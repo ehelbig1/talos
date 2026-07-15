@@ -18,6 +18,7 @@ import {
   HelpCircle,
   Loader2,
   ShieldPlus,
+  Fingerprint,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Dialog } from "@/components/ui";
@@ -378,6 +379,16 @@ export function IntegrationsManager() {
   const handleConnectGcpWrite = () =>
     handleConnectService("Google Cloud provisioning", "/api/gcp/connect-write");
 
+  // GCP Phase D: the BROADEST consent — a full `cloud-platform` token that is
+  // host-reserved (never handed to a workflow module). It exists ONLY so the
+  // controller can mint short-lived (~10 min) impersonated service-account
+  // tokens for Cloud Run / compute workflows, each scoped to ONE SA and bounded
+  // by that SA's IAM roles. Highest-privilege grant on the card — styled
+  // destructive to set it apart from the amber provisioning consent. See
+  // talos-google-cloud::impersonation and docs/gcp-impersonation-setup.md.
+  const handleConnectGcpFull = () =>
+    handleConnectService("Google Cloud impersonation", "/api/gcp/connect-full");
+
   // GitHub App install flow (RFC 0008). Unlike OAuth providers, the backend
   // returns a GitHub *install* URL (not an authorization_url) which we navigate
   // to; GitHub then redirects back to /api/github/setup. A 503 means the App
@@ -427,6 +438,9 @@ export function IntegrationsManager() {
     secondaryLabel,
     secondaryTooltip,
     onSecondaryConnect,
+    tertiaryLabel,
+    tertiaryTooltip,
+    onTertiaryConnect,
   }: {
     title: string;
     description: string;
@@ -440,6 +454,15 @@ export function IntegrationsManager() {
     secondaryLabel?: string;
     secondaryTooltip?: string;
     onSecondaryConnect?: () => void;
+    /**
+     * Optional tertiary consent action, rendered in a stronger (destructive)
+     * style than the secondary one — for the highest-privilege grant on a card
+     * (e.g. GCP full-tier impersonation, which mints broad cloud-platform
+     * tokens host-side).
+     */
+    tertiaryLabel?: string;
+    tertiaryTooltip?: string;
+    onTertiaryConnect?: () => void;
   }) => {
     const serviceIntegrations = integrations.filter(
       (i) => i.service === serviceType,
@@ -487,15 +510,29 @@ export function IntegrationsManager() {
           )}
         </div>
 
-        {onSecondaryConnect && (
-          <button
-            onClick={onSecondaryConnect}
-            title={secondaryTooltip}
-            className="relative z-10 self-start mb-6 inline-flex items-center gap-1.5 text-[9px] font-black uppercase tracking-widest text-warning/80 hover:text-warning border border-warning/20 hover:border-warning/40 bg-warning/5 hover:bg-warning/10 px-3 py-1.5 rounded-xl transition-premium active:scale-95"
-          >
-            <ShieldPlus size={12} />
-            {secondaryLabel ?? "Enable provisioning"}
-          </button>
+        {(onSecondaryConnect || onTertiaryConnect) && (
+          <div className="relative z-10 self-start mb-6 flex flex-wrap items-center gap-2">
+            {onSecondaryConnect && (
+              <button
+                onClick={onSecondaryConnect}
+                title={secondaryTooltip}
+                className="inline-flex items-center gap-1.5 text-[9px] font-black uppercase tracking-widest text-warning/80 hover:text-warning border border-warning/20 hover:border-warning/40 bg-warning/5 hover:bg-warning/10 px-3 py-1.5 rounded-xl transition-premium active:scale-95"
+              >
+                <ShieldPlus size={12} />
+                {secondaryLabel ?? "Enable provisioning"}
+              </button>
+            )}
+            {onTertiaryConnect && (
+              <button
+                onClick={onTertiaryConnect}
+                title={tertiaryTooltip}
+                className="inline-flex items-center gap-1.5 text-[9px] font-black uppercase tracking-widest text-destructive/80 hover:text-destructive border border-destructive/20 hover:border-destructive/40 bg-destructive/5 hover:bg-destructive/10 px-3 py-1.5 rounded-xl transition-premium active:scale-95"
+              >
+                <Fingerprint size={12} />
+                {tertiaryLabel ?? "Enable impersonation"}
+              </button>
+            )}
+          </div>
         )}
 
         <div className="space-y-3 mt-auto relative z-10">
@@ -618,6 +655,17 @@ export function IntegrationsManager() {
               }
               onSecondaryConnect={
                 provider.id === "gcp" ? handleConnectGcpWrite : undefined
+              }
+              tertiaryLabel={
+                provider.id === "gcp" ? "Enable impersonation" : undefined
+              }
+              tertiaryTooltip={
+                provider.id === "gcp"
+                  ? "Broadest consent — a full cloud-platform token, held host-side and never handed to a workflow module. Used only to mint short-lived impersonated service-account tokens for Cloud Run / compute workflows."
+                  : undefined
+              }
+              onTertiaryConnect={
+                provider.id === "gcp" ? handleConnectGcpFull : undefined
               }
             />
           ))}

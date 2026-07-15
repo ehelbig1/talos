@@ -159,4 +159,68 @@ describe("IntegrationsManager", () => {
     });
     expect(calledConnectWrite).toBe(true);
   });
+
+  it("renders an impersonation action for the Google Cloud card with a host-reserved tooltip", async () => {
+    render(<IntegrationsManager />);
+
+    const impersonateBtn = await screen.findByRole("button", {
+      name: /Enable impersonation/i,
+    });
+    expect(impersonateBtn).toHaveAttribute(
+      "title",
+      expect.stringContaining("never handed to a workflow module"),
+    );
+  });
+
+  it("fires GET /api/gcp/connect-full and redirects to the returned authorization_url", async () => {
+    let calledConnectFull = false;
+    server.use(
+      http.get("*/api/gcp/connect-full", () => {
+        calledConnectFull = true;
+        return HttpResponse.json({
+          success: true,
+          data: {
+            authorization_url:
+              "https://accounts.google.com/o/oauth2/auth?scope=cloud-platform",
+            csrf_token: "csrf-full",
+          },
+        });
+      }),
+      // Neither the read-tier nor the write-tier connect should fire for the
+      // impersonation button — if one did, the redirect would still succeed on
+      // the wrong-tier URL and mask a wiring bug.
+      http.get("*/api/gcp/connect", () =>
+        HttpResponse.json({
+          success: true,
+          data: {
+            authorization_url: "https://accounts.google.com/wrong-tier-read",
+            csrf_token: "csrf-wrong-read",
+          },
+        }),
+      ),
+      http.get("*/api/gcp/connect-write", () =>
+        HttpResponse.json({
+          success: true,
+          data: {
+            authorization_url: "https://accounts.google.com/wrong-tier-write",
+            csrf_token: "csrf-wrong-write",
+          },
+        }),
+      ),
+    );
+
+    render(<IntegrationsManager />);
+
+    const impersonateBtn = await screen.findByRole("button", {
+      name: /Enable impersonation/i,
+    });
+    fireEvent.click(impersonateBtn);
+
+    await waitFor(() => {
+      expect(window.location.href).toBe(
+        "https://accounts.google.com/o/oauth2/auth?scope=cloud-platform",
+      );
+    });
+    expect(calledConnectFull).toBe(true);
+  });
 });

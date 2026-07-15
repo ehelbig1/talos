@@ -70,8 +70,9 @@ interface GcpIntegrationInfo {
   id: string;
   account_email: string | null;
   is_active: boolean;
-  // Phase C: consent tier — `'read'` (default) or `'write'` (provisioning).
-  // The same Google account can hold both a read row and a write row.
+  // Consent tier — `'read'` (default), `'write'` (Phase C provisioning), or
+  // `'full'` (Phase D impersonation base: broad cloud-platform, host-reserved).
+  // The same Google account can hold a row for each tier simultaneously.
   tier: string;
 }
 
@@ -580,7 +581,11 @@ export function GoogleCloudWatchChannels(): React.ReactElement | null {
               <span className="text-foreground font-medium">
                 {i.account_email ?? "Google Cloud"}
               </span>
-              {i.tier === "write" ? (
+              {i.tier === "full" ? (
+                <span className="inline-flex items-center text-[10px] font-semibold px-2 py-0.5 rounded-full bg-destructive/10 text-destructive border border-destructive/20">
+                  Impersonation
+                </span>
+              ) : i.tier === "write" ? (
                 <span className="inline-flex items-center text-[10px] font-semibold px-2 py-0.5 rounded-full bg-warning/10 text-warning border border-warning/20">
                   Provisioning
                 </span>
