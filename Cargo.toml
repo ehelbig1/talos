@@ -103,6 +103,7 @@ members = [
     "talos-integration-helpers",
     "talos-google-calendar",
     "talos-gmail",
+    "talos-google-cloud",
     "talos-github",
     "talos-github-repository",
     "talos-github-connect",

@@ -49,6 +49,25 @@ mod tests {
     }
 
     #[test]
+    fn test_google_cloud_access_token_path_format() {
+        // The google_cloud provider stores tokens under a UUID provider_key
+        // (Sha256(google_account_id)[..16]); the vault path must match what
+        // GoogleCloudIntegrationService::get_access_token reads.
+        let user_id = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let provider_key = uuid::Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let path = OAuthCredentialService::access_token_path(
+            "google_cloud",
+            user_id,
+            &provider_key.to_string(),
+        );
+        assert_eq!(
+            path,
+            "oauth/google_cloud/550e8400-e29b-41d4-a716-446655440000/\
+             11111111-2222-3333-4444-555555555555/access_token"
+        );
+    }
+
+    #[test]
     fn test_refresh_token_path_format() {
         let user_id = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
         let path = OAuthCredentialService::refresh_token_path("google", user_id, "primary");

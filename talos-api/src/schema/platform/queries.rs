@@ -354,6 +354,7 @@ impl PlatformQueries {
                 "GMAIL" => IntegrationService::Gmail,
                 "SLACK" => IntegrationService::Slack,
                 "JIRA" => IntegrationService::Jira,
+                "GOOGLE_CLOUD" => IntegrationService::GoogleCloud,
                 // Safety: PROVIDERS is a compile-time constant; unknown values should not appear.
                 other => {
                     tracing::warn!(unknown_enum = other, "Unknown graphql_enum in PROVIDERS");

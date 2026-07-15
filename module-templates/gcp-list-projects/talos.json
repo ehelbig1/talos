@@ -1,0 +1,49 @@
+{
+  "name": "gcp-list-projects",
+  "version": "v1.0.0",
+  "display_name": "GCP: List Projects",
+  "description": "List Google Cloud projects visible to the authenticated account via the Cloud Resource Manager v3 projects:search API. Filter with CRM search syntax (e.g. 'state:ACTIVE'), cap results, and receive structured metadata (project_id, display_name, state, create_time). Building block for cloud-inventory / cost-attribution / drift-detection workflows.\n\nRequires a vault:// reference to a Google Cloud OAuth access token in the AUTH_HEADER config key. The controller resolves + refreshes the token at dispatch time — you only need to pass the vault path.",
+  "category": "Cloud",
+  "capability_world": "http-node",
+  "allowed_hosts": ["cloudresourcemanager.googleapis.com"],
+  "allowed_methods": ["GET"],
+  "requires_secrets": ["oauth/google_cloud/*"],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "required": ["AUTH_HEADER"],
+    "properties": {
+      "AUTH_HEADER": {
+        "type": "string",
+        "description": "vault:// path to the OAuth access token wrapped in 'Bearer ' (e.g. 'Bearer vault://oauth/google_cloud/{user_id}/{provider_key}/access_token'). The controller resolves the vault reference and refreshes the token if expired."
+      },
+      "QUERY": {
+        "type": "string",
+        "default": "state:ACTIVE",
+        "description": "Cloud Resource Manager search query. Common: 'state:ACTIVE' (default), 'displayName:prod*', 'parent:folders/1234'. Empty → all visible projects."
+      },
+      "MAX_RESULTS": {
+        "type": "integer",
+        "default": 25,
+        "description": "Maximum projects to return (1–50). Bounds the single-page projects:search request."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Enable the Cloud Resource Manager API",
+      "detail": "In https://console.cloud.google.com, enable the Cloud Resource Manager API and configure OAuth consent with the 'https://www.googleapis.com/auth/cloud-platform.read-only' scope."
+    },
+    {
+      "step": 2,
+      "title": "Authorize the integration",
+      "detail": "Complete the OAuth flow via your Talos integration UI (/api/gcp/connect). The controller stores the access_token + refresh_token at 'oauth/google_cloud/{user_id}/{provider_key}/access_token' and '.../refresh_token', and tracks expiry in integration_credentials."
+    },
+    {
+      "step": 3,
+      "title": "Configure AUTH_HEADER",
+      "detail": "Set AUTH_HEADER to 'Bearer vault://oauth/google_cloud/{your_user_id}/{your_provider_key}/access_token'. The controller resolves the vault path + refreshes the token before dispatching. If you hit 401s, call refresh_oauth_token(vault_path) to force-refresh and read the outcome."
+    }
+  ]
+}

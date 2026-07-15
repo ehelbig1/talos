@@ -122,6 +122,7 @@ talos-compilation = { path = "../talos-compilation" }
 talos-integration-helpers = { path = "../talos-integration-helpers" }
 talos-google-calendar = { path = "../talos-google-calendar" }
 talos-gmail = { path = "../talos-gmail" }
+talos-google-cloud = { path = "../talos-google-cloud" }
 talos-github = { path = "../talos-github" }
 talos-github-connect = { path = "../talos-github-connect" }
 talos-continuation-trigger = { path = "../talos-continuation-trigger" }

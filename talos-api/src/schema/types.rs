@@ -1075,6 +1075,7 @@ pub enum IntegrationService {
     Gmail,
     Slack,
     Jira,
+    GoogleCloud,
 }
 
 #[derive(SimpleObject, Clone, Debug)]

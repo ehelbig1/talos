@@ -719,6 +719,30 @@ impl OAuthCredentialService {
                             .filter(|v| !v.is_empty())
                     }),
             ),
+            "google_cloud" => (
+                "https://oauth2.googleapis.com/token",
+                // Empty-env class (MCP-710): a helm placeholder `""` falls
+                // through to the shared GOOGLE_CLIENT_ID rather than shadowing
+                // it. Without an arm here the proactive refresh task would log
+                // "No token refresh endpoint configured" and silently skip
+                // every google_cloud token, so they'd expire un-refreshed.
+                std::env::var("GOOGLE_CLOUD_CLIENT_ID")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .or_else(|| {
+                        std::env::var("GOOGLE_CLIENT_ID")
+                            .ok()
+                            .filter(|v| !v.is_empty())
+                    }),
+                std::env::var("GOOGLE_CLOUD_CLIENT_SECRET")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .or_else(|| {
+                        std::env::var("GOOGLE_CLIENT_SECRET")
+                            .ok()
+                            .filter(|v| !v.is_empty())
+                    }),
+            ),
             "slack" => {
                 // Slack bot tokens don't expire. If the proactive refresh task
                 // finds this token (because it has a far-future expiry in
