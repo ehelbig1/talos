@@ -2,12 +2,19 @@
   "name": "gcp-create-push-subscription",
   "version": "v1.0.0",
   "display_name": "GCP: Create Push Subscription",
-  "description": "Create a Google Cloud Pub/Sub PUSH subscription with OIDC-authenticated delivery via 'PUT https://pubsub.googleapis.com/v1/projects/{PROJECT_ID}/subscriptions/{SUBSCRIPTION_NAME}'. Binds the subscription to a topic and points push delivery at a Talos watch-channel endpoint, with an OIDC token minted by the given service account against the given audience (ackDeadlineSeconds=60). Idempotent: if the subscription already exists (HTTP 409) the module returns SUCCESS with already_existed=true, so re-running a provisioning workflow is safe. Second of the three Phase C provisioning modules — the self-serve automation of docs/gcp-push-setup.md (topic → push subscription → monitoring channel).\n\nThis is a WRITE-capable module: it requires the write-tier Google Cloud OAuth consent granted via '/api/gcp/connect-write' (a SEPARATE consent from the read-only '/api/gcp/connect' flow). Set AUTH_HEADER to a vault:// reference under 'oauth/google_cloud_write/...' — the controller resolves + refreshes the token at dispatch time.",
+  "description": "Create a Google Cloud Pub/Sub PUSH subscription with OIDC-authenticated delivery via 'PUT https://pubsub.googleapis.com/v1/projects/{PROJECT_ID}/subscriptions/{SUBSCRIPTION_NAME}'. Binds the subscription to a topic and points push delivery at a Talos watch-channel endpoint, with an OIDC token minted by the given service account against the given audience (ackDeadlineSeconds=60). Idempotent: if the subscription already exists (HTTP 409) the module returns SUCCESS with already_existed=true, so re-running a provisioning workflow is safe. Second of the three Phase C provisioning modules — the self-serve automation of docs/gcp-push-setup.md (topic → push subscription → monitoring channel).\n\nThis is a WRITE-capable module: it requires the write-tier Google Cloud OAuth consent granted via '/api/gcp/connect-write' (a SEPARATE consent from the read-only '/api/gcp/connect' flow). Set AUTH_HEADER to a vault:// reference under 'oauth/google_cloud_write/...' — the controller resolves + refreshes the token at dispatch time.\n\nOn HTTP 409 (name already taken) the module GETs the existing subscription and compares topic, pushEndpoint, and OIDC identity: a match is reported as idempotent success (already_existed=true, config_matches=true); a MISMATCH fails loudly so alerts can never silently flow to a stale endpoint.",
   "category": "Cloud",
   "capability_world": "http-node",
-  "allowed_hosts": ["pubsub.googleapis.com"],
-  "allowed_methods": ["PUT"],
-  "requires_secrets": ["oauth/google_cloud_write/*"],
+  "allowed_hosts": [
+    "pubsub.googleapis.com"
+  ],
+  "allowed_methods": [
+    "GET",
+    "PUT"
+  ],
+  "requires_secrets": [
+    "oauth/google_cloud_write/*"
+  ],
   "requires_approval_for": [],
   "config_schema": {
     "type": "object",

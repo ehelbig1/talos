@@ -10,11 +10,31 @@ use talos_sdk_macros::talos_module;
 
 const MAX_ERROR_EXCERPT_CHARS: usize = 500;
 
-// Typed decoder (NOT top-level serde_json::Value — 3-10x cheaper in WASM fuel).
+// Typed decoders (NOT top-level serde_json::Value — 3-10x cheaper in WASM fuel).
 #[derive(Deserialize)]
 struct SubscriptionResp {
     #[serde(default)]
     name: String,
+    #[serde(default)]
+    topic: String,
+    #[serde(rename = "pushConfig", default)]
+    push_config: Option<PushConfigResp>,
+}
+
+#[derive(Deserialize, Default)]
+struct PushConfigResp {
+    #[serde(rename = "pushEndpoint", default)]
+    push_endpoint: String,
+    #[serde(rename = "oidcToken", default)]
+    oidc_token: Option<OidcTokenResp>,
+}
+
+#[derive(Deserialize, Default)]
+struct OidcTokenResp {
+    #[serde(rename = "serviceAccountEmail", default)]
+    service_account_email: String,
+    #[serde(default)]
+    audience: String,
 }
 
 /// Validate a GCP project id: `^[a-z][a-z0-9-]{4,28}[a-z0-9]$`.
@@ -182,11 +202,68 @@ pub fn run(input: String) -> Result<String, String> {
     let resp =
         talos::core::http::fetch(&req).map_err(|e| format!("subscription create fetch: {:?}", e))?;
 
-    // 409 = subscription already exists → idempotent success for re-runs.
+    // 409 = subscription already exists. NOT blind success: an existing
+    // subscription with a DIFFERENT push endpoint / topic / OIDC identity
+    // would silently deliver alerts elsewhere. GET the live resource and
+    // compare — only a config MATCH is idempotent success; a mismatch fails
+    // loudly so the operator resolves it deliberately.
     if resp.status == 409 {
+        let get_req = talos::core::http::Request {
+            method: talos::core::http::Method::Get,
+            url: format!("https://pubsub.googleapis.com/v1/{}", full_subscription),
+            headers: vec![
+                ("Authorization".to_string(), auth.to_string()),
+                ("Accept".to_string(), "application/json".to_string()),
+            ],
+            body: Vec::new(),
+            timeout_ms: Some(15000),
+        };
+        let get_resp = talos::core::http::fetch(&get_req)
+            .map_err(|e| format!("subscription verify fetch after 409: {:?}", e))?;
+        if !(200..300).contains(&get_resp.status) {
+            let body = String::from_utf8_lossy(&get_resp.body).into_owned();
+            return Err(format!(
+                "subscription '{}' already exists but could not be verified (HTTP {}): {}",
+                full_subscription,
+                get_resp.status,
+                excerpt(&body)
+            ));
+        }
+        let get_body = String::from_utf8(get_resp.body)
+            .map_err(|_| "subscription verify: invalid utf8 response")?;
+        let existing: SubscriptionResp = serde_json::from_str(&get_body)
+            .map_err(|e| format!("subscription verify parse: {}", e))?;
+
+        let pc = existing.push_config.unwrap_or_default();
+        let oidc = pc.oidc_token.unwrap_or_default();
+        let mut mismatches: Vec<String> = Vec::new();
+        if existing.topic != full_topic {
+            mismatches.push(format!("topic (existing: {})", excerpt(&existing.topic)));
+        }
+        if pc.push_endpoint != push_endpoint {
+            mismatches.push("pushEndpoint".to_string());
+        }
+        if oidc.service_account_email != service_account_email {
+            mismatches.push("oidcToken.serviceAccountEmail".to_string());
+        }
+        if oidc.audience != audience {
+            mismatches.push("oidcToken.audience".to_string());
+        }
+        if !mismatches.is_empty() {
+            // Endpoint/audience values are deliberately NOT echoed (the push
+            // endpoint embeds the watch token) — name only the fields.
+            return Err(format!(
+                "subscription '{}' already exists with DIFFERENT config ({}). \
+                 Refusing to report success — delete the subscription or use a new name.",
+                full_subscription,
+                mismatches.join(", ")
+            ));
+        }
+
         let result = serde_json::json!({
             "created": false,
             "already_existed": true,
+            "config_matches": true,
             "subscription": full_subscription,
             "topic": full_topic,
         });
