@@ -161,7 +161,9 @@ pub use sanitizer::{ExecutionSanitizer, OutputSanitizer};
 pub use secret_envelope::{
     validate_seal_output, SealValidationError, SecretEnvelope, MIN_SEAL_NONCE_LEN,
 };
-pub use secrets::{BoxError, GithubInstallationTokenProvider, SecretsResolver};
+pub use secrets::{
+    BoxError, GcpImpersonationTokenProvider, GithubInstallationTokenProvider, SecretsResolver,
+};
 pub use shared_key::{WorkerKeyRing, WorkerSharedKey};
 pub use sub_actor_context::SubworkflowActorContextResolver;
 pub use system_node::{JoinMode, SystemNodeKind};

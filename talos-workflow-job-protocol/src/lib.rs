@@ -1437,12 +1437,30 @@ pub fn is_disallowed_sql_function(name: &str) -> bool {
 ///   `oauth/<provider>/<user_id>/<provider_key>/refresh_token`.
 ///   Access tokens are NOT considered host-internal because workflow
 ///   modules legitimately read them via `vault://` in node config.
+/// - The GCP `google_cloud_full` consent tier: ALL of its tokens
+///   (access AND refresh) are host-only. This tier holds a broad
+///   `cloud-platform` token used solely CONTROLLER-SIDE to mint
+///   short-lived impersonated service-account tokens (Phase D). It is
+///   deliberately never handed to a guest — the whole point of
+///   impersonation is that a module receives a 10-minute, single-SA
+///   token (`gcp/impersonated/<sa>/access_token`, which is NOT reserved),
+///   never the broad grant it was minted from.
 ///
 /// Hygiene checks must use this rather than `is_llm_provider_vault_path`
 /// alone — flagging an OAuth refresh_token as orphan would suggest an
 /// operator delete it, silently breaking the next refresh cycle.
 pub fn is_controller_internal_vault_path(path: &str) -> bool {
     if is_llm_provider_vault_path(path) {
+        return true;
+    }
+    // The full-tier GCP consent is host-only in its ENTIRETY (access +
+    // refresh). Unlike ordinary providers whose access_token is
+    // module-readable via `vault://`, a `cloud-platform` access token is
+    // too broad to ever cross to a guest — it exists only to call
+    // iamcredentials.generateAccessToken controller-side. Reserve the whole
+    // subtree. The minted `gcp/impersonated/*` tokens are a SEPARATE,
+    // non-reserved namespace, so this does not block them.
+    if path.starts_with("oauth/google_cloud_full/") {
         return true;
     }
     // Defensive: refuse to match shapes like "oauth/refresh_token" that
@@ -1907,6 +1925,70 @@ mod vault_matcher_tests {
         assert!(vault_path_permitted(
             &s(&["oauth/google_cloud_write/*"]),
             "oauth/google_cloud_write/1a361562/9c4d/access_token"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod full_tier_reservation_tests {
+    use super::{is_controller_internal_vault_path, vault_path_permitted};
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// SECURITY INVARIANT (GCP Phase D): the `google_cloud_full` consent
+    /// tier holds a broad `cloud-platform` token used only to mint
+    /// impersonated tokens controller-side. BOTH its access AND refresh
+    /// tokens must be host-reserved — a `cloud-platform` access token is
+    /// far too broad to ever reach a guest (unlike ordinary access tokens,
+    /// which are module-readable). This is what the worker's
+    /// `check_secret_allowlist` and the controller's `retain_wire_safe_secrets`
+    /// backstop both inherit from one predicate.
+    #[test]
+    fn full_tier_tokens_are_entirely_host_reserved() {
+        assert!(is_controller_internal_vault_path(
+            "oauth/google_cloud_full/1a361562/9c4d/refresh_token"
+        ));
+        // The distinguishing case: full-tier ACCESS tokens are reserved too,
+        // where every other provider's access token is NOT.
+        assert!(is_controller_internal_vault_path(
+            "oauth/google_cloud_full/1a361562/9c4d/access_token"
+        ));
+    }
+
+    /// The read/write tiers stay module-readable on their access tokens —
+    /// the full-tier reservation must not have widened to them.
+    #[test]
+    fn read_and_write_tier_access_tokens_stay_module_readable() {
+        assert!(!is_controller_internal_vault_path(
+            "oauth/google_cloud/1a361562/9c4d/access_token"
+        ));
+        assert!(!is_controller_internal_vault_path(
+            "oauth/google_cloud_write/1a361562/9c4d/access_token"
+        ));
+    }
+
+    /// The MINTED impersonated token lives in a separate, NON-reserved
+    /// namespace so a module's `gcp/impersonated/*` grant can name it —
+    /// that's the whole delivery mechanism. It must NOT be swept up by the
+    /// full-tier reservation.
+    #[test]
+    fn minted_impersonated_token_is_not_reserved_and_is_grantable() {
+        let minted = "gcp/impersonated/talos-runner@sandbox.iam.gserviceaccount.com/access_token";
+        assert!(
+            !is_controller_internal_vault_path(minted),
+            "minted impersonated token must be deliverable to the guest"
+        );
+        assert!(
+            vault_path_permitted(&s(&["gcp/impersonated/*"]), minted),
+            "a gcp/impersonated/* module grant must cover the minted token"
+        );
+        // And a full-tier grant string must NOT reach the minted namespace
+        // (nor vice-versa) — they are unrelated prefixes.
+        assert!(!vault_path_permitted(
+            &s(&["gcp/impersonated/*"]),
+            "oauth/google_cloud_full/1a361562/9c4d/access_token"
         ));
     }
 }

@@ -38,6 +38,17 @@ static OAUTH_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 pub enum GcpTier {
     Read,
     Write,
+    /// Phase D: broad `cloud-platform` consent used ONLY controller-side to
+    /// mint short-lived impersonated service-account tokens
+    /// (`iamcredentials.generateAccessToken`). Its tokens are host-reserved
+    /// (`is_controller_internal_vault_path` reserves the whole
+    /// `oauth/google_cloud_full/*` subtree, access AND refresh) — a guest
+    /// never receives this grant, only the scoped-down minted token. This is
+    /// the ONLY tier that requests `cloud-platform`, and it exists because
+    /// the IAM Credentials API has no narrower scope; the blast-radius bound
+    /// is moved from OAuth scope (as with Read/Write) to short-lived
+    /// per-SA impersonation instead.
+    Full,
 }
 
 impl GcpTier {
@@ -47,6 +58,7 @@ impl GcpTier {
         match self {
             GcpTier::Read => "google_cloud",
             GcpTier::Write => "google_cloud_write",
+            GcpTier::Full => "google_cloud_full",
         }
     }
 
@@ -55,6 +67,7 @@ impl GcpTier {
         match self {
             GcpTier::Read => "read",
             GcpTier::Write => "write",
+            GcpTier::Full => "full",
         }
     }
 
@@ -73,6 +86,16 @@ impl GcpTier {
             GcpTier::Write => &[
                 "https://www.googleapis.com/auth/pubsub",
                 "https://www.googleapis.com/auth/monitoring",
+                "https://www.googleapis.com/auth/userinfo.email",
+                "openid",
+            ],
+            // Impersonation base: cloud-platform is REQUIRED — the IAM
+            // Credentials API (generateAccessToken) has no narrower scope.
+            // Safe only because this token is host-reserved and never handed
+            // to a guest; the guest receives short-lived per-SA minted
+            // tokens instead. See the `Full` variant docs.
+            GcpTier::Full => &[
+                "https://www.googleapis.com/auth/cloud-platform",
                 "https://www.googleapis.com/auth/userinfo.email",
                 "openid",
             ],
@@ -192,6 +215,13 @@ impl GoogleCloudIntegrationService {
     /// config as the read tier — a SEPARATE consent with elevated scopes.
     pub fn new_write(db_pool: Pool<Postgres>) -> Result<Self> {
         Self::new_with_tier(db_pool, GcpTier::Write)
+    }
+
+    /// Full-tier (Phase D impersonation base) instance. Same OAuth client —
+    /// a SEPARATE `cloud-platform` consent whose tokens are host-reserved and
+    /// used ONLY to mint impersonated service-account tokens. See [`GcpTier::Full`].
+    pub fn new_full(db_pool: Pool<Postgres>) -> Result<Self> {
+        Self::new_with_tier(db_pool, GcpTier::Full)
     }
 
     fn new_with_tier(db_pool: Pool<Postgres>, tier: GcpTier) -> Result<Self> {
@@ -503,6 +533,7 @@ impl talos_oauth::OAuthIntegration for GoogleCloudIntegrationService {
             match self.tier {
                 GcpTier::Read => "google_cloud_connected",
                 GcpTier::Write => "google_cloud_write_connected",
+                GcpTier::Full => "google_cloud_full_connected",
             },
             integration.account_email.as_deref(),
             true,
@@ -664,6 +695,7 @@ impl GoogleCloudIntegrationService {
         let row_provider = match row_tier.as_str() {
             "read" => Some("google_cloud"),
             "write" => Some("google_cloud_write"),
+            "full" => Some("google_cloud_full"),
             other => {
                 tracing::warn!(
                     integration_id = %integration_id,
@@ -710,6 +742,7 @@ impl GoogleCloudIntegrationService {
             user_id,
             match row_tier.as_str() {
                 "write" => "google_cloud_write_disconnected",
+                "full" => "google_cloud_full_disconnected",
                 _ => "google_cloud_disconnected",
             },
             account_email.as_deref(),

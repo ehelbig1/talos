@@ -9,6 +9,7 @@ use super::integration::{GoogleCloudIntegrationInfo, GoogleCloudIntegrationServi
 pub struct GcpOAuthServices {
     pub read: Arc<GoogleCloudIntegrationService>,
     pub write: Arc<GoogleCloudIntegrationService>,
+    pub full: Arc<GoogleCloudIntegrationService>,
 }
 use axum::{
     extract::{Path, Query, State},
@@ -250,6 +251,7 @@ pub async fn gcp_callback_handler(
     // atomic single-use consume.
     let service = match talos_oauth::peek_state_provider(services.read.db_pool(), &state).await {
         Ok(Some(provider)) if provider == "google_cloud_write" => &services.write,
+        Ok(Some(provider)) if provider == "google_cloud_full" => &services.full,
         Ok(_) => &services.read,
         Err(e) => {
             tracing::warn!(error = %e, "Failed to peek Google Cloud OAuth state provider");
