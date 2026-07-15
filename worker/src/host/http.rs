@@ -507,29 +507,50 @@ impl wit_http::Host for TalosContext {
             }
             Err(e) => {
                 get_global_circuit_breaker().record_failure(&host_str);
-                return Err(if e.is_timeout() {
+                if e.is_timeout() {
                     self.emit_host_diagnostic(
                         "request-timeout",
                         &format!("request to '{host_str}' timed out"),
                     )
                     .await;
-                    wit_http::Error::Timeout
-                } else {
-                    // Class only — reqwest's Display can embed proxy /
-                    // internal-infra detail, and the connect-vs-reset
-                    // distinction is all the module author needs.
-                    let class = if e.is_connect() {
-                        "connection failed (refused/unreachable)"
-                    } else {
-                        "request failed after connecting (reset/protocol)"
-                    };
+                    return Err(wit_http::Error::Timeout);
+                }
+                if e.is_connect()
+                    && self.max_llm_tier == talos_workflow_job_protocol::LlmTier::Tier1
+                {
+                    // A Tier-1 (local-egress-only) actor's SsrfFilteringResolver
+                    // drops every public IP, so a connect failure to a
+                    // non-loopback host is almost always the data-egress gate
+                    // — NOT the host being down. Say so with the fix, since the
+                    // resolver itself (a reqwest dns::Resolve impl) has no
+                    // TalosContext to emit from. Loopback/private targets still
+                    // connect under Tier-1 (local Ollama), so those failures
+                    // produce the generic reason below.
                     self.emit_host_diagnostic(
-                        "connection-failed",
-                        &format!("request to '{host_str}': {class}"),
+                        "tier1-egress-blocked",
+                        &format!(
+                            "'{host_str}' was blocked by this workflow's Tier-1 actor \
+                             (local-egress-only — data must not leave the host). To reach \
+                             an external API, bind the workflow to a Tier-2 actor."
+                        ),
                     )
                     .await;
-                    wit_http::Error::Networkerror
-                });
+                    return Err(wit_http::Error::Networkerror);
+                }
+                // Class only — reqwest's Display can embed proxy /
+                // internal-infra detail, and the connect-vs-reset
+                // distinction is all the module author needs.
+                let class = if e.is_connect() {
+                    "connection failed (refused/unreachable)"
+                } else {
+                    "request failed after connecting (reset/protocol)"
+                };
+                self.emit_host_diagnostic(
+                    "connection-failed",
+                    &format!("request to '{host_str}': {class}"),
+                )
+                .await;
+                return Err(wit_http::Error::Networkerror);
             }
         };
 
@@ -1194,9 +1215,26 @@ impl wit_http::Host for TalosContext {
         // Per-failure diagnostics for DISPATCH failures. Validation
         // failures (request_hosts[i] == None) were already diagnosed at
         // validation time; capped globally by HOST_DIAG_CAP.
+        let tier1 = self.max_llm_tier == talos_workflow_job_protocol::LlmTier::Tier1;
         for (idx, r) in &indexed {
             if let Err(e) = r {
                 if let Some(Some(host)) = request_hosts.get(*idx) {
+                    // A Networkerror under a Tier-1 actor is almost always the
+                    // local-egress-only gate (same reasoning as the single-fetch
+                    // path); surface the actionable reason instead of the
+                    // ambiguous connection/reset class.
+                    if tier1 && matches!(e, wit_http::Error::Networkerror) {
+                        self.emit_host_diagnostic(
+                            "tier1-egress-blocked",
+                            &format!(
+                                "fetch_all[{idx}]: '{host}' blocked by this workflow's Tier-1 \
+                                 actor (local-egress-only). Bind a Tier-2 actor to reach \
+                                 external APIs."
+                            ),
+                        )
+                        .await;
+                        continue;
+                    }
                     let class = match e {
                         wit_http::Error::Timeout => "timed out",
                         _ => "failed (connection/reset or response over limits)",

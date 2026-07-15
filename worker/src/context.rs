@@ -1971,6 +1971,8 @@ mod host_diagnostic_tests {
             "circuit-breaker-open",
             "request-timeout",
             "connection-failed",
+            "tier1-egress-blocked",
+            "batch-request-failed",
             "method-allowlist",
         ] {
             let e = build_host_diagnostic_entry("x", "", reason, "m");
