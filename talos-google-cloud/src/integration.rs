@@ -165,11 +165,13 @@ impl GoogleCloudIntegrationService {
             .await
             .context("Failed to fetch Google Cloud access token from vault")?;
 
+        // Path deliberately NOT in the message (it embeds user_id — the
+        // MCP-988 oauth-path-PII class); callers log user_id as a
+        // structured field already.
         secrets.get(&access_token_path).cloned().ok_or_else(|| {
             anyhow!(
-                "Google Cloud access token not found at vault path '{}'. \
-                 Reconnect the Google Cloud integration.",
-                access_token_path
+                "Google Cloud access token not found in vault. \
+                 Reconnect the Google Cloud integration."
             )
         })
     }

@@ -22,6 +22,7 @@ import type { LucideIcon } from "lucide-react";
 import { Dialog } from "@/components/ui";
 import { GoogleCalendarWatchChannels } from "./GoogleCalendarWatchChannels";
 import { GmailWatchChannels } from "./GmailWatchChannels";
+import { GoogleCloudWatchChannels } from "./GoogleCloudWatchChannels";
 
 import type {
   IntegrationService,
@@ -185,6 +186,8 @@ export function IntegrationsManager() {
       { param: "atlassian_error", label: "Jira", isError: true },
       { param: "gmail_connected", label: "Gmail", isError: false },
       { param: "gmail_error", label: "Gmail", isError: true },
+      { param: "gcp_connected", label: "Google Cloud", isError: false },
+      { param: "gcp_error", label: "Google Cloud", isError: true },
       { param: "github_connected", label: "GitHub", isError: false },
       { param: "github_error", label: "GitHub", isError: true },
     ];
@@ -655,6 +658,11 @@ export function IntegrationsManager() {
       {/* Gmail watch channels */}
       <div className="animate-in fade-in duration-700 delay-500">
         <GmailWatchChannels />
+      </div>
+
+      {/* Google Cloud watch channels */}
+      <div className="animate-in fade-in duration-700 delay-500">
+        <GoogleCloudWatchChannels />
       </div>
 
       {/* Disconnect Confirmation Dialog */}

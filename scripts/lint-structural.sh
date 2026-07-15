@@ -2745,7 +2745,7 @@ done < <(
                 next unless $d =~ /\bDebug\b/;
                 next if $body =~ /allow-debug-secret-struct/;
                 next if $body =~ /Zeroizing|Secret</;
-                if ($body =~ /\b(api_key|client_secret|signing_secret|verification_token|bot_token|access_token|refresh_token|private_key|secret_key|password)\s*:\s*(?:Option<\s*)?String/) {
+                if ($body =~ /\b(api_key|client_secret|signing_secret|verification_token|bot_token|access_token|refresh_token|private_key|secret_key|password|push_token)\s*:\s*(?:Option<\s*)?String/) {
                     print "$ARGV: struct $name derives Debug with a plaintext secret field\n";
                 }
             }

@@ -214,6 +214,14 @@ struct PlatformServices {
     github_connect_service: std::sync::Arc<talos_github_connect::GithubConnectService>,
     gmail_watch_service: Option<std::sync::Arc<gmail::watch::GmailWatchService>>,
     gmail_pubsub_verifier: Option<std::sync::Arc<gmail::pubsub_jwt::PubsubJwtVerifier>>,
+    // Google Cloud (Cloud Monitoring) push — all None unless
+    // GCP_PUBSUB_AUDIENCE is set. The verifier is the SHARED
+    // GoogleOidcVerifier (audience passed per-call), so the operator
+    // audience is stored separately for the push handler state.
+    gcp_watch_service: Option<std::sync::Arc<google_cloud::watch::GcpWatchService>>,
+    gcp_pubsub_verifier:
+        Option<std::sync::Arc<talos_integration_helpers::google_jwt::GoogleOidcVerifier>>,
+    gcp_pubsub_audience: Option<String>,
     atlassian_integration_service: std::sync::Arc<atlassian::AtlassianIntegrationService>,
     gmail_api_client: std::sync::Arc<gmail::GmailApiClient>,
     google_calendar_service: std::sync::Arc<google_calendar::GoogleCalendarService>,
@@ -1269,6 +1277,44 @@ async fn build_platform_services(
             _ => None,
         };
 
+    // ---------- Google Cloud push-notification (watch) service ----------
+    // Optional. Enabled only when GCP_PUBSUB_AUDIENCE is set (the
+    // subscription's --push-auth-token-audience). Unlike Gmail there is
+    // NO topic/service-account env: the user creates the Pub/Sub
+    // subscription + service account themselves and each watch row
+    // carries its own expected service-account email. See
+    // docs/gcp-push-setup.md. MCP-710 empty-env class: a helm-placeholder
+    // "" reads as unset (all pushes would reject with an empty audience,
+    // and the disabled-log would never fire).
+    let gcp_pubsub_audience = std::env::var("GCP_PUBSUB_AUDIENCE")
+        .ok()
+        .filter(|v| !v.is_empty());
+    let (gcp_watch_service, gcp_pubsub_verifier): (
+        Option<std::sync::Arc<google_cloud::watch::GcpWatchService>>,
+        Option<std::sync::Arc<talos_integration_helpers::google_jwt::GoogleOidcVerifier>>,
+    ) = match &gcp_pubsub_audience {
+        Some(_) => {
+            tracing::info!("Google Cloud push service enabled");
+            let watch = std::sync::Arc::new(google_cloud::watch::GcpWatchService::new(
+                db_pool.clone(),
+                google_cloud_integration_service.clone(),
+            ));
+            // The shared verifier holds only the JWK cache; the audience
+            // is passed per-call and the service-account email is
+            // per-watch, so one verifier serves every GCP watch channel.
+            let verifier = std::sync::Arc::new(
+                talos_integration_helpers::google_jwt::GoogleOidcVerifier::new(),
+            );
+            (Some(watch), Some(verifier))
+        }
+        None => {
+            tracing::info!(
+                "Google Cloud push service disabled (set GCP_PUBSUB_AUDIENCE to enable)"
+            );
+            (None, None)
+        }
+    };
+
     // ---------- Initialize Atlassian (Jira) integration service ----------
     let atlassian_integration_service = std::sync::Arc::new(
         atlassian::AtlassianIntegrationService::new(db_pool.clone())
@@ -1681,6 +1727,9 @@ async fn build_platform_services(
         github_connect_service,
         gmail_watch_service,
         gmail_pubsub_verifier,
+        gcp_watch_service,
+        gcp_pubsub_verifier,
+        gcp_pubsub_audience,
         atlassian_integration_service,
         gmail_api_client,
         google_calendar_service,
@@ -3886,6 +3935,20 @@ fn spawn_integration_renewal_tasks(
         });
     }
 
+    // ---------- GCP watch create-lock sweep ----------
+    // No renewal task for GCP (the user owns the upstream subscription;
+    // nothing on our side expires). We only sweep the create-lock map so
+    // it can't grow unbounded over the controller's lifetime.
+    if let Some(gcp_watch) = services.gcp_watch_service.clone() {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                gcp_watch.cleanup_create_locks();
+            }
+        });
+    }
+
     // ---------- Start Google Calendar channel renewal task ----------
     if google_calendar_service.is_configured() {
         let renewal_service = google_calendar_service.clone();
@@ -4725,6 +4788,9 @@ fn build_router(
     let github_connect_service = services.github_connect_service.clone();
     let gmail_watch_service = services.gmail_watch_service.clone();
     let gmail_pubsub_verifier = services.gmail_pubsub_verifier.clone();
+    let gcp_watch_service = services.gcp_watch_service.clone();
+    let gcp_pubsub_verifier = services.gcp_pubsub_verifier.clone();
+    let gcp_pubsub_audience = services.gcp_pubsub_audience.clone();
     let atlassian_integration_service = services.atlassian_integration_service.clone();
     let gmail_api_client = services.gmail_api_client.clone();
     let google_calendar_service = services.google_calendar_service.clone();
@@ -5168,6 +5234,118 @@ fn build_router(
         Router::new()
             .route("/api/admin/gmail/watch", post(gmail::admin::create_watch))
             .route("/api/admin/gmail/stop-all", post(gmail::admin::stop_all))
+            .with_state(svc.clone())
+            .layer(from_fn(rate_limit::rate_limit_middleware))
+            .layer(Extension(api_limiter.clone()))
+            .layer(Extension(whitelist.clone()))
+    });
+
+    // ---------- Google Cloud watch-channel routes (user-scoped) ----------
+    // Only wired when the push service is configured (GCP_PUBSUB_AUDIENCE
+    // set). 16 KiB body cap: `CreateGcpWatchRequest` is a handful of
+    // small fields (uuids + an SA email + a display name); the
+    // renew-less test/stop handlers take no body but inherit the cap.
+    let gcp_watch_channel_routes = gcp_watch_service.as_ref().map(|svc| {
+        Router::new()
+            .route(
+                "/api/gcp/watch-channels",
+                get(google_cloud::handlers::list_watch_channels_handler),
+            )
+            .route(
+                "/api/gcp/watch-channels",
+                post(google_cloud::handlers::create_watch_channel_handler),
+            )
+            .route(
+                "/api/gcp/watch-channels/{channel_uuid}/test",
+                post(google_cloud::handlers::test_watch_channel_handler),
+            )
+            .route(
+                "/api/gcp/watch-channels/{channel_uuid}",
+                axum::routing::delete(google_cloud::handlers::stop_watch_channel_handler),
+            )
+            .with_state(svc.clone())
+            .layer(DefaultBodyLimit::max(16 * 1024))
+            .layer(from_fn(rest_auth_middleware))
+            .layer(Extension(auth_service.clone()))
+            .layer(from_fn(rate_limit::rate_limit_middleware))
+            .layer(Extension(api_limiter.clone()))
+            .layer(Extension(whitelist.clone()))
+    });
+
+    // Cloud Monitoring push receiver. PUBLIC — no session auth. The
+    // Google-signed OIDC JWT (audience + per-watch service account) is
+    // the sole authenticator (see google_cloud::handlers). Only wired
+    // when the verifier, watch service, AND audience are all present.
+    let gcp_pubsub_route = if let (Some(verifier), Some(watch), Some(audience)) = (
+        &gcp_pubsub_verifier,
+        &gcp_watch_service,
+        &gcp_pubsub_audience,
+    ) {
+        let dispatch_ctx: Option<google_cloud::dispatch::GcpDispatchContext> =
+            match (nats_client.as_ref(), worker_shared_key.as_ref()) {
+                (Some(nats), Some(key)) => Some(google_cloud::dispatch::GcpDispatchContext {
+                    registry: std::sync::Arc::new(registry::ModuleRegistry::new(
+                        db_pool.clone(),
+                        redis_client.clone(),
+                    )),
+                    execution_service: module_execution_service.clone(),
+                    nats: nats.clone(),
+                    worker_shared_key: key.clone(),
+                    redis: redis_client.clone(),
+                    db_pool: db_pool.clone(),
+                    integrations: google_cloud_integration_service.clone(),
+                    secrets_manager: Some(secrets_manager.clone()),
+                }),
+                _ => {
+                    tracing::warn!(
+                        "GCP push dispatch disabled (NATS or WORKER_SHARED_KEY missing); \
+                         pushes will be recorded but NOT run WASM modules"
+                    );
+                    None
+                }
+            };
+
+        let state = std::sync::Arc::new(google_cloud::handlers::PubsubHandlerState {
+            verifier: verifier.clone(),
+            expected_audience: audience.clone(),
+            watch_service: watch.clone(),
+            dispatch: dispatch_ctx,
+        });
+        Some(
+            Router::new()
+                .route(
+                    "/api/gcp/pubsub/{watch_token}",
+                    post(google_cloud::handlers::pubsub_push_handler),
+                )
+                .with_state(state)
+                // 256 KiB body cap on the PUBLIC push receiver. Unlike
+                // Gmail's tiny `{ emailAddress, historyId }` envelope, a
+                // Cloud Monitoring incident carries documentation /
+                // policy / condition text that can run to tens of KiB.
+                // 256 KiB gives generous headroom while still bounding an
+                // unauthenticated multi-MB parse (JWT verify runs AFTER
+                // body extract — the cap is the only guard before it).
+                // Sizing rationale mirrors MCP-1159.
+                .layer(DefaultBodyLimit::max(256 * 1024))
+                .layer(from_fn(rate_limit::rate_limit_middleware))
+                .layer(Extension(webhook_limiter.clone()))
+                .layer(Extension(whitelist.clone())),
+        )
+    } else {
+        None
+    };
+
+    // Admin-only GCP operations. Same two-gate model as gmail/gcal.
+    let gcp_admin_routes = gcp_watch_service.as_ref().map(|svc| {
+        Router::new()
+            .route(
+                "/api/admin/gcp/watch",
+                post(google_cloud::admin::create_watch),
+            )
+            .route(
+                "/api/admin/gcp/stop-all",
+                post(google_cloud::admin::stop_all),
+            )
             .with_state(svc.clone())
             .layer(from_fn(rate_limit::rate_limit_middleware))
             .layer(Extension(api_limiter.clone()))
@@ -5648,6 +5826,23 @@ fn build_router(
         app
     };
     let app = if let Some(r) = gmail_admin_routes {
+        app.merge(r)
+    } else {
+        app
+    };
+    // Optional GCP push routes — `None` when GCP_PUBSUB_AUDIENCE wasn't
+    // configured at startup.
+    let app = if let Some(r) = gcp_watch_channel_routes {
+        app.merge(r)
+    } else {
+        app
+    };
+    let app = if let Some(r) = gcp_pubsub_route {
+        app.merge(r)
+    } else {
+        app
+    };
+    let app = if let Some(r) = gcp_admin_routes {
         app.merge(r)
     } else {
         app

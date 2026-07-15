@@ -28,9 +28,13 @@
 //! - [`state_store`] — watch-row plumbing over `integration_state`
 //!   ([`state_store::ChannelStore`], [`state_store::ttl_with_grace`],
 //!   [`state_store::CreateLockMap`]).
+//! - [`google_jwt`] — Google OIDC push-JWT verification shared by Gmail
+//!   (Pub/Sub push) and Google Cloud (Monitoring push):
+//!   [`google_jwt::GoogleOidcVerifier`] + the envelope types.
 
 pub mod admin;
 pub mod audit;
+pub mod google_jwt;
 pub mod renewal;
 pub mod state_store;
 

@@ -6,23 +6,37 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Exposes `google_jwt::GoogleOidcVerifier::with_keys_for_test` to
+# DOWNSTREAM crates' tests (e.g. talos-gmail's pubsub_jwt wrapper tests
+# need to inject a locally-minted RSA key set). The helpers crate's own
+# `#[cfg(test)]` covers it internally, so this feature is only enabled by
+# a dependent's dev-dependency, never in production builds.
+test-util = []
+
 [dependencies]
 anyhow.workspace = true
+arc-swap = "1.7"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json"] }
 chrono.workspace = true
 dashmap = "6.1"
+jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 subtle = "2.4"
 talos-config = { path = "../talos-config" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
+talos-http-body = { path = "../talos-http-body" }
+talos-http-utils = { path = "../talos-http-utils" }
 talos-integration-state = { path = "../talos-integration-state" }
 talos-memory = { path = "../talos-memory" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-text-util = { path = "../talos-text-util" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
+thiserror = "2.0"
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 tracing.workspace = true
 uuid.workspace = true
@@ -31,6 +45,12 @@ uuid.workspace = true
 # `start_paused = true` in the renewal-scheduler test needs tokio's
 # test-util clock control.
 tokio = { version = "1", features = ["sync", "rt", "macros", "time", "test-util"] }
+# google_jwt::tests mint RSA keypairs to back locally-signed test JWTs
+# and hand-assemble an `alg: none` token via base64. Production verifies
+# Google's JWKs and never calls rsa::* / base64 directly.
+base64 = "0.22"
+rand = "0.8"
+rsa = { version = "0.9", features = ["pem"] }
 
 [lints]
 workspace = true

@@ -9,14 +9,16 @@ publish.workspace = true
 [dependencies]
 talos-http-utils = { path = "../talos-http-utils" }
 anyhow.workspace = true
-arc-swap = "1.7"
+# arc-swap / jsonwebtoken / thiserror moved out 2026-07: the JWK cache +
+# RS256 verifier they backed were lifted into
+# talos-integration-helpers::google_jwt. jsonwebtoken is now test-only
+# (see [dev-dependencies]).
 async-nats = "0.47"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json"] }
 base64 = "0.22"
 chrono.workspace = true
 dashmap = "6.1"
-jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
 redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde.workspace = true
@@ -39,7 +41,6 @@ talos-registry = { path = "../talos-registry" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-text-util = { path = "../talos-text-util" }
 talos-trace-nats = { path = "../talos-trace-nats" }
-thiserror = "2.0"
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
@@ -50,9 +51,15 @@ uuid.workspace = true
 [dev-dependencies]
 # Used by pubsub_jwt::tests to mint RSA keypairs that back locally-signed
 # test JWTs. Production verifier fetches JWKs from Google and never calls
-# rsa::* directly.
+# rsa::* directly. jsonwebtoken is test-only now that the verifier kernel
+# lives in talos-integration-helpers.
+jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
 rand = "0.8"
 rsa = { version = "0.9", features = ["pem"] }
+# Enable the helpers `test-util` feature so pubsub_jwt's wrapper tests can
+# call GoogleOidcVerifier::with_keys_for_test (gated cross-crate behind
+# that feature).
+talos-integration-helpers = { path = "../talos-integration-helpers", features = ["test-util"] }
 
 [lints]
 workspace = true
