@@ -1248,6 +1248,12 @@ bootstrapSecret:
     GOOGLE_CLIENT_SECRET: ""
     GMAIL_CLIENT_ID: ""
     GMAIL_CLIENT_SECRET: ""
+    # Google Cloud integration (list projects + Cloud Monitoring alerts).
+    # GCP_PUBSUB_AUDIENCE gates the Phase-B push route; leave blank to run
+    # read-only. See docs/gcp-push-setup.md.
+    GOOGLE_CLOUD_CLIENT_ID: ""
+    GOOGLE_CLOUD_CLIENT_SECRET: ""
+    GCP_PUBSUB_AUDIENCE: ""
     SLACK_CLIENT_ID: ""
     SLACK_CLIENT_SECRET: ""
     ATLASSIAN_CLIENT_ID: ""

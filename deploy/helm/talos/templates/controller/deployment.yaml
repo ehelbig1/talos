@@ -200,6 +200,8 @@ spec:
                 "EMBEDDING_API_KEY"
                 "GOOGLE_CLIENT_ID" "GOOGLE_CLIENT_SECRET"
                 "GMAIL_CLIENT_ID" "GMAIL_CLIENT_SECRET"
+                "GOOGLE_CLOUD_CLIENT_ID" "GOOGLE_CLOUD_CLIENT_SECRET"
+                "GCP_PUBSUB_AUDIENCE"
                 "SLACK_CLIENT_ID" "SLACK_CLIENT_SECRET"
                 "ATLASSIAN_CLIENT_ID" "ATLASSIAN_CLIENT_SECRET"
                 "GITHUB_APP_ID" "GITHUB_APP_SLUG" "GITHUB_APP_PRIVATE_KEY" "GITHUB_APP_WEBHOOK_SECRET"
@@ -228,6 +230,8 @@ spec:
               value: "https://{{ (index .Values.controller.ingress.hosts 0).host }}/auth/oauth/google/callback"
             - name: GMAIL_REDIRECT_URI
               value: "https://{{ (index .Values.controller.ingress.hosts 0).host }}/api/gmail/callback"
+            - name: GOOGLE_CLOUD_REDIRECT_URI
+              value: "https://{{ (index .Values.controller.ingress.hosts 0).host }}/api/gcp/callback"
             - name: SLACK_REDIRECT_URI
               value: "https://{{ (index .Values.controller.ingress.hosts 0).host }}/api/slack/callback"
             - name: ATLASSIAN_REDIRECT_URI
