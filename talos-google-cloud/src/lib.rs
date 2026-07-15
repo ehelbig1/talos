@@ -17,11 +17,11 @@ pub mod watch;
 pub mod watch_channel_service;
 #[allow(unused_imports)]
 pub use integration::{
-    GoogleCloudIntegration, GoogleCloudIntegrationInfo, GoogleCloudIntegrationService,
+    GcpTier, GoogleCloudIntegration, GoogleCloudIntegrationInfo, GoogleCloudIntegrationService,
 };
 
 pub mod handlers;
 pub use handlers::{
     connect_gcp_handler, disconnect_integration_handler, gcp_callback_handler,
-    get_integration_handler, list_integrations_handler, list_projects_handler,
+    get_integration_handler, list_integrations_handler, list_projects_handler, GcpOAuthServices,
 };

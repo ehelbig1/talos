@@ -107,6 +107,37 @@ pub struct ConsumedOAuthState {
     pub pkce_verifier: Option<String>,
 }
 
+/// Peek the `provider` bound to a live (unused, unexpired) state token WITHOUT
+/// consuming it.
+///
+/// Purpose: a provider family that shares ONE registered redirect URI across
+/// multiple consent tiers (e.g. `google_cloud` read-only vs `google_cloud_write`
+/// provisioning) needs to know which service should handle the callback before
+/// calling [`consume_oauth_state`]. This is routing metadata only — every
+/// security property (CSRF single-use consume, provider match, expiry, PKCE)
+/// is still enforced by the subsequent consume; a peek→consume race is
+/// harmless because the consume is atomic. Returns `Ok(None)` for an unknown /
+/// used / expired state so the caller falls through to its default provider
+/// and lets `consume_oauth_state` produce the canonical CSRF-safe error.
+pub async fn peek_state_provider(pool: &sqlx::PgPool, state: &str) -> Result<Option<String>> {
+    // Same format-gate as consume (MCP-1171): don't let a multi-KB state
+    // reach the DB.
+    if validate_oauth_state_token_format(state).is_err() {
+        return Ok(None);
+    }
+
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT provider FROM oauth_state_tokens \
+         WHERE state_token = $1 AND used = false AND expires_at > NOW()",
+    )
+    .bind(state)
+    .fetch_optional(pool)
+    .await
+    .context("Failed to peek OAuth state token provider")?;
+
+    Ok(row.map(|(provider,)| provider))
+}
+
 /// Validate + atomically single-use-consume the callback `state` for `provider`,
 /// returning the bound `user_id` + PKCE verifier.
 ///

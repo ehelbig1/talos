@@ -719,7 +719,11 @@ impl OAuthCredentialService {
                             .filter(|v| !v.is_empty())
                     }),
             ),
-            "google_cloud" => (
+            // `google_cloud_write` is the provisioning consent tier (Phase C):
+            // same Google OAuth client, elevated scopes, distinct provider
+            // string so read modules granted `oauth/google_cloud/*` can never
+            // name the write token. Both tiers refresh identically.
+            "google_cloud" | "google_cloud_write" => (
                 "https://oauth2.googleapis.com/token",
                 // Empty-env class (MCP-710): a helm placeholder `""` falls
                 // through to the shared GOOGLE_CLIENT_ID rather than shadowing

@@ -211,6 +211,7 @@ struct PlatformServices {
     slack_integration_service: std::sync::Arc<slack::SlackIntegrationService>,
     gmail_integration_service: std::sync::Arc<gmail::GmailIntegrationService>,
     google_cloud_integration_service: std::sync::Arc<google_cloud::GoogleCloudIntegrationService>,
+    google_cloud_write_service: std::sync::Arc<google_cloud::GoogleCloudIntegrationService>,
     github_connect_service: std::sync::Arc<talos_github_connect::GithubConnectService>,
     gmail_watch_service: Option<std::sync::Arc<gmail::watch::GmailWatchService>>,
     gmail_pubsub_verifier: Option<std::sync::Arc<gmail::pubsub_jwt::PubsubJwtVerifier>>,
@@ -1187,6 +1188,21 @@ async fn build_platform_services(
         "Google Cloud integration service initialized (token encryption + dual-write enabled)"
     );
 
+    // Write-tier (Phase C provisioning) sibling: same OAuth client, separate
+    // consent under provider "google_cloud_write" with scope-narrowed
+    // pubsub+monitoring grants. See GcpTier docs in talos-google-cloud.
+    let google_cloud_write_service = std::sync::Arc::new(
+        google_cloud::GoogleCloudIntegrationService::new_write(db_pool.clone())
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to initialize Google Cloud write-tier service: {}",
+                    e
+                )
+            })?
+            .with_secrets_manager(secrets_manager.clone())
+            .with_credentials_service(oauth_credential_service.clone()),
+    );
+
     // ---------- GitHub App connect service (RFC 0008 Phase B) ----------
     // Optional: enabled only when GITHUB_APP_ID (+ companions) are set. A
     // half-configured App (id set but a required field missing/blank, or an
@@ -1724,6 +1740,7 @@ async fn build_platform_services(
         slack_integration_service,
         gmail_integration_service,
         google_cloud_integration_service,
+        google_cloud_write_service,
         github_connect_service,
         gmail_watch_service,
         gmail_pubsub_verifier,
@@ -4785,6 +4802,7 @@ fn build_router(
     let slack_integration_service = services.slack_integration_service.clone();
     let gmail_integration_service = services.gmail_integration_service.clone();
     let google_cloud_integration_service = services.google_cloud_integration_service.clone();
+    let google_cloud_write_service = services.google_cloud_write_service.clone();
     let github_connect_service = services.github_connect_service.clone();
     let gmail_watch_service = services.gmail_watch_service.clone();
     let gmail_pubsub_verifier = services.gmail_pubsub_verifier.clone();
@@ -5071,6 +5089,16 @@ fn build_router(
             get(google_cloud::list_projects_handler),
         )
         .with_state(google_cloud_integration_service.clone())
+        // Write-tier (provisioning) consent uses the SAME connect handler with
+        // the write-service state — separate route, separate OAuth consent.
+        .merge(
+            Router::new()
+                .route(
+                    "/api/gcp/connect-write",
+                    get(google_cloud::connect_gcp_handler),
+                )
+                .with_state(google_cloud_write_service.clone()),
+        )
         .layer(from_fn(rest_auth_middleware)) // Runs 5th (last) - needs auth_service extension
         .layer(Extension(auth_service.clone())) // Runs 4th - provides auth_service to middleware above
         .layer(from_fn(rate_limit::rate_limit_middleware)) // Runs 3rd
@@ -5080,9 +5108,14 @@ fn build_router(
     // Google Cloud OAuth callback — NO auth middleware.
     // Cross-site redirects from accounts.google.com don't carry session cookies
     // (SameSite policy). The user is identified via the state token instead.
+    // BOTH consent tiers share this registered redirect URI; the handler
+    // routes by the state token's provider.
     let gcp_callback_route = Router::new()
         .route("/api/gcp/callback", get(google_cloud::gcp_callback_handler))
-        .with_state(google_cloud_integration_service.clone())
+        .with_state(std::sync::Arc::new(google_cloud::GcpOAuthServices {
+            read: google_cloud_integration_service.clone(),
+            write: google_cloud_write_service.clone(),
+        }))
         .layer(from_fn(rate_limit::rate_limit_middleware))
         .layer(Extension(api_limiter.clone()))
         .layer(Extension(whitelist.clone()));

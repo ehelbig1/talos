@@ -5,7 +5,8 @@ pub mod refresh_task;
 pub mod resolver;
 pub use credentials::OAuthCredentialService;
 pub use flow::{
-    begin_oauth_authorization, consume_oauth_state, AuthorizeRequest, ConsumedOAuthState,
+    begin_oauth_authorization, consume_oauth_state, peek_state_provider, AuthorizeRequest,
+    ConsumedOAuthState,
 };
 pub use provider::{authorization_url, handle_oauth_callback, OAuthIntegration};
 pub use resolver::ControllerSecretsResolver;
