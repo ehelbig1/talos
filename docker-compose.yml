@@ -400,6 +400,16 @@ services:
       GMAIL_DEFAULT_LABEL_IDS: ${GMAIL_DEFAULT_LABEL_IDS:-INBOX}
       GMAIL_CLIENT_SECRET: ${GMAIL_CLIENT_SECRET:-${GOOGLE_CLIENT_SECRET:-}}
       GMAIL_REDIRECT_URI: ${GMAIL_REDIRECT_URI:-http://localhost:8000/api/gmail/callback}
+      # Google Cloud OAuth Configuration (own OAuth app, or reuse Google's
+      # by adding the cloud-platform.read-only scope). When CLIENT_ID is
+      # unset the integration is disabled. See docs/gcp-push-setup.md.
+      GOOGLE_CLOUD_CLIENT_ID: ${GOOGLE_CLOUD_CLIENT_ID:-${GOOGLE_CLIENT_ID:-}}
+      GOOGLE_CLOUD_CLIENT_SECRET: ${GOOGLE_CLOUD_CLIENT_SECRET:-${GOOGLE_CLIENT_SECRET:-}}
+      GOOGLE_CLOUD_REDIRECT_URI: ${GOOGLE_CLOUD_REDIRECT_URI:-http://localhost:8000/api/gcp/callback}
+      # Cloud Monitoring push (Phase B). Optional; when GCP_PUBSUB_AUDIENCE
+      # is unset the push route + watch service are disabled (read APIs
+      # still work). Must match --push-auth-token-audience on the sub.
+      GCP_PUBSUB_AUDIENCE: ${GCP_PUBSUB_AUDIENCE:-}
       # Slack OAuth Configuration
       SLACK_CLIENT_ID: ${SLACK_CLIENT_ID:-}
       SLACK_CLIENT_SECRET: ${SLACK_CLIENT_SECRET:-}
