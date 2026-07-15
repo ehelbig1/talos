@@ -122,4 +122,21 @@ describe("GoogleCloudWatchChannels", () => {
     expect(screen.getByText("Provisioning")).toBeInTheDocument();
     expect(screen.getByText("Read-only")).toBeInTheDocument();
   });
+
+  it("labels the account chips as OAuth consents, distinct from watch channels", async () => {
+    // Regression (2026-07-15): unlabeled account chips inside the Watch
+    // Channels panel were read as "a watch channel was created" when the
+    // channel table was in fact empty. The chip row must carry an explicit
+    // caption saying these are consents, not channels.
+    mockIntegrations([ACTIVE_INTEGRATION, WRITE_TIER_INTEGRATION]);
+    mockWatches([]);
+    render(<GoogleCloudWatchChannels />);
+
+    await waitFor(() =>
+      expect(screen.getByText(/Connected accounts/i)).toBeInTheDocument(),
+    );
+    expect(
+      screen.getByText(/OAuth consents only; not watch channels/i),
+    ).toBeInTheDocument();
+  });
 });
