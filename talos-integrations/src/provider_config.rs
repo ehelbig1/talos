@@ -169,7 +169,11 @@ pub static PROVIDERS: &[IntegrationProviderConfig] = &[
         // store.rs aliases the table `t` when there is no join, so the
         // identifier + extra_where fragments reference `t.*` (NOT `g.*`,
         // which is the alias only used for join-carrying providers like gcal).
-        account_identifier_column: "COALESCE(t.account_email, 'Google Cloud')",
+        // Phase C: the same account can hold a read row AND a write
+        // (provisioning) row — suffix the write tier so the generic
+        // integrations card distinguishes the two consents.
+        account_identifier_column: "COALESCE(t.account_email, 'Google Cloud') || \
+             CASE WHEN t.tier = 'write' THEN ' (provisioning)' ELSE '' END",
         account_identifier_join: None,
         extra_where: "AND t.is_active = true",
         disconnect_is_soft_delete: true,

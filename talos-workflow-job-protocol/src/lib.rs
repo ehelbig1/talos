@@ -1882,6 +1882,33 @@ mod vault_matcher_tests {
             "oauth/atlassian/token"
         ));
     }
+
+    /// SECURITY INVARIANT (GCP Phase C): a read-tier grant must never match
+    /// the write-tier namespace. `oauth/google_cloud/*` and bare
+    /// `oauth/google_cloud` grants must NOT resolve
+    /// `oauth/google_cloud_write/...` — the distinct provider segment is the
+    /// structural boundary keeping the provisioning token out of read-only
+    /// modules. Both the glob arm (which strips only the `*`, keeping the
+    /// `/`) and the prefix arm (which appends `/` before matching) are
+    /// segment-boundary-safe; this test pins that a refactor to raw string
+    /// prefixes fails loudly.
+    #[test]
+    fn read_tier_grant_cannot_name_write_tier_paths() {
+        for grant in ["oauth/google_cloud/*", "oauth/google_cloud"] {
+            assert!(
+                !vault_path_permitted(
+                    &s(&[grant]),
+                    "oauth/google_cloud_write/1a361562/9c4d/access_token"
+                ),
+                "grant {grant} must not cross into the write tier"
+            );
+        }
+        // And the write grant still matches its own namespace.
+        assert!(vault_path_permitted(
+            &s(&["oauth/google_cloud_write/*"]),
+            "oauth/google_cloud_write/1a361562/9c4d/access_token"
+        ));
+    }
 }
 
 // ============================================================================

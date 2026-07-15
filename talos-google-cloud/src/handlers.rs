@@ -1,5 +1,15 @@
 use super::api::GcpApiClient;
 use super::integration::{GoogleCloudIntegrationInfo, GoogleCloudIntegrationService};
+
+/// The read- and write-tier OAuth services, bundled as one axum state so the
+/// shared `/api/gcp/callback` can route by the state token's provider and the
+/// connect endpoints can pick their tier. Both wrap the same OAuth client /
+/// env config; they differ only in provider string + scopes (see
+/// [`super::integration::GcpTier`]).
+pub struct GcpOAuthServices {
+    pub read: Arc<GoogleCloudIntegrationService>,
+    pub write: Arc<GoogleCloudIntegrationService>,
+}
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -187,9 +197,15 @@ pub async fn connect_gcp_handler(
 /// Handle the Google Cloud OAuth callback. NO session auth — the user is
 /// identified via the state token bound during the connect flow (cross-site
 /// redirects from Google may not carry session cookies under SameSite policy).
+///
+/// BOTH consent tiers share this one registered redirect URI. The state
+/// token's provider (peeked read-only; every security property still enforced
+/// by the atomic consume inside `handle_callback`) routes to the read or
+/// write service. Unknown/expired states fall through to the read service,
+/// whose consume produces the canonical CSRF-safe error.
 pub async fn gcp_callback_handler(
     Query(params): Query<OAuthCallbackParams>,
-    State(service): State<Arc<GoogleCloudIntegrationService>>,
+    State(services): State<Arc<GcpOAuthServices>>,
 ) -> impl IntoResponse {
     // Canonical FRONTEND_URL validation (rejects ? and # in addition to /).
     let frontend_url = talos_config::get_frontend_url();
@@ -229,6 +245,18 @@ pub async fn gcp_callback_handler(
         }
     };
 
+    // Route to the consent tier bound at connect time. Peek is routing
+    // metadata only — `handle_callback` re-verifies the provider match in the
+    // atomic single-use consume.
+    let service = match talos_oauth::peek_state_provider(services.read.db_pool(), &state).await {
+        Ok(Some(provider)) if provider == "google_cloud_write" => &services.write,
+        Ok(_) => &services.read,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to peek Google Cloud OAuth state provider");
+            &services.read
+        }
+    };
+
     match service.handle_callback(code, state).await {
         Ok(integration) => {
             let label = integration
@@ -236,6 +264,7 @@ pub async fn gcp_callback_handler(
                 .clone()
                 .unwrap_or_else(|| "google-cloud".to_string());
             tracing::info!(
+                tier = %integration.tier,
                 "Successfully connected Google Cloud account (integration {})",
                 integration.id
             );

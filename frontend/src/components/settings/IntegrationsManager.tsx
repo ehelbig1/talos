@@ -17,6 +17,7 @@ import {
   AlertTriangle,
   HelpCircle,
   Loader2,
+  ShieldPlus,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Dialog } from "@/components/ui";
@@ -338,9 +339,12 @@ export function IntegrationsManager() {
     }, 500);
   };
 
-  const handleConnectService = async (type: string) => {
+  // `path` lets callers hit a non-default connect route (e.g. the GCP
+  // write-tier / provisioning consent below) while reusing the same
+  // response handling + error messaging.
+  const handleConnectService = async (type: string, path?: string) => {
     try {
-      const res = await authedFetch(`/api/${type}/connect`);
+      const res = await authedFetch(path ?? `/api/${type}/connect`);
       if (res.ok) {
         const d = await res.json();
         if (d.success && d.data?.authorization_url) {
@@ -365,6 +369,14 @@ export function IntegrationsManager() {
       toast.error(`Error connecting ${type}`);
     }
   };
+
+  // GCP Phase C: a SEPARATE, scope-narrowed OAuth consent (Pub/Sub +
+  // Monitoring only, never cloud-platform) used by provisioning workflows.
+  // Deliberately independent of the read-tier `/api/gcp/connect` flow above
+  // — the user can hold both a read row and a write row for the same
+  // Google account (see talos-google-cloud::GcpTier).
+  const handleConnectGcpWrite = () =>
+    handleConnectService("Google Cloud provisioning", "/api/gcp/connect-write");
 
   // GitHub App install flow (RFC 0008). Unlike OAuth providers, the backend
   // returns a GitHub *install* URL (not an authorization_url) which we navigate
@@ -412,6 +424,9 @@ export function IntegrationsManager() {
     onConnect,
     configured = true,
     providerId,
+    secondaryLabel,
+    secondaryTooltip,
+    onSecondaryConnect,
   }: {
     title: string;
     description: string;
@@ -421,6 +436,10 @@ export function IntegrationsManager() {
     onConnect: () => void;
     configured?: boolean;
     providerId?: string;
+    /** Optional secondary consent action (e.g. GCP write-tier provisioning). */
+    secondaryLabel?: string;
+    secondaryTooltip?: string;
+    onSecondaryConnect?: () => void;
   }) => {
     const serviceIntegrations = integrations.filter(
       (i) => i.service === serviceType,
@@ -467,6 +486,17 @@ export function IntegrationsManager() {
             </span>
           )}
         </div>
+
+        {onSecondaryConnect && (
+          <button
+            onClick={onSecondaryConnect}
+            title={secondaryTooltip}
+            className="relative z-10 self-start mb-6 inline-flex items-center gap-1.5 text-[9px] font-black uppercase tracking-widest text-warning/80 hover:text-warning border border-warning/20 hover:border-warning/40 bg-warning/5 hover:bg-warning/10 px-3 py-1.5 rounded-xl transition-premium active:scale-95"
+          >
+            <ShieldPlus size={12} />
+            {secondaryLabel ?? "Enable provisioning"}
+          </button>
+        )}
 
         <div className="space-y-3 mt-auto relative z-10">
           {serviceIntegrations.length > 0 ? (
@@ -577,6 +607,17 @@ export function IntegrationsManager() {
                 provider.id === "google-calendar"
                   ? handleConnectGcal
                   : () => handleConnectService(provider.id)
+              }
+              secondaryLabel={
+                provider.id === "gcp" ? "Enable provisioning" : undefined
+              }
+              secondaryTooltip={
+                provider.id === "gcp"
+                  ? "Grants Talos write access to Pub/Sub and Monitoring only — used by provisioning workflows"
+                  : undefined
+              }
+              onSecondaryConnect={
+                provider.id === "gcp" ? handleConnectGcpWrite : undefined
               }
             />
           ))}

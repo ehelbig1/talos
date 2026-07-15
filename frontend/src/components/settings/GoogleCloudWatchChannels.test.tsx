@@ -9,6 +9,14 @@ const ACTIVE_INTEGRATION = {
   id: "11111111-1111-1111-1111-111111111111",
   account_email: "owner@example.com",
   is_active: true,
+  tier: "read",
+};
+
+const WRITE_TIER_INTEGRATION = {
+  id: "22222222-2222-2222-2222-222222222222",
+  account_email: "owner@example.com",
+  is_active: true,
+  tier: "write",
 };
 
 function mockIntegrations(list: unknown[]) {
@@ -96,5 +104,22 @@ describe("GoogleCloudWatchChannels", () => {
       expect(screen.getByText(pushEndpoint)).toBeInTheDocument(),
     );
     expect(screen.getByText(/copy your push endpoint/i)).toBeInTheDocument();
+  });
+
+  it("badges a write-tier (provisioning) integration distinctly from a read-tier one", async () => {
+    // Phase C: the same Google account can hold both a read row and a write
+    // row — both must render, each with its own tier badge.
+    mockIntegrations([ACTIVE_INTEGRATION, WRITE_TIER_INTEGRATION]);
+    mockWatches([]);
+    render(<GoogleCloudWatchChannels />);
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(/No Google Cloud watches yet/i),
+      ).toBeInTheDocument(),
+    );
+
+    expect(screen.getByText("Provisioning")).toBeInTheDocument();
+    expect(screen.getByText("Read-only")).toBeInTheDocument();
   });
 });

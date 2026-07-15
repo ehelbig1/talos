@@ -1,0 +1,57 @@
+{
+  "name": "gcp-create-monitoring-channel",
+  "version": "v1.0.0",
+  "display_name": "GCP: Create Monitoring Channel",
+  "description": "Create a Cloud Monitoring pubsub notification channel that routes incident notifications to a Pub/Sub topic, via 'POST https://monitoring.googleapis.com/v3/projects/{PROJECT_ID}/notificationChannels'. The POST is NOT idempotent (every call would mint a new channel), so the module first lists existing channels with filter type=\"pubsub\" and matches labels.topic client-side — a re-run finds the prior channel and returns SUCCESS with already_existed=true instead of creating a duplicate. Third of the three Phase C provisioning modules — the self-serve automation of docs/gcp-push-setup.md (topic → push subscription → monitoring channel).\n\nThis is a WRITE-capable module: it requires the write-tier Google Cloud OAuth consent granted via '/api/gcp/connect-write' (a SEPARATE consent from the read-only '/api/gcp/connect' flow). Set AUTH_HEADER to a vault:// reference under 'oauth/google_cloud_write/...' — the controller resolves + refreshes the token at dispatch time.",
+  "category": "Cloud",
+  "capability_world": "http-node",
+  "allowed_hosts": ["monitoring.googleapis.com"],
+  "allowed_methods": ["GET", "POST"],
+  "requires_secrets": ["oauth/google_cloud_write/*"],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "required": ["AUTH_HEADER", "PROJECT_ID", "TOPIC_NAME"],
+    "properties": {
+      "AUTH_HEADER": {
+        "type": "string",
+        "description": "vault:// path to the WRITE-tier OAuth access token wrapped in 'Bearer ' (e.g. 'Bearer vault://oauth/google_cloud_write/{user_id}/{provider_key}/access_token'). The controller resolves the vault reference and refreshes the token if expired. Note the '_write' namespace — the read-tier 'oauth/google_cloud/*' token cannot create notification channels."
+      },
+      "PROJECT_ID": {
+        "type": "string",
+        "description": "GCP project id the notification channel is created in. Must match ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ (validated before the request is built)."
+      },
+      "TOPIC_NAME": {
+        "type": "string",
+        "description": "Short name of the EXISTING Pub/Sub topic incidents should be published to (create it first with 'GCP: Create Pub/Sub Topic'). Must match ^[A-Za-z][A-Za-z0-9._~+%-]{2,254}$ and must not start with 'goog'."
+      },
+      "DISPLAY_NAME": {
+        "type": "string",
+        "default": "Talos incidents",
+        "description": "Human-readable channel name shown in the Cloud Monitoring console. Capped at 100 characters; control characters are stripped."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Create the topic first",
+      "detail": "Run 'GCP: Create Pub/Sub Topic' (or create the topic manually). The channel's labels.topic must point at an existing topic for notifications to flow."
+    },
+    {
+      "step": 2,
+      "title": "Grant write-tier consent",
+      "detail": "Complete the WRITE-tier OAuth flow via '/api/gcp/connect-write' and set AUTH_HEADER to 'Bearer vault://oauth/google_cloud_write/{your_user_id}/{your_provider_key}/access_token'."
+    },
+    {
+      "step": 3,
+      "title": "Attach the channel to alerting policies",
+      "detail": "In Cloud Monitoring, attach the returned channel_name to the alerting policies whose incidents should reach Talos. Combined with 'GCP: Create Push Subscription', incidents then flow topic → subscription → Talos watch channel (see docs/gcp-push-setup.md)."
+    },
+    {
+      "step": 4,
+      "title": "Re-runs are safe",
+      "detail": "The module pre-checks for an existing pubsub channel with the same labels.topic and returns already_existed=true instead of creating a duplicate — safe to include in an idempotent provisioning workflow."
+    }
+  ]
+}
