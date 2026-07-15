@@ -14,6 +14,35 @@ delete the subscription on your side and stop the watch in Talos.
 This doc is the **operator runbook**: everything Talos can't do for
 itself because it involves your GCP project.
 
+> **Phase C shortcut — self-serve provisioning.** Most of the `gcloud`
+> commands below (create topic, create push subscription, create the
+> Monitoring notification channel — steps 1, 4, 5) can now be run as a
+> Talos workflow instead, using the write-tier provisioning modules:
+> `GCP: Create Pub/Sub Topic`, `GCP: Create Push Subscription`,
+> `GCP: Create Monitoring Channel`. Prerequisites for that path:
+>
+> 1. Connect the **provisioning (write) tier** in Settings →
+>    Integrations → Google Cloud → *Enable provisioning* (backed by
+>    `GET /api/gcp/connect-write`). This is a SEPARATE OAuth consent
+>    from the read-only connection, scoped to
+>    `https://www.googleapis.com/auth/pubsub` +
+>    `https://www.googleapis.com/auth/monitoring` — deliberately NOT
+>    `cloud-platform`, so the stored token cannot touch Compute, IAM,
+>    Storage, or anything else even if a workflow misbehaves. Its vault
+>    namespace (`oauth/google_cloud_write/…`) is distinct from the
+>    read tier's, so read-only modules can never resolve it.
+> 2. Steps **2** (service account — a one-time IAM operation) and **3**
+>    (create the watch in Talos) remain as below; IAM writes are out of
+>    the write tier's scope on purpose.
+> 3. Bind the provisioning workflow to an actor with
+>    `max_write_ceiling = 'write'` — the worker refuses non-GET HTTP
+>    for read-only actors when write-ceiling enforcement is on. Add a
+>    Human-Approval-Gate node upstream if you want per-run sign-off.
+>
+> The modules are idempotent: re-running reports `already_existed:
+> true` instead of failing (the Monitoring channel module pre-checks by
+> topic label because its POST is not idempotent upstream).
+
 ## Architecture
 
 ```
