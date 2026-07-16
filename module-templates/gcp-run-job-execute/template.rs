@@ -259,6 +259,18 @@ pub fn run(input: String) -> Result<String, String> {
         serde_json::from_str(&body_str).map_err(|e| format!("job run parse: {}", e))?;
     let execution = op.metadata.unwrap_or_default().name;
     let execution_id = last_segment(&execution).to_string();
+    // The run accepted (2xx) but returned no Execution name in the LRO
+    // metadata — fail loud rather than reporting started:true with an empty
+    // id, which would surface downstream as a confusing "invalid
+    // EXECUTION_NAME" in the poll/logs steps.
+    if execution_id.is_empty() {
+        return Err(
+            "Cloud Run accepted the run but returned no execution name in the operation \
+             metadata — cannot chain poll/logs. Retry, or check the job exists and the SA \
+             has run.jobs.run."
+                .to_string(),
+        );
+    }
 
     let result = serde_json::json!({
         "started": true,

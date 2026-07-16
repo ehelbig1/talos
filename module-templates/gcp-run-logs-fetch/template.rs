@@ -147,7 +147,10 @@ fn resolve_max_entries(config: &serde_json::Value) -> u32 {
         .get("MAX_ENTRIES")
         .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok())))
         .unwrap_or(DEFAULT_MAX_ENTRIES as u64);
-    (raw as u32).clamp(MIN_ENTRIES, MAX_ENTRIES_CAP)
+    // Clamp in u64 BEFORE narrowing — casting first would wrap a value above
+    // u32::MAX down into range (e.g. 2^32+5 → 5) instead of clamping to the
+    // cap (integer-wraparound class, lint check 21).
+    raw.clamp(MIN_ENTRIES as u64, MAX_ENTRIES_CAP as u64) as u32
 }
 
 #[talos_module(world = "http-node")]
