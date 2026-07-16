@@ -149,10 +149,22 @@ pub(crate) async fn dispatch_with_retry(
     // back to the legacy unsigned-reply path for transports that
     // don't pre-allocate inboxes (in-process test stubs, etc.).
     reply_inbox: Option<String>,
+    // RFC 0010 P3 (M3 fix): invoked before EACH send (initial + every
+    // retry) so a claim-based-sealed pipeline can re-arm its InFlightSeals
+    // entry. The worker's claim single-TAKES the seal per attempt, so
+    // without re-registration a retry can't re-claim and fails closed under
+    // `TALOS_ENVELOPE_SEALING=required`. `None` for non-sealed dispatches.
+    on_before_send: Option<&(dyn Fn() + Send + Sync)>,
 ) -> Result<Vec<u8>, String> {
     let mut attempts: u32 = 0;
     let mut current_payload = payload;
     loop {
+        // Re-arm the seal before every attempt (register() overwrites, so
+        // this is idempotent on the first attempt and restores the entry the
+        // previous attempt's claim consumed).
+        if let Some(rearm) = on_before_send {
+            rearm();
+        }
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
             send_with_optional_inbox(
@@ -293,10 +305,18 @@ pub(crate) async fn execute_job_with_retry(
     expression_evaluator: &dyn ExpressionEvaluator,
     // H-1: see `dispatch_with_retry` for the contract.
     reply_inbox: Option<String>,
+    // RFC 0010 P3 (M3 fix): re-arm hook, invoked before EACH send. See
+    // `dispatch_with_retry` for the rationale — the worker's claim
+    // single-takes the seal per attempt, so a retry must re-register it.
+    on_before_send: Option<&(dyn Fn() + Send + Sync)>,
 ) -> Result<serde_json::Value, String> {
     let mut attempts: u32 = 0;
     let mut current_payload = payload;
     loop {
+        // Re-arm the seal before every attempt (see `dispatch_with_retry`).
+        if let Some(rearm) = on_before_send {
+            rearm();
+        }
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
             send_with_optional_inbox(
@@ -875,22 +895,45 @@ impl NodeDispatcher for NatsNodeDispatcher {
         // the wire — the worker obtains the values via a signed claim to
         // `claim_inbox`, sealed to its ephemeral key. Fail-closed when plaintext
         // was resolved but no envelope handle is wired.
-        if let Some(plaintext) = claim_plaintext {
-            let handle = self.envelope.as_ref().ok_or_else(|| -> BoxError {
-                "RFC 0010 P3: dispatch carried plaintext_secrets but no envelope \
+        // RFC 0010 P3 (M3 fix): the re-arm closure is built here and invoked
+        // by `execute_job_with_retry` before EVERY send attempt so a retry can
+        // re-claim after the prior attempt's single-take. Built once, holds an
+        // Arc<InFlightSeals> + the plaintext, and rebuilds+re-registers the
+        // SealContext each call. `None` when this dispatch isn't sealed.
+        let seal_rearm: Option<Box<dyn Fn() + Send + Sync>> =
+            if let Some(plaintext) = claim_plaintext {
+                let handle = self.envelope.as_ref().ok_or_else(|| -> BoxError {
+                    "RFC 0010 P3: dispatch carried plaintext_secrets but no envelope \
                  sealing handle is wired — refusing to dispatch (fail-closed, no \
                  plaintext on the wire)"
-                    .into()
-            })?;
-            let ctx = talos_envelope_seal::SealContext::new(&plaintext)
-                .map_err(|e| -> BoxError { format!("build seal context: {e}").into() })?;
-            handle.in_flight.register(job_id, ctx);
-            req.sealing = talos_workflow_job_protocol::SEALING_CLAIM_ECIES;
-            req.claim_inbox = Some(handle.claim_subject.clone());
-            req.secret_paths = claim_secret_paths;
-            // encrypted_secrets stays empty (the engine set ciphertext/nonce
-            // empty on the claim-based path).
-        }
+                        .into()
+                })?;
+                // Fail-closed early: verify the plaintext can be sealed BEFORE we
+                // dispatch, so an unsealable payload is rejected at dispatch time
+                // rather than surfacing as a claim failure on every attempt.
+                talos_envelope_seal::SealContext::new(&plaintext)
+                    .map_err(|e| -> BoxError { format!("build seal context: {e}").into() })?;
+                req.sealing = talos_workflow_job_protocol::SEALING_CLAIM_ECIES;
+                req.claim_inbox = Some(handle.claim_subject.clone());
+                req.secret_paths = claim_secret_paths;
+                // encrypted_secrets stays empty (the engine set ciphertext/nonce
+                // empty on the claim-based path).
+                let in_flight = handle.in_flight.clone();
+                Some(Box::new(move || {
+                    // Rebuild + register before each send. register() overwrites,
+                    // so the first (pre-dispatch) call arms it and every retry
+                    // restores the entry the previous claim consumed. SealContext
+                    // construction only fails on a serialization error that a
+                    // HashMap<String,String> cannot produce; on the defensive Err
+                    // we skip re-registration → the claim fails → the job fails
+                    // closed (never a plaintext leak).
+                    if let Ok(ctx) = talos_envelope_seal::SealContext::new(&plaintext) {
+                        in_flight.register(job_id, ctx);
+                    }
+                }))
+            } else {
+                None
+            };
 
         // 2. Sign. RFC 0010 P1: prefer the configured dispatch signer (Ed25519
         // or explicit HMAC); fall back to the bare worker_shared_key HMAC path
@@ -983,6 +1026,8 @@ impl NodeDispatcher for NatsNodeDispatcher {
             // loop publishes via `request_with_reply_inbox` instead
             // of the unsigned-reply `request`.
             reply_inbox,
+            // RFC 0010 P3 (M3): re-arm the seal before each attempt.
+            seal_rearm.as_deref(),
         )
         .await;
 
@@ -1098,7 +1143,11 @@ impl NodeDispatcher for NatsNodeDispatcher {
         // `claim_inbox` are bound). The worker claims once and gets the per-step
         // vector back. No plaintext reaches the wire. Fail-closed if plaintext was
         // resolved but no envelope handle is wired.
-        if claim_based {
+        // RFC 0010 P3 (M3 fix): re-arm closure, invoked before EVERY send by
+        // `dispatch_with_retry` so a pipeline retry re-claims after the prior
+        // attempt's single-take. Holds an Arc<InFlightSeals> + the serialized
+        // per-step seal bytes; rebuilds+re-registers the SealContext each call.
+        let seal_rearm: Option<Box<dyn Fn() + Send + Sync>> = if claim_based {
             let handle = self.envelope.as_ref().ok_or_else(|| -> BoxError {
                 "RFC 0010 P3: pipeline carried plaintext_secrets but no envelope sealing handle \
                  is wired — refusing to dispatch (fail-closed, no plaintext on the wire)"
@@ -1107,13 +1156,24 @@ impl NodeDispatcher for NatsNodeDispatcher {
             let bytes = serde_json::to_vec(&per_step_secrets).map_err(|e| -> BoxError {
                 format!("serialize pipeline seal payload: {e}").into()
             })?;
-            handle
-                .in_flight
-                .register(job_id, talos_envelope_seal::SealContext::from_bytes(bytes));
             req.sealing = talos_workflow_job_protocol::SEALING_CLAIM_ECIES;
             req.claim_inbox = Some(handle.claim_subject.clone());
             req.secret_paths = claim_secret_paths;
-        }
+            let in_flight = handle.in_flight.clone();
+            Some(Box::new(move || {
+                // register() overwrites; the first call arms it and each retry
+                // restores the entry the previous claim consumed. `from_bytes`
+                // is infallible (it just wraps the already-serialized bytes),
+                // so re-cloning the Vec per attempt is the only cost (retry is
+                // not a hot path).
+                in_flight.register(
+                    job_id,
+                    talos_envelope_seal::SealContext::from_bytes(bytes.clone()),
+                );
+            }))
+        } else {
+            None
+        };
 
         // 3. Sign (chain-level, independent of any per-step signing). RFC 0010
         // P1: prefer the configured dispatch signer; else the legacy HMAC path.
@@ -1158,6 +1218,8 @@ impl NodeDispatcher for NatsNodeDispatcher {
             // H-1: signed reply inbox so the worker publishes the
             // pipeline result to the HMAC-bound subject only.
             reply_inbox,
+            // RFC 0010 P3 (M3): re-arm the seal before each attempt.
+            seal_rearm.as_deref(),
         )
         .await;
 
