@@ -1,0 +1,65 @@
+{
+  "name": "gcp-run-job-execute",
+  "version": "v1.0.0",
+  "display_name": "GCP: Run Cloud Run Job",
+  "description": "EXECUTE a pre-created Cloud Run Job via 'POST https://run.googleapis.com/v2/projects/{PROJECT_ID}/locations/{REGION}/jobs/{JOB_NAME}:run', optionally overriding the container args and env per run. This is the 'option 1' pattern: the operator pre-creates a `talos-runner` Cloud Run Job ONCE (see docs/gcp-impersonation-setup.md), and workflows only RUN it — this module never creates or deletes the job itself. The call returns a long-running Operation whose metadata is the Execution resource; pair this with 'GCP: Poll Job Execution' (wait for completion) and 'GCP: Fetch Job Logs' (read output) to complete the run→poll→logs pattern.\n\nAuth is the Phase D impersonated-token path: the controller mints a short-lived (~10 min) impersonated service-account access token at dispatch time and injects it under the requested 'gcp/impersonated/<sa_email>/access_token' vault path (granted via the full-tier consent at '/api/gcp/connect-full'). Set AUTH_HEADER to that vault:// reference wrapped in 'Bearer '. NOTE on overrides: the Cloud Run RunJob API exposes only a container `args` override (not an entrypoint/command override), so pass ARGS for the container arguments and ENV for environment variables; a COMMAND (entrypoint replacement) is reserved and rejected — bake the entrypoint into the runner image instead.",
+  "category": "Cloud",
+  "capability_world": "http-node",
+  "allowed_hosts": ["run.googleapis.com"],
+  "allowed_methods": ["POST"],
+  "requires_secrets": ["gcp/impersonated/*"],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "required": ["AUTH_HEADER", "PROJECT_ID", "REGION", "JOB_NAME"],
+    "properties": {
+      "AUTH_HEADER": {
+        "type": "string",
+        "description": "vault:// path to the Phase D impersonated SA access token wrapped in 'Bearer ' (e.g. 'Bearer vault://gcp/impersonated/talos-runner@my-project.iam.gserviceaccount.com/access_token'). Set <sa_email> to your talos-runner service account. The controller mints the impersonated token at dispatch. Least privilege: set the module's allowed_secrets to the EXACT path 'gcp/impersonated/<sa_email>/access_token' rather than the 'gcp/impersonated/*' wildcard."
+      },
+      "PROJECT_ID": {
+        "type": "string",
+        "description": "GCP project id that owns the Cloud Run Job. Must match ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ (validated before the request is built)."
+      },
+      "REGION": {
+        "type": "string",
+        "description": "Cloud Run region (location) of the job, e.g. us-central1 or europe-west1. Must match ^[a-z]+-[a-z]+[0-9]$ (validated before the request is built)."
+      },
+      "JOB_NAME": {
+        "type": "string",
+        "description": "Short name of the PRE-EXISTING Cloud Run Job to run (the operator-created talos-runner job; NOT the full 'projects/...' path). Must match ^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$ (validated before the request is built)."
+      },
+      "ARGS": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Optional per-run container args override (JSON array of strings). Replaces the job's baked-in container args for this run; maps to overrides.containerOverrides[0].args. Omit to run the job's baked-in command. Rejected if not an array of strings."
+      },
+      "ENV": {
+        "type": "object",
+        "description": "Optional per-run environment override (flat JSON object of string->string). Maps to overrides.containerOverrides[0].env as [{name,value}]. Rejected if not a flat string->string object."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Pre-create the talos-runner Cloud Run Job",
+      "detail": "Once per project, the operator creates a Cloud Run Job (conventionally named 'talos-runner') with the container image and default command to run. This module only EXECUTES that job — it never creates or deletes it. See docs/gcp-impersonation-setup.md."
+    },
+    {
+      "step": 2,
+      "title": "Grant full-tier impersonation consent",
+      "detail": "Complete the full-tier Google Cloud consent via '/api/gcp/connect-full'. At dispatch the controller mints a short-lived impersonated access token for your talos-runner service account and injects it under 'gcp/impersonated/<sa_email>/access_token'. The runner SA needs run.jobs.runWithOverrides (roles/run.developer or equivalent) on the job."
+    },
+    {
+      "step": 3,
+      "title": "Configure AUTH_HEADER (least privilege)",
+      "detail": "Set AUTH_HEADER to 'Bearer vault://gcp/impersonated/<sa_email>/access_token' and set the module's allowed_secrets to that EXACT path (not the 'gcp/impersonated/*' wildcard). On 401s, re-consent via /api/gcp/connect-full or refresh the underlying full-tier token."
+    },
+    {
+      "step": 4,
+      "title": "Chain run → poll → logs",
+      "detail": "This module returns 'execution_id' (short) and 'execution' (full resource name). Feed EXECUTION_NAME into 'GCP: Poll Job Execution' in a wait-until-done loop, then 'GCP: Fetch Job Logs' to read the run's output. Pass ARGS/ENV to override the command per run; a COMMAND (entrypoint) override is not supported by the RunJob API and is rejected."
+    }
+  ]
+}
