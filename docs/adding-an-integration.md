@@ -145,6 +145,23 @@ user-scoped resolution (`vault://oauth/<provider>/<user_id>/<key>` in a module's
 `allowed_secrets`), encryption at rest, and DLP are all handled by the shared
 layers.
 
+### Dynamic (mint-on-dispatch) secrets
+
+Two secret paths are **minted at dispatch**, not stored: `github_app:<owner>`
+(RFC 0008) and `gcp/impersonated/<sa_email>/access_token` (Phase D — a
+short-lived impersonated GCP service-account token). Both partition out of the
+vault lookup in `ControllerSecretsResolver::resolve_by_paths`; the underlying
+broad credential is host-reserved (`is_controller_internal_vault_path`) and
+never reaches a guest.
+
+**Least privilege for impersonation grants:** a module's `allowed_secrets`
+*can* be `["gcp/impersonated/*"]`, but prefer granting the **exact** SA path —
+`["gcp/impersonated/talos-runner@<project>.iam.gserviceaccount.com/access_token"]`
+— so the module can only ever mint that one service account, not any SA the
+user's broad consent could reach. Google's per-SA `serviceAccountTokenCreator`
+check is the outer bound; the exact grant is the inner one. See
+`docs/gcp-impersonation-setup.md`.
+
 ## Adding a push-notification integration
 
 On top of the OAuth flow above, a watch/webhook integration (like gmail/gcal)

@@ -1,0 +1,60 @@
+{
+  "name": "gcp-run-execution-poll",
+  "version": "v1.0.0",
+  "display_name": "GCP: Poll Job Execution",
+  "description": "POLL a Cloud Run Job Execution via 'GET https://run.googleapis.com/v2/projects/{PROJECT_ID}/locations/{REGION}/jobs/{JOB_NAME}/executions/{EXECUTION_NAME}' and derive a coarse status: 'succeeded' (succeededCount>=1, failedCount==0, completionTime present), 'failed' (failedCount>=1), or 'running' (otherwise). Companion to 'GCP: Run Cloud Run Job' — feed it the execution_id that the execute step returns. EXECUTION_NAME accepts either the short id or a full 'projects/.../executions/X' resource path (the last segment is extracted).\n\nThis module does NOT block; it returns the current snapshot with a `done` boolean. Drop it inside a workflow wait-until-done loop (add_wait_node + a loop / confidence-gate that re-polls until done==true), so the workflow owns the cadence. Once done, use 'GCP: Fetch Job Logs' to read the run output.\n\nAuth is the Phase D impersonated-token path: the controller mints a short-lived (~10 min) impersonated service-account access token at dispatch and injects it under 'gcp/impersonated/<sa_email>/access_token' (granted via '/api/gcp/connect-full'). Set AUTH_HEADER to that vault:// reference wrapped in 'Bearer '.",
+  "category": "Cloud",
+  "capability_world": "http-node",
+  "allowed_hosts": ["run.googleapis.com"],
+  "allowed_methods": ["GET"],
+  "requires_secrets": ["gcp/impersonated/*"],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "required": ["AUTH_HEADER", "PROJECT_ID", "REGION", "JOB_NAME", "EXECUTION_NAME"],
+    "properties": {
+      "AUTH_HEADER": {
+        "type": "string",
+        "description": "vault:// path to the Phase D impersonated SA access token wrapped in 'Bearer ' (e.g. 'Bearer vault://gcp/impersonated/talos-runner@my-project.iam.gserviceaccount.com/access_token'). Set <sa_email> to your talos-runner service account. The controller mints the impersonated token at dispatch. Least privilege: set the module's allowed_secrets to the EXACT path, not the 'gcp/impersonated/*' wildcard."
+      },
+      "PROJECT_ID": {
+        "type": "string",
+        "description": "GCP project id that owns the Cloud Run Job. Must match ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ (validated before the request is built)."
+      },
+      "REGION": {
+        "type": "string",
+        "description": "Cloud Run region (location) of the job, e.g. us-central1 or europe-west1. Must match ^[a-z]+-[a-z]+[0-9]$ (validated before the request is built)."
+      },
+      "JOB_NAME": {
+        "type": "string",
+        "description": "Short name of the Cloud Run Job whose execution is being polled. Must match ^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$ (validated before the request is built)."
+      },
+      "EXECUTION_NAME": {
+        "type": "string",
+        "description": "The execution to poll — the 'execution_id' returned by 'GCP: Run Cloud Run Job'. Accepts either the short id or a full 'projects/.../executions/X' path (the last segment is used). Must match ^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$ after extraction (validated before the request is built)."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Run the job first",
+      "detail": "Execute the Cloud Run Job with 'GCP: Run Cloud Run Job'. Capture its returned 'execution_id' (or full 'execution') and pass it here as EXECUTION_NAME."
+    },
+    {
+      "step": 2,
+      "title": "Use inside a wait-until-done loop",
+      "detail": "This module returns a snapshot with a `done` boolean; it does NOT block. Wrap it in a workflow loop (add_wait_node for the delay + a loop / confidence-gate re-polling until done==true). Terminal statuses are 'succeeded' and 'failed'."
+    },
+    {
+      "step": 3,
+      "title": "Auth (same as the execute step)",
+      "detail": "Set AUTH_HEADER to 'Bearer vault://gcp/impersonated/<sa_email>/access_token' (full-tier consent via '/api/gcp/connect-full'). The runner SA needs read access to the job (roles/run.viewer or roles/run.developer). On 401s, re-consent or refresh the underlying full-tier token."
+    },
+    {
+      "step": 4,
+      "title": "Fetch logs once done",
+      "detail": "When done==true, run 'GCP: Fetch Job Logs' with the same EXECUTION_NAME to read the execution's stdout/stderr from Cloud Logging."
+    }
+  ]
+}

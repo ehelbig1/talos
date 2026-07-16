@@ -12,9 +12,11 @@
 pub mod admin;
 pub mod api;
 pub mod dispatch;
+pub mod impersonation;
 pub mod integration;
 pub mod watch;
 pub mod watch_channel_service;
+pub use impersonation::GcpImpersonationService;
 #[allow(unused_imports)]
 pub use integration::{
     GcpTier, GoogleCloudIntegration, GoogleCloudIntegrationInfo, GoogleCloudIntegrationService,

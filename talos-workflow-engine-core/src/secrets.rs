@@ -130,3 +130,39 @@ pub trait GithubInstallationTokenProvider: Send + Sync {
         user_id: Uuid,
     ) -> Result<Option<String>, BoxError>;
 }
+
+/// Mints a short-lived impersonated GCP service-account access token
+/// (Phase D — dynamic secret minting).
+///
+/// Injected into a [`SecretsResolver`] so a module secret path of the form
+/// `gcp/impersonated/<service_account_email>/access_token` resolves to a
+/// freshly-minted ~10-minute impersonated token instead of a static vault
+/// secret. Like [`GithubInstallationTokenProvider`], it lives in this
+/// low-level crate so the resolver can hold a `dyn` reference without a
+/// dependency cycle on the GCP crates.
+///
+/// The token is minted by the controller from the requesting user's broad
+/// `google_cloud_full` consent (host-reserved, never guest-visible) via
+/// `iamcredentials.generateAccessToken`. The guest only ever receives the
+/// scoped-down, short-lived impersonated token — never the broad grant.
+#[async_trait]
+pub trait GcpImpersonationTokenProvider: Send + Sync {
+    /// Mint an impersonated access token for `service_account_email`, using
+    /// the broad GCP credential owned by `user_id`. Passing `user_id` makes
+    /// the minted token a per-user credential (tenancy isolation): one
+    /// user's workflow can never mint against another user's consent.
+    ///
+    /// * `Ok(Some(token))` — `user_id` has a `google_cloud_full` consent AND
+    ///   Google permits it to impersonate `service_account_email` (the
+    ///   caller holds `iam.serviceAccountTokenCreator` on that SA); a fresh
+    ///   short-lived token.
+    /// * `Ok(None)` — no full-tier consent owned by `user_id`, or minting is
+    ///   not permitted; the secret is simply not injected, so the module
+    ///   fails closed on the missing secret.
+    /// * `Err` — a consent exists but the mint call itself failed.
+    async fn impersonated_token(
+        &self,
+        service_account_email: &str,
+        user_id: Uuid,
+    ) -> Result<Option<String>, BoxError>;
+}

@@ -19,6 +19,13 @@ const WRITE_TIER_INTEGRATION = {
   tier: "write",
 };
 
+const FULL_TIER_INTEGRATION = {
+  id: "33333333-3333-3333-3333-333333333333",
+  account_email: "owner@example.com",
+  is_active: true,
+  tier: "full",
+};
+
 function mockIntegrations(list: unknown[]) {
   server.use(
     http.get("*/api/gcp/integrations", () =>
@@ -106,10 +113,15 @@ describe("GoogleCloudWatchChannels", () => {
     expect(screen.getByText(/copy your push endpoint/i)).toBeInTheDocument();
   });
 
-  it("badges a write-tier (provisioning) integration distinctly from a read-tier one", async () => {
-    // Phase C: the same Google account can hold both a read row and a write
-    // row — both must render, each with its own tier badge.
-    mockIntegrations([ACTIVE_INTEGRATION, WRITE_TIER_INTEGRATION]);
+  it("badges read, write (provisioning) and full (impersonation) tiers distinctly", async () => {
+    // The same Google account can hold a row for each tier — read (Phase A),
+    // write/provisioning (Phase C) and full/impersonation (Phase D) — and each
+    // must render with its own tier badge.
+    mockIntegrations([
+      ACTIVE_INTEGRATION,
+      WRITE_TIER_INTEGRATION,
+      FULL_TIER_INTEGRATION,
+    ]);
     mockWatches([]);
     render(<GoogleCloudWatchChannels />);
 
@@ -119,8 +131,9 @@ describe("GoogleCloudWatchChannels", () => {
       ).toBeInTheDocument(),
     );
 
-    expect(screen.getByText("Provisioning")).toBeInTheDocument();
     expect(screen.getByText("Read-only")).toBeInTheDocument();
+    expect(screen.getByText("Provisioning")).toBeInTheDocument();
+    expect(screen.getByText("Impersonation")).toBeInTheDocument();
   });
 
   it("labels the account chips as OAuth consents, distinct from watch channels", async () => {

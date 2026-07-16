@@ -1,0 +1,67 @@
+{
+  "name": "gcp-run-logs-fetch",
+  "version": "v1.0.0",
+  "display_name": "GCP: Fetch Job Logs",
+  "description": "FETCH the logs of a Cloud Run Job Execution from Cloud Logging via 'POST https://logging.googleapis.com/v2/entries:list', filtered to resource.type=\"cloud_run_job\", the given JOB_NAME, and the given EXECUTION_NAME. Returns the entries in chronological order (the API is queried newest-first and reversed), each with timestamp, severity, and text (textPayload, or the jsonPayload JSON-stringified, capped at 2000 chars). Third of the run→poll→logs Phase D trio — pair with 'GCP: Run Cloud Run Job' and 'GCP: Poll Job Execution' to run a pre-created job and read its output once done.\n\nIMPORTANT: this module hits logging.googleapis.com — a DIFFERENT host than the run/poll modules (run.googleapis.com). The impersonated service account therefore needs roles/logging.viewer IN ADDITION to Cloud Run access; the docs/gcp-impersonation-setup.md bootstrap grants it. Auth is the Phase D impersonated-token path: the controller mints a short-lived (~10 min) impersonated SA access token at dispatch and injects it under 'gcp/impersonated/<sa_email>/access_token' (granted via '/api/gcp/connect-full'). Set AUTH_HEADER to that vault:// reference wrapped in 'Bearer '.",
+  "category": "Cloud",
+  "capability_world": "http-node",
+  "allowed_hosts": ["logging.googleapis.com"],
+  "allowed_methods": ["POST"],
+  "requires_secrets": ["gcp/impersonated/*"],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "required": ["AUTH_HEADER", "PROJECT_ID", "REGION", "JOB_NAME", "EXECUTION_NAME"],
+    "properties": {
+      "AUTH_HEADER": {
+        "type": "string",
+        "description": "vault:// path to the Phase D impersonated SA access token wrapped in 'Bearer ' (e.g. 'Bearer vault://gcp/impersonated/talos-runner@my-project.iam.gserviceaccount.com/access_token'). Set <sa_email> to your talos-runner service account. The controller mints the impersonated token at dispatch. The SA must hold roles/logging.viewer for this call. Least privilege: set the module's allowed_secrets to the EXACT path, not the 'gcp/impersonated/*' wildcard."
+      },
+      "PROJECT_ID": {
+        "type": "string",
+        "description": "GCP project id whose logs are queried (used as the resourceNames scope 'projects/{PROJECT_ID}'). Must match ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ (validated before the request is built)."
+      },
+      "REGION": {
+        "type": "string",
+        "description": "Cloud Run region of the job. Not used in the Logging filter, but validated for symmetry with the run/poll modules. Must match ^[a-z]+-[a-z]+[0-9]$."
+      },
+      "JOB_NAME": {
+        "type": "string",
+        "description": "Short name of the Cloud Run Job — used in the filter as resource.labels.job_name. Must match ^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$ (validated before the request is built)."
+      },
+      "EXECUTION_NAME": {
+        "type": "string",
+        "description": "The execution whose logs to fetch — the 'execution_id' from 'GCP: Run Cloud Run Job'. Accepts the short id or a full 'projects/.../executions/X' path (last segment used). Used in the filter as labels.\"run.googleapis.com/execution_name\". Must match ^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$ after extraction (validated before the request is built)."
+      },
+      "MAX_ENTRIES": {
+        "type": "integer",
+        "default": 50,
+        "minimum": 1,
+        "maximum": 200,
+        "description": "Max log entries to return (Logging pageSize). Defaults to 50; clamped to the range 1..200."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Run and poll first",
+      "detail": "Execute the job with 'GCP: Run Cloud Run Job' and wait for 'GCP: Poll Job Execution' to report done==true. Then fetch logs here with the same JOB_NAME + EXECUTION_NAME."
+    },
+    {
+      "step": 2,
+      "title": "Grant logging.viewer to the runner SA",
+      "detail": "This call targets logging.googleapis.com (a different host from run.googleapis.com), so the impersonated talos-runner service account needs roles/logging.viewer in addition to its Cloud Run role. The docs/gcp-impersonation-setup.md bootstrap grants it."
+    },
+    {
+      "step": 3,
+      "title": "Auth (Phase D impersonation)",
+      "detail": "Set AUTH_HEADER to 'Bearer vault://gcp/impersonated/<sa_email>/access_token' (full-tier consent via '/api/gcp/connect-full'). The controller mints the impersonated token at dispatch. On 401s, re-consent or refresh the underlying full-tier token."
+    },
+    {
+      "step": 4,
+      "title": "Tune MAX_ENTRIES",
+      "detail": "Set MAX_ENTRIES (1..200, default 50) to bound how many log lines come back. Entries are returned oldest-first; each text field is capped at 2000 chars."
+    }
+  ]
+}
