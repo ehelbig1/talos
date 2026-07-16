@@ -30,6 +30,8 @@ struct ExecutionResp {
     #[serde(default)]
     failed_count: i64,
     #[serde(default)]
+    cancelled_count: i64,
+    #[serde(default)]
     completion_time: Option<String>,
 }
 
@@ -191,13 +193,20 @@ pub fn run(input: String) -> Result<String, String> {
         serde_json::from_str(&body_str).map_err(|e| format!("execution poll parse: {}", e))?;
 
     let completed = exec.completion_time.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
-    // Derive a coarse status. A failed task is terminal regardless of the
-    // completion timestamp; success requires a succeeded task, no failures, and
-    // a completion time; everything else is still running.
+    // Derive a coarse status. TERMINALITY is driven by `completionTime`: any
+    // execution Cloud Run has finished with is done, regardless of counts. A
+    // failed task is terminal even before the timestamp lands. Crucially, a
+    // completed execution with NO successes (cancelled, or never scheduled due
+    // to quota/permission — which increments `cancelledCount`, not
+    // `failedCount`) must resolve to a terminal "failed", NOT "running" — else
+    // a workflow wait-until-done loop (exit on done==true) never exits.
     let status = if exec.failed_count >= 1 {
         "failed"
-    } else if exec.succeeded_count >= 1 && completed {
+    } else if completed && exec.succeeded_count >= 1 {
         "succeeded"
+    } else if completed {
+        // Completed with no successes and no failures = cancelled / stillborn.
+        "failed"
     } else {
         "running"
     };
@@ -212,6 +221,7 @@ pub fn run(input: String) -> Result<String, String> {
         "status": status,
         "succeeded": exec.succeeded_count,
         "failed": exec.failed_count,
+        "cancelled": exec.cancelled_count,
         "running": exec.running_count,
         "done": done,
         "execution": name,

@@ -207,13 +207,20 @@ impl GcpImpersonationService {
         if parsed.access_token.is_empty() {
             return Err(anyhow!("generateAccessToken returned an empty token"));
         }
-        // Prefer Google's stated expiry; fall back to now + requested lifetime.
+        // Prefer Google's stated `expireTime` (always present in practice).
+        // If it's ever missing/unparseable, fall back CONSERVATIVELY to the
+        // refresh margin rather than the full requested lifetime: that makes
+        // the entry immediately non-fresh so the next dispatch re-mints, so we
+        // never serve a token whose real expiry we couldn't confirm (guards the
+        // impossible-but-unsafe case of a below-request org-policy lifetime cap
+        // combined with an omitted expireTime). The token minted THIS call is
+        // still returned and used.
         let expires_at_unix = parsed
             .expire_time
             .as_deref()
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.timestamp())
-            .unwrap_or_else(|| chrono::Utc::now().timestamp() + MINT_LIFETIME_SECS);
+            .unwrap_or_else(|| chrono::Utc::now().timestamp() + REFRESH_MARGIN_SECS);
         Ok(CachedMint {
             token: parsed.access_token,
             expires_at_unix,
