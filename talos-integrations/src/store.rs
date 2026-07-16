@@ -64,34 +64,72 @@ pub async fn list_user_service_integrations(
         .context("Failed to list user service integrations")
 }
 
+/// Outcome of a disconnect: whether a row was affected, plus the vault
+/// provider_key (+ tier discriminator) recovered from that row via
+/// `RETURNING` so the caller can revoke the OAuth token and clean up the
+/// vault — not merely hide the integration.
+#[derive(Debug, Default)]
+pub struct DisconnectOutcome {
+    /// 1 if a matching, owned row was found and disconnected; 0 otherwise.
+    pub rows_affected: u64,
+    /// The row's vault provider_key (from `provider_key_column`). `None` when
+    /// no row matched or the column was NULL.
+    pub provider_key: Option<String>,
+    /// The row's tier discriminator (from `tier_column`), for providers whose
+    /// OAuth provider string is per-tier (GCP). `None` for single-namespace
+    /// providers or when no row matched.
+    pub tier: Option<String>,
+}
+
 /// Disconnect one integration row for a user. Soft-delete providers get
-/// `is_active = false`; the rest are hard-deleted. The table name comes
-/// from the static registry entry (compile-time constant, not user
-/// input); only `id` and `user_id` are bound. Returns rows affected
-/// (0 = not found / not owned).
+/// `is_active = false`; the rest are hard-deleted. The table name and the
+/// `RETURNING` column names come from the static registry entry (compile-time
+/// constants, not user input); only `id` and `user_id` are bound.
+///
+/// `RETURNING`s the row's provider_key (+ tier) so the caller can revoke the
+/// token at the provider and delete it from the vault. For a hard-delete this
+/// is the last chance to read the key — the row is gone after this call.
 pub async fn disconnect_user_integration(
     pool: &PgPool,
     provider: &IntegrationProviderConfig,
     id: Uuid,
     user_id: Uuid,
-) -> Result<u64> {
+) -> Result<DisconnectOutcome> {
+    // `::text` normalises Uuid key columns (oauth_account_id, provider_key) and
+    // text ones (email_address, team_id, cloud_id) to a single String shape.
+    // `tier_column` is optional → project a NULL literal when absent so the row
+    // shape is always (provider_key, tier).
+    let tier_expr = provider.tier_column.unwrap_or("NULL");
+    let returning = format!(
+        "RETURNING {}::text AS provider_key, {}::text AS tier",
+        provider.provider_key_column, tier_expr
+    );
     let sql = if provider.disconnect_is_soft_delete {
         format!(
-            "UPDATE {} SET is_active = false, updated_at = now() WHERE id = $1 AND user_id = $2",
-            provider.db_table
+            "UPDATE {} SET is_active = false, updated_at = now() \
+             WHERE id = $1 AND user_id = $2 {}",
+            provider.db_table, returning
         )
     } else {
         format!(
-            "DELETE FROM {} WHERE id = $1 AND user_id = $2",
-            provider.db_table
+            "DELETE FROM {} WHERE id = $1 AND user_id = $2 {}",
+            provider.db_table, returning
         )
     };
 
-    let result = sqlx::query(&sql)
+    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(&sql)
         .bind(id)
         .bind(user_id)
-        .execute(pool)
+        .fetch_optional(pool)
         .await
         .context("Failed to disconnect integration")?;
-    Ok(result.rows_affected())
+
+    Ok(match row {
+        Some((provider_key, tier)) => DisconnectOutcome {
+            rows_affected: 1,
+            provider_key,
+            tier,
+        },
+        None => DisconnectOutcome::default(),
+    })
 }
