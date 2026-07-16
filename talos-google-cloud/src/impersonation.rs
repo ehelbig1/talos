@@ -76,6 +76,20 @@ fn is_fresh(expires_at_unix: i64, now_unix: i64) -> bool {
     expires_at_unix - now_unix > REFRESH_MARGIN_SECS
 }
 
+/// Extract the project id from a standard SA email
+/// (`<name>@<project>.iam.gserviceaccount.com`), used as the API
+/// billing/quota project (`x-goog-user-project`). Returns `None` for
+/// non-standard SAs (e.g. `…@developer.gserviceaccount.com`), where we omit
+/// the header and let Google attribute the call to the OAuth client's project.
+fn sa_project(sa_email: &str) -> Option<&str> {
+    let domain = sa_email.split_once('@')?.1;
+    let project = domain.strip_suffix(".iam.gserviceaccount.com")?;
+    if project.is_empty() || project.contains('.') {
+        return None;
+    }
+    Some(project)
+}
+
 /// Mints impersonated SA tokens from a user's host-reserved `google_cloud_full`
 /// consent. Holds the full-tier [`GoogleCloudIntegrationService`] (which
 /// refreshes + reads the broad token) plus a pool to resolve the user's
@@ -146,17 +160,25 @@ impl GcpImpersonationService {
             "lifetime": format!("{MINT_LIFETIME_SECS}s"),
         });
 
-        let resp = tokio::time::timeout(
-            MINT_TIMEOUT,
-            IAM_HTTP_CLIENT
-                .post(&url)
-                .bearer_auth(broad_token)
-                .json(&body)
-                .send(),
-        )
-        .await
-        .map_err(|_| anyhow!("generateAccessToken timed out"))?
-        .context("generateAccessToken request failed")?;
+        // Attribute the API call (enablement + quota) to the TARGET SA's
+        // project, not the OAuth client's project. Google bills a user-token
+        // call to the OAuth app's project by default; that project usually
+        // hasn't enabled iamcredentials, whereas the operator DID enable it in
+        // the sandbox project where the SA lives (per the runbook). Requires
+        // the consenting user to hold `serviceusage.services.use` there — an
+        // owner/editor does. Omitted for non-standard SA domains.
+        let mut request = IAM_HTTP_CLIENT
+            .post(&url)
+            .bearer_auth(broad_token)
+            .json(&body);
+        if let Some(project) = sa_project(sa_email) {
+            request = request.header("x-goog-user-project", project);
+        }
+
+        let resp = tokio::time::timeout(MINT_TIMEOUT, request.send())
+            .await
+            .map_err(|_| anyhow!("generateAccessToken timed out"))?
+            .context("generateAccessToken request failed")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -286,5 +308,30 @@ mod cache_freshness_tests {
         let now = 1_000_000;
         assert!(!is_fresh(now - 1, now));
         assert!(!is_fresh(now, now));
+    }
+}
+
+#[cfg(test)]
+mod sa_project_tests {
+    use super::sa_project;
+
+    #[test]
+    fn extracts_project_from_standard_sa() {
+        assert_eq!(
+            sa_project("talos-runner@my-talos-sandbox.iam.gserviceaccount.com"),
+            Some("my-talos-sandbox")
+        );
+    }
+
+    #[test]
+    fn none_for_nonstandard_domains() {
+        // Default compute SA — project is the numeric prefix, not the domain.
+        assert_eq!(
+            sa_project("282126683646-compute@developer.gserviceaccount.com"),
+            None
+        );
+        // Garbage / no domain.
+        assert_eq!(sa_project("not-an-email"), None);
+        assert_eq!(sa_project("a@b.com"), None);
     }
 }

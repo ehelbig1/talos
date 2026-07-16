@@ -5,6 +5,7 @@ use sqlx::{Pool, Postgres};
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::GOOGLE_CLOUD_TIER_PROVIDERS;
 use talos_secrets_manager::SecretsManager;
 
 /// Service for storing and retrieving OAuth credentials using the secrets manager.
@@ -719,11 +720,14 @@ impl OAuthCredentialService {
                             .filter(|v| !v.is_empty())
                     }),
             ),
-            // `google_cloud_write` is the provisioning consent tier (Phase C):
-            // same Google OAuth client, elevated scopes, distinct provider
-            // string so read modules granted `oauth/google_cloud/*` can never
-            // name the write token. Both tiers refresh identically.
-            "google_cloud" | "google_cloud_write" => (
+            // The google_cloud consent tiers (Phase A read / C write / D
+            // full) all refresh IDENTICALLY under GOOGLE_CLOUD_CLIENT_ID —
+            // distinct provider strings only for vault-path isolation.
+            // Data-driven so a NEW tier can't silently miss the refresh path:
+            // `google_cloud_full` omitted here 401'd the impersonation mint
+            // once its ~1h token expired (Phase D live-test bug). Kept in
+            // lockstep with `GOOGLE_REVOKE_PROVIDERS` by a unit test.
+            p if GOOGLE_CLOUD_TIER_PROVIDERS.contains(&p) => (
                 "https://oauth2.googleapis.com/token",
                 // Empty-env class (MCP-710): a helm placeholder `""` falls
                 // through to the shared GOOGLE_CLIENT_ID rather than shadowing

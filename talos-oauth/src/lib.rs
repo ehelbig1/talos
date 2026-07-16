@@ -129,6 +129,16 @@ fn oauth_http_client() -> reqwest::Client {
 /// for Google; via bearer auth for Slack's `auth.revoke`. We deliberately
 /// avoid SDK abstractions here — every revoke endpoint has its own quirks
 /// and we want the wire shape to be reviewable.
+/// The `google_cloud*` OAuth consent tiers (Phase A read / C write / D full)
+/// on the shared Google OAuth client. Every one MUST appear in BOTH the
+/// refresh match (`credentials.rs`) AND [`GOOGLE_REVOKE_PROVIDERS`] — a tier
+/// missing from refresh 401s the impersonation mint once its ~1h token
+/// expires (the Phase D live-test bug); missing from revoke leaves a live
+/// broad token at Google after disconnect. `refresh_and_revoke_lockstep`
+/// pins it.
+pub(crate) const GOOGLE_CLOUD_TIER_PROVIDERS: &[&str] =
+    &["google_cloud", "google_cloud_write", "google_cloud_full"];
+
 /// Every Google-family provider whose tokens revoke at
 /// `https://oauth2.googleapis.com/revoke`. A provider missing here while
 /// present in the refresh match (credentials.rs) fails SILENTLY on
@@ -138,6 +148,7 @@ pub(crate) const GOOGLE_REVOKE_PROVIDERS: &[&str] = &[
     "google_calendar",
     "google_cloud",
     "google_cloud_write",
+    "google_cloud_full",
 ];
 
 pub(crate) async fn revoke_at_provider(provider: &str, token: &str) -> Result<bool> {
@@ -1645,7 +1656,7 @@ impl OAuthService {
 
 #[cfg(test)]
 mod revoke_provider_coverage_tests {
-    use super::GOOGLE_REVOKE_PROVIDERS;
+    use super::{GOOGLE_CLOUD_TIER_PROVIDERS, GOOGLE_REVOKE_PROVIDERS};
 
     /// Drift guard (GCP Phase C review finding #1): `google_cloud_write` was
     /// added to the refresh match but initially NOT the revoke arm, so an
@@ -1659,11 +1670,36 @@ mod revoke_provider_coverage_tests {
             "google_calendar",
             "google_cloud",
             "google_cloud_write",
+            "google_cloud_full",
         ] {
             assert!(
                 GOOGLE_REVOKE_PROVIDERS.contains(&p),
                 "provider {p} refreshes via Google but is missing from GOOGLE_REVOKE_PROVIDERS — \
                  its disconnect would silently skip provider-side revocation"
+            );
+        }
+    }
+
+    /// Refresh↔revoke lockstep (GCP Phase D live-test bug): the refresh match
+    /// in credentials.rs is keyed on `GOOGLE_CLOUD_TIER_PROVIDERS`. Every tier
+    /// in it MUST also be in `GOOGLE_REVOKE_PROVIDERS` — the two paths handle
+    /// the same tokens, and a tier that refreshes but doesn't revoke (or, as
+    /// happened, revokes-per-config but silently doesn't refresh) is the exact
+    /// drift that 401'd the impersonation mint after ~1h.
+    #[test]
+    fn every_google_cloud_tier_refreshes_and_revokes() {
+        // All three consent tiers present.
+        for t in ["google_cloud", "google_cloud_write", "google_cloud_full"] {
+            assert!(
+                GOOGLE_CLOUD_TIER_PROVIDERS.contains(&t),
+                "tier {t} missing from GOOGLE_CLOUD_TIER_PROVIDERS (refresh match key)"
+            );
+        }
+        // …and each is revocable.
+        for t in GOOGLE_CLOUD_TIER_PROVIDERS {
+            assert!(
+                GOOGLE_REVOKE_PROVIDERS.contains(t),
+                "google_cloud tier {t} refreshes but is missing from GOOGLE_REVOKE_PROVIDERS"
             );
         }
     }
