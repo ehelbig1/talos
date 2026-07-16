@@ -1066,16 +1066,22 @@ impl ParallelWorkflowEngine {
                 "error_message": "Registry not available for dispatch execution",
             });
         }
-        let Some(graph_json) = self
-            .get_sub_workflow_graph(sub_wf_id, self.user_id().unwrap_or_else(Uuid::nil))
-            .await
-        else {
+        let user_id = self.user_id().unwrap_or_else(Uuid::nil);
+        let Some(graph_json) = self.get_sub_workflow_graph(sub_wf_id, user_id).await else {
             return origin.not_found_error(sub_wf_id);
         };
         let mut sub_engine = match self.adapter_set().into_engine_with_graph(&graph_json) {
             Ok(e) => e,
             Err(e) => return origin.build_error(e),
         };
+
+        // Fail-closed ceiling composition (H2): dynamic/capability dispatch
+        // builds a sub-engine that inherits the PARENT ceilings verbatim.
+        // Narrow to most-restrictive(parent, dispatch-target actor) so a
+        // target workflow bound to a stricter actor can't run at the
+        // caller's looser tier/write ceiling.
+        self.narrow_subengine_ceilings(&mut sub_engine, sub_wf_id, user_id)
+            .await;
 
         let clean_input = if let Some(obj) = inputs.as_object() {
             let mut cleaned = obj.clone();
@@ -1250,6 +1256,13 @@ impl ParallelWorkflowEngine {
         // const. `0` is the documented disable sentinel — see
         // `set_agent_loop_max_history`.
         let max_history = self.agent_loop_max_history();
+        // Fail-closed ceiling composition (H2), resolved ONCE before the
+        // loop (a single DB lookup, not per-iteration) while `self` is in
+        // scope — the `async move` below captures only `adapter_set_al`,
+        // not `self`. The body workflow is fixed across iterations, so the
+        // narrowed pair is invariant. `Option<(LlmTier, WriteCeiling)>` is
+        // `Copy`, so it moves into the closure by value.
+        let narrowed_ceilings = self.resolve_subworkflow_ceilings(body_wf_id, user_id).await;
         let agent_result =
             match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async move {
                 let mut history: Vec<JsonValue> = Vec::new();
@@ -1288,6 +1301,15 @@ impl ParallelWorkflowEngine {
                     let iter_result =
                         match adapter_set_al.clone().into_engine_with_graph(&graph_json) {
                             Ok(mut sub_engine) => {
+                                // Fail-closed ceiling narrowing (H2): the
+                                // per-iteration sub-engine inherits the
+                                // PARENT ceilings from `adapter_set_al`;
+                                // tighten to the pre-resolved
+                                // most-restrictive(parent, body-actor) pair.
+                                if let Some((tier, write)) = narrowed_ceilings {
+                                    sub_engine.set_max_llm_tier(tier);
+                                    sub_engine.set_max_write_ceiling(write);
+                                }
                                 let sub_execution_id = Uuid::new_v4();
                                 let trigger_node_id = Uuid::new_v4();
                                 sub_engine.add_node(trigger_node_id, None, None, None);

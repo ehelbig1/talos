@@ -2164,8 +2164,12 @@ async fn handle_add_node_to_workflow(
                 } else {
                     format!("{}-node", node_world)
                 };
-                if crate::actor::world_rank(&node_world_full) > crate::actor::world_rank(&actor_max)
-                {
+                // Lattice check (⊆), NOT linear world_rank — a higher rank does
+                // not imply a superset of capabilities (e.g. `secrets-node` ⊄
+                // `cache-node`). Mirrors the runtime gate in
+                // talos_workflow_authorization::check_capability_ceiling so
+                // authoring-time rejection matches execution-time enforcement.
+                if !talos_capability_world::ceiling_permits(&actor_max, &node_world_full) {
                     return mcp_error(
                         req_id,
                         -32603,
@@ -2189,9 +2193,8 @@ async fn handle_add_node_to_workflow(
                             .get(&tid)
                             .map(String::as_str)
                             .unwrap_or("minimal-node");
-                        if crate::actor::world_rank(module_world)
-                            > crate::actor::world_rank(&actor_max)
-                        {
+                        // Lattice check (⊆), NOT linear world_rank (see above).
+                        if !talos_capability_world::ceiling_permits(&actor_max, module_world) {
                             return mcp_error(
                                 req_id,
                                 -32603,

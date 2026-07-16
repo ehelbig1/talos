@@ -82,6 +82,25 @@ impl LlmTier {
             _ => LlmTier::Tier1,
         }
     }
+
+    /// The more restrictive (lower data-egress) of two ceilings — used
+    /// when composing a parent's ceiling with a sub-workflow's own
+    /// actor ceiling so a sub-workflow can only ever be *narrowed*,
+    /// never widened, relative to the caller (privilege can't escalate
+    /// across the sub-workflow boundary).
+    ///
+    /// `Tier1` (local-only) is strictly more restrictive than `Tier2`
+    /// (external allowed), so the result is `Tier2` only when BOTH
+    /// inputs are `Tier2`. The enum is `#[non_exhaustive]`; folding
+    /// every non-`(Tier2, Tier2)` pair into `Tier1` keeps a future
+    /// tier fail-closed here until this combinator is taught its rank.
+    #[must_use]
+    pub fn most_restrictive(self, other: Self) -> Self {
+        match (self, other) {
+            (LlmTier::Tier2, LlmTier::Tier2) => LlmTier::Tier2,
+            _ => LlmTier::Tier1,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -123,5 +142,28 @@ mod tests {
         assert_eq!(LlmTier::from_db_str("Tier1"), LlmTier::Tier1);
         assert_eq!(LlmTier::from_db_str("Tier2"), LlmTier::Tier1);
         assert_eq!(LlmTier::from_db_str("TIER2"), LlmTier::Tier1);
+    }
+
+    #[test]
+    fn most_restrictive_only_widens_when_both_tier2() {
+        // SECURITY: composing a parent ceiling with a sub-workflow's
+        // actor ceiling must NARROW, never widen. Tier2 survives only
+        // when BOTH sides permit external egress.
+        assert_eq!(
+            LlmTier::Tier2.most_restrictive(LlmTier::Tier2),
+            LlmTier::Tier2
+        );
+        assert_eq!(
+            LlmTier::Tier2.most_restrictive(LlmTier::Tier1),
+            LlmTier::Tier1
+        );
+        assert_eq!(
+            LlmTier::Tier1.most_restrictive(LlmTier::Tier2),
+            LlmTier::Tier1
+        );
+        assert_eq!(
+            LlmTier::Tier1.most_restrictive(LlmTier::Tier1),
+            LlmTier::Tier1
+        );
     }
 }

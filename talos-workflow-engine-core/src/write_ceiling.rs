@@ -84,6 +84,23 @@ impl WriteCeiling {
     pub fn allows_write(self) -> bool {
         matches!(self, WriteCeiling::Write)
     }
+
+    /// The more restrictive (lower-privilege) of two ceilings — used when
+    /// composing a parent's ceiling with a sub-workflow's own actor
+    /// ceiling so a sub-workflow can only ever be *narrowed*, never
+    /// widened, relative to the caller.
+    ///
+    /// `ReadOnly` is strictly more restrictive than `Write`, so the
+    /// result is `Write` only when BOTH inputs are `Write`. The enum is
+    /// `#[non_exhaustive]`; folding every non-`(Write, Write)` pair into
+    /// `ReadOnly` keeps a future ceiling fail-closed here.
+    #[must_use]
+    pub fn most_restrictive(self, other: Self) -> Self {
+        match (self, other) {
+            (WriteCeiling::Write, WriteCeiling::Write) => WriteCeiling::Write,
+            _ => WriteCeiling::ReadOnly,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -122,6 +139,28 @@ mod tests {
         assert_eq!(WriteCeiling::from_db_str("Write"), WriteCeiling::ReadOnly);
         assert_eq!(
             WriteCeiling::from_db_str("ReadOnly"),
+            WriteCeiling::ReadOnly
+        );
+    }
+
+    #[test]
+    fn most_restrictive_only_permits_write_when_both_write() {
+        // SECURITY: sub-workflow ceiling composition must narrow, never
+        // widen. Write survives only when BOTH sides permit mutation.
+        assert_eq!(
+            WriteCeiling::Write.most_restrictive(WriteCeiling::Write),
+            WriteCeiling::Write
+        );
+        assert_eq!(
+            WriteCeiling::Write.most_restrictive(WriteCeiling::ReadOnly),
+            WriteCeiling::ReadOnly
+        );
+        assert_eq!(
+            WriteCeiling::ReadOnly.most_restrictive(WriteCeiling::Write),
+            WriteCeiling::ReadOnly
+        );
+        assert_eq!(
+            WriteCeiling::ReadOnly.most_restrictive(WriteCeiling::ReadOnly),
             WriteCeiling::ReadOnly
         );
     }
