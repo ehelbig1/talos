@@ -1407,6 +1407,20 @@ async fn build_platform_services(
         webhook_deduplication.is_some()
     );
 
+    // RFC 0010 P3 (M4): resolve the process-wide claim-based-sealing handle
+    // ONCE and share it across the three module-bound (fire-and-forget)
+    // dispatch paths — webhooks (below), Gmail push, Google-Calendar push.
+    // `Some` only when TALOS_ENVELOPE_SEALING is audit/required AND an Ed25519
+    // controller signing key is configured; those paths then register plaintext
+    // for a worker claim instead of shipping a WSK envelope the worker refuses
+    // under `required`. Resolving here (eagerly, at boot) starts the shared
+    // claim responder + orphan-seal sweep before the first push arrives. Bridged
+    // from the engine-NATS `EnvelopeSealingHandle` into the decoupled
+    // `ModuleSealingHandle` the integration crates depend on.
+    let module_sealing_handle: Option<talos_integration_helpers::ModuleSealingHandle> = nats_client
+        .as_ref()
+        .and_then(talos_engine::nats_run::shared_envelope_sealing_handle);
+
     // ---------- Initialize webhook router ----------
     // NOTE: Slack enrichment (user profiles, channel info, etc.) now happens inside
     // the slack-webhook-listener WASM template, not here in the controller.
@@ -1425,6 +1439,7 @@ async fn build_platform_services(
         tx.clone(),
         dlq_tx.clone(),
         webhook_deduplication.clone(),
+        module_sealing_handle.clone(),
     )?);
 
     // ---------- Initialize authentication service ----------
@@ -4859,6 +4874,14 @@ fn build_router(
     let replay_service = bundle.replay_service.clone();
     let inline_compile_service = bundle.inline_compile_service.clone();
     let search_service = bundle.search_service.clone();
+    // RFC 0010 P3 (M4): the SAME process-wide claim-based-sealing handle main
+    // resolved for the webhook router. `shared_envelope_sealing_handle` is
+    // memoized in a `OnceLock`, so this returns the identical `InFlightSeals` +
+    // claim subject the claim responder subscribes to (never a second store),
+    // for the Gmail-push + Google-Calendar-push fire-and-forget dispatch paths.
+    let module_sealing_handle: Option<talos_integration_helpers::ModuleSealingHandle> = nats_client
+        .as_ref()
+        .and_then(talos_engine::nats_run::shared_envelope_sealing_handle);
     let failure_analysis_service = bundle.failure_analysis_service.clone();
     let actor_lifecycle_service = bundle.actor_lifecycle_service.clone();
     // ---------- Rate limiting configuration ----------
@@ -5250,6 +5273,8 @@ fn build_router(
                         redis: redis_client.clone(),
                         db_pool: db_pool.clone(),
                         secrets_manager: Some(secrets_manager.clone()),
+                        // RFC 0010 P3 (M4): shared claim-based-sealing handle.
+                        sealing_handle: module_sealing_handle.clone(),
                     }),
                     _ => {
                         tracing::warn!(
@@ -5978,6 +6003,9 @@ fn build_router(
         // downstream workflow nodes in-process (workflow chaining).
         .layer(Extension(Some(runtime.clone())))
         .layer(Extension(Some(secrets_manager.clone())))
+        // RFC 0010 P3 (M4): shared claim-based-sealing handle for the
+        // Google-Calendar push handler (fire-and-forget module dispatch).
+        .layer(Extension(module_sealing_handle.clone()))
         // Trusted proxy list — used by rate_limit_middleware to decide whether to
         // trust X-Forwarded-For headers. Shared across all rate-limited routes.
         .layer(Extension(trusted_proxies));

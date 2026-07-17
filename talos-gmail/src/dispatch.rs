@@ -49,6 +49,14 @@ pub struct GmailDispatchContext {
     /// the previous `Default::default()` behaviour, which silently
     /// dropped ALL secrets even in production).
     pub secrets_manager: Option<Arc<SecretsManager>>,
+    /// RFC 0010 P3 (M4): the shared claim-based-sealing handle, injected by
+    /// the controller when `TALOS_ENVELOPE_SEALING` is on (audit/required) and
+    /// an Ed25519 signing key is configured. When `Some` and the module has
+    /// secrets, dispatch registers the plaintext for a worker claim
+    /// (`sealing = SEALING_CLAIM_ECIES`) instead of shipping a WSK envelope —
+    /// which the worker refuses under `required`. `None` keeps the inline
+    /// envelope path (byte-identical to pre-M4).
+    pub sealing_handle: Option<talos_integration_helpers::ModuleSealingHandle>,
 }
 
 /// Dispatch one WASM job per newly-added message in the history
@@ -265,25 +273,31 @@ async fn dispatch_single_message(
         )
         .await;
 
-    // Encrypted secrets combine the MODULE's declared
-    // allowed_secrets PLUS the host-reserved LLM provider keys.
-    // Without this, vault:// header substitution returns NotFound
-    // and llm::* host calls fail with NotConfigured. Mirrors
-    // ParallelWorkflowEngine::build_encrypted_secrets and the
-    // talos-webhooks dispatch path; see CLAUDE.md "Secret Handling
+    // Secret delivery combines the MODULE's declared allowed_secrets
+    // PLUS the host-reserved LLM provider keys. Without this, vault://
+    // header substitution returns NotFound and llm::* host calls fail
+    // with NotConfigured. Mirrors ParallelWorkflowEngine::build_encrypted_secrets
+    // and the talos-webhooks dispatch path; see CLAUDE.md "Secret Handling
     // Rules" for the canonical pattern.
-    let encrypted_secrets = talos_integration_helpers::build_dispatch_encrypted_secrets(
+    //
+    // RFC 0010 P3 (M4): under claim-based sealing (`sealing_handle` is Some)
+    // this registers the plaintext for a worker claim and stamps
+    // `sealing = SEALING_CLAIM_ECIES`; otherwise it builds the inline WSK
+    // envelope (L-1: AAD = execution_id — this dispatch sets both `job_id`
+    // and `workflow_execution_id` to `execution_id`, so the worker decrypts
+    // with the same AAD).
+    let delivery = talos_integration_helpers::prepare_module_dispatch_secrets(
         ctx.secrets_manager.as_ref(),
         module_id,
         user_id,
-        // L-1: AAD = execution_id. This dispatch sets
-        // `JobRequest.workflow_execution_id = execution_id` (and
-        // also `job_id = execution_id`), so the worker decrypts with
-        // the same AAD.
         execution_id,
+        ctx.sealing_handle.as_ref(),
     )
     .await;
 
+    // Placeholder secret-delivery fields; `delivery.apply_to` below writes all
+    // four in one drift-proof mapping (a hand-spread per site risks a future
+    // copy that forgets one — check-17's `Default::default()` class).
     let mut job_request = JobRequest {
         crypto_scheme: 0,
         sealing: 0,
@@ -293,7 +307,7 @@ async fn dispatch_single_message(
         workflow_execution_id: execution_id,
         module_uri: exec_info.module_uri.clone(),
         input_payload,
-        encrypted_secrets,
+        encrypted_secrets: talos_workflow_job_protocol::EncryptedSecrets::empty(),
         timeout_ms: 30_000,
         allowed_hosts: exec_info.allowed_hosts.clone(),
         allowed_methods: exec_info.allowed_methods.clone(),
@@ -331,6 +345,7 @@ async fn dispatch_single_message(
         actor_id: resolved_actor,
         user_id,
     };
+    delivery.apply_to(&mut job_request);
 
     // Signing is mandatory. An unsigned JobRequest is rejected by the worker at
     // verify anyway, so publishing it would just burn NATS bandwidth — bail
@@ -341,6 +356,11 @@ async fn dispatch_single_message(
         None => job_request.sign(ctx.worker_shared_key.as_bytes()),
     };
     if let Err(e) = sign_result {
+        // RFC 0010 P3 (M4): the seal was registered before signing; reclaim it
+        // now rather than leaving it for the TTL sweep (this dispatch is dead).
+        if let Some(h) = &ctx.sealing_handle {
+            h.in_flight.discard(execution_id);
+        }
         let err_msg = format!("failed to sign gmail job: {e}");
         ctx.execution_service
             .fail_execution_best_effort(
@@ -353,7 +373,18 @@ async fn dispatch_single_message(
         bail!(err_msg);
     }
 
-    let payload = serde_json::to_vec(&job_request).context("serialize gmail job")?;
+    let payload = match serde_json::to_vec(&job_request) {
+        Ok(p) => p,
+        Err(e) => {
+            // RFC 0010 P3 (M4): reclaim the seal on this (practically
+            // unreachable) serialize failure too, for parity with the
+            // sign/publish discards above/below.
+            if let Some(h) = &ctx.sealing_handle {
+                h.in_flight.discard(execution_id);
+            }
+            return Err(anyhow::Error::new(e).context("serialize gmail job"));
+        }
+    };
 
     // Edge routing (if enabled) matches gcal's pattern: per-user
     // topic when ENABLE_EDGE_ROUTING=true, else shared talos.jobs.
@@ -392,6 +423,12 @@ async fn dispatch_single_message(
             Ok(())
         }
         Err(e) => {
+            // RFC 0010 P3 (M4): publish failed — the worker will never claim,
+            // so reclaim the registered seal immediately (belt-and-braces with
+            // the TTL sweep).
+            if let Some(h) = &ctx.sealing_handle {
+                h.in_flight.discard(execution_id);
+            }
             let err_msg = format!("NATS publish failed: {e}");
             ctx.execution_service
                 .fail_execution_best_effort(

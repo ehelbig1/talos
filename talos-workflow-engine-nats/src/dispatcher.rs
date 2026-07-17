@@ -712,13 +712,12 @@ pub struct NatsNodeDispatcher {
 }
 
 /// The controller-provided pieces the dispatcher needs to route a claim-based
-/// dispatch: the shared in-flight seal store (also read by the claim responder)
-/// and the responder's subject (stamped into `JobRequest.claim_inbox`).
-#[derive(Clone)]
-pub struct EnvelopeSealingHandle {
-    pub in_flight: Arc<talos_envelope_seal::InFlightSeals>,
-    pub claim_subject: String,
-}
+/// dispatch. Canonical definition lives in `talos-envelope-seal` (the crate
+/// every sealing participant depends on) so the module-bound integration paths
+/// name the SAME type without a dep edge on this engine-NATS layer; re-exported
+/// here to keep existing `talos_workflow_engine_nats::EnvelopeSealingHandle`
+/// paths resolving.
+pub use talos_envelope_seal::EnvelopeSealingHandle;
 
 impl NatsNodeDispatcher {
     /// Build a dispatcher. `event_sink` may be `None` when there's no

@@ -29,6 +29,7 @@ sqlx = { version = "0.8", default-features = false, features = ["postgres", "run
 subtle = "2.4"
 talos-config = { path = "../talos-config" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
+talos-envelope-seal = { path = "../talos-envelope-seal" }
 talos-http-body = { path = "../talos-http-body" }
 talos-http-utils = { path = "../talos-http-utils" }
 talos-integration-state = { path = "../talos-integration-state" }

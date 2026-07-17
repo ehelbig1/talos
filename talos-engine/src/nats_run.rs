@@ -184,6 +184,56 @@ fn envelope_sealing_handle(
                     );
                 }
             });
+            // RFC 0010 P3 (M4): bound `InFlightSeals` against ORPHANED seals.
+            // The engine's request/reply dispatcher removes its context on
+            // claim OR on the post-dispatch `discard`, but module-bound
+            // fire-and-forget pushes (Gmail/GCal/webhooks) publish and return
+            // immediately — they can't `discard`. A worker that dies before
+            // claiming would strand its context here forever. A live worker
+            // claims within milliseconds, so a generous TTL (default 10 min)
+            // never races a legitimate claim. Spawned once, alongside the
+            // responder, so it exists regardless of whether the engine or a
+            // module-bound push initialised the handle first.
+            let sweep_inf = in_flight.clone();
+            // Floor the TTL at 60s: `positive_env_or_default` rejects 0/negative
+            // but accepts e.g. `1`, and a TTL below any plausible dispatch→claim
+            // latency (cold worker start, queue backlog) would evict LEGITIMATE
+            // in-flight seals — fail-closed (job fails, no leak) but a needless
+            // availability footgun. The doc contract "generously larger than
+            // dispatch→claim latency" is enforced here, not by operator
+            // discipline.
+            let configured_ttl: u64 =
+                talos_config::positive_env_or_default("TALOS_SEAL_ORPHAN_TTL_SECS", 600);
+            let ttl_secs = configured_ttl.max(60);
+            if ttl_secs != configured_ttl {
+                tracing::warn!(
+                    target: "talos_security",
+                    configured_ttl,
+                    "TALOS_SEAL_ORPHAN_TTL_SECS below the 60s floor; clamped to 60"
+                );
+            }
+            let sweep_interval_secs: u64 =
+                talos_config::positive_env_or_default("TALOS_SEAL_SWEEP_INTERVAL_SECS", 60);
+            tokio::spawn(async move {
+                let mut ticker =
+                    tokio::time::interval(std::time::Duration::from_secs(sweep_interval_secs));
+                // Skip the immediate first tick — nothing to sweep at startup.
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    let swept =
+                        sweep_inf.sweep_older_than(std::time::Duration::from_secs(ttl_secs));
+                    if swept > 0 {
+                        tracing::warn!(
+                            target: "talos_security",
+                            swept,
+                            ttl_secs,
+                            "RFC 0010 P3 (M4): swept orphaned in-flight seals \
+                             (worker never claimed within TTL)"
+                        );
+                    }
+                }
+            });
             tracing::info!(
                 target: "talos_security",
                 %claim_subject,
@@ -195,6 +245,46 @@ fn envelope_sealing_handle(
             }
         })
         .clone()
+}
+
+/// RFC 0010 P3 (M4): expose the process-wide claim-sealing handle to the
+/// module-bound (fire-and-forget) dispatch paths — Gmail / Google-Calendar
+/// push, generic webhooks — which build `JobRequest`s directly instead of
+/// going through the engine dispatcher.
+///
+/// Returns `Some` ONLY when claim-based sealing is active (`TALOS_ENVELOPE_
+/// SEALING` ∈ {audit, required}) AND an Ed25519 controller signing key is
+/// configured (P3 needs it to sign `SealedSecrets`) — the SAME gate
+/// [`build_nats_dispatcher`] applies. Reuses the memoized `OnceLock`, so the
+/// caller gets the SAME `InFlightSeals` + claim subject the claim responder
+/// subscribes to (never construct a second store — the responder would never
+/// see its registrations). Calling this at controller boot eagerly starts the
+/// responder + sweep so they're ready before the first module-bound push.
+///
+/// Returns `None` when sealing is off, or when it's on but misconfigured (no
+/// Ed25519 key). In the misconfigured case module-bound dispatch falls back to
+/// the inline WSK envelope, which the worker refuses under `required` (loud,
+/// fail-closed) — the same posture the engine takes.
+pub fn shared_envelope_sealing_handle(
+    nats_client: &Arc<async_nats::Client>,
+) -> Option<talos_workflow_engine_nats::EnvelopeSealingHandle> {
+    if !talos_envelope_seal::EnvelopeSealingMode::from_env().seals_claim_based() {
+        return None;
+    }
+    match resolve_dispatch_signer() {
+        Some(talos_workflow_job_protocol::DispatchSigner::Ed25519(sk)) => {
+            Some(envelope_sealing_handle(nats_client, sk))
+        }
+        _ => {
+            tracing::error!(
+                target: "talos_security",
+                "TALOS_ENVELOPE_SEALING is on but no Ed25519 controller signing key is \
+                 configured — module-bound dispatch cannot claim-seal and will fall back to \
+                 the inline envelope (refused under `required`). Set TALOS_CONTROLLER_SIGNING_KEY."
+            );
+            None
+        }
+    }
 }
 
 /// RFC 0010 P1: resolve the controller's dispatch signer. Delegates resolution
