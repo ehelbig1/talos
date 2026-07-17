@@ -1108,7 +1108,7 @@ impl WebhookRouter {
                     };
 
                     // MCP-1144 (2026-05-16): route through the canonical
-                    // helper `talos_integration_helpers::build_dispatch_encrypted_secrets`.
+                    // helper `talos_integration_helpers::prepare_module_dispatch_secrets`.
                     // Pre-fix this site inlined ~50 lines duplicating the
                     // composition logic that already lived in the helper
                     // — module-declared secrets via `get_module_secrets_for_user`

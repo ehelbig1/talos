@@ -5395,6 +5395,11 @@ fn build_router(
                     db_pool: db_pool.clone(),
                     integrations: google_cloud_integration_service.clone(),
                     secrets_manager: Some(secrets_manager.clone()),
+                    // RFC 0010 P3 (M4): shared claim-based-sealing handle —
+                    // the sibling the original M4 sweep missed (found live
+                    // 2026-07-17: first real Pub/Sub push refused under
+                    // `required`).
+                    sealing_handle: module_sealing_handle.clone(),
                 }),
                 _ => {
                     tracing::warn!(
