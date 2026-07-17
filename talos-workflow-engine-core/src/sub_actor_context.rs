@@ -60,4 +60,31 @@ pub trait SubworkflowActorContextResolver: Send + Sync {
     /// safe default — it means "do not inject a context for this
     /// sub-workflow", which is identical to the pre-trait behaviour.
     async fn resolve(&self, workflow_id: Uuid, user_id: Uuid) -> Option<JsonValue>;
+
+    /// Resolve the sub-workflow's bound actor's privilege ceilings
+    /// (`max_llm_tier`, `max_write_ceiling`), scoped to `user_id`.
+    ///
+    /// The executor uses this to run the sub-workflow at the *more
+    /// restrictive* of `(parent_ceiling, sub_actor_ceiling)` on each
+    /// axis — a sub-workflow bound to a stricter actor (e.g. a Tier-1,
+    /// read-only persona) must NOT inherit the parent's looser ceiling.
+    /// Without this, `AdapterSet` copies the parent's ceilings verbatim
+    /// into the sub-engine, silently widening the sub-workflow's
+    /// data-egress and mutation authority — a privilege escalation
+    /// across the sub-workflow boundary.
+    ///
+    /// The default returns `None`, meaning "no distinct sub-actor
+    /// binding known" — the executor then keeps the inherited parent
+    /// ceilings unchanged (the pre-trait behaviour). A resolver that
+    /// CAN answer SHOULD, so a stricter sub-actor is honoured. Note the
+    /// composition is one-directional: it can only ever *narrow* the
+    /// sub-workflow, so returning a LOOSER sub-actor ceiling than the
+    /// parent has no widening effect.
+    async fn resolve_ceilings(
+        &self,
+        _workflow_id: Uuid,
+        _user_id: Uuid,
+    ) -> Option<(crate::LlmTier, crate::WriteCeiling)> {
+        None
+    }
 }

@@ -3560,6 +3560,13 @@ impl ParallelWorkflowEngine {
             }
         }
 
+        // Fail-closed ceiling composition: narrow the sub-engine to the
+        // most-restrictive of (parent, sub-actor) on each axis so a
+        // sub-workflow bound to a stricter actor can't inherit the
+        // parent's looser ceiling. See `narrow_subengine_ceilings`.
+        self.narrow_subengine_ceilings(&mut sub_engine, sub_wf_id, user_id)
+            .await;
+
         // Synthetic trigger node: seeded with the caller's input,
         // wired to every root so root-level modules actually execute.
         // Delegates to the shared helper so this path and the public
@@ -3579,6 +3586,55 @@ impl ParallelWorkflowEngine {
             .map_err(|e| SubflowError::ExecutionFailed(e.to_string()))?;
 
         Ok(Self::collapse_subworkflow_output(&ctx.results, &sub_engine))
+    }
+
+    /// Resolve the ceilings a sub-workflow should run under: the
+    /// most-restrictive of `(this engine's ceiling, the sub-workflow
+    /// actor's ceiling)` on each axis (`max_llm_tier`,
+    /// `max_write_ceiling`).
+    ///
+    /// **Fail-closed, narrow-only composition.** `AdapterSet` copies the
+    /// PARENT ceilings verbatim into a freshly-built sub-engine. Without
+    /// this, a sub-workflow bound to a MORE restrictive actor (e.g. a
+    /// Tier-1, read-only persona) would silently inherit the parent's
+    /// looser ceiling — a privilege escalation across the sub-workflow
+    /// boundary. The composition can only ever *tighten*: a looser
+    /// sub-actor ceiling has no widening effect. `None` (no resolver, no
+    /// distinct sub-actor binding, or an auth/DB-declined lookup) means
+    /// "keep the inherited parent ceiling" — safe, since the parent
+    /// ceiling is already the caller's authorized bound.
+    pub(crate) async fn resolve_subworkflow_ceilings(
+        &self,
+        sub_wf_id: Uuid,
+        user_id: Uuid,
+    ) -> Option<(
+        talos_workflow_engine_core::LlmTier,
+        talos_workflow_engine_core::WriteCeiling,
+    )> {
+        let resolver = self.sub_actor_context_resolver.as_ref()?;
+        let (sub_tier, sub_write) = resolver.resolve_ceilings(sub_wf_id, user_id).await?;
+        Some((
+            self.max_llm_tier.most_restrictive(sub_tier),
+            self.max_write_ceiling.most_restrictive(sub_write),
+        ))
+    }
+
+    /// Apply [`Self::resolve_subworkflow_ceilings`] to a freshly-built
+    /// sub-engine. Call this on EVERY sub-engine built via
+    /// `adapter_set().into_engine_with_graph(...)` before running it —
+    /// `execute_subworkflow_graph`, dynamic/capability dispatch, and the
+    /// agent-loop body all go through here so the fail-closed narrowing
+    /// can't be forgotten on one path (the escalation gap H2 closed).
+    pub(crate) async fn narrow_subengine_ceilings(
+        &self,
+        sub_engine: &mut ParallelWorkflowEngine,
+        sub_wf_id: Uuid,
+        user_id: Uuid,
+    ) {
+        if let Some((tier, write)) = self.resolve_subworkflow_ceilings(sub_wf_id, user_id).await {
+            sub_engine.set_max_llm_tier(tier);
+            sub_engine.set_max_write_ceiling(write);
+        }
     }
 
     /// Reduce a sub-workflow's `results` map into the single value

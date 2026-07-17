@@ -66,4 +66,37 @@ impl SubworkflowActorContextResolver for ControllerSubActorContextResolver {
             actor_id, &memories,
         ))
     }
+
+    async fn resolve_ceilings(
+        &self,
+        workflow_id: Uuid,
+        user_id: Uuid,
+    ) -> Option<(
+        talos_workflow_engine_core::LlmTier,
+        talos_workflow_engine_core::WriteCeiling,
+    )> {
+        // Same fail-closed authorization posture as `resolve`: `get_workflow`
+        // returns `Ok(None)` for a workflow the parent can't see, which we
+        // bubble up as `None` (keep the parent's inherited ceiling — the
+        // executor never widens, so "unknown" is safe). A sub-workflow with
+        // no bound actor also returns `None`.
+        let workflow = self
+            .workflow_repo
+            .get_workflow(workflow_id, user_id)
+            .await
+            .ok()
+            .flatten()?;
+
+        let actor_id = workflow.actor_id?;
+
+        // Tenancy-scoped: get_actor_ceilings returns None if the actor isn't
+        // owned by user_id. On DB error we return None (keep the parent
+        // ceiling) — the parent ceiling is already the caller's authorized
+        // bound, so failing to tighten never escalates.
+        self.workflow_repo
+            .get_actor_ceilings(actor_id, user_id)
+            .await
+            .ok()
+            .flatten()
+    }
 }
