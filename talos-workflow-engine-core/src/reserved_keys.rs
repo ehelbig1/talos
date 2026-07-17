@@ -77,6 +77,13 @@ pub const ACTOR_CONTEXT: &str = "__actor_context__";
 /// after dispatch and commits the writes.
 pub const MEMORY_WRITE: &str = "__memory_write__";
 
+/// Output-side hook: parser/triage modules write normalized operational
+/// alerts under this key (`{"alerts": [...]}` — or a single alert object)
+/// and the controller's node hook persists them into the `ops_alerts`
+/// store with tenancy derived from the execution's bound actor. Sibling
+/// of [`MEMORY_WRITE`]; same opt-in, fire-on-completion semantics.
+pub const OPS_ALERT: &str = "__ops_alert__";
+
 // ── Judge sub-workflow output ───────────────────────────────────────
 
 /// Numeric score the judge returned (0.0..1.0 typical, impl-defined).

@@ -1178,6 +1178,22 @@ impl ActorRepository {
         Ok(owner)
     }
 
+    /// Look up an actor's full tenancy pair `(user_id, org_id)`. Returns
+    /// `Ok(None)` when the actor doesn't exist. Used by the `__ops_alert__`
+    /// node hook to stamp ownership on ingested alerts — same shape as
+    /// [`Self::get_actor_owner_user_id`] plus the (nullable) org, in one
+    /// round-trip instead of two.
+    pub async fn get_actor_tenancy(&self, actor_id: Uuid) -> Result<Option<(Uuid, Option<Uuid>)>> {
+        let row = sqlx::query("SELECT user_id, org_id FROM actors WHERE id = $1")
+            .bind(actor_id)
+            .fetch_optional(&self.db_pool)
+            .await?;
+        row.map(|r| -> Result<(Uuid, Option<Uuid>)> {
+            Ok((r.try_get("user_id")?, r.try_get::<Option<_>, _>("org_id")?))
+        })
+        .transpose()
+    }
+
     /// Fetch execution trend for the last 7 days (date + count pairs).
     pub async fn get_execution_trend_7d(&self, actor_id: Uuid) -> Result<Vec<(NaiveDate, i64)>> {
         let rows: Vec<(NaiveDate, i64)> = sqlx::query_as(

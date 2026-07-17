@@ -31,6 +31,7 @@ members = [
     "talos-db-monitor",
     "talos-worker-fleet",
     "talos-schedule-repo",
+    "talos-ops-alerts-repository",
     "talos-config",
     "talos-integration-state",
     "talos-ml",

@@ -47,6 +47,7 @@ fn all_static_schemas() -> Vec<(&'static str, Vec<serde_json::Value>)> {
         ("graph", crate::graph::tool_schemas()),
         ("knowledge_graph", crate::knowledge_graph::tool_schemas()),
         ("alerts", crate::alerts::tool_schemas()),
+        ("ops_alerts", crate::ops_alerts::tool_schemas()),
         ("schemas", crate::schemas::tool_schemas()),
         ("ollama", crate::ollama::tool_schemas()),
         ("ml", crate::ml::tool_schemas()),

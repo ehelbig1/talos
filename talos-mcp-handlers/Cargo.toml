@@ -67,6 +67,7 @@ talos-search-service = { path = "../talos-search-service" }
 talos-failure-analysis-service = { path = "../talos-failure-analysis-service" }
 talos-actor-lifecycle-service = { path = "../talos-actor-lifecycle-service" }
 talos-schedule-repo = { path = "../talos-schedule-repo" }
+talos-ops-alerts-repository = { path = "../talos-ops-alerts-repository" }
 talos-scheduler = { path = "../talos-scheduler" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-ml = { path = "../talos-ml" }
