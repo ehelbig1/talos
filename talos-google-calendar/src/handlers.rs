@@ -380,7 +380,7 @@ pub async fn create_watch_handler(
             let webhook_url = req.webhook_url.unwrap_or_else(|| {
                 format!(
                     "{}/api/google-calendar/webhook",
-                    talos_config::get_base_url()
+                    talos_public_url::public_base_url_or(talos_config::get_base_url)
                 )
             });
 

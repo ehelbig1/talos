@@ -51,9 +51,23 @@ up: ## Build + start the full dev stack, wait for health
 	@GIT_SHA_OVERRIDE="$$(git rev-parse --short=7 HEAD 2>/dev/null || echo unknown)" \
 	 GIT_DIRTY_OVERRIDE="$$([ -n "$$(git status --porcelain 2>/dev/null)" ] && echo true || echo false)" \
 	 docker compose build controller worker migrate
-	@docker compose up -d --scale worker=1
+	@if grep -Eq '^NGROK_AUTHTOKEN=.+' .env 2>/dev/null; then \
+	    printf '\033[1;36m→ NGROK_AUTHTOKEN present — starting public tunnel (compose profile: public)\033[0m\n'; \
+	    COMPOSE_PROFILES=public docker compose up -d --scale worker=1; \
+	else \
+	    docker compose up -d --scale worker=1; \
+	fi
 	@$(MAKE) _wait-healthy
 	@printf '\033[1;32m✓ stack healthy — http://localhost:8000/health\033[0m\n'
+	@if grep -Eq '^NGROK_AUTHTOKEN=.+' .env 2>/dev/null; then \
+	    sleep 2; \
+	    url="$$(curl -sf http://127.0.0.1:4040/api/tunnels 2>/dev/null | grep -o '"public_url":"https:[^"]*"' | head -1 | cut -d'"' -f4)"; \
+	    if [ -n "$$url" ]; then \
+	        printf '\033[1;36m🌐 public tunnel: %s\033[0m (run get_public_url_status for integration setup)\n' "$$url"; \
+	    else \
+	        printf '\033[1;33m⚠ tunnel starting — check `docker logs talos-ngrok` / http://127.0.0.1:4040\033[0m\n'; \
+	    fi; \
+	fi
 
 down: ## Stop the stack (preserves data volumes)
 	@docker compose down

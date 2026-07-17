@@ -1755,6 +1755,7 @@ dependencies = [
  "talos-node-cache",
  "talos-oauth",
  "talos-organizations",
+ "talos-public-url",
  "talos-rate-limit",
  "talos-registry",
  "talos-replay-diff",
@@ -7904,6 +7905,7 @@ dependencies = [
  "talos-memory",
  "talos-module-executions",
  "talos-oauth",
+ "talos-public-url",
  "talos-registry",
  "talos-secrets-manager",
  "talos-trace-nats",
@@ -7948,6 +7950,7 @@ dependencies = [
  "talos-memory",
  "talos-module-executions",
  "talos-oauth",
+ "talos-public-url",
  "talos-registry",
  "talos-secrets-manager",
  "talos-text-util",
@@ -8239,6 +8242,7 @@ dependencies = [
  "talos-module-repository",
  "talos-oauth",
  "talos-ops-alerts-repository",
+ "talos-public-url",
  "talos-rate-limit",
  "talos-registry",
  "talos-replay-diff",
@@ -8495,6 +8499,21 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "talos-public-url"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "reqwest 0.12.28",
+ "serde_json",
+ "talos-config",
+ "talos-http-body",
+ "talos-http-utils",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

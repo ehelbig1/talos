@@ -53,7 +53,7 @@ pub async fn list_for_user(
         return Ok(vec![]);
     }
 
-    let base = talos_config::get_frontend_url();
+    let base = talos_public_url::public_base_url_or(talos_config::get_frontend_url);
 
     // Batched module-name resolution, same defense-in-depth filter
     // (`user_id IS NULL OR user_id = $caller`) as gmail/gcal.

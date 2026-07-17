@@ -410,7 +410,7 @@ async fn handle_create_webhook(
         ),
         Ok(Some(_)) => {
             let base_url =
-                talos_config::get_base_url();
+                talos_public_url::public_base_url_or(talos_config::get_base_url);
             // Route is `/webhooks/{id}` (plural) — see
             // `webhook_routes` in main.rs. Returning `/webhook/{id}`
             // here used to produce a 404 on every first POST.
@@ -488,7 +488,7 @@ async fn handle_list_webhooks(
 
     match rows {
         Ok(rows) => {
-            let base_url = talos_config::get_base_url();
+            let base_url = talos_public_url::public_base_url_or(talos_config::get_base_url);
             let webhooks: Vec<serde_json::Value> = rows
                 .iter()
                 .map(|r| {
@@ -680,7 +680,7 @@ async fn handle_list_workflow_webhooks(
 
     match rows {
         Ok(rows) => {
-            let base_url = talos_config::get_base_url();
+            let base_url = talos_public_url::public_base_url_or(talos_config::get_base_url);
             let webhooks: Vec<serde_json::Value> = rows
                 .iter()
                 .map(|r| {

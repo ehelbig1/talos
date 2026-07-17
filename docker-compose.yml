@@ -291,6 +291,10 @@ services:
       # publishes to workflow.pipeline.jobs, workers listen on
       # talos.pipeline.jobs, and every dispatch fails with "no responders".
       WORKFLOW_NATS_PREFIX: talos
+      # ngrok sidecar agent API (compose profile `public`). Harmless when
+      # the profile is off — discovery polls quietly and every URL falls
+      # back to FRONTEND_URL/BASE_URL. See talos-public-url.
+      TALOS_NGROK_API_URL: http://ngrok:4040
       RUST_LOG: info,controller=debug,audit_ledger=info
       # Template catalog source. UNSET by default => the controller disk-seeds
       # the ~60 templates baked into its image (module-templates/), so the
@@ -757,6 +761,33 @@ services:
   # ========================================================================
   # Local OCI Registry
   # ========================================================================
+  # ── ngrok tunnel (compose profile: public) ────────────────────────
+  # Publishes the controller on a public https origin so push-based
+  # integrations (GCP Pub/Sub push, Google watch webhooks, inbound
+  # webhooks) can reach a local stack. `make up` enables the profile
+  # automatically when NGROK_AUTHTOKEN is present in .env. With a
+  # reserved domain (NGROK_STATIC_DOMAIN — the ngrok free tier includes
+  # one) the URL is stable across restarts; without it every restart
+  # mints a new origin and provider-side registrations must be updated
+  # (the get_public_url_status MCP tool prints the commands).
+  ngrok:
+    image: ngrok/ngrok:3
+    container_name: talos-ngrok
+    profiles: ["public"]
+    restart: unless-stopped
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:-}
+    # ${VAR:+...} — the --url flag is passed only when a reserved domain
+    # is configured (compose parameter-expansion, shell semantics).
+    command: http controller:8000 --log stdout ${NGROK_STATIC_DOMAIN:+--url=${NGROK_STATIC_DOMAIN}}
+    ports:
+      # ngrok's local inspector UI — host-only bind for debugging.
+      - "127.0.0.1:4040:4040"
+    depends_on:
+      - controller
+    networks:
+      - talos-network
+
   registry:
     image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
     container_name: talos-registry

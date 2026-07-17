@@ -52,6 +52,7 @@ talos-db-monitor = { path = "../talos-db-monitor" }
 talos-worker-fleet = { path = "../talos-worker-fleet" }
 talos-schedule-repo = { path = "../talos-schedule-repo" }
 talos-config = { path = "../talos-config" }
+talos-public-url = { path = "../talos-public-url" }
 talos-config-validator = { path = "../talos-config-validator" }
 talos-integration-state = { path = "../talos-integration-state" }
 talos-system-repo = { path = "../talos-system-repo" }

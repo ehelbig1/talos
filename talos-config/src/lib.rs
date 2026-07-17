@@ -367,7 +367,11 @@ pub fn get_base_url() -> String {
 /// `talos-atlassian::callback_handler` and
 /// `talos-gmail::gmail_callback_handler` so all four OAuth-callback
 /// paths share one contract.
-fn is_valid_frontend_url(raw: &str) -> bool {
+///
+/// `pub` since 2026-07-17: `talos-public-url` applies the SAME origin
+/// contract to `TALOS_PUBLIC_BASE_URL` and ngrok-discovered tunnel
+/// URLs — one predicate, four env vars, no drift.
+pub fn is_valid_frontend_url(raw: &str) -> bool {
     let after_scheme = match raw.strip_prefix("https://") {
         Some(s) => s,
         None => match raw.strip_prefix("http://") {

@@ -85,6 +85,14 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "get_public_url_status",
+            "description": "Show the resolved PUBLIC base URL (explicit TALOS_PUBLIC_BASE_URL, ngrok tunnel discovery, or localhost fallback) and per-integration guidance: which externally-registered endpoints (GCP Pub/Sub push subscriptions, Google watch webhooks, inbound webhooks, approval links) update automatically vs. need the printed commands after a URL change.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        serde_json::json!({
             "name": "set_concurrency_limit",
             "description": "Set or clear the maximum number of concurrent executions for a workflow. Prevents a single workflow from monopolizing workers.",
             "inputSchema": {
@@ -232,6 +240,7 @@ pub async fn dispatch(
             Some(handle_get_failure_notification(req_id, args, state, user_id).await)
         }
         "get_platform_info" => Some(handle_get_platform_info(req_id, state, agent).await),
+        "get_public_url_status" => Some(handle_get_public_url_status(req_id)),
         "set_concurrency_limit" => {
             Some(handle_set_concurrency_limit(req_id, args, state, user_id).await)
         }
@@ -800,6 +809,83 @@ async fn handle_get_failure_notification(
             )
         }
     }
+}
+
+/// Public base-URL status + per-integration guidance. Pure formatting
+/// over `talos_public_url` state — no DB, no auth-sensitive data (the
+/// URL itself is public by definition; push tokens are NOT echoed).
+fn handle_get_public_url_status(req_id: Option<serde_json::Value>) -> JsonRpcResponse {
+    let (base, source) = talos_public_url::resolve(talos_config::get_base_url);
+    let discovered = talos_public_url::discovered();
+    let publicly_reachable = source != talos_public_url::UrlSource::Fallback;
+
+    let guidance = serde_json::json!([
+        {
+            "integration": "inbound_webhooks",
+            "automatic": true,
+            "detail": format!(
+                "Webhook URLs are formatted with the public base at display time — \
+                 re-run list_webhooks/create_webhook to see {base}/webhooks/<id>. \
+                 Nothing is registered provider-side, so URL changes are free."
+            )
+        },
+        {
+            "integration": "approval_links",
+            "automatic": true,
+            "detail": "Approval-gate and callback links format with the public base when generated. Links minted BEFORE a URL change keep the old origin — re-fire the gate if one goes stale."
+        },
+        {
+            "integration": "gcp_pubsub_push",
+            "automatic": false,
+            "detail": format!(
+                "Each GCP watch's push endpoint is {base}/api/gcp/pubsub/<push_token> \
+                 (create_watch_channel returns the full URL; list endpoints via the \
+                 watch-channels API). After a URL change, update the subscription: \
+                 gcloud pubsub subscriptions update <SUB> \
+                 --push-endpoint='{base}/api/gcp/pubsub/<push_token>' \
+                 --push-auth-service-account=<SA_EMAIL>. A reserved ngrok domain \
+                 (NGROK_STATIC_DOMAIN) makes this a one-time setup."
+            )
+        },
+        {
+            "integration": "google_calendar_watch",
+            "automatic": false,
+            "detail": format!(
+                "Google registers the channel address at watch-creation time. After a \
+                 URL change, stop + re-create the watch channel so Google learns \
+                 {base}/api/google-calendar/webhook. (Google requires https and \
+                 rejects localhost — a tunnel or public deploy is mandatory for GCal.)"
+            )
+        },
+        {
+            "integration": "oauth_redirect_uris",
+            "automatic": true,
+            "detail": "OAuth callbacks deliberately stay on FRONTEND_URL (browser-mediated; localhost works in dev and the provider console allowlists it). No action needed unless you want to run the consent flow THROUGH the tunnel — then add the public callback URLs to the provider console once."
+        }
+    ]);
+
+    let result = serde_json::json!({
+        "public_base_url": base,
+        "source": source.as_str(),
+        "publicly_reachable": publicly_reachable,
+        "ngrok": {
+            "agent_api_configured": std::env::var("TALOS_NGROK_API_URL").is_ok(),
+            "agent_api_reachable": talos_public_url::ngrok_api_reachable(),
+            "discovered_url": discovered,
+        },
+        "note": if publicly_reachable {
+            "Externally-reachable endpoints format with this origin."
+        } else {
+            "No public origin active — push-based integrations (GCP Pub/Sub, Google watches) \
+             cannot reach this stack. Start the tunnel: add NGROK_AUTHTOKEN to .env and \
+             `make up` (compose profile `public`), or set TALOS_PUBLIC_BASE_URL explicitly."
+        },
+        "guidance": guidance,
+    });
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&result).unwrap_or_default(),
+    )
 }
 
 async fn handle_get_platform_info(
