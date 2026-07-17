@@ -62,6 +62,28 @@ pub struct IntegrationProviderConfig {
 
     /// Whether disconnect uses soft-delete (UPDATE is_active=false) vs hard-delete (DELETE).
     pub disconnect_is_soft_delete: bool,
+
+    /// Column on `db_table` that holds the vault provider_key for this row — the
+    /// value that keys the unified `integration_credentials` / vault entries
+    /// (e.g. gmail's `email_address`, gcal's `oauth_account_id`, gcp's
+    /// `provider_key`). The generic disconnect `RETURNING`s this so it can
+    /// revoke + clean up the OAuth token, not just hide the row.
+    pub provider_key_column: &'static str,
+
+    /// Base OAuth provider string for vault-path resolution / revoke (the
+    /// namespace segment `store_credentials` used: `"gmail"`, `"slack"`,
+    /// `"atlassian"`, `"google_calendar"`, `"google_cloud"`). For a tiered
+    /// provider (see `tier_column`) this is the DEFAULT; the row's tier value
+    /// overrides it.
+    pub credential_provider: &'static str,
+
+    /// For providers whose OAuth provider string depends on a per-row
+    /// discriminator column (GCP: one row per consent tier, each stored under a
+    /// distinct provider namespace), the name of that column (`"tier"`). The
+    /// generic disconnect `RETURNING`s it and maps the value to the tier's
+    /// provider string so the RIGHT namespace is revoked. `None` for
+    /// single-namespace providers.
+    pub tier_column: Option<&'static str>,
 }
 
 impl IntegrationProviderConfig {
@@ -77,6 +99,30 @@ impl IntegrationProviderConfig {
 /// The frontend reads this list from `/api/integrations/providers` to render
 /// integration cards dynamically — adding a provider here is sufficient for
 /// frontend discovery (no frontend code changes needed).
+/// Resolve the OAuth provider string whose vault namespace should be revoked
+/// when a disconnected row is torn down. For a single-namespace provider it's
+/// the config's `credential_provider`. For a tiered provider (GCP) the row's
+/// `tier` value selects the namespace, derived as `<base>` / `<base>_write` /
+/// `<base>_full` — matching `talos_google_cloud::GcpTier::provider_str`
+/// (the canonical source; pinned by `gcp_tier_provider_strings` test).
+///
+/// Returns `None` for a tiered provider with an unknown/missing tier — fail
+/// closed rather than revoke the wrong namespace (the row is still hidden; the
+/// token just isn't auto-revoked). Mirrors the dedicated GCP disconnect's
+/// unknown-tier handling.
+pub fn revoke_provider_for(
+    config: &IntegrationProviderConfig,
+    tier: Option<&str>,
+) -> Option<String> {
+    match (config.tier_column, tier) {
+        (None, _) => Some(config.credential_provider.to_string()),
+        (Some(_), Some("read")) => Some(config.credential_provider.to_string()),
+        (Some(_), Some("write")) => Some(format!("{}_write", config.credential_provider)),
+        (Some(_), Some("full")) => Some(format!("{}_full", config.credential_provider)),
+        (Some(_), _) => None,
+    }
+}
+
 pub static PROVIDERS: &[IntegrationProviderConfig] = &[
     IntegrationProviderConfig {
         id: "google-calendar",
@@ -106,6 +152,9 @@ pub static PROVIDERS: &[IntegrationProviderConfig] = &[
         // flow sets is_active = false).
         extra_where: "AND g.is_active = true",
         disconnect_is_soft_delete: false,
+        provider_key_column: "oauth_account_id",
+        credential_provider: "google_calendar",
+        tier_column: None,
     },
     IntegrationProviderConfig {
         id: "gmail",
@@ -122,6 +171,9 @@ pub static PROVIDERS: &[IntegrationProviderConfig] = &[
         account_identifier_join: None,
         extra_where: "",
         disconnect_is_soft_delete: false,
+        provider_key_column: "email_address",
+        credential_provider: "gmail",
+        tier_column: None,
     },
     IntegrationProviderConfig {
         id: "slack",
@@ -138,6 +190,9 @@ pub static PROVIDERS: &[IntegrationProviderConfig] = &[
         account_identifier_join: None,
         extra_where: "",
         disconnect_is_soft_delete: false,
+        provider_key_column: "team_id",
+        credential_provider: "slack",
+        tier_column: None,
     },
     IntegrationProviderConfig {
         id: "atlassian",
@@ -154,6 +209,9 @@ pub static PROVIDERS: &[IntegrationProviderConfig] = &[
         account_identifier_join: None,
         extra_where: "AND is_active = true",
         disconnect_is_soft_delete: true,
+        provider_key_column: "cloud_id",
+        credential_provider: "atlassian",
+        tier_column: None,
     },
     IntegrationProviderConfig {
         id: "gcp",
@@ -177,6 +235,11 @@ pub static PROVIDERS: &[IntegrationProviderConfig] = &[
         account_identifier_join: None,
         extra_where: "AND t.is_active = true",
         disconnect_is_soft_delete: true,
+        provider_key_column: "provider_key",
+        // Base namespace; the row's `tier` overrides it to
+        // google_cloud / google_cloud_write / google_cloud_full.
+        credential_provider: "google_cloud",
+        tier_column: Some("tier"),
     },
 ];
 
@@ -220,5 +283,73 @@ mod tests {
              row field), got: {}",
             gcal.account_identifier_column
         );
+    }
+
+    /// Every provider must declare the two fields the generic disconnect needs
+    /// to revoke a token (a missing/empty value would silently skip revocation
+    /// — the very bug this registry data fixes).
+    #[test]
+    fn all_providers_declare_revoke_metadata() {
+        for p in PROVIDERS {
+            assert!(
+                !p.provider_key_column.is_empty(),
+                "{} missing provider_key_column",
+                p.id
+            );
+            assert!(
+                !p.credential_provider.is_empty(),
+                "{} missing credential_provider",
+                p.id
+            );
+        }
+    }
+
+    /// GCP tier → OAuth provider string must match
+    /// `talos_google_cloud::GcpTier::provider_str` exactly (read→google_cloud,
+    /// write→google_cloud_write, full→google_cloud_full). Drift here would
+    /// revoke the wrong vault namespace on a tiered disconnect and strand the
+    /// token — the same drift class as the Phase D refresh/revoke lockstep.
+    #[test]
+    fn gcp_tier_provider_strings() {
+        let gcp = PROVIDERS
+            .iter()
+            .find(|p| p.id == "gcp")
+            .expect("gcp provider must exist");
+        assert_eq!(gcp.tier_column, Some("tier"));
+        assert_eq!(
+            revoke_provider_for(gcp, Some("read")).as_deref(),
+            Some("google_cloud")
+        );
+        assert_eq!(
+            revoke_provider_for(gcp, Some("write")).as_deref(),
+            Some("google_cloud_write")
+        );
+        assert_eq!(
+            revoke_provider_for(gcp, Some("full")).as_deref(),
+            Some("google_cloud_full")
+        );
+        // Unknown / missing tier → fail closed (don't revoke a guessed namespace).
+        assert_eq!(revoke_provider_for(gcp, Some("bogus")), None);
+        assert_eq!(revoke_provider_for(gcp, None), None);
+    }
+
+    /// Single-namespace providers use their base credential_provider verbatim,
+    /// regardless of any (irrelevant) tier value.
+    #[test]
+    fn non_tiered_providers_use_base_provider() {
+        for (id, expected) in [
+            ("gmail", "gmail"),
+            ("slack", "slack"),
+            ("atlassian", "atlassian"),
+            ("google-calendar", "google_calendar"),
+        ] {
+            let p = PROVIDERS.iter().find(|p| p.id == id).unwrap();
+            assert_eq!(p.tier_column, None, "{id} should not be tiered");
+            assert_eq!(
+                revoke_provider_for(p, None).as_deref(),
+                Some(expected),
+                "{id} base provider"
+            );
+        }
     }
 }
