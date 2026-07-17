@@ -75,28 +75,48 @@ impl SubworkflowActorContextResolver for ControllerSubActorContextResolver {
         talos_workflow_engine_core::LlmTier,
         talos_workflow_engine_core::WriteCeiling,
     )> {
-        // Same fail-closed authorization posture as `resolve`: `get_workflow`
-        // returns `Ok(None)` for a workflow the parent can't see, which we
-        // bubble up as `None` (keep the parent's inherited ceiling — the
-        // executor never widens, so "unknown" is safe). A sub-workflow with
-        // no bound actor also returns `None`.
-        let workflow = self
+        // ONE narrow joined query (workflows ⋈ actors, two small columns, no
+        // graph_json, tenancy-scoped on both sides). The first cut called
+        // `get_workflow` (full row incl. the graph, in an RLS tx) just for
+        // `actor_id` plus a second ceilings query — a per-sub-dispatch double
+        // fetch a perf review caught.
+        match self
             .workflow_repo
-            .get_workflow(workflow_id, user_id)
+            .get_workflow_actor_ceilings(workflow_id, user_id)
             .await
-            .ok()
-            .flatten()?;
-
-        let actor_id = workflow.actor_id?;
-
-        // Tenancy-scoped: get_actor_ceilings returns None if the actor isn't
-        // owned by user_id. On DB error we return None (keep the parent
-        // ceiling) — the parent ceiling is already the caller's authorized
-        // bound, so failing to tighten never escalates.
-        self.workflow_repo
-            .get_actor_ceilings(actor_id, user_id)
-            .await
-            .ok()
-            .flatten()
+        {
+            // Workflow visible + actor bound + owned → the real pair.
+            Ok(Some(pair)) => Some(pair),
+            // Workflow not visible / no bound actor / actor not owned →
+            // `None` keeps the parent's inherited ceiling. Safe: the executor
+            // only ever NARROWS, the parent ceiling is already the caller's
+            // authorized bound, and a not-visible workflow fails the graph
+            // fetch in lockstep anyway.
+            Ok(None) => None,
+            // DB error → fail CLOSED to the most-restrictive pair rather than
+            // `None`-ing back to the parent ceiling. A security review flagged
+            // the original `.ok()` here: with the sub-workflow's graph served
+            // from the engine's cache, a transient DB error on THIS query was
+            // the one path where a stricter sub-actor's bound was silently
+            // skipped (fail-open w.r.t. the sub-actor's intent — the same
+            // class #503 converted to fail-closed elsewhere). Matches the
+            // `apply_actor_to_engine` precedent: on DB error, stamp
+            // restrictive. Cost: during a DB blip a sub-workflow runs
+            // local-only/read-only (and likely fails loudly) instead of
+            // running at the looser parent ceiling.
+            Err(e) => {
+                tracing::error!(
+                    target: "talos_security",
+                    %workflow_id,
+                    error = %e,
+                    "resolve_ceilings: DB error resolving sub-workflow actor ceilings; \
+                     failing closed to (Tier1, ReadOnly)"
+                );
+                Some((
+                    talos_workflow_engine_core::LlmTier::Tier1,
+                    talos_workflow_engine_core::WriteCeiling::ReadOnly,
+                ))
+            }
+        }
     }
 }
