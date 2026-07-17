@@ -40,10 +40,32 @@ pub mod state_store;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::Arc;
 use talos_secrets_manager::SecretsManager;
 use talos_workflow_job_protocol::EncryptedSecrets;
 use uuid::Uuid;
+
+/// A process-local handle to the shared claim-based-sealing machinery, injected
+/// into module-bound dispatch contexts by the controller.
+///
+/// This is a deliberately thin, decoupled mirror of
+/// `talos_workflow_engine_nats::EnvelopeSealingHandle` (the same `in_flight` +
+/// `claim_subject` fields). It lives here — in the crate the three integration
+/// stacks (gmail / gcal / webhooks) already depend on — so those crates never
+/// take a dependency on the engine-NATS layer just to name the type. The
+/// controller resolves the ONE process-wide `EnvelopeSealingHandle` (the same
+/// `InFlightSeals` the claim responder subscribes to) and bridges it into this
+/// shape at wiring time.
+#[derive(Clone)]
+pub struct ModuleSealingHandle {
+    /// The shared, process-wide in-flight seal store the claim responder reads.
+    /// MUST be the same instance the responder was spawned with — a second
+    /// store would register seals the responder never sees.
+    pub in_flight: Arc<talos_envelope_seal::InFlightSeals>,
+    /// The replica-local claim subject stamped into `JobRequest.claim_inbox`.
+    pub claim_subject: String,
+}
 
 /// Build the `encrypted_secrets` payload for a module-bound webhook
 /// dispatch (Gmail push, Google-Calendar push, generic webhook).
@@ -100,6 +122,40 @@ pub async fn build_dispatch_encrypted_secrets(
         return EncryptedSecrets::empty();
     };
 
+    let secrets_map = resolve_dispatch_secrets_map(sm, module_id, user_id).await;
+
+    // L-1: bind execution_id as AEAD AAD on the AES-GCM tag — the
+    // worker decrypts with the same AAD pulled from
+    // `JobRequest.workflow_execution_id`. Empty secrets_map still
+    // returns `EncryptedSecrets::empty()` (empty ciphertext +
+    // empty nonce) — that path bypasses AAD entirely on both sides.
+    match EncryptedSecrets::encrypt_with_aad(&secrets_map, key.as_bytes(), execution_id.as_bytes())
+    {
+        Ok(es) => es,
+        Err(e) => {
+            tracing::warn!(
+                module_id = %module_id,
+                error = %e,
+                "Failed to encrypt dispatch secrets — proceeding without them"
+            );
+            EncryptedSecrets::empty()
+        }
+    }
+}
+
+/// Resolve the PLAINTEXT merged secrets map for a module-bound dispatch — the
+/// module's authorised secrets layered with the user's LLM provider keys
+/// (module-declared keys win on conflict). This is the pre-encryption step
+/// factored out of [`build_dispatch_encrypted_secrets`] so the claim-based
+/// sealing path ([`prepare_module_dispatch_secrets`]) can register the same
+/// values in `InFlightSeals` instead of AES-GCM-encrypting them under the
+/// worker shared key. The returned map is the caller's responsibility to
+/// consume promptly — it holds plaintext secret values.
+async fn resolve_dispatch_secrets_map(
+    sm: &Arc<SecretsManager>,
+    module_id: Uuid,
+    user_id: Uuid,
+) -> HashMap<String, String> {
     // MCP-589: route through the user-scoped variant so a malicious
     // user with a secret declaring `allowed_modules: [shared_module]`
     // can't poison the encrypted-secrets payload for another user's
@@ -124,12 +180,9 @@ pub async fn build_dispatch_encrypted_secrets(
     // without that key, and the worker would fail to resolve the
     // vault:// substitution with no log signal on the controller
     // side correlating the worker-side failure back to the LLM-keys
-    // load. Sibling paths in this function (module secrets at line
-    // ~85, encryption failure at line ~106, missing WORKER_SHARED_KEY
-    // at line ~70) all log; this branch was the drift. Same
-    // operator-visibility class as MCP-733..778 fire-and-forget
-    // sweep — DEBUG (not WARN) because a missing LLM key is the
-    // common case for modules that don't need one; sibling
+    // load. Same operator-visibility class as MCP-733..778
+    // fire-and-forget sweep — DEBUG (not WARN) because a missing LLM
+    // key is the common case for modules that don't need one; sibling
     // `ParallelWorkflowEngine::build_encrypted_secrets` follows the
     // same DEBUG convention.
     match sm.get_llm_vault_keys(Some(user_id)).await {
@@ -150,22 +203,246 @@ pub async fn build_dispatch_encrypted_secrets(
         }
     }
 
-    // L-1: bind execution_id as AEAD AAD on the AES-GCM tag — the
-    // worker decrypts with the same AAD pulled from
-    // `JobRequest.workflow_execution_id`. Empty secrets_map still
-    // returns `EncryptedSecrets::empty()` (empty ciphertext +
-    // empty nonce) — that path bypasses AAD entirely on both sides.
-    match EncryptedSecrets::encrypt_with_aad(&secrets_map, key.as_bytes(), execution_id.as_bytes())
-    {
-        Ok(es) => es,
-        Err(e) => {
+    secrets_map
+}
+
+/// How a module-bound dispatch should carry its secrets, spread onto the
+/// `JobRequest` at the call site. Exactly one of two shapes:
+///   * **inline** — `sealing == 0`, a non-empty (or empty) WSK
+///     `encrypted_secrets` envelope (today's behaviour), or
+///   * **claim-sealed** — `sealing == SEALING_CLAIM_ECIES`, empty
+///     `encrypted_secrets`, `claim_inbox = Some(subject)`, plaintext already
+///     registered in the shared `InFlightSeals` for the worker to claim.
+pub struct DispatchSecretDelivery {
+    pub encrypted_secrets: EncryptedSecrets,
+    pub sealing: u8,
+    pub claim_inbox: Option<String>,
+    pub secret_paths: Vec<String>,
+}
+
+/// Prepare the secret-delivery fields for a module-bound (fire-and-forget)
+/// dispatch, honouring the envelope-sealing policy.
+///
+/// * When `sealing_handle` is `Some` (the controller passes it only when
+///   `TALOS_ENVELOPE_SEALING` is `audit`/`required` AND an Ed25519 controller
+///   signing key is configured) AND the module actually has secrets, the
+///   plaintext is registered in the shared `InFlightSeals` keyed on
+///   `execution_id` and the request is stamped for a worker claim
+///   (`sealing = SEALING_CLAIM_ECIES`, `claim_inbox`, empty
+///   `encrypted_secrets`). This is the path that satisfies the worker's
+///   `required`-mode downgrade guard, which refuses `sealing == 0` dispatches
+///   that carry a non-empty WSK envelope.
+/// * Otherwise (sealing off, or no handle available, or the module has no
+///   secrets) it falls back to the inline WSK envelope — byte-identical to the
+///   pre-M4 behaviour. A no-secret dispatch yields an EMPTY envelope, which the
+///   `required` guard allows, so no-secret module pushes keep working.
+///
+/// Fire-and-forget note: the registered seal is bounded by
+/// `InFlightSeals::sweep_older_than` (the controller runs a periodic sweep) —
+/// unlike the engine's request/reply dispatcher, these paths cannot `discard`
+/// after awaiting a result. The worker claims within milliseconds of receiving
+/// the job, so an entry only lingers if the worker died before claiming; the
+/// sweep reclaims it. Callers SHOULD additionally `discard` on a known publish
+/// failure to shrink that window (see the call sites).
+///
+/// `execution_id` MUST equal the `JobRequest.job_id` / `workflow_execution_id`
+/// the caller sets (the worker's `SecretClaim` keys on it), and — on the inline
+/// path — is bound as AES-GCM AAD, exactly as `build_dispatch_encrypted_secrets`
+/// requires.
+pub async fn prepare_module_dispatch_secrets(
+    secrets_manager: Option<&Arc<SecretsManager>>,
+    module_id: Uuid,
+    user_id: Uuid,
+    execution_id: Uuid,
+    sealing_handle: Option<&ModuleSealingHandle>,
+) -> DispatchSecretDelivery {
+    // No SecretsManager (dev/bootstrap) → no secrets to deliver either way.
+    let Some(sm) = secrets_manager else {
+        return DispatchSecretDelivery {
+            encrypted_secrets: EncryptedSecrets::empty(),
+            sealing: 0,
+            claim_inbox: None,
+            secret_paths: Vec::new(),
+        };
+    };
+
+    let secrets_map = resolve_dispatch_secrets_map(sm, module_id, user_id).await;
+    finish_dispatch_delivery(secrets_map, execution_id, sealing_handle, module_id)
+}
+
+/// Pure (DB-free) delivery decision: given the already-resolved plaintext map,
+/// choose the claim-sealed vs inline shape. Split out of
+/// [`prepare_module_dispatch_secrets`] so the branch logic is unit-testable
+/// without a `SecretsManager` / Postgres. `module_id` is used only for log
+/// correlation.
+fn finish_dispatch_delivery(
+    secrets_map: HashMap<String, String>,
+    execution_id: Uuid,
+    sealing_handle: Option<&ModuleSealingHandle>,
+    module_id: Uuid,
+) -> DispatchSecretDelivery {
+    // A no-secret dispatch carries an empty envelope on both paths — the
+    // worker's `required` guard allows `sealing == 0` with an empty envelope,
+    // so there's nothing to seal and no reason to spin up a claim.
+    if secrets_map.is_empty() {
+        return DispatchSecretDelivery {
+            encrypted_secrets: EncryptedSecrets::empty(),
+            sealing: 0,
+            claim_inbox: None,
+            secret_paths: Vec::new(),
+        };
+    }
+
+    // Claim-based sealing path: register the plaintext for the worker to claim,
+    // sealed to its ephemeral key. No plaintext (nor a WSK-openable envelope)
+    // touches the wire.
+    if let Some(handle) = sealing_handle {
+        match talos_envelope_seal::SealContext::new(&secrets_map) {
+            Ok(ctx) => {
+                // Sorted keys for a stable, signature-bound `secret_paths` (the
+                // claim protocol keys on exec_id + the worker's ephemeral key,
+                // not on these paths — they're audit/integrity metadata).
+                let mut secret_paths: Vec<String> = secrets_map.keys().cloned().collect();
+                secret_paths.sort();
+                handle.in_flight.register(execution_id, ctx);
+                return DispatchSecretDelivery {
+                    encrypted_secrets: EncryptedSecrets::empty(),
+                    sealing: talos_workflow_job_protocol::SEALING_CLAIM_ECIES,
+                    claim_inbox: Some(handle.claim_subject.clone()),
+                    secret_paths,
+                };
+            }
+            Err(e) => {
+                // Serialization of a HashMap<String,String> cannot realistically
+                // fail; on the defensive error we FALL THROUGH to the inline WSK
+                // path rather than dropping the secrets. Under `required` the
+                // worker then refuses the inline envelope (fail-closed, loud) —
+                // never a silent plaintext leak.
+                tracing::error!(
+                    target: "talos_security",
+                    module_id = %module_id,
+                    error = %e,
+                    "prepare_module_dispatch_secrets: failed to build seal context; \
+                     falling back to inline envelope (refused under `required`)"
+                );
+            }
+        }
+    }
+
+    // Inline WSK envelope path (sealing off / no handle / seal-build fallback).
+    let encrypted_secrets = match talos_workflow_job_protocol::load_worker_shared_key() {
+        Ok(key) => {
+            match EncryptedSecrets::encrypt_with_aad(
+                &secrets_map,
+                key.as_bytes(),
+                execution_id.as_bytes(),
+            ) {
+                Ok(es) => es,
+                Err(e) => {
+                    tracing::warn!(
+                        module_id = %module_id,
+                        error = %e,
+                        "Failed to encrypt dispatch secrets — proceeding without them"
+                    );
+                    EncryptedSecrets::empty()
+                }
+            }
+        }
+        Err(_) => {
             tracing::warn!(
                 module_id = %module_id,
-                error = %e,
-                "Failed to encrypt dispatch secrets — proceeding without them"
+                "encrypted_secrets skipped: WORKER_SHARED_KEY not configured"
             );
             EncryptedSecrets::empty()
         }
+    };
+    DispatchSecretDelivery {
+        encrypted_secrets,
+        sealing: 0,
+        claim_inbox: None,
+        secret_paths: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod dispatch_delivery_tests {
+    use super::*;
+
+    fn map_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn handle() -> ModuleSealingHandle {
+        ModuleSealingHandle {
+            in_flight: Arc::new(talos_envelope_seal::InFlightSeals::new()),
+            claim_subject: "_INBOX.claim-test".to_string(),
+        }
+    }
+
+    #[test]
+    fn no_secrets_is_empty_inline_regardless_of_handle() {
+        // A no-secret dispatch never seals and never registers — an empty
+        // envelope is allowed under `required`, so the worker runs it as-is.
+        let h = handle();
+        let d = finish_dispatch_delivery(HashMap::new(), Uuid::new_v4(), Some(&h), Uuid::new_v4());
+        assert_eq!(d.sealing, 0);
+        assert!(d.claim_inbox.is_none());
+        assert!(d.secret_paths.is_empty());
+        assert!(d.encrypted_secrets.ciphertext.is_empty());
+        assert!(
+            h.in_flight.is_empty(),
+            "no seal registered for a no-secret dispatch"
+        );
+    }
+
+    #[test]
+    fn secrets_with_handle_registers_and_stamps_claim() {
+        // SECURITY: with a handle AND secrets, the plaintext is registered for a
+        // worker claim and the request is stamped `sealing = SEALING_CLAIM_ECIES`
+        // with an EMPTY envelope — the shape the worker's `required` guard
+        // accepts and no WSK-openable ciphertext on the wire.
+        let h = handle();
+        let exec = Uuid::new_v4();
+        let d = finish_dispatch_delivery(
+            map_of(&[("anthropic/api_key", "sk-x"), ("gmail/token", "t")]),
+            exec,
+            Some(&h),
+            Uuid::new_v4(),
+        );
+        assert_eq!(d.sealing, talos_workflow_job_protocol::SEALING_CLAIM_ECIES);
+        assert_eq!(d.claim_inbox.as_deref(), Some("_INBOX.claim-test"));
+        assert!(
+            d.encrypted_secrets.ciphertext.is_empty(),
+            "no WSK envelope on the sealed path"
+        );
+        // secret_paths = sorted keys (stable, signature-bound audit metadata).
+        assert_eq!(d.secret_paths, vec!["anthropic/api_key", "gmail/token"]);
+        // The seal is claimable exactly once, keyed on the execution id.
+        assert!(
+            h.in_flight.take(exec).is_some(),
+            "plaintext registered for claim"
+        );
+        assert!(h.in_flight.take(exec).is_none(), "single-claim");
+    }
+
+    #[test]
+    fn secrets_without_handle_uses_inline_path() {
+        // No handle (sealing off) → inline path, sealing stays 0. Without a
+        // WORKER_SHARED_KEY in the test env the envelope is empty, but crucially
+        // NOTHING is registered for a claim (no handle to register into).
+        let exec = Uuid::new_v4();
+        let d = finish_dispatch_delivery(
+            map_of(&[("anthropic/api_key", "sk-x")]),
+            exec,
+            None,
+            Uuid::new_v4(),
+        );
+        assert_eq!(d.sealing, 0);
+        assert!(d.claim_inbox.is_none());
+        assert!(d.secret_paths.is_empty());
     }
 }
 

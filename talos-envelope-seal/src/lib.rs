@@ -138,11 +138,22 @@ impl SealContext {
     }
 }
 
+/// A registered seal context plus the instant it was registered. The timestamp
+/// exists solely for [`InFlightSeals::sweep_older_than`] — it bounds the map
+/// against *fire-and-forget* dispatch (module-bound Gmail/GCal/webhook pushes)
+/// which, unlike the engine's request/reply path, cannot `discard` after
+/// awaiting a result. An un-claimed orphan (worker died before claiming) would
+/// otherwise linger forever.
+struct Registered {
+    at: std::time::Instant,
+    ctx: SealContext,
+}
+
 /// The dispatching replica's in-memory `exec_id → SealContext` map. Single-claim
 /// is guaranteed by [`Self::take`] (atomic `DashMap::remove`).
 #[derive(Default)]
 pub struct InFlightSeals {
-    map: DashMap<Uuid, SealContext>,
+    map: DashMap<Uuid, Registered>,
 }
 
 impl InFlightSeals {
@@ -154,7 +165,13 @@ impl InFlightSeals {
     /// Register a job's resolved secrets at dispatch time. Overwrites any prior
     /// context for the same `exec_id` (a re-dispatch supersedes the stale one).
     pub fn register(&self, exec_id: Uuid, ctx: SealContext) {
-        self.map.insert(exec_id, ctx);
+        self.map.insert(
+            exec_id,
+            Registered {
+                at: std::time::Instant::now(),
+                ctx,
+            },
+        );
     }
 
     /// Atomically take the context for `exec_id`, if present. The first caller
@@ -162,7 +179,7 @@ impl InFlightSeals {
     /// primitive.
     #[must_use]
     pub fn take(&self, exec_id: Uuid) -> Option<SealContext> {
-        self.map.remove(&exec_id).map(|(_, v)| v)
+        self.map.remove(&exec_id).map(|(_, v)| v.ctx)
     }
 
     /// Drop an unclaimed context (job finished, failed, or was cancelled before a
@@ -171,8 +188,31 @@ impl InFlightSeals {
         self.map.remove(&exec_id);
     }
 
-    /// Number of in-flight (unclaimed) seal contexts. Bounded by concurrency, not
-    /// by jobs-ever-seen (contexts are removed on claim or discard).
+    /// Evict every context registered longer than `ttl` ago and return how many
+    /// were swept. The safety net for *fire-and-forget* dispatch paths that
+    /// cannot `discard`: the engine's request/reply dispatcher removes its
+    /// context on claim OR on the post-dispatch `discard`, but a module-bound
+    /// push publishes and returns immediately, so a worker that dies before
+    /// claiming would strand its context here. `ttl` must be generously larger
+    /// than the worst-case dispatch→claim latency (a live worker claims within
+    /// milliseconds of receiving the job) so this never races a legitimate
+    /// claim. Zeroization still runs — the swept `SealContext`'s
+    /// `Zeroizing<Vec<u8>>` clears on drop.
+    pub fn sweep_older_than(&self, ttl: std::time::Duration) -> usize {
+        let mut swept = 0usize;
+        self.map.retain(|_, reg| {
+            let keep = reg.at.elapsed() < ttl;
+            if !keep {
+                swept += 1;
+            }
+            keep
+        });
+        swept
+    }
+
+    /// Number of in-flight (unclaimed) seal contexts. Bounded by concurrency and
+    /// the sweep, not by jobs-ever-seen (contexts are removed on claim, discard,
+    /// or sweep).
     #[must_use]
     pub fn len(&self) -> usize {
         self.map.len()
@@ -289,6 +329,34 @@ mod tests {
         assert!(seals.take(exec).is_some(), "first take wins");
         assert!(seals.take(exec).is_none(), "second take gets nothing");
         assert!(seals.is_empty());
+    }
+
+    #[test]
+    fn sweep_evicts_only_entries_older_than_ttl() {
+        let seals = InFlightSeals::new();
+        let exec = Uuid::new_v4();
+        seals.register(exec, ctx_of(&[("k", "v")]));
+
+        // A generous TTL keeps a just-registered entry (the live-worker case:
+        // a claim always arrives well within the TTL, so the sweep never races
+        // a legitimate claim).
+        assert_eq!(
+            seals.sweep_older_than(std::time::Duration::from_secs(3600)),
+            0,
+            "fresh entry is not swept"
+        );
+        assert_eq!(seals.len(), 1);
+
+        // A zero TTL treats every entry as expired — the orphan case (worker
+        // died before claiming). Sweep evicts it and reports the count.
+        assert_eq!(
+            seals.sweep_older_than(std::time::Duration::from_secs(0)),
+            1,
+            "orphaned entry is swept"
+        );
+        assert!(seals.is_empty());
+        // And a claim arriving after the sweep gets nothing (fail-closed).
+        assert!(seals.take(exec).is_none());
     }
 
     #[test]

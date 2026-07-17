@@ -55,6 +55,8 @@ async fn test_router() -> anyhow::Result<WebhookRouter> {
         event_sender,
         dlq_event_sender,
         None,
+        // RFC 0010 P3 (M4): no claim-based sealing handle in this HMAC unit test.
+        None,
     )
 }
 
