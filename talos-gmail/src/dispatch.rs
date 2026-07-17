@@ -295,16 +295,19 @@ async fn dispatch_single_message(
     )
     .await;
 
+    // Placeholder secret-delivery fields; `delivery.apply_to` below writes all
+    // four in one drift-proof mapping (a hand-spread per site risks a future
+    // copy that forgets one — check-17's `Default::default()` class).
     let mut job_request = JobRequest {
         crypto_scheme: 0,
-        sealing: delivery.sealing,
-        secret_paths: delivery.secret_paths,
-        claim_inbox: delivery.claim_inbox,
+        sealing: 0,
+        secret_paths: Vec::new(),
+        claim_inbox: None,
         job_id: execution_id,
         workflow_execution_id: execution_id,
         module_uri: exec_info.module_uri.clone(),
         input_payload,
-        encrypted_secrets: delivery.encrypted_secrets,
+        encrypted_secrets: talos_workflow_job_protocol::EncryptedSecrets::empty(),
         timeout_ms: 30_000,
         allowed_hosts: exec_info.allowed_hosts.clone(),
         allowed_methods: exec_info.allowed_methods.clone(),
@@ -342,6 +345,7 @@ async fn dispatch_single_message(
         actor_id: resolved_actor,
         user_id,
     };
+    delivery.apply_to(&mut job_request);
 
     // Signing is mandatory. An unsigned JobRequest is rejected by the worker at
     // verify anyway, so publishing it would just burn NATS bandwidth — bail

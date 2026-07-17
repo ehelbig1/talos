@@ -1419,11 +1419,7 @@ async fn build_platform_services(
     // `ModuleSealingHandle` the integration crates depend on.
     let module_sealing_handle: Option<talos_integration_helpers::ModuleSealingHandle> = nats_client
         .as_ref()
-        .and_then(talos_engine::nats_run::shared_envelope_sealing_handle)
-        .map(|h| talos_integration_helpers::ModuleSealingHandle {
-            in_flight: h.in_flight,
-            claim_subject: h.claim_subject,
-        });
+        .and_then(talos_engine::nats_run::shared_envelope_sealing_handle);
 
     // ---------- Initialize webhook router ----------
     // NOTE: Slack enrichment (user profiles, channel info, etc.) now happens inside
@@ -4885,11 +4881,7 @@ fn build_router(
     // for the Gmail-push + Google-Calendar-push fire-and-forget dispatch paths.
     let module_sealing_handle: Option<talos_integration_helpers::ModuleSealingHandle> = nats_client
         .as_ref()
-        .and_then(talos_engine::nats_run::shared_envelope_sealing_handle)
-        .map(|h| talos_integration_helpers::ModuleSealingHandle {
-            in_flight: h.in_flight,
-            claim_subject: h.claim_subject,
-        });
+        .and_then(talos_engine::nats_run::shared_envelope_sealing_handle);
     let failure_analysis_service = bundle.failure_analysis_service.clone();
     let actor_lifecycle_service = bundle.actor_lifecycle_service.clone();
     // ---------- Rate limiting configuration ----------

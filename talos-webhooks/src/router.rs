@@ -1131,16 +1131,18 @@ impl WebhookRouter {
                         sealing_handle.as_ref(),
                     )
                     .await;
+                    // Placeholder secret-delivery fields; `delivery.apply_to`
+                    // below writes all four in one drift-proof mapping.
                     let mut req = talos_workflow_job_protocol::JobRequest {
                         crypto_scheme: 0,
-                        sealing: delivery.sealing,
-                        secret_paths: delivery.secret_paths,
-                        claim_inbox: delivery.claim_inbox,
+                        sealing: 0,
+                        secret_paths: Vec::new(),
+                        claim_inbox: None,
                         job_id,
                         workflow_execution_id: job_id, // Standalone webhook uses same ID
                         module_uri: exec_info.module_uri,
                         input_payload,
-                        encrypted_secrets: delivery.encrypted_secrets,
+                        encrypted_secrets: talos_workflow_job_protocol::EncryptedSecrets::empty(),
                         timeout_ms: 3_000,
                         allowed_hosts: exec_info.allowed_hosts,
                         allowed_methods: exec_info.allowed_methods,
@@ -1177,6 +1179,7 @@ impl WebhookRouter {
                         actor_id: resolved_actor,
                         user_id,
                     };
+                    delivery.apply_to(&mut req);
 
                     // RFC 0010 P1: prefer the configured Ed25519 dispatch signer;
                     // else the legacy HMAC path.
@@ -2667,16 +2670,18 @@ impl WebhookRouter {
                 )
                 .await;
 
+                // Placeholder secret-delivery fields; `delivery.apply_to`
+                // below writes all four in one drift-proof mapping.
                 let mut req = talos_workflow_job_protocol::JobRequest {
                     crypto_scheme: 0,
-                    sealing: delivery.sealing,
-                    secret_paths: delivery.secret_paths,
-                    claim_inbox: delivery.claim_inbox,
+                    sealing: 0,
+                    secret_paths: Vec::new(),
+                    claim_inbox: None,
                     job_id,
                     workflow_execution_id: job_id,
                     module_uri: exec_info.module_uri,
                     input_payload: wrapped_input,
-                    encrypted_secrets: delivery.encrypted_secrets,
+                    encrypted_secrets: talos_workflow_job_protocol::EncryptedSecrets::empty(),
                     timeout_ms: 3_000,
                     allowed_hosts: exec_info.allowed_hosts,
                     allowed_methods: exec_info.allowed_methods,
@@ -2705,6 +2710,7 @@ impl WebhookRouter {
                     actor_id: resolved_actor,
                     user_id,
                 };
+                delivery.apply_to(&mut req);
 
                 // RFC 0010 P1: prefer the configured Ed25519 dispatch signer.
                 let sign_result = match talos_workflow_job_protocol::configured_dispatch_signer() {

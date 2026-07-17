@@ -156,6 +156,24 @@ pub struct InFlightSeals {
     map: DashMap<Uuid, Registered>,
 }
 
+/// The process-wide claim-sealing handle a dispatch path needs: the shared
+/// in-flight seal store (also read by the claim responder) plus the responder's
+/// claim subject (stamped into `JobRequest.claim_inbox`).
+///
+/// Lives HERE — the crate every sealing participant already depends on — so
+/// both the engine-NATS dispatcher and the module-bound integration paths
+/// (gmail / gcal / webhooks, via `talos-integration-helpers`) name the SAME
+/// type without an integration→engine-NATS dep edge. There must be exactly one
+/// instance per process (memoized by the controller); a second `InFlightSeals`
+/// would register seals the responder never sees.
+#[derive(Clone)]
+pub struct EnvelopeSealingHandle {
+    /// The shared in-flight seal store the claim responder reads.
+    pub in_flight: std::sync::Arc<InFlightSeals>,
+    /// The replica-local claim subject the responder subscribes to.
+    pub claim_subject: String,
+}
+
 impl InFlightSeals {
     #[must_use]
     pub fn new() -> Self {

@@ -195,8 +195,23 @@ fn envelope_sealing_handle(
             // responder, so it exists regardless of whether the engine or a
             // module-bound push initialised the handle first.
             let sweep_inf = in_flight.clone();
-            let ttl_secs: u64 =
+            // Floor the TTL at 60s: `positive_env_or_default` rejects 0/negative
+            // but accepts e.g. `1`, and a TTL below any plausible dispatch→claim
+            // latency (cold worker start, queue backlog) would evict LEGITIMATE
+            // in-flight seals — fail-closed (job fails, no leak) but a needless
+            // availability footgun. The doc contract "generously larger than
+            // dispatch→claim latency" is enforced here, not by operator
+            // discipline.
+            let configured_ttl: u64 =
                 talos_config::positive_env_or_default("TALOS_SEAL_ORPHAN_TTL_SECS", 600);
+            let ttl_secs = configured_ttl.max(60);
+            if ttl_secs != configured_ttl {
+                tracing::warn!(
+                    target: "talos_security",
+                    configured_ttl,
+                    "TALOS_SEAL_ORPHAN_TTL_SECS below the 60s floor; clamped to 60"
+                );
+            }
             let sweep_interval_secs: u64 =
                 talos_config::positive_env_or_default("TALOS_SEAL_SWEEP_INTERVAL_SECS", 60);
             tokio::spawn(async move {

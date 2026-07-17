@@ -1458,17 +1458,18 @@ pub async fn process_webhook_events(
         )
         .await;
 
-        // Create job request for worker
+        // Create job request for worker. Placeholder secret-delivery fields;
+        // `delivery.apply_to` below writes all four in one drift-proof mapping.
         let mut job_request = JobRequest {
             crypto_scheme: 0,
-            sealing: delivery.sealing,
-            secret_paths: delivery.secret_paths,
-            claim_inbox: delivery.claim_inbox,
+            sealing: 0,
+            secret_paths: Vec::new(),
+            claim_inbox: None,
             job_id,
             workflow_execution_id: job_id, // Single node execution, use same ID
             module_uri: exec_info.module_uri.clone(),
             input_payload,
-            encrypted_secrets: delivery.encrypted_secrets,
+            encrypted_secrets: talos_workflow_job_protocol::EncryptedSecrets::empty(),
             timeout_ms: 30_000, // 30 second timeout
             allowed_hosts: exec_info.allowed_hosts.clone(),
             allowed_methods: exec_info.allowed_methods.clone(),
@@ -1510,6 +1511,7 @@ pub async fn process_webhook_events(
             actor_id: resolved_actor,
             user_id,
         };
+        delivery.apply_to(&mut job_request);
 
         // Sign the job request with the shared key for integrity and replay protection.
         // If the key is unavailable the job is skipped — an unsigned job would be

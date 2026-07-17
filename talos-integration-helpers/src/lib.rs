@@ -46,26 +46,19 @@ use talos_secrets_manager::SecretsManager;
 use talos_workflow_job_protocol::EncryptedSecrets;
 use uuid::Uuid;
 
-/// A process-local handle to the shared claim-based-sealing machinery, injected
-/// into module-bound dispatch contexts by the controller.
+/// The shared claim-based-sealing handle injected into module-bound dispatch
+/// contexts by the controller.
 ///
-/// This is a deliberately thin, decoupled mirror of
-/// `talos_workflow_engine_nats::EnvelopeSealingHandle` (the same `in_flight` +
-/// `claim_subject` fields). It lives here — in the crate the three integration
-/// stacks (gmail / gcal / webhooks) already depend on — so those crates never
-/// take a dependency on the engine-NATS layer just to name the type. The
-/// controller resolves the ONE process-wide `EnvelopeSealingHandle` (the same
-/// `InFlightSeals` the claim responder subscribes to) and bridges it into this
-/// shape at wiring time.
-#[derive(Clone)]
-pub struct ModuleSealingHandle {
-    /// The shared, process-wide in-flight seal store the claim responder reads.
-    /// MUST be the same instance the responder was spawned with — a second
-    /// store would register seals the responder never sees.
-    pub in_flight: Arc<talos_envelope_seal::InFlightSeals>,
-    /// The replica-local claim subject stamped into `JobRequest.claim_inbox`.
-    pub claim_subject: String,
-}
+/// This is the CANONICAL `talos_envelope_seal::EnvelopeSealingHandle`
+/// re-exported under the module-facing name — one type, no mirror struct, no
+/// field-copy bridge (an earlier draft duplicated the two fields here; a
+/// review flagged the silent-partial-copy drift hazard if the handle ever
+/// grows a field). The integration stacks (gmail / gcal / webhooks) name it
+/// through this crate so they depend only on `talos-envelope-seal`, never on
+/// the engine-NATS layer. The controller resolves the ONE process-wide handle
+/// (the same `InFlightSeals` the claim responder subscribes to) and passes it
+/// straight through at wiring time.
+pub use talos_envelope_seal::EnvelopeSealingHandle as ModuleSealingHandle;
 
 /// Build the `encrypted_secrets` payload for a module-bound webhook
 /// dispatch (Gmail push, Google-Calendar push, generic webhook).
@@ -218,6 +211,30 @@ pub struct DispatchSecretDelivery {
     pub sealing: u8,
     pub claim_inbox: Option<String>,
     pub secret_paths: Vec<String>,
+}
+
+impl DispatchSecretDelivery {
+    /// Write ALL delivery fields onto a `JobRequest` in one place.
+    ///
+    /// Call sites construct the request with placeholder values and then apply
+    /// the delivery, instead of hand-spreading the four fields per site — the
+    /// same drift class CLAUDE.md's check 17 closed for `encrypted_secrets:
+    /// Default::default()`: a future 5th dispatch site that copies three of the
+    /// four fields would silently ship `sealing=0` alongside a registered seal.
+    /// A new field added to this struct fails to compile until this method
+    /// handles it (destructuring below is exhaustive by construction).
+    pub fn apply_to(self, req: &mut talos_workflow_job_protocol::JobRequest) {
+        let DispatchSecretDelivery {
+            encrypted_secrets,
+            sealing,
+            claim_inbox,
+            secret_paths,
+        } = self;
+        req.encrypted_secrets = encrypted_secrets;
+        req.sealing = sealing;
+        req.claim_inbox = claim_inbox;
+        req.secret_paths = secret_paths;
+    }
 }
 
 /// Prepare the secret-delivery fields for a module-bound (fire-and-forget)
@@ -426,6 +443,63 @@ mod dispatch_delivery_tests {
             "plaintext registered for claim"
         );
         assert!(h.in_flight.take(exec).is_none(), "single-claim");
+    }
+
+    #[test]
+    fn apply_to_transfers_every_delivery_field() {
+        // The whole point of apply_to is that NO delivery field can be
+        // forgotten at a call site. Lock the four-field transfer; a new field
+        // added to DispatchSecretDelivery breaks apply_to's exhaustive
+        // destructure at compile time, and this test documents the contract.
+        let h = handle();
+        let exec = Uuid::new_v4();
+        let d = finish_dispatch_delivery(
+            map_of(&[("anthropic/api_key", "sk-x")]),
+            exec,
+            Some(&h),
+            Uuid::new_v4(),
+        );
+        let mut req = talos_workflow_job_protocol::JobRequest {
+            crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
+            claim_inbox: None,
+            job_id: exec,
+            workflow_execution_id: exec,
+            module_uri: String::new(),
+            input_payload: serde_json::json!({}),
+            encrypted_secrets: EncryptedSecrets::empty(),
+            timeout_ms: 0,
+            allowed_hosts: Vec::new(),
+            allowed_methods: Vec::new(),
+            allowed_secrets: Vec::new(),
+            allowed_sql_operations: Vec::new(),
+            allow_tier2_exposure: false,
+            priority: 0,
+            deadline_unix_secs: 0,
+            cancellation_token: None,
+            signature: Vec::new(),
+            job_nonce: String::new(),
+            max_llm_tier: Default::default(),
+            max_write_ceiling: Default::default(),
+            wasm_bytes: None,
+            capability_world: None,
+            integration_name: None,
+            expected_wasm_hash: None,
+            max_fuel: 0,
+            dry_run: false,
+            reply_topic: None,
+            actor_id: None,
+            user_id: Uuid::nil(),
+        };
+        d.apply_to(&mut req);
+        assert_eq!(
+            req.sealing,
+            talos_workflow_job_protocol::SEALING_CLAIM_ECIES
+        );
+        assert_eq!(req.claim_inbox.as_deref(), Some("_INBOX.claim-test"));
+        assert_eq!(req.secret_paths, vec!["anthropic/api_key"]);
+        assert!(req.encrypted_secrets.ciphertext.is_empty());
     }
 
     #[test]
