@@ -3756,8 +3756,15 @@ impl AnalyticsRepository {
                 .fetch_all(&self.db_pool);
 
                 let (secrets_rows_res, grants_res) = tokio::join!(secrets_rows_fut, grants_fut);
-                let secrets_rows = secrets_rows_res.unwrap_or_default();
-                let grants: Vec<String> = grants_res.unwrap_or_default();
+                // FAIL CLOSED: a transient error on EITHER query must propagate,
+                // never default to empty. An empty `grants` makes
+                // `secret_path_in_any_grant` report EVERY secret as orphaned/
+                // unused (the `empty_grants_means_orphan` semantics) — feeding
+                // get_unused_secrets, an operator could then delete an in-use
+                // secret during a DB hiccup. `[]` must mean "genuinely no
+                // grants", not "the query failed".
+                let secrets_rows = secrets_rows_res?;
+                let grants: Vec<String> = grants_res?;
 
                 secrets_rows
                     .into_iter()

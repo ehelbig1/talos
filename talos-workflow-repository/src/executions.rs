@@ -1249,6 +1249,48 @@ impl WorkflowRepository {
         .transpose()
     }
 
+    /// Resolve an actor's privilege ceilings (`max_llm_tier`,
+    /// `max_write_ceiling`) scoped to `user_id`. Returns `Ok(None)` when
+    /// the actor doesn't exist OR isn't owned by the user — same
+    /// fail-closed tenancy contract as [`Self::get_actor`], so a parent
+    /// can't resolve ceilings for an actor it doesn't own.
+    ///
+    /// Used by the sub-workflow dispatch path to narrow the sub-engine to
+    /// `most_restrictive(parent, sub-actor)` on each axis. Both columns
+    /// parse through the fail-closed `from_db_str` helpers (unknown /
+    /// malformed values → `Tier1` / `ReadOnly`), so column drift can
+    /// never widen a sub-workflow's authority.
+    pub async fn get_actor_ceilings(
+        &self,
+        actor_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<
+        Option<(
+            talos_workflow_engine_core::LlmTier,
+            talos_workflow_engine_core::WriteCeiling,
+        )>,
+    > {
+        let row = sqlx::query(
+            "SELECT max_llm_tier, max_write_ceiling FROM actors \
+             WHERE id = $1 AND user_id = $2",
+        )
+        .bind(actor_id)
+        .bind(user_id)
+        .fetch_optional(&self.db_pool)
+        .await?;
+
+        row.map(|r| -> Result<_> {
+            let tier = talos_workflow_engine_core::LlmTier::from_db_str(
+                &r.try_get::<String, _>("max_llm_tier")?,
+            );
+            let ceiling = talos_workflow_engine_core::WriteCeiling::from_db_str(
+                &r.try_get::<String, _>("max_write_ceiling")?,
+            );
+            Ok((tier, ceiling))
+        })
+        .transpose()
+    }
+
     /// Count non-archived workflows owned by an actor.
     pub async fn count_actor_workflows(&self, actor_id: Uuid) -> Result<i64> {
         let count: i64 = sqlx::query_scalar(

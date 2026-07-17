@@ -72,6 +72,23 @@ impl OrganizationsMutations {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
         let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
 
+        // Verify caller has Admin+ access at the RESOLVER layer, matching
+        // remove_member / update_member_role. The service (add_member) also
+        // enforces this internally, but the sibling mutations gate here for
+        // defense-in-depth and a consistent "Insufficient permissions"
+        // message; invite_member was the lone gap.
+        talos_organizations::OrganizationService::check_org_access(
+            db_pool,
+            org_id,
+            user_id,
+            talos_organizations::OrgRole::Admin,
+        )
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "Organization access denied for invite_member");
+            async_graphql::Error::new("Insufficient permissions").extend_safe()
+        })?;
+
         // MCP-818 (2026-05-14): align error message with actual
         // accepted set. Pre-fix the error said "must be one of
         // 'viewer', 'member', 'admin'" — accurate for what add_member
