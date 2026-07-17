@@ -604,15 +604,26 @@ async fn handle_delete_module(
 
     // Check references (workflows + webhooks) before deleting
     if !force {
-        let refs = state
+        // FAIL CLOSED: this is the safety guard that prevents deleting a module
+        // still referenced by the user's workflows/webhooks. A transient DB
+        // error must NOT default the counts to zero — that silently passes the
+        // guard and orphans the referencing nodes. Refuse the delete and ask
+        // for a retry (same idiom as install_module_from_catalog's quota gate).
+        let refs = match state
             .module_repo
             .get_module_ref_counts(mod_id, user_id)
             .await
-            .unwrap_or(talos_module_repository::ModuleRefCounts {
-                workflow_count: 0,
-                webhook_count: 0,
-                webhook_ids_sample: vec![],
-            });
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(module_id = %mod_id, error = %e, "delete_module reference-count guard failed");
+                return mcp_error(
+                    req_id,
+                    -32000,
+                    "Reference check failed (database error). Refusing to delete to avoid orphaning referencing workflows/webhooks; retry after the database recovers, or pass force: true to override.",
+                );
+            }
+        };
         if refs.workflow_count > 0 {
             return mcp_text(req_id, &format!(
                 "Module {} is referenced by {} workflow(s). Use force: true to delete anyway, or delete the workflows first.",
@@ -1717,12 +1728,24 @@ async fn handle_batch_delete_modules(
     let mut to_delete: Vec<uuid::Uuid> = Vec::new();
 
     if !force {
-        // Check which modules are referenced by workflows (batch query)
-        let referenced_rows = state
+        // Check which modules are referenced by workflows (batch query).
+        // FAIL CLOSED: a DB error must not default to "none referenced" — that
+        // silently deletes referenced modules. Refuse and ask for a retry.
+        let referenced_rows = match state
             .module_repo
             .find_referenced_modules_in_workflows(&module_ids, user_id)
             .await
-            .unwrap_or_default();
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(error = %e, "batch_delete: workflow-reference guard failed");
+                return mcp_error(
+                    req_id,
+                    -32000,
+                    "Reference check failed (database error). Refusing to delete to avoid orphaning referencing workflows; retry after the database recovers, or pass force: true to override.",
+                );
+            }
+        };
 
         let referenced_set: std::collections::HashSet<uuid::Uuid> =
             referenced_rows.iter().map(|(id, _)| *id).collect();
@@ -1805,11 +1828,23 @@ async fn handle_batch_delete_modules(
     // Webhook-reference guard (mirrors the workflow-reference check above).
     // Only applied when force is false — force: true bypasses both guards.
     let final_delete: Vec<uuid::Uuid> = if !force && !actually_delete.is_empty() {
-        let wh_referenced = state
+        // FAIL CLOSED: a DB error must not default to "no webhook deps" — that
+        // silently deletes modules a webhook depends on.
+        let wh_referenced = match state
             .module_repo
             .find_webhook_dependencies_for_modules(&actually_delete, user_id)
             .await
-            .unwrap_or_default();
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(error = %e, "batch_delete: webhook-dependency guard failed");
+                return mcp_error(
+                    req_id,
+                    -32000,
+                    "Webhook-dependency check failed (database error). Refusing to delete to avoid orphaning webhooks; retry after the database recovers, or pass force: true to override.",
+                );
+            }
+        };
 
         let mut keep = Vec::new();
         for mid in actually_delete {

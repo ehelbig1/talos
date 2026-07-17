@@ -517,8 +517,12 @@ impl WorkflowRepository {
         )
         .bind(module_ids)
         .fetch_all(&self.db_pool)
-        .await
-        .unwrap_or_default();
+        // FAIL CLOSED: a query error must propagate, not silently yield an
+        // empty set. This feeds export_platform_state / export_workflow — a
+        // default `[]` produces a bundle missing every module's
+        // capability_world / source_code / is_compiled, which the export
+        // reports as SUCCESS but re-imports to a wrong/incomplete state.
+        .await?;
 
         let mut out: Vec<ModuleExportInfo> = Vec::new();
         for r in &rows {
