@@ -390,6 +390,13 @@ async fn main() -> anyhow::Result<()> {
     // Verify essential environment configuration early (fail-fast gate).
     validate_startup_config()?;
 
+    // Public base-URL discovery (ngrok sidecar, compose `public`
+    // profile). No-op when TALOS_NGROK_API_URL is unset; otherwise a
+    // background poll keeps externally-reachable endpoint formatting
+    // (Pub/Sub push, watch webhooks, inbound webhooks, approval links)
+    // pointed at the live tunnel origin. See talos-public-url.
+    talos_public_url::spawn_discovery();
+
     // Event buses for execution / DLQ / workflow-started updates.
     let buses = build_event_buses();
 

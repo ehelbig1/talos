@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 talos-http-utils = { path = "../talos-http-utils" }
+talos-public-url = { path = "../talos-public-url" }
 anyhow.workspace = true
 arc-swap = "1.7"
 async-nats = "0.47"

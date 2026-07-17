@@ -53,6 +53,7 @@ talos-execution-repository = { path = "../talos-execution-repository" }
 talos-http-body = { path = "../talos-http-body" }
 talos-graph-rag = { path = "../talos-graph-rag" }
 talos-http-utils = { path = "../talos-http-utils" }
+talos-public-url = { path = "../talos-public-url" }
 talos-llm = { path = "../talos-llm" }
 talos-mcp = { path = "../talos-mcp" }
 talos-memory = { path = "../talos-memory" }

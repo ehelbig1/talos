@@ -32,6 +32,7 @@ members = [
     "talos-worker-fleet",
     "talos-schedule-repo",
     "talos-ops-alerts-repository",
+    "talos-public-url",
     "talos-config",
     "talos-integration-state",
     "talos-ml",

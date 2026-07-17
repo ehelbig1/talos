@@ -103,7 +103,7 @@ pub async fn create_watch(
     // helper shared across every BASE_URL site.
     let webhook_url = format!(
         "{}/api/google-calendar/webhook",
-        talos_config::get_base_url()
+        talos_public_url::public_base_url_or(talos_config::get_base_url)
     );
 
     // Resolve the owning user_id for the audit log. If this SELECT

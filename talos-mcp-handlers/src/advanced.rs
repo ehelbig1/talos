@@ -4100,7 +4100,7 @@ async fn handle_create_approval_gate(
         return mcp_error(req_id, -32000, "Failed to create approval gate");
     }
 
-    let base_url = talos_config::get_base_url();
+    let base_url = talos_public_url::public_base_url_or(talos_config::get_base_url);
     let approve_url = format!("{}/approvals/{}/approve", base_url, token);
     let reject_url = format!("{}/approvals/{}/reject", base_url, token);
 
@@ -4242,7 +4242,7 @@ async fn handle_list_approval_gates(
                 .iter()
                 .map(|r| {
                     // MCP-631: empty-env hardening — see talos_config::get_env.
-                    let base_url = talos_config::get_base_url();
+                    let base_url = talos_public_url::public_base_url_or(talos_config::get_base_url);
 
                     let mut obj = serde_json::json!({
                         "gate_id": r.id.to_string(),
@@ -5609,7 +5609,7 @@ async fn handle_test_approval_webhook(
         );
     }
 
-    let base_url = talos_config::get_base_url();
+    let base_url = talos_public_url::public_base_url_or(talos_config::get_base_url);
 
     // Build a synthetic approval_required payload identical to what create_approval_gate fires
     let payload = serde_json::json!({
@@ -5827,7 +5827,7 @@ async fn handle_create_workflow_suspension(
         },
     };
 
-    let base_url = talos_config::get_base_url();
+    let base_url = talos_public_url::public_base_url_or(talos_config::get_base_url);
     let callback_url = format!("{}/api/callbacks/{}", base_url, correlation_id);
 
     let suspension_id: Uuid = match state

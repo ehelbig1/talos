@@ -471,7 +471,7 @@ pub async fn create_watch_channel_handler(
         .await
     {
         Ok(row) => {
-            let base = talos_config::get_frontend_url();
+            let base = talos_public_url::public_base_url_or(talos_config::get_frontend_url);
             Json(ApiResponse {
                 success: true,
                 data: Some(serde_json::json!({
