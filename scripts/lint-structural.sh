@@ -3681,6 +3681,55 @@ else
 fi
 echo
 
+# ── 57. Sub-engine builds must narrow ceilings ────────────────────────
+# H2 (PR #504): a sub-engine built via `adapter_set().into_engine_with_graph(…)`
+# inherits the PARENT's `max_llm_tier` / `max_write_ceiling` verbatim. If the
+# sub-workflow is bound to a MORE restrictive actor (Tier-1 / read-only), running
+# it at the parent's looser ceiling is a privilege escalation across the
+# sub-workflow boundary. #504 closed it at three build sites via the single
+# chokepoint `narrow_subengine_ceilings` (execute_subworkflow_graph,
+# dynamic/capability dispatch, agent-loop via `resolve_subworkflow_ceilings`
+# hoisted before the loop) — but nothing stops a FOURTH build site (a new
+# system-node kind, a new parallel executor) from compiling, running, and
+# silently widening. Same class as checks 29/56: the compiler can't see it,
+# review might miss it, so freeze it here. Any file with a non-test
+# `into_engine_with_graph(` call must also reference the narrowing chokepoint,
+# or opt out with `// allow-unnarrowed-subengine: <reason>` within 8 lines above
+# (for deliberate parent-context clones that keep the parent's own ceilings).
+bold "▶ check 57: sub-engine built without ceiling narrowing (H2 escalation guard)"
+UNNARROWED_SUBENGINE_HITS="$(grep -rn 'into_engine_with_graph(' \
+        --include='*.rs' \
+        talos-* worker controller 2>/dev/null \
+    | grep -vE '/tests/|_tests\.rs' \
+    | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|///|//!)' \
+    | grep -vE 'fn into_engine_with_graph' \
+    | while IFS= read -r hit; do
+        f="${hit%%:*}"; n="$(echo "$hit" | cut -d: -f2)"
+        # File-level: the chokepoint (or its resolver) referenced anywhere in
+        # the same file counts — the three #504 sites all qualify.
+        if grep -qE 'narrow_subengine_ceilings|resolve_subworkflow_ceilings' "$f"; then
+            continue
+        fi
+        start=$(( n > 8 ? n - 8 : 1 ))
+        if sed -n "${start},${n}p" "$f" | grep -q 'allow-unnarrowed-subengine'; then
+            continue
+        fi
+        echo "$hit"
+    done)"
+if [ -n "$UNNARROWED_SUBENGINE_HITS" ]; then
+    red "✗ sub-engine build site(s) without ceiling narrowing (H2 escalation re-opened):"
+    echo "$UNNARROWED_SUBENGINE_HITS" | sed 's/^/    /'
+    yellow "  → after into_engine_with_graph(…), call"
+    yellow "    self.narrow_subengine_ceilings(&mut sub_engine, sub_wf_id, user_id).await"
+    yellow "    (or hoist resolve_subworkflow_ceilings once for loop bodies) so the"
+    yellow "    sub-engine runs at most_restrictive(parent, sub-actor) on both axes."
+    yellow "  → deliberate parent-ceiling clones: // allow-unnarrowed-subengine: <reason>"
+    EXIT_CODE=1
+else
+    green "✓ every sub-engine build site narrows ceilings (or is explicitly opted out)"
+fi
+echo
+
 # ── 54. Lint self-consistency (meta-check) ────────────────────────────
 # The system whose purpose is catching drift drifted from its own docs:
 # by 2026-07-01 the script had 49 checks while CLAUDE.md said 43 and the

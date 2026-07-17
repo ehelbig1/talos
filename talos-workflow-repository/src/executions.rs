@@ -1249,20 +1249,25 @@ impl WorkflowRepository {
         .transpose()
     }
 
-    /// Resolve an actor's privilege ceilings (`max_llm_tier`,
-    /// `max_write_ceiling`) scoped to `user_id`. Returns `Ok(None)` when
-    /// the actor doesn't exist OR isn't owned by the user — same
-    /// fail-closed tenancy contract as [`Self::get_actor`], so a parent
-    /// can't resolve ceilings for an actor it doesn't own.
+    /// Resolve a WORKFLOW's bound actor's privilege ceilings
+    /// (`max_llm_tier`, `max_write_ceiling`) in ONE narrow query, scoped to
+    /// `user_id` on BOTH the workflow and the actor. Returns `Ok(None)` when
+    /// the workflow isn't visible to the user, has no bound actor, or the
+    /// actor isn't owned by the user — the fail-closed tenancy contract.
     ///
     /// Used by the sub-workflow dispatch path to narrow the sub-engine to
-    /// `most_restrictive(parent, sub-actor)` on each axis. Both columns
-    /// parse through the fail-closed `from_db_str` helpers (unknown /
-    /// malformed values → `Tier1` / `ReadOnly`), so column drift can
-    /// never widen a sub-workflow's authority.
-    pub async fn get_actor_ceilings(
+    /// `most_restrictive(parent, sub-actor)` on each axis. Deliberately a
+    /// single JOIN that never touches `graph_json`: the first-cut resolver
+    /// called `get_workflow` (15 columns incl. the full graph, inside an RLS
+    /// transaction) just to read `actor_id`, then a second query for the
+    /// ceilings — a per-sub-dispatch regression a perf review caught (a
+    /// 5-iteration reflective-retry did 9 redundant heavy fetches). Both
+    /// columns parse through the fail-closed `from_db_str` helpers (unknown /
+    /// malformed values → `Tier1` / `ReadOnly`), so column drift can never
+    /// widen a sub-workflow's authority.
+    pub async fn get_workflow_actor_ceilings(
         &self,
-        actor_id: Uuid,
+        workflow_id: Uuid,
         user_id: Uuid,
     ) -> Result<
         Option<(
@@ -1271,10 +1276,12 @@ impl WorkflowRepository {
         )>,
     > {
         let row = sqlx::query(
-            "SELECT max_llm_tier, max_write_ceiling FROM actors \
-             WHERE id = $1 AND user_id = $2",
+            "SELECT a.max_llm_tier, a.max_write_ceiling \
+             FROM workflows w \
+             JOIN actors a ON a.id = w.actor_id \
+             WHERE w.id = $1 AND w.user_id = $2 AND a.user_id = $2",
         )
-        .bind(actor_id)
+        .bind(workflow_id)
         .bind(user_id)
         .fetch_optional(&self.db_pool)
         .await?;
