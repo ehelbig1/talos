@@ -224,6 +224,136 @@ impl ControllerNodeHook {
             }
         });
     }
+
+    /// Persist normalized ops-alerts when the node output carries the opt-in
+    /// `__ops_alert__` key (sibling of [`Self::persist_memory_write_if_present`]
+    /// — same opt-in, best-effort, fire-on-completion semantics; see
+    /// `talos_workflow_engine_core::reserved_keys::OPS_ALERT`).
+    ///
+    /// Accepted value shapes: `{"alerts": [<alert>, …]}` or a single alert
+    /// object (recognised by a `dedup_key` field). Per-output volume is
+    /// capped at [`MAX_OPS_ALERTS_PER_OUTPUT`]; overflow is LOGGED with the
+    /// dropped count (no silent caps).
+    ///
+    /// Security: every free-text field that reaches the store passes through
+    /// DLP redaction FIRST — alert bodies routinely embed tokens/URLs, and
+    /// the envelope is WASM-supplied (same MCP-989/990 posture as the
+    /// memory-write previews, applied here to the PERSISTED values because
+    /// `ops_alerts.raw`/`title` are stored plaintext, unlike encrypted
+    /// actor_memory). Tenancy is resolved from the execution's bound actor
+    /// (`actors.user_id`/`org_id`) inside the spawned task; failures count
+    /// against `ops_alert_ingest_failures_total{reason}`.
+    pub fn persist_ops_alert_if_present(&self, actor_id: Option<Uuid>, output: &JsonValue) {
+        /// Bound on alerts a single node output may ingest. Far above any
+        /// legitimate parser batch (an email poll yields ≤ ~20) while
+        /// keeping a hostile module from flooding the store in one shot.
+        const MAX_OPS_ALERTS_PER_OUTPUT: usize = 50;
+
+        let Some(oa) = output.get(talos_workflow_engine_core::reserved_keys::OPS_ALERT) else {
+            return;
+        };
+        // `{"alerts": [...]}` (canonical) or a bare single-alert object.
+        let alerts: Vec<JsonValue> = match oa.get("alerts").and_then(JsonValue::as_array) {
+            Some(arr) => arr.clone(),
+            None if oa.get("dedup_key").is_some() => vec![oa.clone()],
+            None => {
+                tracing::warn!(
+                    "__ops_alert__ envelope present but neither an `alerts` array nor a \
+                     single alert object (missing `dedup_key`) — ingest skipped"
+                );
+                return;
+            }
+        };
+        if alerts.is_empty() {
+            return;
+        }
+        let dropped = alerts.len().saturating_sub(MAX_OPS_ALERTS_PER_OUTPUT);
+        if dropped > 0 {
+            tracing::warn!(
+                dropped,
+                cap = MAX_OPS_ALERTS_PER_OUTPUT,
+                "__ops_alert__ envelope exceeded the per-output cap — excess alerts dropped"
+            );
+        }
+        let Some(actor_id) = actor_id else {
+            tracing::warn!(
+                count = alerts.len(),
+                "__ops_alert__ envelope emitted by node but no actor is bound to this \
+                 execution — alerts dropped. Pass actor_id to trigger_workflow, or set \
+                 workflows.actor_id on the workflow definition."
+            );
+            if let Some(m) = talos_metrics::global() {
+                m.ops_alert_ingest_failures_total
+                    .with_label_values(&["tenancy"])
+                    .inc();
+            }
+            return;
+        };
+
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            // Tenancy from the bound actor — one lookup for the whole batch.
+            let tenancy = talos_actor_repository::ActorRepository::new(pool.clone())
+                .get_actor_tenancy(actor_id)
+                .await;
+            let (user_id, org_id) = match tenancy {
+                Ok(Some(pair)) => pair,
+                Ok(None) => {
+                    tracing::warn!(%actor_id, "__ops_alert__: bound actor not found — alerts dropped");
+                    if let Some(m) = talos_metrics::global() {
+                        m.ops_alert_ingest_failures_total
+                            .with_label_values(&["tenancy"])
+                            .inc();
+                    }
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(%actor_id, error = %e, "__ops_alert__: tenancy lookup failed — alerts dropped");
+                    if let Some(m) = talos_metrics::global() {
+                        m.ops_alert_ingest_failures_total
+                            .with_label_values(&["tenancy"])
+                            .inc();
+                    }
+                    return;
+                }
+            };
+
+            let repo = talos_ops_alerts_repository::OpsAlertRepository::new(pool);
+            for a in alerts.into_iter().take(MAX_OPS_ALERTS_PER_OUTPUT) {
+                let get = |k: &str| a.get(k).and_then(JsonValue::as_str).map(str::to_string);
+                // DLP-redact BEFORE persistence (stored plaintext; see doc).
+                let redacted = |k: &str| get(k).map(|s| talos_dlp_provider::redact_str(&s));
+                let alert = talos_ops_alerts_repository::NewOpsAlert {
+                    source: redacted("source").unwrap_or_default(),
+                    external_id: redacted("external_id"),
+                    dedup_key: get("dedup_key").unwrap_or_default(),
+                    title: redacted("title").unwrap_or_default(),
+                    resource: redacted("resource"),
+                    severity_raw: get("severity_raw"),
+                    severity_hint: get("severity_hint"),
+                    // `redact_json_bounded` returns None for oversized
+                    // payloads — the repository additionally bounds bytes.
+                    raw: a
+                        .get("raw")
+                        .and_then(talos_dlp_provider::redact_json_bounded),
+                };
+                match repo.ingest(user_id, org_id, alert).await {
+                    Ok(outcome) => {
+                        tracing::debug!(%actor_id, ?outcome, "__ops_alert__ ingested");
+                    }
+                    Err(e) => {
+                        let reason = e.metric_label();
+                        if let Some(m) = talos_metrics::global() {
+                            m.ops_alert_ingest_failures_total
+                                .with_label_values(&[reason])
+                                .inc();
+                        }
+                        tracing::warn!(%actor_id, error = %e, reason, "__ops_alert__ ingest failed");
+                    }
+                }
+            }
+        });
+    }
 }
 
 impl NodeLifecycleHook for ControllerNodeHook {
@@ -265,6 +395,9 @@ impl NodeLifecycleHook for ControllerNodeHook {
         // whole flow is tokio::spawn'd inside, so node-completion
         // latency is unchanged.
         talos_ml::spawn_distill_from_output(ctx.actor_id, output);
+
+        // ── 4. `__ops_alert__` protocol: persist normalized ops-alerts ──
+        self.persist_ops_alert_if_present(ctx.actor_id, output);
     }
 
     fn on_pipeline_step_completed(&self, actor_id: Option<Uuid>, step_output: &JsonValue) {
@@ -274,6 +407,7 @@ impl NodeLifecycleHook for ControllerNodeHook {
         // inflate rollups by the chain length.
         self.persist_memory_write_if_present(actor_id, step_output);
         talos_ml::spawn_distill_from_output(actor_id, step_output);
+        self.persist_ops_alert_if_present(actor_id, step_output);
     }
 
     fn on_node_failed(

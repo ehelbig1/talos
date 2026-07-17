@@ -80,6 +80,10 @@ pub struct TalosMetrics {
     // See deploy/observability/alerts.yaml for the SLOs built on top.
     pub kek_decrypt_failures_total: CounterVec,
     pub memory_write_failures_total: CounterVec,
+    /// `ops_alerts` ingest failures from the `__ops_alert__` hook.
+    /// Labels: reason=validation|db|tenancy. Sustained bump means alert
+    /// envelopes emitted by parser modules are being lost.
+    pub ops_alert_ingest_failures_total: CounterVec,
     pub module_payload_encryption_failures_total: CounterVec,
     /// Per-row secret-decrypt failures from `SecretsManager::get_module_secrets`.
     /// Labels: reason=missing_dek|cipher_init|aead|invalid_utf8|too_short.
@@ -312,6 +316,17 @@ impl TalosMetrics {
         )?;
         registry.register(Box::new(memory_write_failures_total.clone()))?;
 
+        let ops_alert_ingest_failures_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_ops_alert_ingest_failures_total",
+                "ops_alerts persistence failures from the __ops_alert__ \
+                 hook. Labels: reason=validation|db|tenancy. Sustained bump \
+                 means parser-module alert envelopes are being lost.",
+            ),
+            &["reason"],
+        )?;
+        registry.register(Box::new(ops_alert_ingest_failures_total.clone()))?;
+
         let module_payload_encryption_failures_total = CounterVec::new(
             prometheus::Opts::new(
                 "talos_module_payload_encryption_failures_total",
@@ -410,6 +425,7 @@ impl TalosMetrics {
             dlq_db_errors_total,
             kek_decrypt_failures_total,
             memory_write_failures_total,
+            ops_alert_ingest_failures_total,
             module_payload_encryption_failures_total,
             secret_decrypt_failures_total,
             actor_memory_orphaned_rows,

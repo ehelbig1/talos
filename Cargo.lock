@@ -7612,6 +7612,7 @@ dependencies = [
  "talos-module-executions",
  "talos-module-payload-encryption",
  "talos-oauth",
+ "talos-ops-alerts-repository",
  "talos-registry",
  "talos-retry-intelligence",
  "talos-secrets-manager",
@@ -8457,6 +8458,19 @@ dependencies = [
  "talos-text-util",
  "talos-workflow-engine-core",
  "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "talos-ops-alerts-repository"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
  "tracing",
  "uuid",
 ]

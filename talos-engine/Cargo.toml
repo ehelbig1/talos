@@ -28,6 +28,7 @@ sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-actor-memory-service = { path = "../talos-actor-memory-service" }
 talos-actor-repository = { path = "../talos-actor-repository" }
+talos-ops-alerts-repository = { path = "../talos-ops-alerts-repository" }
 talos-config = { path = "../talos-config" }
 talos-cost-attribution = { path = "../talos-cost-attribution" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }

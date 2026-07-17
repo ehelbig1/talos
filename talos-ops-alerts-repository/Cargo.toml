@@ -1,0 +1,19 @@
+[package]
+name = "talos-ops-alerts-repository"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+thiserror = "2.0"
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
