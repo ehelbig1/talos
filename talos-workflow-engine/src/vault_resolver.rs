@@ -247,7 +247,7 @@ mod tests {
         // still be extracted so the token is prefetched; otherwise the worker
         // forwards the literal string and the provider returns 401.
         let cfg = json!({
-            "AUTH_HEADER": "Bearer vault://oauth/gmail/56a7eea7/helbig.evan@gmail.com/access_token",
+            "AUTH_HEADER": "Bearer vault://oauth/gmail/56a7eea7/user@example.com/access_token",
             "QUERY": "is:unread"
         });
         let refs = extract_vault_refs(&cfg);
@@ -259,7 +259,7 @@ mod tests {
         assert_eq!(refs[0].0, "AUTH_HEADER");
         assert_eq!(
             refs[0].1,
-            "oauth/gmail/56a7eea7/helbig.evan@gmail.com/access_token"
+            "oauth/gmail/56a7eea7/user@example.com/access_token"
         );
     }
 
