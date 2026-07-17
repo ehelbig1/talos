@@ -386,8 +386,10 @@ impl PlatformMutations {
 
         // Soft-delete vs hard-delete + the registry-driven table name live
         // in `talos_integrations::store::disconnect_user_integration`
-        // (compile-time constants; only id and user_id are bound).
-        let rows_affected =
+        // (compile-time constants; only id and user_id are bound). It
+        // RETURNINGs the row's vault provider_key (+ tier) so we can revoke
+        // the token, not just hide the integration.
+        let outcome =
             talos_integrations::store::disconnect_user_integration(db_pool, provider, id, *user_id)
                 .await
                 .map_err(|e| {
@@ -395,10 +397,60 @@ impl PlatformMutations {
                     async_graphql::Error::new("Request could not be completed").extend_safe()
                 })?;
 
-        if rows_affected == 0 {
+        if outcome.rows_affected == 0 {
             return Err(
                 async_graphql::Error::new("Integration not found or access denied").extend_safe(),
             );
+        }
+
+        // Revoke the OAuth token at the provider and delete it from the vault.
+        // WITHOUT this, "disconnect" only hid the row and left a live token in
+        // the vault until natural expiry — a real gap, widened by GCP Phase D
+        // (a disconnected account could leave a live impersonation-capable or
+        // broad cloud-platform token). Best-effort and idempotent (mirrors the
+        // dedicated per-provider disconnect handlers): a revoke failure is
+        // logged and the disconnect still succeeds — the row is already hidden.
+        if let Some(provider_key) = outcome.provider_key.as_deref() {
+            match talos_integrations::provider_config::revoke_provider_for(
+                provider,
+                outcome.tier.as_deref(),
+            ) {
+                Some(oauth_provider) => {
+                    // `data` (not `data_unchecked`) so a schema missing the
+                    // service degrades to a loud error instead of a panic.
+                    // Production injects it (schema builder); its ABSENCE means
+                    // tokens silently wouldn't be revoked — worth an error, not
+                    // a warn.
+                    match ctx.data::<std::sync::Arc<talos_oauth::OAuthCredentialService>>() {
+                        Ok(cred_svc) => {
+                            if let Err(e) = cred_svc
+                                .revoke_and_cleanup(*user_id, &oauth_provider, provider_key)
+                                .await
+                            {
+                                // Don't leak provider/key detail to the client;
+                                // the row is hidden regardless. Log server-side.
+                                tracing::warn!(
+                                    provider = %provider.id,
+                                    error = %e,
+                                    "disconnect: token revoke/vault-cleanup failed — integration \
+                                     hidden, but the stored token may persist until expiry"
+                                );
+                            }
+                        }
+                        Err(_) => tracing::error!(
+                            provider = %provider.id,
+                            "disconnect: OAuthCredentialService not present in schema data — \
+                             token NOT revoked; wire it into the schema builder"
+                        ),
+                    }
+                }
+                None => tracing::warn!(
+                    provider = %provider.id,
+                    tier = ?outcome.tier,
+                    "disconnect: could not resolve OAuth provider for revoke (unknown tier) — \
+                     token not auto-revoked"
+                ),
+            }
         }
 
         Ok(true)
