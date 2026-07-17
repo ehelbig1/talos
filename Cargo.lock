@@ -8090,6 +8090,7 @@ dependencies = [
  "subtle",
  "talos-config",
  "talos-dlp-provider",
+ "talos-envelope-seal",
  "talos-http-body",
  "talos-http-utils",
  "talos-integration-state",

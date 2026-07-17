@@ -463,6 +463,9 @@ pub async fn webhook_notification_handler(
     Extension(runtime): Extension<Option<Arc<TalosRuntime>>>,
     Extension(secrets_manager): Extension<Option<Arc<SecretsManager>>>,
     Extension(worker_manager): Extension<Option<Arc<WorkerManager>>>,
+    // RFC 0010 P3 (M4): the shared claim-based-sealing handle, layered as an
+    // Extension by the controller. `None` when sealing is off or unconfigured.
+    Extension(sealing_handle): Extension<Option<talos_integration_helpers::ModuleSealingHandle>>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     // Explicitly annotate types to help compiler
@@ -618,6 +621,7 @@ pub async fn webhook_notification_handler(
     let runtime_clone = runtime.clone();
     let secrets_clone = secrets_manager.clone();
     let worker_mgr_clone = worker_manager.clone();
+    let sealing_clone = sealing_handle.clone();
 
     tokio::spawn(async move {
         if is_initial_sync {
@@ -648,6 +652,7 @@ pub async fn webhook_notification_handler(
             runtime_clone,
             secrets_clone,
             worker_mgr_clone,
+            sealing_clone,
         )
         .await
         {
@@ -1112,6 +1117,11 @@ pub async fn process_webhook_events(
     runtime: Option<Arc<TalosRuntime>>,
     secrets_manager: Option<Arc<SecretsManager>>,
     worker_manager: Option<Arc<WorkerManager>>,
+    // RFC 0010 P3 (M4): shared claim-based-sealing handle, injected by the
+    // controller (via axum Extension) when sealing is on + Ed25519 configured.
+    // `Some` → register plaintext for a worker claim; `None` → inline WSK
+    // envelope (byte-identical to pre-M4). Borrowed per-event inside the loop.
+    sealing_handle: Option<talos_integration_helpers::ModuleSealingHandle>,
 ) -> Result<()> {
     tracing::debug!("🔄 Processing webhook events for channel {}", channel_uuid);
 
@@ -1429,27 +1439,27 @@ pub async fn process_webhook_events(
             "data": event_clone
         });
 
-        // Encrypted secrets combine the MODULE's declared
-        // allowed_secrets PLUS the host-reserved LLM provider keys.
-        // Without this, modules using talos::core::llm::* fail with
-        // NotConfigured and vault:// header substitution returns
-        // NotFound. Mirrors the canonical pattern in
-        // talos-webhooks::handle_inbound_webhook and the engine's
-        // build_encrypted_secrets helper. (Was previously
-        // Default::default() — fixed alongside gmail dispatch.)
-        let encrypted_secrets = talos_integration_helpers::build_dispatch_encrypted_secrets(
+        // Secret delivery combines the MODULE's declared allowed_secrets
+        // PLUS the host-reserved LLM provider keys. Without this, modules
+        // using talos::core::llm::* fail with NotConfigured and vault://
+        // header substitution returns NotFound. Mirrors the canonical
+        // pattern in talos-webhooks and the engine's build_encrypted_secrets.
+        //
+        // RFC 0010 P3 (M4): under claim-based sealing register the plaintext
+        // for a worker claim (`sealing = SEALING_CLAIM_ECIES`); otherwise the
+        // inline WSK envelope. L-1: AAD = job_id (= workflow_execution_id
+        // below) on the inline path.
+        let delivery = talos_integration_helpers::prepare_module_dispatch_secrets(
             secrets_manager.as_ref(),
             module_uuid,
             user_id,
-            // L-1: AAD = execution_id (= job_id for single-node
-            // dispatches). The JobRequest below sets
-            // `workflow_execution_id = job_id`, matching the worker
-            // decrypt AAD.
             job_id,
+            sealing_handle.as_ref(),
         )
         .await;
 
-        // Create job request for worker
+        // Create job request for worker. Placeholder secret-delivery fields;
+        // `delivery.apply_to` below writes all four in one drift-proof mapping.
         let mut job_request = JobRequest {
             crypto_scheme: 0,
             sealing: 0,
@@ -1459,7 +1469,7 @@ pub async fn process_webhook_events(
             workflow_execution_id: job_id, // Single node execution, use same ID
             module_uri: exec_info.module_uri.clone(),
             input_payload,
-            encrypted_secrets,
+            encrypted_secrets: talos_workflow_job_protocol::EncryptedSecrets::empty(),
             timeout_ms: 30_000, // 30 second timeout
             allowed_hosts: exec_info.allowed_hosts.clone(),
             allowed_methods: exec_info.allowed_methods.clone(),
@@ -1501,6 +1511,7 @@ pub async fn process_webhook_events(
             actor_id: resolved_actor,
             user_id,
         };
+        delivery.apply_to(&mut job_request);
 
         // Sign the job request with the shared key for integrity and replay protection.
         // If the key is unavailable the job is skipped — an unsigned job would be
@@ -1534,6 +1545,11 @@ pub async fn process_webhook_events(
             };
 
         if let Err(sign_err) = sign_result {
+            // RFC 0010 P3 (M4): reclaim the seal registered above — this event
+            // is being skipped, so the worker will never claim it.
+            if let Some(h) = &sealing_handle {
+                h.in_flight.discard(job_id);
+            }
             tracing::error!("❌ {sign_err}. Skipping event.");
             // Mark the execution record as failed so it doesn't stay orphaned.
             if let (Some(svc), Some(eid)) = (execution_service.as_ref(), execution_id) {
@@ -1589,8 +1605,18 @@ pub async fn process_webhook_events(
             continue; // Skip event, don't return Ok(()) completely
         }
 
-        let job_payload =
-            serde_json::to_vec(&job_request).context("Failed to serialize job request")?;
+        let job_payload = match serde_json::to_vec(&job_request) {
+            Ok(p) => p,
+            Err(e) => {
+                // RFC 0010 P3 (M4): reclaim the seal on this (practically
+                // unreachable) serialize failure too, for parity with the
+                // sign/publish discards.
+                if let Some(h) = &sealing_handle {
+                    h.in_flight.discard(job_id);
+                }
+                return Err(anyhow::Error::new(e).context("Failed to serialize job request"));
+            }
+        };
 
         // Fallback to standard topic for generic deployments,
         // or route dynamically via edge node env var.
@@ -1672,6 +1698,11 @@ pub async fn process_webhook_events(
                 }
             }
             Err(e) => {
+                // RFC 0010 P3 (M4): fire-and-forget publish failed — reclaim
+                // the registered seal (belt-and-braces with the TTL sweep).
+                if let Some(h) = &sealing_handle {
+                    h.in_flight.discard(job_id);
+                }
                 tracing::error!("❌ Failed to publish job {} to NATS: {}", job_id, e);
                 let err_str = format!("Failed to publish job to worker: {}", e);
 

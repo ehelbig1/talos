@@ -51,6 +51,13 @@ pub struct WebhookRouter {
     /// Optional Redis-backed deduplication. When present, identical webhook deliveries
     /// (same trigger + same payload fingerprint) within the 1-hour window are suppressed.
     dedup: Option<std::sync::Arc<talos_idempotency::WebhookDeduplication>>,
+    /// RFC 0010 P3 (M4): the shared claim-based-sealing handle, injected by the
+    /// controller when `TALOS_ENVELOPE_SEALING` is on (audit/required) and an
+    /// Ed25519 signing key is configured. `Some` drives both dispatch sites
+    /// (request-reply + DLQ replay) to register plaintext for a worker claim
+    /// instead of shipping a WSK envelope that `required` refuses. `None` keeps
+    /// the inline envelope path (byte-identical to pre-M4).
+    sealing_handle: Option<talos_integration_helpers::ModuleSealingHandle>,
 }
 
 impl WebhookRouter {
@@ -75,6 +82,7 @@ impl WebhookRouter {
         event_sender: tokio::sync::broadcast::Sender<ExecutionEvent>,
         dlq_event_sender: tokio::sync::broadcast::Sender<talos_engine::events::DlqEvent>,
         dedup: Option<std::sync::Arc<talos_idempotency::WebhookDeduplication>>,
+        sealing_handle: Option<talos_integration_helpers::ModuleSealingHandle>,
     ) -> anyhow::Result<Self> {
         let dlq_service = DlqService::new(db_pool.clone(), dlq_event_sender);
         Ok(Self {
@@ -90,6 +98,7 @@ impl WebhookRouter {
             event_sender,
             dlq_service,
             dedup,
+            sealing_handle,
         })
     }
 
@@ -1067,6 +1076,8 @@ impl WebhookRouter {
             let registry = self.registry.clone();
             let nats = self.nats_client.clone();
             let secrets_manager = self.secrets_manager.clone();
+            // RFC 0010 P3 (M4): claim-based sealing handle for this dispatch.
+            let sealing_handle = self.sealing_handle.clone();
             let worker_shared_key_clone = self.worker_shared_key.clone();
             // Result verify-ring (current + staged WORKER_SHARED_KEY_PREVIOUS)
             // so this webhook reply-inbox primary verifier accepts a result
@@ -1108,17 +1119,20 @@ impl WebhookRouter {
                     // hazard. Same logging discipline as the helper
                     // (DEBUG on common-case missing LLM keys, WARN on
                     // shared-key or encryption failure).
-                    let encrypted_secrets =
-                        talos_integration_helpers::build_dispatch_encrypted_secrets(
-                            Some(&secrets_manager),
-                            module_id,
-                            user_id,
-                            // L-1: AAD = job_id (= workflow_execution_id
-                            // below). The worker's decrypt AAD will be
-                            // pulled from `workflow_execution_id`.
-                            job_id,
-                        )
-                        .await;
+                    // RFC 0010 P3 (M4): under claim-based sealing register the
+                    // plaintext for a worker claim (`sealing = SEALING_CLAIM_ECIES`);
+                    // otherwise build the inline WSK envelope. L-1: AAD = job_id
+                    // (= workflow_execution_id below) on the inline path.
+                    let delivery = talos_integration_helpers::prepare_module_dispatch_secrets(
+                        Some(&secrets_manager),
+                        module_id,
+                        user_id,
+                        job_id,
+                        sealing_handle.as_ref(),
+                    )
+                    .await;
+                    // Placeholder secret-delivery fields; `delivery.apply_to`
+                    // below writes all four in one drift-proof mapping.
                     let mut req = talos_workflow_job_protocol::JobRequest {
                         crypto_scheme: 0,
                         sealing: 0,
@@ -1128,7 +1142,7 @@ impl WebhookRouter {
                         workflow_execution_id: job_id, // Standalone webhook uses same ID
                         module_uri: exec_info.module_uri,
                         input_payload,
-                        encrypted_secrets,
+                        encrypted_secrets: talos_workflow_job_protocol::EncryptedSecrets::empty(),
                         timeout_ms: 3_000,
                         allowed_hosts: exec_info.allowed_hosts,
                         allowed_methods: exec_info.allowed_methods,
@@ -1165,6 +1179,7 @@ impl WebhookRouter {
                         actor_id: resolved_actor,
                         user_id,
                     };
+                    delivery.apply_to(&mut req);
 
                     // RFC 0010 P1: prefer the configured Ed25519 dispatch signer;
                     // else the legacy HMAC path.
@@ -1251,6 +1266,15 @@ impl WebhookRouter {
                 }
             })
             .await;
+
+            // RFC 0010 P3 (M4): this path is request/reply — the worker claimed
+            // its sealed secrets DURING the request above. `discard` after the
+            // join reclaims the entry on any outcome where the worker never
+            // claimed (timeout / publish error / task panic); it's a no-op when
+            // the claim already took it. Belt-and-braces with the TTL sweep.
+            if let Some(h) = &self.sealing_handle {
+                h.in_flight.discard(job_id);
+            }
 
             // MCP-961 sibling: saturating u128→i32 conversion. Pre-fix
             // `as i32` wrapped for durations > i32::MAX ms (~24.8 days).
@@ -2579,6 +2603,8 @@ impl WebhookRouter {
             let registry = self.registry.clone();
             let nats = self.nats_client.clone();
             let secrets_manager = self.secrets_manager.clone();
+            // RFC 0010 P3 (M4): claim-based sealing handle for this DLQ replay.
+            let sealing_handle = self.sealing_handle.clone();
             let worker_shared_key_clone = self.worker_shared_key.clone();
             let user_id = trigger.user_id;
 
@@ -2631,6 +2657,21 @@ impl WebhookRouter {
                     }
                 };
 
+                // RFC 0010 P3 (M4): under claim-based sealing register the
+                // plaintext for a worker claim; otherwise the inline WSK
+                // envelope (L-1: AAD = job_id = workflow_execution_id). Same
+                // helper both dispatch sites share, so they can't drift.
+                let delivery = talos_integration_helpers::prepare_module_dispatch_secrets(
+                    Some(&secrets_manager),
+                    module_id,
+                    user_id,
+                    job_id,
+                    sealing_handle.as_ref(),
+                )
+                .await;
+
+                // Placeholder secret-delivery fields; `delivery.apply_to`
+                // below writes all four in one drift-proof mapping.
                 let mut req = talos_workflow_job_protocol::JobRequest {
                     crypto_scheme: 0,
                     sealing: 0,
@@ -2640,23 +2681,7 @@ impl WebhookRouter {
                     workflow_execution_id: job_id,
                     module_uri: exec_info.module_uri,
                     input_payload: wrapped_input,
-                    // MCP-1144 (2026-05-16): canonical helper. The
-                    // MCP-1143 fix mirrored the live path's inline
-                    // composition here; MCP-1144 collapses both into
-                    // `talos_integration_helpers::build_dispatch_encrypted_secrets`
-                    // so neither site can drift from the other in the
-                    // future. Module-declared secrets PLUS host-reserved
-                    // LLM keys; MCP-589 user-scoping.
-                    encrypted_secrets: talos_integration_helpers::build_dispatch_encrypted_secrets(
-                        Some(&secrets_manager),
-                        module_id,
-                        user_id,
-                        // L-1: AAD = job_id (= workflow_execution_id
-                        // above). DLQ replay reuses the same id
-                        // shape as the live path.
-                        job_id,
-                    )
-                    .await,
+                    encrypted_secrets: talos_workflow_job_protocol::EncryptedSecrets::empty(),
                     timeout_ms: 3_000,
                     allowed_hosts: exec_info.allowed_hosts,
                     allowed_methods: exec_info.allowed_methods,
@@ -2685,6 +2710,7 @@ impl WebhookRouter {
                     actor_id: resolved_actor,
                     user_id,
                 };
+                delivery.apply_to(&mut req);
 
                 // RFC 0010 P1: prefer the configured Ed25519 dispatch signer.
                 let sign_result = match talos_workflow_job_protocol::configured_dispatch_signer() {
@@ -2694,6 +2720,10 @@ impl WebhookRouter {
                         .map(|key| req.sign(key.as_bytes())),
                 };
                 if let Some(Err(e)) = sign_result {
+                    // RFC 0010 P3 (M4): reclaim the registered seal — dead dispatch.
+                    if let Some(h) = &sealing_handle {
+                        h.in_flight.discard(job_id);
+                    }
                     tracing::error!(trigger_id = %trigger_id, "DLQ replay: sign failed: {}", e);
                     return;
                 }
@@ -2701,6 +2731,9 @@ impl WebhookRouter {
                 let payload = match serde_json::to_vec(&req) {
                     Ok(p) => p,
                     Err(e) => {
+                        if let Some(h) = &sealing_handle {
+                            h.in_flight.discard(job_id);
+                        }
                         tracing::error!(trigger_id = %trigger_id, "DLQ replay: serialize failed: {}", e);
                         return;
                     }
@@ -2714,6 +2747,12 @@ impl WebhookRouter {
                 };
 
                 if let Err(e) = nats.publish(topic, payload.into()).await {
+                    // RFC 0010 P3 (M4): fire-and-forget publish failed — the
+                    // worker never received the job, so reclaim the seal now
+                    // (belt-and-braces with the TTL sweep).
+                    if let Some(h) = &sealing_handle {
+                        h.in_flight.discard(job_id);
+                    }
                     tracing::error!(trigger_id = %trigger_id, "DLQ replay: NATS publish failed: {}", e);
                 } else {
                     tracing::info!(trigger_id = %trigger_id, job_id = %job_id, "DLQ replay dispatched");
