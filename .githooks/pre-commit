@@ -51,7 +51,31 @@ if [ -n "$STAGED_MIGRATIONS" ]; then
     exit 1
 fi
 
-# 4. Verify Rust compiles (quick check)
+# 4. Personal-information tripwire (PUBLIC repo).
+# Blocks staged ADDED lines matching any pattern in the operator-local file
+# `<git-common-dir>/info/personal-markers` (one case-insensitive fixed string
+# per line, `#` comments allowed). The file lives INSIDE .git so it is
+# uncommittable by construction — the repo never learns the terms it guards
+# (names, employers, clients, personal emails, tenant ids). Absent file =
+# check skipped, so public contributors are unaffected. Shared across git
+# worktrees via git-common-dir.
+MARKER_FILE="$(git rev-parse --git-common-dir)/info/personal-markers"
+if [ -f "$MARKER_FILE" ]; then
+    MARKER_PATTERNS=$(grep -v '^\s*#' "$MARKER_FILE" | grep -v '^\s*$' || true)
+    if [ -n "$MARKER_PATTERNS" ]; then
+        PI_HITS=$(git diff --cached -U0 | grep '^+' | grep -v '^+++' \
+            | grep -i -F -f <(echo "$MARKER_PATTERNS") || true)
+        if [ -n "$PI_HITS" ]; then
+            echo "ERROR: staged changes contain personal-information markers (this repo is PUBLIC):"
+            echo "$PI_HITS" | head -10
+            echo "  Remove the personal data (use example.com placeholders) before committing."
+            echo "  Marker list: $MARKER_FILE (local-only, never committed)."
+            exit 1
+        fi
+    fi
+fi
+
+# 5. Verify Rust compiles (quick check)
 if [ -n "$STAGED_RS" ]; then
     echo "Checking Rust compilation..."
     cargo check --workspace 2>/dev/null || {
