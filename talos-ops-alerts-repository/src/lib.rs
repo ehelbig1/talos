@@ -116,6 +116,9 @@ pub struct OpsAlertRow {
     pub occurrence_count: i32,
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
+    /// Set when the alert re-fired AFTER being resolved (regression); the
+    /// most recent such moment. NULL = never reopened.
+    pub reopened_at: Option<DateTime<Utc>>,
 }
 
 /// Filters for [`OpsAlertRepository::list`]. All optional; `limit` is clamped
@@ -241,7 +244,11 @@ impl OpsAlertRepository {
                 status     = CASE WHEN ops_alerts.status = 'resolved'
                                   THEN 'new' ELSE ops_alerts.status END,
                 resolved_at = CASE WHEN ops_alerts.status = 'resolved'
-                                   THEN NULL ELSE ops_alerts.resolved_at END
+                                   THEN NULL ELSE ops_alerts.resolved_at END,
+                -- Stamp the reopen moment; resolved_at is cleared above so
+                -- this column is the only durable evidence of a regression.
+                reopened_at = CASE WHEN ops_alerts.status = 'resolved'
+                                   THEN NOW() ELSE ops_alerts.reopened_at END
             RETURNING id, occurrence_count, (SELECT status FROM prev) AS prev_status
             "#,
         )
@@ -285,7 +292,7 @@ impl OpsAlertRepository {
             SELECT id, source, external_id, dedup_key, title, resource,
                    severity_raw, severity, triage_source, triage_confidence,
                    corrected_severity, status, occurrence_count,
-                   first_seen, last_seen
+                   first_seen, last_seen, reopened_at
             FROM ops_alerts
             WHERE user_id = $1
               AND ($2::text IS NULL OR status = $2)
@@ -323,6 +330,7 @@ impl OpsAlertRepository {
                     occurrence_count: r.try_get("occurrence_count")?,
                     first_seen: r.try_get("first_seen")?,
                     last_seen: r.try_get("last_seen")?,
+                    reopened_at: r.try_get::<Option<_>, _>("reopened_at")?,
                 })
             })
             .collect()
@@ -422,12 +430,16 @@ impl OpsAlertRepository {
         .fetch_all(&self.db_pool)
         .await?;
         let scalars = sqlx::query(
+            // `reopened_at IS NOT NULL` is the precise regression signal
+            // (stamped by the ingest upsert the moment a resolved row
+            // reopens). The first-cut heuristic (`occurrence_count > 1 AND
+            // …`) counted bumped-while-new rows as "reopened" — observed
+            // live 2026-07-17 reporting 4 reopens on never-resolved alerts.
             "SELECT \
                COUNT(*) FILTER (WHERE status = 'new' \
                                 AND first_seen >= NOW() - INTERVAL '24 hours') AS new_24h, \
                COUNT(*) FILTER (WHERE status <> 'resolved' \
-                                AND occurrence_count > 1 AND resolved_at IS NULL \
-                                AND acked_at IS NULL AND first_seen < last_seen) AS reopened \
+                                AND reopened_at IS NOT NULL) AS reopened \
              FROM ops_alerts WHERE user_id = $1",
         )
         .bind(user_id)

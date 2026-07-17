@@ -117,17 +117,34 @@ fn classify(m: &Message, include_generic: bool) -> Option<Parsed> {
     }
 
     // ── AWS Health / notifications ──────────────────────────────────
-    if from.contains("aws-marketing") || from.contains("amazonaws") || from.contains("aws.amazon")
+    // Sender-DOMAIN checks miss AWS mail relayed through a Google Group
+    // ("'Amazon Web Services' via <group>" — the From domain is the
+    // group's, not Amazon's; observed live 2026-07-17). Also match the
+    // display NAME and the AWS Health envelope marker in the snippet.
+    if from.contains("aws-marketing")
+        || from.contains("amazonaws")
+        || from.contains("aws.amazon")
+        || from.contains("amazon web services")
+        || snippet_lc.contains("aws health event")
     {
         let action_required =
             subject_lc.contains("action may be required") || subject_lc.contains("action required");
+        // "[URGENT] [ACTION REQUIRED]" (e.g. imminent scheduled maintenance)
+        // outranks a plain action-may-be-required notice.
+        let urgent = subject_lc.contains("urgent");
         return Some(Parsed {
             source: "aws-health-email",
             dedup_key: format!("aws|{}", norm_key(subject)),
             title: subject.to_string(),
             resource: String::new(),
             external_id: String::new(),
-            severity_hint: if action_required { "medium" } else { "info" },
+            severity_hint: if urgent {
+                "high"
+            } else if action_required {
+                "medium"
+            } else {
+                "info"
+            },
         });
     }
 
