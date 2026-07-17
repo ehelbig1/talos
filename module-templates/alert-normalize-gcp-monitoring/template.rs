@@ -28,8 +28,15 @@ use talos_sdk_macros::talos_module;
 struct Envelope {
     #[serde(default)]
     config: Config,
+    // GCP watch dispatch shape: {config, data: {incident, incident_id, state}}.
     #[serde(default)]
     data: Option<Data>,
+    // Inbound-webhook shape: {config, input: <posted body>} — the router
+    // wraps the raw POST body under `input` (trigger-input escape-hatch
+    // pattern, DX pain point #13). Lets a plain webhook stand in for the
+    // Pub/Sub watch (e.g. before a public push endpoint exists).
+    #[serde(default)]
+    input: Option<Data>,
     // Tolerate the incident arriving at the top level (direct testing).
     #[serde(default)]
     incident: Option<Incident>,
@@ -55,6 +62,11 @@ struct Data {
 
 #[derive(serde::Deserialize, Default)]
 struct Incident {
+    // Fallback when the caller didn't hoist incident_id to the data
+    // level (webhook-shaped input; the GCP watch dispatch hoists it,
+    // tolerating id-as-number — inside the incident body it's a string).
+    #[serde(default)]
+    incident_id: String,
     #[serde(default)]
     policy_name: String,
     #[serde(default)]
@@ -113,8 +125,8 @@ fn severity_hint(policy_severity: &str) -> &'static str {
 fn run(input: String) -> Result<String, String> {
     let env: Envelope = serde_json::from_str(&input).map_err(|e| e.to_string())?;
 
-    let (incident, top_incident_id, top_state) = match env.data {
-        Some(d) => (d.incident, d.incident_id, d.state),
+    let (incident, top_incident_id, top_state) = match env.data.or(env.input) {
+        Some(d) => (d.incident.or(env.incident), d.incident_id, d.state),
         None => (env.incident, String::new(), String::new()),
     };
     let Some(inc) = incident else {
@@ -133,7 +145,11 @@ fn run(input: String) -> Result<String, String> {
     } else {
         top_state
     };
-    let incident_id = top_incident_id;
+    let incident_id = if top_incident_id.is_empty() {
+        inc.incident_id.clone()
+    } else {
+        top_incident_id
+    };
 
     if state == "closed" && !env.config.include_closed {
         return Ok(serde_json::json!({
