@@ -1320,7 +1320,12 @@ impl ModuleExecutionService {
         let output_data = output_data.map(|v| talos_dlp_provider::redact_json(&v));
 
         // $1 = output_data, $2 = execution_id
-        sqlx::query(
+        //
+        // RETURNING actor_id serves the `__ops_alert__` chokepoint below: a
+        // row comes back ONLY when this call actually transitioned the
+        // execution (the status guard filters replays/late duplicates), and
+        // it carries the actor whose tenancy the ingest resolves against.
+        let transitioned = sqlx::query(
             r#"
             UPDATE module_executions
             SET
@@ -1328,13 +1333,37 @@ impl ModuleExecutionService {
                 output_data = $1,
                 completed_at = NOW()
             WHERE id = $2 AND status IN ('pending', 'running')
+            RETURNING actor_id
             "#,
         )
-        .bind(output_data)
+        .bind(&output_data)
         .bind(execution_id)
-        .execute(&self.db_pool)
+        .fetch_optional(&self.db_pool)
         .await
         .context("Failed to complete execution from worker result")?;
+
+        // `__ops_alert__` protocol for MODULE-BOUND dispatches (GCP
+        // Monitoring Pub/Sub, Gmail/GCal watches, inbound webhooks, the
+        // fire-and-forget `talos.results.*` subscriber): every such result
+        // funnels through this method, making it the sibling chokepoint of
+        // the engine's node hook. Engine-dispatched workflow nodes never
+        // reach here (request-reply → engine hook), so an envelope is
+        // ingested exactly once. Gated on the transition (no replay
+        // double-bumps) and on envelope presence (zero cost otherwise).
+        if let Some(row) = transitioned {
+            if let Some(ref output) = output_data {
+                if talos_ops_alerts_repository::envelope::output_has_envelope(output) {
+                    use sqlx::Row as _;
+                    let actor_id = row.try_get::<Option<Uuid>, _>("actor_id")?;
+                    talos_ops_alerts_repository::envelope::spawn_ingest_from_output(
+                        self.db_pool.clone(),
+                        actor_id,
+                        output,
+                        "module_result",
+                    );
+                }
+            }
+        }
 
         tracing::debug!("Worker completed module execution {}", execution_id);
         Ok(())

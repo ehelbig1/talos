@@ -1,0 +1,25 @@
+{
+  "name": "alert-normalize-gcp-monitoring",
+  "version": "v1.0.0",
+  "display_name": "Alert Normalize (GCP Monitoring)",
+  "description": "Normalize a Cloud Monitoring incident (delivered via the google_cloud Pub/Sub push watch) into the ops-alerts triage store. Emits the __ops_alert__ envelope — dedup on policy+resource so a re-firing condition bumps/reopens one rolling alert instead of creating a row per incident; severity mapped from the alert policy's severity (CRITICAL→critical, ERROR→high, WARNING→medium). Closed-state notifications are skipped by default (INCLUDE_CLOSED). Bind this module to a GCP Monitoring watch channel; triage via list_ops_alerts / correct_ops_alert_severity.",
+  "category": "Operations",
+  "capability_world": "minimal-node",
+  "allowed_hosts": [],
+  "requires_secrets": [],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "SOURCE_PREFIX": {
+        "type": "string",
+        "default": "",
+        "description": "Optional prefix for the emitted source label (e.g. 'sandbox-' → 'sandbox-gcp-monitoring')"
+      },
+      "INCLUDE_CLOSED": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, state=closed notifications are ALSO ingested (they bump the rolling alert and will REOPEN it if an operator already resolved it — usually not what you want). Default skips them; resolve alerts at triage time instead."
+      }
+    }
+  }
+}

@@ -3,8 +3,11 @@
 //! and tenancy-posture rationale).
 //!
 //! Ownership: ALL SQL against `ops_alerts` lives here (repository-per-domain
-//! mandate). Writers: the engine's `__ops_alert__` node hook (ingest) and the
-//! MCP triage surface (ack/resolve/correct). Readers: MCP list/digest tools.
+//! mandate), and so does the `__ops_alert__` envelope protocol itself
+//! ([`envelope`]). Writers: the engine's `__ops_alert__` node hook and the
+//! module-result completion chokepoint (both delegating to
+//! [`envelope::spawn_ingest_from_output`]) plus the MCP triage surface
+//! (ack/resolve/correct). Readers: MCP list/digest tools.
 //!
 //! Invariants this crate enforces (not the callers):
 //! * **Dedup bump never clobbers triage.** `ingest` upserts on
@@ -25,6 +28,8 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
+
+pub mod envelope;
 
 /// Severity labels a triage path may assign. `unclassified` is the ingest
 /// default and deliberately NOT assignable by [`OpsAlertRepository::correct_severity`] /

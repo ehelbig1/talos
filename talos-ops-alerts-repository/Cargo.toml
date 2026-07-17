@@ -11,7 +11,16 @@ anyhow.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+# envelope.rs — the shared `__ops_alert__` ingest core (parse → cap →
+# DLP → tenancy → ingest) consumed by the engine node hook AND the
+# module-result completion chokepoint. Domain crate owns the protocol
+# semantics, mirroring talos-memory.
+talos-actor-repository = { path = "../talos-actor-repository" }
+talos-dlp-provider = { path = "../talos-dlp-provider" }
+talos-metrics = { path = "../talos-metrics" }
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 thiserror = "2.0"
+tokio = { version = "1", features = ["rt"] }
 tracing.workspace = true
 uuid.workspace = true
 
