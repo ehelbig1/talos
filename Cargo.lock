@@ -8238,6 +8238,7 @@ dependencies = [
  "talos-ml",
  "talos-module-repository",
  "talos-oauth",
+ "talos-ops-alerts-repository",
  "talos-rate-limit",
  "talos-registry",
  "talos-replay-diff",

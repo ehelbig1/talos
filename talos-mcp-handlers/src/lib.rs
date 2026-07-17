@@ -162,6 +162,7 @@ pub mod knowledge_graph;
 pub mod ml;
 pub mod modules;
 pub mod ollama;
+pub mod ops_alerts;
 pub mod platform;
 pub mod resources;
 pub mod sandbox;
@@ -906,6 +907,7 @@ pub(crate) fn static_tool_count() -> usize {
             + graph::tool_schemas().len()
             + knowledge_graph::tool_schemas().len()
             + alerts::tool_schemas().len()
+            + ops_alerts::tool_schemas().len()
             + schemas::tool_schemas().len()
             + ollama::tool_schemas().len()
             + ml::tool_schemas().len()
@@ -1068,6 +1070,7 @@ async fn handle_tools_list(
         graph::tool_schemas(),
         knowledge_graph::tool_schemas(),
         alerts::tool_schemas(),
+        ops_alerts::tool_schemas(),
         schemas::tool_schemas(),
         ollama::tool_schemas(),
         ml::tool_schemas(),
@@ -1268,6 +1271,10 @@ async fn handle_tools_call(
         return decorate(r);
     }
     if let Some(r) = alerts::dispatch(name, req.id.clone(), &args, &state, agent.clone()).await {
+        return decorate(r);
+    }
+    if let Some(r) = ops_alerts::dispatch(name, req.id.clone(), &args, &state, agent.clone()).await
+    {
         return decorate(r);
     }
     if let Some(r) =
