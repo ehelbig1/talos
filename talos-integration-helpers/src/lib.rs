@@ -60,86 +60,17 @@ use uuid::Uuid;
 /// straight through at wiring time.
 pub use talos_envelope_seal::EnvelopeSealingHandle as ModuleSealingHandle;
 
-/// Build the `encrypted_secrets` payload for a module-bound webhook
-/// dispatch (Gmail push, Google-Calendar push, generic webhook).
-///
-/// Mirrors the canonical pattern in
-/// `ParallelWorkflowEngine::build_encrypted_secrets`:
-///   1. Pull the module's authorised secrets (`allowed_modules` ∋ module_id).
-///   2. Layer in the LLM provider keys for `user_id` so
-///      `talos::core::llm::*` host functions resolve. Module-declared
-///      keys win on conflict (`HashMap::entry(...).or_insert`).
-///   3. AES-256-GCM-encrypt the merged map under
-///      `WORKER_SHARED_KEY` for transport on the wire.
-///
-/// Returns `EncryptedSecrets::empty()` (empty ciphertext) when:
-///   * `secrets_manager` is `None` (dev/bootstrap path),
-///   * `WORKER_SHARED_KEY` is not configured, or
-///   * encryption itself fails.
-///
-/// All three paths are logged but non-fatal — the dispatch still
-/// publishes a job; the worker simply won't see secrets. This
-/// matches the `Default::default()` behaviour the call sites had
-/// before the LLM-keys gap was discovered, except now the typical
-/// production case (manager present, shared key configured)
-/// actually populates the field.
-///
-/// `Zeroizing<String>` from the LLM-keys cache is cloned at the map
-/// boundary into a plain `String`; the cache copy zeroizes when
-/// `llm_keys` is dropped at the end of this function.
-/// L-1 (2026-05-22): the `execution_id` parameter is bound as AEAD
-/// AAD on the AES-GCM tag — the worker decrypts with the same AAD
-/// pulled from `JobRequest.workflow_execution_id`. Callers MUST pass
-/// the SAME `execution_id` they will set on the JobRequest;
-/// otherwise the worker's tag check fails and the dispatch errors
-/// with "decryption failed".
-pub async fn build_dispatch_encrypted_secrets(
-    secrets_manager: Option<&Arc<SecretsManager>>,
-    module_id: Uuid,
-    user_id: Uuid,
-    execution_id: Uuid,
-) -> EncryptedSecrets {
-    let Some(sm) = secrets_manager else {
-        tracing::debug!(
-            module_id = %module_id,
-            "encrypted_secrets skipped: SecretsManager unavailable in dispatch context"
-        );
-        return EncryptedSecrets::empty();
-    };
-
-    let Ok(key) = talos_workflow_job_protocol::load_worker_shared_key() else {
-        tracing::warn!(
-            module_id = %module_id,
-            "encrypted_secrets skipped: WORKER_SHARED_KEY not configured"
-        );
-        return EncryptedSecrets::empty();
-    };
-
-    let secrets_map = resolve_dispatch_secrets_map(sm, module_id, user_id).await;
-
-    // L-1: bind execution_id as AEAD AAD on the AES-GCM tag — the
-    // worker decrypts with the same AAD pulled from
-    // `JobRequest.workflow_execution_id`. Empty secrets_map still
-    // returns `EncryptedSecrets::empty()` (empty ciphertext +
-    // empty nonce) — that path bypasses AAD entirely on both sides.
-    match EncryptedSecrets::encrypt_with_aad(&secrets_map, key.as_bytes(), execution_id.as_bytes())
-    {
-        Ok(es) => es,
-        Err(e) => {
-            tracing::warn!(
-                module_id = %module_id,
-                error = %e,
-                "Failed to encrypt dispatch secrets — proceeding without them"
-            );
-            EncryptedSecrets::empty()
-        }
-    }
-}
+// `build_dispatch_encrypted_secrets` (the sealing-UNAWARE inline-envelope
+// builder) was DELETED 2026-07-17: after the GCP dispatch — the one sibling
+// the M4 sweep missed, caught live when the first real Pub/Sub push was
+// refused under `required` — moved to `prepare_module_dispatch_secrets`,
+// it had zero callers. Removing it makes the miss unrepresentable: every
+// module-bound dispatch MUST now go through the sealing-aware entry point.
 
 /// Resolve the PLAINTEXT merged secrets map for a module-bound dispatch — the
 /// module's authorised secrets layered with the user's LLM provider keys
 /// (module-declared keys win on conflict). This is the pre-encryption step
-/// factored out of [`build_dispatch_encrypted_secrets`] so the claim-based
+/// factored out of the (since-deleted) inline-envelope builder so the claim-based
 /// sealing path ([`prepare_module_dispatch_secrets`]) can register the same
 /// values in `InFlightSeals` instead of AES-GCM-encrypting them under the
 /// worker shared key. The returned map is the caller's responsibility to
@@ -264,8 +195,8 @@ impl DispatchSecretDelivery {
 ///
 /// `execution_id` MUST equal the `JobRequest.job_id` / `workflow_execution_id`
 /// the caller sets (the worker's `SecretClaim` keys on it), and — on the inline
-/// path — is bound as AES-GCM AAD, exactly as `build_dispatch_encrypted_secrets`
-/// requires.
+/// path — is bound as AES-GCM AAD (the worker decrypts with the AAD pulled from
+/// `JobRequest.workflow_execution_id`).
 pub async fn prepare_module_dispatch_secrets(
     secrets_manager: Option<&Arc<SecretsManager>>,
     module_id: Uuid,
