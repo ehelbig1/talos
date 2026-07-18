@@ -86,7 +86,7 @@ Unknown top-level keys are ignored.
   //   "foreach"       | "wait"            | "sub_workflow"   | "loop"
   //   "while_loop"    | "repeat_loop"     | "fan_in"         | "error_handler"
   //   "collect"       | "synthesize"      | "verify"         |
-  //   "dispatch"      | "capability_dispatch"
+  //   "dispatch"      | "capability_dispatch" | "ops_alerts_digest"
   //
   // LLM-flavored kinds (gated by the `llm-primitives` feature, on by
   // default):
@@ -223,6 +223,19 @@ bounds (e.g. `max_iterations` caps at 50 for agent loops).
 // (or omitted). Pair with `synthesize` if you want to transform the
 // collected list before downstream consumption.
 {}
+```
+
+### `ops_alerts_digest`
+```jsonc
+// Controller-side read of the caller's ops-alerts triage store. Emits
+// { available, digest: { active_by_severity, active_by_source,
+//   new_last_24h, reopened_active }, top_active: [ ... ] } as the node
+// output — the canonical feed for daily-brief compose nodes. Executes
+// in the controller (no worker dispatch, no secrets); tenancy comes
+// from the execution's resolved identity, never from this data object.
+// When the store is unreachable the node emits { available: false }
+// instead of failing the workflow.
+{ "top_limit": 10 }   // active alerts included verbatim (1-25, default 10)
 ```
 
 ### `synthesize`

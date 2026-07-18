@@ -317,28 +317,31 @@ impl OpsAlertRepository {
         .fetch_all(&self.db_pool)
         .await?;
 
-        rows.into_iter()
-            .map(|r| -> Result<OpsAlertRow> {
-                Ok(OpsAlertRow {
-                    id: r.try_get("id")?,
-                    source: r.try_get("source")?,
-                    external_id: r.try_get::<Option<_>, _>("external_id")?,
-                    dedup_key: r.try_get("dedup_key")?,
-                    title: r.try_get("title")?,
-                    resource: r.try_get::<Option<_>, _>("resource")?,
-                    severity_raw: r.try_get::<Option<_>, _>("severity_raw")?,
-                    severity: r.try_get("severity")?,
-                    triage_source: r.try_get::<Option<_>, _>("triage_source")?,
-                    triage_confidence: r.try_get::<Option<_>, _>("triage_confidence")?,
-                    corrected_severity: r.try_get::<Option<_>, _>("corrected_severity")?,
-                    status: r.try_get("status")?,
-                    occurrence_count: r.try_get("occurrence_count")?,
-                    first_seen: r.try_get("first_seen")?,
-                    last_seen: r.try_get("last_seen")?,
-                    reopened_at: r.try_get::<Option<_>, _>("reopened_at")?,
-                })
-            })
-            .collect()
+        rows.into_iter().map(Self::row_to_alert).collect()
+    }
+
+    /// Map a full-projection `ops_alerts` row (the SELECT list shared by
+    /// [`Self::list`] and [`Self::list_active_ranked`]) into
+    /// [`OpsAlertRow`]. Fail-loud `try_get` per checks 52/55.
+    fn row_to_alert(r: sqlx::postgres::PgRow) -> Result<OpsAlertRow> {
+        Ok(OpsAlertRow {
+            id: r.try_get("id")?,
+            source: r.try_get("source")?,
+            external_id: r.try_get::<Option<_>, _>("external_id")?,
+            dedup_key: r.try_get("dedup_key")?,
+            title: r.try_get("title")?,
+            resource: r.try_get::<Option<_>, _>("resource")?,
+            severity_raw: r.try_get::<Option<_>, _>("severity_raw")?,
+            severity: r.try_get("severity")?,
+            triage_source: r.try_get::<Option<_>, _>("triage_source")?,
+            triage_confidence: r.try_get::<Option<_>, _>("triage_confidence")?,
+            corrected_severity: r.try_get::<Option<_>, _>("corrected_severity")?,
+            status: r.try_get("status")?,
+            occurrence_count: r.try_get("occurrence_count")?,
+            first_seen: r.try_get("first_seen")?,
+            last_seen: r.try_get("last_seen")?,
+            reopened_at: r.try_get::<Option<_>, _>("reopened_at")?,
+        })
     }
 
     /// Acknowledge a `new` alert. Returns false when the row doesn't exist,
@@ -417,6 +420,43 @@ impl OpsAlertRepository {
     }
 
     /// Digest counts over the user's alerts (see [`OpsAlertDigest`]).
+    /// List ACTIVE (non-resolved) alerts ranked by triage priority:
+    /// severity first (critical > high > medium > unclassified > low >
+    /// info > noise — unclassified sits mid-rank because a human hasn't
+    /// looked yet), then most-recent activity. Powers the
+    /// `ops_alerts_digest` system node's `top_active` section; `limit`
+    /// clamps to [1, 25] (a briefing slice, not a pagination surface —
+    /// use [`Self::list`] for the full triage view).
+    pub async fn list_active_ranked(&self, user_id: Uuid, limit: i64) -> Result<Vec<OpsAlertRow>> {
+        let limit = limit.clamp(1, 25);
+        let rows = sqlx::query(
+            r#"
+            SELECT id, source, external_id, dedup_key, title, resource,
+                   severity_raw, severity, triage_source, triage_confidence,
+                   corrected_severity, status, occurrence_count,
+                   first_seen, last_seen, reopened_at
+            FROM ops_alerts
+            WHERE user_id = $1 AND status <> 'resolved'
+            ORDER BY CASE severity
+                       WHEN 'critical' THEN 0
+                       WHEN 'high' THEN 1
+                       WHEN 'medium' THEN 2
+                       WHEN 'unclassified' THEN 3
+                       WHEN 'low' THEN 4
+                       WHEN 'info' THEN 5
+                       ELSE 6
+                     END,
+                     last_seen DESC, id DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&self.db_pool)
+        .await?;
+        rows.into_iter().map(Self::row_to_alert).collect()
+    }
+
     pub async fn digest(&self, user_id: Uuid) -> Result<OpsAlertDigest> {
         let sev_rows = sqlx::query(
             "SELECT severity, COUNT(*) AS n FROM ops_alerts \

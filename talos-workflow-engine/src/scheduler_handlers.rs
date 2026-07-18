@@ -140,6 +140,113 @@ impl ParallelWorkflowEngine {
         Some(collected)
     }
 
+    /// [`SystemNodeKind::OpsAlertsDigest`] — controller-side read of the
+    /// ops-alerts triage store through the injected
+    /// [`talos_workflow_engine_core::OpsAlertsReader`] port.
+    ///
+    /// Returns `None` when the node is not an `OpsAlertsDigest` system
+    /// node. Otherwise ALWAYS returns `Some(envelope)` — a missing
+    /// reader (out-of-tree consumer), missing tenant identity, or a
+    /// storage error degrade to `{"available": false, "error": …}`
+    /// rather than failing the workflow: the primary consumer is a
+    /// daily-brief compose node, and a briefing without its alerts
+    /// section beats no briefing. Real errors are logged server-side;
+    /// the envelope carries only a generic message (no schema/query
+    /// detail leaks into node output, which is user-visible).
+    ///
+    /// Tenancy: `self.user_id` — the execution's resolved identity
+    /// (set via actor binding at engine build), never node config.
+    pub(crate) async fn try_dispatch_ops_alerts_digest(
+        &self,
+        node_id: Uuid,
+        execution_id: Uuid,
+    ) -> Option<JsonValue> {
+        let (_, _, Some(SystemNodeKind::OpsAlertsDigest { top_limit })) =
+            self.node_meta.get(&node_id)?
+        else {
+            return None;
+        };
+        let top_limit = *top_limit;
+
+        let unavailable = |reason: &str| {
+            serde_json::json!({
+                "available": false,
+                "error": reason,
+            })
+        };
+
+        let Some(reader) = self.ops_alerts_reader.clone() else {
+            tracing::warn!(
+                %node_id,
+                "ops_alerts_digest: no OpsAlertsReader wired — emitting unavailable envelope"
+            );
+            self.emit_node_lifecycle_events(
+                execution_id,
+                node_id,
+                "Completed",
+                "ops-alerts digest unavailable (reader not wired)".to_string(),
+            );
+            return Some(unavailable(
+                "ops-alerts store not available in this deployment",
+            ));
+        };
+        let Some(user_id) = self.user_id else {
+            tracing::warn!(
+                %node_id,
+                "ops_alerts_digest: execution has no resolved user identity — emitting \
+                 unavailable envelope"
+            );
+            self.emit_node_lifecycle_events(
+                execution_id,
+                node_id,
+                "Completed",
+                "ops-alerts digest unavailable (no tenant identity)".to_string(),
+            );
+            return Some(unavailable("execution has no tenant identity"));
+        };
+
+        // Defensive timeout so a stalled store can't wedge the reactor
+        // (the injected impl's pool has its own timeouts; this is the
+        // engine-side backstop).
+        const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        let output =
+            match tokio::time::timeout(READ_TIMEOUT, reader.snapshot(user_id, top_limit)).await {
+                Ok(Ok(mut snapshot)) => {
+                    if let Some(obj) = snapshot.as_object_mut() {
+                        obj.insert("available".to_string(), serde_json::json!(true));
+                    }
+                    self.emit_node_lifecycle_events(
+                        execution_id,
+                        node_id,
+                        "Completed",
+                        format!("ops-alerts digest fetched (top_limit {top_limit})"),
+                    );
+                    snapshot
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(%node_id, error = %e, "ops_alerts_digest: snapshot failed");
+                    self.emit_node_lifecycle_events(
+                        execution_id,
+                        node_id,
+                        "Completed",
+                        "ops-alerts digest unavailable (storage error)".to_string(),
+                    );
+                    unavailable("ops-alerts read failed")
+                }
+                Err(_) => {
+                    tracing::warn!(%node_id, "ops_alerts_digest: snapshot timed out");
+                    self.emit_node_lifecycle_events(
+                        execution_id,
+                        node_id,
+                        "Completed",
+                        "ops-alerts digest unavailable (timeout)".to_string(),
+                    );
+                    unavailable("ops-alerts read timed out")
+                }
+            };
+        Some(output)
+    }
+
     /// [`SystemNodeKind::Synthesize`] — collect parent outputs, then
     /// (optionally) transform the collected value through a Rhai
     /// expression.

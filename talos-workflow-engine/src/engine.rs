@@ -726,6 +726,13 @@ pub struct ParallelWorkflowEngine {
     /// In production writes to `execution_approvals`; tests can plug
     /// in an auto-approve or auto-deny impl.
     pub(crate) approval_gate: Option<Arc<dyn talos_workflow_engine_core::ApprovalGate>>,
+    /// Read-side port for the ops-alerts triage store — powers the
+    /// `ops_alerts_digest` system node (controller-side read; the
+    /// store is deliberately not reachable from workers). `None`
+    /// (out-of-tree consumers / tests without a store) makes the
+    /// node emit an unavailable-envelope rather than failing the
+    /// workflow.
+    pub(crate) ops_alerts_reader: Option<Arc<dyn talos_workflow_engine_core::OpsAlertsReader>>,
     /// Seals per-dispatch plaintext secrets into the opaque
     /// `(ciphertext, nonce)` pair forwarded on the wire. Defaults to
     /// [`talos_workflow_job_protocol::AesGcmSecretEnvelope`] — a
@@ -846,6 +853,7 @@ pub struct AdapterSet {
     retry_classifier: Option<Arc<dyn talos_workflow_engine_core::RetryClassifier>>,
     module_execution_store: Option<Arc<dyn talos_workflow_engine_core::ModuleExecutionStore>>,
     approval_gate: Option<Arc<dyn talos_workflow_engine_core::ApprovalGate>>,
+    ops_alerts_reader: Option<Arc<dyn talos_workflow_engine_core::OpsAlertsReader>>,
     secret_envelope: Arc<dyn talos_workflow_engine_core::SecretEnvelope>,
     user_id: Option<Uuid>,
     actor_id: Option<Uuid>,
@@ -914,6 +922,7 @@ impl AdapterSet {
         engine.retry_classifier = self.retry_classifier;
         engine.module_execution_store = self.module_execution_store;
         engine.approval_gate = self.approval_gate;
+        engine.ops_alerts_reader = self.ops_alerts_reader;
         engine.secret_envelope = self.secret_envelope;
         engine.user_id = self.user_id;
         engine.actor_id = self.actor_id;
@@ -1005,6 +1014,7 @@ impl ParallelWorkflowEngine {
             retry_classifier: None,
             module_execution_store: None,
             approval_gate: None,
+            ops_alerts_reader: None,
             secret_envelope: Arc::new(talos_workflow_job_protocol::AesGcmSecretEnvelope),
             sandbox_root: Some(default_sandbox_root().to_path_buf()),
             agent_loop_max_history: DEFAULT_AGENT_LOOP_MAX_HISTORY,
@@ -1406,6 +1416,17 @@ impl ParallelWorkflowEngine {
         self.approval_gate = Some(gate);
     }
 
+    /// Inject the ops-alerts read port (powers the `ops_alerts_digest`
+    /// system node). Wired by the controller engine builder; absent in
+    /// out-of-tree consumers, where the node degrades to an
+    /// unavailable-envelope output.
+    pub fn set_ops_alerts_reader(
+        &mut self,
+        reader: Arc<dyn talos_workflow_engine_core::OpsAlertsReader>,
+    ) {
+        self.ops_alerts_reader = Some(reader);
+    }
+
     /// Replace the default module-execution store. Consumers that
     /// don't have a Postgres-backed module store plug in their own
     /// impl (capture, append log, no-op) here.
@@ -1510,6 +1531,7 @@ impl ParallelWorkflowEngine {
             retry_classifier: self.retry_classifier.clone(),
             module_execution_store: self.module_execution_store.clone(),
             approval_gate: self.approval_gate.clone(),
+            ops_alerts_reader: self.ops_alerts_reader.clone(),
             secret_envelope: self.secret_envelope.clone(),
             user_id: self.user_id,
             actor_id: self.actor_id,
@@ -5201,6 +5223,37 @@ impl ParallelWorkflowEngine {
                 {
                     commit_result!(node_id, output);
                     self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    continue;
+                }
+
+                // ── Ops-alerts digest (controller-side triage-store read) ────
+                //
+                // Async (one injected-reader DB round-trip), output flows
+                // downstream — so it takes the `route_system_node_output`
+                // path like Judge, not the bare `commit_result!` of the
+                // pure-local nodes. No worker dispatch and no secrets:
+                // the `encrypted_secrets` discipline does not apply here
+                // by construction (nothing leaves the controller).
+                if let Some(output) = self
+                    .try_dispatch_ops_alerts_digest(node_id, execution_id)
+                    .await
+                {
+                    let chains_ctx = if is_fresh_run {
+                        Some((chains.as_slice(), &node_to_chain))
+                    } else {
+                        None
+                    };
+                    self.route_system_node_output(
+                        node_idx,
+                        output,
+                        execution_id,
+                        chains_ctx,
+                        &exec_ctx,
+                        &mut results,
+                        &mut pending,
+                        &mut ready,
+                    )
+                    .await?;
                     continue;
                 }
 

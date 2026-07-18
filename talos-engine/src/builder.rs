@@ -71,6 +71,9 @@ pub(super) fn build_controller_engine_registry_only(
     engine.set_event_sink(Arc::new(PostgresEventSink::new(pool.clone())));
     engine.set_node_hook(Arc::new(ControllerNodeHook::new(pool.clone())));
     engine.set_module_execution_store(Arc::new(PostgresModuleExecutionStore::new(pool.clone())));
+    engine.set_ops_alerts_reader(Arc::new(
+        crate::ops_alerts_reader::PostgresOpsAlertsReader::new(pool.clone()),
+    ));
     engine.set_approval_gate(Arc::new(PostgresApprovalGate::new(pool)));
     engine.set_expression_evaluator(Arc::new(RhaiEvaluator::new()));
     engine.set_output_sanitizer(Arc::new(DlpSanitizer::new()));

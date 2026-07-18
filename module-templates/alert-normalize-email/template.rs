@@ -94,7 +94,14 @@ fn classify(m: &Message, include_generic: bool) -> Option<Parsed> {
     let snippet_lc = m.snippet.to_lowercase();
 
     // ── Snyk vulnerability digests ──────────────────────────────────
-    if from.contains("snyk") || subject_lc.contains("[snyk]") {
+    // Sender match alone is NOT enough: Snyk also sends product-marketing
+    // mail from the same domain ("Evo Agentic Developer Security - Let's
+    // Go!" was classified `high` on 2026-07-17 — the first live human
+    // correction, to `noise`). Require the vulnerability-alert subject
+    // shape; other Snyk mail falls through to non-alert.
+    if (from.contains("snyk") || subject_lc.contains("[snyk]"))
+        && subject_lc.contains("vulnerability alert")
+    {
         // Subject shape: "[snyk] Vulnerability alert for the <org> organization"
         let org = subject
             .split("for the ")
