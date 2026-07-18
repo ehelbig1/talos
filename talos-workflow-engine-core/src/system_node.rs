@@ -131,6 +131,15 @@ pub enum SystemNodeKind {
     },
     /// Collect branch outputs without otherwise transforming them.
     Collect,
+    /// Controller-side read of the ops-alerts triage store: digest
+    /// counts over the active set plus the top-N active alerts. Output
+    /// flows downstream as ordinary graph data (feeds daily-brief
+    /// compose nodes). Executes via the injected
+    /// [`crate::OpsAlertsReader`] — no worker dispatch, no secrets.
+    OpsAlertsDigest {
+        /// How many active alerts to include verbatim (clamped 1..=25).
+        top_limit: u32,
+    },
     /// Synthesize a value from prior outputs, optionally via expression.
     Synthesize {
         /// Optional expression building the synthesized value.

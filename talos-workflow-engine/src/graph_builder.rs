@@ -525,6 +525,9 @@ fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue
             }),
         ),
         SystemNodeKind::Collect => ("collect", json!({})),
+        SystemNodeKind::OpsAlertsDigest { top_limit } => {
+            ("ops_alerts_digest", json!({ "top_limit": top_limit }))
+        }
         SystemNodeKind::Synthesize { synthesis_expr } => (
             "synthesize",
             match synthesis_expr {
@@ -1271,6 +1274,34 @@ mod tests {
     async fn system_node_collect_round_trips() {
         let decoded = round_trip_kind("collect_node", SystemNodeKind::Collect).await;
         assert!(matches!(decoded, SystemNodeKind::Collect));
+    }
+
+    #[tokio::test]
+    async fn system_node_ops_alerts_digest_round_trips() {
+        let decoded = round_trip_kind(
+            "ops_digest",
+            SystemNodeKind::OpsAlertsDigest { top_limit: 7 },
+        )
+        .await;
+        assert!(matches!(
+            decoded,
+            SystemNodeKind::OpsAlertsDigest { top_limit: 7 }
+        ));
+
+        // The parser clamps hand-authored out-of-range values (the
+        // builder can't produce them, so round-trip through the raw
+        // parser directly).
+        let oversized = serde_json::json!({
+            "id": "ops_digest_big",
+            "type": "system:ops_alerts_digest",
+            "kind": "ops_alerts_digest",
+            "data": { "top_limit": 9999 },
+        });
+        let parsed = crate::graph_parser::parse_system_node_kind("ops_alerts_digest", &oversized);
+        assert!(matches!(
+            parsed,
+            Some(SystemNodeKind::OpsAlertsDigest { top_limit: 25 })
+        ));
     }
 
     #[tokio::test]

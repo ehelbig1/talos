@@ -53,6 +53,7 @@ const KNOWN_SYSTEM_KINDS_BASE: &[&str] = &[
     "fan_in",
     "error_handler",
     "collect",
+    "ops_alerts_digest",
     "synthesize",
     "verify",
     "dispatch",
