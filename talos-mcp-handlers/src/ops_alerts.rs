@@ -24,7 +24,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "status": { "type": "string", "enum": ["new", "acked", "resolved"], "description": "Filter by lifecycle status (omit for all)" },
+                    "status": { "type": "string", "enum": ["new", "acked", "resolved", "all"], "description": "Filter by lifecycle status. Omitted = ACTIVE only (new + acked — the documented default); 'all' includes resolved." },
                     "severity": { "type": "string", "enum": ["critical", "high", "medium", "low", "info", "noise", "unclassified"], "description": "Filter by triaged severity" },
                     "source": { "type": "string", "description": "Filter by source label (e.g. 'snyk-email')" },
                     "since_hours": { "type": "number", "description": "Only alerts with activity in the last N hours (max 720)" },
@@ -138,8 +138,19 @@ async fn handle_list(
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     };
+    // Omitted status = active-only (the tool description has always
+    // promised this; pre-fix the repo returned ALL statuses — the
+    // description/behavior mismatch from the 2026-07-18 retrospective).
+    // 'all' is the explicit escape hatch.
+    let status_arg = opt_str("status");
+    let (status, exclude_resolved) = match status_arg.as_deref() {
+        None => (None, true),
+        Some("all") => (None, false),
+        Some(_) => (status_arg.clone(), false),
+    };
     let filter = OpsAlertFilter {
-        status: opt_str("status"),
+        status,
+        exclude_resolved,
         severity: opt_str("severity"),
         source: opt_str("source"),
         since,

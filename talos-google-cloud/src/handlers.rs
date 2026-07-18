@@ -1,5 +1,6 @@
 use super::api::GcpApiClient;
 use super::integration::{GoogleCloudIntegrationInfo, GoogleCloudIntegrationService};
+use talos_integration_helpers::api_json::ApiJson;
 
 /// The read- and write-tier OAuth services, bundled as one axum state so the
 /// shared `/api/gcp/callback` can route by the state token's provider and the
@@ -458,7 +459,7 @@ pub struct CreateGcpWatchRequest {
 pub async fn create_watch_channel_handler(
     State(service): State<Arc<GcpWatchService>>,
     Extension(user_id): Extension<Uuid>,
-    Json(req): Json<CreateGcpWatchRequest>,
+    ApiJson(req): ApiJson<CreateGcpWatchRequest>,
 ) -> impl IntoResponse {
     match service
         .create_watch(

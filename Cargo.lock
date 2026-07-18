@@ -8795,6 +8795,7 @@ dependencies = [
  "talos-dlp-provider",
  "talos-http-body",
  "talos-http-utils",
+ "talos-integration-helpers",
  "talos-oauth",
  "talos-secrets-manager",
  "talos-text-util",

@@ -633,6 +633,45 @@ impl FailureAnalysisService {
                     obj.insert("engine_error_class".to_string(), serde_json::json!(ec));
                 }
             }
+
+            // Fuel-exhaustion advisor (2026-07-18 retrospective): the
+            // generic playbook explains the fuel FORMULA but never told
+            // the operator what number to SET — even though the platform
+            // records actual consumption per successful run in
+            // `execution_cost_rollup`. When history exists, attach it plus
+            // a concrete recommendation: 1.5× the observed max (headroom
+            // for payload growth), floored at 2× the median, rounded up
+            // to 100K, clamped to the platform's [1M, 50M] fuel window.
+            // Best-effort — a history-query error never degrades the
+            // analysis itself.
+            if error_type == "fuel_exhausted" {
+                if let Ok(Some((runs, p50, max_seen))) = self
+                    .execution_repo
+                    .node_fuel_history(workflow_id, &label, user_id, 30)
+                    .await
+                {
+                    let raw = ((max_seen as f64) * 1.5).max((p50 as f64) * 2.0) as i64;
+                    let recommended = ((raw + 99_999) / 100_000) * 100_000;
+                    let recommended = recommended.clamp(1_000_000, 50_000_000);
+                    if let Some(obj) = failed_node.as_object_mut() {
+                        obj.insert(
+                            "fuel_history".to_string(),
+                            serde_json::json!({
+                                "successful_runs_30d": runs,
+                                "p50_fuel": p50,
+                                "max_fuel_observed": max_seen,
+                                "recommended_max_fuel": recommended,
+                                "note": format!(
+                                    "Successful runs of '{label}' consumed up to {max_seen} fuel \
+                                     (median {p50}) in the last 30 days. Set max_fuel to \
+                                     ~{recommended} via update_node_config (node-level, wins over \
+                                     the module default) or hot_update_module with fuel_budget."
+                                ),
+                            }),
+                        );
+                    }
+                }
+            }
             failed_nodes.push(failed_node);
         }
 

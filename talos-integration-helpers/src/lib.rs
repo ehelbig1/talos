@@ -33,6 +33,7 @@
 //!   [`google_jwt::GoogleOidcVerifier`] + the envelope types.
 
 pub mod admin;
+pub mod api_json;
 pub mod audit;
 pub mod google_jwt;
 pub mod renewal;

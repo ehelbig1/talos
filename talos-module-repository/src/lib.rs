@@ -2511,6 +2511,7 @@ impl ModuleRepository {
         requires_approval_for: &[String],
         config_schema: &serde_json::Value,
         catalog_slug: Option<&str>,
+        fuel_explicit: bool,
     ) -> Result<CatalogInstallResult> {
         let cw_long = if capability_world_short == "trusted" {
             "automation-node".to_string()
@@ -2561,7 +2562,14 @@ impl ModuleRepository {
                         wasm_bytes = EXCLUDED.wasm_bytes, \
                         content_hash = EXCLUDED.content_hash, \
                         size_bytes = EXCLUDED.size_bytes, \
-                        max_fuel = EXCLUDED.max_fuel, \
+                        /* Operator fuel tuning survives re-install unless the \
+                           caller EXPLICITLY passed a fuel_budget ($15) — the \
+                           r236 hot_update semantic applied to the reinstall \
+                           sibling (it silently reset tuned fuel to auto-calc, \
+                           observed live 2026-07-17 on alert-normalize-email: \
+                           10M -> 1.38M). Fresh inserts take the computed value. */ \
+                        max_fuel = CASE WHEN $15 THEN EXCLUDED.max_fuel \
+                                        ELSE modules.max_fuel END, \
                         compiled_at = NOW(), \
                         updated_at = NOW() \
                      RETURNING id, allowed_secrets, content_hash, compiled_at \
@@ -2588,6 +2596,7 @@ impl ModuleRepository {
             .bind(wasm_bytes.len() as i32)
             .bind(max_fuel)
             .bind(catalog_slug)
+            .bind(fuel_explicit)
             .fetch_one(&self.db_pool)
             .await?;
         Ok(CatalogInstallResult {

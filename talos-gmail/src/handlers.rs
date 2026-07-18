@@ -7,6 +7,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use talos_integration_helpers::api_json::ApiJson;
 use uuid::Uuid;
 
 /// Response for OAuth initiation
@@ -337,7 +338,7 @@ pub struct CreateGmailWatchRequest {
 pub async fn create_watch_channel_handler(
     State(service): State<Arc<GmailWatchService>>,
     Extension(user_id): Extension<Uuid>,
-    Json(req): Json<CreateGmailWatchRequest>,
+    ApiJson(req): ApiJson<CreateGmailWatchRequest>,
 ) -> impl IntoResponse {
     match service
         .create_watch(user_id, req.integration_id, req.module_id, req.label_ids)

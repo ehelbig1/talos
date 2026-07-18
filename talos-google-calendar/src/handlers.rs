@@ -10,6 +10,7 @@ use axum::{
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use talos_integration_helpers::api_json::ApiJson;
 use talos_module_executions::{LogLevel, ModuleExecutionService, TriggerType};
 use talos_registry::ModuleRegistry;
 use talos_secrets_manager::SecretsManager;
@@ -358,7 +359,7 @@ pub struct CreateWatchRequest {
 pub async fn create_watch_handler(
     State(service): State<Arc<GoogleCalendarService>>,
     Extension(user_id): Extension<Uuid>,
-    Json(req): Json<CreateWatchRequest>,
+    ApiJson(req): ApiJson<CreateWatchRequest>,
 ) -> impl IntoResponse {
     // Verify user owns the integration
     match service.get_integration(user_id, req.integration_id).await {
