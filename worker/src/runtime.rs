@@ -384,6 +384,78 @@ fn aot_hmac_input(cap: &crate::wit_inspector::CapabilityWorld, serialized: &[u8]
     buf
 }
 
+/// Single source of truth for whether a store gets raw `wasi:sockets`
+/// (`allow_wasi_network`). Raw sockets bypass BOTH the per-module
+/// `allowed_hosts` allowlist AND the host-fn tier gate, so the grant is
+/// deliberately narrow: only the three worlds whose whole purpose is
+/// arbitrary network egress (`Network`/`Database`/`Trusted`), and never
+/// for a Tier-1 (privacy-ceiled) actor.
+///
+/// This MUST be the only place the socket-grant predicate is computed.
+/// It previously drifted: `execute_pipeline_job` derived the flag as
+/// `!(Minimal|Unknown)`, which handed raw TCP to `Http`/`Secrets`/
+/// `Agent`/… pipeline steps that the single-node path denies — a Tier-2
+/// `allowed_hosts` containment/exfiltration bypass that contradicted the
+/// documented layer-3 invariant at `select_tier`. Funnel every call site
+/// here so the three paths cannot diverge again.
+fn socket_grant(
+    cap: &crate::wit_inspector::CapabilityWorld,
+    max_llm_tier: talos_workflow_job_protocol::LlmTier,
+) -> bool {
+    use crate::wit_inspector::CapabilityWorld;
+    matches!(
+        cap,
+        CapabilityWorld::Network | CapabilityWorld::Database | CapabilityWorld::Trusted
+    ) && !matches!(max_llm_tier, talos_workflow_job_protocol::LlmTier::Tier1)
+}
+
+#[cfg(test)]
+mod socket_grant_tests {
+    use super::socket_grant;
+    use crate::wit_inspector::CapabilityWorld;
+    use talos_workflow_job_protocol::LlmTier;
+
+    #[test]
+    fn only_network_database_trusted_get_sockets_at_tier2() {
+        for cap in [
+            CapabilityWorld::Network,
+            CapabilityWorld::Database,
+            CapabilityWorld::Trusted,
+        ] {
+            assert!(socket_grant(&cap, LlmTier::Tier2), "{cap:?} should grant");
+        }
+        // Every other world — including Http, the one the pipeline path
+        // used to over-grant — must NOT get raw sockets.
+        for cap in [
+            CapabilityWorld::Minimal,
+            CapabilityWorld::Http,
+            CapabilityWorld::Secrets,
+            CapabilityWorld::Agent,
+            CapabilityWorld::Filesystem,
+            CapabilityWorld::Messaging,
+            CapabilityWorld::Cache,
+            CapabilityWorld::Governance,
+            CapabilityWorld::Unknown,
+        ] {
+            assert!(!socket_grant(&cap, LlmTier::Tier2), "{cap:?} must deny");
+        }
+    }
+
+    #[test]
+    fn tier1_never_gets_sockets() {
+        for cap in [
+            CapabilityWorld::Network,
+            CapabilityWorld::Database,
+            CapabilityWorld::Trusted,
+        ] {
+            assert!(
+                !socket_grant(&cap, LlmTier::Tier1),
+                "Tier-1 must deny raw sockets even for {cap:?}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod aot_hmac_input_tests {
     //! Pure tests for the canonical HMAC-input layout. Cover the
@@ -2671,11 +2743,7 @@ impl TalosRuntime {
         // worlds; operators who need host-level egress confinement for such a module
         // must run it Tier-1 (raw sockets denied, forcing traffic through the
         // host-fn allowlist) or not grant it a socket-capable world.
-        let allow_wasi_network =
-            matches!(
-                cap,
-                CapabilityWorld::Network | CapabilityWorld::Database | CapabilityWorld::Trusted
-            ) && !matches!(max_llm_tier, talos_workflow_job_protocol::LlmTier::Tier1);
+        let allow_wasi_network = socket_grant(&cap, max_llm_tier);
 
         // Select the correct linker + cache for this tier.
         let (linker, cache) = self.select_tier(&cap)?;
@@ -3218,10 +3286,7 @@ impl TalosRuntime {
         // allow-wasi-network-no-tier: run_sandbox / test_module path — operator-invoked,
         // actor-less, runs Tier2-default (no max_llm_tier param). Not a tier-1 actor
         // execution path; raw sockets are still SSRF-gated by socket_addr_check.
-        let allow_wasi_network = matches!(
-            cap,
-            CapabilityWorld::Network | CapabilityWorld::Database | CapabilityWorld::Trusted
-        );
+        let allow_wasi_network = socket_grant(&cap, talos_workflow_job_protocol::LlmTier::Tier2);
         let (linker, cache) = self.select_tier(&cap)?;
 
         let mut context = TalosContext::new(
@@ -3456,14 +3521,14 @@ impl TalosRuntime {
 
             // Inspect capability world → tiered linker + cache.
             let cap = crate::wit_inspector::inspect_component(&step.wasm_bytes).capability_world;
-            // All worlds except Minimal and Unknown allow outbound network access.
-            // Tier-1 actors get NO raw sockets — same egress-ceiling rationale as
-            // the main `execute_job` path: raw `wasi:sockets` bypass both
-            // `allowed_hosts` and the host-fn tier gate, so a privacy-ceiled actor
-            // could otherwise exfiltrate to any public IP over raw TCP.
-            let allow_wasi_network =
-                !matches!(cap, CapabilityWorld::Minimal | CapabilityWorld::Unknown)
-                    && !matches!(max_llm_tier, talos_workflow_job_protocol::LlmTier::Tier1);
+            // Raw `wasi:sockets` is granted through the SAME chokepoint as the
+            // single-node path (`socket_grant`): only `Network`/`Database`/
+            // `Trusted`, never Tier-1. This site previously used
+            // `!(Minimal|Unknown)`, which handed raw TCP to `Http`/`Secrets`/
+            // `Agent`/… pipeline steps that the single-node path denies —
+            // letting a Tier-2 module bypass its `allowed_hosts` confinement by
+            // running as a pipeline step. Do not re-inline the predicate here.
+            let allow_wasi_network = socket_grant(&cap, max_llm_tier);
             let (linker, cache) = self.select_tier(&cap)?;
 
             // Get or compile InstancePre.
