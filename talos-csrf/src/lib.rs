@@ -80,10 +80,28 @@ const GRACE_CACHE_MAX_ENTRIES: usize = 50_000;
 /// In-memory cache of recently rotated CSRF tokens.
 /// This prevents race conditions where parallel requests are sent before the
 /// browser has updated its cookie jar with the newly rotated token.
-static TOKEN_GRACE_CACHE: OnceLock<DashMap<String, Instant>> = OnceLock::new();
+///
+/// Security review 2026-07-19 (L10): the entry now BINDS the replaced (old)
+/// token to the token it rotated to, restoring the double-submit cookie↔header
+/// binding on the grace path. Key = old token (arrives as the stale
+/// `X-CSRF-Token` header on a racing request); value = (rotated-to token that
+/// the browser's cookie jar now holds, inserted-at). The grace path admits only
+/// when the presented COOKIE matches that rotated-to token — previously it
+/// accepted any recently-rotated header token paired with ANY non-empty cookie,
+/// dropping the binding.
+static TOKEN_GRACE_CACHE: OnceLock<DashMap<String, (String, Instant)>> = OnceLock::new();
 
-fn get_grace_cache() -> &'static DashMap<String, Instant> {
+fn get_grace_cache() -> &'static DashMap<String, (String, Instant)> {
     TOKEN_GRACE_CACHE.get_or_init(DashMap::new)
+}
+
+/// Grace-path check: is `header` a recently-replaced token whose rotated-to
+/// token equals the presented `cookie` (constant-time)? This is the binding the
+/// bare "header in cache" check used to skip.
+fn grace_admits(cookie: &str, header: &str) -> bool {
+    get_grace_cache().get(header).is_some_and(|entry| {
+        constant_time_eq::constant_time_eq(cookie.as_bytes(), entry.0.as_bytes())
+    })
 }
 
 /// MCP-1145: gated insert into the rotation grace cache. When at-cap,
@@ -95,7 +113,10 @@ fn get_grace_cache() -> &'static DashMap<String, Instant> {
 /// the grace path; the user-visible failure is a single 403 on the
 /// racing request, not session breakage. Same fail-closed posture as
 /// the canonical nonce-cache cap-hit handling.
-fn insert_grace_token(token: String) {
+/// Record that `old_token` was just rotated to `new_token`. A racing in-flight
+/// request carrying the stale header `old_token` is then admitted only if its
+/// cookie already holds `new_token` (see [`grace_admits`]).
+fn insert_grace_token(old_token: String, new_token: String) {
     let cache = get_grace_cache();
     // Racy overshoot acceptable — defense-in-depth, not a strict
     // boundary. The pruner runs every 1s; a few-entry overshoot
@@ -110,7 +131,7 @@ fn insert_grace_token(token: String) {
         );
         return;
     }
-    cache.insert(token, Instant::now());
+    cache.insert(old_token, (new_token, Instant::now()));
 }
 
 /// L-15: prune expired tokens from the grace cache, but rate-limit the
@@ -136,7 +157,7 @@ fn prune_grace_cache() {
     }
 
     let cache = get_grace_cache();
-    cache.retain(|_, instant| instant.elapsed() < Duration::from_secs(GRACE_PERIOD_SECONDS));
+    cache.retain(|_, (_, instant)| instant.elapsed() < Duration::from_secs(GRACE_PERIOD_SECONDS));
     *last = Instant::now();
 }
 
@@ -257,16 +278,18 @@ pub async fn csrf_protection(
             }
             let matches_current =
                 constant_time_eq::constant_time_eq(cookie.as_bytes(), header.as_bytes());
-            let matches_grace = !matches_current && get_grace_cache().contains_key(&header);
+            let matches_grace = !matches_current && grace_admits(&cookie, &header);
 
             if matches_current || matches_grace {
-                // CSRF tokens match (either current or recently rotated)
-                // Rotate token for the next request.
-                // Add the token being replaced (the cookie token) to the grace cache
-                // so parallel requests already in flight can still succeed.
-                // MCP-1145: gated insert with cap-hit logging.
-                insert_grace_token(cookie);
-                cookies.add(build_csrf_cookie(generate_csrf_token()));
+                // CSRF tokens match (either current or recently rotated).
+                // Rotate the token for the next request and record the
+                // old→new binding so a racing in-flight request carrying the
+                // stale header is admitted only if its cookie already holds
+                // the rotated-to token. MCP-1145: gated insert with cap-hit
+                // logging.
+                let new_token = generate_csrf_token();
+                insert_grace_token(cookie, new_token.clone());
+                cookies.add(build_csrf_cookie(new_token));
 
                 let response = next.run(request).await;
                 Ok(response)
@@ -427,14 +450,16 @@ pub async fn csrf_protection_graphql(
             }
             let matches_current =
                 constant_time_eq::constant_time_eq(cookie.as_bytes(), header.as_bytes());
-            let matches_grace = !matches_current && get_grace_cache().contains_key(&header);
+            let matches_grace = !matches_current && grace_admits(&cookie, &header);
 
             if matches_current || matches_grace {
-                // Rotate CSRF token after each mutation.
-                // Add the token being replaced to the grace cache.
+                // Rotate the CSRF token after each mutation and record the
+                // old→new binding (grace path requires the racing request's
+                // cookie to match the rotated-to token).
                 // MCP-1145: gated insert with cap-hit logging.
-                insert_grace_token(cookie);
-                cookies.add(build_csrf_cookie(generate_csrf_token()));
+                let new_token = generate_csrf_token();
+                insert_grace_token(cookie, new_token.clone());
+                cookies.add(build_csrf_cookie(new_token));
 
                 let response = next.run(request).await;
                 Ok(response)
@@ -655,9 +680,32 @@ mod grace_cache_cap_tests {
     fn insert_succeeds_below_cap() {
         let _g = grace_test_lock();
         get_grace_cache().clear();
-        let token = generate_csrf_token();
-        insert_grace_token(token.clone());
-        assert!(get_grace_cache().contains_key(&token));
+        let old = generate_csrf_token();
+        let new = generate_csrf_token();
+        insert_grace_token(old.clone(), new.clone());
+        assert!(get_grace_cache().contains_key(&old));
+        get_grace_cache().clear();
+    }
+
+    /// L10: the grace path admits a stale header ONLY when the presented
+    /// cookie matches the token the header rotated to — restoring the
+    /// double-submit binding the bare `contains_key` check dropped.
+    #[test]
+    fn grace_requires_cookie_to_match_rotated_to_token() {
+        let _g = grace_test_lock();
+        get_grace_cache().clear();
+        let old = generate_csrf_token(); // stale header on a racing request
+        let new = generate_csrf_token(); // token the browser jar now holds
+        insert_grace_token(old.clone(), new.clone());
+
+        // Legitimate race: cookie == rotated-to token → admitted.
+        assert!(grace_admits(&new, &old));
+        // Binding restored: same graced header, but a DIFFERENT cookie
+        // (any other value an attacker might supply) → rejected.
+        assert!(!grace_admits("some-other-cookie-value", &old));
+        // A header that was never rotated → rejected regardless of cookie.
+        assert!(!grace_admits(&new, "never-seen-token"));
+
         get_grace_cache().clear();
     }
 
@@ -672,12 +720,12 @@ mod grace_cache_cap_tests {
         let cache = get_grace_cache();
 
         for i in 0..GRACE_CACHE_MAX_ENTRIES {
-            cache.insert(format!("wedge-{}", i), Instant::now());
+            cache.insert(format!("wedge-{}", i), (String::new(), Instant::now()));
         }
         assert_eq!(cache.len(), GRACE_CACHE_MAX_ENTRIES);
 
         let new_token = generate_csrf_token();
-        insert_grace_token(new_token.clone());
+        insert_grace_token(new_token.clone(), generate_csrf_token());
         assert!(!cache.contains_key(&new_token));
         assert_eq!(cache.len(), GRACE_CACHE_MAX_ENTRIES);
 
@@ -698,9 +746,11 @@ mod grace_cache_cap_tests {
         let backdated = Instant::now()
             .checked_sub(Duration::from_secs(60))
             .unwrap_or(Instant::now());
-        cache.insert(expired_token.clone(), backdated);
+        cache.insert(expired_token.clone(), (String::new(), backdated));
 
-        cache.retain(|_, instant| instant.elapsed() < Duration::from_secs(GRACE_PERIOD_SECONDS));
+        cache.retain(|_, (_, instant)| {
+            instant.elapsed() < Duration::from_secs(GRACE_PERIOD_SECONDS)
+        });
 
         assert!(!cache.contains_key(&expired_token));
         cache.clear();

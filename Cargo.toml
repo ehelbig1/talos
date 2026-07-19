@@ -89,6 +89,7 @@ members = [
     "talos-workflow-versions",
     "talos-module-repository",
     "talos-registry",
+    "talos-sigstore-policy",
     "talos-module-templates",
     "talos-rpc-subscribers",
     "talos-actor-scaffold",

@@ -54,6 +54,25 @@ pub struct ApiKey {
 }
 
 /// API Key service
+/// bcrypt's hard input-truncation limit (bytes). Input past this is ignored.
+const BCRYPT_INPUT_LIMIT: usize = 72;
+/// Fixed, non-secret preamble consumed inside the bcrypt window:
+/// `talos_sk_` (9) + the 8-hex-char prefix (which is ALSO verified separately
+/// via the constant-time prefix check + DB lookup).
+const KEY_PREAMBLE_LEN: usize = "talos_sk_".len() + 8;
+/// Compile-time guard (security review 2026-07-19, L4): the secret entropy that
+/// survives bcrypt's 72-byte truncation must stay above 128 bits. Each surviving
+/// hex char is 4 bits. Fails to compile if a future key-layout change erodes it
+/// (e.g. a longer scheme tag or prefix pushing more of the secret past the
+/// cliff) — forcing a deliberate key-format migration instead of a silent
+/// weakening. No weakness today: 220 bits are verified.
+const _: () = assert!(
+    (BCRYPT_INPUT_LIMIT - KEY_PREAMBLE_LEN) * 4 >= 128,
+    "API key layout change pushed verified secret entropy below 128 bits — \
+     hash the secret separately or SHA-256-prehash before bcrypt (this needs a \
+     key-format migration; existing keys were hashed with the old layout)"
+);
+
 pub struct ApiKeyService {
     db_pool: Pool<Postgres>,
     // Simple in‑memory rate limiter: prefix -> (count, window_start)
@@ -79,6 +98,19 @@ impl ApiKeyService {
     /// Generate a new API key
     /// Format: talos_<prefix>_<secret>
     /// Example: talos_sk_1a2b3c4d5e6f7g8h9i0j
+    ///
+    /// Security review 2026-07-19 (L4): bcrypt truncates its input at 72 bytes,
+    /// so only the first 72 chars of the 81-char key are verified. The fixed
+    /// preamble (`talos_sk_` + 8-hex prefix) consumes 17 bytes, leaving 55 of
+    /// the 64 secret hex chars — 220 bits — inside the verified window (the
+    /// 8-hex prefix is ALSO verified independently via the constant-time prefix
+    /// check + DB lookup). 220 bits is far above any practical threshold, so
+    /// there is no weakness today; the static assertion below simply guarantees
+    /// a FUTURE layout change (a longer scheme tag / prefix) can't silently push
+    /// the verified secret entropy below 128 bits without failing the build.
+    /// A real fix (hash the secret alone, or SHA-256-prehash) would invalidate
+    /// every already-issued key, so it is deliberately deferred to a key-format
+    /// migration rather than done implicitly here.
     pub fn generate_key() -> (String, String) {
         use rand::RngCore;
         let mut rng = rand::rngs::OsRng;

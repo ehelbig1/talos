@@ -17,11 +17,11 @@
 ignore = [
     # --- Vulnerabilities in unreachable transitive code paths ---
 
-    # protobuf 2.x uncontrolled-recursion crash. Pulled by prometheus 0.13.x
-    # via opentelemetry-prometheus. Our /metrics endpoint is internal-only;
-    # no attacker-controlled input reaches the protobuf decoder. Blocked
-    # on opentelemetry-prometheus releasing prometheus 0.14 support.
-    "RUSTSEC-2024-0437",
+    # NOTE (2026-07-19): the RUSTSEC-2024-0437 exemption (protobuf 2.x
+    # uncontrolled-recursion crash) was REMOVED to match deny.toml — the otel
+    # stack moved to opentelemetry-prometheus 0.32 / prometheus 0.14, which no
+    # longer pulls protobuf 2.x (only 3.7.2, the fixed line). The ignore was
+    # stale drift between this file and deny.toml.
 
     # rsa Marvin-attack timing sidechannel (RSA private-key sign/decrypt).
     # Pulled by jsonwebtoken 10.x. The vulnerable OP is never invoked:

@@ -1,0 +1,18 @@
+[package]
+name = "talos-sigstore-policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Single source of truth for the Sigstore `--certificate-identity-regexp`
+# policy. Shared by the worker (module_fetcher / startup gate) AND the
+# controller's OCI catalog-sync (talos-registry) so the two processes can
+# never enforce a different identity-pinning strength. Kept light (regex
+# only) so both the WASM-host worker and the controller pull it cheaply.
+[dependencies]
+regex = "1.11"
+
+[lints]
+workspace = true

@@ -257,6 +257,38 @@ async fn handle_graphql_ws(
                                                 payload.clone(),
                                             )
                                         {
+                                            // Security review 2026-07-19 (P3):
+                                            // a pre-2FA (password-only) session
+                                            // may not open subscriptions — none
+                                            // are auth-bootstrap operations, so
+                                            // the allowlist rejects them all.
+                                            // Mirrors the HTTP graphql_handler
+                                            // gate and the REST pre-2FA 403.
+                                            if !is_2fa_verified
+                                                && !talos_api::schema::pre_2fa_operation_allowed(
+                                                    &request.query,
+                                                    request.operation_name.as_deref(),
+                                                )
+                                            {
+                                                let err_msg = serde_json::json!({
+                                                    "type": "error",
+                                                    "id": id,
+                                                    "payload": [{
+                                                        "message": "Two-Factor Authentication \
+                                                            required. Complete 2FA verification \
+                                                            to subscribe."
+                                                    }]
+                                                });
+                                                if let Ok(err_text) =
+                                                    serde_json::to_string(&err_msg)
+                                                {
+                                                    let _ = sink
+                                                        .send(Message::Text(err_text.into()))
+                                                        .await;
+                                                }
+                                                continue;
+                                            }
+
                                             // Add user_id and 2FA status to request data
                                             let req = request.data(user_id).data(
                                                 talos_api::schema::IsTwoFactorVerified(

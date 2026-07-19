@@ -273,6 +273,86 @@ pub(crate) fn is_valid_pg_role_identifier(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Pure decision for the production DB-sandbox posture guard (security
+/// review 2026-07-19, P1). Unit-testable without touching process env.
+///
+/// The `database` capability world lets a guest module run
+/// `SELECT/INSERT/UPDATE/DELETE/MERGE` against the controller's primary
+/// pool. Row/tenant confinement rests on `SET LOCAL ROLE <guest_role>`
+/// (the `talos_guest` role ships with NO table grants, so guest SQL can
+/// only touch tables an operator has explicitly granted). That fence is
+/// opt-in via `TALOS_RPC_GUEST_ROLE`; unset = queries run as the app user
+/// (a superuser in the in-cluster default), i.e. unconfined cross-tenant
+/// read/write. This mirrors `enforce_production_rls_posture`: in
+/// production, refuse to boot unless the fence is configured, or the
+/// operator explicitly accepts the unscoped posture.
+///
+/// * `guest_role` — the trimmed `TALOS_RPC_GUEST_ROLE` (None if unset/empty).
+/// * `ack_unscoped` — `TALOS_ALLOW_UNSCOPED_DB_SANDBOX` opt-in.
+///
+/// Returns `Ok(true)` = fenced (role set + valid), `Ok(false)` = permitted
+/// via explicit acknowledgement (caller should log loudly), `Err(_)` =
+/// refuse boot.
+pub(crate) fn db_sandbox_posture_decision(
+    is_production: bool,
+    guest_role: Option<&str>,
+    ack_unscoped: bool,
+) -> Result<bool, String> {
+    if !is_production {
+        return Ok(true);
+    }
+    let role_valid = guest_role.map(is_valid_pg_role_identifier).unwrap_or(false);
+    if role_valid {
+        return Ok(true);
+    }
+    if ack_unscoped {
+        return Ok(false);
+    }
+    let why = match guest_role {
+        None => "TALOS_RPC_GUEST_ROLE is unset",
+        Some(_) => "TALOS_RPC_GUEST_ROLE is set to an invalid Postgres identifier",
+    };
+    Err(format!(
+        "Database SQL sandbox would run guest SQL as the app user in production \
+         ({why}) — refusing to boot. A `database`-capability module could then \
+         read/write across tenants on the primary pool. Fix by one of: (a) set \
+         TALOS_RPC_GUEST_ROLE to a minimally-privileged role (apply migration \
+         20260522120000_talos_guest_role.sql and grant it only the tables the \
+         sandbox may touch); (b) to run the sandbox unconfined anyway (e.g. a \
+         single-tenant homelab), set TALOS_ALLOW_UNSCOPED_DB_SANDBOX=1 to \
+         acknowledge that guest SQL then runs with full app-user privileges."
+    ))
+}
+
+/// Production fail-closed guard for the DB SQL sandbox. Reads the relevant
+/// env vars and applies [`db_sandbox_posture_decision`]. No-op outside
+/// production. Call at boot alongside `enforce_production_rls_posture`.
+pub fn enforce_production_db_sandbox_posture(is_production: bool) -> anyhow::Result<()> {
+    let raw = std::env::var("TALOS_RPC_GUEST_ROLE").ok();
+    let trimmed = raw.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let ack = matches!(
+        std::env::var("TALOS_ALLOW_UNSCOPED_DB_SANDBOX")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    );
+    match db_sandbox_posture_decision(is_production, trimmed, ack) {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            tracing::error!(
+                target: "talos_security",
+                event_kind = "db_sandbox_unscoped_in_production",
+                "Database SQL sandbox runs guest SQL with full app-user privileges \
+                 in production, accepted via TALOS_ALLOW_UNSCOPED_DB_SANDBOX. A \
+                 `database`-capability module can read/write across tenants. Set \
+                 TALOS_RPC_GUEST_ROLE to a minimally-privileged role for isolation."
+            );
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!(e)),
+    }
+}
+
 /// Wasm-security review 2026-05-22 (MEDIUM-2): execute a guest SQL
 /// query inside a transaction, optionally with `SET LOCAL ROLE`.
 ///
@@ -2859,6 +2939,39 @@ mod controller_function_deny_tests {
                 "invalid identifier `{bad:?}` was accepted — SQL injection risk"
             );
         }
+    }
+
+    #[test]
+    fn db_sandbox_posture_dev_is_permissive() {
+        use super::db_sandbox_posture_decision;
+        // Outside production, every combination permits boot (fenced=true).
+        assert_eq!(db_sandbox_posture_decision(false, None, false), Ok(true));
+        assert_eq!(
+            db_sandbox_posture_decision(false, Some("bad ident"), false),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn db_sandbox_posture_prod_requires_valid_role_or_ack() {
+        use super::db_sandbox_posture_decision;
+        // Valid role → fenced.
+        assert_eq!(
+            db_sandbox_posture_decision(true, Some("talos_guest"), false),
+            Ok(true)
+        );
+        // Unset role, no ack → refuse boot.
+        assert!(db_sandbox_posture_decision(true, None, false).is_err());
+        // Invalid role, no ack → refuse boot (a typo must not silently disable
+        // the fence in production).
+        assert!(db_sandbox_posture_decision(true, Some("talos guest"), false).is_err());
+        // Unset role but explicit ack → permitted-but-unscoped (caller logs).
+        assert_eq!(db_sandbox_posture_decision(true, None, true), Ok(false));
+        // A valid role wins even if the ack is also set (stay fenced).
+        assert_eq!(
+            db_sandbox_posture_decision(true, Some("talos_guest"), true),
+            Ok(true)
+        );
     }
 
     #[test]

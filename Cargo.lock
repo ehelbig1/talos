@@ -7793,6 +7793,7 @@ dependencies = [
  "sha2 0.10.9",
  "subtle",
  "talos-http-body",
+ "talos-http-utils",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -8550,6 +8551,7 @@ dependencies = [
  "talos-capability-world",
  "talos-config",
  "talos-http-body",
+ "talos-sigstore-policy",
  "talos-text-util",
  "talos-workflow-engine-core",
  "tokio",
@@ -8571,6 +8573,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "redis",
+ "talos-config",
  "tokio",
  "tracing",
 ]
@@ -8776,6 +8779,13 @@ dependencies = [
  "anyhow",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "talos-sigstore-policy"
+version = "0.1.0"
+dependencies = [
+ "regex",
 ]
 
 [[package]]
@@ -11428,6 +11438,7 @@ dependencies = [
  "talos-nats-tls",
  "talos-secrets",
  "talos-shutdown",
+ "talos-sigstore-policy",
  "talos-ssrf-classify",
  "talos-text-util",
  "talos-trace",

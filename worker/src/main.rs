@@ -1832,6 +1832,24 @@ async fn main() -> anyhow::Result<()> {
     // MCP-653 RUST_ENV long-tail closure.
     let is_production = talos_config::is_production();
 
+    // SECURITY (2026-07-19, L5): in production, REFUSE to start on a plaintext
+    // NATS URL — same fail-closed posture the controller enforces
+    // (tls-prod-gate-nats). The worker sends HMAC-signed job RESULTS and
+    // receives decrypted secrets over this bus; cleartext on the wire is a
+    // transmission-security violation (HIPAA §164.312(e) / SOC2 CC6.7). Before
+    // this gate the worker only required NATS *auth* in prod and relied on
+    // NATS_CA_FILE being set to force TLS — an operator with a plaintext
+    // `nats://` URL and no CA file transmitted credentials + payloads in the
+    // clear where the controller would have refused to boot.
+    // tls-prod-gate-nats
+    if is_production && !nats_url.starts_with("tls://") && !nats_url.starts_with("nats+tls://") {
+        return Err(anyhow::anyhow!(
+            "NATS_URL must use TLS (tls:// or nats+tls://) in production — refusing to \
+             start. Got scheme: '{}'.",
+            nats_url.split("://").next().unwrap_or("<unknown>")
+        ));
+    }
+
     let nc: Client = match (nats_user, nats_password) {
         (Some(user), Some(pass)) => {
             // apply_nats_ca adds the in-cluster NATS CA + requires TLS when

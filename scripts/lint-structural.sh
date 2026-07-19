@@ -3086,24 +3086,35 @@ bold "▶ check 44: production in-transit TLS gates must fail closed (not warn)"
 # shape (NATS + Postgres shipped warn-only; Redis already panicked).
 
 TLS_GATE_VIOLATIONS=0
+# worker/src added 2026-07-19 (L5): the worker's NATS connection carries the
+# same PHI/credential exposure as the controller's, so its plaintext-scheme gate
+# must fail closed too. EVERY marker occurrence is validated (not just the
+# first) so a second gate softened back to warn-only is still caught.
 for gate in redis nats postgres neo4j; do
-    hit=$(grep -rn "tls-prod-gate-${gate}" --include='*.rs' controller/src talos-db/src 2>/dev/null | head -1 || true)
-    if [ -z "$hit" ]; then
+    # Match STANDALONE marker lines (`    // tls-prod-gate-<name>`) only — this
+    # is the comment placed directly above each gate. A mid-sentence mention in
+    # a `///` doc comment (e.g. "See `tls-prod-gate-postgres`.") is a reference,
+    # not a gate, and must not be validated for a fail-closed action.
+    hits=$(grep -rnE "^[[:space:]]*//[[:space:]]*tls-prod-gate-${gate}\b" --include='*.rs' controller/src talos-db/src worker/src 2>/dev/null || true)
+    if [ -z "$hits" ]; then
         red "✗ missing production TLS gate marker: tls-prod-gate-${gate}"
         TLS_GATE_VIOLATIONS=$((TLS_GATE_VIOLATIONS + 1))
         continue
     fi
-    file=$(echo "$hit" | cut -d: -f1)
-    lineno=$(echo "$hit" | cut -d: -f2)
-    # The marker line + the 12 lines following it must contain a fail-closed
-    # action. A gate softened back to `tracing::warn!` (no return/panic/bail)
-    # is exactly the regression this check exists to catch.
-    window=$(sed -n "${lineno},$((lineno + 12))p" "$file" 2>/dev/null || true)
-    if ! echo "$window" | grep -qE 'return Err|panic!|bail!'; then
-        red "✗ TLS gate '${gate}' at ${file}:${lineno} does not fail closed (no return Err/panic/bail within 12 lines)"
-        yellow "  → a production no-TLS condition must refuse boot, not tracing::warn!"
-        TLS_GATE_VIOLATIONS=$((TLS_GATE_VIOLATIONS + 1))
-    fi
+    while IFS= read -r hit; do
+        [ -z "$hit" ] && continue
+        file=$(echo "$hit" | cut -d: -f1)
+        lineno=$(echo "$hit" | cut -d: -f2)
+        # The marker line + the 12 lines following it must contain a fail-closed
+        # action. A gate softened back to `tracing::warn!` (no return/panic/bail)
+        # is exactly the regression this check exists to catch.
+        window=$(sed -n "${lineno},$((lineno + 12))p" "$file" 2>/dev/null || true)
+        if ! echo "$window" | grep -qE 'return Err|panic!|bail!'; then
+            red "✗ TLS gate '${gate}' at ${file}:${lineno} does not fail closed (no return Err/panic/bail within 12 lines)"
+            yellow "  → a production no-TLS condition must refuse boot, not tracing::warn!"
+            TLS_GATE_VIOLATIONS=$((TLS_GATE_VIOLATIONS + 1))
+        fi
+    done <<< "$hits"
 done
 
 if [ "$TLS_GATE_VIOLATIONS" -gt 0 ]; then
@@ -3325,9 +3336,13 @@ bold "▶ check 49: integration crates must use talos_http_utils::trusted_client
 # resolver, per check 40.) Opt-out for a genuinely special client with
 # `// allow-raw-integration-client: <reason>` within 4 lines above.
 INTEG_CLIENT_VIOLATIONS=0
+# talos-github / talos-google-cloud / talos-integration-helpers added
+# 2026-07-19 (L7): they also carry Bearer/token credentials to configurable or
+# fixed hosts, so a dropped redirect(none()) there is the same leak class.
 integ_client_matches=$(grep -rnE 'reqwest::Client::builder\(\)' \
     talos-gmail/src talos-google-calendar/src talos-slack/src \
-    talos-atlassian/src talos-oauth/src 2>/dev/null \
+    talos-atlassian/src talos-oauth/src talos-github/src \
+    talos-google-cloud/src talos-integration-helpers/src 2>/dev/null \
     | grep -vE '/tests/|_tests\.rs' || true)
 if [ -n "$integ_client_matches" ]; then
     while IFS= read -r line; do

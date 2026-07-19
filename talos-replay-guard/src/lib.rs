@@ -225,16 +225,25 @@ pub fn shared_replay_guard() -> Option<Arc<dyn ReplayGuard>> {
 /// Whether an [`ReplayOutcome::Unavailable`] result should be treated as a
 /// rejection (fail-closed) rather than admitted (fail-open).
 ///
-/// Default is fail-OPEN: a Redis blip degrades to the pre-existing per-replica
-/// protection, which is strictly no worse than before this layer existed, and
-/// HMAC + freshness still gate forgery/stale-replay. High-assurance deploys set
-/// `TALOS_REPLAY_FAIL_CLOSED=1` to instead refuse messages the shared store
-/// couldn't vet.
+/// Security review 2026-07-19 (L1): the default is now **fail-CLOSED in
+/// production**, fail-open in dev. When the shared replay store is unreachable,
+/// a production controller refuses the cross-replica-unvetted message rather
+/// than admitting it on the strength of only the per-replica cache — closing
+/// the window where a captured signed WRITE RPC (state durability / memory
+/// Set/Delete) could be replayed to a *different* replica inside the 60 s
+/// freshness window. HMAC + freshness + per-replica nonce still hold either way.
+///
+/// This is an availability/security trade: a Redis blip will reject RPCs in
+/// prod until it recovers. Operators who prioritise availability opt out
+/// explicitly with `TALOS_REPLAY_FAIL_CLOSED=0`; the env var (any of
+/// 1/true/yes/on or 0/false/no/off) always wins over the environment default.
 pub fn fail_closed_from_env() -> bool {
-    matches!(
-        std::env::var("TALOS_REPLAY_FAIL_CLOSED").ok().as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    )
+    match std::env::var("TALOS_REPLAY_FAIL_CLOSED").ok().as_deref() {
+        Some("1") | Some("true") | Some("yes") | Some("on") => true,
+        Some("0") | Some("false") | Some("no") | Some("off") => false,
+        // Unset (or an unrecognised value): fail-closed in prod, open in dev.
+        _ => talos_config::is_production(),
+    }
 }
 
 /// Resolve an [`ReplayOutcome`] into an admit/reject decision under a fail
