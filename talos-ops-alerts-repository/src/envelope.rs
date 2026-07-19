@@ -14,6 +14,12 @@
 //! (domain crate owns service semantics, not just SQL) and guarantees a
 //! future consumer can't fork the DLP/tenancy discipline.
 //!
+//! Envelope entry shapes:
+//!   * ingest (default): `{source, dedup_key, title, ...}` — create/bump.
+//!   * recovery: `{dedup_key, status_event: "resolved", ...}` — the
+//!     source reported the condition cleared; resolves the rolling
+//!     alert (`resolved_source = 'signal'`) instead of bumping it.
+//!
 //! Security invariants (unchanged from the hook implementation):
 //!   * Every free-text field is DLP-redacted BEFORE persistence —
 //!     `ops_alerts` stores plaintext, and the envelope is WASM-supplied
@@ -61,6 +67,39 @@ pub fn output_has_envelope(output: &JsonValue) -> bool {
     output
         .get(talos_workflow_engine_core::reserved_keys::OPS_ALERT)
         .is_some()
+}
+
+/// What one envelope entry asks the pipeline to do. Pure classification
+/// — split from the ingest loop so the `status_event` contract is
+/// unit-testable without Postgres (house testing convention).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryAction {
+    /// Create-or-bump the rolling alert (the default entry shape).
+    Ingest,
+    /// Source-signaled recovery: resolve the alert with this dedup key.
+    Resolve { dedup_key: String },
+    /// `status_event` present but not a recognized value — skip the
+    /// entry (fail-safe: a typo must not turn a recovery into a bump).
+    SkipUnknownStatusEvent { status_event: String },
+}
+
+/// Classify one envelope entry. Only `status_event: "resolved"` is
+/// recognized today; absence means ingest.
+#[must_use]
+pub fn classify_entry(entry: &JsonValue) -> EntryAction {
+    match entry.get("status_event").and_then(JsonValue::as_str) {
+        None => EntryAction::Ingest,
+        Some("resolved") => EntryAction::Resolve {
+            dedup_key: entry
+                .get("dedup_key")
+                .and_then(JsonValue::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        },
+        Some(other) => EntryAction::SkipUnknownStatusEvent {
+            status_event: other.to_string(),
+        },
+    }
 }
 
 fn bump_failure_metric(reason: &str) {
@@ -134,6 +173,47 @@ pub fn spawn_ingest_from_output(
         let repo = crate::OpsAlertRepository::new(pool);
         for a in alerts.into_iter().take(MAX_OPS_ALERTS_PER_OUTPUT) {
             let get = |k: &str| a.get(k).and_then(JsonValue::as_str).map(str::to_string);
+
+            // ── `status_event` routing — see [`classify_entry`] ──────
+            // A recovery signal must RESOLVE the rolling alert, never
+            // ingest it: a plain ingest would bump the row (and reopen
+            // an operator-resolved one) — the exact wrong reading.
+            match classify_entry(&a) {
+                EntryAction::Ingest => {} // fall through to ingest below
+                EntryAction::Resolve { dedup_key } => {
+                    match repo.resolve_by_dedup_key(user_id, &dedup_key).await {
+                        Ok(true) => {
+                            if let Some(m) = talos_metrics::global() {
+                                m.ops_alert_auto_resolved_total.inc();
+                            }
+                            tracing::info!(
+                                %actor_id, context, dedup_key,
+                                "__ops_alert__: alert auto-resolved by source recovery signal"
+                            );
+                        }
+                        Ok(false) => {
+                            // Never-seen or already-resolved — normal.
+                            tracing::debug!(
+                                %actor_id, context, dedup_key,
+                                "__ops_alert__: resolve signal matched no active alert"
+                            );
+                        }
+                        Err(e) => {
+                            bump_failure_metric("db");
+                            tracing::warn!(%actor_id, context, error = %e, "__ops_alert__ auto-resolve failed");
+                        }
+                    }
+                    continue;
+                }
+                EntryAction::SkipUnknownStatusEvent { status_event } => {
+                    tracing::warn!(
+                        %actor_id, context, status_event,
+                        "__ops_alert__: unknown status_event — entry skipped"
+                    );
+                    continue;
+                }
+            }
+
             // DLP-redact BEFORE persistence (stored plaintext; see module doc).
             let redacted = |k: &str| get(k).map(|s| talos_dlp_provider::redact_str(&s));
             let alert = crate::NewOpsAlert {
@@ -201,6 +281,43 @@ mod tests {
         assert!(extract_alerts(&json!({"ok": 1})).is_none());
         // Non-object envelope.
         assert!(extract_alerts(&json!({"__ops_alert__": "nope"})).is_none());
+    }
+
+    #[test]
+    fn classify_entry_routes_status_events() {
+        assert_eq!(
+            classify_entry(&json!({"dedup_key": "k", "source": "s", "title": "t"})),
+            EntryAction::Ingest
+        );
+        assert_eq!(
+            classify_entry(&json!({"dedup_key": "gcpmon|p|r", "status_event": "resolved"})),
+            EntryAction::Resolve {
+                dedup_key: "gcpmon|p|r".into()
+            }
+        );
+        // Unknown status_event must NOT fall through to ingest — a typo
+        // in a recovery event turning into a bump would reopen
+        // operator-resolved alerts.
+        assert_eq!(
+            classify_entry(&json!({"dedup_key": "k", "status_event": "closed"})),
+            EntryAction::SkipUnknownStatusEvent {
+                status_event: "closed".into()
+            }
+        );
+        // Resolve with a missing dedup_key classifies as Resolve with an
+        // empty key; the repo layer no-ops on empty keys.
+        assert_eq!(
+            classify_entry(&json!({"status_event": "resolved"})),
+            EntryAction::Resolve {
+                dedup_key: String::new()
+            }
+        );
+        // Non-string status_event is treated as absent (ingest) — the
+        // field contract is string-typed.
+        assert_eq!(
+            classify_entry(&json!({"dedup_key": "k", "status_event": 7})),
+            EntryAction::Ingest
+        );
     }
 
     #[test]
