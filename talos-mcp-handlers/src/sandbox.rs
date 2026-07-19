@@ -2371,6 +2371,9 @@ async fn handle_hot_update_module(
                 "affected_workflows": affected_workflows,
                 "affected_count": out.affected_workflows.len(),
             });
+            // The module's config schema / capability description may have
+            // changed — connected MCP streams should re-fetch tools/list.
+            crate::notify_tools_list_changed();
             Some(mcp_text(
                 req_id.clone(),
                 &serde_json::to_string_pretty(&response).unwrap_or_default(),

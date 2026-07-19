@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 talos-http-utils = { path = "../talos-http-utils" }
+talos-integration-helpers = { path = "../talos-integration-helpers" }
 anyhow.workspace = true
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json"] }

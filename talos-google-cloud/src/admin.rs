@@ -23,6 +23,7 @@ use axum::{
 use serde_json::{json, Value as JsonValue};
 use std::sync::Arc;
 use talos_integration_helpers::admin::{authorize_admin_request, require_uuid_field};
+use talos_integration_helpers::api_json::ApiJson;
 use uuid::Uuid;
 
 /// Gate every request behind the shared two-check defense. The
@@ -58,7 +59,7 @@ async fn log_admin_action(pool: &sqlx::PgPool, user_id: Uuid, action: &str, meta
 pub async fn create_watch(
     State(service): State<Arc<GcpWatchService>>,
     headers: HeaderMap,
-    Json(body): Json<JsonValue>,
+    ApiJson(body): ApiJson<JsonValue>,
 ) -> (StatusCode, Json<JsonValue>) {
     if let Err(rejection) = authorize(&headers) {
         return rejection;
@@ -151,7 +152,7 @@ pub async fn create_watch(
 pub async fn stop_all(
     State(service): State<Arc<GcpWatchService>>,
     headers: HeaderMap,
-    Json(body): Json<JsonValue>,
+    ApiJson(body): ApiJson<JsonValue>,
 ) -> (StatusCode, Json<JsonValue>) {
     if let Err(rejection) = authorize(&headers) {
         return rejection;

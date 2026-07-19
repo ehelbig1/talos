@@ -514,6 +514,35 @@ pub fn create_router(
 
 /// Establish an SSE connection (acting as an MCP transport).
 /// Includes periodic token revalidation to propagate session revocations.
+/// Process-wide "the tool set changed" signal. Live SSE / streamable-HTTP
+/// GET streams subscribe and forward `notifications/tools/list_changed`
+/// to their client, so a module install / rename / delete registers or
+/// retires dynamic template tools in ALREADY-CONNECTED sessions instead
+/// of only at reconnect (2026-07-18 retrospective: tools added after a
+/// session started were uncallable until the client reconnected).
+/// Channel of () — receivers re-fetch tools/list themselves; lagged
+/// receivers still learn "something changed", which is all the signal
+/// carries.
+static TOOLS_CHANGED: std::sync::OnceLock<broadcast::Sender<()>> = std::sync::OnceLock::new();
+
+fn tools_changed_channel() -> &'static broadcast::Sender<()> {
+    TOOLS_CHANGED.get_or_init(|| broadcast::channel(16).0)
+}
+
+/// Signal every connected MCP stream that tools/list should be re-fetched.
+/// Fire-and-forget: with no connected listeners `send` errs, which is fine.
+pub(crate) fn notify_tools_list_changed() {
+    let _ = tools_changed_channel().send(());
+}
+
+fn list_changed_event() -> Event {
+    let data = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/tools/list_changed"
+    });
+    Event::default().event("message").data(data.to_string())
+}
+
 async fn sse_handler(
     State(state): State<McpState>,
     axum::extract::Extension(agent): axum::extract::Extension<std::sync::Arc<auth::AgentIdentity>>,
@@ -547,6 +576,21 @@ async fn sse_handler(
             let event = Event::default().event("message").data(data.to_string());
             if tx_notif.send(event).is_err() {
                 break; // client disconnected — stop sending
+            }
+        }
+    });
+
+    // Forward the process-wide tools-changed signal into this agent's
+    // stream for as long as the client is connected.
+    let tx_changes = tx.clone();
+    tokio::spawn(async move {
+        let mut rx = tools_changed_channel().subscribe();
+        // Lagged still means "something changed" — forward it; the loop
+        // ends on channel close (never for the static sender) or client
+        // disconnect (send error).
+        while let Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) = rx.recv().await {
+            if tx_changes.send(list_changed_event()).is_err() {
+                break; // client disconnected
             }
         }
     });
@@ -842,9 +886,21 @@ async fn streamable_http_get_handler(
                 Event::default().event("message").data(data.to_string())
             );
         }
+        let mut rx = tools_changed_channel().subscribe();
         loop {
-            tokio::time::sleep(Duration::from_secs(15)).await;
-            yield Ok::<_, Infallible>(Event::default().comment("keepalive"));
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(15)) => {
+                    yield Ok::<_, Infallible>(Event::default().comment("keepalive"));
+                }
+                res = rx.recv() => {
+                    match res {
+                        Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                            yield Ok::<_, Infallible>(list_changed_event());
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
         }
     };
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
@@ -868,9 +924,21 @@ async fn local_get_handler() -> impl IntoResponse {
                 Event::default().event("message").data(data.to_string())
             );
         }
+        let mut rx = tools_changed_channel().subscribe();
         loop {
-            tokio::time::sleep(Duration::from_secs(15)).await;
-            yield Ok::<_, Infallible>(Event::default().comment("keepalive"));
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(15)) => {
+                    yield Ok::<_, Infallible>(Event::default().comment("keepalive"));
+                }
+                res = rx.recv() => {
+                    match res {
+                        Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                            yield Ok::<_, Infallible>(list_changed_event());
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
         }
     };
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))

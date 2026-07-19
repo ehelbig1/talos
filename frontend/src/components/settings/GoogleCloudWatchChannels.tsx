@@ -37,6 +37,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui";
 import { getCsrfToken } from "@/lib/csrf";
+import { useMyModulesQuery } from "@/generated/graphql";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { cn } from "@/lib/utils";
 
@@ -146,6 +147,16 @@ function CreateGcpWatchDialog({
   const [saEmail, setSaEmail] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [moduleId, setModuleId] = useState("");
+  // Installed-modules dropdown: the previous free-text field expected a
+  // raw UUID — users naturally typed the module NAME, the server
+  // rejected the body, and pre-ApiJson that rejection was plain text
+  // that crashed res.json(). Fetch lazily (only while the dialog is
+  // open) and fall back to free-text entry if the query fails.
+  const modulesQuery = useMyModulesQuery(
+    { limit: 200, offset: 0 },
+    { enabled: open, staleTime: 60_000 },
+  );
+  const moduleOptions = modulesQuery.data?.myModules ?? [];
   const [submitting, setSubmitting] = useState(false);
   // The push endpoint returned by create — surfaced ONCE here with a
   // copy button so the user can paste it into `gcloud`.
@@ -183,7 +194,19 @@ function CreateGcpWatchDialog({
           module_id: moduleId.trim() || null,
         }),
       });
-      const body: ApiResponse<{ push_endpoint?: string }> = await res.json();
+      // Defense in depth alongside the server-side ApiJson envelope: a
+      // proxy/middleware plain-text error must surface as a message, not
+      // as "Unexpected token ... is not valid JSON".
+      const raw = await res.text();
+      let body: ApiResponse<{ push_endpoint?: string }>;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        toast.error(
+          sanitizeErrorMessage(raw.slice(0, 200) || `HTTP ${res.status}`),
+        );
+        return;
+      }
       if (!body.success) {
         toast.error(sanitizeErrorMessage(body.error ?? "Create failed"));
         return;
@@ -300,16 +323,33 @@ function CreateGcpWatchDialog({
             <label className="block text-xs font-semibold text-muted-foreground mb-2">
               Module ID (optional)
             </label>
-            <input
-              type="text"
-              value={moduleId}
-              onChange={(e) => setModuleId(e.target.value)}
-              disabled={submitting}
-              placeholder="UUID of the module to run on each incident"
-              className="w-full h-10 px-3 text-sm bg-background border border-border/60 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/40"
-            />
+            {moduleOptions.length > 0 ? (
+              <select
+                value={moduleId}
+                onChange={(e) => setModuleId(e.target.value)}
+                disabled={submitting}
+                className="w-full h-10 px-3 text-sm bg-background border border-border/60 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/40"
+              >
+                <option value="">(none — bind later)</option>
+                {moduleOptions.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.name}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                type="text"
+                value={moduleId}
+                onChange={(e) => setModuleId(e.target.value)}
+                disabled={submitting}
+                placeholder="UUID of the module to run on each incident"
+                className="w-full h-10 px-3 text-sm bg-background border border-border/60 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/40"
+              />
+            )}
             <p className="text-[11px] text-muted-foreground mt-1.5">
-              Leave blank to bind a module later in the workflow builder.
+              The module that runs on each incident. Leave unset to bind one
+              later in the workflow builder.
             </p>
           </div>
 

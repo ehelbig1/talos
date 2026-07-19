@@ -666,6 +666,7 @@ async fn handle_delete_module(
                 format!("Module {} deleted via MCP delete_module", mod_id),
                 Some(serde_json::json!({ "force": force })),
             );
+            crate::notify_tools_list_changed();
             mcp_text(req_id, &format!("Module {} deleted.", mod_id))
         }
         // MCP-159 (2026-05-08): uniform message — mirrors the
@@ -1882,6 +1883,9 @@ async fn handle_batch_delete_modules(
         0
     };
 
+    if deleted_count > 0 {
+        crate::notify_tools_list_changed();
+    }
     let response = serde_json::json!({
         "deleted_count": deleted_count,
         "skipped": skipped,
@@ -1946,10 +1950,13 @@ async fn handle_rename_module(
         .rename_module(module_id, user_id, new_name)
         .await
     {
-        Ok(n) if n > 0 => mcp_text(
-            req_id,
-            &format!("Module {} renamed to '{}'.", module_id, new_name),
-        ),
+        Ok(n) if n > 0 => {
+            crate::notify_tools_list_changed();
+            mcp_text(
+                req_id,
+                &format!("Module {} renamed to '{}'.", module_id, new_name),
+            )
+        }
         // MCP-155 (2026-05-08): collapse the not-found vs access-denied
         // branches to a single uniform message. The previous shape
         // exposed enough information to enumerate cross-tenant module
@@ -3200,6 +3207,13 @@ async fn handle_install_module_from_catalog(
             //   3. compute_max_fuel(10, 2000, 2.0) baseline (~2.2M)
             // The hardcoded 2M was leaving LLM-backed templates fuel-starved on
             // realistic actor-context payloads — see issue #381.
+            // On RE-install the existing row's max_fuel is PRESERVED unless
+            // the caller explicitly passed fuel_budget (fuel_explicit below) —
+            // template/baseline values only apply to fresh installs. Mirrors
+            // r236's hot_update fuel preservation; the reinstall path was the
+            // unswept sibling (live bite 2026-07-17: tuned 10M silently reset
+            // to 1.38M auto-calc).
+            let fuel_explicit = args.get("fuel_budget").is_some();
             let max_fuel: i64 = if let Some(budget) = args.get("fuel_budget") {
                 crate::sandbox::compute_fuel_from_budget_value(budget) as i64
             } else if let Some(rec) = meta.get("recommended_fuel") {
@@ -3226,6 +3240,7 @@ async fn handle_install_module_from_catalog(
                     // The resolved template DIR is the canonical catalog slug —
                     // stable under display-name renames (DX #14).
                     module_dir.file_name().and_then(|f| f.to_str()),
+                    fuel_explicit,
                 )
                 .await
             {
@@ -3258,6 +3273,9 @@ async fn handle_install_module_from_catalog(
                 capability_world,
                 "Installed module from catalog (modules-only write)"
             );
+            // Dynamic template tools may have appeared/changed — tell
+            // connected MCP streams to re-fetch tools/list.
+            crate::notify_tools_list_changed();
 
             // Pin the module if requested
             // MCP-270 (2026-05-10): direction-class wrong-type rejection.

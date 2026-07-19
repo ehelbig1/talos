@@ -470,6 +470,15 @@ services:
     ports:
       - "8000:8000"
     volumes:
+      # DEV template live-editing: bind-mount the repo's module-templates
+      # over the image-baked copy so install_module_from_catalog picks up
+      # local template edits WITHOUT an image rebuild (the previous dev
+      # loop was rebuild-image or docker-cp — both bad; observed
+      # repeatedly during the alert-normalize template iterations,
+      # 2026-07-17/18). Read-only: the controller never writes templates.
+      # Production (helm) keeps the baked copy — this file IS the dev
+      # stack.
+      - ./module-templates:/app/module-templates:ro
       # Persist cargo registry + build artifacts so runtime compilations
       # (compile_custom_sandbox_template) survive container restarts.
       #

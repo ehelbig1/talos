@@ -1695,26 +1695,7 @@ impl CompilationService {
         // build its own artifact path; the shared target dir still caches
         // dependencies (keyed by their own fingerprints, unaffected by the
         // user crate's name).
-        let raw_package_name = format!("{}-{}", name, job_id.simple())
-            .chars()
-            .map(|c| if c.is_alphanumeric() { c } else { '-' })
-            .collect::<String>()
-            .to_lowercase();
-
-        // Cargo requires every dash-separated segment to start with a letter.
-        // Node IDs ending in digits (e.g. "run-string-2") would produce an invalid
-        // segment "2". Prepend 'n' to any segment that starts with a digit.
-        let package_name = raw_package_name
-            .split('-')
-            .map(|seg| {
-                if seg.starts_with(|c: char| c.is_ascii_digit()) {
-                    format!("n{}", seg)
-                } else {
-                    seg.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("-");
+        let package_name = sanitize_package_name(name, &job_id.simple().to_string());
 
         // Extract the WIT world from the source so the Cargo.toml target world matches
         // exactly what the macro declared. This prevents cargo-component from guessing
@@ -2030,6 +2011,39 @@ panic = "abort"
 /// modules that omitted the annotation, granting the user code privileges
 /// it never asked for. Operators who want the legacy permissive default
 /// can set `TALOS_DEFAULT_WIT_WORLD=automation-node`.
+/// Derive a valid cargo package name (kebab-case label) from a module
+/// display name + per-job suffix.
+///
+/// Cargo label rules enforced here: dash-separated segments must be
+/// non-empty and must not start with a digit. Display names routinely
+/// contain runs of non-alphanumerics — `"Alert Normalize (GCP
+/// Monitoring)"` maps to consecutive dashes, whose empty segments made
+/// cargo-component fail with "dash-separated words may not be empty"
+/// (live hot_update bite, 2026-07-17). Empty segments are FILTERED, not
+/// re-joined; a name that is ALL symbols still yields a valid label
+/// because the alphanumeric `job_id` suffix survives.
+///
+/// The `job_id` suffix is also correctness-critical for concurrency —
+/// see the CONCURRENCY comment at the call site in `create_workspace`.
+fn sanitize_package_name(name: &str, job_suffix: &str) -> String {
+    format!("{name}-{job_suffix}")
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .to_lowercase()
+        .split('-')
+        .filter(|seg| !seg.is_empty())
+        .map(|seg| {
+            if seg.starts_with(|c: char| c.is_ascii_digit()) {
+                format!("n{seg}")
+            } else {
+                seg.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 fn extract_wit_world(source: &str) -> String {
     // MCP-637 (2026-05-12) + wasm-security-review (2026-05-22):
     // closes N-8 (extract_wit_world matches first occurrence
@@ -2531,6 +2545,45 @@ class WitWorld:
         import json as _talos_json
         return _talos_json.dumps(result)
 "#;
+
+#[cfg(test)]
+mod package_name_tests {
+    use super::sanitize_package_name;
+
+    #[test]
+    fn parenthesized_display_names_yield_valid_labels() {
+        // The live hot_update failure shape: parens + spaces → consecutive
+        // dashes → empty label segments.
+        let n = sanitize_package_name("Alert Normalize (GCP Monitoring)", "abc123");
+        assert_eq!(n, "alert-normalize-gcp-monitoring-abc123");
+        assert!(!n.contains("--"));
+    }
+
+    #[test]
+    fn every_segment_is_nonempty_and_letter_led() {
+        for name in [
+            "a  (b)",
+            "(x)",
+            "!!!",
+            "run-string-2",
+            "trailing symbols)))",
+            "日本語 module",
+        ] {
+            let label = sanitize_package_name(name, "0f9a");
+            assert!(!label.is_empty(), "{name:?} produced empty label");
+            for seg in label.split('-') {
+                assert!(
+                    !seg.is_empty(),
+                    "{name:?} produced empty segment in {label:?}"
+                );
+                assert!(
+                    !seg.starts_with(|c: char| c.is_ascii_digit()),
+                    "{name:?} produced digit-led segment in {label:?}"
+                );
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod jspy_world_detection_tests {

@@ -793,8 +793,20 @@ impl WebhookRouter {
                         event_id = %event_id,
                         "Suppressed duplicate webhook delivery"
                     );
-                    // Return 200 so the sender does not retry; log at INFO not WARN.
-                    return Ok((StatusCode::OK, "OK").into_response());
+                    // Return 200 so the sender does not retry; log at INFO not
+                    // WARN. The body SAYS it was suppressed — a bare "OK" made
+                    // manual testing look like a dropped delivery (2026-07-17:
+                    // an identical re-POST during live validation produced no
+                    // execution and nothing to explain why without docker
+                    // logs). Machine-readable so scripted callers can branch.
+                    return Ok((
+                        StatusCode::OK,
+                        axum::Json(serde_json::json!({
+                            "status": "duplicate_suppressed",
+                            "detail": "identical payload already processed within the dedup window; no execution dispatched",
+                        })),
+                    )
+                        .into_response());
                 }
                 Ok(false) => {
                     // Claim recorded — track it so a pre-execution failure can

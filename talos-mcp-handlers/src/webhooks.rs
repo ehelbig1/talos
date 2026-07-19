@@ -492,7 +492,10 @@ async fn handle_list_webhooks(
             let webhooks: Vec<serde_json::Value> = rows
                 .iter()
                 .map(|r| {
-                    let webhook_url = format!("{}/webhook/{}", base_url, r.id);
+                    // Route is `/webhooks/{id}` (plural) — same rule as the create
+                    // handler above; these two list-path siblings were missed
+                    // when that fix landed (copying the listed URL 404'd).
+                    let webhook_url = format!("{}/webhooks/{}", base_url, r.id);
                     serde_json::json!({
                         "id": r.id,
                         "name": r.name,
@@ -684,7 +687,10 @@ async fn handle_list_workflow_webhooks(
             let webhooks: Vec<serde_json::Value> = rows
                 .iter()
                 .map(|r| {
-                    let webhook_url = format!("{}/webhook/{}", base_url, r.id);
+                    // Route is `/webhooks/{id}` (plural) — same rule as the create
+                    // handler above; these two list-path siblings were missed
+                    // when that fix landed (copying the listed URL 404'd).
+                    let webhook_url = format!("{}/webhooks/{}", base_url, r.id);
                     serde_json::json!({
                         "id": r.id,
                         "name": r.name,

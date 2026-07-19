@@ -1121,6 +1121,40 @@ impl ExecutionRepository {
         Ok(chain)
     }
 
+    /// Fuel history for one node of one workflow over the trailing
+    /// `days`: `(successful_runs, p50_fuel, max_fuel_observed)`. Rows in
+    /// `execution_cost_rollup` are written at node COMPLETION, so this
+    /// is effectively successful-run history — exactly the signal a
+    /// fuel-exhaustion remediation needs ("what does this node actually
+    /// consume when it works?"). Tenancy via the workflows join;
+    /// `days` is caller-clamped AND bound `::int` (make_interval is
+    /// int4-only, lint 27). Returns `None` when no history exists.
+    pub async fn node_fuel_history(
+        &self,
+        workflow_id: Uuid,
+        node_label: &str,
+        user_id: Uuid,
+        days: i32,
+    ) -> Result<Option<(i64, i64, i64)>> {
+        let days = days.clamp(1, 365);
+        let row: (i64, i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*)::bigint, \
+                    COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY r.fuel_consumed), 0)::bigint, \
+                    COALESCE(MAX(r.fuel_consumed), 0)::bigint \
+             FROM execution_cost_rollup r \
+             JOIN workflows w ON w.id = r.workflow_id \
+             WHERE r.workflow_id = $1 AND w.user_id = $2 AND r.node_id = $3 \
+               AND r.recorded_at > NOW() - make_interval(days => $4::int)",
+        )
+        .bind(workflow_id)
+        .bind(user_id)
+        .bind(node_label)
+        .bind(days)
+        .fetch_one(&self.db_pool)
+        .await?;
+        Ok(if row.0 == 0 { None } else { Some(row) })
+    }
+
     // ── Execution events ───────────────────────────────────────────────────
 
     /// All events for an execution, ordered by created_at ASC. Hard cap at 1000.

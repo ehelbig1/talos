@@ -131,6 +131,9 @@ pub struct OpsAlertRow {
 #[derive(Debug, Clone, Default)]
 pub struct OpsAlertFilter {
     pub status: Option<String>,
+    /// When true (and `status` is None), resolved rows are excluded —
+    /// the triage-surface default. Explicit `status` filters override.
+    pub exclude_resolved: bool,
     pub severity: Option<String>,
     pub source: Option<String>,
     pub since: Option<DateTime<Utc>>,
@@ -301,6 +304,7 @@ impl OpsAlertRepository {
             FROM ops_alerts
             WHERE user_id = $1
               AND ($2::text IS NULL OR status = $2)
+              AND (NOT $7 OR status <> 'resolved')
               AND ($3::text IS NULL OR severity = $3)
               AND ($4::text IS NULL OR source = $4)
               AND ($5::timestamptz IS NULL OR last_seen >= $5)
@@ -314,6 +318,7 @@ impl OpsAlertRepository {
         .bind(&filter.source)
         .bind(filter.since)
         .bind(limit)
+        .bind(filter.status.is_none() && filter.exclude_resolved)
         .fetch_all(&self.db_pool)
         .await?;
 

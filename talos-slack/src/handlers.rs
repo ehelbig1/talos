@@ -7,6 +7,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use talos_integration_helpers::api_json::ApiJson;
 use uuid::Uuid;
 
 /// Response for OAuth initiation
@@ -355,7 +356,7 @@ impl std::fmt::Debug for CreateAppResponse {
 pub async fn create_app_handler(
     State(client): State<Arc<crate::SlackApiClient>>,
     Extension(_user_id): Extension<Uuid>,
-    Json(req): Json<CreateAppRequest>,
+    ApiJson(req): ApiJson<CreateAppRequest>,
 ) -> impl IntoResponse {
     // Generate manifest
     let manifest = client.generate_manifest(

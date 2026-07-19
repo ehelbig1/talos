@@ -35,6 +35,7 @@ use axum::{
 use serde_json::{json, Value as JsonValue};
 use std::sync::Arc;
 use talos_integration_helpers::admin::{authorize_admin_request, require_uuid_field};
+use talos_integration_helpers::api_json::ApiJson;
 use talos_integration_state::execute_op;
 use talos_memory::integration_state_rpc::{IntegrationOp, IntegrationOpResult, ListFilter};
 use uuid::Uuid;
@@ -82,7 +83,7 @@ async fn log_admin_action(pool: &sqlx::PgPool, user_id: Uuid, action: &str, meta
 pub async fn create_watch(
     State(service): State<Arc<GoogleCalendarService>>,
     headers: HeaderMap,
-    Json(body): Json<JsonValue>,
+    ApiJson(body): ApiJson<JsonValue>,
 ) -> (StatusCode, Json<JsonValue>) {
     if let Err(rejection) = authorize(&headers) {
         return rejection;
@@ -185,7 +186,7 @@ pub async fn create_watch(
 pub async fn stop_orphan(
     State(service): State<Arc<GoogleCalendarService>>,
     headers: HeaderMap,
-    Json(body): Json<JsonValue>,
+    ApiJson(body): ApiJson<JsonValue>,
 ) -> (StatusCode, Json<JsonValue>) {
     if let Err(rejection) = authorize(&headers) {
         return rejection;
@@ -366,7 +367,7 @@ pub async fn stop_orphan(
 pub async fn stop_all(
     State(service): State<Arc<GoogleCalendarService>>,
     headers: HeaderMap,
-    Json(body): Json<JsonValue>,
+    ApiJson(body): ApiJson<JsonValue>,
 ) -> (StatusCode, Json<JsonValue>) {
     if let Err(rejection) = authorize(&headers) {
         return rejection;
