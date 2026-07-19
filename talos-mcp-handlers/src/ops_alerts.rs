@@ -177,6 +177,7 @@ async fn handle_list(
                         "first_seen": a.first_seen.to_rfc3339(),
                         "last_seen": a.last_seen.to_rfc3339(),
                         "reopened_at": a.reopened_at.map(|t| t.to_rfc3339()),
+                        "resolved_source": a.resolved_source,
                     })
                 })
                 .collect();

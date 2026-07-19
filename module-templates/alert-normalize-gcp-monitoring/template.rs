@@ -46,8 +46,16 @@ struct Envelope {
 struct Config {
     #[serde(default, rename = "SOURCE_PREFIX")]
     source_prefix: String,
+    /// Legacy toggle (pre-ON_CLOSED): `true` maps to `ingest`.
     #[serde(default, rename = "INCLUDE_CLOSED")]
     include_closed: bool,
+    /// What a `state: "closed"` notification does:
+    ///   "resolve" (default) — emit a `status_event: "resolved"` entry so
+    ///     the rolling alert auto-resolves (`resolved_source = 'signal'`);
+    ///   "ignore" — skip the notification entirely (old default);
+    ///   "ingest" — treat it as a normal alert event (bumps the row).
+    #[serde(default, rename = "ON_CLOSED")]
+    on_closed: String,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -151,13 +159,54 @@ fn run(input: String) -> Result<String, String> {
         top_incident_id
     };
 
-    if state == "closed" && !env.config.include_closed {
-        return Ok(serde_json::json!({
-            "normalized": 0,
-            "skipped": 1,
-            "reason": "state=closed (set INCLUDE_CLOSED to ingest close events)",
-        })
-        .to_string());
+    if state == "closed" {
+        let on_closed = if !env.config.on_closed.is_empty() {
+            env.config.on_closed.as_str()
+        } else if env.config.include_closed {
+            "ingest" // legacy INCLUDE_CLOSED=true compatibility
+        } else {
+            "resolve"
+        };
+        match on_closed {
+            "ignore" => {
+                return Ok(serde_json::json!({
+                    "normalized": 0,
+                    "skipped": 1,
+                    "reason": "state=closed (ON_CLOSED=ignore)",
+                })
+                .to_string());
+            }
+            "ingest" => {} // fall through to normal alert emission below
+            _ => {
+                // "resolve" (default): the incident closing means the
+                // condition CLEARED — emit a recovery event keyed on the
+                // SAME dedup identity the open event used, so the engine
+                // resolves the rolling alert instead of bumping it.
+                let resource = if !inc.resource_display_name.is_empty() {
+                    inc.resource_display_name.clone()
+                } else if !inc.resource_name.is_empty() {
+                    inc.resource_name.clone()
+                } else {
+                    inc.scoping_project_id.clone()
+                };
+                let policy = if inc.policy_name.is_empty() {
+                    inc.condition_name.clone()
+                } else {
+                    inc.policy_name.clone()
+                };
+                return Ok(serde_json::json!({
+                    "normalized": 0,
+                    "resolved": 1,
+                    "state": "closed",
+                    "__ops_alert__": { "alerts": [{
+                        "source": format!("{}gcp-monitoring", env.config.source_prefix),
+                        "dedup_key": format!("gcpmon|{}|{}", norm_key(&policy), norm_key(&resource)),
+                        "status_event": "resolved",
+                    }] },
+                })
+                .to_string());
+            }
+        }
     }
 
     let resource = if !inc.resource_display_name.is_empty() {

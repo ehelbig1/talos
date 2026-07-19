@@ -2,7 +2,7 @@
   "name": "alert-normalize-gcp-monitoring",
   "version": "v1.0.0",
   "display_name": "Alert Normalize (GCP Monitoring)",
-  "description": "Normalize a Cloud Monitoring incident (delivered via the google_cloud Pub/Sub push watch) into the ops-alerts triage store. Emits the __ops_alert__ envelope — dedup on policy+resource so a re-firing condition bumps/reopens one rolling alert instead of creating a row per incident; severity mapped from the alert policy's severity (CRITICAL→critical, ERROR→high, WARNING→medium). Closed-state notifications are skipped by default (INCLUDE_CLOSED). Bind this module to a GCP Monitoring watch channel; triage via list_ops_alerts / correct_ops_alert_severity.",
+  "description": "Normalize a Cloud Monitoring incident (delivered via the google_cloud Pub/Sub push watch) into the ops-alerts triage store. Emits the __ops_alert__ envelope — dedup on policy+resource so a re-firing condition bumps/reopens one rolling alert instead of creating a row per incident; severity mapped from the alert policy's severity (CRITICAL→critical, ERROR→high, WARNING→medium). state=closed notifications AUTO-RESOLVE the rolling alert by default (status_event: 'resolved' — resolved_source 'signal'); tune with ON_CLOSED. Bind this module to a GCP Monitoring watch channel; triage via list_ops_alerts / correct_ops_alert_severity.",
   "category": "Operations",
   "capability_world": "minimal-node",
   "allowed_hosts": [],
@@ -18,7 +18,17 @@
       "INCLUDE_CLOSED": {
         "type": "boolean",
         "default": false,
-        "description": "When true, state=closed notifications are ALSO ingested (they bump the rolling alert and will REOPEN it if an operator already resolved it — usually not what you want). Default skips them; resolve alerts at triage time instead."
+        "description": "LEGACY (pre-ON_CLOSED): true maps to ON_CLOSED=ingest when ON_CLOSED is unset. Prefer ON_CLOSED."
+      },
+      "ON_CLOSED": {
+        "type": "string",
+        "enum": [
+          "resolve",
+          "ignore",
+          "ingest"
+        ],
+        "default": "resolve",
+        "description": "What a state=closed notification does: 'resolve' (default) auto-resolves the rolling alert via status_event; 'ignore' skips it; 'ingest' treats it as a normal alert event (bumps — will REOPEN an operator-resolved row)."
       }
     }
   }
