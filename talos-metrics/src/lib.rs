@@ -84,6 +84,9 @@ pub struct TalosMetrics {
     /// Labels: reason=validation|db|tenancy. Sustained bump means alert
     /// envelopes emitted by parser modules are being lost.
     pub ops_alert_ingest_failures_total: CounterVec,
+    /// Alerts auto-resolved by a source-signaled recovery
+    /// (`status_event: "resolved"` in the __ops_alert__ envelope).
+    pub ops_alert_auto_resolved_total: Counter,
     pub module_payload_encryption_failures_total: CounterVec,
     /// Per-row secret-decrypt failures from `SecretsManager::get_module_secrets`.
     /// Labels: reason=missing_dek|cipher_init|aead|invalid_utf8|too_short.
@@ -327,6 +330,14 @@ impl TalosMetrics {
         )?;
         registry.register(Box::new(ops_alert_ingest_failures_total.clone()))?;
 
+        let ops_alert_auto_resolved_total = Counter::new(
+            "talos_ops_alert_auto_resolved_total",
+            "ops_alerts rows resolved by a status_event: 'resolved' signal \
+             from the ingest pipeline (source-reported recovery, e.g. a \
+             Cloud Monitoring incident closing).",
+        )?;
+        registry.register(Box::new(ops_alert_auto_resolved_total.clone()))?;
+
         let module_payload_encryption_failures_total = CounterVec::new(
             prometheus::Opts::new(
                 "talos_module_payload_encryption_failures_total",
@@ -426,6 +437,7 @@ impl TalosMetrics {
             kek_decrypt_failures_total,
             memory_write_failures_total,
             ops_alert_ingest_failures_total,
+            ops_alert_auto_resolved_total,
             module_payload_encryption_failures_total,
             secret_decrypt_failures_total,
             actor_memory_orphaned_rows,

@@ -124,6 +124,9 @@ pub struct OpsAlertRow {
     /// Set when the alert re-fired AFTER being resolved (regression); the
     /// most recent such moment. NULL = never reopened.
     pub reopened_at: Option<DateTime<Utc>>,
+    /// Who resolved: 'operator' (MCP triage) or 'signal' (source-reported
+    /// recovery via `status_event`). NULL when unresolved or legacy.
+    pub resolved_source: Option<String>,
 }
 
 /// Filters for [`OpsAlertRepository::list`]. All optional; `limit` is clamped
@@ -300,7 +303,7 @@ impl OpsAlertRepository {
             SELECT id, source, external_id, dedup_key, title, resource,
                    severity_raw, severity, triage_source, triage_confidence,
                    corrected_severity, status, occurrence_count,
-                   first_seen, last_seen, reopened_at
+                   first_seen, last_seen, reopened_at, resolved_source
             FROM ops_alerts
             WHERE user_id = $1
               AND ($2::text IS NULL OR status = $2)
@@ -346,6 +349,7 @@ impl OpsAlertRepository {
             first_seen: r.try_get("first_seen")?,
             last_seen: r.try_get("last_seen")?,
             reopened_at: r.try_get::<Option<_>, _>("reopened_at")?,
+            resolved_source: r.try_get::<Option<_>, _>("resolved_source")?,
         })
     }
 
@@ -367,11 +371,38 @@ impl OpsAlertRepository {
     /// Resolve a `new`/`acked` alert. Returns false when nothing matched.
     pub async fn resolve(&self, user_id: Uuid, alert_id: Uuid) -> Result<bool> {
         let res = sqlx::query(
-            "UPDATE ops_alerts SET status = 'resolved', resolved_at = NOW() \
+            "UPDATE ops_alerts \
+             SET status = 'resolved', resolved_at = NOW(), resolved_source = 'operator' \
              WHERE id = $1 AND user_id = $2 AND status IN ('new','acked')",
         )
         .bind(alert_id)
         .bind(user_id)
+        .execute(&self.db_pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// SIGNAL-sourced resolve: the alert's own source reported the
+    /// condition cleared (`status_event: "resolved"` in the
+    /// `__ops_alert__` envelope — e.g. a Cloud Monitoring incident
+    /// closing). Keyed on the dedup identity because the source doesn't
+    /// know our row id. Same status guard as [`Self::resolve`]
+    /// (new/acked only — an already-resolved row is an idempotent
+    /// no-op, and a future re-fire still REOPENS via ingest). Returns
+    /// whether a row actually transitioned; a close event for an alert
+    /// we never saw open is a normal no-op, not an error.
+    pub async fn resolve_by_dedup_key(&self, user_id: Uuid, dedup_key: &str) -> Result<bool> {
+        let dedup_key = truncate_chars(dedup_key, MAX_KEY_CHARS);
+        if dedup_key.is_empty() {
+            return Ok(false);
+        }
+        let res = sqlx::query(
+            "UPDATE ops_alerts \
+             SET status = 'resolved', resolved_at = NOW(), resolved_source = 'signal' \
+             WHERE user_id = $1 AND dedup_key = $2 AND status IN ('new','acked')",
+        )
+        .bind(user_id)
+        .bind(&dedup_key)
         .execute(&self.db_pool)
         .await?;
         Ok(res.rows_affected() > 0)
@@ -439,7 +470,7 @@ impl OpsAlertRepository {
             SELECT id, source, external_id, dedup_key, title, resource,
                    severity_raw, severity, triage_source, triage_confidence,
                    corrected_severity, status, occurrence_count,
-                   first_seen, last_seen, reopened_at
+                   first_seen, last_seen, reopened_at, resolved_source
             FROM ops_alerts
             WHERE user_id = $1 AND status <> 'resolved'
             ORDER BY CASE severity
