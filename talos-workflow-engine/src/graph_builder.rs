@@ -528,6 +528,7 @@ fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue
         SystemNodeKind::OpsAlertsDigest { top_limit } => {
             ("ops_alerts_digest", json!({ "top_limit": top_limit }))
         }
+        SystemNodeKind::AssistantReport { days } => ("assistant_report", json!({ "days": days })),
         SystemNodeKind::Synthesize { synthesis_expr } => (
             "synthesize",
             match synthesis_expr {
@@ -1301,6 +1302,27 @@ mod tests {
         assert!(matches!(
             parsed,
             Some(SystemNodeKind::OpsAlertsDigest { top_limit: 25 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn system_node_assistant_report_round_trips() {
+        let decoded =
+            round_trip_kind("weekly_report", SystemNodeKind::AssistantReport { days: 7 }).await;
+        assert!(matches!(
+            decoded,
+            SystemNodeKind::AssistantReport { days: 7 }
+        ));
+        let oversized = serde_json::json!({
+            "id": "wr_big",
+            "type": "system:assistant_report",
+            "kind": "assistant_report",
+            "data": { "days": 999 },
+        });
+        let parsed = crate::graph_parser::parse_system_node_kind("assistant_report", &oversized);
+        assert!(matches!(
+            parsed,
+            Some(SystemNodeKind::AssistantReport { days: 31 })
         ));
     }
 

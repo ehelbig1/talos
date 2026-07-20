@@ -77,6 +77,7 @@ pub fn dispatcher_branch_for(kind: &SystemNodeKind) -> &'static str {
         SystemNodeKind::Loop { .. } => "try_dispatch_loop",
         SystemNodeKind::Collect => "try_dispatch_collect",
         SystemNodeKind::OpsAlertsDigest { .. } => "try_dispatch_ops_alerts_digest",
+        SystemNodeKind::AssistantReport { .. } => "try_dispatch_assistant_report",
         SystemNodeKind::Synthesize { .. } => "try_dispatch_synthesize",
         SystemNodeKind::Verify { .. } => "try_dispatch_verify",
         SystemNodeKind::DynamicDispatch { .. } => "try_dispatch_dynamic_dispatch",
@@ -142,6 +143,7 @@ mod tests {
             },
             SystemNodeKind::Collect,
             SystemNodeKind::OpsAlertsDigest { top_limit: 10 },
+            SystemNodeKind::AssistantReport { days: 7 },
             SystemNodeKind::Synthesize {
                 synthesis_expr: None,
             },
@@ -247,16 +249,16 @@ mod tests {
     /// the count drifts.
     ///
     /// Counts as of 2026-04-22 (after `ForEach` removal):
-    ///   13 always-available (`Wait`, `WhileLoop`, `RepeatLoop`,
+    ///   14 always-available (`Wait`, `WhileLoop`, `RepeatLoop`,
     ///   `ErrorHandler`, `FanIn`, `SubWorkflow`, `Loop`, `Collect`,
-    ///   `OpsAlertsDigest`, `Synthesize`, `Verify`, `DynamicDispatch`,
-    ///   `CapabilityDispatch`)
+    ///   `OpsAlertsDigest`, `AssistantReport`, `Synthesize`, `Verify`,
+    ///   `DynamicDispatch`, `CapabilityDispatch`)
     ///   + 8 llm-primitives (`AgentLoop`, `Judge`, `InlineJudge`, `Ensemble`,
     ///   `ConfidenceGate`, `ReActLoop`, `ReflectiveRetry`, `LlmDispatch`)
-    ///   = 21 total.
+    ///   = 22 total.
     #[test]
     fn sample_count_matches_known_enum_size() {
-        const ALWAYS_AVAILABLE: usize = 13;
+        const ALWAYS_AVAILABLE: usize = 14;
         #[cfg(feature = "llm-primitives")]
         const EXPECTED: usize = ALWAYS_AVAILABLE + 8;
         #[cfg(not(feature = "llm-primitives"))]
@@ -290,6 +292,7 @@ mod tests {
             "try_dispatch_loop",
             "try_dispatch_collect",
             "try_dispatch_ops_alerts_digest",
+            "try_dispatch_assistant_report",
             "try_dispatch_synthesize",
             "try_dispatch_verify",
             "try_dispatch_dynamic_dispatch",

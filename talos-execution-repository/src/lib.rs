@@ -1155,6 +1155,51 @@ impl ExecutionRepository {
         Ok(if row.0 == 0 { None } else { Some(row) })
     }
 
+    /// Per-workflow execution counts over the trailing `days` for one
+    /// user: `(workflow_name, total, completed, failed)`, busiest first.
+    /// Powers the `assistant_report` system node. `days` clamped and
+    /// bound `::int` (make_interval is int4-only, lint 27); capped at 50
+    /// workflows (a report slice, not a pagination surface).
+    pub async fn weekly_workflow_stats(
+        &self,
+        user_id: Uuid,
+        days: i32,
+    ) -> Result<Vec<(String, i64, i64, i64)>> {
+        let days = days.clamp(1, 31);
+        Ok(sqlx::query_as(
+            "SELECT w.name, COUNT(*)::bigint, \
+                    COUNT(*) FILTER (WHERE e.status = 'completed')::bigint, \
+                    COUNT(*) FILTER (WHERE e.status = 'failed')::bigint \
+             FROM workflow_executions e \
+             JOIN workflows w ON w.id = e.workflow_id \
+             WHERE w.user_id = $1 \
+               AND e.created_at > NOW() - make_interval(days => $2::int) \
+             GROUP BY w.name ORDER BY COUNT(*) DESC, w.name LIMIT 50",
+        )
+        .bind(user_id)
+        .bind(days)
+        .fetch_all(&self.db_pool)
+        .await?)
+    }
+
+    /// Total fuel + wall-time over the trailing `days` for one user —
+    /// the report's cost line. Tenancy via the workflows join.
+    pub async fn weekly_fuel_totals(&self, user_id: Uuid, days: i32) -> Result<(i64, i64)> {
+        let days = days.clamp(1, 31);
+        Ok(sqlx::query_as(
+            "SELECT COALESCE(SUM(r.fuel_consumed), 0)::bigint, \
+                    COALESCE(SUM(r.wall_time_ms), 0)::bigint \
+             FROM execution_cost_rollup r \
+             JOIN workflows w ON w.id = r.workflow_id \
+             WHERE w.user_id = $1 \
+               AND r.recorded_at > NOW() - make_interval(days => $2::int)",
+        )
+        .bind(user_id)
+        .bind(days)
+        .fetch_one(&self.db_pool)
+        .await?)
+    }
+
     // ── Execution events ───────────────────────────────────────────────────
 
     /// All events for an execution, ordered by created_at ASC. Hard cap at 1000.

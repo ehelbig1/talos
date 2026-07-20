@@ -571,6 +571,24 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "add_assistant_report_node",
+            "description": "Add an assistant-report node to an existing workflow. Controller-side system node: emits a trailing-window activity + learning-health snapshot (per-workflow execution stats, fuel/cost totals, ops-alerts week stats with correction candidates, ML loop health incl. gold accuracy and shadow agreement) as node output for downstream compose nodes — the canonical feed for a weekly assistant report. No worker dispatch, no secrets; degrades to {available: false} instead of failing.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workflow_id": { "type": "string", "description": "UUID of the workflow to add the node to" },
+                    "node_id": { "type": "string", "description": "Unique string ID for the new node" },
+                    "days": { "type": "number", "description": "Trailing window in days (1-31, default 7)" },
+                    "connect_from": {
+                        "description": "Node ID(s) to wire INTO this node (usually the trigger).",
+                        "oneOf": [ { "type": "string" }, { "type": "array", "items": { "type": "string" } } ]
+                    },
+                    "connect_to": { "type": "string", "description": "Optional: ID of an existing node to connect this node TO (e.g. the compose node)." }
+                },
+                "required": ["workflow_id", "node_id"]
+            }
+        }),
+        serde_json::json!({
             "name": "add_ops_alerts_digest_node",
             "description": "Add an ops-alerts digest node to an existing workflow. Controller-side system node: reads the caller's ops-alerts triage store (digest counts over active alerts + the top-N active alerts, severity-ranked) and emits it as node output for downstream nodes — the canonical feed for daily-brief compose nodes. No worker dispatch, no secrets, tenancy from the execution's resolved identity. Degrades to {available: false} instead of failing the workflow when the store is unreachable.",
             "inputSchema": {
@@ -1179,6 +1197,9 @@ pub async fn dispatch(
         "add_collect_node" => Some(handle_add_collect_node(req_id, args, state, agent).await),
         "add_ops_alerts_digest_node" => {
             Some(handle_add_ops_alerts_digest_node(req_id, args, state, agent).await)
+        }
+        "add_assistant_report_node" => {
+            Some(handle_add_assistant_report_node(req_id, args, state, agent).await)
         }
         "add_sub_workflow_node" => {
             Some(handle_add_sub_workflow_node(req_id, args, state, agent).await)
@@ -2602,6 +2623,55 @@ async fn handle_add_collect_node(
             "edges_wired": edges_wired,
             "message": format!(
                 "Collect node '{}' added to workflow {}. Fan-in node — gathers all parent branch outputs into {{count, items: [...]}}.",
+                added.node_id, added.workflow_id
+            ),
+        }))
+        .unwrap_or_default(),
+    )
+}
+
+// ── add_assistant_report_node ────────────────────────────────────────────────
+
+async fn handle_add_assistant_report_node(
+    req_id: Option<serde_json::Value>,
+    args: &serde_json::Value,
+    state: &McpState,
+    agent: Arc<auth::AgentIdentity>,
+) -> JsonRpcResponse {
+    // Clamp mirrors the graph parser (defense in depth).
+    let days = args
+        .get("days")
+        .and_then(serde_json::Value::as_u64)
+        .map_or(7u64, |v| v.clamp(1, 31));
+    let connect_to = args
+        .get("connect_to")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let added = match upsert_system_node(
+        &req_id,
+        args,
+        state,
+        &agent,
+        "assistant_report",
+        serde_json::json!({ "days": days }),
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "workflow_id": added.workflow_id.to_string(),
+            "node_id": added.node_id,
+            "node_type": "assistant_report",
+            "days": days,
+            "downstream": connect_to,
+            "message": format!(
+                "Assistant-report node '{}' added to workflow {}. Emits {{available, window_days, workflows: [...], cost, ops_alerts: {{..., correction_candidates}}, ml: {{models: [...]}}}} for downstream compose nodes.",
                 added.node_id, added.workflow_id
             ),
         }))

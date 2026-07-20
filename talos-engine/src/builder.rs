@@ -74,6 +74,9 @@ pub(super) fn build_controller_engine_registry_only(
     engine.set_ops_alerts_reader(Arc::new(
         crate::ops_alerts_reader::PostgresOpsAlertsReader::new(pool.clone()),
     ));
+    engine.set_assistant_report_reader(Arc::new(
+        crate::assistant_report_reader::PostgresAssistantReportReader::new(pool.clone()),
+    ));
     engine.set_approval_gate(Arc::new(PostgresApprovalGate::new(pool)));
     engine.set_expression_evaluator(Arc::new(RhaiEvaluator::new()));
     engine.set_output_sanitizer(Arc::new(DlpSanitizer::new()));

@@ -140,6 +140,15 @@ pub enum SystemNodeKind {
         /// How many active alerts to include verbatim (clamped 1..=25).
         top_limit: u32,
     },
+    /// Controller-side weekly assistant-activity + learning-health
+    /// snapshot (executions, fuel, ops-alerts week stats, ML loop
+    /// health). Output feeds report compose nodes. Executes via the
+    /// injected [`crate::AssistantReportReader`] — no worker dispatch,
+    /// no secrets.
+    AssistantReport {
+        /// Trailing window in days (clamped 1..=31).
+        days: u32,
+    },
     /// Synthesize a value from prior outputs, optionally via expression.
     Synthesize {
         /// Optional expression building the synthesized value.
