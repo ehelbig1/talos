@@ -309,6 +309,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "max_workflow_count": { "type": "number", "description": "ENFORCED (at create time). Omit for unlimited." },
                     "max_workflows_per_minute": { "type": "number", "description": "ENFORCED per-actor trigger-rate cap (atomic at trigger time). Stored default 10 if omitted." },
                     "max_compilations_per_hour": { "type": "number", "description": "RESERVED — not enforceable as a per-actor cap today: compiles (compile_custom_sandbox / run_sandbox / inline rust_code) are agent/user actions and carry actor_id only optionally (for memory scoping), so most have no actor_budget_policies row to gate on; there is also no per-actor compile-event record to count. Enforcing it needs compile-event tracking AND actor attribution of compiles (or reframing as a per-user/per-agent cap). Stored default 20 if omitted." },
+                    "max_llm_tokens_per_day": { "type": "number", "description": "ENFORCED (at trigger time). Daily LLM token ceiling: refuses a new run once the actor's trailing-24h SUM(prompt+completion tokens) from the llm_usage ledger reaches this cap. Omit for unlimited." },
                     "on_budget_exceeded": { "type": "string", "description": "suspend (default) | alert | block" }
                 },
                 "required": ["actor_id"]
@@ -2350,6 +2351,7 @@ async fn handle_set_actor_budget(
         "max_workflow_count",
         "max_workflows_per_minute",
         "max_compilations_per_hour",
+        "max_llm_tokens_per_day",
     ] {
         if let Some(v) = args.get(*field) {
             if v.as_f64().is_some_and(|f| f.fract() != 0.0) {
@@ -2380,7 +2382,7 @@ async fn handle_set_actor_budget(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let field_checks: [(&str, Option<i64>); 8] = [
+    let field_checks: [(&str, Option<i64>); 9] = [
         ("max_executions_per_hour", eph.map(|n| n as i64)),
         ("max_executions_total", get_i64("max_executions_total")),
         ("max_fuel_per_execution", get_i64("max_fuel_per_execution")),
@@ -2389,6 +2391,7 @@ async fn handle_set_actor_budget(
         ("max_workflow_count", mwc.map(|n| n as i64)),
         ("max_workflows_per_minute", wpm_explicit.map(|n| n as i64)),
         ("max_compilations_per_hour", cph_explicit.map(|n| n as i64)),
+        ("max_llm_tokens_per_day", get_i64("max_llm_tokens_per_day")),
     ];
     for (field, val) in &field_checks {
         if let Some(n) = val {
@@ -2416,6 +2419,7 @@ async fn handle_set_actor_budget(
             wpm,
             cph,
             &on_exceeded,
+            get_i64("max_llm_tokens_per_day"),
         )
         .await
     {
@@ -2446,6 +2450,7 @@ async fn handle_set_actor_budget(
                 "max_workflows_per_minute": wpm,
                 "max_compilations_per_hour": cph,
                 "on_budget_exceeded": on_exceeded,
+                "max_llm_tokens_per_day": get_i64("max_llm_tokens_per_day"),
                 "defaults_applied": defaults_applied,
             });
             spawn_log_action(
@@ -2776,8 +2781,17 @@ async fn handle_get_actor_budget(
             "max_workflows_per_minute":     p.max_workflows_per_minute,
             "max_compilations_per_hour":    p.max_compilations_per_hour,
             "on_budget_exceeded":           &p.on_budget_exceeded,
+            "max_llm_tokens_per_day":       opt_or_unlimited_i64(p.max_llm_tokens_per_day),
         })
     });
+
+    // R2 token ledger: current trailing-24h consumption alongside the
+    // ceiling so operators can see headroom in one call.
+    let llm_tokens_last_24h = state
+        .actor_repo
+        .sum_llm_tokens_last_24h(actor_id)
+        .await
+        .unwrap_or(0);
 
     mcp_text(
         req_id,
@@ -2787,6 +2801,7 @@ async fn handle_get_actor_budget(
             "current_usage": {
                 "executions_last_hour": execs_last_hour,
                 "active_workflow_count": workflow_count,
+                "llm_tokens_last_24h": llm_tokens_last_24h,
             },
             "execution_trend_7d": fuel_trend_7d,
         }))

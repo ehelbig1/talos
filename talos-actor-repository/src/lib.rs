@@ -103,6 +103,32 @@ pub struct ActorBudgetPolicy {
     pub max_workflows_per_minute: i32,
     pub max_compilations_per_hour: i32,
     pub on_budget_exceeded: String,
+    /// R2 token ledger: daily LLM token ceiling (prompt + completion,
+    /// trailing 24 h). `None` = no ceiling.
+    pub max_llm_tokens_per_day: Option<i64>,
+}
+
+/// R2 token ledger: one `(provider, model)` usage aggregate to insert into
+/// the `llm_usage` ledger. Defined here (not the wire crate) so the
+/// repository stays decoupled from the NATS job protocol.
+#[derive(Debug, Clone)]
+pub struct LlmUsageInsert {
+    pub provider: String,
+    pub model: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub calls: i32,
+}
+
+/// R2 token ledger: per-(provider, model) usage rollup over a trailing
+/// window, returned by `llm_usage_by_user_window` for the weekly report.
+#[derive(Debug, Clone)]
+pub struct LlmUsageWindowRow {
+    pub provider: String,
+    pub model: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub calls: i64,
 }
 
 /// Budget summary row returned by `get_actor_budget_summary` (used in get_actor_summary).
@@ -415,6 +441,7 @@ pub(crate) fn default_actor_cache_put(user_id: Uuid, actor_id: Uuid, now: std::t
     }
 }
 
+#[derive(Clone)]
 pub struct ActorRepository {
     db_pool: PgPool,
     /// Optional SecretsManager — when set, `complete_execution` encrypts
@@ -1052,13 +1079,15 @@ impl ActorRepository {
         max_workflows_per_minute: i32,
         max_compilations_per_hour: i32,
         on_budget_exceeded: &str,
+        max_llm_tokens_per_day: Option<i64>,
     ) -> Result<u64> {
         let result = sqlx::query(
             "INSERT INTO actor_budget_policies \
              (actor_id, max_executions_per_hour, max_executions_total, max_fuel_per_execution, \
               max_fuel_per_hour, max_outbound_requests_per_hour, max_workflow_count, \
-              max_workflows_per_minute, max_compilations_per_hour, on_budget_exceeded, updated_at) \
-             SELECT $1, $3, $4, $5, $6, $7, $8, $9, $10, $11, now() \
+              max_workflows_per_minute, max_compilations_per_hour, on_budget_exceeded, \
+              max_llm_tokens_per_day, updated_at) \
+             SELECT $1, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now() \
              WHERE EXISTS (SELECT 1 FROM actors WHERE id = $1 AND user_id = $2) \
              ON CONFLICT (actor_id) DO UPDATE SET \
                  max_executions_per_hour        = EXCLUDED.max_executions_per_hour, \
@@ -1070,6 +1099,7 @@ impl ActorRepository {
                  max_workflows_per_minute       = EXCLUDED.max_workflows_per_minute, \
                  max_compilations_per_hour      = EXCLUDED.max_compilations_per_hour, \
                  on_budget_exceeded             = EXCLUDED.on_budget_exceeded, \
+                 max_llm_tokens_per_day         = EXCLUDED.max_llm_tokens_per_day, \
                  updated_at                     = now()",
         )
         .bind(actor_id)
@@ -1083,6 +1113,7 @@ impl ActorRepository {
         .bind(max_workflows_per_minute)
         .bind(max_compilations_per_hour)
         .bind(on_budget_exceeded)
+        .bind(max_llm_tokens_per_day)
         .execute(&self.db_pool)
         .await?;
         Ok(result.rows_affected())
@@ -1096,7 +1127,8 @@ impl ActorRepository {
         let row = sqlx::query(
             "SELECT max_executions_per_hour, max_executions_total, max_fuel_per_execution, \
                     max_fuel_per_hour, max_outbound_requests_per_hour, max_workflow_count, \
-                    max_workflows_per_minute, max_compilations_per_hour, on_budget_exceeded \
+                    max_workflows_per_minute, max_compilations_per_hour, on_budget_exceeded, \
+                    max_llm_tokens_per_day \
              FROM actor_budget_policies WHERE actor_id = $1",
         )
         .bind(actor_id)
@@ -1114,9 +1146,116 @@ impl ActorRepository {
                 max_workflows_per_minute: r.try_get("max_workflows_per_minute")?,
                 max_compilations_per_hour: r.try_get("max_compilations_per_hour")?,
                 on_budget_exceeded: r.try_get("on_budget_exceeded")?,
+                max_llm_tokens_per_day: r.try_get("max_llm_tokens_per_day")?,
             })
         })
         .transpose()
+    }
+
+    // ── R2 token ledger ────────────────────────────────────────────────────
+
+    /// Batch-insert one verified result's LLM usage into the `llm_usage`
+    /// ledger (UNNEST, single round-trip).
+    ///
+    /// SECURITY (identity from controller records): when `execution_id` is
+    /// present, `workflow_id` / `org_id` — and the `actor_id` / `user_id`
+    /// fallbacks — come from the controller's own `workflow_executions` row
+    /// via the join; the dispatch-context `actor_id` / `user_id` arguments
+    /// are themselves controller-stamped. Nothing identity-bearing is taken
+    /// from the worker's result (it contributes only provider/model/counts).
+    /// With no `execution_id` (controller-side scaffolding calls) the row
+    /// records the caller-resolved `user_id` and NULL workflow/org.
+    pub async fn record_llm_usage(
+        &self,
+        execution_id: Option<Uuid>,
+        actor_id: Option<Uuid>,
+        user_id: Option<Uuid>,
+        entries: &[LlmUsageInsert],
+    ) -> Result<u64> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let providers: Vec<String> = entries.iter().map(|e| e.provider.clone()).collect();
+        let models: Vec<String> = entries.iter().map(|e| e.model.clone()).collect();
+        let prompts: Vec<i64> = entries.iter().map(|e| e.prompt_tokens).collect();
+        let completions: Vec<i64> = entries.iter().map(|e| e.completion_tokens).collect();
+        let calls: Vec<i32> = entries.iter().map(|e| e.calls).collect();
+
+        let result = sqlx::query(
+            "INSERT INTO llm_usage \
+             (execution_id, workflow_id, actor_id, user_id, org_id, \
+              provider, model, prompt_tokens, completion_tokens, calls) \
+             SELECT $1, we.workflow_id, COALESCE(we.actor_id, $2), \
+                    COALESCE(we.user_id, $3), we.org_id, \
+                    u.provider, u.model, u.prompt_tokens, u.completion_tokens, u.calls \
+             FROM UNNEST($4::text[], $5::text[], $6::bigint[], $7::bigint[], $8::int[]) \
+                  AS u(provider, model, prompt_tokens, completion_tokens, calls) \
+             LEFT JOIN workflow_executions we ON we.id = $1",
+        )
+        .bind(execution_id)
+        .bind(actor_id)
+        .bind(user_id)
+        .bind(&providers)
+        .bind(&models)
+        .bind(&prompts)
+        .bind(&completions)
+        .bind(&calls)
+        .execute(&self.db_pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Total LLM tokens (prompt + completion) attributed to an actor over
+    /// the trailing 24 hours — the read side of the
+    /// `max_llm_tokens_per_day` budget ceiling.
+    pub async fn sum_llm_tokens_last_24h(&self, actor_id: Uuid) -> Result<i64> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0)::bigint \
+             FROM llm_usage \
+             WHERE actor_id = $1 AND recorded_at > now() - INTERVAL '24 hours'",
+        )
+        .bind(actor_id)
+        .fetch_one(&self.db_pool)
+        .await?;
+        Ok(total)
+    }
+
+    /// Per-(provider, model) LLM usage rollup for a user over the trailing
+    /// `days` window — feeds the weekly assistant report's cost section.
+    /// `days` is clamped to 1..=90 (check 27: pg `make_interval` int arg is
+    /// int4-only, hence the `::int` cast).
+    pub async fn llm_usage_by_user_window(
+        &self,
+        user_id: Uuid,
+        days: i32,
+    ) -> Result<Vec<LlmUsageWindowRow>> {
+        let days = days.clamp(1, 90);
+        let rows = sqlx::query(
+            "SELECT provider, model, \
+                    COALESCE(SUM(prompt_tokens), 0)::bigint AS prompt_tokens, \
+                    COALESCE(SUM(completion_tokens), 0)::bigint AS completion_tokens, \
+                    COALESCE(SUM(calls), 0)::bigint AS calls \
+             FROM llm_usage \
+             WHERE user_id = $1 AND recorded_at > now() - make_interval(days => $2::int) \
+             GROUP BY provider, model \
+             ORDER BY prompt_tokens + completion_tokens DESC, provider, model",
+        )
+        .bind(user_id)
+        .bind(days)
+        .fetch_all(&self.db_pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| -> Result<LlmUsageWindowRow> {
+                Ok(LlmUsageWindowRow {
+                    provider: r.try_get("provider")?,
+                    model: r.try_get("model")?,
+                    prompt_tokens: r.try_get("prompt_tokens")?,
+                    completion_tokens: r.try_get("completion_tokens")?,
+                    calls: r.try_get("calls")?,
+                })
+            })
+            .collect()
     }
 
     /// Fetch the budget summary columns used by get_actor_summary

@@ -479,17 +479,22 @@ impl WorkflowRepository {
                 .execute(&mut *tx)
                 .await?;
 
-            let policy: Option<(Option<i32>, Option<i32>, Option<i32>, Option<i64>)> =
-                sqlx::query_as(
-                    "SELECT max_executions_per_hour, max_executions_total, \
-                     max_workflows_per_minute, max_fuel_per_hour \
+            let policy: Option<(
+                Option<i32>,
+                Option<i32>,
+                Option<i32>,
+                Option<i64>,
+                Option<i64>,
+            )> = sqlx::query_as(
+                "SELECT max_executions_per_hour, max_executions_total, \
+                     max_workflows_per_minute, max_fuel_per_hour, max_llm_tokens_per_day \
                      FROM actor_budget_policies WHERE actor_id = $1",
-                )
-                .bind(aid)
-                .fetch_optional(&mut *tx)
-                .await?;
+            )
+            .bind(aid)
+            .fetch_optional(&mut *tx)
+            .await?;
 
-            if let Some((per_hour, total, per_minute, fuel_per_hour)) = policy {
+            if let Some((per_hour, total, per_minute, fuel_per_hour, llm_tokens_per_day)) = policy {
                 // Per-minute trigger-rate cap. Counts only rows that carry
                 // this actor_id — top-level triggers (bulk_trigger /
                 // trigger_as_actors included). Sub-workflow chain rows are
@@ -570,6 +575,33 @@ impl WorkflowRepository {
                         tx.rollback().await?;
                         return Ok(ConcurrencyAdmission::ActorBudgetExceeded {
                             kind: "fuel_per_hour",
+                            limit,
+                            count: used,
+                        });
+                    }
+                }
+                // R2 token ledger: rolling daily LLM token ceiling. Sums the
+                // actor's provider-reported tokens (prompt + completion) from
+                // the `llm_usage` ledger over the trailing 24 hours —
+                // populated at result-ingest from the SIGNED
+                // JobResult/PipelineJobResult, attributed from controller
+                // records. Pre-execution gate mirroring `fuel_per_hour`:
+                // refuse to START another run once the ceiling is reached.
+                // Same `::bigint` cast rationale as the fuel sum above
+                // (SUM(bigint) → NUMERIC otherwise).
+                if let Some(limit) = llm_tokens_per_day {
+                    let used: i64 = sqlx::query_scalar(
+                        "SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0)::bigint \
+                         FROM llm_usage \
+                         WHERE actor_id = $1 AND recorded_at > now() - INTERVAL '24 hours'",
+                    )
+                    .bind(aid)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if used >= limit {
+                        tx.rollback().await?;
+                        return Ok(ConcurrencyAdmission::ActorBudgetExceeded {
+                            kind: "llm_tokens_per_day",
                             limit,
                             count: used,
                         });

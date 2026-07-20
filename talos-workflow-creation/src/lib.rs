@@ -391,9 +391,13 @@ impl WorkflowCreationService {
         let catalog_json = serde_json::to_string(&catalog_entries).unwrap_or_default();
         let description_redacted = self.dlp_service.redact_str(description);
 
-        let llm_json = match llm
-            .scaffold_workflow(&description_redacted, &catalog_json)
-            .await
+        // R2 token ledger: attribute this scaffold call's token usage to the
+        // requesting user via the talos-llm task-local scope.
+        let llm_json = match talos_llm::usage::scoped_user(
+            user_id,
+            llm.scaffold_workflow(&description_redacted, &catalog_json),
+        )
+        .await
         {
             Ok(s) => s,
             Err(e) => {

@@ -44,6 +44,7 @@ async fn main() -> anyhow::Result<()> {
             uuid::Uuid::nil(),                                // user_id
             talos_workflow_job_protocol::LlmTier::Tier2,      // max_llm_tier
             talos_workflow_job_protocol::WriteCeiling::Write, // max_write_ceiling
+            None,                                             // llm_usage_out — not collected
         )
         .await
     {

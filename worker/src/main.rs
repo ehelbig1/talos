@@ -987,9 +987,8 @@ async fn execute_job(
     // R2 token ledger: worker-owned accumulator shared with the job's
     // TalosContext; drained into the signed JobResult on EVERY branch below
     // (success, failure, timeout) — tokens spent before a trap are spent.
-    let llm_usage_acc: worker::context::LlmUsageAcc = std::sync::Arc::new(std::sync::Mutex::new(
-        std::collections::HashMap::new(),
-    ));
+    let llm_usage_acc: worker::context::LlmUsageAcc =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     match tokio::time::timeout(
         job_timeout,
         runtime.execute_job_with_full_features(
@@ -1305,9 +1304,8 @@ async fn execute_pipeline_job(
     // R2 token ledger: worker-owned accumulator shared with every step's
     // context; drained into the signed PipelineJobResult on BOTH branches
     // (a mid-pipeline bail still reports the completed steps' tokens).
-    let llm_usage_acc: worker::context::LlmUsageAcc = std::sync::Arc::new(std::sync::Mutex::new(
-        std::collections::HashMap::new(),
-    ));
+    let llm_usage_acc: worker::context::LlmUsageAcc =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
     match runtime
         .execute_pipeline(

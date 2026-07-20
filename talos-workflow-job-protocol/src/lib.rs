@@ -6543,7 +6543,10 @@ mod tests {
         let agg = aggregate_llm_usage(raw);
         assert_eq!(agg.len(), 2);
         let a = agg.iter().find(|e| e.model == "m1").unwrap();
-        assert_eq!((a.prompt_tokens, a.completion_tokens, a.calls), (150, 30, 2));
+        assert_eq!(
+            (a.prompt_tokens, a.completion_tokens, a.calls),
+            (150, 30, 2)
+        );
         let o = agg.iter().find(|e| e.model == "m2").unwrap();
         assert_eq!((o.prompt_tokens, o.completion_tokens, o.calls), (7, 3, 1));
 

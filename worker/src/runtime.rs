@@ -2313,7 +2313,7 @@ impl TalosRuntime {
             uuid::Uuid::nil(), // user_id — legacy helper has no user context
             talos_workflow_job_protocol::LlmTier::default(), // tier2 for legacy helper
             talos_workflow_job_protocol::WriteCeiling::default(), // write (permissive) for legacy helper
-            None,              // llm_usage_out — legacy helper doesn't collect usage
+            None, // llm_usage_out — legacy helper doesn't collect usage
         )
         .await
     }
@@ -3514,8 +3514,8 @@ impl TalosRuntime {
         // PipelineJobResult, mirroring the single-claim secrets model. Use
         // the caller's Arc when provided so usage survives a mid-pipeline
         // bail (the caller drains it on both Ok and Err).
-        let shared_llm_usage: crate::context::LlmUsageAcc = llm_usage_out
-            .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(HashMap::new())));
+        let shared_llm_usage: crate::context::LlmUsageAcc =
+            llm_usage_out.unwrap_or_else(|| Arc::new(std::sync::Mutex::new(HashMap::new())));
 
         // Optional shared sandbox directory (lifetime spans the entire pipeline).
         let shared_sandbox_dir = if share_sandbox {

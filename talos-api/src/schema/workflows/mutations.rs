@@ -668,18 +668,22 @@ impl WorkflowsMutations {
         })?;
 
         let prompt_redacted = talos_dlp_provider::redact_str(&input.prompt);
-        let code = llm_client
-            .generate_code(
+        // R2 token ledger: attribute this call's token usage to the
+        // requesting user via the talos-llm task-local scope.
+        let code = talos_llm::usage::scoped_user(
+            *_user_id,
+            llm_client.generate_code(
                 &prompt_redacted,
                 &input.current_code,
                 &input.capability_world,
-            )
-            .await
-            .map_err(|e: anyhow::Error| {
-                // Added type annotation
-                tracing::error!("Internal error: {}", e);
-                async_graphql::Error::new("An internal error occurred").extend_safe()
-            })?;
+            ),
+        )
+        .await
+        .map_err(|e: anyhow::Error| {
+            // Added type annotation
+            tracing::error!("Internal error: {}", e);
+            async_graphql::Error::new("An internal error occurred").extend_safe()
+        })?;
 
         Ok(GenerateCodeResult { code })
     }

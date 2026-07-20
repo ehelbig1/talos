@@ -519,6 +519,81 @@ async fn main() -> anyhow::Result<()> {
         dataset_service: talos_ml::DatasetService::new(core.secrets_manager.clone()),
         lifecycle_service: talos_ml::LifecycleService::new(core.secrets_manager.clone()),
     });
+
+    // R2 token ledger: install the two process-wide LLM usage recorders
+    // (same OnceLock boot-wiring pattern as DISTILL_CONTEXT above), before
+    // any workflow can run.
+    //
+    // 1. Engine-dispatch sink — every NatsNodeDispatcher built by
+    //    `build_nats_dispatcher` records verified worker-result usage here.
+    //    Identity arrives from the CONTROLLER-side dispatch context and is
+    //    re-resolved against `workflow_executions` inside
+    //    `record_llm_usage` — never from worker claims.
+    {
+        let usage_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
+        talos_engine::nats_run::install_llm_usage_sink(std::sync::Arc::new(
+            move |report: talos_workflow_engine_nats::LlmUsageReport| {
+                let repo = usage_repo.clone();
+                let entries: Vec<talos_actor_repository::LlmUsageInsert> = report
+                    .entries
+                    .iter()
+                    .map(|u| talos_actor_repository::LlmUsageInsert {
+                        provider: u.provider.clone(),
+                        model: u.model.clone(),
+                        prompt_tokens: i64::from(u.prompt_tokens),
+                        completion_tokens: i64::from(u.completion_tokens),
+                        calls: i64::try_from(u.calls).unwrap_or(i32::MAX as i64) as i32,
+                    })
+                    .collect();
+                // Spawned + best-effort: accounting must never block or fail
+                // the dispatch hot path.
+                tokio::spawn(async move {
+                    if let Err(e) = repo
+                        .record_llm_usage(
+                            Some(report.execution_id),
+                            report.actor_id,
+                            report.user_id,
+                            &entries,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            execution_id = %report.execution_id,
+                            error = %e,
+                            "failed to record worker LLM usage"
+                        );
+                    }
+                });
+            },
+        ));
+    }
+    // 2. Controller-side client sink — talos-llm's generate_code /
+    //    generate_text / scaffold_workflow / OllamaClient::complete record
+    //    here. user_id arrives via the `talos_llm::usage::scoped_user`
+    //    task-local when the call site knows the requesting user; NULL
+    //    user/actor rows are platform-attributed (documented in the
+    //    llm_usage migration).
+    {
+        let usage_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
+        talos_llm::usage::set_usage_sink(std::sync::Arc::new(
+            move |rec: talos_llm::usage::LlmUsageRecord| {
+                let repo = usage_repo.clone();
+                let entry = talos_actor_repository::LlmUsageInsert {
+                    provider: rec.provider,
+                    model: rec.model,
+                    prompt_tokens: i64::try_from(rec.prompt_tokens).unwrap_or(i64::MAX),
+                    completion_tokens: i64::try_from(rec.completion_tokens).unwrap_or(i64::MAX),
+                    calls: 1,
+                };
+                let user_id = rec.user_id;
+                tokio::spawn(async move {
+                    if let Err(e) = repo.record_llm_usage(None, None, user_id, &[entry]).await {
+                        tracing::warn!(error = %e, "failed to record controller LLM usage");
+                    }
+                });
+            },
+        ));
+    }
     talos_ml::spawn_policy_evaluator(
         db_pool.clone(),
         talos_ml::DatasetService::new(core.secrets_manager.clone()),

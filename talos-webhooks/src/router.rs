@@ -1103,6 +1103,9 @@ impl WebhookRouter {
                 )
             });
             let user_id = trigger.user_id;
+            // R2 token ledger: pool handle for recording the verified
+            // result's LLM usage inside the dispatch task below.
+            let usage_pool = self.db_pool.clone();
 
             let result = tokio::spawn({
                 let input_payload = wrapped_input.clone();
@@ -1264,6 +1267,45 @@ impl WebhookRouter {
                             );
                             return Err(anyhow::anyhow!("Job result verification failed"));
                         }
+                    }
+
+                    // R2 token ledger: record the VERIFIED result's LLM usage.
+                    // Module-bound webhook dispatch is the one primary-verify
+                    // site outside the engine dispatcher, so it records
+                    // directly (identity from the controller-resolved
+                    // actor/user above, never the worker result). Spawned +
+                    // best-effort: accounting must not delay or fail the
+                    // webhook response.
+                    if !result.llm_usage.is_empty() {
+                        let repo = talos_actor_repository::ActorRepository::new(usage_pool.clone());
+                        let entries: Vec<talos_actor_repository::LlmUsageInsert> = result
+                            .llm_usage
+                            .iter()
+                            .map(|u| talos_actor_repository::LlmUsageInsert {
+                                provider: u.provider.clone(),
+                                model: u.model.clone(),
+                                prompt_tokens: i64::from(u.prompt_tokens),
+                                completion_tokens: i64::from(u.completion_tokens),
+                                calls: i64::from(u.calls).try_into().unwrap_or(i32::MAX),
+                            })
+                            .collect();
+                        tokio::spawn(async move {
+                            if let Err(e) = repo
+                                .record_llm_usage(
+                                    Some(job_id),
+                                    resolved_actor,
+                                    Some(user_id),
+                                    &entries,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    job_id = %job_id,
+                                    error = %e,
+                                    "failed to record webhook module LLM usage"
+                                );
+                            }
+                        });
                     }
 
                     match result.status {

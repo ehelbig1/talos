@@ -11,6 +11,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value as JsonValue};
 use sqlx::PgPool;
+use talos_actor_repository::ActorRepository;
 use talos_execution_repository::ExecutionRepository;
 use talos_ops_alerts_repository::OpsAlertRepository;
 use uuid::Uuid;
@@ -19,6 +20,7 @@ pub struct PostgresAssistantReportReader {
     pool: PgPool,
     executions: ExecutionRepository,
     ops_alerts: OpsAlertRepository,
+    actors: ActorRepository,
 }
 
 impl PostgresAssistantReportReader {
@@ -27,6 +29,7 @@ impl PostgresAssistantReportReader {
         Self {
             executions: ExecutionRepository::new(pool.clone()),
             ops_alerts: OpsAlertRepository::new(pool.clone()),
+            actors: ActorRepository::new(pool.clone()),
             pool,
         }
     }
@@ -62,6 +65,11 @@ impl talos_workflow_engine_core::AssistantReportReader for PostgresAssistantRepo
 
         let ml = talos_ml::loop_health(&self.pool, user_id).await?;
 
+        // R2 token ledger: per-(provider, model) LLM token rollup over the
+        // same window, from the `llm_usage` ledger (worker-verified +
+        // controller-side usage, user-attributed at ingest).
+        let llm_usage = self.actors.llm_usage_by_user_window(user_id, days).await?;
+
         Ok(json!({
             "window_days": days,
             "workflows": workflows.iter().map(|(name, total, completed, failed)| json!({
@@ -73,6 +81,13 @@ impl talos_workflow_engine_core::AssistantReportReader for PostgresAssistantRepo
             "cost": {
                 "fuel_total": fuel_total,
                 "wall_time_ms_total": wall_ms_total,
+                "llm_tokens": llm_usage.iter().map(|u| json!({
+                    "provider": u.provider,
+                    "model": u.model,
+                    "prompt_tokens": u.prompt_tokens,
+                    "completion_tokens": u.completion_tokens,
+                    "calls": u.calls,
+                })).collect::<Vec<_>>(),
             },
             "ops_alerts": {
                 "opened": opened,

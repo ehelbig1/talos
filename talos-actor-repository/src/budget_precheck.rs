@@ -21,6 +21,9 @@ pub struct ActorBudget {
     pub max_executions_per_hour: Option<i32>,
     pub max_executions_total: Option<i64>,
     pub on_budget_exceeded: String,
+    /// R2 token ledger: daily LLM token ceiling (prompt + completion over
+    /// the trailing 24 h from the `llm_usage` ledger). `None` = unlimited.
+    pub max_llm_tokens_per_day: Option<i64>,
 }
 
 /// Load the budget policy for an actor. Returns `Ok(None)` if no policy
@@ -55,6 +58,7 @@ pub async fn load_actor_budget(
         max_executions_per_hour: p.max_executions_per_hour,
         max_executions_total: p.max_executions_total,
         on_budget_exceeded: p.on_budget_exceeded,
+        max_llm_tokens_per_day: p.max_llm_tokens_per_day,
     }))
 }
 
@@ -250,6 +254,46 @@ pub async fn check_actor_total_budget_for_batch(
     Ok(())
 }
 
+/// R2 token ledger: fast-fail pre-check for the daily LLM token ceiling.
+/// The hard cap is the atomic backstop inside
+/// `create_execution_under_concurrency_limit` (advisory-lock-serialized,
+/// same transaction as the INSERT); this pre-check mirrors the per-hour /
+/// total pattern — cheap rejection before any dispatch work, fail-CLOSED
+/// on DB error (MCP-366 class: a silent 0 on error would bypass the cap).
+/// Batch size is irrelevant here (the ledger counts tokens, not
+/// executions), so there is no `_for_batch` sibling.
+pub async fn check_actor_llm_token_budget(
+    pool: &sqlx::PgPool,
+    actor_id: Uuid,
+    budget: &ActorBudget,
+) -> Result<(), String> {
+    let Some(cap) = budget.max_llm_tokens_per_day else {
+        return Ok(());
+    };
+    let repo = crate::ActorRepository::new(pool.clone());
+    let used = match repo.sum_llm_tokens_last_24h(actor_id).await {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::error!(
+                actor_id = %actor_id,
+                error = %e,
+                "sum_llm_tokens_last_24h failed; refusing execution to avoid budget bypass"
+            );
+            return Err(
+                "Budget pre-check failed (database error). Refusing execution to avoid silent budget bypass; retry after the database recovers.".to_string()
+            );
+        }
+    };
+    if used >= cap {
+        return Err(format!(
+            "Actor budget exceeded: {used} LLM tokens consumed in the last 24 hours reaches cap {cap}. \
+             on_budget_exceeded={}. Raise max_llm_tokens_per_day with set_actor_budget or wait for the window to roll.",
+            budget.on_budget_exceeded
+        ));
+    }
+    Ok(())
+}
+
 /// Full execution precheck: status + budget. Composed from the smaller
 /// helpers above so callers can run individual checks as needed (e.g., a
 /// dry-run endpoint might want status-only without budget enforcement).
@@ -288,5 +332,6 @@ pub async fn check_execution_allowed_for_batch(
     };
     check_actor_hour_budget_for_batch(pool, actor_id, &budget, batch_size).await?;
     check_actor_total_budget_for_batch(pool, actor_id, &budget, batch_size).await?;
+    check_actor_llm_token_budget(pool, actor_id, &budget).await?;
     Ok(())
 }
