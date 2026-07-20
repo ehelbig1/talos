@@ -113,10 +113,29 @@ fn softmax_inplace(logits: &mut [f32]) {
 /// label)`; embeddings shorter/longer than the modal dimensionality are
 /// dropped (an embedder change mid-dataset would otherwise poison the fit).
 pub fn fit(train: &[(Vec<f32>, String)], opts: FitOpts) -> Result<LinearModel> {
+    // Uniform-weight delegate — behavior identical to the pre-weighted fit.
+    let weighted: Vec<(Vec<f32>, String, f32)> = train
+        .iter()
+        .map(|(x, l)| (x.clone(), l.clone(), 1.0))
+        .collect();
+    fit_weighted(&weighted, opts)
+}
+
+/// [`fit`] with a PER-SAMPLE weight axis (third tuple element). The
+/// effective weight of a row is `class_weight[y] × sample_weight` — the
+/// class-balance correction and the emphasis axis compose
+/// multiplicatively, and `weight_sum` is the sum of EFFECTIVE weights so
+/// the mean-gradient/L2 scale invariant (`scale = lr / weight_sum`)
+/// holds exactly as before. Introduced for corrections-as-training
+/// (2026-07-19): human corrections carry `correction_weight` (policy,
+/// default 3.0) so ~6% of rows stop drowning in the aggregate gradient.
+/// Non-positive sample weights are clamped to a small epsilon rather
+/// than rejected (a zero would silently delete the row from the fit).
+pub fn fit_weighted(train: &[(Vec<f32>, String, f32)], opts: FitOpts) -> Result<LinearModel> {
     anyhow::ensure!(!train.is_empty(), "cannot fit on an empty train set");
     // Modal dimensionality — the dims the majority of rows agree on.
     let mut dim_votes: BTreeMap<usize, usize> = BTreeMap::new();
-    for (x, _) in train {
+    for (x, _, _) in train {
         *dim_votes.entry(x.len()).or_insert(0) += 1;
     }
     let dims = dim_votes
@@ -132,14 +151,14 @@ pub fn fit(train: &[(Vec<f32>, String)], opts: FitOpts) -> Result<LinearModel> {
     // linger in `n_classes` with count 0: that would make `weight_sum` fall
     // below `n`, silently mis-scaling both the gradient-mean/L2 balance
     // (which relies on `weight_sum == n`) and the balanced class weights.
-    let mut norm_rows: Vec<(Vec<f32>, &str)> = Vec::with_capacity(train.len());
-    for (x, label) in train {
+    let mut norm_rows: Vec<(Vec<f32>, &str, f32)> = Vec::with_capacity(train.len());
+    for (x, label, sw) in train {
         if x.len() != dims {
             continue;
         }
         let mut xn = x.clone();
         l2_normalize(&mut xn);
-        norm_rows.push((xn, label.as_str()));
+        norm_rows.push((xn, label.as_str(), sw.max(1e-6)));
     }
     anyhow::ensure!(
         !norm_rows.is_empty(),
@@ -149,7 +168,7 @@ pub fn fit(train: &[(Vec<f32>, String)], opts: FitOpts) -> Result<LinearModel> {
     // Stable class index over the SURVIVING rows (sorted → deterministic
     // weight layout; every class here has ≥1 row so counts are all > 0).
     let mut class_set: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    for (_, label) in &norm_rows {
+    for (_, label, _) in &norm_rows {
         class_set.insert(label);
     }
     let classes: Vec<String> = class_set.iter().map(|s| s.to_string()).collect();
@@ -166,12 +185,14 @@ pub fn fit(train: &[(Vec<f32>, String)], opts: FitOpts) -> Result<LinearModel> {
 
     let mut xs: Vec<Vec<f32>> = Vec::with_capacity(norm_rows.len());
     let mut ys: Vec<usize> = Vec::with_capacity(norm_rows.len());
+    let mut sws: Vec<f32> = Vec::with_capacity(norm_rows.len());
     let mut class_counts = vec![0usize; n_classes];
-    for (xn, label) in norm_rows {
+    for (xn, label, sw) in norm_rows {
         let ci = class_idx[label];
         class_counts[ci] += 1;
         xs.push(xn);
         ys.push(ci);
+        sws.push(sw);
     }
     let n = xs.len();
 
@@ -189,7 +210,12 @@ pub fn fit(train: &[(Vec<f32>, String)], opts: FitOpts) -> Result<LinearModel> {
             }
         })
         .collect();
-    let weight_sum: f32 = ys.iter().map(|&y| class_weight[y]).sum::<f32>().max(1e-6);
+    let weight_sum: f32 = ys
+        .iter()
+        .zip(sws.iter())
+        .map(|(&y, &sw)| class_weight[y] * sw)
+        .sum::<f32>()
+        .max(1e-6);
 
     let mut weights = vec![0.0f32; n_classes * dims];
     let mut bias = vec![0.0f32; n_classes];
@@ -202,14 +228,14 @@ pub fn fit(train: &[(Vec<f32>, String)], opts: FitOpts) -> Result<LinearModel> {
     for _ in 0..opts.epochs {
         grad_w.iter_mut().for_each(|g| *g = 0.0);
         grad_b.iter_mut().for_each(|g| *g = 0.0);
-        for (x, &y) in xs.iter().zip(ys.iter()) {
+        for ((x, &y), &sw) in xs.iter().zip(ys.iter()).zip(sws.iter()) {
             // logits = W·x + b, then softmax (probs overwritten in full).
             for (c, prob) in probs.iter_mut().enumerate() {
                 let row = &weights[c * dims..(c + 1) * dims];
                 *prob = bias[c] + row.iter().zip(x.iter()).map(|(w, xi)| w * xi).sum::<f32>();
             }
             softmax_inplace(&mut probs);
-            let w = class_weight[y];
+            let w = class_weight[y] * sw;
             for (c, gb) in grad_b.iter_mut().enumerate() {
                 // dL/dz_c = w * (p_c - 1{c==y}); backprop into W_c, b_c.
                 let err = w * (probs[c] - if c == y { 1.0 } else { 0.0 });

@@ -321,6 +321,7 @@ async fn evaluate_one_model(
         k,
         EVAL_HOLDOUT_FRACTION,
         crate::linear::FitOpts::default(),
+        policy.corrections_cfg(),
     )
     .await
     {

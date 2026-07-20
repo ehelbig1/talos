@@ -207,6 +207,113 @@ pub fn stratified_holdout(
     holdout
 }
 
+/// Corrections handling for eval + training (corrections-as-training,
+/// 2026-07-19). Defaults mirror `PolicyJson`'s.
+#[derive(Debug, Clone, Copy)]
+pub struct CorrectionsCfg {
+    /// Per-sample emphasis for correction rows in training (LR sample
+    /// weight; knn vote multiplier). Clamped 1..=10 downstream.
+    pub weight: f32,
+    /// Fraction of corrections held out as the GOLD eval slice.
+    pub gold_fraction: f64,
+    /// Global floor on the gold slice (topped up deterministically when
+    /// the fraction yields fewer), bounded by what the per-class ≥1-in-
+    /// train rule allows.
+    pub min_gold: usize,
+}
+
+impl Default for CorrectionsCfg {
+    fn default() -> Self {
+        Self {
+            weight: 3.0,
+            gold_fraction: 0.3,
+            min_gold: 8,
+        }
+    }
+}
+
+/// Stable per-row split key for corrections: sha256 of `example_key`
+/// when present (survives delete+reinsert — upserts keep the row id,
+/// but a reinsert mints a new UUID and would silently churn gold
+/// membership), falling back to the row id.
+fn correction_sort_key(id: uuid::Uuid, example_key: Option<&str>) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    match example_key {
+        Some(k) if !k.is_empty() => Sha256::digest(k.as_bytes()).into(),
+        _ => Sha256::digest(id.as_bytes()).into(),
+    }
+}
+
+/// Correction-aware split (replaces source-blind [`stratified_holdout`]
+/// in the selection eval). Pre-change, corrections were UUID-hashed
+/// into train/holdout like any other row: the `gold` block was
+/// "whichever corrections happened to land in holdout" — floorless
+/// (could be empty), and its membership churned as the dataset grew.
+///
+/// Now: NON-correction rows keep the exact legacy stratified holdout.
+/// CORRECTIONS are partitioned separately and deterministically (per
+/// class, ordered by [`correction_sort_key`]): `gold_fraction` of each
+/// class (clamp 1..=n-1, classes < [`MIN_CLASS_FOR_HOLDOUT`] wholly in
+/// train) goes to the holdout — becoming the gold slice — topped up to
+/// `min_gold` from the remaining hash order where a class can spare a
+/// row. Every correction NOT in gold lands in train, where the weighted
+/// fit/vote emphasizes it. Returns the full holdout id set.
+pub fn correction_aware_holdout(
+    examples: &[(uuid::Uuid, String, String, Option<String>)],
+    holdout_fraction: f64,
+    cfg: &CorrectionsCfg,
+) -> Vec<uuid::Uuid> {
+    let gold_fraction = cfg.gold_fraction.clamp(0.1, 0.5);
+
+    let (corrections, others): (Vec<_>, Vec<_>) = examples
+        .iter()
+        .partition(|(_, _, source, _)| source == "correction");
+
+    // Non-corrections: legacy behavior verbatim.
+    let other_labels: Vec<(uuid::Uuid, String)> = others
+        .iter()
+        .map(|(id, l, _, _)| (*id, l.clone()))
+        .collect();
+    let mut holdout = stratified_holdout(&other_labels, holdout_fraction);
+
+    // Corrections: per-class deterministic gold slice.
+    let mut by_class: BTreeMap<&str, Vec<(uuid::Uuid, [u8; 32])>> = BTreeMap::new();
+    for (id, label, _, key) in &corrections {
+        by_class
+            .entry(label.as_str())
+            .or_default()
+            .push((*id, correction_sort_key(*id, key.as_deref())));
+    }
+    let mut gold: Vec<uuid::Uuid> = Vec::new();
+    // (class, remaining hash-ordered candidates that can still move to
+    // gold without emptying the class's train share) for the top-up.
+    let mut spare: Vec<(uuid::Uuid, [u8; 32])> = Vec::new();
+    for ids in by_class.values_mut() {
+        ids.sort_by_key(|(_, h)| *h);
+        if ids.len() < MIN_CLASS_FOR_HOLDOUT {
+            continue; // wholly in train — same rule as the legacy split
+        }
+        let take = (((ids.len() as f64) * gold_fraction).round() as usize).clamp(1, ids.len() - 1);
+        gold.extend(ids[..take].iter().map(|(id, _)| *id));
+        // Rows beyond `take` may top up the floor — but always leave ≥1
+        // in train per class.
+        if ids.len() - take > 1 {
+            spare.extend_from_slice(&ids[take..ids.len() - 1]);
+        }
+    }
+    if gold.len() < cfg.min_gold {
+        spare.sort_by_key(|(_, h)| *h);
+        for (id, _) in spare {
+            if gold.len() >= cfg.min_gold {
+                break;
+            }
+            gold.push(id);
+        }
+    }
+    holdout.extend(gold);
+    holdout
+}
+
 /// Macro-averaged F1, over the classes actually PRESENT in the holdout
 /// truth (support > 0) — reported alongside the selection score for
 /// transparency. Excluding `support == 0` classes matters: a backend that
@@ -319,16 +426,19 @@ pub async fn run_backend_selection_eval(
     k: i64,
     holdout_fraction: f64,
     linear_opts: crate::linear::FitOpts,
+    corrections: CorrectionsCfg,
 ) -> anyhow::Result<Vec<BackendCandidate>> {
     service.lock_dataset(&mut *conn, dataset_id).await?;
     service.pin_ann_probes(&mut *conn).await?;
-    let labels = service.load_labels(&mut *conn, dataset_id).await?;
+    let labels = service
+        .load_labels_with_source(&mut *conn, dataset_id)
+        .await?;
     anyhow::ensure!(
         labels.len() >= 10,
         "dataset has only {} labeled examples — need at least 10 for a meaningful eval",
         labels.len()
     );
-    let holdout_ids = stratified_holdout(&labels, holdout_fraction);
+    let holdout_ids = correction_aware_holdout(&labels, holdout_fraction, &corrections);
     anyhow::ensure!(
         !holdout_ids.is_empty(),
         "stratified split produced an empty holdout (all classes below the minimum size)"
@@ -350,7 +460,7 @@ pub async fn run_backend_selection_eval(
             Some(embedding) => service
                 .knn_search(&mut *conn, dataset_id, embedding, k, true)
                 .await
-                .map(|n| crate::knn::knn_vote_balanced(&n, &counts))?,
+                .map(|n| crate::knn::knn_vote_balanced_weighted(&n, &counts, corrections.weight))?,
             None => None,
         };
         knn_scored.push(pred.map(|p| (p.label, p.confidence)));
@@ -362,7 +472,11 @@ pub async fn run_backend_selection_eval(
         macro_recall: macro_recall(&knn_report),
         report: knn_report,
         artifact: None,
-        params: serde_json::json!({ "voting": "balanced-sqrt", "k": k }),
+        params: serde_json::json!({
+            "voting": "balanced-sqrt",
+            "k": k,
+            "correction_weight": corrections.weight,
+        }),
     });
 
     // --- linear (parametric): fit on train, predict holdout ---
@@ -370,9 +484,19 @@ pub async fn run_backend_selection_eval(
     // embedding regime, so sweep L2 and keep the best-macro-F1 fit
     // (auto-tuning; a few sub-second fits). Everything else comes from the
     // caller's base opts.
-    let train = service
-        .load_train_embeddings(&mut *conn, dataset_id)
-        .await?;
+    let train: Vec<(Vec<f32>, String, f32)> = service
+        .load_train_embeddings_with_source(&mut *conn, dataset_id)
+        .await?
+        .into_iter()
+        .map(|(emb, label, is_corr)| {
+            let w = if is_corr {
+                corrections.weight.clamp(1.0, 10.0)
+            } else {
+                1.0
+            };
+            (emb, label, w)
+        })
+        .collect();
     if train.len() >= 10 {
         const L2_GRID: [f32; 3] = [1e-4, 1e-2, 1e-1];
         // (report, artifact, l2, macro_recall) of the best fit so far —
@@ -380,7 +504,7 @@ pub async fn run_backend_selection_eval(
         let mut best: Option<(EvalReport, Vec<u8>, f32, f64)> = None;
         for &l2 in &L2_GRID {
             let opts = crate::linear::FitOpts { l2, ..linear_opts };
-            let model = match crate::linear::fit(&train, opts) {
+            let model = match crate::linear::fit_weighted(&train, opts) {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::warn!(target: "talos_ml", %l2, error = %e, "linear fit failed at this l2");
@@ -414,6 +538,7 @@ pub async fn run_backend_selection_eval(
                     "lr": linear_opts.lr,
                     "l2": l2,
                     "balanced": linear_opts.balanced,
+                    "correction_weight": corrections.weight,
                     "selected_by": "l2-grid",
                 }),
             }),
@@ -446,17 +571,20 @@ pub async fn run_knn_eval(
     dataset_id: uuid::Uuid,
     k: i64,
     holdout_fraction: f64,
+    corrections: CorrectionsCfg,
 ) -> anyhow::Result<EvalReport> {
     service.lock_dataset(&mut *conn, dataset_id).await?;
     // ONCE per tx — knn_search does not pin (see pin_ann_probes).
     service.pin_ann_probes(&mut *conn).await?;
-    let labels = service.load_labels(&mut *conn, dataset_id).await?;
+    let labels = service
+        .load_labels_with_source(&mut *conn, dataset_id)
+        .await?;
     anyhow::ensure!(
         labels.len() >= 10,
         "dataset has only {} labeled examples — need at least 10 for a meaningful eval",
         labels.len()
     );
-    let holdout_ids = stratified_holdout(&labels, holdout_fraction);
+    let holdout_ids = correction_aware_holdout(&labels, holdout_fraction, &corrections);
     anyhow::ensure!(
         !holdout_ids.is_empty(),
         "stratified split produced an empty holdout (all classes below the minimum size)"
@@ -478,7 +606,7 @@ pub async fn run_knn_eval(
             Some(embedding) => service
                 .knn_search(&mut *conn, dataset_id, embedding, k, true)
                 .await
-                .map(|n| crate::knn::knn_vote_balanced(&n, &counts))?,
+                .map(|n| crate::knn::knn_vote_balanced_weighted(&n, &counts, corrections.weight))?,
             None => None,
         };
         scored.push(pred.map(|p| (p.label, p.confidence)));
@@ -488,6 +616,80 @@ pub async fn run_knn_eval(
 
 #[cfg(test)]
 mod tests {
+    use super::{correction_aware_holdout, CorrectionsCfg};
+
+    fn rows(
+        spec: &[(u128, &str, &str, Option<&str>)],
+    ) -> Vec<(uuid::Uuid, String, String, Option<String>)> {
+        spec.iter()
+            .map(|(n, l, s, k)| {
+                (
+                    uuid::Uuid::from_u128(*n),
+                    l.to_string(),
+                    s.to_string(),
+                    k.map(str::to_string),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn correction_split_is_deterministic_and_floored() {
+        // 12 corrections in one class + 20 teacher rows in another.
+        let mut spec: Vec<(u128, &str, &str, Option<&str>)> = Vec::new();
+        for i in 0..12u128 {
+            spec.push((
+                i,
+                "a",
+                "correction",
+                Some(Box::leak(format!("k{i}").into_boxed_str()) as &str),
+            ));
+        }
+        for i in 100..120u128 {
+            spec.push((i, "b", "llm", None));
+        }
+        let examples = rows(&spec);
+        let cfg = CorrectionsCfg {
+            weight: 3.0,
+            gold_fraction: 0.3,
+            min_gold: 8,
+        };
+        let h1 = correction_aware_holdout(&examples, 0.2, &cfg);
+        let h2 = correction_aware_holdout(&examples, 0.2, &cfg);
+        assert_eq!(h1, h2, "split must be deterministic");
+        // Gold floor: fraction gives round(12×0.3)=4, floor tops up to 8,
+        // bounded by leave-one-in-train (max 11 gold; spare rule leaves the
+        // per-class last row in train).
+        let correction_ids: std::collections::HashSet<_> =
+            (0..12u128).map(uuid::Uuid::from_u128).collect();
+        let gold: Vec<_> = h1.iter().filter(|id| correction_ids.contains(id)).collect();
+        assert_eq!(
+            gold.len(),
+            8,
+            "floor must top the gold slice up to min_gold"
+        );
+        // At least one correction stays in train.
+        assert!(gold.len() < 12);
+    }
+
+    #[test]
+    fn tiny_correction_classes_stay_wholly_in_train() {
+        let examples = rows(&[
+            (1, "a", "correction", Some("x1")),
+            (2, "a", "correction", Some("x2")),
+            (100, "b", "llm", None),
+            (101, "b", "llm", None),
+            (102, "b", "llm", None),
+            (103, "b", "llm", None),
+        ]);
+        let cfg = CorrectionsCfg::default();
+        let holdout = correction_aware_holdout(&examples, 0.2, &cfg);
+        // Class "a" has 2 corrections (< MIN_CLASS_FOR_HOLDOUT) — none may
+        // be donated to gold even with the floor unmet.
+        assert!(!holdout.contains(&uuid::Uuid::from_u128(1)));
+        assert!(!holdout.contains(&uuid::Uuid::from_u128(2)));
+    }
+
     use super::*;
     use uuid::Uuid;
 

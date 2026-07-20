@@ -109,10 +109,17 @@ async fn selector_evaluates_both_backends_and_tags_linear_artifact() {
 
     // Run the selector on one shared split.
     let mut conn = pool.acquire().await.unwrap();
-    let candidates =
-        talos_ml::run_backend_selection_eval(&dsvc, &mut conn, ds, 5, 0.2, Default::default())
-            .await
-            .expect("selection eval runs");
+    let candidates = talos_ml::run_backend_selection_eval(
+        &dsvc,
+        &mut conn,
+        ds,
+        5,
+        0.2,
+        Default::default(),
+        talos_ml::CorrectionsCfg::default(),
+    )
+    .await
+    .expect("selection eval runs");
 
     // Both backends were evaluated on the SAME holdout.
     assert_eq!(candidates.len(), 2, "knn + linear both evaluated");

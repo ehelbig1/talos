@@ -148,9 +148,57 @@ pub struct PolicyJson {
     /// judged (default 50) — never demote on a handful of samples.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_shadow_total: Option<i64>,
+    /// Corrections-as-training (2026-07-19): per-sample training
+    /// emphasis for `source='correction'` rows (LR sample weight, knn
+    /// vote multiplier). Default 3.0; validated 1.0..=10.0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correction_weight: Option<f64>,
+    /// Fraction of corrections held out as the GOLD eval slice
+    /// (deterministic per-class hash split). Default 0.3; 0.1..=0.5.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gold_fraction: Option<f64>,
+    /// Global floor on the gold slice size (topped up deterministically;
+    /// bounded by leave-one-in-train). Default 8; 0..=100.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_gold: Option<i64>,
+}
+
+/// Resolve the corrections config for the model that owns `dataset_id`
+/// (defaults when no model / empty or unparseable policy). Manual eval
+/// paths call this so their voting/weighting scheme matches what the
+/// lifecycle promotion path will use — divergent schemes would
+/// mis-calibrate the confidence thresholds recorded in metrics_json.
+pub async fn corrections_cfg_for_dataset(
+    conn: &mut sqlx::PgConnection,
+    dataset_id: uuid::Uuid,
+) -> crate::eval::CorrectionsCfg {
+    let policy: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT policy_json FROM ml_models WHERE dataset_id = $1 LIMIT 1")
+            .bind(dataset_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .ok()
+            .flatten();
+    policy
+        .and_then(|p| PolicyJson::parse(&p).ok())
+        .map(|p| p.corrections_cfg())
+        .unwrap_or_default()
 }
 
 impl PolicyJson {
+    /// Resolved [`crate::eval::CorrectionsCfg`] with policy overrides
+    /// applied over the defaults — the ONE place eval/serve read these
+    /// knobs so the voting scheme can't drift between them.
+    #[must_use]
+    pub fn corrections_cfg(&self) -> crate::eval::CorrectionsCfg {
+        let d = crate::eval::CorrectionsCfg::default();
+        crate::eval::CorrectionsCfg {
+            weight: self.correction_weight.map_or(d.weight, |w| w as f32),
+            gold_fraction: self.gold_fraction.unwrap_or(d.gold_fraction),
+            min_gold: self.min_gold.map_or(d.min_gold, |g| g as usize),
+        }
+    }
+
     /// Parse the stored policy, failing loudly on unknown fields or
     /// wrong types — the write path (ml_set_policy) calls this before
     /// persisting, and the evaluator calls it before judging.
@@ -168,6 +216,21 @@ impl PolicyJson {
         if let Some(n) = self.min_corrections_per_class {
             if n < 0 {
                 return Err("min_corrections_per_class must be >= 0".into());
+            }
+        }
+        if let Some(w) = self.correction_weight {
+            if !(1.0..=10.0).contains(&w) || !w.is_finite() {
+                return Err("correction_weight must be within 1.0..=10.0".into());
+            }
+        }
+        if let Some(f) = self.gold_fraction {
+            if !(0.1..=0.5).contains(&f) || !f.is_finite() {
+                return Err("gold_fraction must be within 0.1..=0.5".into());
+            }
+        }
+        if let Some(g) = self.min_gold {
+            if !(0..=100).contains(&g) {
+                return Err("min_gold must be within 0..=100".into());
             }
         }
         if let Some(ac) = &self.accuracy_at_coverage {
