@@ -80,7 +80,12 @@ export type Enable2FaInput = {
   secret: string;
 };
 
-export type IntegrationService = "GMAIL" | "GOOGLE_CALENDAR" | "JIRA" | "SLACK";
+export type IntegrationService =
+  | "GMAIL"
+  | "GOOGLE_CALENDAR"
+  | "GOOGLE_CLOUD"
+  | "JIRA"
+  | "SLACK";
 
 /** Pagination input for list queries */
 export type PaginationInput = {
@@ -1036,6 +1041,67 @@ export type GetNodeTemplateQuery = {
     icon: string | null;
   };
 };
+
+export type OpsAlertsQueryVariables = Exact<{
+  status?: string | null | undefined;
+  severity?: string | null | undefined;
+  source?: string | null | undefined;
+  limit?: number | null | undefined;
+}>;
+
+export type OpsAlertsQuery = {
+  opsAlerts: Array<{
+    id: string;
+    source: string;
+    externalId: string | null;
+    dedupKey: string;
+    title: string;
+    resource: string | null;
+    severity: string;
+    severityRaw: string | null;
+    triageSource: string | null;
+    triageConfidence: number | null;
+    correctedSeverity: string | null;
+    status: string;
+    occurrenceCount: number;
+    firstSeen: unknown;
+    lastSeen: unknown;
+    reopenedAt: unknown;
+    resolvedSource: string | null;
+  }>;
+};
+
+export type OpsAlertsDigestQueryVariables = Exact<{ [key: string]: never }>;
+
+export type OpsAlertsDigestQuery = {
+  opsAlertsDigest: {
+    newLast24H: number;
+    reopenedActive: number;
+    activeBySeverity: Array<{ severity: string; count: number }>;
+    activeBySource: Array<{ source: string; count: number }>;
+  };
+};
+
+export type CorrectOpsAlertSeverityMutationVariables = Exact<{
+  alertId: string;
+  severity: string;
+}>;
+
+export type CorrectOpsAlertSeverityMutation = {
+  correctOpsAlertSeverity: boolean;
+};
+
+export type AckOpsAlertMutationVariables = Exact<{
+  alertId: string;
+}>;
+
+export type AckOpsAlertMutation = { ackOpsAlert: boolean };
+
+export type ResolveOpsAlertMutationVariables = Exact<{
+  alertId: string;
+}>;
+
+export type ResolveOpsAlertMutation = { resolveOpsAlert: boolean };
 
 export type AnalyzeRhaiQueryVariables = Exact<{
   input: AnalyzeRhaiInput;
@@ -4161,6 +4227,185 @@ export const useGetNodeTemplateQuery = <
       GetNodeTemplateQuery,
       GetNodeTemplateQueryVariables
     >(GetNodeTemplateDocument, variables),
+    ...options,
+  });
+};
+
+export const OpsAlertsDocument = new TypedDocumentString(`
+    query OpsAlerts($status: String, $severity: String, $source: String, $limit: Int) {
+  opsAlerts(status: $status, severity: $severity, source: $source, limit: $limit) {
+    id
+    source
+    externalId
+    dedupKey
+    title
+    resource
+    severity
+    severityRaw
+    triageSource
+    triageConfidence
+    correctedSeverity
+    status
+    occurrenceCount
+    firstSeen
+    lastSeen
+    reopenedAt
+    resolvedSource
+  }
+}
+    `);
+
+export const useOpsAlertsQuery = <TData = OpsAlertsQuery, TError = unknown>(
+  variables?: OpsAlertsQueryVariables,
+  options?: Omit<UseQueryOptions<OpsAlertsQuery, TError, TData>, "queryKey"> & {
+    queryKey?: UseQueryOptions<OpsAlertsQuery, TError, TData>["queryKey"];
+  },
+) => {
+  return useQuery<OpsAlertsQuery, TError, TData>({
+    queryKey:
+      variables === undefined ? ["OpsAlerts"] : ["OpsAlerts", variables],
+    queryFn: graphqlFetcher<OpsAlertsQuery, OpsAlertsQueryVariables>(
+      OpsAlertsDocument,
+      variables,
+    ),
+    ...options,
+  });
+};
+
+export const OpsAlertsDigestDocument = new TypedDocumentString(`
+    query OpsAlertsDigest {
+  opsAlertsDigest {
+    activeBySeverity {
+      severity
+      count
+    }
+    activeBySource {
+      source
+      count
+    }
+    newLast24H
+    reopenedActive
+  }
+}
+    `);
+
+export const useOpsAlertsDigestQuery = <
+  TData = OpsAlertsDigestQuery,
+  TError = unknown,
+>(
+  variables?: OpsAlertsDigestQueryVariables,
+  options?: Omit<
+    UseQueryOptions<OpsAlertsDigestQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<OpsAlertsDigestQuery, TError, TData>["queryKey"];
+  },
+) => {
+  return useQuery<OpsAlertsDigestQuery, TError, TData>({
+    queryKey:
+      variables === undefined
+        ? ["OpsAlertsDigest"]
+        : ["OpsAlertsDigest", variables],
+    queryFn: graphqlFetcher<
+      OpsAlertsDigestQuery,
+      OpsAlertsDigestQueryVariables
+    >(OpsAlertsDigestDocument, variables),
+    ...options,
+  });
+};
+
+export const CorrectOpsAlertSeverityDocument = new TypedDocumentString(`
+    mutation CorrectOpsAlertSeverity($alertId: UUID!, $severity: String!) {
+  correctOpsAlertSeverity(alertId: $alertId, severity: $severity)
+}
+    `);
+
+export const useCorrectOpsAlertSeverityMutation = <
+  TError = unknown,
+  TContext = unknown,
+>(
+  options?: UseMutationOptions<
+    CorrectOpsAlertSeverityMutation,
+    TError,
+    CorrectOpsAlertSeverityMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    CorrectOpsAlertSeverityMutation,
+    TError,
+    CorrectOpsAlertSeverityMutationVariables,
+    TContext
+  >({
+    mutationKey: ["CorrectOpsAlertSeverity"],
+    mutationFn: (variables?: CorrectOpsAlertSeverityMutationVariables) =>
+      graphqlFetcher<
+        CorrectOpsAlertSeverityMutation,
+        CorrectOpsAlertSeverityMutationVariables
+      >(CorrectOpsAlertSeverityDocument, variables)(),
+    ...options,
+  });
+};
+
+export const AckOpsAlertDocument = new TypedDocumentString(`
+    mutation AckOpsAlert($alertId: UUID!) {
+  ackOpsAlert(alertId: $alertId)
+}
+    `);
+
+export const useAckOpsAlertMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    AckOpsAlertMutation,
+    TError,
+    AckOpsAlertMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    AckOpsAlertMutation,
+    TError,
+    AckOpsAlertMutationVariables,
+    TContext
+  >({
+    mutationKey: ["AckOpsAlert"],
+    mutationFn: (variables?: AckOpsAlertMutationVariables) =>
+      graphqlFetcher<AckOpsAlertMutation, AckOpsAlertMutationVariables>(
+        AckOpsAlertDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const ResolveOpsAlertDocument = new TypedDocumentString(`
+    mutation ResolveOpsAlert($alertId: UUID!) {
+  resolveOpsAlert(alertId: $alertId)
+}
+    `);
+
+export const useResolveOpsAlertMutation = <
+  TError = unknown,
+  TContext = unknown,
+>(
+  options?: UseMutationOptions<
+    ResolveOpsAlertMutation,
+    TError,
+    ResolveOpsAlertMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    ResolveOpsAlertMutation,
+    TError,
+    ResolveOpsAlertMutationVariables,
+    TContext
+  >({
+    mutationKey: ["ResolveOpsAlert"],
+    mutationFn: (variables?: ResolveOpsAlertMutationVariables) =>
+      graphqlFetcher<ResolveOpsAlertMutation, ResolveOpsAlertMutationVariables>(
+        ResolveOpsAlertDocument,
+        variables,
+      )(),
     ...options,
   });
 };

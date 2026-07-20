@@ -7,6 +7,12 @@ export type Scalars = {
   Boolean: { input: boolean; output: boolean };
   Int: { input: number; output: number };
   Float: { input: number; output: number };
+  /**
+   * Implement the DateTime<Utc> scalar
+   *
+   * The input/output is a string in RFC3339 format.
+   */
+  DateTime: { input: unknown; output: unknown };
   /** A scalar that can represent any JSON value. */
   JSON: { input: unknown; output: unknown };
   /**
@@ -522,6 +528,7 @@ export type GrantCapabilityCeilingInput = {
 export enum IntegrationService {
   Gmail = "GMAIL",
   GoogleCalendar = "GOOGLE_CALENDAR",
+  GoogleCloud = "GOOGLE_CLOUD",
   Jira = "JIRA",
   Slack = "SLACK",
 }
@@ -685,9 +692,22 @@ export type ModuleExecutionLog = {
 
 export type MutationRoot = {
   __typename?: "MutationRoot";
+  /**
+   * Acknowledge a `new` alert. Returns false when the row doesn't exist,
+   * isn't owned, or isn't `new` (guarded transition).
+   */
+  ackOpsAlert: Scalars["Boolean"]["output"];
   approveExecution: Scalars["Boolean"]["output"];
   /** Clone an actor, copying its semantic and episodic memories into the new actor. */
   cloneActor: ActorSummary;
+  /**
+   * Record a HUMAN severity correction — the distillation gold signal.
+   * Overwrites any classifier label and marks the row corrected. Returns
+   * true when a row transitioned (false = not found / not owned). The
+   * severity is validated against the assignable vocabulary in the resolver
+   * so the caller gets a specific, static message before any DB round-trip.
+   */
+  correctOpsAlertSeverity: Scalars["Boolean"]["output"];
   createActor: ActorSummary;
   createApiKey: ApiKeyCreated;
   createModuleFromTemplate: WasmModule;
@@ -786,6 +806,11 @@ export type MutationRoot = {
    * promotion policy.
    */
   resolveMlDisagreement: MlResolveResult;
+  /**
+   * Resolve a `new`/`acked` alert (operator-sourced). Returns false when
+   * nothing matched. A later re-fire still reopens the row via ingest.
+   */
+  resolveOpsAlert: Scalars["Boolean"]["output"];
   resumeWorkflow: Scalars["Boolean"]["output"];
   retryExecution: Scalars["UUID"]["output"];
   revokeApiKey: Scalars["Boolean"]["output"];
@@ -832,6 +857,10 @@ export type MutationRoot = {
   writeActorMemory: ActorMemoryEntry;
 };
 
+export type MutationRootAckOpsAlertArgs = {
+  alertId: Scalars["UUID"]["input"];
+};
+
 export type MutationRootApproveExecutionArgs = {
   id: Scalars["UUID"]["input"];
   reason?: InputMaybe<Scalars["String"]["input"]>;
@@ -840,6 +869,11 @@ export type MutationRootApproveExecutionArgs = {
 export type MutationRootCloneActorArgs = {
   id: Scalars["UUID"]["input"];
   name?: InputMaybe<Scalars["String"]["input"]>;
+};
+
+export type MutationRootCorrectOpsAlertSeverityArgs = {
+  alertId: Scalars["UUID"]["input"];
+  severity: Scalars["String"]["input"];
 };
 
 export type MutationRootCreateActorArgs = {
@@ -972,6 +1006,10 @@ export type MutationRootReplayWebhookDeadLetterEntryArgs = {
 export type MutationRootResolveMlDisagreementArgs = {
   correctLabel?: InputMaybe<Scalars["String"]["input"]>;
   disagreementId: Scalars["UUID"]["input"];
+};
+
+export type MutationRootResolveOpsAlertArgs = {
+  alertId: Scalars["UUID"]["input"];
 };
 
 export type MutationRootResumeWorkflowArgs = {
@@ -1154,6 +1192,46 @@ export type OauthAuthUrl = {
   provider: Scalars["String"]["output"];
 };
 
+/**
+ * One normalized operational alert as surfaced to the triage UI. Field set
+ * mirrors [`OpsAlertRow`]; `severity` is the effective label (a human
+ * correction overrides the classifier), `correctedSeverity` is set only when
+ * a human corrected it (the distillation gold signal).
+ */
+export type OpsAlert = {
+  __typename?: "OpsAlert";
+  correctedSeverity?: Maybe<Scalars["String"]["output"]>;
+  dedupKey: Scalars["String"]["output"];
+  externalId?: Maybe<Scalars["String"]["output"]>;
+  firstSeen: Scalars["DateTime"]["output"];
+  id: Scalars["UUID"]["output"];
+  lastSeen: Scalars["DateTime"]["output"];
+  occurrenceCount: Scalars["Int"]["output"];
+  /** Set when the alert re-fired AFTER being resolved (regression). */
+  reopenedAt?: Maybe<Scalars["DateTime"]["output"]>;
+  /** `operator` | `signal`, when resolved. */
+  resolvedSource?: Maybe<Scalars["String"]["output"]>;
+  resource?: Maybe<Scalars["String"]["output"]>;
+  severity: Scalars["String"]["output"];
+  severityRaw?: Maybe<Scalars["String"]["output"]>;
+  source: Scalars["String"]["output"];
+  /** `new` | `acked` | `resolved`. */
+  status: Scalars["String"]["output"];
+  title: Scalars["String"]["output"];
+  triageConfidence?: Maybe<Scalars["Float"]["output"]>;
+  /** `heuristic` | `classifier` | `correction`, when triaged. */
+  triageSource?: Maybe<Scalars["String"]["output"]>;
+};
+
+/** Digest rollup over the active (non-resolved) alert set. */
+export type OpsAlertsDigest = {
+  __typename?: "OpsAlertsDigest";
+  activeBySeverity: Array<SeverityCount>;
+  activeBySource: Array<SourceCount>;
+  newLast24H: Scalars["Int"]["output"];
+  reopenedActive: Scalars["Int"]["output"];
+};
+
 /** GraphQL representation of an organization member. */
 export type OrgMemberObj = {
   __typename?: "OrgMemberObj";
@@ -1300,6 +1378,14 @@ export type QueryRoot = {
   nodeTemplate: NodeTemplate;
   nodeTemplates: Array<NodeTemplate>;
   oauthLoginUrl: OauthAuthUrl;
+  /**
+   * The caller's alerts, owner-scoped, newest activity first. With no
+   * explicit `status` the triage default excludes resolved rows; an
+   * explicit `status` filter overrides that.
+   */
+  opsAlerts: Array<OpsAlert>;
+  /** Digest rollup over the caller's active alert set. */
+  opsAlertsDigest: OpsAlertsDigest;
   organization: OrganizationObj;
   organizationMembers: Array<OrgMemberObj>;
   /**
@@ -1438,6 +1524,13 @@ export type QueryRootOauthLoginUrlArgs = {
   provider: Scalars["String"]["input"];
 };
 
+export type QueryRootOpsAlertsArgs = {
+  limit?: InputMaybe<Scalars["Int"]["input"]>;
+  severity?: InputMaybe<Scalars["String"]["input"]>;
+  source?: InputMaybe<Scalars["String"]["input"]>;
+  status?: InputMaybe<Scalars["String"]["input"]>;
+};
+
 export type QueryRootOrganizationArgs = {
   orgId: Scalars["UUID"]["input"];
 };
@@ -1572,10 +1665,24 @@ export type ServiceIntegration = {
   status: Scalars["String"]["output"];
 };
 
+/** `(severity, count)` over the active set. */
+export type SeverityCount = {
+  __typename?: "SeverityCount";
+  count: Scalars["Int"]["output"];
+  severity: Scalars["String"]["output"];
+};
+
 export type SignupInput = {
   email: Scalars["String"]["input"];
   name?: InputMaybe<Scalars["String"]["input"]>;
   password: Scalars["String"]["input"];
+};
+
+/** `(source, count)` over the active set. */
+export type SourceCount = {
+  __typename?: "SourceCount";
+  count: Scalars["Int"]["output"];
+  source: Scalars["String"]["output"];
 };
 
 export type SubscriptionRoot = {

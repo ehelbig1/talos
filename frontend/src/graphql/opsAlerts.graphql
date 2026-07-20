@@ -1,0 +1,62 @@
+# Ops-alerts triage UI — the in-app twin of the one-click email correction
+# links (#523). Source documents for graphql-codegen — `npm run codegen`
+# regenerates the typed react-query hooks + Document constants from these.
+
+query OpsAlerts(
+  $status: String
+  $severity: String
+  $source: String
+  $limit: Int
+) {
+  opsAlerts(
+    status: $status
+    severity: $severity
+    source: $source
+    limit: $limit
+  ) {
+    id
+    source
+    externalId
+    dedupKey
+    title
+    resource
+    severity
+    severityRaw
+    triageSource
+    triageConfidence
+    correctedSeverity
+    status
+    occurrenceCount
+    firstSeen
+    lastSeen
+    reopenedAt
+    resolvedSource
+  }
+}
+
+query OpsAlertsDigest {
+  opsAlertsDigest {
+    activeBySeverity {
+      severity
+      count
+    }
+    activeBySource {
+      source
+      count
+    }
+    newLast24H
+    reopenedActive
+  }
+}
+
+mutation CorrectOpsAlertSeverity($alertId: UUID!, $severity: String!) {
+  correctOpsAlertSeverity(alertId: $alertId, severity: $severity)
+}
+
+mutation AckOpsAlert($alertId: UUID!) {
+  ackOpsAlert(alertId: $alertId)
+}
+
+mutation ResolveOpsAlert($alertId: UUID!) {
+  resolveOpsAlert(alertId: $alertId)
+}

@@ -6,6 +6,7 @@ pub struct QueryRoot(
     crate::schema::auth::queries::AuthQueries,
     crate::schema::ml::queries::MlQueries,
     crate::schema::modules::queries::ModulesQueries,
+    crate::schema::ops_alerts::queries::OpsAlertsQueries,
     crate::schema::organizations::queries::OrganizationsQueries,
     crate::schema::platform::queries::PlatformQueries,
     crate::schema::secrets::queries::SecretsQueries,
