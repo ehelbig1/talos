@@ -2035,15 +2035,22 @@ fn spawn_maintenance_sweeps(
     if talos_ops_alerts_repository::self_monitor::self_alerts_enabled() {
         let self_monitor_pool = db_pool.clone();
         let self_monitor_shutdown = bg_shutdown_rx.clone();
-        let self_monitor_interval: u64 = std::env::var("TALOS_SELF_ALERTS_INTERVAL_SECS")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(talos_ops_alerts_repository::self_monitor::DEFAULT_TICK_INTERVAL_SECS)
-            .clamp(5, 3600);
+        // Canonical env parsing (warns on non-positive garbage instead
+        // of silently substituting — the zero-env-var footgun class).
+        let self_monitor_interval: u64 = talos_config::positive_env_or_default(
+            "TALOS_SELF_ALERTS_INTERVAL_SECS",
+            talos_ops_alerts_repository::self_monitor::DEFAULT_TICK_INTERVAL_SECS,
+        )
+        .clamp(5, 3600);
         tokio::spawn(async move {
             let mut shutdown = self_monitor_shutdown;
             let mut ticker =
                 tokio::time::interval(std::time::Duration::from_secs(self_monitor_interval));
+            // Skip (not Burst, the default) missed ticks: after a
+            // laptop sleep or long DB stall, ONE tick drains the whole
+            // backlog internally — replaying ~60 queued ticks would
+            // just hammer the cursor row with no-op transactions.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // Burn the immediate first tick — nothing has finalized yet
             // this boot, and startup is busy enough.
             ticker.tick().await;

@@ -327,17 +327,7 @@ pub async fn approval_gate_preview(
     (StatusCode::OK, axum::response::Html(html)).into_response()
 }
 
-/// Minimal HTML escape for dynamic content embedded in the preview
-/// page (gate title, description). The approval page is served with
-/// a tight CSP, but defence in depth is cheap here and the gate fields
-/// are user-provided at creation time.
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
+use crate::html_escape;
 
 /// Human-accessible approval gate handler (POST).
 ///

@@ -29,6 +29,16 @@
 //!   unassignable and the corrections-outrank-models invariant holds.
 //! * **Tenancy** rides the token row (`user_id` captured at mint from
 //!   the reader's resolved identity), never the HTTP request.
+//!
+//! Known exposure (documented, accepted): minted URLs transit the
+//! digest/report NODE OUTPUT on their way to the compose/send nodes,
+//! so raw tokens also appear in persisted execution outputs (encrypted
+//! at rest; readable by the owning user via the MCP execution-output
+//! surface — who could equally call `correct_ops_alert_severity`
+//! directly, so no privilege is gained) and in test-run results.
+//! "Hash-only" is a claim about THIS TABLE, not about every transit
+//! surface. Minting is also time-boxed by [`mint_correction_urls`] so
+//! a slow token write can never stall the digest itself.
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -69,52 +79,54 @@ pub fn token_shape_valid(token: &str) -> bool {
 }
 
 impl OpsAlertRepository {
-    /// Mint one correction token per alert id, order-aligned with the
-    /// input. One batched INSERT (UNNEST) per call — digest renders
-    /// mint up to ~15 tokens and run twice a day, so per-row
-    /// round-trips are pure waste. Piggybacks an opportunistic
-    /// expired-token DELETE (indexed range scan) so the table stays
-    /// bounded without a dedicated sweep task.
+    /// Mint one correction token per alert id. Returns `Some(raw)`
+    /// order-aligned with the input ONLY for ids the INSERT actually
+    /// stored — the ownership JOIN can skip rows (alert deleted between
+    /// list and mint, or a foreign id), and rendering a link whose
+    /// token was never persisted would be a silent dead link (review
+    /// 2026-07-20). One statement total: a CTE folds the opportunistic
+    /// expired-token sweep (indexed range scan) into the batched
+    /// UNNEST INSERT, and RETURNING reports which ids landed.
     ///
-    /// Returns the RAW tokens; they exist only in the rendered email.
+    /// Raw tokens exist only in the return value and the rendered
+    /// email; only `sha256_hex` is stored.
     pub async fn mint_correction_tokens(
         &self,
         user_id: Uuid,
         alert_ids: &[Uuid],
-        ttl_hours: i64,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<Option<String>>> {
         if alert_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let ttl_hours = ttl_hours.clamp(1, 24 * 90);
-
-        // Opportunistic cleanup — cheap (indexed), bounded frequency
-        // (only runs when something is minting).
-        sqlx::query("DELETE FROM ops_alert_correction_tokens WHERE expires_at < NOW()")
-            .execute(&self.db_pool)
-            .await?;
 
         let raw: Vec<String> = alert_ids.iter().map(|_| new_raw_token()).collect();
         let hashes: Vec<String> = raw.iter().map(|t| talos_text_util::sha256_hex(t)).collect();
 
-        // The alert_id join guard pins every token to an alert the
-        // minting user actually owns — a caller passing a foreign
-        // alert id mints nothing for it.
-        sqlx::query(
-            "INSERT INTO ops_alert_correction_tokens \
+        let inserted: std::collections::HashSet<Uuid> = sqlx::query_scalar(
+            "WITH gc AS ( \
+                 DELETE FROM ops_alert_correction_tokens WHERE expires_at < NOW() \
+             ) \
+             INSERT INTO ops_alert_correction_tokens \
                  (alert_id, user_id, token_hash, expires_at) \
              SELECT a.id, $1, x.token_hash, NOW() + make_interval(hours => $4::int) \
              FROM UNNEST($2::uuid[], $3::text[]) AS x(alert_id, token_hash) \
-             JOIN ops_alerts a ON a.id = x.alert_id AND a.user_id = $1",
+             JOIN ops_alerts a ON a.id = x.alert_id AND a.user_id = $1 \
+             RETURNING alert_id",
         )
         .bind(user_id)
         .bind(alert_ids)
         .bind(&hashes)
-        .bind(i32::try_from(ttl_hours).unwrap_or(i32::MAX))
-        .execute(&self.db_pool)
-        .await?;
+        .bind(i32::try_from(DEFAULT_TOKEN_TTL_HOURS).unwrap_or(i32::MAX))
+        .fetch_all(&self.db_pool)
+        .await?
+        .into_iter()
+        .collect();
 
-        Ok(raw)
+        Ok(alert_ids
+            .iter()
+            .zip(raw)
+            .map(|(id, tok)| inserted.contains(id).then_some(tok))
+            .collect())
     }
 
     /// Resolve a provided raw token to its alert context. `None` for
@@ -173,6 +185,55 @@ impl OpsAlertRepository {
         .execute(&self.db_pool)
         .await?;
         Ok(())
+    }
+}
+
+/// Hard ceiling on how long link minting may delay a digest render —
+/// the alerts section must never die for an OPTIONAL link write.
+const MINT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The one reader-facing entry point: mint tokens for `alert_ids` and
+/// return ready-to-render URLs, order-aligned, `None` where minting
+/// was skipped/failed. Best-effort by construction — repo errors and
+/// the [`MINT_TIMEOUT`] both degrade to link-less entries with a
+/// structured warn, never an error. Extracted so the digest and report
+/// readers share one copy (review 2026-07-20: the two pasted blocks
+/// were already drifting).
+pub async fn mint_correction_urls(
+    repo: &OpsAlertRepository,
+    user_id: Uuid,
+    alert_ids: &[Uuid],
+    base_url: &str,
+) -> Vec<Option<String>> {
+    if alert_ids.is_empty() {
+        return Vec::new();
+    }
+    match tokio::time::timeout(
+        MINT_TIMEOUT,
+        repo.mint_correction_tokens(user_id, alert_ids),
+    )
+    .await
+    {
+        Ok(Ok(tokens)) => tokens
+            .into_iter()
+            .map(|t| t.map(|t| correction_url(base_url, &t)))
+            .collect(),
+        Ok(Err(e)) => {
+            tracing::warn!(
+                target: "talos_corrections",
+                error = %e,
+                "correction-token mint failed — rendering without links"
+            );
+            vec![None; alert_ids.len()]
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: "talos_corrections",
+                timeout_ms = MINT_TIMEOUT.as_millis() as u64,
+                "correction-token mint timed out — rendering without links"
+            );
+            vec![None; alert_ids.len()]
+        }
     }
 }
 

@@ -447,6 +447,38 @@ impl OpsAlertRepository {
         Ok(res.rows_affected())
     }
 
+    /// Batch form of [`Self::resolve_by_dedup_prefix`] for the
+    /// self-monitor tick: one UPDATE resolves the `talos/` alerts of
+    /// every `(user_id, workflow_id)` pair that went green in a batch
+    /// (the per-row form was an N+1 on the reconciler's most common
+    /// path — review 2026-07-20). Patterns are built from
+    /// [`self_monitor::workflow_dedup_prefix`]; UUID text contains no
+    /// LIKE metacharacters, so no ESCAPE clause is needed.
+    /// Returns the number of rows transitioned.
+    pub async fn resolve_self_alerts_for_workflows(&self, pairs: &[(Uuid, Uuid)]) -> Result<u64> {
+        if pairs.is_empty() {
+            return Ok(0);
+        }
+        let users: Vec<Uuid> = pairs.iter().map(|(u, _)| *u).collect();
+        let patterns: Vec<String> = pairs
+            .iter()
+            .map(|(_, wf)| format!("{}%", self_monitor::workflow_dedup_prefix(*wf)))
+            .collect();
+        let res = sqlx::query(
+            "UPDATE ops_alerts a \
+             SET status = 'resolved', resolved_at = NOW(), resolved_source = 'signal' \
+             FROM UNNEST($1::uuid[], $2::text[]) AS p(user_id, pattern) \
+             WHERE a.user_id = p.user_id AND a.source = $3 \
+               AND a.status IN ('new','acked') AND a.dedup_key LIKE p.pattern",
+        )
+        .bind(&users)
+        .bind(&patterns)
+        .bind(self_monitor::SELF_ALERT_SOURCE)
+        .execute(&self.db_pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Record a HUMAN severity correction — the distillation gold signal.
     /// Overwrites any classifier label and marks the row corrected.
     pub async fn correct_severity(

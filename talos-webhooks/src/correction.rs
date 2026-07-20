@@ -41,13 +41,7 @@ fn invalid_link() -> axum::response::Response {
         .into_response()
 }
 
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
+use crate::html_escape;
 
 fn severity_valid(sev: &str) -> bool {
     ASSIGNABLE_SEVERITIES.contains(&sev)
@@ -101,10 +95,13 @@ pub async fn correction_preview(
     };
     // Alternative severities as small links (same token, different
     // path segment) so a mis-tapped email link is recoverable here.
+    // Sibling-relative href: against the base /corrections/{token}/{sev}
+    // a bare "{s}" replaces only the last segment, keeping the token.
+    // ("../{s}" would strip the token per RFC 3986 and 404.)
     let alts = ASSIGNABLE_SEVERITIES
         .iter()
         .filter(|s| **s != severity)
-        .map(|s| format!("<a href=\"../{s}\">{s}</a>"))
+        .map(|s| format!("<a href=\"{s}\">{s}</a>"))
         .collect::<Vec<_>>()
         .join(" · ");
 

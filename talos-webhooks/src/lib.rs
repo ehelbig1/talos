@@ -21,6 +21,20 @@
 //! including circuit breakers, rate limiting, HMAC verification, and DLQ support.
 
 mod approval;
+
+/// Minimal HTML escape for dynamic content embedded in the public
+/// token-authenticated pages (approval gates, correction links). ONE
+/// copy for the whole crate — these pages render externally-influenced
+/// text (gate titles, alert titles from email/GCP payloads) on
+/// unauthenticated endpoints, so a hardening fix must never land in
+/// one page's private escaper and miss another's.
+pub(crate) fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
 mod correction;
 mod dlq;
 #[allow(

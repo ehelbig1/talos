@@ -47,36 +47,18 @@ impl talos_workflow_engine_core::AssistantReportReader for PostgresAssistantRepo
             self.ops_alerts.week_stats(user_id, days).await?;
         let candidates = self.ops_alerts.correction_candidates(user_id, 5).await?;
 
-        // One-click correction links for the candidates (batched mint;
-        // best-effort — see ops_alerts_reader.rs for the same pattern).
+        // One-click correction links for the candidates — shared
+        // batched/time-boxed/best-effort helper (see
+        // correction_links.rs for the write-inside-read-port rationale).
         let base_url = talos_public_url::public_base_url_or(talos_config::get_base_url);
         let candidate_ids: Vec<Uuid> = candidates.iter().map(|a| a.id).collect();
-        let candidate_urls: Vec<Option<String>> = match self
-            .ops_alerts
-            .mint_correction_tokens(
-                user_id,
-                &candidate_ids,
-                talos_ops_alerts_repository::correction_links::DEFAULT_TOKEN_TTL_HOURS,
-            )
-            .await
-        {
-            Ok(tokens) => tokens
-                .iter()
-                .map(|t| {
-                    Some(
-                        talos_ops_alerts_repository::correction_links::correction_url(&base_url, t),
-                    )
-                })
-                .collect(),
-            Err(e) => {
-                tracing::warn!(
-                    target: "talos_corrections",
-                    error = %e,
-                    "correction-token mint failed — report renders without links"
-                );
-                vec![None; candidates.len()]
-            }
-        };
+        let candidate_urls = talos_ops_alerts_repository::correction_links::mint_correction_urls(
+            &self.ops_alerts,
+            user_id,
+            &candidate_ids,
+            &base_url,
+        )
+        .await;
 
         let ml = talos_ml::loop_health(&self.pool, user_id).await?;
 

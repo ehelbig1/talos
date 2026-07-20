@@ -39,37 +39,18 @@ impl talos_workflow_engine_core::OpsAlertsReader for PostgresOpsAlertsReader {
             .await?;
 
         // One-click correction links: one capability token per listed
-        // alert (batched mint), URL base from the public-URL resolver.
-        // Best-effort — a minting failure degrades to a link-less
-        // digest, never a failed one.
+        // alert. Batched, time-boxed, best-effort — the shared helper
+        // degrades to link-less entries rather than ever failing or
+        // stalling the digest. NOTE: this is a deliberate write inside
+        // a read port (tokens must transit node output to reach the
+        // compose node); see correction_links.rs module docs for the
+        // accepted-exposure rationale.
         let base_url = talos_public_url::public_base_url_or(talos_config::get_base_url);
         let alert_ids: Vec<Uuid> = top.iter().map(|a| a.id).collect();
-        let correction_urls: Vec<Option<String>> = match self
-            .repo
-            .mint_correction_tokens(
-                user_id,
-                &alert_ids,
-                talos_ops_alerts_repository::correction_links::DEFAULT_TOKEN_TTL_HOURS,
-            )
-            .await
-        {
-            Ok(tokens) => tokens
-                .iter()
-                .map(|t| {
-                    Some(
-                        talos_ops_alerts_repository::correction_links::correction_url(&base_url, t),
-                    )
-                })
-                .collect(),
-            Err(e) => {
-                tracing::warn!(
-                    target: "talos_corrections",
-                    error = %e,
-                    "correction-token mint failed — digest renders without links"
-                );
-                vec![None; top.len()]
-            }
-        };
+        let correction_urls = talos_ops_alerts_repository::correction_links::mint_correction_urls(
+            &self.repo, user_id, &alert_ids, &base_url,
+        )
+        .await;
 
         Ok(json!({
             "digest": {
