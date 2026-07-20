@@ -37,15 +37,15 @@ pub use delete::{delete_model, DeleteError, DeleteOutcome};
 pub use digest::{run_digest_tick, spawn_disagreement_digest};
 pub use distill::{spawn_distill_from_output, DistillContext, DISTILL_CONTEXT};
 pub use eval::{
-    coverage_curve, evaluate_predictions, macro_f1, macro_recall, run_backend_selection_eval,
-    run_knn_eval, stratified_holdout, BackendCandidate, ClassMetrics, CoveragePoint, EvalReport,
-    MIN_CLASS_FOR_HOLDOUT,
+    correction_aware_holdout, coverage_curve, evaluate_predictions, macro_f1, macro_recall,
+    run_backend_selection_eval, run_knn_eval, stratified_holdout, BackendCandidate, ClassMetrics,
+    CorrectionsCfg, CoveragePoint, EvalReport, MIN_CLASS_FOR_HOLDOUT,
 };
-pub use knn::{knn_vote, knn_vote_balanced, KnnPrediction, Neighbor};
+pub use knn::{knn_vote, knn_vote_balanced, knn_vote_balanced_weighted, KnnPrediction, Neighbor};
 pub use lifecycle::{
-    bump_shadow_epoch, can_transition, confidence_band, evaluate_policy, shadow_epoch,
-    validate_llm_locality, LifecycleService, LifecycleState, PolicyDecision, PolicyInputs,
-    PolicyJson,
+    bump_shadow_epoch, can_transition, confidence_band, corrections_cfg_for_dataset,
+    evaluate_policy, shadow_epoch, validate_llm_locality, LifecycleService, LifecycleState,
+    PolicyDecision, PolicyInputs, PolicyJson,
 };
 pub use lifecycle_job::{run_policy_tick, spawn_policy_evaluator};
 pub use linear::{FitOpts, LinearModel, LinearPrediction};

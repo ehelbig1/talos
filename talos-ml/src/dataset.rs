@@ -627,6 +627,24 @@ impl DatasetService {
         .await?)
     }
 
+    /// [`Self::load_labels`] plus `source` and `example_key` per row —
+    /// the inputs the correction-aware splitter needs (corrections are
+    /// partitioned by a stable hash of `example_key`, falling back to
+    /// the row id; see `eval::correction_aware_holdout`).
+    pub async fn load_labels_with_source(
+        &self,
+        conn: &mut PgConnection,
+        dataset_id: Uuid,
+    ) -> Result<Vec<(Uuid, String, String, Option<String>)>> {
+        Ok(sqlx::query_as(
+            "SELECT id, label_json->>'label', source, example_key FROM ml_examples \
+             WHERE dataset_id = $1 AND label_json ? 'label'",
+        )
+        .bind(dataset_id)
+        .fetch_all(&mut *conn)
+        .await?)
+    }
+
     /// Train-split embeddings + labels for fitting a parametric backend.
     /// Skips decryption (only the vector + label are needed) and rows with
     /// no stored embedding (a parametric model can't use them — they'd
@@ -637,8 +655,25 @@ impl DatasetService {
         conn: &mut PgConnection,
         dataset_id: Uuid,
     ) -> Result<Vec<(Vec<f32>, String)>> {
-        let rows: Vec<(Option<pgvector::Vector>, Option<String>)> = sqlx::query_as(
-            "SELECT embedding, label_json->>'label' FROM ml_examples \
+        Ok(self
+            .load_train_embeddings_with_source(conn, dataset_id)
+            .await?
+            .into_iter()
+            .map(|(emb, label, _)| (emb, label))
+            .collect())
+    }
+
+    /// [`Self::load_train_embeddings`] plus an `is_correction` flag per
+    /// row so the weighted fit can emphasize human corrections
+    /// (corrections-as-training, 2026-07-19).
+    pub async fn load_train_embeddings_with_source(
+        &self,
+        conn: &mut PgConnection,
+        dataset_id: Uuid,
+    ) -> Result<Vec<(Vec<f32>, String, bool)>> {
+        let rows: Vec<(Option<pgvector::Vector>, Option<String>, bool)> = sqlx::query_as(
+            "SELECT embedding, label_json->>'label', source = 'correction' \
+             FROM ml_examples \
              WHERE dataset_id = $1 AND split = 'train' \
                AND embedding IS NOT NULL AND label_json ? 'label'",
         )
@@ -648,8 +683,8 @@ impl DatasetService {
         .context("load train embeddings")?;
         Ok(rows
             .into_iter()
-            .filter_map(|(emb, label)| match (emb, label) {
-                (Some(v), Some(l)) => Some((v.to_vec(), l)),
+            .filter_map(|(emb, label, is_corr)| match (emb, label) {
+                (Some(v), Some(l)) => Some((v.to_vec(), l, is_corr)),
                 _ => None,
             })
             .collect())
@@ -848,8 +883,9 @@ impl DatasetService {
     ) -> Result<Vec<Neighbor>> {
         let k = k.clamp(1, 50);
         let qvec = pgvector::Vector::from(query.to_vec());
-        let rows: Vec<(String, f64)> = sqlx::query_as(
-            "SELECT label_json->>'label', 1 - (embedding <=> $2) AS sim \
+        let rows: Vec<(String, f64, bool)> = sqlx::query_as(
+            "SELECT label_json->>'label', 1 - (embedding <=> $2) AS sim, \
+                    source = 'correction' AS is_correction \
              FROM ml_examples \
              WHERE dataset_id = $1 AND embedding IS NOT NULL \
                AND label_json ? 'label' \
@@ -864,9 +900,10 @@ impl DatasetService {
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(label, sim)| Neighbor {
+            .map(|(label, sim, is_correction)| Neighbor {
                 label,
                 similarity: sim as f32,
+                is_correction,
             })
             .collect())
     }

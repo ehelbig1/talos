@@ -28,7 +28,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::dataset::DatasetService;
-use crate::knn::knn_vote_balanced;
+use crate::knn::knn_vote_balanced_weighted;
 use crate::registry::ModelRegistry;
 
 /// Default knn neighborhood when the model's `config_json` doesn't pin
@@ -72,6 +72,14 @@ struct ServingConfig {
     k: i64,
     lifecycle_state: String,
     confidence_threshold: f32,
+    /// Correction-emphasis multiplier for the knn vote — read from the
+    /// PROMOTED version's recorded eval params (not the live policy):
+    /// the confidence threshold was calibrated under that exact voting
+    /// scheme, and a policy edit after promotion must not silently
+    /// change how the promoted model serves. Versions promoted before
+    /// corrections-as-training carry no param and serve at 1.0 —
+    /// exactly the scheme they were calibrated with.
+    correction_weight: f32,
 }
 
 /// Whether a call applies the lifecycle serving gate.
@@ -320,6 +328,13 @@ pub async fn serve_predict_batch(
                 .and_then(|v| v.as_f64())
                 .map(|t| t.clamp(0.0, 1.0) as f32)
                 .unwrap_or(GATED_DEFAULT_THRESHOLD);
+            let correction_weight = promoted
+                .metrics_json
+                .get("params")
+                .and_then(|p| p.get("correction_weight"))
+                .and_then(|v| v.as_f64())
+                .map(|w| (w as f32).clamp(1.0, 10.0))
+                .unwrap_or(1.0);
             let cfg = ServingConfig {
                 dataset_id,
                 version_id: promoted.id,
@@ -328,6 +343,7 @@ pub async fn serve_predict_batch(
                 k,
                 lifecycle_state: resolved.lifecycle_state,
                 confidence_threshold,
+                correction_weight,
             };
             cache_put(user_id, model_name, cfg.clone());
             cfg
@@ -448,7 +464,7 @@ pub async fn serve_predict_batch(
                 .knn_search(&mut *conn, cfg.dataset_id, embedding, cfg.k, true)
                 .await
                 .map_err(ServeError::Internal)?;
-            let vote = knn_vote_balanced(&neighbors, &counts)
+            let vote = knn_vote_balanced_weighted(&neighbors, &counts, cfg.correction_weight)
                 .filter(|p| keep_vote(mode, p.confidence, cfg.confidence_threshold));
             out.push(vote.map(|p| ServedPrediction {
                 label: p.label,
@@ -478,6 +494,7 @@ mod tests {
             k,
             lifecycle_state: "shadow".into(),
             confidence_threshold: 0.6,
+            correction_weight: 1.0,
         }
     }
 
