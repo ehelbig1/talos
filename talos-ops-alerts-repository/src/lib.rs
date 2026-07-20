@@ -30,6 +30,7 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 pub mod envelope;
+pub mod self_monitor;
 
 /// Severity labels a triage path may assign. `unclassified` is the ingest
 /// default and deliberately NOT assignable by [`OpsAlertRepository::correct_severity`] /
@@ -406,6 +407,43 @@ impl OpsAlertRepository {
         .execute(&self.db_pool)
         .await?;
         Ok(res.rows_affected() > 0)
+    }
+
+    /// Resolve EVERY active alert whose dedup key starts with `prefix`
+    /// — the self-monitoring success signal ([`self_monitor`]): one
+    /// green unattended run closes all of that workflow's open
+    /// `talos/…` alerts at once. `resolved_source = 'signal'`, same
+    /// new/acked guard as [`Self::resolve_by_dedup_key`], so a later
+    /// re-fire still REOPENS via ingest (regression signal preserved).
+    /// The `source = 'talos'` guard is defense in depth: even a
+    /// pathological prefix can only touch platform-emitted rows.
+    /// Returns the number of rows transitioned.
+    pub async fn resolve_by_dedup_prefix(&self, user_id: Uuid, prefix: &str) -> Result<u64> {
+        let prefix = truncate_chars(prefix, MAX_KEY_CHARS);
+        if prefix.is_empty() {
+            return Ok(0);
+        }
+        // LIKE-escape order matters (MCP-719/955): backslash FIRST,
+        // then the wildcards — reversing doubles the escapes.
+        let pattern = format!(
+            "{}%",
+            prefix
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
+        let res = sqlx::query(
+            "UPDATE ops_alerts \
+             SET status = 'resolved', resolved_at = NOW(), resolved_source = 'signal' \
+             WHERE user_id = $1 AND source = $2 AND status IN ('new','acked') \
+               AND dedup_key LIKE $3 ESCAPE '\\'",
+        )
+        .bind(user_id)
+        .bind(self_monitor::SELF_ALERT_SOURCE)
+        .bind(&pattern)
+        .execute(&self.db_pool)
+        .await?;
+        Ok(res.rows_affected())
     }
 
     /// Record a HUMAN severity correction — the distillation gold signal.
