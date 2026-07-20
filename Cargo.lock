@@ -7254,6 +7254,7 @@ dependencies = [
  "talos-module-executions",
  "talos-module-repository",
  "talos-oauth",
+ "talos-ops-alerts-repository",
  "talos-organizations",
  "talos-rate-limit",
  "talos-registry",

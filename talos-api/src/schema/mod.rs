@@ -11,6 +11,7 @@ pub mod auth;
 pub mod executions;
 pub mod ml;
 pub mod modules;
+pub mod ops_alerts;
 pub mod organizations;
 pub mod platform;
 pub mod secrets;

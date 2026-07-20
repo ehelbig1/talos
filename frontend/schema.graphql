@@ -392,6 +392,13 @@ input CreateWorkflowInput {
 }
 
 """
+Implement the DateTime<Utc> scalar
+
+The input/output is a string in RFC3339 format.
+"""
+scalar DateTime
+
+"""
 A node execution that failed and was moved to the Dead Letter Queue.
 """
 type DeadLetterEntry {
@@ -543,6 +550,7 @@ enum IntegrationService {
 	GMAIL
 	SLACK
 	JIRA
+	GOOGLE_CLOUD
 }
 
 """
@@ -785,6 +793,24 @@ type MutationRoot {
 	provisionMlClassifier(name: String!, labels: [String!]!, actorId: UUID!, fallbackProvider: String, fallbackModel: String, allowExternalLlm: Boolean, k: Int, confidenceThreshold: Float, maxExamples: Int): MlProvisionResult!
 	createModuleFromTemplate(input: CreateModuleInput!): WasmModule!
 	testModule(moduleId: UUID!, input: String, timeoutSecs: Int): TestModuleResult!
+	"""
+	Record a HUMAN severity correction — the distillation gold signal.
+	Overwrites any classifier label and marks the row corrected. Returns
+	true when a row transitioned (false = not found / not owned). The
+	severity is validated against the assignable vocabulary in the resolver
+	so the caller gets a specific, static message before any DB round-trip.
+	"""
+	correctOpsAlertSeverity(alertId: UUID!, severity: String!): Boolean!
+	"""
+	Acknowledge a `new` alert. Returns false when the row doesn't exist,
+	isn't owned, or isn't `new` (guarded transition).
+	"""
+	ackOpsAlert(alertId: UUID!): Boolean!
+	"""
+	Resolve a `new`/`acked` alert (operator-sourced). Returns false when
+	nothing matched. A later re-fire still reopens the row via ingest.
+	"""
+	resolveOpsAlert(alertId: UUID!): Boolean!
 	createOrganization(name: String!, slug: String!): OrganizationObj!
 	inviteMember(orgId: UUID!, targetUserId: UUID!, role: String!): OrgMemberObj!
 	removeMember(orgId: UUID!, targetUserId: UUID!): Boolean!
@@ -934,6 +960,54 @@ type OauthAuthUrl {
 }
 
 """
+One normalized operational alert as surfaced to the triage UI. Field set
+mirrors [`OpsAlertRow`]; `severity` is the effective label (a human
+correction overrides the classifier), `correctedSeverity` is set only when
+a human corrected it (the distillation gold signal).
+"""
+type OpsAlert {
+	id: UUID!
+	source: String!
+	externalId: String
+	dedupKey: String!
+	title: String!
+	resource: String
+	severity: String!
+	severityRaw: String
+	"""
+	`heuristic` | `classifier` | `correction`, when triaged.
+	"""
+	triageSource: String
+	triageConfidence: Float
+	correctedSeverity: String
+	"""
+	`new` | `acked` | `resolved`.
+	"""
+	status: String!
+	occurrenceCount: Int!
+	firstSeen: DateTime!
+	lastSeen: DateTime!
+	"""
+	Set when the alert re-fired AFTER being resolved (regression).
+	"""
+	reopenedAt: DateTime
+	"""
+	`operator` | `signal`, when resolved.
+	"""
+	resolvedSource: String
+}
+
+"""
+Digest rollup over the active (non-resolved) alert set.
+"""
+type OpsAlertsDigest {
+	activeBySeverity: [SeverityCount!]!
+	activeBySource: [SourceCount!]!
+	newLast24H: Int!
+	reopenedActive: Int!
+}
+
+"""
 GraphQL representation of an organization member.
 """
 type OrgMemberObj {
@@ -1056,6 +1130,16 @@ type QueryRoot {
 	nodeTemplate(id: UUID!): NodeTemplate!
 	wasmModules(ids: [UUID!]!): [WasmModule!]!
 	myModules(pagination: PaginationInput): [WasmModule!]!
+	"""
+	The caller's alerts, owner-scoped, newest activity first. With no
+	explicit `status` the triage default excludes resolved rows; an
+	explicit `status` filter overrides that.
+	"""
+	opsAlerts(status: String, severity: String, source: String, limit: Int): [OpsAlert!]!
+	"""
+	Digest rollup over the caller's active alert set.
+	"""
+	opsAlertsDigest: OpsAlertsDigest!
 	myOrganizations: [OrganizationObj!]!
 	organization(orgId: UUID!): OrganizationObj!
 	organizationMembers(orgId: UUID!): [OrgMemberObj!]!
@@ -1224,10 +1308,26 @@ type ServiceIntegration {
 	status: String!
 }
 
+"""
+`(severity, count)` over the active set.
+"""
+type SeverityCount {
+	severity: String!
+	count: Int!
+}
+
 input SignupInput {
 	email: String!
 	password: String!
 	name: String
+}
+
+"""
+`(source, count)` over the active set.
+"""
+type SourceCount {
+	source: String!
+	count: Int!
 }
 
 type SubscriptionRoot {
