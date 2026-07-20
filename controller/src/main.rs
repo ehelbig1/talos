@@ -542,7 +542,7 @@ async fn main() -> anyhow::Result<()> {
                         model: u.model.clone(),
                         prompt_tokens: i64::from(u.prompt_tokens),
                         completion_tokens: i64::from(u.completion_tokens),
-                        calls: i64::try_from(u.calls).unwrap_or(i32::MAX as i64) as i32,
+                        calls: i32::try_from(u.calls).unwrap_or(i32::MAX),
                     })
                     .collect();
                 // Spawned + best-effort: accounting must never block or fail
