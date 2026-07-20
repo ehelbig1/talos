@@ -1,6 +1,7 @@
 pub mod actor_binding;
 pub mod adaptive_fuel;
 pub mod approval_gate;
+pub mod assistant_report_reader;
 pub mod builder;
 pub mod checkpoint_store;
 pub mod error;

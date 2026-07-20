@@ -87,6 +87,7 @@ Unknown top-level keys are ignored.
   //   "while_loop"    | "repeat_loop"     | "fan_in"         | "error_handler"
   //   "collect"       | "synthesize"      | "verify"         |
   //   "dispatch"      | "capability_dispatch" | "ops_alerts_digest"
+  //   "assistant_report"
   //
   // LLM-flavored kinds (gated by the `llm-primitives` feature, on by
   // default):
@@ -236,6 +237,19 @@ bounds (e.g. `max_iterations` caps at 50 for agent loops).
 // When the store is unreachable the node emits { available: false }
 // instead of failing the workflow.
 { "top_limit": 10 }   // active alerts included verbatim (1-25, default 10)
+```
+
+### `assistant_report`
+```jsonc
+// Controller-side trailing-window activity + learning-health snapshot:
+// per-workflow execution stats, fuel/cost totals, ops-alerts week stats
+// (incl. correction candidates), and ML loop health (lifecycle, gold
+// accuracy, shadow agreement, corrections banked). Emits
+// { available, window_days, workflows, cost, ops_alerts, ml } as the
+// node output — the feed for weekly-report compose nodes. Controller
+// execution; tenancy from the resolved identity; { available: false }
+// on storage errors instead of failing the workflow.
+{ "days": 7 }   // trailing window (1-31, default 7)
 ```
 
 ### `synthesize`

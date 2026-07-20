@@ -733,6 +733,11 @@ pub struct ParallelWorkflowEngine {
     /// node emit an unavailable-envelope rather than failing the
     /// workflow.
     pub(crate) ops_alerts_reader: Option<Arc<dyn talos_workflow_engine_core::OpsAlertsReader>>,
+    /// Read-side port for the weekly assistant report — powers the
+    /// `assistant_report` system node. Same None-degrades contract as
+    /// `ops_alerts_reader`.
+    pub(crate) assistant_report_reader:
+        Option<Arc<dyn talos_workflow_engine_core::AssistantReportReader>>,
     /// Seals per-dispatch plaintext secrets into the opaque
     /// `(ciphertext, nonce)` pair forwarded on the wire. Defaults to
     /// [`talos_workflow_job_protocol::AesGcmSecretEnvelope`] — a
@@ -854,6 +859,7 @@ pub struct AdapterSet {
     module_execution_store: Option<Arc<dyn talos_workflow_engine_core::ModuleExecutionStore>>,
     approval_gate: Option<Arc<dyn talos_workflow_engine_core::ApprovalGate>>,
     ops_alerts_reader: Option<Arc<dyn talos_workflow_engine_core::OpsAlertsReader>>,
+    assistant_report_reader: Option<Arc<dyn talos_workflow_engine_core::AssistantReportReader>>,
     secret_envelope: Arc<dyn talos_workflow_engine_core::SecretEnvelope>,
     user_id: Option<Uuid>,
     actor_id: Option<Uuid>,
@@ -923,6 +929,7 @@ impl AdapterSet {
         engine.module_execution_store = self.module_execution_store;
         engine.approval_gate = self.approval_gate;
         engine.ops_alerts_reader = self.ops_alerts_reader;
+        engine.assistant_report_reader = self.assistant_report_reader;
         engine.secret_envelope = self.secret_envelope;
         engine.user_id = self.user_id;
         engine.actor_id = self.actor_id;
@@ -1015,6 +1022,7 @@ impl ParallelWorkflowEngine {
             module_execution_store: None,
             approval_gate: None,
             ops_alerts_reader: None,
+            assistant_report_reader: None,
             secret_envelope: Arc::new(talos_workflow_job_protocol::AesGcmSecretEnvelope),
             sandbox_root: Some(default_sandbox_root().to_path_buf()),
             agent_loop_max_history: DEFAULT_AGENT_LOOP_MAX_HISTORY,
@@ -1427,6 +1435,17 @@ impl ParallelWorkflowEngine {
         self.ops_alerts_reader = Some(reader);
     }
 
+    /// Inject the assistant-report read port (powers the
+    /// `assistant_report` system node). Wired by the controller engine
+    /// builder; absent in out-of-tree consumers, where the node degrades
+    /// to an unavailable-envelope output.
+    pub fn set_assistant_report_reader(
+        &mut self,
+        reader: Arc<dyn talos_workflow_engine_core::AssistantReportReader>,
+    ) {
+        self.assistant_report_reader = Some(reader);
+    }
+
     /// Replace the default module-execution store. Consumers that
     /// don't have a Postgres-backed module store plug in their own
     /// impl (capture, append log, no-op) here.
@@ -1532,6 +1551,7 @@ impl ParallelWorkflowEngine {
             module_execution_store: self.module_execution_store.clone(),
             approval_gate: self.approval_gate.clone(),
             ops_alerts_reader: self.ops_alerts_reader.clone(),
+            assistant_report_reader: self.assistant_report_reader.clone(),
             secret_envelope: self.secret_envelope.clone(),
             user_id: self.user_id,
             actor_id: self.actor_id,
@@ -5236,6 +5256,32 @@ impl ParallelWorkflowEngine {
                 // by construction (nothing leaves the controller).
                 if let Some(output) = self
                     .try_dispatch_ops_alerts_digest(node_id, execution_id)
+                    .await
+                {
+                    let chains_ctx = if is_fresh_run {
+                        Some((chains.as_slice(), &node_to_chain))
+                    } else {
+                        None
+                    };
+                    self.route_system_node_output(
+                        node_idx,
+                        output,
+                        execution_id,
+                        chains_ctx,
+                        &exec_ctx,
+                        &mut results,
+                        &mut pending,
+                        &mut ready,
+                    )
+                    .await?;
+                    continue;
+                }
+
+                // ── Assistant report (controller-side weekly snapshot) ───────
+                // Same async + route-downstream + degrade-not-fail contract
+                // as the ops-alerts digest above.
+                if let Some(output) = self
+                    .try_dispatch_assistant_report(node_id, execution_id)
                     .await
                 {
                     let chains_ctx = if is_fresh_run {

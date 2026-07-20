@@ -493,6 +493,54 @@ impl OpsAlertRepository {
         rows.into_iter().map(Self::row_to_alert).collect()
     }
 
+    /// Trailing-window lifecycle counts for the weekly report:
+    /// `(opened, auto_resolved, operator_resolved, corrected, reopened)`.
+    pub async fn week_stats(&self, user_id: Uuid, days: i32) -> Result<(i64, i64, i64, i64, i64)> {
+        let days = days.clamp(1, 31);
+        Ok(sqlx::query_as(
+            "SELECT \
+               COUNT(*) FILTER (WHERE first_seen > NOW() - make_interval(days => $2::int))::bigint, \
+               COUNT(*) FILTER (WHERE resolved_source = 'signal' \
+                                  AND resolved_at > NOW() - make_interval(days => $2::int))::bigint, \
+               COUNT(*) FILTER (WHERE resolved_source = 'operator' \
+                                  AND resolved_at > NOW() - make_interval(days => $2::int))::bigint, \
+               COUNT(*) FILTER (WHERE corrected_at > NOW() - make_interval(days => $2::int))::bigint, \
+               COUNT(*) FILTER (WHERE reopened_at > NOW() - make_interval(days => $2::int))::bigint \
+             FROM ops_alerts WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .bind(days)
+        .fetch_one(&self.db_pool)
+        .await?)
+    }
+
+    /// Active heuristic-labeled alerts a human hasn't touched, highest
+    /// occurrence first — the weekly report's "correction candidates"
+    /// section (each correction feeds the classifier gold set).
+    pub async fn correction_candidates(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<OpsAlertRow>> {
+        let limit = limit.clamp(1, 10);
+        let rows = sqlx::query(
+            "SELECT id, source, external_id, dedup_key, title, resource, \
+                    severity_raw, severity, triage_source, triage_confidence, \
+                    corrected_severity, status, occurrence_count, \
+                    first_seen, last_seen, reopened_at, resolved_source \
+             FROM ops_alerts \
+             WHERE user_id = $1 AND status <> 'resolved' \
+               AND corrected_severity IS NULL \
+               AND COALESCE(triage_source, 'heuristic') <> 'correction' \
+             ORDER BY occurrence_count DESC, last_seen DESC LIMIT $2",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&self.db_pool)
+        .await?;
+        rows.into_iter().map(Self::row_to_alert).collect()
+    }
+
     pub async fn digest(&self, user_id: Uuid) -> Result<OpsAlertDigest> {
         let sev_rows = sqlx::query(
             "SELECT severity, COUNT(*) AS n FROM ops_alerts \

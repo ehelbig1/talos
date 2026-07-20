@@ -111,6 +111,7 @@
 pub const HAS_LLM_PRIMITIVES: bool = cfg!(feature = "llm-primitives");
 
 mod approval_gate;
+mod assistant_report_reader;
 mod checkpoint;
 mod context;
 mod dispatcher;
@@ -139,6 +140,7 @@ mod wasm_cache;
 mod write_ceiling;
 
 pub use approval_gate::{ApprovalGate, ApprovalStatus};
+pub use assistant_report_reader::AssistantReportReader;
 pub use checkpoint::CheckpointStore;
 pub use context::WorkflowContext;
 pub use dispatcher::{
