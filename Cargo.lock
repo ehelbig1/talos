@@ -1754,6 +1754,7 @@ dependencies = [
  "talos-nats-tls",
  "talos-node-cache",
  "talos-oauth",
+ "talos-ops-alerts-repository",
  "talos-organizations",
  "talos-public-url",
  "talos-rate-limit",

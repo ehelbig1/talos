@@ -2022,6 +2022,60 @@ fn spawn_maintenance_sweeps(
         }
     });
 
+    // ---------- Self-monitoring bridge: execution failures → ops_alerts ----------
+    //
+    // Cursor reconciler over terminal `workflow_executions` rows (see
+    // `talos_ops_alerts_repository::self_monitor` for the design: why a
+    // cursor beats finalizer hooks, the completed_at-vs-updated_at
+    // choice, the safety lag, and the FOR UPDATE SKIP LOCKED
+    // single-instance guard). Unattended failures become deduped
+    // `source='talos'` ops alerts; a later green run auto-resolves
+    // them. Kill switch TALOS_SELF_ALERTS=0; interval
+    // TALOS_SELF_ALERTS_INTERVAL_SECS (default 60, clamped 5..=3600).
+    if talos_ops_alerts_repository::self_monitor::self_alerts_enabled() {
+        let self_monitor_pool = db_pool.clone();
+        let self_monitor_shutdown = bg_shutdown_rx.clone();
+        let self_monitor_interval: u64 = std::env::var("TALOS_SELF_ALERTS_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(talos_ops_alerts_repository::self_monitor::DEFAULT_TICK_INTERVAL_SECS)
+            .clamp(5, 3600);
+        tokio::spawn(async move {
+            let mut shutdown = self_monitor_shutdown;
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(self_monitor_interval));
+            // Burn the immediate first tick — nothing has finalized yet
+            // this boot, and startup is busy enough.
+            ticker.tick().await;
+            tracing::info!(
+                target: "talos_self_alerts",
+                interval_secs = self_monitor_interval,
+                "self-monitoring bridge reconciler started"
+            );
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        talos_ops_alerts_repository::self_monitor::tick_and_log(
+                            &self_monitor_pool,
+                        )
+                        .await;
+                    }
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            tracing::info!("self-monitoring reconciler received shutdown signal");
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    } else {
+        tracing::info!(
+            target: "talos_self_alerts",
+            "self-monitoring bridge disabled via TALOS_SELF_ALERTS"
+        );
+    }
+
     // ---------- RFC 0010 P2 inc.4: dynamic worker-identity key refresh ---------
     //
     // Merges the DB-backed `worker_identities` registry into job_protocol's
