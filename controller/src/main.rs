@@ -5654,6 +5654,21 @@ fn build_router(
         .layer(Extension(webhook_limiter.clone()))
         .layer(Extension(whitelist.clone()));
 
+    // Public one-click ops-alert severity-correction routes (email
+    // capability URLs). Same trust model as the approval gates above:
+    // the cryptographically random token in the path IS the auth, GET
+    // renders a confirm page only (prefetch-safe), POST applies the
+    // correction, and the webhook limiter guards enumeration.
+    let correction_routes = Router::new()
+        .route(
+            "/corrections/{token}/{severity}",
+            get(webhooks::correction_preview).post(webhooks::correction_apply),
+        )
+        .layer(DefaultBodyLimit::max(4096))
+        .layer(from_fn(rate_limit::rate_limit_middleware))
+        .layer(Extension(webhook_limiter.clone()))
+        .layer(Extension(whitelist.clone()));
+
     // Public suspension callback routes.
     // Auth is the 64-hex correlation_id (256-bit random) embedded in the URL.
     // Rate-limited to prevent enumeration brute-force.
@@ -6038,6 +6053,7 @@ fn build_router(
                 .with_state(google_calendar_service.clone()),
         )
         .merge(approval_gate_routes)
+        .merge(correction_routes)
         .merge(suspension_callback_routes)
         .merge(google_calendar_routes)
         .merge(google_calendar_webhook_routes)

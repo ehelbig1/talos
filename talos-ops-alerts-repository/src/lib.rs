@@ -29,6 +29,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+pub mod correction_links;
 pub mod envelope;
 pub mod self_monitor;
 

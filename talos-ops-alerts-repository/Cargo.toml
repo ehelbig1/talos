@@ -9,6 +9,10 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+hex = "0.4"
+rand = { version = "0.8", default-features = true, features = ["std"] }
+subtle = "2.4"
+talos-text-util = { path = "../talos-text-util" }
 serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 # envelope.rs — the shared `__ops_alert__` ingest core (parse → cap →

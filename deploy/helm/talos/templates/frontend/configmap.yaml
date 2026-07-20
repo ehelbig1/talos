@@ -126,6 +126,19 @@ data:
             proxy_set_header X-Forwarded-Proto $scheme;
         }
 
+        # /corrections — public one-click ops-alert severity-correction
+        # links embedded in digest/report emails. Token-authenticated on
+        # the controller; must reach it from the frontend host too, not
+        # fall through to the SPA shell.
+        location /corrections/ {
+            proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
         # /mcp — Model Context Protocol endpoint on the controller. Used
         # by remote MCP clients (Claude Code, Claude Desktop, etc.) to
         # invoke the controller's tool surface. Bearer-token auth is

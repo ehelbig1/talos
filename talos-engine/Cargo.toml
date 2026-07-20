@@ -31,6 +31,7 @@ talos-actor-repository = { path = "../talos-actor-repository" }
 talos-execution-repository = { path = "../talos-execution-repository" }
 talos-ops-alerts-repository = { path = "../talos-ops-alerts-repository" }
 talos-config = { path = "../talos-config" }
+talos-public-url = { path = "../talos-public-url" }
 talos-cost-attribution = { path = "../talos-cost-attribution" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-engine-events = { path = "../talos-engine-events" }
