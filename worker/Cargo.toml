@@ -45,6 +45,7 @@ talos-secrets = { path = "../talos-secrets" }
 talos-memory = { path = "../talos-memory" }
 talos-ssrf-classify = { path = "../talos-ssrf-classify" }
 talos-capability-world = { path = "../talos-capability-world" }
+talos-sigstore-policy = { path = "../talos-sigstore-policy" }
 talos-wit-inspector = { path = "../talos-wit-inspector" }
 talos-trace = { path = "../talos-trace" }
 talos-trace-nats = { path = "../talos-trace-nats" }

@@ -49,9 +49,9 @@ impl Resolve for ControllerSsrfResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let host = name.as_str().to_string();
         Box::pin(async move {
-            // The port is a placeholder; reqwest rewrites it from the URL scheme
-            // before connecting. tokio's `lookup_host` just needs one to return
-            // `SocketAddr`s.
+            // The `:443` here is only to satisfy `lookup_host`'s need for a
+            // port; the REAL port is reset to 0 below so hyper-util substitutes
+            // the URL/scheme port at connect time (see the map at the end).
             let lookup = tokio::net::lookup_host(format!("{host}:443")).await;
             let addrs = match lookup {
                 Ok(it) => it.collect::<Vec<SocketAddr>>(),
@@ -86,7 +86,17 @@ impl Resolve for ControllerSsrfResolver {
                 );
             }
 
-            let iter: Addrs = Box::new(filtered.into_iter());
+            // Reset the placeholder port to 0 so hyper-util substitutes the
+            // actual URL/scheme port at connect time. hyper-util only performs
+            // that substitution when the resolved port is 0 — a non-zero port
+            // (the 443 placeholder above) is used VERBATIM, so leaving it would
+            // send every outbound webhook to :443 regardless of the URL's port
+            // (an `https://host:8443/` webhook would wrongly hit :443). Mirrors
+            // the worker's SsrfFilteringResolver (security review 2026-07-19, L9).
+            let iter: Addrs = Box::new(filtered.into_iter().map(|mut sa| {
+                sa.set_port(0);
+                sa
+            }));
             Ok(iter)
         })
     }

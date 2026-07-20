@@ -615,6 +615,12 @@ impl DlpProvider for PassthroughDlpProvider {
 ///
 /// On any transport or parse error the request falls back silently to
 /// `BuiltinDlpProvider` (infallible principle preserved).
+///
+/// Response bodies are capped at [`MAX_DLP_RESPONSE_BYTES`] so a
+/// compromised/buggy endpoint can't OOM the controller (security review
+/// 2026-07-19, L8).
+const MAX_DLP_RESPONSE_BYTES: u64 = 1 << 20; // 1 MiB — DLP responses are tiny
+
 pub struct ExternalDlpProvider {
     endpoint: String,
     client: reqwest::blocking::Client,
@@ -651,7 +657,38 @@ impl ExternalDlpProvider {
             req = req.header("Authorization", format!("Bearer {tok}"));
         }
         // block_in_place allows blocking calls inside a tokio multi-threaded runtime.
-        tokio::task::block_in_place(|| req.send().ok()?.json::<serde_json::Value>().ok())
+        tokio::task::block_in_place(|| {
+            use std::io::Read;
+            let resp = req.send().ok()?;
+            // Security review 2026-07-19 (L8): bound the response body. The DLP
+            // endpoint is operator-configured but could be compromised/buggy;
+            // an unbounded `.json()` on a multi-GB body would OOM the controller.
+            // `talos_http_body` covers async reqwest only, so cap the blocking
+            // read here. A short-circuit on a lying/oversized Content-Length,
+            // plus a hard `take()` bound that also catches a missing one.
+            if resp
+                .content_length()
+                .is_some_and(|len| len > MAX_DLP_RESPONSE_BYTES)
+            {
+                tracing::warn!(
+                    "ExternalDlpProvider: response Content-Length exceeds cap — \
+                     falling back to the built-in redactor"
+                );
+                return None;
+            }
+            let mut buf = Vec::new();
+            resp.take(MAX_DLP_RESPONSE_BYTES + 1)
+                .read_to_end(&mut buf)
+                .ok()?;
+            if buf.len() as u64 > MAX_DLP_RESPONSE_BYTES {
+                tracing::warn!(
+                    "ExternalDlpProvider: response body exceeds cap — falling back \
+                     to the built-in redactor"
+                );
+                return None;
+            }
+            serde_json::from_slice(&buf).ok()
+        })
     }
 }
 

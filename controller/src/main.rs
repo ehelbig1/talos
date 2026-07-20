@@ -718,6 +718,14 @@ async fn init_database() -> anyhow::Result<sqlx::Pool<sqlx::Postgres>> {
     // (`prod-kek-guard`). No-op outside production, so dev/test is unaffected.
     talos_db::enforce_production_rls_posture(&db_pool, config::is_production()).await?;
 
+    // Security review 2026-07-19 (P1): the `database` capability world runs
+    // guest SQL against this primary pool. In production, refuse to boot unless
+    // the `SET LOCAL ROLE` fence (TALOS_RPC_GUEST_ROLE) is configured — or the
+    // operator explicitly accepts the unscoped posture via
+    // TALOS_ALLOW_UNSCOPED_DB_SANDBOX=1. Mirrors the RLS/env-KEK guards; no-op
+    // outside production.
+    talos_rpc_subscribers::enforce_production_db_sandbox_posture(config::is_production())?;
+
     {
         let migrate_start = std::time::Instant::now();
         match sqlx::migrate!("../migrations").run(&db_pool).await {
@@ -8212,6 +8220,10 @@ async fn graphql_handler(
     // that path.
     let api_key_header_present = headers.contains_key("X-API-Key");
     let mut authenticated = false;
+    // Tracks a JWT session that authenticated but has NOT completed 2FA
+    // (password-only). API keys are always 2FA-verified; unauthenticated
+    // requests stay `false` so the login/signup flow keeps working.
+    let mut pre_2fa_session = false;
     if let Some(api_key) = headers.get("X-API-Key").and_then(|h| h.to_str().ok()) {
         // Get API key service from schema data
         if let Some(api_key_service) = schema.0.data::<std::sync::Arc<api_keys::ApiKeyService>>() {
@@ -8248,6 +8260,7 @@ async fn graphql_handler(
                         req = req.data(crate::api::schema::IsTwoFactorVerified(
                             claims.is_2fa_verified,
                         ));
+                        pre_2fa_session = !claims.is_2fa_verified;
                         tracing::debug!(
                             "Authenticated via JWT for user {} (2FA verified: {})",
                             user_id,
@@ -8257,6 +8270,25 @@ async fn graphql_handler(
                 }
             }
         }
+    }
+
+    // Security review 2026-07-19 (P3): a password-verified but TOTP-pending
+    // session may only run the 2FA-completion / bootstrap operations. This is
+    // the read-surface counterpart to `require_2fa` on mutations and the REST
+    // middleware's pre-2FA 403 — without it, a pre-2FA JWT could read the whole
+    // GraphQL query surface (workflows, executions, decrypted agent memory,
+    // secret metadata). Fails closed on unparseable/ambiguous operations.
+    if pre_2fa_session
+        && !api::schema::pre_2fa_operation_allowed(&req.query, req.operation_name.as_deref())
+    {
+        tracing::debug!("Refused pre-2FA GraphQL operation (2FA not completed)");
+        return GraphQLResponse::from(async_graphql::Response::from_errors(vec![
+            async_graphql::ServerError::new(
+                "Two-Factor Authentication required. Complete 2FA verification to \
+                 access this resource.",
+                None,
+            ),
+        ]));
     }
 
     let mut response = schema.execute(req).await;

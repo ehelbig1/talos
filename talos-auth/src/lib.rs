@@ -774,6 +774,17 @@ impl AuthService {
         if let Some(locked_until) = user.locked_until {
             if locked_until > Utc::now() {
                 let remaining = (locked_until - Utc::now()).num_seconds();
+                // Security review 2026-07-19 (L3): run the same-cost dummy
+                // bcrypt as the user-not-found path (MCP-1084) BEFORE returning.
+                // Without it the locked branch returns ~one-bcrypt faster than
+                // the wrong-password path, so an attacker who has burned the
+                // lockout threshold can distinguish "locked" (real account) from
+                // "wrong password" by timing — a registration oracle the unified
+                // error message otherwise closes.
+                let password_owned = password.to_string();
+                let dummy_hash = self.dummy_password_hash.clone();
+                let _ =
+                    tokio::task::spawn_blocking(move || verify(&password_owned, &dummy_hash)).await;
                 self.log_auth_event_best_effort(
                     Some(user.id),
                     "login_failed",

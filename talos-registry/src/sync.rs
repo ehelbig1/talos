@@ -200,34 +200,21 @@ async fn verify_oci_artifact_signature(reference: &Reference) -> Result<bool> {
         return Ok(true);
     }
     let identity_regexp = env::var("TALOS_SIGSTORE_IDENTITY_REGEXP").unwrap_or_default();
-    if identity_regexp.is_empty() {
-        let msg = "TALOS_SIGSTORE_IDENTITY_REGEXP is empty — \
-                   refusing to verify with no identity pin";
-        match policy {
-            SigstorePolicy::Required => anyhow::bail!("{msg} (Required policy)"),
-            SigstorePolicy::Audit => {
-                tracing::warn!("{msg} (Audit mode: continuing without verification)");
-                return Ok(false);
-            }
-            SigstorePolicy::Disabled => unreachable!(),
-        }
-    }
-    // Reject obvious catch-alls so the operator can't silently neuter
-    // the gate via env. Pure substring match against known patterns —
-    // a defense-in-depth check on top of the worker-side startup
-    // validation. Sibling of `validate_sigstore_identity_regexp` in
-    // worker/src/main.rs; the canonical home is the worker's helper
-    // (the controller never invokes `cosign verify` from anywhere
-    // else, so duplicating the short matcher here is cheaper than
-    // adding a shared `talos-sigstore-policy` crate for one function).
-    let trimmed = identity_regexp.trim();
-    if matches!(
-        trimmed,
-        ".*" | ".+" | "." | "^.*$" | "^.+$" | "^.$" | "^.*" | ".*$"
-    ) {
+    // Validate the identity regexp through the SAME source of truth the
+    // worker enforces at startup (`talos_sigstore_policy`). This closes
+    // the P4 asymmetry (security review 2026-07-19): the previous ad-hoc
+    // catch-all matcher here accepted wildcard-owner patterns like
+    // `^https://github\.com/.*/talos/...@` that the worker's validator
+    // rejects, so the controller's attestation layer trusted identity
+    // regexps the worker would refuse. The empty case (no identity pin)
+    // is also handled by the validator (`Empty`). Any rejection fails
+    // closed under Required and downgrades to unverified under Audit.
+    if let Err(rejection) =
+        talos_sigstore_policy::validate_sigstore_identity_regexp(&identity_regexp)
+    {
         let msg = format!(
-            "TALOS_SIGSTORE_IDENTITY_REGEXP is too broad (`{trimmed}`) — \
-             pin it to your workflow URL pattern"
+            "TALOS_SIGSTORE_IDENTITY_REGEXP rejected — {}",
+            rejection.human_reason()
         );
         match policy {
             SigstorePolicy::Required => anyhow::bail!("{msg} (Required policy)"),

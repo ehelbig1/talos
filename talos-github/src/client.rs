@@ -56,12 +56,15 @@ impl GithubAppClient {
         app_id: impl Into<String>,
         api_base: impl Into<String>,
     ) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .timeout(HTTP_TIMEOUT)
+        // Route through the shared hardened builder (redirect(Policy::none())
+        // + connect_timeout baked in) so this credential-bearing client is
+        // hardened by construction and covered by lint check 49 (security
+        // review 2026-07-19, L7). We keep GitHub's longer 8s connect timeout by
+        // overriding the shared 5s default. redirect-none is critical here — a
+        // redirect could replay the App-JWT Bearer to an attacker-controlled
+        // host — and is now guaranteed by the shared builder.
+        let http = talos_http_utils::trusted_client::hardened_client_builder(HTTP_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
-            // Never follow redirects on an authenticated App-JWT request — a
-            // redirect could replay the Bearer to an attacker-controlled host.
-            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("build GitHub App reqwest client")?;
         Ok(Self {

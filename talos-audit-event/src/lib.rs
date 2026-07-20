@@ -292,9 +292,37 @@ pub fn audit_verify_keys() -> Vec<Vec<u8>> {
     if let Ok(prev) = std::env::var("TALOS_AUDIT_SIGNING_KEY_PREVIOUS") {
         for part in prev.split(',') {
             let trimmed = part.trim();
-            if !trimmed.is_empty() {
-                keys.push(trimmed.as_bytes().to_vec());
+            if trimmed.is_empty() {
+                continue;
             }
+            // Security review 2026-07-19 (L2): apply the SAME 256-bit
+            // effective-entropy floor the current key enforces (MCP-579).
+            // A rotation key is a full-strength verification key — a weak
+            // legacy value left in `..._PREVIOUS` would let an attacker who
+            // brute-forces it forge audit events that pass `verify_chain`
+            // for as long as it stays configured. Drop (and warn on) any
+            // previous key below the floor instead of trusting it.
+            if effective_key_entropy_bytes(trimmed) < MIN_KEY_ENTROPY_BYTES {
+                if talos_config::is_production() {
+                    tracing::error!(
+                        target: "talos_security",
+                        event_kind = "audit_previous_key_below_entropy_floor",
+                        "A TALOS_AUDIT_SIGNING_KEY_PREVIOUS entry has < 256-bit \
+                         effective entropy and was DROPPED from the verifier key \
+                         set — a weak rotation key is forgeable. Remove it or \
+                         replace it with a >= 32-byte (64-hex-char) value."
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "talos_security",
+                        event_kind = "audit_previous_key_below_entropy_floor",
+                        "Dropping a weak TALOS_AUDIT_SIGNING_KEY_PREVIOUS entry \
+                         (< 256-bit effective entropy) from the verifier key set."
+                    );
+                }
+                continue;
+            }
+            keys.push(trimmed.as_bytes().to_vec());
         }
     }
     keys

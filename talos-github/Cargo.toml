@@ -33,6 +33,7 @@ anyhow = { workspace = true, optional = true }
 dashmap = { version = "6", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
 talos-http-body = { path = "../talos-http-body", optional = true }
+talos-http-utils = { path = "../talos-http-utils", optional = true }
 tokio = { version = "1", default-features = false, features = ["sync"], optional = true }
 tracing = { workspace = true, optional = true }
 
@@ -40,7 +41,7 @@ tracing = { workspace = true, optional = true }
 # Async GitHub App API client (mint installation token, get installation) +
 # the in-memory installation-token cache. Off by default so the crypto/parse
 # core stays reqwest-free.
-client = ["dep:anyhow", "dep:dashmap", "dep:reqwest", "dep:talos-http-body", "dep:tokio", "dep:tracing"]
+client = ["dep:anyhow", "dep:dashmap", "dep:reqwest", "dep:talos-http-body", "dep:talos-http-utils", "dep:tokio", "dep:tracing"]
 
 [dev-dependencies]
 # Cross-check: sign with ring, VERIFY with jsonwebtoken (independent impl).

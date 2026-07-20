@@ -175,6 +175,115 @@ pub fn require_2fa(ctx: &Context<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Root fields a pre-2FA (password-verified but TOTP-pending) session may
+/// invoke. Everything else is refused at the GraphQL entry point — the
+/// read-surface counterpart to `require_2fa` on mutations and the REST
+/// middleware's blanket pre-2FA 403 (security review 2026-07-19, P3).
+///
+/// Before this gate, `require_scope` (the query-side authorization helper)
+/// checked only that a `user_id` was present, never `IsTwoFactorVerified`,
+/// so a session holding the password but not the TOTP could read the entire
+/// query surface (workflows, executions, decrypted agent memory via
+/// `actorMemories`, secret metadata). Mutations were already blocked by
+/// `require_2fa`; REST already returned 403 for pre-2FA tokens. This closes
+/// the GraphQL read surface to match.
+///
+/// `me` is included because it is the ONLY resolver the 2FA login flow needs
+/// before verification — it reports the user's 2FA state and is deliberately
+/// un-gated (checks `user_id` presence only). The rest are the auth-bootstrap
+/// mutations (`login`/`signup`/`verifyTwoFactor`/`refreshToken`/`logout`) plus
+/// the introspection meta-fields used by tooling.
+pub const PRE_2FA_ALLOWED_ROOT_FIELDS: &[&str] = &[
+    "me",
+    "verifyTwoFactor",
+    "login",
+    "signup",
+    "refreshToken",
+    "logout",
+    "__typename",
+    "__schema",
+    "__type",
+];
+
+/// Returns `true` if a pre-2FA session may run the selected operation —
+/// i.e. every root field it selects is in [`PRE_2FA_ALLOWED_ROOT_FIELDS`].
+///
+/// Fails CLOSED: an unparseable query, an unresolved/ambiguous operation
+/// name, or an unresolvable (or cyclic) root fragment spread all return
+/// `false`. Root-level inline fragments and fragment spreads are resolved so
+/// the allowlist can't be evaded by wrapping a disallowed field in a
+/// fragment. Pure + unit-tested; the caller (`graphql_handler`) only invokes
+/// it for authenticated-but-not-2FA-verified sessions.
+pub fn pre_2fa_operation_allowed(query: &str, operation_name: Option<&str>) -> bool {
+    use async_graphql::parser::types::{DocumentOperations, OperationDefinition};
+
+    let doc = match async_graphql::parser::parse_query(query) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    let op: &OperationDefinition = match &doc.operations {
+        DocumentOperations::Single(op) => &op.node,
+        DocumentOperations::Multiple(ops) => match operation_name {
+            Some(name) => match ops.get(name) {
+                Some(op) => &op.node,
+                None => return false,
+            },
+            // Spec requires an operationName when multiple operations are
+            // present; tolerate the single-operation-map case, block otherwise.
+            None if ops.len() == 1 => &ops.values().next().expect("len==1").node,
+            None => return false,
+        },
+    };
+    let mut visiting = std::collections::HashSet::new();
+    selection_set_root_fields_allowed(&op.selection_set.node, &doc, &mut visiting)
+}
+
+fn selection_set_root_fields_allowed(
+    sel: &async_graphql::parser::types::SelectionSet,
+    doc: &async_graphql::parser::types::ExecutableDocument,
+    visiting: &mut std::collections::HashSet<String>,
+) -> bool {
+    use async_graphql::parser::types::Selection;
+    for item in &sel.items {
+        match &item.node {
+            Selection::Field(f) => {
+                if !PRE_2FA_ALLOWED_ROOT_FIELDS.contains(&f.node.name.node.as_str()) {
+                    return false;
+                }
+            }
+            Selection::InlineFragment(inline) => {
+                if !selection_set_root_fields_allowed(
+                    &inline.node.selection_set.node,
+                    doc,
+                    visiting,
+                ) {
+                    return false;
+                }
+            }
+            Selection::FragmentSpread(spread) => {
+                let frag_name = spread.node.fragment_name.node.as_str();
+                if !visiting.insert(frag_name.to_string()) {
+                    // Cyclic fragment — fail closed.
+                    return false;
+                }
+                let allowed = match doc.fragments.get(frag_name) {
+                    Some(frag) => selection_set_root_fields_allowed(
+                        &frag.node.selection_set.node,
+                        doc,
+                        visiting,
+                    ),
+                    None => false,
+                };
+                visiting.remove(frag_name);
+                if !allowed {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Gate for system-wide / cross-tenant operations.
 ///
 /// `require_scope(Admin)` deliberately session-bypasses (sessions are
@@ -518,6 +627,95 @@ pub struct RequestMetadata {
 /// Distributed trace ID propagated from the frontend via the X-Trace-ID header.
 #[derive(Clone, Debug)]
 pub struct TraceId(pub String);
+
+#[cfg(test)]
+mod pre_2fa_gate_tests {
+    use super::pre_2fa_operation_allowed;
+
+    #[test]
+    fn allows_me_query() {
+        assert!(pre_2fa_operation_allowed(
+            "query Me { me { id email twoFactorEnabled isTwoFactorVerified } }",
+            None
+        ));
+    }
+
+    #[test]
+    fn allows_auth_bootstrap_mutations() {
+        assert!(pre_2fa_operation_allowed(
+            "mutation V($i: VerifyTwoFactorInput!) { verifyTwoFactor(input: $i) { user { id } } }",
+            None
+        ));
+        assert!(pre_2fa_operation_allowed("mutation { logout }", None));
+        assert!(pre_2fa_operation_allowed(
+            "mutation R { refreshToken { user { id } } }",
+            None
+        ));
+    }
+
+    #[test]
+    fn blocks_sensitive_reads() {
+        // The exact P3 exploit surface: decrypted agent memory + secrets.
+        assert!(!pre_2fa_operation_allowed(
+            "query { actorMemories(actorId: \"x\") { id value } }",
+            None
+        ));
+        assert!(!pre_2fa_operation_allowed(
+            "query { secrets { keyPath } }",
+            None
+        ));
+        assert!(!pre_2fa_operation_allowed(
+            "query { workflows { id } }",
+            None
+        ));
+    }
+
+    #[test]
+    fn blocks_mixed_operation_with_one_disallowed_field() {
+        // `me` is allowed but `workflows` is not — the whole op is refused.
+        assert!(!pre_2fa_operation_allowed(
+            "query { me { id } workflows { id } }",
+            None
+        ));
+    }
+
+    #[test]
+    fn cannot_smuggle_disallowed_field_via_fragment() {
+        let q = "query { ...F } fragment F on QueryRoot { secrets { keyPath } }";
+        assert!(!pre_2fa_operation_allowed(q, None));
+    }
+
+    #[test]
+    fn allows_me_via_fragment() {
+        let q = "query { ...F } fragment F on QueryRoot { me { id } }";
+        assert!(pre_2fa_operation_allowed(q, None));
+    }
+
+    #[test]
+    fn unparseable_query_fails_closed() {
+        assert!(!pre_2fa_operation_allowed("query { unterminated", None));
+    }
+
+    #[test]
+    fn multi_operation_requires_matching_name() {
+        let q = "query A { me { id } } query B { workflows { id } }";
+        // Selecting the safe op by name is allowed…
+        assert!(pre_2fa_operation_allowed(q, Some("A")));
+        // …the unsafe one is blocked…
+        assert!(!pre_2fa_operation_allowed(q, Some("B")));
+        // …and an ambiguous (unnamed) selection over multiple ops fails closed.
+        assert!(!pre_2fa_operation_allowed(q, None));
+    }
+
+    #[test]
+    fn introspection_is_allowed() {
+        assert!(pre_2fa_operation_allowed("query { __typename }", None));
+        assert!(pre_2fa_operation_allowed(
+            "query { __schema { queryType { name } } }",
+            None
+        ));
+    }
+}
 
 #[cfg(test)]
 mod tests {
