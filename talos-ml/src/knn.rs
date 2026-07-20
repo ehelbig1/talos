@@ -13,6 +13,11 @@ pub struct Neighbor {
     pub label: String,
     /// Cosine similarity in [0, 1] (pgvector `1 - cosine_distance`).
     pub similarity: f32,
+    /// Whether this neighbor is a HUMAN CORRECTION row
+    /// (`source = 'correction'`) — corrections-as-training (2026-07-19)
+    /// lets the vote kernel weight these up so flagged failure modes
+    /// pull harder than ordinary teacher-labeled rows.
+    pub is_correction: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -57,9 +62,24 @@ pub fn knn_vote_balanced(
     neighbors: &[Neighbor],
     class_counts: &std::collections::HashMap<String, i64>,
 ) -> Option<KnnPrediction> {
+    // Uniform-weight delegate — identical to the pre-weighted vote.
+    knn_vote_balanced_weighted(neighbors, class_counts, 1.0)
+}
+
+/// [`knn_vote_balanced`] with a correction-emphasis multiplier: a
+/// correction neighbor's damped weight is multiplied by
+/// `correction_weight` (clamped 1..=10). Serving and eval MUST use the
+/// same weight for the same model — confidence thresholds are
+/// calibrated against the voting scheme (see the scheme note above).
+pub fn knn_vote_balanced_weighted(
+    neighbors: &[Neighbor],
+    class_counts: &std::collections::HashMap<String, i64>,
+    correction_weight: f32,
+) -> Option<KnnPrediction> {
     if neighbors.is_empty() {
         return None;
     }
+    let correction_weight = correction_weight.clamp(1.0, 10.0);
     let min_count = class_counts.values().copied().min().unwrap_or(1).max(1);
     let mut weights: std::collections::HashMap<&str, f32> = std::collections::HashMap::new();
     let mut total = 0.0f32;
@@ -69,7 +89,10 @@ pub fn knn_vote_balanced(
             .copied()
             .unwrap_or(min_count)
             .max(1);
-        let w = n.similarity.clamp(0.0, 1.0) / (count as f32).sqrt();
+        let mut w = n.similarity.clamp(0.0, 1.0) / (count as f32).sqrt();
+        if n.is_correction {
+            w *= correction_weight;
+        }
         *weights.entry(n.label.as_str()).or_insert(0.0) += w;
         total += w;
     }
@@ -95,7 +118,33 @@ mod tests {
         Neighbor {
             label: label.to_string(),
             similarity: sim,
+            is_correction: false,
         }
+    }
+
+    fn nc(label: &str, sim: f32) -> Neighbor {
+        Neighbor {
+            label: label.to_string(),
+            similarity: sim,
+            is_correction: true,
+        }
+    }
+
+    #[test]
+    fn correction_weight_boosts_correction_neighbors() {
+        use std::collections::HashMap;
+        let counts: HashMap<String, i64> = [("a".to_string(), 10), ("b".to_string(), 10)].into();
+        // Two ordinary "a" neighbors vs one correction "b" neighbor of
+        // equal similarity: unweighted, "a" wins 2:1; at weight 3 the
+        // correction outvotes them.
+        let neighbors = [n("a", 0.8), n("a", 0.8), nc("b", 0.8)];
+        let unweighted = knn_vote_balanced(&neighbors, &counts).expect("vote");
+        assert_eq!(unweighted.label, "a");
+        let weighted = knn_vote_balanced_weighted(&neighbors, &counts, 3.0).expect("vote");
+        assert_eq!(weighted.label, "b");
+        // Weight clamps: 0.5 clamps up to 1.0 → identical to unweighted.
+        let clamped = knn_vote_balanced_weighted(&neighbors, &counts, 0.5).expect("vote");
+        assert_eq!(clamped.label, "a");
     }
 
     #[test]

@@ -567,6 +567,10 @@ async fn handle_eval_model(
     // the highest-macro-F1 winner as a version — all inside ONE tx (the
     // advisory lock the selector takes holds until commit, so a concurrent
     // eval can't thrash this run's split mid-scoring).
+    // Same corrections scheme as the lifecycle promotion path — manual
+    // and scheduled evals must not calibrate thresholds under different
+    // voting/weighting rules.
+    let corrections_cfg = talos_ml::corrections_cfg_for_dataset(&mut tx, dataset_id).await;
     let candidates = match talos_ml::run_backend_selection_eval(
         &svc,
         &mut tx,
@@ -574,6 +578,7 @@ async fn handle_eval_model(
         k,
         holdout_fraction,
         talos_ml::FitOpts::default(),
+        corrections_cfg,
     )
     .await
     {
