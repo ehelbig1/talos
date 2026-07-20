@@ -560,6 +560,15 @@ async fn do_embedding_request(config: &EmbeddingConfig, truncated: &str) -> Opti
 /// No-op if the embedding provider isn't configured (the inner
 /// `generate_embedding` returns None). Spawned as a background task by
 /// the caller so controller startup isn't delayed by a slow provider.
+/// The identity of the embedding model every NEW vector is produced
+/// by — the value stamped into `embedding_model` columns and required
+/// by semantic reads (strict equality; see the provenance migration
+/// 20260720190000). `None` when embeddings are disabled entirely.
+#[must_use]
+pub fn active_embedding_model() -> Option<String> {
+    EmbeddingConfig::cached().map(|c| c.model)
+}
+
 pub async fn warmup() {
     let started = std::time::Instant::now();
     // Warmup ping carries no actor data — never tier-restricted.
