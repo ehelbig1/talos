@@ -299,7 +299,10 @@ fn truncate_oversized_job_result(
     cap: usize,
 ) -> JobResult {
     JobResult {
-        llm_usage: vec![],
+        // Preserve the token accounting — the usage was real even though
+        // the oversized output is dropped, and the entry vec is small
+        // (capped at MAX_LLM_USAGE_ENTRIES) so it can't re-breach the cap.
+        llm_usage: result.llm_usage.clone(),
         crypto_scheme: 0,
         job_id: result.job_id,
         status: JobStatus::Failed,
@@ -981,6 +984,12 @@ async fn execute_job(
         worker_fallback_secs.saturating_mul(1000)
     };
     let job_timeout = std::time::Duration::from_millis(job_timeout_ms);
+    // R2 token ledger: worker-owned accumulator shared with the job's
+    // TalosContext; drained into the signed JobResult on EVERY branch below
+    // (success, failure, timeout) — tokens spent before a trap are spent.
+    let llm_usage_acc: worker::context::LlmUsageAcc = std::sync::Arc::new(std::sync::Mutex::new(
+        std::collections::HashMap::new(),
+    ));
     match tokio::time::timeout(
         job_timeout,
         runtime.execute_job_with_full_features(
@@ -1008,6 +1017,7 @@ async fn execute_job(
             req.user_id,
             req.max_llm_tier,
             req.max_write_ceiling,
+            Some(llm_usage_acc.clone()),
         ),
     )
     .await
@@ -1018,7 +1028,7 @@ async fn execute_job(
             _span.end_success();
 
             JobResult {
-                llm_usage: vec![],
+                llm_usage: worker::context::drain_llm_usage_entries(&llm_usage_acc),
                 crypto_scheme: 0,
                 job_id: req.job_id,
                 status: JobStatus::Success,
@@ -1039,7 +1049,7 @@ async fn execute_job(
             _span.end_error(&sanitized_error);
 
             JobResult {
-                llm_usage: vec![],
+                llm_usage: worker::context::drain_llm_usage_entries(&llm_usage_acc),
                 crypto_scheme: 0,
                 job_id: req.job_id,
                 status: JobStatus::Failed,
@@ -1059,7 +1069,12 @@ async fn execute_job(
             _span.end_error(&error_msg);
 
             JobResult {
-                llm_usage: vec![],
+                // Timeout drops the execution future, but usage folded
+                // before the deadline is preserved via the shared Arc.
+                // A detached in-flight stream reader could in principle
+                // fold shortly after this drain — those late tokens are
+                // deliberately dropped rather than racing the signature.
+                llm_usage: worker::context::drain_llm_usage_entries(&llm_usage_acc),
                 crypto_scheme: 0,
                 job_id: req.job_id,
                 status: JobStatus::Failed,
@@ -1287,6 +1302,13 @@ async fn execute_pipeline_job(
 
     let overall_timeout = std::time::Duration::from_millis(req.total_timeout_ms);
 
+    // R2 token ledger: worker-owned accumulator shared with every step's
+    // context; drained into the signed PipelineJobResult on BOTH branches
+    // (a mid-pipeline bail still reports the completed steps' tokens).
+    let llm_usage_acc: worker::context::LlmUsageAcc = std::sync::Arc::new(std::sync::Mutex::new(
+        std::collections::HashMap::new(),
+    ));
+
     match runtime
         .execute_pipeline(
             &req.workflow_execution_id.to_string(),
@@ -1295,6 +1317,7 @@ async fn execute_pipeline_job(
             req.share_sandbox,
             req.max_llm_tier,
             req.max_write_ceiling,
+            Some(llm_usage_acc.clone()),
         )
         .await
     {
@@ -1318,7 +1341,7 @@ async fn execute_pipeline_job(
                 .collect();
 
             PipelineJobResult {
-                llm_usage: vec![],
+                llm_usage: worker::context::drain_llm_usage_entries(&llm_usage_acc),
                 crypto_scheme: 0,
                 job_id: req.job_id,
                 overall_status: JobStatus::Success,
@@ -1339,7 +1362,7 @@ async fn execute_pipeline_job(
             _span.end_error(&sanitized_error);
 
             PipelineJobResult {
-                llm_usage: vec![],
+                llm_usage: worker::context::drain_llm_usage_entries(&llm_usage_acc),
                 crypto_scheme: 0,
                 job_id: req.job_id,
                 overall_status: JobStatus::Failed,

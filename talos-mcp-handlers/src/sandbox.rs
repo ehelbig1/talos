@@ -1869,6 +1869,7 @@ async fn handle_run_sandbox(
             // run permissively. The ceiling gates live actor dispatch,
             // which the actor binding stamps at engine dispatch.
             talos_workflow_job_protocol::WriteCeiling::Write,
+            None, // llm_usage_out — internal sandbox path doesn't collect usage
         )
         .await;
 
@@ -3242,6 +3243,7 @@ async fn handle_test_module(
             // run permissively. The ceiling gates live actor dispatch,
             // which the actor binding stamps at engine dispatch.
             talos_workflow_job_protocol::WriteCeiling::Write,
+            None, // llm_usage_out — internal sandbox path doesn't collect usage
         )
         .await;
     let duration_ms = start.elapsed().as_millis();

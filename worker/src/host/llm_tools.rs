@@ -273,6 +273,16 @@ impl wit_llm_tools::Host for TalosContext {
             .parse_tool_completion(&resp_bytes)
             .map_err(wit_llm_tools::Error::ApiError)?;
 
+        // R2 token ledger: fold provider-reported usage into the per-job
+        // accumulator (drained into the signed JobResult at completion).
+        crate::context::fold_llm_usage(
+            &self.llm_usage,
+            adapter.name(),
+            &model,
+            parsed.input_tokens.unwrap_or(0),
+            parsed.output_tokens.unwrap_or(0),
+        );
+
         let content_blocks: Vec<wit_llm_tools::ContentBlock> = parsed
             .blocks
             .into_iter()
