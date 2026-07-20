@@ -8487,6 +8487,7 @@ dependencies = [
  "talos-dlp-provider",
  "talos-metrics",
  "talos-text-util",
+ "talos-workflow-authorization",
  "talos-workflow-engine-core",
  "thiserror 2.0.18",
  "tokio",

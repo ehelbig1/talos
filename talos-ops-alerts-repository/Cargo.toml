@@ -24,9 +24,14 @@ talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-metrics = { path = "../talos-metrics" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 thiserror = "2.0"
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "time"] }
 tracing.workspace = true
 uuid.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# Pins UNATTENDED/ATTENDED trigger lists to the ingress vocabulary.
+talos-workflow-authorization = { path = "../talos-workflow-authorization" }
+

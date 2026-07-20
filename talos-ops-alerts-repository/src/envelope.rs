@@ -81,12 +81,38 @@ pub enum EntryAction {
     /// `status_event` present but not a recognized value — skip the
     /// entry (fail-safe: a typo must not turn a recovery into a bump).
     SkipUnknownStatusEvent { status_event: String },
+    /// Entry claims the platform-reserved namespace (`talos/` dedup
+    /// keys or the `talos` source) — skip it. Modules process
+    /// untrusted content and must not be able to bump, retitle, or
+    /// resolve the self-monitoring bridge's alerts
+    /// ([`crate::self_monitor`]).
+    SkipReservedNamespace { dedup_key: String },
 }
 
 /// Classify one envelope entry. Only `status_event: "resolved"` is
 /// recognized today; absence means ingest.
 #[must_use]
 pub fn classify_entry(entry: &JsonValue) -> EntryAction {
+    // Reserved-namespace guard BEFORE any routing: `talos/…` dedup keys
+    // and the `talos` source belong to the self-monitoring bridge, and
+    // this boundary is the only line between sandboxed modules and the
+    // platform's own alert rows (the ingest upsert and the per-key
+    // resolve are deliberately namespace-agnostic for trusted callers).
+    let dedup_key = entry
+        .get("dedup_key")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    let source = entry
+        .get("source")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    if dedup_key.starts_with(crate::self_monitor::RESERVED_DEDUP_PREFIX)
+        || source == crate::self_monitor::SELF_ALERT_SOURCE
+    {
+        return EntryAction::SkipReservedNamespace {
+            dedup_key: dedup_key.to_string(),
+        };
+    }
     match entry.get("status_event").and_then(JsonValue::as_str) {
         None => EntryAction::Ingest,
         Some("resolved") => EntryAction::Resolve {
@@ -205,6 +231,15 @@ pub fn spawn_ingest_from_output(
                     }
                     continue;
                 }
+                EntryAction::SkipReservedNamespace { dedup_key } => {
+                    bump_failure_metric("namespace");
+                    tracing::warn!(
+                        %actor_id, context, dedup_key,
+                        "__ops_alert__: entry claims the reserved 'talos' namespace — dropped \
+                         (module-emitted alerts cannot touch self-monitoring rows)"
+                    );
+                    continue;
+                }
                 EntryAction::SkipUnknownStatusEvent { status_event } => {
                     tracing::warn!(
                         %actor_id, context, status_event,
@@ -281,6 +316,37 @@ mod tests {
         assert!(extract_alerts(&json!({"ok": 1})).is_none());
         // Non-object envelope.
         assert!(extract_alerts(&json!({"__ops_alert__": "nope"})).is_none());
+    }
+
+    #[test]
+    fn reserved_namespace_is_refused_in_both_directions() {
+        // Ingest-shaped entry claiming a talos/ dedup key → skipped.
+        assert!(matches!(
+            classify_entry(&json!({"dedup_key": "talos/wf/node/fuel_exhausted",
+                                   "source": "custom", "title": "spoof"})),
+            EntryAction::SkipReservedNamespace { .. }
+        ));
+        // Resolve-shaped entry targeting a talos/ key → skipped (a
+        // module must not be able to suppress self-monitoring alerts).
+        assert!(matches!(
+            classify_entry(&json!({"dedup_key": "talos/wf/node/auth",
+                                   "status_event": "resolved"})),
+            EntryAction::SkipReservedNamespace { .. }
+        ));
+        // Claiming the platform source without the prefix → skipped too.
+        assert!(matches!(
+            classify_entry(&json!({"dedup_key": "custom/key", "source": "talos",
+                                   "title": "spoof"})),
+            EntryAction::SkipReservedNamespace { .. }
+        ));
+        // Ordinary sources are untouched.
+        assert!(matches!(
+            classify_entry(
+                &json!({"dedup_key": "gcpmon|p|r", "source": "gcp-monitoring",
+                                   "title": "ok"})
+            ),
+            EntryAction::Ingest
+        ));
     }
 
     #[test]

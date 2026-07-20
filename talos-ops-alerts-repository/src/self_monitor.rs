@@ -75,11 +75,33 @@ use crate::{NewOpsAlert, OpsAlertRepository};
 /// dedup-key namespace prefix — see [`workflow_dedup_prefix`].
 pub const SELF_ALERT_SOURCE: &str = "talos";
 
+/// Reserved dedup-key namespace. The `__ops_alert__` envelope boundary
+/// ([`crate::envelope::classify_entry`]) refuses module-emitted entries
+/// under this prefix (or claiming [`SELF_ALERT_SOURCE`]) so sandboxed
+/// code can never bump, retitle, or resolve self-monitoring rows.
+pub const RESERVED_DEDUP_PREFIX: &str = "talos/";
+
 /// Trigger types considered unattended (nobody is watching a terminal
 /// or editor when these fail). `agent_dispatch` is the legacy alias of
-/// `actor_dispatch` — both appear in stored provenance.
-const UNATTENDED_TRIGGER_TYPES: [&str; 4] =
-    ["scheduled", "webhook", "actor_dispatch", "agent_dispatch"];
+/// `actor_dispatch`; `api` is a caller script, not a human at a
+/// keyboard. A cross-crate test below pins this list against
+/// `talos_workflow_authorization::VALID_TRIGGER_TYPES` so a new
+/// trigger type cannot land silently unmonitored (review 2026-07-20 —
+/// the original list omitted `api`, replaying the exact vocabulary-rot
+/// mode this module's own design doc criticizes).
+const UNATTENDED_TRIGGER_TYPES: [&str; 5] = [
+    "scheduled",
+    "webhook",
+    "actor_dispatch",
+    "agent_dispatch",
+    "api",
+];
+
+/// The complement: trigger types where a human IS watching (manual /
+/// MCP runs). Together with [`UNATTENDED_TRIGGER_TYPES`] this must
+/// cover the full ingress vocabulary — enforced by test.
+#[cfg(test)]
+const ATTENDED_TRIGGER_TYPES: [&str; 1] = ["manual"];
 
 /// Max terminal rows drained per tick (multiple batches per tick until
 /// dry). Bounds transaction size, not throughput.
@@ -125,7 +147,11 @@ pub struct ErrorClass {
 /// Corrections refine from there — hints only seed NEW rows.
 #[must_use]
 pub fn classify_execution_error(msg: &str) -> ErrorClass {
-    let m = msg.to_lowercase();
+    // Cap before lowercasing (the MCP-1135 class: error strings can
+    // embed large quoted response bodies; finalizers truncate, but this
+    // layer should not trust that). 4 KiB matches the retry
+    // classifier's cap.
+    let m: String = msg.chars().take(4096).collect::<String>().to_lowercase();
     let has = |needle: &str| m.contains(needle);
 
     if has("fuel exhausted") {
@@ -158,16 +184,20 @@ pub fn classify_execution_error(msg: &str) -> ErrorClass {
             label: "inter-node contract violation",
             severity_hint: "high",
         }
+    } else if has("timed out") || has("timeout") {
+        // BEFORE the auth branch: a timeout message can contain an
+        // incidental "401" digit run ("timed out after 40100 ms"),
+        // and class is a dedup-key segment — a misclass forks
+        // occurrence history (review 2026-07-20).
+        ErrorClass {
+            class: "timeout",
+            label: "execution timeout",
+            severity_hint: "medium",
+        }
     } else if has("401") || has("access_token invalid") || has("unauthorized") {
         ErrorClass {
             class: "auth",
             label: "upstream auth failure",
-            severity_hint: "medium",
-        }
-    } else if has("timed out") || has("timeout") {
-        ErrorClass {
-            class: "timeout",
-            label: "execution timeout",
             severity_hint: "medium",
         }
     } else if has("networkerror") {
@@ -316,7 +346,36 @@ pub async fn reconcile_tick(pool: &Pool<Postgres>) -> anyhow::Result<TickStats> 
         .fetch_optional(&mut *tx)
         .await?
         else {
-            stats.skipped_lock = true;
+            // SKIP LOCKED returns None for BOTH contention and a
+            // missing seed row — and a missing row would otherwise
+            // disable the bridge silently forever (the exact failure
+            // class this module exists to close). A plain MVCC read
+            // distinguishes them: it sees a locked row just fine.
+            let row_exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM ops_alerts_self_monitor_cursor WHERE singleton)",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if row_exists {
+                stats.skipped_lock = true;
+                tracing::debug!(
+                    target: "talos_self_alerts",
+                    "cursor held by another instance — tick skipped"
+                );
+            } else {
+                tracing::error!(
+                    target: "talos_self_alerts",
+                    "self-monitor cursor row MISSING — re-seeding at NOW() \
+                     (no backfill; the bridge was inert until this tick)"
+                );
+                sqlx::query(
+                    "INSERT INTO ops_alerts_self_monitor_cursor (singleton, cursor_completed_at) \
+                     VALUES (true, NOW()) ON CONFLICT (singleton) DO NOTHING",
+                )
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+            }
             return Ok(stats);
         };
         let cur_ts: chrono::DateTime<chrono::Utc> = cursor.try_get("cursor_completed_at")?;
@@ -332,7 +391,7 @@ pub async fn reconcile_tick(pool: &Pool<Postgres>) -> anyhow::Result<TickStats> 
                     e.provenance->>'trigger_type' AS trigger_type, \
                     w.name AS workflow_name \
              FROM workflow_executions e \
-             JOIN workflows w ON w.id = e.workflow_id \
+             LEFT JOIN workflows w ON w.id = e.workflow_id \
              WHERE e.status IN ('completed','failed') \
                AND e.completed_at IS NOT NULL \
                AND (e.completed_at, e.id) > ($1, $2) \
@@ -378,7 +437,12 @@ pub async fn reconcile_tick(pool: &Pool<Postgres>) -> anyhow::Result<TickStats> 
                     .execute(&mut *tx)
                     .await?;
                     tx.commit().await?;
-                    continue; // ineligible gap skipped; re-check for eligible rows
+                    // No re-loop: max_terminal is the newest terminal
+                    // row inside the lag horizon and the batch query
+                    // just proved nothing eligible exists at or below
+                    // it — the next iteration would provably find
+                    // nothing (review 2026-07-20: the `continue` here
+                    // doubled every quiet tick's transactions).
                 }
             }
             return Ok(stats); // fully drained
@@ -386,15 +450,29 @@ pub async fn reconcile_tick(pool: &Pool<Postgres>) -> anyhow::Result<TickStats> 
 
         let batch_len = rows.len();
         let mut last: Option<(chrono::DateTime<chrono::Utc>, Uuid)> = None;
+        // Successes are the overwhelmingly common case — collect their
+        // (user, workflow) pairs and resolve in ONE batched UPDATE
+        // after the loop instead of one round-trip per green row (the
+        // N+1 the review flagged). Failures stay per-row: each does
+        // multi-statement work and needs individual error isolation.
+        let mut green: Vec<(Uuid, Uuid)> = Vec::new();
+        let mut green_seen: std::collections::HashSet<(Uuid, Uuid)> =
+            std::collections::HashSet::new();
         for row in rows {
             stats.scanned += 1;
             let exec_id: Uuid = row.try_get("id")?;
             let ts: chrono::DateTime<chrono::Utc> = row.try_get("completed_at")?;
             last = Some((ts, exec_id));
-            match process_row(&repo, &row, exec_id).await {
-                Ok(RowOutcome::Ingested) => stats.ingested += 1,
-                Ok(RowOutcome::Resolved(n)) => stats.resolved_alerts += n,
-                Ok(RowOutcome::Nothing) => {}
+            let status: String = row.try_get("status")?;
+            if status == "completed" {
+                let pair = (row.try_get("user_id")?, row.try_get("workflow_id")?);
+                if green_seen.insert(pair) {
+                    green.push(pair);
+                }
+                continue;
+            }
+            match process_failed_row(&repo, &row, exec_id).await {
+                Ok(()) => stats.ingested += 1,
                 Err(e) => {
                     stats.row_errors += 1;
                     bump_failure_metric("db");
@@ -406,6 +484,30 @@ pub async fn reconcile_tick(pool: &Pool<Postgres>) -> anyhow::Result<TickStats> 
                          past the cursor and will not retry; occurrence data only)"
                     );
                 }
+            }
+        }
+        match repo.resolve_self_alerts_for_workflows(&green).await {
+            Ok(0) => {}
+            Ok(n) => {
+                stats.resolved_alerts += n;
+                if let Some(m) = talos_metrics::global() {
+                    m.ops_alert_auto_resolved_total.inc();
+                }
+                tracing::info!(
+                    target: "talos_self_alerts",
+                    resolved = n,
+                    workflows = green.len(),
+                    "self-alerts auto-resolved by successful unattended runs"
+                );
+            }
+            Err(e) => {
+                stats.row_errors += 1;
+                bump_failure_metric("db");
+                tracing::warn!(
+                    target: "talos_self_alerts",
+                    error = %e,
+                    "self-monitor: batched auto-resolve failed — continuing"
+                );
             }
         }
 
@@ -428,41 +530,22 @@ pub async fn reconcile_tick(pool: &Pool<Postgres>) -> anyhow::Result<TickStats> 
     Ok(stats)
 }
 
-enum RowOutcome {
-    Ingested,
-    Resolved(u64),
-    Nothing,
-}
-
-async fn process_row(
+/// Ingest one FAILED execution row as an ops alert (the tick's success
+/// rows resolve in a single batched UPDATE — see the tick loop).
+async fn process_failed_row(
     repo: &OpsAlertRepository,
     row: &sqlx::postgres::PgRow,
     execution_id: Uuid,
-) -> anyhow::Result<RowOutcome> {
-    let status: String = row.try_get("status")?;
+) -> anyhow::Result<()> {
     let user_id: Uuid = row.try_get("user_id")?;
     let org_id: Option<Uuid> = row.try_get("org_id")?;
     let workflow_id: Uuid = row.try_get("workflow_id")?;
-    let workflow_name: String = row.try_get("workflow_name")?;
-
-    if status == "completed" {
-        let resolved = repo
-            .resolve_by_dedup_prefix(user_id, &workflow_dedup_prefix(workflow_id))
-            .await?;
-        if resolved > 0 {
-            if let Some(m) = talos_metrics::global() {
-                m.ops_alert_auto_resolved_total.inc();
-            }
-            tracing::info!(
-                target: "talos_self_alerts",
-                %workflow_id,
-                resolved,
-                "self-alerts auto-resolved by successful unattended run"
-            );
-            return Ok(RowOutcome::Resolved(resolved));
-        }
-        return Ok(RowOutcome::Nothing);
-    }
+    // LEFT-joined: a workflow deleted right after its last failure must
+    // still alert (review 2026-07-20 — the INNER JOIN silently swallowed
+    // those rows and the cursor jumped past them).
+    let workflow_name: String = row
+        .try_get::<Option<String>, _>("workflow_name")?
+        .unwrap_or_else(|| "(deleted workflow)".to_string());
 
     let error_message: Option<String> = row.try_get("error_message")?;
     let error_message = error_message.unwrap_or_else(|| "unknown failure".to_string());
@@ -480,7 +563,8 @@ async fn process_row(
         .collect();
     let excerpt_red = talos_dlp_provider::redact_str(&excerpt);
 
-    let title = match &node {
+    let node_red = node.as_deref().map(talos_dlp_provider::redact_str);
+    let title = match &node_red {
         Some(n) => format!("workflow '{name_red}' failed: {} (node '{n}')", ec.label),
         None => format!("workflow '{name_red}' failed: {}", ec.label),
     };
@@ -510,7 +594,7 @@ async fn process_row(
         ?outcome,
         "execution failure ingested as ops alert"
     );
-    Ok(RowOutcome::Ingested)
+    Ok(())
 }
 
 /// One loggable tick invocation for callers that own the interval loop
@@ -653,6 +737,22 @@ mod tests {
         assert_eq!(c, d);
         assert_ne!(c, e);
         assert!(c.starts_with(&format!("talos/{wf}/-/other_")));
+    }
+
+    #[test]
+    fn trigger_vocabulary_is_fully_classified() {
+        // Every ingress trigger type must be explicitly attended or
+        // unattended — a new type landing in the vocabulary without a
+        // decision here is exactly how the caller-side failure-notify
+        // precedent rotted. Fails compilation-adjacent (this test) the
+        // moment VALID_TRIGGER_TYPES grows.
+        for t in talos_workflow_authorization::VALID_TRIGGER_TYPES {
+            assert!(
+                UNATTENDED_TRIGGER_TYPES.contains(t) || ATTENDED_TRIGGER_TYPES.contains(t),
+                "trigger type '{t}' is not classified attended/unattended in self_monitor — \
+                 decide whether the bridge should monitor it"
+            );
+        }
     }
 
     #[test]
