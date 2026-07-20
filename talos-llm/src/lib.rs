@@ -6,6 +6,8 @@ use std::time::Duration;
 use tracing::{error, warn};
 use zeroize::Zeroizing;
 
+pub mod usage;
+
 // ── HTTP timeouts ────────────────────────────────────────────────────
 //
 // These three values were previously hardcoded as bare `Duration::from_secs(30/60/600)`
@@ -207,6 +209,8 @@ impl LlmClient {
         let api_key = self.resolve_api_key().await?;
         let mut retries = 0;
         let max_retries = 3;
+        // Named so the usage-record call below can't drift from the request.
+        const MODEL: &str = "claude-sonnet-4-6";
 
         let response = loop {
             let req = self
@@ -215,7 +219,7 @@ impl LlmClient {
                 .header("x-api-key", api_key.as_str())
                 .header("anthropic-version", "2023-06-01")
                 .json(&json!({
-                    "model": "claude-sonnet-4-6",
+                    "model": MODEL,
                     "max_tokens": 4096,
                     "system": &system_prompt,
                     "messages": [
@@ -287,6 +291,7 @@ impl LlmClient {
         };
 
         let body: serde_json::Value = talos_http_body::read_json_capped(response).await?;
+        usage::record_anthropic(MODEL, &body);
 
         let mut text = body["content"][0]["text"]
             .as_str()
@@ -314,6 +319,8 @@ impl LlmClient {
         let api_key = self.resolve_api_key().await?;
         let mut retries = 0u32;
         let max_retries = 2u32;
+        // Named so the usage-record call below can't drift from the request.
+        const MODEL: &str = "claude-haiku-4-5-20251001";
 
         let response = loop {
             let req = self
@@ -322,7 +329,7 @@ impl LlmClient {
                 .header("x-api-key", api_key.as_str())
                 .header("anthropic-version", "2023-06-01")
                 .json(&json!({
-                    "model": "claude-haiku-4-5-20251001",
+                    "model": MODEL,
                     "max_tokens": 512,
                     "system": system_prompt,
                     "messages": [{ "role": "user", "content": user_prompt }]
@@ -363,6 +370,7 @@ impl LlmClient {
         };
 
         let body: serde_json::Value = talos_http_body::read_json_capped(response).await?;
+        usage::record_anthropic(MODEL, &body);
         let mut text = body["content"][0]["text"]
             .as_str()
             .unwrap_or("")
@@ -428,6 +436,8 @@ impl LlmClient {
         let api_key = self.resolve_api_key().await?;
         let mut retries = 0;
         let max_retries = 3;
+        // Named so the usage-record call below can't drift from the request.
+        const MODEL: &str = "claude-sonnet-4-6";
 
         let response = loop {
             let req = self
@@ -436,7 +446,7 @@ impl LlmClient {
                 .header("x-api-key", api_key.as_str())
                 .header("anthropic-version", "2023-06-01")
                 .json(&json!({
-                    "model": "claude-sonnet-4-6",
+                    "model": MODEL,
                     "max_tokens": 2048,
                     "system": system_prompt,
                     "messages": [{ "role": "user", "content": &user_prompt }]
@@ -488,6 +498,7 @@ impl LlmClient {
         };
 
         let body: serde_json::Value = talos_http_body::read_json_capped(response).await?;
+        usage::record_anthropic(MODEL, &body);
         let mut text = body["content"][0]["text"]
             .as_str()
             .unwrap_or("")
@@ -588,6 +599,7 @@ impl OllamaClient {
         }
 
         let body: serde_json::Value = talos_http_body::read_json_capped(resp).await?;
+        usage::record_ollama(model, &body);
         let text = body
             .get("message")
             .and_then(|m| m.get("content"))

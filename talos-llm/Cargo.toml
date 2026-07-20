@@ -13,9 +13,13 @@ serde_json.workspace = true
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-http-body = { path = "../talos-http-body" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["time", "rt"] }
 tracing.workspace = true
+uuid.workspace = true
 zeroize = "1.8"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["time", "rt", "macros"] }
 
 [lints]
 workspace = true

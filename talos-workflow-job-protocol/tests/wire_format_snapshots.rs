@@ -254,6 +254,7 @@ fn job_request_signature_snapshot() {
 #[test]
 fn job_result_json_snapshot() {
     let result = JobResult {
+        llm_usage: vec![],
         crypto_scheme: 0,
         job_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0001),
         status: JobStatus::Success,
@@ -327,6 +328,7 @@ fn pipeline_job_request_json_snapshot() {
 #[test]
 fn pipeline_job_result_json_snapshot() {
     let res = PipelineJobResult {
+        llm_usage: vec![],
         crypto_scheme: 0,
         job_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0010),
         step_results: vec![PipelineStepResult {

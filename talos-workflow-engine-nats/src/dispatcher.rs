@@ -1495,6 +1495,7 @@ mod p3_full_loop_tests {
 
                 // Send back a signed JobResult so the dispatcher completes.
                 let mut jr = JobResult {
+                    llm_usage: vec![],
                     job_id: req.job_id,
                     status: JobStatus::Success,
                     output_payload: serde_json::json!({"ok": true}),
@@ -1683,6 +1684,7 @@ mod p3_full_loop_tests {
                 *observed.lock().await = Some(per_step);
 
                 let mut pr = PipelineJobResult {
+                    llm_usage: vec![],
                     job_id: req.job_id,
                     overall_status: talos_workflow_job_protocol::JobStatus::Success,
                     step_results: vec![],
