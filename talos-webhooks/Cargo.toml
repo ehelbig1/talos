@@ -40,6 +40,7 @@ talos-rate-limit = { path = "../talos-rate-limit" }
 talos-registry = { path = "../talos-registry" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 # MCP-1050: canonical truncate_at_char_boundary for webhook UA truncation.
+talos-ops-alerts-repository = { path = "../talos-ops-alerts-repository" }
 talos-text-util = { path = "../talos-text-util" }
 talos-worker-fleet = { path = "../talos-worker-fleet" }
 talos-workflow-engine = { path = "../talos-workflow-engine" }
