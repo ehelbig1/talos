@@ -555,6 +555,11 @@ services:
       context: .
       dockerfile: worker/Dockerfile
     environment:
+      # Injection audit 2026-07-20: the per-actor write-ceiling gate
+      # (readonly vs write) was inert without this — ceilings in the DB
+      # were decorative. Dev runs enforced so regressions surface here
+      # first (prod flips via values.yaml on next deploy).
+      TALOS_WRITE_CEILING_ENFORCED: "1"
       NATS_URL: nats://nats:4222
       NATS_USER: ${NATS_USER:?NATS_USER required in .env}
       NATS_PASSWORD: ${NATS_PASSWORD:?NATS_PASSWORD required in .env}
