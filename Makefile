@@ -241,6 +241,9 @@ ci: lint lint-frontend audit test check-catalog ## Full local gate matching GitH
 drill: ## Run the backup→restore drill (pg_dump + vault snapshot → scratch stack → verify_phase_b)
 	@bash scripts/drills/backup-restore.sh
 
+deploy-prod: ## One-command production deploy: publish (gated+signed) -> pin digests -> install.sh on the VM -> external smoke. ARGS passthrough (--yes, --no-sign, ...)
+	bash scripts/deploy-prod.sh $(ARGS)
+
 smoke: ## End-to-end probe of a deployed cluster (BASE_URL=https://… SMOKE_AGENT_TOKEN=… SMOKE_ACTOR_ID=…)
 	@bash scripts/smoke.sh
 

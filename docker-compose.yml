@@ -33,6 +33,33 @@ services:
     networks:
       - talos-network
 
+  # Local training-gold backup — nightly-equivalent pg_dump of the dev
+  # database to the HOST filesystem (survives docker volume wipes /
+  # `make clean`; rides Time Machine off-box). The dev DB holds the only
+  # copy of human corrections + the ML gold slice; code is in git,
+  # labels aren't. Wake-aware + restore-verified — see
+  # scripts/dev-backup-loop.sh. Override dir with TALOS_BACKUP_DIR.
+  postgres-backup:
+    restart: unless-stopped
+    image: pgvector/pgvector:pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
+    container_name: talos-postgres-backup
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required in .env}
+    volumes:
+      - ${TALOS_BACKUP_DIR:-${HOME}/.talos/backups}:/backups
+      - ./scripts/dev-backup-loop.sh:/usr/local/bin/dev-backup-loop.sh:ro
+    entrypoint: ["/bin/bash", "/usr/local/bin/dev-backup-loop.sh"]
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.25'
+    networks:
+      - talos-network
+
   # Redis Cache
   redis:
     deploy:
