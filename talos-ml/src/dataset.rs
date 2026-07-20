@@ -122,6 +122,15 @@ pub struct DatasetStats {
     pub unlabeled: i64,
 }
 
+/// Gold-slice row for the teacher audit: a decrypted human correction
+/// plus the dedup key the audit reports mismatches under.
+#[derive(Debug, Clone)]
+pub struct GoldExample {
+    pub example_key: Option<String>,
+    pub features_text: String,
+    pub label: String,
+}
+
 /// Review-surface row (small, capped, human-facing by design).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SampledExample {
@@ -607,6 +616,39 @@ impl DatasetService {
             if !yielded {
                 break;
             }
+        }
+        Ok(out)
+    }
+
+    /// Most-recent human corrections, decrypted with their dedup keys —
+    /// the teacher-vs-gold audit's input (every `source='correction'`
+    /// row IS gold truth; the audit needs the full slice, not the
+    /// eval-holdout subset). Capped by the caller.
+    pub async fn load_corrections_decrypted(
+        &self,
+        conn: &mut PgConnection,
+        dataset_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<GoldExample>> {
+        let limit = limit.clamp(1, 100);
+        let rows: Vec<EncRow> = sqlx::query_as(&format!(
+            "SELECT {ENC_ROW_COLS} FROM ml_examples \
+             WHERE dataset_id = $1 AND source = 'correction' AND label_json ? 'label' \
+             ORDER BY created_at DESC, id LIMIT $2",
+        ))
+        .bind(dataset_id)
+        .bind(limit)
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let example_key = row.6.clone();
+            let (_id, label, _source, text) = self.decrypt_row(dataset_id, row).await?;
+            out.push(GoldExample {
+                example_key,
+                features_text: text.to_string(),
+                label,
+            });
         }
         Ok(out)
     }
