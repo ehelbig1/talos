@@ -23,13 +23,14 @@ function models() {
   ];
 }
 
-function feed() {
+function feed(teacherAudit: unknown = null) {
   return {
     modelId: "m-1",
     lifecycleState: "shadow",
     shadowAgreement: 0.942,
     shadowObservations: 121,
     shadowEpoch: 2,
+    teacherAudit,
     pending: [
       {
         id: "d-1",
@@ -137,5 +138,94 @@ describe("ModelReview", () => {
     ).toBeInTheDocument();
     expect(screen.queryByText(/all caught up/i)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
+  });
+
+  it("shows 'not audited yet' when teacherAudit is null", async () => {
+    mockGraphql({
+      mlModelDisagreements: () => ({
+        data: { mlModelDisagreements: feed(null) },
+      }),
+      mlModels: () => ({ data: { mlModels: models() } }),
+    });
+
+    render(<ModelReview />);
+
+    expect(await screen.findByText(/not audited yet/i)).toBeInTheDocument();
+  });
+
+  it("shows audit progress while the teacher audit is running", async () => {
+    mockGraphql({
+      mlModelDisagreements: () => ({
+        data: {
+          mlModelDisagreements: feed({
+            status: "running",
+            started_at: new Date("2026-07-19").toISOString(),
+            done: 30,
+            gold_rows: 80,
+          }),
+        },
+      }),
+      mlModels: () => ({ data: { mlModels: models() } }),
+    });
+
+    render(<ModelReview />);
+
+    expect(await screen.findByText(/auditing/i)).toBeInTheDocument();
+    expect(screen.getByText("30/80")).toBeInTheDocument();
+  });
+
+  it("shows accuracy, per-class agreement, and parse_failed for a completed audit", async () => {
+    mockGraphql({
+      mlModelDisagreements: () => ({
+        data: {
+          mlModelDisagreements: feed({
+            status: "complete",
+            audited_at: new Date("2026-07-19T12:00:00Z").toISOString(),
+            total: 40,
+            compared: 40,
+            agree: 34,
+            parse_failed: 2,
+            accuracy: 0.85,
+            per_class: {
+              archive: { n: 20, agree: 18 },
+              follow_up: { n: 20, agree: 16 },
+            },
+            mismatches: [],
+            teacher: { provider: "ollama", model: "qwen3.6", few_shot_used: 8 },
+          }),
+        },
+      }),
+      mlModels: () => ({ data: { mlModels: models() } }),
+    });
+
+    render(<ModelReview />);
+
+    expect(await screen.findByText("85.0%")).toBeInTheDocument();
+    expect(screen.getByText(/parse failed/i)).toBeInTheDocument();
+    expect(screen.getByText("follow_up")).toBeInTheDocument(); // per-class row label
+    expect(screen.getByText("18/20")).toBeInTheDocument();
+    expect(screen.getByText(/qwen3\.6/)).toBeInTheDocument();
+  });
+
+  it("shows a failure message when the teacher audit fails", async () => {
+    mockGraphql({
+      mlModelDisagreements: () => ({
+        data: {
+          mlModelDisagreements: feed({
+            status: "failed",
+            error: "teacher unavailable (repeated call failures)",
+            failed_at: new Date("2026-07-19").toISOString(),
+          }),
+        },
+      }),
+      mlModels: () => ({ data: { mlModels: models() } }),
+    });
+
+    render(<ModelReview />);
+
+    expect(await screen.findByText(/audit failed/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/teacher unavailable \(repeated call failures\)/i),
+    ).toBeInTheDocument();
   });
 });

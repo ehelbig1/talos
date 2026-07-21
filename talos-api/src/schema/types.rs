@@ -952,6 +952,36 @@ pub struct ActorWorkflowsSummary {
     pub active_workflows: i64,
 }
 
+/// One (provider, model) LLM usage aggregate within a trailing window —
+/// the per-model/provider spend breakdown row for the token-spend panel.
+#[derive(SimpleObject, Clone)]
+pub struct LlmUsageModelRow {
+    pub provider: String,
+    pub model: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub calls: i64,
+}
+
+/// Read-only per-actor LLM token spend summary (R2 token ledger). Mirrors
+/// the `current_usage`/`policy` numbers the MCP `get_actor_budget` tool
+/// already exposes — budget POLICY *writes* stay MCP-only (see
+/// `BudgetPanel`'s "configured via MCP tools" note), this is visibility
+/// only.
+#[derive(SimpleObject, Clone)]
+pub struct LlmUsageSummary {
+    pub actor_id: Uuid,
+    /// Trailing-24h SUM(prompt_tokens + completion_tokens) — the same
+    /// figure `max_llm_tokens_per_day` is enforced against.
+    pub tokens_last_24h: i64,
+    /// Daily token ceiling from the actor's budget policy. `None` =
+    /// unlimited (no policy row, or an explicit NULL ceiling).
+    pub max_llm_tokens_per_day: Option<i64>,
+    /// Per-(provider, model) breakdown over the trailing window (`days`
+    /// arg on the query, default 7, clamped 1..=90).
+    pub by_model: Vec<LlmUsageModelRow>,
+}
+
 #[derive(SimpleObject, Clone)]
 pub struct ActorActionLogEntry {
     pub id: Uuid,

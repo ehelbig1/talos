@@ -57,6 +57,16 @@ pub struct MlDisagreementFeed {
     /// display context for the agreement figure.
     pub shadow_epoch: i32,
     pub pending: Vec<MlDisagreement>,
+    /// The latest teacher-vs-gold audit report (RFC 0011 R3), `ml_models
+    /// .teacher_audit` passed through verbatim — `null` until
+    /// `ml_teacher_audit` has run at least once for this model. Polymorphic
+    /// on `status`: `running` ({done, gold_rows}), `failed` ({error,
+    /// failed_at}), or `complete` (accuracy/per_class/parse_failed/
+    /// audited_at/mismatches — see `talos_ml::teacher_audit` for the exact
+    /// shape). Raw JSON passthrough (like `outputData` elsewhere in this
+    /// schema) rather than a fully-typed union, since the shape varies by
+    /// status and this field is read-only / display-only.
+    pub teacher_audit: Option<serde_json::Value>,
 }
 
 #[derive(Default)]
@@ -146,6 +156,16 @@ impl MlQueries {
                 async_graphql::Error::new("Could not load model status").extend_safe()
             })?;
 
+        // Owner-scoped read on the same tx — same primitive the MCP
+        // `ml_get_model_card` handler uses, so the two protocol surfaces
+        // can't drift on what "the audit" means.
+        let teacher_audit = talos_ml::stored_teacher_audit(&mut tx, model.model_id, user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(target: "talos_ml", error = %e, "stored_teacher_audit");
+                async_graphql::Error::new("Could not load model status").extend_safe()
+            })?;
+
         Ok(MlDisagreementFeed {
             model_id: model.model_id,
             lifecycle_state: model.lifecycle_state,
@@ -154,6 +174,7 @@ impl MlQueries {
                 .map(|(_, n)| n.min(i64::from(i32::MAX)) as i32)
                 .unwrap_or(0),
             shadow_epoch,
+            teacher_audit,
             pending: pending
                 .into_iter()
                 .map(|d| MlDisagreement {
