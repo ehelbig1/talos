@@ -154,7 +154,23 @@ pub fn classify_execution_error(msg: &str) -> ErrorClass {
     let m: String = msg.chars().take(4096).collect::<String>().to_lowercase();
     let has = |needle: &str| m.contains(needle);
 
-    if has("fuel exhausted") {
+    if has("approval was denied") || has("approval denied") {
+        // FIRST branch, deliberately: a human rejecting a
+        // confidence-gate / approval pause fails the execution with the
+        // gate's stable "… approval was denied" reason
+        // (`PostgresApprovalGate` / the Human_Approval_Gate node). That
+        // reason can be wrapped by a finalizer prefix and can carry a
+        // node UUID whose digits could otherwise trip the `401` auth
+        // branch, so this unambiguous phrase is matched before anything
+        // else. The class is NON-ALERTING (see `NON_ALERTING_CLASSES`):
+        // a legitimate "no" is the system working as designed, not a
+        // fault to page on.
+        ErrorClass {
+            class: "approval_denied",
+            label: "human approval denied",
+            severity_hint: "low",
+        }
+    } else if has("fuel exhausted") {
         ErrorClass {
             class: "fuel_exhausted",
             label: "WASM fuel exhausted",
@@ -224,6 +240,28 @@ pub fn classify_execution_error(msg: &str) -> ErrorClass {
             label: "unclassified failure",
             severity_hint: "medium",
         }
+    }
+}
+
+/// Error classes that represent an EXPECTED, human-driven terminal
+/// outcome rather than a platform fault — never surfaced as an ops
+/// alert. This is the error-class analogue of the attended-trigger skip
+/// in [`reconcile_tick`]: the run technically finalized `failed`, but
+/// nobody should be paged.
+///
+/// Currently one member — `approval_denied` (a human clicking "reject"
+/// on a confidence-gate / approval pause). Kept as a list (mirroring
+/// `UNATTENDED_TRIGGER_TYPES`) so future expected outcomes are a
+/// one-line, self-documenting addition.
+const NON_ALERTING_CLASSES: [&str; 1] = ["approval_denied"];
+
+impl ErrorClass {
+    /// Whether a failure of this class should raise an ops alert.
+    /// `false` for expected human-driven outcomes (see
+    /// [`NON_ALERTING_CLASSES`]).
+    #[must_use]
+    pub fn is_alerting(&self) -> bool {
+        !NON_ALERTING_CLASSES.contains(&self.class)
     }
 }
 
@@ -318,6 +356,10 @@ pub fn self_alerts_enabled() -> bool {
 pub struct TickStats {
     pub scanned: u64,
     pub ingested: u64,
+    /// Failed rows deliberately NOT alerted because their error class is
+    /// an expected human-driven outcome (see [`NON_ALERTING_CLASSES`]) —
+    /// e.g. a rejected approval gate. Cursor still advances past them.
+    pub skipped_expected: u64,
     pub resolved_alerts: u64,
     pub row_errors: u64,
     /// Another instance held the cursor — tick skipped.
@@ -471,6 +513,27 @@ pub async fn reconcile_tick(pool: &Pool<Postgres>) -> anyhow::Result<TickStats> 
                 }
                 continue;
             }
+            // A human rejecting an approval/confidence gate finalizes the
+            // run `failed`, but it's an EXPECTED outcome — skip it the
+            // same way an attended trigger type is skipped, so a
+            // legitimate "no" never pages. `last` is already set above,
+            // so the cursor advances past this row and it's never
+            // revisited. (`error_message` is read again inside
+            // `process_failed_row`; the double read keeps that helper
+            // self-contained and the rows are already in memory.)
+            let err_for_class: Option<String> = row.try_get("error_message")?;
+            if let Some(ref m) = err_for_class {
+                if !classify_execution_error(m).is_alerting() {
+                    stats.skipped_expected += 1;
+                    tracing::info!(
+                        target: "talos_self_alerts",
+                        execution_id = %exec_id,
+                        error_class = classify_execution_error(m).class,
+                        "self-monitor: expected human-driven outcome — not alerting"
+                    );
+                    continue;
+                }
+            }
             match process_failed_row(&repo, &row, exec_id).await {
                 Ok(()) => stats.ingested += 1,
                 Err(e) => {
@@ -607,6 +670,7 @@ pub async fn tick_and_log(pool: &Pool<Postgres>) {
                 target: "talos_self_alerts",
                 scanned = s.scanned,
                 ingested = s.ingested,
+                skipped_expected = s.skipped_expected,
                 resolved = s.resolved_alerts,
                 row_errors = s.row_errors,
                 "self-monitor tick"
@@ -699,12 +763,84 @@ mod tests {
                 "stale",
                 "low",
             ),
+            // Human rejected a confidence-gate / approval pause. The
+            // engine-wrapped form the resume finalizer produces.
+            (
+                "approval-resume: resume dispatch failed: workflow execution failed: \
+                 node 'gate' failed: Execution denied: module \
+                 40111111-2222-3333-4444-555555555555 approval was denied",
+                "approval_denied",
+                "low",
+            ),
             ("something entirely novel exploded", "other", "medium"),
         ];
         for (msg, class, sev) in cases {
             let ec = classify_execution_error(msg);
             assert_eq!(ec.class, class, "message: {msg}");
             assert_eq!(ec.severity_hint, sev, "message: {msg}");
+        }
+    }
+
+    #[test]
+    fn approval_denial_is_recognized_and_non_alerting() {
+        // The gate's stable phrasing, and the wrapped form.
+        for msg in [
+            "Execution denied: module 6f1a approval was denied",
+            "node 'gate' failed: Execution denied: module x approval was denied",
+            "APPROVAL DENIED by reviewer",
+        ] {
+            let ec = classify_execution_error(msg);
+            assert_eq!(ec.class, "approval_denied", "message: {msg}");
+            assert!(!ec.is_alerting(), "denial must not alert: {msg}");
+        }
+
+        // The denial branch wins even when the (UUID) node id embeds a
+        // digit run that would otherwise trip the `401` auth branch.
+        let with_401 = "node 'gate' failed: Execution denied: module 401abc approval was denied";
+        assert_eq!(classify_execution_error(with_401).class, "approval_denied");
+    }
+
+    #[test]
+    fn genuine_faults_still_alert() {
+        // Every non-expected class must keep alerting — the skip is
+        // scoped to human-driven outcomes only.
+        for msg in [
+            "WASM fuel exhausted after 42 instructions",
+            "Missing AUTH_HEADER config",
+            "signature verification failed",
+            "something entirely novel exploded",
+        ] {
+            assert!(
+                classify_execution_error(msg).is_alerting(),
+                "fault must alert: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_alerting_classes_are_a_subset_of_known_classes() {
+        // Guard against a typo drifting NON_ALERTING_CLASSES away from a
+        // class classify_execution_error can actually emit — otherwise
+        // the skip would silently never fire.
+        let known = [
+            "approval_denied",
+            "fuel_exhausted",
+            "missing_config",
+            "egress_denied",
+            "signature",
+            "contract",
+            "timeout",
+            "auth",
+            "network",
+            "llm",
+            "stale",
+            "other",
+        ];
+        for c in NON_ALERTING_CLASSES {
+            assert!(
+                known.contains(&c),
+                "NON_ALERTING_CLASSES member '{c}' is not a class classify_execution_error emits"
+            );
         }
     }
 
