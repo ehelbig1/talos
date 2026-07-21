@@ -506,7 +506,9 @@ worker:
     # until enabled — a staged rollout, same shape as the tier ceiling.
     # Read once at boot; controller side needs no change (the field is
     # already HMAC-bound on every JobRequest). Worker-only env.
-    # TALOS_WRITE_CEILING_ENFORCED: "1"
+    # Injection audit 2026-07-20: enforced by default — a readonly
+    # actor's ceiling must be a live control, not a decorative column.
+    TALOS_WRITE_CEILING_ENFORCED: "1"
 
   # Sigstore enforcement for OCI template signatures. The publish workflow
   # (.github/workflows/template-publish.yml) signs every artifact via
