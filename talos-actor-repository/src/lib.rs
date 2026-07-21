@@ -1238,7 +1238,7 @@ impl ActorRepository {
              FROM llm_usage \
              WHERE user_id = $1 AND recorded_at > now() - make_interval(days => $2::int) \
              GROUP BY provider, model \
-             ORDER BY prompt_tokens + completion_tokens DESC, provider, model",
+             ORDER BY (COALESCE(SUM(prompt_tokens), 0) + COALESCE(SUM(completion_tokens), 0)) DESC, provider, model",
         )
         .bind(user_id)
         .bind(days)
@@ -1281,7 +1281,7 @@ impl ActorRepository {
              FROM llm_usage \
              WHERE actor_id = $1 AND recorded_at > now() - make_interval(days => $2::int) \
              GROUP BY provider, model \
-             ORDER BY prompt_tokens + completion_tokens DESC, provider, model \
+             ORDER BY (COALESCE(SUM(prompt_tokens), 0) + COALESCE(SUM(completion_tokens), 0)) DESC, provider, model \
              LIMIT 100",
         )
         .bind(actor_id)
