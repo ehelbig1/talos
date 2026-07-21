@@ -182,6 +182,94 @@ impl ActorsQueries {
         })
     }
 
+    /// Per-actor LLM token spend (R2 token ledger) — the daily-ceiling
+    /// usage bar plus a trailing-window per-model/provider breakdown.
+    /// Read-only visibility surface; mirrors the MCP `get_actor_budget`
+    /// tool's `current_usage`/`policy` numbers so the two protocol
+    /// surfaces agree. `days` defaults to 7, clamped 1..=90 by the
+    /// repository method (mirrors `llm_usage_by_user_window`).
+    async fn llm_usage_summary(
+        &self,
+        ctx: &Context<'_>,
+        actor_id: Uuid,
+        days: Option<i32>,
+    ) -> Result<LlmUsageSummary> {
+        require_scope(ctx, talos_api_keys::ApiKeyScope::WorkflowsRead)?;
+        let user_id = ctx
+            .data_opt::<Uuid>()
+            .copied()
+            .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
+        let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
+
+        // RFC 0005 S3: ownership check on a per-user unit of work (actors
+        // are personal) so the `actors` RLS policy backstops the app-layer
+        // predicate — same shape as actor_executions_summary /
+        // actor_workflows_summary above. The llm_usage / budget-policy
+        // reads that follow run on the bare pool afterward (llm_usage
+        // isn't an RLS-enabled table; ownership is already established).
+        let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
+        let mut uow = talos_db::UnitOfWork::begin_user(db_pool, user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
+
+        let actor_exists = actor_repo
+            .actor_owned_by_user_scoped(uow.conn(), actor_id, user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: actor ownership check failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
+
+        if !actor_exists {
+            return Err(async_graphql::Error::new("Actor not found").extend_safe());
+        }
+        uow.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "graphql: commit transaction error");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
+
+        let policy = actor_repo
+            .get_actor_budget_policy(actor_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: actor budget policy read failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
+        let tokens_last_24h = actor_repo
+            .sum_llm_tokens_last_24h(actor_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: llm token sum failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
+        let by_model = actor_repo
+            .llm_usage_by_actor_window(actor_id, days.unwrap_or(7))
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: llm usage window read failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
+
+        Ok(LlmUsageSummary {
+            actor_id,
+            tokens_last_24h,
+            max_llm_tokens_per_day: policy.and_then(|p| p.max_llm_tokens_per_day),
+            by_model: by_model
+                .into_iter()
+                .map(|r| LlmUsageModelRow {
+                    provider: r.provider,
+                    model: r.model,
+                    prompt_tokens: r.prompt_tokens,
+                    completion_tokens: r.completion_tokens,
+                    calls: r.calls,
+                })
+                .collect(),
+        })
+    }
+
     async fn actor_workflows_summary(
         &self,
         ctx: &Context<'_>,

@@ -8355,6 +8355,7 @@ dependencies = [
  "sha2 0.10.9",
  "sqlx",
  "talos-db",
+ "talos-llm",
  "talos-memory",
  "talos-secrets-manager",
  "talos-tenancy",

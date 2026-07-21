@@ -22,6 +22,10 @@ query MlModelDisagreements($modelName: String!, $limit: Int) {
     shadowAgreement
     shadowObservations
     shadowEpoch
+    # RFC 0011 R3 teacher-vs-gold audit — raw JSON, polymorphic on
+    # `status` (running/failed/complete). Null until ml_teacher_audit has
+    # run at least once. See ModelReview.tsx's TeacherAudit type.
+    teacherAudit
     pending {
       id
       exampleKey

@@ -592,6 +592,26 @@ export type GetActorExecutionsSummaryQuery = {
   };
 };
 
+export type GetActorLlmUsageSummaryQueryVariables = Exact<{
+  actorId: string;
+  days?: number | null | undefined;
+}>;
+
+export type GetActorLlmUsageSummaryQuery = {
+  llmUsageSummary: {
+    actorId: string;
+    tokensLast24H: number;
+    maxLlmTokensPerDay: number | null;
+    byModel: Array<{
+      provider: string;
+      model: string;
+      promptTokens: number;
+      completionTokens: number;
+      calls: number;
+    }>;
+  };
+};
+
 export type UpdateActorMutationVariables = Exact<{
   id: string;
   name?: string | null | undefined;
@@ -912,6 +932,7 @@ export type MlModelDisagreementsQuery = {
     shadowAgreement: number | null;
     shadowObservations: number;
     shadowEpoch: number;
+    teacherAudit: unknown;
     pending: Array<{
       id: string;
       exampleKey: string | null;
@@ -2869,6 +2890,49 @@ export const useGetActorExecutionsSummaryQuery = <
   });
 };
 
+export const GetActorLlmUsageSummaryDocument = new TypedDocumentString(`
+    query GetActorLlmUsageSummary($actorId: UUID!, $days: Int) {
+  llmUsageSummary(actorId: $actorId, days: $days) {
+    actorId
+    tokensLast24H
+    maxLlmTokensPerDay
+    byModel {
+      provider
+      model
+      promptTokens
+      completionTokens
+      calls
+    }
+  }
+}
+    `);
+
+export const useGetActorLlmUsageSummaryQuery = <
+  TData = GetActorLlmUsageSummaryQuery,
+  TError = unknown,
+>(
+  variables: GetActorLlmUsageSummaryQueryVariables,
+  options?: Omit<
+    UseQueryOptions<GetActorLlmUsageSummaryQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<
+      GetActorLlmUsageSummaryQuery,
+      TError,
+      TData
+    >["queryKey"];
+  },
+) => {
+  return useQuery<GetActorLlmUsageSummaryQuery, TError, TData>({
+    queryKey: ["GetActorLlmUsageSummary", variables],
+    queryFn: graphqlFetcher<
+      GetActorLlmUsageSummaryQuery,
+      GetActorLlmUsageSummaryQueryVariables
+    >(GetActorLlmUsageSummaryDocument, variables),
+    ...options,
+  });
+};
+
 export const UpdateActorDocument = new TypedDocumentString(`
     mutation UpdateActor($id: UUID!, $name: String, $description: String, $maxCapabilityWorld: String) {
   updateActor(
@@ -3881,6 +3945,7 @@ export const MlModelDisagreementsDocument = new TypedDocumentString(`
     shadowAgreement
     shadowObservations
     shadowEpoch
+    teacherAudit
     pending {
       id
       exampleKey

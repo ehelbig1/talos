@@ -343,20 +343,13 @@ pub fn create_router(
         talos_failure_analysis_service::FailureAnalysisService,
     >,
     actor_lifecycle_service: std::sync::Arc<talos_actor_lifecycle_service::ActorLifecycleService>,
+    // Ollama client for Tier 1 (local) LLM inference, constructed ONCE in
+    // main() and shared with the automatic teacher-audit scheduler (one
+    // reqwest pool). MCP-630 (2026-05-12): main() routes the URL through
+    // `talos_config::get_env` so a Helm placeholder `ollamaUrl: ""` falls
+    // through to the in-cluster default instead of a base-URL-less client.
+    ollama_client: Option<std::sync::Arc<talos_llm::OllamaClient>>,
 ) -> Router {
-    // Initialize Ollama client for Tier 1 (local) LLM inference.
-    // MCP-630 (2026-05-12): route through `talos_config::get_env` so a
-    // Helm placeholder `ollamaUrl: ""` is treated as "unset" and falls
-    // through to the in-cluster default. Pre-fix the bare
-    // `unwrap_or_else(|_| default)` returned `""`, producing a
-    // base-URL-less `format!("{}/v1/chat/completions", "")` that
-    // failed at request time with a confusing url-parse error instead
-    // of using the default. Sibling to MCP-615/620/621/623.
-    let ollama_url = talos_config::get_env("OLLAMA_URL", "http://ollama:11434");
-    let ollama_client = Some(std::sync::Arc::new(talos_llm::OllamaClient::new(
-        ollama_url,
-    )));
-
     // Construct the actor-policy evaluator with the same repos the
     // MCP handlers use. The sweeper task is started below.
     let policy_evaluator = talos_actor_policies::PolicyEvaluator::new(

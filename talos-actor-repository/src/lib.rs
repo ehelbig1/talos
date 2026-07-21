@@ -1258,6 +1258,50 @@ impl ActorRepository {
             .collect()
     }
 
+    /// Per-(provider, model) LLM usage rollup for ONE actor over the
+    /// trailing `days` window — the per-model/provider spend breakdown for
+    /// the actor-detail token-spend panel (GraphQL `llmUsageSummary`).
+    /// Index-backed by `idx_llm_usage_actor_recorded (actor_id,
+    /// recorded_at)`. `days` clamps 1..=90 like the sibling per-user
+    /// rollup (check 27: `make_interval`'s arg is int4-only, hence the
+    /// `::int` cast). `LIMIT 100` bounds the row count defensively —
+    /// (provider, model) cardinality for one actor is normally tiny, but
+    /// nothing stops it from growing unboundedly over a long window.
+    pub async fn llm_usage_by_actor_window(
+        &self,
+        actor_id: Uuid,
+        days: i32,
+    ) -> Result<Vec<LlmUsageWindowRow>> {
+        let days = days.clamp(1, 90);
+        let rows = sqlx::query(
+            "SELECT provider, model, \
+                    COALESCE(SUM(prompt_tokens), 0)::bigint AS prompt_tokens, \
+                    COALESCE(SUM(completion_tokens), 0)::bigint AS completion_tokens, \
+                    COALESCE(SUM(calls), 0)::bigint AS calls \
+             FROM llm_usage \
+             WHERE actor_id = $1 AND recorded_at > now() - make_interval(days => $2::int) \
+             GROUP BY provider, model \
+             ORDER BY prompt_tokens + completion_tokens DESC, provider, model \
+             LIMIT 100",
+        )
+        .bind(actor_id)
+        .bind(days)
+        .fetch_all(&self.db_pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| -> Result<LlmUsageWindowRow> {
+                Ok(LlmUsageWindowRow {
+                    provider: r.try_get("provider")?,
+                    model: r.try_get("model")?,
+                    prompt_tokens: r.try_get("prompt_tokens")?,
+                    completion_tokens: r.try_get("completion_tokens")?,
+                    calls: r.try_get("calls")?,
+                })
+            })
+            .collect()
+    }
+
     /// Fetch the budget summary columns used by get_actor_summary
     /// (only the three fields rendered in that handler's budget_summary JSON).
     pub async fn get_actor_budget_summary(
