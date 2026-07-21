@@ -2097,6 +2097,42 @@ fn spawn_maintenance_sweeps(
         }
     });
 
+    // ---------- Embedding-model provenance: one-shot grandfather stamp ----------
+    //
+    // Legacy rows (embedding present, model NULL) are attributed to the
+    // currently-configured EMBEDDING_MODEL on first boot after the
+    // provenance migration; semantic reads are strict-equality on the
+    // stamp from then on (see migration 20260720190000). Idempotent —
+    // the predicate self-empties.
+    {
+        let gf_pool = db_pool.clone();
+        tokio::spawn(async move {
+            match talos_memory::grandfather_embedding_model(&gf_pool).await {
+                Ok(n) if n > 0 => tracing::info!(
+                    rows = n,
+                    "embedding provenance: grandfathered actor_memory rows"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "embedding provenance grandfather (actor_memory) failed — \
+                     legacy rows stay invisible to semantic reads until stamped"
+                ),
+            }
+            match talos_ml::dataset::grandfather_examples_embedding_model(&gf_pool).await {
+                Ok(n) if n > 0 => tracing::info!(
+                    rows = n,
+                    "embedding provenance: grandfathered ml_examples rows"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "embedding provenance grandfather (ml_examples) failed"
+                ),
+            }
+        });
+    }
+
     // ---------- Self-monitoring bridge: execution failures → ops_alerts ----------
     //
     // Cursor reconciler over terminal `workflow_executions` rows (see

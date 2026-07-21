@@ -751,8 +751,8 @@ pub async fn persist_memory_with_metadata_typed(
 
     sqlx::query(
         "INSERT INTO actor_memory \
-         (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, embedding, metadata, org_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+         (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, embedding, embedding_model, metadata, org_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
          ON CONFLICT (actor_id, key) DO UPDATE SET \
              value_enc     = EXCLUDED.value_enc, \
              value_key_id  = EXCLUDED.value_key_id, \
@@ -760,6 +760,7 @@ pub async fn persist_memory_with_metadata_typed(
              memory_type   = EXCLUDED.memory_type, \
              expires_at    = EXCLUDED.expires_at, \
              embedding     = COALESCE(EXCLUDED.embedding, actor_memory.embedding), \
+             embedding_model = COALESCE(EXCLUDED.embedding_model, actor_memory.embedding_model), \
              metadata      = COALESCE(EXCLUDED.metadata, actor_memory.metadata), \
              org_id        = EXCLUDED.org_id, \
              updated_at    = now()",
@@ -771,7 +772,8 @@ pub async fn persist_memory_with_metadata_typed(
     .bind(value_format)
     .bind(canonical_type)
     .bind(expires_at)
-    .bind(embedding)
+    .bind(&embedding)
+    .bind(embedding.as_ref().and_then(|_| embedding::active_embedding_model()))
     .bind(metadata)
     .bind(org_id)
     .execute(pool)
@@ -899,8 +901,8 @@ pub async fn persist_memory_in_tx_with_metadata<'c>(
 
     sqlx::query(
         "INSERT INTO actor_memory \
-         (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, embedding, metadata, org_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+         (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, embedding, embedding_model, metadata, org_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
          ON CONFLICT (actor_id, key) DO UPDATE SET \
              value_enc     = EXCLUDED.value_enc, \
              value_key_id  = EXCLUDED.value_key_id, \
@@ -908,6 +910,7 @@ pub async fn persist_memory_in_tx_with_metadata<'c>(
              memory_type   = EXCLUDED.memory_type, \
              expires_at    = EXCLUDED.expires_at, \
              embedding     = COALESCE(EXCLUDED.embedding, actor_memory.embedding), \
+             embedding_model = COALESCE(EXCLUDED.embedding_model, actor_memory.embedding_model), \
              metadata      = COALESCE(EXCLUDED.metadata, actor_memory.metadata), \
              org_id        = EXCLUDED.org_id, \
              updated_at    = now()",
@@ -919,7 +922,8 @@ pub async fn persist_memory_in_tx_with_metadata<'c>(
     .bind(value_format)
     .bind(canonical_type)
     .bind(expires_at)
-    .bind(embedding)
+    .bind(&embedding)
+    .bind(embedding.as_ref().and_then(|_| embedding::active_embedding_model()))
     .bind(metadata)
     .bind(org_id)
     .execute(&mut **tx)
@@ -1436,6 +1440,7 @@ pub async fn recall_semantic_filtered(
                    WHERE actor_id = $1 \
                      AND (expires_at IS NULL OR expires_at > now()) \
                      AND embedding IS NOT NULL \
+                     AND embedding_model = $7 \
                      AND (1.0 - (embedding <=> $2)) >= $3 \
                      AND ($5::text IS NULL OR memory_type = $5) \
                      AND (cardinality($6::text[]) = 0 \
@@ -1451,6 +1456,7 @@ pub async fn recall_semantic_filtered(
             .bind(limit)
             .bind(memory_type_filter)
             .bind(exclude_kinds)
+            .bind(embedding::active_embedding_model())
             .fetch_all(pool)
             .await
             .context("recall_semantic vector query")?;
@@ -2268,6 +2274,25 @@ pub async fn re_encrypt_memories_to_org(pool: &Pool<Postgres>) -> Result<MemoryR
     })
 }
 
+/// One-time grandfather stamp for the provenance migration: legacy rows
+/// (embedding present, model NULL) are attributed to the CURRENTLY
+/// configured model — true as long as the operator did not change
+/// `EMBEDDING_MODEL` in the same deploy (release-notes caveat).
+/// Idempotent (predicate self-empties); called once at controller boot.
+pub async fn grandfather_embedding_model(pool: &Pool<Postgres>) -> Result<u64> {
+    let Some(model) = embedding::active_embedding_model() else {
+        return Ok(0); // embeddings disabled — nothing to attribute
+    };
+    let res = sqlx::query(
+        "UPDATE actor_memory SET embedding_model = $1 \
+         WHERE embedding IS NOT NULL AND embedding_model IS NULL",
+    )
+    .bind(&model)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 pub async fn backfill_embeddings(pool: &Pool<Postgres>, limit: i64) -> Result<usize> {
     backfill_embeddings_filtered(pool, None, limit).await
 }
@@ -2305,13 +2330,14 @@ async fn backfill_embeddings_filtered(
                 "SELECT id, actor_id, key, value_enc, value_key_id, value_format \
              FROM actor_memory \
              WHERE actor_id = $1 \
-               AND embedding IS NULL \
+               AND (embedding IS NULL OR embedding_model IS DISTINCT FROM $3) \
                AND memory_type != 'scratchpad' \
                AND (expires_at IS NULL OR expires_at > NOW()) \
              ORDER BY created_at ASC LIMIT $2",
             )
             .bind(actor_id)
             .bind(limit)
+            .bind(embedding::active_embedding_model())
             .fetch_all(pool)
             .await?
         }
@@ -2319,11 +2345,13 @@ async fn backfill_embeddings_filtered(
             sqlx::query(
                 "SELECT id, actor_id, key, value_enc, value_key_id, value_format \
              FROM actor_memory \
-             WHERE embedding IS NULL AND memory_type != 'scratchpad' \
+             WHERE (embedding IS NULL OR embedding_model IS DISTINCT FROM $2) \
+               AND memory_type != 'scratchpad' \
              AND (expires_at IS NULL OR expires_at > NOW()) \
              ORDER BY created_at ASC LIMIT $1",
             )
             .bind(limit)
+            .bind(embedding::active_embedding_model())
             .fetch_all(pool)
             .await?
         }
@@ -2355,10 +2383,12 @@ async fn backfill_embeddings_filtered(
             // DB stress.
             let vec = pgvector::Vector::from(emb);
             match sqlx::query(
-                "UPDATE actor_memory SET embedding = $1, updated_at = now() WHERE id = $2",
+                "UPDATE actor_memory SET embedding = $1, embedding_model = $3, updated_at = now() \
+                 WHERE id = $2",
             )
             .bind(vec)
             .bind(id)
+            .bind(embedding::active_embedding_model())
             .execute(pool)
             .await
             {
