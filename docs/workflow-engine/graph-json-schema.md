@@ -87,7 +87,7 @@ Unknown top-level keys are ignored.
   //   "while_loop"    | "repeat_loop"     | "fan_in"         | "error_handler"
   //   "collect"       | "synthesize"      | "verify"         |
   //   "dispatch"      | "capability_dispatch" | "ops_alerts_digest"
-  //   "assistant_report"
+  //   "pending_approvals" | "assistant_report"
   //
   // LLM-flavored kinds (gated by the `llm-primitives` feature, on by
   // default):
@@ -237,6 +237,24 @@ bounds (e.g. `max_iterations` caps at 50 for agent loops).
 // When the store is unreachable the node emits { available: false }
 // instead of failing the workflow.
 { "top_limit": 10 }   // active alerts included verbatim (1-25, default 10)
+```
+
+### `pending_approvals`
+```jsonc
+// Controller-side read of the caller's currently-pending human
+// approvals, each carrying a freshly-minted one-click approve/reject
+// capability URL. Emits { available, count, approvals: [ {execution_id,
+//   workflow_id, workflow_name, node_id, requested_at, waiting_seconds,
+//   required_for, approve_url, reject_url} ] } as the node output — the
+// feed for a notify-after-pause approval-notifier compose node (links
+// can only be minted once an execution is actually suspended at its
+// gate, which is exactly what this node reads). Executes in the
+// controller (no worker dispatch, no secrets); tenancy comes from the
+// execution's resolved identity, never from this data object. A mint
+// that fails/times out yields null approve_url/reject_url for that
+// entry rather than dropping it; an unreachable store emits
+// { available: false } instead of failing the workflow.
+{ "limit": 10 }   // pending approvals included verbatim (1-25, default 10)
 ```
 
 ### `assistant_report`
