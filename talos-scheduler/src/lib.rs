@@ -965,21 +965,21 @@ async fn run_scheduled_execution(
     worker_shared_key: Option<WorkerSharedKey>,
     nats_client: Arc<async_nats::Client>,
 ) {
-    // 1. Fetch the workflow's graph + actor binding + description BEFORE
-    //    inserting the execution row so the row carries the workflow's
-    //    bound actor_id from the start. Pre-fix (MCP-21, 2026-05-07) the
-    //    scheduler inserted with no actor_id and the binding never landed
-    //    on the execution row, breaking `get_actor_summary.executions`
-    //    counts and per-actor audit queries on scheduler-fired runs.
+    // 1. Fetch the workflow's actor binding + description BEFORE inserting the
+    //    execution row so the row carries the workflow's bound actor_id from the
+    //    start. Pre-fix (MCP-21, 2026-05-07) the scheduler inserted with no
+    //    actor_id and the binding never landed on the execution row, breaking
+    //    `get_actor_summary.executions` counts and per-actor audit queries on
+    //    scheduler-fired runs. `actor_id` / `description` are workflow-level
+    //    (not versioned), so they still come off the `workflows` row.
     #[derive(sqlx::FromRow)]
-    struct WorkflowGraph {
-        graph_json: String,
+    struct WorkflowMeta {
         actor_id: Option<uuid::Uuid>,
         description: Option<String>,
     }
 
-    let workflow = match sqlx::query_as::<_, WorkflowGraph>(
-        "SELECT graph_json, actor_id, description FROM workflows WHERE id = $1 AND user_id = $2",
+    let workflow = match sqlx::query_as::<_, WorkflowMeta>(
+        "SELECT actor_id, description FROM workflows WHERE id = $1 AND user_id = $2",
     )
     .bind(workflow_id)
     .bind(user_id)
@@ -992,6 +992,51 @@ async fn run_scheduled_execution(
                 execution_id = %execution_id,
                 workflow_id = %workflow_id,
                 "Scheduler: failed to load workflow before INSERT: {}",
+                e
+            );
+            return;
+        }
+    };
+
+    // 1.1. Resolve the graph to RUN the SAME way every manual/programmatic
+    //      trigger does (`trigger.rs` + `call_workflow` both call
+    //      `get_active_version_graph`): the ACTIVE PUBLISHED version, falling
+    //      back to the draft `workflows.graph_json` only when the workflow has
+    //      never been published.
+    //
+    //      Root cause (2026-07-20, pa-morning-dispatch fuel exhaustion): the
+    //      scheduler previously ran the DRAFT graph unconditionally
+    //      (`SELECT graph_json FROM workflows` + `version_id = None`), while
+    //      manual triggers ran the published active version. A published
+    //      workflow's scheduled fires therefore executed a DIFFERENT graph than
+    //      its manual runs — ANY draft/published divergence (per-node `max_fuel`
+    //      overrides, node configs, added/removed nodes) silently changed
+    //      behavior between the two trigger sources. Here the published version
+    //      carried the compose/send `max_fuel` overrides but the draft did not,
+    //      so scheduled runs fell back to the too-low module-row default and
+    //      exhausted fuel while manual runs honored the override. Aligning the
+    //      graph source (and recording the resolved `version_id` below) makes a
+    //      scheduled fire run exactly what was published — consistent with every
+    //      other trigger path — and fixes the fuel divergence at the source.
+    let workflow_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
+    let (graph_json, resolved_version_id): (String, Option<Uuid>) = match workflow_repo
+        .get_active_version_graph(workflow_id, user_id)
+        .await
+    {
+        Ok(Some(pair)) => pair,
+        Ok(None) => {
+            tracing::error!(
+                execution_id = %execution_id,
+                workflow_id = %workflow_id,
+                "Scheduler: no graph found for workflow (active version or draft) before INSERT"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::error!(
+                execution_id = %execution_id,
+                workflow_id = %workflow_id,
+                "Scheduler: failed to resolve workflow graph before INSERT: {}",
                 e
             );
             return;
@@ -1044,16 +1089,16 @@ async fn run_scheduled_execution(
         "user-default-actor"
     };
     let effective_actor_id: Option<Uuid> = {
-        let workflow_repo_for_auth =
-            talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
         let actor_repo_for_auth = talos_actor_repository::ActorRepository::new(db_pool.clone());
+        // Re-verify capability ceilings against the graph that will ACTUALLY run
+        // (the resolved published/active graph above), not the draft.
         match talos_workflow_authorization::resolve_effective_actor(
-            &workflow_repo_for_auth,
+            &workflow_repo,
             &actor_repo_for_auth,
             &db_pool,
             workflow.actor_id,
             user_id,
-            &workflow.graph_json,
+            &graph_json,
         )
         .await
         {
@@ -1146,7 +1191,6 @@ async fn run_scheduled_execution(
         "trigger_type": "scheduled",
         "schedule_id": schedule_id.to_string(),
     });
-    let workflow_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
     // R3 (concurrency-cap fix): route through `create_execution_under_concurrency_limit`
     // — the SAME TOCTOU-safe gate (`SELECT max_concurrent_executions ... FOR
     // UPDATE` + running-count + INSERT in one tx) the manual trigger / webhook
@@ -1161,8 +1205,8 @@ async fn run_scheduled_execution(
             execution_id,
             workflow_id,
             user_id,
-            None, // version_id — scheduler runs the draft graph
-            None, // priority — defaults to "normal"
+            resolved_version_id, // the active published version (or None when running the draft fallback)
+            None,                // priority — defaults to "normal"
             // Phase D2: the gate-resolved actor (default-actor fallback
             // included) so the row's attribution matches the runtime tier
             // instead of relying on the DB auto-stamp trigger to fill NULL.
@@ -1255,7 +1299,6 @@ async fn run_scheduled_execution(
     // (`set_workflow_actor_id`); writes under the Default actor remain
     // reachable via explicit `agent_memory::get/search` calls.
     let actor_context = if let Some(actor_id) = workflow.actor_id {
-        let workflow_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
         let context_hint = workflow.description.as_deref();
         match workflow_repo
             .get_relevant_actor_context(actor_id, 20, context_hint)
@@ -1285,7 +1328,7 @@ async fn run_scheduled_execution(
     let actor_repo = Arc::new(talos_actor_repository::ActorRepository::new(
         db_pool.clone(),
     ));
-    let opts = talos_engine::builder::EngineOpts::for_run(workflow_id, workflow.graph_json.clone())
+    let opts = talos_engine::builder::EngineOpts::for_run(workflow_id, graph_json.clone())
         // Phase D2: the gate-resolved actor (explicit → workflow → default
         // fallback already applied) so the engine tier matches the stamped
         // execution row. Pre-fix an unbound workflow passed (None, None)

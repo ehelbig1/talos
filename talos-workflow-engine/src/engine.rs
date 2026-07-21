@@ -1312,6 +1312,24 @@ impl ParallelWorkflowEngine {
         baseline.max(learned).min(self.max_fuel_per_node)
     }
 
+    /// Extract a node's graph-JSON `max_fuel` override from its stored
+    /// [`node_configs`](Self::node_configs) entry — the whole `data` object
+    /// copied in verbatim during graph load (`parse_graph_document`). Returns
+    /// `None` when the node carries no numeric `max_fuel`, so the caller falls
+    /// back to the module-row default through [`resolve_node_max_fuel`].
+    ///
+    /// The single-node dispatch path reads `max_fuel` out of its *merged*
+    /// `module_config` (module-artifact config + node data) inline; the
+    /// loop-body path has no such merge step, so it routes through this helper.
+    /// Shared by the loop-body dispatch site and its unit test so the override
+    /// extraction can't silently drift.
+    pub(crate) fn node_config_max_fuel(&self, node_id: &Uuid) -> Option<u64> {
+        self.node_configs
+            .get(node_id)
+            .and_then(|cfg| cfg.get("max_fuel"))
+            .and_then(|v| v.as_u64())
+    }
+
     /// Replace the per-module rate-limit counter backing store.
     ///
     /// When `None` (the default), the engine routes

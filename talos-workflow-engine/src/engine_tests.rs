@@ -1037,3 +1037,131 @@ fn resolve_node_max_fuel_guard_mode() {
     let n = Uuid::new_v4();
     assert_eq!(plain.resolve_node_max_fuel(&n, None, 2_200_000), 2_200_000);
 }
+
+// ---------------------------------------------------------------------------
+// Per-node max_fuel override precedence on the loop-body dispatch path.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn loop_body_max_fuel_override_honored() {
+    // Reproduces the loop-body dispatch gap (`scheduler_handlers.rs`
+    // `run_loop_iterations`): the body node's graph-JSON `data.max_fuel`
+    // override must reach `resolve_node_max_fuel`, not the pre-fix hardcoded
+    // `None`. Exercises the exact two production calls the dispatch site now
+    // makes — `node_config_max_fuel(body)` feeding `resolve_node_max_fuel` —
+    // so the test can't drift from the shipped logic.
+    let mut engine = ParallelWorkflowEngine::new();
+    engine.set_max_fuel_per_node(50_000_000);
+
+    let body = Uuid::new_v4();
+    // Body node `data` as it lands in `node_configs` at graph load.
+    engine.node_configs.insert(
+        body,
+        serde_json::json!({ "max_fuel": 8_000_000, "label": "send" }),
+    );
+
+    // Module-row default is far lower (the pa-morning-dispatch 1.38M case).
+    let module_default = 1_380_000u64;
+
+    // Pre-fix behavior: a hardcoded `None` override lets the (lower) module-row
+    // default win — the exact bug this change fixes.
+    assert_eq!(
+        engine.resolve_node_max_fuel(&body, None, module_default),
+        module_default,
+        "hardcoded None reproduces the pre-fix module-row-wins bug"
+    );
+
+    // Post-fix: the helper extracts the override and it wins.
+    assert_eq!(engine.node_config_max_fuel(&body), Some(8_000_000));
+    assert_eq!(
+        engine.resolve_node_max_fuel(&body, engine.node_config_max_fuel(&body), module_default),
+        8_000_000,
+        "body node's data.max_fuel override must be honored"
+    );
+
+    // A body node with NO `max_fuel` in its config falls back to the module
+    // default (byte-for-byte the old path for override-less bodies).
+    let bare = Uuid::new_v4();
+    engine
+        .node_configs
+        .insert(bare, serde_json::json!({ "label": "noop" }));
+    assert_eq!(engine.node_config_max_fuel(&bare), None);
+    assert_eq!(
+        engine.resolve_node_max_fuel(&bare, engine.node_config_max_fuel(&bare), module_default),
+        module_default
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scheduled-path divergence: a node's data.max_fuel override must survive the
+// real graph parse and win over the module-row default. The scheduler bug was
+// loading the DRAFT graph (which lacked the override) instead of the published
+// active version (which carried it); feeding the graph WITH the override here
+// proves fuel is honored once the correct graph is loaded — exercising the real
+// `load_from_graph_json` parser + `resolve_node_max_fuel`, no shadowed logic.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn graph_node_max_fuel_override_survives_load() {
+    let module_id = Uuid::new_v4();
+    let compose_id = Uuid::new_v4();
+    let send_id = Uuid::new_v4();
+
+    // Mirrors the pa-morning-dispatch shape: a `compose` node carrying an
+    // explicit `data.max_fuel` override, and a `send` node without one.
+    let graph = serde_json::json!({
+        "nodes": [
+            {
+                "id": compose_id.to_string(),
+                "type": module_id.to_string(),
+                "data": { "moduleId": module_id.to_string(), "max_fuel": 8_000_000, "label": "compose" }
+            },
+            {
+                "id": send_id.to_string(),
+                "type": module_id.to_string(),
+                "data": { "moduleId": module_id.to_string(), "label": "send" }
+            }
+        ],
+        "edges": [
+            {
+                "source": compose_id.to_string(),
+                "target": send_id.to_string(),
+                "sourceHandle": "output",
+                "targetHandle": "input"
+            }
+        ]
+    });
+
+    let mut engine = ParallelWorkflowEngine::new();
+    engine.set_max_fuel_per_node(50_000_000);
+    engine
+        .load_from_graph_json(&graph)
+        .expect("graph should parse");
+
+    let module_default = 1_380_000u64;
+
+    // `compose` carried `data.max_fuel` — the override survives the parse into
+    // node_configs and wins (the published-graph behavior manual triggers saw).
+    assert_eq!(engine.node_config_max_fuel(&compose_id), Some(8_000_000));
+    assert_eq!(
+        engine.resolve_node_max_fuel(
+            &compose_id,
+            engine.node_config_max_fuel(&compose_id),
+            module_default
+        ),
+        8_000_000
+    );
+
+    // `send` carried none — falls back to the module-row default (the draft-graph
+    // behavior scheduled runs saw before the fix routed them to the published
+    // graph).
+    assert_eq!(engine.node_config_max_fuel(&send_id), None);
+    assert_eq!(
+        engine.resolve_node_max_fuel(
+            &send_id,
+            engine.node_config_max_fuel(&send_id),
+            module_default
+        ),
+        module_default
+    );
+}
