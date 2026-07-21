@@ -594,6 +594,16 @@ async fn main() -> anyhow::Result<()> {
             },
         ));
     }
+    // Shared local-LLM (Ollama) transport — ONE process-wide instance,
+    // reused by BOTH the MCP teacher-audit handler (threaded into McpState
+    // via build_router → create_router) AND the automatic teacher-audit
+    // scheduler below, so they share one reqwest connection pool. MCP-630
+    // idiom: a Helm placeholder `OLLAMA_URL=""` falls through to the
+    // in-cluster default rather than producing a base-URL-less client.
+    let ollama_client = std::sync::Arc::new(talos_llm::OllamaClient::new(talos_config::get_env(
+        "OLLAMA_URL",
+        "http://ollama:11434",
+    )));
     talos_ml::spawn_policy_evaluator(
         db_pool.clone(),
         talos_ml::DatasetService::new(core.secrets_manager.clone()),
@@ -611,6 +621,17 @@ async fn main() -> anyhow::Result<()> {
         std::sync::Arc::new(talos_ml::LifecycleService::new(
             core.secrets_manager.clone(),
         )),
+        bg_shutdown_rx.clone(),
+    );
+    // RFC 0011 R3: automatic weekly teacher-vs-gold audits — every
+    // correction-bearing model gets a fresh bare-prompt ceiling stamped on
+    // its card (TALOS_TEACHER_AUDIT_INTERVAL_DAYS cadence) so the weekly
+    // assistant report can always cite one, without a human running
+    // ml_teacher_audit by hand. Reuses the shared Ollama transport above.
+    talos_ml::spawn_teacher_audit_scheduler(
+        db_pool.clone(),
+        talos_ml::DatasetService::new(core.secrets_manager.clone()),
+        Some(ollama_client.clone()),
         bg_shutdown_rx.clone(),
     );
 
@@ -645,6 +666,7 @@ async fn main() -> anyhow::Result<()> {
         &limiters,
         &bundle,
         actor_repo.clone(),
+        ollama_client.clone(),
     )?;
 
     // Stale-execution cleanup, workflow scheduler, SLA threshold breach check.
@@ -5015,6 +5037,7 @@ fn build_router(
     limiters: &RateLimiters,
     bundle: &SchemaBundle,
     actor_repo: std::sync::Arc<actor_repository::ActorRepository>,
+    ollama_client: std::sync::Arc<talos_llm::OllamaClient>,
 ) -> anyhow::Result<Router> {
     let secrets_manager = core.secrets_manager.clone();
     let registry = core.registry.clone();
@@ -6003,6 +6026,7 @@ fn build_router(
         search_service.clone(),
         failure_analysis_service.clone(),
         actor_lifecycle_service.clone(),
+        Some(ollama_client),
     );
 
     // MCP routes are added separately to avoid the global governor rate limiter.

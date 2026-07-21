@@ -672,6 +672,13 @@ async fn run_audit_task<F, Fut>(
     // would be answered trivially (its labeled text is in the prompt).
     // Anchors are truncated to the wire cap, so compare on that form.
     let anchor_texts: HashSet<&str> = few_shot.iter().map(|(t, _)| t.as_str()).collect();
+    // Captured so every `running` progress stamp carries a `started_at`
+    // (the initial stamp in `start_teacher_audit` has one, but the
+    // per-`PROGRESS_EVERY` stamps below overwrite the whole JSONB). Without
+    // it, the auto-audit scheduler's staleness check
+    // (`teacher_audit_job::teacher_audit_due`) can't tell a live in-progress
+    // audit from a crashed-process leftover.
+    let started_at = chrono::Utc::now();
     let gold_rows = gold.len();
     let mut results: Vec<(Option<String>, RowResult)> = Vec::new();
     let mut skipped_anchors = 0usize;
@@ -739,6 +746,7 @@ async fn run_audit_task<F, Fut>(
         if processed.is_multiple_of(PROGRESS_EVERY) {
             let progress = serde_json::json!({
                 "status": "running",
+                "started_at": started_at,
                 "done": processed,
                 "gold_rows": gold_rows,
                 "skipped_few_shot_anchors": skipped_anchors,
