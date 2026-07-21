@@ -323,7 +323,7 @@ impl DatasetService {
             let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
                 "INSERT INTO ml_examples \
                  (id, dataset_id, user_id, org_id, features_enc, features_key_id, \
-                  features_format, label_json, embedding, source, example_key) ",
+                  features_format, label_json, embedding, embedding_model, source, example_key) ",
             );
             qb.push_values(chunk, |mut b, p| {
                 b.push_bind(p.id)
@@ -335,6 +335,11 @@ impl DatasetService {
                     .push_bind(p.features_format)
                     .push_bind(&p.label_json)
                     .push_bind(&p.embedding)
+                    .push_bind(
+                        p.embedding
+                            .as_ref()
+                            .and_then(|_| talos_memory::embedding::active_embedding_model()),
+                    )
                     .push_bind(p.source)
                     .push_bind(&p.example_key);
             });
@@ -349,6 +354,7 @@ impl DatasetService {
                                 features_format = EXCLUDED.features_format, \
                                 label_json = EXCLUDED.label_json, \
                                 embedding = COALESCE(EXCLUDED.embedding, ml_examples.embedding), \
+                                embedding_model = COALESCE(EXCLUDED.embedding_model, ml_examples.embedding_model), \
                                 source = EXCLUDED.source \
                   WHERE ml_examples.source <> 'correction' \
                      OR EXCLUDED.source = 'correction'",
@@ -717,9 +723,11 @@ impl DatasetService {
             "SELECT embedding, label_json->>'label', source = 'correction' \
              FROM ml_examples \
              WHERE dataset_id = $1 AND split = 'train' \
-               AND embedding IS NOT NULL AND label_json ? 'label'",
+               AND embedding IS NOT NULL AND embedding_model = $2 \
+               AND label_json ? 'label'",
         )
         .bind(dataset_id)
+        .bind(talos_memory::embedding::active_embedding_model())
         .fetch_all(&mut *conn)
         .await
         .context("load train embeddings")?;
@@ -791,6 +799,63 @@ impl DatasetService {
 
     /// Decrypt the holdout set for eval: wipe-on-drop plaintext + the
     /// STORED embedding (eval reuses it instead of re-embedding, which
+    /// Re-embed rows whose vector was produced by a DIFFERENT model
+    /// than the active one (provenance migration follow-path): decrypt
+    /// features, regenerate locally (`local_only = true`, matching the
+    /// append path — dataset text never leaves the host for embedding),
+    /// stamp the new model. Batched; call repeatedly until it returns
+    /// 0. Rows whose embedder call fails are left untouched (still
+    /// invisible to reads via the strict filter — degrade, never mix).
+    pub async fn re_embed_examples(
+        &self,
+        conn: &mut PgConnection,
+        dataset_id: Uuid,
+        limit: i64,
+    ) -> Result<usize> {
+        let Some(active) = talos_memory::embedding::active_embedding_model() else {
+            return Ok(0);
+        };
+        let limit = limit.clamp(1, 500);
+        let rows: Vec<(
+            Uuid,
+            Vec<u8>,
+            Uuid,
+            i16,
+            Option<String>,
+            String,
+            Option<String>,
+        )> = sqlx::query_as(&format!(
+            "SELECT {ENC_ROW_COLS} FROM ml_examples \
+                 WHERE dataset_id = $1 AND embedding IS NOT NULL \
+                   AND embedding_model IS DISTINCT FROM $2 \
+                 ORDER BY created_at ASC LIMIT $3",
+        ))
+        .bind(dataset_id)
+        .bind(&active)
+        .bind(limit)
+        .fetch_all(&mut *conn)
+        .await?;
+
+        let mut done = 0usize;
+        for row in rows {
+            let (id, _label, _source, text) = self.decrypt_row(dataset_id, row).await?;
+            let Some(emb) = talos_memory::embedding::generate_embedding(&text, true).await else {
+                tracing::warn!(%id, "re_embed_examples: embedder unavailable — row left for retry");
+                continue;
+            };
+            sqlx::query(
+                "UPDATE ml_examples SET embedding = $1, embedding_model = $2 WHERE id = $3",
+            )
+            .bind(pgvector::Vector::from(emb))
+            .bind(&active)
+            .bind(id)
+            .execute(&mut *conn)
+            .await?;
+            done += 1;
+        }
+        Ok(done)
+    }
+
     /// is both ~N HTTP calls cheaper and deterministic w.r.t. the
     /// geometry knn actually searches).
     pub async fn load_holdout(
@@ -930,6 +995,7 @@ impl DatasetService {
                     source = 'correction' AS is_correction \
              FROM ml_examples \
              WHERE dataset_id = $1 AND embedding IS NOT NULL \
+               AND embedding_model = $5 \
                AND label_json ? 'label' \
                AND (NOT $4 OR split IS DISTINCT FROM 'holdout') \
              ORDER BY embedding <=> $2 LIMIT $3",
@@ -938,6 +1004,7 @@ impl DatasetService {
         .bind(&qvec)
         .bind(k)
         .bind(train_only)
+        .bind(talos_memory::embedding::active_embedding_model())
         .fetch_all(&mut *conn)
         .await?;
         Ok(rows
@@ -949,4 +1016,22 @@ impl DatasetService {
             })
             .collect())
     }
+}
+
+/// One-time grandfather stamp for the provenance migration (ml_examples
+/// side; sibling of `talos_memory::grandfather_embedding_model`).
+pub async fn grandfather_examples_embedding_model(
+    pool: &sqlx::Pool<sqlx::Postgres>,
+) -> anyhow::Result<u64> {
+    let Some(model) = talos_memory::embedding::active_embedding_model() else {
+        return Ok(0);
+    };
+    let res = sqlx::query(
+        "UPDATE ml_examples SET embedding_model = $1 \
+         WHERE embedding IS NOT NULL AND embedding_model IS NULL",
+    )
+    .bind(&model)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
 }
