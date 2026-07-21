@@ -5397,9 +5397,26 @@ async fn handle_list_pending_approvals(
 
     match rows {
         Ok(rows) => {
+            // Mint one-click approve/reject capability links per pending
+            // approval so a delivery surface (an approval-request email,
+            // digest, or notification workflow) can embed them. Best-effort
+            // and timeout-bounded — a slow/failed mint degrades to link-less
+            // items, never an error (mirrors the ops-alerts digest reader
+            // that mints correction URLs). Tokens are hash-only at rest.
+            let base_url = talos_public_url::public_base_url_or(talos_config::get_base_url);
+            let execution_ids: Vec<Uuid> = rows.iter().map(|r| r.execution_id).collect();
+            let approval_urls = talos_execution_repository::approval_links::mint_approval_urls(
+                &state.execution_repo,
+                user_id,
+                &execution_ids,
+                &base_url,
+            )
+            .await;
+
             let items: Vec<serde_json::Value> = rows
                 .iter()
-                .map(|r| {
+                .zip(approval_urls)
+                .map(|(r, urls)| {
                     let elapsed_secs = r.requested_at
                         .map(|t| (chrono::Utc::now() - t).num_seconds())
                         .unwrap_or(0);
@@ -5411,7 +5428,9 @@ async fn handle_list_pending_approvals(
                         "required_for": r.required_for,
                         "requested_at": r.requested_at.map(|t| t.to_rfc3339()),
                         "waiting_seconds": elapsed_secs,
-                        "action": "Call submit_workflow_approval with this execution_id to approve or reject"
+                        "approve_url": urls.as_ref().map(|u| u.approve_url.clone()),
+                        "reject_url": urls.as_ref().map(|u| u.reject_url.clone()),
+                        "action": "Call submit_workflow_approval with this execution_id, or open the approve_url / reject_url one-click links"
                     })
                 })
                 .collect();

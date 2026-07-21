@@ -170,4 +170,90 @@ impl ExecutionOrchestrationService {
 
         Ok(WaitingResumeOutcome::Resumed)
     }
+
+    /// Record an approval decision for a suspended (`waiting`) execution
+    /// and resume it — the SAME two-step write path
+    /// `submit_workflow_approval` uses ([`ExecutionRepository::
+    /// update_execution_approval_decision`] then
+    /// [`Self::resume_waiting_execution`]), consolidated so the one-click
+    /// email-link HTTP handler and the MCP tool share one code path and
+    /// no resume logic is duplicated.
+    ///
+    /// Scope: the DB-backed confidence-gate pause ONLY. It does NOT touch
+    /// the inline Human_Approval_Gate Redis/NATS signalling — those
+    /// executions are `running`, not `waiting`, and are never targets of
+    /// an approval-link token (tokens are minted from the pending /
+    /// suspended approval set). Ownership is enforced by `user_id` (the
+    /// value the token row bound at mint) on both the decision write and
+    /// the resume claim.
+    ///
+    /// [`ApprovalDecisionOutcome::decision_recorded`] is `false` when no
+    /// pending `execution_approvals` row was flipped — i.e. the execution
+    /// was already decided or is not awaiting approval. Callers render an
+    /// "already decided" page rather than an error in that case; nothing
+    /// is resumed.
+    pub async fn apply_waiting_approval_decision(
+        &self,
+        execution_id: Uuid,
+        user_id: Uuid,
+        approved: bool,
+        reason: Option<&str>,
+    ) -> Result<ApprovalDecisionOutcome, OrchestrationError> {
+        // Ownership re-check (defense in depth — the token already bound
+        // user_id at mint). Never differentiate "not yours" from
+        // "doesn't exist" to the caller; the HTTP layer maps both to the
+        // uniform invalid-link page.
+        match self
+            .execution_repo
+            .get_workflow_execution_owner(execution_id)
+            .await
+            .map_err(OrchestrationError::Internal)?
+        {
+            Some(owner) if owner == user_id => {}
+            _ => return Err(OrchestrationError::ExecutionNotFound(execution_id)),
+        }
+
+        // 1. Record the decision on the pending execution_approvals row.
+        let status_val = if approved { "approved" } else { "denied" };
+        let db_rows_updated = self
+            .execution_repo
+            .update_execution_approval_decision(execution_id, status_val, user_id, reason)
+            .await
+            .map_err(OrchestrationError::Internal)?;
+
+        if db_rows_updated == 0 {
+            // No pending approval → already decided / not waiting. Nothing
+            // to resume; the decided-state is authoritative here.
+            return Ok(ApprovalDecisionOutcome {
+                decision_recorded: false,
+                resumed: false,
+            });
+        }
+
+        // 2. Resume the suspended execution so the gate re-evaluates and
+        //    observes the decision (approved → proceed, denied → fail
+        //    loudly). Fires for BOTH decisions.
+        let resumed = matches!(
+            self.resume_waiting_execution(execution_id, user_id, &[])
+                .await?,
+            WaitingResumeOutcome::Resumed
+        );
+
+        Ok(ApprovalDecisionOutcome {
+            decision_recorded: true,
+            resumed,
+        })
+    }
+}
+
+/// Result of [`ExecutionOrchestrationService::apply_waiting_approval_decision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApprovalDecisionOutcome {
+    /// A pending `execution_approvals` row was flipped to the decision.
+    /// `false` means the execution was already decided or not awaiting
+    /// approval — callers render "already decided", not an error.
+    pub decision_recorded: bool,
+    /// The suspended execution was claimed and a resume dispatched. Only
+    /// possible when `decision_recorded` is `true`.
+    pub resumed: bool,
 }

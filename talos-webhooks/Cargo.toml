@@ -27,6 +27,8 @@ talos-config = { path = "../talos-config" }
 talos-continuation-trigger = { path = "../talos-continuation-trigger" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-engine = { path = "../talos-engine" }
+talos-execution-orchestration = { path = "../talos-execution-orchestration" }
+talos-execution-repository = { path = "../talos-execution-repository" }
 talos-idempotency = { path = "../talos-idempotency" }
 # MCP-1144: canonical encrypted_secrets composition (module-declared
 # secrets + host-reserved LLM provider keys). Replaces ~50 lines of
