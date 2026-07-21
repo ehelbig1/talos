@@ -172,6 +172,44 @@ pub fn validate_severity(s: &str) -> Result<&str, String> {
     }
 }
 
+/// Build the CANONICAL classifier feature text for an alert.
+///
+/// **This form is a cross-component CONTRACT — keep it byte-identical across
+/// all three producers:**
+/// * the `hybrid-classify-alerts` catalog template (runtime prediction),
+/// * the ml dataset bootstrap that seeded the `ops-severity` classifier, and
+/// * the corrections→dataset bridge ([`OpsAlertRepository::correct_severity`] →
+///   `talos_ml::spawn_ops_correction_bridge`).
+///
+/// A drift here silently splits the kNN feature space (the same alert embeds
+/// to a different vector at correction time than at prediction time), so the
+/// human-correction gold example never sits near the row it is meant to fix.
+///
+/// Shape (the `Resource:` line is OMITTED when `resource` is empty/None):
+/// ```text
+/// Title: {title}\nSource: {source}\nResource: {resource}
+/// ```
+#[must_use]
+pub fn canonical_features_text(title: &str, source: &str, resource: Option<&str>) -> String {
+    match resource.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(r) => format!("Title: {title}\nSource: {source}\nResource: {r}"),
+        None => format!("Title: {title}\nSource: {source}"),
+    }
+}
+
+/// Linkage payload returned by a SUCCESSFUL [`OpsAlertRepository::correct_severity`]
+/// so the caller can fan the human label into any ML dataset already tracking
+/// this alert (the corrections→distillation bridge). `example_key` is the
+/// alert's `dedup_key` — the GENERIC containment linkage (a dataset "tracks"
+/// this alert iff it holds an example with this key), so no classifier
+/// model-name is hardcoded anywhere in the bridge. `features_text` is built by
+/// [`canonical_features_text`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorrectionBridge {
+    pub example_key: String,
+    pub features_text: String,
+}
+
 pub struct OpsAlertRepository {
     db_pool: PgPool,
 }
@@ -481,24 +519,42 @@ impl OpsAlertRepository {
 
     /// Record a HUMAN severity correction — the distillation gold signal.
     /// Overwrites any classifier label and marks the row corrected.
+    ///
+    /// Returns `Some(`[`CorrectionBridge`]`)` when a row transitioned (the
+    /// linkage payload the caller feeds into `talos_ml::spawn_ops_correction_bridge`
+    /// to upsert this human label into any dataset already tracking the alert),
+    /// or `None` when nothing matched (absent / not owned). The bridge is
+    /// FIRE-AND-FORGET in the caller: it must never fail the correction itself.
     pub async fn correct_severity(
         &self,
         user_id: Uuid,
         alert_id: Uuid,
         severity: &str,
-    ) -> Result<bool> {
+    ) -> Result<Option<CorrectionBridge>> {
         let sev = validate_severity(severity).map_err(anyhow::Error::msg)?;
-        let res = sqlx::query(
+        // RETURNING the linkage fields in the SAME statement that records the
+        // correction means the bridge keys off the exact row we just wrote —
+        // no second round-trip, no TOCTOU against a concurrent dedup bump.
+        let row = sqlx::query(
             "UPDATE ops_alerts SET severity = $3, corrected_severity = $3, \
                  corrected_at = NOW(), triage_source = 'correction' \
-             WHERE id = $1 AND user_id = $2",
+             WHERE id = $1 AND user_id = $2 \
+             RETURNING dedup_key, title, source, resource",
         )
         .bind(alert_id)
         .bind(user_id)
         .bind(sev)
-        .execute(&self.db_pool)
+        .fetch_optional(&self.db_pool)
         .await?;
-        Ok(res.rows_affected() > 0)
+        let Some(row) = row else { return Ok(None) };
+        let dedup_key: String = row.try_get("dedup_key")?;
+        let title: String = row.try_get("title")?;
+        let source: String = row.try_get("source")?;
+        let resource: Option<String> = row.try_get::<Option<String>, _>("resource")?;
+        Ok(Some(CorrectionBridge {
+            example_key: dedup_key,
+            features_text: canonical_features_text(&title, &source, resource.as_deref()),
+        }))
     }
 
     /// Record a CLASSIFIER triage label. Never overwrites a human correction
@@ -762,5 +818,31 @@ mod tests {
         assert!(validate_severity("unclassified").is_err());
         assert!(validate_severity("sev1").is_err());
         assert!(validate_severity("critical").is_ok());
+    }
+
+    #[test]
+    fn canonical_features_text_matches_the_dataset_convention() {
+        // This exact byte layout is the cross-component contract shared with
+        // the hybrid-classify-alerts template + the ml dataset bootstrap. A
+        // change here is a change to the classifier feature space.
+        assert_eq!(
+            canonical_features_text("Disk full", "gcp-monitoring", Some("prod-db-1")),
+            "Title: Disk full\nSource: gcp-monitoring\nResource: prod-db-1"
+        );
+    }
+
+    #[test]
+    fn canonical_features_text_omits_empty_resource_line() {
+        // No resource → the `Resource:` line is dropped entirely (NOT
+        // rendered as an empty tail), matching the template's omission.
+        assert_eq!(
+            canonical_features_text("AWS Health event", "aws-health-email", None),
+            "Title: AWS Health event\nSource: aws-health-email"
+        );
+        // Whitespace-only resource is treated as absent.
+        assert_eq!(
+            canonical_features_text("t", "s", Some("   ")),
+            "Title: t\nSource: s"
+        );
     }
 }

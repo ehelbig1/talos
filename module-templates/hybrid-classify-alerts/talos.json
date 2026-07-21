@@ -1,0 +1,46 @@
+{
+  "name": "hybrid-classify-alerts",
+  "version": "v1.0.0",
+  "display_name": "Hybrid Classify (Alerts)",
+  "description": "Alert-triage brain Phase 2: the severity Smart-Classifier pass. Sits after an alert normalizer running with EMIT_OPS_ALERTS=false (which hands off a plain {\"alerts\":[...]} array) and becomes the sole __ops_alert__ emitter. For each alert it builds the canonical feature text (Title/Source/Resource), consults the distilled ops-severity model first (talos:core/model predict-batch, lifecycle-gated server-side), and routes ONLY the alerts the model isn't confident about to the LLM (few-shot anchored on human corrections, <untrusted_data> spotlighting). It stamps each alert's severity_hint with the predicted severity, keeps severity_raw untouched, and re-wraps the whole array under __ops_alert__ so the engine ingests it. LLM-labeled alerts emit an __ml_distill__ envelope (active learning; example_key = the alert's dedup_key). Degradation is soft: an alert failing both legs keeps its original severity_hint, and non-classifiable entries (state=closed recovery status_events, which have no title) pass through untouched. severity_hint still applies on FIRST ingest only — human corrections outrank it.",
+  "category": "Operations",
+  "capability_world": "agent-node",
+  "allowed_hosts": [],
+  "allowed_secrets": [],
+  "recommended_fuel": {
+    "expected_items": 10,
+    "bytes_per_item": 2000,
+    "llm_output_bytes": 512,
+    "safety_multiplier": 2.5
+  },
+  "config_schema": {
+    "type": "object",
+    "required": ["MODEL_NAME", "SYSTEM_PROMPT"],
+    "properties": {
+      "MODEL_NAME": {
+        "type": "string",
+        "description": "Registered ml_models name of the severity classifier (e.g. 'ops-severity'). Resolved under the execution user's tenancy; served only once the model reaches hybrid/fast_primary (shadow/llm_only → abstain-all → the LLM leg handles everything). Its labels are the fixed six ops severities."
+      },
+      "SYSTEM_PROMPT": {
+        "type": "string",
+        "description": "The severity rubric for the LLM fallback leg — how to weigh a critical/high/medium/low/info/noise call. Must instruct the model to return {\"label\":\"<one severity>\"}. Alert content is wrapped in <untrusted_data> (spotlighting) with an anti-injection directive before the LLM sees it."
+      },
+      "MODEL": {
+        "type": "string",
+        "default": "qwen3.6:latest",
+        "description": "LLM model identifier for the fallback leg."
+      },
+      "PROVIDER": {
+        "type": "string",
+        "enum": ["ollama", "anthropic", "openai", "gemini"],
+        "default": "ollama",
+        "description": "LLM provider for the fallback leg. 'ollama' (default, Tier 1, local) keeps alert content on-host."
+      },
+      "MAX_TOKENS": {
+        "type": "number",
+        "default": 256,
+        "description": "Max tokens for each single-label LLM severity response."
+      }
+    }
+  }
+}

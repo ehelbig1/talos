@@ -22,6 +22,15 @@ use talos_sdk_macros::talos_module;
 // absent stays unclassified. Hints apply on first ingest only — the
 // classifier pass and human corrections own severity after that.
 //
+// Config `EMIT_OPS_ALERTS` (default true): when true, alerts (and the
+// state=closed recovery event) ride out under `__ops_alert__` so THIS node
+// ingests them. Set it false to emit the SAME entries under a plain
+// `alerts` key for a downstream `hybrid-classify-alerts` node to own — the
+// classifier then decides severity at first ingest and becomes the sole
+// `__ops_alert__` emitter. Recovery (status_event) entries have no title,
+// so the classify node passes them through untouched. Existing single-node
+// deployments are unaffected (default true).
+//
 // Everything is typed-struct parsed per the WASM fuel rules.
 
 #[derive(serde::Deserialize)]
@@ -56,6 +65,26 @@ struct Config {
     ///   "ingest" — treat it as a normal alert event (bumps the row).
     #[serde(default, rename = "ON_CLOSED")]
     on_closed: String,
+    /// `EMIT_OPS_ALERTS` (default true → `None` here means true). When true
+    /// the alerts ride under `__ops_alert__` (this node ingests); when false
+    /// they ride under a plain `alerts` key for a downstream classify node.
+    /// Modeled as `Option<bool>` (NOT bare bool) so the derived `Config`
+    /// default — used when the whole `config` object is absent — resolves to
+    /// `None` → true, rather than a bare bool's `false`.
+    #[serde(default, rename = "EMIT_OPS_ALERTS")]
+    emit_ops_alerts: Option<bool>,
+}
+
+/// Attach the parsed `alerts` to `base` under the right key: `__ops_alert__`
+/// (this node ingests) when `emit_ops_alerts`, else a plain `alerts` key
+/// (a downstream classify node ingests). Shared by both emit sites.
+fn finalize(mut base: serde_json::Value, alerts: Vec<serde_json::Value>, emit_ops_alerts: bool) -> String {
+    if emit_ops_alerts {
+        base["__ops_alert__"] = serde_json::json!({ "alerts": alerts });
+    } else {
+        base["alerts"] = serde_json::json!(alerts);
+    }
+    base.to_string()
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -133,6 +162,9 @@ fn severity_hint(policy_severity: &str) -> &'static str {
 fn run(input: String) -> Result<String, String> {
     let env: Envelope = serde_json::from_str(&input).map_err(|e| e.to_string())?;
 
+    // Default true (absent config → None → true) keeps this node the ingester.
+    let emit_ops_alerts = env.config.emit_ops_alerts.unwrap_or(true);
+
     let (incident, top_incident_id, top_state) = match env.data.or(env.input) {
         Some(d) => (d.incident.or(env.incident), d.incident_id, d.state),
         None => (env.incident, String::new(), String::new()),
@@ -194,17 +226,20 @@ fn run(input: String) -> Result<String, String> {
                 } else {
                     inc.policy_name.clone()
                 };
-                return Ok(serde_json::json!({
-                    "normalized": 0,
-                    "resolved": 1,
-                    "state": "closed",
-                    "__ops_alert__": { "alerts": [{
-                        "source": format!("{}gcp-monitoring", env.config.source_prefix),
-                        "dedup_key": format!("gcpmon|{}|{}", norm_key(&policy), norm_key(&resource)),
-                        "status_event": "resolved",
-                    }] },
-                })
-                .to_string());
+                let recovery = serde_json::json!({
+                    "source": format!("{}gcp-monitoring", env.config.source_prefix),
+                    "dedup_key": format!("gcpmon|{}|{}", norm_key(&policy), norm_key(&resource)),
+                    "status_event": "resolved",
+                });
+                return Ok(finalize(
+                    serde_json::json!({
+                        "normalized": 0,
+                        "resolved": 1,
+                        "state": "closed",
+                    }),
+                    vec![recovery],
+                    emit_ops_alerts,
+                ));
             }
         }
     }
@@ -254,11 +289,13 @@ fn run(input: String) -> Result<String, String> {
         alert["severity_hint"] = serde_json::json!(hint);
     }
 
-    Ok(serde_json::json!({
-        "normalized": 1,
-        "skipped": 0,
-        "state": state,
-        "__ops_alert__": { "alerts": [alert] },
-    })
-    .to_string())
+    Ok(finalize(
+        serde_json::json!({
+            "normalized": 1,
+            "skipped": 0,
+            "state": state,
+        }),
+        vec![alert],
+        emit_ops_alerts,
+    ))
 }

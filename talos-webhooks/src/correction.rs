@@ -152,7 +152,16 @@ pub async fn correction_apply(
         .correct_severity(ctx.user_id, ctx.alert_id, &severity)
         .await
     {
-        Ok(true) => {
+        Ok(Some(bridge)) => {
+            // Fan the human label into any ML dataset already tracking this
+            // alert (corrections→distillation bridge). Fire-and-forget: a
+            // bridge failure must never fail the correction the operator made.
+            talos_ml::spawn_ops_correction_bridge(
+                ctx.user_id,
+                bridge.example_key,
+                bridge.features_text,
+                severity.clone(),
+            );
             if let Err(e) = repo.touch_correction_token(&token).await {
                 tracing::warn!(
                     target: "talos_corrections",
@@ -186,7 +195,7 @@ pub async fn correction_apply(
             );
             (StatusCode::OK, axum::response::Html(html)).into_response()
         }
-        Ok(false) => invalid_link(), // alert vanished (cleanup) — same uniform page
+        Ok(None) => invalid_link(), // alert vanished (cleanup) — same uniform page
         Err(e) => {
             tracing::error!(
                 target: "talos_corrections",
