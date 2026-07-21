@@ -207,7 +207,30 @@ fn normalize(envelope: DistillEnvelope) -> Option<(String, Vec<DistillItem>)> {
         }
         cleaned.push(i);
     }
-    let mut items = cleaned;
+    // Intra-batch dedup, LAST occurrence wins. One envelope can
+    // legitimately carry the same example_key twice — e.g. two alert
+    // emails that normalize to one dedup_key (the AWS Fargate
+    // retirement pair, 2026-07-21) — and a multi-row
+    // `INSERT ... ON CONFLICT DO UPDATE` refuses to affect the same row
+    // twice, failing the WHOLE batch. Done here, not per-emitter, so
+    // every __ml_distill__ producer inherits it (same rationale as the
+    // content-hash fallback above). Every item has Some(key) by now.
+    let mut last_idx: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (idx, it) in cleaned.iter().enumerate() {
+        if let Some(k) = &it.example_key {
+            last_idx.insert(k.clone(), idx);
+        }
+    }
+    let mut items: Vec<DistillItem> = cleaned
+        .into_iter()
+        .enumerate()
+        .filter(|(idx, it)| {
+            it.example_key
+                .as_ref()
+                .is_some_and(|k| last_idx.get(k) == Some(idx))
+        })
+        .map(|(_, it)| it)
+        .collect();
     if items.len() > MAX_DISTILL_ITEMS {
         tracing::warn!(
             model,
@@ -548,6 +571,33 @@ mod tests {
         .unwrap();
         let (_, items) = normalize(single).unwrap();
         assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn normalize_dedups_repeated_example_keys_last_wins() {
+        // Two alerts sharing one dedup_key (the AWS Fargate pair) must
+        // collapse to ONE item — a multi-row ON CONFLICT upsert cannot
+        // affect the same row twice, and a duplicated key would fail the
+        // whole batch insert.
+        let batch: DistillEnvelope = serde_json::from_value(serde_json::json!({
+            "model": "ops-severity",
+            "items": [
+                {"features_text": "Title: retire 13:00", "label": "medium", "example_key": "aws|fargate"},
+                {"features_text": "Title: other", "label": "low", "example_key": "other"},
+                {"features_text": "Title: retire 12:00", "label": "info", "example_key": "aws|fargate"}
+            ]
+        }))
+        .unwrap();
+        let (_, items) = normalize(batch).unwrap();
+        assert_eq!(items.len(), 2);
+        let fargate: Vec<_> = items
+            .iter()
+            .filter(|i| i.example_key.as_deref() == Some("aws|fargate"))
+            .collect();
+        assert_eq!(fargate.len(), 1);
+        assert_eq!(fargate[0].label, "info", "LAST occurrence wins");
+        // Order of survivors is preserved.
+        assert_eq!(items[0].example_key.as_deref(), Some("other"));
     }
 
     #[test]
