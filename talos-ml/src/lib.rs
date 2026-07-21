@@ -59,4 +59,6 @@ pub use serve::{
     few_shot_for_model, invalidate_serving_cache, serve_predict_batch, ServeError, ServeReply,
     ServedPrediction, ServingMode,
 };
-pub use teacher_audit::{stored_teacher_audit, teacher_audit, TeacherAuditError, TeacherRequest};
+pub use teacher_audit::{
+    start_teacher_audit, stored_teacher_audit, TeacherAuditError, TeacherAuditStart, TeacherRequest,
+};
