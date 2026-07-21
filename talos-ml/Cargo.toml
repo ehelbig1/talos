@@ -15,6 +15,7 @@ sha2 = "0.10"
 futures = "0.3"
 pgvector = { version = "0.4", features = ["sqlx"] }
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+talos-llm = { path = "../talos-llm" }
 talos-memory = { path = "../talos-memory" }
 talos-db = { path = "../talos-db" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
