@@ -553,6 +553,22 @@ impl JudgeVerdict {
     }
 }
 
+/// Pull the observe-only `(score, passed)` pair out of a judge node's
+/// enriched output envelope, for the `JudgeScoreRecorder` hook. Returns
+/// `None` when the output carries no `__judge_score__` (not a judge
+/// verdict) — the score is the gate, `__judge_passed__` defaults to
+/// `false` when absent. Kept pure (no engine state) so it is unit-tested
+/// without a runtime. DLP: intentionally reads only the score + pass
+/// boolean, never the reasoning/feedback text.
+pub(crate) fn extract_judge_score(output: &JsonValue) -> Option<(f64, bool)> {
+    let score = output.get("__judge_score__").and_then(|v| v.as_f64())?;
+    let passed = output
+        .get("__judge_passed__")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Some((score, passed))
+}
+
 // Suppress dead‑code warnings to keep the CI passing.
 #[allow(dead_code)]
 /// Parallel execution engine based on Kahn's algorithm.
@@ -738,6 +754,13 @@ pub struct ParallelWorkflowEngine {
     /// `ops_alerts_reader`.
     pub(crate) assistant_report_reader:
         Option<Arc<dyn talos_workflow_engine_core::AssistantReportReader>>,
+    /// Write-side port for observe-only judge verdicts — the engine
+    /// records each `Judge` / `InlineJudge` node's `(score, passed)` here
+    /// (best-effort, spawned) so the weekly `assistant_report` node can
+    /// aggregate them without reading the encrypted node outputs they
+    /// live in. `None` (tests / out-of-tree consumers) skips recording.
+    pub(crate) judge_score_recorder:
+        Option<Arc<dyn talos_workflow_engine_core::JudgeScoreRecorder>>,
     /// Seals per-dispatch plaintext secrets into the opaque
     /// `(ciphertext, nonce)` pair forwarded on the wire. Defaults to
     /// [`talos_workflow_job_protocol::AesGcmSecretEnvelope`] — a
@@ -860,6 +883,7 @@ pub struct AdapterSet {
     approval_gate: Option<Arc<dyn talos_workflow_engine_core::ApprovalGate>>,
     ops_alerts_reader: Option<Arc<dyn talos_workflow_engine_core::OpsAlertsReader>>,
     assistant_report_reader: Option<Arc<dyn talos_workflow_engine_core::AssistantReportReader>>,
+    judge_score_recorder: Option<Arc<dyn talos_workflow_engine_core::JudgeScoreRecorder>>,
     secret_envelope: Arc<dyn talos_workflow_engine_core::SecretEnvelope>,
     user_id: Option<Uuid>,
     actor_id: Option<Uuid>,
@@ -930,6 +954,7 @@ impl AdapterSet {
         engine.approval_gate = self.approval_gate;
         engine.ops_alerts_reader = self.ops_alerts_reader;
         engine.assistant_report_reader = self.assistant_report_reader;
+        engine.judge_score_recorder = self.judge_score_recorder;
         engine.secret_envelope = self.secret_envelope;
         engine.user_id = self.user_id;
         engine.actor_id = self.actor_id;
@@ -1023,6 +1048,7 @@ impl ParallelWorkflowEngine {
             approval_gate: None,
             ops_alerts_reader: None,
             assistant_report_reader: None,
+            judge_score_recorder: None,
             secret_envelope: Arc::new(talos_workflow_job_protocol::AesGcmSecretEnvelope),
             sandbox_root: Some(default_sandbox_root().to_path_buf()),
             agent_loop_max_history: DEFAULT_AGENT_LOOP_MAX_HISTORY,
@@ -1464,6 +1490,17 @@ impl ParallelWorkflowEngine {
         self.assistant_report_reader = Some(reader);
     }
 
+    /// Inject the judge-score write port (records observe-only `Judge` /
+    /// `InlineJudge` verdicts for the weekly `assistant_report` node).
+    /// Wired by the controller engine builder; absent in out-of-tree
+    /// consumers, where judge verdicts are simply not recorded.
+    pub fn set_judge_score_recorder(
+        &mut self,
+        recorder: Arc<dyn talos_workflow_engine_core::JudgeScoreRecorder>,
+    ) {
+        self.judge_score_recorder = Some(recorder);
+    }
+
     /// Replace the default module-execution store. Consumers that
     /// don't have a Postgres-backed module store plug in their own
     /// impl (capture, append log, no-op) here.
@@ -1570,6 +1607,7 @@ impl ParallelWorkflowEngine {
             approval_gate: self.approval_gate.clone(),
             ops_alerts_reader: self.ops_alerts_reader.clone(),
             assistant_report_reader: self.assistant_report_reader.clone(),
+            judge_score_recorder: self.judge_score_recorder.clone(),
             secret_envelope: self.secret_envelope.clone(),
             user_id: self.user_id,
             actor_id: self.actor_id,
@@ -3260,6 +3298,32 @@ impl ParallelWorkflowEngine {
             extra = extra,
             "quality gate completed"
         );
+    }
+
+    /// Best-effort record of an observe-only judge verdict for the weekly
+    /// `assistant_report` node. Extracts `(score, passed)` from the judge
+    /// node's enriched output and hands it to the injected
+    /// [`JudgeScoreRecorder`](talos_workflow_engine_core::JudgeScoreRecorder)
+    /// off the hot path via `tokio::spawn`. No recorder wired, no workflow
+    /// id, or no `__judge_score__` in the output → silent no-op. The
+    /// recorder swallows its own DB errors, so this can NEVER fail the
+    /// workflow — same discipline as the `__ops_alert__` / DLQ hooks.
+    pub(crate) fn record_judge_score(&self, node_id: Uuid, execution_id: Uuid, output: &JsonValue) {
+        let Some(recorder) = self.judge_score_recorder.as_ref() else {
+            return;
+        };
+        let Some(workflow_id) = self.workflow_id else {
+            return;
+        };
+        let Some((score, passed)) = extract_judge_score(output) else {
+            return;
+        };
+        let recorder = Arc::clone(recorder);
+        tokio::spawn(async move {
+            recorder
+                .record(workflow_id, node_id, execution_id, score, passed)
+                .await;
+        });
     }
 
     /// One-shot dispatch of a Judge system node. Builds the judge input from
@@ -5396,6 +5460,9 @@ impl ParallelWorkflowEngine {
                 // ── InlineJudge dispatch (sync expression-driven verdict) ────
                 #[cfg(feature = "llm-primitives")]
                 if let Some(output) = self.try_dispatch_inline_judge(node_idx, node_id, &results) {
+                    // Observe-only: record the verdict for the weekly
+                    // self-report before the output is routed onward.
+                    self.record_judge_score(node_id, execution_id, &output);
                     let chains_ctx = if is_fresh_run {
                         Some((chains.as_slice(), &node_to_chain))
                     } else {
@@ -5427,6 +5494,9 @@ impl ParallelWorkflowEngine {
                     )
                     .await
                 {
+                    // Observe-only: record the verdict for the weekly
+                    // self-report before the output is routed onward.
+                    self.record_judge_score(node_id, execution_id, &output);
                     let chains_ctx = if is_fresh_run {
                         Some((chains.as_slice(), &node_to_chain))
                     } else {

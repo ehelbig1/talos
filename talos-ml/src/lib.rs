@@ -32,6 +32,7 @@ pub mod registry;
 pub mod serve;
 pub mod teacher_audit;
 pub mod teacher_audit_job;
+pub mod teacher_ceilings;
 
 pub use correction::{resolve_disagreement, ResolveError, ResolveOutcome};
 pub use dataset::{
@@ -66,3 +67,4 @@ pub use teacher_audit::{
     start_teacher_audit, stored_teacher_audit, TeacherAuditError, TeacherAuditStart, TeacherRequest,
 };
 pub use teacher_audit_job::{run_teacher_audit_tick, spawn_teacher_audit_scheduler};
+pub use teacher_ceilings::teacher_ceilings;
