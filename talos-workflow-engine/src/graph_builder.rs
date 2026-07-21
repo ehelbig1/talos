@@ -528,6 +528,9 @@ fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue
         SystemNodeKind::OpsAlertsDigest { top_limit } => {
             ("ops_alerts_digest", json!({ "top_limit": top_limit }))
         }
+        SystemNodeKind::PendingApprovals { limit } => {
+            ("pending_approvals", json!({ "limit": limit }))
+        }
         SystemNodeKind::AssistantReport { days } => ("assistant_report", json!({ "days": days })),
         SystemNodeKind::Synthesize { synthesis_expr } => (
             "synthesize",
@@ -1302,6 +1305,34 @@ mod tests {
         assert!(matches!(
             parsed,
             Some(SystemNodeKind::OpsAlertsDigest { top_limit: 25 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn system_node_pending_approvals_round_trips() {
+        let decoded = round_trip_kind(
+            "pending_appr",
+            SystemNodeKind::PendingApprovals { limit: 7 },
+        )
+        .await;
+        assert!(matches!(
+            decoded,
+            SystemNodeKind::PendingApprovals { limit: 7 }
+        ));
+
+        // The parser clamps hand-authored out-of-range values (the
+        // builder can't produce them, so round-trip through the raw
+        // parser directly).
+        let oversized = serde_json::json!({
+            "id": "pending_appr_big",
+            "type": "system:pending_approvals",
+            "kind": "pending_approvals",
+            "data": { "limit": 9999 },
+        });
+        let parsed = crate::graph_parser::parse_system_node_kind("pending_approvals", &oversized);
+        assert!(matches!(
+            parsed,
+            Some(SystemNodeKind::PendingApprovals { limit: 25 })
         ));
     }
 

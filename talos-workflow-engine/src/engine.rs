@@ -749,6 +749,12 @@ pub struct ParallelWorkflowEngine {
     /// node emit an unavailable-envelope rather than failing the
     /// workflow.
     pub(crate) ops_alerts_reader: Option<Arc<dyn talos_workflow_engine_core::OpsAlertsReader>>,
+    /// Read-side port for pending human approvals — powers the
+    /// `pending_approvals` system node (controller-side read + one-click
+    /// capability-URL mint; not reachable from workers). Same
+    /// None-degrades contract as `ops_alerts_reader`.
+    pub(crate) pending_approvals_reader:
+        Option<Arc<dyn talos_workflow_engine_core::PendingApprovalsReader>>,
     /// Read-side port for the weekly assistant report — powers the
     /// `assistant_report` system node. Same None-degrades contract as
     /// `ops_alerts_reader`.
@@ -882,6 +888,7 @@ pub struct AdapterSet {
     module_execution_store: Option<Arc<dyn talos_workflow_engine_core::ModuleExecutionStore>>,
     approval_gate: Option<Arc<dyn talos_workflow_engine_core::ApprovalGate>>,
     ops_alerts_reader: Option<Arc<dyn talos_workflow_engine_core::OpsAlertsReader>>,
+    pending_approvals_reader: Option<Arc<dyn talos_workflow_engine_core::PendingApprovalsReader>>,
     assistant_report_reader: Option<Arc<dyn talos_workflow_engine_core::AssistantReportReader>>,
     judge_score_recorder: Option<Arc<dyn talos_workflow_engine_core::JudgeScoreRecorder>>,
     secret_envelope: Arc<dyn talos_workflow_engine_core::SecretEnvelope>,
@@ -953,6 +960,7 @@ impl AdapterSet {
         engine.module_execution_store = self.module_execution_store;
         engine.approval_gate = self.approval_gate;
         engine.ops_alerts_reader = self.ops_alerts_reader;
+        engine.pending_approvals_reader = self.pending_approvals_reader;
         engine.assistant_report_reader = self.assistant_report_reader;
         engine.judge_score_recorder = self.judge_score_recorder;
         engine.secret_envelope = self.secret_envelope;
@@ -1047,6 +1055,7 @@ impl ParallelWorkflowEngine {
             module_execution_store: None,
             approval_gate: None,
             ops_alerts_reader: None,
+            pending_approvals_reader: None,
             assistant_report_reader: None,
             judge_score_recorder: None,
             secret_envelope: Arc::new(talos_workflow_job_protocol::AesGcmSecretEnvelope),
@@ -1479,6 +1488,17 @@ impl ParallelWorkflowEngine {
         self.ops_alerts_reader = Some(reader);
     }
 
+    /// Inject the pending-approvals read port (powers the
+    /// `pending_approvals` system node). Wired by the controller engine
+    /// builder; absent in out-of-tree consumers, where the node degrades
+    /// to an unavailable-envelope output.
+    pub fn set_pending_approvals_reader(
+        &mut self,
+        reader: Arc<dyn talos_workflow_engine_core::PendingApprovalsReader>,
+    ) {
+        self.pending_approvals_reader = Some(reader);
+    }
+
     /// Inject the assistant-report read port (powers the
     /// `assistant_report` system node). Wired by the controller engine
     /// builder; absent in out-of-tree consumers, where the node degrades
@@ -1606,6 +1626,7 @@ impl ParallelWorkflowEngine {
             module_execution_store: self.module_execution_store.clone(),
             approval_gate: self.approval_gate.clone(),
             ops_alerts_reader: self.ops_alerts_reader.clone(),
+            pending_approvals_reader: self.pending_approvals_reader.clone(),
             assistant_report_reader: self.assistant_report_reader.clone(),
             judge_score_recorder: self.judge_score_recorder.clone(),
             secret_envelope: self.secret_envelope.clone(),
@@ -5338,6 +5359,34 @@ impl ParallelWorkflowEngine {
                 // by construction (nothing leaves the controller).
                 if let Some(output) = self
                     .try_dispatch_ops_alerts_digest(node_id, execution_id)
+                    .await
+                {
+                    let chains_ctx = if is_fresh_run {
+                        Some((chains.as_slice(), &node_to_chain))
+                    } else {
+                        None
+                    };
+                    self.route_system_node_output(
+                        node_idx,
+                        output,
+                        execution_id,
+                        chains_ctx,
+                        &exec_ctx,
+                        &mut results,
+                        &mut pending,
+                        &mut ready,
+                    )
+                    .await?;
+                    continue;
+                }
+
+                // ── Pending approvals (controller-side read + link mint) ─────
+                // Same async + route-downstream + degrade-not-fail contract
+                // as the ops-alerts digest above. No worker dispatch and no
+                // secrets on the wire — the capability URLs are minted
+                // controller-side and flow downstream as node output.
+                if let Some(output) = self
+                    .try_dispatch_pending_approvals(node_id, execution_id)
                     .await
                 {
                     let chains_ctx = if is_fresh_run {

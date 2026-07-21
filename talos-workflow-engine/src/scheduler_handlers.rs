@@ -247,6 +247,125 @@ impl ParallelWorkflowEngine {
         Some(output)
     }
 
+    /// [`SystemNodeKind::PendingApprovals`] — controller-side read of
+    /// the caller's pending human approvals plus freshly-minted
+    /// one-click approve/reject capability URLs, through the injected
+    /// [`talos_workflow_engine_core::PendingApprovalsReader`] port.
+    ///
+    /// Returns `None` when the node is not a `PendingApprovals` system
+    /// node. Otherwise ALWAYS returns `Some(envelope)` — a missing
+    /// reader (out-of-tree consumer), missing tenant identity, or a
+    /// storage error degrade to `{"available": false, "reason": …}`
+    /// rather than failing the workflow: the primary consumer is a
+    /// notify-after-pause compose node, and a notifier without its
+    /// approvals section beats a failed workflow.
+    ///
+    /// SECURITY: the minted URLs are capability secrets. They must
+    /// transit node output (that is the entire point of the node), but
+    /// we NEVER log them or the underlying tokens — only counts. Real
+    /// errors are logged server-side; the envelope carries only a
+    /// generic reason (no schema/query detail leaks into node output,
+    /// which is user-visible).
+    ///
+    /// Tenancy: `self.user_id` — the execution's resolved identity (set
+    /// via actor binding at engine build), never node config.
+    pub(crate) async fn try_dispatch_pending_approvals(
+        &self,
+        node_id: Uuid,
+        execution_id: Uuid,
+    ) -> Option<JsonValue> {
+        let (_, _, Some(SystemNodeKind::PendingApprovals { limit })) =
+            self.node_meta.get(&node_id)?
+        else {
+            return None;
+        };
+        let limit = *limit;
+
+        let unavailable = |reason: &str| {
+            serde_json::json!({
+                "available": false,
+                "reason": reason,
+            })
+        };
+
+        let Some(reader) = self.pending_approvals_reader.clone() else {
+            tracing::warn!(
+                %node_id,
+                "pending_approvals: no PendingApprovalsReader wired — emitting unavailable envelope"
+            );
+            self.emit_node_lifecycle_events(
+                execution_id,
+                node_id,
+                "Completed",
+                "pending-approvals unavailable (reader not wired)".to_string(),
+            );
+            return Some(unavailable(
+                "pending-approvals store not available in this deployment",
+            ));
+        };
+        let Some(user_id) = self.user_id else {
+            tracing::warn!(
+                %node_id,
+                "pending_approvals: execution has no resolved user identity — emitting \
+                 unavailable envelope"
+            );
+            self.emit_node_lifecycle_events(
+                execution_id,
+                node_id,
+                "Completed",
+                "pending-approvals unavailable (no tenant identity)".to_string(),
+            );
+            return Some(unavailable("execution has no tenant identity"));
+        };
+
+        // Defensive timeout so a stalled store (or a slow token mint)
+        // can't wedge the reactor. The reader's own mint step is already
+        // timeout-bounded and best-effort; this is the engine-side
+        // backstop.
+        const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        let output = match tokio::time::timeout(READ_TIMEOUT, reader.pending(user_id, limit)).await
+        {
+            Ok(Ok(mut snapshot)) => {
+                let count = snapshot
+                    .get("count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                if let Some(obj) = snapshot.as_object_mut() {
+                    obj.insert("available".to_string(), serde_json::json!(true));
+                }
+                self.emit_node_lifecycle_events(
+                    execution_id,
+                    node_id,
+                    "Completed",
+                    // Count only — never the URLs (capability secrets).
+                    format!("pending-approvals fetched ({count} pending, limit {limit})"),
+                );
+                snapshot
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(%node_id, error = %e, "pending_approvals: read failed");
+                self.emit_node_lifecycle_events(
+                    execution_id,
+                    node_id,
+                    "Completed",
+                    "pending-approvals unavailable (storage error)".to_string(),
+                );
+                unavailable("pending-approvals read failed")
+            }
+            Err(_) => {
+                tracing::warn!(%node_id, "pending_approvals: read timed out");
+                self.emit_node_lifecycle_events(
+                    execution_id,
+                    node_id,
+                    "Completed",
+                    "pending-approvals unavailable (timeout)".to_string(),
+                );
+                unavailable("pending-approvals read timed out")
+            }
+        };
+        Some(output)
+    }
+
     /// [`SystemNodeKind::AssistantReport`] — controller-side weekly
     /// activity + learning-health snapshot through the injected
     /// [`talos_workflow_engine_core::AssistantReportReader`] port.

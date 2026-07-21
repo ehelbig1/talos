@@ -200,6 +200,15 @@ pub(crate) fn parse_system_node_kind(k: &str, node: &JsonValue) -> Option<System
             .and_then(serde_json::Value::as_u64)
             .map_or(10u32, |v| v.clamp(1, 25) as u32);
         Some(SystemNodeKind::OpsAlertsDigest { top_limit })
+    } else if k == "pending_approvals" {
+        // Clamp defensively at parse time so a hand-authored graph can't
+        // request an unbounded pending-approval list (default 10, cap 25).
+        let limit = node
+            .get("data")
+            .and_then(|d| d.get("limit"))
+            .and_then(serde_json::Value::as_u64)
+            .map_or(10u32, |v| v.clamp(1, 25) as u32);
+        Some(SystemNodeKind::PendingApprovals { limit })
     } else if k == "synthesize" {
         let data = node.get("data").cloned().unwrap_or(serde_json::json!({}));
         Some(SystemNodeKind::Synthesize {

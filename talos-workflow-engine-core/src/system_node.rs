@@ -149,6 +149,19 @@ pub enum SystemNodeKind {
         /// Trailing window in days (clamped 1..=31).
         days: u32,
     },
+    /// Controller-side read of the caller's pending human approvals,
+    /// each carrying a freshly-minted one-click approve/reject
+    /// capability URL. Output flows downstream as ordinary graph data
+    /// (feeds an approval-notifier compose node). Executes via the
+    /// injected [`crate::PendingApprovalsReader`] — no worker dispatch,
+    /// no secrets. Links can only be minted once an execution is
+    /// actually suspended at its gate, which is exactly what this node
+    /// reads, so the notify-after-pause flow reaches for it.
+    PendingApprovals {
+        /// How many pending approvals to include verbatim (clamped
+        /// 1..=25).
+        limit: u32,
+    },
     /// Synthesize a value from prior outputs, optionally via expression.
     Synthesize {
         /// Optional expression building the synthesized value.
