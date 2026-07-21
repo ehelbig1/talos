@@ -63,6 +63,10 @@ const EMBED_CONCURRENCY: usize = 8;
 /// `lifecycle_state` here is never staler than the 15 s TTL.
 #[derive(Debug, Clone)]
 struct ServingConfig {
+    /// Registry model id + the dataset's org — carried so the gray-band
+    /// review hook can insert `ml_disagreements` rows without re-resolving.
+    model_id: Uuid,
+    org_id: Option<Uuid>,
     dataset_id: Uuid,
     /// Promoted version's row id — the key for loading a parametric
     /// backend's artifact (and the linear-model cache).
@@ -72,6 +76,10 @@ struct ServingConfig {
     k: i64,
     lifecycle_state: String,
     confidence_threshold: f32,
+    /// Active-learning gray band (policy knobs, defaults applied at
+    /// resolution). Policy edits propagate within the cache TTL.
+    gray_band: f32,
+    gray_band_daily_cap: i64,
     /// Correction-emphasis multiplier for the knn vote — read from the
     /// PROMOTED version's recorded eval params (not the live policy):
     /// the confidence threshold was calibrated under that exact voting
@@ -111,13 +119,28 @@ fn model_serves(mode: ServingMode, lifecycle_state: &str) -> bool {
 }
 
 /// Whether one slot's vote is returned to the consumer. Gated abstains
-/// below the confidence threshold (→ LLM fallback); Raw keeps every
-/// vote for agreement accounting.
+/// below the confidence threshold (→ LLM fallback), serves at/above.
+/// Raw keeps every vote for agreement accounting.
 fn keep_vote(mode: ServingMode, confidence: f32, threshold: f32) -> bool {
     match mode {
         ServingMode::Raw => true,
         ServingMode::Gated => confidence >= threshold,
     }
+}
+
+/// Gray-band active-learning predicate: a Gated vote that WAS served
+/// (`keep_vote` true) but barely — confidence in
+/// `[threshold, threshold + band)` — is routed to the review queue.
+/// Below the threshold the slot already falls back to the LLM (never
+/// queued here — the shadow flow's abstain accounting owns that case);
+/// at or above `threshold + band` the model is confidently right often
+/// enough that review adds little. Raw mode never routes (shadow
+/// accounting and the MCP sanity tool must not generate review rows).
+fn in_gray_band(mode: ServingMode, confidence: f32, threshold: f32, band: f32) -> bool {
+    mode == ServingMode::Gated
+        && band > 0.0
+        && confidence >= threshold
+        && confidence < threshold + band
 }
 
 static SERVING_CACHE: LazyLock<RwLock<HashMap<(Uuid, String), (ServingConfig, Instant)>>> =
@@ -304,11 +327,11 @@ pub async fn serve_predict_batch(
             // `require_dataset_owner`): even a legitimately-owned model
             // must not search a dataset the signed user doesn't own.
             // Coarse NotAvailable — no foreign-dataset enumeration.
-            match service.dataset_tenancy(&mut *conn, dataset_id).await {
-                Ok(t) if t.user_id == user_id => {}
+            let org_id = match service.dataset_tenancy(&mut *conn, dataset_id).await {
+                Ok(t) if t.user_id == user_id => t.org_id,
                 Ok(_) => return Err(ServeError::NotAvailable),
                 Err(_) => return Err(ServeError::NotAvailable),
-            }
+            };
             let k = resolved
                 .config_json
                 .get("k")
@@ -335,7 +358,17 @@ pub async fn serve_predict_batch(
                 .and_then(|v| v.as_f64())
                 .map(|w| (w as f32).clamp(1.0, 10.0))
                 .unwrap_or(1.0);
+            // Gray-band knobs from the model's policy (accessor defaults
+            // when the policy is absent/empty; ml_set_policy validates
+            // ranges at write time so the stored values are in-range).
+            let policy = resolved
+                .policy_json
+                .as_ref()
+                .and_then(|p| crate::lifecycle::PolicyJson::parse(p).ok())
+                .unwrap_or_default();
             let cfg = ServingConfig {
+                model_id: resolved.model_id,
+                org_id,
                 dataset_id,
                 version_id: promoted.id,
                 version: promoted.version,
@@ -343,6 +376,8 @@ pub async fn serve_predict_batch(
                 k,
                 lifecycle_state: resolved.lifecycle_state,
                 confidence_threshold,
+                gray_band: policy.gray_band() as f32,
+                gray_band_daily_cap: policy.gray_band_daily_cap(),
                 correction_weight,
             };
             cache_put(user_id, model_name, cfg.clone());
@@ -474,6 +509,37 @@ pub async fn serve_predict_batch(
         out
     };
 
+    // Active learning (R3): served-but-barely predictions route to the
+    // review queue ASYNC — the spawn is fire-and-forget and everything
+    // fallible (cap check, dedup, encrypt, insert) happens inside the
+    // spawned task, so it can never add latency or failure to serving.
+    if mode == ServingMode::Gated {
+        let gray: Vec<crate::active_learning::GrayBandItem> = inputs
+            .iter()
+            .zip(&predictions)
+            .filter_map(|(input, slot)| {
+                slot.as_ref()
+                    .filter(|p| {
+                        in_gray_band(mode, p.confidence, cfg.confidence_threshold, cfg.gray_band)
+                    })
+                    .map(|p| crate::active_learning::GrayBandItem {
+                        features_text: input.clone(),
+                        label: p.label.clone(),
+                        confidence: p.confidence,
+                    })
+            })
+            .collect();
+        if !gray.is_empty() {
+            crate::active_learning::spawn_gray_band_review(
+                cfg.model_id,
+                user_id,
+                cfg.org_id,
+                cfg.gray_band_daily_cap,
+                gray,
+            );
+        }
+    }
+
     Ok(ServeReply {
         predictions,
         model_version: cfg.version,
@@ -487,6 +553,8 @@ mod tests {
 
     fn test_cfg(k: i64) -> ServingConfig {
         ServingConfig {
+            model_id: Uuid::from_u128(80),
+            org_id: None,
             dataset_id: Uuid::from_u128(8),
             version_id: Uuid::from_u128(88),
             version: 3,
@@ -494,6 +562,8 @@ mod tests {
             k,
             lifecycle_state: "shadow".into(),
             confidence_threshold: 0.6,
+            gray_band: 0.1,
+            gray_band_daily_cap: 20,
             correction_weight: 1.0,
         }
     }
@@ -519,6 +589,32 @@ mod tests {
         assert!(!keep_vote(ServingMode::Gated, 0.59, 0.6));
         assert!(keep_vote(ServingMode::Gated, 0.6, 0.6));
         assert!(keep_vote(ServingMode::Gated, 0.95, 0.6));
+    }
+
+    #[test]
+    fn gray_band_boundary_decisions() {
+        // Exactly-representable f32 values so the half-open boundary is
+        // testable without float fuzz (0.5 + 0.25 == 0.75 exactly).
+        let (t, b) = (0.5f32, 0.25f32);
+        // Below the threshold: the slot is a FALLBACK (keep_vote false),
+        // never a gray-band route.
+        assert!(!keep_vote(ServingMode::Gated, 0.49, t));
+        assert!(!in_gray_band(ServingMode::Gated, 0.49, t, b));
+        // At the threshold: served AND inside the band (queued).
+        assert!(keep_vote(ServingMode::Gated, 0.5, t));
+        assert!(in_gray_band(ServingMode::Gated, 0.5, t, b));
+        // Just under the band's upper edge: served + queued.
+        assert!(in_gray_band(ServingMode::Gated, 0.7499, t, b));
+        // At threshold + band: served, NOT queued (half-open interval).
+        assert!(keep_vote(ServingMode::Gated, 0.75, t));
+        assert!(!in_gray_band(ServingMode::Gated, 0.75, t, b));
+        // Well above the band: served, not queued.
+        assert!(!in_gray_band(ServingMode::Gated, 0.95, t, b));
+        // Raw mode never routes, even inside the band (shadow accounting
+        // + the MCP sanity tool must not create review rows).
+        assert!(!in_gray_band(ServingMode::Raw, 0.5, t, b));
+        // Band 0.0 disables routing entirely.
+        assert!(!in_gray_band(ServingMode::Gated, 0.5, t, 0.0));
     }
 
     #[test]

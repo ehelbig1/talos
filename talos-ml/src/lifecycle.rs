@@ -161,7 +161,23 @@ pub struct PolicyJson {
     /// bounded by leave-one-in-train). Default 8; 0..=100.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_gold: Option<i64>,
+    /// Active learning (R3): width of the gray band ABOVE the serving
+    /// confidence threshold. A Gated prediction with confidence in
+    /// [threshold, threshold + gray_band) is SERVED but also routed to
+    /// the review queue (kind='low_confidence') — the most informative
+    /// examples for human labeling. 0.0 disables. Default 0.1; 0.0..=0.3.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gray_band: Option<f64>,
+    /// Daily cap on gray-band review rows per model (routing stops for
+    /// the day once reached — serving is unaffected). Default 20; 1..=200.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gray_band_daily_cap: Option<i64>,
 }
+
+/// Gray-band defaults — accessors below apply them so an empty policy
+/// still routes a bounded trickle of barely-served predictions to review.
+pub const DEFAULT_GRAY_BAND: f64 = 0.1;
+pub const DEFAULT_GRAY_BAND_DAILY_CAP: i64 = 20;
 
 /// Resolve the corrections config for the model that owns `dataset_id`
 /// (defaults when no model / empty or unparseable policy). Manual eval
@@ -253,7 +269,30 @@ impl PolicyJson {
                 return Err("min_shadow_total must be >= 1".into());
             }
         }
+        if let Some(b) = self.gray_band {
+            if !(0.0..=0.3).contains(&b) || !b.is_finite() {
+                return Err("gray_band must be within 0.0..=0.3".into());
+            }
+        }
+        if let Some(c) = self.gray_band_daily_cap {
+            if !(1..=200).contains(&c) {
+                return Err("gray_band_daily_cap must be within 1..=200".into());
+            }
+        }
         Ok(())
+    }
+
+    /// Effective gray-band width (default applied).
+    #[must_use]
+    pub fn gray_band(&self) -> f64 {
+        self.gray_band.unwrap_or(DEFAULT_GRAY_BAND)
+    }
+
+    /// Effective gray-band daily cap (default applied).
+    #[must_use]
+    pub fn gray_band_daily_cap(&self) -> i64 {
+        self.gray_band_daily_cap
+            .unwrap_or(DEFAULT_GRAY_BAND_DAILY_CAP)
     }
 }
 
@@ -1008,6 +1047,47 @@ mod tests {
         .is_ok());
         // No LLM legs configured: nothing to pin.
         assert!(validate_llm_locality(&serde_json::json!({"k": 5})).is_ok());
+    }
+
+    #[test]
+    fn gray_band_knob_validation_and_defaults() {
+        // Defaults via accessors when unset.
+        let p = PolicyJson::default();
+        assert_eq!(p.gray_band(), DEFAULT_GRAY_BAND);
+        assert_eq!(p.gray_band_daily_cap(), DEFAULT_GRAY_BAND_DAILY_CAP);
+        // In-range values accepted, including 0.0 (disable) and bounds.
+        for (band, cap) in [(0.0, 1), (0.3, 200), (0.05, 20)] {
+            let p = PolicyJson {
+                gray_band: Some(band),
+                gray_band_daily_cap: Some(cap),
+                ..Default::default()
+            };
+            assert!(p.validate().is_ok(), "band={band} cap={cap}");
+            assert_eq!(p.gray_band(), band);
+            assert_eq!(p.gray_band_daily_cap(), cap);
+        }
+        // Out-of-range rejected.
+        for band in [-0.01, 0.31, f64::NAN] {
+            let p = PolicyJson {
+                gray_band: Some(band),
+                ..Default::default()
+            };
+            assert!(p.validate().is_err(), "band={band} must be rejected");
+        }
+        for cap in [0, -1, 201] {
+            let p = PolicyJson {
+                gray_band_daily_cap: Some(cap),
+                ..Default::default()
+            };
+            assert!(p.validate().is_err(), "cap={cap} must be rejected");
+        }
+        // Unknown-field strictness still holds with the new keys present.
+        let ok = PolicyJson::parse(&serde_json::json!({
+            "gray_band": 0.15,
+            "gray_band_daily_cap": 50
+        }))
+        .unwrap();
+        assert!(ok.validate().is_ok());
     }
 
     #[test]

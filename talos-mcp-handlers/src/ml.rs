@@ -163,6 +163,15 @@ pub fn tool_schemas() -> Vec<Value> {
             }, "required": ["name", "labels", "actor_id"] }
         }),
         serde_json::json!({
+            "name": "ml_teacher_audit",
+            "description": "Run the LLM TEACHER over a model's GOLD slice (its source='correction' rows — human truth) and report teacher-vs-human accuracy + per-class breakdown. Quantifies teacher-label noise, the accuracy CEILING of the distilled model. Uses the SAME prompt/few-shot contract as the production classify leg; local (ollama) teachers only. The result is stored on the model card (teacher_audit).",
+            "inputSchema": { "type": "object", "properties": {
+                "model_id": { "type": "string" },
+                "limit": { "type": "integer", "description": "Gold rows to audit, 1-100 (default 100); each row is one local LLM call" },
+                "system_prompt": { "type": "string", "description": "The classifier node's SYSTEM_PROMPT, for exact prompt parity; omit to audit with the bare label instruction" }
+            }, "required": ["model_id"] }
+        }),
+        serde_json::json!({
             "name": "ml_reset_shadow_window",
             "description": "Rotate a model's shadow-agreement window (new epoch): the drift guard and the card's `shadow` block start counting fresh observations, and history moves to the lifetime aggregate. Use after changing the TEACHER without promoting a version (new fallback model/prompt, correction-loop improvements) — transitions and promotions rotate the window automatically. Audit-logged.",
             "inputSchema": { "type": "object", "properties": {
@@ -217,6 +226,7 @@ pub async fn dispatch(
         "ml_provision_classifier" => {
             Some(handle_provision_classifier(req_id, args, state, user_id).await)
         }
+        "ml_teacher_audit" => Some(handle_teacher_audit(req_id, args, state, user_id).await),
         "ml_reset_shadow_window" => {
             Some(handle_reset_shadow_window(req_id, args, state, user_id).await)
         }
@@ -774,6 +784,11 @@ async fn handle_get_model_card(
         .await
         .map(|v| !v.is_empty())
         .unwrap_or(false);
+    // Latest teacher-vs-gold audit (null until ml_teacher_audit runs).
+    let teacher_audit = talos_ml::stored_teacher_audit(&mut tx, model.model_id, user_id)
+        .await
+        .ok()
+        .flatten();
     let card = serde_json::json!({
         "model_id": model.model_id.to_string(),
         "name": name,
@@ -781,6 +796,7 @@ async fn handle_get_model_card(
         "shadow": shadow,
         "shadow_lifetime": shadow_lifetime,
         "has_pending_disagreements": pending_disagreements,
+        "teacher_audit": teacher_audit,
         "dataset_id": model.dataset_id.map(|d| d.to_string()),
         "config_json": model.config_json,
         "policy_json": model.policy_json,
@@ -1038,6 +1054,75 @@ async fn handle_set_lifecycle(
             "State changed concurrently — re-read the model card and retry",
         ),
         Err(e) => internal(req_id, "set_lifecycle", &e),
+    }
+}
+
+/// Teacher-vs-gold audit: parse → build the local-LLM transport closure →
+/// `talos_ml::teacher_audit` (which owns the prompt contract, tenancy
+/// gates, locality pin, and report storage) → format.
+async fn handle_teacher_audit(
+    req_id: Option<Value>,
+    args: &Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let model_id = match parse_uuid(args, "model_id") {
+        Ok(v) => v,
+        Err(m) => return mcp_error(req_id, -32602, &m),
+    };
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(talos_ml::teacher_audit::MAX_AUDIT_ROWS)
+        .clamp(1, talos_ml::teacher_audit::MAX_AUDIT_ROWS);
+    let system_prompt = args.get("system_prompt").and_then(|v| v.as_str());
+    let Some(ollama) = state.ollama_client.clone() else {
+        return mcp_error(
+            req_id,
+            -32000,
+            "Local LLM (ollama) is not configured — the teacher audit runs locally only",
+        );
+    };
+    let svc = dataset_service(state);
+    let classify = move |r: talos_ml::TeacherRequest| {
+        let ollama = ollama.clone();
+        async move {
+            ollama
+                .complete(
+                    &r.llm_model,
+                    &r.system_prompt,
+                    &r.user_content,
+                    r.max_tokens,
+                )
+                .await
+        }
+    };
+    match talos_ml::teacher_audit(
+        &state.db_pool,
+        &svc,
+        user_id,
+        model_id,
+        limit,
+        system_prompt,
+        classify,
+    )
+    .await
+    {
+        Ok(report) => mcp_text(
+            req_id,
+            &serde_json::to_string_pretty(&serde_json::json!({
+                "model_id": model_id.to_string(),
+                "teacher_audit": report,
+                "next_step": "low accuracy = teacher noise is the model's ceiling — review the mismatches, improve the node's SYSTEM_PROMPT or add corrections (they become few-shot anchors), then re-audit",
+            }))
+            .unwrap_or_default(),
+        ),
+        Err(talos_ml::TeacherAuditError::NotFound) => mcp_error(req_id, -32000, "Model not found"),
+        Err(talos_ml::TeacherAuditError::NoDataset) => {
+            mcp_error(req_id, -32000, "Model has no dataset to audit against")
+        }
+        Err(talos_ml::TeacherAuditError::InvalidConfig(m)) => mcp_error(req_id, -32000, &m),
+        Err(talos_ml::TeacherAuditError::Internal(e)) => internal(req_id, "teacher_audit", &e),
     }
 }
 

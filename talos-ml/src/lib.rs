@@ -14,6 +14,7 @@
 //! actor_memory discipline); embeddings are computed with the LOCAL
 //! embedding pipeline only — dataset content never leaves the host.
 
+pub mod active_learning;
 pub mod correction;
 pub mod dataset;
 pub mod delete;
@@ -28,11 +29,12 @@ pub mod loop_health;
 pub mod provision;
 pub mod registry;
 pub mod serve;
+pub mod teacher_audit;
 
 pub use correction::{resolve_disagreement, ResolveError, ResolveOutcome};
 pub use dataset::{
-    AppendExample, DatasetService, DatasetStats, DatasetTenancy, ExampleSource, HoldoutExample,
-    PreparedExample, SampledExample,
+    AppendExample, DatasetService, DatasetStats, DatasetTenancy, ExampleSource, GoldExample,
+    HoldoutExample, PreparedExample, SampledExample,
 };
 pub use delete::{delete_model, DeleteError, DeleteOutcome};
 pub use digest::{run_digest_tick, spawn_disagreement_digest};
@@ -57,3 +59,4 @@ pub use serve::{
     few_shot_for_model, invalidate_serving_cache, serve_predict_batch, ServeError, ServeReply,
     ServedPrediction, ServingMode,
 };
+pub use teacher_audit::{stored_teacher_audit, teacher_audit, TeacherAuditError, TeacherRequest};
