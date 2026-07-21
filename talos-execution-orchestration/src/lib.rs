@@ -39,7 +39,7 @@ mod retry;
 mod terminal_event;
 mod trigger;
 
-pub use approval_resume::WaitingResumeOutcome;
+pub use approval_resume::{ApprovalDecisionOutcome, WaitingResumeOutcome};
 pub use count_memory_write_nodes::count_memory_write_nodes;
 pub use crash_recovery::{recover_stuck_executions, RecoveryDeps};
 pub use deep_merge::deep_merge;
