@@ -2051,12 +2051,21 @@ impl ParallelWorkflowEngine {
                 integration_name: wasm_module.integration_name.clone(),
                 input_payload: job_input,
                 timeout: std::time::Duration::from_secs(body_timeout_secs),
-                // Module default + adaptive learned ceiling (floor), clamped to
-                // the engine-configured per-node ceiling. Loop bodies carry no
-                // graph-JSON `max_fuel` override (generated per iteration), so
-                // the override is `None`. Shared decision point with the single
+                // Per-node fuel precedence: the loop-body node's graph-JSON
+                // `data.max_fuel` override (if set) > module-row default, then
+                // the adaptive learned ceiling as a floor, clamped to the
+                // engine-configured per-node ceiling. The body node's `data`
+                // lands in `node_configs[body_uuid]` at graph load, so its
+                // override is read via `node_config_max_fuel` — pre-fix this
+                // passed a hardcoded `None`, so a body node with an explicit
+                // `max_fuel` was silently ignored and the (often lower)
+                // module-row default won. Shared decision point with the single
                 // + pipeline paths (see `resolve_node_max_fuel`).
-                max_fuel: self.resolve_node_max_fuel(&body_uuid, None, wasm_module.max_fuel),
+                max_fuel: self.resolve_node_max_fuel(
+                    &body_uuid,
+                    self.node_config_max_fuel(&body_uuid),
+                    wasm_module.max_fuel,
+                ),
                 allowed_hosts: wasm_module.allowed_hosts.clone(),
                 allowed_methods: wasm_module.allowed_methods.clone(),
                 allowed_secrets: wasm_module.allowed_secrets.clone(),
