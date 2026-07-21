@@ -2418,6 +2418,19 @@ async fn handle_add_node_to_workflow(
         .update_workflow_graph_unchecked(wf_id, &updated_json)
         .await;
 
+    // Keep a published workflow's active version in sync with the edited
+    // draft (shared helper — see crate::graph::maybe_auto_publish). Since
+    // PR #531 every trigger path runs the ACTIVE PUBLISHED version, so an
+    // added node otherwise never executes until an explicit publish_version.
+    let auto_publish_note = crate::graph::maybe_auto_publish(
+        &state,
+        wf_id,
+        user_id,
+        "Auto-published after add_node_to_workflow",
+    )
+    .await
+    .message_suffix();
+
     let wf_id_str = wf_id.to_string();
     let node_id_str = node_id.to_string();
     let config_is_empty = config.as_object().map(|m| m.is_empty()).unwrap_or(true);
@@ -2493,6 +2506,7 @@ async fn handle_add_node_to_workflow(
             // llm_output_bytes — NOT a single number).
             "applied_max_fuel": applied_max_fuel,
             "template_interpolation_warnings": template_warnings,
+            "auto_publish_note": auto_publish_note.trim(),
             "next_steps_checklist": checklist,
         }))
         .unwrap_or_default(),
@@ -8565,12 +8579,24 @@ async fn handle_add_edge_to_workflow(
         return mcp_error(req_id, -32000, "Failed to save workflow graph");
     }
 
+    // Keep a published workflow's active version in sync with the new edge
+    // (shared helper — see crate::graph::maybe_auto_publish).
+    let auto_publish_note = crate::graph::maybe_auto_publish(
+        &state,
+        wf_id,
+        user_id,
+        "Auto-published after add_edge_to_workflow",
+    )
+    .await
+    .message_suffix();
+
     let mut resp = serde_json::json!({
         "added": true,
         "workflow_id": wf_id.to_string(),
         "source": source,
         "target": target,
         "edge_type": edge_type,
+        "auto_publish_note": auto_publish_note.trim(),
     });
     if let Some(ref cond) = condition {
         if let Some(obj) = resp.as_object_mut() {
@@ -8809,6 +8835,7 @@ async fn handle_swap_node_module(
         .collect();
 
     // ── Mutate the node (skip when dry_run=true) ─────────────────────────────
+    let mut auto_publish_note: &str = "";
     if !dry_run {
         if let Some(node_map) = node_obj.as_object_mut() {
             node_map.insert(
@@ -8836,6 +8863,17 @@ async fn handle_swap_node_module(
             tracing::error!("swap_node_module update failed: {}", e);
             return mcp_error(req_id, -32000, "Failed to persist workflow graph");
         }
+
+        // Keep a published workflow's active version in sync with the swap
+        // (shared helper — see crate::graph::maybe_auto_publish).
+        auto_publish_note = crate::graph::maybe_auto_publish(
+            &state,
+            wf_id,
+            user_id,
+            "Auto-published after swap_node_module",
+        )
+        .await
+        .message_suffix();
     }
 
     let result = serde_json::json!({
@@ -8848,6 +8886,7 @@ async fn handle_swap_node_module(
         "dropped_config_keys": dropped_keys,
         "new_required_fields": new_required_fields,
         "new_required_secrets": new_required_secrets,
+        "auto_publish_note": auto_publish_note.trim(),
         "next_steps": [
             {
                 "step": 1,
