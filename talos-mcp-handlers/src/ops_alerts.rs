@@ -255,17 +255,29 @@ async fn handle_correct(
         .correct_severity(user_id, alert_id, severity)
         .await
     {
-        Ok(true) => mcp_text(
-            req_id,
-            &serde_json::json!({
-                "alert_id": alert_id,
-                "severity": severity,
-                "corrected": true,
-                "note": "Correction recorded — outranks classifier labels and survives dedup bumps."
-            })
-            .to_string(),
-        ),
-        Ok(false) => mcp_error(req_id, -32000, "Alert not found or not yours"),
+        Ok(Some(bridge)) => {
+            // Fan the human label into any ML dataset already tracking this
+            // alert (corrections→distillation bridge). Fire-and-forget: a
+            // bridge failure must never fail the correction the operator just
+            // made.
+            talos_ml::spawn_ops_correction_bridge(
+                user_id,
+                bridge.example_key,
+                bridge.features_text,
+                severity.to_string(),
+            );
+            mcp_text(
+                req_id,
+                &serde_json::json!({
+                    "alert_id": alert_id,
+                    "severity": severity,
+                    "corrected": true,
+                    "note": "Correction recorded — outranks classifier labels and survives dedup bumps."
+                })
+                .to_string(),
+            )
+        }
+        Ok(None) => mcp_error(req_id, -32000, "Alert not found or not yours"),
         Err(e) => {
             tracing::error!("correct_ops_alert_severity failed: {:#}", e);
             crate::utils::database_error(req_id)

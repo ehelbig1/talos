@@ -29,6 +29,11 @@
         ],
         "default": "resolve",
         "description": "What a state=closed notification does: 'resolve' (default) auto-resolves the rolling alert via status_event; 'ignore' skips it; 'ingest' treats it as a normal alert event (bumps — will REOPEN an operator-resolved row)."
+      },
+      "EMIT_OPS_ALERTS": {
+        "type": "boolean",
+        "default": true,
+        "description": "When true (default), the alert (and any state=closed recovery event) rides out under the __ops_alert__ engine-hook key so THIS node ingests it. Set false to emit the same entries under a plain 'alerts' key for a downstream 'Hybrid Classify (Alerts)' node, which becomes the sole __ops_alert__ emitter and decides severity via the ops-severity classifier + LLM fallback. Recovery (status_event) entries have no title and are passed through the classifier untouched."
       }
     }
   }

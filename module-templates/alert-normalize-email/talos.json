@@ -19,6 +19,11 @@
         "type": "boolean",
         "default": false,
         "description": "When true, mail matching generic alert keywords (alert/incident/outage/failure in the subject) that no specific parser claims is emitted as source 'generic-email' with severity unclassified"
+      },
+      "EMIT_OPS_ALERTS": {
+        "type": "boolean",
+        "default": true,
+        "description": "When true (default), the parsed alerts ride out under the __ops_alert__ engine-hook key so THIS node ingests them into the ops_alerts store (standalone deployment). Set false to emit the same alerts under a plain 'alerts' key instead — hand it to a downstream 'Hybrid Classify (Alerts)' node, which becomes the sole __ops_alert__ emitter and decides severity via the ops-severity classifier + LLM fallback at first ingest."
       }
     }
   }

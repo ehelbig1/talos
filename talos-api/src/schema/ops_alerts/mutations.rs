@@ -39,13 +39,26 @@ impl OpsAlertsMutations {
         if !ASSIGNABLE_SEVERITIES.contains(&severity.trim()) {
             return Err(async_graphql::Error::new(INVALID_SEVERITY_MSG).extend_safe());
         }
-        OpsAlertRepository::new(db_pool.clone())
+        let bridge = OpsAlertRepository::new(db_pool.clone())
             .correct_severity(user_id, alert_id, severity.trim())
             .await
             .map_err(|e| {
                 tracing::error!(target: "talos_ops_alerts", error = %e, "correct_ops_alert_severity failed");
                 async_graphql::Error::new("Could not correct alert severity").extend_safe()
-            })
+            })?;
+        let corrected = bridge.is_some();
+        if let Some(bridge) = bridge {
+            // Fan the human label into any ML dataset already tracking this
+            // alert (corrections→distillation bridge). Fire-and-forget: a
+            // bridge failure must never fail the correction.
+            talos_ml::spawn_ops_correction_bridge(
+                user_id,
+                bridge.example_key,
+                bridge.features_text,
+                severity.trim().to_string(),
+            );
+        }
+        Ok(corrected)
     }
 
     /// Acknowledge a `new` alert. Returns false when the row doesn't exist,

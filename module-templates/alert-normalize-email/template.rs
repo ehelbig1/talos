@@ -21,6 +21,15 @@ use talos_sdk_macros::talos_module;
 // Severity here is a HEURISTIC HINT only (severity_hint applies on first
 // ingest; the Smart-Classifier pass and human corrections own it after
 // that). Everything is typed-struct parsed per the WASM fuel rules.
+//
+// Config `EMIT_OPS_ALERTS` (default true): when true, the parsed alerts
+// ride out under the `__ops_alert__` engine-hook key so THIS node ingests
+// them (the standalone deployment). Set it false to hand the SAME `alerts`
+// array to a downstream `hybrid-classify-alerts` node under a plain
+// `alerts` key instead — the classifier then becomes the SOLE emitter of
+// `__ops_alert__`, so severity is model/LLM-decided at first ingest rather
+// than heuristic. Existing single-node deployments are unaffected (default
+// true keeps this node the emitter).
 
 #[derive(serde::Deserialize)]
 struct Envelope {
@@ -220,6 +229,12 @@ fn run(input: String) -> Result<String, String> {
         .get("INCLUDE_GENERIC")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // Default true → this node ingests (backward-compatible). False → emit a
+    // plain `alerts` array for a downstream classify node to own instead.
+    let emit_ops_alerts = config
+        .get("EMIT_OPS_ALERTS")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
     let messages = env
         .input
@@ -258,15 +273,21 @@ fn run(input: String) -> Result<String, String> {
         }
     }
 
-    // The engine's `__ops_alert__` hook persists `alerts`; the summary
-    // fields are the node's user-visible output for downstream digests.
-    Ok(serde_json::json!({
+    // The summary fields are the node's user-visible output for downstream
+    // digests. The `alerts` array rides under `__ops_alert__` (this node
+    // ingests) OR a plain `alerts` key (a downstream classify node ingests),
+    // per EMIT_OPS_ALERTS.
+    let mut out = serde_json::json!({
         "normalized": alerts.len(),
         "skipped_non_alert": skipped,
         "sources": alerts.iter()
             .filter_map(|a| a.get("source").and_then(|s| s.as_str()))
             .collect::<std::collections::BTreeSet<_>>(),
-        "__ops_alert__": { "alerts": alerts },
-    })
-    .to_string())
+    });
+    if emit_ops_alerts {
+        out["__ops_alert__"] = serde_json::json!({ "alerts": alerts });
+    } else {
+        out["alerts"] = serde_json::json!(alerts);
+    }
+    Ok(out.to_string())
 }

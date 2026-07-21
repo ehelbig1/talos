@@ -8985,6 +8985,7 @@ dependencies = [
  "talos-idempotency",
  "talos-integration-helpers",
  "talos-metrics",
+ "talos-ml",
  "talos-module-executions",
  "talos-module-payload-encryption",
  "talos-ops-alerts-repository",
