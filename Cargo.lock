@@ -8172,6 +8172,7 @@ dependencies = [
  "talos-secrets-manager",
  "tokio",
  "tracing",
+ "uuid",
  "zeroize",
 ]
 

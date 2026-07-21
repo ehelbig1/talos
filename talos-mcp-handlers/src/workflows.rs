@@ -7155,7 +7155,13 @@ fn spawn_llm_auto_fill_task(
                 label,
                 missing_fields.join(", ")
             );
-            let suggestion = match llm_arc.generate_text(sys, &usr).await {
+            // R2 token ledger: attribute usage to the requesting user.
+            let suggestion = match talos_llm::usage::scoped_user(
+                user_id,
+                llm_arc.generate_text(sys, &usr),
+            )
+            .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!("auto_fill_config LLM error for {}: {}", label, e);

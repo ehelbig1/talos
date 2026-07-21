@@ -76,6 +76,13 @@ impl TalosContext {
             self.http_client.clone()
         };
 
+        // R2 token ledger: usage events arrive inside the spawned reader
+        // loop; clone the per-job accumulator + identity in so the fold
+        // lands on this job even though the loop outlives the host call.
+        let usage_acc = self.llm_usage.clone();
+        let usage_provider = adapter.name();
+        let usage_model = model.to_string();
+
         tokio::spawn(async move {
             let client = spawn_http_client;
             let mut req_builder = client.post(&url).header("Content-Type", "application/json");
@@ -221,6 +228,16 @@ impl TalosContext {
                                 input_tokens,
                                 output_tokens,
                             } => {
+                                // R2 token ledger: record even if the guest
+                                // never polls this event off the channel —
+                                // the tokens were spent either way.
+                                crate::context::fold_llm_usage(
+                                    &usage_acc,
+                                    usage_provider,
+                                    &usage_model,
+                                    input_tokens,
+                                    output_tokens,
+                                );
                                 let _ = tx
                                     .send(serde_json::json!({
                                         "type": "usage",

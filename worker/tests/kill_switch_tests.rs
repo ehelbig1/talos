@@ -328,6 +328,7 @@ async fn pipeline_mid_step_failure_propagates() {
             false,
             talos_workflow_job_protocol::LlmTier::Tier2,
             talos_workflow_job_protocol::WriteCeiling::Write,
+            None, // llm_usage_out — not collected in kill-switch tests
         )
         .await;
 
@@ -373,6 +374,7 @@ async fn pipeline_mid_step_trap_propagates() {
             false,
             talos_workflow_job_protocol::LlmTier::Tier2,
             talos_workflow_job_protocol::WriteCeiling::Write,
+            None, // llm_usage_out — not collected in kill-switch tests
         )
         .await;
 
@@ -400,6 +402,7 @@ async fn pipeline_all_steps_ok_succeeds() {
             false,
             talos_workflow_job_protocol::LlmTier::Tier2,
             talos_workflow_job_protocol::WriteCeiling::Write,
+            None, // llm_usage_out — not collected in kill-switch tests
         )
         .await
         .expect("all-ok pipeline should succeed");

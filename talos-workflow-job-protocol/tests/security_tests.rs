@@ -391,6 +391,7 @@ fn unsigned_request_fails_verification() {
 fn tampered_job_result_status_fails() {
     let key = test_key();
     let mut result = JobResult {
+        llm_usage: vec![],
         crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         status: JobStatus::Failed,
@@ -416,6 +417,7 @@ fn tampered_job_result_status_fails() {
 fn tampered_job_result_execution_time_fails() {
     let key = test_key();
     let mut result = JobResult {
+        llm_usage: vec![],
         crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         status: JobStatus::Success,
@@ -558,6 +560,7 @@ fn tampered_pipeline_step_integration_name_fails() {
 
 fn signed_job_result(key: &[u8]) -> JobResult {
     let mut result = JobResult {
+        llm_usage: vec![],
         crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         status: JobStatus::Success,
@@ -689,6 +692,7 @@ fn verify_no_replay_does_not_pollute_cache_for_subsequent_verify() {
 
 fn signed_pipeline_result(key: &[u8]) -> talos_workflow_job_protocol::PipelineJobResult {
     let mut result = talos_workflow_job_protocol::PipelineJobResult {
+        llm_usage: vec![],
         crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         overall_status: JobStatus::Success,
@@ -805,6 +809,7 @@ fn pipeline_verify_no_replay_does_not_pollute_cache() {
 fn tampered_job_result_worker_id_fails() {
     let key = test_key();
     let mut result = JobResult {
+        llm_usage: vec![],
         crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         status: JobStatus::Success,
@@ -832,6 +837,7 @@ fn tampered_job_result_worker_id_fails() {
 fn tampered_pipeline_result_worker_id_fails() {
     let key = test_key();
     let mut result = talos_workflow_job_protocol::PipelineJobResult {
+        llm_usage: vec![],
         crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         step_results: vec![],
@@ -858,6 +864,7 @@ fn worker_id_invalid_chars_rejected_at_sign_time() {
     // worker_id fails closed without producing an artifact at all.
     let key = test_key();
     let mut result = JobResult {
+        llm_usage: vec![],
         crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         status: JobStatus::Success,
@@ -890,6 +897,7 @@ fn worker_id_empty_passes_for_backcompat() {
     // fixtures; empty must still verify cleanly.
     let key = test_key();
     let mut result = JobResult {
+        llm_usage: vec![],
         crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         status: JobStatus::Success,

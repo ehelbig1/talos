@@ -7,6 +7,68 @@ use wasmtime::component::ResourceTable;
 use wasmtime::ResourceLimiter;
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
+/// R2 token ledger: shared per-job LLM usage accumulator.
+///
+/// Keyed by `(provider, model)`; value is
+/// `(prompt_tokens, completion_tokens, calls)` with saturating adds. A plain
+/// std `Mutex` (never held across an await) mirrors `stderr_capture`. The
+/// dispatch paths in `main.rs` create one per job, thread it into the
+/// context, and drain it into the signed result via
+/// [`drain_llm_usage_entries`].
+pub type LlmUsageAcc = Arc<std::sync::Mutex<HashMap<(String, String), (u64, u64, u32)>>>;
+
+/// Fold one LLM call's provider-reported usage into the accumulator.
+/// Saturating arithmetic — a hostile provider reporting `u64::MAX` tokens
+/// shows up as a visible spike, never a wrap. Poisoned-lock is impossible in
+/// practice (no panics while held) but degrades to a silent drop rather than
+/// propagating a panic into the host fn.
+pub fn fold_llm_usage(
+    acc: &LlmUsageAcc,
+    provider: &str,
+    model: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) {
+    if prompt_tokens == 0 && completion_tokens == 0 {
+        return;
+    }
+    if let Ok(mut map) = acc.lock() {
+        let slot = map
+            .entry((provider.to_string(), model.to_string()))
+            .or_insert((0, 0, 0));
+        slot.0 = slot.0.saturating_add(prompt_tokens);
+        slot.1 = slot.1.saturating_add(completion_tokens);
+        slot.2 = slot.2.saturating_add(1);
+    }
+}
+
+/// Drain the accumulator into the wire form for the signed result: sorted by
+/// `(provider, model)` (deterministic), token counts saturated to `u32` (the
+/// wire type; a >4B-token job saturates loudly rather than wrapping), and
+/// truncated to [`talos_workflow_job_protocol::MAX_LLM_USAGE_ENTRIES`].
+pub fn drain_llm_usage_entries(
+    acc: &LlmUsageAcc,
+) -> Vec<talos_workflow_job_protocol::LlmUsageEntry> {
+    let mut items: Vec<((String, String), (u64, u64, u32))> = match acc.lock() {
+        Ok(mut map) => map.drain().collect(),
+        Err(_) => return Vec::new(),
+    };
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    items
+        .into_iter()
+        .take(talos_workflow_job_protocol::MAX_LLM_USAGE_ENTRIES)
+        .map(
+            |((provider, model), (p, c, calls))| talos_workflow_job_protocol::LlmUsageEntry {
+                provider,
+                model,
+                prompt_tokens: u32::try_from(p).unwrap_or(u32::MAX),
+                completion_tokens: u32::try_from(c).unwrap_or(u32::MAX),
+                calls,
+            },
+        )
+        .collect()
+}
+
 /// The execution context for a single Wasm job.
 ///
 /// Holds WASI state, resource limits, pre-fetched secrets, workflow metadata,
@@ -321,6 +383,17 @@ pub struct TalosContext {
     /// Captures bytes written to WASI stderr during execution (panic messages, etc.).
     /// Shared with the WasiCtx via a clone; readable from outside the Store after execution.
     pub stderr_capture: Arc<std::sync::Mutex<Vec<u8>>>,
+
+    /// R2 token ledger: per-job LLM token usage accumulator, keyed by
+    /// `(provider, model)`. The `llm` / `llm-tools` / `llm-streaming` host
+    /// fns fold each provider-reported usage into this map; the job runner
+    /// drains it into the SIGNED `JobResult.llm_usage` /
+    /// `PipelineJobResult.llm_usage` (workers are DB-free — the signed
+    /// result is the only path usage takes to the controller). Same
+    /// share-outside-the-Store pattern as `stderr_capture`: the dispatch
+    /// paths in `main.rs` pass their own Arc in so usage survives job
+    /// timeout/failure (tokens spent before a trap are still spent).
+    pub llm_usage: LlmUsageAcc,
 
     /// When true, non-GET HTTP requests, webhook sends, and messaging publishes
     /// are mocked with success responses instead of executing real network calls.
@@ -1090,6 +1163,10 @@ impl TalosContext {
                 .or_else(|| Some("us-east-1".to_string())),
             metrics: None,
             stderr_capture,
+            // Fresh per-context accumulator; dispatch paths that need to
+            // read usage after execution overwrite this with their own Arc
+            // (same pattern as `state_store` sharing across pipeline steps).
+            llm_usage: Arc::new(std::sync::Mutex::new(HashMap::new())),
             dry_run: false,
             actor_id: None,
             // Stamped from the constructor arg so the SSRF resolver's
@@ -1979,5 +2056,88 @@ mod host_diagnostic_tests {
             let msg = e["message"].as_str().unwrap();
             assert!(msg.starts_with(&format!("[host:{reason}] ")), "{msg}");
         }
+    }
+}
+
+#[cfg(test)]
+mod llm_usage_acc_tests {
+    use super::*;
+
+    fn acc() -> LlmUsageAcc {
+        Arc::new(std::sync::Mutex::new(HashMap::new()))
+    }
+
+    #[test]
+    fn fold_merges_per_provider_model_and_counts_calls() {
+        let a = acc();
+        fold_llm_usage(&a, "anthropic", "m1", 100, 20);
+        fold_llm_usage(&a, "anthropic", "m1", 50, 10);
+        fold_llm_usage(&a, "ollama", "m2", 7, 3);
+        // Zero-usage observations are dropped (a provider that sent no
+        // counts must not inflate `calls`).
+        fold_llm_usage(&a, "ollama", "m2", 0, 0);
+
+        let entries = drain_llm_usage_entries(&a);
+        assert_eq!(entries.len(), 2);
+        // Sorted by (provider, model): anthropic before ollama.
+        assert_eq!(entries[0].provider, "anthropic");
+        assert_eq!(entries[0].model, "m1");
+        assert_eq!(
+            (
+                entries[0].prompt_tokens,
+                entries[0].completion_tokens,
+                entries[0].calls
+            ),
+            (150, 30, 2)
+        );
+        assert_eq!(entries[1].provider, "ollama");
+        assert_eq!(
+            (
+                entries[1].prompt_tokens,
+                entries[1].completion_tokens,
+                entries[1].calls
+            ),
+            (7, 3, 1)
+        );
+    }
+
+    #[test]
+    fn drain_empties_the_accumulator() {
+        let a = acc();
+        fold_llm_usage(&a, "p", "m", 1, 1);
+        assert_eq!(drain_llm_usage_entries(&a).len(), 1);
+        assert!(drain_llm_usage_entries(&a).is_empty());
+    }
+
+    #[test]
+    fn drain_saturates_u64_counts_to_u32_wire_type() {
+        let a = acc();
+        fold_llm_usage(&a, "p", "m", u64::from(u32::MAX) + 5, 1);
+        let entries = drain_llm_usage_entries(&a);
+        assert_eq!(entries[0].prompt_tokens, u32::MAX);
+        assert_eq!(entries[0].completion_tokens, 1);
+    }
+
+    #[test]
+    fn fold_saturates_accumulation() {
+        let a = acc();
+        fold_llm_usage(&a, "p", "m", u64::MAX - 1, 0);
+        fold_llm_usage(&a, "p", "m", 100, 0);
+        let entries = drain_llm_usage_entries(&a);
+        // u64 accumulation saturated, then saturated again to u32.
+        assert_eq!(entries[0].prompt_tokens, u32::MAX);
+        assert_eq!(entries[0].calls, 2);
+    }
+
+    #[test]
+    fn drain_truncates_to_protocol_cap() {
+        let a = acc();
+        for i in 0..(talos_workflow_job_protocol::MAX_LLM_USAGE_ENTRIES + 8) {
+            fold_llm_usage(&a, "p", &format!("model-{i:03}"), 1, 1);
+        }
+        assert_eq!(
+            drain_llm_usage_entries(&a).len(),
+            talos_workflow_job_protocol::MAX_LLM_USAGE_ENTRIES
+        );
     }
 }

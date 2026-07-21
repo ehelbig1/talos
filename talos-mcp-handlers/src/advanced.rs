@@ -1775,6 +1775,7 @@ async fn handle_run_scratch_session(
             uuid::Uuid::nil(), // user_id (controller-internal test path)
             talos_workflow_job_protocol::LlmTier::default(), // tier2 for internal tests
             talos_workflow_job_protocol::WriteCeiling::Write, // permissive: internal test path
+            None,              // llm_usage_out — internal test path doesn't collect usage
         )
         .await;
 
@@ -3036,9 +3037,12 @@ async fn handle_get_config_suggestions(
     );
 
     let user_prompt_redacted = state.dlp_service.redact_str(&user_prompt);
-    let llm_response = llm
-        .generate_text(system_prompt, &user_prompt_redacted)
-        .await;
+    // R2 token ledger: attribute usage to the requesting user.
+    let llm_response = talos_llm::usage::scoped_user(
+        user_id,
+        llm.generate_text(system_prompt, &user_prompt_redacted),
+    )
+    .await;
     let suggestions: serde_json::Value = match llm_response {
         Ok(s) => serde_json::from_str(&s).unwrap_or(serde_json::json!({})),
         Err(e) => {

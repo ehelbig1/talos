@@ -300,6 +300,7 @@ mod tests {
 
     fn result(job_id: Uuid) -> JobResult {
         JobResult {
+            llm_usage: vec![],
             crypto_scheme: 0,
             job_id,
             status: talos_workflow_job_protocol::JobStatus::Success,

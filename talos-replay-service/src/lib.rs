@@ -824,6 +824,7 @@ async fn run_replays(
                 // gate governs live execution, which the actor binding
                 // stamps there.
                 talos_workflow_job_protocol::WriteCeiling::Write,
+                None, // llm_usage_out — replay diagnostics don't collect usage
             )
             .await;
         let duration_ms = start.elapsed().as_millis() as i64;

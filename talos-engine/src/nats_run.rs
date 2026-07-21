@@ -59,6 +59,22 @@ fn ensure_signing_key_present_in_production(
     Ok(())
 }
 
+/// R2 token ledger: process-wide LLM usage sink, installed once at
+/// controller boot (`install_llm_usage_sink`, next to the
+/// `talos_ml::DISTILL_CONTEXT` wiring) and attached to EVERY
+/// `NatsNodeDispatcher` built here — `build_nats_dispatcher` runs per
+/// dispatch, but there must be exactly one recorder per process (same
+/// memoization rationale as `envelope_sealing_handle`). Unset (tests,
+/// tools without a DB) simply drops usage.
+static LLM_USAGE_SINK: std::sync::OnceLock<talos_workflow_engine_nats::LlmUsageSink> =
+    std::sync::OnceLock::new();
+
+/// Install the process-wide LLM usage sink. First caller wins (OnceLock);
+/// the sink MUST be non-blocking (spawn DB writes internally).
+pub fn install_llm_usage_sink(sink: talos_workflow_engine_nats::LlmUsageSink) {
+    let _ = LLM_USAGE_SINK.set(sink);
+}
+
 /// Build the Talos default `NodeDispatcher` from a raw
 /// `async_nats::Client`. Used by `run_with_nats`, `run_with_seed_via_nats`,
 /// and `run_with_trigger_input_via_nats` so construction is in exactly
@@ -91,6 +107,14 @@ pub fn build_nats_dispatcher(
         retry_classifier,
         expression_evaluator,
     );
+    // R2 token ledger: attach the process-wide usage recorder (when the
+    // controller installed one at boot) so every verified result's
+    // llm_usage lands in the ledger regardless of which code path built
+    // this dispatcher.
+    let dispatcher = match LLM_USAGE_SINK.get() {
+        Some(sink) => dispatcher.with_llm_usage_sink(sink.clone()),
+        None => dispatcher,
+    };
     // Inject the result verify-ring: the current signing key plus any
     // WORKER_SHARED_KEY_PREVIOUS staged for a rolling rotation, so a worker
     // result signed under a previous key still verifies. Signing is unchanged

@@ -176,6 +176,7 @@ pub fn parse_scaffold_request(args: &Value) -> Result<ScaffoldRequest, String> {
             "max_workflow_count",
             "max_workflows_per_minute",
             "max_compilations_per_hour",
+            "max_llm_tokens_per_day",
         ] {
             if let Some(v) = o.get(*field) {
                 if v.as_f64().is_some_and(|f| f.fract() != 0.0) {
@@ -195,16 +196,18 @@ pub fn parse_scaffold_request(args: &Value) -> Result<ScaffoldRequest, String> {
         let max_executions_total = get_i64("max_executions_total");
         let max_fuel_per_execution = get_i64("max_fuel_per_execution");
         let max_fuel_per_hour = get_i64("max_fuel_per_hour");
+        let max_llm_tokens_per_day = get_i64("max_llm_tokens_per_day");
 
         // MCP-1183: positivity check on all 8 fields. None = omitted
         // (use default / no limit); 0 or negative is invalid for any
         // budget knob (a zero-fuel budget means no WASM execution
         // can complete; a negative count is semantically meaningless).
-        let field_checks: [(&str, Option<i64>); 8] = [
+        let field_checks: [(&str, Option<i64>); 9] = [
             (
                 "max_executions_per_hour",
                 max_executions_per_hour.map(i64::from),
             ),
+            ("max_llm_tokens_per_day", max_llm_tokens_per_day),
             ("max_executions_total", max_executions_total),
             ("max_fuel_per_execution", max_fuel_per_execution),
             ("max_fuel_per_hour", max_fuel_per_hour),
@@ -239,6 +242,7 @@ pub fn parse_scaffold_request(args: &Value) -> Result<ScaffoldRequest, String> {
             max_workflow_count,
             max_workflows_per_minute,
             max_compilations_per_hour,
+            max_llm_tokens_per_day,
             on_budget_exceeded: o
                 .get("on_budget_exceeded")
                 .and_then(|v| v.as_str())

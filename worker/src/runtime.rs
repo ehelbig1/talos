@@ -2313,6 +2313,7 @@ impl TalosRuntime {
             uuid::Uuid::nil(), // user_id — legacy helper has no user context
             talos_workflow_job_protocol::LlmTier::default(), // tier2 for legacy helper
             talos_workflow_job_protocol::WriteCeiling::default(), // write (permissive) for legacy helper
+            None, // llm_usage_out — legacy helper doesn't collect usage
         )
         .await
     }
@@ -2364,6 +2365,13 @@ impl TalosRuntime {
         // ops when `TALOS_WRITE_CEILING_ENFORCED=1`. Stamped onto the
         // TalosContext alongside `max_llm_tier`.
         max_write_ceiling: talos_workflow_job_protocol::WriteCeiling,
+        // R2 token ledger: when provided, the job's TalosContext shares THIS
+        // accumulator instead of a private one, so the caller can drain
+        // provider-reported LLM token usage after the call returns —
+        // including on failure/timeout (tokens spent before a trap are
+        // still spent). `None` = caller doesn't collect usage (legacy
+        // wrappers, controller-embedded sandbox runs).
+        llm_usage_out: Option<crate::context::LlmUsageAcc>,
     ) -> Result<JsonValue> {
         // Per-job fuel override: use the controller-supplied value when non-zero,
         // otherwise fall back to the runtime's global fuel_limit.
@@ -2547,6 +2555,7 @@ impl TalosRuntime {
                     user_id,
                     max_llm_tier,
                     max_write_ceiling,
+                    llm_usage_out.clone(),
                 )
                 .await
             {
@@ -2698,6 +2707,9 @@ impl TalosRuntime {
         // ops when `TALOS_WRITE_CEILING_ENFORCED=1`. Stamped onto the
         // TalosContext alongside `max_llm_tier`.
         max_write_ceiling: talos_workflow_job_protocol::WriteCeiling,
+        // R2 token ledger: caller-shared LLM usage accumulator (see
+        // `execute_job_with_full_features`).
+        llm_usage_out: Option<crate::context::LlmUsageAcc>,
     ) -> Result<JsonValue> {
         // DISTRIBUTED TRACING: Create execution span
         let execution_id = execution_context
@@ -2786,6 +2798,11 @@ impl TalosRuntime {
         // Wire actor_id for persistent agent-memory operations.
         if let Some(aid) = actor_id {
             context.actor_id = Some(aid);
+        }
+        // R2 token ledger: share the caller's accumulator so LLM usage is
+        // readable after execution (drained into the signed JobResult).
+        if let Some(ref acc) = llm_usage_out {
+            context.llm_usage = acc.clone();
         }
         // Wire LLM tier ceiling. `get_llm_api_key` refuses to resolve
         // external-provider keys when this is Tier1.
@@ -3474,6 +3491,12 @@ impl TalosRuntime {
         // dispatch. `ReadOnly` + enforcement on = data-mutating host ops
         // refused.
         max_write_ceiling: talos_workflow_job_protocol::WriteCeiling,
+        // R2 token ledger: when provided, EVERY step's context shares this
+        // accumulator, so the caller can drain whole-pipeline LLM usage
+        // after the call — including when the pipeline bails mid-way
+        // (tokens spent by completed steps are still spent). Mirrors the
+        // `llm_usage_out` param on `execute_job_with_full_features`.
+        llm_usage_out: Option<crate::context::LlmUsageAcc>,
     ) -> Result<PipelineResult> {
         if steps.is_empty() {
             anyhow::bail!("pipeline must have at least one step");
@@ -3485,6 +3508,14 @@ impl TalosRuntime {
         // One state store shared across all steps.
         let shared_state: Arc<std::sync::Mutex<HashMap<String, String>>> =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        // R2 token ledger: ONE usage accumulator shared by every step's
+        // context — pipeline usage is reported whole-pipeline in the signed
+        // PipelineJobResult, mirroring the single-claim secrets model. Use
+        // the caller's Arc when provided so usage survives a mid-pipeline
+        // bail (the caller drains it on both Ok and Err).
+        let shared_llm_usage: crate::context::LlmUsageAcc =
+            llm_usage_out.unwrap_or_else(|| Arc::new(std::sync::Mutex::new(HashMap::new())));
 
         // Optional shared sandbox directory (lifetime spans the entire pipeline).
         let shared_sandbox_dir = if share_sandbox {
@@ -3588,6 +3619,9 @@ impl TalosRuntime {
 
             // Share the pipeline-scoped state store across steps.
             context.state_store = shared_state.clone();
+
+            // Share the pipeline-scoped LLM usage accumulator across steps.
+            context.llm_usage = shared_llm_usage.clone();
 
             // Share the sandbox directory through the `files` host interface.
             if let Some(ref sandbox_dir) = shared_sandbox_dir {

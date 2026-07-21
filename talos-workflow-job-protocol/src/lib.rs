@@ -2933,6 +2933,97 @@ pub enum JobStatus {
     TimedOut,
 }
 
+/// Upper bound on the number of [`LlmUsageEntry`] rows a single result may
+/// carry. The worker aggregates provider token usage per `(provider, model)`
+/// before draining into the result, so this is a bound on *distinct model
+/// combinations used in one job*, not on the call count. Truncating keeps the
+/// signed payload small and prevents a runaway module (looping over many
+/// model names) from bloating every result message. See
+/// [`aggregate_llm_usage`].
+pub const MAX_LLM_USAGE_ENTRIES: usize = 16;
+
+/// Per-`(provider, model)` LLM token usage observed by the worker during a
+/// single job, surfaced to the controller inside the SIGNED
+/// [`JobResult`] / [`PipelineJobResult`] (workers are credential-free and
+/// DB-free — usage cannot be written to the DB from the worker; it rides the
+/// signed result instead).
+///
+/// Aggregated per provider+model (NOT per call) so the vec is bounded by the
+/// number of distinct models a job touches. `calls` records how many
+/// individual completions folded into this row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmUsageEntry {
+    pub provider: String,
+    pub model: String,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub calls: u32,
+}
+
+impl LlmUsageEntry {
+    /// Canonical single-line form for the signing digest. Fixed-shape,
+    /// pipe-delimited; neither `provider` nor `model` may contain `|` in
+    /// practice (provider is a fixed enum-ish string, model is a
+    /// provider-issued identifier), and even if they did the collision is
+    /// only a hash pre-image concern the SHA-256 absorbs.
+    fn canonical_line(&self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}",
+            self.provider, self.model, self.prompt_tokens, self.completion_tokens, self.calls
+        )
+    }
+}
+
+/// Fold raw per-call `(provider, model, prompt_tokens, completion_tokens)`
+/// observations into a bounded, order-independent `Vec<LlmUsageEntry>`
+/// aggregated per `(provider, model)`.
+///
+/// PURE — no I/O, deterministic. Both the worker's usage-drain path and the
+/// unit tests call this exact function so the merge logic can't drift. Token
+/// counts accumulate with saturating `u32` arithmetic (a single call can't
+/// realistically exceed `u32::MAX` tokens, but saturating keeps it total).
+/// The result is sorted by `(provider, model)` and truncated to
+/// [`MAX_LLM_USAGE_ENTRIES`] so the signing digest and wire size are bounded.
+pub fn aggregate_llm_usage(
+    raw: impl IntoIterator<Item = (String, String, u32, u32)>,
+) -> Vec<LlmUsageEntry> {
+    use std::collections::BTreeMap;
+    let mut acc: BTreeMap<(String, String), (u32, u32, u32)> = BTreeMap::new();
+    for (provider, model, prompt, completion) in raw {
+        let slot = acc.entry((provider, model)).or_insert((0, 0, 0));
+        slot.0 = slot.0.saturating_add(prompt);
+        slot.1 = slot.1.saturating_add(completion);
+        slot.2 = slot.2.saturating_add(1);
+    }
+    acc.into_iter()
+        .map(|((provider, model), (p, c, calls))| LlmUsageEntry {
+            provider,
+            model,
+            prompt_tokens: p,
+            completion_tokens: c,
+            calls,
+        })
+        .take(MAX_LLM_USAGE_ENTRIES)
+        .collect()
+}
+
+/// Bind an `llm_usage` vec into a signing payload: returns `Some(hex_sha256)`
+/// of the canonical, sorted, newline-joined entry lines when non-empty, or
+/// `None` when the vec is empty (so an empty vec appends NOTHING to the
+/// signing payload and old messages verify byte-identically).
+///
+/// Entries are sorted before hashing so the digest is order-independent —
+/// two results with the same usage in a different vec order sign the same.
+fn llm_usage_signing_hash(entries: &[LlmUsageEntry]) -> Option<String> {
+    use sha2::Digest;
+    if entries.is_empty() {
+        return None;
+    }
+    let mut lines: Vec<String> = entries.iter().map(LlmUsageEntry::canonical_line).collect();
+    lines.sort_unstable();
+    Some(hex::encode(Sha256::digest(lines.join("\n").as_bytes())))
+}
+
 /// Result returned by a Worker to the Controller via NATS.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct JobResult {
@@ -2972,6 +3063,17 @@ pub struct JobResult {
     /// HMAC `signing_payload()`, so scheme-0 bytes stay identical to pre-P2.
     #[serde(default)]
     pub crypto_scheme: u8,
+
+    /// Per-`(provider, model)` LLM token usage observed during this job.
+    /// Empty for jobs that made no LLM calls. Bound into
+    /// [`Self::signing_payload`] ONLY when non-empty (append-at-end, so old
+    /// messages with no usage sign byte-identically — no coordinated restart
+    /// for the no-LLM path). The controller attributes these tokens to the
+    /// execution's actor/user from ITS OWN records; the worker-supplied
+    /// provider/model/counts are advisory metrics, not an identity claim.
+    /// Capped at [`MAX_LLM_USAGE_ENTRIES`] by the worker.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub llm_usage: Vec<LlmUsageEntry>,
 }
 
 impl JobResult {
@@ -3007,7 +3109,7 @@ impl JobResult {
         // are pre-split on newlines by the worker). Hash to a fixed
         // 64-char hex digest so the signing payload size is bounded.
         let logs_hash = hex::encode(Sha256::digest(self.logs.join("\n").as_bytes()));
-        format!(
+        let mut payload = format!(
             "{}:{}:{}:{}:{}:{}:{}",
             self.job_id,
             status_str,
@@ -3018,8 +3120,19 @@ impl JobResult {
             logs_hash,
             // L-11: appended AT THE END (after L-10) per the same rule.
             self.worker_id,
-        )
-        .into_bytes()
+        );
+        // R2 token ledger (2026-07-20): bind `llm_usage` ONLY when non-empty,
+        // mirroring the `sealing != 0` conditional-append precedent on
+        // JobRequest. A result with no LLM usage signs byte-identically to the
+        // pre-R2 format (old workers / old messages verify unchanged); a
+        // result that DOES carry usage commits to the sorted canonical entry
+        // digest, so an on-wire tamperer can't inflate/deflate another
+        // actor's token attribution without invalidating the signature.
+        if let Some(usage_hash) = llm_usage_signing_hash(&self.llm_usage) {
+            use std::fmt::Write as _;
+            let _ = write!(payload, ":llm_usage:{usage_hash}");
+        }
+        payload.into_bytes()
     }
 
     /// Sign the result using the pre-shared `key`. **Back-compat wrapper —
@@ -3800,6 +3913,13 @@ pub struct PipelineJobResult {
     /// RFC 0010 P2: signature scheme (see [`JobResult::crypto_scheme`]).
     #[serde(default)]
     pub crypto_scheme: u8,
+
+    /// Per-`(provider, model)` LLM token usage for the WHOLE pipeline
+    /// (accumulated across steps). Same contract as [`JobResult::llm_usage`]:
+    /// empty when no LLM calls happened, bound into the signing payload only
+    /// when non-empty (append-at-end), capped at [`MAX_LLM_USAGE_ENTRIES`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub llm_usage: Vec<LlmUsageEntry>,
 }
 
 impl PipelineJobResult {
@@ -3846,7 +3966,7 @@ impl PipelineJobResult {
             .collect();
         let step_results_hash = hex::encode(Sha256::digest(step_digests.join("\n").as_bytes()));
 
-        format!(
+        let mut payload = format!(
             "pipeline_result:{}:{}:{}:{}:{}:{}:{}",
             self.job_id,
             status_str,
@@ -3859,8 +3979,14 @@ impl PipelineJobResult {
             // step-results hash) per the same rule. See
             // [`JobResult::signing_payload`] for the full rationale.
             self.worker_id,
-        )
-        .into_bytes()
+        );
+        // R2 token ledger (2026-07-20): conditional append-at-end, mirroring
+        // [`JobResult::signing_payload`]. Empty usage = pre-R2 bytes.
+        if let Some(usage_hash) = llm_usage_signing_hash(&self.llm_usage) {
+            use std::fmt::Write as _;
+            let _ = write!(payload, ":llm_usage:{usage_hash}");
+        }
+        payload.into_bytes()
     }
 
     /// Sign the pipeline result using the pre-shared `key`. **Back-compat
@@ -4664,6 +4790,7 @@ mod tests {
     fn test_job_result_sign_and_verify() {
         let key = test_key();
         let mut result = JobResult {
+            llm_usage: vec![],
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
@@ -4686,6 +4813,7 @@ mod tests {
     fn test_job_result_tampered_fails() {
         let key = test_key();
         let mut result = JobResult {
+            llm_usage: vec![],
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
@@ -4712,6 +4840,7 @@ mod tests {
     fn verifier_primary_records_replay_observer_does_not() {
         let key = test_key();
         let mut a = JobResult {
+            llm_usage: vec![],
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
@@ -4750,6 +4879,7 @@ mod tests {
     fn verifier_observer_then_primary_both_succeed() {
         let key = test_key();
         let mut a = JobResult {
+            llm_usage: vec![],
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
@@ -4770,6 +4900,7 @@ mod tests {
     fn verifier_rejects_tampered_signature_in_both_roles() {
         let key = test_key();
         let mut a = JobResult {
+            llm_usage: vec![],
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
@@ -4878,6 +5009,7 @@ mod tests {
     fn test_job_result_unsigned_fails() {
         let key = test_key();
         let result = JobResult {
+            llm_usage: vec![],
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
@@ -4944,6 +5076,7 @@ mod tests {
 
     fn make_test_result() -> JobResult {
         JobResult {
+            llm_usage: vec![],
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
@@ -5615,6 +5748,7 @@ mod tests {
     fn tampered_job_result_logs_fails_verification() {
         let key = test_key();
         let mut result = JobResult {
+            llm_usage: vec![],
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
@@ -5722,6 +5856,7 @@ mod tests {
     fn job_result_with_empty_logs_round_trips() {
         let key = test_key();
         let mut result = JobResult {
+            llm_usage: vec![],
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
@@ -6245,5 +6380,188 @@ mod tests {
             hb.verify_no_replay(&key, 300).is_err(),
             "tampered heartbeat signature must fail in verify_no_replay"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // R2 token ledger: llm_usage wire-format + aggregation tests.
+    // ------------------------------------------------------------------
+
+    fn usage_entries() -> Vec<LlmUsageEntry> {
+        vec![
+            LlmUsageEntry {
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4-5".into(),
+                prompt_tokens: 1200,
+                completion_tokens: 340,
+                calls: 2,
+            },
+            LlmUsageEntry {
+                provider: "ollama".into(),
+                model: "qwen3:6b".into(),
+                prompt_tokens: 900,
+                completion_tokens: 210,
+                calls: 5,
+            },
+        ]
+    }
+
+    /// A result signed WITHOUT llm_usage (the pre-R2 shape) must verify
+    /// unchanged — the empty vec appends nothing to the signing payload,
+    /// so old messages from old workers keep verifying byte-identically.
+    #[test]
+    fn llm_usage_empty_signs_byte_identical_to_pre_r2() {
+        let key = test_key();
+        let mut result = make_test_result();
+        let pre_r2_payload = {
+            // Simulate the pre-R2 payload by construction: empty usage.
+            assert!(result.llm_usage.is_empty());
+            result.sign(&key).unwrap();
+            result.clone()
+        };
+        pre_r2_payload.verify_no_replay(&key, 300).unwrap();
+
+        // Round-trip through the wire (serde) and verify again — the
+        // field is skip_serializing_if-omitted, deserializes to empty via
+        // serde(default), and the payload bytes still match.
+        let wire = serde_json::to_string(&pre_r2_payload).unwrap();
+        assert!(
+            !wire.contains("llm_usage"),
+            "empty llm_usage must be omitted from wire JSON"
+        );
+        let back: JobResult = serde_json::from_str(&wire).unwrap();
+        back.verify_no_replay(&key, 300).unwrap();
+    }
+
+    /// Old-message JSON (captured shape with NO llm_usage key at all)
+    /// deserializes and verifies against a signature produced before the
+    /// field existed.
+    #[test]
+    fn llm_usage_old_wire_json_still_verifies() {
+        let key = test_key();
+        let mut result = make_test_result();
+        result.sign(&key).unwrap();
+        let mut wire: serde_json::Value = serde_json::to_value(&result).unwrap();
+        // Assert the key truly isn't on the wire, then re-parse as if the
+        // JSON came from an old worker.
+        assert!(wire.get("llm_usage").is_none());
+        // Belt-and-braces: explicitly remove in case a future serde change
+        // starts emitting it.
+        wire.as_object_mut().unwrap().remove("llm_usage");
+        let back: JobResult = serde_json::from_value(wire).unwrap();
+        back.verify_no_replay(&key, 300).unwrap();
+    }
+
+    /// A result carrying usage round-trips (field survives serde) and
+    /// verifies; tampering with any usage number invalidates the signature.
+    #[test]
+    fn llm_usage_round_trip_and_tamper_detection() {
+        let key = test_key();
+        let mut result = make_test_result();
+        result.llm_usage = usage_entries();
+        result.sign(&key).unwrap();
+
+        let wire = serde_json::to_string(&result).unwrap();
+        assert!(wire.contains("llm_usage"));
+        let back: JobResult = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.llm_usage, usage_entries());
+        back.verify_no_replay(&key, 300).unwrap();
+
+        // Tamper: inflate the completion tokens.
+        let mut tampered = back.clone();
+        tampered.llm_usage[0].completion_tokens += 1;
+        assert!(
+            tampered.verify_no_replay(&key, 300).is_err(),
+            "tampered token count must invalidate the signature"
+        );
+
+        // Tamper: strip the usage entirely (deflation attack).
+        let mut stripped = back;
+        stripped.llm_usage.clear();
+        assert!(
+            stripped.verify_no_replay(&key, 300).is_err(),
+            "stripping llm_usage from a signed result must fail verification"
+        );
+    }
+
+    /// The usage digest is order-independent: same entries in a different
+    /// vec order produce the same signed bytes.
+    #[test]
+    fn llm_usage_signing_is_order_independent() {
+        let mut a = make_test_result();
+        a.llm_usage = usage_entries();
+        let mut b = make_test_result();
+        b.job_id = a.job_id;
+        let mut rev = usage_entries();
+        rev.reverse();
+        b.llm_usage = rev;
+        assert_eq!(a.signing_payload(), b.signing_payload());
+    }
+
+    /// PipelineJobResult mirrors the same contract.
+    #[test]
+    fn pipeline_llm_usage_round_trip_and_compat() {
+        let key = test_key();
+        let mut result = PipelineJobResult {
+            llm_usage: vec![],
+            crypto_scheme: 0,
+            job_id: Uuid::new_v4(),
+            overall_status: JobStatus::Success,
+            step_results: vec![],
+            final_output: serde_json::json!({"ok": true}),
+            total_time_ms: 5,
+            signature: vec![],
+            result_nonce: String::new(),
+            worker_id: String::new(),
+        };
+        // Empty usage: omitted from wire, verifies (pre-R2 compat).
+        result.sign(&key).unwrap();
+        let wire = serde_json::to_string(&result).unwrap();
+        assert!(!wire.contains("llm_usage"));
+        let back: PipelineJobResult = serde_json::from_str(&wire).unwrap();
+        back.verify_no_replay(&key, 300).unwrap();
+
+        // Non-empty usage: bound + tamper-evident.
+        result.llm_usage = usage_entries();
+        result.sign(&key).unwrap();
+        let back: PipelineJobResult =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+        back.verify_no_replay(&key, 300).unwrap();
+        let mut tampered = back;
+        tampered.llm_usage[1].prompt_tokens = 0;
+        assert!(tampered.verify_no_replay(&key, 300).is_err());
+    }
+
+    /// aggregate_llm_usage folds per-call observations per (provider, model),
+    /// counts calls, saturates, and caps the output length.
+    #[test]
+    fn aggregate_llm_usage_merges_counts_and_caps() {
+        let raw = vec![
+            ("anthropic".to_string(), "m1".to_string(), 100u32, 20u32),
+            ("anthropic".to_string(), "m1".to_string(), 50, 10),
+            ("ollama".to_string(), "m2".to_string(), 7, 3),
+        ];
+        let agg = aggregate_llm_usage(raw);
+        assert_eq!(agg.len(), 2);
+        let a = agg.iter().find(|e| e.model == "m1").unwrap();
+        assert_eq!(
+            (a.prompt_tokens, a.completion_tokens, a.calls),
+            (150, 30, 2)
+        );
+        let o = agg.iter().find(|e| e.model == "m2").unwrap();
+        assert_eq!((o.prompt_tokens, o.completion_tokens, o.calls), (7, 3, 1));
+
+        // Saturating add: near-max counts don't wrap.
+        let sat = aggregate_llm_usage(vec![
+            ("p".to_string(), "m".to_string(), u32::MAX - 1, u32::MAX - 1),
+            ("p".to_string(), "m".to_string(), 100, 100),
+        ]);
+        assert_eq!(sat[0].prompt_tokens, u32::MAX);
+        assert_eq!(sat[0].completion_tokens, u32::MAX);
+
+        // Cap: more than MAX_LLM_USAGE_ENTRIES distinct models truncates.
+        let many: Vec<_> = (0..MAX_LLM_USAGE_ENTRIES + 8)
+            .map(|i| ("p".to_string(), format!("model-{i:03}"), 1u32, 1u32))
+            .collect();
+        assert_eq!(aggregate_llm_usage(many).len(), MAX_LLM_USAGE_ENTRIES);
     }
 }

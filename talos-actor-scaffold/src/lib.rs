@@ -91,6 +91,9 @@ pub struct BudgetSpec {
     pub max_compilations_per_hour: Option<i32>,
     /// `"suspend"` (default) | `"alert"` | `"block"`.
     pub on_budget_exceeded: Option<String>,
+    /// R2 token ledger: daily LLM token ceiling (prompt + completion,
+    /// trailing 24 h). `None` = no ceiling.
+    pub max_llm_tokens_per_day: Option<i64>,
 }
 
 /// Optional starter workflow shape. When present, the service builds
@@ -409,6 +412,7 @@ pub async fn scaffold_actor(
                 wpm,
                 cph,
                 on_exceeded,
+                b.max_llm_tokens_per_day,
             )
             .await
         {

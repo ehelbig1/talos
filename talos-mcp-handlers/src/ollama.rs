@@ -84,7 +84,7 @@ pub async fn dispatch(
         "ollama_pull_model" => Some(handle_pull_model(req_id, args, state, user_id).await),
         "ollama_delete_model" => Some(handle_delete_model(req_id, args, state, user_id).await),
         "ollama_show_model" => Some(handle_show_model(req_id, args, state).await),
-        "local_llm_complete" => Some(handle_local_complete(req_id, args, state).await),
+        "local_llm_complete" => Some(handle_local_complete(req_id, args, state, user_id).await),
         _ => None,
     }
 }
@@ -323,6 +323,7 @@ async fn handle_local_complete(
     req_id: Option<Value>,
     args: &Value,
     state: &McpState,
+    user_id: uuid::Uuid,
 ) -> JsonRpcResponse {
     let client = match &state.ollama_client {
         Some(c) => c,
@@ -374,10 +375,22 @@ async fn handle_local_complete(
         return mcp_error(req_id, -32602, "system_prompt exceeds 50KB limit");
     }
 
-    match client
-        .complete(&model, system_prompt, user_prompt, max_tokens)
+    // R2 token ledger: attribute usage to the requesting user (nil uuid
+    // from a non-user agent context records unscoped — the task-local
+    // still carries it, but the ledger insert treats it as a real user id
+    // only when non-nil).
+    let completion = if user_id.is_nil() {
+        client
+            .complete(&model, system_prompt, user_prompt, max_tokens)
+            .await
+    } else {
+        talos_llm::usage::scoped_user(
+            user_id,
+            client.complete(&model, system_prompt, user_prompt, max_tokens),
+        )
         .await
-    {
+    };
+    match completion {
         Ok(text) => mcp_text(req_id, &text),
         Err(e) => {
             // MCP-316 (2026-05-11): mirror the MCP-217 redaction applied

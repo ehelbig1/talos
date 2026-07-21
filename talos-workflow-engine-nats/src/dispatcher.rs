@@ -309,6 +309,11 @@ pub(crate) async fn execute_job_with_retry(
     // `dispatch_with_retry` for the rationale — the worker's claim
     // single-takes the seal per attempt, so a retry must re-register it.
     on_before_send: Option<&(dyn Fn() + Send + Sync)>,
+    // R2 token ledger: usage hook, invoked once per VERIFIED JobResult
+    // (per attempt — failed attempts spent tokens too) carrying non-empty
+    // `llm_usage`. The hook owner attaches identity from the
+    // controller-side dispatch context.
+    on_llm_usage: Option<&(dyn Fn(Vec<talos_workflow_job_protocol::LlmUsageEntry>) + Send + Sync)>,
 ) -> Result<serde_json::Value, String> {
     let mut attempts: u32 = 0;
     let mut current_payload = payload;
@@ -379,6 +384,19 @@ pub(crate) async fn execute_job_with_retry(
                             worker_id = %job_result.worker_id,
                             "JobResult verified — worker attribution recorded"
                         );
+                    }
+                }
+
+                // R2 token ledger: record the verified result's usage BEFORE
+                // the success/retry branching — a failed attempt's tokens
+                // were spent regardless of whether we retry. Placed after
+                // signature verification so an on-wire forgery can't inflate
+                // another actor's ledger. (When `verify_ring` is None — test
+                // harnesses only — the hook still fires; production always
+                // verifies.)
+                if let Some(hook) = on_llm_usage {
+                    if !job_result.llm_usage.is_empty() {
+                        hook(job_result.llm_usage.clone());
                     }
                 }
 
@@ -709,6 +727,11 @@ pub struct NatsNodeDispatcher {
     /// with `plaintext_secrets` but no handle here is refused (fail-closed) —
     /// plaintext must never fall back onto the wire.
     envelope: Option<EnvelopeSealingHandle>,
+    /// R2 token ledger: optional controller-installed usage recorder,
+    /// invoked once per VERIFIED result (single-node and pipeline) that
+    /// carries non-empty `llm_usage`. `None` (default) drops usage — test
+    /// harnesses and consumers that don't account.
+    llm_usage_sink: Option<LlmUsageSink>,
 }
 
 /// The controller-provided pieces the dispatcher needs to route a claim-based
@@ -718,6 +741,28 @@ pub struct NatsNodeDispatcher {
 /// here to keep existing `talos_workflow_engine_nats::EnvelopeSealingHandle`
 /// paths resolving.
 pub use talos_envelope_seal::EnvelopeSealingHandle;
+
+/// R2 token ledger: one verified result's LLM usage, attributed with the
+/// CONTROLLER's own dispatch identity (`DispatchJob` /
+/// `ChainDispatchRequest` fields the engine stamped from its execution
+/// records) — the worker-supplied result contributes ONLY the
+/// provider/model/token counts, never the identity.
+#[derive(Debug, Clone)]
+pub struct LlmUsageReport {
+    /// Workflow execution that owned the dispatch (controller-side).
+    pub execution_id: Uuid,
+    /// Actor bound to the dispatch, when actor-owned (controller-side).
+    pub actor_id: Option<Uuid>,
+    /// Owning user of the dispatch (controller-side).
+    pub user_id: Option<Uuid>,
+    /// Verified per-(provider, model) usage from the SIGNED result.
+    pub entries: Vec<talos_workflow_job_protocol::LlmUsageEntry>,
+}
+
+/// Controller-installed recorder for [`LlmUsageReport`]s. MUST be
+/// non-blocking (spawn DB writes internally) — it runs inline on the
+/// dispatch hot path right after result verification.
+pub type LlmUsageSink = Arc<dyn Fn(LlmUsageReport) + Send + Sync>;
 
 impl NatsNodeDispatcher {
     /// Build a dispatcher. `event_sink` may be `None` when there's no
@@ -747,7 +792,18 @@ impl NatsNodeDispatcher {
             retry_classifier,
             expression_evaluator,
             envelope: None,
+            llm_usage_sink: None,
         }
+    }
+
+    /// R2 token ledger: install the usage recorder. The dispatcher calls it
+    /// once per verified result carrying non-empty `llm_usage`, with the
+    /// identity taken from the CONTROLLER-side dispatch context. Omit it to
+    /// drop usage (default).
+    #[must_use]
+    pub fn with_llm_usage_sink(mut self, sink: LlmUsageSink) -> Self {
+        self.llm_usage_sink = Some(sink);
+        self
     }
 
     /// RFC 0010 P3 (D3b): install the claim-based sealing handle. When set, a
@@ -1003,6 +1059,26 @@ impl NodeDispatcher for NatsNodeDispatcher {
         } else {
             None
         };
+        // R2 token ledger: per-attempt usage hook. Identity comes from the
+        // CONTROLLER-side DispatchJob (stamped by the engine from its own
+        // execution records), never from the worker's result.
+        let usage_hook: Option<
+            Box<dyn Fn(Vec<talos_workflow_job_protocol::LlmUsageEntry>) + Send + Sync>,
+        > = self.llm_usage_sink.as_ref().map(|sink| {
+            let sink = sink.clone();
+            let (execution_id, actor_id, user_id) = (job.execution_id, job.actor_id, job.user_id);
+            Box::new(
+                move |entries: Vec<talos_workflow_job_protocol::LlmUsageEntry>| {
+                    sink(LlmUsageReport {
+                        execution_id,
+                        actor_id,
+                        user_id,
+                        entries,
+                    });
+                },
+            )
+                as Box<dyn Fn(Vec<talos_workflow_job_protocol::LlmUsageEntry>) + Send + Sync>
+        });
         let result = execute_job_with_retry(
             self.transport.as_ref(),
             topic,
@@ -1027,6 +1103,8 @@ impl NodeDispatcher for NatsNodeDispatcher {
             reply_inbox,
             // RFC 0010 P3 (M3): re-arm the seal before each attempt.
             seal_rearm.as_deref(),
+            // R2 token ledger: record verified per-attempt usage.
+            usage_hook.as_deref(),
         )
         .await;
 
@@ -1263,6 +1341,20 @@ impl NodeDispatcher for NatsNodeDispatcher {
             }
         }
 
+        // R2 token ledger: record the verified pipeline's whole-chain usage.
+        // Identity from the CONTROLLER-side ChainDispatchRequest / step
+        // DispatchJobs (engine-stamped) — never from the worker result.
+        if let Some(sink) = self.llm_usage_sink.as_ref() {
+            if !result.llm_usage.is_empty() {
+                sink(LlmUsageReport {
+                    execution_id: request.workflow_execution_id,
+                    actor_id: request.steps.iter().find_map(|s| s.actor_id),
+                    user_id: request.user_id,
+                    entries: result.llm_usage.clone(),
+                });
+            }
+        }
+
         // 8. Map per-step results back into the abstract shape.
         let steps: Vec<ChainStepResult> = result
             .step_results
@@ -1495,6 +1587,7 @@ mod p3_full_loop_tests {
 
                 // Send back a signed JobResult so the dispatcher completes.
                 let mut jr = JobResult {
+                    llm_usage: vec![],
                     job_id: req.job_id,
                     status: JobStatus::Success,
                     output_payload: serde_json::json!({"ok": true}),
@@ -1683,6 +1776,7 @@ mod p3_full_loop_tests {
                 *observed.lock().await = Some(per_step);
 
                 let mut pr = PipelineJobResult {
+                    llm_usage: vec![],
                     job_id: req.job_id,
                     overall_status: talos_workflow_job_protocol::JobStatus::Success,
                     step_results: vec![],
