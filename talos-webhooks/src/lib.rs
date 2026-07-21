@@ -21,6 +21,7 @@
 //! including circuit breakers, rate limiting, HMAC verification, and DLQ support.
 
 mod approval;
+mod approval_actions;
 
 /// Minimal HTML escape for dynamic content embedded in the public
 /// token-authenticated pages (approval gates, correction links). ONE
@@ -55,6 +56,7 @@ pub use rate_limiter::CircuitBreakerFailureType;
 pub use approval::{
     approval_gate_handler, approval_gate_preview, approval_handler, ApprovalPayload,
 };
+pub use approval_actions::{approval_action_apply, approval_action_preview};
 pub use correction::{correction_apply, correction_preview};
 pub use dlq::{DlqMetrics, DlqService};
 pub use router::{webhook_handler, WebhookRouter};

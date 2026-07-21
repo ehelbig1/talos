@@ -10,6 +10,10 @@ use sqlx::{PgPool, Row};
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// One-click email approve/reject capability links for suspended
+/// confidence-gate executions (`/approval-actions/{token}/{action}`).
+pub mod approval_links;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Row DTOs
 // ─────────────────────────────────────────────────────────────────────────────

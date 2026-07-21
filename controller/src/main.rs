@@ -5810,6 +5810,24 @@ fn build_router(
         .layer(Extension(webhook_limiter.clone()))
         .layer(Extension(whitelist.clone()));
 
+    // Public one-click approve/reject routes for SUSPENDED confidence-gate
+    // executions (email capability URLs). Same trust model as the approval
+    // gates and corrections above: the cryptographically random token in
+    // the path IS the auth, GET renders a confirm page only (prefetch-safe),
+    // POST applies the decision via the shared record-then-resume path, and
+    // the webhook limiter guards enumeration. Distinct from
+    // /approvals/{token} (that's the continuation-gate subsystem); these
+    // resume a paused execution's checkpoint (submit_workflow_approval path).
+    let approval_action_routes = Router::new()
+        .route(
+            "/approval-actions/{token}/{action}",
+            get(webhooks::approval_action_preview).post(webhooks::approval_action_apply),
+        )
+        .layer(DefaultBodyLimit::max(4096))
+        .layer(from_fn(rate_limit::rate_limit_middleware))
+        .layer(Extension(webhook_limiter.clone()))
+        .layer(Extension(whitelist.clone()));
+
     // Public suspension callback routes.
     // Auth is the 64-hex correlation_id (256-bit random) embedded in the URL.
     // Rate-limited to prevent enumeration brute-force.
@@ -6196,6 +6214,7 @@ fn build_router(
         )
         .merge(approval_gate_routes)
         .merge(correction_routes)
+        .merge(approval_action_routes)
         .merge(suspension_callback_routes)
         .merge(google_calendar_routes)
         .merge(google_calendar_webhook_routes)
@@ -6235,6 +6254,10 @@ fn build_router(
         // downstream workflow nodes in-process (workflow chaining).
         .layer(Extension(Some(runtime.clone())))
         .layer(Extension(Some(secrets_manager.clone())))
+        // Shared orchestration service — the one-click approve/reject email
+        // links (/approval-actions/{token}) apply decisions through the same
+        // record-then-resume write path as submit_workflow_approval.
+        .layer(Extension(Some(execution_orchestration_service.clone())))
         // RFC 0010 P3 (M4): shared claim-based-sealing handle for the
         // Google-Calendar push handler (fire-and-forget module dispatch).
         .layer(Extension(module_sealing_handle.clone()))

@@ -456,13 +456,13 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "call_workflow",
-            "description": "Execute a sub-workflow synchronously and return its output inline. Unlike trigger_workflow (which runs async), this waits for completion and returns the result directly. Useful for workflow composition.",
+            "description": "Execute a sub-workflow synchronously and return its output inline. Unlike trigger_workflow (which runs async), this waits for completion and returns the result directly. Useful for workflow composition. If the workflow runs longer than timeout_secs, the call returns status='running' with the execution_id — the workflow keeps running to completion in the background (finalizing its own status); poll get_execution_status for the result.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "workflow_id": { "type": "string", "description": "UUID of the workflow to execute" },
                     "input": { "type": "object", "description": "Optional input data passed to the first node(s)" },
-                    "timeout_secs": { "type": "number", "description": "Maximum time to wait for completion in seconds (default: 30, max: 120). Sync MCP responses can't tie up the connection for >2 min; for longer workflows use trigger_workflow (async) and poll get_execution_status." },
+                    "timeout_secs": { "type": "number", "description": "Maximum time to wait synchronously for completion in seconds (default: 30, max: 120). This bounds only how long the call blocks — it does NOT cap the workflow, which runs to its own execution_timeout_secs in the background. Sync MCP responses can't tie up the connection for >2 min; if the window elapses you get status='running' + execution_id, so for longer workflows prefer trigger_workflow (async) and poll get_execution_status." },
                     "dry_run": { "type": "boolean", "description": "When true, non-GET HTTP requests, webhook sends, and messaging publishes are mocked. Useful for testing workflow logic without side effects." }
                 },
                 "required": ["workflow_id"]
@@ -4186,13 +4186,27 @@ async fn handle_call_workflow(
 
     let secrets_manager = state.secrets_manager.clone();
 
-    // Build the engine via the canonical builder. TimeoutPolicy::ForceOverride
-    // applies the caller's `timeout_secs` AFTER load_graph_from_json so it
-    // wins over any graph-level execution_timeout_secs. Pre-r228, the
-    // pre-load `set_execution_timeout_secs(timeout_secs)` was silently
-    // overwritten by the graph's value during parse_graph_document — the
-    // wall-clock cap (tokio::time::timeout below) still fired correctly,
-    // but engine-internal timeout was wrong. Now both layers agree.
+    // Build the engine via the canonical builder.
+    //
+    // TimeoutPolicy::Honor (default) — the engine's wall-clock cap comes from
+    // the graph's own `execution_timeout_secs` (falling back to the engine's
+    // 300 s compile-time default). This is DELIBERATELY decoupled from the
+    // caller's `timeout_secs`, which now only bounds how long THIS handler
+    // blocks on the detached run (see the spawn + JoinHandle-await below).
+    //
+    // Pre-fix this used `.with_timeout_override(timeout_secs)` AND drove the
+    // engine INLINE in the request future under `tokio::time::timeout`. That
+    // coupled the run to the request lifetime: when the MCP client hit its
+    // ~120 s call timeout and dropped the connection, the whole handler future
+    // was cancelled mid-run — already-dispatched worker jobs completed and
+    // reported, but nothing finalized the execution row, which sat `running`
+    // indefinitely (observed live 2026-07-21, exec e33c8e2e, pa-daily-brief
+    // with a judge sub-workflow, >120 s: all nodes done, row wedged 40+ min).
+    // Now the run + finalize live in a detached `tokio::spawn` that OWNS the
+    // engine, so a client disconnect / sync-wait timeout can't cancel it —
+    // it drives to a terminal status and finalizes the row regardless. Mirrors
+    // handle_test_workflow / handle_test_workflow_draft and the GraphQL
+    // test-workflow mutation.
     //
     // Actor binding: this path uses wf_record.actor_id ONLY (no caller-arg
     // fallback) — asymmetric from MCP trigger_workflow. Preserved as-is
@@ -4208,7 +4222,6 @@ async fn handle_call_workflow(
         // an unbound draft test running at the Tier-1 fail-safe is acceptable
         // for a test path and matches its historical behavior.
         .with_effective_actor(None, wf_record.actor_id)
-        .with_timeout_override(timeout_secs)
         .with_dry_run(dry_run);
     let mut engine = match talos_engine::builder::for_workflow(
         registry,
@@ -4235,100 +4248,151 @@ async fn handle_call_workflow(
 
     let worker_key = crate::utils::load_worker_shared_key_logged(file!());
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        talos_engine::nats_run::run_with_trigger_input_via_nats(
+    // Spawn the engine drive DETACHED so a client disconnect or an elapsed
+    // sync-wait can't cancel it mid-run. The task OWNS the engine and always
+    // finalizes the execution row (completed / waiting / failed) plus fires the
+    // failure alert + webhook on a genuine failure — regardless of whether the
+    // request future is still awaiting. The handler awaits the JoinHandle under
+    // its own `timeout_secs` deadline; on deadline it returns a structured
+    // "still running — poll get_execution_status" response with the
+    // execution_id, while the detached task keeps going.
+    let repo_for_spawn = state.workflow_repo.clone();
+    let exec_repo_for_spawn = state.execution_repo.clone();
+    let nats_for_alert = state.nats_client.clone();
+    let webhook_repo = state.workflow_repo.clone();
+    let spawn_handle = tokio::spawn(async move {
+        let run_result = talos_engine::nats_run::run_with_trigger_input_via_nats(
             &mut engine,
             nats,
             worker_key,
             input_payload,
             exec_id,
-        ),
-    )
-    .await;
-
-    match result {
-        Ok(Ok(ctx)) => {
-            let node_labels = engine.node_labels();
-            let output = crate::utils::project_engine_results_to_output(&ctx.results, node_labels);
-            let output_json = talos_dlp_provider::redact_json(&serde_json::Value::Object(output));
-            // PR #423 sibling: a wait/confidence-gate pause is NOT completed —
-            // persist status='waiting' and surface "waiting" to the caller so
-            // the paused run isn't treated as terminal.
-            let is_waiting = ctx.waiting;
-            if is_waiting {
-                let _ = state
-                    .workflow_repo
-                    .mark_execution_waiting(exec_id, &output_json)
-                    .await;
-            } else {
-                let _ = state
-                    .workflow_repo
-                    .mark_execution_completed(exec_id, &output_json)
-                    .await;
+        )
+        .await;
+        // Snapshot node_labels AFTER the run so the synthetic `__trigger__`
+        // node added by the transport is included (see handle_test_workflow
+        // for the leaked-UUID-key regression this ordering avoids).
+        let node_labels_snapshot: std::collections::HashMap<uuid::Uuid, String> =
+            engine.node_labels().clone();
+        match run_result {
+            Ok(ctx) => {
+                let output = crate::utils::project_engine_results_to_output(
+                    &ctx.results,
+                    &node_labels_snapshot,
+                );
+                let output_json =
+                    talos_dlp_provider::redact_json(&serde_json::Value::Object(output));
+                // PR #423 sibling: a wait/confidence-gate pause is NOT
+                // completed — persist status='waiting' and surface "waiting"
+                // so the paused run isn't treated as terminal.
+                let is_waiting = ctx.waiting;
+                if is_waiting {
+                    let _ = repo_for_spawn
+                        .mark_execution_waiting(exec_id, &output_json)
+                        .await;
+                    Ok::<_, String>(("waiting".to_string(), output_json))
+                } else {
+                    let _ = repo_for_spawn
+                        .mark_execution_completed(exec_id, &output_json)
+                        .await;
+                    Ok::<_, String>(("completed".to_string(), output_json))
+                }
             }
+            Err(e) => {
+                let err_str = e.to_string();
+                let _ = repo_for_spawn
+                    .mark_execution_failed(exec_id, &err_str, None)
+                    .await;
+                // Alert + webhook fire from INSIDE the detached task so they
+                // still run when the client has already disconnected — pre-fix
+                // an abandoned failure notified nobody.
+                talos_execution_result_collector::publish_execution_failure_alert(
+                    &exec_repo_for_spawn,
+                    nats_for_alert.as_deref(),
+                    user_id,
+                    wf_id,
+                    exec_id,
+                    &err_str,
+                )
+                .await;
+                crate::utils::dispatch_failure_webhook(&webhook_repo, wf_id, exec_id, &err_str)
+                    .await;
+                Err(err_str)
+            }
+        }
+    });
 
-            Some(mcp_text(
-                req_id.clone(),
-                &serde_json::to_string_pretty(&serde_json::json!({
-                    "execution_id": exec_id.to_string(),
-                    "status": if is_waiting { "waiting" } else { "completed" },
-                    "output": output_json,
-                }))
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), spawn_handle).await {
+        // Within-deadline success — EXACT pre-fix response shape.
+        Ok(Ok(Ok((status, output_json)))) => Some(mcp_text(
+            req_id.clone(),
+            &serde_json::to_string_pretty(&call_workflow_terminal_body(
+                exec_id,
+                &status,
+                &output_json,
+            ))
+            .unwrap_or_default(),
+        )),
+        // Within-deadline genuine failure — EXACT pre-fix error shape. The
+        // detached task already marked the row failed + fired alert/webhook.
+        Ok(Ok(Err(err_str))) => Some(mcp_error(
+            req_id.clone(),
+            -32000,
+            &format!("Workflow execution failed: {}", err_str),
+        )),
+        // Task panicked or was cancelled out-of-band. Finalize defensively.
+        Ok(Err(join_err)) => {
+            let msg = format!("Engine task terminated unexpectedly: {}", join_err);
+            let _ = state
+                .workflow_repo
+                .mark_execution_failed(exec_id, &msg, None)
+                .await;
+            Some(mcp_error(req_id.clone(), -32000, &msg))
+        }
+        // Sync-wait window elapsed: the detached task keeps running and will
+        // write its own terminal status. Return a structured `running`
+        // response so the caller can poll rather than seeing a failure. This
+        // is the anti-orphan path — the engine is NOT dropped here.
+        Err(_) => Some(mcp_text(
+            req_id.clone(),
+            &serde_json::to_string_pretty(&call_workflow_running_body(exec_id, timeout_secs))
                 .unwrap_or_default(),
-            ))
-        }
-        Ok(Err(e)) => {
-            let err_str = e.to_string();
-            let _ = state
-                .workflow_repo
-                .mark_execution_failed(exec_id, &err_str, None)
-                .await;
-            talos_execution_result_collector::publish_execution_failure_alert(
-                &state.execution_repo,
-                state.nats_client.as_deref(),
-                user_id,
-                wf_id,
-                exec_id,
-                &err_str,
-            )
-            .await;
-            crate::utils::dispatch_failure_webhook(&state.workflow_repo, wf_id, exec_id, &err_str)
-                .await;
-            Some(mcp_error(
-                req_id.clone(),
-                -32000,
-                &format!("Workflow execution failed: {}", err_str),
-            ))
-        }
-        Err(_) => {
-            let timeout_msg = format!(
-                "Workflow execution timed out after {} seconds",
-                timeout_secs
-            );
-            let _ = state
-                .workflow_repo
-                .mark_execution_failed(exec_id, &timeout_msg, None)
-                .await;
-            talos_execution_result_collector::publish_execution_failure_alert(
-                &state.execution_repo,
-                state.nats_client.as_deref(),
-                user_id,
-                wf_id,
-                exec_id,
-                &timeout_msg,
-            )
-            .await;
-            crate::utils::dispatch_failure_webhook(
-                &state.workflow_repo,
-                wf_id,
-                exec_id,
-                &timeout_msg,
-            )
-            .await;
-            Some(mcp_error(req_id.clone(), -32000, &timeout_msg))
-        }
+        )),
     }
+}
+
+/// Body for the within-deadline terminal (`completed` / `waiting`) response of
+/// `call_workflow`. Pure so the exact shape is regression-locked by a unit
+/// test — the `{execution_id, status, output}` triple is a public contract
+/// used by sub-workflow-composition callers.
+fn call_workflow_terminal_body(
+    exec_id: uuid::Uuid,
+    status: &str,
+    output_json: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "execution_id": exec_id.to_string(),
+        "status": status,
+        "output": output_json,
+    })
+}
+
+/// Body for the sync-wait-elapsed `running` response of `call_workflow`. Pure:
+/// this is the anti-orphan path's contract — callers branch on
+/// `status == "running"` to poll `get_execution_status`, so the key set is
+/// locked by a unit test.
+fn call_workflow_running_body(exec_id: uuid::Uuid, timeout_secs: u64) -> serde_json::Value {
+    serde_json::json!({
+        "execution_id": exec_id.to_string(),
+        "status": "running",
+        "hint": format!(
+            "Workflow exceeded the {}s call_workflow sync-wait but is still running \
+             in the background. Poll `get_execution_status` with the returned \
+             execution_id for the final result, or raise `timeout_secs` (max 120) \
+             on future calls.",
+            timeout_secs
+        ),
+    })
 }
 
 async fn handle_clone_workflow(
@@ -10737,4 +10801,57 @@ mod tests {
     // count_memory_write_nodes tests moved to talos-execution-orchestration —
     // the canonical implementation now lives there. See
     // talos-execution-orchestration/src/count_memory_write_nodes.rs.
+
+    use super::{call_workflow_running_body, call_workflow_terminal_body};
+
+    /// The within-deadline terminal response shape is a public contract for
+    /// sub-workflow-composition callers: `{execution_id, status, output}` and
+    /// NOTHING else (no `hint`, so a completed run isn't misread as still
+    /// running). Locks the shape against the detach refactor (2026-07-21).
+    #[test]
+    fn call_workflow_terminal_body_shape() {
+        let exec = uuid::Uuid::nil();
+        let out = serde_json::json!({"result": 42});
+        for status in ["completed", "waiting"] {
+            let body = call_workflow_terminal_body(exec, status, &out);
+            assert_eq!(
+                body["execution_id"],
+                serde_json::json!("00000000-0000-0000-0000-000000000000")
+            );
+            assert_eq!(body["status"], serde_json::json!(status));
+            assert_eq!(body["output"], out);
+            assert!(
+                body.get("hint").is_none(),
+                "terminal body must not carry a `hint` — that key signals the still-running path"
+            );
+        }
+    }
+
+    /// The sync-wait-elapsed response is the anti-orphan contract: callers
+    /// branch on `status == "running"` to poll. It MUST carry the
+    /// execution_id (so the caller can poll) and status="running", and it
+    /// MUST NOT carry an `output` (there is none yet).
+    #[test]
+    fn call_workflow_running_body_shape() {
+        let exec = uuid::Uuid::nil();
+        let body = call_workflow_running_body(exec, 30);
+        assert_eq!(
+            body["execution_id"],
+            serde_json::json!("00000000-0000-0000-0000-000000000000")
+        );
+        assert_eq!(body["status"], serde_json::json!("running"));
+        assert!(
+            body.get("output").is_none(),
+            "still-running body must not claim an output"
+        );
+        let hint = body["hint"].as_str().unwrap_or_default();
+        assert!(
+            hint.contains("30s"),
+            "hint should echo the elapsed sync-wait"
+        );
+        assert!(
+            hint.contains("get_execution_status"),
+            "hint must point the caller at the poll path"
+        );
+    }
 }
