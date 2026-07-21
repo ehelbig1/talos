@@ -164,7 +164,7 @@ pub fn tool_schemas() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "ml_teacher_audit",
-            "description": "Run the LLM TEACHER over a model's GOLD slice (its source='correction' rows — human truth) and report teacher-vs-human accuracy + per-class breakdown. Quantifies teacher-label noise, the accuracy CEILING of the distilled model. Uses the SAME prompt/few-shot contract as the production classify leg; local (ollama) teachers only. The result is stored on the model card (teacher_audit).",
+            "description": "Run the LLM TEACHER over a model's GOLD slice (its source='correction' rows — human truth) and report teacher-vs-human accuracy + per-class breakdown. Quantifies teacher-label noise, the accuracy CEILING of the distilled model. Uses the SAME prompt/few-shot contract as the production classify leg; local (ollama) teachers only. ASYNC: returns {status:'started', gold_rows} immediately (config errors still return synchronously) and runs the ≤100-call loop in the background — POLL ml_get_model_card and read teacher_audit (status: running→complete/failed) for progress and the result. A second start while one is running is refused.",
             "inputSchema": { "type": "object", "properties": {
                 "model_id": { "type": "string" },
                 "limit": { "type": "integer", "description": "Gold rows to audit, 1-100 (default 100); each row is one local LLM call" },
@@ -1058,8 +1058,10 @@ async fn handle_set_lifecycle(
 }
 
 /// Teacher-vs-gold audit: parse → build the local-LLM transport closure →
-/// `talos_ml::teacher_audit` (which owns the prompt contract, tenancy
-/// gates, locality pin, and report storage) → format.
+/// `talos_ml::start_teacher_audit` (which owns the prompt contract, tenancy
+/// gates, locality pin, and background execution) → format. The audit runs
+/// in the background; this returns as soon as the config is validated and
+/// the loop is spawned. Poll `ml_get_model_card` for the result.
 async fn handle_teacher_audit(
     req_id: Option<Value>,
     args: &Value,
@@ -1075,7 +1077,11 @@ async fn handle_teacher_audit(
         .and_then(|v| v.as_i64())
         .unwrap_or(talos_ml::teacher_audit::MAX_AUDIT_ROWS)
         .clamp(1, talos_ml::teacher_audit::MAX_AUDIT_ROWS);
-    let system_prompt = args.get("system_prompt").and_then(|v| v.as_str());
+    // Owned so it can move into the Send + 'static classify closure / task.
+    let system_prompt = args
+        .get("system_prompt")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     let Some(ollama) = state.ollama_client.clone() else {
         return mcp_error(
             req_id,
@@ -1084,6 +1090,8 @@ async fn handle_teacher_audit(
         );
     };
     let svc = dataset_service(state);
+    // Send + 'static: captures only an Arc<OllamaClient>, so it detaches
+    // cleanly onto the spawned audit task.
     let classify = move |r: talos_ml::TeacherRequest| {
         let ollama = ollama.clone();
         async move {
@@ -1097,7 +1105,7 @@ async fn handle_teacher_audit(
                 .await
         }
     };
-    match talos_ml::teacher_audit(
+    match talos_ml::start_teacher_audit(
         &state.db_pool,
         &svc,
         user_id,
@@ -1108,12 +1116,14 @@ async fn handle_teacher_audit(
     )
     .await
     {
-        Ok(report) => mcp_text(
+        Ok(started) => mcp_text(
             req_id,
             &serde_json::to_string_pretty(&serde_json::json!({
+                "status": "started",
                 "model_id": model_id.to_string(),
-                "teacher_audit": report,
-                "next_step": "low accuracy = teacher noise is the model's ceiling — review the mismatches, improve the node's SYSTEM_PROMPT or add corrections (they become few-shot anchors), then re-audit",
+                "gold_rows": started.gold_rows,
+                "poll": "ml_get_model_card",
+                "next_step": "the audit runs in the background (≤100 local LLM calls) — poll ml_get_model_card and read teacher_audit.status (running → complete/failed); on complete, review mismatches (real disagreements only) and parse_failed, improve the node's SYSTEM_PROMPT or add corrections, then re-audit",
             }))
             .unwrap_or_default(),
         ),
@@ -1122,6 +1132,11 @@ async fn handle_teacher_audit(
             mcp_error(req_id, -32000, "Model has no dataset to audit against")
         }
         Err(talos_ml::TeacherAuditError::InvalidConfig(m)) => mcp_error(req_id, -32000, &m),
+        Err(talos_ml::TeacherAuditError::AlreadyRunning) => mcp_error(
+            req_id,
+            -32000,
+            "A teacher audit is already running for this model — poll ml_get_model_card for progress",
+        ),
         Err(talos_ml::TeacherAuditError::Internal(e)) => internal(req_id, "teacher_audit", &e),
     }
 }
