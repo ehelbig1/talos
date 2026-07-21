@@ -60,6 +60,91 @@ services:
     networks:
       - talos-network
 
+  # Vault KEK backup — file-storage volume snapshot. Vault holds the per-org
+  # DEKs + every OAuth token; losing it makes ALL encrypted rows permanently
+  # unreadable (the single worst dev-stack failure mode). The file backend
+  # has no consistent-snapshot API, so we tar /vault/file opaquely with a
+  # read-stability retry (see scripts/dev-volume-backup-loop.sh). The volume
+  # is mounted READ-ONLY — a volume-level copy needs no Vault token, so none
+  # is granted (least privilege). Verification is INTEGRITY-ONLY (tar -tzf +
+  # expected paths + manifest), NOT a restore-verify — the real proof of DEK
+  # usability is a manual restore + controller /health green. Separate
+  # sidecar (not folded into postgres-backup) for failure isolation and
+  # because it needs a different mount set. Reuses the pgvector image purely
+  # for its GNU coreutils (tar/sha256sum/find) — already pulled, no Vault
+  # tooling involved.
+  vault-backup:
+    restart: unless-stopped
+    image: pgvector/pgvector:pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
+    container_name: talos-vault-backup
+    depends_on:
+      vault:
+        condition: service_healthy
+    environment:
+      BACKUP_TARGET: vault
+      SRC_DIR: /vault-data
+      EXPECTED_PATHS: "./core ./sys ./logical"
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-24}
+      RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+    volumes:
+      - ${TALOS_BACKUP_DIR:-${HOME}/.talos/backups}:/backups
+      # READ-ONLY: the sidecar only reads the file backend to copy it. No RW,
+      # no Vault token, no unseal key — a torn opaque tar is the worst case.
+      - vault_data:/vault-data:ro
+      - ./scripts/dev-volume-backup-loop.sh:/usr/local/bin/dev-volume-backup-loop.sh:ro
+    entrypoint: ["/bin/bash", "/usr/local/bin/dev-volume-backup-loop.sh"]
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.25'
+    networks:
+      - talos-network
+
+  # Neo4j graph backup — data volume snapshot + live cypher count. Neo4j
+  # graph-RAG data is valuable but RECONSTRUCTIBLE via graph_backfill, so
+  # this is a convenience net, not last-line-of-defense. Community Edition's
+  # `neo4j-admin database dump` needs the DB STOPPED — we won't stop the live
+  # graph on a schedule — and online backup is Enterprise-only, so we tar
+  # /data with the same read-stability retry. Uses the neo4j image so
+  # cypher-shell is available to record a live node/relationship count in the
+  # manifest (a liveness/sanity datum — Community can't spin a scratch DB for
+  # a true restore-verify). Read-only mount; separate sidecar for failure
+  # isolation.
+  neo4j-backup:
+    restart: unless-stopped
+    image: neo4j:5.26-community@sha256:b357872da95a164c5243ca8d9060601130717ff43cee3c829402fab46209a412
+    container_name: talos-neo4j-backup
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    environment:
+      BACKUP_TARGET: neo4j
+      SRC_DIR: /neo4j-data
+      EXPECTED_PATHS: "./databases ./transactions"
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?NEO4J_PASSWORD required in .env}
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-24}
+      RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+    volumes:
+      - ${TALOS_BACKUP_DIR:-${HOME}/.talos/backups}:/backups
+      - neo4j_data:/neo4j-data:ro
+      - ./scripts/dev-volume-backup-loop.sh:/usr/local/bin/dev-volume-backup-loop.sh:ro
+    entrypoint: ["/bin/bash", "/usr/local/bin/dev-volume-backup-loop.sh"]
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.25'
+    networks:
+      - talos-network
+
+  # NOTE: Redis is intentionally NOT backed up. It is cache-only for the dev
+  # stack (embedding LRU, OCI module cache, semantic cache, rate-limit
+  # buckets, LLM-key cache) — every entry is regenerated on demand or mirrors
+  # Postgres. A Redis backup would only add noise.
+
   # Redis Cache
   redis:
     deploy:
