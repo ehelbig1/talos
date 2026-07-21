@@ -1190,6 +1190,20 @@ impl ModuleRegistry {
 
     /// Prepares a module for execution and returns the necessary information.
     /// If the module is not an OCI image, it ensures the module is loaded into the Redis cache.
+    ///
+    /// FUEL CONTRACT: the `max_fuel` returned here is the module-row default
+    /// (`wasm_modules.max_fuel`) with NO graph-JSON `data.max_fuel` override
+    /// applied — deliberately. This path backs the module-bound direct-fire
+    /// family (gmail / gcp / google_calendar / webhook push dispatch), which
+    /// fires a single module in response to an inbound event with NO owning
+    /// workflow node, hence no node config to override from. The override
+    /// precedence (`node data.max_fuel` > module default > adaptive floor)
+    /// lives in `ParallelWorkflowEngine::resolve_node_max_fuel` and only applies
+    /// on the graph-execution paths (single-node / pipeline / loop body), where
+    /// a node actually exists. Operators needing a non-default fuel ceiling for
+    /// inbound-event processing wrap the module in a workflow node (which then
+    /// carries `data.max_fuel`) — the module row is the correct, only source of
+    /// truth for a bare module fire.
     pub async fn get_execution_info(
         &self,
         module_id: Uuid,
