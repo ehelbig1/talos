@@ -107,6 +107,23 @@ query GetActorExecutionsSummary($actorId: UUID!) {
   }
 }
 
+# R2 token ledger — per-actor LLM token spend (read-only; budget policy
+# writes stay MCP-only, see BudgetPanel.tsx).
+query GetActorLlmUsageSummary($actorId: UUID!, $days: Int) {
+  llmUsageSummary(actorId: $actorId, days: $days) {
+    actorId
+    tokensLast24H
+    maxLlmTokensPerDay
+    byModel {
+      provider
+      model
+      promptTokens
+      completionTokens
+      calls
+    }
+  }
+}
+
 mutation UpdateActor(
   $id: UUID!
   $name: String

@@ -558,6 +558,44 @@ A scalar that can represent any JSON value.
 """
 scalar JSON
 
+"""
+One (provider, model) LLM usage aggregate within a trailing window —
+the per-model/provider spend breakdown row for the token-spend panel.
+"""
+type LlmUsageModelRow {
+	provider: String!
+	model: String!
+	promptTokens: Int!
+	completionTokens: Int!
+	calls: Int!
+}
+
+"""
+Read-only per-actor LLM token spend summary (R2 token ledger). Mirrors
+the `current_usage`/`policy` numbers the MCP `get_actor_budget` tool
+already exposes — budget POLICY *writes* stay MCP-only (see
+`BudgetPanel`'s "configured via MCP tools" note), this is visibility
+only.
+"""
+type LlmUsageSummary {
+	actorId: UUID!
+	"""
+	Trailing-24h SUM(prompt_tokens + completion_tokens) — the same
+	figure `max_llm_tokens_per_day` is enforced against.
+	"""
+	tokensLast24H: Int!
+	"""
+	Daily token ceiling from the actor's budget policy. `None` =
+	unlimited (no policy row, or an explicit NULL ceiling).
+	"""
+	maxLlmTokensPerDay: Int
+	"""
+	Per-(provider, model) breakdown over the trailing window (`days`
+	arg on the query, default 7, clamped 1..=90).
+	"""
+	byModel: [LlmUsageModelRow!]!
+}
+
 input LoginInput {
 	email: String!
 	password: String!
@@ -636,6 +674,18 @@ type MlDisagreementFeed {
 	"""
 	shadowEpoch: Int!
 	pending: [MlDisagreement!]!
+	"""
+	The latest teacher-vs-gold audit report (RFC 0011 R3), `ml_models
+	.teacher_audit` passed through verbatim — `null` until
+	`ml_teacher_audit` has run at least once for this model. Polymorphic
+	on `status`: `running` ({done, gold_rows}), `failed` ({error,
+	failed_at}), or `complete` (accuracy/per_class/parse_failed/
+	audited_at/mismatches — see `talos_ml::teacher_audit` for the exact
+	shape). Raw JSON passthrough (like `outputData` elsewhere in this
+	schema) rather than a fully-typed union, since the shape varies by
+	status and this field is read-only / display-only.
+	"""
+	teacherAudit: JSON
 }
 
 """
@@ -1049,6 +1099,15 @@ type QueryRoot {
 	actors: [ActorSummary!]!
 	actor(id: UUID!): ActorDetails
 	actorExecutionsSummary(actorId: UUID!): ActorExecutionsSummary!
+	"""
+	Per-actor LLM token spend (R2 token ledger) — the daily-ceiling
+	usage bar plus a trailing-window per-model/provider breakdown.
+	Read-only visibility surface; mirrors the MCP `get_actor_budget`
+	tool's `current_usage`/`policy` numbers so the two protocol
+	surfaces agree. `days` defaults to 7, clamped 1..=90 by the
+	repository method (mirrors `llm_usage_by_user_window`).
+	"""
+	llmUsageSummary(actorId: UUID!, days: Int): LlmUsageSummary!
 	actorWorkflowsSummary(actorId: UUID!): ActorWorkflowsSummary!
 	actorActionLog(actorId: UUID!, limit: Int): [ActorActionLogEntry!]!
 	"""

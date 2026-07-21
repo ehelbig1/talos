@@ -533,6 +533,46 @@ export enum IntegrationService {
   Slack = "SLACK",
 }
 
+/**
+ * One (provider, model) LLM usage aggregate within a trailing window —
+ * the per-model/provider spend breakdown row for the token-spend panel.
+ */
+export type LlmUsageModelRow = {
+  __typename?: "LlmUsageModelRow";
+  calls: Scalars["Int"]["output"];
+  completionTokens: Scalars["Int"]["output"];
+  model: Scalars["String"]["output"];
+  promptTokens: Scalars["Int"]["output"];
+  provider: Scalars["String"]["output"];
+};
+
+/**
+ * Read-only per-actor LLM token spend summary (R2 token ledger). Mirrors
+ * the `current_usage`/`policy` numbers the MCP `get_actor_budget` tool
+ * already exposes — budget POLICY *writes* stay MCP-only (see
+ * `BudgetPanel`'s "configured via MCP tools" note), this is visibility
+ * only.
+ */
+export type LlmUsageSummary = {
+  __typename?: "LlmUsageSummary";
+  actorId: Scalars["UUID"]["output"];
+  /**
+   * Per-(provider, model) breakdown over the trailing window (`days`
+   * arg on the query, default 7, clamped 1..=90).
+   */
+  byModel: Array<LlmUsageModelRow>;
+  /**
+   * Daily token ceiling from the actor's budget policy. `None` =
+   * unlimited (no policy row, or an explicit NULL ceiling).
+   */
+  maxLlmTokensPerDay?: Maybe<Scalars["Int"]["output"]>;
+  /**
+   * Trailing-24h SUM(prompt_tokens + completion_tokens) — the same
+   * figure `max_llm_tokens_per_day` is enforced against.
+   */
+  tokensLast24H: Scalars["Int"]["output"];
+};
+
 export type LoginInput = {
   email: Scalars["String"]["input"];
   password: Scalars["String"]["input"];
@@ -608,6 +648,18 @@ export type MlDisagreementFeed = {
    */
   shadowEpoch: Scalars["Int"]["output"];
   shadowObservations: Scalars["Int"]["output"];
+  /**
+   * The latest teacher-vs-gold audit report (RFC 0011 R3), `ml_models
+   * .teacher_audit` passed through verbatim — `null` until
+   * `ml_teacher_audit` has run at least once for this model. Polymorphic
+   * on `status`: `running` ({done, gold_rows}), `failed` ({error,
+   * failed_at}), or `complete` (accuracy/per_class/parse_failed/
+   * audited_at/mismatches — see `talos_ml::teacher_audit` for the exact
+   * shape). Raw JSON passthrough (like `outputData` elsewhere in this
+   * schema) rather than a fully-typed union, since the shape varies by
+   * status and this field is read-only / display-only.
+   */
+  teacherAudit?: Maybe<Scalars["JSON"]["output"]>;
 };
 
 /**
@@ -1347,6 +1399,15 @@ export type QueryRoot = {
   latestWorkflowExecutions: Array<WorkflowExecution>;
   linkedOauthAccounts: Array<OauthAccount>;
   /**
+   * Per-actor LLM token spend (R2 token ledger) — the daily-ceiling
+   * usage bar plus a trailing-window per-model/provider breakdown.
+   * Read-only visibility surface; mirrors the MCP `get_actor_budget`
+   * tool's `current_usage`/`policy` numbers so the two protocol
+   * surfaces agree. `days` defaults to 7, clamped 1..=90 by the
+   * repository method (mirrors `llm_usage_by_user_window`).
+   */
+  llmUsageSummary: LlmUsageSummary;
+  /**
    * MCP-1190 (2026-05-17): `limit` arg added with default 100 and
    * hard cap of 1000. Pre-fix the query did `fetch_all` on
    * mcp_agents with NO LIMIT — no formal per-user MCP-agent cap
@@ -1482,6 +1543,11 @@ export type QueryRootGetWorkflowChangelogArgs = {
 
 export type QueryRootLatestWorkflowExecutionsArgs = {
   workflowIds: Array<Scalars["UUID"]["input"]>;
+};
+
+export type QueryRootLlmUsageSummaryArgs = {
+  actorId: Scalars["UUID"]["input"];
+  days?: InputMaybe<Scalars["Int"]["input"]>;
 };
 
 export type QueryRootMcpAgentsArgs = {

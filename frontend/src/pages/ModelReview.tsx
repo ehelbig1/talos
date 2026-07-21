@@ -9,6 +9,8 @@ import {
   X,
   Bot,
   Cpu,
+  GraduationCap,
+  AlertTriangle,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -21,6 +23,176 @@ import { LIFECYCLE_STYLE, lifecycleLabel } from "@/lib/mlLifecycle";
 
 function pct(v: number | null | undefined): string {
   return v == null ? "—" : `${(v * 100).toFixed(1)}%`;
+}
+
+// ── RFC 0011 R3 teacher-vs-gold audit ───────────────────────────────────────
+// `teacherAudit` is a raw JSON passthrough of `ml_models.teacher_audit`
+// (talos-ml::teacher_audit) — polymorphic on `status`. Mirrors the shape
+// documented in talos-ml/src/teacher_audit.rs exactly; see that module for
+// the authoritative contract.
+
+interface TeacherAuditPerClass {
+  n: number;
+  agree: number;
+}
+
+interface TeacherAuditMismatch {
+  example_key?: string | null;
+  human: string;
+  teacher: string;
+}
+
+interface TeacherAuditRunning {
+  status: "running";
+  started_at?: string;
+  done?: number;
+  gold_rows: number;
+  skipped_few_shot_anchors?: number;
+}
+
+interface TeacherAuditFailed {
+  status: "failed";
+  error: string;
+  failed_at: string;
+}
+
+interface TeacherAuditComplete {
+  status: "complete";
+  audited_at: string;
+  total: number;
+  compared: number;
+  agree: number;
+  parse_failed: number;
+  accuracy: number | null;
+  per_class: Record<string, TeacherAuditPerClass>;
+  mismatches: TeacherAuditMismatch[];
+  teacher: { provider: string; model: string; few_shot_used: number };
+}
+
+type TeacherAudit =
+  | TeacherAuditRunning
+  | TeacherAuditFailed
+  | TeacherAuditComplete;
+
+function isTeacherAudit(value: unknown): value is TeacherAudit {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "status" in value &&
+    typeof (value as { status: unknown }).status === "string"
+  );
+}
+
+/** "Teacher ceiling" card — the LLM teacher's accuracy against human-corrected
+ * gold rows. Distilled fast models can never beat this number, so it's the
+ * ceiling on how good the classifier can get. Handles the three
+ * `teacher_audit` states (running/failed/complete) plus "never audited". */
+function TeacherCeilingCard({ audit }: { audit: unknown }) {
+  if (!isTeacherAudit(audit)) {
+    return (
+      <div className="px-6 py-5 bg-white/[0.02] border border-white/5 rounded-[2rem]">
+        <div className="flex items-center gap-2 mb-1">
+          <GraduationCap className="w-4 h-4 text-muted-foreground/40" />
+          <span className="text-[9px] text-muted-foreground/40 font-black uppercase tracking-[0.25em]">
+            Teacher ceiling
+          </span>
+        </div>
+        <p className="text-[10px] text-muted-foreground/30 font-bold uppercase tracking-widest mt-2">
+          Not audited yet — run ml_teacher_audit to measure the teacher's
+          accuracy against gold corrections.
+        </p>
+      </div>
+    );
+  }
+
+  if (audit.status === "running") {
+    const done = audit.done ?? 0;
+    const total = Math.max(audit.gold_rows, 1);
+    const progressPct = Math.min(100, Math.round((done / total) * 100));
+    return (
+      <div className="px-6 py-5 bg-white/[0.02] border border-primary/20 rounded-[2rem]">
+        <div className="flex items-center gap-2 mb-3">
+          <GraduationCap className="w-4 h-4 text-primary animate-pulse" />
+          <span className="text-[9px] text-primary/80 font-black uppercase tracking-[0.25em]">
+            Teacher ceiling — auditing
+          </span>
+          <span className="ml-auto text-[10px] text-muted-foreground/50 font-bold">
+            {done}/{audit.gold_rows}
+          </span>
+        </div>
+        <div className="h-1.5 bg-white/5 rounded-full overflow-hidden">
+          <div
+            className="h-full bg-primary shadow-[0_0_10px_hsla(var(--primary),0.6)] transition-all duration-500 ease-premium-out"
+            style={{ width: `${progressPct}%` }}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  if (audit.status === "failed") {
+    return (
+      <div className="px-6 py-5 bg-white/[0.02] border border-destructive/20 rounded-[2rem]">
+        <div className="flex items-center gap-2 mb-1">
+          <AlertTriangle className="w-4 h-4 text-destructive/70" />
+          <span className="text-[9px] text-destructive/70 font-black uppercase tracking-[0.25em]">
+            Teacher ceiling — audit failed
+          </span>
+        </div>
+        <p className="text-[10px] text-muted-foreground/40 font-bold uppercase tracking-widest mt-2">
+          {audit.error}
+        </p>
+      </div>
+    );
+  }
+
+  // complete
+  const perClassEntries = Object.entries(audit.per_class);
+  return (
+    <div className="px-6 py-5 bg-white/[0.02] border border-white/5 rounded-[2rem]">
+      <div className="flex flex-wrap items-center gap-x-8 gap-y-3">
+        <div className="flex items-center gap-2">
+          <GraduationCap className="w-4 h-4 text-primary/70" />
+          <span className="text-[9px] text-muted-foreground/40 font-black uppercase tracking-[0.25em]">
+            Teacher ceiling
+          </span>
+        </div>
+        <Stat
+          label="Accuracy"
+          value={pct(audit.accuracy)}
+          hint={`${audit.agree}/${audit.compared} agree`}
+        />
+        <Stat label="Parse failed" value={String(audit.parse_failed)} />
+        <span className="ml-auto text-[9px] text-muted-foreground/30 font-black uppercase tracking-[0.25em]">
+          {new Date(audit.audited_at).toLocaleString()} · teacher:{" "}
+          {audit.teacher.model}
+        </span>
+      </div>
+      {perClassEntries.length > 0 && (
+        <div className="mt-4 space-y-2">
+          {perClassEntries.map(([label, { n, agree }]) => {
+            const classPct = n > 0 ? (agree / n) * 100 : 0;
+            return (
+              <div key={label} className="flex items-center gap-3">
+                <span className="w-28 shrink-0 text-[10px] text-muted-foreground/60 font-bold truncate capitalize">
+                  {label}
+                </span>
+                <div className="flex-1 h-1.5 bg-white/5 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-primary/70 transition-all duration-500 ease-premium-out"
+                    style={{ width: `${classPct}%` }}
+                  />
+                </div>
+                <span className="w-16 shrink-0 text-[10px] text-muted-foreground/40 font-bold text-right tabular-nums">
+                  {agree}/{n}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
 }
 
 export default function ModelReview() {
@@ -192,6 +364,14 @@ export default function ModelReview() {
                   <Sparkles className="w-3.5 h-3.5 text-primary/40" />
                   Corrections train the model toward promotion
                 </div>
+              </div>
+            )}
+
+            {/* Teacher ceiling — the LLM teacher's accuracy on gold rows,
+                the distilled model's accuracy ceiling. */}
+            {feed && (
+              <div className="mb-8">
+                <TeacherCeilingCard audit={feed.teacherAudit} />
               </div>
             )}
 
