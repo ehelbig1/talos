@@ -62,8 +62,11 @@ const MAX_MISMATCHES: usize = 20;
 /// Few-shot anchors — matches the production classify leg's
 /// `model::few_shot(name, 6)`.
 const FEW_SHOT_K: u32 = 6;
-/// Response budget. The template uses 256 with `think:false`; the
-/// server-side client can't disable reasoning, so leave preamble room.
+/// Response budget. The template uses 256 with `think:false`; the MCP
+/// handler's transport now mirrors that (`OllamaClient::complete_structured`
+/// — think off, `format:"json"`), but the budget keeps preamble headroom
+/// for transports that can't honor `think` (the structured call's 4xx
+/// fallback, or a future non-Ollama teacher).
 const TEACHER_MAX_TOKENS: u32 = 1024;
 /// Consecutive-transport-failure budget before the audit aborts (a dead
 /// teacher endpoint must fail the run, not produce a 0%-agreement lie).

@@ -1092,11 +1092,16 @@ async fn handle_teacher_audit(
     let svc = dataset_service(state);
     // Send + 'static: captures only an Arc<OllamaClient>, so it detaches
     // cleanly onto the spawned audit task.
+    // `complete_structured` = the Smart Classifier template's LLM options
+    // (think:false, format:"json", temp 0.1). Reasoning teachers (qwen3.6)
+    // otherwise burn the whole response budget thinking without emitting
+    // the {"label": ...} object — measured 23/100 unparseable replies on
+    // the 2026-07-21 audit; reasoning-off also ~3x'd the inbox A/B.
     let classify = move |r: talos_ml::TeacherRequest| {
         let ollama = ollama.clone();
         async move {
             ollama
-                .complete(
+                .complete_structured(
                     &r.llm_model,
                     &r.system_prompt,
                     &r.user_content,

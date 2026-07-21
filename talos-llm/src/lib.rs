@@ -522,6 +522,42 @@ impl LlmClient {
 // Tier 1: Ollama (Local LLM) Client
 // ============================================================================
 
+/// Native `/api/chat` request body. Pure so the option wiring is
+/// unit-testable: `think` is only serialized when explicitly set (models
+/// without a reasoning mode can reject the field), `json_format` maps to
+/// the native `format:"json"` constraint, and structured calls pin
+/// `temperature` to the Smart Classifier template's 0.1.
+fn build_chat_body(
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    max_tokens: u32,
+    think: Option<bool>,
+    json_format: bool,
+) -> serde_json::Value {
+    let mut messages = vec![];
+    if !system_prompt.is_empty() {
+        messages.push(json!({"role": "system", "content": system_prompt}));
+    }
+    messages.push(json!({"role": "user", "content": user_prompt}));
+
+    let mut options = json!({ "num_predict": max_tokens });
+    let mut body = json!({
+        "model": model,
+        "messages": messages,
+        "stream": false,
+    });
+    if let Some(t) = think {
+        body["think"] = json!(t);
+    }
+    if json_format {
+        body["format"] = json!("json");
+        options["temperature"] = json!(0.1);
+    }
+    body["options"] = options;
+    body
+}
+
 /// Client for local Ollama inference. Data never leaves the network — no DLP
 /// needed. Used for quick, frequent, simple tasks (classification, extraction,
 /// summarization) and for processing sensitive data that must stay on-prem.
@@ -570,19 +606,51 @@ impl OllamaClient {
         user_prompt: &str,
         max_tokens: u32,
     ) -> Result<String> {
-        let mut messages = vec![];
-        if !system_prompt.is_empty() {
-            messages.push(json!({"role": "system", "content": system_prompt}));
+        let body = build_chat_body(model, system_prompt, user_prompt, max_tokens, None, false);
+        self.chat(model, body).await
+    }
+
+    /// Classification-shaped completion mirroring the Smart Classifier
+    /// template's LLM leg (`think:false`, `format:"json"`, `temperature
+    /// 0.1`) — for callers that need a small JSON object back, not prose.
+    /// Reasoning models (qwen3.6 et al.) otherwise burn the whole
+    /// `num_predict` budget thinking without ever emitting the JSON (the
+    /// teacher audit measured 23/100 such replies on 2026-07-21).
+    ///
+    /// Some models reject the `think` field outright (HTTP 400 on models
+    /// without a reasoning mode, Ollama version dependent) — on a 4xx the
+    /// call retries ONCE without `think`, keeping `format`/temperature, so
+    /// a non-reasoning teacher still gets structured output.
+    pub async fn complete_structured(
+        &self,
+        model: &str,
+        system_prompt: &str,
+        user_prompt: &str,
+        max_tokens: u32,
+    ) -> Result<String> {
+        let body = build_chat_body(
+            model,
+            system_prompt,
+            user_prompt,
+            max_tokens,
+            Some(false),
+            true,
+        );
+        match self.chat(model, body).await {
+            Ok(text) => Ok(text),
+            Err(e) if e.to_string().contains("HTTP 4") => {
+                let body =
+                    build_chat_body(model, system_prompt, user_prompt, max_tokens, None, true);
+                self.chat(model, body).await
+            }
+            Err(e) => Err(e),
         }
-        messages.push(json!({"role": "user", "content": user_prompt}));
+    }
 
-        let body = json!({
-            "model": model,
-            "messages": messages,
-            "stream": false,
-            "options": { "num_predict": max_tokens },
-        });
-
+    /// Shared native `/api/chat` round-trip: POST → status check (body
+    /// logged server-side only, length-capped) → usage record → content
+    /// extraction.
+    async fn chat(&self, model: &str, body: serde_json::Value) -> Result<String> {
         let resp = self
             .client
             .post(format!("{}/api/chat", self.base_url))
@@ -670,5 +738,46 @@ impl OllamaClient {
             return Err(anyhow!("Ollama show failed: HTTP {}", resp.status()));
         }
         talos_http_body::read_json_capped(resp).await
+    }
+}
+
+#[cfg(test)]
+mod chat_body_tests {
+    use super::build_chat_body;
+
+    #[test]
+    fn plain_body_omits_think_and_format() {
+        let b = build_chat_body("m", "sys", "user", 256, None, false);
+        assert!(b.get("think").is_none(), "think only serializes when set");
+        assert!(b.get("format").is_none());
+        assert_eq!(b["options"]["num_predict"], 256);
+        assert!(b["options"].get("temperature").is_none());
+        assert_eq!(b["stream"], false);
+        assert_eq!(b["messages"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn structured_body_disables_think_and_pins_json() {
+        let b = build_chat_body("m", "sys", "user", 1024, Some(false), true);
+        assert_eq!(b["think"], false);
+        assert_eq!(b["format"], "json");
+        assert_eq!(b["options"]["temperature"], 0.1);
+        assert_eq!(b["options"]["num_predict"], 1024);
+    }
+
+    #[test]
+    fn structured_fallback_body_keeps_format_without_think() {
+        // The 4xx retry path: think dropped, structured constraints kept.
+        let b = build_chat_body("m", "sys", "user", 1024, None, true);
+        assert!(b.get("think").is_none());
+        assert_eq!(b["format"], "json");
+        assert_eq!(b["options"]["temperature"], 0.1);
+    }
+
+    #[test]
+    fn empty_system_prompt_sends_single_message() {
+        let b = build_chat_body("m", "", "user", 64, None, false);
+        assert_eq!(b["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(b["messages"][0]["role"], "user");
     }
 }
