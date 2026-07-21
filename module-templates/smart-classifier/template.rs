@@ -264,7 +264,7 @@ pub fn run(input: String) -> Result<String, String> {
     // 2. LLM fallback. First fetch the model's human-correction anchors
     // (best-effort — a fresh model has none and any infra error degrades
     // to an unaugmented prompt; cancellation unwinds per the WIT contract).
-    let few_shot: Vec<(String, String)> = match talos::core::model::few_shot(&model_name, 6) {
+    let few_shot: Vec<(String, String)> = match talos::core::model::few_shot(&model_name, 8) {
         Ok(examples) => examples
             .into_iter()
             // Only anchor labels that are still in this node's configured

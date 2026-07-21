@@ -9,8 +9,9 @@
 //!
 //! The teacher invocation mirrors the production classify leg
 //! (`module-templates/smart-classifier/template.rs::llm_classify`) on the
-//! few-shot scaffold (`few_shot_corrections`, k = 6, the server-side
-//! source behind the template's `model::few_shot(name, 6)`), the
+//! few-shot scaffold (`few_shot_corrections`, k = 8 — the MAX_FEWSHOT_K
+//! RPC cap, the server-side source behind the template's
+//! `model::few_shot(name, 8)`), the
 //! `<untrusted_data>` spotlighting, and the balanced-object output parse.
 //! The one deliberate divergence is the OUTPUT CONTRACT: the audit's
 //! appended instruction is an explicit OVERRIDE of any earlier
@@ -60,8 +61,12 @@ pub const MAX_AUDIT_ROWS: i64 = 100;
 /// Mismatch detail cap in the stored/returned report.
 const MAX_MISMATCHES: usize = 20;
 /// Few-shot anchors — matches the production classify leg's
-/// `model::few_shot(name, 6)`.
-const FEW_SHOT_K: u32 = 6;
+/// `model::few_shot(name, 8)` — raised 6→8 (the signed-RPC
+/// `MAX_FEWSHOT_K` cap) 2026-07-21: the archive/to_read boundary is
+/// personal taste encoded almost entirely by these anchors, and the
+/// class-balanced selection gets one more example per class out of the
+/// bump (3 classes: 2→2-3 each).
+const FEW_SHOT_K: u32 = 8;
 /// Response budget. The template uses 256 with `think:false`; the MCP
 /// handler's transport now mirrors that (`OllamaClient::complete_structured`
 /// — think off, `format:"json"`), but the budget keeps preamble headroom
