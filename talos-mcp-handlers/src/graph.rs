@@ -295,6 +295,140 @@ async fn save_graph_json_unchecked(
     }
 }
 
+/// What to do after a graph mutation, decided from the
+/// `workflow_has_active_version` probe. Pulled out as a pure function so
+/// the publish-or-skip decision is unit-testable without a database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublishAction {
+    /// Workflow has an active published version — publish a new one to
+    /// keep the published copy in sync with the edited draft.
+    Publish,
+    /// Draft-only workflow (never published) — nothing to sync, stay draft.
+    Skip,
+    /// Couldn't determine published-version status (DB hiccup) — warn +
+    /// skip, and tell the operator to publish manually if needed.
+    ProbeFailed,
+}
+
+/// Decide the post-mutation publish action from the
+/// `workflow_has_active_version` probe result. `None` = probe errored.
+pub(crate) fn decide_publish_action(has_active_version: Option<bool>) -> PublishAction {
+    match has_active_version {
+        Some(true) => PublishAction::Publish,
+        Some(false) => PublishAction::Skip,
+        None => PublishAction::ProbeFailed,
+    }
+}
+
+/// Outcome of [`maybe_auto_publish`]. Carries the message suffix that
+/// each graph-mutating handler appends to its response so the operator
+/// learns whether the published version was kept in sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AutoPublishOutcome {
+    /// Draft-only workflow — no publish attempted (empty suffix).
+    DraftOnly,
+    /// A fresh version was published to keep the published copy in sync.
+    Published,
+    /// Auto-publish was attempted but failed — draft saved, published stale.
+    PublishFailed,
+    /// Published-version status could not be probed (DB hiccup).
+    ProbeFailed,
+}
+
+impl AutoPublishOutcome {
+    /// The (space-prefixed) message suffix to append to a handler's
+    /// response text. Empty for the draft-only case. Mirrors the exact
+    /// wording `update_node_config` used before this was generalized.
+    pub(crate) fn message_suffix(self) -> &'static str {
+        match self {
+            AutoPublishOutcome::DraftOnly => "",
+            AutoPublishOutcome::Published => {
+                " Auto-published new version to keep published workflow in sync."
+            }
+            AutoPublishOutcome::PublishFailed => {
+                " Warning: auto-publish failed; the draft was saved but the published version is \
+                 out of sync. Run publish_version manually."
+            }
+            AutoPublishOutcome::ProbeFailed => {
+                " Warning: couldn't verify published-version status (DB hiccup). If this workflow \
+                 has a published version, run publish_version to apply the change."
+            }
+        }
+    }
+
+    /// Whether a new version was actually published. Exercised by the
+    /// unit tests (asserts published→true, draft-only/failure→false);
+    /// kept as a first-class accessor so callers that want to branch on
+    /// "did we sync?" don't re-`matches!` the variant.
+    #[allow(dead_code)]
+    pub(crate) fn published(self) -> bool {
+        matches!(self, AutoPublishOutcome::Published)
+    }
+}
+
+/// Auto-publish a new workflow version after a graph mutation, when — and
+/// only when — the workflow already has an active published version.
+///
+/// This is the ONE shared implementation of the "keep published in sync"
+/// behavior. Since PR #531 every trigger path (manual, MCP `call_workflow`,
+/// scheduler) runs the ACTIVE PUBLISHED version of a workflow, so a graph
+/// edit made through any mutation tool silently never executes until an
+/// explicit `publish_version`. Historically only `update_node_config`
+/// auto-published; every other graph-mutating handler
+/// (`add_node_to_workflow`, `add_edge_to_workflow`, `swap_node_module`,
+/// the `add_*_node` system-node setters, standalone `add_edge`/`remove_edge`,
+/// …) left the published copy stale — that cost 30 min of live debugging
+/// on 2026-07-21 ("the classify node didn't run"). Routing every mutation
+/// through this helper makes the behavior uniform.
+///
+/// Draft-only workflows (never published) stay drafts. The caller is
+/// expected to have already persisted the new graph via `save_graph_json`
+/// (or the repository's `update_workflow_graph[_unchecked]`) — this only
+/// snapshots the just-saved `workflows.graph_json` into a new active
+/// version. Validation is deliberately skipped on the sync publish (the
+/// `None` arg) — the draft was already accepted by the mutation.
+pub(crate) async fn maybe_auto_publish(
+    state: &McpState,
+    wf_id: Uuid,
+    user_id: Uuid,
+    description: &str,
+) -> AutoPublishOutcome {
+    let probe = state.workflow_repo.workflow_has_active_version(wf_id).await;
+    let has_active = match probe {
+        Ok(v) => Some(v),
+        Err(ref e) => {
+            tracing::warn!(
+                target: "talos_audit",
+                workflow_id = %wf_id,
+                error = %e,
+                "auto-publish: couldn't probe workflow_has_active_version — skipped"
+            );
+            None
+        }
+    };
+    match decide_publish_action(has_active) {
+        PublishAction::Skip => AutoPublishOutcome::DraftOnly,
+        PublishAction::ProbeFailed => AutoPublishOutcome::ProbeFailed,
+        PublishAction::Publish => {
+            match talos_workflow_versions::WorkflowVersionService::publish_version(
+                &state.db_pool,
+                wf_id,
+                user_id,
+                Some(description.to_string()),
+                None, // skip validation on auto-publish sync
+            )
+            .await
+            {
+                Ok((_v, _warnings)) => AutoPublishOutcome::Published,
+                Err(e) => {
+                    tracing::error!(err = ?e, workflow_id = %wf_id, "Auto-publish after graph mutation failed");
+                    AutoPublishOutcome::PublishFailed
+                }
+            }
+        }
+    }
+}
+
 /// Shape returned by [`upsert_system_node`]. Carries the verified
 /// workflow_id + node_id plus pre-formatted wiring strings so handler
 /// bodies can splice them into their response text without re-
@@ -303,7 +437,16 @@ pub(crate) struct AddedSystemNode {
     pub workflow_id: Uuid,
     pub node_id: String,
     pub wiring_in: String,
+    /// Trailing text spliced after `wiring_in` in the handler's response —
+    /// the outgoing-edge line PLUS the auto-publish sync note (see
+    /// [`maybe_auto_publish`]). Folding the note here means every handler
+    /// that already prints `wiring_out` surfaces the "kept published in
+    /// sync" status for free. Handlers that build their own response body
+    /// (loop/collect/dispatch/…) instead read `auto_publish_note`.
     pub wiring_out: String,
+    /// The bare auto-publish sync note (possibly empty), for handlers that
+    /// don't print `wiring_out` and want to append it to their own message.
+    pub auto_publish_note: String,
 }
 
 /// Shared boilerplate for `add_*_node` MCP handlers that write a
@@ -415,20 +558,35 @@ pub(crate) async fn upsert_system_node(
     )
     .await?;
 
+    let auto_publish_note = maybe_auto_publish(
+        state,
+        workflow_id,
+        user_id,
+        &format!("Auto-published after adding {} node", kind),
+    )
+    .await
+    .message_suffix()
+    .to_string();
+
     let wiring_in = if !connect_from_sources.is_empty() {
         format!("\nWired: {} → {}", connect_from_sources.join(", "), node_id)
     } else {
         String::new()
     };
-    let wiring_out = connect_to
+    let mut wiring_out = connect_to
         .map(|t| format!("\nWired: {} → {}", node_id, t))
         .unwrap_or_default();
+    // Fold the auto-publish note into wiring_out so every handler that
+    // already splices wiring_out surfaces it; the raw note is also
+    // exposed for handlers that build a bespoke response body.
+    wiring_out.push_str(&auto_publish_note);
 
     Ok(AddedSystemNode {
         workflow_id,
         node_id,
         wiring_in,
         wiring_out,
+        auto_publish_note,
     })
 }
 
@@ -1817,45 +1975,13 @@ async fn handle_update_node_config(
                             }
                         }
 
-                        // Auto-publish if this workflow has an active published version.
-                        //
-                        // MCP-842 (2026-05-14): explicit match. Pre-fix `.unwrap_or(false)`
-                        // collapsed DB error → false → silently skipped the auto-publish,
-                        // leaving the operator with a draft that diverged from the
-                        // still-published version with NO warning in the response.
-                        // Same misleading-discriminator class as MCP-838/839/840/841
-                        // applied to a side-effect-or-not branch.
-                        match state.workflow_repo.workflow_has_active_version(wf_id).await {
-                            Ok(true) => {
-                                match talos_workflow_versions::WorkflowVersionService::publish_version(
-                                    &state.db_pool,
-                                    wf_id,
-                                    user_id,
-                                    Some("Auto-published after node removal".to_string()),
-                                    None, // skip validation on auto-publish sync
-                                )
+                        // Auto-publish if this workflow has an active published
+                        // version (shared helper — see maybe_auto_publish).
+                        msg.push_str(
+                            maybe_auto_publish(state, wf_id, user_id, "Auto-published after node removal")
                                 .await
-                                {
-                                    Ok((_v, _warnings)) => {
-                                        msg.push_str(" Auto-published new version to keep published workflow in sync.");
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(err = ?e, workflow_id = %wf_id, "Auto-publish after remove_node failed");
-                                        msg.push_str(" Warning: auto-publish failed; the draft was saved but the published version is out of sync. Run publish_version manually.");
-                                    }
-                                }
-                            }
-                            Ok(false) => {}
-                            Err(e) => {
-                                tracing::warn!(
-                                    target: "talos_audit",
-                                    workflow_id = %wf_id,
-                                    error = %e,
-                                    "remove_node: couldn't probe workflow_has_active_version — auto-publish skipped"
-                                );
-                                msg.push_str(" Warning: couldn't verify published-version status (DB hiccup). If this workflow has a published version, run publish_version to apply the change.");
-                            }
-                        }
+                                .message_suffix(),
+                        );
 
                         return mcp_text(req_id, &msg);
                 }
@@ -1916,40 +2042,13 @@ async fn handle_update_node_config(
         }
     }
 
-    // Auto-publish if this workflow has an active published version.
-    // MCP-842 (2026-05-14): explicit match; see remove_node above for
-    // the misleading-discriminator class rationale.
-    match state.workflow_repo.workflow_has_active_version(wf_id).await {
-        Ok(true) => {
-            match talos_workflow_versions::WorkflowVersionService::publish_version(
-                &state.db_pool,
-                wf_id,
-                user_id,
-                Some("Auto-published after config update".to_string()),
-                None, // skip validation on auto-publish sync
-            )
+    // Auto-publish if this workflow has an active published version
+    // (shared helper — see maybe_auto_publish).
+    msg.push_str(
+        maybe_auto_publish(state, wf_id, user_id, "Auto-published after config update")
             .await
-            {
-                Ok((_v, _warnings)) => {
-                    msg.push_str(" Auto-published new version to keep published workflow in sync.");
-                }
-                Err(e) => {
-                    tracing::error!(err = ?e, workflow_id = %wf_id, "Auto-publish after update_node_config failed");
-                    msg.push_str(" Warning: auto-publish failed; the draft was saved but the published version is out of sync. Run publish_version manually.");
-                }
-            }
-        }
-        Ok(false) => {}
-        Err(e) => {
-            tracing::warn!(
-                target: "talos_audit",
-                workflow_id = %wf_id,
-                error = %e,
-                "update_node_config: couldn't probe workflow_has_active_version — auto-publish skipped"
-            );
-            msg.push_str(" Warning: couldn't verify published-version status (DB hiccup). If this workflow has a published version, run publish_version to apply the change.");
-        }
-    }
+            .message_suffix(),
+    );
 
     match machine_block {
         Some(mb) => mcp_text_with_json(req_id, &msg, mb),
@@ -2227,14 +2326,20 @@ async fn handle_duplicate_node(
         return resp;
     }
 
+    let sync_note =
+        maybe_auto_publish(state, wf_id, user_id, "Auto-published after node duplicate")
+            .await
+            .message_suffix();
+
     mcp_text(
         req_id,
         &format!(
-            "Node '{}' duplicated as '{}' in workflow {}.\nNew node: {}",
+            "Node '{}' duplicated as '{}' in workflow {}.\nNew node: {}{}",
             source_node_id,
             new_node_id,
             wf_id,
-            serde_json::to_string_pretty(&new_node).unwrap_or_default()
+            serde_json::to_string_pretty(&new_node).unwrap_or_default(),
+            sync_note
         ),
     )
 }
@@ -2366,11 +2471,15 @@ async fn handle_add_edge(
         return resp;
     }
 
+    let sync_note = maybe_auto_publish(state, wf_id, user_id, "Auto-published after edge add")
+        .await
+        .message_suffix();
+
     mcp_text(
         req_id,
         &format!(
-            "Edge added: {} -> {} in workflow {}.",
-            source, target, wf_id
+            "Edge added: {} -> {} in workflow {}.{}",
+            source, target, wf_id, sync_note
         ),
     )
 }
@@ -2422,11 +2531,15 @@ async fn handle_remove_edge(
         return resp;
     }
 
+    let sync_note = maybe_auto_publish(state, wf_id, user_id, "Auto-published after edge removal")
+        .await
+        .message_suffix();
+
     mcp_text(
         req_id,
         &format!(
-            "Edge {} -> {} removed from workflow {}.",
-            source, target, wf_id
+            "Edge {} -> {} removed from workflow {}.{}",
+            source, target, wf_id, sync_note
         ),
     )
 }
@@ -2559,8 +2672,8 @@ async fn handle_add_loop_node(
             "max_iterations": max_iterations,
             "edges_wired": edges_wired,
             "message": format!(
-                "Loop node '{}' added to workflow {}. Body: '{}', condition: '{}', max_iterations: {}.",
-                added.node_id, added.workflow_id, body_node_id, condition, max_iterations
+                "Loop node '{}' added to workflow {}. Body: '{}', condition: '{}', max_iterations: {}.{}",
+                added.node_id, added.workflow_id, body_node_id, condition, max_iterations, added.auto_publish_note
             ),
         }))
         .unwrap_or_default(),
@@ -2622,8 +2735,8 @@ async fn handle_add_collect_node(
             "downstream": connect_to,
             "edges_wired": edges_wired,
             "message": format!(
-                "Collect node '{}' added to workflow {}. Fan-in node — gathers all parent branch outputs into {{count, items: [...]}}.",
-                added.node_id, added.workflow_id
+                "Collect node '{}' added to workflow {}. Fan-in node — gathers all parent branch outputs into {{count, items: [...]}}.{}",
+                added.node_id, added.workflow_id, added.auto_publish_note
             ),
         }))
         .unwrap_or_default(),
@@ -2671,8 +2784,8 @@ async fn handle_add_assistant_report_node(
             "days": days,
             "downstream": connect_to,
             "message": format!(
-                "Assistant-report node '{}' added to workflow {}. Emits {{available, window_days, workflows: [...], cost, ops_alerts: {{..., correction_candidates}}, ml: {{models: [...]}}}} for downstream compose nodes.",
-                added.node_id, added.workflow_id
+                "Assistant-report node '{}' added to workflow {}. Emits {{available, window_days, workflows: [...], cost, ops_alerts: {{..., correction_candidates}}, ml: {{models: [...]}}}} for downstream compose nodes.{}",
+                added.node_id, added.workflow_id, added.auto_publish_note
             ),
         }))
         .unwrap_or_default(),
@@ -2721,8 +2834,8 @@ async fn handle_add_ops_alerts_digest_node(
             "top_limit": top_limit,
             "downstream": connect_to,
             "message": format!(
-                "Ops-alerts digest node '{}' added to workflow {}. Emits {{available, digest: {{active_by_severity, active_by_source, new_last_24h, reopened_active}}, top_active: [...]}} for downstream compose nodes.",
-                added.node_id, added.workflow_id
+                "Ops-alerts digest node '{}' added to workflow {}. Emits {{available, digest: {{active_by_severity, active_by_source, new_last_24h, reopened_active}}, top_active: [...]}} for downstream compose nodes.{}",
+                added.node_id, added.workflow_id, added.auto_publish_note
             ),
         }))
         .unwrap_or_default(),
@@ -2815,8 +2928,8 @@ async fn handle_add_sub_workflow_node(
             "timeout_secs": timeout_secs,
             "edges_wired": edges_wired,
             "message": format!(
-                "Sub-workflow node '{}' added to workflow {}. Invokes workflow {} with {}s timeout.",
-                added.node_id, added.workflow_id, sub_workflow_id, timeout_secs
+                "Sub-workflow node '{}' added to workflow {}. Invokes workflow {} with {}s timeout.{}",
+                added.node_id, added.workflow_id, sub_workflow_id, timeout_secs, added.auto_publish_note
             ),
         }))
         .unwrap_or_default(),
@@ -2923,11 +3036,20 @@ async fn handle_copy_node(
         return e;
     }
 
+    let sync_note = maybe_auto_publish(
+        state,
+        target_wf_id,
+        user_id,
+        "Auto-published after node copy",
+    )
+    .await
+    .message_suffix();
+
     mcp_text(
         req_id,
         &format!(
-            "Node '{}' copied from workflow {} to workflow {} as '{}'.",
-            source_node_id, source_wf_id, target_wf_id, target_node_id
+            "Node '{}' copied from workflow {} to workflow {} as '{}'.{}",
+            source_node_id, source_wf_id, target_wf_id, target_node_id, sync_note
         ),
     )
 }
@@ -3024,6 +3146,15 @@ async fn handle_set_node_description(
         return e;
     }
 
+    let sync_note = maybe_auto_publish(
+        state,
+        wf_id,
+        user_id,
+        "Auto-published after node description update",
+    )
+    .await
+    .message_suffix();
+
     // MCP-150 (2026-05-08): JSON envelope on success.
     mcp_text(
         req_id,
@@ -3032,8 +3163,8 @@ async fn handle_set_node_description(
             "workflow_id": wf_id.to_string(),
             "node_id": node_id,
             "message": format!(
-                "Description set on node '{}' in workflow {}.",
-                node_id, wf_id
+                "Description set on node '{}' in workflow {}.{}",
+                node_id, wf_id, sync_note
             ),
         }))
         .unwrap_or_default(),
@@ -3375,27 +3506,18 @@ async fn handle_add_skip_condition(
         return e;
     }
 
-    // Check if there's a published version -- warn that it won't take effect until republished.
-    //
-    // MCP-845 (2026-05-14): same misleading-discriminator class as MCP-842
-    // (auto-publish sites). Pre-fix `.unwrap_or(false)` collapsed DB errors
-    // into "no published version" → no operator note appended → operator
-    // thinks "saved + applied" when actually they may need to publish.
-    // Distinguish Ok/Err: on Err, append a note that explicitly says we
-    // couldn't verify so the operator runs publish_version defensively.
-    let note = match state.workflow_repo.workflow_has_active_version(workflow_id).await {
-        Ok(true) => "\n\nNote: This workflow has a published version. The skip condition is saved to the draft but trigger_workflow uses the published version. Run publish_version to apply the change.",
-        Ok(false) => "",
-        Err(e) => {
-            tracing::warn!(
-                target: "talos_audit",
-                workflow_id = %workflow_id,
-                error = %e,
-                "add_skip_condition: couldn't probe workflow_has_active_version — defaulting note to operator-must-publish"
-            );
-            "\n\nNote: Couldn't verify whether this workflow has a published version (DB hiccup). The skip condition is saved to the draft regardless; if a published version exists, run publish_version to apply the change."
-        }
-    };
+    // Auto-publish if this workflow has an active published version, so the
+    // skip condition actually takes effect (shared helper — see
+    // maybe_auto_publish). Previously this only appended an advisory note and
+    // left the operator to publish manually.
+    let note = maybe_auto_publish(
+        state,
+        workflow_id,
+        user_id,
+        "Auto-published after skip-condition change",
+    )
+    .await
+    .message_suffix();
 
     mcp_text(
         req_id,
@@ -3560,8 +3682,8 @@ async fn handle_add_capability_dispatch_node(
         .map(|w| format!("\n\n{}", w))
         .unwrap_or_default();
     mcp_text(req_id, &format!(
-        "Capability dispatch node '{}' added to workflow {}.\nRequired capabilities: {:?}\nTimeout: {}s\n\nAt runtime, the engine will find the best-matching workflow with ALL required capabilities and execute it as a sub-workflow.{}{}",
-        added.node_id, added.workflow_id, required_capabilities, timeout_secs, wiring, warning_line
+        "Capability dispatch node '{}' added to workflow {}.\nRequired capabilities: {:?}\nTimeout: {}s\n\nAt runtime, the engine will find the best-matching workflow with ALL required capabilities and execute it as a sub-workflow.{}{}{}",
+        added.node_id, added.workflow_id, required_capabilities, timeout_secs, wiring, warning_line, added.auto_publish_note
     ))
 }
 
@@ -3627,8 +3749,8 @@ async fn handle_add_dispatch_node(
     };
 
     mcp_text(req_id, &format!(
-        "Dynamic dispatch node '{}' added to workflow {}.\nExpression: {}\nTimeout: {}s\n\nAt runtime, the expression is evaluated against the node's input to determine which workflow to invoke.",
-        added.node_id, added.workflow_id, dispatch_expression, timeout_secs
+        "Dynamic dispatch node '{}' added to workflow {}.\nExpression: {}\nTimeout: {}s\n\nAt runtime, the expression is evaluated against the node's input to determine which workflow to invoke.{}",
+        added.node_id, added.workflow_id, dispatch_expression, timeout_secs, added.auto_publish_note
     ))
 }
 
@@ -3708,23 +3830,17 @@ async fn handle_set_continue_on_error(
         return e;
     }
 
-    // MCP-845 (2026-05-14): same misleading-discriminator fix as the
-    // skip-condition note above. Pre-fix .unwrap_or(false) collapsed
-    // DB errors into the "no note" branch — operator silently misses
-    // the "run publish_version" hint.
-    let note = match state.workflow_repo.workflow_has_active_version(workflow_id).await {
-        Ok(true) => "\n\nNote: This workflow has a published version. The change is saved to the draft but trigger_workflow uses the published version. Run publish_version to apply the change.",
-        Ok(false) => "",
-        Err(e) => {
-            tracing::warn!(
-                target: "talos_audit",
-                workflow_id = %workflow_id,
-                error = %e,
-                "set_continue_on_error: couldn't probe workflow_has_active_version — defaulting note to operator-must-publish"
-            );
-            "\n\nNote: Couldn't verify whether this workflow has a published version (DB hiccup). The change is saved to the draft regardless; if a published version exists, run publish_version to apply the change."
-        }
-    };
+    // Auto-publish if this workflow has an active published version so the
+    // change takes effect (shared helper — see maybe_auto_publish). Was an
+    // advisory-note-only path before.
+    let note = maybe_auto_publish(
+        state,
+        workflow_id,
+        user_id,
+        "Auto-published after continue_on_error change",
+    )
+    .await
+    .message_suffix();
 
     let action = if enabled { "enabled" } else { "disabled" };
     mcp_text(
@@ -3996,6 +4112,15 @@ async fn handle_add_error_handler(
         return e;
     }
 
+    let sync_note = maybe_auto_publish(
+        state,
+        wf_id,
+        user_id,
+        "Auto-published after adding error handler",
+    )
+    .await
+    .message_suffix();
+
     let skipped_nodes: Vec<String> = already_wired.into_iter().collect();
     mcp_text(
         req_id,
@@ -4006,6 +4131,7 @@ async fn handle_add_error_handler(
             "wired_nodes": nodes_to_wire,
             "skipped_nodes": skipped_nodes,
             "error_edges_added": nodes_to_wire.len(),
+            "auto_publish_note": sync_note.trim(),
             "next_steps": [
                 format!(
                     "Configure the handler: update_node_config workflow_id={} node_id={}",
@@ -4170,6 +4296,10 @@ async fn handle_fix_fan_in(
 
     let diff = compute_mcp_graph_diff(&graph_json_str, &updated_json);
 
+    let sync_note = maybe_auto_publish(state, wf_id, user_id, "Auto-published after fan-in fix")
+        .await
+        .message_suffix();
+
     mcp_text(
         req_id,
         &serde_json::to_string_pretty(&json!({
@@ -4178,6 +4308,7 @@ async fn handle_fix_fan_in(
             "edges_rewired": edges_rewired,
             "convergence_node": convergence_node_id,
             "diff": diff,
+            "auto_publish_note": sync_note.trim(),
             "next_steps": [
                 format!("Run get_workflow_quickstart workflow_id={} to verify structural_warnings are resolved", wf_id),
                 "Test the workflow with trigger_workflow to confirm fan-in outputs are collected correctly",
@@ -5565,5 +5696,66 @@ mod dropped_top_level_keys_tests {
         let mut dropped = dropped_top_level_keys(&old, &new);
         dropped.sort();
         assert_eq!(dropped, vec!["A".to_string(), "B".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod auto_publish_decision_tests {
+    use super::{decide_publish_action, AutoPublishOutcome, PublishAction};
+
+    // ── decide_publish_action: the publish-or-skip decision ──────────────
+
+    #[test]
+    fn published_workflow_triggers_publish() {
+        // An active published version exists → publish a new one to sync.
+        assert_eq!(decide_publish_action(Some(true)), PublishAction::Publish);
+    }
+
+    #[test]
+    fn draft_only_workflow_skips_publish() {
+        // Never published → stay a draft, nothing to sync.
+        assert_eq!(decide_publish_action(Some(false)), PublishAction::Skip);
+    }
+
+    #[test]
+    fn probe_error_does_not_publish() {
+        // Couldn't determine status (DB hiccup) → warn + skip, never a
+        // blind publish that could clobber a good published version.
+        assert_eq!(decide_publish_action(None), PublishAction::ProbeFailed);
+    }
+
+    // ── AutoPublishOutcome: message suffix + published() flag ─────────────
+
+    #[test]
+    fn draft_only_outcome_is_silent_and_unpublished() {
+        assert_eq!(AutoPublishOutcome::DraftOnly.message_suffix(), "");
+        assert!(!AutoPublishOutcome::DraftOnly.published());
+    }
+
+    #[test]
+    fn published_outcome_mirrors_merge_config_message() {
+        // Byte-for-byte the wording update_node_config used pre-refactor,
+        // so existing operator-facing text doesn't change.
+        assert_eq!(
+            AutoPublishOutcome::Published.message_suffix(),
+            " Auto-published new version to keep published workflow in sync."
+        );
+        assert!(AutoPublishOutcome::Published.published());
+    }
+
+    #[test]
+    fn publish_failed_outcome_warns_and_is_unpublished() {
+        assert!(AutoPublishOutcome::PublishFailed
+            .message_suffix()
+            .contains("auto-publish failed"));
+        assert!(!AutoPublishOutcome::PublishFailed.published());
+    }
+
+    #[test]
+    fn probe_failed_outcome_warns_and_is_unpublished() {
+        assert!(AutoPublishOutcome::ProbeFailed
+            .message_suffix()
+            .contains("couldn't verify published-version status"));
+        assert!(!AutoPublishOutcome::ProbeFailed.published());
     }
 }

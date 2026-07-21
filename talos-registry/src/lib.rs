@@ -1,5 +1,6 @@
 pub mod api;
 pub mod module_fetcher;
+pub mod reconcile;
 pub mod sync;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -799,6 +800,30 @@ impl ModuleRegistry {
         let wasm_bytes: Vec<u8> = row
             .try_get("wasm_bytes")
             .context("modules.wasm_bytes: try_get failed (schema drift?)")?;
+
+        // 2026-07-21 defect: a catalog registration path could leave a
+        // metadata-only row (NULL wasm_bytes, no oci_url) — advertised as a
+        // template but non-executable, surfacing at dispatch as a confusing
+        // "Module not found". Fail loud with an actionable message so the
+        // caller (or the resolve-fallback chain) reports what to do rather
+        // than shipping an empty binary to the worker. A row with an
+        // `oci_url` is fine — the worker fetches its bytes from the registry.
+        let oci_url_present = row
+            .try_get::<Option<String>, _>("oci_url")
+            .context("modules.oci_url: try_get failed (schema drift?)")?
+            .map(|u| !u.is_empty())
+            .unwrap_or(false);
+        if wasm_bytes.is_empty() && !oci_url_present {
+            let module_name: String = row
+                .try_get::<Option<String>, _>("name")?
+                .unwrap_or_default();
+            anyhow::bail!(
+                "Module '{}' has no compiled WASM yet (metadata-only catalog row). \
+                 Run install_module_from_catalog to compile it before use.",
+                module_name
+            );
+        }
+
         if !wasm_bytes.is_empty() {
             // Oversized (redis-routed) modules must be resident BEFORE this
             // fetch returns — the worker fetches by `redis:wasm:` URI and

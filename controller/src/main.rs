@@ -8760,21 +8760,6 @@ async fn seed_templates(
             continue;
         }
 
-        // Phase 5: detect whether the on-disk source differs from the
-        // persisted `modules.source_code` so we can trigger a background
-        // recompile after the upsert. IS DISTINCT FROM handles NULL-safe
-        // comparison correctly.
-        let stale_id: Option<uuid::Uuid> = sqlx::query_scalar(
-            "SELECT id FROM modules \
-             WHERE name = $1 AND user_id IS NULL \
-               AND source_code IS DISTINCT FROM $2",
-        )
-        .bind(&name)
-        .bind(&code_template)
-        .fetch_optional(&registry.db_pool)
-        .await
-        .unwrap_or(None);
-
         // Read capability_world from talos.json; default to 'automation-node' when absent
         // so unknown modules get maximum restriction (safest default for new templates).
         let capability_world = manifest
@@ -8793,67 +8778,59 @@ async fn seed_templates(
             format!("{}-node", capability_world)
         };
 
-        // Phase 5: seed the unified `modules` table directly with
-        // `kind = 'catalog'` + `user_id IS NULL`. Matches the partial
-        // unique index `modules_catalog_name_uniq` so catalog entries keep
-        // a stable UUID across rebuilds. Mirrors the registry::api and
-        // registry::sync catalog-publish paths.
-        let result: Result<uuid::Uuid, _> = sqlx::query_scalar(
-            "INSERT INTO modules ( \
-                 user_id, name, kind, category, description, config_schema, \
-                 source_code, allowed_hosts, allowed_secrets, requires_approval_for, \
-                 capability_world, catalog_slug, language, created_at, updated_at \
-             ) VALUES ( \
-                 NULL, $1, 'catalog', $2, $3, $4, \
-                 $5, $6, $7, $8, \
-                 $9, $10, 'rust', NOW(), NOW() \
-             ) \
-             ON CONFLICT (name) WHERE user_id IS NULL DO UPDATE SET \
-                 category              = EXCLUDED.category, \
-                 catalog_slug          = EXCLUDED.catalog_slug, \
-                 description           = EXCLUDED.description, \
-                 config_schema         = EXCLUDED.config_schema, \
-                 source_code           = EXCLUDED.source_code, \
-                 allowed_hosts         = EXCLUDED.allowed_hosts, \
-                 allowed_secrets       = EXCLUDED.allowed_secrets, \
-                 requires_approval_for = EXCLUDED.requires_approval_for, \
-                 capability_world      = EXCLUDED.capability_world, \
-                 updated_at            = NOW() \
-             RETURNING id",
+        // The stable template identity: the on-disk directory name. This —
+        // NOT the mutable display `name` — is the natural key for a catalog
+        // template, so a renamed `display_name` updates the existing row
+        // instead of minting a duplicate "twin".
+        let catalog_slug = match path.file_name().and_then(|f| f.to_str()) {
+            Some(s) => s.to_string(),
+            None => {
+                tracing::warn!("Skipping template '{}': unreadable directory name", name);
+                continue;
+            }
+        };
+
+        // Phase 5 / 2026-07-21 defect fix: seed the unified `modules` table
+        // idempotently keyed on `catalog_slug` (rename-safe — prevents NEW
+        // twins), returning whether the WASM needs (re)compilation. Unlike
+        // the old name-keyed upsert, `needs_recompile` is true on a fresh
+        // insert too (no WASM yet), which fixes the metadata-only first-seed
+        // row that previously persisted with NULL wasm_bytes.
+        let registered = talos_registry::reconcile::upsert_catalog_template_by_slug(
+            &registry.db_pool,
+            talos_registry::reconcile::CatalogUpsert {
+                name: &name,
+                category: &category,
+                description: &description,
+                config_schema: &config_schema,
+                source_code: &code_template,
+                allowed_hosts: &allowed_hosts,
+                allowed_secrets: &allowed_secrets,
+                requires_approval_for: &requires_approval_for,
+                capability_world_long: &cw_long,
+                catalog_slug: &catalog_slug,
+            },
         )
-        .bind(&name)
-        .bind(&category)
-        .bind(&description)
-        .bind(&config_schema)
-        .bind(&code_template)
-        .bind(&allowed_hosts)
-        .bind(&allowed_secrets)
-        .bind(&requires_approval_for)
-        .bind(&cw_long)
-        .bind(path.file_name().and_then(|f| f.to_str()))
-        .fetch_one(&registry.db_pool)
         .await;
 
-        match result {
-            Ok(template_id) => {
+        match registered {
+            Ok(reg) => {
                 count += 1;
-                // If source_code changed, spawn a background task to
-                // recompile and update `modules.wasm_bytes` once the new
-                // binary is ready. Existing compiled rows for user sandboxes
-                // are intentionally preserved — workflows already running
-                // against old compiled binaries must not be broken across a
-                // server restart. They will pick up the new template the
-                // next time the user explicitly recompiles their module.
-                if stale_id.is_some() {
+                // Recompile when the source changed OR the row still has no
+                // WASM. On success, write the fresh bytes to EVERY row
+                // sharing this slug (the shared catalog row AND any per-user
+                // installs) so stale twins run new code without rewriting
+                // any workflow graph_json.
+                if reg.needs_recompile {
                     let pool_bg = registry.db_pool.clone();
                     let compiler_bg = compiler.clone();
                     let name_bg = name.clone();
                     let code_bg = code_template.clone();
-                    let tid = template_id;
+                    let slug_bg = catalog_slug.clone();
                     tokio::spawn(async move {
                         tracing::info!(
                             template = %name_bg,
-                            "Template source changed — background recompilation started"
+                            "Catalog template needs WASM — background compilation started"
                         );
                         match compiler_bg
                             .compile_to_wasm(
@@ -8869,29 +8846,24 @@ async fn seed_templates(
                                     let bytes_len = wasm_bytes.len();
                                     use sha2::{Digest, Sha256};
                                     let hash = format!("{:x}", Sha256::digest(&wasm_bytes));
-                                    match sqlx::query(
-                                        "UPDATE modules \
-                                         SET wasm_bytes = $1, content_hash = $2, \
-                                             size_bytes = $3, compiled_at = NOW(), \
-                                             updated_at = NOW() \
-                                         WHERE id = $4",
+                                    match talos_registry::reconcile::refresh_catalog_wasm_by_slug(
+                                        &pool_bg,
+                                        &slug_bg,
+                                        &wasm_bytes,
+                                        &hash,
                                     )
-                                    .bind(&wasm_bytes)
-                                    .bind(&hash)
-                                    .bind(bytes_len as i32)
-                                    .bind(tid)
-                                    .execute(&pool_bg)
                                     .await
                                     {
-                                        Ok(_) => tracing::info!(
+                                        Ok(rows) => tracing::info!(
                                             template = %name_bg,
                                             bytes = bytes_len,
-                                            "Background recompilation complete — modules.wasm_bytes updated"
+                                            rows_updated = rows,
+                                            "Background compilation complete — refreshed all catalog twins for this template"
                                         ),
                                         Err(e) => tracing::warn!(
                                             template = %name_bg,
                                             error = %e,
-                                            "Background recompilation succeeded but DB update failed"
+                                            "Background compilation succeeded but DB update failed"
                                         ),
                                     }
                                 }
@@ -8900,14 +8872,14 @@ async fn seed_templates(
                                 tracing::warn!(
                                     template = %name_bg,
                                     errors = ?result.errors,
-                                    "Background recompilation failed — keeping existing wasm_bytes"
+                                    "Background compilation failed — keeping existing wasm_bytes"
                                 );
                             }
                             Err(e) => {
                                 tracing::warn!(
                                     template = %name_bg,
                                     error = %e,
-                                    "Background recompilation error — keeping existing wasm_bytes"
+                                    "Background compilation error — keeping existing wasm_bytes"
                                 );
                             }
                         }
@@ -8919,6 +8891,18 @@ async fn seed_templates(
     }
 
     tracing::info!("Seeded {} module templates from disk", count);
+
+    // Read-only duplicate-catalog reconciler: log any pre-existing twins and
+    // the workflows referencing a stale one. Never rewrites user data.
+    match talos_registry::reconcile::reconcile_duplicate_catalog_modules(&registry.db_pool).await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(
+            duplicate_sets = n,
+            "catalog duplicate reconciler found duplicate module twins (see warnings above)"
+        ),
+        Err(e) => tracing::warn!(error = %e, "catalog duplicate reconciler failed"),
+    }
+
     Ok(())
 }
 
