@@ -1165,3 +1165,47 @@ fn graph_node_max_fuel_override_survives_load() {
         module_default
     );
 }
+
+// ── extract_judge_score (observe-only judge verdict recording) ──────────
+
+#[test]
+fn extract_judge_score_reads_score_and_passed() {
+    let out = serde_json::json!({
+        "__judge_score__": 0.82,
+        "__judge_passed__": true,
+        "__judge_reasoning__": "looks good",
+        "content": "…",
+    });
+    assert_eq!(extract_judge_score(&out), Some((0.82, true)));
+}
+
+#[test]
+fn extract_judge_score_defaults_passed_false_when_absent() {
+    // A rejected verdict envelope carries the score but the recorder must
+    // still capture it; missing `__judge_passed__` reads as false.
+    let out = serde_json::json!({ "__judge_score__": 0.10 });
+    assert_eq!(extract_judge_score(&out), Some((0.10, false)));
+}
+
+#[test]
+fn extract_judge_score_none_without_score() {
+    // Non-judge node output (no `__judge_score__`) → nothing to record.
+    let out = serde_json::json!({ "content": "hello", "__judge_passed__": true });
+    assert_eq!(extract_judge_score(&out), None);
+    // Non-object output is also a no-op.
+    assert_eq!(extract_judge_score(&serde_json::json!("x")), None);
+}
+
+#[test]
+fn extract_judge_score_ignores_reasoning_text() {
+    // DLP: the extractor never surfaces reasoning/feedback — only (score,
+    // passed) leave this function.
+    let out = serde_json::json!({
+        "__judge_score__": 0.5,
+        "__judge_passed__": false,
+        "__judge_feedback__": "email said SECRET stuff",
+    });
+    let (score, passed) = extract_judge_score(&out).expect("has score");
+    assert_eq!(score, 0.5);
+    assert!(!passed);
+}

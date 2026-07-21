@@ -65,6 +65,19 @@ impl talos_workflow_engine_core::AssistantReportReader for PostgresAssistantRepo
 
         let ml = talos_ml::loop_health(&self.pool, user_id).await?;
 
+        // Per-model teacher-audit ceilings (weekly automatic audit). The
+        // JSONB holds only the latest audit, so this is current-only —
+        // `trend_available: false` inside signals a history table would be
+        // needed for a delta. Degrades to an empty `models` array when no
+        // model has been audited yet.
+        let teacher_audits = talos_ml::teacher_ceilings(&self.pool, user_id).await?;
+
+        // Observe-only judge scores per workflow over the window, recorded
+        // at evaluation time into the unencrypted `judge_scores` table
+        // (the node outputs they come from are encrypted at rest). Empty
+        // when no judged workflow ran in the window.
+        let judge_scores = self.executions.weekly_judge_scores(user_id, days).await?;
+
         // R2 token ledger: per-(provider, model) LLM token rollup over the
         // same window, from the `llm_usage` ledger (worker-verified +
         // controller-side usage, user-attributed at ingest).
@@ -106,6 +119,17 @@ impl talos_workflow_engine_core::AssistantReportReader for PostgresAssistantRepo
                     })).collect::<Vec<_>>(),
             },
             "ml": ml,
+            "teacher_audits": teacher_audits,
+            "judge_scores": {
+                "trailing_days": days,
+                "workflows": judge_scores.iter().map(|s| json!({
+                    "name": s.workflow_name,
+                    "runs": s.runs,
+                    "avg_score": s.avg_score,
+                    "pass_rate": s.pass_rate,
+                    "worst_score": s.worst_score,
+                })).collect::<Vec<_>>(),
+            },
         }))
     }
 }

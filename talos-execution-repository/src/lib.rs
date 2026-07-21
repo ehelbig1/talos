@@ -80,6 +80,20 @@ pub struct ExecutionEvent {
     pub error_class: Option<String>,
 }
 
+/// Per-workflow aggregate of observe-only judge verdicts over a trailing
+/// window — the `judge_scores` section of the weekly assistant report.
+/// `avg_score` / `pass_rate` / `worst_score` are `Option` so a schema
+/// drift on the aggregate columns surfaces as an error (via `try_get?`)
+/// rather than a silent default.
+#[derive(Debug)]
+pub struct JudgeScoreStat {
+    pub workflow_name: String,
+    pub runs: i64,
+    pub avg_score: Option<f64>,
+    pub pass_rate: Option<f64>,
+    pub worst_score: Option<f64>,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Repository
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1202,6 +1216,82 @@ impl ExecutionRepository {
         .bind(days)
         .fetch_one(&self.db_pool)
         .await?)
+    }
+
+    // ── Judge scores (observe-only quality signals) ────────────────────────
+
+    /// Record one observe-only judge verdict into `judge_scores`.
+    /// Conn-taking (lint-50 shape) so the caller owns the executor — the
+    /// best-effort recorder acquires a pooled connection and calls this,
+    /// swallowing any error. Scores + the pass boolean ONLY: the judge
+    /// reasoning/feedback text is never persisted here (it can quote
+    /// email-derived content — DLP).
+    pub async fn record_judge_score(
+        conn: &mut sqlx::PgConnection,
+        workflow_id: Uuid,
+        node_id: Uuid,
+        execution_id: Uuid,
+        score: f64,
+        passed: bool,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO judge_scores \
+                 (workflow_id, node_id, execution_id, score, passed) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(workflow_id)
+        .bind(node_id)
+        .bind(execution_id)
+        .bind(score)
+        .bind(passed)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
+    /// Per-workflow judge-score aggregates over the trailing `days` for
+    /// one user — the report's `judge_scores` section. Run count, average
+    /// score, pass rate, and worst (min) score per judged workflow.
+    /// Tenancy via the workflows join (`w.user_id = $1`), which also drops
+    /// rows whose workflow was deleted.
+    pub async fn weekly_judge_scores(
+        &self,
+        user_id: Uuid,
+        days: i32,
+    ) -> Result<Vec<JudgeScoreStat>> {
+        let days = days.clamp(1, 31);
+        let rows = sqlx::query(
+            "SELECT w.name AS workflow_name, \
+                    COUNT(*)::bigint AS runs, \
+                    AVG(js.score)::float8 AS avg_score, \
+                    (COUNT(*) FILTER (WHERE js.passed))::float8 \
+                        / NULLIF(COUNT(*), 0) AS pass_rate, \
+                    MIN(js.score)::float8 AS worst_score \
+             FROM judge_scores js \
+             JOIN workflows w ON w.id = js.workflow_id \
+             WHERE w.user_id = $1 \
+               AND js.created_at > NOW() - make_interval(days => $2::int) \
+             GROUP BY w.name \
+             ORDER BY runs DESC, w.name LIMIT 50",
+        )
+        .bind(user_id)
+        .bind(days)
+        .fetch_all(&self.db_pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(JudgeScoreStat {
+                    workflow_name: r
+                        .try_get::<Option<String>, _>("workflow_name")?
+                        .unwrap_or_default(),
+                    runs: r.try_get::<Option<i64>, _>("runs")?.unwrap_or(0),
+                    avg_score: r.try_get::<Option<f64>, _>("avg_score")?,
+                    pass_rate: r.try_get::<Option<f64>, _>("pass_rate")?,
+                    worst_score: r.try_get::<Option<f64>, _>("worst_score")?,
+                })
+            })
+            .collect()
     }
 
     // ── Execution events ───────────────────────────────────────────────────

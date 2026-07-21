@@ -9,6 +9,7 @@ pub mod event_sink;
 pub mod events;
 pub mod expression_evaluator;
 pub mod fence;
+pub mod judge_score_recorder;
 pub mod module_execution_store;
 pub mod module_fetcher;
 pub mod nats_run;
