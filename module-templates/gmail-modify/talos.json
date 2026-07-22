@@ -1,0 +1,81 @@
+{
+  "name": "gmail-modify",
+  "version": "v1.0.0",
+  "display_name": "Gmail: Modify Labels",
+  "description": "Modify Gmail message labels — mark read, add or remove labels. The dedup + loop-guard leg of the email-your-assistant channel: after the assistant reads and acts on a message, mark it read (remove 'UNREAD') and/or move it out of the trigger label so the same message is never processed twice.\n\nAccepts message ids three ways: MESSAGE_IDS (array), MESSAGE_ID (single), OR chained from an upstream node that emits messages[].id (e.g. Gmail: Get Message / Gmail: List Messages), including under an __accumulated__ multi-parent merge.\n\nDRY_RUN defaults to TRUE (house pattern): reports exactly what it WOULD change and makes NO POST until you flip it to false. Best-effort batch — a per-message failure is recorded and the batch continues; one bad id never fails the whole run. Capped at 25 messages per invocation.\n\nGmail label rules: system labels ('UNREAD', 'INBOX', 'STARRED', 'IMPORTANT', 'SPAM', 'TRASH') work by name. CUSTOM labels require their label ID (looks like 'Label_1234...'), NOT the display name — pass ids as given.\n\nRequires a vault:// reference to a Google OAuth access token in AUTH_HEADER. The controller resolves + refreshes the token at dispatch time.",
+  "category": "Communication",
+  "capability_world": "http-node",
+  "allowed_hosts": ["gmail.googleapis.com"],
+  "allowed_methods": ["POST"],
+  "requires_secrets": ["oauth/gmail/*"],
+  "requires_approval_for": [],
+  "recommended_fuel": {
+    "expected_items": 25,
+    "bytes_per_item": 2000,
+    "llm_output_bytes": 0,
+    "safety_multiplier": 3.0
+  },
+  "config_schema": {
+    "type": "object",
+    "required": ["AUTH_HEADER"],
+    "properties": {
+      "AUTH_HEADER": {
+        "type": "string",
+        "description": "vault:// path to the OAuth access token wrapped in 'Bearer ' (e.g. 'Bearer vault://oauth/gmail/{user_id}/{email}/access_token'). The controller resolves the vault reference and refreshes the token if expired."
+      },
+      "MESSAGE_IDS": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Gmail message ids to modify. Also accepts a single MESSAGE_ID, or ids chained from upstream messages[].id. Capped at 25 per run."
+      },
+      "MESSAGE_ID": {
+        "type": "string",
+        "description": "Convenience: a single message id (merged with MESSAGE_IDS and any upstream ids, deduped)."
+      },
+      "ADD_LABELS": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": [],
+        "description": "Label ids to ADD. System labels ('INBOX', 'STARRED', 'IMPORTANT') by name; custom labels by their 'Label_...' id."
+      },
+      "REMOVE_LABELS": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": [],
+        "description": "Label ids to REMOVE. E.g. ['UNREAD'] to mark read. System labels by name; custom labels by their 'Label_...' id."
+      },
+      "DRY_RUN": {
+        "type": "boolean",
+        "default": true,
+        "description": "When true (default), report what WOULD change and make NO POST. Set false to apply the modifications."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Enable the Gmail API",
+      "detail": "In https://console.cloud.google.com, enable the Gmail API and configure OAuth consent with the 'https://www.googleapis.com/auth/gmail.modify' scope (modify is required to add/remove labels — gmail.readonly is NOT sufficient)."
+    },
+    {
+      "step": 2,
+      "title": "Authorize the integration",
+      "detail": "Complete the OAuth flow via your Talos integration UI or CLI. The controller stores the access_token + refresh_token at 'oauth/gmail/{user_id}/{email}/access_token' and 'oauth/gmail/{user_id}/{email}/refresh_token', and tracks expiry in integration_credentials."
+    },
+    {
+      "step": 3,
+      "title": "Configure AUTH_HEADER",
+      "detail": "Set AUTH_HEADER to 'Bearer vault://oauth/gmail/{your_user_id}/{your_email}/access_token'. The controller resolves the vault path + refreshes the token before dispatch. If you hit 401s, call refresh_oauth_token(vault_path) to force-refresh and read the outcome."
+    },
+    {
+      "step": 4,
+      "title": "Look up custom label ids",
+      "detail": "System labels (UNREAD, INBOX, STARRED, IMPORTANT, SPAM, TRASH) work by name. For a CUSTOM label (e.g. 'Ask'), fetch its id from GET https://gmail.googleapis.com/gmail/v1/users/me/labels — the modify API needs the 'Label_...' id, not the display name."
+    },
+    {
+      "step": 5,
+      "title": "Test with DRY_RUN first",
+      "detail": "Leave DRY_RUN=true and inspect the results array (each entry status='dry_run'). When the id set + label changes look right, set DRY_RUN=false to apply."
+    }
+  ]
+}
