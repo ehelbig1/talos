@@ -1,0 +1,73 @@
+{
+  "name": "gmail-get-message",
+  "version": "v1.0.0",
+  "display_name": "Gmail: Get Message",
+  "description": "Fetch ONE Gmail message (or a small labeled set) with the FULL detail an email-reply channel needs that Gmail: List Messages does NOT return: the plain-text body, the routing headers (To / Message-ID / In-Reply-To), the thread_id, and a parsed Authentication-Results verdict (SPF / DKIM / DMARC) used to gate sender trust.\n\nTwo modes: set MESSAGE_ID to fetch one specific message, OR set QUERY (e.g. 'label:Ask is:unread') + MAX_RESULTS to list then fetch each. Fetches format=full and extracts the text/plain MIME part (falls back to the snippet), capped at MAX_BODY_BYTES on a UTF-8 char boundary.\n\nThis is the 'read the email my assistant was sent' leg of the email-your-assistant channel. Chains cleanly into Gmail: Modify (mark read / label) via the shared messages[].id output shape.\n\nRequires a vault:// reference to a Google OAuth access token in the AUTH_HEADER config key. The controller resolves + refreshes the token at dispatch time.",
+  "category": "Communication",
+  "capability_world": "http-node",
+  "allowed_hosts": ["gmail.googleapis.com"],
+  "allowed_methods": ["GET"],
+  "requires_secrets": ["oauth/gmail/*"],
+  "requires_approval_for": [],
+  "recommended_fuel": {
+    "expected_items": 5,
+    "bytes_per_item": 50000,
+    "llm_output_bytes": 0,
+    "safety_multiplier": 3.0
+  },
+  "config_schema": {
+    "type": "object",
+    "required": ["AUTH_HEADER"],
+    "properties": {
+      "AUTH_HEADER": {
+        "type": "string",
+        "description": "vault:// path to the OAuth access token wrapped in 'Bearer ' (e.g. 'Bearer vault://oauth/gmail/{user_id}/{email}/access_token'). The controller resolves the vault reference and refreshes the token if expired."
+      },
+      "MESSAGE_ID": {
+        "type": "string",
+        "description": "Mode A: fetch this one Gmail message id. If set, QUERY / MAX_RESULTS are ignored. Provide MESSAGE_ID or QUERY — at least one is required."
+      },
+      "QUERY": {
+        "type": "string",
+        "description": "Mode B: Gmail search query (same syntax as the web UI, e.g. 'label:Ask is:unread', 'from:me@x.com newer_than:1h'). Lists matching ids then fetches each in full. Ignored when MESSAGE_ID is set."
+      },
+      "MAX_RESULTS": {
+        "type": "integer",
+        "default": 5,
+        "description": "QUERY mode only: maximum messages to fetch in full (1-10). Each match is one extra full-body HTTP call — keep tight for fuel."
+      },
+      "MAX_BODY_BYTES": {
+        "type": "integer",
+        "default": 16384,
+        "description": "Cap on extracted body_text bytes. Truncated on a UTF-8 char boundary so multi-byte codepoints are never split."
+      },
+      "TRUSTED_AUTHSERV": {
+        "type": "string",
+        "default": "google.com",
+        "description": "The receiving authority whose Authentication-Results header we trust (the authserv-id, e.g. Gmail stamps 'mx.google.com'). Only verdicts from a header whose authserv-id equals this value OR ends with '.<value>' (dot-boundary suffix) feed spf_pass/dkim_pass/dmarc_pass. This defeats sender spoofing: an attacker's own injected Authentication-Results header carries a foreign authserv-id and is ignored. Change only for a self-hosted MTA."
+      }
+    }
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Enable the Gmail API",
+      "detail": "In https://console.cloud.google.com, enable the Gmail API and configure OAuth consent with the 'https://www.googleapis.com/auth/gmail.readonly' scope (format=full needs read access to bodies — gmail.metadata is NOT sufficient for this module)."
+    },
+    {
+      "step": 2,
+      "title": "Authorize the integration",
+      "detail": "Complete the OAuth flow via your Talos integration UI or CLI. The controller stores the access_token + refresh_token at 'oauth/gmail/{user_id}/{email}/access_token' and 'oauth/gmail/{user_id}/{email}/refresh_token', and tracks expiry in integration_credentials."
+    },
+    {
+      "step": 3,
+      "title": "Configure AUTH_HEADER",
+      "detail": "Set AUTH_HEADER to 'Bearer vault://oauth/gmail/{your_user_id}/{your_email}/access_token'. The controller resolves the vault path + refreshes the token before dispatch. If you hit 401s, call refresh_oauth_token(vault_path) to force-refresh and read the outcome."
+    },
+    {
+      "step": 4,
+      "title": "Gate sender trust on the auth verdict",
+      "detail": "Each message carries an 'auth' object: { spf_pass, dkim_pass, dmarc_pass, trusted, raw_present }. The verdicts are computed ONLY from an Authentication-Results header stamped by TRUSTED_AUTHSERV (default google.com) — a header an attacker injected into the message they sent carries a foreign authserv-id and is ignored, so 'trusted' is false and all three verdicts are false. In the email-your-assistant channel, refuse to act unless BOTH trusted==true AND dmarc_pass==true, so a spoofed 'from your own address' email can't drive the assistant."
+    }
+  ]
+}
