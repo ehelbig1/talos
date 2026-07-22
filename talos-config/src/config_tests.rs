@@ -549,6 +549,58 @@ mod tests {
     }
 
     #[test]
+    fn test_smart_memory_context_p2_ranking_defaults() {
+        let _g = env_lock();
+        for v in [
+            "SMART_MEMORY_CONTEXT_W_RELEVANCE",
+            "SMART_MEMORY_CONTEXT_W_RECENCY",
+            "SMART_MEMORY_CONTEXT_W_IMPORTANCE",
+            "SMART_MEMORY_CONTEXT_RECENCY_HALFLIFE_DAYS",
+            "SMART_MEMORY_CONTEXT_GRAPH_BASELINE",
+            "SMART_MEMORY_CONTEXT_RECENCY_BASELINE",
+            "ENABLE_SMART_MEMORY_HYDE",
+        ] {
+            env::remove_var(v);
+        }
+        assert!((crate::smart_memory_context_w_relevance() - 1.0).abs() < f64::EPSILON);
+        assert!((crate::smart_memory_context_w_recency() - 0.3).abs() < f64::EPSILON);
+        assert!((crate::smart_memory_context_w_importance() - 0.5).abs() < f64::EPSILON);
+        assert!((crate::smart_memory_context_recency_halflife_days() - 7.0).abs() < f64::EPSILON);
+        assert!((crate::smart_memory_context_graph_baseline() - 0.6).abs() < f64::EPSILON);
+        assert!((crate::smart_memory_context_recency_baseline() - 0.4).abs() < f64::EPSILON);
+        assert!(!crate::smart_memory_hyde_enabled());
+    }
+
+    #[test]
+    fn test_smart_memory_context_p2_overrides_and_guards() {
+        let _g = env_lock();
+        // Positive overrides honoured.
+        env::set_var("SMART_MEMORY_CONTEXT_W_RECENCY", "2.0");
+        assert!((crate::smart_memory_context_w_recency() - 2.0).abs() < f64::EPSILON);
+        // =0 collapses to the default (would silently drop the whole signal).
+        env::set_var("SMART_MEMORY_CONTEXT_W_IMPORTANCE", "0");
+        assert!((crate::smart_memory_context_w_importance() - 0.5).abs() < f64::EPSILON);
+        // Half-life of 0 (divide-by-zero) collapses to the default.
+        env::set_var("SMART_MEMORY_CONTEXT_RECENCY_HALFLIFE_DAYS", "0");
+        assert!((crate::smart_memory_context_recency_halflife_days() - 7.0).abs() < f64::EPSILON);
+        // Baselines clamp into [0, 1].
+        env::set_var("SMART_MEMORY_CONTEXT_GRAPH_BASELINE", "5.0");
+        assert!((crate::smart_memory_context_graph_baseline() - 1.0).abs() < f64::EPSILON);
+        // HyDE toggle honours canonical truthy tokens.
+        env::set_var("ENABLE_SMART_MEMORY_HYDE", "yes");
+        assert!(crate::smart_memory_hyde_enabled());
+        for v in [
+            "SMART_MEMORY_CONTEXT_W_RECENCY",
+            "SMART_MEMORY_CONTEXT_W_IMPORTANCE",
+            "SMART_MEMORY_CONTEXT_RECENCY_HALFLIFE_DAYS",
+            "SMART_MEMORY_CONTEXT_GRAPH_BASELINE",
+            "ENABLE_SMART_MEMORY_HYDE",
+        ] {
+            env::remove_var(v);
+        }
+    }
+
+    #[test]
     fn test_is_allowed_origin_matching() {
         let _g = env_lock();
         env::set_var("RUST_ENV", "development");

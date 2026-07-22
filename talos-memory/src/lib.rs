@@ -1263,6 +1263,73 @@ pub async fn recall_recent_excluding_types_and_kinds(
     Ok(out)
 }
 
+/// Timestamp-carrying sibling of [`recall_recent_excluding_types_and_kinds`]:
+/// identical query, decrypt column set, AAD path, and `metadata.kind`
+/// filter, but ALSO projects each row's `updated_at` so the smart
+/// actor-context builder (Phase 2) can feed the recency signal into its
+/// fused ranker.
+///
+/// Returns `(key, value, memory_type, updated_at)` tuples. `updated_at` is
+/// read as `Option<DateTime<Utc>>` (structural-lint check 52: a
+/// renamed/retyped column propagates as an error via `?`, a NULL yields
+/// `None` rather than a silent default — the column is `NOT NULL` in the
+/// schema, so `None` is effectively unreachable but the ranker treats a
+/// missing timestamp as a neutral recency signal regardless).
+///
+/// Tenancy/crypto invariants are byte-for-byte those of the non-`_ts`
+/// sibling: only ever `WHERE actor_id = $1`, the exact
+/// `actor_id, key, value_enc, value_key_id, value_format, memory_type`
+/// projection that `decrypt_row_value` requires for MCP-S2 AAD dispatch,
+/// and the same NULL-safe `metadata->>'kind' != ALL($4)` predicate. The
+/// only additions are the projected `updated_at` column and the wider
+/// return tuple.
+///
+/// `limit` is clamped to `[1, MAX_LIST_LIMIT]`.
+#[allow(clippy::type_complexity)]
+pub async fn recall_recent_excluding_types_and_kinds_ts(
+    pool: &Pool<Postgres>,
+    actor_id: Uuid,
+    exclude_types: &[&str],
+    exclude_kinds: &[String],
+    limit: i64,
+) -> Result<Vec<(String, serde_json::Value, String, Option<DateTime<Utc>>)>> {
+    let limit = limit.clamp(1, MAX_LIST_LIMIT);
+    let owned_types: Vec<String> = exclude_types.iter().map(|s| (*s).to_string()).collect();
+    let rows = sqlx::query(
+        "SELECT actor_id, key, value_enc, value_key_id, value_format, memory_type, updated_at \
+         FROM actor_memory \
+         WHERE actor_id = $1 \
+           AND NOT (memory_type = ANY($2)) \
+           AND (expires_at IS NULL OR expires_at > now()) \
+           AND (cardinality($4::text[]) = 0 \
+                OR metadata IS NULL \
+                OR metadata->>'kind' IS NULL \
+                OR metadata->>'kind' != ALL($4::text[])) \
+         ORDER BY updated_at DESC LIMIT $3",
+    )
+    .bind(actor_id)
+    .bind(&owned_types)
+    .bind(limit)
+    .bind(exclude_kinds)
+    .fetch_all(pool)
+    .await
+    .context("recall_recent_excluding_types_and_kinds_ts")?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        use sqlx::Row as _;
+        let key: String = r.try_get("key")?;
+        let memory_type: String = r.try_get("memory_type")?;
+        // check 52: read as Option so a dropped/retyped column errors via `?`
+        // rather than silently defaulting; NULL (unreachable, NOT NULL col)
+        // maps to None which the ranker treats as neutral recency.
+        let updated_at: Option<DateTime<Utc>> =
+            r.try_get::<Option<DateTime<Utc>>, _>("updated_at")?;
+        let value = decrypt_row_value(r).await?;
+        out.push((key, value, memory_type, updated_at));
+    }
+    Ok(out)
+}
+
 pub async fn list_memories(
     pool: &Pool<Postgres>,
     actor_id: Uuid,

@@ -153,8 +153,19 @@ impl WorkflowRepository {
     ///    `smart_memory_context_min_score()` instead of `0.0`, dropping
     ///    weak neighbours.
     /// 3. **Merge + dedup** — graph + semantic + recency layers are all
-    ///    gathered (not early-returned) and de-duplicated by key.
-    /// 4. **Byte budget** — the merged candidates are packed under
+    ///    gathered (not early-returned) and de-duplicated by key, keeping the
+    ///    highest-relevance instance of each.
+    /// 4. **Fused ranking (Phase 2)** — the merged candidates are scored by a
+    ///    weighted blend of relevance + recency-decay + importance
+    ///    (`talos_memory::actor_context::fused_score`, weights from
+    ///    `smart_memory_context_w_*`) and packed in fused-score order rather
+    ///    than raw retrieval order.
+    /// 5. **HyDE toggle (Phase 2)** — when `smart_memory_hyde_enabled()` is
+    ///    ON the semantic layer embeds a HyDE-rewritten query
+    ///    (`SearchMethod::HyDE`) instead of the raw hint; the same
+    ///    `min_score` + `exclude_kinds` filters and the tier-1 embed gate
+    ///    apply either way.
+    /// 6. **Byte budget** — the ranked candidates are packed under
     ///    `smart_memory_context_byte_budget()` with a per-memory cap, so a
     ///    few large memories can't balloon a node's parse-fuel.
     async fn get_relevant_actor_context_smart(
@@ -198,6 +209,18 @@ impl WorkflowRepository {
         // clamps the limit to [1, 50] internally and applies the
         // `metadata.kind != ALL(...)` + `>= min_score` predicates at the DB
         // layer (only ever scoped to the bound `actor_id`).
+        //
+        // Phase 2: the search METHOD is HyDE-toggled. Direct embeds the raw
+        // hint; HyDE embeds a hypothetical-answer rewrite. Same filter/floor
+        // args and the same tier-1 embed gate apply either way — we route
+        // through `recall_semantic_filtered` (not the exclude-kinds-less
+        // `recall_hyde` wrapper) precisely so the synthetic-kind filter is
+        // preserved under HyDE.
+        let search_method = if talos_config::smart_memory_hyde_enabled() {
+            talos_memory::SearchMethod::HyDE
+        } else {
+            talos_memory::SearchMethod::Direct
+        };
         let semantic_hits = if let Some(hint) = context_hint {
             let fetch = limit.saturating_mul(3).max(limit + 5) as i64;
             talos_memory::recall_semantic_filtered(
@@ -207,7 +230,7 @@ impl WorkflowRepository {
                 fetch,
                 min_score,
                 None,
-                talos_memory::SearchMethod::Direct,
+                search_method,
                 &exclude_kinds,
             )
             .await?
@@ -219,8 +242,11 @@ impl WorkflowRepository {
         // Layer 3: Recency — non-scratchpad, kind-filtered. Unlike the
         // legacy path (which only falls back here when semantic returned
         // nothing), the smart path always folds recency in and lets the
-        // byte budget decide what survives.
-        let recency = talos_memory::recall_recent_excluding_types_and_kinds(
+        // fused rank + byte budget decide what survives. The `_ts` variant
+        // also projects `updated_at` so the recency signal survives into the
+        // fused scorer (same decrypt column set + AAD path as the non-`_ts`
+        // sibling — only `updated_at` is added).
+        let recency = talos_memory::recall_recent_excluding_types_and_kinds_ts(
             &self.db_pool,
             actor_id,
             &["scratchpad"],
@@ -229,17 +255,33 @@ impl WorkflowRepository {
         )
         .await?;
 
-        // Merge + dedup + scratchpad/floor selection (pure, tested), then
-        // deterministically bound the assembled payload to the byte budget.
+        // Merge + dedup + scratchpad/floor selection (pure, tested), threading
+        // the per-layer relevance/recency/importance signals into Candidates.
         let candidates = talos_memory::actor_context::select_candidates(
             graph_candidate,
             semantic_hits,
             recency,
             min_score,
+            talos_config::smart_memory_context_graph_baseline(),
+            talos_config::smart_memory_context_recency_baseline(),
         );
+
+        // Fused multi-signal rank (relevance + recency-decay + importance),
+        // then deterministically bound the assembled payload to the byte
+        // budget in fused-score order. `now` is injected once here so the
+        // production path uses the real clock while tests stay deterministic.
+        let weights = talos_memory::actor_context::Weights {
+            relevance: talos_config::smart_memory_context_w_relevance(),
+            recency: talos_config::smart_memory_context_w_recency(),
+            importance: talos_config::smart_memory_context_w_importance(),
+            recency_halflife_days: talos_config::smart_memory_context_recency_halflife_days(),
+        };
+        let ranked =
+            talos_memory::actor_context::rank_candidates(candidates, &weights, chrono::Utc::now());
+        let rows = talos_memory::actor_context::candidates_into_rows(ranked);
         Ok(talos_memory::actor_context::pack_within_budget(
             actor_id,
-            candidates,
+            rows,
             byte_budget,
             per_memory_cap,
         ))
