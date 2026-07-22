@@ -468,7 +468,7 @@ pub async fn test_watch_channel_handler(
     };
     let integration = match service
         .integrations
-        .get_integration(user_id, row.integration_id)
+        .get_integration(row.integration_id, user_id)
         .await
     {
         Ok(Some(i)) => i,
@@ -743,7 +743,7 @@ pub async fn pubsub_push_handler(
     tokio::spawn(async move {
         let integration = match svc
             .integrations
-            .get_integration(user_id, row.integration_id)
+            .get_integration(row.integration_id, user_id)
             .await
         {
             Ok(Some(i)) => i,
