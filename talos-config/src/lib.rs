@@ -342,6 +342,19 @@ pub fn smart_memory_context_recency_baseline() -> f64 {
     positive_env_or_default::<f64>("SMART_MEMORY_CONTEXT_RECENCY_BASELINE", 0.4).clamp(0.0, 1.0)
 }
 
+/// Phase 3a: weight on the durable access-frequency boost folded INTO the
+/// importance signal (NOT a separate fused term — `fused_score` stays 3-term).
+/// A memory the actor keeps pulling into context is nudged up by
+/// `access_weight * normalized_access_count`. Default 0.15 — small, so access
+/// frequency refines but never dominates the base/hint importance. Clamped to
+/// `[0.0, 1.0]`. Override via `SMART_MEMORY_CONTEXT_ACCESS_WEIGHT`; `=0`/negative
+/// or unparseable falls back to the default (destructive-zero guard — a `0`
+/// would silently disable the whole access signal; the additive+clamped blend
+/// keeps importance in `[0, 1]` for any value in range).
+pub fn smart_memory_context_access_weight() -> f64 {
+    positive_env_or_default::<f64>("SMART_MEMORY_CONTEXT_ACCESS_WEIGHT", 0.15).clamp(0.0, 1.0)
+}
+
 /// Canonical resolver for the HyDE (Hypothetical Document Embeddings) toggle
 /// on the smart actor-context semantic layer (`ENABLE_SMART_MEMORY_HYDE`).
 /// Default OFF.

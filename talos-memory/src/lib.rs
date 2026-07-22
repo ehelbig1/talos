@@ -514,6 +514,18 @@ pub struct MemoryHit {
     /// source / generated_at context alongside each hit (e.g. sandbox
     /// `agent_memory::search` → WIT `search-result.metadata`).
     pub metadata: Option<serde_json::Value>,
+    /// Durable write-time importance score in `[0, 1]` from the
+    /// `actor_memory.importance` column (Phase 3a). `None` for rows written
+    /// before the column existed; the smart-context ranker treats `None` as
+    /// an absent hint and falls back to `metadata.importance`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub importance: Option<f64>,
+    /// Durable `actor_memory.access_count` — number of times this row has been
+    /// packed into an injected `__actor_context__` set. Feeds the fused
+    /// ranker's access-frequency boost. `None` only on projection drift (the
+    /// column is `NOT NULL DEFAULT 0`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_count: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -749,10 +761,21 @@ pub async fn persist_memory_with_metadata_typed(
                 ))
             })?;
 
+    // Phase 3a: durable write-time importance signal in [0, 1] — the
+    // memory-type base blended 50/50 with a numeric `metadata.importance`.
+    // Shared single-source scorer with the ranker (no shadowed copy). Written
+    // REGARDLESS of the smart-context feature flag: a harmless dormant column
+    // that accrues for when the flag is on (and for Phase 3b consolidation).
+    // Bound as `real` (f32) to match the column type. On overwrite it is
+    // re-scored (EXCLUDED.importance); `access_count` / `last_accessed_at` are
+    // intentionally NOT touched here — access history persists across content
+    // updates (the recall-path bump owns those columns).
+    let importance_score = actor_context::write_time_importance(canonical_type, metadata) as f32;
+
     sqlx::query(
         "INSERT INTO actor_memory \
-         (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, embedding, embedding_model, metadata, org_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+         (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, embedding, embedding_model, metadata, org_id, importance) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
          ON CONFLICT (actor_id, key) DO UPDATE SET \
              value_enc     = EXCLUDED.value_enc, \
              value_key_id  = EXCLUDED.value_key_id, \
@@ -763,6 +786,7 @@ pub async fn persist_memory_with_metadata_typed(
              embedding_model = COALESCE(EXCLUDED.embedding_model, actor_memory.embedding_model), \
              metadata      = COALESCE(EXCLUDED.metadata, actor_memory.metadata), \
              org_id        = EXCLUDED.org_id, \
+             importance    = EXCLUDED.importance, \
              updated_at    = now()",
     )
     .bind(actor_id)
@@ -776,6 +800,7 @@ pub async fn persist_memory_with_metadata_typed(
     .bind(embedding.as_ref().and_then(|_| embedding::active_embedding_model()))
     .bind(metadata)
     .bind(org_id)
+    .bind(importance_score)
     .execute(pool)
     .await
     .context("Failed to persist actor memory")
@@ -1292,11 +1317,14 @@ pub async fn recall_recent_excluding_types_and_kinds_ts(
     exclude_types: &[&str],
     exclude_kinds: &[String],
     limit: i64,
-) -> Result<Vec<(String, serde_json::Value, String, Option<DateTime<Utc>>)>> {
+) -> Result<Vec<actor_context::RecencyRow>> {
     let limit = limit.clamp(1, MAX_LIST_LIMIT);
     let owned_types: Vec<String> = exclude_types.iter().map(|s| (*s).to_string()).collect();
+    // Phase 3a: also project the durable `importance` + `access_count` signal
+    // columns so the fused ranker's importance term survives into the recency
+    // layer (same decrypt column set + AAD path as before — additive only).
     let rows = sqlx::query(
-        "SELECT actor_id, key, value_enc, value_key_id, value_format, memory_type, updated_at \
+        "SELECT actor_id, key, value_enc, value_key_id, value_format, memory_type, updated_at, importance, access_count \
          FROM actor_memory \
          WHERE actor_id = $1 \
            AND NOT (memory_type = ANY($2)) \
@@ -1324,8 +1352,25 @@ pub async fn recall_recent_excluding_types_and_kinds_ts(
         // maps to None which the ranker treats as neutral recency.
         let updated_at: Option<DateTime<Utc>> =
             r.try_get::<Option<DateTime<Utc>>, _>("updated_at")?;
+        // `importance` is `real` (f32) + NULLable (pre-Phase-3a rows) — read as
+        // Option<f32> (matches the column type; f64 would type-mismatch) and
+        // widen to f64 for the ranker. check 52: `?` propagates projection drift.
+        let importance: Option<f64> = r.try_get::<Option<f32>, _>("importance")?.map(|v| v as f64);
+        // `access_count` is `integer` (int4 → i32) NOT NULL DEFAULT 0; read as
+        // Option<i32> (matches the column type) so drift errors loud, then widen
+        // to i64. None (drift only) maps to a neutral boost in the ranker.
+        let access_count: Option<i64> = r
+            .try_get::<Option<i32>, _>("access_count")?
+            .map(|v| v as i64);
         let value = decrypt_row_value(r).await?;
-        out.push((key, value, memory_type, updated_at));
+        out.push((
+            key,
+            value,
+            memory_type,
+            updated_at,
+            importance,
+            access_count,
+        ));
     }
     Ok(out)
 }
@@ -1597,7 +1642,7 @@ pub async fn recall_semantic_filtered(
         // Using `!= ALL(...)` over `NOT IN (...)` is safer with NULLs:
         // `NULL NOT IN (...)` evaluates to UNKNOWN and would drop rows.
         let sql =
-            "SELECT key, value_enc, value_key_id, value_format, memory_type, expires_at, updated_at, metadata, \
+            "SELECT key, value_enc, value_key_id, value_format, memory_type, expires_at, updated_at, metadata, importance, access_count, \
                           (1.0 - (embedding <=> $2)) AS score \
                    FROM actor_memory \
                    WHERE actor_id = $1 \
@@ -1652,6 +1697,13 @@ pub async fn recall_semantic_filtered(
                     updated_at: r.try_get("updated_at")?,
                     score: r.try_get::<f64, _>("score")?,
                     metadata: r.try_get::<Option<serde_json::Value>, _>("metadata")?,
+                    // Phase 3a durable signals. check 52: read as Option (matches
+                    // the `real`/`int4` column types) + `?` so projection drift
+                    // fails loud; widen to the ranker's f64/i64.
+                    importance: r.try_get::<Option<f32>, _>("importance")?.map(|v| v as f64),
+                    access_count: r
+                        .try_get::<Option<i32>, _>("access_count")?
+                        .map(|v| v as i64),
                 });
             }
             return Ok(SearchOutcome {
@@ -1757,7 +1809,7 @@ async fn recall_keyword_inner(
         // search surface; this fallback only fires when embeddings are
         // unavailable (queue stall, model down).
         let rows = sqlx::query(
-            "SELECT actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, updated_at, metadata \
+            "SELECT actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, updated_at, metadata, importance, access_count \
              FROM actor_memory \
              WHERE actor_id = $1 \
                AND (expires_at IS NULL OR expires_at > now()) \
@@ -1803,7 +1855,7 @@ async fn recall_keyword_inner(
     // sibling drift that broke keyword-fallback recall for any actor
     // with at least one v1 row.
     let rows = sqlx::query(
-        "SELECT actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, updated_at, metadata \
+        "SELECT actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, updated_at, metadata, importance, access_count \
          FROM actor_memory \
          WHERE actor_id = $1 \
            AND (expires_at IS NULL OR expires_at > now()) \
@@ -1914,6 +1966,12 @@ async fn rows_to_memory_hits(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<Mem
             updated_at: r.try_get("updated_at")?,
             score: (1.0 - (i as f64 * 0.02)).max(0.0),
             metadata: r.try_get::<Option<serde_json::Value>, _>("metadata")?,
+            // Phase 3a durable signals. check 52: Option read + `?` fails loud on
+            // projection drift; widen `real`/`int4` to the ranker's f64/i64.
+            importance: r.try_get::<Option<f32>, _>("importance")?.map(|v| v as f64),
+            access_count: r
+                .try_get::<Option<i32>, _>("access_count")?
+                .map(|v| v as i64),
         });
     }
     Ok(hits)
@@ -1922,6 +1980,37 @@ async fn rows_to_memory_hits(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<Mem
 // ============================================================================
 // Mutations
 // ============================================================================
+
+/// Phase 3a: bump the durable access signal for a set of memory keys that were
+/// just packed into an injected `__actor_context__` set.
+///
+/// ONE batched UPDATE per context injection (not per row, not per recall):
+/// `access_count += 1`, `last_accessed_at = now()` for every `(actor_id, key)`
+/// in `keys`. Scoped `WHERE actor_id = $1 AND key = ANY($2)` — a strict
+/// tenancy invariant: only ever touches the bound actor's own rows.
+///
+/// This is the FIRST recall-path mutation in the memory service; callers MUST
+/// invoke it fire-and-forget (`tokio::spawn`, best-effort) so it never adds
+/// latency to context assembly. Deliberately does NOT bump `updated_at` (an
+/// access is not a content write — recency-decay should track writes, not
+/// reads) and does NOT touch `importance`. Returns the number of rows updated.
+/// An empty `keys` slice is a no-op (returns 0 without a query).
+pub async fn bump_access(pool: &Pool<Postgres>, actor_id: Uuid, keys: &[String]) -> Result<u64> {
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    let result = sqlx::query(
+        "UPDATE actor_memory \
+         SET access_count = access_count + 1, last_accessed_at = now() \
+         WHERE actor_id = $1 AND key = ANY($2)",
+    )
+    .bind(actor_id)
+    .bind(keys)
+    .execute(pool)
+    .await
+    .context("bump_access")?;
+    Ok(result.rows_affected())
+}
 
 pub async fn forget(pool: &Pool<Postgres>, actor_id: Uuid, key: &str) -> Result<ForgetOutcome> {
     let result = sqlx::query(
