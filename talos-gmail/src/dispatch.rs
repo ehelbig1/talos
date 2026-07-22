@@ -24,12 +24,40 @@ use super::watch::GmailWatchRow;
 use anyhow::{bail, Context, Result};
 use redis::AsyncCommands;
 use std::sync::Arc;
+use talos_continuation_trigger::{trigger_continuation_workflow, TriggerSourceKind};
 use talos_module_executions::{LogLevel, ModuleExecutionService, TriggerType};
 use talos_registry::ModuleRegistry;
 use talos_secrets_manager::SecretsManager;
 use talos_workflow_engine_core::WorkerSharedKey;
 use talos_workflow_job_protocol::JobRequest;
 use uuid::Uuid;
+
+/// What an inbound Gmail push should dispatch to, decided from the
+/// watch row's bindings. Pure selection — no I/O — so the precedence
+/// rule is unit-testable without NATS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DispatchTarget {
+    /// A full workflow execution (`workflow_id` bound).
+    Workflow(Uuid),
+    /// A single WASM module job per message (`module_id` bound).
+    Module(Uuid),
+    /// Nothing bound — the cursor still advances, but no job fires.
+    None,
+}
+
+/// Precedence rule: **`workflow_id` wins when both are set.** A workflow
+/// is the strictly more capable target (it can itself dispatch modules,
+/// run the authorization gate, resolve an effective actor), so a mailbox
+/// carrying both bindings is treated as workflow-bound. When only one is
+/// set it selects that; when neither is set the push no-ops (cursor still
+/// advances upstream).
+pub(crate) fn select_dispatch_target(row: &GmailWatchRow) -> DispatchTarget {
+    match (row.workflow_id, row.module_id) {
+        (Some(workflow_id), _) => DispatchTarget::Workflow(workflow_id),
+        (None, Some(module_id)) => DispatchTarget::Module(module_id),
+        (None, None) => DispatchTarget::None,
+    }
+}
 
 /// Every service the dispatch path needs. Constructed once at
 /// controller startup and Arc-cloned into the handler state.
@@ -71,13 +99,17 @@ pub(crate) async fn dispatch_history_entries(
     row: &GmailWatchRow,
     entries: &[HistoryEntry],
 ) -> Result<()> {
-    // Early outs — cheap checks before any module load.
-    let module_id = match row.module_id {
-        Some(id) => id,
-        None => {
+    // Branch selection — workflow_id wins over module_id (see
+    // `select_dispatch_target`). Cheap, no I/O, before any module load.
+    let module_id = match select_dispatch_target(row) {
+        DispatchTarget::Workflow(workflow_id) => {
+            return dispatch_to_workflow(ctx, user_id, row, workflow_id, entries).await;
+        }
+        DispatchTarget::Module(id) => id,
+        DispatchTarget::None => {
             tracing::debug!(
                 channel_uuid = %row.id,
-                "gmail dispatch: no module bound — cursor advanced but nothing to dispatch"
+                "gmail dispatch: no module/workflow bound — cursor advanced but nothing to dispatch"
             );
             return Ok(());
         }
@@ -167,6 +199,146 @@ pub(crate) async fn dispatch_history_entries(
     }
 
     Ok(())
+}
+
+/// Trigger one full workflow execution for a push whose watch row is
+/// workflow-bound. Unlike the module path (one job per message), this
+/// fires the workflow ONCE per history page carrying new messages — the
+/// workflow re-fetches its own mail, so the trigger input is minimal
+/// (`{source, email_address, history_id}`) and carries no message bodies.
+///
+/// Dispatch goes through `trigger_continuation_workflow`, which runs the
+/// workflow-authorization gate + effective-actor resolution, creates the
+/// execution row, builds the engine (with the resolved actor's tier), and
+/// dispatches over NATS. Errors here never abort the push — the caller
+/// logs and still advances the cursor, exactly as for the module path.
+async fn dispatch_to_workflow(
+    ctx: &GmailDispatchContext,
+    user_id: Uuid,
+    row: &GmailWatchRow,
+    workflow_id: Uuid,
+    entries: &[HistoryEntry],
+) -> Result<()> {
+    // Collect the newly-added messages on this page (same source the module
+    // path uses). No new messages (e.g. a label-only change) → advance the
+    // cursor without spinning up a run.
+    let messages: Vec<&super::api::HistoryMessageRef> = entries
+        .iter()
+        .flat_map(|e| e.messages_added.iter().map(|ma| &ma.message))
+        .collect();
+    if messages.is_empty() {
+        return Ok(());
+    }
+
+    // Redelivery guard. Pub/Sub is at-least-once, and two concurrent
+    // deliveries of the same push both read the pre-advance cursor — so
+    // advancing the cursor alone does NOT prevent a duplicate trigger.
+    // Reuse the module path's atomic SETNX dedup: it claims each message_id
+    // (24h TTL) and returns only the freshly-claimed ones, so at most one
+    // delivery fires the workflow for a given message set. When Redis is
+    // unavailable we trigger anyway (better to duplicate than drop —
+    // matching the module path); the target workflow re-fetches its own
+    // mail and should be idempotent (e.g. fetch-unread-then-archive).
+    if let Some(ref redis) = ctx.redis {
+        match deduplicate_messages(redis, &messages, &row.email_address).await {
+            Ok(fresh) if fresh.is_empty() => {
+                tracing::debug!(
+                    channel_uuid = %row.id,
+                    workflow_id = %workflow_id,
+                    "gmail dispatch: all messages already seen (redelivery); skipping workflow trigger"
+                );
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    channel_uuid = %row.id,
+                    "gmail dispatch: Redis dedup failed; triggering workflow anyway (may duplicate)"
+                );
+            }
+        }
+    }
+
+    // `trigger_continuation_workflow` builds a real engine, which needs a
+    // SecretsManager. The dispatch context makes it optional (dev/bootstrap
+    // stacks). When absent we log + no-op rather than run a workflow with no
+    // secret access; the cursor still advances upstream.
+    let secrets_manager = match ctx.secrets_manager.clone() {
+        Some(sm) => sm,
+        None => {
+            tracing::warn!(
+                channel_uuid = %row.id,
+                workflow_id = %workflow_id,
+                "gmail dispatch: workflow trigger requires a SecretsManager (none configured); skipping — cursor still advances"
+            );
+            return Ok(());
+        }
+    };
+
+    // Precedence visibility: if BOTH bindings are present, make it obvious in
+    // the logs why the module was skipped in favour of the workflow.
+    if row.module_id.is_some() {
+        tracing::info!(
+            channel_uuid = %row.id,
+            workflow_id = %workflow_id,
+            module_id = ?row.module_id,
+            "gmail dispatch: both workflow_id and module_id bound — workflow_id takes precedence"
+        );
+    }
+
+    // Minimal trigger input. The workflow re-fetches its own mail via the
+    // gmail catalog modules, so no message ids/bodies are needed here.
+    let payload = serde_json::json!({
+        "source": "gmail_push",
+        "email_address": row.email_address,
+        "history_id": row.history_id,
+    });
+
+    tracing::info!(
+        channel_uuid = %row.id,
+        workflow_id = %workflow_id,
+        history_id = %row.history_id,
+        "gmail dispatch: triggering workflow for inbound push"
+    );
+
+    // `source_id` = the watch channel UUID; surfaces in the workflow's
+    // trigger input as `gmail_channel_id` with `triggered_by: "gmail_push"`.
+    match trigger_continuation_workflow(
+        &ctx.db_pool,
+        ctx.registry.clone(),
+        Some(ctx.nats.clone()),
+        secrets_manager,
+        user_id,
+        workflow_id,
+        &payload,
+        row.id,
+        TriggerSourceKind::GmailPush,
+    )
+    .await
+    {
+        Some(execution_id) => {
+            tracing::info!(
+                channel_uuid = %row.id,
+                workflow_id = %workflow_id,
+                execution_id = %execution_id,
+                "✅ gmail push triggered workflow execution"
+            );
+            Ok(())
+        }
+        None => {
+            // trigger_continuation_workflow fails CLOSED (auth-gate denial,
+            // actor not runnable, missing workflow, DB error) and logs the
+            // specific reason internally. Surface a generic marker here;
+            // don't abort the push — the cursor still advances.
+            tracing::warn!(
+                channel_uuid = %row.id,
+                workflow_id = %workflow_id,
+                "gmail dispatch: workflow trigger produced no execution (denied by auth gate or setup failure)"
+            );
+            Ok(())
+        }
+    }
 }
 
 async fn dispatch_single_message(
@@ -493,4 +665,87 @@ async fn mark_message_processed(
         .await
         .context("redis SET EX")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A watch row with the given bindings; other fields are inert for
+    /// selection.
+    fn row_with(module_id: Option<Uuid>, workflow_id: Option<Uuid>) -> GmailWatchRow {
+        GmailWatchRow {
+            id: Uuid::new_v4(),
+            integration_id: Uuid::new_v4(),
+            email_address: "u@example.com".to_string(),
+            topic_name: "projects/p/topics/t".to_string(),
+            history_id: 42,
+            label_ids: vec!["INBOX".to_string()],
+            expiration_ms: 0,
+            module_id,
+            workflow_id,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn selects_module_when_only_module_bound() {
+        let m = Uuid::new_v4();
+        assert_eq!(
+            select_dispatch_target(&row_with(Some(m), None)),
+            DispatchTarget::Module(m)
+        );
+    }
+
+    #[test]
+    fn selects_workflow_when_only_workflow_bound() {
+        let w = Uuid::new_v4();
+        assert_eq!(
+            select_dispatch_target(&row_with(None, Some(w))),
+            DispatchTarget::Workflow(w)
+        );
+    }
+
+    #[test]
+    fn none_when_neither_bound() {
+        assert_eq!(
+            select_dispatch_target(&row_with(None, None)),
+            DispatchTarget::None
+        );
+    }
+
+    #[test]
+    fn workflow_wins_when_both_bound() {
+        let m = Uuid::new_v4();
+        let w = Uuid::new_v4();
+        // Precedence rule: workflow_id takes priority over module_id.
+        assert_eq!(
+            select_dispatch_target(&row_with(Some(m), Some(w))),
+            DispatchTarget::Workflow(w)
+        );
+    }
+
+    /// A pre-existing watch row serialized before `workflow_id` existed
+    /// must still decode (serde default => None), so old rows keep their
+    /// module-dispatch behaviour after this change ships.
+    #[test]
+    fn legacy_row_without_workflow_id_decodes_to_module() {
+        let m = Uuid::new_v4();
+        let legacy = serde_json::json!({
+            "id": Uuid::new_v4(),
+            "integration_id": Uuid::new_v4(),
+            "email_address": "u@example.com",
+            "topic_name": "projects/p/topics/t",
+            "history_id": 7,
+            "label_ids": ["INBOX"],
+            "expiration_ms": 0,
+            "module_id": m,
+            "created_at_ms": 0,
+            "updated_at_ms": 0
+        });
+        let row: GmailWatchRow = serde_json::from_value(legacy).expect("legacy row decodes");
+        assert_eq!(row.workflow_id, None);
+        assert_eq!(select_dispatch_target(&row), DispatchTarget::Module(m));
+    }
 }

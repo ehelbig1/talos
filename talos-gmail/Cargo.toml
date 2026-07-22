@@ -29,6 +29,12 @@ sqlx = { version = "0.8", default-features = false, features = ["postgres", "run
 # MCP-1021: canonical FRONTEND_URL validation (rejects ? and # in addition
 # to /; the inline validator we removed only checked /).
 talos-config = { path = "../talos-config" }
+# Push → workflow trigger. talos-continuation-trigger is a leaf of the
+# execution-engine stack (engine / repos / authorization); nothing in its
+# dep tree references talos-gmail, so this edge introduces no cycle. It
+# runs the workflow-authorization gate + effective-actor resolution before
+# building the engine (CLAUDE.md lint checks 42/56).
+talos-continuation-trigger = { path = "../talos-continuation-trigger" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-http-body = { path = "../talos-http-body" }
 talos-integration-helpers = { path = "../talos-integration-helpers" }

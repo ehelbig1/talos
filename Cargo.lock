@@ -7861,6 +7861,7 @@ dependencies = [
  "sqlx",
  "talos-actor-repository",
  "talos-config",
+ "talos-continuation-trigger",
  "talos-dlp-provider",
  "talos-http-body",
  "talos-http-utils",

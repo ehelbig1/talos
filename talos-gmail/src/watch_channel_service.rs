@@ -20,6 +20,7 @@ pub struct GmailWatchSummary {
     pub expiration: DateTime<Utc>,
     pub module_id: Option<Uuid>,
     pub module_name: Option<String>,
+    pub workflow_id: Option<Uuid>,
     pub updated_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recent_failure: Option<RenewalFailure>,
@@ -77,6 +78,7 @@ pub async fn list_for_user(
             module_name: r
                 .module_id
                 .and_then(|id| module_name_by_id.get(&id).cloned()),
+            workflow_id: r.workflow_id,
             updated_at: DateTime::<Utc>::from_timestamp_millis(r.updated_at_ms)
                 .unwrap_or_else(Utc::now),
             recent_failure: None,
