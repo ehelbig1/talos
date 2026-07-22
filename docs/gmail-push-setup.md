@@ -27,6 +27,13 @@ email so the handler routes it correctly.
 ## Prerequisites
 
 - A GCP project you control (free tier is fine for personal use).
+  **CRITICAL: this MUST be the same project that owns the Gmail OAuth
+  client** the integration authenticates through. Gmail's `users.watch`
+  rejects any topic outside that project with
+  `Invalid topicName does not match projects/<oauth-project>/topics/*`.
+  If you're unsure which project that is, the error message names it — put
+  the topic there. (A separate "sandbox" project you use for other GCP work
+  will NOT work.)
 - `gcloud` authenticated as a principal with `pubsub.admin` in that
   project.
 - Talos's `BASE_URL` already set to a public HTTPS URL (ngrok in dev,
