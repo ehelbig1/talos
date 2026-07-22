@@ -924,10 +924,17 @@ pub async fn persist_memory_in_tx_with_metadata<'c>(
                 )
             })?;
 
+    // Phase 3a: durable write-time importance signal — mirror the non-tx
+    // `persist_memory_with_metadata_typed` path so a row written IN a tx (e.g.
+    // a Phase-3b `consolidate_memory` summary) carries the same durable
+    // `importance` as one written outside a tx, instead of landing NULL. Shared
+    // single-source scorer (memory-type base ⊕ numeric `metadata.importance`).
+    let importance_score = actor_context::write_time_importance(canonical_type, metadata) as f32;
+
     sqlx::query(
         "INSERT INTO actor_memory \
-         (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, embedding, embedding_model, metadata, org_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+         (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, embedding, embedding_model, metadata, org_id, importance) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
          ON CONFLICT (actor_id, key) DO UPDATE SET \
              value_enc     = EXCLUDED.value_enc, \
              value_key_id  = EXCLUDED.value_key_id, \
@@ -938,6 +945,7 @@ pub async fn persist_memory_in_tx_with_metadata<'c>(
              embedding_model = COALESCE(EXCLUDED.embedding_model, actor_memory.embedding_model), \
              metadata      = COALESCE(EXCLUDED.metadata, actor_memory.metadata), \
              org_id        = EXCLUDED.org_id, \
+             importance    = EXCLUDED.importance, \
              updated_at    = now()",
     )
     .bind(actor_id)
@@ -951,6 +959,7 @@ pub async fn persist_memory_in_tx_with_metadata<'c>(
     .bind(embedding.as_ref().and_then(|_| embedding::active_embedding_model()))
     .bind(metadata)
     .bind(org_id)
+    .bind(importance_score)
     .execute(&mut **tx)
     .await
     .context("Failed to persist actor memory (in tx)")?;
