@@ -452,16 +452,21 @@ pub fn select_candidates(
 /// `now` is injected for determinism (see [`fused_score`]). `access_weight` is
 /// threaded into [`fused_score`]'s importance term.
 pub fn rank_candidates(
-    mut candidates: Vec<Candidate>,
+    candidates: Vec<Candidate>,
     w: &Weights,
     now: DateTime<Utc>,
     access_weight: f64,
 ) -> Vec<Candidate> {
-    candidates.sort_by(|a, b| {
-        use std::cmp::Ordering;
-        let sa = fused_score(a, w, now, access_weight);
-        let sb = fused_score(b, w, now, access_weight);
-        sb.partial_cmp(&sa)
+    use std::cmp::Ordering;
+    // Decorate: compute each candidate's fused score ONCE (O(n)) rather than
+    // re-evaluating `fused_score` — which includes a `powf` recency decay — on
+    // every comparison inside `sort_by` (O(n log n) evaluations).
+    let mut scored: Vec<(f64, Candidate)> = candidates
+        .into_iter()
+        .map(|c| (fused_score(&c, w, now, access_weight), c))
+        .collect();
+    scored.sort_by(|(sa, a), (sb, b)| {
+        sb.partial_cmp(sa)
             .unwrap_or(Ordering::Equal)
             .then_with(|| {
                 b.relevance
@@ -475,7 +480,7 @@ pub fn rank_candidates(
                 (None, None) => Ordering::Equal,
             })
     });
-    candidates
+    scored.into_iter().map(|(_, c)| c).collect()
 }
 
 /// Flatten ranked candidates into the `(key, value, memory_type)` rows that
@@ -515,19 +520,48 @@ pub fn pack_within_budget(
     byte_budget: usize,
     per_memory_cap: usize,
 ) -> Vec<ActorMemoryRow> {
+    // A per-memory cap larger than the whole budget would let the first
+    // (highest-ranked) value — truncated only to the cap — exceed the budget on
+    // its own and abort packing with an EMPTY result, even though smaller
+    // lower-ranked rows would have fit. Clamp so per-memory truncation never
+    // exceeds the total budget (misconfiguration robustness; the defaults —
+    // cap 3000, budget 12000 — never hit this).
+    let per_memory_cap = per_memory_cap.min(byte_budget);
+
+    // Exact O(n) budget accounting. `assemble_payload` serializes to
+    //   {"actor_id":"<uuid>","memories":[<entry>,<entry>,...]}
+    // and serde_json is context-free: an entry `{"key":k,"value":v,"type":t}`
+    // serializes byte-for-byte the same standalone as inside the array. So the
+    // full length is exactly `base` (the empty-array payload) + Σ entry_len +
+    // (count-1) commas. We serialize each truncated entry ONCE and keep a
+    // running total, instead of re-assembling + re-serializing the whole
+    // growing payload every iteration (which was O(n²) in cumulative payload
+    // size — the hot path a prior fuel regression was about). The `≤ byte_budget`
+    // guarantee is preserved exactly (not approximated).
+    let base_len = serde_json::to_vec(&assemble_payload(actor_id, &[]))
+        .map(|b| b.len())
+        .unwrap_or(usize::MAX);
+
     let mut selected: Vec<ActorMemoryRow> = Vec::new();
+    let mut entries_len: usize = 0;
     for (key, value, mem_type) in candidates {
         let (value, _truncated) = truncate_value(value, per_memory_cap);
-        selected.push((key, value, mem_type));
-        let size = serde_json::to_vec(&assemble_payload(actor_id, &selected))
-            .map(|b| b.len())
-            .unwrap_or(usize::MAX);
-        if size > byte_budget {
+        let entry_len =
+            serde_json::to_vec(&json!({ "key": &key, "value": &value, "type": &mem_type }))
+                .map(|b| b.len())
+                .unwrap_or(usize::MAX);
+        // commas = new_count - 1 = selected.len() (before pushing).
+        let total = base_len
+            .saturating_add(entries_len)
+            .saturating_add(entry_len)
+            .saturating_add(selected.len());
+        if total > byte_budget {
             // This row (even after per-memory truncation) doesn't fit —
             // drop it and stop. Nothing lower-ranked is more deserving.
-            selected.pop();
             break;
         }
+        entries_len += entry_len;
+        selected.push((key, value, mem_type));
     }
     selected
 }
@@ -583,6 +617,44 @@ mod tests {
             Value::String("x".repeat(len)),
             "semantic".to_string(),
         )
+    }
+
+    #[test]
+    fn pack_many_small_items_bound_is_exact() {
+        // Exercises the O(n) incremental accounting on the many-small-rows path
+        // (the case the old O(n²) full-reassemble handled and where the
+        // "an entry serializes the same standalone as in the array" byte-
+        // identity must hold). 500 tiny memories, generous budget: the packed
+        // set must (a) stay <= budget when re-measured by the REAL
+        // assemble_payload, and (b) be maximal — adding the next dropped
+        // candidate would exceed the budget.
+        let actor = Uuid::new_v4();
+        let candidates: Vec<ActorMemoryRow> = (0..500)
+            .map(|i| big_string_memory(&format!("k{i:03}"), 30))
+            .collect();
+        let all = candidates.clone();
+        let budget = 8_000;
+        let packed = pack_within_budget(actor, candidates, budget, 3_000);
+        let size = serde_json::to_vec(&assemble_payload(actor, &packed))
+            .unwrap()
+            .len();
+        assert!(
+            size <= budget,
+            "incremental accounting overshot: {size} > {budget}"
+        );
+        assert!(packed.len() < all.len(), "not all 500 should fit in 8KB");
+        assert!(packed.len() > 10, "many small rows should pack");
+        // Maximality: adding the first dropped candidate would exceed budget —
+        // proves the incremental total equals the real assembled size (no drift).
+        let mut plus_one = packed.clone();
+        plus_one.push(all[packed.len()].clone());
+        let size_plus = serde_json::to_vec(&assemble_payload(actor, &plus_one))
+            .unwrap()
+            .len();
+        assert!(
+            size_plus > budget,
+            "packer stopped early: adding one more ({size_plus}B) still fit under {budget}B"
+        );
     }
 
     #[test]

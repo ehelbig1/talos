@@ -613,7 +613,18 @@ mod tests {
         // HyDE toggle honours canonical truthy tokens.
         env::set_var("ENABLE_SMART_MEMORY_HYDE", "yes");
         assert!(crate::smart_memory_hyde_enabled());
+        // `+Inf` is accepted by `positive_env_or_default` (Inf > 0) but would
+        // make every fused_score Inf → all-equal ranking collapse. The weight
+        // knobs cap it at a large finite value, keeping the ranking total.
+        env::set_var("SMART_MEMORY_CONTEXT_W_RELEVANCE", "inf");
+        let w = crate::smart_memory_context_w_relevance();
+        assert!(
+            w.is_finite(),
+            "inf weight must be clamped to a finite value"
+        );
+        assert!((w - 1_000_000.0).abs() < f64::EPSILON);
         for v in [
+            "SMART_MEMORY_CONTEXT_W_RELEVANCE",
             "SMART_MEMORY_CONTEXT_W_RECENCY",
             "SMART_MEMORY_CONTEXT_W_IMPORTANCE",
             "SMART_MEMORY_CONTEXT_RECENCY_HALFLIFE_DAYS",

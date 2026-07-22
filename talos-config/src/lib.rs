@@ -298,16 +298,26 @@ pub fn smart_memory_context_min_score() -> f64 {
 // signal — the destructive-zero guard treats that as a misconfiguration; use
 // a small positive value like `0.01` to de-weight a signal intentionally).
 
+/// Upper clamp on the fused-rank weight knobs. `positive_env_or_default`
+/// rejects `NaN` and `≤0` but ACCEPTS `+Inf` (`"inf".parse::<f64>()` succeeds,
+/// `Inf > 0.0`). An `Inf` weight makes every `fused_score` `Inf`, so all
+/// candidates compare `Equal` and the ranking collapses to input order. Cap the
+/// weights at a large-but-finite value — far above any sane weight ratio — so a
+/// stray `=inf` env can't degenerate the ranking. Keeps every knob finite.
+const SMART_MEMORY_WEIGHT_MAX: f64 = 1_000_000.0;
+
 /// Weight on the cosine-relevance signal in the fused rank. Default 1.0.
 /// Override via `SMART_MEMORY_CONTEXT_W_RELEVANCE`.
 pub fn smart_memory_context_w_relevance() -> f64 {
     positive_env_or_default::<f64>("SMART_MEMORY_CONTEXT_W_RELEVANCE", 1.0)
+        .min(SMART_MEMORY_WEIGHT_MAX)
 }
 
 /// Weight on the recency-decay signal in the fused rank. Default 0.3.
 /// Override via `SMART_MEMORY_CONTEXT_W_RECENCY`.
 pub fn smart_memory_context_w_recency() -> f64 {
     positive_env_or_default::<f64>("SMART_MEMORY_CONTEXT_W_RECENCY", 0.3)
+        .min(SMART_MEMORY_WEIGHT_MAX)
 }
 
 /// Weight on the importance signal (memory-type base blended with an optional
@@ -315,6 +325,7 @@ pub fn smart_memory_context_w_recency() -> f64 {
 /// `SMART_MEMORY_CONTEXT_W_IMPORTANCE`.
 pub fn smart_memory_context_w_importance() -> f64 {
     positive_env_or_default::<f64>("SMART_MEMORY_CONTEXT_W_IMPORTANCE", 0.5)
+        .min(SMART_MEMORY_WEIGHT_MAX)
 }
 
 /// Exponential recency half-life in DAYS: a memory `half_life` days old
