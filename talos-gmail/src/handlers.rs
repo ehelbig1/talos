@@ -332,6 +332,11 @@ pub struct CreateGmailWatchRequest {
     pub label_ids: Option<Vec<String>>,
     #[serde(default)]
     pub module_id: Option<Uuid>,
+    /// Optional bound workflow. When set, an inbound push triggers a
+    /// full workflow execution instead of a single module job. Takes
+    /// precedence over `module_id` when both are supplied.
+    #[serde(default)]
+    pub workflow_id: Option<Uuid>,
 }
 
 /// POST /api/gmail/watch-channels
@@ -341,7 +346,13 @@ pub async fn create_watch_channel_handler(
     ApiJson(req): ApiJson<CreateGmailWatchRequest>,
 ) -> impl IntoResponse {
     match service
-        .create_watch(user_id, req.integration_id, req.module_id, req.label_ids)
+        .create_watch(
+            user_id,
+            req.integration_id,
+            req.module_id,
+            req.workflow_id,
+            req.label_ids,
+        )
         .await
     {
         Ok(row) => Json(ApiResponse {
@@ -353,6 +364,8 @@ pub async fn create_watch_channel_handler(
                 "history_id": row.history_id,
                 "label_ids": row.label_ids,
                 "expiration_ms": row.expiration_ms,
+                "module_id": row.module_id,
+                "workflow_id": row.workflow_id,
             })),
             error: None,
         })
@@ -363,6 +376,7 @@ pub async fn create_watch_channel_handler(
                 user_id = %user_id,
                 integration_id = %req.integration_id,
                 module_id = ?req.module_id,
+                workflow_id = ?req.workflow_id,
                 error = %e,
                 "Failed to create Gmail watch channel"
             );

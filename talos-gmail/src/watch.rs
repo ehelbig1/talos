@@ -83,7 +83,17 @@ pub(crate) struct GmailWatchRow {
     #[serde(default)]
     pub label_ids: Vec<String>,
     pub expiration_ms: i64,
+    /// Optional bound WASM module — one inbound message → one dispatched
+    /// module job. Mutually informative with `workflow_id`: when both
+    /// are set, `workflow_id` WINS (see `dispatch::select_dispatch_target`).
     pub module_id: Option<Uuid>,
+    /// Optional bound WORKFLOW — an inbound push triggers one full
+    /// workflow execution (the workflow re-fetches its own mail).
+    /// Takes precedence over `module_id` when both are set.
+    /// `#[serde(default)]` so pre-existing watch rows (serialized before
+    /// this field existed) decode to `None`.
+    #[serde(default)]
+    pub workflow_id: Option<Uuid>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -154,6 +164,7 @@ impl GmailWatchService {
         user_id: Uuid,
         integration_id: Uuid,
         module_id: Option<Uuid>,
+        workflow_id: Option<Uuid>,
         label_ids: Option<Vec<String>>,
     ) -> Result<GmailWatchRow> {
         let _guard = self.acquire_lock(user_id, integration_id).await;
@@ -178,6 +189,7 @@ impl GmailWatchService {
                 }
             }
             existing.module_id = module_id;
+            existing.workflow_id = workflow_id;
             existing.updated_at_ms = Utc::now().timestamp_millis();
             self.upsert_row(user_id, &existing).await?;
             return Ok(existing);
@@ -187,6 +199,7 @@ impl GmailWatchService {
             user_id,
             integration_id,
             module_id,
+            workflow_id,
             label_ids.unwrap_or_else(|| self.default_label_ids.clone()),
         )
         .await
@@ -222,11 +235,12 @@ impl GmailWatchService {
             tracing::warn!(error = %e, "users.stop during renew failed; continuing with re-create");
         }
 
-        // Preserve history_id and label_ids + module_id across the
-        // rotation.
+        // Preserve history_id and label_ids + module_id + workflow_id
+        // across the rotation.
         let history_id = old.history_id;
         let label_ids = old.label_ids.clone();
         let module_id = old.module_id;
+        let workflow_id = old.workflow_id;
         let integration_id = old.integration_id;
         let old_id = old.id;
 
@@ -237,7 +251,7 @@ impl GmailWatchService {
         // returns a NEW historyId (current tip) which we deliberately
         // ignore — our stored cursor is the authority.
         let mut new_row = self
-            .create_fresh_watch_locked(user_id, integration_id, module_id, label_ids)
+            .create_fresh_watch_locked(user_id, integration_id, module_id, workflow_id, label_ids)
             .await
             .context("create_fresh during renew")?;
         if new_row.history_id < history_id {
@@ -390,6 +404,7 @@ impl GmailWatchService {
         user_id: Uuid,
         integration_id: Uuid,
         module_id: Option<Uuid>,
+        workflow_id: Option<Uuid>,
         label_ids: Vec<String>,
     ) -> Result<GmailWatchRow> {
         let integration = self
@@ -424,6 +439,7 @@ impl GmailWatchService {
             label_ids,
             expiration_ms: watch_resp.expiration_ms as i64,
             module_id,
+            workflow_id,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
         };
@@ -485,6 +501,7 @@ impl GmailWatchService {
                     "history_id": row.history_id,
                     "expiration": row.expiration_ms,
                     "module_id": row.module_id,
+                    "workflow_id": row.workflow_id,
                     "label_ids": row.label_ids,
                 }),
             },

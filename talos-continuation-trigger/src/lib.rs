@@ -29,6 +29,11 @@ use uuid::Uuid;
 pub enum TriggerSourceKind {
     ApprovalGate,
     WorkflowSuspension,
+    /// A Gmail push notification (Pub/Sub) whose watch row carries a
+    /// bound `workflow_id`. `source_id` is the watch channel UUID; the
+    /// triggered workflow re-fetches its own mail, so the trigger
+    /// payload only carries `{source, email_address, history_id}`.
+    GmailPush,
 }
 
 impl TriggerSourceKind {
@@ -36,12 +41,14 @@ impl TriggerSourceKind {
         match self {
             TriggerSourceKind::ApprovalGate => "approval_gate",
             TriggerSourceKind::WorkflowSuspension => "workflow_suspension",
+            TriggerSourceKind::GmailPush => "gmail_push",
         }
     }
     fn id_field(self) -> &'static str {
         match self {
             TriggerSourceKind::ApprovalGate => "approval_gate_id",
             TriggerSourceKind::WorkflowSuspension => "suspension_id",
+            TriggerSourceKind::GmailPush => "gmail_channel_id",
         }
     }
 }

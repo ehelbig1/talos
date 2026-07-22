@@ -86,9 +86,13 @@ pub async fn create_watch(
         .get("module_id")
         .and_then(|v| v.as_str())
         .and_then(|s| Uuid::parse_str(s).ok());
+    let workflow_id: Option<Uuid> = body
+        .get("workflow_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok());
 
     match service
-        .create_watch(user_id, integration_id, module_id, label_ids)
+        .create_watch(user_id, integration_id, module_id, workflow_id, label_ids)
         .await
     {
         Ok(row) => {
@@ -102,6 +106,8 @@ pub async fn create_watch(
                     "email_address": row.email_address,
                     "topic_name": row.topic_name,
                     "label_ids": row.label_ids,
+                    "module_id": row.module_id,
+                    "workflow_id": row.workflow_id,
                 }),
             )
             .await;
@@ -113,6 +119,8 @@ pub async fn create_watch(
                     "topic_name": row.topic_name,
                     "history_id": row.history_id,
                     "expiration_ms": row.expiration_ms,
+                    "module_id": row.module_id,
+                    "workflow_id": row.workflow_id,
                 })),
             )
         }
@@ -126,6 +134,7 @@ pub async fn create_watch(
                 user_id = %user_id,
                 ?integration_id,
                 ?module_id,
+                ?workflow_id,
                 "gmail admin: create_watch failed: {:#}",
                 e
             );
