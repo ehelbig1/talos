@@ -612,37 +612,19 @@ impl GraphRagService {
             // deployments that haven't migrated.
             return TierDecision::External;
         };
-        match repo.get_actor_max_llm_tier(actor_id).await {
-            Ok(Some(talos_workflow_job_protocol::LlmTier::Tier2)) => TierDecision::External,
-            Ok(Some(talos_workflow_job_protocol::LlmTier::Tier1)) => {
-                if self.tier1_local_ok && self.ollama.is_some() {
-                    TierDecision::LocalOnly
-                } else {
-                    TierDecision::Skip
-                }
-            }
-            // `LlmTier` is non-exhaustive (per upstream); a future
-            // stricter-than-tier1 variant must not inherit tier1's
-            // local-attestation carve-out — fail closed.
-            #[allow(unreachable_patterns)]
-            Ok(Some(_)) => TierDecision::Skip,
-            Ok(None) => {
-                tracing::warn!(
-                    target: "talos_graph_rag",
-                    actor_id = %actor_id,
-                    "Actor not found during tier check — failing closed (skip LLM extraction)"
-                );
-                TierDecision::Skip
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "talos_graph_rag",
-                    actor_id = %actor_id,
-                    error = %e,
-                    "Tier lookup failed — failing closed (skip LLM extraction)"
-                );
-                TierDecision::Skip
-            }
+        // Delegate to the SHARED fail-closed tier gate on ActorRepository so
+        // graph-RAG and the Phase-3b consolidation loop can never drift. The
+        // decision matrix (Tier2→External, Tier1+attested+ollama→LocalOnly,
+        // everything else→Skip, fail-closed on missing/DB-error) lives there;
+        // this thin map only translates the shared enum into graph-RAG's
+        // local `TierDecision` to avoid churning every call site.
+        match repo
+            .resolve_llm_tier_decision(actor_id, self.tier1_local_ok, self.ollama.is_some())
+            .await
+        {
+            talos_actor_repository::LlmTierDecision::External => TierDecision::External,
+            talos_actor_repository::LlmTierDecision::LocalOnly => TierDecision::LocalOnly,
+            talos_actor_repository::LlmTierDecision::Skip => TierDecision::Skip,
         }
     }
 

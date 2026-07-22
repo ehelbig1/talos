@@ -2117,6 +2117,153 @@ pub async fn measure_and_forget_keys_in_tx<'c>(
     Ok((row.0, row.1 as u64))
 }
 
+/// Atomic persist-summary + forget-sources consolidation kernel — the SINGLE
+/// implementation shared by the MCP `consolidate_actor_memory` handler and the
+/// Phase-3b autonomous consolidation loop (`talos_memory_consolidation`).
+///
+/// In ONE committed transaction it:
+///   1. enriches `semantic_value` (when it's a JSON object) with
+///      `__consolidated_from_count__` (source key count) and
+///      `__consolidated_at__` (RFC-3339-ish UTC). Non-object values pass
+///      through untouched. Callers that want a human `__consolidated_note__`
+///      insert it into `semantic_value` before calling.
+///   2. persists the enriched value as a `"semantic"` memory under
+///      `semantic_key`, stamping the passed `metadata` (e.g.
+///      `{"kind": "consolidated", ...}`).
+///   3. hard-deletes the `source_keys` episodic rows (batched DELETE).
+///   4. commits — so the summary and the source deletion are all-or-nothing.
+///      Any error before commit rolls back BOTH (zero mutation).
+///
+/// Post-commit (outside the tx, by design — a rolled-back tx must not corrupt
+/// the graph) it fires graph-RAG entity extraction for the new semantic row.
+///
+/// Returns the number of source rows retired.
+pub async fn consolidate_memory(
+    pool: &Pool<Postgres>,
+    actor_id: Uuid,
+    semantic_key: &str,
+    semantic_value: serde_json::Value,
+    source_keys: &[String],
+    metadata: Option<serde_json::Value>,
+) -> Result<u64> {
+    // Enrich provenance onto object values only (mirrors the MCP handler's
+    // pre-extraction behaviour).
+    let final_value = if let Some(obj) = semantic_value.as_object() {
+        let mut enriched = obj.clone();
+        enriched.insert(
+            "__consolidated_from_count__".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(source_keys.len() as u64)),
+        );
+        enriched.insert(
+            "__consolidated_at__".to_string(),
+            serde_json::Value::String(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+        );
+        serde_json::Value::Object(enriched)
+    } else {
+        semantic_value
+    };
+
+    // Persist the summary + delete the absorbed sources atomically. Without
+    // the transaction, a crash between INSERT and DELETE would leave both the
+    // new semantic entry AND the old episodic entries present simultaneously.
+    let mut tx = pool.begin().await.context("consolidate_memory: begin tx")?;
+
+    persist_memory_in_tx_with_metadata(
+        &mut tx,
+        actor_id,
+        semantic_key,
+        &final_value,
+        metadata.as_ref(),
+        "semantic",
+        None,
+    )
+    .await
+    .context("consolidate_memory: persist semantic summary")?;
+
+    // Never delete the summary we just wrote: if a caller (e.g. the MCP
+    // `consolidate_actor_memory` handler with operator-supplied keys) includes
+    // `semantic_key` in `source_keys`, the DELETE would wipe the fresh summary
+    // in the same tx — losing BOTH the summary and its sources. Filter it out.
+    let retire_keys: Vec<String> = source_keys
+        .iter()
+        .filter(|k| k.as_str() != semantic_key)
+        .cloned()
+        .collect();
+    let retired_count = forget_keys_in_tx(&mut tx, actor_id, &retire_keys)
+        .await
+        .context("consolidate_memory: forget source keys")?;
+
+    tx.commit().await.context("consolidate_memory: commit")?;
+
+    // Post-commit only — running graph extraction inside the tx would corrupt
+    // the graph if the tx rolled back.
+    spawn_graph_extraction(actor_id, semantic_key.to_string(), final_value);
+
+    Ok(retired_count)
+}
+
+/// Scan one actor's OLD, COLD, LOW-importance EPISODIC memories — the Phase-3b
+/// consolidation candidate set. Returns decrypted `(key, value, memory_type)`
+/// triples for up to `limit` rows.
+///
+/// Scope is deliberately narrow so consolidation never touches valuable or
+/// recent memory:
+///   * `memory_type = 'episodic'` only — never semantic / working / scratchpad.
+///   * older than `min_age_days` (`updated_at < now() - interval`).
+///   * low or UNSCORED importance (`importance IS NULL OR importance < max`).
+///     Phase-3a leaves older rows' `importance` NULL; those unscored + cold
+///     rows ARE the prime candidates (resolves the Phase-3a NULL-ordering
+///     note), so NULLs sort FIRST.
+///
+/// Order: `importance ASC NULLS FIRST, last_accessed_at ASC NULLS FIRST,
+/// updated_at ASC` — coldest, least-important, oldest first, matching the
+/// `idx_actor_memory_signals(actor_id, importance, last_accessed_at)` index.
+pub async fn scan_consolidation_candidates(
+    pool: &Pool<Postgres>,
+    actor_id: Uuid,
+    min_age_days: f64,
+    max_importance: f64,
+    limit: i64,
+) -> Result<Vec<(String, serde_json::Value, String)>> {
+    // `make_interval` takes int4 only (lint 27) — bind i32 days AND cast
+    // `$2::int` in SQL. `min_age_days` is an f64 config value; round to the
+    // nearest whole day. FLOOR AT 1: a sub-1-day setting (e.g. 0.4) would
+    // otherwise round to 0 → `updated_at < now()` matches essentially every
+    // episodic row, defeating the "never touch recent memory" invariant and
+    // making recent low-importance rows deletable. Consolidation always leaves
+    // at least a full day of headroom.
+    let min_age_days_i32 = (min_age_days.round() as i32).max(1);
+    let sql = "SELECT actor_id, key, value_enc, value_key_id, value_format, memory_type \
+               FROM actor_memory \
+               WHERE actor_id = $1 \
+                 AND memory_type = 'episodic' \
+                 AND (expires_at IS NULL OR expires_at > now()) \
+                 AND updated_at < now() - make_interval(days => $2::int) \
+                 AND (importance IS NULL OR importance < $3) \
+               ORDER BY importance ASC NULLS FIRST, last_accessed_at ASC NULLS FIRST, updated_at ASC \
+               LIMIT $4";
+    let rows = sqlx::query(sql)
+        .bind(actor_id)
+        .bind(min_age_days_i32)
+        .bind(max_importance)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .context("scan_consolidation_candidates query")?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        // `key` + `memory_type` read fail-loud (checks 52/55); value decrypts
+        // through the canonical AAD-aware helper (projects actor_id/key/
+        // value_format — fails loud on projection drift).
+        let key: String = row.try_get::<String, _>("key")?;
+        let memory_type: String = row.try_get::<String, _>("memory_type")?;
+        let value = decrypt_row_value(row).await?;
+        out.push((key, value, memory_type));
+    }
+    Ok(out)
+}
+
 /// Measure the on-disk text size of a memory entry's `value` column,
 /// transaction-scoped. Returns 0 if the row doesn't exist. Used by the
 /// context-compression handler to compute bytes-saved estimates atomically

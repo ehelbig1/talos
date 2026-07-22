@@ -37,6 +37,37 @@ pub struct ActorMemory {
     pub value: serde_json::Value,
 }
 
+/// What an actor's LLM data-egress ceiling permits for ONE
+/// LLM-over-actor-memory attempt (graph-RAG entity extraction OR Phase-3b
+/// consolidation). Computed by [`ActorRepository::resolve_llm_tier_decision`];
+/// callers select their backend strictly from this — no reading
+/// `max_llm_tier` directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmTierDecision {
+    /// Tier2 actor: any configured backend is permitted (external allowed).
+    External,
+    /// Tier1 actor on a deployment whose operator has attested the Ollama
+    /// backend is on-host: the LOCAL backend ONLY. An external provider is
+    /// NEVER consulted on this path, even when a key is present.
+    LocalOnly,
+    /// No LLM: tier1 without attestation, actor row missing, tier lookup
+    /// error, or a future stricter-than-tier1 variant. Fail-closed default —
+    /// the memory content never reaches any LLM.
+    Skip,
+}
+
+/// One active actor row surfaced by the cross-tenant consolidation scan
+/// ([`ActorRepository::scan_actors_for_consolidation`]). `max_llm_tier` is
+/// carried so the loop can resolve the egress decision from the scanned row
+/// (via [`llm_tier_decision_from_tier_str`]) without a per-actor tier lookup
+/// (no N+1). The row's org is resolved inside the persist path, so it is not
+/// carried here.
+#[derive(Debug, Clone)]
+pub struct ConsolidationActor {
+    pub actor_id: Uuid,
+    pub max_llm_tier: String,
+}
+
 /// Full actor detail row returned by `get_actor_detail`.
 #[derive(Debug)]
 pub struct ActorDetail {
@@ -2241,6 +2272,122 @@ impl ActorRepository {
             .map(talos_workflow_job_protocol::LlmTier::from_db_str))
     }
 
+    /// Resolve the LLM data-egress decision for an actor whose memory is
+    /// about to be summarized by an LLM. This is the SINGLE canonical
+    /// fail-closed tier gate shared by graph-RAG's entity-extraction path
+    /// (`talos_graph_rag::ExtractionService`) AND the Phase-3b memory
+    /// consolidation loop (`talos_memory_consolidation`) — do NOT reimplement
+    /// the decision matrix; a security decision copy-pasted drifts.
+    ///
+    /// The matrix (both callers depend on this exact behaviour):
+    ///   * `Tier2`  → [`LlmTierDecision::External`] (any backend permitted).
+    ///   * `Tier1`  → [`LlmTierDecision::LocalOnly`] ONLY when BOTH the
+    ///     operator has attested the Ollama backend is on-host
+    ///     (`tier1_local_ok`) AND that backend is actually wired
+    ///     (`ollama_available`); otherwise [`LlmTierDecision::Skip`]. The
+    ///     attestation vouches for the backend's locality, not for
+    ///     unattributable writes — it never widens the Skip cases below.
+    ///   * `Ok(None)` (actor row missing) → [`LlmTierDecision::Skip`]. A
+    ///     memory referencing a missing actor is unusual; fail closed rather
+    ///     than leak privacy-sensitive content to an external provider.
+    ///   * `Err(...)` (DB error) → [`LlmTierDecision::Skip`] (fail closed).
+    ///   * Any future stricter-than-tier1 variant → [`LlmTierDecision::Skip`]
+    ///     (`LlmTier` is non-exhaustive; a new stricter tier must not inherit
+    ///     tier1's local-attestation carve-out).
+    pub async fn resolve_llm_tier_decision(
+        &self,
+        actor_id: Uuid,
+        tier1_local_ok: bool,
+        ollama_available: bool,
+    ) -> LlmTierDecision {
+        let lookup = self.get_actor_max_llm_tier(actor_id).await;
+        // Log the fail-closed cases here (async context) so operators can
+        // correlate a Skip with the underlying cause; the pure decision
+        // matrix itself lives in `decide_llm_tier` so it's unit-testable
+        // without Postgres.
+        match &lookup {
+            Ok(None) => tracing::warn!(
+                target: "talos_actor_repository",
+                actor_id = %actor_id,
+                "resolve_llm_tier_decision: actor not found — failing closed (Skip)"
+            ),
+            Err(e) => tracing::warn!(
+                target: "talos_actor_repository",
+                actor_id = %actor_id,
+                error = %e,
+                "resolve_llm_tier_decision: tier lookup failed — failing closed (Skip)"
+            ),
+            _ => {}
+        }
+        decide_llm_tier(lookup.map_err(|_| ()), tier1_local_ok, ollama_available)
+    }
+
+    /// Cross-tenant scan of active actors for the Phase-3b consolidation
+    /// loop. Returns `(actor_id, org_id, max_llm_tier)` for up to `limit`
+    /// active actors, ordered by `id` for a stable, N+1-free sweep (one
+    /// query instead of a per-actor tier lookup).
+    ///
+    /// This is a PLATFORM scan: the consolidation loop runs AS the platform
+    /// background service, not on behalf of any single user, so no RLS tenant
+    /// scope is applied here (same posture as `talos-ml`'s teacher-audit
+    /// `scan_candidates`). The per-actor tier gate
+    /// ([`Self::resolve_llm_tier_decision`]) and the per-actor org (returned
+    /// here) are what bound what each actor's memory may reach.
+    pub async fn scan_actors_for_consolidation(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<ConsolidationActor>> {
+        // Least-recently-swept first (rotation cursor): `last_consolidated_at
+        // ASC NULLS FIRST` guarantees every active actor is eventually reached
+        // even when the fleet exceeds `limit` — an `ORDER BY id` scan would
+        // starve higher-id actors forever. `mark_actors_consolidated` advances
+        // the cursor after each tick. `id` is the stable tiebreaker.
+        let rows = sqlx::query(
+            "SELECT id, max_llm_tier FROM actors \
+             WHERE status = 'active' \
+             ORDER BY last_consolidated_at ASC NULLS FIRST, id \
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.db_pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            // Fail-loud reads (checks 52/55): schema drift errors instead of
+            // silently defaulting. `id`/`max_llm_tier` are NOT NULL.
+            let actor_id: Uuid = r.try_get::<Uuid, _>("id")?;
+            // Fail CLOSED on the (unreachable — NOT NULL DEFAULT) NULL case:
+            // an absent tier must not become tier2/External. "tier1" →
+            // most-restrictive; `LlmTier::from_db_str` maps unknown → Tier1 too.
+            let max_llm_tier: String = r
+                .try_get::<Option<String>, _>("max_llm_tier")?
+                .unwrap_or_else(|| "tier1".to_string());
+            out.push(ConsolidationActor {
+                actor_id,
+                max_llm_tier,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Advance the consolidation rotation cursor for every actor a tick
+    /// processed (consolidated OR skipped), so the next tick moves on to the
+    /// least-recently-swept actors. Best-effort: a failure here only means the
+    /// next tick may re-examine the same actors, never data loss. No-op on an
+    /// empty slice.
+    pub async fn mark_actors_consolidated(&self, actor_ids: &[Uuid]) -> Result<u64> {
+        if actor_ids.is_empty() {
+            return Ok(0);
+        }
+        let result =
+            sqlx::query("UPDATE actors SET last_consolidated_at = now() WHERE id = ANY($1)")
+                .bind(actor_ids)
+                .execute(&self.db_pool)
+                .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Set an actor's LLM data-egress ceiling. Validates user ownership
     /// before mutating. Returns true if the row was updated, false if
     /// the actor doesn't exist or doesn't belong to the user.
@@ -3451,6 +3598,120 @@ mod summary_truncation_tests {
         assert!(truncated.len() <= 1000);
         // Validity check: the truncation must produce a well-formed UTF-8 string.
         assert!(truncated.chars().next().is_some());
+    }
+}
+
+/// Pure fail-closed tier-decision matrix, factored out of
+/// [`ActorRepository::resolve_llm_tier_decision`] so every arm is unit-testable
+/// without a real ActorRepository or Postgres. `lookup` is the resolved outcome
+/// of `get_actor_max_llm_tier` with its error type erased to `()` (the caller
+/// logs before erasing). Keep this in sync with the async method's doc-comment
+/// contract — this IS the contract.
+pub(crate) fn decide_llm_tier(
+    lookup: Result<Option<talos_workflow_job_protocol::LlmTier>, ()>,
+    tier1_local_ok: bool,
+    ollama_available: bool,
+) -> LlmTierDecision {
+    match lookup {
+        Ok(Some(talos_workflow_job_protocol::LlmTier::Tier2)) => LlmTierDecision::External,
+        Ok(Some(talos_workflow_job_protocol::LlmTier::Tier1)) => {
+            if tier1_local_ok && ollama_available {
+                LlmTierDecision::LocalOnly
+            } else {
+                LlmTierDecision::Skip
+            }
+        }
+        // `LlmTier` is non-exhaustive — a future stricter-than-tier1 variant
+        // must not inherit tier1's local carve-out.
+        #[allow(unreachable_patterns)]
+        Ok(Some(_)) => LlmTierDecision::Skip,
+        Ok(None) => LlmTierDecision::Skip, // actor missing — fail closed
+        Err(()) => LlmTierDecision::Skip,  // DB error — fail closed
+    }
+}
+
+/// Resolve the egress decision from an ALREADY-FETCHED `max_llm_tier` string
+/// (e.g. the value carried on a [`ConsolidationActor`] from the batch scan),
+/// avoiding a per-actor tier lookup (no N+1). The string is mapped through
+/// `LlmTier::from_db_str`, which fail-closes an unknown/empty value to `Tier1`
+/// — so a corrupt tier can never yield `External`. Shares the exact same
+/// fail-closed matrix as the async [`ActorRepository::resolve_llm_tier_decision`]
+/// (both call [`decide_llm_tier`]); the "actor missing" arm is not applicable
+/// here since the actor came from the scan.
+pub fn llm_tier_decision_from_tier_str(
+    max_llm_tier: &str,
+    tier1_local_ok: bool,
+    ollama_available: bool,
+) -> LlmTierDecision {
+    let tier = talos_workflow_job_protocol::LlmTier::from_db_str(max_llm_tier);
+    decide_llm_tier(Ok(Some(tier)), tier1_local_ok, ollama_available)
+}
+
+#[cfg(test)]
+mod llm_tier_decision_tests {
+    use super::{decide_llm_tier, LlmTierDecision};
+    use talos_workflow_job_protocol::LlmTier;
+
+    #[test]
+    fn tier2_is_external() {
+        assert_eq!(
+            decide_llm_tier(Ok(Some(LlmTier::Tier2)), false, false),
+            LlmTierDecision::External
+        );
+        // Tier2 is External regardless of attestation / ollama presence.
+        assert_eq!(
+            decide_llm_tier(Ok(Some(LlmTier::Tier2)), true, true),
+            LlmTierDecision::External
+        );
+    }
+
+    #[test]
+    fn tier1_attested_with_ollama_is_local_only() {
+        assert_eq!(
+            decide_llm_tier(Ok(Some(LlmTier::Tier1)), true, true),
+            LlmTierDecision::LocalOnly
+        );
+    }
+
+    #[test]
+    fn tier1_without_attestation_is_skip() {
+        // Even with ollama wired, no operator attestation → Skip (never egress).
+        assert_eq!(
+            decide_llm_tier(Ok(Some(LlmTier::Tier1)), false, true),
+            LlmTierDecision::Skip
+        );
+    }
+
+    #[test]
+    fn tier1_without_ollama_is_skip() {
+        assert_eq!(
+            decide_llm_tier(Ok(Some(LlmTier::Tier1)), true, false),
+            LlmTierDecision::Skip
+        );
+    }
+
+    #[test]
+    fn missing_actor_is_skip() {
+        assert_eq!(decide_llm_tier(Ok(None), true, true), LlmTierDecision::Skip);
+    }
+
+    #[test]
+    fn db_error_is_skip() {
+        assert_eq!(decide_llm_tier(Err(()), true, true), LlmTierDecision::Skip);
+    }
+
+    #[test]
+    fn from_tier_str_maps_and_fails_closed() {
+        use super::llm_tier_decision_from_tier_str as d;
+        // Canonical strings.
+        assert_eq!(d("tier2", true, true), LlmTierDecision::External);
+        assert_eq!(d("tier1", true, true), LlmTierDecision::LocalOnly);
+        assert_eq!(d("tier1", false, true), LlmTierDecision::Skip);
+        // A corrupt / unknown tier string must NOT become External — from_db_str
+        // fail-closes to Tier1, so it's Skip (or LocalOnly only when attested).
+        assert_eq!(d("garbage", true, true), LlmTierDecision::LocalOnly);
+        assert_eq!(d("garbage", false, false), LlmTierDecision::Skip);
+        assert_eq!(d("", false, false), LlmTierDecision::Skip);
     }
 }
 

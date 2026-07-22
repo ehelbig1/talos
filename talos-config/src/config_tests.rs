@@ -638,4 +638,67 @@ mod tests {
         env::remove_var("RUST_ENV");
         env::remove_var("ALLOWED_ORIGIN");
     }
+
+    #[test]
+    fn test_memory_consolidation_config() {
+        let _g = env_lock();
+        // Master switch defaults OFF; honours canonical truthy tokens.
+        for v in [
+            "ENABLE_MEMORY_CONSOLIDATION",
+            "MEMORY_CONSOLIDATION_TIER1_LOCAL_OK",
+            "MEMORY_CONSOLIDATION_INTERVAL_SECS",
+            "MEMORY_CONSOLIDATION_MIN_AGE_DAYS",
+            "MEMORY_CONSOLIDATION_MAX_IMPORTANCE",
+            "MEMORY_CONSOLIDATION_BATCH_SIZE",
+            "MEMORY_CONSOLIDATION_MAX_ACTORS_PER_TICK",
+            "MEMORY_CONSOLIDATION_MODEL",
+        ] {
+            env::remove_var(v);
+        }
+        assert!(!crate::memory_consolidation_enabled());
+        assert!(!crate::memory_consolidation_tier1_local_ok());
+        env::set_var("ENABLE_MEMORY_CONSOLIDATION", "on");
+        assert!(crate::memory_consolidation_enabled());
+        env::set_var("MEMORY_CONSOLIDATION_TIER1_LOCAL_OK", "true");
+        assert!(crate::memory_consolidation_tier1_local_ok());
+
+        // Numeric defaults.
+        assert_eq!(crate::memory_consolidation_interval_secs(), 3600);
+        assert!((crate::memory_consolidation_min_age_days() - 30.0).abs() < f64::EPSILON);
+        assert!((crate::memory_consolidation_max_importance() - 0.4).abs() < f64::EPSILON);
+        assert_eq!(crate::memory_consolidation_batch_size(), 20);
+        assert_eq!(crate::memory_consolidation_max_actors_per_tick(), 25);
+        assert_eq!(crate::memory_consolidation_model(), "qwen2.5:7b");
+
+        // Destructive-zero / clamp guards.
+        env::set_var("MEMORY_CONSOLIDATION_INTERVAL_SECS", "0");
+        assert_eq!(crate::memory_consolidation_interval_secs(), 3600);
+        env::set_var("MEMORY_CONSOLIDATION_MAX_IMPORTANCE", "5.0");
+        assert!((crate::memory_consolidation_max_importance() - 1.0).abs() < f64::EPSILON);
+        // Batch size clamps to [3, 100]: below floor and above ceiling.
+        env::set_var("MEMORY_CONSOLIDATION_BATCH_SIZE", "1");
+        assert_eq!(crate::memory_consolidation_batch_size(), 3);
+        env::set_var("MEMORY_CONSOLIDATION_BATCH_SIZE", "1000");
+        assert_eq!(crate::memory_consolidation_batch_size(), 100);
+        // Actors-per-tick clamps to [1, 500].
+        env::set_var("MEMORY_CONSOLIDATION_MAX_ACTORS_PER_TICK", "99999");
+        assert_eq!(crate::memory_consolidation_max_actors_per_tick(), 500);
+        // Blank model falls back to the default.
+        env::set_var("MEMORY_CONSOLIDATION_MODEL", "   ");
+        assert_eq!(crate::memory_consolidation_model(), "qwen2.5:7b");
+        env::set_var("MEMORY_CONSOLIDATION_MODEL", "llama3.1:8b");
+        assert_eq!(crate::memory_consolidation_model(), "llama3.1:8b");
+
+        for v in [
+            "ENABLE_MEMORY_CONSOLIDATION",
+            "MEMORY_CONSOLIDATION_TIER1_LOCAL_OK",
+            "MEMORY_CONSOLIDATION_INTERVAL_SECS",
+            "MEMORY_CONSOLIDATION_MAX_IMPORTANCE",
+            "MEMORY_CONSOLIDATION_BATCH_SIZE",
+            "MEMORY_CONSOLIDATION_MAX_ACTORS_PER_TICK",
+            "MEMORY_CONSOLIDATION_MODEL",
+        ] {
+            env::remove_var(v);
+        }
+    }
 }

@@ -5291,8 +5291,10 @@ async fn handle_consolidate_actor_memory(
         None => "",
     };
 
-    // Enrich the semantic value with consolidation metadata if it's an object.
-    let final_value = if let Some(obj) = semantic_value.as_object() {
+    // Enrich the semantic value with the human-supplied note if it's an
+    // object; the `__consolidated_from_count__` / `__consolidated_at__`
+    // provenance stamps are added by the shared kernel below.
+    let note_enriched = if let Some(obj) = semantic_value.as_object() {
         let mut enriched = obj.clone();
         if !note.is_empty() {
             enriched.insert(
@@ -5300,62 +5302,31 @@ async fn handle_consolidate_actor_memory(
                 serde_json::Value::String(note.to_string()),
             );
         }
-        enriched.insert(
-            "__consolidated_from_count__".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(source_keys.len() as u64)),
-        );
-        enriched.insert(
-            "__consolidated_at__".to_string(),
-            serde_json::Value::String(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()),
-        );
         serde_json::Value::Object(enriched)
     } else {
         semantic_value
     };
 
-    // Write semantic memory + delete source episodic entries atomically.
-    // Without a transaction, a crash between INSERT and DELETE leaves both
-    // the new semantic entry and the old episodic entries present simultaneously.
-    let mut tx = match state.db_pool.begin().await {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!("consolidate_actor_memory begin tx: {}", e);
-            return mcp_error(req_id, -32000, "Failed to start transaction");
-        }
-    };
-
-    if let Err(e) = talos_actor_memory_service::persist_memory_in_tx(
-        &mut tx,
+    // Delegate the atomic persist-summary + forget-sources + post-commit graph
+    // extraction to the canonical kernel shared with the Phase-3b autonomous
+    // consolidation loop (`talos_memory::consolidate_memory`) — ONE atomic
+    // implementation, no drift.
+    let retired_count = match talos_memory::consolidate_memory(
+        &state.db_pool,
         actor_id,
         semantic_key,
-        &final_value,
-        "semantic",
+        note_enriched,
+        &source_keys,
         None,
     )
     .await
     {
-        tracing::error!("consolidate_actor_memory write: {}", e);
-        let _ = tx.rollback().await;
-        return mcp_error(req_id, -32000, "Failed to write semantic memory");
-    }
-
-    // Hard-delete the source episodic entries that were absorbed.
-    // Single batched DELETE replaces the per-key loop — same semantics, one
-    // round-trip inside the transaction instead of N.
-    let retired_count =
-        talos_actor_memory_service::forget_keys_in_tx(&mut tx, actor_id, &source_keys)
-            .await
-            .unwrap_or(0);
-
-    if let Err(e) = tx.commit().await {
-        tracing::error!("consolidate_actor_memory commit: {}", e);
-        return mcp_error(req_id, -32000, "Failed to commit consolidation");
-    }
-
-    // Post-commit: fire graph extraction for the new semantic entry.
-    // Running it inside the tx would corrupt the graph if the tx
-    // rolled back.
-    talos_memory::spawn_graph_extraction(actor_id, semantic_key.to_string(), final_value.clone());
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!("consolidate_actor_memory: {}", e);
+            return mcp_error(req_id, -32000, "Failed to consolidate memory");
+        }
+    };
 
     spawn_log_action(
         state.db_pool.clone(),
