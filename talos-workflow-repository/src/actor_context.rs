@@ -246,12 +246,18 @@ impl WorkflowRepository {
         // also projects `updated_at` so the recency signal survives into the
         // fused scorer (same decrypt column set + AAD path as the non-`_ts`
         // sibling — only `updated_at` is added).
+        // Fetch recency at 1× the limit (not 2×). Recency rows enter the fused
+        // rank at only the `recency_baseline` relevance and rarely out-score a
+        // real semantic hit, so `limit` recent rows are ample headroom for the
+        // final packed set — while every extra fetched row costs an AES-GCM
+        // decrypt (per-row HKDF subkey) on this per-execution hot path. The 3×
+        // semantic over-fetch already supplies the dedup/ranking headroom.
         let recency = talos_memory::recall_recent_excluding_types_and_kinds_ts(
             &self.db_pool,
             actor_id,
             &["scratchpad"],
             &exclude_kinds,
-            limit.saturating_mul(2) as i64,
+            limit as i64,
         )
         .await?;
 

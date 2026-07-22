@@ -2323,16 +2323,19 @@ impl ActorRepository {
     }
 
     /// Cross-tenant scan of active actors for the Phase-3b consolidation
-    /// loop. Returns `(actor_id, org_id, max_llm_tier)` for up to `limit`
-    /// active actors, ordered by `id` for a stable, N+1-free sweep (one
-    /// query instead of a per-actor tier lookup).
+    /// loop. Returns [`ConsolidationActor`] (`actor_id` + `max_llm_tier`) for up
+    /// to `limit` active actors, ordered by `last_consolidated_at ASC NULLS
+    /// FIRST, id` — a least-recently-swept rotation cursor for fair fleet
+    /// coverage — in a single N+1-free query (the tier is carried on the row,
+    /// so no per-actor tier lookup).
     ///
     /// This is a PLATFORM scan: the consolidation loop runs AS the platform
     /// background service, not on behalf of any single user, so no RLS tenant
     /// scope is applied here (same posture as `talos-ml`'s teacher-audit
     /// `scan_candidates`). The per-actor tier gate
-    /// ([`Self::resolve_llm_tier_decision`]) and the per-actor org (returned
-    /// here) are what bound what each actor's memory may reach.
+    /// ([`llm_tier_decision_from_tier_str`] over the carried `max_llm_tier`) is
+    /// what bounds where each actor's memory may go; the row's org is resolved
+    /// inside the persist path, not carried here.
     pub async fn scan_actors_for_consolidation(
         &self,
         limit: i64,

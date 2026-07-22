@@ -2155,13 +2155,26 @@ pub async fn consolidate_memory(
     source_keys: &[String],
     metadata: Option<serde_json::Value>,
 ) -> Result<u64> {
+    // Never delete the summary we just wrote: if a caller (e.g. the MCP
+    // `consolidate_actor_memory` handler with operator-supplied keys) includes
+    // `semantic_key` in `source_keys`, the DELETE would wipe the fresh summary
+    // in the same tx — losing BOTH the summary and its sources. Filter it out
+    // up front so the provenance count below reflects the rows ACTUALLY retired.
+    let retire_keys: Vec<String> = source_keys
+        .iter()
+        .filter(|k| k.as_str() != semantic_key)
+        .cloned()
+        .collect();
+
     // Enrich provenance onto object values only (mirrors the MCP handler's
-    // pre-extraction behaviour).
+    // pre-extraction behaviour). Count from `retire_keys` (post-filter) so
+    // `__consolidated_from_count__` matches the number of rows that will be
+    // retired, not the raw (possibly self-key-inclusive) input.
     let final_value = if let Some(obj) = semantic_value.as_object() {
         let mut enriched = obj.clone();
         enriched.insert(
             "__consolidated_from_count__".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(source_keys.len() as u64)),
+            serde_json::Value::Number(serde_json::Number::from(retire_keys.len() as u64)),
         );
         enriched.insert(
             "__consolidated_at__".to_string(),
@@ -2189,15 +2202,6 @@ pub async fn consolidate_memory(
     .await
     .context("consolidate_memory: persist semantic summary")?;
 
-    // Never delete the summary we just wrote: if a caller (e.g. the MCP
-    // `consolidate_actor_memory` handler with operator-supplied keys) includes
-    // `semantic_key` in `source_keys`, the DELETE would wipe the fresh summary
-    // in the same tx — losing BOTH the summary and its sources. Filter it out.
-    let retire_keys: Vec<String> = source_keys
-        .iter()
-        .filter(|k| k.as_str() != semantic_key)
-        .cloned()
-        .collect();
     let retired_count = forget_keys_in_tx(&mut tx, actor_id, &retire_keys)
         .await
         .context("consolidate_memory: forget source keys")?;
@@ -2225,8 +2229,11 @@ pub async fn consolidate_memory(
 ///     note), so NULLs sort FIRST.
 ///
 /// Order: `importance ASC NULLS FIRST, last_accessed_at ASC NULLS FIRST,
-/// updated_at ASC` — coldest, least-important, oldest first, matching the
-/// `idx_actor_memory_signals(actor_id, importance, last_accessed_at)` index.
+/// updated_at ASC` — coldest, least-important, oldest first. The
+/// `idx_actor_memory_signals(actor_id, importance, last_accessed_at)` index
+/// serves the `actor_id` equality prefix; the NULLS-FIRST ordering and the
+/// `memory_type`/`updated_at` predicates aren't covered, so Postgres sorts the
+/// matched rows — cheap because per-actor episodic cardinality is bounded.
 pub async fn scan_consolidation_candidates(
     pool: &Pool<Postgres>,
     actor_id: Uuid,
