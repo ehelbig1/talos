@@ -15,6 +15,7 @@ pub mod module_fetcher;
 pub mod nats_run;
 pub mod node_hook;
 pub mod ops_alerts_reader;
+pub mod pending_approvals_reader;
 pub mod retry_classifier;
 pub mod rhai_helpers;
 pub mod sanitizer;

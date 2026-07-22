@@ -780,6 +780,39 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "add_pending_approvals_node",
+            "description": "Add a pending-approvals node to an existing workflow. Controller-side system node: reads the caller's currently-pending human approvals and emits each one WITH a freshly-minted one-click approve/reject capability URL as node output — the canonical feed for a notify-after-pause approval-notifier compose node (the approval-request email can only carry working links once an execution has actually paused at its gate, which is exactly what this node reads). No worker dispatch, no secrets, tenancy from the execution's resolved identity. Degrades to {available: false} instead of failing the workflow when the store is unreachable.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workflow_id": {
+                        "type": "string",
+                        "description": "UUID of the workflow to add the node to"
+                    },
+                    "node_id": {
+                        "type": "string",
+                        "description": "Unique string ID for the new node"
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "How many pending approvals to include verbatim (1-25, default 10)"
+                    },
+                    "connect_from": {
+                        "description": "Node ID(s) to wire INTO this node (usually the trigger).",
+                        "oneOf": [
+                            { "type": "string" },
+                            { "type": "array", "items": { "type": "string" } }
+                        ]
+                    },
+                    "connect_to": {
+                        "type": "string",
+                        "description": "Optional: ID of an existing node to connect this node TO (e.g. the compose node)."
+                    }
+                },
+                "required": ["workflow_id", "node_id"]
+            }
+        }),
+        serde_json::json!({
             "name": "add_collect_node",
             "description": "Add a collect node to an existing workflow. Gathers all parent branch outputs into a JSON array for aggregate operations after parallel fan-out. For new workflows, prefer declaring this node inline via node_type: 'collect' in create_workflow. Use this tool to add the node to an existing workflow. Use connect_from to wire one or more branch endpoints in the same call.",
             "inputSchema": {
@@ -1355,6 +1388,9 @@ pub async fn dispatch(
         "add_collect_node" => Some(handle_add_collect_node(req_id, args, state, agent).await),
         "add_ops_alerts_digest_node" => {
             Some(handle_add_ops_alerts_digest_node(req_id, args, state, agent).await)
+        }
+        "add_pending_approvals_node" => {
+            Some(handle_add_pending_approvals_node(req_id, args, state, agent).await)
         }
         "add_assistant_report_node" => {
             Some(handle_add_assistant_report_node(req_id, args, state, agent).await)
@@ -2835,6 +2871,56 @@ async fn handle_add_ops_alerts_digest_node(
             "downstream": connect_to,
             "message": format!(
                 "Ops-alerts digest node '{}' added to workflow {}. Emits {{available, digest: {{active_by_severity, active_by_source, new_last_24h, reopened_active}}, top_active: [...]}} for downstream compose nodes.{}",
+                added.node_id, added.workflow_id, added.auto_publish_note
+            ),
+        }))
+        .unwrap_or_default(),
+    )
+}
+
+// ── add_pending_approvals_node ───────────────────────────────────────────────
+
+async fn handle_add_pending_approvals_node(
+    req_id: Option<serde_json::Value>,
+    args: &serde_json::Value,
+    state: &McpState,
+    agent: Arc<auth::AgentIdentity>,
+) -> JsonRpcResponse {
+    // Clamp mirrors the graph parser (defense in depth — a hand-edited
+    // graph re-clamps at parse time anyway).
+    let limit = args
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .map_or(10u64, |v| v.clamp(1, 25));
+    let connect_to = args
+        .get("connect_to")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let added = match upsert_system_node(
+        &req_id,
+        args,
+        state,
+        &agent,
+        "pending_approvals",
+        serde_json::json!({ "limit": limit }),
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "workflow_id": added.workflow_id.to_string(),
+            "node_id": added.node_id,
+            "node_type": "pending_approvals",
+            "limit": limit,
+            "downstream": connect_to,
+            "message": format!(
+                "Pending-approvals node '{}' added to workflow {}. Emits {{available, count, approvals: [{{execution_id, workflow_id, workflow_name, node_id, requested_at, waiting_seconds, required_for, approve_url, reject_url}}]}} for downstream notify-after-pause compose nodes.{}",
                 added.node_id, added.workflow_id, added.auto_publish_note
             ),
         }))
