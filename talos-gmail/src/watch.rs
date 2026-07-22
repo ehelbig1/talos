@@ -223,7 +223,7 @@ impl GmailWatchService {
         // matching gcal's stop-then-create pattern.
         let integration = self
             .integrations
-            .get_integration(user_id, old.integration_id)
+            .get_integration(old.integration_id, user_id)
             .await
             .context("fetch integration for renew")?
             .ok_or_else(|| anyhow!("integration {} not found", old.integration_id))?;
@@ -273,7 +273,7 @@ impl GmailWatchService {
         };
         let integration_opt = self
             .integrations
-            .get_integration(user_id, row.integration_id)
+            .get_integration(row.integration_id, user_id)
             .await
             .ok()
             .flatten();
@@ -409,7 +409,7 @@ impl GmailWatchService {
     ) -> Result<GmailWatchRow> {
         let integration = self
             .integrations
-            .get_integration(user_id, integration_id)
+            .get_integration(integration_id, user_id)
             .await?
             .ok_or_else(|| {
                 anyhow!(
