@@ -373,6 +373,83 @@ pub fn smart_memory_hyde_enabled() -> bool {
     bool_env_or_default("ENABLE_SMART_MEMORY_HYDE", false)
 }
 
+// ── Phase 3b: autonomous memory consolidation ───────────────────────────────
+//
+// A default-OFF background loop that summarizes an actor's older, low-importance
+// episodic memories via a TIER-GATED LLM (tier-1 → local Ollama ONLY or SKIP;
+// tier-2 → external allowed) and consolidates them into ONE durable semantic
+// summary (atomic persist-summary + forget-sources). All knobs route through the
+// destructive-zero guards so a `=0`/negative misconfig substitutes the default
+// + WARN rather than producing a runaway or degenerate scan.
+
+/// Master switch for the autonomous consolidation loop
+/// (`ENABLE_MEMORY_CONSOLIDATION`). Default OFF — when unset the scheduler is
+/// not even spawned (zero background overhead). Truthy tokens per
+/// [`bool_env_or_default`].
+pub fn memory_consolidation_enabled() -> bool {
+    bool_env_or_default("ENABLE_MEMORY_CONSOLIDATION", false)
+}
+
+/// Operator attestation that `OLLAMA_URL` points at an ON-HOST model, so a
+/// TIER-1 actor's private memory may be summarized locally without egress
+/// (`MEMORY_CONSOLIDATION_TIER1_LOCAL_OK`). Default FALSE (fail-closed: a
+/// tier-1 actor is SKIPPED unless the operator explicitly attests locality).
+/// Mirrors graph-RAG's `TALOS_GRAPH_RAG_TIER1_LOCAL_OK`.
+pub fn memory_consolidation_tier1_local_ok() -> bool {
+    bool_env_or_default("MEMORY_CONSOLIDATION_TIER1_LOCAL_OK", false)
+}
+
+/// Wake interval for the consolidation scheduler in seconds
+/// (`MEMORY_CONSOLIDATION_INTERVAL_SECS`). Default 3600 (hourly). `=0`/negative
+/// falls back to the default.
+pub fn memory_consolidation_interval_secs() -> u64 {
+    positive_env_or_default::<u64>("MEMORY_CONSOLIDATION_INTERVAL_SECS", 3600)
+}
+
+/// Minimum row age in DAYS before an episodic memory is eligible for
+/// consolidation (`MEMORY_CONSOLIDATION_MIN_AGE_DAYS`). Default 30.0 — only the
+/// long tail is consolidated, never recent memory. `=0`/negative falls back to
+/// the default.
+pub fn memory_consolidation_min_age_days() -> f64 {
+    positive_env_or_default::<f64>("MEMORY_CONSOLIDATION_MIN_AGE_DAYS", 30.0)
+}
+
+/// Importance ceiling for consolidation candidates
+/// (`MEMORY_CONSOLIDATION_MAX_IMPORTANCE`). Default 0.4, clamped to `[0.0, 1.0]`
+/// — only LOW-importance (or unscored NULL) rows are consolidated; high-value
+/// memory is never touched. `=0`/negative falls back to the default (0.0 would
+/// exclude everything except unscored rows).
+pub fn memory_consolidation_max_importance() -> f64 {
+    positive_env_or_default::<f64>("MEMORY_CONSOLIDATION_MAX_IMPORTANCE", 0.4).clamp(0.0, 1.0)
+}
+
+/// Number of candidate rows summarized per actor per tick
+/// (`MEMORY_CONSOLIDATION_BATCH_SIZE`). Default 20, clamped to `[3, 100]`. The
+/// floor of 3 means a trivial cluster is never "consolidated" (nothing worth
+/// summarizing). `=0`/negative falls back to the default.
+pub fn memory_consolidation_batch_size() -> i64 {
+    positive_env_or_default::<i64>("MEMORY_CONSOLIDATION_BATCH_SIZE", 20).clamp(3, 100)
+}
+
+/// Maximum distinct actors processed per tick
+/// (`MEMORY_CONSOLIDATION_MAX_ACTORS_PER_TICK`). Default 25, clamped to
+/// `[1, 500]` so one tick can't stampede the whole fleet. `=0`/negative falls
+/// back to the default.
+pub fn memory_consolidation_max_actors_per_tick() -> i64 {
+    positive_env_or_default::<i64>("MEMORY_CONSOLIDATION_MAX_ACTORS_PER_TICK", 25).clamp(1, 500)
+}
+
+/// Ollama model used to generate the consolidation summary on the tier-1
+/// LOCAL-only path (`MEMORY_CONSOLIDATION_MODEL`). Default `qwen2.5:7b`.
+pub fn memory_consolidation_model() -> String {
+    let v = get_env("MEMORY_CONSOLIDATION_MODEL", "qwen2.5:7b");
+    if v.trim().is_empty() {
+        "qwen2.5:7b".to_string()
+    } else {
+        v
+    }
+}
+
 /// Validated allowed origins, computed once at startup.
 /// Production panics happen at init time, not on every request.
 static ALLOWED_ORIGINS: LazyLock<Vec<String>> = LazyLock::new(|| {

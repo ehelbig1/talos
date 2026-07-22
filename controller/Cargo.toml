@@ -95,6 +95,8 @@ talos-module-executions = { path = "../talos-module-executions" }
 talos-memory-crypto = { path = "../talos-memory-crypto" }
 # RFC 0011 P2c: DatasetService construction for the ml-predict RPC context.
 talos-ml = { path = "../talos-ml" }
+# Phase 3b: autonomous actor-memory consolidation scheduler.
+talos-memory-consolidation = { path = "../talos-memory-consolidation" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 talos-actor-memory-service = { path = "../talos-actor-memory-service" }
 talos-advanced-repository = { path = "../talos-advanced-repository" }

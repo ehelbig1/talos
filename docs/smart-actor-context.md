@@ -369,3 +369,109 @@ collapses to the default (a `0` would silently disable the whole access signal),
 values above `1.0` clamp. Small by default so access frequency refines but never
 dominates base/hint importance. Wired through `docker-compose.yml`'s controller
 `environment:` alongside the other `SMART_MEMORY_CONTEXT_*` passthroughs.
+
+---
+
+## Phase 3b — autonomous consolidation
+
+A **default-OFF** background loop (`talos-memory-consolidation`) that summarizes
+an actor's long-tail memories via a **tier-gated LLM** and consolidates them:
+persist ONE durable semantic summary and delete the source episodic rows, all in
+one committed transaction. Wired in `controller/src/main.rs` next to the
+teacher-audit scheduler; `spawn_memory_consolidation_scheduler` returns without
+spawning a task when the loop is disabled (zero background overhead).
+
+### The tier gate (fail-closed, tier-1 local-only)
+
+The #1 invariant: a **tier-1 actor** (`actors.max_llm_tier = 'tier1'`) has
+privacy-sensitive memory that **MUST NEVER reach an external LLM provider**. Its
+summary is generated on a **local Ollama model ONLY**, or **skipped entirely**.
+
+The decision is the **shared** `ActorRepository::resolve_llm_tier_decision`
+(the same fail-closed matrix graph-RAG's entity extraction uses — one
+implementation, no drift), returning `{External, LocalOnly, Skip}`:
+
+| Actor tier | Condition | Decision | LLM used |
+|---|---|---|---|
+| `tier2` | — | `External` | Anthropic (external) allowed |
+| `tier1` | `tier1_local_ok` attested **and** Ollama wired | `LocalOnly` | local Ollama only |
+| `tier1` | otherwise | `Skip` | none |
+| missing actor / DB error / unknown tier | — | `Skip` | none |
+
+`tier1_local_ok` is an operator attestation (`MEMORY_CONSOLIDATION_TIER1_LOCAL_OK`,
+default **false**) that `OLLAMA_URL` points at an on-host model. Fail-closed: a
+missing actor, a DB error, or an unknown tier all **Skip** — the content never
+reaches any LLM. In code, the external `LlmClient` is constructed **only** on the
+`SummarizeExternal` routing branch (`plan_action`), so a `LocalOnly`/`Skip`
+actor's content can never touch Anthropic even by accident.
+
+### The candidate scan
+
+`talos_memory::scan_consolidation_candidates` (SQL lives in `talos-memory`, per
+lint 1) selects an actor's **episodic** rows that are **old**, **cold**, and
+**low- or unscored-importance**:
+
+```sql
+WHERE actor_id = $1
+  AND memory_type = 'episodic'
+  AND (expires_at IS NULL OR expires_at > now())
+  AND updated_at < now() - make_interval(days => $2::int)   -- min age (lint 27 cast)
+  AND (importance IS NULL OR importance < $3)               -- low / unscored
+ORDER BY importance ASC NULLS FIRST,
+         last_accessed_at ASC NULLS FIRST,
+         updated_at ASC                                     -- coldest, least-important, oldest first
+LIMIT $4
+```
+
+`NULLS FIRST` is deliberate: Phase-3a leaves older rows' `importance` and
+`last_accessed_at` NULL, and those **unscored + never-re-accessed** rows are
+exactly the prime consolidation candidates (this resolves the Phase-3a
+NULL-ordering note). Semantic / working / scratchpad memory and recent or
+high-importance rows are **never** touched. `min_age_days` is floored at **1**
+in the scan (`(round() as i32).max(1)`) so even a misconfigured sub-1-day
+setting always leaves a full day of headroom — recent memory can never be
+consolidated.
+
+### Fair fleet rotation
+
+The per-tick scan is bounded (`max_actors_per_tick`), so `scan_actors_for_
+consolidation` orders active actors by **`last_consolidated_at ASC NULLS FIRST`**
+(a least-recently-swept cursor; migration `20260722010000`) and the loop stamps
+every actor it examined — consolidated, tier-gate-skipped, or no-candidates —
+via `mark_actors_consolidated`. Without the cursor an `ORDER BY id` scan would
+revisit the same lowest-id actors each tick and starve the rest once the fleet
+exceeds the per-tick cap. The tier decision is resolved from the `max_llm_tier`
+already carried on the scanned row (`llm_tier_decision_from_tier_str`, sharing
+the same pure fail-closed matrix as graph-RAG's async path) — no per-actor tier
+lookup.
+
+### The atomic persist + forget
+
+`talos_memory::consolidate_memory` is the single kernel shared by the MCP
+`consolidate_actor_memory` handler and this loop. In one transaction it persists
+the summary as a `"semantic"` memory (stamped `metadata.kind = "consolidated"`)
+and hard-deletes the source keys, then commits. Graph-RAG entity extraction fires
+**post-commit** only (a rolled-back tx must not corrupt the graph). Any LLM
+failure or parse failure ⇒ **zero mutation** (the sources stay intact).
+
+Consolidated summaries are **recalled**, not filtered: `"consolidated"` is
+deliberately **NOT** in `SYNTHETIC_MEMORY_KINDS` — a consolidated summary
+represents real past content that it replaces, so it should surface in recall
+(unlike fresh synthetic self-inferences, which are excluded to avoid feedback
+amplification).
+
+### Config knobs
+
+| Function | Env var | Default | Notes |
+|---|---|---|---|
+| `memory_consolidation_enabled()` | `ENABLE_MEMORY_CONSOLIDATION` | `false` | master switch; scheduler not spawned when off |
+| `memory_consolidation_tier1_local_ok()` | `MEMORY_CONSOLIDATION_TIER1_LOCAL_OK` | `false` | operator attestation OLLAMA_URL is on-host |
+| `memory_consolidation_interval_secs()` | `MEMORY_CONSOLIDATION_INTERVAL_SECS` | `3600` | tick cadence |
+| `memory_consolidation_min_age_days()` | `MEMORY_CONSOLIDATION_MIN_AGE_DAYS` | `30.0` | only rows older than this |
+| `memory_consolidation_max_importance()` | `MEMORY_CONSOLIDATION_MAX_IMPORTANCE` | `0.4` | clamp `[0,1]`; only low-importance rows |
+| `memory_consolidation_batch_size()` | `MEMORY_CONSOLIDATION_BATCH_SIZE` | `20` | clamp `[3,100]`; floor 3 skips trivial clusters |
+| `memory_consolidation_max_actors_per_tick()` | `MEMORY_CONSOLIDATION_MAX_ACTORS_PER_TICK` | `25` | clamp `[1,500]` |
+| `memory_consolidation_model()` | `MEMORY_CONSOLIDATION_MODEL` | `qwen2.5:7b` | local Ollama model for the tier-1 path |
+
+All numeric knobs route through `positive_env_or_default` (destructive-zero
+guard) and are wired through `docker-compose.yml`'s controller `environment:`.

@@ -635,6 +635,18 @@ async fn main() -> anyhow::Result<()> {
         bg_shutdown_rx.clone(),
     );
 
+    // Phase 3b: autonomous actor-memory consolidation. Default-OFF
+    // (ENABLE_MEMORY_CONSOLIDATION) — spawn_* returns without a task when
+    // disabled. Tier-1 actors only consolidate on the shared Ollama transport
+    // (or Skip); the tier gate is the shared ActorRepository decision.
+    talos_memory_consolidation::spawn_memory_consolidation_scheduler(
+        db_pool.clone(),
+        talos_actor_repository::ActorRepository::new(db_pool.clone()),
+        Some(ollama_client.clone()),
+        core.secrets_manager.clone(),
+        bg_shutdown_rx.clone(),
+    );
+
     // Embedding backfill, readiness recomputation, SLA degradation alerting.
     spawn_analytics_tasks(db_pool.clone(), bg_shutdown_rx.clone());
 

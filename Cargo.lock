@@ -1744,6 +1744,7 @@ dependencies = [
  "talos-mcp-handlers",
  "talos-mcp-tool-schema",
  "talos-memory",
+ "talos-memory-consolidation",
  "talos-memory-crypto",
  "talos-metrics",
  "talos-ml",
@@ -8325,6 +8326,26 @@ dependencies = [
  "tracing",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "talos-memory-consolidation"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "talos-actor-repository",
+ "talos-config",
+ "talos-llm",
+ "talos-memory",
+ "talos-secrets-manager",
+ "talos-workflow-job-protocol",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
