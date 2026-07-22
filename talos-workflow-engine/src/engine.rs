@@ -1111,6 +1111,20 @@ impl ParallelWorkflowEngine {
         &self.node_configs
     }
 
+    /// Whether `node_id` declares it consumes the injected
+    /// `__actor_context__` (its `needs_memory` graph-json field). Defaults
+    /// to `true` for any node without the field — an existing graph
+    /// behaves exactly as before. Consulted at dispatch time only when
+    /// `talos_config::smart_memory_context_enabled()` is ON; when OFF the
+    /// context is injected into every node regardless (byte-identical to
+    /// the legacy path). See
+    /// [`talos_workflow_engine_core::reserved_keys::should_inject_actor_context`].
+    pub(crate) fn node_needs_memory(&self, node_id: Uuid) -> bool {
+        talos_workflow_engine_core::reserved_keys::node_needs_memory_from_config(
+            self.node_configs.get(&node_id),
+        )
+    }
+
     /// Per-node metadata: `(module_id, retry_policy, system_kind)`.
     /// `module_id` is `None` for system-only nodes; `system_kind` is
     /// `None` for plain module nodes.

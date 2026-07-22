@@ -515,6 +515,40 @@ mod tests {
     }
 
     #[test]
+    fn test_smart_memory_context_defaults() {
+        let _g = env_lock();
+        env::remove_var("ENABLE_SMART_MEMORY_CONTEXT");
+        env::remove_var("SMART_MEMORY_CONTEXT_BYTE_BUDGET");
+        env::remove_var("SMART_MEMORY_CONTEXT_PER_MEMORY_CAP");
+        env::remove_var("SMART_MEMORY_CONTEXT_MIN_SCORE");
+        // Flag defaults OFF → legacy byte-identical behaviour.
+        assert!(!crate::smart_memory_context_enabled());
+        assert_eq!(crate::smart_memory_context_byte_budget(), 12_000);
+        assert_eq!(crate::smart_memory_context_per_memory_cap(), 3_000);
+        assert!((crate::smart_memory_context_min_score() - 0.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_smart_memory_context_overrides_and_guards() {
+        let _g = env_lock();
+        env::set_var("ENABLE_SMART_MEMORY_CONTEXT", "on");
+        assert!(crate::smart_memory_context_enabled());
+        // Positive overrides are honoured.
+        env::set_var("SMART_MEMORY_CONTEXT_BYTE_BUDGET", "5000");
+        assert_eq!(crate::smart_memory_context_byte_budget(), 5_000);
+        // =0 collapses to the default (destructive-zero guard).
+        env::set_var("SMART_MEMORY_CONTEXT_PER_MEMORY_CAP", "0");
+        assert_eq!(crate::smart_memory_context_per_memory_cap(), 3_000);
+        // min_score is clamped into [0, 1]; a >1 value clamps to 1.0.
+        env::set_var("SMART_MEMORY_CONTEXT_MIN_SCORE", "5.0");
+        assert!((crate::smart_memory_context_min_score() - 1.0).abs() < f64::EPSILON);
+        env::remove_var("ENABLE_SMART_MEMORY_CONTEXT");
+        env::remove_var("SMART_MEMORY_CONTEXT_BYTE_BUDGET");
+        env::remove_var("SMART_MEMORY_CONTEXT_PER_MEMORY_CAP");
+        env::remove_var("SMART_MEMORY_CONTEXT_MIN_SCORE");
+    }
+
+    #[test]
     fn test_is_allowed_origin_matching() {
         let _g = env_lock();
         env::set_var("RUST_ENV", "development");

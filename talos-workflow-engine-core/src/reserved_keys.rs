@@ -77,6 +77,39 @@ pub const ACTOR_CONTEXT: &str = "__actor_context__";
 /// after dispatch and commits the writes.
 pub const MEMORY_WRITE: &str = "__memory_write__";
 
+/// Per-node graph-json field: does this node consume the injected
+/// [`ACTOR_CONTEXT`]? Defaults to `true` (see
+/// [`node_needs_memory_from_config`]) so the field is fully
+/// backward-compatible — an author or a Phase-2 pass opts a node OUT by
+/// setting `needs_memory: false` in its `data`.
+pub const NEEDS_MEMORY: &str = "needs_memory";
+
+/// Read a node's `needs_memory` flag from its `data`/config object,
+/// defaulting to `true` when absent, non-boolean, or the node has no
+/// config. Keeping the default `true` means an existing graph (which has
+/// no such field) behaves exactly as before — every node is treated as a
+/// memory consumer.
+pub fn node_needs_memory_from_config(config: Option<&serde_json::Value>) -> bool {
+    config
+        .and_then(|c| c.get(NEEDS_MEMORY))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+}
+
+/// Decide whether the engine should inject [`ACTOR_CONTEXT`] into a node's
+/// input.
+///
+/// * `smart_enabled` = `talos_config::smart_memory_context_enabled()`.
+/// * `node_needs_memory` = [`node_needs_memory_from_config`] for the node.
+///
+/// When smart-context is OFF this ALWAYS returns `true` — injection is
+/// byte-identical to the legacy "inject into every node" behaviour,
+/// ignoring `needs_memory` entirely. When ON, injection is scoped to
+/// nodes that declare they consume memory.
+pub fn should_inject_actor_context(smart_enabled: bool, node_needs_memory: bool) -> bool {
+    !smart_enabled || node_needs_memory
+}
+
 /// Output-side hook: parser/triage modules write normalized operational
 /// alerts under this key (`{"alerts": [...]}` — or a single alert object)
 /// and the controller's node hook persists them into the `ops_alerts`
@@ -206,3 +239,43 @@ pub const LOOP_ITERATION: &str = "__loop_iteration";
 /// injected onto the synthetic trigger node so downstream branches
 /// can read the trigger payload even after intermediate transforms.
 pub const TRIGGER_INPUT: &str = "__trigger_input__";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn needs_memory_defaults_true_when_absent() {
+        assert!(node_needs_memory_from_config(None));
+        assert!(node_needs_memory_from_config(Some(&json!({}))));
+        assert!(node_needs_memory_from_config(Some(&json!({ "other": 1 }))));
+        // Non-boolean value → default true (don't silently drop context).
+        assert!(node_needs_memory_from_config(Some(
+            &json!({ "needs_memory": "no" })
+        )));
+    }
+
+    #[test]
+    fn needs_memory_honours_explicit_flag() {
+        assert!(node_needs_memory_from_config(Some(
+            &json!({ "needs_memory": true })
+        )));
+        assert!(!node_needs_memory_from_config(Some(
+            &json!({ "needs_memory": false })
+        )));
+    }
+
+    #[test]
+    fn inject_gate_off_always_injects() {
+        // Flag OFF → inject regardless of needs_memory (byte-identical).
+        assert!(should_inject_actor_context(false, true));
+        assert!(should_inject_actor_context(false, false));
+    }
+
+    #[test]
+    fn inject_gate_on_respects_needs_memory() {
+        assert!(should_inject_actor_context(true, true));
+        assert!(!should_inject_actor_context(true, false));
+    }
+}

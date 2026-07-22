@@ -221,6 +221,67 @@ pub fn admin_ops_enabled() -> bool {
     bool_env_or_default("ENABLE_ADMIN_OPS", false)
 }
 
+/// Canonical resolver for the smart actor-memory-context builder feature
+/// flag (`ENABLE_SMART_MEMORY_CONTEXT`). Default OFF.
+///
+/// When OFF, `__actor_context__` assembly and per-node injection are
+/// byte-identical to the legacy path: the count-capped, unfiltered,
+/// `min_score = 0.0` retriever runs and every node receives the context.
+/// When ON, the retriever kind-filters synthetic self-outputs, applies a
+/// similarity floor ([`smart_memory_context_min_score`]), packs candidates
+/// under a byte budget ([`smart_memory_context_byte_budget`] /
+/// [`smart_memory_context_per_memory_cap`]), and the engine injects the
+/// context only into nodes that declare `needs_memory = true` (the
+/// default, so no consumer silently loses context).
+///
+/// Accepted truthy tokens match every other flag: `true | 1 | yes | on`
+/// (case-insensitive) — see [`bool_env_or_default`].
+pub fn smart_memory_context_enabled() -> bool {
+    bool_env_or_default("ENABLE_SMART_MEMORY_CONTEXT", false)
+}
+
+/// Total byte budget for the assembled `__actor_context__` payload when
+/// [`smart_memory_context_enabled`] is ON. Default 12_000 bytes (~3k
+/// tokens by the bytes/4 estimate). Overridable via
+/// `SMART_MEMORY_CONTEXT_BYTE_BUDGET`; `=0`/negative falls back to the
+/// default (destructive-zero guard, see [`positive_env_or_default`]).
+///
+/// The packer ([`crate`]-external `talos_memory::actor_context::pack_within_budget`])
+/// walks candidates in relevance order and stops before the serialized
+/// payload would exceed this bound, so the injected context can never
+/// balloon a node's parse-fuel regardless of how large individual
+/// memories are.
+pub fn smart_memory_context_byte_budget() -> usize {
+    // Floor well above the empty `{actor_id, memories:[]}` wrapper (~65 B)
+    // so the packer's `<= byte_budget` bound is always meaningful — a
+    // sub-1 KB actor context is useless anyway.
+    positive_env_or_default::<usize>("SMART_MEMORY_CONTEXT_BYTE_BUDGET", 12_000).max(1_024)
+}
+
+/// Per-memory serialized-value byte cap when
+/// [`smart_memory_context_enabled`] is ON. Default 3_000 bytes. A single
+/// memory whose serialized value exceeds this cap has its content
+/// truncated at a UTF-8 char boundary (never mid-codepoint) and marked,
+/// so one 15KB `daily_brief`/`ask_thread` value can't dominate the whole
+/// budget. Overridable via `SMART_MEMORY_CONTEXT_PER_MEMORY_CAP`;
+/// `=0`/negative falls back to the default.
+pub fn smart_memory_context_per_memory_cap() -> usize {
+    // Floor comfortably above the truncation marker (~14 B) so per-memory
+    // truncation always has room to leave meaningful content and the cap is
+    // honoured for any configured value.
+    positive_env_or_default::<usize>("SMART_MEMORY_CONTEXT_PER_MEMORY_CAP", 3_000).max(256)
+}
+
+/// Cosine-similarity floor for semantic recall when
+/// [`smart_memory_context_enabled`] is ON. Default 0.25 (the legacy path
+/// uses 0.0, i.e. no floor). Clamped to `[0.0, 1.0]`. Overridable via
+/// `SMART_MEMORY_CONTEXT_MIN_SCORE`; `=0`/negative or unparseable falls
+/// back to the default (use a small positive value like `0.05` to
+/// approximate "no floor" without losing the destructive-zero guard).
+pub fn smart_memory_context_min_score() -> f64 {
+    positive_env_or_default::<f64>("SMART_MEMORY_CONTEXT_MIN_SCORE", 0.25).clamp(0.0, 1.0)
+}
+
 /// Validated allowed origins, computed once at startup.
 /// Production panics happen at init time, not on every request.
 static ALLOWED_ORIGINS: LazyLock<Vec<String>> = LazyLock::new(|| {

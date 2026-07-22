@@ -1072,6 +1072,45 @@ pub async fn count_memories(pool: &Pool<Postgres>, actor_id: Uuid) -> Result<i64
 /// (`decrypt_row_value`) is the only way to read encrypted values.
 ///
 /// `limit` is clamped to `[1, MAX_LIST_LIMIT]`.
+/// Canonical set of `metadata.kind` labels identifying SYNTHETIC LLM
+/// self-outputs — briefs, judge verdicts, dispatch traces, digests — that
+/// a workflow persists to `actor_memory` and could otherwise recall as its
+/// own "source" on the next run (hallucination amplification; see the
+/// CLAUDE.md "metadata.kind convention" section).
+///
+/// SINGLE SOURCE OF TRUTH: the smart actor-context builder passes this to
+/// [`recall_semantic_filtered`] / [`recall_recent_excluding_types_and_kinds`]
+/// so grounding context excludes self-outputs, and any future writer that
+/// stamps one of these kinds agrees with the reader by construction.
+///
+/// Conservative by design — only SELF-OUTPUT kinds belong here, NEVER
+/// human-sourced memories. When in doubt, leave a kind OUT: a human note
+/// wrongly excluded from grounding is a worse failure than a synthetic
+/// note wrongly included.
+pub const SYNTHETIC_MEMORY_KINDS: &[&str] = &[
+    "recall",
+    "meeting_prep",
+    "daily_brief",
+    "ask_thread",
+    "synthesize",
+    "judge",
+    "inline_judge",
+    "ensemble",
+    "llm_dispatch",
+    "capability_dispatch",
+    "ml_digest",
+    "commitment_check",
+];
+
+/// [`SYNTHETIC_MEMORY_KINDS`] as an owned `Vec<String>` for the
+/// `text[]`-bind recall APIs.
+pub fn synthetic_memory_kinds() -> Vec<String> {
+    SYNTHETIC_MEMORY_KINDS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
 pub async fn recall_recent_by_types(
     pool: &Pool<Postgres>,
     actor_id: Uuid,
@@ -1156,6 +1195,63 @@ pub async fn recall_recent_excluding_types(
     .fetch_all(pool)
     .await
     .context("recall_recent_excluding_types")?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        use sqlx::Row as _;
+        let key: String = r.try_get("key")?;
+        let memory_type: String = r.try_get("memory_type")?;
+        let value = decrypt_row_value(r).await?;
+        out.push((key, value, memory_type));
+    }
+    Ok(out)
+}
+
+/// Recency fallback that ALSO excludes rows whose `metadata.kind` matches
+/// any entry in `exclude_kinds` — the kind-filtered sibling of
+/// [`recall_recent_excluding_types`].
+///
+/// Used by the smart actor-context builder's Layer-3 (recency) so
+/// synthetic self-outputs ([`SYNTHETIC_MEMORY_KINDS`]) are dropped from
+/// grounding context the same way the semantic layer drops them. `NULL`
+/// metadata / missing `kind` passes the filter (treated as non-synthetic);
+/// the `!= ALL(...)` form is NULL-safe (unlike `NOT IN`). An empty
+/// `exclude_kinds` is a no-op equivalent to
+/// [`recall_recent_excluding_types`].
+///
+/// `limit` is clamped to `[1, MAX_LIST_LIMIT]`.
+pub async fn recall_recent_excluding_types_and_kinds(
+    pool: &Pool<Postgres>,
+    actor_id: Uuid,
+    exclude_types: &[&str],
+    exclude_kinds: &[String],
+    limit: i64,
+) -> Result<Vec<(String, serde_json::Value, String)>> {
+    let limit = limit.clamp(1, MAX_LIST_LIMIT);
+    let owned_types: Vec<String> = exclude_types.iter().map(|s| (*s).to_string()).collect();
+    // Same MCP-S2 projection contract as recall_recent_excluding_types
+    // (actor_id + value_format for AAD-bound decrypt; never the dropped
+    // legacy `value` column). The `metadata.kind != ALL($4)` predicate
+    // mirrors recall_semantic_filtered exactly so both retrieval layers
+    // agree on what counts as synthetic.
+    let rows = sqlx::query(
+        "SELECT actor_id, key, value_enc, value_key_id, value_format, memory_type \
+         FROM actor_memory \
+         WHERE actor_id = $1 \
+           AND NOT (memory_type = ANY($2)) \
+           AND (expires_at IS NULL OR expires_at > now()) \
+           AND (cardinality($4::text[]) = 0 \
+                OR metadata IS NULL \
+                OR metadata->>'kind' IS NULL \
+                OR metadata->>'kind' != ALL($4::text[])) \
+         ORDER BY updated_at DESC LIMIT $3",
+    )
+    .bind(actor_id)
+    .bind(&owned_types)
+    .bind(limit)
+    .bind(exclude_kinds)
+    .fetch_all(pool)
+    .await
+    .context("recall_recent_excluding_types_and_kinds")?;
     let mut out = Vec::with_capacity(rows.len());
     for r in &rows {
         use sqlx::Row as _;
