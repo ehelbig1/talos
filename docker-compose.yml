@@ -421,6 +421,22 @@ services:
       # etc). MUST remain unset in production. Set to "1" only when
       # actively using docs/gcal-live-test.md or equivalent ops tooling.
       ENABLE_ADMIN_OPS: ${ENABLE_ADMIN_OPS:-}
+      # Smart actor-memory context (talos#550): retrieval-based, byte-budgeted,
+      # kind-filtered, node-scoped __actor_context__. Default OFF (byte-identical
+      # to legacy). Knobs default in-code; override only to tune.
+      ENABLE_SMART_MEMORY_CONTEXT: ${ENABLE_SMART_MEMORY_CONTEXT:-}
+      SMART_MEMORY_CONTEXT_BYTE_BUDGET: ${SMART_MEMORY_CONTEXT_BYTE_BUDGET:-}
+      SMART_MEMORY_CONTEXT_PER_MEMORY_CAP: ${SMART_MEMORY_CONTEXT_PER_MEMORY_CAP:-}
+      SMART_MEMORY_CONTEXT_MIN_SCORE: ${SMART_MEMORY_CONTEXT_MIN_SCORE:-}
+      # Phase 2 (talos#551): fused relevance/recency/importance ranking
+      # weights + HyDE toggle. All default in-code; override only to tune.
+      SMART_MEMORY_CONTEXT_W_RELEVANCE: ${SMART_MEMORY_CONTEXT_W_RELEVANCE:-}
+      SMART_MEMORY_CONTEXT_W_RECENCY: ${SMART_MEMORY_CONTEXT_W_RECENCY:-}
+      SMART_MEMORY_CONTEXT_W_IMPORTANCE: ${SMART_MEMORY_CONTEXT_W_IMPORTANCE:-}
+      SMART_MEMORY_CONTEXT_RECENCY_HALFLIFE_DAYS: ${SMART_MEMORY_CONTEXT_RECENCY_HALFLIFE_DAYS:-}
+      SMART_MEMORY_CONTEXT_GRAPH_BASELINE: ${SMART_MEMORY_CONTEXT_GRAPH_BASELINE:-}
+      SMART_MEMORY_CONTEXT_RECENCY_BASELINE: ${SMART_MEMORY_CONTEXT_RECENCY_BASELINE:-}
+      ENABLE_SMART_MEMORY_HYDE: ${ENABLE_SMART_MEMORY_HYDE:-}
       # MinIO / S3 configuration for audit ledger
       AWS_ENDPOINT_URL: http://minio:9000
       MINIO_ENDPOINT: http://minio:9000

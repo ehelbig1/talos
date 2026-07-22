@@ -282,6 +282,84 @@ pub fn smart_memory_context_min_score() -> f64 {
     positive_env_or_default::<f64>("SMART_MEMORY_CONTEXT_MIN_SCORE", 0.25).clamp(0.0, 1.0)
 }
 
+// ── Phase 2: fused multi-signal ranking weights ─────────────────────────────
+//
+// When [`smart_memory_context_enabled`] is ON, the smart retriever blends
+// three signals per candidate into one fused score
+// (`talos_memory::actor_context::fused_score`):
+//
+//   fused = W_RELEVANCE * relevance
+//         + W_RECENCY   * recency_decay(now - updated_at)
+//         + W_IMPORTANCE * importance(memory_type, importance_hint)
+//
+// and packs candidates in fused-score-descending order. All three weights
+// route through `positive_env_or_default` so a `=0`/negative misconfig
+// substitutes the default + WARN (a `0` weight would silently drop a whole
+// signal — the destructive-zero guard treats that as a misconfiguration; use
+// a small positive value like `0.01` to de-weight a signal intentionally).
+
+/// Weight on the cosine-relevance signal in the fused rank. Default 1.0.
+/// Override via `SMART_MEMORY_CONTEXT_W_RELEVANCE`.
+pub fn smart_memory_context_w_relevance() -> f64 {
+    positive_env_or_default::<f64>("SMART_MEMORY_CONTEXT_W_RELEVANCE", 1.0)
+}
+
+/// Weight on the recency-decay signal in the fused rank. Default 0.3.
+/// Override via `SMART_MEMORY_CONTEXT_W_RECENCY`.
+pub fn smart_memory_context_w_recency() -> f64 {
+    positive_env_or_default::<f64>("SMART_MEMORY_CONTEXT_W_RECENCY", 0.3)
+}
+
+/// Weight on the importance signal (memory-type base blended with an optional
+/// `metadata.importance` hint) in the fused rank. Default 0.5. Override via
+/// `SMART_MEMORY_CONTEXT_W_IMPORTANCE`.
+pub fn smart_memory_context_w_importance() -> f64 {
+    positive_env_or_default::<f64>("SMART_MEMORY_CONTEXT_W_IMPORTANCE", 0.5)
+}
+
+/// Exponential recency half-life in DAYS: a memory `half_life` days old
+/// contributes half the recency weight of a brand-new one
+/// (`recency_decay(age) = 0.5^(age_days / half_life_days)`). Default 7.0.
+/// Override via `SMART_MEMORY_CONTEXT_RECENCY_HALFLIFE_DAYS`; `=0`/negative
+/// (which would divide-by-zero / invert the decay) falls back to the default.
+pub fn smart_memory_context_recency_halflife_days() -> f64 {
+    positive_env_or_default::<f64>("SMART_MEMORY_CONTEXT_RECENCY_HALFLIFE_DAYS", 7.0)
+}
+
+/// Baseline relevance assigned to the graph-RAG entity-context candidate
+/// (which carries no cosine score). Default 0.6; clamped to `[0.0, 1.0]`.
+/// Override via `SMART_MEMORY_CONTEXT_GRAPH_BASELINE`.
+pub fn smart_memory_context_graph_baseline() -> f64 {
+    positive_env_or_default::<f64>("SMART_MEMORY_CONTEXT_GRAPH_BASELINE", 0.6).clamp(0.0, 1.0)
+}
+
+/// Baseline relevance assigned to recency-layer candidates (which carry no
+/// cosine score — they were selected by `updated_at`, not similarity).
+/// Default 0.4; clamped to `[0.0, 1.0]`. Kept below the graph baseline so a
+/// bare recency row doesn't outrank an entity-graph hit on relevance alone.
+/// Override via `SMART_MEMORY_CONTEXT_RECENCY_BASELINE`.
+pub fn smart_memory_context_recency_baseline() -> f64 {
+    positive_env_or_default::<f64>("SMART_MEMORY_CONTEXT_RECENCY_BASELINE", 0.4).clamp(0.0, 1.0)
+}
+
+/// Canonical resolver for the HyDE (Hypothetical Document Embeddings) toggle
+/// on the smart actor-context semantic layer (`ENABLE_SMART_MEMORY_HYDE`).
+/// Default OFF.
+///
+/// When ON (and [`smart_memory_context_enabled`] is also ON), the semantic
+/// layer embeds a HyDE-rewritten query
+/// (`SearchMethod::HyDE` — "An answer to the question '…' would be: ") instead
+/// of the raw context hint (`SearchMethod::Direct`). Same `min_score` +
+/// `exclude_kinds` filters apply either way, and HyDE still embeds — so the
+/// tier-1 local-only embed gate inside `recall_semantic_filtered` applies
+/// unchanged.
+///
+/// Accepted truthy tokens: `true | 1 | yes | on` (case-insensitive) — see
+/// [`bool_env_or_default`].
+pub fn smart_memory_hyde_enabled() -> bool {
+    bool_env_or_default("ENABLE_SMART_MEMORY_HYDE", false)
+}
+
 /// Validated allowed origins, computed once at startup.
 /// Production panics happen at init time, not on every request.
 static ALLOWED_ORIGINS: LazyLock<Vec<String>> = LazyLock::new(|| {
