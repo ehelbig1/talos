@@ -263,3 +263,109 @@ promotes a stale item — i.e. the weights move the ranking in the expected
 direction. The eval is pure: fixtures are scored directly via `fused_score` /
 `rank_candidates` with an injected `now`; no embeddings or DB. This proves the
 fusion improves ORDERING, not just the Phase-1 byte bound.
+
+## Phase 3a — durable memory signals
+
+Phases 1+2 rank from signals computed at retrieval time (cosine relevance,
+`updated_at`, `metadata.importance`). Phase 3a adds three **durable** columns to
+`actor_memory` that accrue over a memory's life and feed the SAME fused ranker,
+plus the substrate for Phase 3b consolidation.
+
+### New columns (`migrations/20260722000000_actor_memory_signal_columns.sql`)
+
+| Column | Type | Notes |
+|---|---|---|
+| `importance` | `real` NULLable | Write-time importance score in `[0,1]`. `NULL` = "not yet scored" (rows written before this migration) — the ranker treats `NULL` as an absent hint. No NOT NULL default (a synthetic default is indistinguishable from a real score). |
+| `access_count` | `integer NOT NULL DEFAULT 0` | Times this row was packed into an injected `__actor_context__` set. |
+| `last_accessed_at` | `timestamptz` NULLable | Most-recent injection time; substrate for the Phase 3b cold-memory scan. |
+
+Index `idx_actor_memory_signals (actor_id, importance, last_accessed_at)`
+supports Phase 3b's "stale + low-importance" candidate scan. The migration is
+idempotent (`ADD COLUMN IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`), no
+`CONCURRENTLY`. The `value_enc`/`value_key_id`/`value_format` decrypt path is
+untouched — these are additive plaintext SIGNAL columns only.
+
+### Write-time importance scoring
+
+`talos_memory::persist_memory_with_metadata_typed` computes
+`actor_context::write_time_importance(memory_type, metadata)` on every write and
+binds it into `importance` (INSERT + `ON CONFLICT DO UPDATE SET importance =
+EXCLUDED.importance` — re-scored on overwrite). The score is the memory-type
+base (`importance_base`) blended 50/50 with a numeric `metadata.importance` when
+present, else the bare base — the SAME semantics `importance()` uses for its
+hint, in ONE shared `pub fn` so the write path and the ranker can never drift.
+It is written **regardless of the `ENABLE_SMART_MEMORY_CONTEXT` flag** (a
+harmless dormant column that accrues for when the flag is on and for 3b).
+`access_count` / `last_accessed_at` are deliberately NOT reset on a content
+update — access history persists across overwrites.
+
+### Non-blocking access tracking
+
+After the smart path (`get_relevant_actor_context_smart`) packs its final set,
+it bumps the durable access signal for exactly those rows via
+`talos_memory::bump_access(pool, actor_id, keys)` — ONE batched
+`UPDATE … SET access_count = access_count + 1, last_accessed_at = now()
+WHERE actor_id = $1 AND key = ANY($2)` per context injection. This is the
+first-ever recall-path mutation, so it runs **fire-and-forget** in a
+`tokio::spawn` (best-effort, logged at debug on error, never propagated) — it
+adds zero latency to context assembly. It fires **only on the flag-ON smart
+path**; with the flag off, no bump occurs. The SQL lives in `talos-memory`
+(never inline in the repository crate — lint check 1). `bump_access` does not
+touch `updated_at` (an access is a read, not a content write — recency-decay
+tracks writes) or `importance`.
+
+### Durable signals into the fused ranker
+
+The recall functions the smart path uses (`recall_semantic_filtered` and
+`recall_recent_excluding_types_and_kinds_ts`) now project `importance` +
+`access_count`, read as `Option` with fail-loud drift semantics
+(`try_get::<Option<f32/i32>, _>("col")?` — checks 52/55; widened to the ranker's
+`f64`/`i64`). `MemoryHit` gained `importance: Option<f64>` + `access_count:
+Option<i64>`. In `select_candidates`:
+
+- `Candidate.importance_final` ← the durable `importance` column when present.
+  This is a **final** write-time score (already base⊕`metadata.importance`
+  blended at persist time), so the ranker uses it **directly** — no second base
+  blend. This matters because Phase 3b consolidation writes explicit importance
+  values; a re-blend would attenuate them back toward the type base.
+- `Candidate.importance_hint` ← the legacy `metadata.importance` **only** for
+  pre-3a rows (durable column NULL). A raw override that `importance()` blends
+  50/50 with the type base — the exact Phase 2 behavior, preserved.
+- The two are mutually exclusive per candidate: durable column set ⇒
+  `importance_final`; else the metadata fallback ⇒ `importance_hint`. Precedence
+  is `importance_final` > `importance_hint` > bare base.
+- `Candidate.access_boost` ← `access_boost(access_count)` =
+  `1 - 1/(1 + count)` — a saturating curve in `[0,1)` (0 accesses → `0.0`
+  neutral; diminishing returns as it grows). `None` (older rows / no signal) is
+  neutral.
+
+The access signal folds **into the importance term** rather than adding a
+fourth fused term — `fused_score` stays 3-term (relevance + recency +
+importance), avoiding Weights/knob churn:
+
+```text
+base_importance = importance_final.clamp(0,1)                     [durable column — used directly]
+                | (importance_base(type) + hint.clamp(0,1)) / 2   [pre-3a metadata fallback — blended]
+                | importance_base(type)                           [bare base, no signal]
+importance(c)   = clamp01( base_importance + access_weight * access_boost )   [base_importance if no boost]
+fused_score(c)  = W_RELEVANCE  * relevance
+                + W_RECENCY    * recency_decay(now - updated_at)
+                + W_IMPORTANCE * importance(c)
+```
+
+The nudge is **additive and clamped**, so access frequency only ever raises
+importance and the result stays in `[0,1]`; when `access_boost` is `None` the
+result is exactly the base/hint blend (flag-off and pre-3a parity). The function
+stays total/pure/NaN-safe (non-finite weight or boost degrades to a zero nudge).
+
+### New config knob
+
+| Function | Env var | Default |
+|---|---|---|
+| `smart_memory_context_access_weight()` | `SMART_MEMORY_CONTEXT_ACCESS_WEIGHT` | `0.15` |
+
+`positive_env_or_default` + clamp to `[0,1]`: `=0`/negative/unparseable
+collapses to the default (a `0` would silently disable the whole access signal),
+values above `1.0` clamp. Small by default so access frequency refines but never
+dominates base/hint importance. Wired through `docker-compose.yml`'s controller
+`environment:` alongside the other `SMART_MEMORY_CONTEXT_*` passthroughs.

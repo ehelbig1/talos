@@ -276,15 +276,41 @@ impl WorkflowRepository {
             importance: talos_config::smart_memory_context_w_importance(),
             recency_halflife_days: talos_config::smart_memory_context_recency_halflife_days(),
         };
-        let ranked =
-            talos_memory::actor_context::rank_candidates(candidates, &weights, chrono::Utc::now());
+        let ranked = talos_memory::actor_context::rank_candidates(
+            candidates,
+            &weights,
+            chrono::Utc::now(),
+            talos_config::smart_memory_context_access_weight(),
+        );
         let rows = talos_memory::actor_context::candidates_into_rows(ranked);
-        Ok(talos_memory::actor_context::pack_within_budget(
+        let packed = talos_memory::actor_context::pack_within_budget(
             actor_id,
             rows,
             byte_budget,
             per_memory_cap,
-        ))
+        );
+
+        // Phase 3a: bump the durable access signal for exactly the rows that
+        // survived into the injected set — FIRE-AND-FORGET so this first-ever
+        // recall-path mutation never adds latency to context assembly. ONE
+        // batched UPDATE, best-effort: log at debug on error, never propagate.
+        // Only fires on the flag-ON smart path (this method). The
+        // `__graph_context__` synthetic key harmlessly matches no row.
+        let bump_keys: Vec<String> = packed.iter().map(|(k, _, _)| k.clone()).collect();
+        if !bump_keys.is_empty() {
+            let pool = self.db_pool.clone();
+            tokio::spawn(async move {
+                if let Err(e) = talos_memory::bump_access(&pool, actor_id, &bump_keys).await {
+                    tracing::debug!(
+                        %actor_id,
+                        error = %e,
+                        "actor-context access bump failed (non-fatal)"
+                    );
+                }
+            });
+        }
+
+        Ok(packed)
     }
 
     /// Fetch recent working/episodic memories for an actor with a configurable limit.

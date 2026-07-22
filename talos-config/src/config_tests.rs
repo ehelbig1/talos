@@ -572,6 +572,30 @@ mod tests {
     }
 
     #[test]
+    fn test_smart_memory_context_p3a_access_weight() {
+        let _g = env_lock();
+        env::remove_var("SMART_MEMORY_CONTEXT_ACCESS_WEIGHT");
+        // Default.
+        assert!((crate::smart_memory_context_access_weight() - 0.15).abs() < f64::EPSILON);
+        // Positive override honoured.
+        env::set_var("SMART_MEMORY_CONTEXT_ACCESS_WEIGHT", "0.5");
+        assert!((crate::smart_memory_context_access_weight() - 0.5).abs() < f64::EPSILON);
+        // =0 collapses to the default (destructive-zero guard).
+        env::set_var("SMART_MEMORY_CONTEXT_ACCESS_WEIGHT", "0");
+        assert!((crate::smart_memory_context_access_weight() - 0.15).abs() < f64::EPSILON);
+        // Negative collapses to the default.
+        env::set_var("SMART_MEMORY_CONTEXT_ACCESS_WEIGHT", "-1");
+        assert!((crate::smart_memory_context_access_weight() - 0.15).abs() < f64::EPSILON);
+        // Garbage collapses to the default.
+        env::set_var("SMART_MEMORY_CONTEXT_ACCESS_WEIGHT", "not-a-number");
+        assert!((crate::smart_memory_context_access_weight() - 0.15).abs() < f64::EPSILON);
+        // Above range clamps to 1.0.
+        env::set_var("SMART_MEMORY_CONTEXT_ACCESS_WEIGHT", "5.0");
+        assert!((crate::smart_memory_context_access_weight() - 1.0).abs() < f64::EPSILON);
+        env::remove_var("SMART_MEMORY_CONTEXT_ACCESS_WEIGHT");
+    }
+
+    #[test]
     fn test_smart_memory_context_p2_overrides_and_guards() {
         let _g = env_lock();
         // Positive overrides honoured.
