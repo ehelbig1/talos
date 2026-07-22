@@ -43,6 +43,15 @@ impl WorkflowRepository {
         limit: usize,
         context_hint: Option<&str>,
     ) -> Result<Vec<(String, serde_json::Value, String)>> {
+        // Smart path (default-OFF): kind-filtered, min-score-floored,
+        // byte-budgeted assembly. When the flag is OFF the legacy body
+        // below runs unchanged — byte-identical output.
+        if talos_config::smart_memory_context_enabled() {
+            return self
+                .get_relevant_actor_context_smart(actor_id, limit, context_hint)
+                .await;
+        }
+
         let mut results: Vec<(String, serde_json::Value, String)> = Vec::new();
 
         // Layer 1: Graph RAG — traverse entity relationships.
@@ -127,6 +136,113 @@ impl WorkflowRepository {
         .await?;
         results.extend(extra);
         Ok(results)
+    }
+
+    /// Smart actor-context retriever — the ON branch of
+    /// [`Self::get_relevant_actor_context`], gated by
+    /// `talos_config::smart_memory_context_enabled()`.
+    ///
+    /// Improvements over the legacy path, all preserving the same
+    /// tenancy/crypto invariants (only ever queries the bound `actor_id`,
+    /// always through `talos_memory`'s decrypt-correct, tier-1-embed-gated
+    /// recall APIs — no hand-rolled SQL/decrypt):
+    /// 1. **Kind filter** — every layer excludes synthetic self-outputs
+    ///    ([`talos_memory::SYNTHETIC_MEMORY_KINDS`]) so the LLM never
+    ///    grounds on its own prior briefs/verdicts.
+    /// 2. **Min-score floor** — semantic recall uses
+    ///    `smart_memory_context_min_score()` instead of `0.0`, dropping
+    ///    weak neighbours.
+    /// 3. **Merge + dedup** — graph + semantic + recency layers are all
+    ///    gathered (not early-returned) and de-duplicated by key.
+    /// 4. **Byte budget** — the merged candidates are packed under
+    ///    `smart_memory_context_byte_budget()` with a per-memory cap, so a
+    ///    few large memories can't balloon a node's parse-fuel.
+    async fn get_relevant_actor_context_smart(
+        &self,
+        actor_id: Uuid,
+        limit: usize,
+        context_hint: Option<&str>,
+    ) -> Result<Vec<(String, serde_json::Value, String)>> {
+        let byte_budget = talos_config::smart_memory_context_byte_budget();
+        let per_memory_cap = talos_config::smart_memory_context_per_memory_cap();
+        let min_score = talos_config::smart_memory_context_min_score();
+        let exclude_kinds = talos_memory::synthetic_memory_kinds();
+
+        // Layer 1: Graph RAG — entity relationships. Not a synthetic
+        // self-output (no `metadata.kind`), so it is kept as-is; the
+        // per-memory cap in the packer bounds its size like any other row.
+        let mut graph_candidate: Option<(String, serde_json::Value, String)> = None;
+        if let Some(hint) = context_hint {
+            if let Some(graph) = talos_graph_rag::GRAPH_SERVICE.get() {
+                match graph.get_graph_context(actor_id, hint, 2, 20).await {
+                    Ok(ctx) => {
+                        let entity_count = ctx
+                            .get("entity_count")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        if entity_count > 0 {
+                            graph_candidate =
+                                Some(("__graph_context__".to_string(), ctx, "graph".to_string()));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "Graph context retrieval failed (non-fatal)");
+                    }
+                }
+            }
+        }
+
+        // Layer 2: Vector similarity — kind-filtered + min-score-floored.
+        // Over-fetch 3x the count budget so we still have enough distinct
+        // candidates after dedup + the byte-budget pack. `recall_semantic_filtered`
+        // clamps the limit to [1, 50] internally and applies the
+        // `metadata.kind != ALL(...)` + `>= min_score` predicates at the DB
+        // layer (only ever scoped to the bound `actor_id`).
+        let semantic_hits = if let Some(hint) = context_hint {
+            let fetch = limit.saturating_mul(3).max(limit + 5) as i64;
+            talos_memory::recall_semantic_filtered(
+                &self.db_pool,
+                actor_id,
+                hint,
+                fetch,
+                min_score,
+                None,
+                talos_memory::SearchMethod::Direct,
+                &exclude_kinds,
+            )
+            .await?
+            .hits
+        } else {
+            Vec::new()
+        };
+
+        // Layer 3: Recency — non-scratchpad, kind-filtered. Unlike the
+        // legacy path (which only falls back here when semantic returned
+        // nothing), the smart path always folds recency in and lets the
+        // byte budget decide what survives.
+        let recency = talos_memory::recall_recent_excluding_types_and_kinds(
+            &self.db_pool,
+            actor_id,
+            &["scratchpad"],
+            &exclude_kinds,
+            limit.saturating_mul(2) as i64,
+        )
+        .await?;
+
+        // Merge + dedup + scratchpad/floor selection (pure, tested), then
+        // deterministically bound the assembled payload to the byte budget.
+        let candidates = talos_memory::actor_context::select_candidates(
+            graph_candidate,
+            semantic_hits,
+            recency,
+            min_score,
+        );
+        Ok(talos_memory::actor_context::pack_within_budget(
+            actor_id,
+            candidates,
+            byte_budget,
+            per_memory_cap,
+        ))
     }
 
     /// Fetch recent working/episodic memories for an actor with a configurable limit.

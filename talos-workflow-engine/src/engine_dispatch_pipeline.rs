@@ -330,8 +330,16 @@ impl ParallelWorkflowEngine {
                 }
             }
             if let Some(ref ctx) = self.actor_context {
-                if let Some(obj) = wrapped.as_object_mut() {
-                    obj.insert("__actor_context__".to_string(), ctx.clone());
+                // Node-scoped injection keyed on the chain's head node.
+                // OFF → inject as today; ON → only when the head declares
+                // `needs_memory` (default true).
+                if talos_workflow_engine_core::reserved_keys::should_inject_actor_context(
+                    talos_config::smart_memory_context_enabled(),
+                    self.node_needs_memory(chain_head_id),
+                ) {
+                    if let Some(obj) = wrapped.as_object_mut() {
+                        obj.insert("__actor_context__".to_string(), ctx.clone());
+                    }
                 }
             }
             first.input_payload = wrapped;

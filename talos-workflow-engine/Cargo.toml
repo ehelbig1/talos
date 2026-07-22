@@ -13,6 +13,7 @@ homepage = "https://github.com/aegix-dev/talos-workflow-engine"
 
 [dependencies]
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version = "0.3", default-features = false }
+talos-config = { path = "../talos-config", version = "0.1.0" }
 anyhow = "1.0"
 async-trait = "0.1"
 cap-std = "3.4"

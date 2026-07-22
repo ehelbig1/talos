@@ -190,7 +190,15 @@ impl ParallelWorkflowEngine {
                 merged.insert("__accumulated__".to_string(), (**acc).clone());
             }
             if let Some(ref ctx) = self.actor_context {
-                merged.insert("__actor_context__".to_string(), ctx.clone());
+                // Node-scoped injection: OFF → inject into every node
+                // (byte-identical to the legacy path); ON → only nodes
+                // that declare `needs_memory` (default true).
+                if talos_workflow_engine_core::reserved_keys::should_inject_actor_context(
+                    talos_config::smart_memory_context_enabled(),
+                    self.node_needs_memory(node_id),
+                ) {
+                    merged.insert("__actor_context__".to_string(), ctx.clone());
+                }
             }
             // `__trigger_input__` survives every hop — including across
             // sub-workflow boundaries when the dispatcher wraps the child
