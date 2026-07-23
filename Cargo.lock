@@ -8340,6 +8340,7 @@ dependencies = [
  "sqlx",
  "talos-actor-repository",
  "talos-config",
+ "talos-graph-rag",
  "talos-llm",
  "talos-memory",
  "talos-secrets-manager",

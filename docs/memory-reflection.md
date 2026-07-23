@@ -75,6 +75,31 @@ metadata)`:
 - `metadata = {"kind": "reflection", "source_count": N, "reflected_at": <ts>}`.
 - **Deletes nothing.** No source is retired.
 
+## Schema-constrained output (both tiers)
+
+The reflection JSON contract is enforced with **schema-constrained structured
+output**, not prompt-and-parse — the reliability fix that makes the well-formed
+shape the default rather than the lucky case:
+
+- **Local (tier-1, Ollama):** `OllamaClient::complete_with_schema` passes
+  `reflection_schema()` in the Ollama `format` field (Ollama Structured Outputs),
+  which shape-constrains the reply — distinct from the old `format:"json"` mode
+  that guaranteed valid JSON *syntax* only. Temperature is pinned to `0.1` for
+  deterministic structure, and the 4xx-retry path drops `think` while keeping the
+  schema.
+- **External (tier-2, Anthropic):** `LlmClient::generate_with_schema` uses
+  **tool-use** — a single tool whose `input_schema` is `reflection_schema()` with
+  `tool_choice` forcing it — and extracts the `tool_use` block's `input`. This
+  replaces `generate_text`'s ask-for-JSON-and-strip-fences approach, which could
+  still return the wrong shape.
+
+`consolidate` uses the same pair with `consolidation_schema()`. The tolerant
+parsers (`coerce_json_object` → `parse_reflection` / `parse_summary`) remain as
+belt-and-suspenders for a model that ignores the constraint, but they are no
+longer the primary guarantee. Both schema builders live in
+`talos-memory-consolidation` and feed **both** structured-output paths from one
+definition, so the local and external contracts can never drift apart.
+
 ## Self-grounding guard
 
 `"reflection"` is a member of `talos_memory::SYNTHETIC_MEMORY_KINDS`, so
@@ -88,22 +113,95 @@ By design, reflections are **not auto-injected** into grounding context.
 Deliberately feeding reflections into response context is a controlled
 follow-up, not part of this phase.
 
-### Known gap — the graph-RAG grounding layer
+## Phase 4 — entity-graph synthesis (graph-write policy + graph-aware reflection)
 
-The kind-filter guard covers the **semantic + recency** layers of
-`get_relevant_actor_context_smart`. It does NOT cover **Layer 1 (graph RAG)**:
-`persist_reflection` writes a normal semantic memory, so — like `daily_brief`,
-`meeting_prep`, and every other synthetic kind — it fires `spawn_graph_extraction`,
-seeding Neo4j with entities derived from the reflection's insight text. Graph
-entities don't carry the source memory's `metadata.kind`, so reflection-derived
-entities remain eligible for the graph grounding layer. The exposure is mild
-(the reflection loop's own input scan reads `actor_memory` directly, never the
-graph, so the loop itself can't re-ingest its output — no self-drift), it's
-**pre-existing platform behavior shared by all synthetic kinds** (not introduced
-here), and tier-1 privacy is intact (graph extraction is independently
-tier-gated). Phase 4 (entity-graph synthesis) owns the deliberate decision of
-what synthesized memory should and shouldn't enter the entity graph — including
-whether reflections should graph-extract at all.
+Phase 4 resolves the prior "graph-RAG grounding layer" gap. It has three parts.
+
+### 1. Graph-write policy — synthetic self-outputs do NOT auto-extract
+
+`talos_memory::spawn_graph_extraction` now takes a `kind: Option<&str>` and
+**skips generic auto-extraction when the kind is a synthetic self-output**
+(`talos_memory::is_synthetic_memory_kind` / `SYNTHETIC_MEMORY_KINDS`, which
+includes `"reflection"`, `daily_brief`, `judge`, `ml_digest`, …). Rationale: the
+entity graph is built from **real source memories**, never the assistant's own
+inferences — auto-mining reflections/briefs/verdicts into Neo4j would let a
+future response ground on entities derived from a prior inference (reflection →
+graph → recall → reflection feedback amplification).
+
+The two internal call sites thread the kind through:
+
+- `persist_memory_with_metadata_typed` passes the row's `metadata.kind`
+  (`metadata_kind(metadata)`), so a `persist_reflection` write (stamped
+  `{"kind":"reflection"}`) no longer auto-extracts.
+- `consolidate_memory` passes `Some("consolidated")`. **`"consolidated"` is
+  deliberately absent from `SYNTHETIC_MEMORY_KINDS`** — a consolidated summary
+  is condensed **real** content, so it STILL auto-extracts. Verified by
+  `spawn_graph_extraction_synthetic_kind_tests`.
+- The MCP `compress_actor_context` path passes `None` (condensed real memories,
+  no synthetic kind) → still extracts.
+
+Reflection-derived entities therefore reach the graph via exactly **one**
+deliberate, curated path — the entity synthesis below — instead of noisy
+insight-text auto-mining.
+
+### 2. Deliberate entity synthesis — curated first-class graph nodes
+
+The reflection JSON contract gained an `entities` field:
+
+```json
+{"insights":[...], "themes":[...], "open_threads":[...],
+ "entities":[{"name":"...", "type":"Person|Project|Ticket|Concept|...",
+              "facts":["..."],
+              "relationships":[{"type":"WORKS_ON|BLOCKED_BY|...","target":"..."}]}]}
+```
+
+`parse_reflection_entities` extracts these tolerantly (missing/malformed
+`entities` → empty; nameless entries dropped; empty-predicate/target
+relationships filtered) so reflection never fails on a model that ignored the
+contract. Each synthesized entity is upserted into the actor's graph via two new
+`GraphRagService` primitives:
+
+- **`upsert_entity(actor_id, label, name, props)`** — node-only MERGE
+  (`build_node_upsert_cypher`, a PURE unit-tested helper):
+  `MERGE (n:{label} {actor_id:$actor_id, name:$name}) SET n += $props SET
+  n.source_key=$source_key, n.updated_at=$now`. `label` runs through
+  `sanitize_label` (allowlist → canonical token or `Concept`); `props` run
+  through the same `sanitize_property_key` + reserved-key guard as extraction,
+  so a synthesized prop named `actor_id`/`name`/`source_key`/`updated_at` is
+  **dropped** — a fact can never hijack the tenant boundary or MERGE identity.
+- **`upsert_entity_relationship(...)`** — reuses the batched triple-upsert
+  kernel (labels/predicate sanitized, `actor_id`-scoped MERGE) for the edges.
+
+Both stamp `source_key = "reflection_synthesis"` to distinguish curated
+reflection entities from auto-extracted ones. Persistence is **best-effort**:
+node/edge failures log and continue; the reflection memory write is the primary
+output and lands regardless (`persist_synthesized_entities`).
+
+### 3. Graph-aware reflection — multi-hop input
+
+Before building the prompt, `run_reflection_tick` fetches the actor's **current
+entity graph** (`GraphRagService::get_graph_context(actor_id, hint, 2, 30)`,
+seeded by a hint built from recent memory keys) and folds it into the reflection
+user prompt as `entity_graph` context, byte-capped separately
+(`MAX_GRAPH_CONTEXT_BYTES`) so it never crowds out the flat memory rows. The
+system prompt instructs the model to **reason over accumulated multi-hop
+relationships** (Person → owns → Project → blocked-by → …), not just flat rows.
+The fetch is best-effort and non-fatal: no graph handle / query error / empty
+graph → `None`, and the prompt degrades to flat-memory-only.
+
+### Tier-1 privacy & actor scoping
+
+- **No new external-LLM path.** The `entities` list comes from the reflection
+  completion that is **already tier-gated** (`plan_action` — a tier-1 actor's
+  synthesis runs on **local Ollama only**). The graph **write** is a Neo4j MERGE
+  (no LLM, no external egress), so it needs no additional tier gate. The
+  auto-extraction path (`extract_and_store_entities`) remains independently
+  tier-gated for real memories.
+- **Actor-scoped.** Every graph read (`get_graph_context`) and write
+  (`upsert_entity` / `upsert_entity_relationship`) is keyed on `actor_id`
+  (`WHERE`/`MERGE ... actor_id=$actor_id`); one actor's entities can never touch
+  another's, and the reserved-property guard prevents a synthesized prop from
+  rewriting `actor_id`.
 
 ## Fair rotation
 

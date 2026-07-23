@@ -432,14 +432,71 @@ pub async fn decrypt_row_value(row: &sqlx::postgres::PgRow) -> anyhow::Result<se
     resolve_stored_value(value_plain, value_enc, value_key_id, aad, value_format).await
 }
 
+/// True when `kind` is a SYNTHETIC self-output kind (a reflection, brief,
+/// judge verdict, dispatch trace, digest, …) that the assistant produced
+/// itself. Single source of truth is [`SYNTHETIC_MEMORY_KINDS`].
+///
+/// GRAPH-WRITE POLICY (Phase 4): the entity graph is built from REAL source
+/// memories, NEVER from the assistant's own inferences. Auto-mining a
+/// synthetic self-output into the entity graph would let a future response
+/// ground on entities derived from a prior inference — a feedback-
+/// amplification path (reflection → graph → recall → reflection). So the
+/// generic auto-extraction SKIPS these kinds; synthetic self-outputs reach
+/// the graph ONLY via a deliberate, curated path (the reflection loop's
+/// entity synthesis in `talos_memory_consolidation`).
+///
+/// NOTE: `"consolidated"` is deliberately NOT synthetic — a consolidated
+/// summary is condensed REAL content (episodic rows collapsed into a
+/// semantic memory), so it SHOULD still auto-extract. Verified in
+/// `spawn_graph_extraction_synthetic_kind_tests`.
+pub fn is_synthetic_memory_kind(kind: &str) -> bool {
+    SYNTHETIC_MEMORY_KINDS.contains(&kind)
+}
+
+/// Extract the `metadata.kind` string label from an optional metadata JSON
+/// object, if present. Used at the [`spawn_graph_extraction`] call sites to
+/// apply the graph-write policy (synthetic self-outputs skip extraction).
+pub fn metadata_kind(metadata: Option<&serde_json::Value>) -> Option<&str> {
+    metadata
+        .and_then(|m| m.get("kind"))
+        .and_then(|k| k.as_str())
+}
+
 /// Public helper — spawn graph-RAG entity extraction for a memory
 /// write. `persist_memory` calls this itself on success; the `_in_tx`
 /// variant does *not*, leaving it to the caller so the hook only
 /// fires after a successful `tx.commit().await` (preventing graph
 /// drift from rolled-back transactions).
 ///
+/// GRAPH-WRITE POLICY: when `kind` is a SYNTHETIC self-output kind (see
+/// [`is_synthetic_memory_kind`] / [`SYNTHETIC_MEMORY_KINDS`]) the generic
+/// auto-extraction is SKIPPED — the assistant's own inferences
+/// (reflections, briefs, judge verdicts, digests) must not be auto-mined
+/// into the entity graph (feedback-amplification guard). Real source
+/// memories (`kind = None` or a non-synthetic kind such as
+/// `"consolidated"`) still extract.
+///
 /// Safe no-op when no hook is registered.
-pub fn spawn_graph_extraction(actor_id: Uuid, key: String, value: serde_json::Value) {
+pub fn spawn_graph_extraction(
+    actor_id: Uuid,
+    key: String,
+    value: serde_json::Value,
+    kind: Option<&str>,
+) {
+    // Graph-write policy: synthetic self-output kinds never auto-extract.
+    if let Some(k) = kind {
+        if is_synthetic_memory_kind(k) {
+            tracing::debug!(
+                actor_id = %actor_id,
+                key = %key,
+                kind = %k,
+                "Skipping graph entity extraction for synthetic self-output kind \
+                 (graph-write policy: entity graph is built from real source memories, \
+                 not the assistant's own inferences)"
+            );
+            return;
+        }
+    }
     let Some(hook) = GRAPH_HOOK.get().cloned() else {
         return;
     };
@@ -806,9 +863,18 @@ pub async fn persist_memory_with_metadata_typed(
     .context("Failed to persist actor memory")
     .map_err(MemoryWriteError::Db)?;
 
-    let graph_extraction_attempted = canonical_type != "scratchpad" && GRAPH_HOOK.get().is_some();
+    // Graph-write policy (Phase 4): synthetic self-output kinds
+    // (reflections/briefs/verdicts/digests — stamped via `metadata.kind`)
+    // are EXCLUDED from generic auto-extraction so the assistant's own
+    // inferences never pollute the entity graph. `spawn_graph_extraction`
+    // enforces the skip; we surface it in `graph_extraction_attempted` so
+    // callers/metrics observe the true outcome.
+    let extraction_kind = metadata_kind(metadata);
+    let graph_extraction_attempted = canonical_type != "scratchpad"
+        && GRAPH_HOOK.get().is_some()
+        && !extraction_kind.is_some_and(is_synthetic_memory_kind);
     if graph_extraction_attempted {
-        spawn_graph_extraction(actor_id, key.to_string(), value.clone());
+        spawn_graph_extraction(actor_id, key.to_string(), value.clone(), extraction_kind);
     }
 
     Ok(PersistOutcome {
@@ -2413,8 +2479,15 @@ pub async fn consolidate_memory(
     tx.commit().await.context("consolidate_memory: commit")?;
 
     // Post-commit only — running graph extraction inside the tx would corrupt
-    // the graph if the tx rolled back.
-    spawn_graph_extraction(actor_id, semantic_key.to_string(), final_value);
+    // the graph if the tx rolled back. A consolidated summary is condensed
+    // REAL content (not a synthetic self-output), so it STILL auto-extracts —
+    // `"consolidated"` is deliberately absent from `SYNTHETIC_MEMORY_KINDS`.
+    spawn_graph_extraction(
+        actor_id,
+        semantic_key.to_string(),
+        final_value,
+        Some("consolidated"),
+    );
 
     Ok(retired_count)
 }
@@ -3145,6 +3218,58 @@ pub async fn sweep_expired(pool: &Pool<Postgres>, grace_hours: i64) -> Result<u6
 // `cargo test -p talos-memory` stays green in CI even when services
 // aren't running.
 // ============================================================================
+#[cfg(test)]
+mod spawn_graph_extraction_synthetic_kind_tests {
+    use super::*;
+
+    // GRAPH-WRITE POLICY (Phase 4): synthetic self-output kinds must NOT
+    // auto-extract into the entity graph; real / condensed-real content must.
+    #[test]
+    fn reflection_and_self_outputs_are_synthetic() {
+        for k in [
+            "reflection",
+            "daily_brief",
+            "judge",
+            "ml_digest",
+            "synthesize",
+        ] {
+            assert!(
+                is_synthetic_memory_kind(k),
+                "{k} must be treated as a synthetic self-output (skips auto-extraction)"
+            );
+        }
+    }
+
+    #[test]
+    fn consolidated_is_not_synthetic_still_extracts() {
+        // A consolidated summary is condensed REAL content — it MUST remain
+        // eligible for auto-extraction (verifies the deliberate omission of
+        // "consolidated" from SYNTHETIC_MEMORY_KINDS).
+        assert!(
+            !is_synthetic_memory_kind("consolidated"),
+            "consolidated summaries are real condensed content and must still extract"
+        );
+    }
+
+    #[test]
+    fn real_source_kinds_and_absent_kind_extract() {
+        // Human-sourced / integration-sourced content and rows with no kind
+        // are not synthetic → they extract.
+        assert!(!is_synthetic_memory_kind("jira_work_context"));
+        assert!(!is_synthetic_memory_kind("email_triage"));
+        assert_eq!(metadata_kind(None), None);
+    }
+
+    #[test]
+    fn metadata_kind_extracts_string_label() {
+        let md = serde_json::json!({ "kind": "reflection", "source_count": 3 });
+        assert_eq!(metadata_kind(Some(&md)), Some("reflection"));
+        // Missing / non-string kind → None (treated as non-synthetic).
+        assert_eq!(metadata_kind(Some(&serde_json::json!({}))), None);
+        assert_eq!(metadata_kind(Some(&serde_json::json!({ "kind": 7 }))), None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
