@@ -492,9 +492,9 @@ amplification).
 
 | Function | Env var | Default | Notes |
 |---|---|---|---|
-| `memory_consolidation_enabled()` | `ENABLE_MEMORY_CONSOLIDATION` | `false` | master switch; scheduler not spawned when off |
+| `memory_consolidation_enabled()` | `ENABLE_MEMORY_CONSOLIDATION` | `true` | master switch (default ON, Tier 3); scheduler not spawned when off |
 | `memory_consolidation_tier1_local_ok()` | `MEMORY_CONSOLIDATION_TIER1_LOCAL_OK` | `false` | operator attestation OLLAMA_URL is on-host |
-| `memory_consolidation_interval_secs()` | `MEMORY_CONSOLIDATION_INTERVAL_SECS` | `3600` | tick cadence |
+| `memory_consolidation_interval_secs()` | `MEMORY_CONSOLIDATION_INTERVAL_SECS` | `86400` | tick cadence (daily; only touches the 30-day cold tail) |
 | `memory_consolidation_min_age_days()` | `MEMORY_CONSOLIDATION_MIN_AGE_DAYS` | `30.0` | only rows older than this |
 | `memory_consolidation_max_importance()` | `MEMORY_CONSOLIDATION_MAX_IMPORTANCE` | `0.4` | clamp `[0,1]`; only low-importance rows |
 | `memory_consolidation_batch_size()` | `MEMORY_CONSOLIDATION_BATCH_SIZE` | `20` | clamp `[3,100]`; floor 3 skips trivial clusters |
@@ -503,3 +503,65 @@ amplification).
 
 All numeric knobs route through `positive_env_or_default` (destructive-zero
 guard) and are wired through `docker-compose.yml`'s controller `environment:`.
+
+# Tier 3 — self-maintaining memory (learning loops default-ON, 2026-07)
+
+The grounding path (Tier 1) and universal injection (Tier 2) made grounded
+memory the default everywhere it's *read*. Tier 3 flips the four **learning
+loops** that make that memory *improve itself* from opt-in to default-ON, so the
+system gets better with use without any operator action:
+
+| Loop | Flag (now default `true`) | What it does | Why safe to default-on |
+|---|---|---|---|
+| Rank provenance | `ENABLE_MEMORY_RANK_PROVENANCE` | records execution→memory→outcome signal (keys + numeric features, **never values**) | fire-and-forget, batched single-INSERT, tenant-scoped, retention-swept |
+| Rank training | `ENABLE_ADAPTIVE_RANK_TRAINING` | CPU-only per-actor weight fit from that signal | no LLM/egress; cold-start fail-closed to global weights; weights clamped so ranking can't invert |
+| Reflection | `ENABLE_MEMORY_REFLECTION` | daily higher-order insight synthesis → one `reflection/latest` semantic memory | input scan **excludes its own kind** → cannot amplify; non-destructive write |
+| Consolidation | `ENABLE_MEMORY_CONSOLIDATION` | daily condense of the 30-day cold episodic tail → one semantic summary, sources retired | convergent (monotone-reducing), not amplifying |
+
+## Local-first routing (privacy default for the LLM loops)
+
+Reflection and consolidation call an LLM. Their routing is **local-first**: the
+loop-specific `plan_action` prefers the **on-host Ollama model for ALL tiers**
+whenever it's reachable — so a tier-2 actor's memory content (including work/CRM
+data) **never egresses during background maintenance**. The external provider is
+a *fallback* used only when no local model is available, and that fallback is
+itself **budget-gated** (skipped when the actor is over its
+`max_llm_tokens_per_day`). This is strictly more private than the actor's tier
+ceiling requires: a tier-2 ceiling *allows* external but does not *mandate* it.
+
+The shared fail-closed `decide_llm_tier` matrix (also used by graph-RAG) is
+deliberately **unchanged** — local-first lives only in the memory loops'
+`plan_action`. Tier-1 stays doubly fail-safe: a tier-1 actor is `Skip`ped
+entirely unless the operator separately attests on-host Ollama via
+`MEMORY_{REFLECTION,CONSOLIDATION}_TIER1_LOCAL_OK` (default `false`).
+
+Routing matrix for the loops:
+
+| Actor tier | Ollama reachable | Attestation | Action | LLM used |
+|---|---|---|---|---|
+| `tier2` | yes | — | `SummarizeLocal` | local Ollama (**no egress**) |
+| `tier2` | no | — | `SummarizeExternal` | external (budget-gated fallback) |
+| `tier1` | yes | attested | `SummarizeLocal` | local Ollama |
+| `tier1` | yes | not attested | `Skip` | none |
+| `tier1` | no | — | `Skip` | none |
+
+## Self-amplification: closed by construction
+
+The one thing that makes memory-write loops dangerous — an LLM citing its own
+prior output as "source" so hallucinations compound each run — is closed
+unconditionally: reflection's input scan filters `SYNTHETIC_MEMORY_KINDS` at the
+DB layer (so it can never reflect on its own `reflection/latest`), and the
+default injection path (`get_relevant_actor_context_smart`) excludes the same
+kinds at every layer. The legacy (`ENABLE_SMART_MEMORY_CONTEXT=false`) recall
+path now also excludes synthetic kinds in both its semantic and recency layers
+(defense-in-depth), so reflections can't leak into general context there either.
+Consolidation is convergent by construction (it reads `episodic`, writes
+`semantic`, and deletes its sources), so it cannot amplify.
+
+## Rollout note
+
+Provenance and training pair as a producer→consumer: training only produces
+learned weights once provenance has accrued ≥ `ADAPTIVE_RANK_MIN_EXAMPLES`
+labeled examples for an actor. Flipping both on together is safe — serving stays
+on global weights during the warm-up window — but learned per-actor ranking only
+kicks in after the corpus matures.

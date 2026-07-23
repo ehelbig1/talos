@@ -51,12 +51,25 @@ pub enum PlannedAction {
 }
 
 /// Pure routing decision. `Skip` from the tier gate, OR fewer than `batch_floor`
-/// candidates, both short-circuit to [`PlannedAction::Skip`]. Only a
-/// tier-2 (`External`) actor with enough candidates routes to an external LLM.
+/// candidates, both short-circuit to [`PlannedAction::Skip`].
+///
+/// **Local-first privacy policy (2026-07).** Autonomous background maintenance
+/// does not need frontier-model quality and MUST NOT egress memory content when
+/// a local model can do the job. So a tier-2 (`External`) actor routes to
+/// [`PlannedAction::SummarizeLocal`] whenever `ollama_available` — external is a
+/// *fallback* used only when the local model is unreachable. This is strictly
+/// more private than the actor's tier ceiling permits (tier-2 *allows* external
+/// but does not *require* it), so it needs no extra attestation: a tier-2
+/// actor's content stays on-host during background summarization. Tier-1
+/// (`LocalOnly`/`Skip`) is unchanged — it already never reaches an external
+/// provider. The shared [`decide_llm_tier`](talos_actor_repository) matrix
+/// (also used by graph-RAG) is deliberately NOT touched; this loop-specific
+/// preference lives here.
 pub fn plan_action(
     decision: LlmTierDecision,
     candidate_count: usize,
     batch_floor: i64,
+    ollama_available: bool,
 ) -> PlannedAction {
     if candidate_count < batch_floor.max(0) as usize {
         return PlannedAction::Skip;
@@ -64,8 +77,35 @@ pub fn plan_action(
     match decision {
         LlmTierDecision::Skip => PlannedAction::Skip,
         LlmTierDecision::LocalOnly => PlannedAction::SummarizeLocal,
+        // Local-first: prefer the on-host model for tier-2 too; only fall back
+        // to the external provider when no local model is available.
+        LlmTierDecision::External if ollama_available => PlannedAction::SummarizeLocal,
         LlmTierDecision::External => PlannedAction::SummarizeExternal,
     }
+}
+
+/// Best-effort per-actor daily token-budget check, consulted ONLY on the
+/// external-summarize fallback (local summarization is on-host and free, so it
+/// is never budget-gated). Returns `true` when the actor has a positive
+/// `max_llm_tokens_per_day` ceiling AND its trailing-24h ledger spend already
+/// meets/exceeds it — the loop then skips the rare external call rather than
+/// pushing an already-over-budget actor further over.
+///
+/// **Fail-OPEN by design.** This is a COST control, not a security control —
+/// egress is already governed fail-CLOSED by the tier gate + local-first
+/// routing. A missing budget row means "no ceiling" (the platform default); a
+/// DB error on either read must not strand background maintenance. So any
+/// absent-policy / unset-ceiling / non-positive-ceiling / read-error case
+/// returns `false` (allow). Mirrors the ledger's own "accounting, not
+/// authorization" posture.
+async fn external_budget_exhausted(actor_repo: &ActorRepository, actor_id: uuid::Uuid) -> bool {
+    let Ok(Some(policy)) = actor_repo.get_actor_budget_policy(actor_id).await else {
+        return false;
+    };
+    let Some(max) = policy.max_llm_tokens_per_day.filter(|m| *m > 0) else {
+        return false;
+    };
+    matches!(actor_repo.sum_llm_tokens_last_24h(actor_id).await, Ok(spent) if spent >= max)
 }
 
 /// Build the (system, user) prompt for the consolidation summarizer.
@@ -286,7 +326,7 @@ async fn run_consolidation_tick(
             }
         };
 
-        let action = plan_action(decision, candidates.len(), BATCH_FLOOR);
+        let action = plan_action(decision, candidates.len(), BATCH_FLOOR, ollama.is_some());
         if action == PlannedAction::Skip {
             tracing::debug!(
                 target: "talos_memory_consolidation",
@@ -332,6 +372,12 @@ async fn run_consolidation_tick(
                 }
             }
             PlannedAction::SummarizeExternal => {
+                // External fallback (ollama unreachable). Cost gate: skip if the
+                // actor is already over its daily token budget.
+                if external_budget_exhausted(actor_repo, actor_id).await {
+                    tracing::info!(target: "talos_memory_consolidation", %actor_id, "actor over daily LLM-token budget; skipping external consolidation");
+                    continue;
+                }
                 let client = talos_llm::LlmClient::with_vault(secrets_manager.clone(), None);
                 match client
                     .generate_with_schema(
@@ -782,7 +828,7 @@ async fn run_reflection_tick(
             }
         };
 
-        let action = plan_action(decision, memories.len(), min_memories);
+        let action = plan_action(decision, memories.len(), min_memories, ollama.is_some());
         if action == PlannedAction::Skip {
             tracing::debug!(
                 target: "talos_memory_reflection",
@@ -832,6 +878,12 @@ async fn run_reflection_tick(
                 }
             }
             PlannedAction::SummarizeExternal => {
+                // External fallback (ollama unreachable). Cost gate: skip if the
+                // actor is already over its daily token budget.
+                if external_budget_exhausted(actor_repo, actor_id).await {
+                    tracing::info!(target: "talos_memory_reflection", %actor_id, "actor over daily LLM-token budget; skipping external reflection");
+                    continue;
+                }
                 let client = talos_llm::LlmClient::with_vault(secrets_manager.clone(), None);
                 match client
                     .generate_with_schema(&system, &user, &reflection_schema(), "record_reflection")
@@ -1161,9 +1213,14 @@ mod tests {
 
     #[test]
     fn plan_action_skip_decision_never_summarizes() {
-        // A Skip tier decision NEVER summarizes, regardless of candidate count.
+        // A Skip tier decision NEVER summarizes, regardless of candidate count
+        // or local-model availability.
         assert_eq!(
-            plan_action(LlmTierDecision::Skip, 100, BATCH_FLOOR),
+            plan_action(LlmTierDecision::Skip, 100, BATCH_FLOOR, true),
+            PlannedAction::Skip
+        );
+        assert_eq!(
+            plan_action(LlmTierDecision::Skip, 100, BATCH_FLOOR, false),
             PlannedAction::Skip
         );
     }
@@ -1172,41 +1229,60 @@ mod tests {
     fn plan_action_too_few_candidates_skips() {
         // Even a tier-2 actor with fewer than the floor is skipped (no LLM).
         assert_eq!(
-            plan_action(LlmTierDecision::External, 2, BATCH_FLOOR),
+            plan_action(LlmTierDecision::External, 2, BATCH_FLOOR, false),
             PlannedAction::Skip
         );
         assert_eq!(
-            plan_action(LlmTierDecision::LocalOnly, 2, BATCH_FLOOR),
+            plan_action(LlmTierDecision::LocalOnly, 2, BATCH_FLOOR, true),
             PlannedAction::Skip
         );
     }
 
     #[test]
     fn plan_action_local_only_routes_local() {
-        // The security-critical routing: LocalOnly NEVER routes external.
+        // The security-critical routing: LocalOnly NEVER routes external,
+        // regardless of the ollama flag.
         assert_eq!(
-            plan_action(LlmTierDecision::LocalOnly, 10, BATCH_FLOOR),
+            plan_action(LlmTierDecision::LocalOnly, 10, BATCH_FLOOR, true),
+            PlannedAction::SummarizeLocal
+        );
+        assert_eq!(
+            plan_action(LlmTierDecision::LocalOnly, 10, BATCH_FLOOR, false),
             PlannedAction::SummarizeLocal
         );
     }
 
     #[test]
-    fn plan_action_external_routes_external() {
+    fn plan_action_external_prefers_local_when_ollama_available() {
+        // LOCAL-FIRST: a tier-2 (External) actor summarizes on the LOCAL model
+        // when one is available — its memory content stays on-host during
+        // background maintenance. This is the privacy default.
         assert_eq!(
-            plan_action(LlmTierDecision::External, 10, BATCH_FLOOR),
+            plan_action(LlmTierDecision::External, 10, BATCH_FLOOR, true),
+            PlannedAction::SummarizeLocal
+        );
+    }
+
+    #[test]
+    fn plan_action_external_falls_back_to_external_without_ollama() {
+        // Only when no local model is reachable does a tier-2 actor fall back
+        // to the external provider.
+        assert_eq!(
+            plan_action(LlmTierDecision::External, 10, BATCH_FLOOR, false),
             PlannedAction::SummarizeExternal
         );
     }
 
     #[test]
     fn plan_action_at_floor_boundary() {
-        // Exactly at the floor is enough; one below is not.
+        // Exactly at the floor is enough; one below is not. (ollama off so the
+        // routing lands on the external fallback for a crisp assertion.)
         assert_eq!(
-            plan_action(LlmTierDecision::External, 3, 3),
+            plan_action(LlmTierDecision::External, 3, 3, false),
             PlannedAction::SummarizeExternal
         );
         assert_eq!(
-            plan_action(LlmTierDecision::External, 2, 3),
+            plan_action(LlmTierDecision::External, 2, 3, false),
             PlannedAction::Skip
         );
     }
@@ -1290,19 +1366,25 @@ mod tests {
         // never summarizes regardless of memory count; the floor is
         // min_memories.
         assert_eq!(
-            plan_action(LlmTierDecision::LocalOnly, 10, 8),
+            plan_action(LlmTierDecision::LocalOnly, 10, 8, true),
             PlannedAction::SummarizeLocal
         );
         assert_eq!(
-            plan_action(LlmTierDecision::Skip, 100, 8),
+            plan_action(LlmTierDecision::Skip, 100, 8, true),
             PlannedAction::Skip
         );
         assert_eq!(
-            plan_action(LlmTierDecision::External, 7, 8),
+            plan_action(LlmTierDecision::External, 7, 8, true),
             PlannedAction::Skip // below the min-memories floor
         );
+        // External + ollama → local-first (privacy default); external only as
+        // the no-local fallback.
         assert_eq!(
-            plan_action(LlmTierDecision::External, 8, 8),
+            plan_action(LlmTierDecision::External, 8, 8, true),
+            PlannedAction::SummarizeLocal
+        );
+        assert_eq!(
+            plan_action(LlmTierDecision::External, 8, 8, false),
             PlannedAction::SummarizeExternal
         );
     }

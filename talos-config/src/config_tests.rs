@@ -681,15 +681,17 @@ mod tests {
         ] {
             env::remove_var(v);
         }
-        assert!(!crate::memory_consolidation_enabled());
+        assert!(crate::memory_consolidation_enabled(), "default ON (Tier 3)");
         assert!(!crate::memory_consolidation_tier1_local_ok());
+        env::set_var("ENABLE_MEMORY_CONSOLIDATION", "off");
+        assert!(!crate::memory_consolidation_enabled(), "disablable");
         env::set_var("ENABLE_MEMORY_CONSOLIDATION", "on");
         assert!(crate::memory_consolidation_enabled());
         env::set_var("MEMORY_CONSOLIDATION_TIER1_LOCAL_OK", "true");
         assert!(crate::memory_consolidation_tier1_local_ok());
 
         // Numeric defaults.
-        assert_eq!(crate::memory_consolidation_interval_secs(), 3600);
+        assert_eq!(crate::memory_consolidation_interval_secs(), 86400);
         assert!((crate::memory_consolidation_min_age_days() - 30.0).abs() < f64::EPSILON);
         assert!((crate::memory_consolidation_max_importance() - 0.4).abs() < f64::EPSILON);
         assert_eq!(crate::memory_consolidation_batch_size(), 20);
@@ -698,7 +700,7 @@ mod tests {
 
         // Destructive-zero / clamp guards.
         env::set_var("MEMORY_CONSOLIDATION_INTERVAL_SECS", "0");
-        assert_eq!(crate::memory_consolidation_interval_secs(), 3600);
+        assert_eq!(crate::memory_consolidation_interval_secs(), 86400);
         env::set_var("MEMORY_CONSOLIDATION_MAX_IMPORTANCE", "5.0");
         assert!((crate::memory_consolidation_max_importance() - 1.0).abs() < f64::EPSILON);
         // Batch size clamps to [3, 100]: below floor and above ceiling.
@@ -742,9 +744,11 @@ mod tests {
         ] {
             env::remove_var(v);
         }
-        // Master switch + attestation default OFF; honour truthy tokens.
-        assert!(!crate::memory_reflection_enabled());
+        // Master switch default ON (Tier 3); attestation default OFF; honour tokens.
+        assert!(crate::memory_reflection_enabled(), "default ON (Tier 3)");
         assert!(!crate::memory_reflection_tier1_local_ok());
+        env::set_var("ENABLE_MEMORY_REFLECTION", "off");
+        assert!(!crate::memory_reflection_enabled(), "disablable");
         env::set_var("ENABLE_MEMORY_REFLECTION", "on");
         assert!(crate::memory_reflection_enabled());
         env::set_var("MEMORY_REFLECTION_TIER1_LOCAL_OK", "true");
@@ -792,16 +796,19 @@ mod tests {
         }
     }
 
-    /// Memory-rank provenance flag defaults OFF and honours truthy tokens.
+    /// Memory-rank provenance flag defaults ON (Tier 3) and is disablable.
     #[test]
-    fn test_memory_rank_provenance_enabled_default_off() {
+    fn test_memory_rank_provenance_enabled_default_on() {
         let _g = env_lock();
         env::remove_var("ENABLE_MEMORY_RANK_PROVENANCE");
-        assert!(!crate::memory_rank_provenance_enabled(), "default OFF");
+        assert!(
+            crate::memory_rank_provenance_enabled(),
+            "default ON (Tier 3)"
+        );
+        env::set_var("ENABLE_MEMORY_RANK_PROVENANCE", "0");
+        assert!(!crate::memory_rank_provenance_enabled(), "disablable");
         env::set_var("ENABLE_MEMORY_RANK_PROVENANCE", "true");
         assert!(crate::memory_rank_provenance_enabled());
-        env::set_var("ENABLE_MEMORY_RANK_PROVENANCE", "0");
-        assert!(!crate::memory_rank_provenance_enabled());
         env::remove_var("ENABLE_MEMORY_RANK_PROVENANCE");
     }
 
@@ -826,8 +833,8 @@ mod tests {
         env::remove_var("MEMORY_RANK_PROVENANCE_RETENTION_DAYS");
     }
 
-    /// Adaptive-rank SERVING defaults ON (cold-start byte-identical), TRAINING
-    /// defaults OFF; they toggle independently.
+    /// Adaptive-rank SERVING and TRAINING both default ON (Tier 3); they toggle
+    /// independently and are each disablable.
     #[test]
     fn test_adaptive_rank_flags_defaults() {
         let _g = env_lock();
@@ -835,12 +842,14 @@ mod tests {
         env::remove_var("ENABLE_ADAPTIVE_RANK_TRAINING");
         assert!(crate::adaptive_rank_enabled(), "serving default ON");
         assert!(
-            !crate::adaptive_rank_training_enabled(),
-            "training default OFF"
+            crate::adaptive_rank_training_enabled(),
+            "training default ON (Tier 3)"
         );
-        // Serving is explicitly disablable.
+        // Both are explicitly disablable.
         env::set_var("ENABLE_ADAPTIVE_RANK", "false");
         assert!(!crate::adaptive_rank_enabled());
+        env::set_var("ENABLE_ADAPTIVE_RANK_TRAINING", "false");
+        assert!(!crate::adaptive_rank_training_enabled());
         // Independent toggles.
         env::set_var("ENABLE_ADAPTIVE_RANK", "1");
         assert!(crate::adaptive_rank_enabled());

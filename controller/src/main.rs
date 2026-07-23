@@ -635,10 +635,11 @@ async fn main() -> anyhow::Result<()> {
         bg_shutdown_rx.clone(),
     );
 
-    // Phase 3b: autonomous actor-memory consolidation. Default-OFF
-    // (ENABLE_MEMORY_CONSOLIDATION) — spawn_* returns without a task when
-    // disabled. Tier-1 actors only consolidate on the shared Ollama transport
-    // (or Skip); the tier gate is the shared ActorRepository decision.
+    // Phase 3b: autonomous actor-memory consolidation. Default-ON (Tier 3,
+    // ENABLE_MEMORY_CONSOLIDATION) — spawn_* returns without a task when
+    // disabled. LOCAL-FIRST: summarizes on the on-host Ollama for all tiers when
+    // reachable (external is a budget-gated fallback); tier-1 actors only
+    // consolidate on Ollama when attested, else Skip (shared tier gate).
     talos_memory_consolidation::spawn_memory_consolidation_scheduler(
         db_pool.clone(),
         talos_actor_repository::ActorRepository::new(db_pool.clone()),
@@ -647,10 +648,11 @@ async fn main() -> anyhow::Result<()> {
         bg_shutdown_rx.clone(),
     );
 
-    // Phase 3: autonomous actor-memory REFLECTION. Default-OFF
-    // (ENABLE_MEMORY_REFLECTION) — spawn_* returns without a task when disabled.
+    // Phase 3: autonomous actor-memory REFLECTION. Default-ON (Tier 3,
+    // ENABLE_MEMORY_REFLECTION) — spawn_* returns without a task when disabled.
     // Reads across an actor's meaningful memories and synthesizes higher-order
-    // insights via the SAME tier gate (tier-1 → local Ollama only, or Skip),
+    // insights LOCAL-FIRST (on-host Ollama for all tiers when reachable; external
+    // is a budget-gated fallback; tier-1 → local only when attested, else Skip),
     // writing ONE non-destructive `reflection`-kind semantic memory. Distinct
     // rotation cursor (last_reflected_at) from consolidation.
     talos_memory_consolidation::spawn_memory_reflection_scheduler(
@@ -661,10 +663,11 @@ async fn main() -> anyhow::Result<()> {
         bg_shutdown_rx.clone(),
     );
 
-    // Adaptive per-actor memory ranking — Phase 2 (learned ranker). Default-OFF
-    // (ENABLE_ADAPTIVE_RANK_TRAINING) — spawn_* returns without a task when
-    // disabled. Pure numeric fit over the Phase-1 provenance corpus: no LLM, no
-    // secrets, no tier gate (zero data egress).
+    // Adaptive per-actor memory ranking — Phase 2 (learned ranker). Default-ON
+    // (Tier 3, ENABLE_ADAPTIVE_RANK_TRAINING) — spawn_* returns without a task
+    // when disabled. Pure numeric fit over the Phase-1 provenance corpus: no LLM,
+    // no secrets, no tier gate (zero data egress). Cold-start fail-closed to
+    // global weights until an actor has enough labeled examples.
     talos_memory_ranking::spawn_rank_training_scheduler(
         db_pool.clone(),
         talos_actor_repository::ActorRepository::new(db_pool.clone()),
