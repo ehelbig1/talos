@@ -744,7 +744,10 @@ impl OllamaClient {
         );
         match self.chat(model, body).await {
             Ok(text) => Ok(text),
-            Err(e) if e.to_string().contains("HTTP 4") => {
+            // Retry WITHOUT `think` only on a 400 — the model rejected the
+            // `think` field (not all Ollama models support it). Narrow to 400
+            // so a 401/404/429 fails fast instead of a wasted second call.
+            Err(e) if e.to_string().contains("HTTP 400") => {
                 let body = build_chat_body(
                     model,
                     system_prompt,
@@ -785,7 +788,10 @@ impl OllamaClient {
         );
         match self.chat(model, body).await {
             Ok(text) => Ok(text),
-            Err(e) if e.to_string().contains("HTTP 4") => {
+            // Retry WITHOUT `think` only on a 400 — the model rejected the
+            // `think` field (not all Ollama models support it). Narrow to 400
+            // so a 401/404/429 fails fast instead of a wasted second call.
+            Err(e) if e.to_string().contains("HTTP 400") => {
                 let body = build_chat_body(
                     model,
                     system_prompt,
