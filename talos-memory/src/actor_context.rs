@@ -290,7 +290,10 @@ pub fn recency_decay(age_days: f64, half_life_days: f64) -> f64 {
 
 /// The recency component of a candidate's fused score: [`recency_decay`] of
 /// its age when it has an `updated_at`, else [`NEUTRAL_RECENCY`].
-fn recency_component(c: &Candidate, now: DateTime<Utc>, half_life_days: f64) -> f64 {
+///
+/// `pub` so provenance recording (Phase 1 of adaptive memory ranking) can
+/// snapshot the SAME recency feature the ranker used — no re-derivation drift.
+pub fn recency_component(c: &Candidate, now: DateTime<Utc>, half_life_days: f64) -> f64 {
     match c.updated_at {
         Some(ts) => {
             let age_days = (now - ts).num_seconds() as f64 / 86_400.0;

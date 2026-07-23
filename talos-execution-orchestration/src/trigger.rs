@@ -282,6 +282,13 @@ impl ExecutionOrchestrationService {
             )));
         }
 
+        // Mint the execution id EARLY (before step 8) so actor-context
+        // injection can stamp memory-rank provenance rows with it. This is
+        // just UUID generation — the execution row INSERT stays at step 11
+        // and reuses this same id. Flag-off, the only observable effect is
+        // that the id exists a few lines sooner (inert).
+        let execution_id = Uuid::new_v4();
+
         // 8. Optional actor-context injection. Mutates the payload in
         // place under `__actor_context__`; only fires when the caller
         // explicitly opts in. The 50-memory cap mirrors the inline
@@ -295,6 +302,7 @@ impl ExecutionOrchestrationService {
             inject_memory_context,
             max_memories,
             wf_record.description.as_deref(),
+            Some(execution_id),
         )
         .await;
 
@@ -318,9 +326,10 @@ impl ExecutionOrchestrationService {
             .resolve_root_from_parent(parent_execution_id, user_id)
             .await;
 
-        // 11. Mint the execution row. Priority comes from the graph
+        // 11. Mint the execution row. `execution_id` was generated above
+        // (step 8) so provenance recording could reference it; the row
+        // INSERT below uses that same id. Priority comes from the graph
         // metadata if present, defaulting to "normal".
-        let execution_id = Uuid::new_v4();
         let priority = serde_json::from_str::<serde_json::Value>(&graph_json)
             .ok()
             .and_then(|v| {

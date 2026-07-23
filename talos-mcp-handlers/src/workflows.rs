@@ -2975,6 +2975,8 @@ async fn handle_test_workflow_draft(
             inject_context,
             max_memories,
             wf_description.as_deref(),
+            // Draft/test path — no durable execution to key provenance to.
+            None,
         )
         .await;
     }
@@ -5541,6 +5543,7 @@ async fn handle_trigger_workflow_as_actors(
                     actor_id,
                     max_memories,
                     wf_record.description.as_deref(),
+                    None,
                 )
                 .await
             {
@@ -6291,6 +6294,8 @@ async fn handle_test_workflow(
             inject_context,
             max_memories,
             test_wf_record.description.as_deref(),
+            // Test path — no durable execution to key provenance to.
+            None,
         )
         .await;
     }
