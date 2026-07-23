@@ -2977,6 +2977,8 @@ async fn handle_test_workflow_draft(
             wf_description.as_deref(),
             // Draft/test path — no durable execution to key provenance to.
             None,
+            // Explicit caller opt-in (a test invocation) → Full scope.
+            talos_workflow_repository::MemoryScope::Full,
         )
         .await;
     }
@@ -5544,6 +5546,8 @@ async fn handle_trigger_workflow_as_actors(
                     max_memories,
                     wf_record.description.as_deref(),
                     None,
+                    // Per-actor auto-injection → curated scope (secure default).
+                    talos_workflow_repository::MemoryScope::Curated,
                 )
                 .await
             {
@@ -6296,6 +6300,8 @@ async fn handle_test_workflow(
             test_wf_record.description.as_deref(),
             // Test path — no durable execution to key provenance to.
             None,
+            // Explicit caller opt-in (a test invocation) → Full scope.
+            talos_workflow_repository::MemoryScope::Full,
         )
         .await;
     }

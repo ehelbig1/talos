@@ -12,6 +12,38 @@ use crate::*;
 // `get_actor_memories` (read from non-existent `actor_memories`
 // plural table). For live reads use `talos_memory::list_memories`.
 
+/// Which memory types are eligible for injection into `__actor_context__`.
+///
+/// The distinction is a SECURITY control: `working` memory is short-lived
+/// scratch where a workflow might stash a transient token, so grounding-BY-
+/// DEFAULT must not surface it into an execution trace. `Curated` is therefore
+/// the default for auto-injection; `Full` is reserved for callers who pass
+/// `inject_memory_context=true` deliberately (the trigger tool docs warn that
+/// working/episodic memory can carry sensitive values that land in traces).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MemoryScope {
+    /// Durable, curated memory only: `semantic` + `episodic` (persona, daily
+    /// briefs, meeting prep, consolidated facts). Excludes `working` (and
+    /// `scratchpad`, which the retriever already drops). The secure default.
+    #[default]
+    Curated,
+    /// All live memory types, including `working`. Deliberate opt-in.
+    Full,
+}
+
+/// Drop memory rows outside the [`MemoryScope`]. `Curated` removes `working`
+/// rows (`scratchpad` is already excluded upstream by the retriever); `Full`
+/// is a no-op. Pure so the scope boundary is unit-testable.
+pub(crate) fn apply_memory_scope(
+    mut rows: Vec<(String, serde_json::Value, String)>,
+    scope: MemoryScope,
+) -> Vec<(String, serde_json::Value, String)> {
+    if scope == MemoryScope::Curated {
+        rows.retain(|(_, _, memory_type)| memory_type != "working");
+    }
+    rows
+}
+
 impl WorkflowRepository {
     // ── Actor memory (actor_memory table with memory_type) ─────────────────
 
@@ -43,7 +75,26 @@ impl WorkflowRepository {
     /// their ranking-feature snapshot) when `ENABLE_MEMORY_RANK_PROVENANCE` is
     /// on. `None` (draft/test/scheduler/sub-workflow paths) skips provenance —
     /// the ranking output is unaffected either way.
+    ///
+    /// `scope` bounds which memory TYPES are eligible (see [`MemoryScope`]):
+    /// auto-injection passes `Curated` (durable semantic+episodic only, the
+    /// secure default), while an explicit caller opt-in passes `Full`.
     pub async fn get_relevant_actor_context(
+        &self,
+        actor_id: Uuid,
+        limit: usize,
+        context_hint: Option<&str>,
+        execution_id: Option<Uuid>,
+        scope: MemoryScope,
+    ) -> Result<Vec<(String, serde_json::Value, String)>> {
+        let rows = self
+            .get_relevant_actor_context_unscoped(actor_id, limit, context_hint, execution_id)
+            .await?;
+        Ok(apply_memory_scope(rows, scope))
+    }
+
+    /// Inner retriever, scope-unaware. See [`Self::get_relevant_actor_context`].
+    async fn get_relevant_actor_context_unscoped(
         &self,
         actor_id: Uuid,
         limit: usize,
@@ -438,7 +489,8 @@ impl WorkflowRepository {
         actor_id: Uuid,
         limit: usize,
     ) -> Result<Vec<(String, serde_json::Value, String)>> {
-        self.get_relevant_actor_context(actor_id, limit, None, None)
+        // Legacy helper explicitly about working/episodic memory → Full scope.
+        self.get_relevant_actor_context(actor_id, limit, None, None, MemoryScope::Full)
             .await
     }
 
@@ -454,5 +506,44 @@ impl WorkflowRepository {
         talos_memory::persist_memory(&self.db_pool, actor_id, key, value, "scratchpad", None)
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod memory_scope_tests {
+    use super::{apply_memory_scope, MemoryScope};
+    use serde_json::json;
+
+    fn rows() -> Vec<(String, serde_json::Value, String)> {
+        vec![
+            ("persona".into(), json!({}), "semantic".into()),
+            ("daily_brief/latest".into(), json!({}), "episodic".into()),
+            ("scratch_token".into(), json!({}), "working".into()),
+        ]
+    }
+
+    #[test]
+    fn curated_drops_working_keeps_semantic_and_episodic() {
+        let out = apply_memory_scope(rows(), MemoryScope::Curated);
+        let types: Vec<&str> = out.iter().map(|(_, _, t)| t.as_str()).collect();
+        assert!(types.contains(&"semantic"));
+        assert!(types.contains(&"episodic"));
+        assert!(
+            !types.contains(&"working"),
+            "working must be dropped in Curated"
+        );
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn full_keeps_everything() {
+        let out = apply_memory_scope(rows(), MemoryScope::Full);
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().any(|(_, _, t)| t == "working"));
+    }
+
+    #[test]
+    fn default_is_curated() {
+        assert_eq!(MemoryScope::default(), MemoryScope::Curated);
     }
 }

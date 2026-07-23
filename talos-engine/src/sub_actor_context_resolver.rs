@@ -54,7 +54,14 @@ impl SubworkflowActorContextResolver for ControllerSubActorContextResolver {
         // pick the same memories that a direct trigger would have picked.
         let memories = self
             .workflow_repo
-            .get_relevant_actor_context(actor_id, 20, workflow.description.as_deref(), None)
+            .get_relevant_actor_context(
+                actor_id,
+                20,
+                workflow.description.as_deref(),
+                None,
+                // Auto-injection into a sub-workflow → curated scope (secure default).
+                talos_workflow_repository::MemoryScope::Curated,
+            )
             .await
             .ok()?;
 

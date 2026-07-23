@@ -3911,7 +3911,15 @@ async fn handle_preview_actor_context(
 
     let memories = match state
         .workflow_repo
-        .get_relevant_actor_context(actor_id, max_memories, context_hint, None)
+        // Preview mirrors the EXPLICIT `inject_memory_context=true` contract this
+        // tool documents → Full scope (shows the complete available set).
+        .get_relevant_actor_context(
+            actor_id,
+            max_memories,
+            context_hint,
+            None,
+            talos_workflow_repository::MemoryScope::Full,
+        )
         .await
     {
         Ok(rows) => rows,
