@@ -1134,6 +1134,12 @@ pub const SYNTHETIC_MEMORY_KINDS: &[&str] = &[
     "capability_dispatch",
     "ml_digest",
     "commitment_check",
+    // Phase 3 reflection: higher-order self-inferences synthesized by the
+    // reflection loop. Excluded from grounding recall so the LLM never grounds
+    // on its OWN prior inferences (feedback-amplification guard). Reflections
+    // remain accessible via explicit `actor_recall`/`actor_recall_semantic`,
+    // which do NOT apply this exclusion.
+    "reflection",
 ];
 
 /// [`SYNTHETIC_MEMORY_KINDS`] as an owned `Vec<String>` for the
@@ -2476,6 +2482,95 @@ pub async fn scan_consolidation_candidates(
         out.push((key, value, memory_type));
     }
     Ok(out)
+}
+
+/// Scan an actor's MEANINGFUL memories for the autonomous reflection loop
+/// (Phase 3). Returns decrypted `(key, value, memory_type)` for the most
+/// recently updated `semantic`+`episodic` memories the actor holds — the
+/// substrate the reflection LLM synthesizes higher-order insights over.
+///
+/// What it INCLUDES / EXCLUDES:
+/// * `memory_type IN ('semantic','episodic')` — NOT `scratchpad`/`working`,
+///   which are ephemeral bookkeeping with no reflective value.
+/// * Excludes every synthetic kind in `exclude_kinds` (pass
+///   [`synthetic_memory_kinds`], which now contains `"reflection"`) via the
+///   SAME NULL-safe `metadata->>'kind' != ALL($N)` predicate the recall APIs
+///   use. Excluding `"reflection"` is ESSENTIAL: reflecting over prior
+///   reflections would drift/amplify the model's own inferences.
+/// * Only live rows (`expires_at IS NULL OR expires_at > now()`).
+/// * `ORDER BY updated_at DESC` (most recent context first), `LIMIT $N`.
+///
+/// Actor-scoped (`WHERE actor_id = $1`) and fail-loud (`try_get::<_,_>()?`)
+/// throughout; value decrypts through the canonical AAD-aware
+/// [`decrypt_row_value`] helper (projects `actor_id`/`value_format`).
+pub async fn scan_reflection_input(
+    pool: &Pool<Postgres>,
+    actor_id: Uuid,
+    exclude_kinds: &[String],
+    limit: i64,
+) -> Result<Vec<(String, serde_json::Value, String)>> {
+    let limit = limit.clamp(1, MAX_LIST_LIMIT);
+    let sql = "SELECT actor_id, key, value_enc, value_key_id, value_format, memory_type \
+               FROM actor_memory \
+               WHERE actor_id = $1 \
+                 AND memory_type IN ('semantic', 'episodic') \
+                 AND (expires_at IS NULL OR expires_at > now()) \
+                 AND (cardinality($2::text[]) = 0 \
+                      OR metadata IS NULL \
+                      OR metadata->>'kind' IS NULL \
+                      OR metadata->>'kind' != ALL($2::text[])) \
+               ORDER BY updated_at DESC \
+               LIMIT $3";
+    let rows = sqlx::query(sql)
+        .bind(actor_id)
+        .bind(exclude_kinds)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .context("scan_reflection_input query")?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        // Fail-loud reads (checks 52/55); value decrypts through the canonical
+        // AAD-aware helper (fails loud on projection drift).
+        let key: String = row.try_get::<String, _>("key")?;
+        let memory_type: String = row.try_get::<String, _>("memory_type")?;
+        let value = decrypt_row_value(row).await?;
+        out.push((key, value, memory_type));
+    }
+    Ok(out)
+}
+
+/// Persist a reflection as a NON-DESTRUCTIVE `semantic` memory (Phase 3).
+///
+/// Reflection AUGMENTS — unlike [`consolidate_memory`], which atomically
+/// forgets its source rows, this writes ONE new memory and DELETES NOTHING.
+/// It is a thin wrapper over [`persist_memory_with_metadata`] pinned to
+/// `memory_type = "semantic"` (semantic memories ignore TTL, so the reflection
+/// is durable), which routes through the canonical always-encrypt path
+/// (per-org DEK, AAD bound to `(actor_id, key)`). Callers pass
+/// `key = "reflection/latest"` so the single current reflection per actor is
+/// OVERWRITTEN each cycle (the `ON CONFLICT (actor_id, key)` upsert refreshes
+/// it) rather than accumulating unboundedly — mirroring the `daily_brief/latest`
+/// convention.
+pub async fn persist_reflection(
+    pool: &Pool<Postgres>,
+    actor_id: Uuid,
+    key: &str,
+    value: serde_json::Value,
+    metadata: serde_json::Value,
+) -> Result<()> {
+    persist_memory_with_metadata(
+        pool,
+        actor_id,
+        key,
+        &value,
+        Some(&metadata),
+        "semantic",
+        None,
+    )
+    .await
+    .map(|_outcome| ())
 }
 
 /// Measure the on-disk text size of a memory entry's `value` column,

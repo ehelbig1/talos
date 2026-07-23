@@ -713,6 +713,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_memory_reflection_config() {
+        let _g = env_lock();
+        for v in [
+            "ENABLE_MEMORY_REFLECTION",
+            "MEMORY_REFLECTION_TIER1_LOCAL_OK",
+            "MEMORY_REFLECTION_INTERVAL_SECS",
+            "MEMORY_REFLECTION_INPUT_CAP",
+            "MEMORY_REFLECTION_MIN_MEMORIES",
+            "MEMORY_REFLECTION_MAX_ACTORS_PER_TICK",
+            "MEMORY_REFLECTION_MODEL",
+        ] {
+            env::remove_var(v);
+        }
+        // Master switch + attestation default OFF; honour truthy tokens.
+        assert!(!crate::memory_reflection_enabled());
+        assert!(!crate::memory_reflection_tier1_local_ok());
+        env::set_var("ENABLE_MEMORY_REFLECTION", "on");
+        assert!(crate::memory_reflection_enabled());
+        env::set_var("MEMORY_REFLECTION_TIER1_LOCAL_OK", "true");
+        assert!(crate::memory_reflection_tier1_local_ok());
+
+        // Numeric defaults (daily cadence).
+        assert_eq!(crate::memory_reflection_interval_secs(), 86_400);
+        assert_eq!(crate::memory_reflection_input_cap(), 40);
+        assert_eq!(crate::memory_reflection_min_memories(), 8);
+        assert_eq!(crate::memory_reflection_max_actors_per_tick(), 25);
+        assert_eq!(crate::memory_reflection_model(), "qwen2.5:7b");
+
+        // Destructive-zero / clamp guards.
+        env::set_var("MEMORY_REFLECTION_INTERVAL_SECS", "0");
+        assert_eq!(crate::memory_reflection_interval_secs(), 86_400);
+        // Input cap clamps to [5, 200].
+        env::set_var("MEMORY_REFLECTION_INPUT_CAP", "1");
+        assert_eq!(crate::memory_reflection_input_cap(), 5);
+        env::set_var("MEMORY_REFLECTION_INPUT_CAP", "9999");
+        assert_eq!(crate::memory_reflection_input_cap(), 200);
+        // Min-memories clamps to [3, 100].
+        env::set_var("MEMORY_REFLECTION_MIN_MEMORIES", "1");
+        assert_eq!(crate::memory_reflection_min_memories(), 3);
+        env::set_var("MEMORY_REFLECTION_MIN_MEMORIES", "9999");
+        assert_eq!(crate::memory_reflection_min_memories(), 100);
+        // Actors-per-tick clamps to [1, 500].
+        env::set_var("MEMORY_REFLECTION_MAX_ACTORS_PER_TICK", "99999");
+        assert_eq!(crate::memory_reflection_max_actors_per_tick(), 500);
+        // Blank model falls back to the default.
+        env::set_var("MEMORY_REFLECTION_MODEL", "   ");
+        assert_eq!(crate::memory_reflection_model(), "qwen2.5:7b");
+        env::set_var("MEMORY_REFLECTION_MODEL", "llama3.1:8b");
+        assert_eq!(crate::memory_reflection_model(), "llama3.1:8b");
+
+        for v in [
+            "ENABLE_MEMORY_REFLECTION",
+            "MEMORY_REFLECTION_TIER1_LOCAL_OK",
+            "MEMORY_REFLECTION_INTERVAL_SECS",
+            "MEMORY_REFLECTION_INPUT_CAP",
+            "MEMORY_REFLECTION_MIN_MEMORIES",
+            "MEMORY_REFLECTION_MAX_ACTORS_PER_TICK",
+            "MEMORY_REFLECTION_MODEL",
+        ] {
+            env::remove_var(v);
+        }
+    }
+
     /// Memory-rank provenance flag defaults OFF and honours truthy tokens.
     #[test]
     fn test_memory_rank_provenance_enabled_default_off() {

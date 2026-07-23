@@ -450,6 +450,17 @@ services:
       MEMORY_CONSOLIDATION_BATCH_SIZE: ${MEMORY_CONSOLIDATION_BATCH_SIZE:-}
       MEMORY_CONSOLIDATION_MAX_ACTORS_PER_TICK: ${MEMORY_CONSOLIDATION_MAX_ACTORS_PER_TICK:-}
       MEMORY_CONSOLIDATION_MODEL: ${MEMORY_CONSOLIDATION_MODEL:-}
+      # Autonomous memory REFLECTION — Phase 3. Default-OFF: when
+      # ENABLE_MEMORY_REFLECTION is unset the scheduler is not spawned.
+      # Reflection AUGMENTS (writes one reflection/latest semantic memory,
+      # deletes nothing). Separate tier-1 attestation from consolidation.
+      ENABLE_MEMORY_REFLECTION: ${ENABLE_MEMORY_REFLECTION:-}
+      MEMORY_REFLECTION_TIER1_LOCAL_OK: ${MEMORY_REFLECTION_TIER1_LOCAL_OK:-}
+      MEMORY_REFLECTION_INTERVAL_SECS: ${MEMORY_REFLECTION_INTERVAL_SECS:-}
+      MEMORY_REFLECTION_INPUT_CAP: ${MEMORY_REFLECTION_INPUT_CAP:-}
+      MEMORY_REFLECTION_MIN_MEMORIES: ${MEMORY_REFLECTION_MIN_MEMORIES:-}
+      MEMORY_REFLECTION_MAX_ACTORS_PER_TICK: ${MEMORY_REFLECTION_MAX_ACTORS_PER_TICK:-}
+      MEMORY_REFLECTION_MODEL: ${MEMORY_REFLECTION_MODEL:-}
       # Adaptive per-actor memory ranking — Phase 1 (provenance). Default-OFF:
       # when ENABLE_MEMORY_RANK_PROVENANCE is unset no provenance rows are
       # written and the retention sweep loop is not spawned.

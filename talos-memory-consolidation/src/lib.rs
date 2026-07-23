@@ -319,6 +319,281 @@ async fn run_consolidation_tick(
     Ok(())
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// Phase 3: the REFLECTION loop
+//
+// A daily per-actor background loop that reads across an actor's meaningful
+// (semantic+episodic) memories and synthesizes HIGHER-ORDER INSIGHTS —
+// recurring themes, evolving priorities, relationships, open threads — via the
+// SAME tier-gated LLM matrix as consolidation. Unlike consolidation it is
+// NON-DESTRUCTIVE: it writes ONE new `reflection`-kind semantic memory and
+// deletes NOTHING (reflection AUGMENTS; consolidation retires). The input scan
+// EXCLUDES prior reflections (and all synthetic kinds) so the loop never
+// reflects on its own inferences (drift guard), and `"reflection"` is in
+// `talos_memory::SYNTHETIC_MEMORY_KINDS` so reflections are excluded from
+// grounding recall (feedback-amplification guard).
+//
+// The tier gate is REUSED VERBATIM (`plan_action` / `PlannedAction` /
+// `llm_tier_decision_from_tier_str`): a tier-1 actor's memory is reflected on
+// LOCAL Ollama ONLY, or Skipped — the external `LlmClient` is constructed ONLY
+// on the `SummarizeExternal` branch, exactly as in consolidation.
+// ════════════════════════════════════════════════════════════════════════
+
+/// Max tokens for the reflection generation (both backends). Larger than the
+/// consolidation summary — reflection emits a structured multi-field insight
+/// set, not one paragraph.
+const REFLECTION_MAX_TOKENS: u32 = 1536;
+
+/// The single durable reflection key per actor. OVERWRITTEN each cycle (the
+/// `ON CONFLICT (actor_id, key)` upsert in `persist_reflection` refreshes it)
+/// so reflections don't accumulate unboundedly — mirrors `daily_brief/latest`.
+const REFLECTION_KEY: &str = "reflection/latest";
+
+/// Build the (system, user) prompt for the reflection synthesizer.
+/// Deterministic given the memory set (unit-testable). The set of
+/// `(key, value, memory_type)` rows is serialized compactly and byte-capped so
+/// a pathological actor can't blow the model's context (same cap shape as
+/// [`build_consolidation_prompt`]).
+pub fn build_reflection_prompt(
+    memories: &[(String, serde_json::Value, String)],
+) -> (String, String) {
+    let system = "You are a reflective analyst studying a person's accumulated work/life memories. \
+Identify HIGHER-ORDER INSIGHTS — recurring themes, evolving priorities/goals, relationships between \
+people/projects, and open threads/loose ends. Do NOT merely summarize; INFER what matters and what's \
+changing. Return JSON: {\"insights\": [\"...\"], \"themes\": [\"...\"], \"open_threads\": [\"...\"]}."
+        .to_string();
+
+    const MAX_USER_PROMPT_BYTES: usize = 24_000;
+    let mut items = Vec::with_capacity(memories.len());
+    for (key, value, _mtype) in memories {
+        items.push(serde_json::json!({ "key": key, "value": value }));
+    }
+    let mut user = serde_json::to_string(&serde_json::json!({ "memories": items }))
+        .unwrap_or_else(|_| "{\"memories\":[]}".to_string());
+    if user.len() > MAX_USER_PROMPT_BYTES {
+        let mut end = MAX_USER_PROMPT_BYTES;
+        while end > 0 && !user.is_char_boundary(end) {
+            end -= 1;
+        }
+        user.truncate(end);
+    }
+    (system, user)
+}
+
+/// Parse the LLM reflection output into the semantic value payload. Tolerant of
+/// non-JSON output: a raw string that doesn't parse as a JSON object is wrapped
+/// as `{"insights": [<raw>]}` so reflection never fails on a chatty model.
+pub fn parse_reflection(raw: &str) -> serde_json::Value {
+    let trimmed = raw.trim();
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(v) if v.is_object() => v,
+        _ => serde_json::json!({ "insights": [trimmed] }),
+    }
+}
+
+/// Spawn the reflection scheduler. Default-OFF: when
+/// [`talos_config::memory_reflection_enabled`] is false, logs once and returns
+/// WITHOUT spawning a task (zero background overhead).
+///
+/// `ollama = None` disables the local backend (tier-1 actors then Skip); the
+/// external path is unaffected.
+pub fn spawn_memory_reflection_scheduler(
+    pool: PgPool,
+    actor_repo: ActorRepository,
+    ollama: Option<Arc<OllamaClient>>,
+    secrets_manager: Arc<SecretsManager>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    if !talos_config::memory_reflection_enabled() {
+        tracing::info!(
+            target: "talos_memory_reflection",
+            "memory reflection disabled (ENABLE_MEMORY_REFLECTION unset); scheduler not spawned"
+        );
+        return;
+    }
+
+    // Misconfiguration guard: if the input cap is below the min-memories floor,
+    // `scan_reflection_input` can never return enough rows to clear the floor,
+    // so reflection silently no-ops for every actor. Warn loudly rather than
+    // leaving the operator to wonder why nothing reflects.
+    let cap = talos_config::memory_reflection_input_cap();
+    let min = talos_config::memory_reflection_min_memories();
+    if cap < min {
+        tracing::warn!(
+            target: "talos_memory_reflection",
+            input_cap = cap,
+            min_memories = min,
+            "MEMORY_REFLECTION_INPUT_CAP < MEMORY_REFLECTION_MIN_MEMORIES — reflection will \
+             never reach the floor and no actor will ever be reflected; raise the input cap"
+        );
+    }
+
+    let interval_secs = talos_config::memory_reflection_interval_secs();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tracing::info!(
+            target: "talos_memory_reflection",
+            interval_secs,
+            ollama_configured = ollama.is_some(),
+            tier1_local_ok = talos_config::memory_reflection_tier1_local_ok(),
+            "memory reflection scheduler active"
+        );
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown_rx.changed() => {
+                    tracing::info!(target: "talos_memory_reflection", "memory reflection scheduler shutting down");
+                    break;
+                }
+                _ = interval.tick() => {
+                    if let Err(e) = run_reflection_tick(&pool, &actor_repo, ollama.as_ref(), &secrets_manager).await {
+                        tracing::warn!(target: "talos_memory_reflection", error = %e, "reflection tick failed; retrying next interval");
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// One reflection pass over the fleet. Scans up to `max_actors_per_tick` active
+/// actors (least-recently-reflected first); for each, resolves the shared tier
+/// decision, scans meaningful memories, and — only when [`plan_action`] permits
+/// — synthesizes insights and writes ONE non-destructive reflection. Every LLM,
+/// parse, or write failure logs and continues with ZERO source deletion (there
+/// are no sources to delete — reflection never deletes).
+async fn run_reflection_tick(
+    pool: &PgPool,
+    actor_repo: &ActorRepository,
+    ollama: Option<&Arc<OllamaClient>>,
+    secrets_manager: &Arc<SecretsManager>,
+) -> anyhow::Result<()> {
+    let tier1_local_ok = talos_config::memory_reflection_tier1_local_ok();
+    let input_cap = talos_config::memory_reflection_input_cap();
+    let min_memories = talos_config::memory_reflection_min_memories();
+    let max_actors = talos_config::memory_reflection_max_actors_per_tick();
+    let model = talos_config::memory_reflection_model();
+    let exclude_kinds = talos_memory::synthetic_memory_kinds();
+
+    let actors = actor_repo.scan_actors_for_reflection(max_actors).await?;
+    tracing::debug!(target: "talos_memory_reflection", actor_count = actors.len(), "reflection tick scanning actors");
+
+    // Every actor the scan surfaced is stamped at tick end so the rotation
+    // cursor advances — whether it reflected, skipped on the tier gate, or had
+    // too few memories. Without this the sweep would revisit the same
+    // lowest-cursor actors forever and starve the rest.
+    let swept_ids: Vec<uuid::Uuid> = actors.iter().map(|a| a.actor_id).collect();
+
+    for actor in actors {
+        let actor_id = actor.actor_id;
+        // Shared fail-closed tier gate — the SAME pure matrix consolidation and
+        // graph-RAG use. A corrupt tier string maps to Tier1 → Skip; it can
+        // never yield External.
+        let decision = talos_actor_repository::llm_tier_decision_from_tier_str(
+            &actor.max_llm_tier,
+            tier1_local_ok,
+            ollama.is_some(),
+        );
+
+        // Scan meaningful memories (semantic+episodic, synthetic+reflection
+        // EXCLUDED — reflecting on prior reflections would drift).
+        let memories = match talos_memory::scan_reflection_input(
+            pool,
+            actor_id,
+            &exclude_kinds,
+            input_cap,
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(target: "talos_memory_reflection", %actor_id, error = %e, "reflection input scan failed; skipping actor");
+                continue;
+            }
+        };
+
+        let action = plan_action(decision, memories.len(), min_memories);
+        if action == PlannedAction::Skip {
+            tracing::debug!(
+                target: "talos_memory_reflection",
+                %actor_id,
+                ?decision,
+                memories = memories.len(),
+                "skipping actor (tier gate Skip or too few memories); no LLM, no write"
+            );
+            continue;
+        }
+
+        let (system, user) = build_reflection_prompt(&memories);
+
+        // Generate the reflection. SECURITY: the external `LlmClient` is
+        // constructed ONLY on the SummarizeExternal branch — a LocalOnly/Skip
+        // actor's content never reaches Anthropic.
+        let raw = match action {
+            PlannedAction::SummarizeLocal => {
+                let Some(ollama) = ollama else {
+                    tracing::warn!(target: "talos_memory_reflection", %actor_id, "local reflection planned but ollama unavailable; skipping");
+                    continue;
+                };
+                match ollama
+                    .complete_structured(&model, &system, &user, REFLECTION_MAX_TOKENS)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(target: "talos_memory_reflection", %actor_id, error = %e, "local LLM reflection failed; no write");
+                        continue;
+                    }
+                }
+            }
+            PlannedAction::SummarizeExternal => {
+                let client = talos_llm::LlmClient::with_vault(secrets_manager.clone(), None);
+                match client.generate_text(&system, &user).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(target: "talos_memory_reflection", %actor_id, error = %e, "external LLM reflection failed; no write");
+                        continue;
+                    }
+                }
+            }
+            PlannedAction::Skip => continue, // handled above; unreachable
+        };
+
+        let source_count = memories.len();
+        let value = parse_reflection(&raw);
+        let metadata = serde_json::json!({
+            "kind": "reflection",
+            "source_count": source_count,
+            "reflected_at": chrono::Utc::now().to_rfc3339(),
+        });
+
+        // NON-DESTRUCTIVE write: one new semantic memory at `reflection/latest`,
+        // encrypted via the per-org DEK/AAD path. NOTHING is deleted.
+        match talos_memory::persist_reflection(pool, actor_id, REFLECTION_KEY, value, metadata)
+            .await
+        {
+            Ok(()) => tracing::info!(
+                target: "talos_memory_reflection",
+                %actor_id,
+                source_count,
+                reflection_key = REFLECTION_KEY,
+                "wrote reflection insight (non-destructive; sources intact)"
+            ),
+            Err(e) => {
+                tracing::warn!(target: "talos_memory_reflection", %actor_id, error = %e, "persist_reflection failed; no write")
+            }
+        }
+    }
+
+    // Advance the reflection rotation cursor for every actor this tick examined
+    // so the next tick moves on to the least-recently-reflected actors.
+    // Best-effort — a failure only means a repeat next tick.
+    if let Err(e) = actor_repo.mark_actors_reflected(&swept_ids).await {
+        tracing::warn!(target: "talos_memory_reflection", error = %e, "failed to advance reflection rotation cursor");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,5 +718,101 @@ mod tests {
         )];
         let (_s, u) = build_consolidation_prompt(&batch);
         assert!(u.len() <= 24_000);
+    }
+
+    // ── Reflection helpers ──────────────────────────────────────────────
+
+    #[test]
+    fn reflection_plan_action_reuses_tier_gate() {
+        // The reflection loop reuses `plan_action` verbatim: a tier-1 actor
+        // whose gate resolves LocalOnly NEVER routes external; a Skip gate
+        // never summarizes regardless of memory count; the floor is
+        // min_memories.
+        assert_eq!(
+            plan_action(LlmTierDecision::LocalOnly, 10, 8),
+            PlannedAction::SummarizeLocal
+        );
+        assert_eq!(
+            plan_action(LlmTierDecision::Skip, 100, 8),
+            PlannedAction::Skip
+        );
+        assert_eq!(
+            plan_action(LlmTierDecision::External, 7, 8),
+            PlannedAction::Skip // below the min-memories floor
+        );
+        assert_eq!(
+            plan_action(LlmTierDecision::External, 8, 8),
+            PlannedAction::SummarizeExternal
+        );
+    }
+
+    #[test]
+    fn parse_reflection_valid_json_object() {
+        let v = parse_reflection(
+            "{\"insights\": [\"prioritizes X\"], \"themes\": [\"growth\"], \"open_threads\": [\"Y\"]}",
+        );
+        assert_eq!(v["insights"][0], "prioritizes X");
+        assert_eq!(v["themes"][0], "growth");
+        assert_eq!(v["open_threads"][0], "Y");
+    }
+
+    #[test]
+    fn parse_reflection_non_json_wraps_as_insight() {
+        let v = parse_reflection("The user is shifting focus toward platform reliability.");
+        assert!(v.is_object());
+        assert_eq!(
+            v["insights"][0],
+            "The user is shifting focus toward platform reliability."
+        );
+    }
+
+    #[test]
+    fn parse_reflection_json_array_wraps() {
+        // A non-object JSON value is wrapped, not passed through.
+        let v = parse_reflection("[1, 2, 3]");
+        assert!(v.is_object());
+        assert_eq!(v["insights"][0], "[1, 2, 3]");
+    }
+
+    #[test]
+    fn reflection_prompt_is_deterministic_and_bounded() {
+        let memories = vec![
+            (
+                "note/1".to_string(),
+                serde_json::json!({"note": "shipped auth refactor"}),
+                "episodic".to_string(),
+            ),
+            (
+                "pref/mode".to_string(),
+                serde_json::json!({"pref": "prefers async reviews"}),
+                "semantic".to_string(),
+            ),
+        ];
+        let (s1, u1) = build_reflection_prompt(&memories);
+        let (s2, u2) = build_reflection_prompt(&memories);
+        assert_eq!(s1, s2);
+        assert_eq!(u1, u2);
+        assert!(s1.contains("HIGHER-ORDER INSIGHTS"));
+        assert!(s1.contains("open_threads"));
+        assert!(u1.contains("shipped auth refactor"));
+        assert!(u1.contains("prefers async reviews"));
+    }
+
+    #[test]
+    fn reflection_prompt_truncates_oversized_input() {
+        let big = "x".repeat(100_000);
+        let memories = vec![(
+            "k".to_string(),
+            serde_json::json!({ "v": big }),
+            "semantic".to_string(),
+        )];
+        let (_s, u) = build_reflection_prompt(&memories);
+        assert!(u.len() <= 24_000);
+    }
+
+    #[test]
+    fn reflection_key_is_stable_latest() {
+        // The single-latest overwrite key must not drift.
+        assert_eq!(REFLECTION_KEY, "reflection/latest");
     }
 }
