@@ -259,6 +259,7 @@ pub async fn start_graph_backfill(
 /// PROVENANCE (which keys + their ranking-feature snapshot) keyed by
 /// execution when `ENABLE_MEMORY_RANK_PROVENANCE` is on. `None` on paths
 /// with no durable execution (draft/test previews) — provenance is skipped.
+#[allow(clippy::too_many_arguments)]
 pub async fn inject_actor_context_into_input(
     workflow_repo: &talos_workflow_repository::WorkflowRepository,
     input: &mut serde_json::Value,
@@ -267,6 +268,7 @@ pub async fn inject_actor_context_into_input(
     max_memories: usize,
     context_hint: Option<&str>,
     execution_id: Option<uuid::Uuid>,
+    scope: talos_workflow_repository::MemoryScope,
 ) {
     if !inject {
         return;
@@ -281,7 +283,7 @@ pub async fn inject_actor_context_into_input(
     // while preserving the best-effort contract that caller code
     // relies on.
     let memories = match workflow_repo
-        .get_relevant_actor_context(actor_id, max_memories, context_hint, execution_id)
+        .get_relevant_actor_context(actor_id, max_memories, context_hint, execution_id, scope)
         .await
     {
         Ok(rows) => rows,

@@ -261,8 +261,8 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         serde_json::json!({
             "name": "trigger_workflow",
             "description": "Trigger (run/execute/fire/start/launch) a workflow by ID asynchronously. Returns the execution_id to check status. Also called: run workflow, execute workflow, fire workflow, start workflow run. For synchronous execution (wait for result) use call_workflow instead. \
-                Memory context injection: when actor_id is set, the actor's recent working and episodic memories (up to max_context_memories, default 10) are automatically injected into the trigger input under __actor_context__. This lets LLM nodes access actor state without explicit memory reads, but increases payload size and fuel consumption proportionally. \
-                IMPORTANT — security: any sensitive values in working/episodic actor memory (API keys, credentials, PII) will appear in the execution input, execution trace, and any get_execution_status output. Use semantic memory or separate secret management for sensitive values, and pass inject_memory_context=false to disable injection entirely.",
+                Memory context injection (grounding-by-default): an ACTOR-BOUND workflow injects its actor's CURATED memory (durable semantic+episodic, up to max_context_memories) into the trigger input under __actor_context__ BY DEFAULT — no flag needed — so LLM nodes ground on actor state without explicit reads. Transient `working` memory is EXCLUDED by default (it can hold short-lived secrets). Pass inject_memory_context=true for the FULL scope (adds working memory — see security note); pass false, or set a top-level `inject_memory: false` in the workflow's graph_json, to disable. Injection increases payload size / fuel proportionally. \
+                IMPORTANT — security: injected memory appears in the execution input, trace, and get_execution_status output (encrypted at rest + DLP-redacted for structured secrets, but free-text is visible to authorized trace readers). The curated default already excludes `working` memory; only pass inject_memory_context=true when that actor's working/episodic memory is known non-sensitive.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2977,6 +2977,8 @@ async fn handle_test_workflow_draft(
             wf_description.as_deref(),
             // Draft/test path — no durable execution to key provenance to.
             None,
+            // Explicit caller opt-in (a test invocation) → Full scope.
+            talos_workflow_repository::MemoryScope::Full,
         )
         .await;
     }
@@ -5544,6 +5546,8 @@ async fn handle_trigger_workflow_as_actors(
                     max_memories,
                     wf_record.description.as_deref(),
                     None,
+                    // Per-actor auto-injection → curated scope (secure default).
+                    talos_workflow_repository::MemoryScope::Curated,
                 )
                 .await
             {
@@ -6296,6 +6300,8 @@ async fn handle_test_workflow(
             test_wf_record.description.as_deref(),
             // Test path — no durable execution to key provenance to.
             None,
+            // Explicit caller opt-in (a test invocation) → Full scope.
+            talos_workflow_repository::MemoryScope::Full,
         )
         .await;
     }

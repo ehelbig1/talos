@@ -89,13 +89,21 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
         // MCP-S2: AAD = module_execution_id binds the ciphertext to
         // this row so an attacker with DB write capability can't swap
         // payload columns across executions.
+        // DLP-redact BEFORE encryption so the AT-REST ciphertext is scrubbed too
+        // — not just the plaintext fallback below. A decrypted trace read
+        // (`get_node_io`) must not surface secret-shaped values that leaked into
+        // a node input (e.g. a token in injected actor memory). Parity with the
+        // output path (`collect_success_output`) and the sibling controller-side
+        // store (`talos-module-executions`). Redaction only rewrites the STORED
+        // copy — the module receives its runtime input over NATS, untouched.
+        let redacted_input = talos_dlp_provider::redact_json(input);
         let bundle = talos_module_payload_encryption::encrypt_payload_bundle(
             self.secrets_manager.as_ref(),
             id,
             // Per-org DEK arc: scope to the execution's tenant org via the parent
             // workflow execution (resolved inside encrypt_payload_bundle).
             Some(workflow_execution_id),
-            Some(input),
+            Some(&redacted_input),
             None,
             None,
         )
@@ -115,10 +123,11 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
         // fix at talos-webhooks/src/lib.rs and at record_completed
         // below.
         let encrypting = bundle.encrypting();
+        // Reuse the already-redacted input for the plaintext-fallback column.
         let redacted_pt_input = if encrypting {
             None
         } else {
-            Some(talos_dlp_provider::redact_json(input))
+            Some(redacted_input)
         };
         let pt_input = redacted_pt_input.as_ref();
 

@@ -289,20 +289,53 @@ impl ExecutionOrchestrationService {
         // that the id exists a few lines sooner (inert).
         let execution_id = Uuid::new_v4();
 
-        // 8. Optional actor-context injection. Mutates the payload in
-        // place under `__actor_context__`; only fires when the caller
-        // explicitly opts in. The 50-memory cap mirrors the inline
-        // handler's clamp to prevent runaway context size.
+        // 8. Actor-context injection — GROUNDING BY DEFAULT (Tier 2). Memory is
+        // injected into `__actor_context__` when the workflow is ACTOR-BOUND
+        // (`wf_record.actor_id`, the binding — NOT the effective/default actor,
+        // whose shared pool would cross-contaminate; this matches the scheduler),
+        // UNLESS the workflow opts out via a top-level `inject_memory: false` in
+        // graph_json — OR when the caller explicitly passed
+        // `inject_memory_context=true`.
+        //
+        // SECURITY: a DEFAULTED injection uses the CURATED scope (durable
+        // semantic+episodic only) so transient `working` memory never lands in
+        // an execution trace by default; an EXPLICIT caller opt-in gets the FULL
+        // scope (the trigger tool docs warn that working memory can carry
+        // sensitive values). Tenancy: `wf_record.actor_id` is the workflow's own
+        // actor (workflow loaded WHERE user_id = caller; actor bound only after
+        // ownership validation), and recall is single-actor — no cross-tenant path.
         let mut input_payload = input_payload_arg;
         let max_memories = 10; // Historical default — keep in lockstep with the inline handler.
+
+        // Parse graph_json ONCE here (reused for `priority` at step 11). Large
+        // graphs make a double-parse wasteful.
+        let graph_val = serde_json::from_str::<serde_json::Value>(&graph_json).ok();
+        let opted_out = graph_val
+            .as_ref()
+            .and_then(|v| v.get("inject_memory"))
+            .and_then(|b| b.as_bool())
+            == Some(false);
+        let explicit = inject_memory_context;
+        let should_inject = !opted_out && (explicit || wf_record.actor_id.is_some());
+        let inject_actor = if explicit {
+            trigger_agent_id.or(wf_record.actor_id)
+        } else {
+            wf_record.actor_id
+        };
+        let inject_scope = if explicit {
+            talos_workflow_repository::MemoryScope::Full
+        } else {
+            talos_workflow_repository::MemoryScope::Curated
+        };
         talos_actor_memory_service::inject_actor_context_into_input(
             &self.workflow_repo,
             &mut input_payload,
-            trigger_agent_id,
-            inject_memory_context,
+            inject_actor,
+            should_inject,
             max_memories,
             wf_record.description.as_deref(),
             Some(execution_id),
+            inject_scope,
         )
         .await;
 
@@ -330,8 +363,8 @@ impl ExecutionOrchestrationService {
         // (step 8) so provenance recording could reference it; the row
         // INSERT below uses that same id. Priority comes from the graph
         // metadata if present, defaulting to "normal".
-        let priority = serde_json::from_str::<serde_json::Value>(&graph_json)
-            .ok()
+        let priority = graph_val
+            .as_ref()
             .and_then(|v| {
                 v.get("priority")
                     .and_then(|p| p.as_str())

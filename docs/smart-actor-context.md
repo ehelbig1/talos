@@ -1,11 +1,39 @@
 # Smart actor-memory context
 
-Bounded, cleaned, node-scoped `__actor_context__` assembly — behind a
-default-OFF flag. When the flag is OFF the behaviour is **byte-identical**
-to the legacy path. **Phase 1** (below) added the byte budget, kind filter,
-min-score floor, and node-scoped injection. **Phase 2** (further down) blends
-the retrieval layers into one fused relevance/recency/importance ranking and
-adds a HyDE toggle.
+Bounded, cleaned, node-scoped `__actor_context__` assembly. **Phase 1** (below)
+added the byte budget, kind filter, min-score floor, and node-scoped injection.
+**Phase 2** (further down) blends the retrieval layers into one fused
+relevance/recency/importance ranking and adds a HyDE toggle.
+
+## Grounding by default (2026-07)
+
+Grounded memory is now the **default**, not opt-in:
+
+- **Assembly** is smart by default — `ENABLE_SMART_MEMORY_CONTEXT` and
+  `ENABLE_ADAPTIVE_RANK` (serving) default **ON** (set `=false` to fall back to
+  the legacy unranked path). So `__actor_context__` is always ranked, kind-
+  filtered, and byte-budgeted; the per-node `needs_memory` gate is therefore
+  active by default (only nodes with `needs_memory != false` receive it).
+- **Recall** is ranker-backed by default — `ENABLE_RANKED_RECALL` defaults **ON**,
+  so the explicit recall path (worker `agent_memory::search`, MCP
+  `actor_recall_*`) routes through the same fused ranker.
+- **Injection is automatic for actor-bound workflows** (Tier 2): a workflow with
+  a bound `actor_id` injects `__actor_context__` **by default** — the direct
+  trigger + GraphQL/UI paths (via `ExecutionOrchestrationService::trigger`), the
+  scheduler, sub-workflows, and `GmailPush` new-executions. The **binding**
+  actor drives it (never the shared user-default actor — that would
+  cross-contaminate memory pools); **resumes** (`ApprovalGate`/
+  `WorkflowSuspension`) never inject.
+  - **Secure default scope = `Curated`** (durable `semantic` + `episodic` only).
+    Transient `working` memory is EXCLUDED by default so a short-lived secret
+    never lands in an execution trace. An explicit `inject_memory_context=true`
+    opts into the `Full` scope (adds `working`). See `MemoryScope`.
+  - **Per-workflow opt-out**: a top-level `inject_memory: false` in `graph_json`
+    (default true) disables injection for that workflow — versions with it, no
+    migration.
+  - **Defense in depth**: injected memory is encrypted at rest and DLP-redacted
+    (structured secrets) on BOTH the module-input and output copies; tenancy is
+    single-actor and the actor is the workflow's own (owner-validated).
 
 ## Phase 1
 

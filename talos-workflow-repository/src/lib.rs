@@ -19,6 +19,7 @@ mod stats;
 mod templates;
 mod workflows;
 
+pub use actor_context::MemoryScope;
 pub use executions::*;
 pub use graph_export::*;
 pub use search::*;
