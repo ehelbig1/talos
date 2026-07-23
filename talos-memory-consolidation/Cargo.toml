@@ -13,6 +13,7 @@ serde.workspace = true
 serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-config = { path = "../talos-config" }
+talos-graph-rag = { path = "../talos-graph-rag" }
 talos-llm = { path = "../talos-llm" }
 talos-memory = { path = "../talos-memory" }
 talos-actor-repository = { path = "../talos-actor-repository" }

@@ -5633,8 +5633,10 @@ async fn handle_compress_actor_context(
     // Post-commit: fire graph extraction only for the entries that
     // actually landed. Doing it inside the tx would let a rollback
     // poison the graph.
+    // These are condensed REAL memories (context compression), not synthetic
+    // self-outputs, so they carry no synthetic `kind` and DO auto-extract.
     for (key, value, _memory_type, _ttl, _bytes) in &prepared {
-        talos_memory::spawn_graph_extraction(actor_id, key.clone(), value.clone());
+        talos_memory::spawn_graph_extraction(actor_id, key.clone(), value.clone(), None);
     }
 
     let bytes_saved = bytes_removed.saturating_sub(bytes_added);

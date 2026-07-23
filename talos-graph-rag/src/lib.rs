@@ -1103,6 +1103,118 @@ impl GraphRagService {
         Ok(())
     }
 
+    /// Deliberate, curated NODE upsert — MERGE one entity node (no edge)
+    /// and accumulate its facts as properties. This is the FIRST-CLASS
+    /// graph-write path for synthesized entity facts (the reflection loop's
+    /// entity synthesis), distinct from the generic `extract_and_store_entities`
+    /// auto-mining path that the graph-write policy now SKIPS for synthetic
+    /// self-outputs.
+    ///
+    /// Security / correctness:
+    /// * `label` is run through [`sanitize_label`] (allowlist → canonical
+    ///   token or `Concept`), so a caller-supplied label can neither inject
+    ///   Cypher nor mint an arbitrary node type.
+    /// * `props` values are stringified and run through the SAME
+    ///   `sanitize_property_key` + length/count caps as the extraction path
+    ///   (via [`build_property_bolt_map`]), so a synthesized prop named
+    ///   `actor_id`/`name`/`source_key`/`updated_at` is DROPPED — a fact can
+    ///   never hijack the tenant boundary or the MERGE identity.
+    /// * `$actor_id` + `$name` are the MERGE identity → the write is
+    ///   ACTOR-SCOPED; one actor's entities can never touch another's.
+    ///
+    /// Best-effort by design: an empty `name` is a no-op; Neo4j errors
+    /// propagate as `Err` for the caller to log-and-continue.
+    pub async fn upsert_entity(
+        &self,
+        actor_id: Uuid,
+        label: &str,
+        name: &str,
+        props: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Ok(());
+        }
+        let label = sanitize_label(label);
+        // Stringify prop values (strings pass through; other JSON scalars/
+        // structures are rendered compactly) then reuse the extraction-path
+        // sanitizer: reserved-key stripping + key charset-normalization +
+        // value-length + per-node count caps all happen inside
+        // `build_property_bolt_map` → `sanitized_property_pairs`.
+        let pairs: Vec<(String, String)> = props
+            .into_iter()
+            .map(|(k, v)| {
+                let s = match v {
+                    serde_json::Value::String(s) => s,
+                    other => other.to_string(),
+                };
+                (k, s)
+            })
+            .collect();
+        let bolt_props = build_property_bolt_map(&pairs);
+
+        let cypher = build_node_upsert_cypher(&label);
+        let actor_str = actor_id.to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        let q = neo4rs::query(&cypher)
+            .param("actor_id", actor_str.as_str())
+            .param("name", name)
+            .param("source_key", SYNTHESIS_SOURCE_KEY)
+            .param("now", now.as_str())
+            .param("props", neo4rs::BoltType::Map(bolt_props));
+
+        self.graph
+            .run(q)
+            .await
+            .context("Neo4j node upsert failed")?;
+        tracing::debug!(
+            actor_id = %actor_id,
+            label = %label,
+            "Synthesized entity node upserted"
+        );
+        Ok(())
+    }
+
+    /// Deliberate, curated RELATIONSHIP upsert — MERGE a single
+    /// subject→predicate→object edge (creating the endpoint nodes if
+    /// absent). Reuses the batched triple upsert kernel so labels/predicate
+    /// go through [`sanitize_label`] and the edge is ACTOR-SCOPED via the
+    /// same `$actor_id` MERGE identity. Companion to [`upsert_entity`] for
+    /// the reflection loop's synthesized relationships.
+    ///
+    /// Best-effort: an empty subject/object name is a no-op.
+    pub async fn upsert_entity_relationship(
+        &self,
+        actor_id: Uuid,
+        subject_label: &str,
+        subject_name: &str,
+        predicate: &str,
+        object_label: &str,
+        object_name: &str,
+    ) -> Result<()> {
+        let subject_name = subject_name.trim();
+        let object_name = object_name.trim();
+        if subject_name.is_empty() || object_name.is_empty() {
+            return Ok(());
+        }
+        let triple = Triple {
+            subject: Entity {
+                label: subject_label.to_string(),
+                name: subject_name.to_string(),
+                properties: vec![],
+            },
+            predicate: predicate.to_string(),
+            object: Entity {
+                label: object_label.to_string(),
+                name: object_name.to_string(),
+                properties: vec![],
+            },
+        };
+        // `upsert_triples` sanitizes labels/predicate and binds actor_id.
+        self.upsert_triples(actor_id, SYNTHESIS_SOURCE_KEY, &[triple])
+            .await
+    }
+
     /// Retrieve graph context for a query by finding matching entities
     /// and traversing 1-2 hops to related nodes.
     ///
@@ -1393,7 +1505,10 @@ fn group_triples_for_upsert(triples: &[Triple]) -> Vec<UpsertGroup> {
     for triple in triples {
         let s_label = sanitize_label(&triple.subject.label);
         let o_label = sanitize_label(&triple.object.label);
-        let pred = sanitize_label(&triple.predicate);
+        // Predicate slot uses the unambiguous edge-type sanitizer (unknown →
+        // RELATED_TO), NOT sanitize_label (which mis-maps single-word predicates
+        // like MANAGES/DRIVES to the `Concept` node-label fallback).
+        let pred = sanitize_predicate(&triple.predicate);
 
         let key = (s_label.clone(), o_label.clone(), pred.clone());
         let idx = *index.entry(key).or_insert_with(|| {
@@ -1439,6 +1554,27 @@ fn build_unwind_upsert_cypher(subject_label: &str, object_label: &str, predicate
          SET o.source_key = $source_key, o.updated_at = $now \
          MERGE (s)-[r:{predicate}]->(o) \
          SET r.source_key = $source_key, r.updated_at = $now"
+    )
+}
+
+/// Build the NODE-ONLY upsert MERGE for a single entity (no edge). Mirror
+/// of [`build_unwind_upsert_cypher`] for the deliberate per-entity fact
+/// accumulation path ([`GraphRagService::upsert_entity`]). `label` is
+/// already sanitized by the caller (allowlisted canonical token — never
+/// raw input — so it's safe in the un-parameterizable label position; see
+/// `sanitize_label`). `$actor_id` + `$name` form the MERGE identity (the
+/// actor-scoped tenant boundary); `$props` is a bound map applied via
+/// `SET n += $props` (keys arrive as data — can't inject Cypher, and
+/// `sanitize_property_key` already drops the reserved structural keys, so
+/// the caller-supplied map can't clobber `actor_id`/`name`/`source_key`/
+/// `updated_at`). The structural `SET n.source_key/updated_at` is emitted
+/// AFTER `SET n += $props` so provenance always wins (defense in depth).
+/// Pure — unit-tested without Neo4j.
+fn build_node_upsert_cypher(label: &str) -> String {
+    format!(
+        "MERGE (n:{label} {{actor_id: $actor_id, name: $name}}) \
+         SET n += $props \
+         SET n.source_key = $source_key, n.updated_at = $now"
     )
 }
 
@@ -1557,6 +1693,27 @@ fn sanitize_label(label: &str) -> String {
     }
 }
 
+/// Sanitize a relationship PREDICATE for use as a Cypher edge type. Unlike
+/// [`sanitize_label`] (which is ambiguous between node-labels and edge-types and
+/// only classifies an unknown token as an edge when it is ALL-CAPS *with an
+/// underscore*), this is unambiguous: the value is ALWAYS an edge type, so any
+/// value not in [`ALLOWED_EDGE_TYPES`] maps to `RELATED_TO` — never to the
+/// node-label fallback `Concept`. This fixes single-word predicates like
+/// `MANAGES` / `DRIVES` / `INVITES` (no underscore) that `sanitize_label` would
+/// otherwise mis-map to a `Concept` edge type. Used by the upsert path for the
+/// predicate slot; `sanitize_label` remains for the two node-label slots.
+fn sanitize_predicate(predicate: &str) -> String {
+    let normalized: String = predicate
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    ALLOWED_EDGE_TYPES
+        .iter()
+        .find(|&&t| t.eq_ignore_ascii_case(&normalized))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "RELATED_TO".to_string())
+}
+
 /// Structural property keys that MUST NOT be settable from extracted
 /// entity properties. `actor_id` is the tenant boundary (overwriting it
 /// would move the node into another actor's subgraph); `name` is the
@@ -1565,6 +1722,12 @@ fn sanitize_label(label: &str) -> String {
 /// Cypher, but it CAN clobber these if the map carries them — so they're
 /// dropped here (case-insensitive, after charset normalization).
 const RESERVED_PROPERTY_KEYS: &[&str] = &["actor_id", "name", "source_key", "updated_at"];
+
+/// Provenance `source_key` stamped on nodes/edges written via the deliberate
+/// entity-synthesis path ([`GraphRagService::upsert_entity`] /
+/// [`GraphRagService::upsert_entity_relationship`]) — distinguishes curated
+/// reflection-synthesized entities from auto-extracted ones in the graph.
+const SYNTHESIS_SOURCE_KEY: &str = "reflection_synthesis";
 
 /// Max sanitized property-key length. Neo4j has no hard limit, but a
 /// bound keeps a hostile/runaway extractor from minting absurd keys.
@@ -1773,6 +1936,79 @@ mod sanitize_label_tests {
         // Filters to "OWNS_RELDETACHDELETE" — all-caps with an underscore, so the
         // edge-shape heuristic maps it to RELATED_TO (still a fixed safe token).
         assert_eq!(sanitize_label("OWNS_REL DETACH DELETE"), "RELATED_TO");
+    }
+}
+
+#[cfg(test)]
+mod node_upsert_tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_predicate_maps_unknown_single_word_to_related_to_not_concept() {
+        // The bug this fixes: single-word predicates (no underscore) that
+        // `sanitize_label` mis-maps to the `Concept` node-label fallback.
+        for p in ["MANAGES", "DRIVES", "INVITES", "MONITORS", "manages"] {
+            assert_eq!(
+                sanitize_predicate(p),
+                "RELATED_TO",
+                "unknown predicate {p} must map to RELATED_TO, never Concept"
+            );
+        }
+        // Allowlisted edge types survive with canonical casing.
+        assert_eq!(sanitize_predicate("blocked_by"), "BLOCKED_BY");
+        assert_eq!(sanitize_predicate("ASSIGNED_TO"), "ASSIGNED_TO");
+        // Never emits a node-label token.
+        assert_ne!(sanitize_predicate("SomeThing"), "Concept");
+    }
+
+    // The node-upsert Cypher is PURE and unit-testable without Neo4j (mirror
+    // of `build_unwind_upsert_cypher`). Pin the MERGE identity + provenance
+    // shape and the label sanitization / reserved-key guard the async
+    // `upsert_entity` relies on.
+    #[test]
+    fn node_upsert_cypher_uses_actor_scoped_merge_identity() {
+        let c = build_node_upsert_cypher("Person");
+        assert!(
+            c.contains("MERGE (n:Person {actor_id: $actor_id, name: $name})"),
+            "node MERGE must be keyed on (actor_id, name): {c}"
+        );
+        // Provenance is written AFTER `SET n += $props` so it always wins.
+        let props_at = c.find("SET n += $props").expect("props set present");
+        let prov_at = c
+            .find("SET n.source_key = $source_key")
+            .expect("provenance set present");
+        assert!(
+            props_at < prov_at,
+            "structural provenance must be SET after caller props: {c}"
+        );
+    }
+
+    #[test]
+    fn upsert_entity_label_is_sanitized_to_allowlist() {
+        // An injection-shaped or unknown label never reaches Cypher raw — it
+        // is mapped to a safe allowlisted token (or Concept).
+        assert_eq!(sanitize_label("Person) DETACH DELETE n //"), "Concept");
+        assert_eq!(sanitize_label("project"), "Project");
+    }
+
+    #[test]
+    fn synthesized_props_cannot_hijack_reserved_keys() {
+        // The exact guard `upsert_entity` leans on: a synthesized fact named
+        // actor_id/name/source_key/updated_at is DROPPED, so it can't move the
+        // node into another tenant or clobber the MERGE identity/provenance.
+        let raw = vec![
+            ("actor_id".to_string(), "attacker-uuid".to_string()),
+            ("name".to_string(), "impostor".to_string()),
+            ("source_key".to_string(), "forged".to_string()),
+            ("updated_at".to_string(), "1970".to_string()),
+            ("role".to_string(), "Staff Engineer".to_string()),
+        ];
+        let kept = sanitized_property_pairs(&raw);
+        assert_eq!(
+            kept,
+            vec![("role".to_string(), "Staff Engineer".to_string())],
+            "reserved structural keys must be stripped; only the real fact survives"
+        );
     }
 }
 

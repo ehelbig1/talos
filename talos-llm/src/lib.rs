@@ -390,6 +390,107 @@ impl LlmClient {
         Ok(text.trim().to_string())
     }
 
+    /// STRUCTURED-OUTPUT completion via Anthropic TOOL-USE — the reliable
+    /// external path. Unlike [`Self::generate_text`] (which asks for JSON in the
+    /// prompt and strips markdown fences off the free-text reply — the model can
+    /// still return the wrong shape), this forces the model to return a
+    /// `tool_use` block whose `input` conforms to `schema`, via a single-tool
+    /// definition + `tool_choice`. Returns the tool input serialized as a JSON
+    /// string (so callers parse it exactly like the Ollama path). `max_tokens`
+    /// is 2048 (structured payloads like a reflection exceed `generate_text`'s
+    /// 512). Falls back to text extraction if the response carries no tool_use.
+    pub async fn generate_with_schema(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+        schema: &serde_json::Value,
+        tool_name: &str,
+    ) -> Result<String> {
+        let api_key = self.resolve_api_key().await?;
+        let mut retries = 0u32;
+        let max_retries = 2u32;
+        const MODEL: &str = "claude-haiku-4-5-20251001";
+
+        let response = loop {
+            let req = self
+                .client
+                .post("https://api.anthropic.com/v1/messages")
+                .header("x-api-key", api_key.as_str())
+                .header("anthropic-version", "2023-06-01")
+                .json(&json!({
+                    "model": MODEL,
+                    "max_tokens": 2048,
+                    "system": system_prompt,
+                    "messages": [{ "role": "user", "content": user_prompt }],
+                    "tools": [{
+                        "name": tool_name,
+                        "description": "Record the structured result. Populate every field per the schema.",
+                        "input_schema": schema,
+                    }],
+                    // Force the model to emit exactly this tool's schema-shaped input.
+                    "tool_choice": { "type": "tool", "name": tool_name },
+                }));
+
+            let resp = req.send().await?;
+            if resp.status().is_success() {
+                break resp;
+            }
+            let status = resp.status();
+            if (status.as_u16() == 529 || status.is_server_error() || status.as_u16() == 429)
+                && retries < max_retries
+            {
+                retries += 1;
+                let backoff = 2_u64.pow(retries);
+                warn!(
+                    "generate_with_schema: API {} — retry {}/{} in {}s",
+                    status, retries, max_retries, backoff
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                continue;
+            }
+            // Same DLP-redacted server-side logging / opaque caller error as
+            // `generate_text` (MCP-454/527).
+            let text = talos_http_body::read_error_text_capped(resp).await;
+            let redacted = talos_dlp_provider::redact_str(&text);
+            error!(
+                status = %status,
+                body_len = text.len(),
+                body = %redacted,
+                "generate_with_schema API error"
+            );
+            return Err(anyhow!("LLM API error: HTTP {}", status));
+        };
+
+        let body: serde_json::Value = talos_http_body::read_json_capped(response).await?;
+        usage::record_anthropic(MODEL, &body);
+
+        // Extract the tool_use block's `input` (the schema-conformant object) and
+        // serialize it back to a JSON string so callers parse it identically to
+        // the Ollama path.
+        if let Some(content) = body["content"].as_array() {
+            for item in content {
+                if item["type"] == "tool_use" {
+                    let input = &item["input"];
+                    if input.is_object() {
+                        return Ok(input.to_string());
+                    }
+                }
+            }
+            // No tool_use — fall back to any text block (defensive; tool_choice
+            // should guarantee a tool_use).
+            for item in content {
+                if item["type"] == "text" {
+                    if let Some(t) = item["text"].as_str() {
+                        return Ok(t.trim().to_string());
+                    }
+                }
+            }
+        }
+        Err(anyhow!(
+            "generate_with_schema: response carried no tool_use or text block"
+        ))
+    }
+
     /// Generate a workflow scaffold from a natural language description and a compact catalog.
     ///
     /// Returns a JSON string with the suggested workflow structure:
@@ -533,7 +634,11 @@ fn build_chat_body(
     user_prompt: &str,
     max_tokens: u32,
     think: Option<bool>,
-    json_format: bool,
+    // Ollama `format` field: `None` = free text; `Some("json")` = basic JSON
+    // MODE (valid syntax only, no schema); `Some(<json-schema-object>)` =
+    // STRUCTURED OUTPUTS (the model is constrained to the schema — the reliable
+    // path). See `complete_structured` (json mode) vs `complete_with_schema`.
+    format: Option<serde_json::Value>,
 ) -> serde_json::Value {
     let mut messages = vec![];
     if !system_prompt.is_empty() {
@@ -550,8 +655,9 @@ fn build_chat_body(
     if let Some(t) = think {
         body["think"] = json!(t);
     }
-    if json_format {
-        body["format"] = json!("json");
+    if let Some(fmt) = format {
+        body["format"] = fmt;
+        // Low temperature for any constrained-output mode (json or schema).
         options["temperature"] = json!(0.1);
     }
     body["options"] = options;
@@ -606,7 +712,7 @@ impl OllamaClient {
         user_prompt: &str,
         max_tokens: u32,
     ) -> Result<String> {
-        let body = build_chat_body(model, system_prompt, user_prompt, max_tokens, None, false);
+        let body = build_chat_body(model, system_prompt, user_prompt, max_tokens, None, None);
         self.chat(model, body).await
     }
 
@@ -634,13 +740,60 @@ impl OllamaClient {
             user_prompt,
             max_tokens,
             Some(false),
-            true,
+            Some(json!("json")),
         );
         match self.chat(model, body).await {
             Ok(text) => Ok(text),
             Err(e) if e.to_string().contains("HTTP 4") => {
-                let body =
-                    build_chat_body(model, system_prompt, user_prompt, max_tokens, None, true);
+                let body = build_chat_body(
+                    model,
+                    system_prompt,
+                    user_prompt,
+                    max_tokens,
+                    None,
+                    Some(json!("json")),
+                );
+                self.chat(model, body).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// STRUCTURED-OUTPUT completion — the reliable path. Unlike
+    /// [`Self::complete_structured`] (Ollama `format:"json"`, which only
+    /// guarantees valid JSON *syntax* — the model can still return the wrong
+    /// SHAPE, e.g. nesting the whole payload in one field), this passes a JSON
+    /// SCHEMA to Ollama's `format` field (Ollama Structured Outputs), so the
+    /// model is CONSTRAINED to the schema. The returned text is schema-conformant
+    /// JSON. Same `think:false` + 4xx-retry-without-think resilience as
+    /// `complete_structured` (the schema is preserved across the retry).
+    pub async fn complete_with_schema(
+        &self,
+        model: &str,
+        system_prompt: &str,
+        user_prompt: &str,
+        max_tokens: u32,
+        schema: &serde_json::Value,
+    ) -> Result<String> {
+        let body = build_chat_body(
+            model,
+            system_prompt,
+            user_prompt,
+            max_tokens,
+            Some(false),
+            Some(schema.clone()),
+        );
+        match self.chat(model, body).await {
+            Ok(text) => Ok(text),
+            Err(e) if e.to_string().contains("HTTP 4") => {
+                let body = build_chat_body(
+                    model,
+                    system_prompt,
+                    user_prompt,
+                    max_tokens,
+                    None,
+                    Some(schema.clone()),
+                );
                 self.chat(model, body).await
             }
             Err(e) => Err(e),
@@ -744,10 +897,28 @@ impl OllamaClient {
 #[cfg(test)]
 mod chat_body_tests {
     use super::build_chat_body;
+    use serde_json::json;
+
+    #[test]
+    fn schema_body_sets_format_object_and_pins_temperature() {
+        // A schema (object) in `format` is the Ollama Structured-Outputs mode —
+        // shape-constrained, not just valid-JSON. The object must be forwarded
+        // verbatim and temperature pinned low for deterministic structure.
+        let schema = json!({
+            "type": "object",
+            "properties": { "summary": { "type": "string" } },
+            "required": ["summary"]
+        });
+        let b = build_chat_body("m", "sys", "user", 512, Some(false), Some(schema.clone()));
+        assert_eq!(b["think"], false);
+        assert_eq!(b["format"], schema, "schema must be forwarded verbatim");
+        assert_eq!(b["options"]["temperature"], 0.1);
+        assert_eq!(b["options"]["num_predict"], 512);
+    }
 
     #[test]
     fn plain_body_omits_think_and_format() {
-        let b = build_chat_body("m", "sys", "user", 256, None, false);
+        let b = build_chat_body("m", "sys", "user", 256, None, None);
         assert!(b.get("think").is_none(), "think only serializes when set");
         assert!(b.get("format").is_none());
         assert_eq!(b["options"]["num_predict"], 256);
@@ -758,7 +929,7 @@ mod chat_body_tests {
 
     #[test]
     fn structured_body_disables_think_and_pins_json() {
-        let b = build_chat_body("m", "sys", "user", 1024, Some(false), true);
+        let b = build_chat_body("m", "sys", "user", 1024, Some(false), Some(json!("json")));
         assert_eq!(b["think"], false);
         assert_eq!(b["format"], "json");
         assert_eq!(b["options"]["temperature"], 0.1);
@@ -768,7 +939,7 @@ mod chat_body_tests {
     #[test]
     fn structured_fallback_body_keeps_format_without_think() {
         // The 4xx retry path: think dropped, structured constraints kept.
-        let b = build_chat_body("m", "sys", "user", 1024, None, true);
+        let b = build_chat_body("m", "sys", "user", 1024, None, Some(json!("json")));
         assert!(b.get("think").is_none());
         assert_eq!(b["format"], "json");
         assert_eq!(b["options"]["temperature"], 0.1);
@@ -776,7 +947,7 @@ mod chat_body_tests {
 
     #[test]
     fn empty_system_prompt_sends_single_message() {
-        let b = build_chat_body("m", "", "user", 64, None, false);
+        let b = build_chat_body("m", "", "user", 64, None, None);
         assert_eq!(b["messages"].as_array().unwrap().len(), 1);
         assert_eq!(b["messages"][0]["role"], "user");
     }

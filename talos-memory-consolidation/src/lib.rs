@@ -100,15 +100,77 @@ Return JSON {\"summary\": \"...\", \"key_facts\": [...]}."
     (system, user)
 }
 
-/// Parse the LLM summary output into the semantic value payload. Tolerant of
-/// non-JSON output: a raw string that doesn't parse as a JSON object is wrapped
-/// as `{"summary": <raw>}` so consolidation never fails on a chatty model.
-pub fn parse_summary(raw: &str) -> serde_json::Value {
+/// JSON Schema for the consolidation output contract `{summary, key_facts}`.
+/// Feeds BOTH structured-output paths: the Ollama `format` field (local, tier-1)
+/// and the Anthropic tool `input_schema` (external, tier-2). Schema-constraining
+/// the output is what makes the summary reliably parseable — the prior
+/// `format:"json"` (Ollama) / prompt-and-parse (Anthropic) modes only guaranteed
+/// valid JSON *syntax*, not this *shape*, so a model could return the whole
+/// payload under the wrong key and `parse_summary` would silently wrap it.
+pub fn consolidation_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "summary": {
+                "type": "string",
+                "description": "ONE concise durable summary of the consolidated memories."
+            },
+            "key_facts": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Concrete facts, names, entities, dates, and commitments worth preserving."
+            }
+        },
+        "required": ["summary", "key_facts"]
+    })
+}
+
+/// Best-effort recovery of a JSON OBJECT from an LLM completion. Local models
+/// (Ollama) frequently wrap structured output in ways a bare `from_str` rejects,
+/// silently collapsing the payload into a fallback field and LOSING the real
+/// structure (e.g. dropping the synthesized `entities`). This handles the common
+/// cases:
+/// 1. plain object — parse as-is;
+/// 2. markdown code fence (```json … ```) or leading/trailing prose — slice the
+///    outermost `{ … }` and parse that;
+/// 3. double-encoded — the model returned the object as a JSON *string*; decode
+///    once more.
+/// Returns `None` when no object can be recovered (the caller applies its own
+/// tolerant wrap).
+pub fn coerce_json_object(raw: &str) -> Option<serde_json::Value> {
     let trimmed = raw.trim();
-    match serde_json::from_str::<serde_json::Value>(trimmed) {
-        Ok(v) if v.is_object() => v,
-        _ => serde_json::json!({ "summary": trimmed }),
+    // (1) direct
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if v.is_object() {
+            return Some(v);
+        }
+        // (3) double-encoded: a JSON string whose contents are the object.
+        if let serde_json::Value::String(s) = &v {
+            if let Ok(inner) = serde_json::from_str::<serde_json::Value>(s.trim()) {
+                if inner.is_object() {
+                    return Some(inner);
+                }
+            }
+        }
     }
+    // (2) slice the outermost {...} (strips code fences / prose on both sides).
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if end > start {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&trimmed[start..=end]) {
+                if v.is_object() {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parse the LLM summary output into the semantic value payload. Tolerant of
+/// non-JSON output: a raw string that doesn't recover to a JSON object is
+/// wrapped as `{"summary": <raw>}` so consolidation never fails on a chatty model.
+pub fn parse_summary(raw: &str) -> serde_json::Value {
+    coerce_json_object(raw).unwrap_or_else(|| serde_json::json!({ "summary": raw.trim() }))
 }
 
 /// Deterministic semantic key for a consolidated summary:
@@ -253,7 +315,13 @@ async fn run_consolidation_tick(
                     continue;
                 };
                 match ollama
-                    .complete_structured(&model, &system, &user, SUMMARY_MAX_TOKENS)
+                    .complete_with_schema(
+                        &model,
+                        &system,
+                        &user,
+                        SUMMARY_MAX_TOKENS,
+                        &consolidation_schema(),
+                    )
                     .await
                 {
                     Ok(s) => s,
@@ -265,7 +333,15 @@ async fn run_consolidation_tick(
             }
             PlannedAction::SummarizeExternal => {
                 let client = talos_llm::LlmClient::with_vault(secrets_manager.clone(), None);
-                match client.generate_text(&system, &user).await {
+                match client
+                    .generate_with_schema(
+                        &system,
+                        &user,
+                        &consolidation_schema(),
+                        "record_consolidation",
+                    )
+                    .await
+                {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::warn!(target: "talos_memory_consolidation", %actor_id, error = %e, "external LLM summarize failed; no mutation");
@@ -349,18 +425,45 @@ const REFLECTION_MAX_TOKENS: u32 = 1536;
 /// so reflections don't accumulate unboundedly — mirrors `daily_brief/latest`.
 const REFLECTION_KEY: &str = "reflection/latest";
 
+/// Max serialized bytes of the entity-graph context folded into the
+/// reflection user prompt. Kept well below the overall prompt cap so the
+/// flat memory rows stay the dominant signal even when an actor has a large
+/// accumulated graph (`get_graph_context` is itself node-capped, but this is
+/// the belt-and-suspenders bound). Truncation is at a char boundary.
+const MAX_GRAPH_CONTEXT_BYTES: usize = 8_000;
+
 /// Build the (system, user) prompt for the reflection synthesizer.
-/// Deterministic given the memory set (unit-testable). The set of
-/// `(key, value, memory_type)` rows is serialized compactly and byte-capped so
-/// a pathological actor can't blow the model's context (same cap shape as
-/// [`build_consolidation_prompt`]).
+/// Deterministic given the memory set + optional graph context
+/// (unit-testable). The `(key, value, memory_type)` rows are serialized
+/// compactly and byte-capped so a pathological actor can't blow the model's
+/// context (same cap shape as [`build_consolidation_prompt`]).
+///
+/// Phase 4 (graph-aware reflection + entity synthesis):
+/// * `graph_context` — when `Some`, the actor's CURRENT entity graph
+///   (`talos_graph_rag::GraphRagService::get_graph_context` output:
+///   `{entities: [{type, name, relationships: [...]}], ...}`) is folded in as
+///   CONTEXT so the LLM reasons over accumulated multi-hop relationships
+///   (Person → owns → Project → blocked-by → …), not just flat rows. `None`
+///   (graph unavailable / empty / errored) degrades gracefully to the
+///   flat-memory-only prompt.
+/// * The JSON contract additionally requests durable `entities` — curated
+///   entity facts + relationships the caller upserts into the graph as
+///   first-class nodes (the deliberate curated path that replaces the generic
+///   auto-extraction the graph-write policy now skips for reflections).
 pub fn build_reflection_prompt(
     memories: &[(String, serde_json::Value, String)],
+    graph_context: Option<&serde_json::Value>,
 ) -> (String, String) {
     let system = "You are a reflective analyst studying a person's accumulated work/life memories. \
 Identify HIGHER-ORDER INSIGHTS — recurring themes, evolving priorities/goals, relationships between \
 people/projects, and open threads/loose ends. Do NOT merely summarize; INFER what matters and what's \
-changing. Return JSON: {\"insights\": [\"...\"], \"themes\": [\"...\"], \"open_threads\": [\"...\"]}."
+changing. When an ENTITY GRAPH is provided, reason OVER the accumulated relationships (multi-hop: \
+Person → owns → Project → blocked-by → …), not just the flat memory rows. ALSO extract durable ENTITY \
+FACTS worth remembering as first-class graph nodes. Return JSON: {\"insights\": [\"...\"], \
+\"themes\": [\"...\"], \"open_threads\": [\"...\"], \"entities\": [{\"name\": \"...\", \
+\"type\": \"Person|Project|Ticket|Concept|Organization|...\", \"facts\": [\"...\"], \
+\"relationships\": [{\"type\": \"WORKS_ON|BLOCKED_BY|OWNS|ASSIGNED_TO|RELATED_TO|...\", \
+\"target\": \"...\"}]}]}."
         .to_string();
 
     const MAX_USER_PROMPT_BYTES: usize = 24_000;
@@ -368,8 +471,29 @@ changing. Return JSON: {\"insights\": [\"...\"], \"themes\": [\"...\"], \"open_t
     for (key, value, _mtype) in memories {
         items.push(serde_json::json!({ "key": key, "value": value }));
     }
-    let mut user = serde_json::to_string(&serde_json::json!({ "memories": items }))
-        .unwrap_or_else(|_| "{\"memories\":[]}".to_string());
+
+    // Fold in the current entity graph as CONTEXT, separately byte-capped so
+    // it never crowds out the memory rows. Best-effort: on serialization
+    // failure or absence, `entity_graph` is null and the prompt degrades to
+    // the flat-memory-only shape.
+    let entity_graph: serde_json::Value = match graph_context {
+        Some(g) => {
+            let s = serde_json::to_string(g).unwrap_or_default();
+            if s.len() > MAX_GRAPH_CONTEXT_BYTES {
+                // Too large to fold verbatim; pass a compact marker rather
+                // than a truncated (invalid) JSON blob.
+                serde_json::json!({ "note": "entity graph omitted (too large)" })
+            } else {
+                g.clone()
+            }
+        }
+        None => serde_json::Value::Null,
+    };
+
+    let mut user = serde_json::to_string(
+        &serde_json::json!({ "memories": items, "entity_graph": entity_graph }),
+    )
+    .unwrap_or_else(|_| "{\"memories\":[]}".to_string());
     if user.len() > MAX_USER_PROMPT_BYTES {
         let mut end = MAX_USER_PROMPT_BYTES;
         while end > 0 && !user.is_char_boundary(end) {
@@ -380,15 +504,161 @@ changing. Return JSON: {\"insights\": [\"...\"], \"themes\": [\"...\"], \"open_t
     (system, user)
 }
 
+/// JSON Schema for the reflection output contract
+/// `{insights, themes, open_threads, entities:[{name,type,facts,relationships}]}`.
+/// Feeds BOTH structured-output paths (Ollama `format` / Anthropic tool
+/// `input_schema`). Schema-constraining the nested `entities` shape is the
+/// direct fix for the flaky local-model output observed in live testing —
+/// qwen sometimes double-encoded the whole reply into `insights[0]`, yielding
+/// zero synthesized entities. `parse_reflection` / `parse_reflection_entities`
+/// remain tolerant as belt-and-suspenders, but the schema makes the
+/// well-formed shape the *default* rather than the lucky case.
+pub fn reflection_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "insights": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Higher-order inferences about what matters and what is changing (not mere summary)."
+            },
+            "themes": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Recurring themes across the memories."
+            },
+            "open_threads": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Unresolved threads / loose ends."
+            },
+            "entities": {
+                "type": "array",
+                "description": "Durable entity facts worth remembering as first-class graph nodes.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "type": {
+                            "type": "string",
+                            "description": "Person|Project|Ticket|Concept|Organization|..."
+                        },
+                        "facts": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "relationships": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "type": {
+                                        "type": "string",
+                                        "description": "WORKS_ON|BLOCKED_BY|OWNS|ASSIGNED_TO|RELATED_TO|..."
+                                    },
+                                    "target": { "type": "string" }
+                                },
+                                "required": ["type", "target"]
+                            }
+                        }
+                    },
+                    "required": ["name", "type", "facts"]
+                }
+            }
+        },
+        "required": ["insights", "themes", "open_threads", "entities"]
+    })
+}
+
+/// Parsed synthesized entity from a reflection output's `entities` array —
+/// the durable graph-facts contract. `parse_reflection_entities` is tolerant:
+/// a missing/malformed `entities` field yields an empty Vec so reflection
+/// never fails on a model that ignored the entity contract.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SynthesizedEntity {
+    pub name: String,
+    pub entity_type: String,
+    pub facts: Vec<String>,
+    pub relationships: Vec<SynthesizedRelationship>,
+}
+
+/// One relationship on a [`SynthesizedEntity`] — `(predicate, target-name)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SynthesizedRelationship {
+    pub predicate: String,
+    pub target: String,
+}
+
+/// Extract the durable `entities` list from a parsed reflection value.
+/// TOLERANT by design (Phase 4 contract): a missing `entities` key, a
+/// non-array value, or entries missing `name` yield an empty / filtered
+/// result — the graph enrichment is best-effort and must never fail the
+/// reflection memory write. Entries with an empty `name` are dropped.
+/// Pure — unit-tested without a live graph.
+pub fn parse_reflection_entities(value: &serde_json::Value) -> Vec<SynthesizedEntity> {
+    let Some(arr) = value.get("entities").and_then(|e| e.as_array()) else {
+        return Vec::new();
+    };
+    // Cap the node key (name) and relationship targets — they become MERGE
+    // identities, so an oversized value is an ugly (token-bounded, but still
+    // unbounded-in-principle) graph key. `.chars().take()` is char-safe.
+    const MAX_NAME_CHARS: usize = 160;
+    let cap_name = |s: &str| -> String { s.trim().chars().take(MAX_NAME_CHARS).collect() };
+
+    let mut out = Vec::new();
+    for e in arr {
+        let name = cap_name(e.get("name").and_then(|n| n.as_str()).unwrap_or_default());
+        if name.is_empty() {
+            continue;
+        }
+        let entity_type = e
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("Concept")
+            .to_string();
+        let facts = e
+            .get("facts")
+            .and_then(|f| f.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|f| f.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let relationships = e
+            .get("relationships")
+            .and_then(|r| r.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|r| {
+                        let predicate = r.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+                        let target = r.get("target").and_then(|t| t.as_str()).unwrap_or_default();
+                        if predicate.is_empty() || target.trim().is_empty() {
+                            return None;
+                        }
+                        Some(SynthesizedRelationship {
+                            predicate: predicate.to_string(),
+                            target: cap_name(target),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push(SynthesizedEntity {
+            name,
+            entity_type,
+            facts,
+            relationships,
+        });
+    }
+    out
+}
+
 /// Parse the LLM reflection output into the semantic value payload. Tolerant of
 /// non-JSON output: a raw string that doesn't parse as a JSON object is wrapped
 /// as `{"insights": [<raw>]}` so reflection never fails on a chatty model.
 pub fn parse_reflection(raw: &str) -> serde_json::Value {
-    let trimmed = raw.trim();
-    match serde_json::from_str::<serde_json::Value>(trimmed) {
-        Ok(v) if v.is_object() => v,
-        _ => serde_json::json!({ "insights": [trimmed] }),
-    }
+    coerce_json_object(raw).unwrap_or_else(|| serde_json::json!({ "insights": [raw.trim()] }))
 }
 
 /// Spawn the reflection scheduler. Default-OFF: when
@@ -524,7 +794,16 @@ async fn run_reflection_tick(
             continue;
         }
 
-        let (system, user) = build_reflection_prompt(&memories);
+        // GRAPH-AWARE REFLECTION (Phase 4): fetch the actor's CURRENT entity
+        // graph so the LLM reasons over accumulated multi-hop relationships,
+        // not just flat memory rows. Best-effort + ACTOR-SCOPED: every read in
+        // `get_graph_context` is `WHERE n.actor_id=$actor_id`; on any error /
+        // no graph handle, we proceed WITHOUT it (the prompt degrades to
+        // flat-memory-only). Only fetched for actors that will actually reflect
+        // (post-gate) — no graph query for skipped actors.
+        let graph_context = fetch_reflection_graph_context(actor_id, &memories).await;
+
+        let (system, user) = build_reflection_prompt(&memories, graph_context.as_ref());
 
         // Generate the reflection. SECURITY: the external `LlmClient` is
         // constructed ONLY on the SummarizeExternal branch — a LocalOnly/Skip
@@ -536,7 +815,13 @@ async fn run_reflection_tick(
                     continue;
                 };
                 match ollama
-                    .complete_structured(&model, &system, &user, REFLECTION_MAX_TOKENS)
+                    .complete_with_schema(
+                        &model,
+                        &system,
+                        &user,
+                        REFLECTION_MAX_TOKENS,
+                        &reflection_schema(),
+                    )
                     .await
                 {
                     Ok(s) => s,
@@ -548,7 +833,10 @@ async fn run_reflection_tick(
             }
             PlannedAction::SummarizeExternal => {
                 let client = talos_llm::LlmClient::with_vault(secrets_manager.clone(), None);
-                match client.generate_text(&system, &user).await {
+                match client
+                    .generate_with_schema(&system, &user, &reflection_schema(), "record_reflection")
+                    .await
+                {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::warn!(target: "talos_memory_reflection", %actor_id, error = %e, "external LLM reflection failed; no write");
@@ -567,21 +855,51 @@ async fn run_reflection_tick(
             "reflected_at": chrono::Utc::now().to_rfc3339(),
         });
 
+        // DELIBERATE ENTITY SYNTHESIS (Phase 4): parse the durable entity facts
+        // out of the SAME tier-gated completion BEFORE the memory value is
+        // moved into `persist_reflection`. These reach the graph ONLY via the
+        // curated `upsert_entity` path below — the generic auto-extraction is
+        // now SKIPPED for `kind = "reflection"` (graph-write policy), so this
+        // is the one high-quality signal replacing the noisy auto-mining.
+        let entities = parse_reflection_entities(&value);
+
         // NON-DESTRUCTIVE write: one new semantic memory at `reflection/latest`,
-        // encrypted via the per-org DEK/AAD path. NOTHING is deleted.
-        match talos_memory::persist_reflection(pool, actor_id, REFLECTION_KEY, value, metadata)
-            .await
+        // encrypted via the per-org DEK/AAD path. NOTHING is deleted. This is
+        // the PRIMARY output — it must not fail because of graph issues.
+        let reflection_written = match talos_memory::persist_reflection(
+            pool,
+            actor_id,
+            REFLECTION_KEY,
+            value,
+            metadata,
+        )
+        .await
         {
-            Ok(()) => tracing::info!(
-                target: "talos_memory_reflection",
-                %actor_id,
-                source_count,
-                reflection_key = REFLECTION_KEY,
-                "wrote reflection insight (non-destructive; sources intact)"
-            ),
-            Err(e) => {
-                tracing::warn!(target: "talos_memory_reflection", %actor_id, error = %e, "persist_reflection failed; no write")
+            Ok(()) => {
+                tracing::info!(
+                    target: "talos_memory_reflection",
+                    %actor_id,
+                    source_count,
+                    reflection_key = REFLECTION_KEY,
+                    "wrote reflection insight (non-destructive; sources intact)"
+                );
+                true
             }
+            Err(e) => {
+                tracing::warn!(target: "talos_memory_reflection", %actor_id, error = %e, "persist_reflection failed; no write");
+                false
+            }
+        };
+
+        // Upsert the synthesized entities into the actor's graph as first-class
+        // nodes — ONLY when the reflection memory actually landed (don't
+        // half-apply a reflection's graph side effects when its own row failed).
+        // Best-effort, ACTOR-SCOPED, and needs NO additional tier gate: the
+        // entity list came from the reflection completion that was ALREADY
+        // tier-gated (a tier-1 actor's synthesis ran on LOCAL Ollama), and the
+        // write itself is a Neo4j MERGE — no LLM, no external egress.
+        if reflection_written {
+            persist_synthesized_entities(actor_id, &entities).await;
         }
     }
 
@@ -594,9 +912,252 @@ async fn run_reflection_tick(
     Ok(())
 }
 
+/// Build a fulltext hint for `get_graph_context` from the actor's recent
+/// memory keys — seeds the multi-hop traversal toward the actor's actual
+/// content rather than the whole graph. Distinct, non-empty keys joined and
+/// byte-capped. Empty when there are no usable keys (the caller then passes
+/// `""`, which `get_graph_context` still handles). Pure — unit-tested.
+fn reflection_graph_hint(memories: &[(String, serde_json::Value, String)]) -> String {
+    // Seed the graph fulltext search from the memory CONTENT (values), not the
+    // keys. Entity NAMES (people, projects) live in the values; the graph's
+    // fulltext index is over entity names, so keys like `jira_work_context` /
+    // `note/1` would almost never match and leave graph-aware reflection inert.
+    // We collect distinct alphanumeric word tokens (>= 3 chars) from the values
+    // — this both surfaces name-bearing terms AND strips Lucene special chars
+    // (`{`, `:`, `"`, …) that a raw-JSON hint could inject into the fulltext
+    // query. Bounded in both token count and bytes.
+    const MAX_HINT_BYTES: usize = 512;
+    const MAX_TOKENS: usize = 60;
+    let mut seen = std::collections::HashSet::new();
+    let mut parts: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    'outer: for (_key, value, _t) in memories {
+        let text = match value {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        for token in text.split(|c: char| !c.is_alphanumeric()) {
+            let t = token.trim();
+            if t.len() < 3 {
+                continue;
+            }
+            let lower = t.to_lowercase();
+            if !seen.insert(lower) {
+                continue;
+            }
+            total += t.len() + 1;
+            parts.push(t.to_string());
+            if parts.len() >= MAX_TOKENS || total >= MAX_HINT_BYTES {
+                break 'outer;
+            }
+        }
+    }
+    let mut hint = parts.join(" ");
+    if hint.len() > MAX_HINT_BYTES {
+        let mut end = MAX_HINT_BYTES;
+        while end > 0 && !hint.is_char_boundary(end) {
+            end -= 1;
+        }
+        hint.truncate(end);
+    }
+    hint
+}
+
+/// Best-effort fetch of the actor's current entity graph for graph-aware
+/// reflection. Returns `None` when no graph service is configured or the
+/// query errors — reflection then proceeds on flat memory only. ACTOR-SCOPED:
+/// `get_graph_context` filters every node/edge by `actor_id`.
+async fn fetch_reflection_graph_context(
+    actor_id: uuid::Uuid,
+    memories: &[(String, serde_json::Value, String)],
+) -> Option<serde_json::Value> {
+    let svc = talos_graph_rag::GRAPH_SERVICE.get()?;
+    let hint = reflection_graph_hint(memories);
+    // 2 hops / 30 nodes — enough for multi-hop relationship context without an
+    // expensive traversal (get_graph_context caps hops≤3, nodes≤50 internally).
+    match svc.get_graph_context(actor_id, &hint, 2, 30).await {
+        Ok(ctx) => {
+            let count = ctx
+                .get("entity_count")
+                .and_then(|c| c.as_u64())
+                .unwrap_or(0);
+            if count == 0 {
+                None
+            } else {
+                tracing::debug!(
+                    target: "talos_memory_reflection",
+                    %actor_id,
+                    entity_count = count,
+                    "fetched entity-graph context for reflection"
+                );
+                Some(ctx)
+            }
+        }
+        Err(e) => {
+            tracing::debug!(
+                target: "talos_memory_reflection",
+                %actor_id,
+                error = %e,
+                "graph context fetch failed; reflecting on flat memory only"
+            );
+            None
+        }
+    }
+}
+
+/// Upsert reflection-synthesized entities + their relationships into the
+/// actor's graph. Best-effort and ACTOR-SCOPED. No-op when no graph service
+/// is configured. Every node upsert and edge upsert is independent: one
+/// failure logs and continues so a single bad entity can't drop the rest.
+async fn persist_synthesized_entities(actor_id: uuid::Uuid, entities: &[SynthesizedEntity]) {
+    if entities.is_empty() {
+        return;
+    }
+    let Some(svc) = talos_graph_rag::GRAPH_SERVICE.get() else {
+        tracing::debug!(
+            target: "talos_memory_reflection",
+            %actor_id,
+            "no graph service configured; skipping entity synthesis persist"
+        );
+        return;
+    };
+
+    // Bound total work regardless of what the model returned (a max-tokens bump
+    // could otherwise let it emit an unbounded entity list).
+    const MAX_SYNTH_ENTITIES: usize = 64;
+    const MAX_SYNTH_RELS_PER_ENTITY: usize = 16;
+
+    // Resolve a relationship TARGET's node label from the synthesized entity set
+    // when the target is itself a named entity — so `Ada —WORKS_ON→ Talos`
+    // reuses the typed `Project:Talos` node rather than minting a duplicate
+    // `Concept:Talos` (MERGE keys on label+actor_id+name). Falls back to
+    // `Concept` for targets not in the set.
+    let type_by_name: std::collections::HashMap<&str, &str> = entities
+        .iter()
+        .take(MAX_SYNTH_ENTITIES)
+        .map(|e| (e.name.as_str(), e.entity_type.as_str()))
+        .collect();
+
+    let mut nodes_ok = 0usize;
+    let mut edges_ok = 0usize;
+    for entity in entities.iter().take(MAX_SYNTH_ENTITIES) {
+        // Facts → node properties. Numbered keys keep them distinct and within
+        // the per-node property cap (sanitizer drops reserved keys / caps count).
+        let mut props = serde_json::Map::new();
+        for (i, fact) in entity.facts.iter().enumerate() {
+            props.insert(format!("fact_{i}"), serde_json::Value::String(fact.clone()));
+        }
+        match svc
+            .upsert_entity(actor_id, &entity.entity_type, &entity.name, props)
+            .await
+        {
+            Ok(()) => nodes_ok += 1,
+            Err(e) => tracing::warn!(
+                target: "talos_memory_reflection",
+                %actor_id,
+                error = %e,
+                "synthesized-entity node upsert failed (non-fatal)"
+            ),
+        }
+
+        for rel in entity.relationships.iter().take(MAX_SYNTH_RELS_PER_ENTITY) {
+            // Reuse the target's typed node when it's a known synthesized entity;
+            // otherwise `Concept` (sanitize_label maps it safely). Subject label
+            // is the entity type.
+            let object_label = type_by_name
+                .get(rel.target.as_str())
+                .copied()
+                .unwrap_or("Concept");
+            match svc
+                .upsert_entity_relationship(
+                    actor_id,
+                    &entity.entity_type,
+                    &entity.name,
+                    &rel.predicate,
+                    object_label,
+                    &rel.target,
+                )
+                .await
+            {
+                Ok(()) => edges_ok += 1,
+                Err(e) => tracing::warn!(
+                    target: "talos_memory_reflection",
+                    %actor_id,
+                    error = %e,
+                    "synthesized-entity relationship upsert failed (non-fatal)"
+                ),
+            }
+        }
+    }
+    tracing::info!(
+        target: "talos_memory_reflection",
+        %actor_id,
+        entities = entities.len(),
+        nodes_upserted = nodes_ok,
+        edges_upserted = edges_ok,
+        "synthesized entities upserted into actor graph (curated graph-write path)"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consolidation_schema_matches_output_contract() {
+        // The schema's required keys must be exactly the fields parse_summary
+        // consumes — a drift here would let the model omit `summary` and still
+        // satisfy the constraint.
+        let s = consolidation_schema();
+        assert_eq!(s["type"], "object");
+        let req: Vec<&str> = s["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(req.contains(&"summary"));
+        assert!(req.contains(&"key_facts"));
+        assert_eq!(s["properties"]["summary"]["type"], "string");
+        assert_eq!(s["properties"]["key_facts"]["type"], "array");
+    }
+
+    #[test]
+    fn reflection_schema_matches_output_contract() {
+        // Must mirror the reflection JSON contract INCLUDING the nested entity
+        // shape (name/type/facts + relationships[{type,target}]) — the nested
+        // constraint is the direct fix for the flaky local-model entity output.
+        let s = reflection_schema();
+        assert_eq!(s["type"], "object");
+        let req: Vec<&str> = s["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        for k in ["insights", "themes", "open_threads", "entities"] {
+            assert!(req.contains(&k), "missing required key {k}");
+        }
+        let ent = &s["properties"]["entities"]["items"];
+        assert_eq!(ent["type"], "object");
+        let ent_req: Vec<&str> = ent["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(ent_req.contains(&"name"));
+        assert!(ent_req.contains(&"type"));
+        let rel = &ent["properties"]["relationships"]["items"];
+        let rel_req: Vec<&str> = rel["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(rel_req.contains(&"type"));
+        assert!(rel_req.contains(&"target"));
+    }
 
     #[test]
     fn plan_action_skip_decision_never_summarizes() {
@@ -775,6 +1336,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_reflection_recovers_messy_local_model_output() {
+        // The real failure a local model produced: the structure survives even
+        // when the model fences it, prefixes prose, or double-encodes it — so
+        // the synthesized `entities` are NOT lost to the fallback wrap.
+        let obj = r#"{"insights":["a"],"entities":[{"name":"Rune","type":"Project"}]}"#;
+
+        // (1) code fence + prose
+        let fenced = format!("Here is the reflection:\n```json\n{obj}\n```\nDone.");
+        let v = parse_reflection(&fenced);
+        assert_eq!(
+            v["entities"][0]["name"], "Rune",
+            "must recover from a fenced/prose-wrapped object"
+        );
+
+        // (2) double-encoded: the object returned as a JSON string.
+        let encoded = serde_json::Value::String(obj.to_string()).to_string();
+        let v2 = parse_reflection(&encoded);
+        assert_eq!(
+            v2["entities"][0]["name"], "Rune",
+            "must recover a double-encoded object"
+        );
+
+        // (3) plain object still works.
+        let v3 = parse_reflection(obj);
+        assert_eq!(v3["entities"][0]["type"], "Project");
+    }
+
+    #[test]
     fn reflection_prompt_is_deterministic_and_bounded() {
         let memories = vec![
             (
@@ -788,14 +1377,154 @@ mod tests {
                 "semantic".to_string(),
             ),
         ];
-        let (s1, u1) = build_reflection_prompt(&memories);
-        let (s2, u2) = build_reflection_prompt(&memories);
+        let (s1, u1) = build_reflection_prompt(&memories, None);
+        let (s2, u2) = build_reflection_prompt(&memories, None);
         assert_eq!(s1, s2);
         assert_eq!(u1, u2);
         assert!(s1.contains("HIGHER-ORDER INSIGHTS"));
         assert!(s1.contains("open_threads"));
+        // Phase 4: the entity-synthesis contract is present in the system prompt.
+        assert!(s1.contains("entities"));
+        assert!(s1.contains("ENTITY FACTS"));
         assert!(u1.contains("shipped auth refactor"));
         assert!(u1.contains("prefers async reviews"));
+        // No graph → entity_graph is null in the user prompt.
+        assert!(u1.contains("\"entity_graph\":null"));
+    }
+
+    #[test]
+    fn reflection_prompt_folds_in_graph_context() {
+        let memories = vec![(
+            "note/1".to_string(),
+            serde_json::json!({"note": "x"}),
+            "episodic".to_string(),
+        )];
+        let graph = serde_json::json!({
+            "entities": [{
+                "type": "Project", "name": "Talos",
+                "relationships": [{"type": "BLOCKED_BY", "target": "SECP-11779", "target_labels": ["Ticket"]}]
+            }],
+            "entity_count": 1,
+            "query": "note/1",
+        });
+        let (system, user) = build_reflection_prompt(&memories, Some(&graph));
+        // Graph context is folded into the user prompt so the LLM can reason
+        // over accumulated multi-hop relationships.
+        assert!(user.contains("entity_graph"));
+        assert!(user.contains("Talos"));
+        assert!(user.contains("BLOCKED_BY"));
+        // System prompt instructs multi-hop reasoning over the graph.
+        assert!(system.contains("multi-hop"));
+    }
+
+    #[test]
+    fn reflection_prompt_omits_oversized_graph_context() {
+        // A pathologically large graph is replaced by a compact marker rather
+        // than a truncated (invalid) JSON blob, and never crowds out memories.
+        let big_name = "z".repeat(20_000);
+        let graph = serde_json::json!({
+            "entities": [{"type": "Concept", "name": big_name, "relationships": []}],
+            "entity_count": 1,
+        });
+        let memories = vec![(
+            "k".to_string(),
+            serde_json::json!({"v": "real memory"}),
+            "semantic".to_string(),
+        )];
+        let (_s, user) = build_reflection_prompt(&memories, Some(&graph));
+        assert!(user.contains("entity graph omitted (too large)"));
+        assert!(user.contains("real memory"));
+    }
+
+    #[test]
+    fn parse_reflection_entities_extracts_curated_facts() {
+        let v = serde_json::json!({
+            "insights": ["..."],
+            "entities": [
+                {
+                    "name": "Ada Lovelace",
+                    "type": "Person",
+                    "facts": ["leads the platform team", "prefers async reviews"],
+                    "relationships": [
+                        {"type": "WORKS_ON", "target": "Talos"},
+                        {"type": "OWNS", "target": "SECP-11779"}
+                    ]
+                }
+            ]
+        });
+        let entities = parse_reflection_entities(&v);
+        assert_eq!(entities.len(), 1);
+        let e = &entities[0];
+        assert_eq!(e.name, "Ada Lovelace");
+        assert_eq!(e.entity_type, "Person");
+        assert_eq!(e.facts.len(), 2);
+        assert_eq!(e.relationships.len(), 2);
+        assert_eq!(e.relationships[0].predicate, "WORKS_ON");
+        assert_eq!(e.relationships[0].target, "Talos");
+    }
+
+    #[test]
+    fn parse_reflection_entities_is_tolerant() {
+        // Missing entities key → empty (never fails reflection).
+        assert!(parse_reflection_entities(&serde_json::json!({"insights": []})).is_empty());
+        // Non-array entities → empty.
+        assert!(parse_reflection_entities(&serde_json::json!({"entities": "nope"})).is_empty());
+        // Entry missing name → dropped; malformed relationship → filtered.
+        let v = serde_json::json!({
+            "entities": [
+                {"type": "Concept", "facts": ["orphan"]},
+                {"name": "  ", "type": "Person"},
+                {"name": "Good", "relationships": [{"type": "", "target": "x"}, {"type": "OWNS", "target": ""}]}
+            ]
+        });
+        let entities = parse_reflection_entities(&v);
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].name, "Good");
+        // No `type` field → defaults to Concept.
+        assert_eq!(entities[0].entity_type, "Concept");
+        assert!(
+            entities[0].relationships.is_empty(),
+            "empty predicate and empty target relationships are filtered"
+        );
+    }
+
+    #[test]
+    fn reflection_graph_hint_dedups_and_caps() {
+        // The hint is derived from memory CONTENT (values), not keys — entity
+        // NAMES live in the values and the graph's fulltext index is over names.
+        // Keys (`jira_work_context`) must NOT leak into the hint.
+        let memories = vec![
+            (
+                "jira_work_context".to_string(),
+                serde_json::json!({ "note": "Rune blocked on Migration. Rune owns Migration." }),
+                "semantic".to_string(),
+            ),
+            (
+                "email_triage".to_string(),
+                // Lucene special chars in the raw value must be stripped, not
+                // injected into the fulltext query.
+                serde_json::json!({ "text": "Priya: {reviews} the \"Migration\"" }),
+                "episodic".to_string(),
+            ),
+        ];
+        let hint = reflection_graph_hint(&memories);
+        let tokens: Vec<&str> = hint.split(' ').collect();
+        // Name-bearing content tokens are surfaced...
+        assert!(tokens.contains(&"Rune"), "hint: {hint:?}");
+        assert!(tokens.contains(&"Priya"), "hint: {hint:?}");
+        assert!(tokens.contains(&"Migration"), "hint: {hint:?}");
+        // ...deduped (Rune/Migration appear multiple times, once each)...
+        assert_eq!(tokens.iter().filter(|t| **t == "Rune").count(), 1);
+        assert_eq!(tokens.iter().filter(|t| **t == "Migration").count(), 1);
+        // ...and keys never leak in.
+        assert!(!hint.contains("jira_work_context"), "hint: {hint:?}");
+        assert!(!hint.contains("email_triage"), "hint: {hint:?}");
+        // Lucene special chars stripped (no `{`, `}`, `:`, `"`).
+        assert!(
+            !hint.contains(['{', '}', ':', '"']),
+            "hint must not carry Lucene metachars: {hint:?}"
+        );
+        assert!(reflection_graph_hint(&[]).is_empty());
     }
 
     #[test]
@@ -806,7 +1535,7 @@ mod tests {
             serde_json::json!({ "v": big }),
             "semantic".to_string(),
         )];
-        let (_s, u) = build_reflection_prompt(&memories);
+        let (_s, u) = build_reflection_prompt(&memories, None);
         assert!(u.len() <= 24_000);
     }
 
