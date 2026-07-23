@@ -521,11 +521,26 @@ mod tests {
         env::remove_var("SMART_MEMORY_CONTEXT_BYTE_BUDGET");
         env::remove_var("SMART_MEMORY_CONTEXT_PER_MEMORY_CAP");
         env::remove_var("SMART_MEMORY_CONTEXT_MIN_SCORE");
-        // Flag defaults OFF → legacy byte-identical behaviour.
+        // Flag defaults ON (2026-07: grounded memory is the default). An
+        // explicit falsey value falls back to the legacy path.
+        assert!(crate::smart_memory_context_enabled());
+        env::set_var("ENABLE_SMART_MEMORY_CONTEXT", "false");
         assert!(!crate::smart_memory_context_enabled());
+        env::remove_var("ENABLE_SMART_MEMORY_CONTEXT");
         assert_eq!(crate::smart_memory_context_byte_budget(), 12_000);
         assert_eq!(crate::smart_memory_context_per_memory_cap(), 3_000);
         assert!((crate::smart_memory_context_min_score() - 0.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_ranked_recall_default_on_and_disablable() {
+        let _g = env_lock();
+        env::remove_var("ENABLE_RANKED_RECALL");
+        // Default ON (2026-07: grounded recall is the default).
+        assert!(crate::ranked_recall_enabled());
+        env::set_var("ENABLE_RANKED_RECALL", "off");
+        assert!(!crate::ranked_recall_enabled());
+        env::remove_var("ENABLE_RANKED_RECALL");
     }
 
     #[test]
@@ -811,17 +826,21 @@ mod tests {
         env::remove_var("MEMORY_RANK_PROVENANCE_RETENTION_DAYS");
     }
 
-    /// Both adaptive-rank flags default OFF and independently toggle.
+    /// Adaptive-rank SERVING defaults ON (cold-start byte-identical), TRAINING
+    /// defaults OFF; they toggle independently.
     #[test]
-    fn test_adaptive_rank_flags_default_off() {
+    fn test_adaptive_rank_flags_defaults() {
         let _g = env_lock();
         env::remove_var("ENABLE_ADAPTIVE_RANK");
         env::remove_var("ENABLE_ADAPTIVE_RANK_TRAINING");
-        assert!(!crate::adaptive_rank_enabled(), "serving default OFF");
+        assert!(crate::adaptive_rank_enabled(), "serving default ON");
         assert!(
             !crate::adaptive_rank_training_enabled(),
             "training default OFF"
         );
+        // Serving is explicitly disablable.
+        env::set_var("ENABLE_ADAPTIVE_RANK", "false");
+        assert!(!crate::adaptive_rank_enabled());
         // Independent toggles.
         env::set_var("ENABLE_ADAPTIVE_RANK", "1");
         assert!(crate::adaptive_rank_enabled());
