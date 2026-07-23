@@ -188,6 +188,22 @@ controller:
     GLOBAL_RATE_LIMIT: "10000"
     ALLOW_DEV_UNSAFE_CSRF_BYPASS: "false"
     ENABLE_HSTS: "true"
+    # ── Grounded memory (default ON) ───────────────────────────────────────
+    # The adaptive-memory grounding path is the default. Set any of these to
+    # "false" to fall back to the legacy unranked memory behaviour.
+    #   ENABLE_SMART_MEMORY_CONTEXT — assemble injected __actor_context__ via the
+    #     fused ranker (kind-filtered, similarity-floored, byte-budgeted) instead
+    #     of the legacy count-capped cosine merge.
+    #   ENABLE_RANKED_RECALL — route the explicit recall path (actor_recall_*,
+    #     worker agent_memory::search) through the same fused ranker.
+    #   ENABLE_ADAPTIVE_RANK — serve LEARNED per-actor weights when present
+    #     (cold-start safe: byte-identical to global weights until training runs).
+    # The learning LOOPS that PRODUCE those weights / reflections stay opt-in:
+    # ENABLE_ADAPTIVE_RANK_TRAINING, ENABLE_MEMORY_REFLECTION,
+    # ENABLE_MEMORY_CONSOLIDATION, ENABLE_MEMORY_RANK_PROVENANCE (unset = off).
+    ENABLE_SMART_MEMORY_CONTEXT: "true"
+    ENABLE_RANKED_RECALL: "true"
+    ENABLE_ADAPTIVE_RANK: "true"
     # KEK (key-encryption-key) backend that wraps every DEK.
     #   "vault" (default) — KMS-backed HashiCorp Vault transit; the root key
     #     never leaves Vault. Required posture for HIPAA/SOC2/ISO key management.

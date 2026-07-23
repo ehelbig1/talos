@@ -222,22 +222,45 @@ pub fn admin_ops_enabled() -> bool {
 }
 
 /// Canonical resolver for the smart actor-memory-context builder feature
-/// flag (`ENABLE_SMART_MEMORY_CONTEXT`). Default OFF.
+/// flag (`ENABLE_SMART_MEMORY_CONTEXT`). **Default ON** (2026-07: grounded
+/// memory is the default — set `ENABLE_SMART_MEMORY_CONTEXT=false|0|no|off` to
+/// fall back to the legacy path).
 ///
-/// When OFF, `__actor_context__` assembly and per-node injection are
-/// byte-identical to the legacy path: the count-capped, unfiltered,
-/// `min_score = 0.0` retriever runs and every node receives the context.
-/// When ON, the retriever kind-filters synthetic self-outputs, applies a
-/// similarity floor ([`smart_memory_context_min_score`]), packs candidates
-/// under a byte budget ([`smart_memory_context_byte_budget`] /
-/// [`smart_memory_context_per_memory_cap`]), and the engine injects the
-/// context only into nodes that declare `needs_memory = true` (the
+/// When ON (the default), the retriever kind-filters synthetic self-outputs,
+/// applies a similarity floor ([`smart_memory_context_min_score`]), packs
+/// candidates under a byte budget ([`smart_memory_context_byte_budget`] /
+/// [`smart_memory_context_per_memory_cap`]) ranked by the fused scorer (learned
+/// per-actor weights when [`adaptive_rank_enabled`] is on), and the engine
+/// injects the context only into nodes that declare `needs_memory = true` (the
 /// default, so no consumer silently loses context).
+/// When explicitly disabled, `__actor_context__` assembly and per-node injection
+/// are byte-identical to the legacy path: the count-capped, unfiltered,
+/// `min_score = 0.0` retriever runs and every node receives the context.
 ///
 /// Accepted truthy tokens match every other flag: `true | 1 | yes | on`
 /// (case-insensitive) — see [`bool_env_or_default`].
 pub fn smart_memory_context_enabled() -> bool {
-    bool_env_or_default("ENABLE_SMART_MEMORY_CONTEXT", false)
+    bool_env_or_default("ENABLE_SMART_MEMORY_CONTEXT", true)
+}
+
+/// Route the EXPLICIT semantic-recall path (the worker `agent_memory::search`
+/// RPC + the MCP `actor_recall_semantic` / `actor_recall_hyde` handlers)
+/// through the smart-context fused ranker instead of raw pgvector-cosine order.
+/// When ON, recall overfetches then re-orders by the same relevance + recency +
+/// importance + access-frequency blend the `__actor_context__` grounding path
+/// uses — and by the learned PER-ACTOR weights when [`adaptive_rank_enabled`]
+/// is also on. **Default ON** (2026-07: grounded recall is the default) — set
+/// `ENABLE_RANKED_RECALL=false|0|no|off` to fall back to plain pgvector-cosine.
+/// Cold-start safe: with no learned weights and default config weights this is
+/// the same fused blend the grounding path uses; disabling it is byte-identical
+/// to raw cosine.
+///
+/// This is the "grounding any time memory is needed" switch: it makes every
+/// workflow that recalls memory benefit from the adaptive-memory arc with no
+/// per-workflow change. Independent of [`smart_memory_context_enabled`] (which
+/// governs the auto-injected grounding payload, a different path).
+pub fn ranked_recall_enabled() -> bool {
+    bool_env_or_default("ENABLE_RANKED_RECALL", true)
 }
 
 /// Total byte budget for the assembled `__actor_context__` payload when
@@ -586,22 +609,30 @@ pub fn memory_rank_provenance_retention_days() -> i64 {
 // are stored in `actors.metadata.rank_weights` and injected at the ranker seam
 // in place of the global `SMART_MEMORY_CONTEXT_W_*` constants.
 //
-// TWO independent default-OFF flags: `ENABLE_ADAPTIVE_RANK_TRAINING` gates the
-// scheduled fit job (which writes weights); `ENABLE_ADAPTIVE_RANK` gates
-// SERVING (whether the ranker consults learned weights when present). Both off
-// ⇒ byte-identical ranking to today and no training task spawned. The training
-// fit is a PURE numeric computation over Phase-1 numeric signals only — no LLM,
-// no memory VALUES, zero data egress — so unlike consolidation/reflection it
-// needs no tier gate.
+// TWO independent flags: `ENABLE_ADAPTIVE_RANK_TRAINING` gates the scheduled fit
+// job (which writes weights) — DEFAULT OFF (no background job unless an operator
+// opts into the learning loop); `ENABLE_ADAPTIVE_RANK` gates SERVING (whether
+// the ranker consults learned weights when present) — DEFAULT ON, but cold-start
+// safe: with no weights written yet it is byte-identical to global-weight
+// ranking, so it costs only a cheap per-actor SELECT and auto-adopts weights the
+// moment training is enabled and produces them. The training fit is a PURE
+// numeric computation over Phase-1 numeric signals only — no LLM, no memory
+// VALUES, zero data egress — so unlike consolidation/reflection it needs no tier
+// gate.
 
-/// SERVING switch (`ENABLE_ADAPTIVE_RANK`). Default OFF. When on, the smart
-/// ranker consults `actors.metadata.rank_weights` and — when present, parseable,
-/// and backed by enough examples — uses the learned per-actor weights instead of
-/// the global `SMART_MEMORY_CONTEXT_W_*` constants. Off / missing / unparseable
-/// ⇒ exact current (global-weight) behaviour. Truthy tokens per
-/// [`bool_env_or_default`].
+/// SERVING switch (`ENABLE_ADAPTIVE_RANK`). **Default ON** (2026-07: grounded
+/// memory is the default) — set `ENABLE_ADAPTIVE_RANK=false|0|no|off` to force
+/// global weights only. When on, the smart ranker consults
+/// `actors.metadata.rank_weights` and — when present, parseable, and backed by
+/// enough examples — uses the learned per-actor weights instead of the global
+/// `SMART_MEMORY_CONTEXT_W_*` constants. **Cold-start safe**: with no learned
+/// weights (the state until `ENABLE_ADAPTIVE_RANK_TRAINING` runs) serving is
+/// byte-identical to global-weight behaviour — the only cost is one cheap
+/// indexed per-actor `SELECT`. This is why it defaults on: the moment training
+/// produces weights, serving picks them up with no further config. Truthy tokens
+/// per [`bool_env_or_default`].
 pub fn adaptive_rank_enabled() -> bool {
-    bool_env_or_default("ENABLE_ADAPTIVE_RANK", false)
+    bool_env_or_default("ENABLE_ADAPTIVE_RANK", true)
 }
 
 /// TRAINING switch (`ENABLE_ADAPTIVE_RANK_TRAINING`) for the scheduled per-actor

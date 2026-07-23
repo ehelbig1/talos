@@ -57,6 +57,7 @@ talos-public-url = { path = "../talos-public-url" }
 talos-llm = { path = "../talos-llm" }
 talos-mcp = { path = "../talos-mcp" }
 talos-memory = { path = "../talos-memory" }
+talos-memory-ranking = { path = "../talos-memory-ranking" }
 talos-module-repository = { path = "../talos-module-repository" }
 talos-oauth = { path = "../talos-oauth" }
 talos-registry = { path = "../talos-registry" }
@@ -82,6 +83,7 @@ talos-validation = { path = "../talos-validation" }
 talos-webhook-repository = { path = "../talos-webhook-repository" }
 talos-webhooks = { path = "../talos-webhooks" }
 talos-execution-orchestration = { path = "../talos-execution-orchestration" }
+talos-evaluation = { path = "../talos-evaluation" }
 talos-workflow-manifest = { path = "../talos-workflow-manifest" }
 talos-execution-result-collector = { path = "../talos-execution-result-collector" }
 talos-hot-update-service = { path = "../talos-hot-update-service" }

@@ -28,6 +28,7 @@ talos-graph-rag = { path = "../talos-graph-rag" }
 talos-integration-state = { path = "../talos-integration-state" }
 talos-db = { path = "../talos-db" }
 talos-memory = { path = "../talos-memory" }
+talos-memory-ranking = { path = "../talos-memory-ranking" }
 # RFC 0011 P2c: `talos.ml.predict` serving (model resolution + knn
 # batch inference under a tenant-scoped read tx).
 talos-ml = { path = "../talos-ml" }

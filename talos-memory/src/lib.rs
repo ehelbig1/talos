@@ -2272,6 +2272,85 @@ pub async fn fetch_rank_training_examples(
     Ok(out)
 }
 
+/// One execution's memory footprint joined to its outcome, aggregated per
+/// execution (contrast [`RankTrainingExample`], which is per-memory-row). Used
+/// by the OBSERVATIONAL evaluation: within executions that carried memory, does
+/// higher mean relevance track a better judge outcome? Values-free.
+#[derive(Clone, Debug)]
+pub struct ExecutionMemoryOutcome {
+    pub execution_id: Uuid,
+    /// Mean fused rank score across the memories injected into this execution.
+    pub mean_fused: f64,
+    /// Max fused rank score among injected memories.
+    pub max_fused: f64,
+    /// Number of memories injected.
+    pub mem_count: i64,
+    /// Newest judge verdict for the execution, if any.
+    pub judge_score: Option<f64>,
+    pub judge_passed: Option<bool>,
+    pub execution_status: Option<String>,
+}
+
+/// Per-execution aggregate of `execution_memory_context` joined to each
+/// execution's NEWEST judge verdict and status. Actor-scoped
+/// (`WHERE emc.actor_id = $1`). `limit` is clamped to
+/// `[0, RANK_TRAINING_EXAMPLE_MAX]`. Reads are fail-loud. Only executions that
+/// actually carried memory context appear (memory-OFF runs write no provenance
+/// rows — which is exactly why observational analysis cannot prove ON-vs-OFF
+/// causation, only correlation within the memory-ON population).
+pub async fn fetch_execution_memory_outcomes(
+    pool: &Pool<Postgres>,
+    actor_id: Uuid,
+    since: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<ExecutionMemoryOutcome>> {
+    let limit = limit.clamp(0, RANK_TRAINING_EXAMPLE_MAX);
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        "SELECT emc.execution_id, \
+                AVG(emc.fused_score)::float8 AS mean_fused, \
+                MAX(emc.fused_score)::float8 AS max_fused, \
+                COUNT(*)::int8 AS mem_count, \
+                js.score AS judge_score, js.passed AS judge_passed, \
+                we.status AS execution_status \
+         FROM execution_memory_context emc \
+         LEFT JOIN LATERAL ( \
+             SELECT score, passed FROM judge_scores j \
+             WHERE j.execution_id = emc.execution_id \
+             ORDER BY j.created_at DESC LIMIT 1 \
+         ) js ON true \
+         LEFT JOIN workflow_executions we ON we.id = emc.execution_id \
+         WHERE emc.actor_id = $1 AND emc.created_at >= $2 \
+         GROUP BY emc.execution_id, js.score, js.passed, we.status \
+         ORDER BY MAX(emc.created_at) DESC \
+         LIMIT $3",
+    )
+    .bind(actor_id)
+    .bind(since)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .context("fetch_execution_memory_outcomes")?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        out.push(ExecutionMemoryOutcome {
+            execution_id: row
+                .try_get::<Option<Uuid>, _>("execution_id")?
+                .unwrap_or(actor_id),
+            mean_fused: row.try_get::<Option<f64>, _>("mean_fused")?.unwrap_or(0.0),
+            max_fused: row.try_get::<Option<f64>, _>("max_fused")?.unwrap_or(0.0),
+            mem_count: row.try_get::<Option<i64>, _>("mem_count")?.unwrap_or(0),
+            judge_score: row.try_get::<Option<f64>, _>("judge_score")?,
+            judge_passed: row.try_get::<Option<bool>, _>("judge_passed")?,
+            execution_status: row.try_get::<Option<String>, _>("execution_status")?,
+        });
+    }
+    Ok(out)
+}
+
 /// Delete provenance rows older than `retention_days`. Bound as `i32` and cast
 /// `$1::int` per lint 27 (`make_interval` args are int4-only). Returns the
 /// number of rows deleted. Harmless when the table is empty.

@@ -1684,7 +1684,14 @@ async fn execute_memory_op(
             // excludes rows whose metadata.kind ∈ the list at the DB
             // layer so synthetic outputs never re-enter an LLM's
             // source list.
-            let outcome = talos_memory::recall_semantic_filtered(
+            // Grounding-backed recall: routes through the smart-context fused
+            // ranker (relevance + recency + importance + access, learned
+            // per-actor weights when ENABLE_ADAPTIVE_RANK is on) when
+            // ENABLE_RANKED_RECALL is set; otherwise byte-identical to plain
+            // recall_semantic_filtered. Covers EVERY worker `agent_memory::search`
+            // recall, so all recall-using workflows benefit with no per-workflow
+            // change.
+            let outcome = talos_memory_ranking::recall_semantic_ranked(
                 pool,
                 actor_id,
                 &query,
