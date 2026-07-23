@@ -37,6 +37,7 @@ members = [
     "talos-integration-state",
     "talos-ml",
     "talos-memory-consolidation",
+    "talos-memory-ranking",
     "talos-system-repo",
     "talos-api-keys",
     "talos-graph-rag",

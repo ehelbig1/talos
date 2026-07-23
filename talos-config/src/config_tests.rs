@@ -746,4 +746,86 @@ mod tests {
         assert_eq!(crate::memory_rank_provenance_retention_days(), 3650);
         env::remove_var("MEMORY_RANK_PROVENANCE_RETENTION_DAYS");
     }
+
+    /// Both adaptive-rank flags default OFF and independently toggle.
+    #[test]
+    fn test_adaptive_rank_flags_default_off() {
+        let _g = env_lock();
+        env::remove_var("ENABLE_ADAPTIVE_RANK");
+        env::remove_var("ENABLE_ADAPTIVE_RANK_TRAINING");
+        assert!(!crate::adaptive_rank_enabled(), "serving default OFF");
+        assert!(
+            !crate::adaptive_rank_training_enabled(),
+            "training default OFF"
+        );
+        // Independent toggles.
+        env::set_var("ENABLE_ADAPTIVE_RANK", "1");
+        assert!(crate::adaptive_rank_enabled());
+        assert!(!crate::adaptive_rank_training_enabled());
+        env::set_var("ENABLE_ADAPTIVE_RANK_TRAINING", "true");
+        assert!(crate::adaptive_rank_training_enabled());
+        env::remove_var("ENABLE_ADAPTIVE_RANK");
+        env::remove_var("ENABLE_ADAPTIVE_RANK_TRAINING");
+    }
+
+    /// The numeric adaptive-rank knobs default correctly, clamp to range, and
+    /// reject destructive `=0`/negative/garbage values.
+    #[test]
+    fn test_adaptive_rank_numeric_knobs_default_and_clamp() {
+        let _g = env_lock();
+        for v in [
+            "ADAPTIVE_RANK_MIN_EXAMPLES",
+            "ADAPTIVE_RANK_TRAINING_INTERVAL_SECS",
+            "ADAPTIVE_RANK_LOOKBACK_DAYS",
+            "ADAPTIVE_RANK_MAX_ACTORS_PER_TICK",
+        ] {
+            env::remove_var(v);
+        }
+        // Defaults.
+        assert_eq!(crate::adaptive_rank_min_examples(), 50);
+        assert_eq!(crate::adaptive_rank_training_interval_secs(), 21_600);
+        assert_eq!(crate::adaptive_rank_lookback_days(), 30);
+        assert_eq!(crate::adaptive_rank_max_actors_per_tick(), 50);
+
+        // Destructive-zero / negative / garbage → default.
+        for bad in ["0", "-1", "not-a-number"] {
+            env::set_var("ADAPTIVE_RANK_MIN_EXAMPLES", bad);
+            assert_eq!(crate::adaptive_rank_min_examples(), 50);
+            env::set_var("ADAPTIVE_RANK_MAX_ACTORS_PER_TICK", bad);
+            assert_eq!(crate::adaptive_rank_max_actors_per_tick(), 50);
+        }
+
+        // Lower clamps.
+        env::set_var("ADAPTIVE_RANK_MIN_EXAMPLES", "1");
+        assert_eq!(crate::adaptive_rank_min_examples(), 10);
+        env::set_var("ADAPTIVE_RANK_TRAINING_INTERVAL_SECS", "10");
+        assert_eq!(crate::adaptive_rank_training_interval_secs(), 300);
+        env::set_var("ADAPTIVE_RANK_MAX_ACTORS_PER_TICK", "0");
+        assert_eq!(crate::adaptive_rank_max_actors_per_tick(), 50); // 0 → default
+
+        // Upper clamps.
+        env::set_var("ADAPTIVE_RANK_MIN_EXAMPLES", "9999999");
+        assert_eq!(crate::adaptive_rank_min_examples(), 100_000);
+        env::set_var("ADAPTIVE_RANK_TRAINING_INTERVAL_SECS", "99999999");
+        assert_eq!(crate::adaptive_rank_training_interval_secs(), 604_800);
+        env::set_var("ADAPTIVE_RANK_LOOKBACK_DAYS", "999999");
+        assert_eq!(crate::adaptive_rank_lookback_days(), 3650);
+        env::set_var("ADAPTIVE_RANK_MAX_ACTORS_PER_TICK", "99999");
+        assert_eq!(crate::adaptive_rank_max_actors_per_tick(), 500);
+
+        // Valid pass-through.
+        env::set_var("ADAPTIVE_RANK_MIN_EXAMPLES", "100");
+        assert_eq!(crate::adaptive_rank_min_examples(), 100);
+        env::set_var("ADAPTIVE_RANK_LOOKBACK_DAYS", "14");
+        assert_eq!(crate::adaptive_rank_lookback_days(), 14);
+
+        for v in [
+            "ADAPTIVE_RANK_MIN_EXAMPLES",
+            "ADAPTIVE_RANK_TRAINING_INTERVAL_SECS",
+            "ADAPTIVE_RANK_LOOKBACK_DAYS",
+            "ADAPTIVE_RANK_MAX_ACTORS_PER_TICK",
+        ] {
+            env::remove_var(v);
+        }
+    }
 }

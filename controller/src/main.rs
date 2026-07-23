@@ -647,6 +647,16 @@ async fn main() -> anyhow::Result<()> {
         bg_shutdown_rx.clone(),
     );
 
+    // Adaptive per-actor memory ranking — Phase 2 (learned ranker). Default-OFF
+    // (ENABLE_ADAPTIVE_RANK_TRAINING) — spawn_* returns without a task when
+    // disabled. Pure numeric fit over the Phase-1 provenance corpus: no LLM, no
+    // secrets, no tier gate (zero data egress).
+    talos_memory_ranking::spawn_rank_training_scheduler(
+        db_pool.clone(),
+        talos_actor_repository::ActorRepository::new(db_pool.clone()),
+        bg_shutdown_rx.clone(),
+    );
+
     // Embedding backfill, readiness recomputation, SLA degradation alerting.
     spawn_analytics_tasks(db_pool.clone(), bg_shutdown_rx.clone());
 

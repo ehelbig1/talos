@@ -20,6 +20,7 @@ talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-engine-events = { path = "../talos-engine-events" }
 talos-graph-rag = { path = "../talos-graph-rag" }
 talos-memory = { path = "../talos-memory" }
+talos-memory-ranking = { path = "../talos-memory-ranking" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-text-util = { path = "../talos-text-util" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }

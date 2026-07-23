@@ -284,14 +284,33 @@ impl WorkflowRepository {
         // then deterministically bound the assembled payload to the byte
         // budget in fused-score order. `now` is injected once here so the
         // production path uses the real clock while tests stay deterministic.
-        let weights = talos_memory::actor_context::Weights {
+        // Fused-ranking weights. DEFAULT: the global `SMART_MEMORY_CONTEXT_W_*`
+        // constants. When `ENABLE_ADAPTIVE_RANK` is on AND this actor has a
+        // TRUSTED learned model (Phase 2), use its per-actor LEARNED weights
+        // instead. Flag-off / no model / parse-fail / too-few-examples /
+        // degenerate mapping ALL fall back here to the EXACT global-config
+        // weights — so flag-off (or cold-start) ranking is byte-identical to
+        // today. The learned weights only change the fused SCORE ORDER; the
+        // recency half-life stays global (only the 3 blend weights + access are
+        // learned) and `pack_within_budget` + everything downstream is
+        // unchanged.
+        let global_weights = talos_memory::actor_context::Weights {
             relevance: talos_config::smart_memory_context_w_relevance(),
             recency: talos_config::smart_memory_context_w_recency(),
             importance: talos_config::smart_memory_context_w_importance(),
             recency_halflife_days: talos_config::smart_memory_context_recency_halflife_days(),
         };
+        let global_access_weight = talos_config::smart_memory_context_access_weight();
+        let (weights, access_weight) = if talos_config::adaptive_rank_enabled() {
+            // Keyed on the bound `actor_id` — reads only this actor's learned
+            // weights (per-actor isolation). Non-fatal: any miss → global.
+            talos_memory_ranking::load_serving_weights(&self.db_pool, actor_id)
+                .await
+                .unwrap_or((global_weights, global_access_weight))
+        } else {
+            (global_weights, global_access_weight)
+        };
         let now = chrono::Utc::now();
-        let access_weight = talos_config::smart_memory_context_access_weight();
         let ranked =
             talos_memory::actor_context::rank_candidates(candidates, &weights, now, access_weight);
 

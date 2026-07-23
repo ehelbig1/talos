@@ -1746,6 +1746,7 @@ dependencies = [
  "talos-memory",
  "talos-memory-consolidation",
  "talos-memory-crypto",
+ "talos-memory-ranking",
  "talos-metrics",
  "talos-ml",
  "talos-module-executions",
@@ -8360,6 +8361,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-memory-ranking"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "talos-actor-repository",
+ "talos-config",
+ "talos-memory",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "talos-metrics"
 version = "0.1.0"
 dependencies = [
@@ -9242,6 +9260,7 @@ dependencies = [
  "talos-engine-events",
  "talos-graph-rag",
  "talos-memory",
+ "talos-memory-ranking",
  "talos-secrets-manager",
  "talos-tenancy",
  "talos-text-util",

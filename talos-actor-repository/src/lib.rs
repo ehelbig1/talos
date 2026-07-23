@@ -2391,6 +2391,118 @@ impl ActorRepository {
         Ok(result.rows_affected())
     }
 
+    // ── Adaptive per-actor memory ranking — Phase 2 (learned weights) ──────
+    //
+    // Learned per-actor fused-ranking weights are stored in the actor's
+    // `metadata.rank_weights` JSONB slot. The three methods below are the
+    // read (serving), write (training-fit), and scan (training rotation)
+    // surfaces. Every one keys STRICTLY on `actor_id` — the per-actor tenancy
+    // isolation invariant: one actor's fit can only ever read/write its OWN
+    // row, so one actor's outcomes can never influence another's weights.
+    // RLS on `actors` is a defence-in-depth backstop; the `WHERE id = $1`
+    // predicate is the primary guarantee.
+
+    /// Read the learned rank-weights blob (`actors.metadata->'rank_weights'`)
+    /// for one actor. `Ok(None)` when the actor is missing OR has no learned
+    /// weights yet (cold-start). Fail-loud read (`try_get::<Option<_>,_>()?`)
+    /// so a projection/type drift errors instead of silently defaulting
+    /// (checks 52/55). Keyed on `actor_id` only — pure per-actor isolation.
+    pub async fn get_actor_rank_weights(
+        &self,
+        actor_id: Uuid,
+    ) -> Result<Option<serde_json::Value>> {
+        let row = sqlx::query(
+            "SELECT metadata->'rank_weights' AS rank_weights FROM actors WHERE id = $1",
+        )
+        .bind(actor_id)
+        .fetch_optional(&self.db_pool)
+        .await?;
+        match row {
+            Some(r) => Ok(r.try_get::<Option<serde_json::Value>, _>("rank_weights")?),
+            None => Ok(None),
+        }
+    }
+
+    /// Persist the learned rank-weights blob into `actors.metadata.rank_weights`
+    /// for one actor (the training-fit writer). Uses `jsonb_set` over a
+    /// `COALESCE(metadata,'{}')` so a NULL-metadata actor is handled and every
+    /// OTHER metadata key is preserved. Keyed STRICTLY on `actor_id` — a fit for
+    /// one actor can only ever write that actor's row (per-actor isolation; RLS
+    /// is the backstop). Returns true if a row was updated.
+    pub async fn set_actor_rank_weights(
+        &self,
+        actor_id: Uuid,
+        rank_weights: &serde_json::Value,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE actors \
+             SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{rank_weights}', $2), \
+                 updated_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(actor_id)
+        .bind(rank_weights)
+        .execute(&self.db_pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Cross-tenant scan of active actors for the Phase-2 rank-training loop.
+    /// Returns up to `limit` active actor ids.
+    ///
+    /// This is a PLATFORM scan (same posture as `scan_actors_for_consolidation`
+    /// and `talos-ml`'s teacher-audit): the training loop runs AS the platform
+    /// background service, not on behalf of any single user, so no RLS tenant
+    /// scope is applied. The subsequent fit + write is keyed per `actor_id`,
+    /// which is where per-actor tenancy isolation lives.
+    ///
+    /// Rotation: ordered `ORDER BY id` (deterministic, stable). For a fleet
+    /// SMALLER than `limit` (the common case — the training set is small and
+    /// `ADAPTIVE_RANK_MAX_ACTORS_PER_TICK` defaults to 50) every actor is
+    /// reached each tick, so no cursor is needed. If the active fleet grows
+    /// beyond one tick's `limit`, a dedicated `last_rank_trained_at` rotation
+    /// cursor (mirroring consolidation's `last_consolidated_at`) is the
+    /// follow-up — deliberately deferred for v1 to avoid a migration, since
+    /// a stale-but-present learned weight simply keeps serving the last fit.
+    pub async fn scan_actors_for_rank_training(&self, limit: i64) -> Result<Vec<Uuid>> {
+        // Least-recently-trained first (rotation cursor): never-trained actors
+        // (`last_rank_trained_at IS NULL`) sort FIRST, so every active actor is
+        // eventually fit even when the fleet exceeds one tick's `limit` — an
+        // `ORDER BY id` scan would train only the lowest-id N forever and leave
+        // the rest permanently on global weights. `mark_actors_rank_trained`
+        // advances the cursor after each tick. `id` is the stable tiebreaker.
+        let rows = sqlx::query(
+            "SELECT id FROM actors WHERE status = 'active' \
+             ORDER BY last_rank_trained_at ASC NULLS FIRST, id \
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.db_pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            // Fail-loud read (checks 52/55): `id` is NOT NULL — a drift errors.
+            out.push(r.try_get::<Uuid, _>("id")?);
+        }
+        Ok(out)
+    }
+
+    /// Advance the rank-training rotation cursor for every actor a tick examined
+    /// (fit OR skipped for too-few examples), so the next tick moves on to the
+    /// least-recently-trained actors. Best-effort — a failure only means a
+    /// repeat next tick, never data loss. No-op on an empty slice.
+    pub async fn mark_actors_rank_trained(&self, actor_ids: &[Uuid]) -> Result<u64> {
+        if actor_ids.is_empty() {
+            return Ok(0);
+        }
+        let result =
+            sqlx::query("UPDATE actors SET last_rank_trained_at = now() WHERE id = ANY($1)")
+                .bind(actor_ids)
+                .execute(&self.db_pool)
+                .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Set an actor's LLM data-egress ceiling. Validates user ownership
     /// before mutating. Returns true if the row was updated, false if
     /// the actor doesn't exist or doesn't belong to the user.
