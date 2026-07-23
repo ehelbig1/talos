@@ -7492,6 +7492,7 @@ dependencies = [
  "async-nats",
  "serde_json",
  "sqlx",
+ "talos-actor-memory-service",
  "talos-actor-repository",
  "talos-advanced-repository",
  "talos-dlp-provider",

@@ -81,7 +81,7 @@ pub async fn trigger_continuation_workflow(
 ) -> Option<String> {
     let repo = Arc::new(AdvancedRepository::new(db_pool.clone()));
     let execution_id = Uuid::new_v4();
-    let trigger_payload = serde_json::json!({
+    let mut trigger_payload = serde_json::json!({
         source_kind.id_field(): source_id.to_string(),
         "payload": payload,
         "triggered_by": source_kind.triggered_by(),
@@ -241,6 +241,38 @@ pub async fn trigger_continuation_workflow(
         }
     };
 
+    // Tier 2: grounding for push-triggered NEW executions. Inject curated actor
+    // memory when this is a GmailPush (a FRESH execution) whose target workflow
+    // is ACTOR-BOUND (`workflow_actor_id` — the binding, never the user-default
+    // actor, matching the scheduler's contamination-safe rule) and not opted
+    // out. RESUMES (`ApprovalGate` / `WorkflowSuspension`) NEVER inject: their
+    // pre-suspension half already ran with its own context, so re-injecting
+    // would be duplicate/incorrect. Auth has passed above, so a bound actor here
+    // is validated + active. Curated scope keeps transient `working` memory out
+    // of the trace; `insert_queued_execution` below additionally DLP-redacts the
+    // stored payload. No relevance hint on a push event → recency-based recall.
+    if matches!(source_kind, TriggerSourceKind::GmailPush) {
+        if let Some(bound_actor) = workflow_actor_id {
+            let opted_out = serde_json::from_str::<serde_json::Value>(&graph_json)
+                .ok()
+                .and_then(|v| v.get("inject_memory").and_then(|b| b.as_bool()))
+                == Some(false);
+            if !opted_out {
+                talos_actor_memory_service::inject_actor_context_into_input(
+                    &workflow_repo_for_auth,
+                    &mut trigger_payload,
+                    Some(bound_actor),
+                    true,
+                    10,
+                    None,
+                    Some(execution_id),
+                    talos_workflow_repository::MemoryScope::Curated,
+                )
+                .await;
+            }
+        }
+    }
+
     // 1. Create execution record (queued; transitions to running in the spawn below)
     if let Err(e) = repo
         .insert_queued_execution(execution_id, workflow_id, user_id, &trigger_payload)
@@ -360,18 +392,20 @@ pub async fn trigger_continuation_workflow(
     // MCP-683: keep a SecretsManager clone for the post-run encryption-
     // aware persistence; the builder consumes the Arc below.
     let sm_for_persist = secrets_manager.clone();
-    let mut engine = match for_workflow(
-        registry,
-        secrets_manager,
-        actor_repo,
-        user_id,
-        // Phase D2: bind the gate-resolved actor so the resumed half of
-        // the run executes at the same tier (and with the same
-        // `__memory_write__` capability) as the pre-suspension half.
-        EngineOpts::for_run(workflow_id, graph_json.clone())
-            .with_effective_actor(effective_actor_id, workflow_actor_id),
-    )
-    .await
+    // Phase D2: bind the gate-resolved actor so the resumed half of the run
+    // executes at the same tier (and with the same `__memory_write__`
+    // capability) as the pre-suspension half.
+    let mut engine_opts = EngineOpts::for_run(workflow_id, graph_json.clone())
+        .with_effective_actor(effective_actor_id, workflow_actor_id);
+    // Tier 2: LIFT any injected `__actor_context__` (GmailPush path above) onto
+    // the engine so per-node `needs_memory` gating applies and it reaches deeper
+    // LLM nodes, not just the root — matching the scheduler / direct-trigger
+    // lift. The payload keeps its own copy for the stored trace.
+    if let Some(ctx) = trigger_payload.get("__actor_context__") {
+        engine_opts = engine_opts.with_actor_context(Some(ctx.clone()));
+    }
+    let mut engine = match for_workflow(registry, secrets_manager, actor_repo, user_id, engine_opts)
+        .await
     {
         Ok(e) => e,
         Err(BuildError::GraphLoad(engine_err)) => {
