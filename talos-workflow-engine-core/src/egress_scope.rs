@@ -118,6 +118,35 @@ impl EgressScope {
             (None, None) => None,
         }
     }
+
+    /// The concrete scope a NULL/unset override resolves to for a given LLM
+    /// tier — the SAME tier-derived default the worker applies in
+    /// `resolve_local_egress_only`'s `None` arm (`Tier1` → `Local`, everything
+    /// else → `Public`). Keep these in lockstep.
+    ///
+    /// This exists so sub-workflow narrowing can be made SYMMETRIC with the
+    /// concrete tier/write axes: a sub-actor that is air-gapped only by its
+    /// tier default (egress column NULL) must NOT lose that air-gap when
+    /// invoked under a caller with an explicit `Public` scope. Callers resolve
+    /// BOTH sides to their effective scope via [`Self::effective`] before
+    /// [`Self::narrow`], so a `None` never "defers to caller" across the
+    /// sub-workflow boundary.
+    #[must_use]
+    pub fn tier_default(tier: crate::LlmTier) -> Self {
+        match tier {
+            crate::LlmTier::Tier1 => EgressScope::Local,
+            _ => EgressScope::Public,
+        }
+    }
+
+    /// Resolve an override `Option` to the concrete scope actually in force:
+    /// an explicit value wins, otherwise the tier-derived default
+    /// ([`Self::tier_default`]). Use before [`Self::narrow`] on each side of a
+    /// sub-workflow composition.
+    #[must_use]
+    pub fn effective(scope: Option<Self>, tier: crate::LlmTier) -> Self {
+        scope.unwrap_or_else(|| Self::tier_default(tier))
+    }
 }
 
 #[cfg(test)]
@@ -157,6 +186,35 @@ mod tests {
         assert_eq!(
             EgressScope::from_db_opt(Some("garbage")),
             Some(EgressScope::Local)
+        );
+    }
+
+    #[test]
+    fn effective_folds_tier_default_and_preserves_subworkflow_airgap() {
+        use crate::LlmTier;
+        // A NULL override resolves to the tier default (mirrors the worker gate).
+        assert_eq!(
+            EgressScope::effective(None, LlmTier::Tier1),
+            EgressScope::Local
+        );
+        assert_eq!(
+            EgressScope::effective(None, LlmTier::Tier2),
+            EgressScope::Public
+        );
+        // An explicit value wins over the tier default.
+        assert_eq!(
+            EgressScope::effective(Some(EgressScope::Public), LlmTier::Tier1),
+            EgressScope::Public
+        );
+        // THE FIX: a Tier-1 sub-actor with NO explicit override (air-gapped
+        // only by its tier default) must NOT lose its air-gap under a Public
+        // parent. Resolving both sides to effective BEFORE narrow guarantees it.
+        let parent = EgressScope::effective(Some(EgressScope::Public), LlmTier::Tier2);
+        let sub = EgressScope::effective(None, LlmTier::Tier1); // NULL column, Tier1
+        assert_eq!(
+            EgressScope::narrow(Some(parent), Some(sub)),
+            Some(EgressScope::Local),
+            "Tier-1 sub-actor air-gap must survive a Public parent"
         );
     }
 

@@ -3789,13 +3789,27 @@ impl ParallelWorkflowEngine {
         let resolver = self.sub_actor_context_resolver.as_ref()?;
         let (sub_tier, sub_write, sub_egress) =
             resolver.resolve_ceilings(sub_wf_id, user_id).await?;
+        // Egress narrows one-directionally (explicit Local wins), but — unlike
+        // the concrete tier/write axes — the override is an `Option` where
+        // `None` means "tier-derived default". Resolve BOTH sides to their
+        // EFFECTIVE concrete scope FIRST so a sub-actor air-gapped only by its
+        // tier default (egress column NULL, e.g. every pre-feature Tier-1
+        // actor) is NOT silently widened to a `Public` parent's scope across
+        // the sub-workflow boundary. Without this, `narrow(Some(Public), None)`
+        // would defer to the parent and drop the sub-actor's air-gap.
+        let parent_egress = talos_workflow_engine_core::EgressScope::effective(
+            self.egress_scope,
+            self.max_llm_tier,
+        );
+        let sub_egress_eff =
+            talos_workflow_engine_core::EgressScope::effective(sub_egress, sub_tier);
         Some((
             self.max_llm_tier.most_restrictive(sub_tier),
             self.max_write_ceiling.most_restrictive(sub_write),
-            // Egress narrows the same one-directional way: an explicit Local on
-            // either side wins (air-gapped sub-actor can't inherit parent's
-            // public egress); a None side defers to the other.
-            talos_workflow_engine_core::EgressScope::narrow(self.egress_scope, sub_egress),
+            talos_workflow_engine_core::EgressScope::narrow(
+                Some(parent_egress),
+                Some(sub_egress_eff),
+            ),
         ))
     }
 

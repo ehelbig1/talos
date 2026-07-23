@@ -689,6 +689,7 @@ impl fmt::Debug for DispatchJob {
             .field("dry_run", &self.dry_run)
             .field("max_llm_tier", &self.max_llm_tier)
             .field("max_write_ceiling", &self.max_write_ceiling)
+            .field("egress_scope", &self.egress_scope)
             .field("max_retries", &self.max_retries)
             .field("backoff_ms", &self.backoff_ms)
             .field("retry_condition", &self.retry_condition)
