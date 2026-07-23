@@ -484,6 +484,7 @@ mod signature_failure_payload_tests {
             signature: vec![1, 2, 3],
             max_llm_tier: LlmTier::default(),
             max_write_ceiling: talos_workflow_job_protocol::WriteCeiling::default(),
+            egress_scope: None,
             job_nonce: "attacker-chosen-nonce".to_string(),
             actor_id: None,
             wasm_bytes: None,

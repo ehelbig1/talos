@@ -1775,7 +1775,7 @@ async fn handle_run_scratch_session(
             uuid::Uuid::nil(), // user_id (controller-internal test path)
             talos_workflow_job_protocol::LlmTier::default(), // tier2 for internal tests
             talos_workflow_job_protocol::WriteCeiling::Write, // permissive: internal test path
-            None, // egress_scope — internal path: tier-derived default
+            None,              // egress_scope — internal path: tier-derived default
             None,              // llm_usage_out — internal test path doesn't collect usage
         )
         .await;

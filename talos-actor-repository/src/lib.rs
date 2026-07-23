@@ -2670,12 +2670,13 @@ impl ActorRepository {
         user_id: Uuid,
         scope: Option<talos_workflow_job_protocol::EgressScope>,
     ) -> Result<bool> {
-        let result = sqlx::query("UPDATE actors SET egress_scope = $1 WHERE id = $2 AND user_id = $3")
-            .bind(scope.map(|s| s.as_signing_str()))
-            .bind(actor_id)
-            .bind(user_id)
-            .execute(&self.db_pool)
-            .await?;
+        let result =
+            sqlx::query("UPDATE actors SET egress_scope = $1 WHERE id = $2 AND user_id = $3")
+                .bind(scope.map(|s| s.as_signing_str()))
+                .bind(actor_id)
+                .bind(user_id)
+                .execute(&self.db_pool)
+                .await?;
         Ok(result.rows_affected() > 0)
     }
 

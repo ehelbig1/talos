@@ -1956,10 +1956,7 @@ impl ParallelWorkflowEngine {
     /// Stamp the blanket network-egress scope override. Called by
     /// `talos_engine::actor_binding::apply_actor_to_engine` from
     /// `actors.egress_scope`. `None` = tier-derived default at the worker.
-    pub fn set_egress_scope(
-        &mut self,
-        scope: Option<talos_workflow_engine_core::EgressScope>,
-    ) {
+    pub fn set_egress_scope(&mut self, scope: Option<talos_workflow_engine_core::EgressScope>) {
         self.egress_scope = scope;
     }
 

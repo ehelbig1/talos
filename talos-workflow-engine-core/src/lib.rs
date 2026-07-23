@@ -116,9 +116,9 @@ mod checkpoint;
 mod context;
 mod dispatcher;
 mod edge;
+mod egress_scope;
 mod event_sink;
 mod expression;
-mod egress_scope;
 mod graph_store;
 mod judge_score_recorder;
 mod llm_tier;
@@ -152,11 +152,11 @@ pub use dispatcher::{
     DEFAULT_DISPATCH_TIMEOUT_SECS,
 };
 pub use edge::EdgeLogic;
+pub use egress_scope::EgressScope;
 pub use event_sink::{EventSink, NodeEventWrite};
 pub use expression::ExpressionEvaluator;
 pub use graph_store::WorkflowGraphStore;
 pub use judge_score_recorder::JudgeScoreRecorder;
-pub use egress_scope::EgressScope;
 pub use llm_tier::LlmTier;
 pub use module_artifact::WasmModuleArtifact;
 pub use module_execution_store::{ExecutionStartedContext, ModuleExecutionStore};

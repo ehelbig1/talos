@@ -89,7 +89,7 @@ fn deterministic_job_request() -> JobRequest {
         signature: vec![],
         max_llm_tier: LlmTier::default(),
         max_write_ceiling: WriteCeiling::default(),
-        egress_scope: None,        // Fixed nonce so the signing payload is deterministic.
+        egress_scope: None, // Fixed nonce so the signing payload is deterministic.
         // The first segment is the unix timestamp; "0" pretends the
         // request was signed at the epoch. The second segment is
         // 16 random hex bytes — using all-zeros for reproducibility.
@@ -315,7 +315,8 @@ fn pipeline_job_request_json_snapshot() {
         share_sandbox: false,
         max_llm_tier: LlmTier::default(),
         max_write_ceiling: WriteCeiling::default(),
-        egress_scope: None,        reply_topic: None,
+        egress_scope: None,
+        reply_topic: None,
     };
     let actual = serde_json::to_string(&req).expect("serialize");
     let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000010","workflow_execution_id":"00000000-0000-0000-0000-000000000011","steps":[{"module_id":"00000000-0000-0000-0000-000000000013","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000013","wasm_bytes":[0,97,115,109],"config":{"setting":"value"},"allowed_hosts":["api.example.com"],"allowed_methods":["GET"],"allowed_secrets":[],"allowed_sql_operations":[],"allow_tier2_exposure":false,"encrypted_secrets":{"ciphertext":[170],"nonce":[1,1,1,1,1,1,1,1,1,1,1,1]},"max_fuel":1000000,"max_memory_mb":128,"timeout_ms":30000,"priority":100,"expected_wasm_hash":"deadbeef"}],"total_timeout_ms":60000,"share_sandbox":false,"signature":[202,254],"job_nonce":"0:00000000000000000000000000000000","user_id":"00000000-0000-0000-0000-000000000012","max_llm_tier":"tier2","max_write_ceiling":"write","crypto_scheme":0}"#;
