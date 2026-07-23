@@ -56,6 +56,7 @@ fn make_tier1_context_with_llm_host(world: CapabilityWorld, llm_host: &str) -> T
         // tier gates read Tier1. (Previously set on the field post-build,
         // which no longer reconfigures the resolver.)
         talos_workflow_job_protocol::LlmTier::Tier1,
+        None, // egress_scope: tier-derived default
     )
     .expect("failed to create TalosContext")
 }

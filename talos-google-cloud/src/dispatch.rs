@@ -221,7 +221,7 @@ pub(crate) async fn dispatch_monitoring_incident(
     // Fail OPEN to actor-less Tier-2 on any resolution error so a
     // transient DB hiccup never drops an inbound incident.
     let actor_repo = talos_actor_repository::ActorRepository::new(ctx.db_pool.clone());
-    let (resolved_actor, actor_tier, actor_write_ceiling) =
+    let (resolved_actor, actor_tier, actor_write_ceiling, actor_egress) =
         match actor_repo.resolve_effective_actor(user_id, None).await {
             Ok(aid) => {
                 let tier = actor_repo
@@ -236,7 +236,17 @@ pub(crate) async fn dispatch_monitoring_incident(
                     .ok()
                     .flatten()
                     .unwrap_or(talos_workflow_job_protocol::WriteCeiling::Write);
-                (Some(aid), tier, write_ceiling)
+                // Egress override travels too, so a module bound to an
+                // air-gapped (egress=local) actor stays air-gapped. Fail OPEN
+                // to None (tier-derived default) on error, matching the Tier-2
+                // fail-open posture of this inbound-incident path.
+                let egress = actor_repo
+                    .get_actor_egress_scope(aid)
+                    .await
+                    .ok()
+                    .flatten()
+                    .flatten();
+                (Some(aid), tier, write_ceiling, egress)
             }
             Err(e) => {
                 tracing::warn!(
@@ -247,6 +257,7 @@ pub(crate) async fn dispatch_monitoring_incident(
                     None,
                     talos_workflow_job_protocol::LlmTier::default(),
                     talos_workflow_job_protocol::WriteCeiling::default(),
+                    None,
                 )
             }
         };
@@ -319,6 +330,7 @@ pub(crate) async fn dispatch_monitoring_incident(
         job_nonce: String::new(),
         max_llm_tier: actor_tier,
         max_write_ceiling: actor_write_ceiling,
+        egress_scope: actor_egress,
         wasm_bytes: None,
         capability_world: None,
         integration_name: exec_info.integration_name.clone(),

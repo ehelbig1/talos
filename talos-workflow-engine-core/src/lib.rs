@@ -116,6 +116,7 @@ mod checkpoint;
 mod context;
 mod dispatcher;
 mod edge;
+mod egress_scope;
 mod event_sink;
 mod expression;
 mod graph_store;
@@ -151,6 +152,7 @@ pub use dispatcher::{
     DEFAULT_DISPATCH_TIMEOUT_SECS,
 };
 pub use edge::EdgeLogic;
+pub use egress_scope::EgressScope;
 pub use event_sink::{EventSink, NodeEventWrite};
 pub use expression::ExpressionEvaluator;
 pub use graph_store::WorkflowGraphStore;

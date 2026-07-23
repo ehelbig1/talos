@@ -1024,7 +1024,7 @@ impl WebhookRouter {
             // travels with the job below. Fail OPEN to actor-less Tier-2
             // (today's behaviour) on any resolution error so a transient DB
             // hiccup never drops an inbound webhook.
-            let (resolved_actor, actor_tier, actor_write_ceiling) = {
+            let (resolved_actor, actor_tier, actor_write_ceiling, actor_egress) = {
                 let actor_repo = talos_actor_repository::ActorRepository::new(self.db_pool.clone());
                 match actor_repo
                     .resolve_effective_actor(trigger.user_id, None)
@@ -1047,7 +1047,15 @@ impl WebhookRouter {
                             .ok()
                             .flatten()
                             .unwrap_or(talos_workflow_job_protocol::WriteCeiling::Write);
-                        (Some(aid), tier, write_ceiling)
+                        // Egress override travels too; fail OPEN to None
+                        // (tier-derived default) on error.
+                        let egress = actor_repo
+                            .get_actor_egress_scope(aid)
+                            .await
+                            .ok()
+                            .flatten()
+                            .flatten();
+                        (Some(aid), tier, write_ceiling, egress)
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -1058,6 +1066,7 @@ impl WebhookRouter {
                             None,
                             talos_workflow_job_protocol::LlmTier::default(),
                             talos_workflow_job_protocol::WriteCeiling::default(),
+                            None,
                         )
                     }
                 }
@@ -1176,6 +1185,7 @@ impl WebhookRouter {
                         // wrap-in-a-workflow workaround.
                         max_llm_tier: actor_tier,
                         max_write_ceiling: actor_write_ceiling,
+                        egress_scope: actor_egress,
                         job_nonce: String::new(),
                         wasm_bytes: None,
                         capability_world: None,
@@ -2666,7 +2676,7 @@ impl WebhookRouter {
             // the live webhook path above). Webhook triggers carry no actor →
             // the user's default actor; its tier travels with the re-dispatched
             // job. Fail OPEN to actor-less Tier-2 on any resolution error.
-            let (resolved_actor, actor_tier, actor_write_ceiling) = {
+            let (resolved_actor, actor_tier, actor_write_ceiling, actor_egress) = {
                 let actor_repo = talos_actor_repository::ActorRepository::new(self.db_pool.clone());
                 match actor_repo.resolve_effective_actor(user_id, None).await {
                     Ok(aid) => {
@@ -2682,7 +2692,13 @@ impl WebhookRouter {
                             .ok()
                             .flatten()
                             .unwrap_or(talos_workflow_job_protocol::WriteCeiling::Write);
-                        (Some(aid), tier, write_ceiling)
+                        let egress = actor_repo
+                            .get_actor_egress_scope(aid)
+                            .await
+                            .ok()
+                            .flatten()
+                            .flatten();
+                        (Some(aid), tier, write_ceiling, egress)
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -2693,6 +2709,7 @@ impl WebhookRouter {
                             None,
                             talos_workflow_job_protocol::LlmTier::default(),
                             talos_workflow_job_protocol::WriteCeiling::default(),
+                            None,
                         )
                     }
                 }
@@ -2752,6 +2769,7 @@ impl WebhookRouter {
                     // user's default actor at tier1 gives egress control).
                     max_llm_tier: actor_tier,
                     max_write_ceiling: actor_write_ceiling,
+                    egress_scope: actor_egress,
                     wasm_bytes: None,
                     capability_world: None,
                     // MCP-1090: propagate integration_name (DLQ replay).

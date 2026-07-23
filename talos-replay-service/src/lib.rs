@@ -824,6 +824,11 @@ async fn run_replays(
                 // gate governs live execution, which the actor binding
                 // stamps there.
                 talos_workflow_job_protocol::WriteCeiling::Write,
+                // Egress scope: replay is an operator-invoked diagnostic; no
+                // actor egress override → tier-derived default. (The tier gate
+                // via `llm_tier` still keeps stored Tier-1 data off external
+                // LLM hosts.)
+                None,
                 None, // llm_usage_out — replay diagnostics don't collect usage
             )
             .await;

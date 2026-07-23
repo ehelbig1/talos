@@ -336,6 +336,28 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                 "required": ["actor_id", "tier"]
             }
         }),
+        // ── Network-egress scope (blanket public-egress gate) ─────────────
+        serde_json::json!({
+            "name": "set_actor_egress_scope",
+            "description": "Set the blanket NETWORK-EGRESS scope for an actor — INDEPENDENT of the LLM tier. \
+                'local' = deny ALL public network egress (fully air-gapped; the actor's modules can't reach any public host). \
+                'public' = permit public egress (subject to each module's allowed_hosts + SSRF filtering). \
+                Clearing to null falls back to the tier-derived default (tier1 => local, tier2 => public). \
+                Use 'public' on a tier-1 actor to keep its LLM hard-gated on-host (external LLM still refused) while still letting it reach a legitimate public API like Gmail — the combination the binary tier can't express. \
+                Enforced worker-side at the SSRF resolver; does NOT loosen the LLM-provider deny (that stays keyed to the LLM tier).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "actor_id": { "type": "string" },
+                    "scope": {
+                        "type": ["string", "null"],
+                        "enum": ["local", "public", null],
+                        "description": "local = no public egress, public = public egress allowed, null = clear override (tier-derived default)"
+                    }
+                },
+                "required": ["actor_id"]
+            }
+        }),
         serde_json::json!({
             "name": "set_actor_write_ceiling",
             "description": "Set the data-mutation (WRITE) ceiling for an actor — a default-deny gate on data-mutating operations. \
@@ -924,6 +946,9 @@ pub async fn dispatch(
         "set_actor_budget" => handle_set_actor_budget(req_id, args, state, user_id).await,
         "set_actor_llm_tier_ceiling" => {
             handle_set_actor_llm_tier_ceiling(req_id, args, state, user_id).await
+        }
+        "set_actor_egress_scope" => {
+            handle_set_actor_egress_scope(req_id, args, state, user_id).await
         }
         "set_actor_write_ceiling" => {
             handle_set_actor_write_ceiling(req_id, args, state, user_id).await
@@ -2594,6 +2619,111 @@ async fn handle_set_actor_llm_tier_ceiling(
             "previous_tier": prev_str,
             "max_llm_tier": tier.as_signing_str(),
             "enforcement": "Worker-side at llm::complete entry + HTTP host gate + vault-header gate. Takes effect on the NEXT job dispatched for this actor.",
+        }))
+        .unwrap_or_default(),
+    )
+}
+
+/// Set (or clear) an actor's blanket network-egress scope — INDEPENDENT of the
+/// LLM tier. `scope` = "local" | "public" | null (clear → tier-derived default).
+/// Thin wrapper: resolve + validate → `ActorRepository::set_actor_egress_scope`
+/// → append-only audit event.
+async fn handle_set_actor_egress_scope(
+    req_id: Option<serde_json::Value>,
+    args: &Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let actor_id = match resolve_actor_via_repo(&req_id, args, &state.actor_repo, user_id).await {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    // `scope` is optional/nullable: absent OR explicit null clears the override
+    // (back to the tier-derived default). A present non-null string must be a
+    // recognised scope; a wrong-type value is a distinct, clearer error.
+    let scope: Option<talos_workflow_job_protocol::EgressScope> = match args.get("scope") {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_str() {
+            Some("local") => Some(talos_workflow_job_protocol::EgressScope::Local),
+            Some("public") => Some(talos_workflow_job_protocol::EgressScope::Public),
+            Some(other) => {
+                return mcp_error(
+                    req_id,
+                    -32602,
+                    &format!(
+                        "scope must be 'local', 'public', or null, got '{}'",
+                        talos_text_util::bounded_preview(other, 64)
+                    ),
+                );
+            }
+            None => {
+                let kind = crate::utils::json_type_name(v);
+                return mcp_error(
+                    req_id,
+                    -32602,
+                    &format!("scope must be a string ('local'/'public') or null, got {kind}"),
+                );
+            }
+        },
+    };
+
+    // Capture the previous scope for the audit transition (best-effort).
+    let previous = state
+        .actor_repo
+        .get_actor_egress_scope(actor_id)
+        .await
+        .ok()
+        .flatten()
+        .flatten();
+
+    let updated = match state
+        .actor_repo
+        .set_actor_egress_scope(actor_id, user_id, scope)
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(%actor_id, error = %e, "set_actor_egress_scope failed");
+            return mcp_error(req_id, -32603, "Failed to update actor egress scope");
+        }
+    };
+    if !updated {
+        return mcp_error(req_id, -32602, "Actor not found or access denied");
+    }
+
+    let prev_str = previous.map(|s| s.as_signing_str()).unwrap_or("default");
+    let new_str = scope.map(|s| s.as_signing_str()).unwrap_or("default");
+    let details = serde_json::json!({
+        "previous_egress_scope": prev_str,
+        "new_egress_scope": new_str,
+    });
+    if let Err(e) = state
+        .actor_repo
+        .insert_admin_event_log(
+            user_id,
+            "actor_egress_scope_set",
+            "actor",
+            Some(actor_id),
+            &format!("Actor egress scope: {prev_str} → {new_str}"),
+            Some(&details),
+        )
+        .await
+    {
+        tracing::warn!(
+            %actor_id,
+            error = %e,
+            "set_actor_egress_scope: audit log write failed (policy change applied)"
+        );
+    }
+
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "actor_id": actor_id.to_string(),
+            "previous_egress_scope": prev_str,
+            "egress_scope": new_str,
+            "note": "Overrides ONLY the blanket public-egress SSRF gate; the external-LLM deny stays keyed to the LLM tier. Takes effect on the NEXT job dispatched for this actor.",
         }))
         .unwrap_or_default(),
     )

@@ -5,8 +5,8 @@
 
 use serde_json::json;
 use talos_workflow_job_protocol::{
-    EncryptedSecrets, JobRequest, JobResult, JobStatus, LlmTier, PipelineJobRequest, PipelineStep,
-    WriteCeiling,
+    EgressScope, EncryptedSecrets, JobRequest, JobResult, JobStatus, LlmTier, PipelineJobRequest,
+    PipelineStep, WriteCeiling,
 };
 use uuid::Uuid;
 
@@ -37,6 +37,7 @@ fn make_job_request() -> JobRequest {
         signature: vec![],
         max_llm_tier: LlmTier::default(),
         max_write_ceiling: WriteCeiling::default(),
+        egress_scope: None,
         job_nonce: String::new(),
         actor_id: None,
         wasm_bytes: None,
@@ -236,6 +237,52 @@ fn tampered_input_payload_fails_verification() {
 }
 
 #[test]
+fn tampered_egress_scope_fails_verification() {
+    // An on-wire attacker must not be able to flip a signed egress_scope —
+    // e.g. downgrade a `public` job to `local` (DoS) or, worse, lift a
+    // `local` (air-gapped) actor's block to `public` to exfiltrate.
+    let key = test_key();
+    let mut req = make_job_request();
+    req.egress_scope = Some(EgressScope::Public);
+    req.sign(&key).unwrap();
+    req.egress_scope = Some(EgressScope::Local);
+    assert!(
+        req.verify(&key, 300).is_err(),
+        "Tampered egress_scope must invalidate the signature"
+    );
+}
+
+#[test]
+fn stripping_signed_egress_scope_fails_verification() {
+    // Stripping the override (Some → None) would fall an air-gapped-via-override
+    // actor back to its tier-derived default. Because the field is bound ONLY
+    // when Some, stripping it changes the signed bytes → verification fails.
+    let key = test_key();
+    let mut req = make_job_request();
+    req.egress_scope = Some(EgressScope::Local);
+    req.sign(&key).unwrap();
+    req.egress_scope = None;
+    assert!(
+        req.verify(&key, 300).is_err(),
+        "Stripping a signed egress_scope must invalidate the signature"
+    );
+}
+
+#[test]
+fn default_none_egress_scope_signature_is_stable() {
+    // The default (None) appends nothing to the signing payload, so a
+    // round-trip signs+verifies exactly as before the field existed.
+    let key = test_key();
+    let mut req = make_job_request();
+    assert!(req.egress_scope.is_none());
+    req.sign(&key).unwrap();
+    assert!(
+        req.verify(&key, 300).is_ok(),
+        "default-None egress_scope must sign+verify cleanly"
+    );
+}
+
+#[test]
 fn tampered_timeout_fails_verification() {
     let key = test_key();
     let mut req = make_job_request();
@@ -307,6 +354,7 @@ fn pipeline_tampered_step_count_fails() {
         signature: vec![],
         max_llm_tier: LlmTier::default(),
         max_write_ceiling: WriteCeiling::default(),
+        egress_scope: None,
         reply_topic: None,
         job_nonce: String::new(),
         user_id: Uuid::new_v4(),
@@ -339,6 +387,7 @@ fn pipeline_tampered_share_sandbox_fails() {
         signature: vec![],
         max_llm_tier: LlmTier::default(),
         max_write_ceiling: WriteCeiling::default(),
+        egress_scope: None,
         reply_topic: None,
         job_nonce: String::new(),
         user_id: Uuid::new_v4(),
@@ -536,6 +585,7 @@ fn tampered_pipeline_step_integration_name_fails() {
         signature: vec![],
         max_llm_tier: LlmTier::default(),
         max_write_ceiling: WriteCeiling::default(),
+        egress_scope: None,
         reply_topic: None,
         job_nonce: String::new(),
         user_id: Uuid::new_v4(),

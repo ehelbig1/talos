@@ -132,6 +132,27 @@ The tier travels with the job — HMAC-bound in BOTH `JobRequest` AND
 wire-format stability rule). An on-wire attacker can't downgrade a
 tier-1 ceiling to tier-2 without invalidating the signature.
 
+**`egress_scope` — a SEPARATE axis from `max_llm_tier`** (2026-07). `max_llm_tier`
+historically drove BOTH "no external LLM" AND a blanket "no public network egress
+at all" (the worker SSRF `local_egress_only`), so a tier-1 actor couldn't reach a
+legitimate public API like Gmail even though its LLM was already ollama-pinned
+(this broke the inbox organizers when PA went tier-1). `actors.egress_scope`
+(`local`|`public`, NULLABLE) decouples them: it overrides ONLY the blanket
+public-egress SSRF gate (`worker::context` `resolve_local_egress_only`), leaving
+the LLM-provider deny + raw-`wasi:sockets` grant + public-IP-literal deny all
+keyed to `max_llm_tier`. `NULL` = tier-derived default (`tier1`→local,
+`tier2`→public — byte-identical to pre-split). `Some(Public)` on a `tier1` actor
+= reaches declared `allowed_hosts` (Gmail) while STILL refusing external LLM. The
+override travels HMAC-bound alongside `max_llm_tier` (conditional-append, so
+default-`None` is byte-identical; a `public`↔`local` flip or strip fails
+verification), stamped by `apply_actor_to_engine` (fail-closed to `Local`) +
+every module-bound dispatch path, and narrowed across sub-workflows via
+`EgressScope::narrow` (explicit `Local` on either side wins). Operator tool:
+`set_actor_egress_scope(actor_id, scope)` (`admin_event_log`; scope null clears
+the override). Core type `talos_workflow_engine_core::EgressScope` (fail-closed
+`from_db_str`→`Local`). **The house pattern for a Gmail-reading privacy actor is
+`max_llm_tier=tier1` + `egress_scope=public`**, NOT tier-2.
+
 **Five enforcement surfaces in the worker** (all guarded by `self.max_llm_tier == Tier1`):
 1. `host_impl::get_llm_api_key` / `get_llm_api_key_by_name` — refuse to resolve external-provider vault keys (the `decide_llm_tier_access` helper centralises this — see `llm_tier_decision_tests`).
 2. `host_impl::resolve_vault_header` — refuse `vault://anthropic|openai|gemini/*` substitution into HTTP headers.

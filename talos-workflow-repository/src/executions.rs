@@ -1305,10 +1305,11 @@ impl WorkflowRepository {
         Option<(
             talos_workflow_engine_core::LlmTier,
             talos_workflow_engine_core::WriteCeiling,
+            Option<talos_workflow_engine_core::EgressScope>,
         )>,
     > {
         let row = sqlx::query(
-            "SELECT a.max_llm_tier, a.max_write_ceiling \
+            "SELECT a.max_llm_tier, a.max_write_ceiling, a.egress_scope \
              FROM workflows w \
              JOIN actors a ON a.id = w.actor_id \
              WHERE w.id = $1 AND w.user_id = $2 AND a.user_id = $2",
@@ -1325,7 +1326,12 @@ impl WorkflowRepository {
             let ceiling = talos_workflow_engine_core::WriteCeiling::from_db_str(
                 &r.try_get::<String, _>("max_write_ceiling")?,
             );
-            Ok((tier, ceiling))
+            // NULL egress_scope → None (tier-derived default preserved);
+            // a present-but-garbage value fails closed to Local via from_db_str.
+            let egress = talos_workflow_engine_core::EgressScope::from_db_opt(
+                r.try_get::<Option<String>, _>("egress_scope")?.as_deref(),
+            );
+            Ok((tier, ceiling, egress))
         })
         .transpose()
     }

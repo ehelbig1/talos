@@ -2639,6 +2639,47 @@ impl ActorRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Resolve an actor's blanket network-egress scope OVERRIDE (independent of
+    /// `max_llm_tier`). Outer `Option` = the actor row exists; inner `Option` =
+    /// the nullable `egress_scope` column (SQL NULL → `None`, preserving the
+    /// tier-derived default; a present value parses fail-closed to `Local` via
+    /// `from_db_str`).
+    pub async fn get_actor_egress_scope(
+        &self,
+        actor_id: Uuid,
+    ) -> Result<Option<Option<talos_workflow_job_protocol::EgressScope>>> {
+        let row: Option<Option<String>> =
+            sqlx::query_scalar("SELECT egress_scope FROM actors WHERE id = $1")
+                .bind(actor_id)
+                .fetch_optional(&self.db_pool)
+                .await?;
+        Ok(row.map(|col| talos_workflow_job_protocol::EgressScope::from_db_opt(col.as_deref())))
+    }
+
+    /// Set (or clear) an actor's network-egress scope override. Validates user
+    /// ownership before mutating. Passing `None` clears the override back to SQL
+    /// NULL (tier-derived default). Returns true if a row was updated. Unlike
+    /// the write-ceiling setter, no grant-guard GUC is needed: `egress_scope`
+    /// only governs the blanket public-egress SSRF gate, and both tightening
+    /// (`public`→`local`) and loosening (`local`→`public`) are legitimate
+    /// operator actions — the LLM-provider gate stays keyed to `max_llm_tier`
+    /// regardless, so this can never open external-LLM egress.
+    pub async fn set_actor_egress_scope(
+        &self,
+        actor_id: Uuid,
+        user_id: Uuid,
+        scope: Option<talos_workflow_job_protocol::EgressScope>,
+    ) -> Result<bool> {
+        let result =
+            sqlx::query("UPDATE actors SET egress_scope = $1 WHERE id = $2 AND user_id = $3")
+                .bind(scope.map(|s| s.as_signing_str()))
+                .bind(actor_id)
+                .bind(user_id)
+                .execute(&self.db_pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Fetch only the max_capability_world string for a user (used by user_max_world helper).
     /// Returns None if no explicit grant exists.
     pub async fn get_user_max_capability_world(&self, user_id: Uuid) -> Result<Option<String>> {

@@ -2313,6 +2313,7 @@ impl TalosRuntime {
             uuid::Uuid::nil(), // user_id — legacy helper has no user context
             talos_workflow_job_protocol::LlmTier::default(), // tier2 for legacy helper
             talos_workflow_job_protocol::WriteCeiling::default(), // write (permissive) for legacy helper
+            None, // egress_scope — legacy helper: tier-derived default
             None, // llm_usage_out — legacy helper doesn't collect usage
         )
         .await
@@ -2365,6 +2366,9 @@ impl TalosRuntime {
         // ops when `TALOS_WRITE_CEILING_ENFORCED=1`. Stamped onto the
         // TalosContext alongside `max_llm_tier`.
         max_write_ceiling: talos_workflow_job_protocol::WriteCeiling,
+        // Blanket network-egress scope override (independent of `max_llm_tier`).
+        // `None` = tier-derived default; drives the SSRF `local_egress_only` gate.
+        egress_scope: Option<talos_workflow_job_protocol::EgressScope>,
         // R2 token ledger: when provided, the job's TalosContext shares THIS
         // accumulator instead of a private one, so the caller can drain
         // provider-reported LLM token usage after the call returns —
@@ -2555,6 +2559,7 @@ impl TalosRuntime {
                     user_id,
                     max_llm_tier,
                     max_write_ceiling,
+                    egress_scope,
                     llm_usage_out.clone(),
                 )
                 .await
@@ -2707,6 +2712,8 @@ impl TalosRuntime {
         // ops when `TALOS_WRITE_CEILING_ENFORCED=1`. Stamped onto the
         // TalosContext alongside `max_llm_tier`.
         max_write_ceiling: talos_workflow_job_protocol::WriteCeiling,
+        // Blanket network-egress scope override (independent of `max_llm_tier`).
+        egress_scope: Option<talos_workflow_job_protocol::EgressScope>,
         // R2 token ledger: caller-shared LLM usage accumulator (see
         // `execute_job_with_full_features`).
         llm_usage_out: Option<crate::context::LlmUsageAcc>,
@@ -2772,8 +2779,10 @@ impl TalosRuntime {
             allow_wasi_network,
             token_sender,
             self.global_expose_fallback.clone(),
-            // S3: Tier-1 wires the SSRF resolver to local-egress-only.
+            // Tier drives the LLM-provider gate; egress_scope (override) drives
+            // the blanket public-egress SSRF gate. `None` = tier-derived default.
             max_llm_tier,
+            egress_scope,
         )?;
 
         // Attach OpenTelemetry metrics so host functions can record events.
@@ -3320,6 +3329,8 @@ impl TalosRuntime {
             // run_sandbox / test_module path — operator-invoked, actor-less,
             // Tier2-default (allowed_hosts is empty/deny-all anyway).
             talos_workflow_job_protocol::LlmTier::default(),
+            // No actor → no egress override; tier-derived default (public).
+            None,
         )?;
 
         // Attach OpenTelemetry metrics so host functions can record events.
@@ -3491,6 +3502,9 @@ impl TalosRuntime {
         // dispatch. `ReadOnly` + enforcement on = data-mutating host ops
         // refused.
         max_write_ceiling: talos_workflow_job_protocol::WriteCeiling,
+        // Blanket network-egress scope override stamped on every step's
+        // TalosContext (independent of `max_llm_tier`). `None` = tier-default.
+        egress_scope: Option<talos_workflow_job_protocol::EgressScope>,
         // R2 token ledger: when provided, EVERY step's context shares this
         // accumulator, so the caller can drain whole-pipeline LLM usage
         // after the call — including when the pipeline bails mid-way
@@ -3593,9 +3607,10 @@ impl TalosRuntime {
                 allow_wasi_network,
                 None,
                 self.global_expose_fallback.clone(),
-                // S3: pipeline-wide tier ceiling → local-egress-only resolver
-                // for Tier-1, matching the single-node execute_job path.
+                // Tier drives the LLM-provider gate; egress_scope (override)
+                // drives the blanket public-egress gate, matching execute_job.
                 max_llm_tier,
+                egress_scope,
             )?;
             // Attach OpenTelemetry metrics so host functions can record events.
             if let Some(ref m) = self.metrics {
@@ -4212,6 +4227,8 @@ impl TalosRuntime {
             // AOT path; it passes allow_wasi_network=false. No tier-1 actor
             // routes through here.
             talos_workflow_job_protocol::LlmTier::default(),
+            // Actor-less AOT path → tier-derived egress default (public).
+            None,
         )?;
 
         // Attach OpenTelemetry metrics so host functions can record events.

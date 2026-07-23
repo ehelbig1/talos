@@ -484,6 +484,7 @@ mod signature_failure_payload_tests {
             signature: vec![1, 2, 3],
             max_llm_tier: LlmTier::default(),
             max_write_ceiling: talos_workflow_job_protocol::WriteCeiling::default(),
+            egress_scope: None,
             job_nonce: "attacker-chosen-nonce".to_string(),
             actor_id: None,
             wasm_bytes: None,
@@ -1016,6 +1017,7 @@ async fn execute_job(
             req.user_id,
             req.max_llm_tier,
             req.max_write_ceiling,
+            req.egress_scope,
             Some(llm_usage_acc.clone()),
         ),
     )
@@ -1315,6 +1317,7 @@ async fn execute_pipeline_job(
             req.share_sandbox,
             req.max_llm_tier,
             req.max_write_ceiling,
+            req.egress_scope,
             Some(llm_usage_acc.clone()),
         )
         .await

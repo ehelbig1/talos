@@ -97,5 +97,35 @@ pub async fn apply_actor_to_engine(
         }
     };
     engine.set_max_write_ceiling(ceiling);
+
+    // Blanket network-egress scope override — independent of the LLM tier.
+    // `None` (SQL NULL, the default for every actor) preserves the tier-derived
+    // default at the worker; an explicit `local`/`public` overrides only the
+    // blanket public-egress SSRF gate. Fail-closed to `Some(Local)` (no public
+    // egress) on actor-not-found / DB error, mirroring the Tier1/ReadOnly
+    // posture above — an unresolvable actor gets the MOST restrictive egress.
+    let egress = match repo.get_actor_egress_scope(actor_id).await {
+        Ok(Some(scope)) => scope,
+        Ok(None) => {
+            tracing::warn!(
+                %actor_id,
+                "apply_actor_to_engine: actor not found; stamping local egress and erroring"
+            );
+            engine.set_egress_scope(Some(talos_workflow_engine_core::EgressScope::Local));
+            return Err(anyhow::anyhow!(
+                "actor {actor_id} not found when resolving egress scope"
+            ));
+        }
+        Err(e) => {
+            tracing::error!(
+                %actor_id,
+                error = %e,
+                "apply_actor_to_engine: DB error resolving egress scope; stamping local egress and erroring"
+            );
+            engine.set_egress_scope(Some(talos_workflow_engine_core::EgressScope::Local));
+            return Err(e.context("apply_actor_to_engine: failed to resolve actor egress scope"));
+        }
+    };
+    engine.set_egress_scope(egress);
     Ok(())
 }

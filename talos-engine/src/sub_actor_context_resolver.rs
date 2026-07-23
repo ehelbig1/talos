@@ -81,6 +81,7 @@ impl SubworkflowActorContextResolver for ControllerSubActorContextResolver {
     ) -> Option<(
         talos_workflow_engine_core::LlmTier,
         talos_workflow_engine_core::WriteCeiling,
+        Option<talos_workflow_engine_core::EgressScope>,
     )> {
         // ONE narrow joined query (workflows ⋈ actors, two small columns, no
         // graph_json, tenancy-scoped on both sides). The first cut called
@@ -122,6 +123,8 @@ impl SubworkflowActorContextResolver for ControllerSubActorContextResolver {
                 Some((
                     talos_workflow_engine_core::LlmTier::Tier1,
                     talos_workflow_engine_core::WriteCeiling::ReadOnly,
+                    // Fail closed on the egress axis too: no public egress.
+                    Some(talos_workflow_engine_core::EgressScope::Local),
                 ))
             }
         }

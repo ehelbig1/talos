@@ -227,6 +227,14 @@ pub struct DispatchJob {
     /// can't silently mutate data without an explicit grant.
     pub max_write_ceiling: crate::WriteCeiling,
 
+    /// Blanket network-egress scope override (independent of `max_llm_tier`).
+    /// `None` (default) falls back to the tier-derived default at the worker;
+    /// `Some(Public)` permits public egress even for a `Tier1` actor whose LLM
+    /// stays hard-gated local; `Some(Local)` denies all public egress. Sourced
+    /// from `actors.egress_scope` via `apply_actor_to_engine`. See
+    /// [`crate::EgressScope`].
+    pub egress_scope: Option<crate::EgressScope>,
+
     // ── Retry policy ─────────────────────────────────────────────────
     /// Max retries for transient failures. Timeouts do not retry.
     pub max_retries: u32,
@@ -333,6 +341,7 @@ impl Default for DispatchJob {
             // and every user workflow must pass through it (lint check 29), so a
             // user-built workflow can't reach this permissive default.
             max_write_ceiling: crate::WriteCeiling::Write,
+            egress_scope: None,
             max_retries: 0,
             backoff_ms: 0,
             retry_condition: None,
@@ -542,6 +551,14 @@ impl DispatchJobBuilder {
         self
     }
 
+    /// Blanket network-egress scope override (independent of `max_llm_tier`).
+    /// Builder default is `None` (tier-derived); real dispatch paths overwrite
+    /// via the actor-stamping step from `actors.egress_scope`.
+    pub fn egress_scope(mut self, scope: Option<crate::EgressScope>) -> Self {
+        self.inner.egress_scope = scope;
+        self
+    }
+
     /// Data-mutation ceiling for the dispatched job. `ReadOnly` refuses
     /// every mutating host surface; `Write` permits mutation. Sourced from
     /// `actors.max_write_ceiling` via the actor-stamping step; permissive
@@ -672,6 +689,7 @@ impl fmt::Debug for DispatchJob {
             .field("dry_run", &self.dry_run)
             .field("max_llm_tier", &self.max_llm_tier)
             .field("max_write_ceiling", &self.max_write_ceiling)
+            .field("egress_scope", &self.egress_scope)
             .field("max_retries", &self.max_retries)
             .field("backoff_ms", &self.backoff_ms)
             .field("retry_condition", &self.retry_condition)
@@ -765,6 +783,14 @@ pub struct ChainDispatchRequest {
     /// Sourced from `actors.max_write_ceiling` via the canonical builder;
     /// permissive `Write` default for trusted actor-less jobs.
     pub max_write_ceiling: crate::WriteCeiling,
+
+    /// Blanket network-egress scope override (independent of `max_llm_tier`).
+    /// `None` (default) falls back to the tier-derived default at the worker;
+    /// `Some(Public)` permits public egress even for a `Tier1` actor whose LLM
+    /// stays hard-gated local; `Some(Local)` denies all public egress. Sourced
+    /// from `actors.egress_scope` via `apply_actor_to_engine`. See
+    /// [`crate::EgressScope`].
+    pub egress_scope: Option<crate::EgressScope>,
     /// Aggregate budget for the whole chain (sum of per-step budgets
     /// plus any slack the caller wants).
     pub total_timeout: Duration,

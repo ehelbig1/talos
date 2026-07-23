@@ -870,6 +870,7 @@ impl TalosContext {
         token_sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
         global_expose_fallback: Arc<crate::expose_fallback::ExposeFallback>,
         max_llm_tier: talos_workflow_job_protocol::LlmTier,
+        egress_scope: Option<talos_workflow_job_protocol::EgressScope>,
     ) -> anyhow::Result<Self> {
         // ── Ephemeral sandbox ────────────────────────────────────────────────
         // Create the per-execution temporary directory.  It is automatically
@@ -1047,12 +1048,20 @@ impl TalosContext {
         // scoped to this execution's explicit hostnames. See the
         // resolver doc-comment for the per-host bypass rationale.
         //
-        // S3 (2026-06-23): a Tier-1 actor is "local-Ollama-only — data
-        // must NOT leave host". Wire `local_egress_only` so the resolver
-        // denies every public (globally-routable) resolved address,
-        // regardless of hostname, closing the DNS hole the name-based
-        // `tier1_egress_deny_reason` fast-fail gate cannot.
-        let local_egress_only = matches!(max_llm_tier, talos_workflow_job_protocol::LlmTier::Tier1);
+        // S3 (2026-06-23): the blanket "no public egress, data must NOT leave
+        // host" SSRF gate — the resolver denies every public (globally-routable)
+        // resolved address regardless of hostname, closing the DNS hole the
+        // name-based `tier1_egress_deny_reason` fast-fail gate cannot.
+        //
+        // 2026-07-23: this gate is now driven by the `egress_scope` OVERRIDE
+        // (independent of `max_llm_tier`), falling back to the tier-derived
+        // default when unset. This decouples "no external LLM" (still keyed to
+        // `max_llm_tier` via `tier1_egress_deny_reason`) from "no public egress
+        // at all". So an actor can be `Tier1` (LLM hard-gated local) yet
+        // `egress_scope = Public` — reaching declared `allowed_hosts` like
+        // Gmail while its LLM stays on-host. Fail-closed: an unset scope on a
+        // Tier1 actor stays air-gapped exactly as before (byte-identical).
+        let local_egress_only = resolve_local_egress_only(egress_scope, max_llm_tier);
         let http_client = build_per_execution_http_client(&allowed_hosts, local_egress_only);
 
         Ok(Self {
@@ -1905,6 +1914,77 @@ mod fs_preopen_policy_tests {
                 "{w:?} must not get a filesystem preopen"
             );
         }
+    }
+}
+
+/// Resolve the worker's blanket public-egress SSRF gate (`local_egress_only`)
+/// from the per-actor `egress_scope` OVERRIDE, falling back to the tier-derived
+/// default when the override is unset. This is the sole decoupling point of the
+/// LLM-tier / network-egress split — extracted pure so the full matrix is
+/// unit-testable without building a `TalosContext`.
+///
+/// SECURITY: an explicit `Public` is the ONLY value that permits public egress;
+/// `Local`, any future (non_exhaustive) `EgressScope` variant, and (via the
+/// `None` fallback) a `Tier1` actor without an override all deny it. The
+/// LLM-provider deny is NOT decided here — it stays keyed to `max_llm_tier` in
+/// `tier1_egress_deny_reason`, so a `Tier1 + Public` actor reaches public hosts
+/// like Gmail but STILL cannot reach an external LLM provider.
+fn resolve_local_egress_only(
+    egress_scope: Option<talos_workflow_job_protocol::EgressScope>,
+    max_llm_tier: talos_workflow_job_protocol::LlmTier,
+) -> bool {
+    match egress_scope {
+        Some(talos_workflow_job_protocol::EgressScope::Public) => false,
+        Some(_) => true, // Local + any future variant → fail closed (no egress)
+        None => matches!(max_llm_tier, talos_workflow_job_protocol::LlmTier::Tier1),
+    }
+}
+
+#[cfg(test)]
+mod egress_scope_gate_tests {
+    use super::resolve_local_egress_only;
+    use talos_workflow_job_protocol::{EgressScope, LlmTier};
+
+    #[test]
+    fn none_override_falls_back_to_tier_default() {
+        // The backward-compatible path: every existing actor (egress_scope
+        // NULL → None) keeps the exact pre-split behavior.
+        assert!(
+            resolve_local_egress_only(None, LlmTier::Tier1),
+            "Tier1 + no override stays air-gapped (byte-identical to pre-split)"
+        );
+        assert!(
+            !resolve_local_egress_only(None, LlmTier::Tier2),
+            "Tier2 + no override permits public egress (unchanged)"
+        );
+    }
+
+    #[test]
+    fn explicit_public_permits_egress_even_on_tier1() {
+        // THE new capability: a Tier1 actor (LLM hard-gated local) can reach
+        // public hosts like Gmail when egress_scope=Public. The LLM-provider
+        // deny is enforced elsewhere (keyed to the tier), not here.
+        assert!(
+            !resolve_local_egress_only(Some(EgressScope::Public), LlmTier::Tier1),
+            "Tier1 + egress=public → public egress ALLOWED (Gmail reachable)"
+        );
+        assert!(!resolve_local_egress_only(
+            Some(EgressScope::Public),
+            LlmTier::Tier2
+        ));
+    }
+
+    #[test]
+    fn explicit_local_denies_egress_even_on_tier2() {
+        // The override tightens too: a Tier2 actor can be pinned air-gapped.
+        assert!(
+            resolve_local_egress_only(Some(EgressScope::Local), LlmTier::Tier2),
+            "Tier2 + egress=local → public egress DENIED"
+        );
+        assert!(resolve_local_egress_only(
+            Some(EgressScope::Local),
+            LlmTier::Tier1
+        ));
     }
 }
 

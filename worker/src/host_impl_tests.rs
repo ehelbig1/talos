@@ -19,6 +19,7 @@ async fn test_http_fetch_forbidden_world() {
         None,
         std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
         LlmTier::default(),
+        None,
     )
     .unwrap();
 
@@ -48,6 +49,7 @@ async fn test_http_fetch_allowlist_enforcement() {
         None,
         std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
         LlmTier::default(),
+        None,
     )
     .unwrap();
 
@@ -94,6 +96,7 @@ async fn test_http_ssrf_protection() {
         None,
         std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
         LlmTier::default(),
+        None,
     )
     .unwrap();
 
@@ -141,6 +144,7 @@ async fn test_crypto_hash_limits() {
         None,
         std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
         LlmTier::default(),
+        None,
     )
     .unwrap();
 
@@ -172,6 +176,7 @@ async fn test_crypto_random_bytes_limits() {
         None,
         std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
         LlmTier::default(),
+        None,
     )
     .unwrap();
 
@@ -201,6 +206,7 @@ async fn test_json_path_query() {
         None,
         std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
         LlmTier::default(),
+        None,
     )
     .unwrap();
 
@@ -261,6 +267,7 @@ async fn test_logging_redaction() {
         None,
         std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
         LlmTier::default(),
+        None,
     )
     .unwrap();
 
@@ -291,6 +298,7 @@ async fn test_datetime_operations() {
         None,
         std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
         LlmTier::default(),
+        None,
     )
     .unwrap();
 
@@ -378,6 +386,7 @@ async fn fetch_with_bearer_sends_single_bearer_prefix() {
         None,
         std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
         LlmTier::default(),
+        None,
     )
     .unwrap();
 

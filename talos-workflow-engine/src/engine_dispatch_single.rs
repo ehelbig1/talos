@@ -374,6 +374,7 @@ impl ParallelWorkflowEngine {
             dry_run: self.dry_run,
             max_llm_tier: self.max_llm_tier,
             max_write_ceiling: self.max_write_ceiling,
+            egress_scope: self.egress_scope,
             max_retries: retry.max_retries,
             backoff_ms: retry.backoff_ms,
             retry_condition: retry.retry_condition.clone(),

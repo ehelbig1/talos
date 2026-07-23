@@ -1161,7 +1161,7 @@ pub async fn process_webhook_events(
     // OPEN to actor-less Tier-2 (today's behaviour) on any resolution error so a
     // transient DB hiccup never drops inbound calendar events.
     let actor_repo = talos_actor_repository::ActorRepository::new(service.db_pool.clone());
-    let (resolved_actor, actor_tier, actor_write_ceiling) = match actor_repo
+    let (resolved_actor, actor_tier, actor_write_ceiling, actor_egress) = match actor_repo
         .resolve_effective_actor(user_id, None)
         .await
     {
@@ -1178,7 +1178,15 @@ pub async fn process_webhook_events(
                 .ok()
                 .flatten()
                 .unwrap_or(talos_workflow_job_protocol::WriteCeiling::Write);
-            (Some(aid), tier, write_ceiling)
+            // Egress override travels too (air-gapped actor stays air-gapped);
+            // fail OPEN to None (tier-derived default) on error.
+            let egress = actor_repo
+                .get_actor_egress_scope(aid)
+                .await
+                .ok()
+                .flatten()
+                .flatten();
+            (Some(aid), tier, write_ceiling, egress)
         }
         Err(e) => {
             tracing::warn!(
@@ -1189,6 +1197,7 @@ pub async fn process_webhook_events(
                 None,
                 talos_workflow_job_protocol::LlmTier::default(),
                 talos_workflow_job_protocol::WriteCeiling::default(),
+                None,
             )
         }
     };
@@ -1489,6 +1498,7 @@ pub async fn process_webhook_events(
             // wrap-in-a-workflow workaround.
             max_llm_tier: actor_tier,
             max_write_ceiling: actor_write_ceiling,
+            egress_scope: actor_egress,
             wasm_bytes: None, // PERFORMANCE: Include bytes directly (avoids file I/O)
             capability_world: None,
             // MCP-1090 (2026-05-16): propagate per-module integration_name

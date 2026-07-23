@@ -89,7 +89,7 @@ fn deterministic_job_request() -> JobRequest {
         signature: vec![],
         max_llm_tier: LlmTier::default(),
         max_write_ceiling: WriteCeiling::default(),
-        // Fixed nonce so the signing payload is deterministic.
+        egress_scope: None, // Fixed nonce so the signing payload is deterministic.
         // The first segment is the unix timestamp; "0" pretends the
         // request was signed at the epoch. The second segment is
         // 16 random hex bytes — using all-zeros for reproducibility.
@@ -315,6 +315,7 @@ fn pipeline_job_request_json_snapshot() {
         share_sandbox: false,
         max_llm_tier: LlmTier::default(),
         max_write_ceiling: WriteCeiling::default(),
+        egress_scope: None,
         reply_topic: None,
     };
     let actual = serde_json::to_string(&req).expect("serialize");
