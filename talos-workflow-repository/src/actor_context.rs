@@ -101,9 +101,10 @@ impl WorkflowRepository {
         context_hint: Option<&str>,
         execution_id: Option<Uuid>,
     ) -> Result<Vec<(String, serde_json::Value, String)>> {
-        // Smart path (default-OFF): kind-filtered, min-score-floored,
-        // byte-budgeted assembly. When the flag is OFF the legacy body
-        // below runs unchanged — byte-identical output.
+        // Smart path (default-ON since the grounding-path tier): kind-filtered,
+        // min-score-floored, byte-budgeted assembly. When the flag is explicitly
+        // disabled the legacy body below runs — now also synthetic-kind-filtered
+        // (Layers 2+3) so reflections can't leak into general context there.
         if talos_config::smart_memory_context_enabled() {
             return self
                 .get_relevant_actor_context_smart(actor_id, limit, context_hint, execution_id)
@@ -143,13 +144,22 @@ impl WorkflowRepository {
             limit.saturating_sub(1) // Reserve 1 slot for graph context
         };
 
+        // Exclude synthetic self-outputs (reflections, consolidated summaries'
+        // siblings, prior briefs/verdicts) so this legacy path never grounds an
+        // unrelated workflow on the assistant's OWN generated memory — parity
+        // with the smart path's kind filter. Defense-in-depth: the reflection
+        // LOOP already excludes its own kind at its input unconditionally; this
+        // closes the residual edge where a reflection could surface in general
+        // `__actor_context__` when smart-context is explicitly disabled.
+        let exclude_kinds = talos_memory::synthetic_memory_kinds();
+
         if let Some(hint) = context_hint {
             // Overfetch by 2x so we still hit `vector_limit` distinct
             // non-scratchpad neighbors after the filter below. Without the
             // pad, an actor with mostly engine-trace memories would see its
             // semantic context starved and fall through to Layer 3 every run.
             let vector_fetch_limit = vector_limit.saturating_mul(2).max(vector_limit + 5);
-            let outcome = talos_memory::recall_semantic(
+            let outcome = talos_memory::recall_semantic_filtered(
                 &self.db_pool,
                 actor_id,
                 hint,
@@ -157,6 +167,7 @@ impl WorkflowRepository {
                 0.0,
                 None,
                 talos_memory::SearchMethod::Direct,
+                &exclude_kinds,
             )
             .await?;
             if outcome.method == "vector_cosine" && !outcome.hits.is_empty() {
@@ -182,13 +193,15 @@ impl WorkflowRepository {
             }
         }
 
-        // Layer 3: Recency fallback across non-scratchpad types. The
-        // scratchpad exclusion mirrors Layer 2 — see comment above for
-        // the recursive-context-growth rationale.
-        let extra = talos_memory::recall_recent_excluding_types(
+        // Layer 3: Recency fallback across non-scratchpad types, ALSO excluding
+        // synthetic self-output kinds (parity with Layer 2 above). The
+        // scratchpad exclusion mirrors Layer 2 — see comment above for the
+        // recursive-context-growth rationale.
+        let extra = talos_memory::recall_recent_excluding_types_and_kinds(
             &self.db_pool,
             actor_id,
             &["scratchpad"],
+            &exclude_kinds,
             limit as i64,
         )
         .await?;

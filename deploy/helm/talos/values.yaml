@@ -198,12 +198,32 @@ controller:
     #     worker agent_memory::search) through the same fused ranker.
     #   ENABLE_ADAPTIVE_RANK — serve LEARNED per-actor weights when present
     #     (cold-start safe: byte-identical to global weights until training runs).
-    # The learning LOOPS that PRODUCE those weights / reflections stay opt-in:
-    # ENABLE_ADAPTIVE_RANK_TRAINING, ENABLE_MEMORY_REFLECTION,
-    # ENABLE_MEMORY_CONSOLIDATION, ENABLE_MEMORY_RANK_PROVENANCE (unset = off).
     ENABLE_SMART_MEMORY_CONTEXT: "true"
     ENABLE_RANKED_RECALL: "true"
     ENABLE_ADAPTIVE_RANK: "true"
+    # ── Self-maintaining memory: the learning LOOPS (default ON) ───────────
+    # These make grounded memory improve itself over time. All default ON; set
+    # any to "false" to disable (the loop's scheduler is then not even spawned).
+    #   ENABLE_MEMORY_RANK_PROVENANCE — record the execution→memory→outcome
+    #     signal (memory KEYS + numeric ranking features only, never VALUES) the
+    #     ranker learns from. Fire-and-forget, retention-swept.
+    #   ENABLE_ADAPTIVE_RANK_TRAINING — CPU-only per-actor weight fit (no LLM, no
+    #     egress). Cold-start fail-closed to global weights until an actor has
+    #     enough labeled examples; learned weights clamped so ranking can't invert.
+    #   ENABLE_MEMORY_REFLECTION — daily per-actor higher-order insight synthesis
+    #     (non-destructive; input excludes its own kind so it can't amplify).
+    #   ENABLE_MEMORY_CONSOLIDATION — daily condense of the 30-day-old cold
+    #     episodic tail into one semantic summary (convergent; retires sources).
+    # The two LLM loops (reflection, consolidation) are LOCAL-FIRST: they use the
+    # on-host Ollama model for ALL tiers when it's reachable, so memory content
+    # never egresses during background maintenance; the external provider is a
+    # budget-gated fallback used only when no local model is available. Tier-1
+    # actors stay doubly fail-safe — skipped entirely unless the operator
+    # attests local Ollama via MEMORY_{REFLECTION,CONSOLIDATION}_TIER1_LOCAL_OK.
+    ENABLE_MEMORY_RANK_PROVENANCE: "true"
+    ENABLE_ADAPTIVE_RANK_TRAINING: "true"
+    ENABLE_MEMORY_REFLECTION: "true"
+    ENABLE_MEMORY_CONSOLIDATION: "true"
     # KEK (key-encryption-key) backend that wraps every DEK.
     #   "vault" (default) — KMS-backed HashiCorp Vault transit; the root key
     #     never leaves Vault. Required posture for HIPAA/SOC2/ISO key management.

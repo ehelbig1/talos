@@ -421,11 +421,17 @@ pub fn smart_memory_hyde_enabled() -> bool {
 // + WARN rather than producing a runaway or degenerate scan.
 
 /// Master switch for the autonomous consolidation loop
-/// (`ENABLE_MEMORY_CONSOLIDATION`). Default OFF — when unset the scheduler is
-/// not even spawned (zero background overhead). Truthy tokens per
-/// [`bool_env_or_default`].
+/// (`ENABLE_MEMORY_CONSOLIDATION`). Default ON (2026-07, "Tier 3"): grounded
+/// memory maintains itself by default. Safe to default-on — the loop is
+/// convergent (condenses the 30-day cold episodic tail into one semantic
+/// summary and forgets the sources, so it can never amplify), the LLM leg is
+/// LOCAL-FIRST (on-host model preferred for all tiers; external only as a
+/// no-local fallback, itself budget-gated), and tier-1 stays doubly fail-safe
+/// (skipped unless `MEMORY_CONSOLIDATION_TIER1_LOCAL_OK` is separately
+/// attested). Disable with a falsey value — the scheduler is then not even
+/// spawned (zero overhead). Truthy tokens per [`bool_env_or_default`].
 pub fn memory_consolidation_enabled() -> bool {
-    bool_env_or_default("ENABLE_MEMORY_CONSOLIDATION", false)
+    bool_env_or_default("ENABLE_MEMORY_CONSOLIDATION", true)
 }
 
 /// Operator attestation that `OLLAMA_URL` points at an ON-HOST model, so a
@@ -438,10 +444,12 @@ pub fn memory_consolidation_tier1_local_ok() -> bool {
 }
 
 /// Wake interval for the consolidation scheduler in seconds
-/// (`MEMORY_CONSOLIDATION_INTERVAL_SECS`). Default 3600 (hourly). `=0`/negative
-/// falls back to the default.
+/// (`MEMORY_CONSOLIDATION_INTERVAL_SECS`). Default 86400 (daily) — the loop only
+/// ever processes the 30-day-old cold episodic tail, so an hourly wake was far
+/// more aggressive than the work warrants; daily matches reflection's cadence.
+/// `=0`/negative falls back to the default.
 pub fn memory_consolidation_interval_secs() -> u64 {
-    positive_env_or_default::<u64>("MEMORY_CONSOLIDATION_INTERVAL_SECS", 3600)
+    positive_env_or_default::<u64>("MEMORY_CONSOLIDATION_INTERVAL_SECS", 86400)
 }
 
 /// Minimum row age in DAYS before an episodic memory is eligible for
@@ -498,10 +506,16 @@ pub fn memory_consolidation_model() -> String {
 // operator attestation (independent control).
 
 /// Master switch for the autonomous reflection loop (`ENABLE_MEMORY_REFLECTION`).
-/// Default OFF — when unset the scheduler is not even spawned (zero background
-/// overhead). Truthy tokens per [`bool_env_or_default`].
+/// Default ON (2026-07, "Tier 3"). Safe to default-on — self-amplification is
+/// closed by construction (the loop's input scan EXCLUDES the `reflection`
+/// synthetic kind at the DB layer, so it can never reflect on its own prior
+/// output), the write is non-destructive and self-overwriting (`reflection/latest`),
+/// the LLM leg is LOCAL-FIRST + budget-gated on the external fallback, and
+/// tier-1 stays doubly fail-safe (skipped unless `MEMORY_REFLECTION_TIER1_LOCAL_OK`
+/// is attested). Disable with a falsey value — scheduler then not spawned.
+/// Truthy tokens per [`bool_env_or_default`].
 pub fn memory_reflection_enabled() -> bool {
-    bool_env_or_default("ENABLE_MEMORY_REFLECTION", false)
+    bool_env_or_default("ENABLE_MEMORY_REFLECTION", true)
 }
 
 /// Operator attestation that `OLLAMA_URL` points at an ON-HOST model, so a
@@ -574,11 +588,15 @@ pub fn memory_reflection_model() -> String {
 // off, and `provenance_recording_effective()` below encodes the dependency.
 
 /// Master switch for memory-rank provenance recording
-/// (`ENABLE_MEMORY_RANK_PROVENANCE`). Default OFF. **Provenance only actually
-/// records when [`smart_memory_context_enabled`] is ALSO on** — see
+/// (`ENABLE_MEMORY_RANK_PROVENANCE`). Default ON (2026-07, "Tier 3") — the
+/// execution→memory→outcome signal the per-actor ranker learns from. Safe to
+/// default-on: the write is a fire-and-forget, batched single-INSERT of memory
+/// KEYS + numeric ranking features only (never memory VALUES), tenant-scoped,
+/// indexed, and retention-swept. **Provenance only actually records when
+/// [`smart_memory_context_enabled`] is ALSO on** (now also default-on) — see
 /// [`provenance_recording_effective`]. Truthy tokens per [`bool_env_or_default`].
 pub fn memory_rank_provenance_enabled() -> bool {
-    bool_env_or_default("ENABLE_MEMORY_RANK_PROVENANCE", false)
+    bool_env_or_default("ENABLE_MEMORY_RANK_PROVENANCE", true)
 }
 
 /// Whether memory-rank provenance will ACTUALLY record — the AND of the
@@ -636,12 +654,17 @@ pub fn adaptive_rank_enabled() -> bool {
 }
 
 /// TRAINING switch (`ENABLE_ADAPTIVE_RANK_TRAINING`) for the scheduled per-actor
-/// fit job. Default OFF — when unset the training scheduler is not even spawned
-/// (zero background overhead). Independent of [`adaptive_rank_enabled`]: an
-/// operator can accrue learned weights (training on) before flipping serving on.
-/// Truthy tokens per [`bool_env_or_default`].
+/// fit job. Default ON (2026-07, "Tier 3") — the ranker actually learns per
+/// actor. Safe to default-on: the fit is CPU-only (no LLM, no egress, no
+/// secrets), cold-start fail-closed at every layer (below `min_examples` /
+/// single-class / non-finite → keep global weights, write nothing; serving
+/// falls back to the global blend on any miss), and learned weights are clamped
+/// to the shared global ceiling with negatives dropped so ranking can never
+/// invert. Benefit is simply delayed until provenance accrues enough labeled
+/// examples. Independent of [`adaptive_rank_enabled`]. Truthy tokens per
+/// [`bool_env_or_default`].
 pub fn adaptive_rank_training_enabled() -> bool {
-    bool_env_or_default("ENABLE_ADAPTIVE_RANK_TRAINING", false)
+    bool_env_or_default("ENABLE_ADAPTIVE_RANK_TRAINING", true)
 }
 
 /// Minimum usable labeled examples an actor must have before a learned model is
