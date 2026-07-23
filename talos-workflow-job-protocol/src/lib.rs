@@ -1182,6 +1182,7 @@ pub fn is_llm_provider_vault_path(path: &str) -> bool {
 /// without pulling engine-core directly. The underlying type lives in
 /// engine-core because `DispatchJob` carries it through the dispatch
 /// pipeline and engine-core sits below job-protocol in the dep graph.
+pub use talos_workflow_engine_core::EgressScope;
 pub use talos_workflow_engine_core::LlmTier;
 pub use talos_workflow_engine_core::WriteCeiling;
 
@@ -2464,6 +2465,20 @@ pub struct JobRequest {
     #[serde(default)]
     pub max_write_ceiling: WriteCeiling,
 
+    /// Blanket network-egress scope — a security axis INDEPENDENT of
+    /// `max_llm_tier`. `None` (the default, and every legacy/existing actor)
+    /// falls back to the tier-derived default (`Tier1` ⇒ local, `Tier2` ⇒
+    /// public). `Some(Local)` denies all public egress; `Some(Public)` permits
+    /// it (subject to `allowed_hosts` + SSRF filtering) even for a `Tier1`
+    /// actor whose LLM stays hard-gated local. See [`EgressScope`].
+    ///
+    /// HMAC-bound ONLY when `Some` (see `signing_payload`): a `None` value
+    /// appends nothing, keeping every pre-existing signature byte-identical, so
+    /// the field ships inert. An on-wire attacker cannot flip `Public`→`Local`
+    /// (or vice-versa) without invalidating the signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_scope: Option<EgressScope>,
+
     /// When true, non-GET HTTP requests are mocked (returns 200 with dry_run metadata).
     /// GET requests execute normally for data fetching.
     #[serde(default)]
@@ -2718,6 +2733,20 @@ impl JobRequest {
             // `max_llm_tier` before it.
             self.max_write_ceiling.as_signing_str(),
         );
+
+        // Egress-scope override appended AT THE END, ONLY when `Some`, per the
+        // wire-format stability rule. A `None` (the default + every legacy /
+        // existing actor) appends NOTHING, so pre-existing signatures stay
+        // byte-identical and the field ships inert — no coordinated restart for
+        // the default path. When `Some`, the `:egress=<scope>` suffix is
+        // HMAC-bound so an on-wire attacker can't flip `public`↔`local` (e.g.
+        // downgrade an air-gapped actor to public egress, or strip a
+        // local-only actor's exfiltration block). Bound AFTER `max_write_ceiling`
+        // and BEFORE the conditional sealing block.
+        if let Some(scope) = self.egress_scope {
+            use std::fmt::Write as _;
+            let _ = write!(payload, ":egress={}", scope.as_signing_str());
+        }
 
         // RFC 0010 P3 (D3b): bind `sealing` + `secret_paths` ONLY when a
         // non-legacy sealing scheme is in effect. For `sealing == 0` (today's
@@ -3492,6 +3521,14 @@ pub struct PipelineJobRequest {
     #[serde(default)]
     pub max_write_ceiling: WriteCeiling,
 
+    /// Blanket network-egress scope override, stamped uniformly onto every
+    /// pipeline step (mirrors `max_llm_tier` / `max_write_ceiling`). `None`
+    /// (default) falls back to the tier-derived default. HMAC-bound only when
+    /// `Some` so default messages stay byte-identical. See [`EgressScope`] and
+    /// [`JobRequest::egress_scope`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_scope: Option<EgressScope>,
+
     /// H-1: signed reply-inbox commitment. Same semantics as
     /// [`JobRequest::reply_topic`] — the worker MUST publish its
     /// `PipelineJobResult` to this exact NATS subject when set,
@@ -3720,6 +3757,15 @@ impl PipelineJobRequest {
             // `readonly` pipeline to `write` without invalidating the signature.
             self.max_write_ceiling.as_signing_str(),
         );
+
+        // Egress-scope override appended AT THE END, ONLY when `Some`, per the
+        // wire-format stability rule — `None` appends nothing so default
+        // messages stay byte-identical. HMAC-bound against `public`↔`local`
+        // tampering. Mirrors `JobRequest::signing_payload`.
+        if let Some(scope) = self.egress_scope {
+            use std::fmt::Write as _;
+            let _ = write!(payload, ":egress={}", scope.as_signing_str());
+        }
 
         // RFC 0010 P3 (D3b): bind `sealing` + `secret_paths` ONLY when a
         // non-legacy sealing scheme is in effect, so `sealing == 0` bytes stay
@@ -4671,7 +4717,7 @@ mod tests {
             signature: vec![],
             max_llm_tier: LlmTier::default(),
             max_write_ceiling: WriteCeiling::default(),
-            job_nonce: String::new(),
+            egress_scope: None,            job_nonce: String::new(),
             actor_id: None,
             wasm_bytes: None,
             capability_world: None,
@@ -4724,7 +4770,7 @@ mod tests {
             signature: vec![],
             max_llm_tier: LlmTier::default(),
             max_write_ceiling: WriteCeiling::default(),
-            job_nonce: String::new(),
+            egress_scope: None,            job_nonce: String::new(),
             actor_id: None,
             wasm_bytes: None,
             capability_world: None,
@@ -4769,7 +4815,7 @@ mod tests {
             signature: vec![],
             max_llm_tier: LlmTier::default(),
             max_write_ceiling: WriteCeiling::default(),
-            job_nonce: String::new(),
+            egress_scope: None,            job_nonce: String::new(),
             actor_id: None,
             wasm_bytes: None,
             capability_world: None,
@@ -4942,7 +4988,7 @@ mod tests {
             signature: vec![],
             max_llm_tier: LlmTier::default(),
             max_write_ceiling: WriteCeiling::default(),
-            job_nonce: String::new(),
+            egress_scope: None,            job_nonce: String::new(),
             actor_id: None,
             wasm_bytes: None,
             capability_world: None,
@@ -4987,7 +5033,7 @@ mod tests {
             signature: vec![],
             max_llm_tier: LlmTier::default(),
             max_write_ceiling: WriteCeiling::default(),
-            job_nonce: String::new(),
+            egress_scope: None,            job_nonce: String::new(),
             actor_id: None,
             wasm_bytes: None,
             capability_world: None,
@@ -5049,7 +5095,7 @@ mod tests {
             signature: vec![],
             max_llm_tier: LlmTier::default(),
             max_write_ceiling: WriteCeiling::default(),
-            job_nonce: String::new(),
+            egress_scope: None,            job_nonce: String::new(),
             actor_id,
             wasm_bytes: None,
             capability_world: None,
@@ -5841,7 +5887,7 @@ mod tests {
             user_id: Uuid::nil(),
             max_llm_tier: LlmTier::default(),
             max_write_ceiling: WriteCeiling::default(),
-            reply_topic: Some("_INBOX.legit.xyz".to_string()),
+            egress_scope: None,            reply_topic: Some("_INBOX.legit.xyz".to_string()),
         };
         req.sign(&key).unwrap();
         req.reply_topic = Some("talos.admin.commands".to_string());
@@ -6054,7 +6100,7 @@ mod tests {
             user_id: Uuid::nil(),
             max_llm_tier: LlmTier::default(),
             max_write_ceiling: WriteCeiling::default(),
-            reply_topic: None,
+            egress_scope: None,            reply_topic: None,
         }
     }
 

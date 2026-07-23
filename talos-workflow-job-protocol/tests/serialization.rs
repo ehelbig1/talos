@@ -41,7 +41,7 @@ fn job_request_roundtrip() {
         reply_topic: None,
         max_llm_tier: LlmTier::default(),
         max_write_ceiling: WriteCeiling::default(),
-    };
+        egress_scope: None,    };
     let ser = serde_json::to_string(&req).expect("serialize request");
     let de: JobRequest = serde_json::from_str(&ser).expect("deserialize request");
     assert_eq!(req.job_id, de.job_id);
@@ -114,7 +114,7 @@ fn pipeline_job_request_roundtrip() {
         signature: vec![],
         max_llm_tier: LlmTier::default(),
         max_write_ceiling: WriteCeiling::default(),
-        reply_topic: None,
+        egress_scope: None,        reply_topic: None,
         job_nonce: "0:deadbeef".to_string(),
         user_id: Uuid::new_v4(),
     };
@@ -146,7 +146,7 @@ fn pipeline_job_request_sign_and_verify() {
         signature: vec![],
         max_llm_tier: LlmTier::default(),
         max_write_ceiling: WriteCeiling::default(),
-        reply_topic: None,
+        egress_scope: None,        reply_topic: None,
         job_nonce: String::new(),
         user_id: Uuid::new_v4(),
     };
@@ -175,7 +175,7 @@ fn pipeline_job_request_tampered_step_fails() {
         signature: vec![],
         max_llm_tier: LlmTier::default(),
         max_write_ceiling: WriteCeiling::default(),
-        reply_topic: None,
+        egress_scope: None,        reply_topic: None,
         job_nonce: String::new(),
         user_id: Uuid::new_v4(),
     };

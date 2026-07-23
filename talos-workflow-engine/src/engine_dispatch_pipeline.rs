@@ -304,7 +304,7 @@ impl ParallelWorkflowEngine {
                 // `actors.max_llm_tier` by the controller at dispatch time).
                 max_llm_tier: self.max_llm_tier,
                 max_write_ceiling: self.max_write_ceiling,
-                max_retries: 0,
+                egress_scope: self.egress_scope,                max_retries: 0,
                 backoff_ms: 0,
                 retry_condition: None,
                 retry_delay_expr: None,
@@ -419,7 +419,7 @@ impl ParallelWorkflowEngine {
             // TalosContext with this value.
             max_llm_tier: self.max_llm_tier,
             max_write_ceiling: self.max_write_ceiling,
-            total_timeout: std::time::Duration::from_secs(timeout_secs),
+            egress_scope: self.egress_scope,            total_timeout: std::time::Duration::from_secs(timeout_secs),
             max_retries: chain_retry.max_retries,
             backoff_ms: chain_retry.backoff_ms,
             retry_condition: chain_retry.retry_condition.clone(),

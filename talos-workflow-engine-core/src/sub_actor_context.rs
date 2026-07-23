@@ -84,7 +84,11 @@ pub trait SubworkflowActorContextResolver: Send + Sync {
         &self,
         _workflow_id: Uuid,
         _user_id: Uuid,
-    ) -> Option<(crate::LlmTier, crate::WriteCeiling)> {
+    ) -> Option<(
+        crate::LlmTier,
+        crate::WriteCeiling,
+        Option<crate::EgressScope>,
+    )> {
         None
     }
 }

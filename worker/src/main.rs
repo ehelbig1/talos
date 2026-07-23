@@ -1016,6 +1016,7 @@ async fn execute_job(
             req.user_id,
             req.max_llm_tier,
             req.max_write_ceiling,
+            req.egress_scope,
             Some(llm_usage_acc.clone()),
         ),
     )
@@ -1315,6 +1316,7 @@ async fn execute_pipeline_job(
             req.share_sandbox,
             req.max_llm_tier,
             req.max_write_ceiling,
+            req.egress_scope,
             Some(llm_usage_acc.clone()),
         )
         .await

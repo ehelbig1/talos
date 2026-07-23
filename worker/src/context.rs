@@ -870,6 +870,7 @@ impl TalosContext {
         token_sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
         global_expose_fallback: Arc<crate::expose_fallback::ExposeFallback>,
         max_llm_tier: talos_workflow_job_protocol::LlmTier,
+        egress_scope: Option<talos_workflow_job_protocol::EgressScope>,
     ) -> anyhow::Result<Self> {
         // ── Ephemeral sandbox ────────────────────────────────────────────────
         // Create the per-execution temporary directory.  It is automatically
@@ -1047,12 +1048,27 @@ impl TalosContext {
         // scoped to this execution's explicit hostnames. See the
         // resolver doc-comment for the per-host bypass rationale.
         //
-        // S3 (2026-06-23): a Tier-1 actor is "local-Ollama-only — data
-        // must NOT leave host". Wire `local_egress_only` so the resolver
-        // denies every public (globally-routable) resolved address,
-        // regardless of hostname, closing the DNS hole the name-based
-        // `tier1_egress_deny_reason` fast-fail gate cannot.
-        let local_egress_only = matches!(max_llm_tier, talos_workflow_job_protocol::LlmTier::Tier1);
+        // S3 (2026-06-23): the blanket "no public egress, data must NOT leave
+        // host" SSRF gate — the resolver denies every public (globally-routable)
+        // resolved address regardless of hostname, closing the DNS hole the
+        // name-based `tier1_egress_deny_reason` fast-fail gate cannot.
+        //
+        // 2026-07-23: this gate is now driven by the `egress_scope` OVERRIDE
+        // (independent of `max_llm_tier`), falling back to the tier-derived
+        // default when unset. This decouples "no external LLM" (still keyed to
+        // `max_llm_tier` via `tier1_egress_deny_reason`) from "no public egress
+        // at all". So an actor can be `Tier1` (LLM hard-gated local) yet
+        // `egress_scope = Public` — reaching declared `allowed_hosts` like
+        // Gmail while its LLM stays on-host. Fail-closed: an unset scope on a
+        // Tier1 actor stays air-gapped exactly as before (byte-identical).
+        let local_egress_only = match egress_scope {
+            Some(talos_workflow_job_protocol::EgressScope::Public) => false,
+            // `Local` AND any future (non_exhaustive) variant fail closed to
+            // "no public egress" — a scope the worker doesn't understand must
+            // never open egress.
+            Some(_) => true,
+            None => matches!(max_llm_tier, talos_workflow_job_protocol::LlmTier::Tier1),
+        };
         let http_client = build_per_execution_http_client(&allowed_hosts, local_egress_only);
 
         Ok(Self {

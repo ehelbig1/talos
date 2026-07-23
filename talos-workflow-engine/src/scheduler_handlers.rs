@@ -1630,9 +1630,10 @@ impl ParallelWorkflowEngine {
                                 // PARENT ceilings from `adapter_set_al`;
                                 // tighten to the pre-resolved
                                 // most-restrictive(parent, body-actor) pair.
-                                if let Some((tier, write)) = narrowed_ceilings {
+                                if let Some((tier, write, egress)) = narrowed_ceilings {
                                     sub_engine.set_max_llm_tier(tier);
                                     sub_engine.set_max_write_ceiling(write);
+                                    sub_engine.set_egress_scope(egress);
                                 }
                                 let sub_execution_id = Uuid::new_v4();
                                 let trigger_node_id = Uuid::new_v4();
@@ -2201,7 +2202,7 @@ impl ParallelWorkflowEngine {
                 dry_run: self.dry_run,
                 max_llm_tier: self.max_llm_tier,
                 max_write_ceiling: self.max_write_ceiling,
-                max_retries: 2,
+                egress_scope: self.egress_scope,                max_retries: 2,
                 backoff_ms: 500,
                 retry_condition: None,
                 retry_delay_expr: None,

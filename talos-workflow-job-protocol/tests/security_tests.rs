@@ -37,7 +37,7 @@ fn make_job_request() -> JobRequest {
         signature: vec![],
         max_llm_tier: LlmTier::default(),
         max_write_ceiling: WriteCeiling::default(),
-        job_nonce: String::new(),
+        egress_scope: None,        job_nonce: String::new(),
         actor_id: None,
         wasm_bytes: None,
         capability_world: None,
@@ -307,7 +307,7 @@ fn pipeline_tampered_step_count_fails() {
         signature: vec![],
         max_llm_tier: LlmTier::default(),
         max_write_ceiling: WriteCeiling::default(),
-        reply_topic: None,
+        egress_scope: None,        reply_topic: None,
         job_nonce: String::new(),
         user_id: Uuid::new_v4(),
     };
@@ -339,7 +339,7 @@ fn pipeline_tampered_share_sandbox_fails() {
         signature: vec![],
         max_llm_tier: LlmTier::default(),
         max_write_ceiling: WriteCeiling::default(),
-        reply_topic: None,
+        egress_scope: None,        reply_topic: None,
         job_nonce: String::new(),
         user_id: Uuid::new_v4(),
     };
@@ -536,7 +536,7 @@ fn tampered_pipeline_step_integration_name_fails() {
         signature: vec![],
         max_llm_tier: LlmTier::default(),
         max_write_ceiling: WriteCeiling::default(),
-        reply_topic: None,
+        egress_scope: None,        reply_topic: None,
         job_nonce: String::new(),
         user_id: Uuid::new_v4(),
     };

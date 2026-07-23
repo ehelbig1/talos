@@ -386,7 +386,7 @@ async fn dispatch_single_message(
     // OPEN to actor-less Tier-2 (today's behaviour) on any resolution error so
     // a transient DB hiccup never drops an inbound message.
     let actor_repo = talos_actor_repository::ActorRepository::new(ctx.db_pool.clone());
-    let (resolved_actor, actor_tier, actor_write_ceiling) = match actor_repo
+    let (resolved_actor, actor_tier, actor_write_ceiling, actor_egress) = match actor_repo
         .resolve_effective_actor(user_id, None)
         .await
     {
@@ -403,7 +403,15 @@ async fn dispatch_single_message(
                 .ok()
                 .flatten()
                 .unwrap_or(talos_workflow_job_protocol::WriteCeiling::Write);
-            (Some(aid), tier, write_ceiling)
+            // Egress override travels too (air-gapped actor stays air-gapped);
+            // fail OPEN to None (tier-derived default) on error.
+            let egress = actor_repo
+                .get_actor_egress_scope(aid)
+                .await
+                .ok()
+                .flatten()
+                .flatten();
+            (Some(aid), tier, write_ceiling, egress)
         }
         Err(e) => {
             tracing::warn!(
@@ -414,6 +422,7 @@ async fn dispatch_single_message(
                 None,
                 talos_workflow_job_protocol::LlmTier::default(),
                 talos_workflow_job_protocol::WriteCeiling::default(),
+                None,
             )
         }
     };
@@ -498,6 +507,7 @@ async fn dispatch_single_message(
         // wrap-in-a-workflow workaround.
         max_llm_tier: actor_tier,
         max_write_ceiling: actor_write_ceiling,
+        egress_scope: actor_egress,
         wasm_bytes: None,
         capability_world: None,
         integration_name: exec_info.integration_name.clone(),

@@ -708,6 +708,10 @@ pub struct ParallelWorkflowEngine {
     /// Permissive `Write` default (system/actor-less jobs); actor binding
     /// stamps the real ceiling (new actors → `ReadOnly`).
     pub(crate) max_write_ceiling: talos_workflow_engine_core::WriteCeiling,
+    /// Blanket network-egress scope override, stamped by `apply_actor_to_engine`
+    /// from `actors.egress_scope` (independent of `max_llm_tier`). `None` =
+    /// tier-derived default. Propagated to every `DispatchJob`/`JobRequest`.
+    pub(crate) egress_scope: Option<talos_workflow_engine_core::EgressScope>,
     /// Parent workflow definition id. Threaded into the
     /// [`NodeLifecycleHook::on_node_completed`] context so per-workflow
     /// cost rollups attribute to the right workflow row, not the
@@ -900,6 +904,7 @@ pub struct AdapterSet {
     /// via `set_max_llm_tier` before running.
     max_llm_tier: talos_workflow_engine_core::LlmTier,
     max_write_ceiling: talos_workflow_engine_core::WriteCeiling,
+    egress_scope: Option<talos_workflow_engine_core::EgressScope>,
     sandbox_root: Option<std::path::PathBuf>,
     agent_loop_max_history: usize,
     max_prefetch_successors: usize,
@@ -973,6 +978,7 @@ impl AdapterSet {
         // ensemble / sub-workflow a tier-2 actor legitimately runs).
         engine.max_llm_tier = self.max_llm_tier;
         engine.max_write_ceiling = self.max_write_ceiling;
+        engine.egress_scope = self.egress_scope;
         engine.dry_run = self.dry_run;
         engine.sandbox_root = self.sandbox_root;
         engine.agent_loop_max_history = self.agent_loop_max_history;
@@ -1039,6 +1045,7 @@ impl ParallelWorkflowEngine {
             // Paired with `DispatchJob::default()`'s Tier1 default so
             // the engine→dispatch chain is uniformly fail-closed.
             max_llm_tier: talos_workflow_engine_core::LlmTier::Tier1,
+            egress_scope: None,
             // Permissive default; actor binding stamps `ReadOnly` for new
             // actors. Unlike Tier1 above, a `ReadOnly` default would break
             // trusted actor-less system writes (see DispatchJob::default).
@@ -1649,6 +1656,7 @@ impl ParallelWorkflowEngine {
             dry_run: self.dry_run,
             max_llm_tier: self.max_llm_tier,
             max_write_ceiling: self.max_write_ceiling,
+            egress_scope: self.egress_scope,
             sandbox_root: self.sandbox_root.clone(),
             agent_loop_max_history: self.agent_loop_max_history,
             max_prefetch_successors: self.max_prefetch_successors,
@@ -1943,6 +1951,16 @@ impl ParallelWorkflowEngine {
     /// from `actors.max_llm_tier` before calling `run()` / `run_with_seed()`.
     pub fn set_max_llm_tier(&mut self, tier: talos_workflow_engine_core::LlmTier) {
         self.max_llm_tier = tier;
+    }
+
+    /// Stamp the blanket network-egress scope override. Called by
+    /// `talos_engine::actor_binding::apply_actor_to_engine` from
+    /// `actors.egress_scope`. `None` = tier-derived default at the worker.
+    pub fn set_egress_scope(
+        &mut self,
+        scope: Option<talos_workflow_engine_core::EgressScope>,
+    ) {
+        self.egress_scope = scope;
     }
 
     /// Stamp the data-mutation ceiling. Called by
@@ -3769,12 +3787,18 @@ impl ParallelWorkflowEngine {
     ) -> Option<(
         talos_workflow_engine_core::LlmTier,
         talos_workflow_engine_core::WriteCeiling,
+        Option<talos_workflow_engine_core::EgressScope>,
     )> {
         let resolver = self.sub_actor_context_resolver.as_ref()?;
-        let (sub_tier, sub_write) = resolver.resolve_ceilings(sub_wf_id, user_id).await?;
+        let (sub_tier, sub_write, sub_egress) =
+            resolver.resolve_ceilings(sub_wf_id, user_id).await?;
         Some((
             self.max_llm_tier.most_restrictive(sub_tier),
             self.max_write_ceiling.most_restrictive(sub_write),
+            // Egress narrows the same one-directional way: an explicit Local on
+            // either side wins (air-gapped sub-actor can't inherit parent's
+            // public egress); a None side defers to the other.
+            talos_workflow_engine_core::EgressScope::narrow(self.egress_scope, sub_egress),
         ))
     }
 
@@ -3790,9 +3814,12 @@ impl ParallelWorkflowEngine {
         sub_wf_id: Uuid,
         user_id: Uuid,
     ) {
-        if let Some((tier, write)) = self.resolve_subworkflow_ceilings(sub_wf_id, user_id).await {
+        if let Some((tier, write, egress)) =
+            self.resolve_subworkflow_ceilings(sub_wf_id, user_id).await
+        {
             sub_engine.set_max_llm_tier(tier);
             sub_engine.set_max_write_ceiling(write);
+            sub_engine.set_egress_scope(egress);
         }
     }
 
