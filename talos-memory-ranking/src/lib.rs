@@ -37,11 +37,13 @@
 //!   thus (unlike consolidation/reflection) no `max_llm_tier` gate is needed.
 
 pub mod model;
+pub mod recall;
 
 pub use model::{
     build_training_set, example_label, example_to_features, fit_rank_weights,
     rank_weights_to_fused, RankWeights, FUSED_WEIGHT_MAX, N_FEATURES,
 };
+pub use recall::recall_semantic_ranked;
 
 use sqlx::PgPool;
 use talos_actor_repository::ActorRepository;

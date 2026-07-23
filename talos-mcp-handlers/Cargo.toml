@@ -57,6 +57,7 @@ talos-public-url = { path = "../talos-public-url" }
 talos-llm = { path = "../talos-llm" }
 talos-mcp = { path = "../talos-mcp" }
 talos-memory = { path = "../talos-memory" }
+talos-memory-ranking = { path = "../talos-memory-ranking" }
 talos-module-repository = { path = "../talos-module-repository" }
 talos-oauth = { path = "../talos-oauth" }
 talos-registry = { path = "../talos-registry" }

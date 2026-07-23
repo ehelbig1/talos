@@ -240,6 +240,22 @@ pub fn smart_memory_context_enabled() -> bool {
     bool_env_or_default("ENABLE_SMART_MEMORY_CONTEXT", false)
 }
 
+/// Route the EXPLICIT semantic-recall path (the worker `agent_memory::search`
+/// RPC + the MCP `actor_recall_semantic` / `actor_recall_hyde` handlers)
+/// through the smart-context fused ranker instead of raw pgvector-cosine order.
+/// When ON, recall overfetches then re-orders by the same relevance + recency +
+/// importance + access-frequency blend the `__actor_context__` grounding path
+/// uses — and by the learned PER-ACTOR weights when [`adaptive_rank_enabled`]
+/// is also on. Default OFF ⇒ recall is byte-identical to today (plain cosine).
+///
+/// This is the "grounding any time memory is needed" switch: it makes every
+/// workflow that recalls memory benefit from the adaptive-memory arc with no
+/// per-workflow change. Independent of [`smart_memory_context_enabled`] (which
+/// governs the auto-injected grounding payload, a different path).
+pub fn ranked_recall_enabled() -> bool {
+    bool_env_or_default("ENABLE_RANKED_RECALL", false)
+}
+
 /// Total byte budget for the assembled `__actor_context__` payload when
 /// [`smart_memory_context_enabled`] is ON. Default 12_000 bytes (~3k
 /// tokens by the bytes/4 estimate). Overridable via

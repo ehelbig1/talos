@@ -5749,7 +5749,11 @@ async fn handle_actor_recall_semantic(
         },
     };
 
-    match talos_actor_memory_service::recall_semantic(
+    // Grounding-backed recall: routes through the smart-context fused ranker
+    // when ENABLE_RANKED_RECALL is on (byte-identical to plain recall_semantic
+    // otherwise). `&[]` = no kind exclusions, matching the prior recall_semantic
+    // call (which delegated to recall_semantic_filtered with an empty list).
+    match talos_memory_ranking::recall_semantic_ranked(
         &state.db_pool,
         actor_id,
         query,
@@ -5757,6 +5761,7 @@ async fn handle_actor_recall_semantic(
         min_score,
         memory_type_filter,
         talos_actor_memory_service::SearchMethod::Direct,
+        &[],
     )
     .await
     {
@@ -5926,13 +5931,19 @@ async fn handle_actor_recall_hyde(
         },
     };
 
-    match talos_actor_memory_service::recall_hyde(
+    // Grounding-backed HyDE recall: same ranker routing as actor_recall_semantic
+    // (byte-identical to recall_hyde when ENABLE_RANKED_RECALL is off). The HyDE
+    // query-expansion still happens inside recall_semantic_filtered via
+    // SearchMethod::HyDE; the ranker only re-orders the resulting hits.
+    match talos_memory_ranking::recall_semantic_ranked(
         &state.db_pool,
         actor_id,
         query,
         limit,
         min_score,
         memory_type_filter,
+        talos_actor_memory_service::SearchMethod::HyDE,
+        &[],
     )
     .await
     {
