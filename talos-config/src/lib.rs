@@ -461,6 +461,48 @@ pub fn memory_consolidation_model() -> String {
     }
 }
 
+// ── Adaptive per-actor memory ranking — Phase 1 (provenance) ────────────────
+//
+// Records, for each actor-bound execution that injected `__actor_context__`,
+// WHICH memory keys were in that context + their per-memory ranking-feature
+// snapshot, so a later phase can learn which memories lead to good outcomes.
+// Default-OFF: when the flag is unset the injection path is byte-identical to
+// today and no provenance rows are written.
+//
+// HARD DEPENDENCY: provenance is recorded ONLY on the smart-context path
+// (`get_relevant_actor_context_smart`), because the per-memory feature snapshot
+// (relevance/recency/importance/fused_score) exists only there — the legacy
+// path has no fused signals to record. So `ENABLE_MEMORY_RANK_PROVENANCE=1`
+// records NOTHING unless `ENABLE_SMART_MEMORY_CONTEXT=1` is ALSO set. The
+// controller logs a WARN at startup if provenance is on while smart-context is
+// off, and `provenance_recording_effective()` below encodes the dependency.
+
+/// Master switch for memory-rank provenance recording
+/// (`ENABLE_MEMORY_RANK_PROVENANCE`). Default OFF. **Provenance only actually
+/// records when [`smart_memory_context_enabled`] is ALSO on** — see
+/// [`provenance_recording_effective`]. Truthy tokens per [`bool_env_or_default`].
+pub fn memory_rank_provenance_enabled() -> bool {
+    bool_env_or_default("ENABLE_MEMORY_RANK_PROVENANCE", false)
+}
+
+/// Whether memory-rank provenance will ACTUALLY record — the AND of the
+/// provenance flag and the smart-context flag it depends on (provenance is
+/// captured only on the smart-context path). Use this for the startup
+/// dependency check; `memory_rank_provenance_enabled` alone is misleading
+/// (it's on but inert when smart-context is off).
+pub fn provenance_recording_effective() -> bool {
+    memory_rank_provenance_enabled() && smart_memory_context_enabled()
+}
+
+/// Retention window (DAYS) for `execution_memory_context` rows, swept
+/// periodically (`MEMORY_RANK_PROVENANCE_RETENTION_DAYS`). Default 90, clamped
+/// to `[1, 3650]`. `=0`/negative falls back to the default (destructive-zero
+/// guard: bound directly into `now() - make_interval(days => $1)`, a `=0` sweep
+/// would delete every row).
+pub fn memory_rank_provenance_retention_days() -> i64 {
+    positive_env_or_default::<i64>("MEMORY_RANK_PROVENANCE_RETENTION_DAYS", 90).clamp(1, 3650)
+}
+
 /// Validated allowed origins, computed once at startup.
 /// Production panics happen at init time, not on every request.
 static ALLOWED_ORIGINS: LazyLock<Vec<String>> = LazyLock::new(|| {

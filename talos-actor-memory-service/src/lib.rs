@@ -252,6 +252,13 @@ pub async fn start_graph_backfill(
 /// repo enforces nothing here. `context_hint` is forwarded to the
 /// graph-RAG-backed `get_relevant_actor_context` so injection picks
 /// the most pertinent memories rather than just the most recent.
+///
+/// `execution_id` is the id of the execution this context is being packed
+/// for (minted before injection on the trigger path). It is forwarded to
+/// `get_relevant_actor_context` so the smart path can record memory-rank
+/// PROVENANCE (which keys + their ranking-feature snapshot) keyed by
+/// execution when `ENABLE_MEMORY_RANK_PROVENANCE` is on. `None` on paths
+/// with no durable execution (draft/test previews) — provenance is skipped.
 pub async fn inject_actor_context_into_input(
     workflow_repo: &talos_workflow_repository::WorkflowRepository,
     input: &mut serde_json::Value,
@@ -259,6 +266,7 @@ pub async fn inject_actor_context_into_input(
     inject: bool,
     max_memories: usize,
     context_hint: Option<&str>,
+    execution_id: Option<uuid::Uuid>,
 ) {
     if !inject {
         return;
@@ -273,7 +281,7 @@ pub async fn inject_actor_context_into_input(
     // while preserving the best-effort contract that caller code
     // relies on.
     let memories = match workflow_repo
-        .get_relevant_actor_context(actor_id, max_memories, context_hint)
+        .get_relevant_actor_context(actor_id, max_memories, context_hint, execution_id)
         .await
     {
         Ok(rows) => rows,

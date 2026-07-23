@@ -2131,6 +2131,81 @@ fn spawn_maintenance_sweeps(
         }
     });
 
+    // ---------- Memory-rank provenance retention sweep ----------
+    //
+    // Adaptive per-actor memory ranking — Phase 1. The
+    // `execution_memory_context` table accrues one row per packed memory per
+    // actor-bound execution when `ENABLE_MEMORY_RANK_PROVENANCE` is on. This
+    // task deletes rows older than the retention window so the training
+    // substrate stays bounded. Gated on the flag: when provenance is OFF the
+    // table is never written, so there is nothing to sweep — we skip spawning
+    // the loop entirely (the DELETE would only ever hit an empty table).
+    // Interval defaults to 3600s, clamped [300s, 86400s].
+    //
+    // Dependency warning: provenance is captured ONLY on the smart-context
+    // path, so `ENABLE_MEMORY_RANK_PROVENANCE=1` records nothing unless
+    // `ENABLE_SMART_MEMORY_CONTEXT=1` is also set. Warn loudly so an operator
+    // expecting a training corpus isn't surprised by an empty table.
+    if talos_config::memory_rank_provenance_enabled()
+        && !talos_config::smart_memory_context_enabled()
+    {
+        tracing::warn!(
+            "ENABLE_MEMORY_RANK_PROVENANCE is on but ENABLE_SMART_MEMORY_CONTEXT is off — \
+             provenance records ONLY on the smart-context path, so NO training data will be \
+             collected. Enable ENABLE_SMART_MEMORY_CONTEXT to accrue the memory-rank corpus."
+        );
+    }
+    if talos_config::memory_rank_provenance_enabled() {
+        let prov_pool = db_pool.clone();
+        let prov_shutdown = bg_shutdown_rx.clone();
+        let prov_interval_secs: u64 = talos_config::positive_env_or_default(
+            "MEMORY_RANK_PROVENANCE_SWEEP_INTERVAL_SECS",
+            3600,
+        )
+        .clamp(300, 86_400);
+        tokio::spawn(async move {
+            let mut shutdown = prov_shutdown;
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(prov_interval_secs));
+            // Burn the immediate first tick so we don't sweep at startup.
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let retention_days = talos_config::memory_rank_provenance_retention_days();
+                        match talos_memory::sweep_execution_memory_context(
+                            &prov_pool,
+                            retention_days,
+                        )
+                        .await
+                        {
+                            Ok(n) if n > 0 => tracing::info!(
+                                target: "talos_engine",
+                                event_kind = "memory_rank_provenance_sweep",
+                                deleted = n,
+                                retention_days,
+                                "swept expired memory-rank provenance rows"
+                            ),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                "memory-rank provenance retention sweep failed (non-fatal)"
+                            ),
+                        }
+                    }
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            tracing::info!(
+                                "memory-rank provenance sweep loop received shutdown signal"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // ---------- Embedding-model provenance: one-shot grandfather stamp ----------
     //
     // Legacy rows (embedding present, model NULL) are attributed to the

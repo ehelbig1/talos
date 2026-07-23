@@ -712,4 +712,38 @@ mod tests {
             env::remove_var(v);
         }
     }
+
+    /// Memory-rank provenance flag defaults OFF and honours truthy tokens.
+    #[test]
+    fn test_memory_rank_provenance_enabled_default_off() {
+        let _g = env_lock();
+        env::remove_var("ENABLE_MEMORY_RANK_PROVENANCE");
+        assert!(!crate::memory_rank_provenance_enabled(), "default OFF");
+        env::set_var("ENABLE_MEMORY_RANK_PROVENANCE", "true");
+        assert!(crate::memory_rank_provenance_enabled());
+        env::set_var("ENABLE_MEMORY_RANK_PROVENANCE", "0");
+        assert!(!crate::memory_rank_provenance_enabled());
+        env::remove_var("ENABLE_MEMORY_RANK_PROVENANCE");
+    }
+
+    /// Retention days defaults to 90, clamps to [1, 3650], and rejects
+    /// the destructive `=0`/negative values.
+    #[test]
+    fn test_memory_rank_provenance_retention_days_default_and_clamp() {
+        let _g = env_lock();
+        env::remove_var("MEMORY_RANK_PROVENANCE_RETENTION_DAYS");
+        assert_eq!(crate::memory_rank_provenance_retention_days(), 90);
+        // Destructive-zero / negative → default.
+        env::set_var("MEMORY_RANK_PROVENANCE_RETENTION_DAYS", "0");
+        assert_eq!(crate::memory_rank_provenance_retention_days(), 90);
+        env::set_var("MEMORY_RANK_PROVENANCE_RETENTION_DAYS", "-5");
+        assert_eq!(crate::memory_rank_provenance_retention_days(), 90);
+        // Valid value passes through.
+        env::set_var("MEMORY_RANK_PROVENANCE_RETENTION_DAYS", "30");
+        assert_eq!(crate::memory_rank_provenance_retention_days(), 30);
+        // Upper clamp.
+        env::set_var("MEMORY_RANK_PROVENANCE_RETENTION_DAYS", "999999");
+        assert_eq!(crate::memory_rank_provenance_retention_days(), 3650);
+        env::remove_var("MEMORY_RANK_PROVENANCE_RETENTION_DAYS");
+    }
 }

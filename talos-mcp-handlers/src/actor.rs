@@ -3911,7 +3911,7 @@ async fn handle_preview_actor_context(
 
     let memories = match state
         .workflow_repo
-        .get_relevant_actor_context(actor_id, max_memories, context_hint)
+        .get_relevant_actor_context(actor_id, max_memories, context_hint, None)
         .await
     {
         Ok(rows) => rows,

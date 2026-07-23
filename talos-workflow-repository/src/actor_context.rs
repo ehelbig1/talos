@@ -37,18 +37,25 @@ impl WorkflowRepository {
     ///
     /// The graph context is prepended as a special `__graph_context__`
     /// entry so the LLM sees entity relationships alongside memory values.
+    ///
+    /// `execution_id` is the execution this context is being packed for, used
+    /// ONLY by the smart path to record memory-rank PROVENANCE (which keys +
+    /// their ranking-feature snapshot) when `ENABLE_MEMORY_RANK_PROVENANCE` is
+    /// on. `None` (draft/test/scheduler/sub-workflow paths) skips provenance —
+    /// the ranking output is unaffected either way.
     pub async fn get_relevant_actor_context(
         &self,
         actor_id: Uuid,
         limit: usize,
         context_hint: Option<&str>,
+        execution_id: Option<Uuid>,
     ) -> Result<Vec<(String, serde_json::Value, String)>> {
         // Smart path (default-OFF): kind-filtered, min-score-floored,
         // byte-budgeted assembly. When the flag is OFF the legacy body
         // below runs unchanged — byte-identical output.
         if talos_config::smart_memory_context_enabled() {
             return self
-                .get_relevant_actor_context_smart(actor_id, limit, context_hint)
+                .get_relevant_actor_context_smart(actor_id, limit, context_hint, execution_id)
                 .await;
         }
 
@@ -173,6 +180,7 @@ impl WorkflowRepository {
         actor_id: Uuid,
         limit: usize,
         context_hint: Option<&str>,
+        execution_id: Option<Uuid>,
     ) -> Result<Vec<(String, serde_json::Value, String)>> {
         let byte_budget = talos_config::smart_memory_context_byte_budget();
         let per_memory_cap = talos_config::smart_memory_context_per_memory_cap();
@@ -282,12 +290,46 @@ impl WorkflowRepository {
             importance: talos_config::smart_memory_context_w_importance(),
             recency_halflife_days: talos_config::smart_memory_context_recency_halflife_days(),
         };
-        let ranked = talos_memory::actor_context::rank_candidates(
-            candidates,
-            &weights,
-            chrono::Utc::now(),
-            talos_config::smart_memory_context_access_weight(),
-        );
+        let now = chrono::Utc::now();
+        let access_weight = talos_config::smart_memory_context_access_weight();
+        let ranked =
+            talos_memory::actor_context::rank_candidates(candidates, &weights, now, access_weight);
+
+        // Phase 1 (adaptive memory ranking): snapshot each ranked candidate's
+        // per-memory ranking features BEFORE `candidates_into_rows` drops them,
+        // keyed by memory key. Only built when provenance is ON and there is a
+        // real execution to key it to — otherwise this stays empty and the hot
+        // path is byte-identical to today (no clones, no work). Cheap: numeric
+        // signals only, no memory-value clone. The features mirror EXACTLY what
+        // the fused ranker used (same `now`/`weights`/`access_weight`).
+        let record_provenance =
+            execution_id.is_some() && talos_config::memory_rank_provenance_enabled();
+        let feature_snapshots: std::collections::HashMap<
+            String,
+            (f64, f64, f64, Option<f64>, f64),
+        > = if record_provenance {
+            ranked
+                .iter()
+                .map(|c| {
+                    let relevance = c.relevance;
+                    let recency = talos_memory::actor_context::recency_component(
+                        c,
+                        now,
+                        weights.recency_halflife_days,
+                    );
+                    let importance = talos_memory::actor_context::importance(c, access_weight);
+                    let fused =
+                        talos_memory::actor_context::fused_score(c, &weights, now, access_weight);
+                    (
+                        c.key.clone(),
+                        (relevance, recency, importance, c.access_boost, fused),
+                    )
+                })
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+
         let rows = talos_memory::actor_context::candidates_into_rows(ranked);
         let packed = talos_memory::actor_context::pack_within_budget(
             actor_id,
@@ -316,6 +358,57 @@ impl WorkflowRepository {
             });
         }
 
+        // Phase 1 (adaptive memory ranking): record the per-memory ranking
+        // features of the packed set keyed by execution — the training
+        // substrate a later phase joins to execution OUTCOME. FIRE-AND-FORGET
+        // (like `bump_access`): never on the latency path, never propagates.
+        // Gated on the flag AND a real execution id (both folded into
+        // `record_provenance` / the presence of `feature_snapshots`). Stores
+        // memory KEYS + numeric signals ONLY — never memory values.
+        if record_provenance {
+            if let Some(execution_id) = execution_id {
+                let prov_rows: Vec<talos_memory::MemoryContextProvenanceRow> = packed
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(rank, (key, _, _))| {
+                        feature_snapshots.get(key).map(
+                            |&(relevance, recency, importance, access_boost, fused_score)| {
+                                talos_memory::MemoryContextProvenanceRow {
+                                    memory_key: key.clone(),
+                                    relevance,
+                                    recency,
+                                    importance,
+                                    access_boost,
+                                    fused_score,
+                                    rank: rank as i32,
+                                }
+                            },
+                        )
+                    })
+                    .collect();
+                if !prov_rows.is_empty() {
+                    let pool = self.db_pool.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = talos_memory::record_execution_memory_context(
+                            &pool,
+                            execution_id,
+                            actor_id,
+                            &prov_rows,
+                        )
+                        .await
+                        {
+                            tracing::debug!(
+                                %actor_id,
+                                %execution_id,
+                                error = %e,
+                                "memory-rank provenance write failed (non-fatal)"
+                            );
+                        }
+                    });
+                }
+            }
+        }
+
         Ok(packed)
     }
 
@@ -326,7 +419,8 @@ impl WorkflowRepository {
         actor_id: Uuid,
         limit: usize,
     ) -> Result<Vec<(String, serde_json::Value, String)>> {
-        self.get_relevant_actor_context(actor_id, limit, None).await
+        self.get_relevant_actor_context(actor_id, limit, None, None)
+            .await
     }
 
     /// Upsert a scratchpad execution trace. Delegates to the canonical

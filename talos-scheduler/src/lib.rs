@@ -1300,8 +1300,15 @@ async fn run_scheduled_execution(
     // reachable via explicit `agent_memory::get/search` calls.
     let actor_context = if let Some(actor_id) = workflow.actor_id {
         let context_hint = workflow.description.as_deref();
+        // Pass `Some(execution_id)` so the smart path records memory-rank
+        // PROVENANCE for this scheduled run (which keys were packed + their
+        // ranking-feature snapshot) when `ENABLE_MEMORY_RANK_PROVENANCE` is on.
+        // The scheduler is the PRIMARY actor-bound context-injection path, so it
+        // is the main training-data source for the learned ranker. The execution
+        // row already exists here (created at `create_execution_under_concurrency_
+        // limit` above), so provenance rows join cleanly to `judge_scores`.
         match workflow_repo
-            .get_relevant_actor_context(actor_id, 20, context_hint)
+            .get_relevant_actor_context(actor_id, 20, context_hint, Some(execution_id))
             .await
         {
             Ok(rows) if !rows.is_empty() => Some(talos_memory::actor_context::assemble_payload(

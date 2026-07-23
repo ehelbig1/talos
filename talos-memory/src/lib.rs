@@ -2021,6 +2021,204 @@ pub async fn bump_access(pool: &Pool<Postgres>, actor_id: Uuid, keys: &[String])
     Ok(result.rows_affected())
 }
 
+// ============================================================================
+// Adaptive per-actor memory ranking — Phase 1: provenance
+// ============================================================================
+//
+// Records, for each actor-bound execution that injected `__actor_context__`,
+// WHICH memory keys were in that context and their per-memory ranking-feature
+// snapshot (relevance / recency / importance / access_boost / fused_score /
+// rank), so a later phase can join this to execution OUTCOME (`judge_scores`,
+// `workflow_executions.status`) and LEARN which memories lead to good results.
+//
+// Privacy: stores memory KEYS + numeric feature signals ONLY — never memory
+// VALUES. Actor-scoped by construction. Retention-bounded via
+// `sweep_execution_memory_context`. Default-OFF at the caller (gated on
+// `talos_config::memory_rank_provenance_enabled()`).
+
+/// One packed memory's ranking-feature snapshot at context-pack time — the
+/// per-row features `record_execution_memory_context` persists. `relevance`,
+/// `recency`, `importance`, `fused_score` mirror the fused-ranker signals;
+/// `access_boost` is `None` when the row carried no durable access signal;
+/// `rank` is the 0-based position in the packed (injected) set.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryContextProvenanceRow {
+    pub memory_key: String,
+    pub relevance: f64,
+    pub recency: f64,
+    pub importance: f64,
+    pub access_boost: Option<f64>,
+    pub fused_score: f64,
+    pub rank: i32,
+}
+
+/// Persist the ranking-feature snapshot for the memories that were packed into
+/// one execution's `__actor_context__`. ONE batched multi-row INSERT via
+/// `UNNEST` (never a per-row loop). Empty `rows` → no-op returns 0.
+///
+/// Actor-scoped by construction: `actor_id` is a column and every value comes
+/// from a single actor's packed set. `real` columns are bound as `f32`.
+/// Callers MUST invoke this fire-and-forget (`tokio::spawn`, best-effort) — it
+/// is off the request latency path, exactly like [`bump_access`].
+pub async fn record_execution_memory_context(
+    pool: &Pool<Postgres>,
+    execution_id: Uuid,
+    actor_id: Uuid,
+    rows: &[MemoryContextProvenanceRow],
+) -> Result<u64> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    // Column-parallel arrays fed into a single `UNNEST(...)` — one round trip
+    // regardless of row count. `access_boost` stays nullable (Vec<Option<f32>>).
+    let keys: Vec<String> = rows.iter().map(|r| r.memory_key.clone()).collect();
+    let relevance: Vec<f32> = rows.iter().map(|r| r.relevance as f32).collect();
+    let recency: Vec<f32> = rows.iter().map(|r| r.recency as f32).collect();
+    let importance: Vec<f32> = rows.iter().map(|r| r.importance as f32).collect();
+    let access_boost: Vec<Option<f32>> = rows
+        .iter()
+        .map(|r| r.access_boost.map(|b| b as f32))
+        .collect();
+    let fused_score: Vec<f32> = rows.iter().map(|r| r.fused_score as f32).collect();
+    let rank: Vec<i32> = rows.iter().map(|r| r.rank).collect();
+
+    let result = sqlx::query(
+        "INSERT INTO execution_memory_context \
+             (execution_id, actor_id, memory_key, relevance, recency, importance, \
+              access_boost, fused_score, rank) \
+         SELECT $1, $2, k, rel, rec, imp, ab, fs, rk \
+         FROM UNNEST($3::text[], $4::real[], $5::real[], $6::real[], \
+                     $7::real[], $8::real[], $9::int[]) \
+              AS t(k, rel, rec, imp, ab, fs, rk)",
+    )
+    .bind(execution_id)
+    .bind(actor_id)
+    .bind(&keys)
+    .bind(&relevance)
+    .bind(&recency)
+    .bind(&importance)
+    .bind(&access_boost)
+    .bind(&fused_score)
+    .bind(&rank)
+    .execute(pool)
+    .await
+    .context("record_execution_memory_context")?;
+    Ok(result.rows_affected())
+}
+
+/// A labeled training example for the Phase-2 learned ranker: one memory's
+/// pack-time feature snapshot joined to its execution's OUTCOME label
+/// (`judge_score` / `judge_passed` — the newest judge verdict for that
+/// execution — and `execution_status`). Outcome fields are `Option` because a
+/// provenance row may have no judge verdict and/or an orphaned execution.
+#[derive(Clone, Debug)]
+pub struct RankTrainingExample {
+    pub memory_key: String,
+    pub relevance: f64,
+    pub recency: f64,
+    pub importance: f64,
+    pub access_boost: Option<f64>,
+    pub fused_score: f64,
+    pub rank: i32,
+    pub judge_score: Option<f64>,
+    pub judge_passed: Option<bool>,
+    pub execution_status: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Upper bound on the labeled-example fetch, so a caller-supplied `limit`
+/// can't ask for an unbounded scan.
+const RANK_TRAINING_EXAMPLE_MAX: i64 = 50_000;
+
+/// Fetch labeled training examples for one actor since `since`, newest first.
+/// Left-joins each provenance row to (a) the NEWEST judge verdict for its
+/// execution and (b) the execution status — the labeled-data source Phase 2
+/// consumes. Actor-scoped (`WHERE emc.actor_id = $1`). `limit` is clamped to
+/// `[0, RANK_TRAINING_EXAMPLE_MAX]`. Reads are fail-loud (`try_get`).
+pub async fn fetch_rank_training_examples(
+    pool: &Pool<Postgres>,
+    actor_id: Uuid,
+    since: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<RankTrainingExample>> {
+    let limit = limit.clamp(0, RANK_TRAINING_EXAMPLE_MAX);
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        "SELECT emc.memory_key, emc.relevance, emc.recency, emc.importance, \
+                emc.access_boost, emc.fused_score, emc.rank, emc.created_at, \
+                js.score AS judge_score, js.passed AS judge_passed, \
+                we.status AS execution_status \
+         FROM execution_memory_context emc \
+         LEFT JOIN LATERAL ( \
+             SELECT score, passed FROM judge_scores j \
+             WHERE j.execution_id = emc.execution_id \
+             ORDER BY j.created_at DESC LIMIT 1 \
+         ) js ON true \
+         LEFT JOIN workflow_executions we ON we.id = emc.execution_id \
+         WHERE emc.actor_id = $1 AND emc.created_at >= $2 \
+         ORDER BY emc.created_at DESC \
+         LIMIT $3",
+    )
+    .bind(actor_id)
+    .bind(since)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .context("fetch_rank_training_examples")?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        // `real` columns come back as f32 (widened to f64); nullable columns
+        // read as Option so schema drift errors via `?` instead of a silent
+        // default (checks 52/55).
+        let relevance: f32 = row.try_get::<Option<f32>, _>("relevance")?.unwrap_or(0.0);
+        let recency: f32 = row.try_get::<Option<f32>, _>("recency")?.unwrap_or(0.0);
+        let importance: f32 = row.try_get::<Option<f32>, _>("importance")?.unwrap_or(0.0);
+        let access_boost: Option<f32> = row.try_get::<Option<f32>, _>("access_boost")?;
+        let fused_score: f32 = row.try_get::<Option<f32>, _>("fused_score")?.unwrap_or(0.0);
+        let rank: i32 = row.try_get::<Option<i32>, _>("rank")?.unwrap_or(0);
+        out.push(RankTrainingExample {
+            memory_key: row
+                .try_get::<Option<String>, _>("memory_key")?
+                .unwrap_or_default(),
+            relevance: relevance as f64,
+            recency: recency as f64,
+            importance: importance as f64,
+            access_boost: access_boost.map(|b| b as f64),
+            fused_score: fused_score as f64,
+            rank,
+            judge_score: row.try_get::<Option<f64>, _>("judge_score")?,
+            judge_passed: row.try_get::<Option<bool>, _>("judge_passed")?,
+            execution_status: row.try_get::<Option<String>, _>("execution_status")?,
+            created_at: row
+                .try_get::<Option<DateTime<Utc>>, _>("created_at")?
+                .unwrap_or_else(Utc::now),
+        });
+    }
+    Ok(out)
+}
+
+/// Delete provenance rows older than `retention_days`. Bound as `i32` and cast
+/// `$1::int` per lint 27 (`make_interval` args are int4-only). Returns the
+/// number of rows deleted. Harmless when the table is empty.
+pub async fn sweep_execution_memory_context(
+    pool: &Pool<Postgres>,
+    retention_days: i64,
+) -> Result<u64> {
+    let days: i32 = retention_days.clamp(1, i32::MAX as i64) as i32;
+    let result = sqlx::query(
+        "DELETE FROM execution_memory_context \
+         WHERE created_at < now() - make_interval(days => $1::int)",
+    )
+    .bind(days)
+    .execute(pool)
+    .await
+    .context("sweep_execution_memory_context")?;
+    Ok(result.rows_affected())
+}
+
 pub async fn forget(pool: &Pool<Postgres>, actor_id: Uuid, key: &str) -> Result<ForgetOutcome> {
     let result = sqlx::query(
         "UPDATE actor_memory \
