@@ -19,11 +19,16 @@ use talos_secrets_manager::SecretsManager;
 use crate::error::EvaluationError;
 use crate::stats::{aggregate_paired, analyze_observational, EvalSummary, PairedResult};
 
-/// Max eval tasks per run (each costs 2 workflow executions + 2 judge calls).
-const MAX_TASKS: usize = 50;
-/// Clamp for the per-arm synchronous wait.
+/// Max eval tasks per run. Each task = 2 workflow executions + 2 judge calls,
+/// and the whole run is SYNCHRONOUS, so this bounds the single MCP call's
+/// wall-clock (tasks × 2 × wait_ms worst case). Keep small — the tool guidance
+/// is 2–5; 10 is the hard ceiling before a caller should batch.
+const MAX_TASKS: usize = 10;
+/// Clamp for the per-arm wait (now a real deadline — we poll to terminal).
 const MAX_WAIT_MS: u64 = 300_000;
 const MIN_WAIT_MS: u64 = 1_000;
+/// How often to poll an arm's execution row while waiting for a terminal state.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1_500);
 /// Judge output token budget — a score + one-sentence reason is small.
 const JUDGE_MAX_TOKENS: u32 = 512;
 /// Byte caps so a large workflow output / task input can't blow the judge prompt.
@@ -282,7 +287,12 @@ impl EvaluationService {
             trigger_agent_id: Some(input.actor_id),
             inject_memory_context: inject_memory,
             dry_run: false,
-            wait_ms: Some(wait_ms),
+            // Dispatch async and poll to a TRUE terminal state ourselves (below).
+            // The orchestration sync-wait caps at 30s and returns a non-terminal
+            // status silently; relying on it would score any arm slower than 30s
+            // as 0 — and the ON arm (larger prompt from injected context) is the
+            // systematically slower one, biasing the experiment AGAINST memory.
+            wait_ms: None,
         };
         let outcome = self
             .orchestration
@@ -299,20 +309,35 @@ impl EvaluationService {
         };
         let exec_id = exec.execution_id;
 
-        // Decrypted final output (user-scoped read — RLS-backstopped).
-        let row = self
-            .execution_repo
-            .get_execution(exec_id, input.user_id)
-            .await
-            .map_err(EvaluationError::Internal)?;
-        let (output, status) = match row {
-            Some(r) => (r.output_data, r.status),
-            None => (None, "unknown".to_string()),
+        // Poll the execution row (user-scoped, RLS-backstopped) until it reaches
+        // a terminal state or the eval's own deadline elapses.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+        let (output, status) = loop {
+            let row = self
+                .execution_repo
+                .get_execution(exec_id, input.user_id)
+                .await
+                .map_err(EvaluationError::Internal)?;
+            match row {
+                Some(r) if is_terminal(&r.status) => break (r.output_data, r.status),
+                _ => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                // Never reached terminal within the deadline → SKIP this arm
+                // (propagates as a whole-task skip via `?` in run_task), NOT a 0
+                // score. Scoring a still-running arm 0 would corrupt the paired
+                // aggregate with a false negative.
+                return Err(EvaluationError::Orchestration(format!(
+                    "arm did not reach a terminal state within {wait_ms}ms"
+                )));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
         };
 
         let (score, passed, reasoning) = match &output {
             Some(v) => self.judge(backend, task, v).await?,
-            // No output (failed / crashed arm) is the worst outcome: score 0.
+            // Terminal but no output (failed / cancelled / timed_out) is a real
+            // quality signal — score 0.
             None => (0.0, false, format!("no output (status={status})")),
         };
 
@@ -440,6 +465,13 @@ fn parse_object(raw: &str) -> Option<Value> {
     None
 }
 
+/// Whether an execution status is terminal (the row won't change further).
+/// `timed_out` and `cancelled` are terminal-but-outputless → scored 0 (a real
+/// quality signal), distinct from "not yet terminal" → the arm is skipped.
+fn is_terminal(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "cancelled" | "timed_out")
+}
+
 /// Map an `OrchestrationError` to an operator-safe string, collapsing any
 /// variant that could carry internal DB/dispatch detail.
 fn safe_orch(e: &OrchestrationError) -> String {
@@ -496,6 +528,18 @@ mod tests {
     fn parse_judgment_no_score_is_none() {
         assert!(parse_judgment(r#"{"reasoning":"no score here"}"#).is_none());
         assert!(parse_judgment("not json at all").is_none());
+    }
+
+    #[test]
+    fn terminal_states_classified() {
+        for s in ["completed", "failed", "cancelled", "timed_out"] {
+            assert!(is_terminal(s), "{s} should be terminal");
+        }
+        for s in [
+            "running", "queued", "pending", "resuming", "waiting", "unknown",
+        ] {
+            assert!(!is_terminal(s), "{s} should NOT be terminal");
+        }
     }
 
     #[test]
