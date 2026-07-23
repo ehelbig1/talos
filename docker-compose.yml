@@ -456,6 +456,18 @@ services:
       ENABLE_MEMORY_RANK_PROVENANCE: ${ENABLE_MEMORY_RANK_PROVENANCE:-}
       MEMORY_RANK_PROVENANCE_RETENTION_DAYS: ${MEMORY_RANK_PROVENANCE_RETENTION_DAYS:-}
       MEMORY_RANK_PROVENANCE_SWEEP_INTERVAL_SECS: ${MEMORY_RANK_PROVENANCE_SWEEP_INTERVAL_SECS:-}
+      # Adaptive per-actor memory ranking — Phase 2 (learned ranker). Two
+      # independent default-OFF flags: ENABLE_ADAPTIVE_RANK_TRAINING gates the
+      # scheduled per-actor logistic-regression fit (writes learned weights to
+      # actors.metadata.rank_weights); ENABLE_ADAPTIVE_RANK gates SERVING (the
+      # ranker uses learned weights when present). Both off ⇒ byte-identical
+      # ranking + no training task. Pure numeric fit — no LLM, no tier gate.
+      ENABLE_ADAPTIVE_RANK: ${ENABLE_ADAPTIVE_RANK:-}
+      ENABLE_ADAPTIVE_RANK_TRAINING: ${ENABLE_ADAPTIVE_RANK_TRAINING:-}
+      ADAPTIVE_RANK_MIN_EXAMPLES: ${ADAPTIVE_RANK_MIN_EXAMPLES:-}
+      ADAPTIVE_RANK_TRAINING_INTERVAL_SECS: ${ADAPTIVE_RANK_TRAINING_INTERVAL_SECS:-}
+      ADAPTIVE_RANK_LOOKBACK_DAYS: ${ADAPTIVE_RANK_LOOKBACK_DAYS:-}
+      ADAPTIVE_RANK_MAX_ACTORS_PER_TICK: ${ADAPTIVE_RANK_MAX_ACTORS_PER_TICK:-}
       # MinIO / S3 configuration for audit ledger
       AWS_ENDPOINT_URL: http://minio:9000
       MINIO_ENDPOINT: http://minio:9000

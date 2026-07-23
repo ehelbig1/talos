@@ -97,6 +97,7 @@ talos-memory-crypto = { path = "../talos-memory-crypto" }
 talos-ml = { path = "../talos-ml" }
 # Phase 3b: autonomous actor-memory consolidation scheduler.
 talos-memory-consolidation = { path = "../talos-memory-consolidation" }
+talos-memory-ranking = { path = "../talos-memory-ranking" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 talos-actor-memory-service = { path = "../talos-actor-memory-service" }
 talos-advanced-repository = { path = "../talos-advanced-repository" }

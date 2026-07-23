@@ -304,7 +304,11 @@ pub fn smart_memory_context_min_score() -> f64 {
 /// candidates compare `Equal` and the ranking collapses to input order. Cap the
 /// weights at a large-but-finite value — far above any sane weight ratio — so a
 /// stray `=inf` env can't degenerate the ranking. Keeps every knob finite.
-const SMART_MEMORY_WEIGHT_MAX: f64 = 1_000_000.0;
+///
+/// `pub` so the Phase-2 learned-ranker (`talos-memory-ranking`) clamps its
+/// mapped per-actor weights to the SAME bound rather than hand-mirroring the
+/// literal (which would silently drift if this constant is retuned).
+pub const SMART_MEMORY_WEIGHT_MAX: f64 = 1_000_000.0;
 
 /// Weight on the cosine-relevance signal in the fused rank. Default 1.0.
 /// Override via `SMART_MEMORY_CONTEXT_W_RELEVANCE`.
@@ -501,6 +505,76 @@ pub fn provenance_recording_effective() -> bool {
 /// would delete every row).
 pub fn memory_rank_provenance_retention_days() -> i64 {
     positive_env_or_default::<i64>("MEMORY_RANK_PROVENANCE_RETENTION_DAYS", 90).clamp(1, 3650)
+}
+
+// ── Adaptive per-actor memory ranking — Phase 2 (learned ranker) ────────────
+//
+// Phase 2 LEARNS per-actor fused-ranking weights from the Phase-1 provenance
+// corpus (`execution_memory_context` joined to execution outcomes). A tiny
+// per-actor logistic regression over the recorded features
+// `[relevance, recency, importance, access_boost]` predicts the outcome label;
+// its coefficients ARE the adaptive per-actor blend weights. Learned weights
+// are stored in `actors.metadata.rank_weights` and injected at the ranker seam
+// in place of the global `SMART_MEMORY_CONTEXT_W_*` constants.
+//
+// TWO independent default-OFF flags: `ENABLE_ADAPTIVE_RANK_TRAINING` gates the
+// scheduled fit job (which writes weights); `ENABLE_ADAPTIVE_RANK` gates
+// SERVING (whether the ranker consults learned weights when present). Both off
+// ⇒ byte-identical ranking to today and no training task spawned. The training
+// fit is a PURE numeric computation over Phase-1 numeric signals only — no LLM,
+// no memory VALUES, zero data egress — so unlike consolidation/reflection it
+// needs no tier gate.
+
+/// SERVING switch (`ENABLE_ADAPTIVE_RANK`). Default OFF. When on, the smart
+/// ranker consults `actors.metadata.rank_weights` and — when present, parseable,
+/// and backed by enough examples — uses the learned per-actor weights instead of
+/// the global `SMART_MEMORY_CONTEXT_W_*` constants. Off / missing / unparseable
+/// ⇒ exact current (global-weight) behaviour. Truthy tokens per
+/// [`bool_env_or_default`].
+pub fn adaptive_rank_enabled() -> bool {
+    bool_env_or_default("ENABLE_ADAPTIVE_RANK", false)
+}
+
+/// TRAINING switch (`ENABLE_ADAPTIVE_RANK_TRAINING`) for the scheduled per-actor
+/// fit job. Default OFF — when unset the training scheduler is not even spawned
+/// (zero background overhead). Independent of [`adaptive_rank_enabled`]: an
+/// operator can accrue learned weights (training on) before flipping serving on.
+/// Truthy tokens per [`bool_env_or_default`].
+pub fn adaptive_rank_training_enabled() -> bool {
+    bool_env_or_default("ENABLE_ADAPTIVE_RANK_TRAINING", false)
+}
+
+/// Minimum usable labeled examples an actor must have before a learned model is
+/// fit / trusted (`ADAPTIVE_RANK_MIN_EXAMPLES`). Default 50, clamped to
+/// `[10, 100000]`. Below this the fit returns `None` (cold-start → global
+/// defaults) and serving falls back to global weights even if a stale row
+/// exists. `=0`/negative falls back to the default.
+pub fn adaptive_rank_min_examples() -> i64 {
+    positive_env_or_default::<i64>("ADAPTIVE_RANK_MIN_EXAMPLES", 50).clamp(10, 100_000)
+}
+
+/// Wake interval for the training scheduler in seconds
+/// (`ADAPTIVE_RANK_TRAINING_INTERVAL_SECS`). Default 21600 (6h), clamped to
+/// `[300, 604800]`. `=0`/negative falls back to the default.
+pub fn adaptive_rank_training_interval_secs() -> u64 {
+    positive_env_or_default::<u64>("ADAPTIVE_RANK_TRAINING_INTERVAL_SECS", 21_600)
+        .clamp(300, 604_800)
+}
+
+/// Training lookback window in DAYS (`ADAPTIVE_RANK_LOOKBACK_DAYS`). The fit only
+/// consumes provenance rows newer than `now - lookback_days`, so weights adapt
+/// to recent outcomes and a poisoned old batch ages out. Default 30, clamped to
+/// `[1, 3650]`. `=0`/negative falls back to the default.
+pub fn adaptive_rank_lookback_days() -> i64 {
+    positive_env_or_default::<i64>("ADAPTIVE_RANK_LOOKBACK_DAYS", 30).clamp(1, 3650)
+}
+
+/// Maximum distinct actors fit per training tick
+/// (`ADAPTIVE_RANK_MAX_ACTORS_PER_TICK`). Default 50, clamped to `[1, 500]` so
+/// one tick can't stampede the whole fleet. `=0`/negative falls back to the
+/// default.
+pub fn adaptive_rank_max_actors_per_tick() -> i64 {
+    positive_env_or_default::<i64>("ADAPTIVE_RANK_MAX_ACTORS_PER_TICK", 50).clamp(1, 500)
 }
 
 /// Validated allowed origins, computed once at startup.
