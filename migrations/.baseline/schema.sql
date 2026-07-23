@@ -490,8 +490,6 @@ CREATE TABLE public.actors (
     max_llm_tier text DEFAULT 'tier2'::text NOT NULL,
     org_id uuid,
     is_default boolean DEFAULT false NOT NULL,
-    egress_scope text DEFAULT NULL,
-    CONSTRAINT actors_egress_scope_check CHECK ((egress_scope IS NULL OR (egress_scope = ANY (ARRAY['local'::text, 'public'::text])))),
     CONSTRAINT actors_max_llm_tier_check CHECK ((max_llm_tier = ANY (ARRAY['tier1'::text, 'tier2'::text]))),
     CONSTRAINT actors_status_check CHECK ((status = ANY (ARRAY['active'::text, 'suspended'::text, 'terminated'::text, 'archived'::text])))
 );
