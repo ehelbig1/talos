@@ -156,6 +156,7 @@ pub mod analytics;
 pub mod auth;
 pub mod capability_worlds;
 pub mod configuration;
+pub mod evaluation;
 pub mod executions;
 pub mod graph;
 pub mod knowledge_graph;
@@ -972,6 +973,7 @@ pub(crate) fn static_tool_count() -> usize {
             + schemas::tool_schemas().len()
             + ollama::tool_schemas().len()
             + ml::tool_schemas().len()
+            + evaluation::tool_schemas().len()
     });
     *COUNT
 }
@@ -1135,6 +1137,7 @@ async fn handle_tools_list(
         schemas::tool_schemas(),
         ollama::tool_schemas(),
         ml::tool_schemas(),
+        evaluation::tool_schemas(),
     ]
     .concat();
 
@@ -1361,6 +1364,10 @@ async fn handle_tools_call(
         return decorate(r);
     }
     if let Some(r) = ml::dispatch(name, req.id.clone(), &args, &state, agent.clone()).await {
+        return decorate(r);
+    }
+    if let Some(r) = evaluation::dispatch(name, req.id.clone(), &args, &state, agent.clone()).await
+    {
         return decorate(r);
     }
 

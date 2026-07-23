@@ -67,6 +67,7 @@ members = [
     "talos-inline-compile-service",
     "talos-search-service",
     "talos-failure-analysis-service",
+    "talos-evaluation",
     "talos-actor-lifecycle-service",
     "talos-hot-update-service",
     "talos-secrets-manager",

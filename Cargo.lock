@@ -7682,6 +7682,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-evaluation"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "talos-actor-repository",
+ "talos-execution-orchestration",
+ "talos-execution-repository",
+ "talos-llm",
+ "talos-memory",
+ "talos-secrets-manager",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "talos-execution-orchestration"
 version = "0.1.0"
 dependencies = [
@@ -8238,6 +8259,7 @@ dependencies = [
  "talos-dlp",
  "talos-dlp-provider",
  "talos-engine",
+ "talos-evaluation",
  "talos-execution-orchestration",
  "talos-execution-repository",
  "talos-execution-result-collector",

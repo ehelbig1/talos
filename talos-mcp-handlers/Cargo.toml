@@ -82,6 +82,7 @@ talos-validation = { path = "../talos-validation" }
 talos-webhook-repository = { path = "../talos-webhook-repository" }
 talos-webhooks = { path = "../talos-webhooks" }
 talos-execution-orchestration = { path = "../talos-execution-orchestration" }
+talos-evaluation = { path = "../talos-evaluation" }
 talos-workflow-manifest = { path = "../talos-workflow-manifest" }
 talos-execution-result-collector = { path = "../talos-execution-result-collector" }
 talos-hot-update-service = { path = "../talos-hot-update-service" }
