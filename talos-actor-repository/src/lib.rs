@@ -2391,6 +2391,70 @@ impl ActorRepository {
         Ok(result.rows_affected())
     }
 
+    /// Batch scan for the autonomous memory-REFLECTION loop (Phase 3). Returns
+    /// [`ConsolidationActor`] (`actor_id` + `max_llm_tier`) for up to `limit`
+    /// active actors, ordered by `last_reflected_at ASC NULLS FIRST, id` — a
+    /// least-recently-reflected rotation cursor for fair fleet coverage — in a
+    /// single N+1-free query (the tier is carried on the row, so no per-actor
+    /// tier lookup).
+    ///
+    /// Reflection uses its OWN cursor column (`last_reflected_at`), distinct
+    /// from consolidation's `last_consolidated_at`, so the two independent-cadence
+    /// loops never couple their rotation. Same PLATFORM-scan posture as
+    /// [`scan_actors_for_consolidation`]: it runs AS the background service, not
+    /// on behalf of any user, so no RLS tenant scope is applied; the per-actor
+    /// tier gate ([`llm_tier_decision_from_tier_str`] over the carried
+    /// `max_llm_tier`) is what bounds where each actor's memory may go.
+    pub async fn scan_actors_for_reflection(&self, limit: i64) -> Result<Vec<ConsolidationActor>> {
+        // Least-recently-reflected first (rotation cursor): `last_reflected_at
+        // ASC NULLS FIRST` guarantees every active actor is eventually reached
+        // even when the fleet exceeds `limit`. `mark_actors_reflected` advances
+        // the cursor after each tick. `id` is the stable tiebreaker.
+        let rows = sqlx::query(
+            "SELECT id, max_llm_tier FROM actors \
+             WHERE status = 'active' \
+             ORDER BY last_reflected_at ASC NULLS FIRST, id \
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.db_pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            // Fail-loud reads (checks 52/55): schema drift errors instead of
+            // silently defaulting. `id`/`max_llm_tier` are NOT NULL.
+            let actor_id: Uuid = r.try_get::<Uuid, _>("id")?;
+            // Fail CLOSED on the (unreachable — NOT NULL DEFAULT) NULL case:
+            // an absent tier must not become tier2/External. "tier1" →
+            // most-restrictive; `LlmTier::from_db_str` maps unknown → Tier1 too.
+            let max_llm_tier: String = r
+                .try_get::<Option<String>, _>("max_llm_tier")?
+                .unwrap_or_else(|| "tier1".to_string());
+            out.push(ConsolidationActor {
+                actor_id,
+                max_llm_tier,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Advance the reflection rotation cursor for every actor a tick processed
+    /// (reflected OR skipped), so the next tick moves on to the
+    /// least-recently-reflected actors. Best-effort: a failure here only means
+    /// the next tick may re-examine the same actors, never data loss. No-op on
+    /// an empty slice.
+    pub async fn mark_actors_reflected(&self, actor_ids: &[Uuid]) -> Result<u64> {
+        if actor_ids.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query("UPDATE actors SET last_reflected_at = now() WHERE id = ANY($1)")
+            .bind(actor_ids)
+            .execute(&self.db_pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     // ── Adaptive per-actor memory ranking — Phase 2 (learned weights) ──────
     //
     // Learned per-actor fused-ranking weights are stored in the actor's

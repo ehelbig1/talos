@@ -647,6 +647,20 @@ async fn main() -> anyhow::Result<()> {
         bg_shutdown_rx.clone(),
     );
 
+    // Phase 3: autonomous actor-memory REFLECTION. Default-OFF
+    // (ENABLE_MEMORY_REFLECTION) — spawn_* returns without a task when disabled.
+    // Reads across an actor's meaningful memories and synthesizes higher-order
+    // insights via the SAME tier gate (tier-1 → local Ollama only, or Skip),
+    // writing ONE non-destructive `reflection`-kind semantic memory. Distinct
+    // rotation cursor (last_reflected_at) from consolidation.
+    talos_memory_consolidation::spawn_memory_reflection_scheduler(
+        db_pool.clone(),
+        talos_actor_repository::ActorRepository::new(db_pool.clone()),
+        Some(ollama_client.clone()),
+        core.secrets_manager.clone(),
+        bg_shutdown_rx.clone(),
+    );
+
     // Adaptive per-actor memory ranking — Phase 2 (learned ranker). Default-OFF
     // (ENABLE_ADAPTIVE_RANK_TRAINING) — spawn_* returns without a task when
     // disabled. Pure numeric fit over the Phase-1 provenance corpus: no LLM, no

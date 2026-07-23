@@ -465,6 +465,75 @@ pub fn memory_consolidation_model() -> String {
     }
 }
 
+// ── Autonomous memory reflection — Phase 3 ──────────────────────────────────
+//
+// A scheduled per-actor background loop that reads across an actor's meaningful
+// (semantic+episodic) memories and synthesizes HIGHER-ORDER INSIGHTS via a
+// TIER-GATED LLM, written back as ONE `reflection`-kind semantic memory WITHOUT
+// deleting any sources (reflection AUGMENTS; consolidation retires). Default-OFF
+// and tier-gated on the same shared matrix as consolidation, with its OWN
+// operator attestation (independent control).
+
+/// Master switch for the autonomous reflection loop (`ENABLE_MEMORY_REFLECTION`).
+/// Default OFF — when unset the scheduler is not even spawned (zero background
+/// overhead). Truthy tokens per [`bool_env_or_default`].
+pub fn memory_reflection_enabled() -> bool {
+    bool_env_or_default("ENABLE_MEMORY_REFLECTION", false)
+}
+
+/// Operator attestation that `OLLAMA_URL` points at an ON-HOST model, so a
+/// TIER-1 actor's private memory may be reflected on locally without egress
+/// (`MEMORY_REFLECTION_TIER1_LOCAL_OK`). Default FALSE (fail-closed: a tier-1
+/// actor is SKIPPED unless the operator explicitly attests locality). This is a
+/// SEPARATE attestation from consolidation's `MEMORY_CONSOLIDATION_TIER1_LOCAL_OK`
+/// — the two loops are controlled independently.
+pub fn memory_reflection_tier1_local_ok() -> bool {
+    bool_env_or_default("MEMORY_REFLECTION_TIER1_LOCAL_OK", false)
+}
+
+/// Wake interval for the reflection scheduler in seconds
+/// (`MEMORY_REFLECTION_INTERVAL_SECS`). Default 86400 (daily) — a slower cadence
+/// than consolidation, since higher-order insights change slowly. `=0`/negative
+/// falls back to the default.
+pub fn memory_reflection_interval_secs() -> u64 {
+    positive_env_or_default::<u64>("MEMORY_REFLECTION_INTERVAL_SECS", 86_400)
+}
+
+/// Maximum number of an actor's memories fed to the reflection LLM per cycle
+/// (`MEMORY_REFLECTION_INPUT_CAP`). Default 40, clamped to `[5, 200]` so a
+/// pathological actor can't blow the model's context. `=0`/negative falls back
+/// to the default.
+pub fn memory_reflection_input_cap() -> i64 {
+    positive_env_or_default::<i64>("MEMORY_REFLECTION_INPUT_CAP", 40).clamp(5, 200)
+}
+
+/// Minimum number of meaningful memories an actor must hold before reflection
+/// runs (`MEMORY_REFLECTION_MIN_MEMORIES`). Default 8, clamped to `[3, 100]`.
+/// Below this floor there is too little to synthesize — the actor is skipped
+/// (no LLM, no write). `=0`/negative falls back to the default.
+pub fn memory_reflection_min_memories() -> i64 {
+    positive_env_or_default::<i64>("MEMORY_REFLECTION_MIN_MEMORIES", 8).clamp(3, 100)
+}
+
+/// Maximum distinct actors processed per tick
+/// (`MEMORY_REFLECTION_MAX_ACTORS_PER_TICK`). Default 25, clamped to `[1, 500]`
+/// so one tick can't stampede the whole fleet. `=0`/negative falls back to the
+/// default.
+pub fn memory_reflection_max_actors_per_tick() -> i64 {
+    positive_env_or_default::<i64>("MEMORY_REFLECTION_MAX_ACTORS_PER_TICK", 25).clamp(1, 500)
+}
+
+/// Ollama model used to generate the reflection on the tier-1 LOCAL-only path
+/// (`MEMORY_REFLECTION_MODEL`). Default matches consolidation's default model.
+pub fn memory_reflection_model() -> String {
+    let v = get_env("MEMORY_REFLECTION_MODEL", "qwen2.5:7b");
+    if v.trim().is_empty() {
+        "qwen2.5:7b".to_string()
+    } else {
+        v
+    }
+}
+
 // ── Adaptive per-actor memory ranking — Phase 1 (provenance) ────────────────
 //
 // Records, for each actor-bound execution that injected `__actor_context__`,
