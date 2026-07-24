@@ -44,16 +44,29 @@ impl ParallelWorkflowEngine {
         _execution_sandbox: Option<Arc<cap_std::fs::Dir>>,
     ) -> (NodeIndex, Result<JsonValue, String>) {
         let module_id_resolved = self.resolve_module_id(node_id);
-        let retry = self
-            .node_meta
-            .get(&node_id)
-            .and_then(|(_, rp, _)| rp.clone())
-            .unwrap_or_default();
 
         let wasm_module = match self.fetch_module(node_id).await {
             Ok(m) => m,
             Err(e) => return (node_idx, Err(e)),
         };
+
+        // Absent-policy fallback is METHOD-AWARE, not a blanket count:
+        // a node with no explicit retry config retries transient
+        // failures only when its module is read-only / pure compute
+        // (worlds minimal/secrets, or http/agent with GET/HEAD-only
+        // methods). Side-effect-capable modules fail closed to 0 so a
+        // retry can never double-fire a send. Explicit per-node
+        // `retry_count` (including 0) always wins.
+        let retry = self
+            .node_meta
+            .get(&node_id)
+            .and_then(|(_, rp, _)| rp.clone())
+            .unwrap_or_else(|| {
+                talos_workflow_engine_core::RetryPolicy::default_for_module(
+                    &wasm_module.allowed_methods,
+                    Some(&wasm_module.capability_world),
+                )
+            });
 
         // Approval gate: verify an approved record exists when the
         // module declares `requires_approval_for`.
