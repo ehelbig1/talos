@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router";
 // Data layer: generated react-query hooks (one per operation in
 // src/graphql/*.graphql) — no direct graphqlRequest calls in pages.
 import {

@@ -1,5 +1,5 @@
 import React, { useMemo } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router";
 import { Bot, GitBranch, Shuffle } from "lucide-react";
 import { type ActorActionLogEntry } from "@/lib/graphqlApi";
 import { LocalEmptyState, relativeTime } from "./shared";

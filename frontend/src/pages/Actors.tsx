@@ -1,5 +1,5 @@
 import React, { useState, useMemo, Suspense } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";

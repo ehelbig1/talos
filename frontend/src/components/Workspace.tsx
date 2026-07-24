@@ -4,7 +4,7 @@ import React, {
   useMemo,
   useSyncExternalStore,
 } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import ErrorBoundary from "@/components/ErrorBoundary";
 import { LoadingSpinner } from "@/components/LoadingSpinner";

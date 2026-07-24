@@ -1,5 +1,5 @@
 import React, { Suspense, lazy, useEffect } from "react";
-import { useParams, useSearchParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router";
 import ErrorBoundary from "@/components/ErrorBoundary";
 import { loadWorkflowById } from "@/lib/workflowLoader";
 import { useGetModulesLoaderQuery } from "@/generated/graphql";
