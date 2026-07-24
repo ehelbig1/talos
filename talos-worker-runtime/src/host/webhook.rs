@@ -249,6 +249,40 @@ impl wit_webhook::Host for TalosContext {
 
         let client = self.http_client.clone();
 
+        // Opt-in idempotency (Task 2): a webhook send is always a POST
+        // (mutating). When the engine stamped a key and the guest didn't set its
+        // own `Idempotency-Key` header, this send participates in the worker-side
+        // dedup store — belt-and-suspenders on top of the header for
+        // destinations that don't honor it. Compute the key ONCE before the
+        // retry loop; `None` (non-declaring send, or guest-provided key) opts
+        // out entirely.
+        let dedup_key: Option<String> = self.idempotency_key.as_ref().and_then(|idem| {
+            let guest_set = headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("idempotency-key"));
+            if guest_set {
+                None
+            } else {
+                Some(idem.clone())
+            }
+        });
+        // Short-circuit if this key already completed successfully in-process.
+        if let Some(ref k) = dedup_key {
+            if let talos_idempotency::DedupCheck::Completed(cached) =
+                crate::host::http::get_global_idempotency_store().check(k)
+            {
+                tracing::info!(
+                    "idempotent webhook send short-circuited: returning cached response \
+                     for a previously-completed idempotency key (worker-side dedup)"
+                );
+                return Ok(wit_webhook::WebhookResponse {
+                    status: cached.status,
+                    body: String::from_utf8_lossy(&cached.body).into_owned(),
+                    retries: 0,
+                });
+            }
+        }
+
         let mut retries = 0u32;
         loop {
             let mut req_builder = client
@@ -305,6 +339,22 @@ impl wit_webhook::Host for TalosContext {
                         }
                     }
                     let body = String::from_utf8_lossy(&bytes).into_owned();
+                    // Task 2: record a SUCCESSFUL (2xx) idempotent delivery so a
+                    // later send under the same engine-stamped key is
+                    // short-circuited. Only 2xx is cached — a non-2xx must stay
+                    // retryable. Non-declaring sends never touch the store.
+                    if let Some(ref k) = dedup_key {
+                        if crate::host::http::dedup_cacheable_status(status) {
+                            crate::host::http::get_global_idempotency_store().complete(
+                                k,
+                                talos_idempotency::DedupResponse {
+                                    status,
+                                    headers: Vec::new(),
+                                    body: bytes.clone(),
+                                },
+                            );
+                        }
+                    }
                     return Ok(wit_webhook::WebhookResponse {
                         status,
                         body,

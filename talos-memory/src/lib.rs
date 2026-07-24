@@ -51,6 +51,12 @@ pub const MAX_VALUE_BYTES: usize = 64 * 1024;
 pub const MAX_METADATA_BYTES: usize = 16 * 1024;
 pub const MAX_MEMORIES_PER_ACTOR: i64 = 10_000;
 pub const MAX_LIST_LIMIT: i64 = 200;
+/// Hard cap on how many actors one batched listing
+/// ([`list_memories_with_ciphertext_batched_scoped`]) will read. The
+/// `actorsMemories` GraphQL resolver rejects larger batches loudly before
+/// calling; the batched fn truncates as defense in depth so a future caller
+/// can't fan a single `= ANY($1)` scan across an unbounded actor set.
+pub const MAX_ACTOR_IDS_PER_BATCH: usize = 100;
 pub const MEMORY_TYPES: &[&str] = &["working", "episodic", "semantic", "scratchpad"];
 
 /// CSV rendering of [`MEMORY_TYPES`] for error messages.
@@ -1613,6 +1619,116 @@ pub async fn decrypt_memory_list_row(row: &MemoryListRowEnc) -> Result<serde_jso
         row.value_format,
     )
     .await
+}
+
+/// Batched sibling of [`list_memories_with_ciphertext_scoped`]: the
+/// non-expired ciphertext-bearing memory rows for MANY actors in ONE
+/// query. Closes the residual per-actor listing loop the `actorsMemories`
+/// GraphQL resolver ran after #566 collapsed the per-actor GraphQL
+/// round-trips — the N reads inside the single resolver tx become one
+/// `actor_id = ANY($1)` scan.
+///
+/// **Per-actor fairness.** A windowed
+/// `ROW_NUMBER() OVER (PARTITION BY actor_id ORDER BY created_at DESC, key ASC)`
+/// caps EACH actor at `limit_per_actor` rows (newest-first) so one
+/// memory-heavy actor can't starve the batch — the single-actor path's
+/// per-actor `LIMIT` becomes a per-partition window here. The outer
+/// `ORDER BY actor_id, memory_type, key ASC` reproduces the single-actor
+/// path's within-actor ordering (`memory_type, key ASC`) so the grouped
+/// output is byte-identical to the pre-batch per-actor loop.
+///
+/// Takes the caller's connection (like the single-actor scoped fn) so the
+/// resolver's per-user unit of work keeps its RLS backstop; do NOT add a
+/// pool variant — it would split the snapshot. The projection carries the
+/// MCP-S2 columns (`actor_id`, `value_format`) that AAD-bound decryption
+/// requires; `value_format` maps to a NOT-NULL `i16` via `FromRow`, so a
+/// dropped/retyped column fails LOUD (schema drift → `Err`, never a silent
+/// default — read-side sibling of lint checks 34/52). Decrypt each returned
+/// row with [`decrypt_memory_list_row`] AFTER the tx commits (the loop is
+/// connection-free). Actors with no matching rows return NO rows here —
+/// callers that need one group per requested actor reconstruct the empty
+/// groups via [`group_memory_list_rows_by_actor`].
+pub async fn list_memories_with_ciphertext_batched_scoped(
+    conn: &mut sqlx::PgConnection,
+    actor_ids: &[Uuid],
+    memory_type_filter: Option<&str>,
+    limit_per_actor: i64,
+) -> Result<Vec<MemoryListRowEnc>> {
+    if actor_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Defense in depth: the resolver rejects >MAX_ACTOR_IDS_PER_BATCH ids
+    // before calling, so this truncation is unreachable in practice — it
+    // bounds the `= ANY($1)` scan for any future direct caller.
+    let capped_ids: &[Uuid] = if actor_ids.len() > MAX_ACTOR_IDS_PER_BATCH {
+        &actor_ids[..MAX_ACTOR_IDS_PER_BATCH]
+    } else {
+        actor_ids
+    };
+    // Mirror the single-actor scoped fn: trust the resolver's clamp (it caps
+    // per-actor rows the same way `actorMemories` does). `.max(1)` only
+    // guards a non-positive window (`rn <= 0` returns nothing) — it never
+    // reduces a valid caller limit, so output stays byte-identical.
+    let limit = limit_per_actor.max(1);
+    sqlx::query_as::<_, MemoryListRowEnc>(
+        "SELECT actor_id, key, value_enc, value_key_id, value_format, \
+                memory_type, expires_at, updated_at \
+         FROM ( \
+             SELECT actor_id, key, value_enc, value_key_id, value_format, \
+                    memory_type, expires_at, updated_at, \
+                    ROW_NUMBER() OVER ( \
+                        PARTITION BY actor_id \
+                        ORDER BY created_at DESC, key ASC \
+                    ) AS rn \
+             FROM actor_memory \
+             WHERE actor_id = ANY($1) \
+               AND ($2::text IS NULL OR memory_type = $2) \
+               AND (expires_at IS NULL OR expires_at > NOW()) \
+         ) ranked \
+         WHERE rn <= $3 \
+         ORDER BY actor_id, memory_type, key ASC",
+    )
+    .bind(capped_ids)
+    .bind(memory_type_filter)
+    .bind(limit)
+    .fetch_all(conn)
+    .await
+    .context("list_memories_with_ciphertext_batched_scoped")
+}
+
+/// Group the flat rows from [`list_memories_with_ciphertext_batched_scoped`]
+/// by `actor_id`, preserving the caller's `ordered` actor sequence and
+/// emitting an EMPTY group for any requested actor that returned no rows —
+/// so the batched `actorsMemories` resolver reproduces the same
+/// one-group-per-owned-actor shape the per-actor loop produced (an owned
+/// actor with no memories was a group with an empty list, not an absent
+/// group). Within each actor the rows keep the batch query's
+/// `memory_type, key ASC` order.
+///
+/// `ordered` is expected to be duplicate-free (the resolver collapses
+/// duplicate ids in its ownership filter); a repeated id would still be
+/// safe here (its rows land in the first occurrence, later occurrences get
+/// an empty group). Pure so unit tests exercise the real grouping logic.
+pub fn group_memory_list_rows_by_actor(
+    ordered: &[Uuid],
+    rows: Vec<MemoryListRowEnc>,
+) -> Vec<(Uuid, Vec<MemoryListRowEnc>)> {
+    let mut by_actor: std::collections::HashMap<Uuid, Vec<MemoryListRowEnc>> =
+        std::collections::HashMap::with_capacity(ordered.len());
+    for id in ordered {
+        by_actor.entry(*id).or_default();
+    }
+    for row in rows {
+        // Rows whose actor is not in `ordered` are dropped defensively —
+        // the query only selects `= ANY(ordered)`, so this can't happen.
+        if let Some(bucket) = by_actor.get_mut(&row.actor_id) {
+            bucket.push(row);
+        }
+    }
+    ordered
+        .iter()
+        .map(|id| (*id, by_actor.remove(id).unwrap_or_default()))
+        .collect()
 }
 
 /// Hard upper bound on the row count `list_keys` will return regardless
@@ -4046,5 +4162,183 @@ mod tests {
     fn default_expires_at_semantic_with_no_override_returns_none() {
         // semantic type with no explicit TTL = no expiry.
         assert!(super::default_expires_at("semantic", None).is_none());
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Batched actor-memory listing (the `actorsMemories` N+1 close). Covers
+// the pure grouping helper (`group_memory_list_rows_by_actor`) and the
+// per-row decrypt dispatch (`decrypt_memory_list_row`) across format
+// versions + drift. The SQL fn `list_memories_with_ciphertext_batched_scoped`
+// itself (the `= ANY($1)` window-cap query) needs a live Postgres — the
+// project has no in-crate DB harness for talos-memory (all unit tests here
+// are pure), so its query behavior (per-actor cap newest-first, empty
+// actor_ids, unknown-actor-absent, value_format-projection fail-loud via
+// FromRow) is exercised by the controller integration suite against the
+// isolated-DB harness, mirrored by the pure grouping + decrypt assertions
+// below.
+// ─────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod batched_listing_tests {
+    use super::{
+        decrypt_memory_list_row, group_memory_list_rows_by_actor, register_memory_crypto_hook,
+        DecryptFuture, EncryptFuture, MemoryCryptoHook, MemoryListRowEnc,
+    };
+    use chrono::Utc;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    fn row(actor_id: Uuid, key: &str, memory_type: &str) -> MemoryListRowEnc {
+        MemoryListRowEnc {
+            actor_id,
+            key: key.to_string(),
+            value_enc: None,
+            value_key_id: None,
+            value_format: 0,
+            memory_type: memory_type.to_string(),
+            expires_at: None,
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn grouping_preserves_requested_order_and_partitions_rows() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        // Rows arrive interleaved (the batched query orders by actor_id, but
+        // the grouper must not depend on input order).
+        let rows = vec![
+            row(b, "k1", "working"),
+            row(a, "k1", "working"),
+            row(b, "k2", "episodic"),
+            row(a, "k2", "episodic"),
+        ];
+        let grouped = group_memory_list_rows_by_actor(&[a, b], rows);
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].0, a, "requested order (a before b) preserved");
+        assert_eq!(grouped[1].0, b);
+        let a_keys: Vec<_> = grouped[0].1.iter().map(|r| r.key.as_str()).collect();
+        let b_keys: Vec<_> = grouped[1].1.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(a_keys, vec!["k1", "k2"], "actor a keeps only its own rows");
+        assert_eq!(b_keys, vec!["k1", "k2"], "actor b keeps only its own rows");
+    }
+
+    #[test]
+    fn owned_actor_with_no_rows_yields_empty_group_not_absent() {
+        // Byte-identical to the pre-batch loop: an owned actor with no
+        // memories was a group with an empty list, NOT an omitted group.
+        let a = Uuid::new_v4();
+        let empty_actor = Uuid::new_v4();
+        let rows = vec![row(a, "k1", "working")];
+        let grouped = group_memory_list_rows_by_actor(&[a, empty_actor], rows);
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[1].0, empty_actor);
+        assert!(
+            grouped[1].1.is_empty(),
+            "empty owned actor must produce a present-but-empty group"
+        );
+    }
+
+    #[test]
+    fn empty_ordered_yields_no_groups() {
+        let grouped = group_memory_list_rows_by_actor(&[], vec![]);
+        assert!(grouped.is_empty());
+    }
+
+    #[test]
+    fn rows_for_unrequested_actor_are_dropped() {
+        // The resolver only passes owned ids to `ordered`; a stray row for
+        // an id not in `ordered` (defensive — can't happen, the query is
+        // `= ANY(ordered)`) must not manufacture an extra group.
+        let a = Uuid::new_v4();
+        let stray = Uuid::new_v4();
+        let rows = vec![row(a, "k1", "working"), row(stray, "k1", "working")];
+        let grouped = group_memory_list_rows_by_actor(&[a], rows);
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].0, a);
+        assert_eq!(grouped[0].1.len(), 1);
+    }
+
+    // Stub crypto hook: echoes the JSON-serialized plaintext it "encrypts"
+    // straight back on decrypt (ciphertext == JSON bytes) for the known
+    // format versions, and fails LOUD on any other version so a drifted /
+    // unknown `value_format` surfaces as an Err rather than a silent
+    // default (decrypt-side mirror of the query's FromRow fail-loud).
+    struct EchoFormatHook;
+    impl MemoryCryptoHook for EchoFormatHook {
+        fn encrypt(
+            &self,
+            plaintext: String,
+            _org_id: Option<Uuid>,
+            _aad: Vec<u8>,
+        ) -> EncryptFuture {
+            Box::pin(async move { Ok((Uuid::nil(), plaintext.into_bytes(), 3i16)) })
+        }
+        fn decrypt(
+            &self,
+            _key_id: Uuid,
+            ciphertext: Vec<u8>,
+            _aad: Vec<u8>,
+            format_version: i16,
+        ) -> DecryptFuture {
+            Box::pin(async move {
+                match format_version {
+                    0 | 1 | 3 | 4 => {
+                        let s = String::from_utf8(ciphertext)
+                            .map_err(|e| anyhow::anyhow!("utf8: {e}"))?;
+                        Ok(zeroize::Zeroizing::new(s))
+                    }
+                    other => anyhow::bail!("unknown value_format {other} (schema drift)"),
+                }
+            })
+        }
+    }
+
+    fn enc_row(
+        actor: Uuid,
+        key: &str,
+        fmt: i16,
+        json_value: &serde_json::Value,
+    ) -> MemoryListRowEnc {
+        let payload = serde_json::to_string(json_value).expect("serialize");
+        MemoryListRowEnc {
+            actor_id: actor,
+            key: key.to_string(),
+            value_enc: Some(payload.into_bytes()),
+            value_key_id: Some(Uuid::new_v4()),
+            value_format: fmt,
+            memory_type: "working".to_string(),
+            expires_at: None,
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn decrypt_dispatches_across_format_versions_in_one_batch_and_fails_loud_on_drift() {
+        // Global OnceLock hook; register is idempotent and no other
+        // talos-memory unit test depends on the no-hook state.
+        register_memory_crypto_hook(Arc::new(EchoFormatHook));
+        let actor = Uuid::new_v4();
+
+        // v0/v1/v3/v4 rows all decrypt through the per-row format dispatch.
+        for fmt in [0i16, 1, 3, 4] {
+            let expected = serde_json::json!(format!("value-for-format-{fmt}"));
+            let r = enc_row(actor, &format!("k{fmt}"), fmt, &expected);
+            let got = decrypt_memory_list_row(&r)
+                .await
+                .expect("known format must decrypt");
+            assert_eq!(got, expected, "format {fmt} round-trips to its own value");
+        }
+
+        // A drifted / unknown value_format must fail LOUD (Err), never a
+        // silent default.
+        let drift = enc_row(actor, "kbad", 99, &serde_json::json!("x"));
+        let err = decrypt_memory_list_row(&drift)
+            .await
+            .expect_err("unknown value_format must fail loud");
+        assert!(
+            format!("{err:#}").contains("99"),
+            "error must surface the drifted format: {err:#}"
+        );
     }
 }

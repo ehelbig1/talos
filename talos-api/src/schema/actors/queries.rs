@@ -584,13 +584,14 @@ impl ActorsQueries {
     /// `actors` (1 + N requests, each opening its own tenant-scoped tx
     /// and ownership check). This resolver serves the same data in ONE
     /// request: one per-user unit of work, ONE batched ownership read
-    /// (`actor_ids_owned_by_user_scoped`), then the per-actor listings
-    /// on the same connection/snapshot. (Collapsing the listings into a
-    /// single `actor_id = ANY($1)` query needs a batched read in
-    /// `talos-memory` — actor_memory access MUST go through
-    /// `talos_memory::*` — tracked as a follow-up; the request-level
-    /// fan-out and per-request auth/tx overhead are already collapsed
-    /// here.)
+    /// (`actor_ids_owned_by_user_scoped`), then ONE batched listing
+    /// (`list_memories_with_ciphertext_batched_scoped`, a single
+    /// `actor_id = ANY($1)` window-capped scan) on the same
+    /// connection/snapshot. The prior residual — a per-actor listing
+    /// loop inside this one tx, because a crypto-aware `= ANY($1)` read
+    /// had to live in `talos-memory` (all actor_memory access MUST go
+    /// through `talos_memory::*`) — is now closed, so the whole page is
+    /// two queries (ownership + listing) regardless of actor count.
     ///
     /// Tenancy: ids that are unknown or another tenant's are silently
     /// skipped (no group), so absence is indistinguishable from
@@ -649,25 +650,28 @@ impl ActorsQueries {
             })?;
         let ordered = filter_owned_preserving_order(&actor_ids, &owned);
 
-        let mut per_actor_rows = Vec::with_capacity(ordered.len());
-        for actor_id in ordered {
-            let rows = talos_memory::list_memories_with_ciphertext_scoped(
-                uow.conn(),
-                actor_id,
-                memory_type.as_deref(),
-                limit_val,
-            )
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "graphql: batched actor memories read failed");
-                async_graphql::Error::new("Request could not be completed").extend_safe()
-            })?;
-            per_actor_rows.push((actor_id, rows));
-        }
+        // ONE batched, window-capped `actor_id = ANY($1)` scan (the SQL
+        // lives in talos-memory — the crypto-aware access path — so this
+        // resolver stays raw-sqlx-free, lint check 50). Actors that
+        // returned no rows are re-materialized as empty groups below so
+        // the output shape matches the pre-batch per-actor loop.
+        let flat_rows = talos_memory::list_memories_with_ciphertext_batched_scoped(
+            uow.conn(),
+            &ordered,
+            memory_type.as_deref(),
+            limit_val,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "graphql: batched actor memories read failed");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
         uow.commit().await.map_err(|e| {
             tracing::error!(error = %e, "graphql: commit transaction error");
             async_graphql::Error::new("Request could not be completed").extend_safe()
         })?;
+
+        let per_actor_rows = talos_memory::group_memory_list_rows_by_actor(&ordered, flat_rows);
 
         let mut groups = Vec::with_capacity(per_actor_rows.len());
         for (actor_id, rows) in per_actor_rows {

@@ -140,10 +140,12 @@ NGINX_FILE="$(mktemp)"
 trap 'rm -f "$ROUTES_FILE" "$NGINX_FILE"' EXIT
 
 # Extract the path arg from .route("/X", …) AND .nest("/X", …) calls in
-# main.rs and normalise to the first path segment. Skip routes annotated
+# main.rs AND bootstrap/router.rs (build_router moved there in the 2026-07
+# main.rs decomposition — the guardrail must follow the registrations) and
+# normalise to the first path segment. Skip routes annotated
 # `// no-nginx-route`. Both `route` and `nest` register a top-level path;
 # nesting matters for things like `Router::new().nest("/mcp", …)`.
-grep -nE '\.(route|nest)\("/' controller/src/main.rs \
+grep -nhE '\.(route|nest)\("/' controller/src/main.rs controller/src/bootstrap/router.rs \
     | grep -v 'no-nginx-route' \
     | grep -oE '\.(route|nest)\("/[^"]*"' \
     | grep -oE '"/[^"]*"' \
@@ -194,7 +196,7 @@ if [ -n "$MISSING" ]; then
     yellow "⚠ controller routes missing a matching top-level nginx location:"
     while IFS= read -r r; do printf '  %s\n' "$r"; done <<<"$MISSING"
     yellow "  → if intentionally internal (probes, scrape token, etc.), add"
-    yellow "    // no-nginx-route on the .route() line in main.rs"
+    yellow "    // no-nginx-route on the .route() line (main.rs / bootstrap/router.rs)"
     yellow "  → otherwise add a matching location block to"
     yellow "    deploy/helm/talos/templates/frontend/configmap.yaml"
 fi

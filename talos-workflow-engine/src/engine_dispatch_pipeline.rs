@@ -116,7 +116,7 @@ impl ParallelWorkflowEngine {
             // its full wasm_bytes blob SELECTed) at most once per run. The Arc
             // is read-only here (`artifact.as_ref()` everywhere below), so the
             // cache hand-out is a refcount bump, not a blob clone.
-            let (artifact, module_config) = match self.module_fetcher.as_ref() {
+            let (artifact, mut module_config) = match self.module_fetcher.as_ref() {
                 Some(fetcher) => match self
                     .fetch_module_artifact_cached(fetcher, step_module_id, uid)
                     .await
@@ -233,6 +233,71 @@ impl ParallelWorkflowEngine {
                 }
                 _ => crate::secrets_pipeline::DispatchSecrets::default(),
             };
+
+            // Opt-in idempotency (Task 1 follow-up): resolve THIS step's
+            // declared key from its merged config, STRIP the engine-only
+            // `__idempotency_key__` directive so it never reaches guest code as
+            // module input, and stamp the resolved key onto the step's
+            // DispatchJob (the NATS adapter maps it to `PipelineStep.idempotency_key`,
+            // HMAC-bound via the `:idem=` signing segment). `auto`/`true` derive
+            // a STABLE `<exec_id>:<step_node_id>` key — stable across retry
+            // attempts of the same dispatch (so the destination dedupes a
+            // retried step) and unique per logical send per execution. Mirrors
+            // the single-node path in `engine_dispatch_single`.
+            let step_idempotency_key =
+                talos_workflow_engine_core::reserved_keys::resolve_idempotency_key(
+                    Some(&module_config),
+                    &execution_id,
+                    &step_node_id,
+                );
+            if let Some(obj) = module_config.as_object_mut() {
+                obj.remove(talos_workflow_engine_core::reserved_keys::IDEMPOTENCY_KEY);
+            }
+
+            // Base per-step retry count (same precedence as before: explicit
+            // node policy → method-aware default; expression-gated policies
+            // fall back to 0 because the worker can't evaluate Rhai).
+            let base_max_retries = {
+                let step_policy = self
+                    .node_meta
+                    .get(&step_node_id)
+                    .and_then(|(_, rp, _)| rp.clone());
+                match step_policy {
+                    Some(p)
+                        if p.retry_condition.is_some() || p.retry_delay_expression.is_some() =>
+                    {
+                        tracing::debug!(
+                            %step_node_id,
+                            "pipeline step has an expression-gated retry policy; \
+                             in-worker step retries disabled for this step \
+                             (expressions are controller-side only)"
+                        );
+                        0
+                    }
+                    Some(p) => p.max_retries,
+                    None => talos_workflow_engine_core::default_max_retries_for_module(
+                        artifact
+                            .as_ref()
+                            .map(|a| a.allowed_methods.as_slice())
+                            .unwrap_or(&[]),
+                        artifact.as_ref().map(|a| a.capability_world.as_str()),
+                    ),
+                }
+            };
+            // When idempotency IS declared, a declared Idempotency-Key header
+            // makes an otherwise-non-idempotent send step safe to retry at the
+            // HTTP boundary — upgrade 0→transient only for HTTP-egress worlds,
+            // never lower an explicit count, never touch a non-declaring step.
+            // Same decision (unit-tested) the single-node path uses.
+            let step_max_retries = talos_workflow_engine_core::effective_retries_with_idempotency(
+                base_max_retries,
+                artifact
+                    .as_ref()
+                    .map(|a| a.capability_world.as_str())
+                    .unwrap_or(""),
+                step_idempotency_key.is_some(),
+            );
+
             step_jobs.push(DispatchJob {
                 execution_id,
                 node_id: step_node_id,
@@ -316,50 +381,25 @@ impl ParallelWorkflowEngine {
                 max_llm_tier: self.max_llm_tier,
                 max_write_ceiling: self.max_write_ceiling,
                 egress_scope: self.egress_scope,
-                // Per-step idempotency is a follow-up (see docs/nats-subjects.md
-                // sibling note); the single-node dispatch path carries the
-                // engine-stamped key today.
-                idempotency_key: None,
+                // Opt-in per-step idempotency (Task 1 follow-up): the resolved
+                // key (or `None` for a non-declaring step), stamped above and
+                // HMAC-bound via the `:idem=` pipeline signing segment. The
+                // worker emits it as an `Idempotency-Key` header on the step's
+                // mutating sends.
+                idempotency_key: step_idempotency_key,
                 // Per-step retry policy (2026-07-24): pipelines previously
                 // hardcoded 0 here, so a chain step NEVER retried an
                 // application failure — the chain-level `dispatch_with_retry`
                 // only covers transport errors. Now each step carries its own
                 // node policy (method-aware default when absent), executed
                 // IN-WORKER by the pipeline step loop under the transient
-                // classifier. Steps whose policy carries a Rhai
-                // retry_condition / retry_delay_expression fall back to 0:
-                // the worker cannot evaluate expressions, and silently
-                // ignoring a user's retry-blocking condition would re-fire
-                // nodes the user explicitly gated (those nodes still honor
-                // their full policy on the single-node dispatch path).
-                max_retries: {
-                    let step_policy = self
-                        .node_meta
-                        .get(&step_node_id)
-                        .and_then(|(_, rp, _)| rp.clone());
-                    match step_policy {
-                        Some(p)
-                            if p.retry_condition.is_some()
-                                || p.retry_delay_expression.is_some() =>
-                        {
-                            tracing::debug!(
-                                %step_node_id,
-                                "pipeline step has an expression-gated retry policy; \
-                                 in-worker step retries disabled for this step \
-                                 (expressions are controller-side only)"
-                            );
-                            0
-                        }
-                        Some(p) => p.max_retries,
-                        None => talos_workflow_engine_core::default_max_retries_for_module(
-                            artifact
-                                .as_ref()
-                                .map(|a| a.allowed_methods.as_slice())
-                                .unwrap_or(&[]),
-                            artifact.as_ref().map(|a| a.capability_world.as_str()),
-                        ),
-                    }
-                },
+                // classifier. `effective_retries_with_idempotency` (applied
+                // above) upgrades a DECLARED-idempotent HTTP-egress send step
+                // from 0→transient; a non-declaring step keeps its base count.
+                // Steps whose policy carries a Rhai retry_condition /
+                // retry_delay_expression fall back to 0 (the worker cannot
+                // evaluate expressions).
+                max_retries: step_max_retries,
                 backoff_ms: self
                     .node_meta
                     .get(&step_node_id)

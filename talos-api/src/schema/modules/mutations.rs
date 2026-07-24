@@ -9,8 +9,8 @@ use super::super::{require_2fa, require_scope, SafeErrorExtensions};
 use crate::schema::types::*;
 use talos_compilation::CompilationService;
 use talos_registry::ModuleRegistry;
+use talos_worker_runtime::TalosRuntime;
 use talos_workflow_engine::ParallelWorkflowEngine;
-use worker::TalosRuntime;
 
 #[derive(Default)]
 pub struct ModulesMutations;
@@ -177,7 +177,7 @@ impl ModulesMutations {
             let mut hasher = sha2::Sha256::new();
             hasher.update(&precompiled);
             let hash = format!("{:x}", hasher.finalize());
-            let inspection = worker::inspect_component(&precompiled);
+            let inspection = talos_worker_runtime::inspect_component(&precompiled);
 
             (
                 precompiled,
@@ -208,7 +208,7 @@ impl ModulesMutations {
                 "".to_string(), // Empty source
                 0,
                 hash,
-                worker::CapabilityWorld::Unknown, // Worker will determine this at runtime
+                talos_worker_runtime::CapabilityWorld::Unknown, // Worker will determine this at runtime
                 vec![],
             )
         } else {
@@ -616,9 +616,9 @@ impl ModulesMutations {
                 std::collections::HashMap::new(),
                 None,
                 timeout,
-                worker::runtime::RetryPolicy::default(),
+                talos_worker_runtime::runtime::RetryPolicy::default(),
                 None,
-                worker::runtime::SecurityPolicy::default(),
+                talos_worker_runtime::runtime::SecurityPolicy::default(),
                 None,                                             // capability_world_hint
                 None,                                             // max_fuel_override
                 false,                                            // dry_run

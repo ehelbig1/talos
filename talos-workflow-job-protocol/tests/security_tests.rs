@@ -73,6 +73,7 @@ fn make_pipeline_step() -> PipelineStep {
         integration_name: None,
         max_retries: 0,
         retry_backoff_ms: 0,
+        idempotency_key: None,
     }
 }
 

@@ -790,6 +790,179 @@ impl WebhookDeduplication {
     }
 }
 
+// ============================================================================
+// In-memory, per-process idempotency dedup store (worker-side)
+// ============================================================================
+//
+// The credential-free worker has NO Redis (all data-plane access is signed
+// NATS-RPC to the controller), so [`IdempotencyService`] above — which is
+// Redis-backed — is not usable there. This lightweight in-memory store is the
+// worker's belt-and-suspenders layer ON TOP OF the `Idempotency-Key` HTTP
+// header a mutating send already carries when the node declared
+// `__idempotency_key__`:
+//
+// * The HEADER is the primary mechanism — it lets a *destination that honors
+//   it* collapse a retried/duplicate send.
+// * This STORE covers the case where the destination does NOT honor the header:
+//   once a send under key `K` has COMPLETED SUCCESSFULLY in this process, a
+//   subsequent send under the same `K` (a module firing twice, an in-worker
+//   pipeline-step re-execution, or a controller re-dispatch that lands on the
+//   same worker within the TTL) is short-circuited and returns the cached
+//   response instead of re-firing.
+//
+// KNOWN GAP (documented, not a bug): a send that TIMES OUT after the
+// destination already applied it is never recorded here (no success was
+// observed), so a subsequent attempt still re-fires — closing that requires
+// destination-side idempotency support (the header). This store only dedupes
+// *observed* successes, which is the safe direction: a non-2xx response is NOT
+// cached, so a genuinely-failed op stays retryable.
+
+/// A neutral cached response for the in-memory dedup store. Deliberately
+/// transport-agnostic (status + headers + body) so both the `http::fetch` and
+/// `webhook::send` host paths can reconstruct their own response type from it
+/// without this crate depending on the WIT bindings.
+#[derive(Debug, Clone)]
+pub struct DedupResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// Outcome of [`InMemoryIdempotencyStore::check`].
+#[derive(Debug, Clone)]
+pub enum DedupCheck {
+    /// No fresh completed record for this key — the caller MUST fire the send
+    /// and, on a successful response, call [`InMemoryIdempotencyStore::complete`].
+    Proceed,
+    /// This key already completed successfully in this process within the TTL
+    /// window — return this cached response verbatim instead of re-firing.
+    Completed(DedupResponse),
+}
+
+struct DedupEntry {
+    stored_at: std::time::Instant,
+    response: DedupResponse,
+}
+
+/// Per-process, in-memory, TTL-bounded idempotency dedup store. Cheap: a single
+/// `Mutex<HashMap>` guarded by short, await-free critical sections. Bounded by
+/// both a TTL sweep (read- and write-path) and a hard entry cap, so memory can
+/// never grow monotonically with distinct-keys-ever-seen.
+pub struct InMemoryIdempotencyStore {
+    inner: std::sync::Mutex<InMemoryInner>,
+    ttl: Duration,
+    max_entries: usize,
+}
+
+struct InMemoryInner {
+    entries: std::collections::HashMap<String, DedupEntry>,
+    last_sweep: std::time::Instant,
+}
+
+impl InMemoryIdempotencyStore {
+    /// Create a store with the given completed-record TTL and hard entry cap.
+    #[must_use]
+    pub fn new(ttl: Duration, max_entries: usize) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(InMemoryInner {
+                entries: std::collections::HashMap::new(),
+                last_sweep: std::time::Instant::now(),
+            }),
+            ttl,
+            max_entries: max_entries.max(1),
+        }
+    }
+
+    /// Sweep expired entries. Called opportunistically from `check`/`complete`
+    /// but rate-limited to at most once per `ttl` so hot paths don't pay an
+    /// O(n) scan on every call. Caller holds the lock.
+    fn maybe_sweep(&self, inner: &mut InMemoryInner, now: std::time::Instant) {
+        if now.duration_since(inner.last_sweep) < self.ttl {
+            return;
+        }
+        let ttl = self.ttl;
+        inner
+            .entries
+            .retain(|_, e| now.duration_since(e.stored_at) < ttl);
+        inner.last_sweep = now;
+    }
+
+    /// Check for a fresh completed record. Returns [`DedupCheck::Completed`]
+    /// with the cached response when this key completed within the TTL, else
+    /// [`DedupCheck::Proceed`]. A stale (expired) record is treated as a miss.
+    #[must_use]
+    pub fn check(&self, key: &str) -> DedupCheck {
+        let now = std::time::Instant::now();
+        let mut inner = match self.inner.lock() {
+            Ok(g) => g,
+            // Poisoned lock (a prior panic while holding it): fail OPEN — a
+            // dedup store must never block a legitimate send. Proceed as if
+            // there were no record.
+            Err(_) => return DedupCheck::Proceed,
+        };
+        self.maybe_sweep(&mut inner, now);
+        match inner.entries.get(key) {
+            Some(e) if now.duration_since(e.stored_at) < self.ttl => {
+                DedupCheck::Completed(e.response.clone())
+            }
+            _ => DedupCheck::Proceed,
+        }
+    }
+
+    /// Record a SUCCESSFUL completion for `key`. Callers MUST only record
+    /// responses that represent a genuine success (2xx) — a failed op must stay
+    /// retryable, so non-success responses are not stored by convention. The
+    /// hard entry cap is enforced here: when full, an expired-entry sweep runs
+    /// first, and if the map is still at capacity the record is dropped
+    /// (best-effort — the header remains the primary dedup mechanism).
+    pub fn complete(&self, key: &str, response: DedupResponse) {
+        let now = std::time::Instant::now();
+        let mut inner = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => return, // poisoned: skip recording, fail open
+        };
+        // Only force a sweep when we're at the cap; otherwise honor the
+        // rate-limited cadence.
+        if inner.entries.len() >= self.max_entries {
+            let ttl = self.ttl;
+            inner
+                .entries
+                .retain(|_, e| now.duration_since(e.stored_at) < ttl);
+            inner.last_sweep = now;
+        } else {
+            self.maybe_sweep(&mut inner, now);
+        }
+        if inner.entries.len() >= self.max_entries && !inner.entries.contains_key(key) {
+            // Still full after sweeping and this is a new key — drop it rather
+            // than grow unbounded. Log once-ish at debug; the miss is benign.
+            tracing::debug!(
+                cap = self.max_entries,
+                "in-memory idempotency store at capacity; dropping new dedup record"
+            );
+            return;
+        }
+        inner.entries.insert(
+            key.to_string(),
+            DedupEntry {
+                stored_at: now,
+                response,
+            },
+        );
+    }
+
+    /// Test/introspection helper: current number of retained entries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.lock().map(|g| g.entries.len()).unwrap_or(0)
+    }
+
+    /// Whether the store currently holds no entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1128,5 +1301,68 @@ mod middleware_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod in_memory_dedup_tests {
+    use super::{DedupCheck, DedupResponse, InMemoryIdempotencyStore};
+    use std::time::Duration;
+
+    fn resp(status: u16) -> DedupResponse {
+        DedupResponse {
+            status,
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            body: b"{\"ok\":true}".to_vec(),
+        }
+    }
+
+    #[test]
+    fn miss_then_complete_then_hit_short_circuits() {
+        let store = InMemoryIdempotencyStore::new(Duration::from_secs(60), 100);
+        // First check: no record → Proceed.
+        assert!(matches!(store.check("k1"), DedupCheck::Proceed));
+        // Record a success.
+        store.complete("k1", resp(200));
+        // Second check: same key → Completed with the cached response.
+        match store.check("k1") {
+            DedupCheck::Completed(r) => {
+                assert_eq!(r.status, 200);
+                assert_eq!(r.body, b"{\"ok\":true}");
+            }
+            DedupCheck::Proceed => panic!("expected a completed short-circuit"),
+        }
+    }
+
+    #[test]
+    fn distinct_keys_are_independent() {
+        let store = InMemoryIdempotencyStore::new(Duration::from_secs(60), 100);
+        store.complete("a", resp(200));
+        assert!(matches!(store.check("a"), DedupCheck::Completed(_)));
+        // A DIFFERENT key (the non-declaring / different-send case) is
+        // unaffected — no dedup, must Proceed.
+        assert!(matches!(store.check("b"), DedupCheck::Proceed));
+    }
+
+    #[test]
+    fn expired_record_is_a_miss() {
+        // Zero TTL → any stored record is immediately stale.
+        let store = InMemoryIdempotencyStore::new(Duration::from_millis(0), 100);
+        store.complete("k", resp(200));
+        // `now - stored_at < 0ms` is false → treated as a miss.
+        assert!(matches!(store.check("k"), DedupCheck::Proceed));
+    }
+
+    #[test]
+    fn entry_cap_is_bounded() {
+        let store = InMemoryIdempotencyStore::new(Duration::from_secs(600), 4);
+        for i in 0..50 {
+            store.complete(&format!("k{i}"), resp(200));
+        }
+        assert!(
+            store.len() <= 4,
+            "store must stay within its hard entry cap (was {})",
+            store.len()
+        );
     }
 }

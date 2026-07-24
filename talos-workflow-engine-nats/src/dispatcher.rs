@@ -1196,6 +1196,12 @@ impl NodeDispatcher for NatsNodeDispatcher {
                 // conditional `:retries=` signing segment.
                 max_retries: job.max_retries,
                 retry_backoff_ms: job.backoff_ms,
+                // Opt-in per-step idempotency (Task 1 follow-up): stamped by
+                // the engine only for a step whose node declared
+                // `__idempotency_key__`. HMAC-bound via the pipeline signing
+                // payload's conditional `:idem=` segment. `None` for every
+                // non-declaring step — ships nothing on the wire.
+                idempotency_key: job.idempotency_key.clone(),
             })
             .collect();
 

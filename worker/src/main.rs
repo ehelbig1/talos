@@ -1300,9 +1300,12 @@ async fn execute_pipeline_job(
                 allowed_sql_operations: step.allowed_sql_operations.clone(),
                 allow_tier2_exposure: step.allow_tier2_exposure,
                 integration_name: step.integration_name.clone(),
-                // Per-step idempotency is a follow-up (PipelineStep carries no
-                // idempotency_key yet); single-node sends carry it today.
-                idempotency_key: None,
+                // Opt-in per-step idempotency (Task 1 follow-up): threaded from
+                // the HMAC-bound `PipelineStep.idempotency_key` into the step's
+                // TalosContext (execute_pipeline), where the http/webhook host
+                // fns emit it as an `Idempotency-Key` header on mutating sends —
+                // the same path single-node dispatch uses.
+                idempotency_key: step.idempotency_key.clone(),
             },
             user_id: Some(req.user_id),
             // Per-step in-worker retry policy (2026-07-24). HMAC-bound via

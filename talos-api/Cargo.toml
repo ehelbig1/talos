@@ -47,11 +47,9 @@ talos-execution-repository = { path = "../talos-execution-repository" }
 talos-workflow-engine = { path = "../talos-workflow-engine" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 tower-cookies = "0.11"
-# Renamed import of the extracted WASM host runtime (was `worker = { path = "../worker" }`,
-# the deployable bin). The `worker` alias keeps `worker::…` paths in src/schema
-# compiling without content edits there; migrate to `talos_worker_runtime::…` when
-# next touching those files.
-worker = { package = "talos-worker-runtime", path = "../talos-worker-runtime" }
+# The extracted WASM host runtime (was `worker = { path = "../worker" }`, the
+# deployable bin). Schema files reference it as `talos_worker_runtime::…`.
+talos-worker-runtime = { path = "../talos-worker-runtime" }
 talos-google-calendar = { path = "../talos-google-calendar" }
 talos-integrations = { path = "../talos-integrations" }
 talos-llm = { path = "../talos-llm" }
