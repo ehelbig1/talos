@@ -177,11 +177,16 @@ const MCP_AUTH_RATE_LIMITER_MAX_ENTRIES: usize = 50_000;
 /// at the default cost runs in ~100 ms inside `spawn_blocking`, so the
 /// budget is ~0.6 CPU-sec/min/user — well inside normal load.
 ///
-/// Future work: extract the cache to a shared crate and wire the
-/// revoke handlers (`revoke_mcp_agent` in GraphQL + the MCP equivalent)
-/// to call `BCRYPT_VERIFY_CACHE.remove(&token_lookup_hash)` directly,
-/// closing the grace window entirely. Blocked today by the crate-
-/// dependency direction: talos-api MUST NOT depend on talos-mcp-handlers.
+/// 2026-07-24: proactive cross-crate invalidation is IMPLEMENTED without
+/// inverting the dependency direction (talos-api still does not depend on
+/// talos-mcp-handlers). This crate — the cache owner — exposes
+/// [`invalidate_token_cache`] / [`invalidate_agent_token_cache`]; the
+/// controller (which depends on BOTH crates) injects a closure over them
+/// into the GraphQL schema as `talos_api::schema::McpTokenCacheInvalidator`,
+/// and `revoke_mcp_agent` calls it after a successful DELETE. The hook is
+/// best-effort and PROCESS-LOCAL: if it isn't wired (tests, alternate
+/// deployments) or in OTHER controller processes of a multi-replica fleet,
+/// the TTL below + the MCP-991 sweep remain the backstop.
 const BCRYPT_CACHE_TTL_SECS: u64 = 10;
 /// Maximum number of entries in the bcrypt verification cache before eviction runs.
 const BCRYPT_CACHE_MAX_ENTRIES: usize = 1_000;
@@ -192,9 +197,9 @@ const BCRYPT_CACHE_MAX_ENTRIES: usize = 1_000;
 /// `revoke_mcp_agent` mutation (`DELETE FROM mcp_agents …` in talos-api),
 /// existing cache entries keyed on `token_lookup_hash` remain valid until
 /// their TTL expires (up to BCRYPT_CACHE_TTL_SECS = 10 s). Cross-crate
-/// proactive invalidation is "Future work" (see the `BCRYPT_CACHE_TTL_SECS`
-/// comment) — the dep-direction rule blocks talos-api from calling into
-/// talos-mcp-handlers. The sweep is the contained alternative: a single
+/// proactive invalidation now exists (see the `BCRYPT_CACHE_TTL_SECS`
+/// comment and [`invalidate_agent_token_cache`]) but is process-local and
+/// best-effort — the sweep remains the fleet-wide backstop: a single
 /// background task here batches a `SELECT id FROM mcp_agents WHERE id =
 /// ANY($1) AND is_active = true` against ALL cached agent_ids every
 /// `SWEEP_INTERVAL_SECS` and evicts entries whose agents are no longer
@@ -351,6 +356,64 @@ pub fn spawn_bcrypt_cache_revocation_sweep(
 /// the cache only skips re-verification for up to BCRYPT_CACHE_TTL_SECS seconds.
 static BCRYPT_VERIFY_CACHE: LazyLock<DashMap<String, (Instant, AgentIdentity)>> =
     LazyLock::new(DashMap::new);
+
+/// Proactively remove one bearer-token cache entry, keyed by the token's
+/// SHA-256 lookup hash — the SAME key format the auth middleware computes
+/// (`hex(SHA-256(full token))`, matching `mcp_agents.token_lookup_hash`;
+/// see the MCP-715 doc on [`BCRYPT_VERIFY_CACHE`]). Returns `true` when an
+/// entry was present and removed.
+///
+/// Infallible and lock-cheap (single DashMap shard op) — safe to call from
+/// any revoke path. Logs `key_hash` (the SHA-256 lookup hash) only; never
+/// token material.
+pub fn invalidate_token_cache(token_lookup_hash: &str) -> bool {
+    match BCRYPT_VERIFY_CACHE.remove(token_lookup_hash) {
+        Some((_, (_, identity))) => {
+            tracing::info!(
+                target: "talos_audit",
+                agent_id = %identity.agent_id,
+                key_hash = %token_lookup_hash,
+                "bcrypt cache: proactively invalidated token entry on revoke"
+            );
+            true
+        }
+        None => false,
+    }
+}
+
+/// Proactively remove EVERY cached verification whose verified identity
+/// belongs to `agent_id`. Returns the number of entries removed.
+///
+/// This is the shape revoke paths actually need: `revoke_mcp_agent` holds
+/// the agent's UUID, not the plaintext token (and therefore not its lookup
+/// hash — the DB row is already deleted by the time the hook fires). The
+/// cache is keyed by `token_lookup_hash`, so we scan values for the
+/// matching `agent_id` and remove each entry by its hash key via
+/// [`invalidate_token_cache`]. The cache is capped at
+/// `BCRYPT_CACHE_MAX_ENTRIES` (1000), so the O(n) scan is trivially cheap
+/// relative to a revoke mutation's DB roundtrip.
+pub fn invalidate_agent_token_cache(agent_id: Uuid) -> usize {
+    let keys: Vec<String> = BCRYPT_VERIFY_CACHE
+        .iter()
+        .filter(|kv| kv.value().1.agent_id == agent_id)
+        .map(|kv| kv.key().clone())
+        .collect();
+    let mut removed = 0usize;
+    for key in &keys {
+        if invalidate_token_cache(key) {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        tracing::info!(
+            target: "talos_audit",
+            %agent_id,
+            removed,
+            "bcrypt cache: proactive revoke invalidation removed cached token entries"
+        );
+    }
+    removed
+}
 
 /// Check IP-based rate limit for MCP auth. Returns `Err(())` if rate limit exceeded.
 fn check_mcp_auth_rate_limit(ip: &str) -> Result<(), ()> {
@@ -742,5 +805,97 @@ mod mcp_auth_rate_limiter_cap_tests {
         assert!(limiter.contains_key(ip));
 
         limiter.clear();
+    }
+}
+
+/// Proactive revoke-time invalidation of the bearer-token cache
+/// (2026-07-24). Verifies a cached-then-invalidated token misses the
+/// cache immediately, without waiting out the TTL or the MCP-991 sweep.
+#[cfg(test)]
+mod bcrypt_cache_invalidation_tests {
+    use super::*;
+
+    /// BCRYPT_VERIFY_CACHE is process-global — serialise tests that touch
+    /// it, same pattern as LIMITER_TEST_LOCK above. Unique key prefixes
+    /// per test add belt-and-braces isolation.
+    static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn cache_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        CACHE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn test_identity(agent_id: Uuid) -> AgentIdentity {
+        AgentIdentity {
+            agent_id,
+            name: "test-agent".to_string(),
+            role_name: "developer".to_string(),
+            allowed_capabilities: vec!["minimal".to_string()],
+            user_id: None,
+        }
+    }
+
+    /// Simulate the middleware's insert path: SHA-256 lookup hash of the
+    /// full token → (now, identity). Uses the SAME hash computation as
+    /// `mcp_auth_middleware` so the test exercises the real key format.
+    fn seed_cache(token: &str, agent_id: Uuid) -> String {
+        let token_lookup_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+        BCRYPT_VERIFY_CACHE.insert(
+            token_lookup_hash.clone(),
+            (Instant::now(), test_identity(agent_id)),
+        );
+        token_lookup_hash
+    }
+
+    /// Cached → invalidate by lookup hash → cache miss. The exact
+    /// requirement: revocation removes the entry keyed by the token's
+    /// SHA-256 lookup hash immediately.
+    #[test]
+    fn cached_then_invalidated_token_misses_cache() {
+        let _g = cache_test_lock();
+        let agent_id = Uuid::new_v4();
+        let hash = seed_cache("tok-invalidate-by-hash-1", agent_id);
+
+        // Cached (fresh — well inside TTL).
+        assert!(
+            BCRYPT_VERIFY_CACHE.contains_key(&hash),
+            "seed must be cached"
+        );
+
+        // Proactive invalidation removes it immediately.
+        assert!(invalidate_token_cache(&hash), "entry was present → true");
+        assert!(
+            !BCRYPT_VERIFY_CACHE.contains_key(&hash),
+            "invalidated token must miss the cache immediately (no TTL wait)"
+        );
+
+        // Idempotent + fail-safe: second call is a no-op, never panics.
+        assert!(!invalidate_token_cache(&hash));
+    }
+
+    /// Agent-id-shaped invalidation (what `revoke_mcp_agent` uses — it
+    /// holds the UUID, not the token): removes every entry belonging to
+    /// the revoked agent and ONLY those.
+    #[test]
+    fn invalidate_by_agent_id_removes_all_of_that_agents_tokens_only() {
+        let _g = cache_test_lock();
+        let revoked = Uuid::new_v4();
+        let bystander = Uuid::new_v4();
+
+        let h1 = seed_cache("tok-revoked-a", revoked);
+        let h2 = seed_cache("tok-revoked-b", revoked);
+        let h3 = seed_cache("tok-bystander", bystander);
+
+        assert_eq!(invalidate_agent_token_cache(revoked), 2);
+        assert!(!BCRYPT_VERIFY_CACHE.contains_key(&h1));
+        assert!(!BCRYPT_VERIFY_CACHE.contains_key(&h2));
+        assert!(
+            BCRYPT_VERIFY_CACHE.contains_key(&h3),
+            "other agents' cached tokens must survive"
+        );
+
+        // Unknown agent → 0 removed, no panic (fail-safe).
+        assert_eq!(invalidate_agent_token_cache(Uuid::new_v4()), 0);
+
+        BCRYPT_VERIFY_CACHE.remove(&h3);
     }
 }
