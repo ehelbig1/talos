@@ -976,8 +976,8 @@ impl WasmModule {
         // This site was the lone unmigrated reference in talos-api.
         use std::str::FromStr;
         self.capability_world.as_ref().map(|w| {
-            let world = worker::CapabilityWorld::from_str(w.as_str())
-                .unwrap_or(worker::CapabilityWorld::Unknown);
+            let world = talos_worker_runtime::CapabilityWorld::from_str(w.as_str())
+                .unwrap_or(talos_worker_runtime::CapabilityWorld::Unknown);
             talos_mcp_tool_schema::capability_world_description(&world).to_string()
         })
     }
