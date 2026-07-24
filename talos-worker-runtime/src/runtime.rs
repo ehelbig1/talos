@@ -1141,22 +1141,64 @@ pub(crate) fn pipeline_retry_backoff_ms(base_ms: u64, completed_attempts: u32) -
 
 /// Whether a failed pipeline step should be retried in-worker.
 ///
-/// All four gates must hold: the step declared retry budget, the
-/// budget isn't exhausted, the error classifies TRANSIENT (auth /
-/// fuel / validation failures never re-run), and the remaining
-/// overall-pipeline deadline can absorb the backoff plus at least one
-/// more meaningful attempt. Pure so the gate is unit-testable without
-/// a wasm runtime.
+/// All five gates must hold: the step declared retry budget, the budget
+/// isn't exhausted, the error classifies TRANSIENT (auth / fuel /
+/// validation failures never re-run), the remaining overall-pipeline
+/// deadline can absorb the backoff plus at least one more meaningful
+/// attempt, AND the target host's circuit breaker is not OPEN.
+///
+/// `circuit_open` is the per-host breaker verdict (see
+/// [`first_open_circuit_host_in`]): once a host has failed repeatedly in
+/// a short window the breaker opens, and re-attempting a step bound to it
+/// during the cooldown just burns the pipeline deadline against a host we
+/// already know is down — so a `true` here fails the step fast. Pure so
+/// the gate is unit-testable without a wasm runtime.
 pub(crate) fn should_retry_pipeline_step(
     completed_attempts: u32,
     max_retries: u32,
     err_text: &str,
     remaining: std::time::Duration,
     backoff: std::time::Duration,
+    circuit_open: bool,
 ) -> bool {
-    completed_attempts <= max_retries
+    !circuit_open
+        && completed_attempts <= max_retries
         && is_transient_error_text(err_text)
         && remaining > backoff + std::time::Duration::from_millis(250)
+}
+
+/// Fixed fast-fail message emitted when a per-host circuit breaker is OPEN
+/// and the retry loop short-circuits. Host-only (never the full URL /
+/// query string — security invariant) and deliberately worded so it
+/// carries NO transient token: [`is_transient_error_text`] and the
+/// controller-side `talos_retry_intelligence::classify_error` both treat
+/// "circuit open" as non-transient, so the fast-fail does not itself
+/// trigger another round of retries.
+pub(crate) fn circuit_open_error(host: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "circuit open for host {host}: cooling down after repeated failures — \
+         skipping retries until the host recovers"
+    )
+}
+
+/// Return the first declared host whose per-host circuit breaker is
+/// currently OPEN, or `None` if none are.
+///
+/// The breaker keys on the target HOST (never the full URL), so this
+/// matches a module's `allowed_hosts` entry against the breaker state.
+/// A wildcard (`*`) or empty entry is skipped — we can't identify the
+/// real target for a wildcard grant, so those fall through to the normal
+/// transient-retry path rather than being gated by an unrelated host's
+/// breaker. Takes the breaker by reference so it is unit-testable against
+/// a local instance without the process-global singleton.
+pub(crate) fn first_open_circuit_host_in<'a>(
+    breaker: &crate::circuit_breaker::HttpCircuitBreaker,
+    allowed_hosts: &'a [String],
+) -> Option<&'a str> {
+    allowed_hosts.iter().map(|h| h.trim()).find(|h| {
+        let h = *h;
+        !h.is_empty() && h != "*" && breaker.is_open(h)
+    })
 }
 
 /// String-shape core of [`is_transient_error`], shared with the
@@ -2681,10 +2723,37 @@ impl TalosRuntime {
                     return Ok(result);
                 }
                 Err(e) => {
-                    if attempt < retry_policy.max_attempts && is_transient_error(&e) {
-                        last_error = Some(e);
-                        continue; // Retry
-                    } else {
+                    // Per-host circuit breaker gate: during a sustained
+                    // outage the breaker for this module's host opens after
+                    // repeated failures; re-dispatching the WASM module
+                    // against a dead host just burns the retry budget. When
+                    // OPEN, skip the in-worker retries and fail fast with a
+                    // clear, non-transient reason (host-only, no URL). Only
+                    // gates transient errors — a non-transient failure
+                    // already fails fast through the normal path below.
+                    if is_transient_error(&e) {
+                        if let Some(open_host) = first_open_circuit_host_in(
+                            crate::circuit_breaker::get_global_circuit_breaker(),
+                            &allowed_hosts,
+                        ) {
+                            tracing::warn!(
+                                target: "talos_runtime",
+                                host = %open_host,
+                                "WASM job short-circuited: host circuit breaker OPEN"
+                            );
+                            if let Some(ref otel_metrics) = self.metrics {
+                                let total_duration = overall_start.elapsed().as_millis() as f64;
+                                otel_metrics.record_execution(total_duration, "error");
+                                otel_metrics.record_error("circuit_open");
+                            }
+                            return Err(circuit_open_error(open_host));
+                        }
+                        if attempt < retry_policy.max_attempts {
+                            last_error = Some(e);
+                            continue; // Retry
+                        }
+                    }
+                    {
                         // Record failure metrics (if enabled).
                         // The error in `e` has already been formatted by the inner execution
                         // function into a user-facing message:
@@ -3701,6 +3770,16 @@ impl TalosRuntime {
                             pipeline_retry_backoff_ms(step.retry_backoff_ms, completed_attempts);
                         let remaining =
                             deadline.saturating_duration_since(std::time::Instant::now());
+                        // Per-host circuit breaker: if one of this step's
+                        // declared hosts is failing fast (breaker OPEN),
+                        // skip retries entirely — re-attempting a step
+                        // bound to a host we already know is down just
+                        // burns the pipeline deadline. Host-only (never
+                        // the URL) per the security invariant.
+                        let open_host = first_open_circuit_host_in(
+                            crate::circuit_breaker::get_global_circuit_breaker(),
+                            &step.allowed_hosts,
+                        );
                         if step.max_retries > 0
                             && should_retry_pipeline_step(
                                 completed_attempts,
@@ -3708,6 +3787,7 @@ impl TalosRuntime {
                                 &e.to_string(),
                                 remaining,
                                 std::time::Duration::from_millis(backoff_ms),
+                                open_host.is_some(),
                             )
                         {
                             tracing::warn!(
@@ -3720,6 +3800,18 @@ impl TalosRuntime {
                             );
                             tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                             continue;
+                        }
+                        // When the breaker forced the stop, surface a
+                        // clear, non-transient reason instead of the raw
+                        // (possibly transient-looking) attempt error.
+                        if let Some(open_host) = open_host {
+                            tracing::warn!(
+                                target: "talos_runtime",
+                                step_module_id = %step.module_id,
+                                host = %open_host,
+                                "pipeline step short-circuited: host circuit breaker OPEN"
+                            );
+                            return Err(circuit_open_error(open_host));
                         }
                         return Err(e);
                     }
@@ -4619,13 +4711,14 @@ mod pipeline_step_retry_tests {
     fn retry_gate_requires_budget_transience_and_deadline() {
         let ten_s = Duration::from_secs(10);
         let short_backoff = Duration::from_millis(100);
-        // Happy path: budget left, transient, deadline roomy.
+        // Happy path: budget left, transient, deadline roomy, breaker closed.
         assert!(should_retry_pipeline_step(
             1,
             2,
             "timed out",
             ten_s,
-            short_backoff
+            short_backoff,
+            false,
         ));
         // Budget exhausted (completed_attempts > max_retries).
         assert!(!should_retry_pipeline_step(
@@ -4633,7 +4726,8 @@ mod pipeline_step_retry_tests {
             2,
             "timed out",
             ten_s,
-            short_backoff
+            short_backoff,
+            false,
         ));
         // Non-transient never retries even with budget.
         assert!(!should_retry_pipeline_step(
@@ -4641,7 +4735,8 @@ mod pipeline_step_retry_tests {
             2,
             "401 unauthorized",
             ten_s,
-            short_backoff
+            short_backoff,
+            false,
         ));
         // Deadline can't absorb backoff + a meaningful attempt.
         assert!(!should_retry_pipeline_step(
@@ -4649,8 +4744,65 @@ mod pipeline_step_retry_tests {
             2,
             "timed out",
             Duration::from_millis(120),
-            short_backoff
+            short_backoff,
+            false,
         ));
+    }
+
+    #[test]
+    fn retry_gate_short_circuits_when_host_circuit_open() {
+        let ten_s = Duration::from_secs(10);
+        let short_backoff = Duration::from_millis(100);
+        // Everything else says "retry" (budget + transient + deadline),
+        // but an OPEN host circuit overrides and fails fast.
+        assert!(
+            !should_retry_pipeline_step(1, 2, "timed out", ten_s, short_backoff, true),
+            "open host circuit must veto an otherwise-retryable step"
+        );
+    }
+
+    #[test]
+    fn first_open_circuit_host_matches_declared_host() {
+        use crate::circuit_breaker::{CircuitBreakerConfig, HttpCircuitBreaker};
+        let cb = HttpCircuitBreaker::new(CircuitBreakerConfig::default());
+        let hosts = vec![
+            "gmail.googleapis.com".to_string(),
+            "example.com".to_string(),
+        ];
+        // Nothing open yet.
+        assert_eq!(first_open_circuit_host_in(&cb, &hosts), None);
+        // Trip the breaker for one declared host (default threshold = 5).
+        for _ in 0..5 {
+            cb.record_failure("gmail.googleapis.com");
+        }
+        assert_eq!(
+            first_open_circuit_host_in(&cb, &hosts),
+            Some("gmail.googleapis.com")
+        );
+    }
+
+    #[test]
+    fn first_open_circuit_host_ignores_wildcard_and_blank() {
+        use crate::circuit_breaker::{CircuitBreakerConfig, HttpCircuitBreaker};
+        let cb = HttpCircuitBreaker::new(CircuitBreakerConfig::default());
+        // A wildcard grant can't identify a real target host, so even a
+        // fully-open breaker for some host must not gate a "*" module.
+        for _ in 0..5 {
+            cb.record_failure("anything.example.com");
+        }
+        let hosts = vec!["*".to_string(), "".to_string(), "  ".to_string()];
+        assert_eq!(first_open_circuit_host_in(&cb, &hosts), None);
+    }
+
+    #[test]
+    fn circuit_open_error_is_host_only_and_non_transient() {
+        let err = circuit_open_error("gmail.googleapis.com");
+        let msg = err.to_string();
+        // Names the host (breaker key) …
+        assert!(msg.contains("gmail.googleapis.com"));
+        // … carries NO transient token, so neither the worker gate nor
+        // the controller classifier re-triggers retries on it.
+        assert!(!is_transient_error_text(&msg));
     }
 
     #[test]

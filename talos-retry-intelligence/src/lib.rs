@@ -98,6 +98,19 @@ pub fn classify_error(error_msg: &str) -> String {
     };
     let lower = truncated.to_lowercase();
 
+    // Per-host circuit breaker fast-fail (worker `circuit_open_error`).
+    // Hoisted ABOVE every other bucket because the worker may append the
+    // last underlying error (which can carry transient tokens like
+    // "connection refused") — but a circuit-open fast-fail is
+    // deliberately NON-transient: the host is known-down and cooling
+    // down, so re-dispatching just hammers it. Keying on the stable
+    // "circuit open" marker makes the controller-side dispatcher skip its
+    // re-dispatch retries, the cross-process complement of the worker's
+    // in-process retry gate.
+    if lower.contains("circuit open") || lower.contains("circuit breaker open") {
+        return "circuit_open".to_string();
+    }
+
     if lower.contains("fuel exhausted") || lower.contains("out of fuel") {
         return "fuel_exhaustion".to_string();
     }
@@ -357,6 +370,35 @@ mod tests {
         // a SQL syntax error or constraint violation will never
         // succeed on retry.
         assert!(!is_transient_error_type("database_error"));
+        // Circuit-open fast-fail is deliberately NON-transient: the host
+        // is known-down and cooling down, so retrying just hammers it.
+        assert!(!is_transient_error_type("circuit_open"));
+    }
+
+    #[test]
+    fn circuit_open_classified_non_transient() {
+        // The worker's `circuit_open_error` message shape.
+        let classified = classify_error(
+            "circuit open for host gmail.googleapis.com: cooling down after \
+             repeated failures — skipping retries until the host recovers",
+        );
+        assert_eq!(classified, "circuit_open");
+        assert!(
+            !is_transient_error_type(&classified),
+            "a circuit-open fast-fail must not trigger dispatcher retries"
+        );
+    }
+
+    #[test]
+    fn circuit_open_wins_over_embedded_transient_token() {
+        // Even if a circuit-open message embeds the underlying transient
+        // error (e.g. "connection refused"), the hoisted circuit_open
+        // bucket must win so the fast-fail is not re-classified transient.
+        let classified = classify_error(
+            "circuit open for host api.example.com (last error: connection refused)",
+        );
+        assert_eq!(classified, "circuit_open");
+        assert!(!is_transient_error_type(&classified));
     }
 
     #[test]
