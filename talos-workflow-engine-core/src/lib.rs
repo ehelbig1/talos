@@ -180,7 +180,7 @@ pub use secrets::{
     BoxError, GcpImpersonationTokenProvider, GithubInstallationTokenProvider, SecretsResolver,
 };
 pub use shared_key::{WorkerKeyRing, WorkerSharedKey};
-pub use sub_actor_context::SubworkflowActorContextResolver;
+pub use sub_actor_context::{SubworkflowActorContextResolver, SubworkflowBinding};
 pub use system_node::{JoinMode, SystemNodeKind};
 pub use transport::JobTransport;
 pub use wasm_cache::{scoped_wasm_cache_key, scoped_wasm_redis_uri};

@@ -49,6 +49,47 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
+/// A sub-workflow's resolved binding: the actor identity it should run
+/// under (memory scope + action attribution) plus the privilege ceilings
+/// it should run at.
+///
+/// Returned by [`SubworkflowActorContextResolver::resolve_binding`] and
+/// applied by the executor to a freshly-built sub-engine. The two axes
+/// are deliberately independent:
+///
+/// * **`actor_id`** — the sub-workflow's OWN bound actor. `Some(id)` → the
+///   sub-engine adopts this identity, so direct `agent_memory::get/set`
+///   RPCs inside the sub-workflow resolve against the sub-workflow's actor
+///   (the identity its `workflows.actor_id` records, and the same actor the
+///   `resolve` context-injection path already uses). `None` → identity is
+///   unknown (a DB-error fail-closed lookup); the executor keeps the
+///   parent's identity — the caller's already-authorized bound — while
+///   still applying the fail-closed ceilings below. Adopting the
+///   sub-actor's identity is NOT an escalation: the resolver only returns
+///   a binding for a workflow visible to `user_id` bound to an actor owned
+///   by `user_id` (owner-validated, same gate as `resolve`).
+/// * **`max_llm_tier` / `max_write_ceiling` / `egress_scope`** — the
+///   sub-actor's RAW ceilings. The executor composes these with the
+///   parent's as `most_restrictive(parent, sub)` on each axis — a
+///   one-directional narrowing that can never widen the sub-workflow's
+///   authority.
+#[derive(Debug, Clone, Copy)]
+pub struct SubworkflowBinding {
+    /// The sub-workflow's own bound actor, or `None` when the identity
+    /// couldn't be resolved (fail-closed DB error) — see the type docs.
+    pub actor_id: Option<Uuid>,
+    /// The sub-actor's LLM tier ceiling (data-egress). The executor composes
+    /// it with the parent's as `most_restrictive` — never widened.
+    pub max_llm_tier: crate::LlmTier,
+    /// The sub-actor's write ceiling (mutation authority). Composed with the
+    /// parent's as `most_restrictive` — never widened.
+    pub max_write_ceiling: crate::WriteCeiling,
+    /// The sub-actor's blanket public-egress override (`None` = tier-derived
+    /// default). Composed with the parent's via `EgressScope::narrow` —
+    /// explicit `Local` on either side wins.
+    pub egress_scope: Option<crate::EgressScope>,
+}
+
 /// Resolve the `__actor_context__` payload for a sub-workflow about
 /// to be dispatched. Returns `None` when the workflow has no actor
 /// binding, the actor has no memories worth injecting, or the
@@ -61,34 +102,31 @@ pub trait SubworkflowActorContextResolver: Send + Sync {
     /// sub-workflow", which is identical to the pre-trait behaviour.
     async fn resolve(&self, workflow_id: Uuid, user_id: Uuid) -> Option<JsonValue>;
 
-    /// Resolve the sub-workflow's bound actor's privilege ceilings
-    /// (`max_llm_tier`, `max_write_ceiling`), scoped to `user_id`.
+    /// Resolve the sub-workflow's bound actor identity AND privilege
+    /// ceilings in one lookup, scoped to `user_id`.
     ///
-    /// The executor uses this to run the sub-workflow at the *more
-    /// restrictive* of `(parent_ceiling, sub_actor_ceiling)` on each
-    /// axis — a sub-workflow bound to a stricter actor (e.g. a Tier-1,
-    /// read-only persona) must NOT inherit the parent's looser ceiling.
-    /// Without this, `AdapterSet` copies the parent's ceilings verbatim
-    /// into the sub-engine, silently widening the sub-workflow's
-    /// data-egress and mutation authority — a privilege escalation
-    /// across the sub-workflow boundary.
+    /// The executor uses the result to (a) run the sub-workflow under its
+    /// OWN actor's memory scope (so direct `agent_memory` RPCs agree with
+    /// the `resolve` context-injection path — see [`SubworkflowBinding`]),
+    /// and (b) run at the *more restrictive* of
+    /// `(parent_ceiling, sub_actor_ceiling)` on each ceiling axis — a
+    /// sub-workflow bound to a stricter actor (e.g. a Tier-1, read-only
+    /// persona) must NOT inherit the parent's looser ceiling. Without
+    /// this, `AdapterSet` copies the parent's identity AND ceilings
+    /// verbatim into the sub-engine, both silently ignoring the
+    /// sub-workflow's own binding.
     ///
-    /// The default returns `None`, meaning "no distinct sub-actor
-    /// binding known" — the executor then keeps the inherited parent
-    /// ceilings unchanged (the pre-trait behaviour). A resolver that
-    /// CAN answer SHOULD, so a stricter sub-actor is honoured. Note the
-    /// composition is one-directional: it can only ever *narrow* the
-    /// sub-workflow, so returning a LOOSER sub-actor ceiling than the
-    /// parent has no widening effect.
-    async fn resolve_ceilings(
+    /// The default returns `None`, meaning "no distinct sub-actor binding
+    /// known" — the executor then keeps the inherited parent identity and
+    /// ceilings unchanged (the pre-trait behaviour). A resolver that CAN
+    /// answer SHOULD. Note the ceiling composition is one-directional: it
+    /// can only ever *narrow* the sub-workflow, so a LOOSER sub-actor
+    /// ceiling than the parent's has no widening effect.
+    async fn resolve_binding(
         &self,
         _workflow_id: Uuid,
         _user_id: Uuid,
-    ) -> Option<(
-        crate::LlmTier,
-        crate::WriteCeiling,
-        Option<crate::EgressScope>,
-    )> {
+    ) -> Option<SubworkflowBinding> {
         None
     }
 }

@@ -2818,7 +2818,7 @@ impl ActorRepository {
     /// (`talos_engine::actor_binding::apply_actor_to_engine`) does a single
     /// round-trip instead of three sequential single-column SELECTs (a
     /// per-dispatch latency regression a perf review caught). Mirrors
-    /// `WorkflowRepository::get_workflow_actor_ceilings`'s one-JOIN shape.
+    /// `WorkflowRepository::get_workflow_actor_binding`'s one-JOIN shape.
     ///
     /// `Ok(None)` = the actor row does not exist (caller should fail closed —
     /// a race between an ownership check and dispatch); `Ok(Some(..))` = the

@@ -3702,22 +3702,27 @@ else
 fi
 echo
 
-# ── 57. Sub-engine builds must narrow ceilings ────────────────────────
+# ── 57. Sub-engine builds must bind the sub-actor + narrow ceilings ────
 # H2 (PR #504): a sub-engine built via `adapter_set().into_engine_with_graph(…)`
-# inherits the PARENT's `max_llm_tier` / `max_write_ceiling` verbatim. If the
-# sub-workflow is bound to a MORE restrictive actor (Tier-1 / read-only), running
-# it at the parent's looser ceiling is a privilege escalation across the
-# sub-workflow boundary. #504 closed it at three build sites via the single
-# chokepoint `narrow_subengine_ceilings` (execute_subworkflow_graph,
-# dynamic/capability dispatch, agent-loop via `resolve_subworkflow_ceilings`
-# hoisted before the loop) — but nothing stops a FOURTH build site (a new
-# system-node kind, a new parallel executor) from compiling, running, and
-# silently widening. Same class as checks 29/56: the compiler can't see it,
-# review might miss it, so freeze it here. Any file with a non-test
-# `into_engine_with_graph(` call must also reference the narrowing chokepoint,
-# or opt out with `// allow-unnarrowed-subengine: <reason>` within 8 lines above
-# (for deliberate parent-context clones that keep the parent's own ceilings).
-bold "▶ check 57: sub-engine built without ceiling narrowing (H2 escalation guard)"
+# inherits the PARENT's `actor_id` / `max_llm_tier` / `max_write_ceiling`
+# verbatim. Two escalation/correctness gaps: (a) if the sub-workflow is bound to
+# a MORE restrictive actor (Tier-1 / read-only), running it at the parent's
+# looser ceiling is a privilege escalation across the sub-workflow boundary; and
+# (b) the sub-workflow's direct `agent_memory` RPCs would resolve against the
+# PARENT's actor rather than its own bound actor — silently disagreeing with the
+# __actor_context__ injection path and writing memory into the wrong actor
+# (identity axis added 2026-07). #504 + the identity fix close both at three
+# build sites via the single chokepoint `bind_subengine_actor_and_ceilings`
+# (execute_subworkflow_graph, dynamic/capability dispatch, agent-loop via
+# `resolve_subworkflow_binding` hoisted before the loop) — but nothing stops a
+# FOURTH build site (a new system-node kind, a new parallel executor) from
+# compiling, running, and silently widening / mis-scoping. Same class as checks
+# 29/56: the compiler can't see it, review might miss it, so freeze it here. Any
+# file with a non-test `into_engine_with_graph(` call must also reference the
+# binding chokepoint, or opt out with `// allow-unnarrowed-subengine: <reason>`
+# within 8 lines above (for deliberate parent-context clones that keep the
+# parent's own identity + ceilings).
+bold "▶ check 57: sub-engine built without actor-bind + ceiling narrowing (H2 escalation guard)"
 UNNARROWED_SUBENGINE_HITS="$(grep -rn 'into_engine_with_graph(' \
         --include='*.rs' \
         talos-* worker controller 2>/dev/null \
@@ -3728,7 +3733,7 @@ UNNARROWED_SUBENGINE_HITS="$(grep -rn 'into_engine_with_graph(' \
         f="${hit%%:*}"; n="$(echo "$hit" | cut -d: -f2)"
         # File-level: the chokepoint (or its resolver) referenced anywhere in
         # the same file counts — the three #504 sites all qualify.
-        if grep -qE 'narrow_subengine_ceilings|resolve_subworkflow_ceilings' "$f"; then
+        if grep -qE 'bind_subengine_actor_and_ceilings|resolve_subworkflow_binding' "$f"; then
             continue
         fi
         start=$(( n > 8 ? n - 8 : 1 ))
@@ -3741,10 +3746,10 @@ if [ -n "$UNNARROWED_SUBENGINE_HITS" ]; then
     red "✗ sub-engine build site(s) without ceiling narrowing (H2 escalation re-opened):"
     echo "$UNNARROWED_SUBENGINE_HITS" | sed 's/^/    /'
     yellow "  → after into_engine_with_graph(…), call"
-    yellow "    self.narrow_subengine_ceilings(&mut sub_engine, sub_wf_id, user_id).await"
-    yellow "    (or hoist resolve_subworkflow_ceilings once for loop bodies) so the"
-    yellow "    sub-engine runs at most_restrictive(parent, sub-actor) on both axes."
-    yellow "  → deliberate parent-ceiling clones: // allow-unnarrowed-subengine: <reason>"
+    yellow "    self.bind_subengine_actor_and_ceilings(&mut sub_engine, sub_wf_id, user_id).await"
+    yellow "    (or hoist resolve_subworkflow_binding once for loop bodies) so the sub-engine"
+    yellow "    adopts the sub-actor's identity and runs at most_restrictive(parent, sub-actor)."
+    yellow "  → deliberate parent-context clones: // allow-unnarrowed-subengine: <reason>"
     EXIT_CODE=1
 else
     green "✓ every sub-engine build site narrows ceilings (or is explicitly opted out)"
