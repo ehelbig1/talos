@@ -14,5 +14,8 @@ talos-secrets-manager = { path = "../talos-secrets-manager" }
 uuid.workspace = true
 zeroize = "1.8"
 
+[dev-dependencies]
+tokio.workspace = true
+
 [lints]
 workspace = true

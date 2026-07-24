@@ -31,6 +31,36 @@ pub enum ClaimLeaseOutcome {
     Unavailable,
 }
 
+/// The claim-CAS Lua script. Runs the whole read-compare-write in one `EVAL`,
+/// so it is atomic across replicas — two racing claims cannot both observe
+/// `dispatched`. Extracted verbatim from [`RedisLease::try_claim`] so its shape
+/// is unit-testable without a live broker.
+///
+/// KEYS[1] = lease key; ARGV[1] = worker_id; ARGV[2] = lease_ms.
+pub(crate) const CLAIM_CAS_SCRIPT: &str = r#"
+            local cur = redis.call('GET', KEYS[1])
+            if cur == false then return 'MISSING' end
+            if cur == 'dispatched' then
+                redis.call('SET', KEYS[1], 'claimed:' .. ARGV[1], 'PX', ARGV[2])
+                return 'CLAIMED'
+            end
+            if cur == 'claimed:' .. ARGV[1] then return 'SELF' end
+            return 'OTHER'
+        "#;
+
+/// Map the CAS script's string verdict to a [`ClaimLeaseOutcome`]. Extracted
+/// verbatim from [`RedisLease::try_claim`] so the mapping is unit-testable
+/// without a live broker. Any unrecognized verdict maps to `ClaimedByOther`
+/// (fail-closed: an unknown state must not grant the claim).
+pub(crate) fn cas_verdict_to_outcome(verdict: &str) -> ClaimLeaseOutcome {
+    match verdict {
+        "CLAIMED" => ClaimLeaseOutcome::Claimed,
+        "SELF" => ClaimLeaseOutcome::AlreadyClaimedBySelf,
+        "MISSING" => ClaimLeaseOutcome::Missing,
+        _ => ClaimLeaseOutcome::ClaimedByOther,
+    }
+}
+
 /// Atomic CAS lease keyed `envelope:lease:{exec_id}`. Cheap to clone (wraps a
 /// multiplexed `ConnectionManager`).
 #[derive(Clone)]
@@ -90,31 +120,15 @@ impl RedisLease {
         worker_id: &str,
         lease_ms: u64,
     ) -> ClaimLeaseOutcome {
-        // KEYS[1] = lease key; ARGV[1] = worker_id; ARGV[2] = lease_ms.
-        const CAS: &str = r#"
-            local cur = redis.call('GET', KEYS[1])
-            if cur == false then return 'MISSING' end
-            if cur == 'dispatched' then
-                redis.call('SET', KEYS[1], 'claimed:' .. ARGV[1], 'PX', ARGV[2])
-                return 'CLAIMED'
-            end
-            if cur == 'claimed:' .. ARGV[1] then return 'SELF' end
-            return 'OTHER'
-        "#;
         let mut conn = self.conn.clone();
-        let res: redis::RedisResult<String> = redis::Script::new(CAS)
+        let res: redis::RedisResult<String> = redis::Script::new(CLAIM_CAS_SCRIPT)
             .key(self.key(exec_id))
             .arg(worker_id)
             .arg(lease_ms.max(1))
             .invoke_async(&mut conn)
             .await;
         match res {
-            Ok(s) => match s.as_str() {
-                "CLAIMED" => ClaimLeaseOutcome::Claimed,
-                "SELF" => ClaimLeaseOutcome::AlreadyClaimedBySelf,
-                "MISSING" => ClaimLeaseOutcome::Missing,
-                _ => ClaimLeaseOutcome::ClaimedByOther,
-            },
+            Ok(s) => cas_verdict_to_outcome(&s),
             Err(e) => {
                 tracing::warn!(
                     target: "talos_security",
@@ -140,6 +154,71 @@ impl RedisLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Pure logic (no broker required) ----
+
+    /// The verdict → outcome mapping must cover the script's four return
+    /// strings exactly, and any UNKNOWN verdict must map to the rejecting
+    /// outcome (`ClaimedByOther`), never to `Claimed` — an unrecognized
+    /// state must not grant the claim.
+    #[test]
+    fn cas_verdict_mapping_is_exhaustive_and_fails_closed() {
+        assert_eq!(
+            cas_verdict_to_outcome("CLAIMED"),
+            ClaimLeaseOutcome::Claimed
+        );
+        assert_eq!(
+            cas_verdict_to_outcome("SELF"),
+            ClaimLeaseOutcome::AlreadyClaimedBySelf
+        );
+        assert_eq!(
+            cas_verdict_to_outcome("MISSING"),
+            ClaimLeaseOutcome::Missing
+        );
+        assert_eq!(
+            cas_verdict_to_outcome("OTHER"),
+            ClaimLeaseOutcome::ClaimedByOther
+        );
+        // Unknown / garbage verdicts fail closed to the rejecting outcome.
+        for garbage in ["", "claimed", "Claimed", "OK", "1", "nil"] {
+            assert_eq!(
+                cas_verdict_to_outcome(garbage),
+                ClaimLeaseOutcome::ClaimedByOther,
+                "unknown verdict {garbage:?} must reject, never claim"
+            );
+        }
+    }
+
+    /// Shape of the Lua CAS script: it must read the current state with GET
+    /// BEFORE conditionally writing with SET (the compare-and-swap order),
+    /// transition `dispatched → claimed:<worker_id>`, refresh the TTL with
+    /// PX on claim, and return each of the four verdict strings the outcome
+    /// mapping expects. Locked in so an edit that reorders the read/write or
+    /// renames a verdict breaks here instead of silently desynchronizing
+    /// from `cas_verdict_to_outcome`.
+    #[test]
+    fn cas_script_shape() {
+        let s = CLAIM_CAS_SCRIPT;
+        let get_pos = s
+            .find("redis.call('GET', KEYS[1])")
+            .expect("script reads current state via GET KEYS[1]");
+        let set_pos = s
+            .find("redis.call('SET', KEYS[1], 'claimed:' .. ARGV[1], 'PX', ARGV[2])")
+            .expect("script CASes to claimed:<worker_id> with a PX TTL refresh");
+        assert!(get_pos < set_pos, "CAS must read (GET) before write (SET)");
+
+        // The dispatched-state guard wraps the write.
+        assert!(s.contains("if cur == 'dispatched' then"));
+        // Idempotent-redelivery check compares against THIS worker's claim.
+        assert!(s.contains("if cur == 'claimed:' .. ARGV[1] then return 'SELF' end"));
+        // Missing key (expired / never dispatched) is detected via Lua's
+        // false-on-missing GET semantics.
+        assert!(s.contains("if cur == false then return 'MISSING' end"));
+        // All four verdicts the outcome mapping dispatches on are produced.
+        for verdict in ["'CLAIMED'", "'SELF'", "'MISSING'", "'OTHER'"] {
+            assert!(s.contains(verdict), "script must return {verdict}");
+        }
+    }
 
     // Live-Redis tests. Gated on TALOS_TEST_REDIS_URL so they no-op in
     // environments without a broker (mirrors talos-replay-guard's gating).
