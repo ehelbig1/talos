@@ -923,7 +923,10 @@ impl WorkflowRepository {
         // sentinel JSON object describing the truncation.
         let bounded = bound_execution_payload(output);
         let output = &*bounded;
-        if let Some((key_id, enc_bytes, format_version)) = self
+        // rows_affected across both branches so the outcome counter only fires
+        // on a real terminal transition (the guarded UPDATE hits 0 rows when
+        // the row was already terminal / claimed by another writer).
+        let rows_affected = if let Some((key_id, enc_bytes, format_version)) = self
             .maybe_encrypt_execution_output(execution_id, output)
             .await?
         {
@@ -939,7 +942,8 @@ impl WorkflowRepository {
             .bind(format_version)
             .bind(execution_id)
             .execute(&self.db_pool)
-            .await?;
+            .await?
+            .rows_affected()
         } else {
             // MCP-971 (2026-05-15): DLP-redact the plaintext fallback
             // output before bind. The encrypt branch above is the
@@ -961,7 +965,13 @@ impl WorkflowRepository {
             .bind(&redacted)
             .bind(execution_id)
             .execute(&self.db_pool)
-            .await?;
+            .await?
+            .rows_affected()
+        };
+        // talos_workflow_executions_total{status="success"} — see
+        // talos_metrics::record_workflow_outcome (feeds TalosWorkflowFailureRateHigh).
+        if rows_affected > 0 {
+            talos_metrics::record_workflow_outcome("success");
         }
         Ok(())
     }
@@ -1078,7 +1088,10 @@ impl WorkflowRepository {
             }
             _ => None,
         };
-        if self.secrets_manager.is_some() {
+        // rows_affected across both branches — the outcome counter only fires
+        // on a real terminal transition (guarded UPDATE, 0 rows when already
+        // terminal / claimed by another writer).
+        let rows_affected = if self.secrets_manager.is_some() {
             // Encrypted-aware branch: writes ciphertext when present,
             // NULLs plaintext column unconditionally so a stale value
             // can't survive a fail-rewrite. MCP-S2: format_version is
@@ -1105,7 +1118,8 @@ impl WorkflowRepository {
             .bind(enc_format)
             .bind(execution_id)
             .execute(&self.db_pool)
-            .await?;
+            .await?
+            .rows_affected()
         } else {
             // MCP-971: DLP-redact the plaintext fallback output. Same
             // defence-in-depth as mark_execution_completed above. The
@@ -1123,7 +1137,13 @@ impl WorkflowRepository {
             .bind(redacted_output.as_ref())
             .bind(execution_id)
             .execute(&self.db_pool)
-            .await?;
+            .await?
+            .rows_affected()
+        };
+        // talos_workflow_executions_total{status="failure"} — feeds the
+        // TalosWorkflowFailureRateHigh alert; only on a real transition.
+        if rows_affected > 0 {
+            talos_metrics::record_workflow_outcome("failure");
         }
         Ok(())
     }

@@ -160,6 +160,48 @@ groups:
             encrypted on write or not being decrypted on read.
 
   # ────────────────────────────────────────────────────────────────────
+  - name: talos.reliability
+    interval: 30s
+    rules:
+
+      # ── Workflow-execution failure rate — closes the detect→NOTIFY loop.
+      # get_health_dashboard / the operator digest already SHOW
+      # failure_rate_24h_pct, but nothing PUSHED an alert; a sustained
+      # outage (e.g. the 2026-07-23 worker-DNS incident that failed ~125
+      # scheduled runs) went unpaged. Fires on the ratio of terminal
+      # failures to all terminal executions over 15m. Both series are
+      # pre-seeded at 0 (talos_metrics::TalosMetrics::new) so the ratio is
+      # well-defined in steady state; the >0.05 denominator guard avoids
+      # dividing a handful of executions into a scary percentage on a quiet
+      # cluster.
+      - alert: TalosWorkflowFailureRateHigh
+        expr: |
+          (
+            sum(rate(talos_workflow_executions_total{status="failure"}[15m]))
+            /
+            clamp_min(sum(rate(talos_workflow_executions_total[15m])), 0.001)
+          ) > 0.25
+          and
+          sum(rate(talos_workflow_executions_total[15m])) > 0.005
+        for: 10m
+        labels:
+          severity: warning
+          category: reliability-degraded
+        annotations:
+          summary: "Workflow failure rate above 25% (sustained 10m)"
+          description: |
+            {{ $value | humanizePercentage }} of terminal workflow executions
+            are failing over the last 15m. This is the push-alert companion to
+            the get_health_dashboard `failure_rate_24h_pct` / operator-digest
+            `reliability` signals. Common causes: a sustained upstream/egress
+            outage (worker DNS or a third-party API down — the per-host circuit
+            breaker should be fast-failing those), a bad deploy, or a
+            provider-credential expiry. Check top_failures_24h via
+            get_error_report (no workflow_id → platform-wide rollup) and
+            tail_worker_logs on a recent failed execution for the node-level
+            cause.
+
+  # ────────────────────────────────────────────────────────────────────
   - name: talos.vault
     interval: 30s
     rules:

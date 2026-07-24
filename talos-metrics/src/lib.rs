@@ -32,6 +32,26 @@ pub fn global() -> Option<&'static Arc<TalosMetrics>> {
     METRICS.get()
 }
 
+/// Record a terminal workflow-execution outcome on the process-global
+/// `talos_workflow_executions_total{status}` counter. Inert when metrics
+/// aren't wired (unit tests, any process without `set_global`) — never
+/// unwraps, mirroring [`global`]'s contract.
+///
+/// Called from the two terminal-write chokepoints
+/// (`mark_execution_completed` → `"success"`, `mark_execution_failed` →
+/// `"failure"`) so every finalizing caller (trigger / retry / replay /
+/// crash-recovery / GraphQL / MCP) feeds the counter without each site
+/// remembering to. This is the metric the TalosWorkflowFailureRateHigh
+/// alert fires on — before this wiring the counter was registered but
+/// never incremented (dead), so any alert on it would never have fired.
+pub fn record_workflow_outcome(status: &str) {
+    if let Some(m) = global() {
+        m.workflow_executions_total
+            .with_label_values(&[status])
+            .inc();
+    }
+}
+
 /// Global metrics registry and collectors
 pub struct TalosMetrics {
     pub registry: Registry,
@@ -211,6 +231,19 @@ impl TalosMetrics {
             &["status"], // success, failure, timeout, cancelled
         )?;
         registry.register(Box::new(workflow_executions_total.clone()))?;
+        // Pre-seed the two terminal outcomes the finalizers write (success /
+        // failure) at 0 — same reasoning as crash_recovery_total below: the
+        // series must exist in steady state so `rate()` in the
+        // TalosWorkflowFailureRateHigh alert (deploy/helm files/alerts.yaml)
+        // has something to reference before the first failure. `timeout` /
+        // `cancelled` are deliberately NOT seeded: nothing increments them yet
+        // (the scheduler writes those states via a raw UPDATE), so seeding
+        // them would imply a wired signal that doesn't exist.
+        for outcome in ["success", "failure"] {
+            workflow_executions_total
+                .with_label_values(&[outcome])
+                .inc_by(0.0);
+        }
 
         let workflow_execution_duration_seconds = HistogramVec::new(
             prometheus::HistogramOpts::new(
@@ -569,6 +602,46 @@ mod tests {
         assert!(rendered.contains(r#"talos_crash_recovery_total{outcome="resumed"} 1"#));
         assert!(rendered.contains(r#"talos_crash_recovery_total{outcome="reclaimed"} 3"#));
         assert!(rendered.contains(r#"talos_crash_recovery_total{outcome="failed"} 0"#));
+    }
+
+    // workflow_executions_total must be pre-seeded at 0 for success+failure
+    // (so the TalosWorkflowFailureRateHigh alert's rate() has a series in
+    // steady state) and increment per status label. Before this wiring the
+    // counter was registered but never incremented — a dead metric that made
+    // any alert on it silently un-fireable.
+    #[test]
+    fn workflow_executions_metric_seeded_and_increments() {
+        let m = TalosMetrics::new().unwrap();
+        let rendered = m.render_prometheus().expect("render");
+        for status in ["success", "failure"] {
+            assert!(
+                rendered.contains(&format!(
+                    "talos_workflow_executions_total{{status=\"{status}\"}} 0"
+                )),
+                "workflow_executions_total[{status}] not pre-seeded at 0\n{rendered}"
+            );
+        }
+        m.workflow_executions_total
+            .with_label_values(&["failure"])
+            .inc();
+        m.workflow_executions_total
+            .with_label_values(&["success"])
+            .inc_by(3.0);
+        let rendered = m.render_prometheus().expect("render");
+        assert!(rendered.contains(r#"talos_workflow_executions_total{status="failure"} 1"#));
+        assert!(rendered.contains(r#"talos_workflow_executions_total{status="success"} 3"#));
+    }
+
+    // record_workflow_outcome is inert (no panic) when metrics aren't wired —
+    // the finalizers call it unconditionally, and unit tests / any process
+    // without set_global must not blow up.
+    #[test]
+    fn record_workflow_outcome_is_inert_without_global() {
+        // Does not panic even though set_global may not have run in this test
+        // binary. (If a sibling test already set the global, this still just
+        // increments harmlessly.)
+        super::record_workflow_outcome("failure");
+        super::record_workflow_outcome("success");
     }
 
     // set_global / global round-trip. One-shot semantics: subsequent
