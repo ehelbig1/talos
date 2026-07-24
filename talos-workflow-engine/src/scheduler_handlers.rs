@@ -1493,12 +1493,13 @@ impl ParallelWorkflowEngine {
             Err(e) => return origin.build_error(e),
         };
 
-        // Fail-closed ceiling composition (H2): dynamic/capability dispatch
-        // builds a sub-engine that inherits the PARENT ceilings verbatim.
-        // Narrow to most-restrictive(parent, dispatch-target actor) so a
-        // target workflow bound to a stricter actor can't run at the
-        // caller's looser tier/write ceiling.
-        self.narrow_subengine_ceilings(&mut sub_engine, sub_wf_id, user_id)
+        // Fail-closed binding (H2 + identity): dynamic/capability dispatch
+        // builds a sub-engine that inherits the PARENT identity + ceilings
+        // verbatim. Rebind to the dispatch-target's OWN actor (memory scope)
+        // and narrow to most-restrictive(parent, target actor) on each ceiling
+        // axis so a target workflow bound to a stricter actor can't run at the
+        // caller's looser tier/write ceiling or read the caller's memory.
+        self.bind_subengine_actor_and_ceilings(&mut sub_engine, sub_wf_id, user_id)
             .await;
 
         let clean_input = if let Some(obj) = inputs.as_object() {
@@ -1674,13 +1675,14 @@ impl ParallelWorkflowEngine {
         // const. `0` is the documented disable sentinel — see
         // `set_agent_loop_max_history`.
         let max_history = self.agent_loop_max_history();
-        // Fail-closed ceiling composition (H2), resolved ONCE before the
-        // loop (a single DB lookup, not per-iteration) while `self` is in
-        // scope — the `async move` below captures only `adapter_set_al`,
-        // not `self`. The body workflow is fixed across iterations, so the
-        // narrowed pair is invariant. `Option<(LlmTier, WriteCeiling)>` is
-        // `Copy`, so it moves into the closure by value.
-        let narrowed_ceilings = self.resolve_subworkflow_ceilings(body_wf_id, user_id).await;
+        // Fail-closed binding (H2 + identity), resolved ONCE before the loop
+        // (a single DB lookup, not per-iteration) while `self` is in scope —
+        // the `async move` below captures only `adapter_set_al`, not `self`.
+        // The body workflow is fixed across iterations, so the resolved
+        // binding is invariant. `SubworkflowBinding` is `Copy`, so it moves
+        // into the closure by value; the per-iteration apply is an associated
+        // fn (no `self` capture).
+        let sub_binding = self.resolve_subworkflow_binding(body_wf_id, user_id).await;
         let agent_result =
             match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async move {
                 let mut history: Vec<JsonValue> = Vec::new();
@@ -1719,15 +1721,17 @@ impl ParallelWorkflowEngine {
                     let iter_result =
                         match adapter_set_al.clone().into_engine_with_graph(&graph_json) {
                             Ok(mut sub_engine) => {
-                                // Fail-closed ceiling narrowing (H2): the
-                                // per-iteration sub-engine inherits the
-                                // PARENT ceilings from `adapter_set_al`;
+                                // Fail-closed binding (H2 + identity): the
+                                // per-iteration sub-engine inherits the PARENT
+                                // identity + ceilings from `adapter_set_al`;
+                                // rebind to the body-workflow's own actor and
                                 // tighten to the pre-resolved
-                                // most-restrictive(parent, body-actor) pair.
-                                if let Some((tier, write, egress)) = narrowed_ceilings {
-                                    sub_engine.set_max_llm_tier(tier);
-                                    sub_engine.set_max_write_ceiling(write);
-                                    sub_engine.set_egress_scope(egress);
+                                // most-restrictive(parent, body-actor) ceilings.
+                                if let Some(binding) = sub_binding {
+                                    ParallelWorkflowEngine::apply_subworkflow_binding(
+                                        &mut sub_engine,
+                                        &binding,
+                                    );
                                 }
                                 let sub_execution_id = Uuid::new_v4();
                                 let trigger_node_id = Uuid::new_v4();

@@ -1301,35 +1301,41 @@ impl WorkflowRepository {
         .transpose()
     }
 
-    /// Resolve a WORKFLOW's bound actor's privilege ceilings
-    /// (`max_llm_tier`, `max_write_ceiling`) in ONE narrow query, scoped to
-    /// `user_id` on BOTH the workflow and the actor. Returns `Ok(None)` when
-    /// the workflow isn't visible to the user, has no bound actor, or the
-    /// actor isn't owned by the user — the fail-closed tenancy contract.
+    /// Resolve a WORKFLOW's bound actor identity AND privilege ceilings
+    /// (`actor_id`, `max_llm_tier`, `max_write_ceiling`, `egress_scope`) in
+    /// ONE narrow query, scoped to `user_id` on BOTH the workflow and the
+    /// actor. Returns `Ok(None)` when the workflow isn't visible to the
+    /// user, has no bound actor, or the actor isn't owned by the user — the
+    /// fail-closed tenancy contract.
     ///
-    /// Used by the sub-workflow dispatch path to narrow the sub-engine to
-    /// `most_restrictive(parent, sub-actor)` on each axis. Deliberately a
-    /// single JOIN that never touches `graph_json`: the first-cut resolver
-    /// called `get_workflow` (15 columns incl. the full graph, inside an RLS
-    /// transaction) just to read `actor_id`, then a second query for the
-    /// ceilings — a per-sub-dispatch regression a perf review caught (a
-    /// 5-iteration reflective-retry did 9 redundant heavy fetches). Both
-    /// columns parse through the fail-closed `from_db_str` helpers (unknown /
+    /// Used by the sub-workflow dispatch path to (a) run the sub-engine
+    /// under its OWN actor's memory scope and (b) narrow the sub-engine to
+    /// `most_restrictive(parent, sub-actor)` on each ceiling axis. The
+    /// `actor_id` is `a.id` — the JOIN succeeds only when the workflow has a
+    /// bound actor owned by `user_id`, so a returned `Some` always carries a
+    /// real, owner-validated actor. Deliberately a single JOIN that never
+    /// touches `graph_json`: the first-cut resolver called `get_workflow`
+    /// (15 columns incl. the full graph, inside an RLS transaction) just to
+    /// read `actor_id`, then a second query for the ceilings — a
+    /// per-sub-dispatch regression a perf review caught (a 5-iteration
+    /// reflective-retry did 9 redundant heavy fetches). Both ceiling columns
+    /// parse through the fail-closed `from_db_str` helpers (unknown /
     /// malformed values → `Tier1` / `ReadOnly`), so column drift can never
     /// widen a sub-workflow's authority.
-    pub async fn get_workflow_actor_ceilings(
+    pub async fn get_workflow_actor_binding(
         &self,
         workflow_id: Uuid,
         user_id: Uuid,
     ) -> Result<
         Option<(
+            Uuid,
             talos_workflow_engine_core::LlmTier,
             talos_workflow_engine_core::WriteCeiling,
             Option<talos_workflow_engine_core::EgressScope>,
         )>,
     > {
         let row = sqlx::query(
-            "SELECT a.max_llm_tier, a.max_write_ceiling, a.egress_scope \
+            "SELECT a.id AS actor_id, a.max_llm_tier, a.max_write_ceiling, a.egress_scope \
              FROM workflows w \
              JOIN actors a ON a.id = w.actor_id \
              WHERE w.id = $1 AND w.user_id = $2 AND a.user_id = $2",
@@ -1340,6 +1346,7 @@ impl WorkflowRepository {
         .await?;
 
         row.map(|r| -> Result<_> {
+            let actor_id = r.try_get::<Uuid, _>("actor_id")?;
             let tier = talos_workflow_engine_core::LlmTier::from_db_str(
                 &r.try_get::<String, _>("max_llm_tier")?,
             );
@@ -1351,7 +1358,7 @@ impl WorkflowRepository {
             let egress = talos_workflow_engine_core::EgressScope::from_db_opt(
                 r.try_get::<Option<String>, _>("egress_scope")?.as_deref(),
             );
-            Ok((tier, ceiling, egress))
+            Ok((actor_id, tier, ceiling, egress))
         })
         .transpose()
     }

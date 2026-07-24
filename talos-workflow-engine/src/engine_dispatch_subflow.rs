@@ -5,8 +5,9 @@
 //! `dispatch_reflective_retry`, `dispatch_llm_dispatch`, and
 //! `dispatch_subworkflow`, plus the shared invocation kernel they all
 //! route through (`execute_subworkflow_graph`,
-//! `collapse_subworkflow_output`, ceiling narrowing via
-//! `resolve_subworkflow_ceilings` / `narrow_subengine_ceilings`) and
+//! `collapse_subworkflow_output`, sub-actor identity rebind + ceiling
+//! narrowing via `resolve_subworkflow_binding` /
+//! `bind_subengine_actor_and_ceilings`) and
 //! the engine-side judge glue ([`JudgeVerdict`], [`SubflowError`],
 //! `record_judge_score`). Pure code movement from the previous
 //! engine.rs location — no behaviour change. Lifted out so the
@@ -1209,11 +1210,13 @@ impl ParallelWorkflowEngine {
             }
         }
 
-        // Fail-closed ceiling composition: narrow the sub-engine to the
-        // most-restrictive of (parent, sub-actor) on each axis so a
-        // sub-workflow bound to a stricter actor can't inherit the
-        // parent's looser ceiling. See `narrow_subengine_ceilings`.
-        self.narrow_subengine_ceilings(&mut sub_engine, sub_wf_id, user_id)
+        // Bind the sub-engine to the sub-workflow's OWN actor identity
+        // (so direct agent_memory RPCs resolve against the sub-workflow's
+        // actor, matching the __actor_context__ injection above) AND narrow
+        // each ceiling to the most-restrictive of (parent, sub-actor) so a
+        // sub-workflow bound to a stricter actor can't inherit the parent's
+        // looser ceiling. See `bind_subengine_actor_and_ceilings`.
+        self.bind_subengine_actor_and_ceilings(&mut sub_engine, sub_wf_id, user_id)
             .await;
 
         // Synthetic trigger node: seeded with the caller's input,
@@ -1237,33 +1240,40 @@ impl ParallelWorkflowEngine {
         Ok(Self::collapse_subworkflow_output(&ctx.results, &sub_engine))
     }
 
-    /// Resolve the ceilings a sub-workflow should run under: the
-    /// most-restrictive of `(this engine's ceiling, the sub-workflow
-    /// actor's ceiling)` on each axis (`max_llm_tier`,
-    /// `max_write_ceiling`).
+    /// Resolve the binding a sub-workflow should run under: its OWN actor
+    /// identity (memory scope + action attribution) plus the ceilings, where
+    /// each ceiling is the most-restrictive of `(this engine's ceiling, the
+    /// sub-workflow actor's ceiling)` on each axis (`max_llm_tier`,
+    /// `max_write_ceiling`, `egress_scope`).
     ///
-    /// **Fail-closed, narrow-only composition.** `AdapterSet` copies the
-    /// PARENT ceilings verbatim into a freshly-built sub-engine. Without
-    /// this, a sub-workflow bound to a MORE restrictive actor (e.g. a
-    /// Tier-1, read-only persona) would silently inherit the parent's
-    /// looser ceiling — a privilege escalation across the sub-workflow
-    /// boundary. The composition can only ever *tighten*: a looser
-    /// sub-actor ceiling has no widening effect. `None` (no resolver, no
-    /// distinct sub-actor binding, or an auth/DB-declined lookup) means
-    /// "keep the inherited parent ceiling" — safe, since the parent
-    /// ceiling is already the caller's authorized bound.
-    pub(crate) async fn resolve_subworkflow_ceilings(
+    /// **Identity: adopt the sub-actor.** `AdapterSet` copies the PARENT's
+    /// `actor_id` verbatim into a freshly-built sub-engine, so without this a
+    /// sub-workflow's direct `agent_memory::get/set` RPCs resolve against the
+    /// PARENT's memory even though the sub-workflow is bound to a different
+    /// actor — silently disagreeing with the `__actor_context__` injection
+    /// path (which already uses the sub-actor) and writing memory into the
+    /// wrong actor. We pass the sub-actor's `actor_id` straight through
+    /// (identity is not a lattice — it's simply adopted); the executor sets
+    /// it. This is not an escalation: the resolver only answers for a
+    /// workflow visible to `user_id` bound to an actor owned by `user_id`.
+    ///
+    /// **Ceilings: fail-closed, narrow-only composition.** Without this, a
+    /// sub-workflow bound to a MORE restrictive actor (e.g. a Tier-1,
+    /// read-only persona) would silently inherit the parent's looser
+    /// ceiling — a privilege escalation across the sub-workflow boundary.
+    /// The composition can only ever *tighten*: a looser sub-actor ceiling
+    /// has no widening effect.
+    ///
+    /// `None` (no resolver, or no distinct sub-actor binding) means "keep the
+    /// inherited parent identity + ceilings" — safe, since the parent bound
+    /// is already the caller's authorized one.
+    pub(crate) async fn resolve_subworkflow_binding(
         &self,
         sub_wf_id: Uuid,
         user_id: Uuid,
-    ) -> Option<(
-        talos_workflow_engine_core::LlmTier,
-        talos_workflow_engine_core::WriteCeiling,
-        Option<talos_workflow_engine_core::EgressScope>,
-    )> {
+    ) -> Option<talos_workflow_engine_core::SubworkflowBinding> {
         let resolver = self.sub_actor_context_resolver.as_ref()?;
-        let (sub_tier, sub_write, sub_egress) =
-            resolver.resolve_ceilings(sub_wf_id, user_id).await?;
+        let sub = resolver.resolve_binding(sub_wf_id, user_id).await?;
         // Egress narrows one-directionally (explicit Local wins), but — unlike
         // the concrete tier/write axes — the override is an `Option` where
         // `None` means "tier-derived default". Resolve BOTH sides to their
@@ -1277,35 +1287,60 @@ impl ParallelWorkflowEngine {
             self.max_llm_tier,
         );
         let sub_egress_eff =
-            talos_workflow_engine_core::EgressScope::effective(sub_egress, sub_tier);
-        Some((
-            self.max_llm_tier.most_restrictive(sub_tier),
-            self.max_write_ceiling.most_restrictive(sub_write),
-            talos_workflow_engine_core::EgressScope::narrow(
+            talos_workflow_engine_core::EgressScope::effective(sub.egress_scope, sub.max_llm_tier);
+        Some(talos_workflow_engine_core::SubworkflowBinding {
+            // Identity is adopted verbatim (see doc) — no narrowing.
+            actor_id: sub.actor_id,
+            max_llm_tier: self.max_llm_tier.most_restrictive(sub.max_llm_tier),
+            max_write_ceiling: self
+                .max_write_ceiling
+                .most_restrictive(sub.max_write_ceiling),
+            egress_scope: talos_workflow_engine_core::EgressScope::narrow(
                 Some(parent_egress),
                 Some(sub_egress_eff),
             ),
-        ))
+        })
     }
 
-    /// Apply [`Self::resolve_subworkflow_ceilings`] to a freshly-built
+    /// Apply a resolved [`talos_workflow_engine_core::SubworkflowBinding`] to a
+    /// freshly-built sub-engine: adopt the sub-workflow's own actor identity
+    /// (when known) and stamp the fail-closed narrowed ceilings.
+    ///
+    /// Identity and the tier ceiling are stamped **together** here — the same
+    /// invariant lint check 29 enforces for the top-level
+    /// `apply_actor_to_engine` path (never set `actor_id` without stamping the
+    /// tier, or a Tier-1 actor silently runs Tier-2). This call site is inside
+    /// `talos-workflow-engine`, where the setter legitimately lives, so the
+    /// bare `set_actor_id` is exempt by design.
+    pub(crate) fn apply_subworkflow_binding(
+        sub_engine: &mut ParallelWorkflowEngine,
+        binding: &talos_workflow_engine_core::SubworkflowBinding,
+    ) {
+        // `None` = identity couldn't be resolved (fail-closed DB error); keep
+        // the parent's already-authorized identity rather than guess a scope.
+        if let Some(actor_id) = binding.actor_id {
+            sub_engine.set_actor_id(actor_id);
+        }
+        sub_engine.set_max_llm_tier(binding.max_llm_tier);
+        sub_engine.set_max_write_ceiling(binding.max_write_ceiling);
+        sub_engine.set_egress_scope(binding.egress_scope);
+    }
+
+    /// Apply [`Self::resolve_subworkflow_binding`] to a freshly-built
     /// sub-engine. Call this on EVERY sub-engine built via
     /// `adapter_set().into_engine_with_graph(...)` before running it —
     /// `execute_subworkflow_graph`, dynamic/capability dispatch, and the
-    /// agent-loop body all go through here so the fail-closed narrowing
-    /// can't be forgotten on one path (the escalation gap H2 closed).
-    pub(crate) async fn narrow_subengine_ceilings(
+    /// agent-loop body all go through here so the identity rebind AND the
+    /// fail-closed ceiling narrowing can't be forgotten on one path (the
+    /// escalation gap H2 closed; the identity axis added 2026-07).
+    pub(crate) async fn bind_subengine_actor_and_ceilings(
         &self,
         sub_engine: &mut ParallelWorkflowEngine,
         sub_wf_id: Uuid,
         user_id: Uuid,
     ) {
-        if let Some((tier, write, egress)) =
-            self.resolve_subworkflow_ceilings(sub_wf_id, user_id).await
-        {
-            sub_engine.set_max_llm_tier(tier);
-            sub_engine.set_max_write_ceiling(write);
-            sub_engine.set_egress_scope(egress);
+        if let Some(binding) = self.resolve_subworkflow_binding(sub_wf_id, user_id).await {
+            Self::apply_subworkflow_binding(sub_engine, &binding);
         }
     }
 
@@ -1477,5 +1512,177 @@ impl ParallelWorkflowEngine {
             }
         }
         output
+    }
+}
+
+#[cfg(test)]
+mod identity_binding_tests {
+    //! Unit coverage for the sub-workflow identity rebind + fail-closed
+    //! ceiling narrowing (`resolve_subworkflow_binding` /
+    //! `apply_subworkflow_binding`). These exercise the real production
+    //! composition — a mock resolver stands in for the DB lookup, but the
+    //! narrowing math and the identity-adoption rule are the shipping code.
+
+    use super::ParallelWorkflowEngine;
+    use async_trait::async_trait;
+    use serde_json::Value as JsonValue;
+    use std::sync::Arc;
+    use talos_workflow_engine_core::{
+        EgressScope, LlmTier, SubworkflowActorContextResolver, SubworkflowBinding, WriteCeiling,
+    };
+    use uuid::Uuid;
+
+    /// A resolver that returns a fixed binding (or `None`), standing in for
+    /// the DB-backed `ControllerSubActorContextResolver`.
+    struct MockResolver(Option<SubworkflowBinding>);
+
+    #[async_trait]
+    impl SubworkflowActorContextResolver for MockResolver {
+        async fn resolve(&self, _workflow_id: Uuid, _user_id: Uuid) -> Option<JsonValue> {
+            None
+        }
+        async fn resolve_binding(
+            &self,
+            _workflow_id: Uuid,
+            _user_id: Uuid,
+        ) -> Option<SubworkflowBinding> {
+            self.0
+        }
+    }
+
+    fn engine_with_binding(
+        parent_tier: LlmTier,
+        parent_write: WriteCeiling,
+        parent_egress: Option<EgressScope>,
+        sub: Option<SubworkflowBinding>,
+    ) -> ParallelWorkflowEngine {
+        let mut e = ParallelWorkflowEngine::new();
+        e.set_max_llm_tier(parent_tier);
+        e.set_max_write_ceiling(parent_write);
+        e.set_egress_scope(parent_egress);
+        e.set_sub_actor_context_resolver(Arc::new(MockResolver(sub)));
+        e
+    }
+
+    #[tokio::test]
+    async fn resolve_binding_adopts_sub_actor_and_narrows_ceilings() {
+        let sub_actor = Uuid::new_v4();
+        // Parent is loose (Tier2 / Write / Public); sub-actor is strict
+        // (Tier1 / ReadOnly / egress NULL → tier-derived Local).
+        let e = engine_with_binding(
+            LlmTier::Tier2,
+            WriteCeiling::Write,
+            Some(EgressScope::Public),
+            Some(SubworkflowBinding {
+                actor_id: Some(sub_actor),
+                max_llm_tier: LlmTier::Tier1,
+                max_write_ceiling: WriteCeiling::ReadOnly,
+                egress_scope: None,
+            }),
+        );
+
+        let binding = e
+            .resolve_subworkflow_binding(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .expect("resolver returns a binding");
+
+        // Identity: the sub-workflow's own actor is adopted verbatim.
+        assert_eq!(binding.actor_id, Some(sub_actor));
+        // Ceilings: narrowed to the stricter sub-actor on every axis.
+        assert_eq!(binding.max_llm_tier, LlmTier::Tier1);
+        assert_eq!(binding.max_write_ceiling, WriteCeiling::ReadOnly);
+        // Tier1 sub-actor with NULL egress → effective Local; narrow(Public, Local) = Local.
+        assert_eq!(binding.egress_scope, Some(EgressScope::Local));
+    }
+
+    #[tokio::test]
+    async fn resolve_binding_looser_sub_actor_never_widens_but_identity_still_adopted() {
+        let sub_actor = Uuid::new_v4();
+        // Parent is strict (Tier1 / ReadOnly / Local); sub-actor is loose.
+        let e = engine_with_binding(
+            LlmTier::Tier1,
+            WriteCeiling::ReadOnly,
+            Some(EgressScope::Local),
+            Some(SubworkflowBinding {
+                actor_id: Some(sub_actor),
+                max_llm_tier: LlmTier::Tier2,
+                max_write_ceiling: WriteCeiling::Write,
+                egress_scope: Some(EgressScope::Public),
+            }),
+        );
+
+        let binding = e
+            .resolve_subworkflow_binding(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .expect("resolver returns a binding");
+
+        // Identity is adopted even when the sub-actor is LOOSER — identity is
+        // not a lattice; only ceilings narrow.
+        assert_eq!(binding.actor_id, Some(sub_actor));
+        // Every ceiling stays at the stricter parent value (no widening).
+        assert_eq!(binding.max_llm_tier, LlmTier::Tier1);
+        assert_eq!(binding.max_write_ceiling, WriteCeiling::ReadOnly);
+        assert_eq!(binding.egress_scope, Some(EgressScope::Local));
+    }
+
+    #[tokio::test]
+    async fn resolve_binding_no_resolver_returns_none() {
+        // No resolver wired → keep the parent's inherited identity + ceilings.
+        let e = ParallelWorkflowEngine::new();
+        assert!(e
+            .resolve_subworkflow_binding(Uuid::new_v4(), Uuid::new_v4())
+            .await
+            .is_none());
+    }
+
+    #[test]
+    fn apply_binding_some_actor_rebinds_identity_and_stamps_ceilings() {
+        let parent_actor = Uuid::new_v4();
+        let sub_actor = Uuid::new_v4();
+        let mut e = ParallelWorkflowEngine::new();
+        e.set_actor_id(parent_actor);
+
+        ParallelWorkflowEngine::apply_subworkflow_binding(
+            &mut e,
+            &SubworkflowBinding {
+                actor_id: Some(sub_actor),
+                max_llm_tier: LlmTier::Tier1,
+                max_write_ceiling: WriteCeiling::ReadOnly,
+                egress_scope: Some(EgressScope::Local),
+            },
+        );
+
+        // The sub-actor identity replaces the parent's — direct agent_memory
+        // RPCs in the sub-workflow now resolve against the sub-actor.
+        assert_eq!(e.actor_id, Some(sub_actor));
+        assert_eq!(e.max_llm_tier, LlmTier::Tier1);
+        assert_eq!(e.max_write_ceiling, WriteCeiling::ReadOnly);
+        assert_eq!(e.egress_scope, Some(EgressScope::Local));
+    }
+
+    #[test]
+    fn apply_binding_none_actor_keeps_parent_identity() {
+        let parent_actor = Uuid::new_v4();
+        let mut e = ParallelWorkflowEngine::new();
+        e.set_actor_id(parent_actor);
+
+        // actor_id: None models the fail-closed DB-error path — ceilings still
+        // apply (fail-closed), but the parent's authorized identity is kept
+        // rather than guessing a scope.
+        ParallelWorkflowEngine::apply_subworkflow_binding(
+            &mut e,
+            &SubworkflowBinding {
+                actor_id: None,
+                max_llm_tier: LlmTier::Tier1,
+                max_write_ceiling: WriteCeiling::ReadOnly,
+                egress_scope: Some(EgressScope::Local),
+            },
+        );
+
+        assert_eq!(e.actor_id, Some(parent_actor));
+        // Fail-closed ceilings were still stamped.
+        assert_eq!(e.max_llm_tier, LlmTier::Tier1);
+        assert_eq!(e.max_write_ceiling, WriteCeiling::ReadOnly);
+        assert_eq!(e.egress_scope, Some(EgressScope::Local));
     }
 }
