@@ -191,12 +191,20 @@ impl ParallelWorkflowEngine {
             }
             if let Some(ref ctx) = self.actor_context {
                 // Node-scoped injection: OFF → inject into every node
-                // (byte-identical to the legacy path); ON → only nodes
-                // that declare `needs_memory` (default true).
-                if talos_workflow_engine_core::reserved_keys::should_inject_actor_context(
-                    talos_config::smart_memory_context_enabled(),
-                    self.node_needs_memory(node_id),
-                ) {
+                // (byte-identical to the legacy path); ON → only nodes that
+                // declare `needs_memory` — which now defaults to `false` for
+                // pure-egress/send worlds (http/network/messaging) so curated
+                // memory doesn't reach the delivery-pattern "send" leg by
+                // default (an explicit `needs_memory: true` still injects).
+                // The fleet-wide `ENABLE_ACTOR_CONTEXT_INJECTION` kill-switch is
+                // the OUTERMOST gate — off ⇒ no node ever receives context,
+                // regardless of how `self.actor_context` got set.
+                if talos_config::actor_context_injection_enabled()
+                    && talos_workflow_engine_core::reserved_keys::should_inject_actor_context(
+                        talos_config::smart_memory_context_enabled(),
+                        self.node_needs_memory_for_world(node_id, &wasm_module.capability_world),
+                    )
+                {
                     merged.insert("__actor_context__".to_string(), ctx.clone());
                 }
             }

@@ -604,6 +604,51 @@ async fn main() -> anyhow::Result<()> {
         "OLLAMA_URL",
         "http://ollama:11434",
     )));
+
+    // B1: probe the local Ollama backend ONCE at boot for the autonomous memory
+    // loops. Those loops route LOCAL-FIRST (external is a budget-gated fallback),
+    // so the `ollama_available` signal they consult MUST reflect REAL
+    // reachability — not merely that a client object exists (it always does; the
+    // `OllamaClient` is constructed unconditionally with an in-cluster default
+    // URL). Without this probe, a fresh production deploy with Ollama disabled
+    // (`ollama.enabled: false`) would route every tier-2 actor to a dead local
+    // endpoint every tick — permanent per-actor WARN spam, memory never
+    // consolidates, and the external fallback the docs promise never fires. A
+    // `None` here disables local summarization for the memory loops: tier-2
+    // actors go straight to the external provider (budget-gated), tier-1 actors
+    // Skip (they can't egress). The runtime tier-2 failure-fallback still covers
+    // a backend that goes down AFTER a successful boot probe. Bounded 3s timeout
+    // so a down backend can't stall startup. Scoped to the memory loops only —
+    // teacher-audit / graph-RAG keep the raw client and handle their own errors.
+    let memory_loop_ollama = match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        ollama_client.list_models(),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {
+            tracing::info!(
+                target: "talos_memory",
+                "Ollama reachable at boot — memory loops summarize LOCAL-FIRST"
+            );
+            Some(ollama_client.clone())
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                target: "talos_memory",
+                error = %e,
+                "Ollama unreachable at boot — memory loops route tier-2 to the external fallback; tier-1 actors Skip"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: "talos_memory",
+                "Ollama boot probe timed out — memory loops route tier-2 to the external fallback; tier-1 actors Skip"
+            );
+            None
+        }
+    };
     talos_ml::spawn_policy_evaluator(
         db_pool.clone(),
         talos_ml::DatasetService::new(core.secrets_manager.clone()),
@@ -643,7 +688,7 @@ async fn main() -> anyhow::Result<()> {
     talos_memory_consolidation::spawn_memory_consolidation_scheduler(
         db_pool.clone(),
         talos_actor_repository::ActorRepository::new(db_pool.clone()),
-        Some(ollama_client.clone()),
+        memory_loop_ollama.clone(),
         core.secrets_manager.clone(),
         bg_shutdown_rx.clone(),
     );
@@ -658,7 +703,7 @@ async fn main() -> anyhow::Result<()> {
     talos_memory_consolidation::spawn_memory_reflection_scheduler(
         db_pool.clone(),
         talos_actor_repository::ActorRepository::new(db_pool.clone()),
-        Some(ollama_client.clone()),
+        memory_loop_ollama.clone(),
         core.secrets_manager.clone(),
         bg_shutdown_rx.clone(),
     );

@@ -35,6 +35,12 @@ impl ControllerSubActorContextResolver {
 #[async_trait]
 impl SubworkflowActorContextResolver for ControllerSubActorContextResolver {
     async fn resolve(&self, workflow_id: Uuid, user_id: Uuid) -> Option<JsonValue> {
+        // Fleet-wide kill-switch: skip sub-workflow context assembly entirely
+        // when actor-context injection is disabled (the dispatch chokepoints
+        // would refuse it anyway — this avoids the wasted lookup).
+        if !talos_config::actor_context_injection_enabled() {
+            return None;
+        }
         // Authorization is enforced inside `get_workflow` — it returns
         // `Ok(None)` when `workflow_id` is not visible to `user_id`,
         // which we bubble up as "no context" (correct fail-closed

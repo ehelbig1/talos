@@ -90,10 +90,22 @@ pub const NEEDS_MEMORY: &str = "needs_memory";
 /// no such field) behaves exactly as before — every node is treated as a
 /// memory consumer.
 pub fn node_needs_memory_from_config(config: Option<&serde_json::Value>) -> bool {
+    explicit_needs_memory(config).unwrap_or(true)
+}
+
+/// Read ONLY an EXPLICIT `needs_memory` boolean from a node's `data`/config
+/// object — `Some(true)`/`Some(false)` when the field is present and boolean,
+/// `None` when absent, non-boolean, or the node has no config.
+///
+/// This separates "the author said X" from "the default." The engine composes
+/// the `None` case with a capability-world-aware default
+/// (`talos_capability_world::world_defaults_no_memory`) so pure-egress/send
+/// nodes don't receive injected memory unless opted in, while an explicit flag
+/// always wins — see `ParallelWorkflowEngine::node_needs_memory_for_world`.
+pub fn explicit_needs_memory(config: Option<&serde_json::Value>) -> Option<bool> {
     config
         .and_then(|c| c.get(NEEDS_MEMORY))
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true)
 }
 
 /// Decide whether the engine should inject [`ACTOR_CONTEXT`] into a node's
@@ -264,6 +276,28 @@ mod tests {
         assert!(!node_needs_memory_from_config(Some(
             &json!({ "needs_memory": false })
         )));
+    }
+
+    #[test]
+    fn explicit_needs_memory_distinguishes_absent_from_false() {
+        // Present + boolean → Some(bool). Everything else → None (the engine
+        // then applies the world-aware default).
+        assert_eq!(
+            explicit_needs_memory(Some(&json!({ "needs_memory": true }))),
+            Some(true)
+        );
+        assert_eq!(
+            explicit_needs_memory(Some(&json!({ "needs_memory": false }))),
+            Some(false)
+        );
+        assert_eq!(explicit_needs_memory(None), None);
+        assert_eq!(explicit_needs_memory(Some(&json!({}))), None);
+        assert_eq!(explicit_needs_memory(Some(&json!({ "other": 1 }))), None);
+        // Non-boolean value is NOT an explicit opt-in/out → None (default path).
+        assert_eq!(
+            explicit_needs_memory(Some(&json!({ "needs_memory": "yes" }))),
+            None
+        );
     }
 
     #[test]

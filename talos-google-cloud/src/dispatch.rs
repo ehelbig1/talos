@@ -224,28 +224,11 @@ pub(crate) async fn dispatch_monitoring_incident(
     let (resolved_actor, actor_tier, actor_write_ceiling, actor_egress) =
         match actor_repo.resolve_effective_actor(user_id, None).await {
             Ok(aid) => {
-                let tier = actor_repo
-                    .get_actor_max_llm_tier(aid)
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or(talos_workflow_job_protocol::LlmTier::Tier2);
-                let write_ceiling = actor_repo
-                    .get_actor_max_write_ceiling(aid)
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or(talos_workflow_job_protocol::WriteCeiling::Write);
-                // Egress override travels too, so a module bound to an
-                // air-gapped (egress=local) actor stays air-gapped. Fail OPEN
-                // to None (tier-derived default) on error, matching the Tier-2
-                // fail-open posture of this inbound-incident path.
-                let egress = actor_repo
-                    .get_actor_egress_scope(aid)
-                    .await
-                    .ok()
-                    .flatten()
-                    .flatten();
+                // One joined SELECT, fail-OPEN to actor-less Tier-2 on any
+                // error (a module bound to an air-gapped (egress=local) actor
+                // stays air-gapped via the egress override), matching the
+                // Tier-2 fail-open posture of this inbound-incident path.
+                let (tier, write_ceiling, egress) = actor_repo.get_module_bound_ceilings(aid).await;
                 (Some(aid), tier, write_ceiling, egress)
             }
             Err(e) => {

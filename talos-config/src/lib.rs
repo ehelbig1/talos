@@ -243,6 +243,25 @@ pub fn smart_memory_context_enabled() -> bool {
     bool_env_or_default("ENABLE_SMART_MEMORY_CONTEXT", true)
 }
 
+/// FLEET-WIDE kill-switch for actor-context (`__actor_context__`) injection —
+/// the outermost gate, independent of [`smart_memory_context_enabled`].
+/// **Default ON.** Set `ENABLE_ACTOR_CONTEXT_INJECTION=false|0|no|off` to stop
+/// grounded-memory injection ENTIRELY.
+///
+/// This is a SEPARATE axis from `ENABLE_SMART_MEMORY_CONTEXT`, which only chooses
+/// smart-vs-legacy assembly — with smart OFF the legacy path STILL injects into
+/// every node, so it is NOT an off-switch. When THIS flag is off, no node ever
+/// receives `__actor_context__` (gated at the two engine dispatch chokepoints,
+/// regardless of how the engine's actor-context got set), and the expensive
+/// trigger/scheduler assembly is short-circuited too. The escape hatch for an
+/// operator who wants grounding fully off fleet-wide (privacy posture, incident
+/// containment, A/B baseline) without unbinding every actor.
+///
+/// Accepted truthy tokens: `true | 1 | yes | on` — see [`bool_env_or_default`].
+pub fn actor_context_injection_enabled() -> bool {
+    bool_env_or_default("ENABLE_ACTOR_CONTEXT_INJECTION", true)
+}
+
 /// Route the EXPLICIT semantic-recall path (the worker `agent_memory::search`
 /// RPC + the MCP `actor_recall_semantic` / `actor_recall_hyde` handlers)
 /// through the smart-context fused ranker instead of raw pgvector-cosine order.
@@ -628,8 +647,9 @@ pub fn memory_rank_provenance_retention_days() -> i64 {
 // in place of the global `SMART_MEMORY_CONTEXT_W_*` constants.
 //
 // TWO independent flags: `ENABLE_ADAPTIVE_RANK_TRAINING` gates the scheduled fit
-// job (which writes weights) — DEFAULT OFF (no background job unless an operator
-// opts into the learning loop); `ENABLE_ADAPTIVE_RANK` gates SERVING (whether
+// job (which writes weights) — DEFAULT ON (2026-07 "Tier 3": the ranker learns
+// per actor by default; the fit is CPU-only, cold-start fail-closed, zero
+// egress); `ENABLE_ADAPTIVE_RANK` gates SERVING (whether
 // the ranker consults learned weights when present) — DEFAULT ON, but cold-start
 // safe: with no weights written yet it is byte-identical to global-weight
 // ranking, so it costs only a cheap per-actor SELECT and auto-adopts weights the
@@ -698,6 +718,27 @@ pub fn adaptive_rank_lookback_days() -> i64 {
 /// default.
 pub fn adaptive_rank_max_actors_per_tick() -> i64 {
     positive_env_or_default::<i64>("ADAPTIVE_RANK_MAX_ACTORS_PER_TICK", 50).clamp(1, 500)
+}
+
+/// Per-ORG fan-out cap for the autonomous memory loops
+/// (`MEMORY_LOOP_MAX_ACTORS_PER_ORG_PER_TICK`) — shared by consolidation,
+/// reflection, and rank-training scans. Bounds how many of ONE organization's
+/// actors a single tick may claim, so a tenant with thousands of actors can't
+/// crowd every other org out of the per-tick budget and lengthen their rotation
+/// cadence (the rotation cursor guarantees eventual coverage but not fair
+/// *pacing* across orgs).
+///
+/// **Default 0 = DISABLED** (no per-org cap): byte-identical to the historical
+/// scan for single-org / homelab deployments (the common case), and zero query
+/// overhead — the windowed variant only runs when this is set `> 0`. Multi-tenant
+/// operators set a positive value (e.g. `50`) to guarantee cross-org fairness.
+/// Negative values are treated as 0 (disabled).
+pub fn memory_loop_max_actors_per_org_per_tick() -> i64 {
+    std::env::var("MEMORY_LOOP_MAX_ACTORS_PER_ORG_PER_TICK")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(0)
 }
 
 /// Validated allowed origins, computed once at startup.

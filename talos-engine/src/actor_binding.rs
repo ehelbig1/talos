@@ -39,93 +39,51 @@ pub async fn apply_actor_to_engine(
     actor_id: Uuid,
 ) -> Result<()> {
     engine.set_actor_id(actor_id);
-    let tier = match repo.get_actor_max_llm_tier(actor_id).await {
-        Ok(Some(t)) => t,
+
+    // Resolve all three ceilings in ONE row read (was three sequential
+    // single-column SELECTs — a per-dispatch latency regression a perf review
+    // caught). The fail-closed contract is UNCHANGED: on actor-not-found or DB
+    // error we stamp the MOST restrictive value on every axis — `Tier1` (LLM
+    // stays local), `ReadOnly` (refuse mutation), `Some(Local)` (no public
+    // egress) — and return `Err` so the caller can abort. Reverting any axis to
+    // its permissive default on a transient Postgres blip would silently
+    // escalate a sensitive actor's authority, which is never acceptable for a
+    // privacy/mutation ceiling.
+    let (tier, ceiling, egress) = match repo.get_actor_ceilings(actor_id).await {
+        Ok(Some(triple)) => triple,
         Ok(None) => {
-            // Actor doesn't exist — caller should have verified
-            // ownership. Treat as fail-closed so a race (actor
-            // deleted between ownership check and dispatch) doesn't
-            // escalate to Tier2.
+            // Actor doesn't exist — caller should have verified ownership.
+            // Treat as fail-closed so a race (actor deleted between the
+            // ownership check and dispatch) can't escalate any ceiling.
             tracing::warn!(
                 %actor_id,
-                "apply_actor_to_engine: actor not found; stamping Tier1 and erroring"
+                "apply_actor_to_engine: actor not found; stamping most-restrictive ceilings and erroring"
             );
             engine.set_max_llm_tier(LlmTier::Tier1);
+            engine.set_max_write_ceiling(WriteCeiling::ReadOnly);
+            engine.set_egress_scope(Some(talos_workflow_engine_core::EgressScope::Local));
             return Err(anyhow::anyhow!(
-                "actor {actor_id} not found when resolving tier ceiling"
+                "actor {actor_id} not found when resolving engine ceilings"
             ));
         }
         Err(e) => {
-            // DB error — fail-closed to Tier1 and surface the error.
-            // Caller typically logs + aborts the dispatch; the
-            // conservative tier stamp defends if the caller proceeds.
             tracing::error!(
                 %actor_id,
                 error = %e,
-                "apply_actor_to_engine: DB error resolving tier; stamping Tier1 and erroring"
+                "apply_actor_to_engine: DB error resolving ceilings; stamping most-restrictive ceilings and erroring"
             );
             engine.set_max_llm_tier(LlmTier::Tier1);
-            return Err(e.context("apply_actor_to_engine: failed to resolve actor tier ceiling"));
+            engine.set_max_write_ceiling(WriteCeiling::ReadOnly);
+            engine.set_egress_scope(Some(talos_workflow_engine_core::EgressScope::Local));
+            return Err(e.context("apply_actor_to_engine: failed to resolve actor ceilings"));
         }
     };
     engine.set_max_llm_tier(tier);
-
-    // Data-mutation ceiling — same fail-closed contract as the tier above,
-    // but fail-closed to `ReadOnly` (refuse mutation) rather than Tier1.
-    // New actors resolve to `ReadOnly` (the migration's column default), so a
-    // freshly-built workflow can't mutate data until an operator grants write.
-    let ceiling = match repo.get_actor_max_write_ceiling(actor_id).await {
-        Ok(Some(c)) => c,
-        Ok(None) => {
-            tracing::warn!(
-                %actor_id,
-                "apply_actor_to_engine: actor not found; stamping ReadOnly and erroring"
-            );
-            engine.set_max_write_ceiling(WriteCeiling::ReadOnly);
-            return Err(anyhow::anyhow!(
-                "actor {actor_id} not found when resolving write ceiling"
-            ));
-        }
-        Err(e) => {
-            tracing::error!(
-                %actor_id,
-                error = %e,
-                "apply_actor_to_engine: DB error resolving write ceiling; stamping ReadOnly and erroring"
-            );
-            engine.set_max_write_ceiling(WriteCeiling::ReadOnly);
-            return Err(e.context("apply_actor_to_engine: failed to resolve actor write ceiling"));
-        }
-    };
     engine.set_max_write_ceiling(ceiling);
-
     // Blanket network-egress scope override — independent of the LLM tier.
     // `None` (SQL NULL, the default for every actor) preserves the tier-derived
     // default at the worker; an explicit `local`/`public` overrides only the
-    // blanket public-egress SSRF gate. Fail-closed to `Some(Local)` (no public
-    // egress) on actor-not-found / DB error, mirroring the Tier1/ReadOnly
-    // posture above — an unresolvable actor gets the MOST restrictive egress.
-    let egress = match repo.get_actor_egress_scope(actor_id).await {
-        Ok(Some(scope)) => scope,
-        Ok(None) => {
-            tracing::warn!(
-                %actor_id,
-                "apply_actor_to_engine: actor not found; stamping local egress and erroring"
-            );
-            engine.set_egress_scope(Some(talos_workflow_engine_core::EgressScope::Local));
-            return Err(anyhow::anyhow!(
-                "actor {actor_id} not found when resolving egress scope"
-            ));
-        }
-        Err(e) => {
-            tracing::error!(
-                %actor_id,
-                error = %e,
-                "apply_actor_to_engine: DB error resolving egress scope; stamping local egress and erroring"
-            );
-            engine.set_egress_scope(Some(talos_workflow_engine_core::EgressScope::Local));
-            return Err(e.context("apply_actor_to_engine: failed to resolve actor egress scope"));
-        }
-    };
+    // blanket public-egress SSRF gate.
     engine.set_egress_scope(egress);
     Ok(())
 }

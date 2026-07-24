@@ -550,6 +550,39 @@ pub fn world_allows_secrets(world: &str) -> bool {
     )
 }
 
+/// Worlds whose nodes exist primarily to EGRESS / SEND (make outbound network
+/// calls or publish output) and therefore have NO reason to receive the
+/// injected `__actor_context__` memory view by default.
+///
+/// # Why this exists (security)
+///
+/// Grounding-by-default injects a per-actor memory view into every node that
+/// declares `needs_memory` — which DEFAULTS to `true` for backward
+/// compatibility. Combined with the `egress_scope` split (a `tier1` actor may
+/// now be `egress=public` to reach e.g. Gmail while keeping its LLM local), a
+/// default-injected memory view can reach the "send" leg of a workflow and
+/// egress to a declared host. That defeats the `docs/delivery-node-pattern.md`
+/// split (compose-with-memory node → send-with-network-NO-memory node).
+///
+/// So for these pure-egress/send worlds the injection default flips to `false`:
+/// a node in one of them receives `__actor_context__` ONLY when its config sets
+/// `needs_memory: true` EXPLICITLY. Higher worlds that legitimately REASON over
+/// memory — `agent` / `trusted` / `automation` (the "compose" leg) — are
+/// deliberately NOT here: they keep the default-`true` behaviour and rely on the
+/// author's compose/send split for egress isolation. Non-egress worlds
+/// (`minimal` / `secrets` / `cache` / `database` / `filesystem` / `governance`)
+/// also stay default-`true` — flipping them would change behaviour without
+/// closing an exfil path.
+///
+/// This is a DEFAULT only; an explicit `needs_memory` in node config always wins
+/// (the engine composes this with
+/// `talos_workflow_engine_core::reserved_keys::explicit_needs_memory` at the
+/// injection sites — see `ParallelWorkflowEngine::node_needs_memory_for_world`).
+#[must_use]
+pub fn world_defaults_no_memory(world: &str) -> bool {
+    matches!(world_short(world), "http" | "network" | "messaging")
+}
+
 // ============================================================================
 // Write-ceiling mutation profile
 // ============================================================================
@@ -947,6 +980,43 @@ mod ceiling_tests {
                     "lattice allows ({c} ⊇ {r}) but rank rejected it — rank/lattice inconsistency"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn pure_egress_worlds_default_to_no_memory() {
+        // The pure-egress / send worlds — curated memory must NOT reach these
+        // by default (delivery-node-pattern "send" leg + tier1+public exfil).
+        for w in ["http", "http-node", "network", "network-node", "messaging"] {
+            assert!(
+                world_defaults_no_memory(w),
+                "{w} should default to NO memory injection"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_reasoning_and_neutral_worlds_keep_memory_default() {
+        // The "compose"/reasoning worlds and the non-egress worlds keep the
+        // default-true behaviour (an explicit needs_memory:false still opts out
+        // per-node; that's decided in the engine, not here).
+        for w in [
+            "agent",
+            "agent-node",
+            "trusted",
+            "automation-node",
+            "minimal",
+            "secrets",
+            "cache",
+            "database",
+            "filesystem",
+            "governance",
+            "unknown",
+        ] {
+            assert!(
+                !world_defaults_no_memory(w),
+                "{w} must keep the default-true memory posture"
+            );
         }
     }
 }

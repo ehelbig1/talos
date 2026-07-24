@@ -270,6 +270,31 @@ pub async fn inject_actor_context_into_input(
     execution_id: Option<uuid::Uuid>,
     scope: talos_workflow_repository::MemoryScope,
 ) {
+    // SECURITY (reserved-key spoof guard): `__actor_context__` is an
+    // engine-AUTHORED reserved key — the assembled per-actor memory view. Once
+    // grounding-by-default made it a LIVE, TRUSTED consumer (it is lifted at the
+    // trigger/test seams and fed to `with_actor_context`), a caller-supplied
+    // top-level `__actor_context__` on the inbound payload became a
+    // context-spoofing vector: a SKIPPED or empty injection (opt-out / no actor
+    // / no memories — every early return below) would otherwise leave the
+    // attacker/stale value in place to be lifted and trusted. This function is
+    // the single chokepoint every inbound-trigger/test payload passes through
+    // BEFORE the lift, and no legitimate internal path sets these keys top-level
+    // on an inbound payload (sub-workflows / continuation / scheduler all
+    // RE-DERIVE context server-side from their own actor binding), so stripping
+    // the engine-reserved keys here is pure hardening. Done UNCONDITIONALLY,
+    // ahead of every early return, so a skipped injection can never pass a
+    // spoofed value through. The real context (when injected) overwrites the
+    // now-cleared slot below.
+    if let Some(obj) = input.as_object_mut() {
+        for reserved in [
+            talos_workflow_engine_core::reserved_keys::ACTOR_CONTEXT,
+            talos_workflow_engine_core::reserved_keys::ACCUMULATED,
+            talos_workflow_engine_core::reserved_keys::TRIGGER_INPUT,
+        ] {
+            obj.remove(reserved);
+        }
+    }
     if !inject {
         return;
     }

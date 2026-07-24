@@ -12,6 +12,7 @@ serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }
 talos-graph-rag = { path = "../talos-graph-rag" }
 talos-memory = { path = "../talos-memory" }
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 tokio = { version = "1", features = ["sync", "rt", "macros"] }
 tracing.workspace = true

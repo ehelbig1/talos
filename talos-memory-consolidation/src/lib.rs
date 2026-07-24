@@ -108,6 +108,35 @@ async fn external_budget_exhausted(actor_repo: &ActorRepository, actor_id: uuid:
     matches!(actor_repo.sum_llm_tokens_last_24h(actor_id).await, Ok(spent) if spent >= max)
 }
 
+/// Run ONE external-provider structured summarization for a tier-2 actor,
+/// gated by the daily token budget. Shared by BOTH the `SummarizeExternal`
+/// branch AND the tier-2 local-failure fallback (B1) in each loop, so the
+/// vault-first client construction and the cost gate live in exactly one place.
+///
+/// Returns `Ok(Some(raw))` on a successful completion, `Ok(None)` when the call
+/// was skipped because the actor is over its daily token budget (cost control,
+/// fail-open), and `Err` when the external LLM itself failed. The CALLER is
+/// responsible for the security gate: this MUST only be reached for a tier-2
+/// (`External`) actor — a tier-1 (`LocalOnly`) actor's content must never egress.
+async fn summarize_external_budgeted(
+    actor_repo: &ActorRepository,
+    secrets_manager: &Arc<SecretsManager>,
+    actor_id: uuid::Uuid,
+    system: &str,
+    user: &str,
+    schema: &serde_json::Value,
+    tool_name: &str,
+) -> anyhow::Result<Option<String>> {
+    if external_budget_exhausted(actor_repo, actor_id).await {
+        return Ok(None);
+    }
+    let client = talos_llm::LlmClient::with_vault(secrets_manager.clone(), None);
+    let raw = client
+        .generate_with_schema(system, user, schema, tool_name)
+        .await?;
+    Ok(Some(raw))
+}
+
 /// Build the (system, user) prompt for the consolidation summarizer.
 /// Deterministic given the batch, so it's unit-testable. The batch of
 /// `(key, value, memory_type)` rows is serialized compactly and capped so a
@@ -366,29 +395,62 @@ async fn run_consolidation_tick(
                 {
                     Ok(s) => s,
                     Err(e) => {
-                        tracing::warn!(target: "talos_memory_consolidation", %actor_id, error = %e, "local LLM summarize failed; no mutation");
-                        continue;
+                        // B1: local model failed. For a tier-2 (`External`)
+                        // actor, external is a FALLBACK — retry there rather
+                        // than dead-ending (this is what makes local-first's
+                        // "external when local is unavailable" promise real
+                        // when Ollama is misconfigured/down). A tier-1
+                        // (`LocalOnly`) actor MUST NOT egress: a local failure
+                        // just means no consolidation this tick.
+                        if matches!(decision, LlmTierDecision::External) {
+                            tracing::warn!(target: "talos_memory_consolidation", %actor_id, error = %e, "local LLM summarize failed; falling back to external provider (tier-2)");
+                            match summarize_external_budgeted(
+                                actor_repo,
+                                secrets_manager,
+                                actor_id,
+                                &system,
+                                &user,
+                                &consolidation_schema(),
+                                "record_consolidation",
+                            )
+                            .await
+                            {
+                                Ok(Some(s)) => s,
+                                Ok(None) => {
+                                    tracing::info!(target: "talos_memory_consolidation", %actor_id, "over daily LLM-token budget; skipping external fallback");
+                                    continue;
+                                }
+                                Err(e2) => {
+                                    tracing::warn!(target: "talos_memory_consolidation", %actor_id, error = %e2, "external fallback also failed; no mutation");
+                                    continue;
+                                }
+                            }
+                        } else {
+                            tracing::warn!(target: "talos_memory_consolidation", %actor_id, error = %e, "local LLM summarize failed; no mutation (tier-1 local-only)");
+                            continue;
+                        }
                     }
                 }
             }
             PlannedAction::SummarizeExternal => {
-                // External fallback (ollama unreachable). Cost gate: skip if the
-                // actor is already over its daily token budget.
-                if external_budget_exhausted(actor_repo, actor_id).await {
-                    tracing::info!(target: "talos_memory_consolidation", %actor_id, "actor over daily LLM-token budget; skipping external consolidation");
-                    continue;
-                }
-                let client = talos_llm::LlmClient::with_vault(secrets_manager.clone(), None);
-                match client
-                    .generate_with_schema(
-                        &system,
-                        &user,
-                        &consolidation_schema(),
-                        "record_consolidation",
-                    )
-                    .await
+                // External path (ollama unreachable at planning time). Cost gate
+                // + vault client construction live in the shared helper.
+                match summarize_external_budgeted(
+                    actor_repo,
+                    secrets_manager,
+                    actor_id,
+                    &system,
+                    &user,
+                    &consolidation_schema(),
+                    "record_consolidation",
+                )
+                .await
                 {
-                    Ok(s) => s,
+                    Ok(Some(s)) => s,
+                    Ok(None) => {
+                        tracing::info!(target: "talos_memory_consolidation", %actor_id, "actor over daily LLM-token budget; skipping external consolidation");
+                        continue;
+                    }
                     Err(e) => {
                         tracing::warn!(target: "talos_memory_consolidation", %actor_id, error = %e, "external LLM summarize failed; no mutation");
                         continue;
@@ -872,24 +934,59 @@ async fn run_reflection_tick(
                 {
                     Ok(s) => s,
                     Err(e) => {
-                        tracing::warn!(target: "talos_memory_reflection", %actor_id, error = %e, "local LLM reflection failed; no write");
-                        continue;
+                        // B1: tier-2 local-failure fallback to external (see the
+                        // consolidation branch for the rationale). Tier-1
+                        // (`LocalOnly`) never egresses — a local failure just
+                        // means no reflection this tick.
+                        if matches!(decision, LlmTierDecision::External) {
+                            tracing::warn!(target: "talos_memory_reflection", %actor_id, error = %e, "local LLM reflection failed; falling back to external provider (tier-2)");
+                            match summarize_external_budgeted(
+                                actor_repo,
+                                secrets_manager,
+                                actor_id,
+                                &system,
+                                &user,
+                                &reflection_schema(),
+                                "record_reflection",
+                            )
+                            .await
+                            {
+                                Ok(Some(s)) => s,
+                                Ok(None) => {
+                                    tracing::info!(target: "talos_memory_reflection", %actor_id, "over daily LLM-token budget; skipping external fallback");
+                                    continue;
+                                }
+                                Err(e2) => {
+                                    tracing::warn!(target: "talos_memory_reflection", %actor_id, error = %e2, "external fallback also failed; no write");
+                                    continue;
+                                }
+                            }
+                        } else {
+                            tracing::warn!(target: "talos_memory_reflection", %actor_id, error = %e, "local LLM reflection failed; no write (tier-1 local-only)");
+                            continue;
+                        }
                     }
                 }
             }
             PlannedAction::SummarizeExternal => {
-                // External fallback (ollama unreachable). Cost gate: skip if the
-                // actor is already over its daily token budget.
-                if external_budget_exhausted(actor_repo, actor_id).await {
-                    tracing::info!(target: "talos_memory_reflection", %actor_id, "actor over daily LLM-token budget; skipping external reflection");
-                    continue;
-                }
-                let client = talos_llm::LlmClient::with_vault(secrets_manager.clone(), None);
-                match client
-                    .generate_with_schema(&system, &user, &reflection_schema(), "record_reflection")
-                    .await
+                // External path (ollama unreachable at planning time). Cost gate
+                // + vault client construction live in the shared helper.
+                match summarize_external_budgeted(
+                    actor_repo,
+                    secrets_manager,
+                    actor_id,
+                    &system,
+                    &user,
+                    &reflection_schema(),
+                    "record_reflection",
+                )
+                .await
                 {
-                    Ok(s) => s,
+                    Ok(Some(s)) => s,
+                    Ok(None) => {
+                        tracing::info!(target: "talos_memory_reflection", %actor_id, "actor over daily LLM-token budget; skipping external reflection");
+                        continue;
+                    }
                     Err(e) => {
                         tracing::warn!(target: "talos_memory_reflection", %actor_id, error = %e, "external LLM reflection failed; no write");
                         continue;

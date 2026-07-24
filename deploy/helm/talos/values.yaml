@@ -224,6 +224,35 @@ controller:
     ENABLE_ADAPTIVE_RANK_TRAINING: "true"
     ENABLE_MEMORY_REFLECTION: "true"
     ENABLE_MEMORY_CONSOLIDATION: "true"
+    # Tier-1 (data-must-stay-on-host) attestations for the two LLM loops. Default
+    # FALSE = fail-closed: a tier-1 actor is SKIPPED by the loop unless you vouch
+    # that OLLAMA_URL resolves ON-HOST (mirrors graphRag.tier1LocalOk). Set true
+    # ONLY if the Ollama endpoint cannot leave the host. Tier-2 actors are
+    # unaffected (they summarise on local Ollama when reachable regardless, per
+    # the local-first policy). If Ollama is NOT deployed (ollama.enabled=false),
+    # leave these false — the loops route tier-2 to the external provider and
+    # skip tier-1 automatically (a boot-time reachability probe handles it).
+    MEMORY_CONSOLIDATION_TIER1_LOCAL_OK: "false"
+    MEMORY_REFLECTION_TIER1_LOCAL_OK: "false"
+    # Fleet-wide kill-switch for actor-context (__actor_context__) injection.
+    # Default ON. Set "false" to stop grounded-memory injection ENTIRELY (no node
+    # receives context; the trigger/scheduler assembly is short-circuited too) —
+    # a break-glass switch independent of ENABLE_SMART_MEMORY_CONTEXT (which only
+    # picks smart-vs-legacy ASSEMBLY and still injects when "false").
+    ENABLE_ACTOR_CONTEXT_INJECTION: "true"
+    # ── Optional memory-loop tuning (code defaults shown; uncomment to override) ─
+    # LOCAL summarisation model for the two LLM loops (must be pulled in Ollama):
+    #   MEMORY_CONSOLIDATION_MODEL: "qwen2.5:7b"
+    #   MEMORY_REFLECTION_MODEL: "qwen2.5:7b"
+    # Loop cadence (seconds; default 86400 = daily; clamped in code):
+    #   MEMORY_CONSOLIDATION_INTERVAL_SECS: "86400"
+    #   MEMORY_REFLECTION_INTERVAL_SECS: "86400"
+    #   ADAPTIVE_RANK_TRAINING_INTERVAL_SECS: "21600"
+    # MULTI-TENANT fairness: cap how many of ONE org's actors a single loop tick
+    # may claim, so a large tenant can't lengthen other orgs' rotation cadence.
+    # Default 0 = DISABLED (byte-identical single-org behaviour, zero overhead).
+    # Set a positive value (e.g. "50") on multi-tenant clusters:
+    #   MEMORY_LOOP_MAX_ACTORS_PER_ORG_PER_TICK: "0"
     # KEK (key-encryption-key) backend that wraps every DEK.
     #   "vault" (default) — KMS-backed HashiCorp Vault transit; the root key
     #     never leaves Vault. Required posture for HIPAA/SOC2/ISO key management.
