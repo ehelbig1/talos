@@ -1072,9 +1072,16 @@ fn clear_job_nonce_cache_for_test() {
 /// `skip_serializing_if` helpers for zero-default numeric fields —
 /// keeps default-valued wire messages byte-identical to the
 /// pre-field format (the wire-format stability rule).
+///
+/// The `&T` signature is REQUIRED by serde: `skip_serializing_if` calls
+/// the predicate as `fn(&FieldType) -> bool`. Clippy's
+/// `trivially_copy_pass_by_ref` would prefer by-value for these Copy
+/// types, but serde's contract dictates the reference — allow it.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_default_u32(v: &u32) -> bool {
     *v == 0
 }
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_default_u64(v: &u64) -> bool {
     *v == 0
 }

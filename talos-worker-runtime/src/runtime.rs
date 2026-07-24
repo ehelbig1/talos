@@ -3822,7 +3822,7 @@ impl TalosRuntime {
             context.llm_usage = shared_llm_usage.clone();
 
             // Share the sandbox directory through the `files` host interface.
-            if let Some(ref sandbox_dir) = shared_sandbox_dir {
+            if let Some(sandbox_dir) = shared_sandbox_dir {
                 context.fs_dir = cap_std::fs::Dir::open_ambient_dir(
                     sandbox_dir.path(),
                     cap_std::ambient_authority(),
@@ -3908,7 +3908,7 @@ impl TalosRuntime {
                 }
             };
 
-            let mut step_output: JsonValue = serde_json::from_str(&output_str).map_err(|e| {
+            let step_output: JsonValue = serde_json::from_str(&output_str).map_err(|e| {
                 // Bare serde errors like "expected value at line 1 column 1"
                 // are unhelpful: the operator can't tell whether the module
                 // returned an empty body, a truncated LLM response, or HTML.
