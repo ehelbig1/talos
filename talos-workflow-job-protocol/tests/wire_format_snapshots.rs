@@ -103,6 +103,7 @@ fn deterministic_job_request() -> JobRequest {
         max_fuel: 1_000_000,
         dry_run: false,
         reply_topic: None,
+        idempotency_key: None,
     }
 }
 

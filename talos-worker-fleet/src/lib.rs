@@ -177,7 +177,10 @@ pub async fn start_worker_management(
         tracing::info!("Worker heartbeat listener started");
         let mut backoff_secs: u64 = 1;
         loop {
-            let mut subscriber = match nats_hb.subscribe("talos.workers.heartbeat.>").await {
+            let mut subscriber = match nats_hb
+                .subscribe(talos_workflow_job_protocol::subjects::WORKERS_HEARTBEAT_WILDCARD)
+                .await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!(

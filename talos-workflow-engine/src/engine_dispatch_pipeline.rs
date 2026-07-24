@@ -316,6 +316,10 @@ impl ParallelWorkflowEngine {
                 max_llm_tier: self.max_llm_tier,
                 max_write_ceiling: self.max_write_ceiling,
                 egress_scope: self.egress_scope,
+                // Per-step idempotency is a follow-up (see docs/nats-subjects.md
+                // sibling note); the single-node dispatch path carries the
+                // engine-stamped key today.
+                idempotency_key: None,
                 // Per-step retry policy (2026-07-24): pipelines previously
                 // hardcoded 0 here, so a chain step NEVER retried an
                 // application failure — the chain-level `dispatch_with_retry`

@@ -891,6 +891,7 @@ impl NodeDispatcher for NatsNodeDispatcher {
         let job_id = job.job_id.unwrap_or_else(uuid::Uuid::new_v4);
         let claim_plaintext = job.plaintext_secrets.take();
         let claim_secret_paths = std::mem::take(&mut job.secret_paths);
+        let idempotency_key = job.idempotency_key.take();
 
         // 1. Assemble the wire-format `JobRequest`.
         let mut req = JobRequest {
@@ -941,6 +942,11 @@ impl NodeDispatcher for NatsNodeDispatcher {
             // `msg.reply == req.reply_topic` and refuse to publish
             // results to anything else.
             reply_topic: reply_inbox.clone(),
+            // Opt-in idempotency (Task 3): stamped by the engine only for a
+            // node that declared `__idempotency_key__`. HMAC-bound (conditional
+            // append) so it can't be stripped/swapped on the wire. `None` for
+            // every other dispatch — ships nothing.
+            idempotency_key,
         };
 
         // RFC 0010 P3 (D3b): when the engine resolved PLAINTEXT secrets for this

@@ -156,7 +156,7 @@ impl wit_secrets::Host for TalosContext {
                             // above is the WORM source-of-truth; this
                             // publish is replication only.
                             if let Err(e) = nats
-                                .publish("talos.audit.ledger".to_string(), bytes.into())
+                                .publish(talos_workflow_job_protocol::subjects::AUDIT_LEDGER.to_string(), bytes.into())
                                 .await
                             {
                                 tracing::warn!(
@@ -507,7 +507,10 @@ impl wit_secrets::Host for TalosContext {
                             // the only operational signal that
                             // replication failed.
                             if let Err(e) = nats
-                                .publish("talos.audit.ledger".to_string(), bytes.into())
+                                .publish(
+                                    talos_workflow_job_protocol::subjects::AUDIT_LEDGER.to_string(),
+                                    bytes.into(),
+                                )
                                 .await
                             {
                                 tracing::warn!(

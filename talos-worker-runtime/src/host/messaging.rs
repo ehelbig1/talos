@@ -451,7 +451,8 @@ impl wit_events::Host for TalosContext {
 
         // Best-effort publish — events don't fail the module if NATS is down.
         if let Some(nats) = &self.nats_client {
-            let topic = format!("talos.events.{}.{}", exec_id, event_type);
+            let topic =
+                talos_workflow_job_protocol::subjects::workflow_event_for(&exec_id, &event_type);
             if let Ok(payload_bytes) = serde_json::to_vec(&event_json) {
                 let _ = nats.publish(topic, payload_bytes.into()).await;
             }

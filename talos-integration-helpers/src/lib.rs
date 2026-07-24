@@ -422,6 +422,7 @@ mod dispatch_delivery_tests {
             max_fuel: 0,
             dry_run: false,
             reply_topic: None,
+            idempotency_key: None,
             actor_id: None,
             user_id: Uuid::nil(),
         };

@@ -48,6 +48,7 @@ fn make_job_request() -> JobRequest {
         max_fuel: 0,
         dry_run: false,
         reply_topic: None,
+        idempotency_key: None,
     }
 }
 

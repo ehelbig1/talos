@@ -288,7 +288,7 @@ impl wit_agent_orchestration::Host for TalosContext {
         }
 
         // Build NATS topic for agent invocation
-        let topic = format!("talos.agent.{}.invoke", msg.target);
+        let topic = talos_workflow_job_protocol::subjects::agent_invoke_for(&msg.target);
 
         // H-4: build a SIGNED envelope. Pre-fix the payload was an
         // unsigned JSON object on `talos.agent.*` — any in-cluster
@@ -433,7 +433,7 @@ impl wit_agent_orchestration::Host for TalosContext {
             return Err(wit_agent_orchestration::Error::InvocationFailed);
         }
 
-        let topic = format!("talos.agent.{}.message", msg.target);
+        let topic = talos_workflow_job_protocol::subjects::agent_message_for(&msg.target);
 
         // H-4: signed NATS envelope, see invoke() above for rationale.
         let payload_json: serde_json::Value = serde_json::from_str(&msg.payload)

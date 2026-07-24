@@ -116,6 +116,15 @@ pub struct TalosContext {
     /// Scopes every integration_state RPC the module makes.
     pub integration_name: Option<String>,
 
+    /// Opt-in idempotency key stamped by the engine when the workflow node
+    /// declared `__idempotency_key__`. When `Some`, the HTTP host emits it as an
+    /// `Idempotency-Key` header on MUTATING outbound requests (`fetch` /
+    /// `webhook::send`) so a retried send is deduplicated at the destination
+    /// (the Stripe / industry pattern). Never read from guest args — it comes
+    /// from the (HMAC-bound) `JobRequest.idempotency_key` set by the controller.
+    /// `None` for every non-declaring node → no header is added.
+    pub idempotency_key: Option<String>,
+
     /// Pluggable secret provider — the single source of truth for all secret resolution.
     ///
     /// Backs three-tier secret access:
@@ -1078,6 +1087,9 @@ impl TalosContext {
             // default is None so non-integration modules fall through to
             // the `unauthorized` path in integration_state host fns.
             integration_name: None,
+            // Populated downstream from the JobRequest (via SecurityPolicy) —
+            // None at construct time so non-declaring nodes add no header.
+            idempotency_key: None,
             provider,
             expose_call_count: std::sync::atomic::AtomicU64::new(0),
             secret_tier2_exposed: std::sync::atomic::AtomicBool::new(false),
@@ -1535,7 +1547,10 @@ impl TalosContext {
                 match serde_json::to_vec(&msg) {
                     Ok(bytes) => {
                         if let Err(e) = nats
-                            .publish("talos.audit.ledger".to_string(), bytes.into())
+                            .publish(
+                                talos_workflow_job_protocol::subjects::AUDIT_LEDGER.to_string(),
+                                bytes.into(),
+                            )
                             .await
                         {
                             tracing::warn!(

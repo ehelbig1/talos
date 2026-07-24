@@ -262,6 +262,20 @@ impl wit_webhook::Host for TalosContext {
                     .map_err(|_| wit_webhook::Error::Sendfailed)?;
                 req_builder = req_builder.header(k.as_str(), resolved.as_ref());
             }
+            // Opt-in idempotency (Task 3): a webhook send is always a POST
+            // (mutating), so emit the engine-stamped `Idempotency-Key` header so
+            // a retried delivery is deduplicated at the destination. Reused
+            // verbatim across retry attempts of this dispatch (that IS the point
+            // — same key ⇒ the destination collapses duplicates). Skipped when
+            // the guest already set the header.
+            if let Some(ref idem) = self.idempotency_key {
+                let guest_set = headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("idempotency-key"));
+                if !guest_set {
+                    req_builder = req_builder.header("Idempotency-Key", idem.as_str());
+                }
+            }
 
             match req_builder.send().await {
                 Ok(resp) => {

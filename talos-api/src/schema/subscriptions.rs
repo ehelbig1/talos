@@ -240,7 +240,7 @@ impl SubscriptionRoot {
             // MCP-1048: .extend_safe() for scrubber whitelist parity.
             .ok_or_else(|| async_graphql::Error::new("Streaming not available").extend_safe())?;
 
-        let topic = format!("talos.llm.stream.{}", execution_id);
+        let topic = talos_workflow_job_protocol::subjects::llm_stream_for(execution_id);
         // MCP-873 (2026-05-14): log the NATS subscribe error before
         // collapsing to "Failed to subscribe". Pre-fix the `_` swallow
         // hid TLS/auth/permission failures behind a generic message,

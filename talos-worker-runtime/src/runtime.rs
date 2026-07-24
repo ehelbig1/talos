@@ -131,6 +131,11 @@ pub struct SecurityPolicy {
     /// namespace to scope writes to. None = the module is not an
     /// integration; integration_state calls return `unauthorized`.
     pub integration_name: Option<String>,
+    /// Opt-in idempotency key (from `JobRequest.idempotency_key`). When `Some`,
+    /// applied to `TalosContext` so the HTTP host emits it as an
+    /// `Idempotency-Key` header on mutating outbound requests. `None` for every
+    /// non-declaring node.
+    pub idempotency_key: Option<String>,
 }
 // ---------------------------------------------------------------------
 // AOT versioning
@@ -2856,6 +2861,7 @@ impl TalosRuntime {
         // the module is not an integration; those host fns return
         // `unauthorized` without any DB round-trip.
         context.integration_name = security_policy.integration_name.clone();
+        context.idempotency_key = security_policy.idempotency_key.clone();
 
         // Enable dry-run mode if requested (mocks non-GET HTTP, webhook, messaging calls).
         if dry_run {
@@ -3086,7 +3092,10 @@ impl TalosRuntime {
                     match serde_json::to_vec(&msg) {
                         Ok(bytes) => {
                             if let Err(e) = nats
-                                .publish("talos.audit.ledger".to_string(), bytes.into())
+                                .publish(
+                                    talos_workflow_job_protocol::subjects::AUDIT_LEDGER.to_string(),
+                                    bytes.into(),
+                                )
                                 .await
                             {
                                 tracing::warn!(
@@ -3794,6 +3803,7 @@ impl TalosRuntime {
             context.set_allowed_sql_operations(step.security_policy.allowed_sql_operations.clone());
             context.set_allow_tier2_exposure(step.security_policy.allow_tier2_exposure);
             context.integration_name = step.security_policy.integration_name.clone();
+            context.idempotency_key = step.security_policy.idempotency_key.clone();
             // Stamp the pipeline-wide LLM tier ceiling so every step's
             // host-fn gates (llm::*, wit_http, graphql, webhook, http_stream)
             // enforce the same contract as a single-node JobRequest.

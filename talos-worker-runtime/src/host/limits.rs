@@ -69,7 +69,8 @@ pub(crate) const MAX_MESSAGING_PUBLISHES_PER_EXECUTION: u64 = 1000;
 // Deny-lists historically drift (PR #114/#115/#117); these two rules are why the
 // surface is currently airtight despite no per-subject NATS ACLs.
 pub(crate) const RESERVED_PUBLISH_PREFIXES: &[&str] = &[
-    "talos.", "wasm.",   // wasm.log.* — controller WASM-log subscriber
+    talos_workflow_job_protocol::subjects::NAMESPACE_PREFIX,
+    "wasm.",   // wasm.log.* — controller WASM-log subscriber
     "$",       // NATS system subjects: $SYS.*, $JS.API.*, $KV, $OBJ, …
     "_INBOX.", // NATS request/reply inboxes
 ];

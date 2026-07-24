@@ -110,6 +110,7 @@ async fn main() -> Result<()> {
         egress_scope: None,
         dry_run: false,
         reply_topic: None,
+        idempotency_key: None,
     };
     let key = [0u8; 32];
     req.sign(&key).map_err(|e| anyhow::anyhow!("sign: {e}"))?;

@@ -375,7 +375,7 @@ async fn publish_result_with_retry(
     if let Some(reply) = reply_topic {
         publish_bytes_with_retry(nc, reply, payload, max_attempts).await
     } else {
-        let result_topic = format!("talos.results.{}", result.job_id);
+        let result_topic = talos_workflow_job_protocol::subjects::results_for(result.job_id);
         publish_bytes_with_retry(nc, result_topic, payload, max_attempts).await
     }
 }
@@ -495,6 +495,7 @@ mod signature_failure_payload_tests {
             max_fuel: 0,
             dry_run: false,
             reply_topic: None,
+            idempotency_key: None,
         }
     }
 
@@ -955,6 +956,9 @@ async fn execute_job(
         allowed_sql_operations: req.allowed_sql_operations.clone(),
         allow_tier2_exposure: req.allow_tier2_exposure,
         integration_name: req.integration_name.clone(),
+        // Opt-in idempotency (Task 3): HMAC-bound on the JobRequest; the HTTP
+        // host emits it as an `Idempotency-Key` header on mutating sends.
+        idempotency_key: req.idempotency_key.clone(),
     };
 
     // Parse the capability world hint from the controller.  When present and non-Unknown,
@@ -1296,6 +1300,9 @@ async fn execute_pipeline_job(
                 allowed_sql_operations: step.allowed_sql_operations.clone(),
                 allow_tier2_exposure: step.allow_tier2_exposure,
                 integration_name: step.integration_name.clone(),
+                // Per-step idempotency is a follow-up (PipelineStep carries no
+                // idempotency_key yet); single-node sends carry it today.
+                idempotency_key: None,
             },
             user_id: Some(req.user_id),
             // Per-step in-worker retry policy (2026-07-24). HMAC-bound via
@@ -1953,11 +1960,11 @@ async fn main() -> anyhow::Result<()> {
     let single_job_topic = std::env::var("NATS_JOB_TOPIC")
         .ok()
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "talos.jobs".to_string());
+        .unwrap_or_else(|| talos_workflow_job_protocol::subjects::JOBS.to_string());
     let pipeline_job_topic = std::env::var("NATS_PIPELINE_TOPIC")
         .ok()
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "talos.pipeline.jobs".to_string());
+        .unwrap_or_else(|| talos_workflow_job_protocol::subjects::PIPELINE_JOBS.to_string());
     // Use the topic names as the queue groups so multiple edge nodes on the same topic load-balance
     let queue_group = single_job_topic.clone();
     let pipeline_queue_group = pipeline_job_topic.clone();
@@ -2471,7 +2478,7 @@ async fn main() -> anyhow::Result<()> {
                                         publish_bytes_with_retry(&nc_clone, reply, cached, 3).await
                                     } else {
                                         let result_topic =
-                                            format!("talos.pipeline.results.{}", req.job_id);
+                                            talos_workflow_job_protocol::subjects::pipeline_results_for(req.job_id);
                                         publish_bytes_with_retry(&nc_clone, result_topic, cached, 3).await
                                     };
                                     if let Err(e) = publish_result {
@@ -2590,7 +2597,7 @@ async fn main() -> anyhow::Result<()> {
                                 let publish_result = if let Some(reply) = reply_to {
                                     publish_bytes_with_retry(&nc_clone, reply, payload, 3).await
                                 } else {
-                                    let result_topic = format!("talos.pipeline.results.{}", result.job_id);
+                                    let result_topic = talos_workflow_job_protocol::subjects::pipeline_results_for(result.job_id);
                                     publish_bytes_with_retry(&nc_clone, result_topic, payload, 3).await
                                 };
                                 if let Err(e) = publish_result {

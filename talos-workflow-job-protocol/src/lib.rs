@@ -18,6 +18,10 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use uuid::Uuid;
 
+/// Canonical NATS subject registry — one authoritative name per `talos.*`
+/// subject shared across process boundaries.
+pub mod subjects;
+
 /// RFC 0010 P3 (D3b) — per-execution ephemeral secret-envelope sealing.
 pub mod envelope_seal;
 pub use envelope_seal::{
@@ -2551,6 +2555,26 @@ pub struct JobRequest {
     /// have the controller seal the secrets straight to them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_inbox: Option<String>,
+
+    /// Opt-in idempotency key for a SEND node (webhook / HTTP POST / messaging).
+    ///
+    /// When the workflow author declares idempotency on a node (config key
+    /// `__idempotency_key__`), the engine stamps a STABLE key here — stable
+    /// across retry attempts of the same dispatch, unique per logical send. The
+    /// worker emits it as an `Idempotency-Key` HTTP header on MUTATING outbound
+    /// requests (`fetch` / `webhook::send`) so a retried send is deduplicated at
+    /// the destination (the Stripe / RFC-draft industry pattern). Its presence is
+    /// ALSO what lets the engine's method-aware retry default grant retries to an
+    /// otherwise-non-idempotent send world — see
+    /// `talos_workflow_engine_core::default_max_retries_for_module`.
+    ///
+    /// HMAC-bound ONLY when `Some` (see [`Self::signing_payload`]): a `None`
+    /// value (every non-declaring node, and every legacy wire message) appends
+    /// NOTHING, so pre-existing signatures stay byte-identical and the field
+    /// ships inert. When `Some`, the `:idem=<key>` suffix is bound so an on-wire
+    /// attacker cannot strip the key (forcing a duplicate on retry) or swap it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 impl JobRequest {
@@ -2779,6 +2803,18 @@ impl JobRequest {
                 lp(&paths.join(",")),
                 lp(claim_inbox)
             );
+        }
+
+        // Idempotency key appended AT THE END, ONLY when `Some`, per the
+        // wire-format stability rule — a `None` (every non-declaring node +
+        // every legacy message) appends nothing, so pre-existing signatures are
+        // byte-identical and the field ships inert. When `Some`, binding the key
+        // stops an on-wire attacker from stripping it (which would let a retried
+        // send re-fire un-deduped) or swapping it for a colliding value.
+        // Length-prefixed because a user-supplied key is free-form.
+        if let Some(ref idem) = self.idempotency_key {
+            use std::fmt::Write as _;
+            let _ = write!(payload, ":idem={}", lp(idem));
         }
 
         payload.into_bytes()
@@ -4776,6 +4812,7 @@ mod tests {
             max_fuel: 0,
             dry_run: false,
             reply_topic: None,
+            idempotency_key: None,
         };
         req.sign(&key).unwrap();
 
@@ -4830,6 +4867,7 @@ mod tests {
             max_fuel: 0,
             dry_run: false,
             reply_topic: None,
+            idempotency_key: None,
         };
 
         req.sign(&key).unwrap();
@@ -4876,6 +4914,7 @@ mod tests {
             max_fuel: 0,
             dry_run: false,
             reply_topic: None,
+            idempotency_key: None,
         };
         req.sign(&key).unwrap();
         req.module_uri = "wasm://evil-module/v1".to_string(); // tamper
@@ -5050,6 +5089,7 @@ mod tests {
             max_fuel: 0,
             dry_run: false,
             reply_topic: None,
+            idempotency_key: None,
         };
         req.sign(&key).unwrap();
         // An attacker cannot escalate from GET-only to POST by modifying the field.
@@ -5096,6 +5136,7 @@ mod tests {
             max_fuel: 0,
             dry_run: false,
             reply_topic: None,
+            idempotency_key: None,
         };
         req.sign(&key).unwrap();
         // Reordering must not affect verification (sorted before hashing).
@@ -5159,6 +5200,7 @@ mod tests {
             max_fuel: 0,
             dry_run: false,
             reply_topic: None,
+            idempotency_key: None,
         }
     }
 
