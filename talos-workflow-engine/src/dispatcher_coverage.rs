@@ -79,6 +79,7 @@ pub fn dispatcher_branch_for(kind: &SystemNodeKind) -> &'static str {
         SystemNodeKind::OpsAlertsDigest { .. } => "try_dispatch_ops_alerts_digest",
         SystemNodeKind::PendingApprovals { .. } => "try_dispatch_pending_approvals",
         SystemNodeKind::AssistantReport { .. } => "try_dispatch_assistant_report",
+        SystemNodeKind::OperatorDigest { .. } => "try_dispatch_operator_digest",
         SystemNodeKind::Synthesize { .. } => "try_dispatch_synthesize",
         SystemNodeKind::Verify { .. } => "try_dispatch_verify",
         SystemNodeKind::DynamicDispatch { .. } => "try_dispatch_dynamic_dispatch",
@@ -146,6 +147,7 @@ mod tests {
             SystemNodeKind::OpsAlertsDigest { top_limit: 10 },
             SystemNodeKind::PendingApprovals { limit: 10 },
             SystemNodeKind::AssistantReport { days: 7 },
+            SystemNodeKind::OperatorDigest { days: 7 },
             SystemNodeKind::Synthesize {
                 synthesis_expr: None,
             },
@@ -250,17 +252,18 @@ mod tests {
     /// the constructor here. This test fails with a clear message if
     /// the count drifts.
     ///
-    /// Counts as of 2026-07-21 (after `PendingApprovals` addition):
-    ///   15 always-available (`Wait`, `WhileLoop`, `RepeatLoop`,
+    /// Counts as of 2026-07-24 (after `OperatorDigest` addition):
+    ///   16 always-available (`Wait`, `WhileLoop`, `RepeatLoop`,
     ///   `ErrorHandler`, `FanIn`, `SubWorkflow`, `Loop`, `Collect`,
     ///   `OpsAlertsDigest`, `PendingApprovals`, `AssistantReport`,
-    ///   `Synthesize`, `Verify`, `DynamicDispatch`, `CapabilityDispatch`)
+    ///   `OperatorDigest`, `Synthesize`, `Verify`, `DynamicDispatch`,
+    ///   `CapabilityDispatch`)
     ///   + 8 llm-primitives (`AgentLoop`, `Judge`, `InlineJudge`, `Ensemble`,
     ///   `ConfidenceGate`, `ReActLoop`, `ReflectiveRetry`, `LlmDispatch`)
-    ///   = 23 total.
+    ///   = 24 total.
     #[test]
     fn sample_count_matches_known_enum_size() {
-        const ALWAYS_AVAILABLE: usize = 15;
+        const ALWAYS_AVAILABLE: usize = 16;
         #[cfg(feature = "llm-primitives")]
         const EXPECTED: usize = ALWAYS_AVAILABLE + 8;
         #[cfg(not(feature = "llm-primitives"))]
@@ -296,6 +299,7 @@ mod tests {
             "try_dispatch_ops_alerts_digest",
             "try_dispatch_pending_approvals",
             "try_dispatch_assistant_report",
+            "try_dispatch_operator_digest",
             "try_dispatch_synthesize",
             "try_dispatch_verify",
             "try_dispatch_dynamic_dispatch",

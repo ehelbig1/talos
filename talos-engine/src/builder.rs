@@ -80,6 +80,9 @@ pub(super) fn build_controller_engine_registry_only(
     engine.set_assistant_report_reader(Arc::new(
         crate::assistant_report_reader::PostgresAssistantReportReader::new(pool.clone()),
     ));
+    engine.set_operator_digest_reader(Arc::new(
+        crate::operator_digest_reader::PostgresOperatorDigestReader::new(pool.clone()),
+    ));
     engine.set_judge_score_recorder(Arc::new(
         crate::judge_score_recorder::PostgresJudgeScoreRecorder::new(pool.clone()),
     ));

@@ -1217,6 +1217,35 @@ pub fn synthetic_memory_kinds() -> Vec<String> {
         .collect()
 }
 
+/// Count actor-memory writes GROUPED BY `metadata->>'kind'` over the trailing
+/// `days`, USER-SCOPED (joins `actors` on `user_id`) — the operator digest's
+/// "what the autonomous loops + workflows produced" panel (briefs, reflections,
+/// consolidations, CRM entries, …). Rows with NULL `metadata.kind`
+/// (engine-trace writes) bucket under `'(unlabeled)'`. `updated_at` is the write
+/// timestamp. Returns `(kind, count)`, most-written first. `metadata` is a plain
+/// JSONB column (never encrypted), so this needs no decryption — a pure count.
+pub async fn count_recent_writes_by_kind(
+    pool: &Pool<Postgres>,
+    user_id: Uuid,
+    days: i32,
+) -> Result<Vec<(String, i64)>> {
+    let days = days.clamp(1, 31);
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT COALESCE(am.metadata->>'kind', '(unlabeled)') AS kind, COUNT(*)::bigint \
+         FROM actor_memory am JOIN actors a ON a.id = am.actor_id \
+         WHERE a.user_id = $1 \
+           AND am.updated_at > NOW() - make_interval(days => $2::int) \
+         GROUP BY COALESCE(am.metadata->>'kind', '(unlabeled)') \
+         ORDER BY COUNT(*) DESC",
+    )
+    .bind(user_id)
+    .bind(days)
+    .fetch_all(pool)
+    .await
+    .context("count_recent_writes_by_kind")?;
+    Ok(rows)
+}
+
 pub async fn recall_recent_by_types(
     pool: &Pool<Postgres>,
     actor_id: Uuid,

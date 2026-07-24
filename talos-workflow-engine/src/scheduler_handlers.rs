@@ -464,6 +464,100 @@ impl ParallelWorkflowEngine {
         Some(output)
     }
 
+    /// [`SystemNodeKind::OperatorDigest`] — controller-side autonomy-cockpit
+    /// snapshot (ran / learned / `needs_me` over a trailing window) through the
+    /// injected [`talos_workflow_engine_core::OperatorDigestReader`] port.
+    /// Identical contract to [`Self::try_dispatch_assistant_report`]: `None`
+    /// when the node isn't this kind; otherwise ALWAYS `Some(envelope)`,
+    /// degrading to `{"available": false, "error": …}` (generic message only —
+    /// real errors log server-side) rather than failing the workflow.
+    pub(crate) async fn try_dispatch_operator_digest(
+        &self,
+        node_id: Uuid,
+        execution_id: Uuid,
+    ) -> Option<JsonValue> {
+        let (_, _, Some(SystemNodeKind::OperatorDigest { days })) = self.node_meta.get(&node_id)?
+        else {
+            return None;
+        };
+        let days = *days;
+
+        let unavailable = |reason: &str| {
+            serde_json::json!({
+                "available": false,
+                "error": reason,
+            })
+        };
+
+        let Some(reader) = self.operator_digest_reader.clone() else {
+            tracing::warn!(
+                %node_id,
+                "operator_digest: no OperatorDigestReader wired — emitting unavailable envelope"
+            );
+            self.emit_node_lifecycle_events(
+                execution_id,
+                node_id,
+                "Completed",
+                "operator digest unavailable (reader not wired)".to_string(),
+            );
+            return Some(unavailable(
+                "operator digest not available in this deployment",
+            ));
+        };
+        let Some(user_id) = self.user_id else {
+            tracing::warn!(
+                %node_id,
+                "operator_digest: execution has no resolved user identity — emitting \
+                 unavailable envelope"
+            );
+            self.emit_node_lifecycle_events(
+                execution_id,
+                node_id,
+                "Completed",
+                "operator digest unavailable (no tenant identity)".to_string(),
+            );
+            return Some(unavailable("execution has no tenant identity"));
+        };
+
+        const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        let output = match tokio::time::timeout(READ_TIMEOUT, reader.snapshot(user_id, days)).await
+        {
+            Ok(Ok(mut snapshot)) => {
+                if let Some(obj) = snapshot.as_object_mut() {
+                    obj.insert("available".to_string(), serde_json::json!(true));
+                }
+                self.emit_node_lifecycle_events(
+                    execution_id,
+                    node_id,
+                    "Completed",
+                    format!("operator digest fetched ({days}d window)"),
+                );
+                snapshot
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(%node_id, error = %e, "operator_digest: snapshot failed");
+                self.emit_node_lifecycle_events(
+                    execution_id,
+                    node_id,
+                    "Completed",
+                    "operator digest unavailable (storage error)".to_string(),
+                );
+                unavailable("operator digest read failed")
+            }
+            Err(_) => {
+                tracing::warn!(%node_id, "operator_digest: snapshot timed out");
+                self.emit_node_lifecycle_events(
+                    execution_id,
+                    node_id,
+                    "Completed",
+                    "operator digest unavailable (timeout)".to_string(),
+                );
+                unavailable("operator digest read timed out")
+            }
+        };
+        Some(output)
+    }
+
     /// [`SystemNodeKind::Synthesize`] — collect parent outputs, then
     /// (optionally) transform the collected value through a Rhai
     /// expression.

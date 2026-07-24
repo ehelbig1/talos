@@ -360,6 +360,16 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "get_operator_digest",
+            "description": "Autonomy cockpit: a time-windowed view of what your AUTONOMOUS machinery did, learned, and needs you to decide. RAN — executions grouped by trigger_type (scheduled/webhook/actor_dispatch runs shown apart from manual ones), per-workflow stats, and schedule health (with overdue flags). LEARNED — what the loops produced: memory writes by kind (briefs/reflections/consolidations/CRM), per-actor rank-weight fits, ML loop health, judge scores. NEEDS_ME — the unified decision inbox: pending approvals + ops-alert corrections + autonomous failures + active alert backlog, with a single total. Superset of get_daily_digest / assistant_report focused on autonomy oversight.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "days": { "type": "integer", "description": "Trailing window in days (1-31, default 1 = overnight)." }
+                }
+            }
+        }),
+        serde_json::json!({
             "name": "set_workflow_capabilities",
             "description": "Set structured capability tags on a workflow (e.g., 'http-fetch', 'data-transform'). Capabilities enable semantic discovery.",
             "inputSchema": {
@@ -564,6 +574,9 @@ pub async fn dispatch(
             Some(handle_get_workflow_risk_assessment(req_id, args, state, user_id).await)
         }
         "get_daily_digest" => Some(handle_get_daily_digest(req_id, args, state, user_id).await),
+        "get_operator_digest" => {
+            Some(handle_get_operator_digest(req_id, args, state, user_id).await)
+        }
         "set_workflow_capabilities" => {
             Some(handle_set_workflow_capabilities(req_id, args, state, user_id).await)
         }
@@ -4177,6 +4190,35 @@ async fn handle_get_workflow_risk_assessment(
         req_id,
         &serde_json::to_string_pretty(&result).unwrap_or_default(),
     )
+}
+
+/// Autonomy cockpit — the three-panel operator digest (ran / learned /
+/// needs_me) over a trailing window. Thin wrapper: parse `days`, call the
+/// shared `OperatorDigestService`, return the JSON. Tenancy is the
+/// authenticated `user_id`.
+async fn handle_get_operator_digest(
+    req_id: Option<serde_json::Value>,
+    args: &serde_json::Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let days = args
+        .get("days")
+        .and_then(serde_json::Value::as_u64)
+        .map(|d| d.clamp(1, 31) as u32)
+        .unwrap_or(1);
+
+    let service = talos_operator_digest::OperatorDigestService::new(state.db_pool.clone());
+    match service.snapshot(user_id, days).await {
+        Ok(digest) => mcp_text(
+            req_id,
+            &serde_json::to_string_pretty(&digest).unwrap_or_default(),
+        ),
+        Err(e) => {
+            tracing::error!("get_operator_digest failed: {}", e);
+            mcp_error(req_id, -32000, "Failed to build operator digest")
+        }
+    }
 }
 
 async fn handle_get_daily_digest(

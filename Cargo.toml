@@ -36,6 +36,7 @@ members = [
     "talos-config",
     "talos-integration-state",
     "talos-ml",
+    "talos-operator-digest",
     "talos-memory-consolidation",
     "talos-memory-ranking",
     "talos-system-repo",

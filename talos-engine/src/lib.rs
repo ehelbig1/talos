@@ -14,6 +14,7 @@ pub mod module_execution_store;
 pub mod module_fetcher;
 pub mod nats_run;
 pub mod node_hook;
+pub mod operator_digest_reader;
 pub mod ops_alerts_reader;
 pub mod pending_approvals_reader;
 pub mod retry_classifier;

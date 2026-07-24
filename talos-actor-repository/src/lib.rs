@@ -2563,6 +2563,38 @@ impl ActorRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Actors whose learned rank weights were (re)fit within the trailing
+    /// `days`, for the operator digest's "what the learning loops produced"
+    /// panel. Reads `actors.metadata->'rank_weights'->>'fitted_at'` (stamped by
+    /// the rank-training loop) — USER-SCOPED (`WHERE user_id = $1`), most-recent
+    /// fit first. Returns `(actor_name, n_examples, fitted_at)`; actors with no
+    /// fit or a fit outside the window are excluded. `n_examples` COALESCEs to 0
+    /// when the JSON lacks it. The `fitted_at` cast is safe: the value is written
+    /// by our own RFC-3339 serializer, never user input.
+    pub async fn recent_rank_fits(
+        &self,
+        user_id: Uuid,
+        days: i32,
+    ) -> Result<Vec<(String, i64, chrono::DateTime<chrono::Utc>)>> {
+        let days = days.clamp(1, 31);
+        Ok(sqlx::query_as(
+            "SELECT COALESCE(name, '(unnamed)'), \
+                    COALESCE((metadata->'rank_weights'->>'n_examples')::bigint, 0), \
+                    (metadata->'rank_weights'->>'fitted_at')::timestamptz \
+             FROM actors \
+             WHERE user_id = $1 \
+               AND metadata->'rank_weights'->>'fitted_at' IS NOT NULL \
+               AND (metadata->'rank_weights'->>'fitted_at')::timestamptz \
+                   > NOW() - make_interval(days => $2::int) \
+             ORDER BY (metadata->'rank_weights'->>'fitted_at')::timestamptz DESC \
+             LIMIT 50",
+        )
+        .bind(user_id)
+        .bind(days)
+        .fetch_all(&self.db_pool)
+        .await?)
+    }
+
     /// Cross-tenant scan of active actors for the Phase-2 rank-training loop.
     /// Returns up to `limit` active actor ids.
     ///

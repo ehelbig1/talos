@@ -38,6 +38,7 @@ talos-engine-events = { path = "../talos-engine-events" }
 talos-http-utils = { path = "../talos-http-utils" }
 talos-memory = { path = "../talos-memory" }
 talos-ml = { path = "../talos-ml" }
+talos-operator-digest = { path = "../talos-operator-digest" }
 talos-metrics = { path = "../talos-metrics" }
 talos-analytics-repository = { path = "../talos-analytics-repository" }
 talos-compilation = { path = "../talos-compilation" }

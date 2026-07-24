@@ -764,6 +764,11 @@ pub struct ParallelWorkflowEngine {
     /// `ops_alerts_reader`.
     pub(crate) assistant_report_reader:
         Option<Arc<dyn talos_workflow_engine_core::AssistantReportReader>>,
+    /// Read-side port for the operator digest (autonomy cockpit) — powers
+    /// the `operator_digest` system node. Same None-degrades contract as
+    /// `assistant_report_reader`.
+    pub(crate) operator_digest_reader:
+        Option<Arc<dyn talos_workflow_engine_core::OperatorDigestReader>>,
     /// Write-side port for observe-only judge verdicts — the engine
     /// records each `Judge` / `InlineJudge` node's `(score, passed)` here
     /// (best-effort, spawned) so the weekly `assistant_report` node can
@@ -894,6 +899,7 @@ pub struct AdapterSet {
     ops_alerts_reader: Option<Arc<dyn talos_workflow_engine_core::OpsAlertsReader>>,
     pending_approvals_reader: Option<Arc<dyn talos_workflow_engine_core::PendingApprovalsReader>>,
     assistant_report_reader: Option<Arc<dyn talos_workflow_engine_core::AssistantReportReader>>,
+    operator_digest_reader: Option<Arc<dyn talos_workflow_engine_core::OperatorDigestReader>>,
     judge_score_recorder: Option<Arc<dyn talos_workflow_engine_core::JudgeScoreRecorder>>,
     secret_envelope: Arc<dyn talos_workflow_engine_core::SecretEnvelope>,
     user_id: Option<Uuid>,
@@ -967,6 +973,7 @@ impl AdapterSet {
         engine.ops_alerts_reader = self.ops_alerts_reader;
         engine.pending_approvals_reader = self.pending_approvals_reader;
         engine.assistant_report_reader = self.assistant_report_reader;
+        engine.operator_digest_reader = self.operator_digest_reader;
         engine.judge_score_recorder = self.judge_score_recorder;
         engine.secret_envelope = self.secret_envelope;
         engine.user_id = self.user_id;
@@ -1064,6 +1071,7 @@ impl ParallelWorkflowEngine {
             ops_alerts_reader: None,
             pending_approvals_reader: None,
             assistant_report_reader: None,
+            operator_digest_reader: None,
             judge_score_recorder: None,
             secret_envelope: Arc::new(talos_workflow_job_protocol::AesGcmSecretEnvelope),
             sandbox_root: Some(default_sandbox_root().to_path_buf()),
@@ -1552,6 +1560,17 @@ impl ParallelWorkflowEngine {
         self.assistant_report_reader = Some(reader);
     }
 
+    /// Inject the operator-digest read port (powers the `operator_digest`
+    /// system node — the autonomy cockpit). Wired by the controller engine
+    /// builder; absent in out-of-tree consumers, where the node degrades to
+    /// an unavailable-envelope output.
+    pub fn set_operator_digest_reader(
+        &mut self,
+        reader: Arc<dyn talos_workflow_engine_core::OperatorDigestReader>,
+    ) {
+        self.operator_digest_reader = Some(reader);
+    }
+
     /// Inject the judge-score write port (records observe-only `Judge` /
     /// `InlineJudge` verdicts for the weekly `assistant_report` node).
     /// Wired by the controller engine builder; absent in out-of-tree
@@ -1670,6 +1689,7 @@ impl ParallelWorkflowEngine {
             ops_alerts_reader: self.ops_alerts_reader.clone(),
             pending_approvals_reader: self.pending_approvals_reader.clone(),
             assistant_report_reader: self.assistant_report_reader.clone(),
+            operator_digest_reader: self.operator_digest_reader.clone(),
             judge_score_recorder: self.judge_score_recorder.clone(),
             secret_envelope: self.secret_envelope.clone(),
             user_id: self.user_id,
@@ -5486,6 +5506,32 @@ impl ParallelWorkflowEngine {
                 // as the ops-alerts digest above.
                 if let Some(output) = self
                     .try_dispatch_assistant_report(node_id, execution_id)
+                    .await
+                {
+                    let chains_ctx = if is_fresh_run {
+                        Some((chains.as_slice(), &node_to_chain))
+                    } else {
+                        None
+                    };
+                    self.route_system_node_output(
+                        node_idx,
+                        output,
+                        execution_id,
+                        chains_ctx,
+                        &exec_ctx,
+                        &mut results,
+                        &mut pending,
+                        &mut ready,
+                    )
+                    .await?;
+                    continue;
+                }
+
+                // ── Operator digest (controller-side autonomy cockpit) ───────
+                // Same async + route-downstream + degrade-not-fail contract
+                // as the assistant report above.
+                if let Some(output) = self
+                    .try_dispatch_operator_digest(node_id, execution_id)
                     .await
                 {
                     let chains_ctx = if is_fresh_run {
