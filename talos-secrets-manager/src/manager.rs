@@ -1666,7 +1666,7 @@ impl SecretsManager {
     /// `encrypted_value` to the row's `id`. v0 (legacy, no AAD) and v1
     /// are the only currently-defined values; the migration's CHECK
     /// constraint enforces this.
-    pub const SECRETS_AAD_FORMAT_V1: i16 = 1;
+    pub const SECRETS_AAD_FORMAT_V1: i16 = crate::SecretFormat::V1Aad.as_version();
 
     /// Universal AAD format version constant — same numeric value as
     /// `SECRETS_AAD_FORMAT_V1`. Defined separately so the `secrets`
@@ -1675,7 +1675,7 @@ impl SecretsManager {
     /// header secret, execution output, module payloads, actor memory).
     /// Every table that adopts the AAD pattern shares this version
     /// number — there is no per-table v1/v2 divergence today.
-    pub const AAD_FORMAT_V1: i16 = 1;
+    pub const AAD_FORMAT_V1: i16 = crate::SecretFormat::V1Aad.as_version();
 
     /// AAD format version 2. Currently used ONLY by `module_executions`
     /// payload bundles (`talos_module_payload_encryption`), where v2 binds a
@@ -1687,7 +1687,7 @@ impl SecretsManager {
     /// version number only tells the *reader* which AAD bytes to reconstruct.
     /// Other tables continue to write v1 — there is no v2 row outside module
     /// payloads.
-    pub const AAD_FORMAT_V2: i16 = 2;
+    pub const AAD_FORMAT_V2: i16 = crate::SecretFormat::V2AadSlotTagged.as_version();
 
     /// AAD format version 3: AAD-bound **and per-context key-derived**.
     ///
@@ -1710,7 +1710,7 @@ impl SecretsManager {
     /// per-row `format_version` column is the sole signal a reader has to
     /// derive the key rather than use `dek.key` directly. A v3 write
     /// REQUIRES a non-empty AAD (an empty context defeats the partition).
-    pub const AAD_FORMAT_V3_DERIVED: i16 = 3;
+    pub const AAD_FORMAT_V3_DERIVED: i16 = crate::SecretFormat::V3Derived.as_version();
 
     /// AAD format version 4: per-context key-derived from a **per-organization
     /// root DEK** rather than the single global DEK.
@@ -1730,7 +1730,7 @@ impl SecretsManager {
     /// number exists so operators and the (later-phase) re-encrypt sweep can
     /// tell a per-org row from a global one by the format column alone, without
     /// joining to `encryption_keys.org_id`.
-    pub const AAD_FORMAT_V4_ORG_DERIVED: i16 = 4;
+    pub const AAD_FORMAT_V4_ORG_DERIVED: i16 = crate::SecretFormat::V4OrgDerived.as_version();
 
     /// HKDF-SHA256 salt / domain-separation label for v3 per-context DEK
     /// subkey derivation. Distinct from any other HKDF label in the
@@ -1767,26 +1767,31 @@ impl SecretsManager {
         encrypted: &[u8],
         format_version: i16,
     ) -> Result<Zeroizing<String>, SecretsError> {
-        // 2026-05-28 audit S2#9 follow-up: explicit-version match
-        // (sibling of `decrypt_versioned` below). `>=` invited a
-        // forward-compat trap; tighten to `==` and fail-closed on
-        // unknown values so a v1-reader against a v2-writer surfaces
-        // loudly at dispatch instead of mis-decrypting silently.
-        match format_version {
-            0 => self.decrypt_value_by_key(key_id, encrypted).await,
-            v if v == Self::SECRETS_AAD_FORMAT_V1 => {
+        // 2026-05-28 audit S2#9 follow-up, typed 2026-07-24: the
+        // version is validated fail-closed by `SecretFormat::from_version`
+        // and dispatched EXHAUSTIVELY — a future v5 variant forces this
+        // match to be revisited at compile time instead of relying on a
+        // reviewer remembering this site. v3/v4 decrypt identically
+        // (per-context-derived key bound to secret_id; v4's only
+        // difference is the IKM is a per-org DEK named by `key_id`,
+        // which `get_dek` resolves by id — no org awareness needed).
+        match crate::SecretFormat::from_version(format_version)? {
+            crate::SecretFormat::V0Legacy => self.decrypt_value_by_key(key_id, encrypted).await,
+            crate::SecretFormat::V1Aad => {
                 self.decrypt_value_by_key_with_aad(key_id, encrypted, secret_id.as_bytes())
                     .await
             }
-            // v3 and v4 decrypt identically: per-context-derived key bound to
-            // secret_id (same AAD as v1). v4's only difference is the IKM is a
-            // per-org DEK named by `key_id`, which `get_dek` resolves by id — so
-            // the read path needs no org awareness. See AAD_FORMAT_V4_ORG_DERIVED.
-            v if v == Self::AAD_FORMAT_V3_DERIVED || v == Self::AAD_FORMAT_V4_ORG_DERIVED => {
+            // v2 is a module-payload-bundle format (per-slot AAD tag);
+            // it is never valid on the `secrets` table and the table's
+            // CHECK constraint excludes it — reject explicitly rather
+            // than routing it through the v1 path.
+            crate::SecretFormat::V2AadSlotTagged => {
+                Err(SecretsError::UnknownFormat(format_version))
+            }
+            crate::SecretFormat::V3Derived | crate::SecretFormat::V4OrgDerived => {
                 self.decrypt_value_derived_with_aad(key_id, encrypted, secret_id.as_bytes())
                     .await
             }
-            other => Err(SecretsError::UnknownFormat(other)),
         }
     }
 
@@ -1812,41 +1817,28 @@ impl SecretsManager {
         aad: &[u8],
         format_version: i16,
     ) -> Result<Zeroizing<String>, SecretsError> {
-        // 2026-05-28 audit S2#9 follow-up: explicit-version match.
-        // Pre-fix `>= AAD_FORMAT_V1` meant a future v2 ciphertext with
-        // a NEW AAD shape (e.g. different separator, different bound
-        // fields) would silently route through the v1 AAD-binding
-        // path with the caller-supplied v1-AAD bytes — likely
-        // succeeding (random-looking AAD bytes accepted, tag check
-        // passes against an undocumented format) OR silently failing
-        // with a generic decryption error that masks the real cause.
-        // Tighten to `==` and fail-closed on unknown formats so a
-        // v1-reader against a v2-writer surfaces loudly at
-        // dispatch time, not as a mysterious decrypt failure.
-        match format_version {
-            0 => self.decrypt_value_by_key(key_id, encrypted).await,
-            // v1 and v2 are decrypted identically at the crypto layer — both
-            // pass the caller-supplied AAD into AES-GCM. The version only
-            // signals to the *caller* how to reconstruct that AAD (v2 module
-            // payloads fold a per-slot tag in; see `talos_module_payload_encryption`).
-            v if v == Self::AAD_FORMAT_V1 || v == Self::AAD_FORMAT_V2 => {
+        // 2026-05-28 audit S2#9 follow-up, typed 2026-07-24: the raw
+        // column value is validated fail-closed by
+        // `SecretFormat::from_version` (unknown/negative → UnknownFormat,
+        // preserving the loud v(N)-reader-vs-v(N+1)-writer failure the
+        // audit demanded), then routed via `decrypt_route()`, which
+        // states the crypto-layer equivalences ONCE: v1/v2 both decrypt
+        // with the caller-supplied AAD under the DEK (the version only
+        // tells the *caller* which AAD bytes to reconstruct — v2 module
+        // payloads fold a per-slot tag in), and v3/v4 both re-derive the
+        // per-context subkey from the DEK named by the row's `key_id`
+        // (v3 → global DEK, v4 → per-org DEK; `get_dek` resolves by id,
+        // so decrypt needs no org awareness).
+        match crate::SecretFormat::from_version(format_version)?.decrypt_route() {
+            crate::DecryptRoute::LegacyNoAad => self.decrypt_value_by_key(key_id, encrypted).await,
+            crate::DecryptRoute::CallerAad => {
                 self.decrypt_value_by_key_with_aad(key_id, encrypted, aad)
                     .await
             }
-            // v3: same wire format as v1/v2, but the AES key is the
-            // per-context HKDF subkey of the DEK rather than the DEK
-            // itself. The AAD is reconstructed identically by the caller
-            // and used both to derive the key AND as the GCM tag binding.
-            // v3 and v4 decrypt IDENTICALLY: both re-derive the per-context
-            // subkey from the DEK named by the row's `key_id` (v3 → the global
-            // DEK, v4 → a per-org DEK) and the same AAD. The org scoping lives
-            // entirely in WHICH DEK `key_id` points at, which `get_dek` resolves
-            // by id — so decrypt needs no org awareness. See AAD_FORMAT_V4_ORG_DERIVED.
-            v if v == Self::AAD_FORMAT_V3_DERIVED || v == Self::AAD_FORMAT_V4_ORG_DERIVED => {
+            crate::DecryptRoute::DerivedAad => {
                 self.decrypt_value_derived_with_aad(key_id, encrypted, aad)
                     .await
             }
-            other => Err(SecretsError::UnknownFormat(other)),
         }
     }
 
