@@ -170,7 +170,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_health_dashboard",
-            "description": "Overview of workflow health: failing workflows, long-running executions, and summary counts.",
+            "description": "Overview of workflow health: failing workflows, long-running executions, and summary counts. The summary includes failure_rate_24h_pct (failed/(failed+completed) over 24h, null when no executions), and top_failures_24h lists up to 10 workflows grouped by 24h failure count with last_failed_at and a truncated representative error_message — this surfaces mass transient outages that the currently-failing heuristic misses.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -276,14 +276,14 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_error_report",
-            "description": "Comprehensive error analysis for a workflow: total failures, error fingerprints, node-level failure breakdown, and time-of-day failure patterns.",
+            "description": "Comprehensive error analysis. With workflow_id: per-workflow report — total failures, error fingerprints, node-level failure breakdown, and time-of-day failure patterns. Without workflow_id: platform-wide rollup across all your workflows — total failures, error fingerprints grouped across workflows, and per-workflow failure counts. Useful after a mass/transient outage where no single workflow is the culprit.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workflow_id": { "type": "string", "description": "UUID of the workflow to analyze" },
-                    "days": { "type": "number", "description": "Number of days to look back (default: 7, max: 90)" }
-                },
-                "required": ["workflow_id"]
+                    "workflow_id": { "type": "string", "description": "UUID of the workflow to analyze. Omit for a platform-wide (user-scoped) rollup across all workflows." },
+                    "days": { "type": "number", "description": "Number of days to look back (default: 7, max: 90)" },
+                    "limit": { "type": "number", "description": "Global mode only: max workflows in the per-workflow failure breakdown (default: 20, max: 100)" }
+                }
             }
         }),
         serde_json::json!({
@@ -798,6 +798,36 @@ async fn handle_get_health_dashboard(
         })
         .collect();
 
+    // 2026-07-24: grouped 24h failure rollup. The `failing_workflows`
+    // heuristic above only surfaces workflows that are CURRENTLY failing,
+    // so a mass transient outage (many workflows each failing a few times,
+    // then recovering) showed `failing_workflow_count: 0` while the raw
+    // failed/completed counts said ~34% of runs died. `top_failures_24h`
+    // + `failure_rate_24h_pct` make that class of incident visible.
+    let top_failure_rows = match state.analytics_repo.get_top_failures_24h(user_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "get_top_failures_24h returned error");
+            Vec::new()
+        }
+    };
+
+    let top_failures: Vec<serde_json::Value> = top_failure_rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "workflow_id": r.workflow_id.to_string(),
+                "workflow_name": r.workflow_name,
+                "failed_count": r.failed_count,
+                "last_failed_at": r.last_failed_at.map(|t| t.to_rfc3339()),
+                "error_message": r
+                    .latest_error_message
+                    .as_deref()
+                    .map(truncate_error_message),
+            })
+        })
+        .collect();
+
     let summary = match state
         .analytics_repo
         .get_health_summary_counts(user_id)
@@ -815,6 +845,7 @@ async fn handle_get_health_dashboard(
             "currently_running": summary.running,
             "failed_last_24h": summary.failed_24h,
             "completed_last_24h": summary.completed_24h,
+            "failure_rate_24h_pct": failure_rate_pct(summary.failed_24h, summary.completed_24h),
             "failing_workflow_count": failing.len(),
             "long_running_execution_count": long_running.len(),
             "loop_capped_workflow_count": loop_capped.len(),
@@ -822,12 +853,95 @@ async fn handle_get_health_dashboard(
         "failing_workflows": failing,
         "long_running_executions": long_running,
         "loop_capped_workflows": loop_capped,
+        "top_failures_24h": top_failures,
     });
 
     mcp_text(
         req_id,
         &serde_json::to_string_pretty(&result).unwrap_or_default(),
     )
+}
+
+/// Pure: 24h failure rate as failed/(failed+completed) percent, rounded
+/// to 1 decimal. `None` (serialized as JSON null) when the window has no
+/// terminal executions at all — a rate over zero runs is meaningless and
+/// `0.0` would falsely read as "healthy".
+pub(crate) fn failure_rate_pct(failed: i64, completed: i64) -> Option<f64> {
+    let total = failed + completed;
+    if total <= 0 || failed < 0 || completed < 0 {
+        return None;
+    }
+    Some(((failed as f64 / total as f64) * 1000.0).round() / 10.0)
+}
+
+/// Representative error messages on the dashboard are previews, not full
+/// payloads — cap at ~200 bytes on a char boundary (delegates to
+/// `talos_text_util::bounded_preview`, which appends an ellipsis marker
+/// when it truncates).
+pub(crate) fn truncate_error_message(msg: &str) -> String {
+    talos_text_util::bounded_preview(msg, 200).into_owned()
+}
+
+#[cfg(test)]
+mod health_dashboard_summary_tests {
+    use super::{failure_rate_pct, truncate_error_message};
+
+    #[test]
+    fn failure_rate_none_when_no_executions() {
+        assert_eq!(failure_rate_pct(0, 0), None);
+    }
+
+    #[test]
+    fn failure_rate_zero_when_all_completed() {
+        assert_eq!(failure_rate_pct(0, 245), Some(0.0));
+    }
+
+    #[test]
+    fn failure_rate_hundred_when_all_failed() {
+        assert_eq!(failure_rate_pct(125, 0), Some(100.0));
+    }
+
+    #[test]
+    fn failure_rate_rounds_to_one_decimal() {
+        // The motivating incident: 125 failed / 245 completed → 33.8%.
+        assert_eq!(failure_rate_pct(125, 245), Some(33.8));
+        // 1/3 → 33.333... → 33.3
+        assert_eq!(failure_rate_pct(1, 2), Some(33.3));
+        // 2/3 → 66.666... → 66.7
+        assert_eq!(failure_rate_pct(2, 1), Some(66.7));
+    }
+
+    #[test]
+    fn failure_rate_negative_counts_are_null_not_garbage() {
+        // Defensive: COUNT(*) can't go negative, but a future refactor
+        // feeding a delta here shouldn't produce a nonsense percentage.
+        assert_eq!(failure_rate_pct(-1, 10), None);
+        assert_eq!(failure_rate_pct(10, -1), None);
+    }
+
+    #[test]
+    fn truncation_passes_short_messages_through() {
+        let msg = "connection refused by upstream";
+        assert_eq!(truncate_error_message(msg), msg);
+    }
+
+    #[test]
+    fn truncation_caps_long_messages() {
+        let msg = "x".repeat(1000);
+        let out = truncate_error_message(&msg);
+        assert!(out.len() <= 200, "expected <= 200 bytes, got {}", out.len());
+        assert!(out.ends_with('…'), "truncated preview carries a marker");
+    }
+
+    #[test]
+    fn truncation_respects_char_boundaries() {
+        // 4-byte scalar values: naive byte slicing at 200 would panic.
+        let msg = "🦀".repeat(100); // 400 bytes
+        let out = truncate_error_message(&msg);
+        assert!(out.len() <= 200);
+        // Must still be valid UTF-8 (implied by String) and non-empty.
+        assert!(!out.is_empty());
+    }
 }
 
 async fn handle_get_workflow_dependencies(
@@ -2173,14 +2287,107 @@ async fn handle_get_all_workflow_stats(
     }
 }
 
+/// Which report `get_error_report` should produce, derived from the
+/// (now-optional) `workflow_id` argument.
+///
+/// Kept as a pure parse step so the two modes' argument handling is unit-
+/// testable without a DB: absent/null → `Global`; a valid UUID →
+/// `PerWorkflow`; a malformed value is an ERROR (via
+/// `parse_optional_uuid_strict`), never a silent fall-through to the
+/// global rollup — a typo'd workflow_id silently widening the report to
+/// every workflow would be the same silent-drop class MCP-309 fixed.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ErrorReportMode {
+    Global,
+    PerWorkflow(Uuid),
+}
+
+pub(crate) fn parse_error_report_mode(
+    args: &serde_json::Value,
+    req_id: &Option<serde_json::Value>,
+) -> Result<ErrorReportMode, JsonRpcResponse> {
+    Ok(
+        match crate::utils::parse_optional_uuid_strict(args, "workflow_id", req_id)? {
+            Some(id) => ErrorReportMode::PerWorkflow(id),
+            None => ErrorReportMode::Global,
+        },
+    )
+}
+
+/// Pure: group raw `(error_message, started_at)` rows (most-recent first)
+/// into fingerprint buckets and return the top-`top_k` as JSON objects
+/// `{fingerprint, count, latest_message, latest_at}`.
+///
+/// Shared by BOTH `get_error_report` modes (per-workflow and global) so
+/// the fingerprinting behavior can never drift between them — this is the
+/// logic that previously lived inline in the per-workflow handler.
+/// Ordered by count desc with the fingerprint string as a deterministic
+/// tiebreaker (the inline version iterated a HashMap, so tie order was
+/// nondeterministic across runs).
+pub(crate) fn group_error_fingerprints(
+    error_rows: &[(String, chrono::DateTime<chrono::Utc>)],
+    top_k: usize,
+) -> Vec<serde_json::Value> {
+    // HashMap<fingerprint, (count, latest_message, latest_at)> — keeping
+    // the most-recent timestamp + message means the first row encountered
+    // (rows are DESC-sorted) wins, and later rows just bump count.
+    let mut fingerprint_groups: std::collections::HashMap<
+        String,
+        (usize, String, chrono::DateTime<chrono::Utc>),
+    > = std::collections::HashMap::new();
+    for (msg, started_at) in error_rows {
+        let fp = talos_analytics_repository::fingerprint_error_message(msg);
+        match fingerprint_groups.get_mut(&fp) {
+            Some(entry) => {
+                entry.0 += 1;
+                if *started_at > entry.2 {
+                    entry.2 = *started_at;
+                    entry.1 = msg.clone();
+                }
+            }
+            None => {
+                fingerprint_groups.insert(fp, (1, msg.clone(), *started_at));
+            }
+        }
+    }
+
+    let mut groups: Vec<(String, usize, String, chrono::DateTime<chrono::Utc>)> =
+        fingerprint_groups
+            .into_iter()
+            .map(|(fp, (count, latest_msg, latest_at))| (fp, count, latest_msg, latest_at))
+            .collect();
+    groups.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    groups.truncate(top_k);
+    groups
+        .into_iter()
+        .map(|(fp, count, latest_msg, latest_at)| {
+            serde_json::json!({
+                "fingerprint": fp,
+                "count": count,
+                "latest_message": latest_msg,
+                "latest_at": latest_at.to_rfc3339(),
+            })
+        })
+        .collect()
+}
+
+/// Source-row cap for the GLOBAL fingerprint rollup. Higher than the
+/// per-workflow 200 because it spans every workflow the user owns; still
+/// a hard bound so a pathological failure storm can't make the handler
+/// pull unbounded rows.
+const GLOBAL_ERROR_ROWS_CAP: i64 = 500;
+
 async fn handle_get_error_report(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
     state: &McpState,
     user_id: Uuid,
 ) -> JsonRpcResponse {
-    let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
-        Ok(id) => id,
+    let wf_id = match parse_error_report_mode(args, &req_id) {
+        Ok(ErrorReportMode::PerWorkflow(id)) => id,
+        Ok(ErrorReportMode::Global) => {
+            return handle_error_report_global(req_id, args, state, user_id).await;
+        }
         Err(resp) => return resp,
     };
 
@@ -2223,46 +2430,9 @@ async fn handle_get_error_report(
         .unwrap_or_default();
     let error_msgs: Vec<String> = error_rows.iter().map(|(m, _)| m.clone()).collect();
 
-    // HashMap<fingerprint, (count, latest_message, latest_at)> — keeping
-    // the most-recent timestamp + message means the first row encountered
-    // (rows are DESC-sorted) wins, and later rows just bump count.
-    let mut fingerprint_groups: std::collections::HashMap<
-        String,
-        (usize, String, chrono::DateTime<chrono::Utc>),
-    > = std::collections::HashMap::new();
-    for (msg, started_at) in &error_rows {
-        let fp = talos_analytics_repository::fingerprint_error_message(msg);
-        match fingerprint_groups.get_mut(&fp) {
-            Some(entry) => {
-                entry.0 += 1;
-                if *started_at > entry.2 {
-                    entry.2 = *started_at;
-                    entry.1 = msg.clone();
-                }
-            }
-            None => {
-                fingerprint_groups.insert(fp, (1, msg.clone(), *started_at));
-            }
-        }
-    }
-
-    let mut error_fingerprints: Vec<serde_json::Value> = fingerprint_groups
-        .into_iter()
-        .map(|(fp, (count, latest_msg, latest_at))| {
-            serde_json::json!({
-                "fingerprint": fp,
-                "count": count,
-                "latest_message": latest_msg,
-                "latest_at": latest_at.to_rfc3339(),
-            })
-        })
-        .collect();
-    error_fingerprints.sort_by(|a, b| {
-        let ca = a.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
-        let cb = b.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
-        cb.cmp(&ca)
-    });
-    error_fingerprints.truncate(10);
+    // Fingerprint grouping shared with the global mode — see
+    // `group_error_fingerprints`.
+    let error_fingerprints = group_error_fingerprints(&error_rows, 10);
 
     // Node-level failure breakdown from execution_events
     let node_failures = state
@@ -2368,6 +2538,192 @@ async fn handle_get_error_report(
         req_id,
         &serde_json::to_string_pretty(&result).unwrap_or_default(),
     )
+}
+
+/// Global (no `workflow_id`) mode of `get_error_report`: a user-scoped,
+/// platform-wide failure rollup for the window. Motivated by the same
+/// 2026-07-24 incident as `top_failures_24h` — a mass transient outage
+/// had no single workflow to point `get_error_report` at, and the
+/// per-workflow requirement forced operators to iterate every workflow
+/// by hand to see the blast radius.
+///
+/// Shares `group_error_fingerprints` with the per-workflow path so the
+/// fingerprinting semantics are identical in both modes.
+async fn handle_error_report_global(
+    req_id: Option<serde_json::Value>,
+    args: &serde_json::Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let days = match crate::utils::validate_range_i64(args, "days", 1, 90, 7, &req_id) {
+        Ok(v) => v as i32,
+        Err(resp) => return resp,
+    };
+    // Caller-clamped breadth of the per-workflow breakdown (lint check 12
+    // discipline — validated range, never a raw caller value into LIMIT).
+    let limit = match crate::utils::validate_range_i64(args, "limit", 1, 100, 20, &req_id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    // Total failures across all the user's workflows in the window.
+    let stats = state
+        .analytics_repo
+        .get_exec_stats_global(user_id, days)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "get_exec_stats_global failed for error report");
+            talos_analytics_repository::ExecStats::empty()
+        });
+
+    let error_rows = match state
+        .analytics_repo
+        .get_error_messages_with_started_at_global(user_id, days, GLOBAL_ERROR_ROWS_CAP)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, "global error-message query failed");
+            return mcp_error(req_id, -32000, "Failed to fetch error report");
+        }
+    };
+    let error_fingerprints = group_error_fingerprints(&error_rows, 10);
+
+    let per_workflow_rows = match state
+        .analytics_repo
+        .get_per_workflow_failure_counts(user_id, days, limit)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, "per-workflow failure-count query failed");
+            return mcp_error(req_id, -32000, "Failed to fetch error report");
+        }
+    };
+    let workflow_failure_counts: Vec<serde_json::Value> = per_workflow_rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "workflow_id": r.workflow_id.to_string(),
+                "workflow_name": r.workflow_name,
+                "failed_count": r.failed_count,
+                "last_failed_at": r.last_failed_at.map(|t| t.to_rfc3339()),
+            })
+        })
+        .collect();
+
+    let result = serde_json::json!({
+        "scope": "global",
+        "period_days": days,
+        "total_failures": stats.failed,
+        "error_fingerprints": error_fingerprints,
+        "workflow_failure_counts": workflow_failure_counts,
+    });
+
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&result).unwrap_or_default(),
+    )
+}
+
+#[cfg(test)]
+mod error_report_mode_tests {
+    use super::{group_error_fingerprints, parse_error_report_mode, ErrorReportMode};
+    use chrono::{Duration, TimeZone, Utc};
+
+    // -- argument parsing: the two modes -------------------------------
+
+    #[test]
+    fn missing_workflow_id_selects_global_mode() {
+        let args = serde_json::json!({});
+        assert_eq!(
+            parse_error_report_mode(&args, &None).unwrap(),
+            ErrorReportMode::Global
+        );
+    }
+
+    #[test]
+    fn null_workflow_id_selects_global_mode() {
+        let args = serde_json::json!({ "workflow_id": null });
+        assert_eq!(
+            parse_error_report_mode(&args, &None).unwrap(),
+            ErrorReportMode::Global
+        );
+    }
+
+    #[test]
+    fn valid_workflow_id_selects_per_workflow_mode() {
+        let id = uuid::Uuid::new_v4();
+        let args = serde_json::json!({ "workflow_id": id.to_string() });
+        assert_eq!(
+            parse_error_report_mode(&args, &None).unwrap(),
+            ErrorReportMode::PerWorkflow(id)
+        );
+    }
+
+    #[test]
+    fn malformed_workflow_id_is_an_error_not_global_fallthrough() {
+        // A typo'd workflow_id must NOT silently widen the report to
+        // every workflow (silent-drop class, MCP-309).
+        let args = serde_json::json!({ "workflow_id": "not-a-uuid" });
+        assert!(parse_error_report_mode(&args, &None).is_err());
+    }
+
+    #[test]
+    fn wrong_type_workflow_id_is_an_error() {
+        let args = serde_json::json!({ "workflow_id": 42 });
+        assert!(parse_error_report_mode(&args, &None).is_err());
+    }
+
+    // -- fingerprint grouping (shared by both modes) --------------------
+
+    fn ts(offset_secs: i64) -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 7, 24, 12, 0, 0).unwrap() + Duration::seconds(offset_secs)
+    }
+
+    #[test]
+    fn groups_equivalent_messages_under_one_fingerprint() {
+        let rows = vec![
+            ("timeout after 91".to_string(), ts(2)),
+            ("timeout after 32".to_string(), ts(1)),
+        ];
+        let out = group_error_fingerprints(&rows, 10);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["count"], 2);
+        // Most recent occurrence wins as the representative message.
+        assert_eq!(out[0]["latest_message"], "timeout after 91");
+        assert_eq!(out[0]["latest_at"], ts(2).to_rfc3339());
+    }
+
+    #[test]
+    fn orders_by_count_desc_with_fingerprint_tiebreaker() {
+        let rows = vec![
+            ("aaa distinct error".to_string(), ts(0)),
+            ("zzz frequent error".to_string(), ts(1)),
+            ("zzz frequent error".to_string(), ts(2)),
+            ("bbb distinct error".to_string(), ts(3)),
+        ];
+        let out = group_error_fingerprints(&rows, 10);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["fingerprint"], "zzz frequent error");
+        // Count ties break on fingerprint string, deterministically.
+        assert_eq!(out[1]["fingerprint"], "aaa distinct error");
+        assert_eq!(out[2]["fingerprint"], "bbb distinct error");
+    }
+
+    #[test]
+    fn truncates_to_top_k() {
+        let rows: Vec<(String, chrono::DateTime<Utc>)> = (0..15)
+            .map(|i| (format!("unique error kind {i} occurred"), ts(i)))
+            .collect();
+        let out = group_error_fingerprints(&rows, 10);
+        assert_eq!(out.len(), 10);
+    }
+
+    #[test]
+    fn empty_rows_produce_empty_fingerprints() {
+        assert!(group_error_fingerprints(&[], 10).is_empty());
+    }
 }
 
 /// Detect the "fuel-bump band-aid" anti-pattern from raw error messages.

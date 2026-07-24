@@ -95,10 +95,7 @@ impl RetryPolicy {
     /// Full [`RetryPolicy`] for a module with no explicit retry
     /// configuration — [`default_max_retries_for_module`] for the
     /// count, the standard 500 ms base backoff otherwise.
-    pub fn default_for_module(
-        allowed_methods: &[String],
-        capability_world: Option<&str>,
-    ) -> Self {
+    pub fn default_for_module(allowed_methods: &[String], capability_world: Option<&str>) -> Self {
         Self {
             max_retries: default_max_retries_for_module(allowed_methods, capability_world),
             ..Self::default()
@@ -156,9 +153,18 @@ mod default_for_module_tests {
     fn governance_and_send_worlds_never_retry() {
         // Approval gate re-fire on rejection was the documented reason
         // the old creation-time default existed — preserved structurally.
-        assert_eq!(default_max_retries_for_module(&[], Some("governance-node")), 0);
-        assert_eq!(default_max_retries_for_module(&[], Some("messaging-node")), 0);
-        assert_eq!(default_max_retries_for_module(&[], Some("database-node")), 0);
+        assert_eq!(
+            default_max_retries_for_module(&[], Some("governance-node")),
+            0
+        );
+        assert_eq!(
+            default_max_retries_for_module(&[], Some("messaging-node")),
+            0
+        );
+        assert_eq!(
+            default_max_retries_for_module(&[], Some("database-node")),
+            0
+        );
         assert_eq!(default_max_retries_for_module(&[], Some("network-node")), 0);
     }
 
