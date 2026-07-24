@@ -39,8 +39,8 @@ use crate::db::init_pool;
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::http::{header, HeaderValue, Request};
 use axum::middleware::{from_fn, Next};
+use talos_worker_runtime::runtime::TalosRuntime;
 use tokio::sync::broadcast;
-use worker::runtime::TalosRuntime;
 
 mod actor_memory_service;
 mod actor_policies;
@@ -5137,6 +5137,23 @@ fn build_schema_and_services(
         ))
         .data(async_graphql::dataloader::DataLoader::new(
             crate::api::schema::ModuleExecutionLogLoader(module_execution_service.clone()),
+            tokio::spawn,
+        ))
+        // N+1 batchers for id-only child objects (schedule/approval/
+        // execution → workflow name, workflow/execution → actor name,
+        // workflow → latest execution). Keys carry the caller's user/org
+        // scope so each batched query preserves the per-row tenancy
+        // predicate — see the loader docs in talos-api/src/schema/types.rs.
+        .data(async_graphql::dataloader::DataLoader::new(
+            crate::api::schema::WorkflowNameLoader(db_pool.clone()),
+            tokio::spawn,
+        ))
+        .data(async_graphql::dataloader::DataLoader::new(
+            crate::api::schema::ActorNameLoader(db_pool.clone()),
+            tokio::spawn,
+        ))
+        .data(async_graphql::dataloader::DataLoader::new(
+            crate::api::schema::LatestExecutionLoader(db_pool.clone()),
             tokio::spawn,
         ))
         .data(nats_client.clone())

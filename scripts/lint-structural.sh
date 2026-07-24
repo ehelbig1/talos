@@ -84,7 +84,7 @@ PROJECTION_PATTERNS=(
 
 # Default scan scope: the credential-bearing crates that must route through
 # talos_memory::*. Deliberately EXCLUDES talos-memory/src, the canonical writer.
-DEFAULT_DIRS="controller/src talos-secrets/src talos-dlp/src worker/src"
+DEFAULT_DIRS="controller/src talos-secrets/src talos-dlp/src worker/src talos-worker-runtime/src"
 
 VIOLATIONS=0
 check_pattern() {
@@ -225,7 +225,7 @@ bold "▶ check 3: __actor_context__ injection key (no __agent_context__ regress
 LEGACY_HITS=$(grep -rEn '__agent_context__' \
                 --include='*.rs' \
                 --exclude-dir=target \
-                controller/src talos-memory/src worker/src module-templates 2>/dev/null \
+                controller/src talos-memory/src worker/src talos-worker-runtime/src module-templates 2>/dev/null \
             || true)
 
 LEGACY_VIOLATIONS=0
@@ -1226,7 +1226,7 @@ done < <(grep -rEn \
             --include='*.rs' \
             --exclude-dir=target \
             --exclude-dir=tests \
-            controller/src worker/src talos-engine talos-workflow-engine \
+            controller/src worker/src talos-worker-runtime/src talos-engine talos-workflow-engine \
             talos-workflow-engine-nats talos-execution-orchestration \
             talos-continuation-trigger talos-webhooks talos-google-calendar \
             talos-gmail talos-replay-service talos-jobs talos-rpc-subscribers \
@@ -1255,9 +1255,10 @@ bold "▶ check 18: JobResult/.sign() in worker (must use sign_with_worker_id)"
 # contributor adding a new dispatch path could call the back-compat
 # wrapper and quietly degrade the audit-trail forensic guarantee.
 #
-# This check fires only on `worker/src/**/*.rs`. The protocol crate's
-# own tests + the JobRequest::sign (request, not result) flows are
-# out of scope.
+# This check fires only on `worker/src/**/*.rs` + the extracted
+# `talos-worker-runtime/src/**/*.rs` (the worker's library half moved
+# there in July 2026). The protocol crate's own tests + the
+# JobRequest::sign (request, not result) flows are out of scope.
 RESULT_SIGN_VIOLATIONS=0
 while IFS= read -r line; do
     file="$(echo "$line" | cut -d: -f1)"
@@ -1281,7 +1282,7 @@ while IFS= read -r line; do
 done < <(grep -rEn '\.sign\(' \
             --include='*.rs' \
             --exclude-dir=target \
-            worker/src 2>/dev/null \
+            worker/src talos-worker-runtime/src 2>/dev/null \
         || true)
 
 if [ "$RESULT_SIGN_VIOLATIONS" -gt 0 ]; then
@@ -1326,7 +1327,7 @@ DUAL_PUBLISH_VIOLATIONS=0
 # pattern. False positives can be suppressed via the per-line opt-out
 # marker.
 
-WORKER_RS_FILES=$(find worker/src -name '*.rs' \
+WORKER_RS_FILES=$(find worker/src talos-worker-runtime/src -name '*.rs' \
     -not -path '*/tests/*' \
     -not -name '*_tests.rs' 2>/dev/null || true)
 
@@ -1448,7 +1449,10 @@ REQUIRED_PROPOSALS=(
 )
 
 PROPOSAL_VIOLATIONS=0
-RUNTIME_FILE="worker/src/runtime.rs"
+# runtime.rs moved worker/src → talos-worker-runtime/src (July 2026 lib
+# extraction); the fallback path keeps the check working on older branches.
+RUNTIME_FILE="talos-worker-runtime/src/runtime.rs"
+[ -f "$RUNTIME_FILE" ] || RUNTIME_FILE="worker/src/runtime.rs"
 if [ -f "$RUNTIME_FILE" ]; then
     for proposal in "${REQUIRED_PROPOSALS[@]}"; do
         # Use literal string match (-F) since the pattern contains parens.
@@ -1458,11 +1462,11 @@ if [ -f "$RUNTIME_FILE" ]; then
         fi
     done
 else
-    yellow "  (worker/src/runtime.rs not found — skipping check)"
+    yellow "  (runtime.rs not found in talos-worker-runtime/src or worker/src — skipping check)"
 fi
 
 if [ "$PROPOSAL_VIOLATIONS" -gt 0 ]; then
-    red "✗ $PROPOSAL_VIOLATIONS WASM proposal lockdown call(s) missing in worker/src/runtime.rs"
+    red "✗ $PROPOSAL_VIOLATIONS WASM proposal lockdown call(s) missing in $RUNTIME_FILE"
     yellow "  → keep the explicit deny-list current; adding a new wasmtime proposal"
     yellow "    silently widens the Cranelift codegen attack surface."
     yellow "  → see docs/wasmtime-version-tracking.md for the upgrade checklist."
@@ -2782,9 +2786,9 @@ bold "▶ check 38: allow_wasi_network grants must gate on max_llm_tier (tier-1 
 WASI_TIER_VIOLATIONS=0
 if [ -n "$RG_BIN" ]; then
     wn_matches=$("$RG_BIN" -n --no-heading -g '*.rs' \
-        -e 'allow_wasi_network[[:space:]]*=' worker/ 2>/dev/null || true)
+        -e 'allow_wasi_network[[:space:]]*=' worker/ talos-worker-runtime/ 2>/dev/null || true)
 else
-    wn_matches=$(grep -rnE --include='*.rs' 'allow_wasi_network[[:space:]]*=' worker/ 2>/dev/null || true)
+    wn_matches=$(grep -rnE --include='*.rs' 'allow_wasi_network[[:space:]]*=' worker/ talos-worker-runtime/ 2>/dev/null || true)
 fi
 
 if [ -n "$wn_matches" ]; then
@@ -3095,7 +3099,7 @@ for gate in redis nats postgres neo4j; do
     # is the comment placed directly above each gate. A mid-sentence mention in
     # a `///` doc comment (e.g. "See `tls-prod-gate-postgres`.") is a reference,
     # not a gate, and must not be validated for a fail-closed action.
-    hits=$(grep -rnE "^[[:space:]]*//[[:space:]]*tls-prod-gate-${gate}\b" --include='*.rs' controller/src talos-db/src worker/src 2>/dev/null || true)
+    hits=$(grep -rnE "^[[:space:]]*//[[:space:]]*tls-prod-gate-${gate}\b" --include='*.rs' controller/src talos-db/src worker/src talos-worker-runtime/src 2>/dev/null || true)
     if [ -z "$hits" ]; then
         red "✗ missing production TLS gate marker: tls-prod-gate-${gate}"
         TLS_GATE_VIOLATIONS=$((TLS_GATE_VIOLATIONS + 1))
@@ -3594,7 +3598,7 @@ echo
 # it in `guard_codegen_panic`). The single legitimate site inside that
 # method is tagged `// allow-unguarded-component-new`.
 bold "▶ check 53: unguarded wasmtime Component::new in worker runtime (must route through the panic guard)"
-UNGUARDED_CN="$(grep -rEn 'Component::new\(' --include='*.rs' worker/src 2>/dev/null \
+UNGUARDED_CN="$(grep -rEn 'Component::new\(' --include='*.rs' worker/src talos-worker-runtime/src 2>/dev/null \
     | grep -v 'allow-unguarded-component-new' \
     | grep -vE '//.*Component::new' || true)"
 if [ -n "$UNGUARDED_CN" ]; then

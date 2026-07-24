@@ -1787,6 +1787,7 @@ dependencies = [
  "talos-webhooks",
  "talos-worker-fleet",
  "talos-worker-identity-repository",
+ "talos-worker-runtime",
  "talos-workflow-authorization",
  "talos-workflow-creation",
  "talos-workflow-creation-helpers",
@@ -1817,7 +1818,6 @@ dependencies = [
  "tracing-subscriber",
  "urlencoding",
  "uuid",
- "worker",
  "zeroize",
 ]
 
@@ -7271,6 +7271,7 @@ dependencies = [
  "talos-validation",
  "talos-webhook-repository",
  "talos-webhooks",
+ "talos-worker-runtime",
  "talos-workflow-authorization",
  "talos-workflow-creation",
  "talos-workflow-creation-helpers",
@@ -7284,7 +7285,6 @@ dependencies = [
  "tower-cookies",
  "tracing",
  "uuid",
- "worker",
 ]
 
 [[package]]
@@ -7946,13 +7946,13 @@ dependencies = [
  "talos-secrets-manager",
  "talos-trace-nats",
  "talos-worker-fleet",
+ "talos-worker-runtime",
  "talos-workflow-engine-core",
  "talos-workflow-job-protocol",
  "tokio",
  "tracing",
  "urlencoding",
  "uuid",
- "worker",
 ]
 
 [[package]]
@@ -8067,6 +8067,22 @@ dependencies = [
  "talos-ssrf-classify",
  "tokio",
  "tower",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "talos-hygiene-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde_json",
+ "talos-analytics-repository",
+ "talos-execution-repository",
+ "talos-module-repository",
+ "talos-workflow-repository",
+ "thiserror 1.0.69",
  "tracing",
  "uuid",
 ]
@@ -8272,6 +8288,7 @@ dependencies = [
  "talos-hot-update-service",
  "talos-http-body",
  "talos-http-utils",
+ "talos-hygiene-service",
  "talos-inline-compile-service",
  "talos-llm",
  "talos-mcp",
@@ -8291,6 +8308,7 @@ dependencies = [
  "talos-scheduler",
  "talos-search-service",
  "talos-secrets-manager",
+ "talos-session-brief-service",
  "talos-subworkflow-contract",
  "talos-system-repo",
  "talos-tenancy",
@@ -8298,6 +8316,7 @@ dependencies = [
  "talos-validation",
  "talos-webhook-repository",
  "talos-webhooks",
+ "talos-worker-runtime",
  "talos-workflow-authorization",
  "talos-workflow-creation",
  "talos-workflow-creation-helpers",
@@ -8316,7 +8335,6 @@ dependencies = [
  "tracing",
  "urlencoding",
  "uuid",
- "worker",
 ]
 
 [[package]]
@@ -8462,6 +8480,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "talos-secrets-manager",
+ "tokio",
  "uuid",
  "zeroize",
 ]
@@ -8693,13 +8712,13 @@ dependencies = [
  "talos-registry",
  "talos-replay-diff",
  "talos-secrets-manager",
+ "talos-worker-runtime",
  "talos-workflow-engine",
  "talos-workflow-job-protocol",
  "talos-workflow-repository",
  "thiserror 1.0.69",
  "tracing",
  "uuid",
- "worker",
 ]
 
 [[package]]
@@ -8720,6 +8739,7 @@ dependencies = [
  "anyhow",
  "async-nats",
  "futures",
+ "serde",
  "serde_json",
  "sqlparser",
  "sqlx",
@@ -8872,6 +8892,21 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+]
+
+[[package]]
+name = "talos-session-brief-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde_json",
+ "talos-advanced-repository",
+ "talos-hygiene-service",
+ "talos-search-service",
+ "thiserror 1.0.69",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -9134,6 +9169,62 @@ dependencies = [
  "sqlx",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "talos-worker-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "base64 0.22.1",
+ "bytes",
+ "cap-std",
+ "chrono",
+ "csv",
+ "dashmap 6.2.1",
+ "futures-util",
+ "hex",
+ "hmac 0.12.1",
+ "md5",
+ "minijinja",
+ "oci-distribution",
+ "opentelemetry",
+ "opentelemetry-prometheus",
+ "opentelemetry_sdk",
+ "prometheus",
+ "quick-xml",
+ "rand 0.8.6",
+ "redis",
+ "regex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlparser",
+ "subtle",
+ "talos-audit-event",
+ "talos-config",
+ "talos-dlp-provider",
+ "talos-memory",
+ "talos-secrets",
+ "talos-sigstore-policy",
+ "talos-ssrf-classify",
+ "talos-text-util",
+ "talos-trace",
+ "talos-trace-nats",
+ "talos-wit-inspector",
+ "talos-workflow-job-protocol",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-opentelemetry",
+ "url",
+ "uuid",
+ "wasmtime",
+ "wasmtime-wasi",
+ "wasmtime-wasi-http",
 ]
 
 [[package]]
@@ -11507,67 +11598,31 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-nats",
- "base64 0.22.1",
  "bytes",
- "cap-std",
- "chrono",
- "csv",
- "dashmap 6.2.1",
  "futures-util",
  "hex",
- "hmac 0.12.1",
- "lru 0.16.4",
- "md5",
- "minijinja",
- "oci-distribution",
  "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry-prometheus",
- "opentelemetry_sdk",
- "pgvector",
  "prometheus",
- "proptest",
- "quick-xml",
  "rand 0.8.6",
  "redis",
- "regex",
  "reqwest 0.12.28",
  "rustls",
- "serde",
  "serde_json",
  "sha2 0.10.9",
- "sqlparser",
- "sqlx",
  "subtle",
- "talos-audit-event",
- "talos-capability-world",
  "talos-config",
- "talos-dlp",
- "talos-dlp-provider",
  "talos-memory",
  "talos-nats-tls",
- "talos-secrets",
  "talos-shutdown",
- "talos-sigstore-policy",
- "talos-ssrf-classify",
- "talos-text-util",
- "talos-trace",
- "talos-trace-nats",
- "talos-wit-inspector",
+ "talos-worker-runtime",
  "talos-workflow-engine-core",
  "talos-workflow-job-protocol",
- "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
- "url",
  "uuid",
- "wasmparser 0.224.1",
  "wasmtime",
- "wasmtime-wasi",
- "wasmtime-wasi-http",
  "wat",
  "wit-component 0.224.1",
  "wit-parser 0.224.1",

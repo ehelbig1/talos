@@ -3,8 +3,8 @@ mod test_helpers;
 use controller::registry::{ModuleRegistry, WasmModule};
 use serde_json::json;
 use sqlx::{Pool, Postgres};
+use talos_worker_runtime::CapabilityWorld;
 use uuid::Uuid;
-use worker::CapabilityWorld;
 
 async fn setup_registry() -> (ModuleRegistry, Pool<Postgres>) {
     let db_pool = test_helpers::get_test_db_pool().await;

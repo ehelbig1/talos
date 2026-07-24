@@ -146,7 +146,7 @@ dotenvy = "0.15"
 petgraph = "0.6"
 futures = "0.3"
 async-trait = "0.1"  # Only needed for dyn-compatible async traits (JobHandler)
-worker = { path = "../worker" }
+talos-worker-runtime = { path = "../talos-worker-runtime" }
 rand = { version = "0.8", default-features = true, features = ["std"] }
 anyhow = "1.0"
 # Logging dependencies

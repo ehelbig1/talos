@@ -1,35 +1,21 @@
-//! Talos worker library exposing the runtime and host implementations.
+//! Thin re-export shim over [`talos_worker_runtime`].
 //!
-//! The `worker` binary (`main.rs`) consumes this library crate (`use
-//! worker::…`) rather than re-declaring the same modules — one module
-//! tree, compiled once.
+//! The worker's library half (the entire wasmtime WASM host: runtime,
+//! context, host/ modules, module_fetcher, sql_validator, wit_inspector, …)
+//! moved to the `talos-worker-runtime` workspace crate in July 2026 so
+//! controller-side consumers depend on a library crate instead of this
+//! deployable binary. This shim keeps `worker::…` paths resolving for the
+//! bin (`main.rs`), the integration tests, and anything not yet migrated —
+//! same pattern as the `controller/src/*` re-export shims.
+//!
+//! Only genuinely bin-only modules remain declared here:
+//! `metrics_server` (worker-process Prometheus endpoint), `secret_claim`
+//! (worker-side envelope-seal claim client), and `self_register`
+//! (boot-time worker-identity registration). New runtime logic goes in
+//! `talos-worker-runtime`, not here.
 
-pub mod audit;
-pub mod bindings;
-pub mod circuit_breaker;
-pub mod context;
-pub mod error_sanitize;
-pub mod expose_fallback;
-pub mod host;
-pub mod host_impl;
-pub mod job_idempotency;
-pub mod job_span;
-pub mod metrics;
+pub use talos_worker_runtime::*;
+
 pub mod metrics_server;
-pub mod module_fetcher;
-pub mod runtime;
-pub mod s3_signer;
 pub mod secret_claim;
 pub mod self_register;
-pub mod sql_validator;
-pub mod ssrf_resolver;
-pub mod trace_nats;
-pub mod tracing;
-pub mod wit_inspector;
-pub mod worker_identity;
-
-pub use runtime::TalosRuntime;
-pub use wit_inspector::{
-    inspect_component, validate_capability_level, CapabilityWorld, ComponentInspection,
-};
-pub use worker_identity::worker_identity;
