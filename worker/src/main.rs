@@ -1298,6 +1298,11 @@ async fn execute_pipeline_job(
                 integration_name: step.integration_name.clone(),
             },
             user_id: Some(req.user_id),
+            // Per-step in-worker retry policy (2026-07-24). HMAC-bound via
+            // the pipeline signing payload's conditional `:retries=` segment,
+            // so these values are verified before we reach here.
+            max_retries: step.max_retries,
+            retry_backoff_ms: step.retry_backoff_ms,
         });
     }
 

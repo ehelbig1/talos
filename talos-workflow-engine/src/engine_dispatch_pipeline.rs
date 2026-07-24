@@ -316,12 +316,55 @@ impl ParallelWorkflowEngine {
                 max_llm_tier: self.max_llm_tier,
                 max_write_ceiling: self.max_write_ceiling,
                 egress_scope: self.egress_scope,
-                max_retries: 0,
-                backoff_ms: 0,
+                // Per-step retry policy (2026-07-24): pipelines previously
+                // hardcoded 0 here, so a chain step NEVER retried an
+                // application failure — the chain-level `dispatch_with_retry`
+                // only covers transport errors. Now each step carries its own
+                // node policy (method-aware default when absent), executed
+                // IN-WORKER by the pipeline step loop under the transient
+                // classifier. Steps whose policy carries a Rhai
+                // retry_condition / retry_delay_expression fall back to 0:
+                // the worker cannot evaluate expressions, and silently
+                // ignoring a user's retry-blocking condition would re-fire
+                // nodes the user explicitly gated (those nodes still honor
+                // their full policy on the single-node dispatch path).
+                max_retries: {
+                    let step_policy = self
+                        .node_meta
+                        .get(&step_node_id)
+                        .and_then(|(_, rp, _)| rp.clone());
+                    match step_policy {
+                        Some(p)
+                            if p.retry_condition.is_some()
+                                || p.retry_delay_expression.is_some() =>
+                        {
+                            tracing::debug!(
+                                %step_node_id,
+                                "pipeline step has an expression-gated retry policy; \
+                                 in-worker step retries disabled for this step \
+                                 (expressions are controller-side only)"
+                            );
+                            0
+                        }
+                        Some(p) => p.max_retries,
+                        None => talos_workflow_engine_core::default_max_retries_for_module(
+                            artifact
+                                .as_ref()
+                                .map(|a| a.allowed_methods.as_slice())
+                                .unwrap_or(&[]),
+                            artifact.as_ref().map(|a| a.capability_world.as_str()),
+                        ),
+                    }
+                },
+                backoff_ms: self
+                    .node_meta
+                    .get(&step_node_id)
+                    .and_then(|(_, rp, _)| rp.as_ref().map(|p| p.backoff_ms))
+                    .unwrap_or(500),
                 retry_condition: None,
                 retry_delay_expr: None,
-                // Chain-level retry emits under the chain's aggregate
-                // policy, not per-step.
+                // Chain-level retry events are not emitted per-step; the
+                // worker logs per-attempt retries into the step's module log.
                 emit_retry_events: false,
             });
         }

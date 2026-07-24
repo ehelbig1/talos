@@ -70,6 +70,8 @@ fn make_pipeline_step() -> PipelineStep {
         cancellation_token: None,
         expected_wasm_hash: None,
         integration_name: None,
+        max_retries: 0,
+        retry_backoff_ms: 0,
     }
 }
 

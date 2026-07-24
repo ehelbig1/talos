@@ -1182,6 +1182,14 @@ impl NodeDispatcher for NatsNodeDispatcher {
                 cancellation_token: None,
                 expected_wasm_hash: job.expected_wasm_hash.clone(),
                 integration_name: job.integration_name.clone(),
+                // Per-step retry policy (2026-07-24): executed IN-WORKER by
+                // the pipeline step loop, gated by the worker's transient
+                // classifier. The engine stamps these from each step node's
+                // own retry policy (method-aware default when absent) — see
+                // `engine_dispatch_pipeline`. HMAC-bound via the
+                // conditional `:retries=` signing segment.
+                max_retries: job.max_retries,
+                retry_backoff_ms: job.backoff_ms,
             })
             .collect();
 

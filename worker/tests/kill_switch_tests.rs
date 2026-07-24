@@ -302,6 +302,8 @@ fn pipeline_step(id: &str, bytes: Vec<u8>) -> PipelineStepSpec {
         timeout: Duration::from_secs(10),
         security_policy: SecurityPolicy::default(),
         user_id: None,
+        max_retries: 0,
+        retry_backoff_ms: 0,
     }
 }
 

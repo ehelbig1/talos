@@ -160,6 +160,8 @@ async fn main() -> Result<()> {
             cancellation_token: None,
             integration_name: None,
             expected_wasm_hash: None,
+            max_retries: 0,
+            retry_backoff_ms: 0,
         }],
         signature: vec![],
         job_nonce: String::new(),

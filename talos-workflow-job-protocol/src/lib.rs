@@ -1065,6 +1065,16 @@ fn clear_job_nonce_cache_for_test() {
     }
 }
 
+/// `skip_serializing_if` helpers for zero-default numeric fields —
+/// keeps default-valued wire messages byte-identical to the
+/// pre-field format (the wire-format stability rule).
+fn is_default_u32(v: &u32) -> bool {
+    *v == 0
+}
+fn is_default_u64(v: &u64) -> bool {
+    *v == 0
+}
+
 fn default_priority() -> u8 {
     100
 }
@@ -3478,6 +3488,23 @@ pub struct PipelineStep {
     /// so it's per-step rather than at the pipeline level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integration_name: Option<String>,
+
+    /// Per-step retry ceiling for TRANSIENT application failures,
+    /// executed IN-WORKER by `execute_pipeline`'s step loop (the
+    /// pipeline claims its sealed secrets once per dispatch; in-worker
+    /// step retries reuse the already-claimed material, so no re-claim
+    /// races). 0 = no retries — the historical behavior and the serde
+    /// default, so legacy senders/readers are unaffected. The worker's
+    /// transient-error classifier still gates every retry on top of
+    /// this ceiling (auth/fuel/validation failures never re-run).
+    /// HMAC-bound via the conditional `:retries=` signing segment.
+    #[serde(default, skip_serializing_if = "is_default_u32")]
+    pub max_retries: u32,
+    /// Base backoff between step retry attempts in milliseconds
+    /// (exponential growth + jitter applied by the worker). 0 = use
+    /// the worker's default. Signed alongside `max_retries`.
+    #[serde(default, skip_serializing_if = "is_default_u64")]
+    pub retry_backoff_ms: u64,
 }
 
 /// A pipeline job dispatched by the Controller to a Worker via NATS.
@@ -3786,6 +3813,27 @@ impl PipelineJobRequest {
                 lp(&paths.join(",")),
                 lp(self.claim_inbox.as_deref().unwrap_or("-")),
             );
+        }
+
+        // Per-step retry policy (2026-07-24) appended AT THE END, ONLY when
+        // any step carries a non-zero value, so all-zero (legacy) pipelines
+        // stay byte-identical. Binding matters in both directions: a
+        // tamperer bumping `max_retries` amplifies side-effect re-fires and
+        // worker load; zeroing it silently strips an operator's declared
+        // resilience. Fixed-width decimals joined per step — no
+        // length-prefix needed for pure numerics.
+        if self
+            .steps
+            .iter()
+            .any(|s| s.max_retries != 0 || s.retry_backoff_ms != 0)
+        {
+            use std::fmt::Write as _;
+            let step_retries: Vec<String> = self
+                .steps
+                .iter()
+                .map(|s| format!("{}|{}", s.max_retries, s.retry_backoff_ms))
+                .collect();
+            let _ = write!(payload, ":retries={}", step_retries.join(";;"));
         }
 
         payload.into_bytes()
@@ -6088,6 +6136,8 @@ mod tests {
             cancellation_token: None,
             expected_wasm_hash: None,
             integration_name: None,
+            max_retries: 0,
+            retry_backoff_ms: 0,
         }
     }
 
