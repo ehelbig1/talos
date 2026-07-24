@@ -86,6 +86,11 @@ impl ParallelWorkflowEngine {
         // `PipelineJobRequest`; an in-process test dispatcher might
         // just loop `dispatch` via `dispatch_chain_sequential`).
         let mut step_jobs: Vec<DispatchJob> = Vec::with_capacity(chain.len());
+        // The chain head's resolved capability world, captured during the step
+        // loop so the actor-context injection below can apply the same
+        // world-aware `needs_memory` default the single-node path uses (a
+        // pure-egress head node doesn't receive injected memory by default).
+        let mut head_capability_world: Option<String> = None;
         for (i, &_step_idx) in chain.iter().enumerate() {
             let step_node_id = chain_node_ids[i];
             let step_module_id = chain_module_ids[i];
@@ -126,6 +131,12 @@ impl ParallelWorkflowEngine {
                 },
                 None => (None, serde_json::json!({})),
             };
+
+            // Capture the head node's capability world for the memory-injection
+            // gate below (see `head_capability_world`).
+            if step_node_id == chain_head_id {
+                head_capability_world = artifact.as_ref().map(|a| a.capability_world.clone());
+            }
 
             // Approval gate (per pipeline step).
             let requires_approval: Vec<String> = artifact
@@ -331,13 +342,26 @@ impl ParallelWorkflowEngine {
                 }
             }
             if let Some(ref ctx) = self.actor_context {
-                // Node-scoped injection keyed on the chain's head node.
-                // OFF → inject as today; ON → only when the head declares
-                // `needs_memory` (default true).
-                if talos_workflow_engine_core::reserved_keys::should_inject_actor_context(
-                    talos_config::smart_memory_context_enabled(),
-                    self.node_needs_memory(chain_head_id),
-                ) {
+                // Node-scoped injection keyed on the chain's head node. OFF →
+                // inject as today; ON → only when the head declares
+                // `needs_memory` — world-aware default (a pure-egress/send head
+                // world defaults to NO memory; explicit `needs_memory: true`
+                // still injects). `head_capability_world` is None only if the
+                // head artifact didn't resolve, in which case we fall back to
+                // the config-only default (treat as memory-consuming) — the
+                // conservative choice.
+                let head_needs_memory = match head_capability_world.as_deref() {
+                    Some(world) => self.node_needs_memory_for_world(chain_head_id, world),
+                    None => self.node_needs_memory(chain_head_id),
+                };
+                // Fleet-wide `ENABLE_ACTOR_CONTEXT_INJECTION` kill-switch is the
+                // outermost gate (off ⇒ no injection anywhere).
+                if talos_config::actor_context_injection_enabled()
+                    && talos_workflow_engine_core::reserved_keys::should_inject_actor_context(
+                        talos_config::smart_memory_context_enabled(),
+                        head_needs_memory,
+                    )
+                {
                     if let Some(obj) = wrapped.as_object_mut() {
                         obj.insert("__actor_context__".to_string(), ctx.clone());
                     }

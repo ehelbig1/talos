@@ -1132,6 +1132,27 @@ impl ParallelWorkflowEngine {
         )
     }
 
+    /// Capability-world-aware variant of [`node_needs_memory`](Self::node_needs_memory).
+    ///
+    /// An EXPLICIT `needs_memory` in node config always wins. When absent, the
+    /// default is `false` for pure-egress/send worlds (http / network /
+    /// messaging — see [`talos_capability_world::world_defaults_no_memory`]) and
+    /// `true` for every other world. This keeps the injected `__actor_context__`
+    /// memory view OUT of the "send" leg of the delivery-node-pattern by default
+    /// — a security default that matters now that a `tier1` actor can be
+    /// `egress=public` (so injected memory could otherwise egress). Call this at
+    /// dispatch, where the node's resolved `capability_world` is known.
+    pub(crate) fn node_needs_memory_for_world(
+        &self,
+        node_id: Uuid,
+        capability_world: &str,
+    ) -> bool {
+        talos_workflow_engine_core::reserved_keys::explicit_needs_memory(
+            self.node_configs.get(&node_id),
+        )
+        .unwrap_or_else(|| !talos_capability_world::world_defaults_no_memory(capability_world))
+    }
+
     /// Per-node metadata: `(module_id, retry_policy, system_kind)`.
     /// `module_id` is `None` for system-only nodes; `system_kind` is
     /// `None` for plain module nodes.

@@ -1031,30 +1031,13 @@ impl WebhookRouter {
                     .await
                 {
                     Ok(aid) => {
-                        let tier = actor_repo
-                            .get_actor_max_llm_tier(aid)
-                            .await
-                            .ok()
-                            .flatten()
-                            .unwrap_or(talos_workflow_job_protocol::LlmTier::Tier2);
-                        // Same shape as the tier: the actor's write ceiling
-                        // travels with the direct-dispatched webhook job.
-                        // Permissive `Write` fallback (grandfathered existing
-                        // actors are `write`) so it's non-breaking.
-                        let write_ceiling = actor_repo
-                            .get_actor_max_write_ceiling(aid)
-                            .await
-                            .ok()
-                            .flatten()
-                            .unwrap_or(talos_workflow_job_protocol::WriteCeiling::Write);
-                        // Egress override travels too; fail OPEN to None
-                        // (tier-derived default) on error.
-                        let egress = actor_repo
-                            .get_actor_egress_scope(aid)
-                            .await
-                            .ok()
-                            .flatten()
-                            .flatten();
+                        // One joined SELECT, fail-OPEN to actor-less Tier-2 on
+                        // any error: the actor's tier + write ceiling + egress
+                        // override all travel with the direct-dispatched webhook
+                        // job (grandfathered existing actors are Tier-2/Write,
+                        // so the fallback is non-breaking).
+                        let (tier, write_ceiling, egress) =
+                            actor_repo.get_module_bound_ceilings(aid).await;
                         (Some(aid), tier, write_ceiling, egress)
                     }
                     Err(e) => {
@@ -2680,24 +2663,11 @@ impl WebhookRouter {
                 let actor_repo = talos_actor_repository::ActorRepository::new(self.db_pool.clone());
                 match actor_repo.resolve_effective_actor(user_id, None).await {
                     Ok(aid) => {
-                        let tier = actor_repo
-                            .get_actor_max_llm_tier(aid)
-                            .await
-                            .ok()
-                            .flatten()
-                            .unwrap_or(talos_workflow_job_protocol::LlmTier::Tier2);
-                        let write_ceiling = actor_repo
-                            .get_actor_max_write_ceiling(aid)
-                            .await
-                            .ok()
-                            .flatten()
-                            .unwrap_or(talos_workflow_job_protocol::WriteCeiling::Write);
-                        let egress = actor_repo
-                            .get_actor_egress_scope(aid)
-                            .await
-                            .ok()
-                            .flatten()
-                            .flatten();
+                        // One joined SELECT, fail-OPEN to actor-less Tier-2 on
+                        // any error (egress override travels so an air-gapped
+                        // actor stays air-gapped).
+                        let (tier, write_ceiling, egress) =
+                            actor_repo.get_module_bound_ceilings(aid).await;
                         (Some(aid), tier, write_ceiling, egress)
                     }
                     Err(e) => {

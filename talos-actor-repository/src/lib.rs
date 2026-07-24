@@ -2345,15 +2345,43 @@ impl ActorRepository {
         // even when the fleet exceeds `limit` — an `ORDER BY id` scan would
         // starve higher-id actors forever. `mark_actors_consolidated` advances
         // the cursor after each tick. `id` is the stable tiebreaker.
-        let rows = sqlx::query(
-            "SELECT id, max_llm_tier FROM actors \
-             WHERE status = 'active' \
-             ORDER BY last_consolidated_at ASC NULLS FIRST, id \
-             LIMIT $1",
-        )
-        .bind(limit)
-        .fetch_all(&self.db_pool)
-        .await?;
+        //
+        // Per-org fairness cap (opt-in): when
+        // `MEMORY_LOOP_MAX_ACTORS_PER_ORG_PER_TICK > 0`, a window ranks each
+        // org's actors by the SAME rotation cursor and keeps only the top N per
+        // org before the global order+LIMIT, so one mega-org can't crowd the
+        // tick. Default (0) runs the historical query verbatim — no window, no
+        // behaviour change for single-org deployments.
+        let per_org_cap = talos_config::memory_loop_max_actors_per_org_per_tick();
+        let rows = if per_org_cap > 0 {
+            sqlx::query(
+                "SELECT id, max_llm_tier FROM ( \
+                   SELECT id, max_llm_tier, last_consolidated_at, \
+                          ROW_NUMBER() OVER ( \
+                            PARTITION BY org_id \
+                            ORDER BY last_consolidated_at ASC NULLS FIRST, id \
+                          ) AS rn \
+                   FROM actors WHERE status = 'active' \
+                 ) ranked \
+                 WHERE rn <= $2 \
+                 ORDER BY last_consolidated_at ASC NULLS FIRST, id \
+                 LIMIT $1",
+            )
+            .bind(limit)
+            .bind(per_org_cap)
+            .fetch_all(&self.db_pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT id, max_llm_tier FROM actors \
+                 WHERE status = 'active' \
+                 ORDER BY last_consolidated_at ASC NULLS FIRST, id \
+                 LIMIT $1",
+            )
+            .bind(limit)
+            .fetch_all(&self.db_pool)
+            .await?
+        };
 
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
@@ -2410,15 +2438,39 @@ impl ActorRepository {
         // ASC NULLS FIRST` guarantees every active actor is eventually reached
         // even when the fleet exceeds `limit`. `mark_actors_reflected` advances
         // the cursor after each tick. `id` is the stable tiebreaker.
-        let rows = sqlx::query(
-            "SELECT id, max_llm_tier FROM actors \
-             WHERE status = 'active' \
-             ORDER BY last_reflected_at ASC NULLS FIRST, id \
-             LIMIT $1",
-        )
-        .bind(limit)
-        .fetch_all(&self.db_pool)
-        .await?;
+        //
+        // Opt-in per-org fairness cap — identical shape to
+        // `scan_actors_for_consolidation` (default 0 = historical query verbatim).
+        let per_org_cap = talos_config::memory_loop_max_actors_per_org_per_tick();
+        let rows = if per_org_cap > 0 {
+            sqlx::query(
+                "SELECT id, max_llm_tier FROM ( \
+                   SELECT id, max_llm_tier, last_reflected_at, \
+                          ROW_NUMBER() OVER ( \
+                            PARTITION BY org_id \
+                            ORDER BY last_reflected_at ASC NULLS FIRST, id \
+                          ) AS rn \
+                   FROM actors WHERE status = 'active' \
+                 ) ranked \
+                 WHERE rn <= $2 \
+                 ORDER BY last_reflected_at ASC NULLS FIRST, id \
+                 LIMIT $1",
+            )
+            .bind(limit)
+            .bind(per_org_cap)
+            .fetch_all(&self.db_pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT id, max_llm_tier FROM actors \
+                 WHERE status = 'active' \
+                 ORDER BY last_reflected_at ASC NULLS FIRST, id \
+                 LIMIT $1",
+            )
+            .bind(limit)
+            .fetch_all(&self.db_pool)
+            .await?
+        };
 
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
@@ -2535,14 +2587,37 @@ impl ActorRepository {
         // `ORDER BY id` scan would train only the lowest-id N forever and leave
         // the rest permanently on global weights. `mark_actors_rank_trained`
         // advances the cursor after each tick. `id` is the stable tiebreaker.
-        let rows = sqlx::query(
-            "SELECT id FROM actors WHERE status = 'active' \
-             ORDER BY last_rank_trained_at ASC NULLS FIRST, id \
-             LIMIT $1",
-        )
-        .bind(limit)
-        .fetch_all(&self.db_pool)
-        .await?;
+        // Opt-in per-org fairness cap — same shape as the consolidation/reflection
+        // scans (default 0 = historical query verbatim).
+        let per_org_cap = talos_config::memory_loop_max_actors_per_org_per_tick();
+        let rows = if per_org_cap > 0 {
+            sqlx::query(
+                "SELECT id FROM ( \
+                   SELECT id, last_rank_trained_at, \
+                          ROW_NUMBER() OVER ( \
+                            PARTITION BY org_id \
+                            ORDER BY last_rank_trained_at ASC NULLS FIRST, id \
+                          ) AS rn \
+                   FROM actors WHERE status = 'active' \
+                 ) ranked \
+                 WHERE rn <= $2 \
+                 ORDER BY last_rank_trained_at ASC NULLS FIRST, id \
+                 LIMIT $1",
+            )
+            .bind(limit)
+            .bind(per_org_cap)
+            .fetch_all(&self.db_pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT id FROM actors WHERE status = 'active' \
+                 ORDER BY last_rank_trained_at ASC NULLS FIRST, id \
+                 LIMIT $1",
+            )
+            .bind(limit)
+            .fetch_all(&self.db_pool)
+            .await?
+        };
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
             // Fail-loud read (checks 52/55): `id` is NOT NULL — a drift errors.
@@ -2678,6 +2753,96 @@ impl ActorRepository {
                 .execute(&self.db_pool)
                 .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Resolve all three per-actor engine ceilings — `max_llm_tier`,
+    /// `max_write_ceiling`, and the nullable `egress_scope` override — in ONE
+    /// row read, so the canonical actor→engine binding
+    /// (`talos_engine::actor_binding::apply_actor_to_engine`) does a single
+    /// round-trip instead of three sequential single-column SELECTs (a
+    /// per-dispatch latency regression a perf review caught). Mirrors
+    /// `WorkflowRepository::get_workflow_actor_ceilings`'s one-JOIN shape.
+    ///
+    /// `Ok(None)` = the actor row does not exist (caller should fail closed —
+    /// a race between an ownership check and dispatch); `Ok(Some(..))` = the
+    /// resolved triple. Every column parses through a fail-closed `from_db_str`
+    /// / `from_db_opt` helper (unknown / malformed → `Tier1` / `ReadOnly` /
+    /// `Local`), so column drift can never widen an actor's authority.
+    /// Read-side schema drift on any column surfaces as an `Err` (never a
+    /// silent default) via `try_get::<Option<_>>?` — the check-52 idiom.
+    pub async fn get_actor_ceilings(
+        &self,
+        actor_id: Uuid,
+    ) -> Result<
+        Option<(
+            talos_workflow_job_protocol::LlmTier,
+            talos_workflow_job_protocol::WriteCeiling,
+            Option<talos_workflow_job_protocol::EgressScope>,
+        )>,
+    > {
+        let row = sqlx::query(
+            "SELECT max_llm_tier, max_write_ceiling, egress_scope FROM actors WHERE id = $1",
+        )
+        .bind(actor_id)
+        .fetch_optional(&self.db_pool)
+        .await?;
+
+        row.map(|r| -> Result<_> {
+            // NULL max_llm_tier / max_write_ceiling → the column default applies
+            // at write time, so a live row should never be NULL here; read as
+            // Option so drift errors rather than silently defaulting, then fail
+            // closed on an unexpected NULL.
+            let tier = talos_workflow_job_protocol::LlmTier::from_db_str(
+                r.try_get::<Option<String>, _>("max_llm_tier")?
+                    .as_deref()
+                    .unwrap_or("tier1"),
+            );
+            let ceiling = talos_workflow_job_protocol::WriteCeiling::from_db_str(
+                r.try_get::<Option<String>, _>("max_write_ceiling")?
+                    .as_deref()
+                    .unwrap_or("readonly"),
+            );
+            let egress = talos_workflow_job_protocol::EgressScope::from_db_opt(
+                r.try_get::<Option<String>, _>("egress_scope")?.as_deref(),
+            );
+            Ok((tier, ceiling, egress))
+        })
+        .transpose()
+    }
+
+    /// FAIL-OPEN ceiling resolution for MODULE-BOUND dispatch paths (gmail /
+    /// google-calendar / google-cloud / webhook push). Collapses the three
+    /// per-axis SELECTs into the single [`Self::get_actor_ceilings`] join, then
+    /// maps any failure to the actor-less **Tier-2** posture
+    /// (`Tier2` / `Write` / no egress override).
+    ///
+    /// This is deliberately the OPPOSITE fail direction from
+    /// `apply_actor_to_engine` (which fails CLOSED to `Tier1` / `ReadOnly` /
+    /// `Local`): a module-bound push carries no owning workflow and a transient
+    /// DB hiccup must never DROP an inbound message — the historical behaviour is
+    /// "dispatch actor-less Tier-2 on any resolution error." The three inline
+    /// `.ok().flatten().unwrap_or(default)` blocks these paths used to run
+    /// (three round-trips) collapse here to one query with identical semantics:
+    /// row present → its real ceilings; row missing OR DB error → the Tier-2
+    /// default triple.
+    pub async fn get_module_bound_ceilings(
+        &self,
+        actor_id: Uuid,
+    ) -> (
+        talos_workflow_job_protocol::LlmTier,
+        talos_workflow_job_protocol::WriteCeiling,
+        Option<talos_workflow_job_protocol::EgressScope>,
+    ) {
+        match self.get_actor_ceilings(actor_id).await {
+            Ok(Some(triple)) => triple,
+            // Missing row or DB error → fail OPEN to actor-less Tier-2 (never
+            // drop an inbound push over a transient hiccup).
+            _ => (
+                talos_workflow_job_protocol::LlmTier::Tier2,
+                talos_workflow_job_protocol::WriteCeiling::Write,
+                None,
+            ),
+        }
     }
 
     /// Fetch only the max_capability_world string for a user (used by user_max_world helper).

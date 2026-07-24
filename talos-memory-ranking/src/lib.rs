@@ -45,6 +45,10 @@ pub use model::{
 };
 pub use recall::recall_semantic_ranked;
 
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
+use std::time::{Duration, Instant};
+
 use sqlx::PgPool;
 use talos_actor_repository::ActorRepository;
 use tokio::sync::watch;
@@ -53,6 +57,54 @@ use uuid::Uuid;
 /// Upper bound on the per-actor training fetch, so one degenerate actor can't
 /// pull an unbounded scan. The Phase-1 query additionally clamps its own limit.
 const TRAINING_FETCH_CAP: i64 = 20_000;
+
+// ── Serving-weights cache (F3) ──────────────────────────────────────────────
+//
+// `load_serving_weights` is called on EVERY grounded recall through the ranker
+// seam. Uncached, each call did one indexed `actors` SELECT (+ built a throwaway
+// `ActorRepository`). Learned weights change only once per training tick (daily
+// by default), so a short-TTL read-through cache turns the steady state into a
+// pure in-memory lookup. Both POSITIVE (learned weights) and NEGATIVE
+// (cold-start `None`) results are cached — cold-start actors would otherwise hit
+// the DB every recall too.
+//
+// Freshness: the training tick calls `invalidate_serving_weights(actor)` right
+// after it writes new weights, so on the writing controller a fresh fit serves
+// IMMEDIATELY. On OTHER controllers in a multi-replica deployment the TTL is the
+// propagation bound (fine for daily-cadence weights). The TTL also bounds entry
+// lifetime for actors whose recall traffic goes quiet.
+//
+// Growth is bounded WITHOUT a background task: an insert that finds the map at
+// or above `SERVING_WEIGHTS_SWEEP_THRESHOLD` first reaps expired entries
+// (read-path eviction handles active actors; this amortized sweep handles ones
+// that went dark), and a hard `SERVING_WEIGHTS_MAX_ENTRIES` backstop clears the
+// map if the live set is still pathologically large (cheap — it self-refills).
+const SERVING_WEIGHTS_TTL: Duration = Duration::from_secs(300);
+const SERVING_WEIGHTS_SWEEP_THRESHOLD: usize = 4_096;
+const SERVING_WEIGHTS_MAX_ENTRIES: usize = 50_000;
+
+struct ServingWeightsEntry {
+    /// `None` = cold-start (no usable learned weights) — cached so cold-start
+    /// actors don't re-hit the DB every recall.
+    value: Option<(talos_memory::actor_context::Weights, f64)>,
+    expires_at: Instant,
+}
+
+fn serving_weights_cache() -> &'static RwLock<HashMap<Uuid, ServingWeightsEntry>> {
+    static CACHE: OnceLock<RwLock<HashMap<Uuid, ServingWeightsEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Drop any cached serving weights for `actor_id` so the next recall re-reads
+/// from the DB. Called by the training tick immediately after it writes new
+/// weights (scoped write-path invalidation — see the cache patterns in
+/// CLAUDE.md). Poison-tolerant: a poisoned lock still yields the map.
+pub fn invalidate_serving_weights(actor_id: Uuid) {
+    serving_weights_cache()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&actor_id);
+}
 
 /// Serving-side load of an actor's learned fused weights, for the ranker seam.
 ///
@@ -67,7 +119,55 @@ const TRAINING_FETCH_CAP: i64 = 20_000;
 ///
 /// Note: this does NOT check `ENABLE_ADAPTIVE_RANK` — the caller gates on the
 /// flag so a flag-off path skips the read entirely.
+///
+/// Backed by a short-TTL process-local cache (see the module constants): a hit
+/// returns without touching the DB; a miss loads via [`load_serving_weights_db`]
+/// and populates the cache. The training tick invalidates on write.
 pub async fn load_serving_weights(
+    pool: &PgPool,
+    actor_id: Uuid,
+) -> Option<(talos_memory::actor_context::Weights, f64)> {
+    // Fast path: cache hit that hasn't expired.
+    {
+        let cache = serving_weights_cache()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = cache.get(&actor_id) {
+            if entry.expires_at > Instant::now() {
+                return entry.value;
+            }
+        }
+    }
+
+    // Miss (or expired): load from DB and populate the cache (positive AND
+    // negative results are cached).
+    let value = load_serving_weights_db(pool, actor_id).await;
+    let entry = ServingWeightsEntry {
+        value,
+        expires_at: Instant::now() + SERVING_WEIGHTS_TTL,
+    };
+    {
+        let mut cache = serving_weights_cache()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Amortized sweep: when the map grows past the threshold, reap expired
+        // entries (handles actors that went dark); if the live set is still
+        // pathological, hard-clear (self-refills). Bounds growth with no task.
+        if cache.len() >= SERVING_WEIGHTS_SWEEP_THRESHOLD {
+            let now = Instant::now();
+            cache.retain(|_, e| e.expires_at > now);
+            if cache.len() >= SERVING_WEIGHTS_MAX_ENTRIES {
+                cache.clear();
+            }
+        }
+        cache.insert(actor_id, entry);
+    }
+    value
+}
+
+/// Uncached DB read of an actor's learned fused weights. See
+/// [`load_serving_weights`] for the contract; this is the miss path.
+async fn load_serving_weights_db(
     pool: &PgPool,
     actor_id: Uuid,
 ) -> Option<(talos_memory::actor_context::Weights, f64)> {
@@ -199,23 +299,36 @@ async fn run_rank_training_tick(pool: &PgPool, actor_repo: &ActorRepository) -> 
                 };
                 // Keyed strictly on `actor_id` — writes ONLY this actor's row.
                 match actor_repo.set_actor_rank_weights(actor_id, &json).await {
-                    Ok(updated) => tracing::info!(
-                        target: "talos_memory_ranking",
-                        %actor_id,
-                        updated,
-                        n_examples = rw.n_examples,
-                        w_relevance = rw.w_relevance,
-                        w_recency = rw.w_recency,
-                        w_importance = rw.w_importance,
-                        w_access = rw.w_access,
-                        "fit per-actor rank weights"
-                    ),
+                    Ok(updated) => {
+                        // Scoped write-path invalidation: drop this actor's
+                        // cached serving weights so the fresh fit serves on the
+                        // very next recall (no waiting out the TTL on the
+                        // writing controller).
+                        invalidate_serving_weights(actor_id);
+                        tracing::info!(
+                            target: "talos_memory_ranking",
+                            %actor_id,
+                            updated,
+                            n_examples = rw.n_examples,
+                            w_relevance = rw.w_relevance,
+                            w_recency = rw.w_recency,
+                            w_importance = rw.w_importance,
+                            w_access = rw.w_access,
+                            "fit per-actor rank weights"
+                        );
+                    }
                     Err(e) => {
                         tracing::warn!(target: "talos_memory_ranking", %actor_id, error = %e, "rank-weights write failed")
                     }
                 }
             }
-            None => tracing::debug!(
+            // INFO (not DEBUG): this per-actor-per-tick line is how an operator
+            // sees WHICH actors aren't learning yet and WHY (too few / one-class
+            // examples). At DEBUG it was invisible under the prod INFO level, so
+            // "training is on but nothing is being learned" looked like silence.
+            // Low-frequency (bounded per tick, daily cadence) — no spam risk,
+            // unlike the per-recall serving-side fallbacks which stay DEBUG.
+            None => tracing::info!(
                 target: "talos_memory_ranking",
                 %actor_id,
                 usable_examples = train.len(),
@@ -231,4 +344,88 @@ async fn run_rank_training_tick(pool: &PgPool, actor_repo: &ActorRepository) -> 
         tracing::warn!(target: "talos_memory_ranking", error = %e, "failed to advance rank-training rotation cursor");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod serving_cache_tests {
+    use super::*;
+
+    fn sample() -> (talos_memory::actor_context::Weights, f64) {
+        (
+            talos_memory::actor_context::Weights {
+                relevance: 0.5,
+                recency: 0.3,
+                importance: 0.2,
+                recency_halflife_days: 30.0,
+            },
+            0.1,
+        )
+    }
+
+    fn insert(
+        actor_id: Uuid,
+        value: Option<(talos_memory::actor_context::Weights, f64)>,
+        ttl: Duration,
+    ) {
+        serving_weights_cache()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                actor_id,
+                ServingWeightsEntry {
+                    value,
+                    expires_at: Instant::now() + ttl,
+                },
+            );
+    }
+
+    fn peek(actor_id: Uuid) -> Option<Option<(talos_memory::actor_context::Weights, f64)>> {
+        let cache = serving_weights_cache()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache
+            .get(&actor_id)
+            .and_then(|e| (e.expires_at > Instant::now()).then_some(e.value))
+    }
+
+    #[test]
+    fn invalidate_removes_cached_entry() {
+        let actor = Uuid::new_v4();
+        insert(actor, Some(sample()), SERVING_WEIGHTS_TTL);
+        assert!(
+            peek(actor).is_some(),
+            "entry should be present before invalidation"
+        );
+        invalidate_serving_weights(actor);
+        assert!(
+            peek(actor).is_none(),
+            "invalidation must drop the entry so the next recall re-reads the DB"
+        );
+    }
+
+    #[test]
+    fn expired_entry_is_not_served() {
+        let actor = Uuid::new_v4();
+        // Already-expired TTL → the read-path freshness check must reject it.
+        insert(actor, Some(sample()), Duration::from_millis(0));
+        assert!(
+            peek(actor).is_none(),
+            "an expired entry must not be served (read-path eviction)"
+        );
+        invalidate_serving_weights(actor);
+    }
+
+    #[test]
+    fn negative_result_is_cacheable() {
+        // Cold-start `None` is cached too, so cold-start actors don't re-hit the
+        // DB every recall.
+        let actor = Uuid::new_v4();
+        insert(actor, None, SERVING_WEIGHTS_TTL);
+        // `Weights` isn't `PartialEq`, so match the shape rather than `assert_eq!`.
+        assert!(
+            matches!(peek(actor), Some(None)),
+            "None must round-trip through the cache (fresh entry, value == None)"
+        );
+        invalidate_serving_weights(actor);
+    }
 }

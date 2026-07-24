@@ -316,7 +316,44 @@ impl ExecutionOrchestrationService {
             .and_then(|b| b.as_bool())
             == Some(false);
         let explicit = inject_memory_context;
-        let should_inject = !opted_out && (explicit || wf_record.actor_id.is_some());
+        // PERF (A1a): the default actor-bound injection assembles the full
+        // per-actor memory view (graph-RAG + several DB round-trips) at trigger
+        // time. Skip that assembly when the graph has NO node that could consume
+        // `__actor_context__` — i.e. EVERY node explicitly set
+        // `needs_memory: false`. Conservative and cheap (walks the
+        // already-parsed `graph_val`, no module lookups): any node without an
+        // explicit `false` is treated as a potential consumer, so we only skip
+        // when the whole graph opted out. An EXPLICIT caller opt-in always
+        // assembles (the caller asked for it). NOTE: this only flips
+        // `should_inject` to false — `inject_actor_context_into_input` still runs
+        // and performs its unconditional reserved-key strip (the A2 spoof
+        // guard); it just returns before the expensive assembly.
+        let graph_may_consume_memory = |graph: Option<&serde_json::Value>| -> bool {
+            let Some(nodes) = graph
+                .and_then(|g| g.get("nodes"))
+                .and_then(|n| n.as_array())
+            else {
+                return true; // unparseable / unknown shape → assemble (conservative)
+            };
+            if nodes.is_empty() {
+                return true;
+            }
+            // May consume unless EVERY node explicitly opted out.
+            nodes.iter().any(|node| {
+                node.get("data")
+                    .and_then(|d| d.get("needs_memory"))
+                    .and_then(|v| v.as_bool())
+                    != Some(false)
+            })
+        };
+        // Fleet-wide kill-switch is the OUTERMOST gate: off ⇒ skip the whole
+        // assembly here (the dispatch chokepoints also refuse injection, so this
+        // is purely to avoid the wasted graph-RAG/DB work on the hot trigger
+        // path). See `talos_config::actor_context_injection_enabled`.
+        let should_inject = talos_config::actor_context_injection_enabled()
+            && !opted_out
+            && (explicit
+                || (wf_record.actor_id.is_some() && graph_may_consume_memory(graph_val.as_ref())));
         let inject_actor = if explicit {
             trigger_agent_id.or(wf_record.actor_id)
         } else {

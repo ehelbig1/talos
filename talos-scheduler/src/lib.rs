@@ -1298,7 +1298,12 @@ async fn run_scheduled_execution(
     // back on scheduled runs must be bound to its own actor
     // (`set_workflow_actor_id`); writes under the Default actor remain
     // reachable via explicit `agent_memory::get/search` calls.
-    let actor_context = if let Some(actor_id) = workflow.actor_id {
+    let actor_context = if !talos_config::actor_context_injection_enabled() {
+        // Fleet-wide kill-switch: skip the graph-RAG/DB assembly entirely (the
+        // dispatch chokepoints refuse injection regardless — this avoids the
+        // wasted lookup on every scheduled fire).
+        None
+    } else if let Some(actor_id) = workflow.actor_id {
         let context_hint = workflow.description.as_deref();
         // Pass `Some(execution_id)` so the smart path records memory-rank
         // PROVENANCE for this scheduled run (which keys were packed + their
