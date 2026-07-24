@@ -30,11 +30,12 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_workflow_graph",
-            "description": "Get a simplified, visual-friendly DAG representation of a workflow. Shows nodes as 'name (module) [world]' and edges as 'source -> target [condition]'.",
+            "description": "Canonical graph-read tool — the `view` parameter selects the output shape. view='graph' (default): a simplified, visual-friendly DAG representation of a workflow. Shows nodes as 'name (module) [world]' and edges as 'source -> target [condition]'. view='topology': structured DAG analysis — longest path length, parallel width, critical path nodes, and bottleneck fan-in points (replaces the deprecated get_workflow_topology). Each view emits the same output its legacy tool produced; the deprecated name still dispatches with a deprecation notice.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workflow_id": { "type": "string", "description": "UUID of the workflow" }
+                    "workflow_id": { "type": "string", "description": "UUID of the workflow" },
+                    "view": { "type": "string", "enum": ["graph", "topology"], "description": "Output shape (default: 'graph'). graph = visual-friendly DAG rendering; topology = structured DAG analysis (longest path, parallel width, critical path, fan-in points)." }
                 },
                 "required": ["workflow_id"]
             }
@@ -98,7 +99,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_workflow_identity",
-            "description": "Author/debug view of a workflow. Returns: name, description, capabilities, intent, declared input_schema, readiness_score (raw), readiness_computed_at, node_count, plus a _see_also block pointing at the dedicated tools for inferred-input-schema (get_workflow_input_schema), readiness-score breakdown (get_readiness_breakdown), and representative output structure (get_node_output on a recent execution). For operational monitoring (execution stats, version history, module deps, schedules) use get_workflow_summary instead.",
+            "description": "Author/debug view of a workflow. Returns: name, description, capabilities, intent, declared input_schema, readiness_score (raw), readiness_computed_at, node_count, plus a _see_also block pointing at the dedicated tools for inferred-input-schema (get_workflow_input_schema), readiness-score breakdown (get_readiness_breakdown), and representative output structure (get_node_output on a recent execution). For operational monitoring (execution stats, version history, module deps, schedules) use get_workflow (view: 'summary') instead.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

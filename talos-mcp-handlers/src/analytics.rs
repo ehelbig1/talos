@@ -178,13 +178,15 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_workflow_dependencies",
-            "description": "List all external dependencies of a workflow: modules, secrets, webhooks, and schedules.",
+            "description": "Canonical dependency-read tool — the `view` parameter selects the output shape. view='list' (default): all external dependencies of one workflow — modules, secrets, webhooks, and schedules (requires workflow_id). view='map': cross-workflow module-dependency map showing which modules are shared across which workflows, across ALL your workflows (no workflow_id needed; replaces the deprecated get_workflow_dependency_map). view='call_tree': the full call tree across sub-workflows — which workflows call which, with circular-reference detection (requires workflow_id; optional max_depth; replaces the deprecated get_workflow_call_tree). Each view emits the same JSON its legacy tool produced; the deprecated names still dispatch with a deprecation notice.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workflow_id": { "type": "string", "description": "UUID of the workflow" }
+                    "view": { "type": "string", "enum": ["list", "map", "call_tree"], "description": "Output shape (default: 'list'). list/call_tree operate on one workflow (workflow_id required); map spans all your workflows (workflow_id ignored)." },
+                    "workflow_id": { "type": "string", "description": "UUID of the workflow (required for views 'list' and 'call_tree'; ignored for 'map')" },
+                    "max_depth": { "type": "number", "description": "view='call_tree' only. Maximum recursion depth (default 3, max 5)" }
                 },
-                "required": ["workflow_id"]
+                "required": []
             }
         }),
         serde_json::json!({
@@ -253,18 +255,6 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
-            "name": "get_workflow_call_tree",
-            "description": "Show the full call tree across sub-workflows — which workflows call which. Detects circular references.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "workflow_id": { "type": "string", "description": "UUID of the root workflow" },
-                    "max_depth": { "type": "number", "description": "Maximum recursion depth (default 3, max 5)" }
-                },
-                "required": ["workflow_id"]
-            }
-        }),
-        serde_json::json!({
             "name": "get_all_workflow_stats",
             "description": "Aggregate dashboard across all workflows. Returns per-workflow stats (total, succeeded, failed, avg duration) for the top 50 most active workflows sorted by failure count.",
             "inputSchema": {
@@ -298,17 +288,6 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
-            "name": "get_workflow_topology",
-            "description": "DAG analysis for a workflow: longest path length, parallel width, critical path nodes, and bottleneck fan-in points.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "workflow_id": { "type": "string", "description": "UUID of the workflow to analyze" }
-                },
-                "required": ["workflow_id"]
-            }
-        }),
-        serde_json::json!({
             "name": "get_node_failure_breakdown",
             "description": "Node-level failure analysis with human-readable labels. Resolves node UUIDs from execution_events back to the workflow graph labels.",
             "inputSchema": {
@@ -318,14 +297,6 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "days": { "type": "number", "description": "Number of days to look back (default: 7, max: 90)" }
                 },
                 "required": ["workflow_id"]
-            }
-        }),
-        serde_json::json!({
-            "name": "get_workflow_dependency_map",
-            "description": "Visualize cross-workflow module dependencies. Shows which modules are shared across which workflows.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {}
             }
         }),
         serde_json::json!({
@@ -549,7 +520,15 @@ pub async fn dispatch(
             Some(handle_list_workflow_triggers(req_id, args, state, user_id).await)
         }
         "get_workflow_call_tree" => {
-            Some(handle_get_workflow_call_tree(req_id, args, state, user_id).await)
+            // Deprecated alias (2026-07 consolidation) — identical output to
+            // get_workflow_dependencies view='call_tree', with a deprecation
+            // notice injected. Removed from tool_schemas; dispatch-only.
+            let resp = handle_get_workflow_call_tree(req_id.clone(), args, state, user_id).await;
+            Some(crate::actor::inject_deprecation_pub(
+                resp,
+                "get_workflow_call_tree",
+                "get_workflow_dependencies (view: 'call_tree')",
+            ))
         }
         "get_all_workflow_stats" => {
             Some(handle_get_all_workflow_stats(req_id, args, state, user_id).await)
@@ -559,13 +538,30 @@ pub async fn dispatch(
             Some(handle_suggest_retry_config(req_id, args, state, user_id).await)
         }
         "get_workflow_topology" => {
-            Some(handle_get_workflow_topology(req_id, args, state, user_id).await)
+            // Deprecated alias (2026-07 consolidation) — identical output to
+            // get_workflow_graph view='topology', with a deprecation notice
+            // injected. Removed from tool_schemas; dispatch-only.
+            let resp = handle_get_workflow_topology(req_id.clone(), args, state, user_id).await;
+            Some(crate::actor::inject_deprecation_pub(
+                resp,
+                "get_workflow_topology",
+                "get_workflow_graph (view: 'topology')",
+            ))
         }
         "get_node_failure_breakdown" => {
             Some(handle_get_node_failure_breakdown(req_id, args, state, user_id).await)
         }
         "get_workflow_dependency_map" => {
-            Some(handle_get_workflow_dependency_map(req_id, args, state, user_id).await)
+            // Deprecated alias (2026-07 consolidation) — identical output to
+            // get_workflow_dependencies view='map', with a deprecation notice
+            // injected. Removed from tool_schemas; dispatch-only.
+            let resp =
+                handle_get_workflow_dependency_map(req_id.clone(), args, state, user_id).await;
+            Some(crate::actor::inject_deprecation_pub(
+                resp,
+                "get_workflow_dependency_map",
+                "get_workflow_dependencies (view: 'map')",
+            ))
         }
         "get_workflow_performance_report" => {
             Some(handle_get_workflow_performance_report(req_id, args, state, user_id).await)
@@ -944,7 +940,73 @@ mod health_dashboard_summary_tests {
     }
 }
 
+/// The three output shapes of the consolidated `get_workflow_dependencies`
+/// tool (2026-07 workflow-read consolidation). `List` is the historical
+/// `get_workflow_dependencies` body; the other two emit JSON byte-identical
+/// to the deprecated tools they absorbed (`get_workflow_dependency_map` /
+/// `get_workflow_call_tree`, still dispatchable as aliases).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DependencyView {
+    List,
+    Map,
+    CallTree,
+}
+
+/// Parse the optional `view` argument. Absent / null → `List`
+/// (back-compat: pre-consolidation calls carry no `view`). Unknown values
+/// and wrong types reject loudly (-32602 at the handler) with the valid
+/// list + per-view argument hints — never silently default.
+fn parse_dependency_view(args: &serde_json::Value) -> Result<DependencyView, String> {
+    match args.get("view") {
+        None | Some(serde_json::Value::Null) => Ok(DependencyView::List),
+        Some(serde_json::Value::String(s)) => match s.as_str() {
+            "list" => Ok(DependencyView::List),
+            "map" => Ok(DependencyView::Map),
+            "call_tree" => Ok(DependencyView::CallTree),
+            other => Err(format!(
+                "Invalid 'view' value '{other}': must be one of 'list', 'map', \
+                 'call_tree'. list (default) shows one workflow's external \
+                 dependencies — modules, secrets, webhooks, schedules \
+                 (workflow_id required); map shows cross-workflow module sharing \
+                 across ALL your workflows (workflow_id ignored); call_tree walks \
+                 sub-workflow calls from a root workflow (workflow_id required, \
+                 optional max_depth 1-5)."
+            )),
+        },
+        Some(v) => Err(format!(
+            "'view' must be a string, got {}",
+            crate::utils::json_type_name(v)
+        )),
+    }
+}
+
+/// Canonical dependency-read entry point: route on `view` to the
+/// shape-specific implementation. Each implementation's output is
+/// byte-identical to the tool it previously backed.
 async fn handle_get_workflow_dependencies(
+    req_id: Option<serde_json::Value>,
+    args: &serde_json::Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let view = match parse_dependency_view(args) {
+        Ok(v) => v,
+        Err(msg) => return mcp_error(req_id, -32602, &msg),
+    };
+    match view {
+        DependencyView::List => {
+            handle_get_workflow_dependencies_list(req_id, args, state, user_id).await
+        }
+        DependencyView::Map => {
+            handle_get_workflow_dependency_map(req_id, args, state, user_id).await
+        }
+        DependencyView::CallTree => {
+            handle_get_workflow_call_tree(req_id, args, state, user_id).await
+        }
+    }
+}
+
+async fn handle_get_workflow_dependencies_list(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
     state: &McpState,
@@ -3186,7 +3248,9 @@ async fn handle_suggest_retry_config(
     )
 }
 
-async fn handle_get_workflow_topology(
+/// `pub(crate)`: also the view='topology' arm of the consolidated
+/// `get_workflow_graph` tool (dispatched from `configuration.rs`).
+pub(crate) async fn handle_get_workflow_topology(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
     state: &McpState,
@@ -6145,5 +6209,66 @@ mod readiness_classification_tests {
                 ts
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod dependency_view_tests {
+    use super::{parse_dependency_view, DependencyView};
+    use serde_json::json;
+
+    #[test]
+    fn absent_view_defaults_to_list() {
+        // Back-compat: every pre-consolidation get_workflow_dependencies
+        // call carries no `view` and must keep producing the per-workflow
+        // dependency list.
+        assert_eq!(
+            parse_dependency_view(&json!({"workflow_id": "x"})),
+            Ok(DependencyView::List)
+        );
+    }
+
+    #[test]
+    fn null_view_defaults_to_list() {
+        assert_eq!(
+            parse_dependency_view(&json!({"view": null})),
+            Ok(DependencyView::List)
+        );
+    }
+
+    #[test]
+    fn each_known_view_parses() {
+        for (name, expected) in [
+            ("list", DependencyView::List),
+            ("map", DependencyView::Map),
+            ("call_tree", DependencyView::CallTree),
+        ] {
+            assert_eq!(
+                parse_dependency_view(&json!({ "view": name })),
+                Ok(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_view_is_rejected_with_helpful_message() {
+        let err = parse_dependency_view(&json!({"view": "tree"})).unwrap_err();
+        // The handler maps this Err to -32602; the message must echo the
+        // bad value AND enumerate every valid view with its argument hint.
+        assert!(err.contains("Invalid 'view' value 'tree'"), "{err}");
+        for valid in ["'list'", "'map'", "'call_tree'"] {
+            assert!(err.contains(valid), "message missing {valid}: {err}");
+        }
+        assert!(err.contains("workflow_id"), "{err}");
+        assert!(err.contains("max_depth"), "{err}");
+    }
+
+    #[test]
+    fn wrong_type_view_is_rejected_loudly() {
+        // Direction-class rule (MCP-267 family): a wrong-typed opt-in must
+        // reject, not silently collapse to the default view.
+        let err = parse_dependency_view(&json!({"view": 3})).unwrap_err();
+        assert!(err.contains("'view' must be a string"), "{err}");
+        assert!(err.contains("number"), "{err}");
     }
 }

@@ -229,7 +229,64 @@ async fn handle_test_condition(
     }
 }
 
+/// The two output shapes of the consolidated `get_workflow_graph` tool
+/// (2026-07 workflow-read consolidation). `Graph` is the historical
+/// `get_workflow_graph` body; `Topology` emits JSON byte-identical to
+/// the deprecated `get_workflow_topology` tool it absorbed (still
+/// dispatchable as an alias).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphView {
+    Graph,
+    Topology,
+}
+
+/// Parse the optional `view` argument. Absent / null → `Graph`
+/// (back-compat: pre-consolidation calls carry no `view`). Unknown values
+/// and wrong types reject loudly (-32602 at the handler) with the valid
+/// list + per-view argument hints — never silently default.
+fn parse_graph_view(args: &serde_json::Value) -> Result<GraphView, String> {
+    match args.get("view") {
+        None | Some(serde_json::Value::Null) => Ok(GraphView::Graph),
+        Some(serde_json::Value::String(s)) => match s.as_str() {
+            "graph" => Ok(GraphView::Graph),
+            "topology" => Ok(GraphView::Topology),
+            other => Err(format!(
+                "Invalid 'view' value '{other}': must be one of 'graph', 'topology'. \
+                 Both views take workflow_id. graph (default) returns the \
+                 visual-friendly DAG rendering (nodes, edges, ASCII graph); \
+                 topology returns structured DAG analysis (longest path, parallel \
+                 width, critical path, fan-in points)."
+            )),
+        },
+        Some(v) => Err(format!(
+            "'view' must be a string, got {}",
+            crate::utils::json_type_name(v)
+        )),
+    }
+}
+
+/// Canonical graph-read entry point: route on `view` to the
+/// shape-specific implementation. Each implementation's output is
+/// byte-identical to the tool it previously backed.
 async fn handle_get_workflow_graph(
+    req_id: Option<serde_json::Value>,
+    args: &serde_json::Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let view = match parse_graph_view(args) {
+        Ok(v) => v,
+        Err(msg) => return mcp_error(req_id, -32602, &msg),
+    };
+    match view {
+        GraphView::Graph => handle_get_workflow_graph_render(req_id, args, state, user_id).await,
+        GraphView::Topology => {
+            crate::analytics::handle_get_workflow_topology(req_id, args, state, user_id).await
+        }
+    }
+}
+
+async fn handle_get_workflow_graph_render(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
     state: &McpState,
@@ -1004,5 +1061,60 @@ async fn handle_get_workflow_identity(
             tracing::error!(workflow_id = %wf_id, "get_workflow_identity failed: {:#}", e);
             mcp_error(req_id, -32000, "Failed to load workflow identity")
         }
+    }
+}
+
+#[cfg(test)]
+mod graph_view_tests {
+    use super::{parse_graph_view, GraphView};
+    use serde_json::json;
+
+    #[test]
+    fn absent_view_defaults_to_graph() {
+        // Back-compat: every pre-consolidation get_workflow_graph call
+        // carries no `view` and must keep producing the DAG rendering.
+        assert_eq!(
+            parse_graph_view(&json!({"workflow_id": "x"})),
+            Ok(GraphView::Graph)
+        );
+    }
+
+    #[test]
+    fn null_view_defaults_to_graph() {
+        assert_eq!(
+            parse_graph_view(&json!({"view": null})),
+            Ok(GraphView::Graph)
+        );
+    }
+
+    #[test]
+    fn each_known_view_parses() {
+        for (name, expected) in [
+            ("graph", GraphView::Graph),
+            ("topology", GraphView::Topology),
+        ] {
+            assert_eq!(parse_graph_view(&json!({ "view": name })), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn unknown_view_is_rejected_with_helpful_message() {
+        let err = parse_graph_view(&json!({"view": "summary"})).unwrap_err();
+        // The handler maps this Err to -32602; the message must echo the
+        // bad value AND enumerate every valid view with its argument hint.
+        assert!(err.contains("Invalid 'view' value 'summary'"), "{err}");
+        for valid in ["'graph'", "'topology'"] {
+            assert!(err.contains(valid), "message missing {valid}: {err}");
+        }
+        assert!(err.contains("workflow_id"), "{err}");
+    }
+
+    #[test]
+    fn wrong_type_view_is_rejected_loudly() {
+        // Direction-class rule (MCP-267 family): a wrong-typed opt-in must
+        // reject, not silently collapse to the default view.
+        let err = parse_graph_view(&json!({"view": 3})).unwrap_err();
+        assert!(err.contains("'view' must be a string"), "{err}");
+        assert!(err.contains("number"), "{err}");
     }
 }
