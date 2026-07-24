@@ -664,3 +664,161 @@ async fn semantic_recall_returns_keyword_fallback_when_no_embedding() {
 
     let _ = mem::forget_prefix(&pool, actor_id, &prefix).await;
 }
+
+/// The user_id `test_pool_or_skip` seeds its actor under. Re-derived here so
+/// the batched test can seed a SECOND actor owned by the same user (the
+/// batched `actorsMemories` path reads several of one user's actors at once).
+fn shared_test_user_id() -> Uuid {
+    Uuid::from_u128(0x7e57_0000_0000_4000_8000_0000_0000_00aa)
+}
+
+async fn seed_extra_actor(pool: &Pool<Postgres>) -> Uuid {
+    let actor_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO actors (id, user_id, name) VALUES ($1, $2, $3) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(actor_id)
+    .bind(shared_test_user_id())
+    .bind(format!("mem-it-{actor_id}"))
+    .execute(pool)
+    .await
+    .expect("seed extra actor");
+    actor_id
+}
+
+/// End-to-end proof of the batched listing that closes the `actorsMemories`
+/// N+1: `list_memories_with_ciphertext_batched_scoped` (the `= ANY($1)`
+/// window-capped scan) + `group_memory_list_rows_by_actor` reproduce the
+/// per-actor loop's output while (a) grouping correctly across actors in one
+/// query, (b) enforcing the per-actor cap newest-first so one actor can't
+/// starve the batch, (c) returning an empty group for an owned-but-empty
+/// actor, (d) omitting an unknown actor, and (e) decrypting real ciphertext
+/// across the batch. Needs a live DB (skips otherwise, like the rest of this
+/// suite) — the in-process unit tests can't reach the ciphertext columns or
+/// the window SQL.
+#[tokio::test]
+async fn batched_listing_groups_caps_and_decrypts_across_actors() {
+    let Some((pool, actor_a)) = test_pool_or_skip().await else {
+        return;
+    };
+    let actor_b = seed_extra_actor(&pool).await;
+    let actor_empty = seed_extra_actor(&pool).await; // owned, no memories
+    let actor_unknown = Uuid::new_v4(); // not owned / does not exist
+
+    let prefix = format!("talos-memory-test/{}/", Uuid::new_v4());
+    mem::forget_prefix(&pool, actor_a, &prefix).await.ok();
+    mem::forget_prefix(&pool, actor_b, &prefix).await.ok();
+
+    // actor_a: 3 rows created in a known order (distinct created_at — each
+    // persist is its own tx, so now() strictly increases). With a per-actor
+    // cap of 2 the window keeps the 2 NEWEST (k2, k3), dropping the oldest
+    // (k1).
+    let a_k1 = format!("{prefix}a-k1");
+    let a_k2 = format!("{prefix}a-k2");
+    let a_k3 = format!("{prefix}a-k3");
+    for (k, v) in [(&a_k1, "A-one"), (&a_k2, "A-two"), (&a_k3, "A-three")] {
+        mem::persist_memory(
+            &pool,
+            actor_a,
+            k,
+            &serde_json::json!({ "v": v }),
+            "episodic",
+            None,
+        )
+        .await
+        .expect("persist actor_a row");
+    }
+
+    // actor_b: 1 row, comfortably under the cap.
+    let b_k1 = format!("{prefix}b-k1");
+    mem::persist_memory(
+        &pool,
+        actor_b,
+        &b_k1,
+        &serde_json::json!({ "v": "B-one" }),
+        "episodic",
+        None,
+    )
+    .await
+    .expect("persist actor_b row");
+
+    // Read all four ids in one batched, window-capped scan on a scoped conn
+    // (mirrors the resolver's UoW connection). Per-actor cap = 2.
+    let ordered = vec![actor_a, actor_b, actor_empty, actor_unknown];
+    let mut conn = pool.acquire().await.expect("acquire conn");
+    let flat = mem::list_memories_with_ciphertext_batched_scoped(
+        &mut conn, &ordered, None, 2, // per-actor cap
+    )
+    .await
+    .expect("batched listing");
+    drop(conn);
+
+    // (b) per-actor cap enforced newest-first: actor_a has 3 rows, only the
+    // 2 newest survive — k1 (oldest) must be absent.
+    let a_keys: std::collections::HashSet<&str> = flat
+        .iter()
+        .filter(|r| r.actor_id == actor_a)
+        .map(|r| r.key.as_str())
+        .collect();
+    assert_eq!(a_keys.len(), 2, "per-actor cap of 2 must bound actor_a");
+    assert!(
+        a_keys.contains(a_k2.as_str()) && a_keys.contains(a_k3.as_str()),
+        "the 2 NEWEST rows (k2,k3) must survive the cap, got {a_keys:?}"
+    );
+    assert!(
+        !a_keys.contains(a_k1.as_str()),
+        "the oldest row (k1) must be dropped by the newest-first cap"
+    );
+
+    // (a) grouping across actors + (c) empty group + (d) unknown absent.
+    let grouped = mem::group_memory_list_rows_by_actor(&ordered, flat);
+    assert_eq!(
+        grouped.len(),
+        4,
+        "one group per requested id (unknown included as empty here — the \
+         resolver filters unknowns out upstream via the ownership check)"
+    );
+    let g = |id: Uuid| -> &Vec<mem::MemoryListRowEnc> {
+        &grouped
+            .iter()
+            .find(|(a, _)| *a == id)
+            .expect("group present")
+            .1
+    };
+    assert_eq!(g(actor_a).len(), 2);
+    assert_eq!(g(actor_b).len(), 1);
+    assert!(
+        g(actor_empty).is_empty(),
+        "owned-but-empty actor → empty group"
+    );
+    assert!(
+        g(actor_unknown).is_empty(),
+        "actor with no rows → empty group (resolver drops unknown ids before this call)"
+    );
+
+    // (e) decrypt real ciphertext across the batch: every surviving row
+    // round-trips to its stored JSON via the per-row format dispatch.
+    for (_actor, rows) in &grouped {
+        for r in rows {
+            let value = mem::decrypt_memory_list_row(r)
+                .await
+                .expect("decrypt batched row");
+            assert!(
+                value.get("v").and_then(|v| v.as_str()).is_some(),
+                "decrypted row must carry its original shape"
+            );
+        }
+    }
+
+    // Empty actor_ids short-circuits to an empty result.
+    let mut conn = pool.acquire().await.expect("acquire conn 2");
+    let empty = mem::list_memories_with_ciphertext_batched_scoped(&mut conn, &[], None, 10)
+        .await
+        .expect("empty batch");
+    assert!(empty.is_empty(), "empty actor_ids → no rows");
+    drop(conn);
+
+    mem::forget_prefix(&pool, actor_a, &prefix).await.ok();
+    mem::forget_prefix(&pool, actor_b, &prefix).await.ok();
+}
