@@ -1706,7 +1706,6 @@ dependencies = [
  "talos-auth-types",
  "talos-capability-downgrade",
  "talos-capability-world",
- "talos-circuit-breaker",
  "talos-compilation",
  "talos-config",
  "talos-config-validator",
@@ -1723,7 +1722,6 @@ dependencies = [
  "talos-execution-orchestration",
  "talos-execution-repository",
  "talos-failure-analysis-service",
- "talos-feature-flags",
  "talos-github",
  "talos-github-connect",
  "talos-github-repository",
@@ -7437,15 +7435,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "talos-circuit-breaker"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "talos-compilation"
 version = "0.1.0"
 dependencies = [
@@ -7788,21 +7777,6 @@ dependencies = [
  "talos-execution-repository",
  "talos-workflow-types",
  "thiserror 1.0.69",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "talos-feature-flags"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sqlx",
- "tokio",
  "tracing",
  "uuid",
 ]
@@ -8575,11 +8549,13 @@ dependencies = [
  "serde_json",
  "sqlx",
  "talos-actor-repository",
+ "talos-analytics-repository",
  "talos-execution-repository",
  "talos-memory",
  "talos-ml",
  "talos-ops-alerts-repository",
  "talos-schedule-repo",
+ "talos-text-util",
  "tracing",
  "uuid",
 ]

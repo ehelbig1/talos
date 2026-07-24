@@ -180,7 +180,13 @@ pub fn generate_api_documentation() -> ApiDocumentation {
     // the docs response (`{}/graphql`, etc.). Route through the
     // canonical helper so empty is treated as unset. Same fix shape
     // as MCP-630/631.
-    let base_url = talos_config::get_env("BASE_URL", "http://localhost:3000");
+    // 2026-07-24: switched from a local `get_env("BASE_URL", ":3000")`
+    // read to the canonical `talos_config::get_base_url()` accessor —
+    // the local read had drifted to a `:3000` default while the
+    // canonical default is `:8000` (same variable, two defaults; see
+    // docs/configuration-reference.md "Duplicate / deprecated / drift
+    // pairs"). The accessor also validates the URL shape.
+    let base_url = talos_config::get_base_url();
 
     ApiDocumentation {
         version: env!("CARGO_PKG_VERSION").to_string(),

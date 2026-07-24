@@ -117,7 +117,7 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `TRUSTED_IPS` | none (optional) | controller | IP allowlist | 🔒 |
 | `TRUSTED_PROXY_CIDRS` | `""` | both | Trusted reverse-proxy CIDRs for RFC 7239 client-IP extraction (rate limiting) | 🔒 |
 | `FRONTEND_URL` | `http://localhost:3000` | both | Frontend base for OAuth redirects (validated; open-redirect guard) | 🔒 |
-| `BASE_URL` | `http://localhost:8000` ⚠ (see duplicates) | both | Public API base for webhook/callback URLs (`talos_config::get_base_url`) | 🔒 |
+| `BASE_URL` | `http://localhost:8000` | both | Public API base for webhook/callback URLs (`talos_config::get_base_url`) | 🔒 |
 | `CACHE_ADMIN_USER_IDS` | none | controller | User ids permitted cache-admin operations | 🔒 |
 
 ### RLS / tenancy / RPC posture
@@ -412,7 +412,7 @@ Several default **ON** as of the 2026-07 "Tier 3" learning-loops cutover.
 |---|---|
 | `GOOGLE_CLIENT_ID`/`_SECRET` ← `GMAIL_CLIENT_ID`/`_SECRET` | `GOOGLE_*` is canonical; the `GMAIL_*` spelling is a **legacy fallback** read second (`talos-oauth/src/credentials.rs`). Configure `GOOGLE_*` for new deployments. |
 | `GOOGLE_CLOUD_CLIENT_ID`/`_SECRET` ← `GOOGLE_CLIENT_ID`/`_SECRET` | GCP-specific vars override; generic `GOOGLE_*` is the fallback. Intentional layering, not deprecation. |
-| `BASE_URL` default **drift** | Canonical `talos_config::get_base_url()` defaults to `http://localhost:8000`, but `talos-api-docs` reads `BASE_URL` with default `http://localhost:3000`. Same variable, two defaults — should be normalized to the canonical accessor. |
+| `BASE_URL` default drift | **RESOLVED 2026-07-24**: `talos-api-docs` previously read `BASE_URL` with a drifted `http://localhost:3000` default; it now calls the canonical `talos_config::get_base_url()` accessor (default `http://localhost:8000`, validated). One default everywhere. |
 | `TALOS_BASE_URL` vs `BASE_URL` | Distinct today: `TALOS_BASE_URL` is a platform-status display override (`talos-mcp-handlers`), `BASE_URL` builds real callback/webhook URLs. Confusable naming; prefer `BASE_URL` (via `get_base_url`) for anything functional. |
 | `<VAR>_FILE` / `<VAR>_PREVIOUS` families | Not duplicates — the Docker-secrets and key-rotation patterns: `JWT_SECRET(_FILE)`, `JWT_PRIVATE_KEY(_FILE)`, `JWT_PUBLIC_KEY(_FILE/_PREVIOUS)`, `JWT_ALGORITHM(_PREVIOUS)`, `WORKER_SHARED_KEY(_FILE/_PREVIOUS)`, `TALOS_AOT_HMAC_KEY(_PREVIOUS)`, `TALOS_AUDIT_SIGNING_KEY(_PREVIOUS)`, `TALOS_CONTROLLER_PUBLIC_KEY(_PREVIOUS)`, `TALOS_MASTER_KEY(_FILE)`, `VAULT_*(_FILE)`, `NATS_PASSWORD(_FILE)`. |
 | `TALOS_MAX_CONCURRENT_EXECUTIONS` vs `TALOS_MAX_CONCURRENT_NODES` | Distinct knobs (execution-level vs node-level concurrency) — easily confused, not duplicates. |

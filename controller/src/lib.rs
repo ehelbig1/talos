@@ -26,7 +26,6 @@ pub mod api_keys;
 pub mod atlassian;
 pub mod auth;
 pub mod capability_downgrade;
-pub mod circuit_breaker;
 pub mod compilation;
 pub mod config;
 pub mod cost_attribution;
