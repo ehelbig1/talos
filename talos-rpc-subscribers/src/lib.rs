@@ -24,6 +24,7 @@
 //! unchanged; subjects, caps, reply semantics, and log/metric shapes
 //! preserved byte-for-byte.
 
+mod admission;
 mod kernel;
 use kernel::record_rpc_metric;
 
@@ -54,7 +55,11 @@ const SHARED_NONCE_TTL_SECS: u64 = 120;
 /// The key namespaces on `subject` so a memory-op nonce can't collide with a
 /// graph-search nonce, and on `actor_id` (host-supplied, not guest-controllable)
 /// so the single-use domain matches the signature's binding.
-async fn crossreplica_replay_ok(subject: &str, actor_id: uuid::Uuid, nonce: &str) -> bool {
+pub(crate) async fn crossreplica_replay_ok(
+    subject: &str,
+    actor_id: uuid::Uuid,
+    nonce: &str,
+) -> bool {
     let Some(guard) = talos_replay_guard::shared_replay_guard() else {
         return true;
     };
@@ -69,6 +74,176 @@ async fn crossreplica_replay_ok(subject: &str, actor_id: uuid::Uuid, nonce: &str
         );
     }
     talos_replay_guard::admit(outcome, talos_replay_guard::fail_closed_from_env())
+}
+
+// ============================================================================
+// Admission-gate identities (see `admission.rs` module docs)
+// ============================================================================
+//
+// One `AdmittableRpc` impl per signed-RPC protocol, grouped here so the
+// full (wire subject, signing subject) table is reviewable in one
+// screen. Each impl is pure delegation: `verify_signature` calls the
+// protocol's existing `verify()` in `talos_memory::*_rpc`; the two
+// subject consts are the SAME constants the subscriber's spec and
+// metrics use (pinned by `admission_identity_tests` below).
+
+impl admission::AdmittableRpc for talos_memory::graph_rpc::GraphSearchRequest {
+    const WIRE_SUBJECT: &'static str = talos_memory::graph_rpc::SUBJECT_GRAPH_SEARCH;
+    const SIGNING_SUBJECT: &'static str = talos_memory::graph_rpc::SUBJECT_NAME;
+    fn verify_signature(&self) -> bool {
+        self.verify()
+    }
+    fn actor_id(&self) -> uuid::Uuid {
+        self.actor_id
+    }
+    fn nonce(&self) -> &str {
+        &self.nonce
+    }
+}
+
+impl admission::AdmittableRpc for talos_memory::ml_rpc::MlPredictRequest {
+    const WIRE_SUBJECT: &'static str = talos_memory::ml_rpc::SUBJECT_ML_PREDICT;
+    const SIGNING_SUBJECT: &'static str = talos_memory::ml_rpc::SUBJECT_NAME;
+    fn verify_signature(&self) -> bool {
+        self.verify()
+    }
+    fn actor_id(&self) -> uuid::Uuid {
+        self.actor_id
+    }
+    fn nonce(&self) -> &str {
+        &self.nonce
+    }
+}
+
+impl admission::AdmittableRpc for talos_memory::ml_rpc::MlFewShotRequest {
+    const WIRE_SUBJECT: &'static str = talos_memory::ml_rpc::SUBJECT_ML_FEWSHOT;
+    const SIGNING_SUBJECT: &'static str = talos_memory::ml_rpc::SUBJECT_NAME_FEWSHOT;
+    fn verify_signature(&self) -> bool {
+        self.verify()
+    }
+    fn actor_id(&self) -> uuid::Uuid {
+        self.actor_id
+    }
+    fn nonce(&self) -> &str {
+        &self.nonce
+    }
+}
+
+impl admission::AdmittableRpc for talos_memory::memory_rpc::MemoryRpcRequest {
+    const WIRE_SUBJECT: &'static str = talos_memory::memory_rpc::SUBJECT_MEMORY_OP;
+    const SIGNING_SUBJECT: &'static str = talos_memory::memory_rpc::SUBJECT_NAME;
+    fn verify_signature(&self) -> bool {
+        self.verify()
+    }
+    fn actor_id(&self) -> uuid::Uuid {
+        self.actor_id
+    }
+    fn nonce(&self) -> &str {
+        &self.nonce
+    }
+}
+
+impl admission::AdmittableRpc for talos_memory::database_rpc::DatabaseRpcRequest {
+    const WIRE_SUBJECT: &'static str = talos_memory::database_rpc::SUBJECT_DATABASE_QUERY;
+    const SIGNING_SUBJECT: &'static str = talos_memory::database_rpc::SUBJECT_NAME;
+    fn verify_signature(&self) -> bool {
+        self.verify()
+    }
+    fn actor_id(&self) -> uuid::Uuid {
+        self.actor_id
+    }
+    fn nonce(&self) -> &str {
+        &self.nonce
+    }
+}
+
+impl admission::AdmittableRpc for talos_memory::state_rpc::StateWriteRequest {
+    const WIRE_SUBJECT: &'static str = talos_memory::state_rpc::SUBJECT_STATE_WRITE;
+    const SIGNING_SUBJECT: &'static str = talos_memory::state_rpc::SUBJECT_NAME;
+    fn verify_signature(&self) -> bool {
+        self.verify()
+    }
+    fn actor_id(&self) -> uuid::Uuid {
+        self.actor_id
+    }
+    fn nonce(&self) -> &str {
+        &self.nonce
+    }
+}
+
+impl admission::AdmittableRpc for talos_memory::integration_state_rpc::IntegrationStateRequest {
+    const WIRE_SUBJECT: &'static str =
+        talos_memory::integration_state_rpc::SUBJECT_INTEGRATION_STATE_OP;
+    const SIGNING_SUBJECT: &'static str = talos_memory::integration_state_rpc::SUBJECT_NAME;
+    fn verify_signature(&self) -> bool {
+        self.verify()
+    }
+    fn actor_id(&self) -> uuid::Uuid {
+        self.actor_id
+    }
+    fn nonce(&self) -> &str {
+        &self.nonce
+    }
+}
+
+/// Recover the parsed request in the `Unauthorized`/`Replay` arms of an
+/// admission match. The gate only returns those variants AFTER a
+/// successful parse (a parse failure is `Malformed`), so this re-parse
+/// cannot fail in practice — it exists because [`admission::AdmitError`]
+/// deliberately carries no request data, while the pre-gate rejection
+/// logs/metrics interpolate signed identity fields (`actor_id`,
+/// `execution_id`, `integration_name`). Cost: one extra parse on the
+/// rejection path only. Callers bail without replying on the
+/// unreachable `None` — the same terminal state as a malformed payload
+/// whose reply publish failed.
+fn reparse_for_rejection<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Option<T> {
+    serde_json::from_slice(payload).ok()
+}
+
+#[cfg(test)]
+mod admission_identity_tests {
+    //! Pins each protocol's (wire, signing) subject pair to the exact
+    //! literal the pre-gate call sites passed to
+    //! `crossreplica_replay_ok` / `check_and_record_nonce`. A swapped
+    //! or drifted const would silently split a protocol's replay
+    //! domain; these literals make that a test failure.
+    use crate::admission::AdmittableRpc;
+
+    fn identity<T: AdmittableRpc>() -> (&'static str, &'static str) {
+        (T::WIRE_SUBJECT, T::SIGNING_SUBJECT)
+    }
+
+    #[test]
+    fn wire_and_signing_subjects_match_pre_gate_call_sites() {
+        assert_eq!(
+            identity::<talos_memory::graph_rpc::GraphSearchRequest>(),
+            ("talos.graph.search", "graph_rpc")
+        );
+        assert_eq!(
+            identity::<talos_memory::ml_rpc::MlPredictRequest>(),
+            ("talos.ml.predict", "ml_rpc")
+        );
+        assert_eq!(
+            identity::<talos_memory::ml_rpc::MlFewShotRequest>(),
+            ("talos.ml.fewshot", "ml_fewshot_rpc")
+        );
+        assert_eq!(
+            identity::<talos_memory::memory_rpc::MemoryRpcRequest>(),
+            ("talos.memory.op", "memory_rpc")
+        );
+        assert_eq!(
+            identity::<talos_memory::database_rpc::DatabaseRpcRequest>(),
+            ("talos.database.query", "database_rpc")
+        );
+        assert_eq!(
+            identity::<talos_memory::state_rpc::StateWriteRequest>(),
+            ("talos.state.write", "state_rpc")
+        );
+        assert_eq!(
+            identity::<talos_memory::integration_state_rpc::IntegrationStateRequest>(),
+            ("talos.integration_state.op", "integration_state_rpc")
+        );
+    }
 }
 
 // ============================================================================
@@ -548,9 +723,9 @@ pub fn spawn_graph_rpc_subscriber(
                 None => return,
             };
 
-            let req: GraphSearchRequest = match serde_json::from_slice(&msg.payload) {
-                Ok(r) => r,
-                Err(e) => {
+            let req = match admission::admit_from_bytes::<GraphSearchRequest>(&msg.payload).await {
+                Ok(admitted) => admitted.into_inner(),
+                Err(admission::AdmitError::Malformed(e)) => {
                     let reply = GraphSearchReply {
                         result: Err(GraphRpcError::InvalidInput(format!(
                             "malformed request: {e}"
@@ -571,61 +746,61 @@ pub fn spawn_graph_rpc_subscriber(
                     );
                     return;
                 }
+                Err(admission::AdmitError::Unauthorized) => {
+                    let Some(req) = reparse_for_rejection::<GraphSearchRequest>(&msg.payload)
+                    else {
+                        return;
+                    };
+                    tracing::warn!(
+                        actor_id = %req.actor_id,
+                        "graph-search RPC: HMAC or freshness verification failed"
+                    );
+                    let reply = GraphSearchReply {
+                        result: Err(GraphRpcError::Unauthorized),
+                    };
+                    let _ = nats_client
+                        .publish(
+                            reply_to,
+                            serde_json::to_vec(&reply).unwrap_or_default().into(),
+                        )
+                        .await;
+                    record_rpc_metric(
+                        SUBJECT_GRAPH_SEARCH,
+                        req.actor_id,
+                        "unauthorized",
+                        start.elapsed().as_millis() as u64,
+                        0,
+                    );
+                    return;
+                }
+                Err(admission::AdmitError::Replay) => {
+                    let Some(req) = reparse_for_rejection::<GraphSearchRequest>(&msg.payload)
+                    else {
+                        return;
+                    };
+                    tracing::warn!(
+                        actor_id = %req.actor_id,
+                        "graph-search RPC: nonce replay rejected"
+                    );
+                    let reply = GraphSearchReply {
+                        result: Err(GraphRpcError::Unauthorized),
+                    };
+                    let _ = nats_client
+                        .publish(
+                            reply_to,
+                            serde_json::to_vec(&reply).unwrap_or_default().into(),
+                        )
+                        .await;
+                    record_rpc_metric(
+                        SUBJECT_GRAPH_SEARCH,
+                        req.actor_id,
+                        "replay",
+                        start.elapsed().as_millis() as u64,
+                        0,
+                    );
+                    return;
+                }
             };
-
-            if !req.verify()
-                || !crossreplica_replay_ok(SUBJECT_GRAPH_SEARCH, req.actor_id, &req.nonce).await
-            {
-                tracing::warn!(
-                    actor_id = %req.actor_id,
-                    "graph-search RPC: HMAC or freshness verification failed"
-                );
-                let reply = GraphSearchReply {
-                    result: Err(GraphRpcError::Unauthorized),
-                };
-                let _ = nats_client
-                    .publish(
-                        reply_to,
-                        serde_json::to_vec(&reply).unwrap_or_default().into(),
-                    )
-                    .await;
-                record_rpc_metric(
-                    SUBJECT_GRAPH_SEARCH,
-                    req.actor_id,
-                    "unauthorized",
-                    start.elapsed().as_millis() as u64,
-                    0,
-                );
-                return;
-            }
-
-            if !talos_memory::rpc_auth::check_and_record_nonce(
-                talos_memory::graph_rpc::SUBJECT_NAME,
-                req.actor_id,
-                &req.nonce,
-            ) {
-                tracing::warn!(
-                    actor_id = %req.actor_id,
-                    "graph-search RPC: nonce replay rejected"
-                );
-                let reply = GraphSearchReply {
-                    result: Err(GraphRpcError::Unauthorized),
-                };
-                let _ = nats_client
-                    .publish(
-                        reply_to,
-                        serde_json::to_vec(&reply).unwrap_or_default().into(),
-                    )
-                    .await;
-                record_rpc_metric(
-                    SUBJECT_GRAPH_SEARCH,
-                    req.actor_id,
-                    "replay",
-                    start.elapsed().as_millis() as u64,
-                    0,
-                );
-                return;
-            }
 
             let depth = req.max_depth.min(MAX_DEPTH);
             let limit = req.limit.clamp(1, MAX_LIMIT);
@@ -846,9 +1021,12 @@ pub fn spawn_ml_rpc_subscriber(
                 None => return,
             };
 
-            let req: MlPredictRequest = match serde_json::from_slice(&msg.payload) {
-                Ok(r) => r,
-                Err(_) => {
+            // verify() covers HMAC + freshness + the structural caps
+            // (validate_structure runs inside it), so no separate
+            // size-cap pass is needed here.
+            let req = match admission::admit_from_bytes::<MlPredictRequest>(&msg.payload).await {
+                Ok(admitted) => admitted.into_inner(),
+                Err(admission::AdmitError::Malformed(_)) => {
                     // Generic Invalid — parse detail stays server-side.
                     publish_reply(
                         &nats_client,
@@ -865,58 +1043,53 @@ pub fn spawn_ml_rpc_subscriber(
                     );
                     return;
                 }
+                Err(admission::AdmitError::Unauthorized) => {
+                    let Some(req) = reparse_for_rejection::<MlPredictRequest>(&msg.payload) else {
+                        return;
+                    };
+                    tracing::warn!(
+                        actor_id = %req.actor_id,
+                        "ml-predict RPC: HMAC or freshness verification failed"
+                    );
+                    publish_reply(
+                        &nats_client,
+                        reply_to,
+                        &MlPredictResponse::Err(MlRpcError::Unauthorized),
+                    )
+                    .await;
+                    record_rpc_metric(
+                        SUBJECT_ML_PREDICT,
+                        req.actor_id,
+                        "unauthorized",
+                        start.elapsed().as_millis() as u64,
+                        0,
+                    );
+                    return;
+                }
+                Err(admission::AdmitError::Replay) => {
+                    let Some(req) = reparse_for_rejection::<MlPredictRequest>(&msg.payload) else {
+                        return;
+                    };
+                    tracing::warn!(
+                        actor_id = %req.actor_id,
+                        "ml-predict RPC: nonce replay rejected"
+                    );
+                    publish_reply(
+                        &nats_client,
+                        reply_to,
+                        &MlPredictResponse::Err(MlRpcError::Unauthorized),
+                    )
+                    .await;
+                    record_rpc_metric(
+                        SUBJECT_ML_PREDICT,
+                        req.actor_id,
+                        "replay",
+                        start.elapsed().as_millis() as u64,
+                        0,
+                    );
+                    return;
+                }
             };
-
-            // verify() covers HMAC + freshness + the structural caps
-            // (validate_structure runs inside it), so no separate
-            // size-cap pass is needed here.
-            if !req.verify()
-                || !crossreplica_replay_ok(SUBJECT_ML_PREDICT, req.actor_id, &req.nonce).await
-            {
-                tracing::warn!(
-                    actor_id = %req.actor_id,
-                    "ml-predict RPC: HMAC or freshness verification failed"
-                );
-                publish_reply(
-                    &nats_client,
-                    reply_to,
-                    &MlPredictResponse::Err(MlRpcError::Unauthorized),
-                )
-                .await;
-                record_rpc_metric(
-                    SUBJECT_ML_PREDICT,
-                    req.actor_id,
-                    "unauthorized",
-                    start.elapsed().as_millis() as u64,
-                    0,
-                );
-                return;
-            }
-
-            if !talos_memory::rpc_auth::check_and_record_nonce(
-                talos_memory::ml_rpc::SUBJECT_NAME,
-                req.actor_id,
-                &req.nonce,
-            ) {
-                tracing::warn!(
-                    actor_id = %req.actor_id,
-                    "ml-predict RPC: nonce replay rejected"
-                );
-                publish_reply(
-                    &nats_client,
-                    reply_to,
-                    &MlPredictResponse::Err(MlRpcError::Unauthorized),
-                )
-                .await;
-                record_rpc_metric(
-                    SUBJECT_ML_PREDICT,
-                    req.actor_id,
-                    "replay",
-                    start.elapsed().as_millis() as u64,
-                    0,
-                );
-                return;
-            }
 
             let Some(ctx) = ML_PREDICT_CONTEXT.get() else {
                 publish_reply(
@@ -1120,9 +1293,10 @@ pub fn spawn_ml_fewshot_subscriber(
                 None => return,
             };
 
-            let req: MlFewShotRequest = match serde_json::from_slice(&msg.payload) {
-                Ok(r) => r,
-                Err(_) => {
+            // verify() covers HMAC + freshness + structural caps.
+            let req = match admission::admit_from_bytes::<MlFewShotRequest>(&msg.payload).await {
+                Ok(admitted) => admitted.into_inner(),
+                Err(admission::AdmitError::Malformed(_)) => {
                     publish_reply(
                         &nats_client,
                         reply_to,
@@ -1138,56 +1312,53 @@ pub fn spawn_ml_fewshot_subscriber(
                     );
                     return;
                 }
+                Err(admission::AdmitError::Unauthorized) => {
+                    let Some(req) = reparse_for_rejection::<MlFewShotRequest>(&msg.payload) else {
+                        return;
+                    };
+                    tracing::warn!(
+                        actor_id = %req.actor_id,
+                        "ml-fewshot RPC: HMAC or freshness verification failed"
+                    );
+                    publish_reply(
+                        &nats_client,
+                        reply_to,
+                        &MlFewShotResponse::Err(MlRpcError::Unauthorized),
+                    )
+                    .await;
+                    record_rpc_metric(
+                        SUBJECT_ML_FEWSHOT,
+                        req.actor_id,
+                        "unauthorized",
+                        start.elapsed().as_millis() as u64,
+                        0,
+                    );
+                    return;
+                }
+                Err(admission::AdmitError::Replay) => {
+                    let Some(req) = reparse_for_rejection::<MlFewShotRequest>(&msg.payload) else {
+                        return;
+                    };
+                    tracing::warn!(
+                        actor_id = %req.actor_id,
+                        "ml-fewshot RPC: nonce replay rejected"
+                    );
+                    publish_reply(
+                        &nats_client,
+                        reply_to,
+                        &MlFewShotResponse::Err(MlRpcError::Unauthorized),
+                    )
+                    .await;
+                    record_rpc_metric(
+                        SUBJECT_ML_FEWSHOT,
+                        req.actor_id,
+                        "replay",
+                        start.elapsed().as_millis() as u64,
+                        0,
+                    );
+                    return;
+                }
             };
-
-            // verify() covers HMAC + freshness + structural caps.
-            if !req.verify()
-                || !crossreplica_replay_ok(SUBJECT_ML_FEWSHOT, req.actor_id, &req.nonce).await
-            {
-                tracing::warn!(
-                    actor_id = %req.actor_id,
-                    "ml-fewshot RPC: HMAC or freshness verification failed"
-                );
-                publish_reply(
-                    &nats_client,
-                    reply_to,
-                    &MlFewShotResponse::Err(MlRpcError::Unauthorized),
-                )
-                .await;
-                record_rpc_metric(
-                    SUBJECT_ML_FEWSHOT,
-                    req.actor_id,
-                    "unauthorized",
-                    start.elapsed().as_millis() as u64,
-                    0,
-                );
-                return;
-            }
-
-            if !talos_memory::rpc_auth::check_and_record_nonce(
-                talos_memory::ml_rpc::SUBJECT_NAME_FEWSHOT,
-                req.actor_id,
-                &req.nonce,
-            ) {
-                tracing::warn!(
-                    actor_id = %req.actor_id,
-                    "ml-fewshot RPC: nonce replay rejected"
-                );
-                publish_reply(
-                    &nats_client,
-                    reply_to,
-                    &MlFewShotResponse::Err(MlRpcError::Unauthorized),
-                )
-                .await;
-                record_rpc_metric(
-                    SUBJECT_ML_FEWSHOT,
-                    req.actor_id,
-                    "replay",
-                    start.elapsed().as_millis() as u64,
-                    0,
-                );
-                return;
-            }
 
             let Some(ctx) = ML_PREDICT_CONTEXT.get() else {
                 publish_reply(
@@ -1377,9 +1548,9 @@ pub fn spawn_memory_rpc_subscriber(
                 }
             };
 
-            let req: MemoryRpcRequest = match serde_json::from_slice(&msg.payload) {
-                Ok(r) => r,
-                Err(e) => {
+            let req = match admission::admit_from_bytes::<MemoryRpcRequest>(&msg.payload).await {
+                Ok(admitted) => admitted.into_inner(),
+                Err(admission::AdmitError::Malformed(e)) => {
                     send_err(MemoryRpcError::InvalidInput(format!(
                         "malformed request: {e}"
                     )))
@@ -1393,45 +1564,43 @@ pub fn spawn_memory_rpc_subscriber(
                     );
                     return;
                 }
+                Err(admission::AdmitError::Unauthorized) => {
+                    let Some(req) = reparse_for_rejection::<MemoryRpcRequest>(&msg.payload) else {
+                        return;
+                    };
+                    tracing::warn!(
+                        actor_id = %req.actor_id,
+                        "memory RPC: HMAC or freshness verification failed"
+                    );
+                    send_err(MemoryRpcError::Unauthorized).await;
+                    record_rpc_metric(
+                        SUBJECT_MEMORY_OP,
+                        req.actor_id,
+                        "unauthorized",
+                        start.elapsed().as_millis() as u64,
+                        0,
+                    );
+                    return;
+                }
+                Err(admission::AdmitError::Replay) => {
+                    let Some(req) = reparse_for_rejection::<MemoryRpcRequest>(&msg.payload) else {
+                        return;
+                    };
+                    tracing::warn!(
+                        actor_id = %req.actor_id,
+                        "memory RPC: nonce replay rejected"
+                    );
+                    send_err(MemoryRpcError::Unauthorized).await;
+                    record_rpc_metric(
+                        SUBJECT_MEMORY_OP,
+                        req.actor_id,
+                        "replay",
+                        start.elapsed().as_millis() as u64,
+                        0,
+                    );
+                    return;
+                }
             };
-
-            if !req.verify()
-                || !crossreplica_replay_ok(SUBJECT_MEMORY_OP, req.actor_id, &req.nonce).await
-            {
-                tracing::warn!(
-                    actor_id = %req.actor_id,
-                    "memory RPC: HMAC or freshness verification failed"
-                );
-                send_err(MemoryRpcError::Unauthorized).await;
-                record_rpc_metric(
-                    SUBJECT_MEMORY_OP,
-                    req.actor_id,
-                    "unauthorized",
-                    start.elapsed().as_millis() as u64,
-                    0,
-                );
-                return;
-            }
-
-            if !talos_memory::rpc_auth::check_and_record_nonce(
-                talos_memory::memory_rpc::SUBJECT_NAME,
-                req.actor_id,
-                &req.nonce,
-            ) {
-                tracing::warn!(
-                    actor_id = %req.actor_id,
-                    "memory RPC: nonce replay rejected"
-                );
-                send_err(MemoryRpcError::Unauthorized).await;
-                record_rpc_metric(
-                    SUBJECT_MEMORY_OP,
-                    req.actor_id,
-                    "replay",
-                    start.elapsed().as_millis() as u64,
-                    0,
-                );
-                return;
-            }
 
             let _permit = sem.acquire_owned().await;
             let permit_at = std::time::Instant::now();
@@ -1779,9 +1948,9 @@ pub fn spawn_database_rpc_subscriber(
                 }
             };
 
-            let req: DatabaseRpcRequest = match serde_json::from_slice(&msg.payload) {
-                Ok(r) => r,
-                Err(e) => {
+            let req = match admission::admit_from_bytes::<DatabaseRpcRequest>(&msg.payload).await {
+                Ok(admitted) => admitted.into_inner(),
+                Err(admission::AdmitError::Malformed(e)) => {
                     send(Err(DatabaseRpcError::InvalidQuery(format!(
                         "malformed request: {e}"
                     ))))
@@ -1795,45 +1964,45 @@ pub fn spawn_database_rpc_subscriber(
                     );
                     return;
                 }
+                Err(admission::AdmitError::Unauthorized) => {
+                    let Some(req) = reparse_for_rejection::<DatabaseRpcRequest>(&msg.payload)
+                    else {
+                        return;
+                    };
+                    tracing::warn!(
+                        actor_id = %req.actor_id,
+                        "database RPC: HMAC or freshness verification failed"
+                    );
+                    send(Err(DatabaseRpcError::Unauthorized)).await;
+                    record_rpc_metric(
+                        SUBJECT_DATABASE_QUERY,
+                        req.actor_id,
+                        "unauthorized",
+                        start.elapsed().as_millis() as u64,
+                        0,
+                    );
+                    return;
+                }
+                Err(admission::AdmitError::Replay) => {
+                    let Some(req) = reparse_for_rejection::<DatabaseRpcRequest>(&msg.payload)
+                    else {
+                        return;
+                    };
+                    tracing::warn!(
+                        actor_id = %req.actor_id,
+                        "database RPC: nonce replay rejected"
+                    );
+                    send(Err(DatabaseRpcError::Unauthorized)).await;
+                    record_rpc_metric(
+                        SUBJECT_DATABASE_QUERY,
+                        req.actor_id,
+                        "replay",
+                        start.elapsed().as_millis() as u64,
+                        0,
+                    );
+                    return;
+                }
             };
-
-            if !req.verify()
-                || !crossreplica_replay_ok(SUBJECT_DATABASE_QUERY, req.actor_id, &req.nonce).await
-            {
-                tracing::warn!(
-                    actor_id = %req.actor_id,
-                    "database RPC: HMAC or freshness verification failed"
-                );
-                send(Err(DatabaseRpcError::Unauthorized)).await;
-                record_rpc_metric(
-                    SUBJECT_DATABASE_QUERY,
-                    req.actor_id,
-                    "unauthorized",
-                    start.elapsed().as_millis() as u64,
-                    0,
-                );
-                return;
-            }
-
-            if !talos_memory::rpc_auth::check_and_record_nonce(
-                talos_memory::database_rpc::SUBJECT_NAME,
-                req.actor_id,
-                &req.nonce,
-            ) {
-                tracing::warn!(
-                    actor_id = %req.actor_id,
-                    "database RPC: nonce replay rejected"
-                );
-                send(Err(DatabaseRpcError::Unauthorized)).await;
-                record_rpc_metric(
-                    SUBJECT_DATABASE_QUERY,
-                    req.actor_id,
-                    "replay",
-                    start.elapsed().as_millis() as u64,
-                    0,
-                );
-                return;
-            }
 
             // M-7: controller-side AST re-parse as defense-in-depth.
             //
@@ -2191,9 +2360,9 @@ pub fn spawn_state_write_subscriber(
         let pool = pool.clone();
         async move {
             let start = std::time::Instant::now();
-            let req: StateWriteRequest = match serde_json::from_slice(&msg.payload) {
-                Ok(r) => r,
-                Err(e) => {
+            let req = match admission::admit_from_bytes::<StateWriteRequest>(&msg.payload).await {
+                Ok(admitted) => admitted.into_inner(),
+                Err(admission::AdmitError::Malformed(e)) => {
                     tracing::debug!(error = %e, "state-write: malformed payload dropped");
                     record_rpc_metric(
                         SUBJECT_STATE_WRITE,
@@ -2204,44 +2373,43 @@ pub fn spawn_state_write_subscriber(
                     );
                     return;
                 }
+                Err(admission::AdmitError::Unauthorized) => {
+                    let Some(req) = reparse_for_rejection::<StateWriteRequest>(&msg.payload) else {
+                        return;
+                    };
+                    tracing::warn!(
+                        actor_id = %req.actor_id,
+                        execution_id = %req.execution_id,
+                        "state-write: HMAC or freshness verification failed — request dropped"
+                    );
+                    record_rpc_metric(
+                        SUBJECT_STATE_WRITE,
+                        req.actor_id,
+                        "unauthorized",
+                        start.elapsed().as_millis() as u64,
+                        0,
+                    );
+                    return;
+                }
+                Err(admission::AdmitError::Replay) => {
+                    let Some(req) = reparse_for_rejection::<StateWriteRequest>(&msg.payload) else {
+                        return;
+                    };
+                    tracing::warn!(
+                        actor_id = %req.actor_id,
+                        execution_id = %req.execution_id,
+                        "state-write: nonce replay rejected"
+                    );
+                    record_rpc_metric(
+                        SUBJECT_STATE_WRITE,
+                        req.actor_id,
+                        "replay",
+                        start.elapsed().as_millis() as u64,
+                        0,
+                    );
+                    return;
+                }
             };
-            if !req.verify()
-                || !crossreplica_replay_ok(SUBJECT_STATE_WRITE, req.actor_id, &req.nonce).await
-            {
-                tracing::warn!(
-                    actor_id = %req.actor_id,
-                    execution_id = %req.execution_id,
-                    "state-write: HMAC or freshness verification failed — request dropped"
-                );
-                record_rpc_metric(
-                    SUBJECT_STATE_WRITE,
-                    req.actor_id,
-                    "unauthorized",
-                    start.elapsed().as_millis() as u64,
-                    0,
-                );
-                return;
-            }
-
-            if !talos_memory::rpc_auth::check_and_record_nonce(
-                talos_memory::state_rpc::SUBJECT_NAME,
-                req.actor_id,
-                &req.nonce,
-            ) {
-                tracing::warn!(
-                    actor_id = %req.actor_id,
-                    execution_id = %req.execution_id,
-                    "state-write: nonce replay rejected"
-                );
-                record_rpc_metric(
-                    SUBJECT_STATE_WRITE,
-                    req.actor_id,
-                    "replay",
-                    start.elapsed().as_millis() as u64,
-                    0,
-                );
-                return;
-            }
 
             let _permit = sem.acquire_owned().await;
             let permit_at = std::time::Instant::now();
@@ -2486,9 +2654,11 @@ pub fn spawn_integration_state_subscriber(
                 }
             };
 
-            let req: IntegrationStateRequest = match serde_json::from_slice(&msg.payload) {
-                Ok(r) => r,
-                Err(e) => {
+            let req = match admission::admit_from_bytes::<IntegrationStateRequest>(&msg.payload)
+                .await
+            {
+                Ok(admitted) => admitted.into_inner(),
+                Err(admission::AdmitError::Malformed(e)) => {
                     send_err(IntegrationStateError::InvalidInput(format!(
                         "malformed request: {e}"
                     )))
@@ -2502,48 +2672,47 @@ pub fn spawn_integration_state_subscriber(
                     );
                     return;
                 }
+                Err(admission::AdmitError::Unauthorized) => {
+                    let Some(req) = reparse_for_rejection::<IntegrationStateRequest>(&msg.payload)
+                    else {
+                        return;
+                    };
+                    tracing::warn!(
+                        actor_id = %req.actor_id,
+                        integration = %req.integration_name,
+                        "integration-state RPC: HMAC or freshness verification failed"
+                    );
+                    send_err(IntegrationStateError::Unauthorized).await;
+                    record_rpc_metric(
+                        SUBJECT_INTEGRATION_STATE_OP,
+                        req.actor_id,
+                        "unauthorized",
+                        start.elapsed().as_millis() as u64,
+                        0,
+                    );
+                    return;
+                }
+                Err(admission::AdmitError::Replay) => {
+                    let Some(req) = reparse_for_rejection::<IntegrationStateRequest>(&msg.payload)
+                    else {
+                        return;
+                    };
+                    tracing::warn!(
+                        actor_id = %req.actor_id,
+                        integration = %req.integration_name,
+                        "integration-state RPC: nonce replay rejected"
+                    );
+                    send_err(IntegrationStateError::Unauthorized).await;
+                    record_rpc_metric(
+                        SUBJECT_INTEGRATION_STATE_OP,
+                        req.actor_id,
+                        "replay",
+                        start.elapsed().as_millis() as u64,
+                        0,
+                    );
+                    return;
+                }
             };
-
-            if !req.verify()
-                || !crossreplica_replay_ok(SUBJECT_INTEGRATION_STATE_OP, req.actor_id, &req.nonce)
-                    .await
-            {
-                tracing::warn!(
-                    actor_id = %req.actor_id,
-                    integration = %req.integration_name,
-                    "integration-state RPC: HMAC or freshness verification failed"
-                );
-                send_err(IntegrationStateError::Unauthorized).await;
-                record_rpc_metric(
-                    SUBJECT_INTEGRATION_STATE_OP,
-                    req.actor_id,
-                    "unauthorized",
-                    start.elapsed().as_millis() as u64,
-                    0,
-                );
-                return;
-            }
-
-            if !talos_memory::rpc_auth::check_and_record_nonce(
-                talos_memory::integration_state_rpc::SUBJECT_NAME,
-                req.actor_id,
-                &req.nonce,
-            ) {
-                tracing::warn!(
-                    actor_id = %req.actor_id,
-                    integration = %req.integration_name,
-                    "integration-state RPC: nonce replay rejected"
-                );
-                send_err(IntegrationStateError::Unauthorized).await;
-                record_rpc_metric(
-                    SUBJECT_INTEGRATION_STATE_OP,
-                    req.actor_id,
-                    "replay",
-                    start.elapsed().as_millis() as u64,
-                    0,
-                );
-                return;
-            }
 
             let _permit = sem.acquire_owned().await;
             let permit_at = std::time::Instant::now();

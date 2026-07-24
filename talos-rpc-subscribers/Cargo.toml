@@ -10,6 +10,7 @@ publish.workspace = true
 anyhow.workspace = true
 async-nats = "0.47"
 futures = "0.3"
+serde.workspace = true
 serde_json.workspace = true
 # M-7: AST-based SQL validation re-applied at the controller boundary
 # as defense-in-depth against worker↔Postgres parser-divergence. Same
