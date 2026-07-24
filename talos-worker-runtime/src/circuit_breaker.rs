@@ -384,6 +384,32 @@ impl HttpCircuitBreaker {
         }
     }
 
+    /// Read-only peek: is the circuit for `host` currently OPEN and
+    /// still within its cooldown window?
+    ///
+    /// Distinct from [`Self::allow_request`], which MUTATES (drives the
+    /// Open→HalfOpen transition and the half-open test-token accounting).
+    /// `is_open` never mutates — it is the retry-decision gate: when a
+    /// host's circuit is OPEN and cooling down, in-worker retries against
+    /// it are pointless (the outage is sustained), so the retry loop
+    /// short-circuits and fails fast instead of burning its budget on a
+    /// host we already know is down.
+    ///
+    /// Returns `false` once the cooldown has elapsed (the circuit is
+    /// ready for a half-open trial) so the next real request still gets
+    /// its single probe via `allow_request`, and `false` for a host with
+    /// no record or a Closed/HalfOpen circuit.
+    pub fn is_open(&self, host: &str) -> bool {
+        self.records
+            .get(host)
+            .map(|r| {
+                r.state == CircuitState::Open
+                    && Instant::now().duration_since(r.last_state_change)
+                        < self.config.open_duration
+            })
+            .unwrap_or(false)
+    }
+
     /// Get the current state of a circuit breaker for a host (for debugging/metrics).
     pub fn get_state(&self, host: &str) -> Option<String> {
         self.records.get(host).map(|r| match r.state {
@@ -492,6 +518,70 @@ mod tests {
 
         // Circuit should now be closed
         assert_eq!(cb.get_state(host), Some("closed".to_string()));
+    }
+
+    #[test]
+    fn is_open_false_when_closed_or_unknown() {
+        let cb = HttpCircuitBreaker::default();
+        // Never-seen host has no record.
+        assert!(!cb.is_open("unseen.example.com"));
+        // A host with sub-threshold failures stays Closed → not open.
+        let host = "example.com";
+        cb.record_failure(host);
+        assert!(!cb.is_open(host), "one failure must not open the circuit");
+    }
+
+    #[test]
+    fn is_open_true_within_cooldown_then_false_after() {
+        let config = CircuitBreakerConfig {
+            open_duration: Duration::from_millis(30),
+            ..Default::default()
+        };
+        let cb = HttpCircuitBreaker::new(config);
+        let host = "down.example.com";
+
+        // Trip the circuit (default threshold = 5).
+        for _ in 0..5 {
+            cb.record_failure(host);
+        }
+        // Within cooldown: is_open reports true and — crucially — does
+        // NOT mutate state (unlike allow_request, which would transition
+        // to HalfOpen once the cooldown elapses).
+        assert!(cb.is_open(host));
+        assert!(
+            cb.is_open(host),
+            "is_open must be idempotent / non-mutating"
+        );
+        assert_eq!(cb.get_state(host), Some("open".to_string()));
+
+        // After the cooldown elapses, is_open reports false so the next
+        // real request can take its half-open trial via allow_request.
+        std::thread::sleep(Duration::from_millis(45));
+        assert!(
+            !cb.is_open(host),
+            "past cooldown the breaker must permit a half-open trial"
+        );
+        // State is still Open until allow_request is called (is_open is a
+        // pure peek), but the retry gate keys on is_open, not raw state.
+        assert_eq!(cb.get_state(host), Some("open".to_string()));
+    }
+
+    #[test]
+    fn is_open_false_in_half_open() {
+        let config = CircuitBreakerConfig {
+            open_duration: Duration::from_millis(0),
+            ..Default::default()
+        };
+        let cb = HttpCircuitBreaker::new(config);
+        let host = "recover.example.com";
+        for _ in 0..5 {
+            cb.record_failure(host);
+        }
+        // open_duration=0 → first allow_request transitions to HalfOpen.
+        assert!(cb.allow_request(host));
+        assert_eq!(cb.get_state(host), Some("half_open".to_string()));
+        // A half-open circuit is under trial, not "open" for retry-gating.
+        assert!(!cb.is_open(host));
     }
 
     /// MCP-711: CIRCUIT_BREAKER_TEST_REQUESTS=0 would pin every tripped
