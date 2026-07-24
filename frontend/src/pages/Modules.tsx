@@ -1,5 +1,5 @@
 import React, { useState, useMemo } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router";
 import { useWorkflowStore } from "@/store/workflowStore";
 import { useMyModulesQuery } from "@/generated/graphql";
 import { cn } from "@/lib/utils";

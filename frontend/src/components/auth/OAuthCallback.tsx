@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { SectionHeader } from "@/components/ui/SectionHeader";
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router";
 import { Check, X } from "lucide-react";
 
 export function OAuthCallback() {
