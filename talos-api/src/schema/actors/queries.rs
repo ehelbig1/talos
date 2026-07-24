@@ -576,6 +576,131 @@ impl ActorsQueries {
         Ok(out)
     }
 
+    /// Batched sibling of `actorMemories`: one request returns the
+    /// memories of MANY owned actors, grouped per actor.
+    ///
+    /// N+1 this closes: the Briefings page fanned out one
+    /// `actorMemories(actorId)` GraphQL round-trip PER actor after
+    /// `actors` (1 + N requests, each opening its own tenant-scoped tx
+    /// and ownership check). This resolver serves the same data in ONE
+    /// request: one per-user unit of work, ONE batched ownership read
+    /// (`actor_ids_owned_by_user_scoped`), then the per-actor listings
+    /// on the same connection/snapshot. (Collapsing the listings into a
+    /// single `actor_id = ANY($1)` query needs a batched read in
+    /// `talos-memory` — actor_memory access MUST go through
+    /// `talos_memory::*` — tracked as a follow-up; the request-level
+    /// fan-out and per-request auth/tx overhead are already collapsed
+    /// here.)
+    ///
+    /// Tenancy: ids that are unknown or another tenant's are silently
+    /// skipped (no group), so absence is indistinguishable from
+    /// non-existence. Duplicated ids collapse to one group.
+    async fn actors_memories(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(desc = "Actors to read (max 100 ids)")] actor_ids: Vec<Uuid>,
+        #[graphql(desc = "Filter by type: working | episodic | semantic | scratchpad")]
+        memory_type: Option<String>,
+        #[graphql(desc = "Max rows PER ACTOR (default 1000, max 1000)")] limit_per_actor: Option<
+            i32,
+        >,
+    ) -> Result<Vec<ActorMemoryGroup>> {
+        require_scope(ctx, talos_api_keys::ApiKeyScope::WorkflowsRead)?;
+        let user_id = ctx
+            .data_opt::<Uuid>()
+            .copied()
+            .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
+        let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
+
+        if actor_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        // Mirror `latestWorkflowExecutions`' explicit arg cap: refuse
+        // oversized batches loudly instead of truncating silently.
+        if actor_ids.len() > 100 {
+            return Err(
+                async_graphql::Error::new("actor_ids must contain at most 100 entries")
+                    .extend_safe(),
+            );
+        }
+
+        // MCP-1188 sibling: cap PER-ACTOR rows at 1000 even if the
+        // caller passes a larger value; negatives / zero clamp up to 1.
+        let limit_val: i64 = i64::from(limit_per_actor.unwrap_or(1000).clamp(1, 1000));
+
+        // RFC 0005 S3: batched ownership check + memory reads in ONE
+        // per-user unit of work (actors are personal), so every read
+        // gets the RLS backstop on a single snapshot. Commit before the
+        // (connection-free) decrypt loop below.
+        let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
+        let mut uow = talos_db::UnitOfWork::begin_user(db_pool, user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: tenant scope error");
+                async_graphql::Error::new("Request scope error").extend_safe()
+            })?;
+
+        let owned = actor_repo
+            .actor_ids_owned_by_user_scoped(uow.conn(), &actor_ids, user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: batched actor ownership check failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
+        let ordered = filter_owned_preserving_order(&actor_ids, &owned);
+
+        let mut per_actor_rows = Vec::with_capacity(ordered.len());
+        for actor_id in ordered {
+            let rows = talos_memory::list_memories_with_ciphertext_scoped(
+                uow.conn(),
+                actor_id,
+                memory_type.as_deref(),
+                limit_val,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "graphql: batched actor memories read failed");
+                async_graphql::Error::new("Request could not be completed").extend_safe()
+            })?;
+            per_actor_rows.push((actor_id, rows));
+        }
+        uow.commit().await.map_err(|e| {
+            tracing::error!(error = %e, "graphql: commit transaction error");
+            async_graphql::Error::new("Request could not be completed").extend_safe()
+        })?;
+
+        let mut groups = Vec::with_capacity(per_actor_rows.len());
+        for (actor_id, rows) in per_actor_rows {
+            let mut memories = Vec::with_capacity(rows.len());
+            for r in &rows {
+                let value = talos_memory::decrypt_memory_list_row(r)
+                    .await
+                    .map_err(|e| {
+                        // Same redaction contract as `actorMemories`: the
+                        // chain may include KEK provider URLs, transit-key
+                        // names, DEK UUIDs, and aead::Error — server
+                        // internals that must not cross the GraphQL
+                        // boundary.
+                        tracing::error!(
+                            actor_id = %actor_id,
+                            "actors_memories: row decrypt failed: {:#}",
+                            e
+                        );
+                        async_graphql::Error::new("Failed to decrypt actor memory").extend_safe()
+                    })?;
+                memories.push(ActorMemoryEntry {
+                    key: r.key.clone(),
+                    value: value.to_string(),
+                    memory_type: r.memory_type.clone(),
+                    expires_at: r.expires_at.map(|d| d.to_rfc3339()),
+                    updated_at: r.updated_at.to_rfc3339(),
+                });
+            }
+            groups.push(ActorMemoryGroup { actor_id, memories });
+        }
+        Ok(groups)
+    }
+
     /// MCP-1190 (2026-05-17): `limit` arg added with default 100 and
     /// hard cap of 1000. Pre-fix the query did `fetch_all` on
     /// mcp_agents with NO LIMIT — no formal per-user MCP-agent cap
@@ -620,5 +745,68 @@ impl ActorsQueries {
                     .map(|dt: chrono::DateTime<chrono::Utc>| dt.to_rfc3339()),
             })
             .collect())
+    }
+}
+
+/// Tenancy + shape filter for the batched `actorsMemories` read: keep
+/// only requested ids that survived the batched ownership check, in the
+/// caller's original order, with duplicates collapsed to their first
+/// occurrence. Pure so the unit tests below exercise the exact
+/// production logic (see the "unit tests exercise real production code"
+/// testing convention).
+fn filter_owned_preserving_order(requested: &[Uuid], owned: &[Uuid]) -> Vec<Uuid> {
+    let owned_set: std::collections::HashSet<Uuid> = owned.iter().copied().collect();
+    let mut seen = std::collections::HashSet::new();
+    requested
+        .iter()
+        .copied()
+        .filter(|id| owned_set.contains(id) && seen.insert(*id))
+        .collect()
+}
+
+#[cfg(test)]
+mod actors_memories_tests {
+    use super::filter_owned_preserving_order;
+    use uuid::Uuid;
+
+    fn ids(n: usize) -> Vec<Uuid> {
+        (0..n).map(|_| Uuid::new_v4()).collect()
+    }
+
+    #[test]
+    fn non_owned_ids_are_silently_dropped() {
+        let all = ids(3);
+        let owned = vec![all[0], all[2]];
+        assert_eq!(
+            filter_owned_preserving_order(&all, &owned),
+            vec![all[0], all[2]],
+            "the id missing from the ownership result must produce no group — \
+             a cross-tenant or unknown id is indistinguishable from absence"
+        );
+    }
+
+    #[test]
+    fn caller_order_is_preserved_regardless_of_ownership_result_order() {
+        let all = ids(3);
+        // Ownership check returns rows in arbitrary (DB) order.
+        let owned = vec![all[2], all[0], all[1]];
+        assert_eq!(filter_owned_preserving_order(&all, &owned), all);
+    }
+
+    #[test]
+    fn duplicate_ids_collapse_to_first_occurrence() {
+        let all = ids(2);
+        let requested = vec![all[0], all[1], all[0], all[1], all[0]];
+        assert_eq!(
+            filter_owned_preserving_order(&requested, &all),
+            vec![all[0], all[1]],
+            "duplicated ids must not multiply the per-actor listing work"
+        );
+    }
+
+    #[test]
+    fn empty_ownership_result_yields_no_groups() {
+        let all = ids(2);
+        assert!(filter_owned_preserving_order(&all, &[]).is_empty());
     }
 }

@@ -2,8 +2,8 @@ import React, { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   listActors,
-  listActorMemories,
-  type ActorMemoryEntry,
+  listActorsMemories,
+  type ActorMemoryGroup,
 } from "@/lib/graphqlApi";
 import { cn } from "@/lib/utils";
 import {
@@ -60,25 +60,39 @@ function parseMemoryValue(raw: string): unknown {
 
 async function loadBriefings(): Promise<Briefing[]> {
   const actors = await listActors();
-  const perActor = await Promise.all(
-    actors.map(async (a) => {
-      // One actor's memory read failing must not sink the whole page.
-      const entries = await listActorMemories(a.id, "episodic").catch(
-        () => [] as ActorMemoryEntry[],
-      );
-      return entries
+  const nameById = new Map(actors.map((a) => [a.id, a.name]));
+
+  // Batched read: pre-fix this fanned out one `actorMemories` GraphQL
+  // round-trip PER actor (1 + N requests); `actorsMemories` returns
+  // every owned actor's memories grouped in ONE request. The server
+  // caps a batch at 100 ids, so chunk defensively for memory-heavy
+  // accounts. One chunk failing must not sink the whole page.
+  const CHUNK = 100;
+  const chunks: string[][] = [];
+  for (let i = 0; i < actors.length; i += CHUNK) {
+    chunks.push(actors.slice(i, i + CHUNK).map((a) => a.id));
+  }
+  const perChunk = await Promise.all(
+    chunks.map((ids) =>
+      listActorsMemories(ids, "episodic").catch(() => [] as ActorMemoryGroup[]),
+    ),
+  );
+
+  return perChunk
+    .flat()
+    .flatMap((group) =>
+      group.memories
         .filter((e) => e.key.endsWith("/latest"))
         .map<Briefing>((e) => ({
-          actorId: a.id,
-          actorName: a.name,
+          actorId: group.actorId,
+          actorName: nameById.get(group.actorId) ?? group.actorId,
           key: e.key,
           kind: e.key.split("/")[0] ?? e.key,
           updatedAt: e.updatedAt,
           value: parseMemoryValue(e.value),
-        }));
-    }),
-  );
-  return perActor.flat().sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+        })),
+    )
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
 // ── Presentation helpers ─────────────────────────────────────────────────────

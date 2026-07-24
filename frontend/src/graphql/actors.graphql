@@ -172,6 +172,19 @@ query GetActorMemories($actorId: UUID!, $memoryType: String) {
   }
 }
 
+query GetActorsMemories($actorIds: [UUID!]!, $memoryType: String) {
+  actorsMemories(actorIds: $actorIds, memoryType: $memoryType) {
+    actorId
+    memories {
+      key
+      value
+      memoryType
+      expiresAt
+      updatedAt
+    }
+  }
+}
+
 mutation WriteActorMemory($input: WriteActorMemoryInput!) {
   writeActorMemory(input: $input) {
     key

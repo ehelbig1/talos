@@ -353,6 +353,24 @@ export type UnlinkOAuthMutationVariables = Exact<{
 
 export type UnlinkOAuthMutation = { unlinkOauthAccount: boolean };
 
+export type Setup2FaMutationVariables = Exact<{ [key: string]: never }>;
+
+export type Setup2FaMutation = {
+  setupTwoFactor: { secret: string; qrCodeUrl: string; qrCodePng: string };
+};
+
+export type Enable2FaMutationVariables = Exact<{
+  input: Enable2FaInput;
+}>;
+
+export type Enable2FaMutation = {
+  enableTwoFactor: { backupCodes: Array<string> };
+};
+
+export type Disable2FaMutationVariables = Exact<{ [key: string]: never }>;
+
+export type Disable2FaMutation = { disableTwoFactor: boolean };
+
 export type ListOrgsQueryVariables = Exact<{ [key: string]: never }>;
 
 export type ListOrgsQuery = {
@@ -438,24 +456,6 @@ export type TransferOwnershipMutationVariables = Exact<{
 export type TransferOwnershipMutation = {
   transferOwnership: { id: string; name: string; ownerId: string };
 };
-
-export type Setup2FaMutationVariables = Exact<{ [key: string]: never }>;
-
-export type Setup2FaMutation = {
-  setupTwoFactor: { secret: string; qrCodeUrl: string; qrCodePng: string };
-};
-
-export type Enable2FaMutationVariables = Exact<{
-  input: Enable2FaInput;
-}>;
-
-export type Enable2FaMutation = {
-  enableTwoFactor: { backupCodes: Array<string> };
-};
-
-export type Disable2FaMutationVariables = Exact<{ [key: string]: never }>;
-
-export type Disable2FaMutation = { disableTwoFactor: boolean };
 
 export type ListActorSummariesQueryVariables = Exact<{ [key: string]: never }>;
 
@@ -664,6 +664,24 @@ export type GetActorMemoriesQuery = {
     memoryType: string;
     expiresAt: string | null;
     updatedAt: string;
+  }>;
+};
+
+export type GetActorsMemoriesQueryVariables = Exact<{
+  actorIds: Array<string> | string;
+  memoryType?: string | null | undefined;
+}>;
+
+export type GetActorsMemoriesQuery = {
+  actorsMemories: Array<{
+    actorId: string;
+    memories: Array<{
+      key: string;
+      value: string;
+      memoryType: string;
+      expiresAt: string | null;
+      updatedAt: string;
+    }>;
   }>;
 };
 
@@ -2236,6 +2254,102 @@ export const useUnlinkOAuthMutation = <TError = unknown, TContext = unknown>(
   });
 };
 
+export const Setup2FaDocument = new TypedDocumentString(`
+    mutation Setup2FA {
+  setupTwoFactor {
+    secret
+    qrCodeUrl
+    qrCodePng
+  }
+}
+    `);
+
+export const useSetup2FaMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    Setup2FaMutation,
+    TError,
+    Setup2FaMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    Setup2FaMutation,
+    TError,
+    Setup2FaMutationVariables,
+    TContext
+  >({
+    mutationKey: ["Setup2FA"],
+    mutationFn: (variables?: Setup2FaMutationVariables) =>
+      graphqlFetcher<Setup2FaMutation, Setup2FaMutationVariables>(
+        Setup2FaDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const Enable2FaDocument = new TypedDocumentString(`
+    mutation Enable2FA($input: Enable2FAInput!) {
+  enableTwoFactor(input: $input) {
+    backupCodes
+  }
+}
+    `);
+
+export const useEnable2FaMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    Enable2FaMutation,
+    TError,
+    Enable2FaMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    Enable2FaMutation,
+    TError,
+    Enable2FaMutationVariables,
+    TContext
+  >({
+    mutationKey: ["Enable2FA"],
+    mutationFn: (variables?: Enable2FaMutationVariables) =>
+      graphqlFetcher<Enable2FaMutation, Enable2FaMutationVariables>(
+        Enable2FaDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const Disable2FaDocument = new TypedDocumentString(`
+    mutation Disable2FA {
+  disableTwoFactor
+}
+    `);
+
+export const useDisable2FaMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    Disable2FaMutation,
+    TError,
+    Disable2FaMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    Disable2FaMutation,
+    TError,
+    Disable2FaMutationVariables,
+    TContext
+  >({
+    mutationKey: ["Disable2FA"],
+    mutationFn: (variables?: Disable2FaMutationVariables) =>
+      graphqlFetcher<Disable2FaMutation, Disable2FaMutationVariables>(
+        Disable2FaDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
 export const ListOrgsDocument = new TypedDocumentString(`
     query ListOrgs {
   myOrganizations {
@@ -2472,102 +2586,6 @@ export const useTransferOwnershipMutation = <
         TransferOwnershipMutation,
         TransferOwnershipMutationVariables
       >(TransferOwnershipDocument, variables)(),
-    ...options,
-  });
-};
-
-export const Setup2FaDocument = new TypedDocumentString(`
-    mutation Setup2FA {
-  setupTwoFactor {
-    secret
-    qrCodeUrl
-    qrCodePng
-  }
-}
-    `);
-
-export const useSetup2FaMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<
-    Setup2FaMutation,
-    TError,
-    Setup2FaMutationVariables,
-    TContext
-  >,
-) => {
-  return useMutation<
-    Setup2FaMutation,
-    TError,
-    Setup2FaMutationVariables,
-    TContext
-  >({
-    mutationKey: ["Setup2FA"],
-    mutationFn: (variables?: Setup2FaMutationVariables) =>
-      graphqlFetcher<Setup2FaMutation, Setup2FaMutationVariables>(
-        Setup2FaDocument,
-        variables,
-      )(),
-    ...options,
-  });
-};
-
-export const Enable2FaDocument = new TypedDocumentString(`
-    mutation Enable2FA($input: Enable2FAInput!) {
-  enableTwoFactor(input: $input) {
-    backupCodes
-  }
-}
-    `);
-
-export const useEnable2FaMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<
-    Enable2FaMutation,
-    TError,
-    Enable2FaMutationVariables,
-    TContext
-  >,
-) => {
-  return useMutation<
-    Enable2FaMutation,
-    TError,
-    Enable2FaMutationVariables,
-    TContext
-  >({
-    mutationKey: ["Enable2FA"],
-    mutationFn: (variables?: Enable2FaMutationVariables) =>
-      graphqlFetcher<Enable2FaMutation, Enable2FaMutationVariables>(
-        Enable2FaDocument,
-        variables,
-      )(),
-    ...options,
-  });
-};
-
-export const Disable2FaDocument = new TypedDocumentString(`
-    mutation Disable2FA {
-  disableTwoFactor
-}
-    `);
-
-export const useDisable2FaMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<
-    Disable2FaMutation,
-    TError,
-    Disable2FaMutationVariables,
-    TContext
-  >,
-) => {
-  return useMutation<
-    Disable2FaMutation,
-    TError,
-    Disable2FaMutationVariables,
-    TContext
-  >({
-    mutationKey: ["Disable2FA"],
-    mutationFn: (variables?: Disable2FaMutationVariables) =>
-      graphqlFetcher<Disable2FaMutation, Disable2FaMutationVariables>(
-        Disable2FaDocument,
-        variables,
-      )(),
     ...options,
   });
 };
@@ -3052,6 +3070,47 @@ export const useGetActorMemoriesQuery = <
       GetActorMemoriesQuery,
       GetActorMemoriesQueryVariables
     >(GetActorMemoriesDocument, variables),
+    ...options,
+  });
+};
+
+export const GetActorsMemoriesDocument = new TypedDocumentString(`
+    query GetActorsMemories($actorIds: [UUID!]!, $memoryType: String) {
+  actorsMemories(actorIds: $actorIds, memoryType: $memoryType) {
+    actorId
+    memories {
+      key
+      value
+      memoryType
+      expiresAt
+      updatedAt
+    }
+  }
+}
+    `);
+
+export const useGetActorsMemoriesQuery = <
+  TData = GetActorsMemoriesQuery,
+  TError = unknown,
+>(
+  variables: GetActorsMemoriesQueryVariables,
+  options?: Omit<
+    UseQueryOptions<GetActorsMemoriesQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<
+      GetActorsMemoriesQuery,
+      TError,
+      TData
+    >["queryKey"];
+  },
+) => {
+  return useQuery<GetActorsMemoriesQuery, TError, TData>({
+    queryKey: ["GetActorsMemories", variables],
+    queryFn: graphqlFetcher<
+      GetActorsMemoriesQuery,
+      GetActorsMemoriesQueryVariables
+    >(GetActorsMemoriesDocument, variables),
     ...options,
   });
 };

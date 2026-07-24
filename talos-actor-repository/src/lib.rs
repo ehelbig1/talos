@@ -1713,6 +1713,31 @@ impl ActorRepository {
         Ok(exists)
     }
 
+    /// Batch variant of [`Self::actor_owned_by_user_scoped`]: returns the
+    /// subset of `actor_ids` that exist AND belong to `user_id`, in one
+    /// round-trip on the caller's scoped connection (the actors RLS
+    /// policy backstops the ownership predicate within the same snapshot
+    /// as the reads it gates). Ids not returned are either unknown or
+    /// another tenant's — callers must skip them, never fall back to an
+    /// unscoped read.
+    pub async fn actor_ids_owned_by_user_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        actor_ids: &[Uuid],
+        user_id: Uuid,
+    ) -> Result<Vec<Uuid>> {
+        if actor_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let owned: Vec<Uuid> =
+            sqlx::query_scalar("SELECT id FROM actors WHERE id = ANY($1) AND user_id = $2")
+                .bind(actor_ids)
+                .bind(user_id)
+                .fetch_all(conn)
+                .await?;
+        Ok(owned)
+    }
+
     /// Execution status counts for an actor (`workflow_executions` RLS
     /// backstops via the caller's scoped connection).
     pub async fn get_actor_execution_counts_scoped(
@@ -3375,6 +3400,33 @@ impl ActorRepository {
         .execute(&self.db_pool)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    /// Batch fetch of `(actor_id, name)` pairs scoped to `user_id`.
+    /// Single round-trip via `WHERE id = ANY($1) AND user_id = $2` —
+    /// the batch sibling of [`get_actor_basic_info`], used by the GraphQL
+    /// `ActorNameLoader` DataLoader to resolve actor attribution on
+    /// workflow / execution lists without a per-row `actors` query.
+    ///
+    /// Security: actors are personal, so the `user_id` predicate is the
+    /// exact tenancy gate `get_actor_basic_info` applies per-row — ids
+    /// belonging to another user are simply absent from the result.
+    /// Empty input short-circuits without touching the DB.
+    pub async fn get_actor_names_by_ids(
+        &self,
+        actor_ids: &[Uuid],
+        user_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, String>> {
+        if actor_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows: Vec<(Uuid, String)> =
+            sqlx::query_as("SELECT id, name FROM actors WHERE id = ANY($1) AND user_id = $2")
+                .bind(actor_ids)
+                .bind(user_id)
+                .fetch_all(&self.db_pool)
+                .await?;
+        Ok(rows.into_iter().collect())
     }
 
     /// Lightweight projection used to render the post-update_actor response.
