@@ -3749,6 +3749,149 @@ if [ -n "$UNNARROWED_SUBENGINE_HITS" ]; then
 else
     green "✓ every sub-engine build site narrows ceilings (or is explicitly opted out)"
 fi
+# ── 58. Registered-but-never-incremented Prometheus metric (dead metric) ──
+# A metric field on `TalosMetrics` that is declared + registry.register()ed
+# but never actually mutated is DEAD: it stays flat at 0 forever, so any
+# Prometheus alert / dashboard built on it silently never fires. This is
+# how the 2026-07-24 workflow failure-rate alert would have been born
+# useless — `talos_workflow_executions_total` was registered but had zero
+# `.inc()` sites (fixed in #570 by wiring the mark_execution_* chokepoints).
+#
+# Detection: for every metric collector field in the struct, require at
+# least one LIVE mutation somewhere in the workspace — `.field … .inc()/
+# .inc_by(nonzero)/.add()/.dec()/.observe()/.set()/.set_to_current_time()`.
+# The `new()` registration (`let field = …::new`, `register(Box::new(
+# field.clone()))`) and the pre-seed loops (`field.with_label_values(…)
+# .inc_by(0.0)` on the BARE local) don't match — real increments go
+# through `self.field`/`m.field` (leading dot); registration/seed use the
+# bare local. `#[cfg(test)]` regions are dropped so a metric incremented
+# only by a test still counts as dead. Opt out for a genuinely
+# externally-set/scrape-only metric with `// allow-unincremented-metric:
+# <reason>` on the field's struct-declaration line.
+bold "▶ check 58: registered Prometheus metric never incremented (dead metric)"
+METRICS_LIB="talos-metrics/src/lib.rs"
+if [ -f "$METRICS_LIB" ]; then
+    DEAD_METRICS="$(
+        find talos-* worker controller -name '*.rs' -not -path '*/target/*' 2>/dev/null \
+            | grep -vE '/tests/|_tests?\.rs' \
+            | perl -e '
+                # NB: NOT perl -0777 — that would put STDIN (the piped file
+                # list) into slurp mode too; each `local $/;` slurp below is
+                # scoped to its own block so the line-based STDIN read works.
+                #
+                # We do NOT strip #[cfg(test)] regions: brace-matching them
+                # without a real tokenizer desyncs on `{`/`}` in string/char
+                # literals (manager.rs crypto code triggered exactly this),
+                # producing FALSE POSITIVES that block correct PRs — the
+                # cardinal sin for a structural lint. Instead a test-only
+                # increment counts as "live" (an accepted false-NEGATIVE:
+                # rare, and low-harm). The register-and-forget bug this check
+                # targets has ZERO increments anywhere — prod OR test — so it
+                # is still caught.
+                my $lib = shift @ARGV;
+                my $src;
+                { open(my $fh, "<", $lib) or die "open $lib: $!"; local $/; $src = <$fh>; close $fh; }
+                # Field names from the TalosMetrics struct (metric collector
+                # types only; `registry: Registry` and non-metric fields are
+                # excluded by the type allow-list).
+                my ($struct) = $src =~ /pub struct TalosMetrics \{(.*?)\n\}/s;
+                my @fields; my %optout;
+                for my $line (split /\n/, ($struct // "")) {
+                    if ($line =~ /pub (\w+):\s*(?:Int)?(?:Counter|Gauge|Histogram)(?:Vec)?\b/) {
+                        my $f = $1;
+                        push @fields, $f;
+                        $optout{$f} = 1 if $line =~ m{//\s*allow-unincremented-metric};
+                    }
+                }
+                # Haystack: every workspace .rs (test files already excluded by
+                # the caller), with each file truncated at its first
+                # #[cfg(test)] so test-only increments do not mask a dead
+                # metric. Newlines collapsed so a multi-line
+                # `.field .with_label_values(..) .inc()` matches as one stmt.
+                my $hay = "";
+                while (my $f = <STDIN>) {
+                    chomp $f;
+                    open(my $g, "<", $f) or next;
+                    my $c; { local $/; $c = <$g>; } close $g;
+                    $hay .= " " . ($c // "");
+
+                }
+                $hay =~ s/\s+/ /g;
+                for my $field (@fields) {
+                    next if $optout{$field};
+                    # Reset the m//g scan position: scalar m//g maintains
+                    # pos($hay) ACROSS these per-field while loops, so after a
+                    # field matches LIVE and we `last`, the next field would
+                    # resume mid-haystack and miss its own earlier increments
+                    # (order-dependent false positives). Start each field at 0.
+                    pos($hay) = undef;
+                    my $live = 0;
+                    while ($hay =~ /\.\Q$field\E\b([^;]*?)\.(inc|inc_by|add|dec|observe|set|set_to_current_time)\s*\(([^)]*)\)/g) {
+                        my ($method, $args) = ($2, $3);
+                        # Pre-seed / no-op: .inc_by(0), .inc_by(0.0), .inc_by(0f64)
+                        next if $method eq "inc_by" && $args =~ /^\s*0(?:\.0*)?(?:f64)?\s*$/;
+                        $live = 1; last;
+                    }
+                    print "$field\n" unless $live;
+                }
+            ' "$METRICS_LIB"
+    )"
+    # Burn-down baseline (introduced 2026-07-24 with this check, like checks
+    # 52/55): metrics that were already declared + registered but never
+    # instrumented when the check landed. The check FAILS only on a NEW dead
+    # metric — these 14 are pre-existing observability debt to wire down over
+    # time. To burn one down: add a real increment site AND delete it from
+    # this list (a now-live baseline entry is itself a failure below, so the
+    # list can't rot). Do NOT add to this list to silence the check — a new
+    # dead metric means the alert/dashboard you're building is inert; wire it.
+    BASELINE_DEAD="$(printf '%s\n' \
+        webhook_requests_total \
+        webhook_request_duration_seconds \
+        auth_attempts_total \
+        auth_failures_total \
+        auth_2fa_attempts_total \
+        api_key_validations_total \
+        module_executions_total \
+        module_execution_duration_seconds \
+        workflow_execution_duration_seconds \
+        rate_limit_hits_total \
+        cache_hits_total \
+        cache_misses_total \
+        circuit_breaker_opens_total \
+        circuit_breaker_blocks_total \
+        | sort)"
+    DEAD_SORTED="$(printf '%s' "$DEAD_METRICS" | grep -vE '^$' | sort || true)"
+    # NEW dead = flagged now but not in the baseline → hard fail.
+    NEW_DEAD="$(comm -23 <(printf '%s\n' "$DEAD_SORTED" | grep -vE '^$') <(printf '%s\n' "$BASELINE_DEAD") || true)"
+    # STALE baseline = listed but no longer dead (someone wired it) → remove it.
+    STALE_BASELINE="$(comm -13 <(printf '%s\n' "$DEAD_SORTED" | grep -vE '^$') <(printf '%s\n' "$BASELINE_DEAD") || true)"
+    DEAD58_FAIL=0
+    if [ -n "$NEW_DEAD" ]; then
+        red "✗ NEW dead metric(s) — registered but never incremented (alerts on them never fire):"
+        echo "$NEW_DEAD" | sed 's/^/    /'
+        yellow "  → add a real mutation site: m.<field>.with_label_values(&[…]).inc()"
+        yellow "    (or .observe()/.set() for histograms/gauges), at the event's"
+        yellow "    chokepoint (see talos_metrics::record_workflow_outcome for the pattern)."
+        yellow "  → genuinely external/scrape-only? // allow-unincremented-metric: <reason>"
+        yellow "    on the field's struct-declaration line."
+        DEAD58_FAIL=1
+    fi
+    if [ -n "$STALE_BASELINE" ]; then
+        red "✗ baselined dead metric(s) are now incremented — remove them from BASELINE_DEAD (check 58):"
+        echo "$STALE_BASELINE" | sed 's/^/    /'
+        yellow "  → the burn-down list must shrink, never rot: delete these names from"
+        yellow "    BASELINE_DEAD in scripts/lint-structural.sh."
+        DEAD58_FAIL=1
+    fi
+    if [ "$DEAD58_FAIL" -gt 0 ]; then
+        EXIT_CODE=1
+    else
+        BASELINE_N="$(printf '%s\n' "$BASELINE_DEAD" | grep -cvE '^$' || true)"
+        green "✓ no new dead metrics (${BASELINE_N} pre-existing in burn-down baseline)"
+    fi
+else
+    yellow "⊘ check 58 skipped — $METRICS_LIB not found"
+fi
 echo
 
 # ── 54. Lint self-consistency (meta-check) ────────────────────────────
