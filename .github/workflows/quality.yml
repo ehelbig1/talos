@@ -208,7 +208,6 @@ jobs:
             --test runtime_integration_test \
             --test trap_test
           cargo nextest run -p controller \
-            --test circuit_breaker_integration \
             --test execution_event_tests \
             --test js_compilation_tests \
             --test nats_topic_tests \

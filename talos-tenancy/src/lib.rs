@@ -6,7 +6,8 @@
 // `limits_cache` field has no reader until a real consumer is built.
 // Removing the attribute would surface the dead-field warning on
 // every workspace build without any operator-actionable cleanup.
-// Sibling of `talos-feature-flags`'s MCP-940 placeholder retention.
+// Sibling of the talos-secrets-rotation placeholder retention (the
+// former talos-feature-flags sibling was deleted 2026-07-24).
 #![allow(dead_code)]
 //! Multi-tenancy isolation and resource limits.
 //!

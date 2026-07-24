@@ -2297,6 +2297,9 @@ impl ParallelWorkflowEngine {
                 max_llm_tier: self.max_llm_tier,
                 max_write_ceiling: self.max_write_ceiling,
                 egress_scope: self.egress_scope,
+                // Loop-body idempotency is a follow-up; the single-node dispatch
+                // path carries the engine-stamped key today.
+                idempotency_key: None,
                 max_retries: 2,
                 backoff_ms: 500,
                 retry_condition: None,

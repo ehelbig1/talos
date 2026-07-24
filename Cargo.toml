@@ -14,8 +14,6 @@ members = [
     "talos-auth",
     "talos-rate-limit",
     "talos-csrf",
-    "talos-circuit-breaker",
-    "talos-feature-flags",
     "talos-idempotency",
     "talos-cost-attribution",
     "talos-errors",

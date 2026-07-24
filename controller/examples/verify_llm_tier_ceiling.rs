@@ -110,6 +110,7 @@ async fn main() -> Result<()> {
         egress_scope: None,
         dry_run: false,
         reply_topic: None,
+        idempotency_key: None,
     };
     let key = [0u8; 32];
     req.sign(&key).map_err(|e| anyhow::anyhow!("sign: {e}"))?;
@@ -160,6 +161,8 @@ async fn main() -> Result<()> {
             cancellation_token: None,
             integration_name: None,
             expected_wasm_hash: None,
+            max_retries: 0,
+            retry_backoff_ms: 0,
         }],
         signature: vec![],
         job_nonce: String::new(),

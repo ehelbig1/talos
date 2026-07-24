@@ -131,6 +131,11 @@ pub struct SecurityPolicy {
     /// namespace to scope writes to. None = the module is not an
     /// integration; integration_state calls return `unauthorized`.
     pub integration_name: Option<String>,
+    /// Opt-in idempotency key (from `JobRequest.idempotency_key`). When `Some`,
+    /// applied to `TalosContext` so the HTTP host emits it as an
+    /// `Idempotency-Key` header on mutating outbound requests. `None` for every
+    /// non-declaring node.
+    pub idempotency_key: Option<String>,
 }
 // ---------------------------------------------------------------------
 // AOT versioning
@@ -1113,12 +1118,65 @@ where
 
 /// Determine if an error is transient and should be retried
 fn is_transient_error(error: &anyhow::Error) -> bool {
-    let error_str = error.to_string().to_lowercase();
+    is_transient_error_text(&error.to_string())
+}
 
-    // Network-related errors (transient)
+/// Exponential backoff with deterministic-jitter for in-pipeline step
+/// retries: `base * 2^attempt` capped at 60 s, plus up to 25% jitter
+/// from the clock's subsecond nanos (no RNG dependency — same shape as
+/// the controller-side dispatcher backoff). `base_ms == 0` uses 500 ms.
+pub(crate) fn pipeline_retry_backoff_ms(base_ms: u64, completed_attempts: u32) -> u64 {
+    let base = if base_ms == 0 { 500 } else { base_ms };
+    let backoff = base
+        .saturating_mul(2u64.saturating_pow(completed_attempts.saturating_sub(1)))
+        .min(60_000);
+    let jitter = backoff / 4;
+    let jitter_val = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64
+        % jitter.max(1);
+    backoff + jitter_val
+}
+
+/// Whether a failed pipeline step should be retried in-worker.
+///
+/// All four gates must hold: the step declared retry budget, the
+/// budget isn't exhausted, the error classifies TRANSIENT (auth /
+/// fuel / validation failures never re-run), and the remaining
+/// overall-pipeline deadline can absorb the backoff plus at least one
+/// more meaningful attempt. Pure so the gate is unit-testable without
+/// a wasm runtime.
+pub(crate) fn should_retry_pipeline_step(
+    completed_attempts: u32,
+    max_retries: u32,
+    err_text: &str,
+    remaining: std::time::Duration,
+    backoff: std::time::Duration,
+) -> bool {
+    completed_attempts <= max_retries
+        && is_transient_error_text(err_text)
+        && remaining > backoff + std::time::Duration::from_millis(250)
+}
+
+/// String-shape core of [`is_transient_error`], shared with the
+/// pipeline step-retry gate.
+fn is_transient_error_text(error_str: &str) -> bool {
+    let error_str = error_str.to_lowercase();
+
+    // Network-related errors (transient). Both "timeout" AND "timed out"
+    // are matched: the worker's own step-timeout message reads "timed
+    // out after {:?}" (no "timeout" substring), so without the second
+    // token a genuine connection-stall step timeout — the exact
+    // 2026-07-23 outage signature — would be misclassified permanent and
+    // skip the in-worker retry. Compute-runaway timeouts are caught by
+    // fuel first; a rare epoch-deadline compute timeout retrying wastes
+    // at most the step's budget, and only idempotent steps carry a retry
+    // budget (method-aware default), so this cannot double-fire a send.
     if error_str.contains("connection refused")
         || error_str.contains("connection reset")
         || error_str.contains("timeout")
+        || error_str.contains("timed out")
         || error_str.contains("temporary failure")
         || error_str.contains("try again")
         || error_str.contains("unavailable")
@@ -1177,6 +1235,11 @@ pub struct PipelineStepSpec {
     pub security_policy: SecurityPolicy,
     /// User ID for global rate limiting and audit logging.
     pub user_id: Option<uuid::Uuid>,
+    /// In-worker retry ceiling for TRANSIENT step failures (0 = none —
+    /// the historical behavior). Gated by [`should_retry_pipeline_step`].
+    pub max_retries: u32,
+    /// Base backoff between retry attempts in ms (0 = worker default).
+    pub retry_backoff_ms: u64,
 }
 
 /// Result of executing a pipeline.
@@ -2798,6 +2861,7 @@ impl TalosRuntime {
         // the module is not an integration; those host fns return
         // `unauthorized` without any DB round-trip.
         context.integration_name = security_policy.integration_name.clone();
+        context.idempotency_key = security_policy.idempotency_key.clone();
 
         // Enable dry-run mode if requested (mocks non-GET HTTP, webhook, messaging calls).
         if dry_run {
@@ -3028,7 +3092,10 @@ impl TalosRuntime {
                     match serde_json::to_vec(&msg) {
                         Ok(bytes) => {
                             if let Err(e) = nats
-                                .publish("talos.audit.ledger".to_string(), bytes.into())
+                                .publish(
+                                    talos_workflow_job_protocol::subjects::AUDIT_LEDGER.to_string(),
+                                    bytes.into(),
+                                )
                                 .await
                             {
                                 tracing::warn!(
@@ -3543,20 +3610,6 @@ impl TalosRuntime {
         let mut step_times_ms: Vec<u64> = Vec::with_capacity(steps.len());
 
         for step in &steps {
-            // Enforce the overall deadline.
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                anyhow::bail!(
-                    "pipeline overall timeout ({:?}) exceeded before step '{}' could run",
-                    overall_timeout,
-                    step.module_id,
-                );
-            }
-            let remaining = deadline - now;
-            let step_timeout = step.timeout.min(remaining);
-
-            let step_start = std::time::Instant::now();
-
             // Compute module SHA256 for cache lookup.
             let module_hash_bytes: [u8; 32] = {
                 let mut hasher = Sha256::new();
@@ -3595,6 +3648,135 @@ impl TalosRuntime {
                 "input": previous_output,
             });
 
+            // ── Per-attempt execution loop (2026-07-24) ─────────────────
+            // Pipelines historically ran each step EXACTLY once — the
+            // chain-level dispatcher retry only covers transport errors,
+            // so a transient application failure in any step failed the
+            // whole pipeline. Each attempt gets a fresh TalosContext /
+            // Store (fresh WASM memory + WASI sandbox view); the
+            // pipeline-scoped Arcs (state store, LLM-usage accumulator,
+            // shared sandbox dir) are deliberately attempt-shared, same
+            // as a re-dispatched single-node job. Retry is gated by
+            // `should_retry_pipeline_step`: declared per-step budget,
+            // transient classification, and remaining overall deadline.
+            let mut completed_attempts: u32 = 0;
+            let (step_output_raw, fuel_consumed, step_start) = loop {
+                // Enforce the overall deadline (re-checked per attempt).
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    anyhow::bail!(
+                        "pipeline overall timeout ({:?}) exceeded before step '{}' could run",
+                        overall_timeout,
+                        step.module_id,
+                    );
+                }
+                let remaining = deadline - now;
+                let step_timeout = step.timeout.min(remaining);
+
+                let step_start = std::time::Instant::now();
+
+                let attempt: anyhow::Result<(JsonValue, Option<u64>)> = self
+                    .execute_pipeline_step_attempt(
+                        step,
+                        &instance_pre,
+                        &cap,
+                        allow_wasi_network,
+                        &step_input,
+                        step_timeout,
+                        workflow_execution_id,
+                        max_llm_tier,
+                        max_write_ceiling,
+                        egress_scope,
+                        &shared_state,
+                        &shared_llm_usage,
+                        shared_sandbox_dir.as_ref(),
+                    )
+                    .await;
+
+                match attempt {
+                    Ok((out, fuel)) => break (out, fuel, step_start),
+                    Err(e) => {
+                        completed_attempts += 1;
+                        let backoff_ms =
+                            pipeline_retry_backoff_ms(step.retry_backoff_ms, completed_attempts);
+                        let remaining =
+                            deadline.saturating_duration_since(std::time::Instant::now());
+                        if step.max_retries > 0
+                            && should_retry_pipeline_step(
+                                completed_attempts,
+                                step.max_retries,
+                                &e.to_string(),
+                                remaining,
+                                std::time::Duration::from_millis(backoff_ms),
+                            )
+                        {
+                            tracing::warn!(
+                                target: "talos_runtime",
+                                step_module_id = %step.module_id,
+                                attempt = completed_attempts,
+                                max_retries = step.max_retries,
+                                backoff_ms,
+                                "pipeline step failed with transient error; retrying: {e}"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                            continue;
+                        }
+                        return Err(e);
+                    }
+                }
+            };
+            let step_output = step_output_raw;
+
+            let step_time_ms = step_start.elapsed().as_millis() as u64;
+            let mut step_output = step_output;
+
+            // Inject fuel consumption metadata into the step output.
+            // Per-step limit (each pipeline step carries its own max_fuel).
+            if let Some(consumed) = fuel_consumed {
+                if let Some(obj) = step_output.as_object_mut() {
+                    obj.insert("__fuel_consumed__".to_string(), serde_json::json!(consumed));
+                    obj.insert(
+                        "__fuel_limit__".to_string(),
+                        serde_json::json!(step.max_fuel),
+                    );
+                }
+            }
+
+            step_outputs.push(step_output.clone());
+            step_times_ms.push(step_time_ms);
+            previous_output = step_output;
+        }
+
+        Ok(PipelineResult {
+            step_outputs,
+            final_output: previous_output,
+            step_times_ms,
+        })
+    }
+
+    /// One execution attempt of one pipeline step — fresh context /
+    /// store / instance per call. Split out of [`Self::execute_pipeline`]
+    /// so the per-attempt body has a single Result exit the retry loop
+    /// can classify; every operator-facing error string is preserved
+    /// verbatim from the pre-retry inline code.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_pipeline_step_attempt(
+        &self,
+        step: &PipelineStepSpec,
+        instance_pre: &wasmtime::component::InstancePre<TalosContext>,
+        cap: &crate::wit_inspector::CapabilityWorld,
+        allow_wasi_network: bool,
+        step_input: &JsonValue,
+        step_timeout: Duration,
+        workflow_execution_id: &str,
+        max_llm_tier: talos_workflow_job_protocol::LlmTier,
+        max_write_ceiling: talos_workflow_job_protocol::WriteCeiling,
+        egress_scope: Option<talos_workflow_job_protocol::EgressScope>,
+        shared_state: &Arc<std::sync::Mutex<HashMap<String, String>>>,
+        shared_llm_usage: &crate::context::LlmUsageAcc,
+        shared_sandbox_dir: Option<&tempfile::TempDir>,
+    ) -> anyhow::Result<(JsonValue, Option<u64>)> {
+        {
             // Create a TalosContext for this step (fresh WASM memory / WASI sandbox).
             let mut context = TalosContext::new(
                 cap.clone(),
@@ -3621,6 +3803,7 @@ impl TalosRuntime {
             context.set_allowed_sql_operations(step.security_policy.allowed_sql_operations.clone());
             context.set_allow_tier2_exposure(step.security_policy.allow_tier2_exposure);
             context.integration_name = step.security_policy.integration_name.clone();
+            context.idempotency_key = step.security_policy.idempotency_key.clone();
             // Stamp the pipeline-wide LLM tier ceiling so every step's
             // host-fn gates (llm::*, wit_http, graphql, webhook, http_stream)
             // enforce the same contract as a single-node JobRequest.
@@ -3639,7 +3822,7 @@ impl TalosRuntime {
             context.llm_usage = shared_llm_usage.clone();
 
             // Share the sandbox directory through the `files` host interface.
-            if let Some(ref sandbox_dir) = shared_sandbox_dir {
+            if let Some(sandbox_dir) = shared_sandbox_dir {
                 context.fs_dir = cap_std::fs::Dir::open_ambient_dir(
                     sandbox_dir.path(),
                     cap_std::ambient_authority(),
@@ -3725,7 +3908,7 @@ impl TalosRuntime {
                 }
             };
 
-            let mut step_output: JsonValue = serde_json::from_str(&output_str).map_err(|e| {
+            let step_output: JsonValue = serde_json::from_str(&output_str).map_err(|e| {
                 // Bare serde errors like "expected value at line 1 column 1"
                 // are unhelpful: the operator can't tell whether the module
                 // returned an empty body, a truncated LLM response, or HTML.
@@ -3741,29 +3924,12 @@ impl TalosRuntime {
                 )
             })?;
 
-            // Inject fuel consumption metadata into the step output.
-            // Per-step limit (each pipeline step carries its own max_fuel).
-            if let Some(consumed) = fuel_consumed {
-                if let Some(obj) = step_output.as_object_mut() {
-                    obj.insert("__fuel_consumed__".to_string(), serde_json::json!(consumed));
-                    obj.insert(
-                        "__fuel_limit__".to_string(),
-                        serde_json::json!(step_max_fuel),
-                    );
-                }
-            }
-
-            let step_time_ms = step_start.elapsed().as_millis() as u64;
-            step_outputs.push(step_output.clone());
-            step_times_ms.push(step_time_ms);
-            previous_output = step_output;
+            // Fuel metadata injection + step timing + accumulation happen in
+            // the caller (`execute_pipeline`), once per SUCCESSFUL step —
+            // not per attempt — so a retried step reports only its winning
+            // attempt's fuel. Return the parsed output + fuel consumed.
+            Ok((step_output, fuel_consumed))
         }
-
-        Ok(PipelineResult {
-            step_outputs,
-            final_output: previous_output,
-            step_times_ms,
-        })
     }
 
     // ========================================================================
@@ -4421,6 +4587,91 @@ pub struct RuntimeHealthStatus {
 // ============================================================================
 // TESTS
 // ============================================================================
+
+#[cfg(test)]
+mod pipeline_step_retry_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn transient_text_matches_both_timeout_spellings() {
+        // The worker's own step-timeout message uses "timed out"; the
+        // classifier must catch both spellings (the 2026-07-24 gate bug).
+        assert!(is_transient_error_text(
+            "Pipeline step 'fetch' timed out after 30s"
+        ));
+        assert!(is_transient_error_text("connection timeout"));
+        assert!(is_transient_error_text("networkerror: connection reset"));
+        assert!(is_transient_error_text("503 service unavailable"));
+    }
+
+    #[test]
+    fn permanent_errors_are_not_transient() {
+        assert!(!is_transient_error_text("401 unauthorized"));
+        assert!(!is_transient_error_text(
+            "fuel exhausted after 6000000 instructions"
+        ));
+        assert!(!is_transient_error_text("invalid json: expected value"));
+        assert!(!is_transient_error_text("missing AUTH_HEADER config"));
+    }
+
+    #[test]
+    fn retry_gate_requires_budget_transience_and_deadline() {
+        let ten_s = Duration::from_secs(10);
+        let short_backoff = Duration::from_millis(100);
+        // Happy path: budget left, transient, deadline roomy.
+        assert!(should_retry_pipeline_step(
+            1,
+            2,
+            "timed out",
+            ten_s,
+            short_backoff
+        ));
+        // Budget exhausted (completed_attempts > max_retries).
+        assert!(!should_retry_pipeline_step(
+            3,
+            2,
+            "timed out",
+            ten_s,
+            short_backoff
+        ));
+        // Non-transient never retries even with budget.
+        assert!(!should_retry_pipeline_step(
+            1,
+            2,
+            "401 unauthorized",
+            ten_s,
+            short_backoff
+        ));
+        // Deadline can't absorb backoff + a meaningful attempt.
+        assert!(!should_retry_pipeline_step(
+            1,
+            2,
+            "timed out",
+            Duration::from_millis(120),
+            short_backoff
+        ));
+    }
+
+    #[test]
+    fn backoff_grows_capped_and_jittered() {
+        // completed_attempts=1 → base*2^0 = base (+ up to 25% jitter).
+        for _ in 0..8 {
+            let b = pipeline_retry_backoff_ms(1000, 1);
+            assert!(
+                (1000..=1250).contains(&b),
+                "attempt1 backoff {b} out of range"
+            );
+        }
+        // Growth: attempt 2 ≈ 2000, attempt 3 ≈ 4000 (+ jitter).
+        assert!(pipeline_retry_backoff_ms(1000, 2) >= 2000);
+        assert!(pipeline_retry_backoff_ms(1000, 3) >= 4000);
+        // Cap at 60s even for a huge attempt count.
+        assert!(pipeline_retry_backoff_ms(1000, 30) <= 60_000 + 15_000);
+        // base 0 → default 500.
+        assert!((500..=625).contains(&pipeline_retry_backoff_ms(0, 1)));
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -32,6 +32,7 @@ use chrono::Utc;
 use serde_json::{json, Value as JsonValue};
 use sqlx::PgPool;
 use talos_actor_repository::ActorRepository;
+use talos_analytics_repository::{failure_rate_pct, AnalyticsRepository, TopFailureRow};
 use talos_execution_repository::ExecutionRepository;
 use talos_ops_alerts_repository::OpsAlertRepository;
 use talos_schedule_repo::ScheduleRepository;
@@ -54,6 +55,7 @@ pub struct OperatorDigestService {
     actors: ActorRepository,
     ops_alerts: OpsAlertRepository,
     schedules: ScheduleRepository,
+    analytics: AnalyticsRepository,
 }
 
 impl OperatorDigestService {
@@ -64,13 +66,16 @@ impl OperatorDigestService {
             actors: ActorRepository::new(pool.clone()),
             ops_alerts: OpsAlertRepository::new(pool.clone()),
             schedules: ScheduleRepository::new(pool.clone()),
+            analytics: AnalyticsRepository::new(pool.clone()),
             pool,
         }
     }
 
-    /// Build the three-panel digest for `user_id` over the trailing `days`
-    /// (clamped to `[1, 31]`). Best-effort per panel; the outer result only
-    /// errors on a catastrophic failure that leaves nothing to report.
+    /// Build the digest for `user_id` over the trailing `days` (clamped to
+    /// `[1, 31]`): the three core panels (ran / learned / needs_me) plus the
+    /// cost line and the fixed-24h reliability line. Best-effort per panel;
+    /// the outer result only errors on a catastrophic failure that leaves
+    /// nothing to report.
     pub async fn snapshot(&self, user_id: Uuid, days: u32) -> anyhow::Result<JsonValue> {
         let days = days.clamp(1, 31) as i32;
 
@@ -81,6 +86,13 @@ impl OperatorDigestService {
             "learned": self.learned_panel(user_id, days).await,
             "needs_me": self.needs_me_panel(user_id, days).await,
             "cost": self.cost_panel(user_id, days).await,
+            // Additive (2026-07-24): existing consumers (operator_digest
+            // system node, get_operator_digest MCP tool, the frontend
+            // Autonomy page) pass the snapshot through untouched, so a new
+            // top-level section is safe. ALWAYS a fixed 24h window — it
+            // mirrors the health dashboard's incident lens — regardless of
+            // `window_days`.
+            "reliability": self.reliability_panel(user_id).await,
         }))
     }
 
@@ -298,6 +310,34 @@ impl OperatorDigestService {
         })
     }
 
+    /// Reliability line — 24h failure rate + failed/completed counts + the
+    /// top 3 failing workflows by 24h failures. Fixed 24h window by design
+    /// (independent of `window_days`): it reuses the health dashboard's
+    /// grouped rollup (`AnalyticsRepository::get_top_failures_24h`) and its
+    /// failure-rate definition, so the digest and the dashboard can never
+    /// disagree about whether last night was an incident.
+    ///
+    /// Best-effort like every other panel: an unavailable analytics plane
+    /// yields `{ "available": false }` — never `0%` masquerading as healthy.
+    async fn reliability_panel(&self, user_id: Uuid) -> JsonValue {
+        let counts = match self.analytics.get_health_summary_counts(user_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(%user_id, error = %e, "operator_digest: reliability counts failed");
+                return json!({ "available": false });
+            }
+        };
+        let top = self
+            .analytics
+            .get_top_failures_24h(user_id)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(%user_id, error = %e, "operator_digest: top-failures rollup failed");
+                Vec::new()
+            });
+        build_reliability_section(counts.failed_24h, counts.completed_24h, &top)
+    }
+
     /// Cost line — fuel + wall time + per-(provider, model) LLM token rollup.
     async fn cost_panel(&self, user_id: Uuid, days: i32) -> JsonValue {
         let (fuel_total, wall_ms_total) = self
@@ -331,6 +371,65 @@ impl OperatorDigestService {
     }
 }
 
+/// A 24h failure rate above this is flagged `degraded` (the status line
+/// says so explicitly, so LLM compose nodes and the email template carry
+/// the wording through without re-deriving the threshold).
+const RELIABILITY_DEGRADED_THRESHOLD_PCT: f64 = 10.0;
+
+/// Pure builder for the reliability section — testable without a DB.
+///
+/// `failure_rate_24h_pct` is `null` when the 24h window has no terminal
+/// executions (rate over zero runs is meaningless; `0.0` would falsely
+/// read "healthy"), matching `failure_rate_pct`'s contract. `degraded`
+/// flips only when the rate strictly exceeds
+/// [`RELIABILITY_DEGRADED_THRESHOLD_PCT`]. Error messages are previews,
+/// not payloads — capped at ~200 bytes on a char boundary, same policy as
+/// the health dashboard.
+fn build_reliability_section(
+    failed_24h: i64,
+    completed_24h: i64,
+    top_failures: &[TopFailureRow],
+) -> JsonValue {
+    let rate = failure_rate_pct(failed_24h, completed_24h);
+    let degraded = rate.is_some_and(|r| r > RELIABILITY_DEGRADED_THRESHOLD_PCT);
+    let status_line = match rate {
+        None => "No terminal executions in the last 24h.".to_string(),
+        Some(r) if degraded => format!(
+            "24h failure rate {r}% ({failed_24h} failed / {completed_24h} completed) — DEGRADED (above the {RELIABILITY_DEGRADED_THRESHOLD_PCT}% threshold)."
+        ),
+        Some(r) => format!(
+            "24h failure rate {r}% ({failed_24h} failed / {completed_24h} completed) — healthy."
+        ),
+    };
+
+    let top: Vec<JsonValue> = top_failures
+        .iter()
+        .take(3)
+        .map(|r| {
+            json!({
+                "workflow_id": r.workflow_id,
+                "workflow_name": r.workflow_name,
+                "failed_count_24h": r.failed_count,
+                "last_failed_at": r.last_failed_at,
+                "latest_error_preview": r
+                    .latest_error_message
+                    .as_deref()
+                    .map(|m| talos_text_util::bounded_preview(m, 200).into_owned()),
+            })
+        })
+        .collect();
+
+    json!({
+        "available": true,
+        "failed_24h": failed_24h,
+        "completed_24h": completed_24h,
+        "failure_rate_24h_pct": rate,
+        "degraded": degraded,
+        "status_line": status_line,
+        "top_failing_workflows_24h": top,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,5 +443,78 @@ mod tests {
         assert!(!is_autonomous("manual"));
         assert!(!is_autonomous("api"));
         assert!(!is_autonomous("")); // absent → treated as manual by the query's COALESCE
+    }
+
+    fn top_row(name: &str, failed: i64, err: Option<&str>) -> TopFailureRow {
+        TopFailureRow {
+            workflow_id: Uuid::new_v4(),
+            workflow_name: name.to_string(),
+            failed_count: failed,
+            last_failed_at: Some(Utc::now()),
+            latest_error_message: err.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn reliability_degraded_above_ten_percent() {
+        // The motivating incident shape: 125 failed / 245 completed → 33.8%.
+        let s = build_reliability_section(125, 245, &[]);
+        assert_eq!(s["available"], true);
+        assert_eq!(s["failed_24h"], 125);
+        assert_eq!(s["completed_24h"], 245);
+        assert_eq!(s["failure_rate_24h_pct"], 33.8);
+        assert_eq!(s["degraded"], true);
+        let line = s["status_line"].as_str().unwrap();
+        assert!(
+            line.contains("33.8%"),
+            "status line carries the rate: {line}"
+        );
+        assert!(
+            line.contains("DEGRADED"),
+            "status line flags the threshold: {line}"
+        );
+    }
+
+    #[test]
+    fn reliability_healthy_at_or_below_threshold() {
+        // Exactly 10.0% is NOT degraded — the flag fires strictly above.
+        let s = build_reliability_section(1, 9, &[]);
+        assert_eq!(s["failure_rate_24h_pct"], 10.0);
+        assert_eq!(s["degraded"], false);
+        assert!(s["status_line"].as_str().unwrap().contains("healthy"));
+
+        let s = build_reliability_section(0, 50, &[]);
+        assert_eq!(s["failure_rate_24h_pct"], 0.0);
+        assert_eq!(s["degraded"], false);
+    }
+
+    #[test]
+    fn reliability_null_rate_when_no_terminal_executions() {
+        let s = build_reliability_section(0, 0, &[]);
+        assert!(s["failure_rate_24h_pct"].is_null());
+        assert_eq!(s["degraded"], false);
+        assert!(s["status_line"]
+            .as_str()
+            .unwrap()
+            .contains("No terminal executions"));
+    }
+
+    #[test]
+    fn reliability_top_failures_capped_at_three_with_bounded_error_preview() {
+        let long_err = "x".repeat(1000);
+        let rows = vec![
+            top_row("wf-a", 12, Some(&long_err)),
+            top_row("wf-b", 7, Some("connection refused")),
+            top_row("wf-c", 3, None),
+            top_row("wf-d", 1, Some("should be cut by the top-3 cap")),
+        ];
+        let s = build_reliability_section(23, 100, &rows);
+        let top = s["top_failing_workflows_24h"].as_array().unwrap();
+        assert_eq!(top.len(), 3, "top failing workflows capped at 3");
+        assert_eq!(top[0]["workflow_name"], "wf-a");
+        assert_eq!(top[0]["failed_count_24h"], 12);
+        // Error previews are bounded, not full payloads.
+        assert!(top[0]["latest_error_preview"].as_str().unwrap().len() <= 220);
+        assert!(top[2]["latest_error_preview"].is_null());
     }
 }

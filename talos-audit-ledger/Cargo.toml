@@ -35,6 +35,9 @@ serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-config = { path = "../talos-config" }
 talos-audit-event = { path = "../talos-audit-event" }
+# For the canonical NATS subject registry (talos.audit.ledger) shared with the
+# worker producer — the ledger is the consumer of this subject.
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-http-utils = { path = "../talos-http-utils" }

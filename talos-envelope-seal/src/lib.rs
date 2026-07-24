@@ -303,8 +303,25 @@ pub fn handle_secret_claim(
         .take(claim.exec_id)
         .ok_or(ClaimError::UnknownExecution)?;
 
-    let seal = seal_secrets(&claim.epk_w, claim.exec_id, &claim.worker_id, ctx.bytes())
-        .map_err(ClaimError::SealFailed)?;
+    // Re-register on seal-crypto failure so the execution can re-claim.
+    // Pre-fix (2026-07-24), `take` above removed the context BEFORE the
+    // seal, so a `SealFailed` (e.g. an authenticated worker presenting a
+    // low-order / malformed ephemeral key, or a transient RNG/HKDF error)
+    // left the context permanently gone — the execution could never
+    // recover its secrets even on a legitimate retry. Restoring the
+    // (still-owned) context on failure keeps single-claim semantics
+    // intact: a concurrent claim during the brief failure window still
+    // finds it absent (take-first-wins is unchanged); this only re-opens
+    // the slot for a LATER retry after this claim demonstrably produced no
+    // sealed output. `register` overwrites, matching the dispatcher's M3
+    // re-arm closure.
+    let seal = match seal_secrets(&claim.epk_w, claim.exec_id, &claim.worker_id, ctx.bytes()) {
+        Ok(seal) => seal,
+        Err(e) => {
+            in_flight.register(claim.exec_id, SealContext::from_bytes(ctx.bytes().to_vec()));
+            return Err(ClaimError::SealFailed(e));
+        }
+    };
 
     Ok(SealedSecrets::new_signed(
         claim.exec_id,
@@ -855,11 +872,11 @@ mod tests {
 
     /// A low-order (all-zero) ephemeral key from an AUTHENTICATED worker
     /// fails the seal with `SealFailed` (non-contributory ECDH is rejected).
-    /// Documents current behavior: the context IS consumed before the seal
-    /// runs (take-then-seal), so the sabotaged execution cannot re-claim —
-    /// fail-closed against probing, at the cost of that job's secrets.
+    /// The context is RE-REGISTERED on seal failure (2026-07-24 fix) so the
+    /// execution can re-claim — a transient seal error (or a self-inflicted
+    /// bad-key attempt) no longer permanently strands the job's secrets.
     #[test]
-    fn low_order_ephemeral_key_fails_seal_closed() {
+    fn low_order_ephemeral_key_fails_seal_but_context_is_recoverable() {
         let _g = REGISTRY_LOCK.lock().unwrap();
         let worker_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
         set_dynamic_worker_public_keys(vec![("worker-lo".to_string(), worker_sk.verifying_key())]);
@@ -871,17 +888,38 @@ mod tests {
 
         // [0u8; 32] is the identity/low-order point: X25519 output is all-zero
         // → `was_contributory()` is false → derive_seal_key fails closed.
-        let claim = SecretClaim::new_signed(exec, "worker-lo".into(), [0u8; 32], &worker_sk);
-        match handle_secret_claim(&claim, &seals, &controller_sk, 60) {
+        let bad_claim = SecretClaim::new_signed(exec, "worker-lo".into(), [0u8; 32], &worker_sk);
+        match handle_secret_claim(&bad_claim, &seals, &controller_sk, 60) {
             Err(ClaimError::SealFailed(_)) => {}
             other => panic!("expected SealFailed for low-order epk_w, got {other:?}"),
         }
-        // Current behavior: the context was atomically taken before sealing,
-        // so a retry claim finds nothing.
+        // NEW behavior: the context is restored, so a subsequent legitimate
+        // claim (real ephemeral key) succeeds — the seal failure did not
+        // strand the execution.
         assert!(
-            seals.is_empty(),
-            "context is consumed by the failed seal (documented)"
+            !seals.is_empty(),
+            "context must be re-registered after a failed seal so the execution can retry"
         );
+        let we = WorkerEphemeral::generate();
+        let good_claim =
+            SecretClaim::new_signed(exec, "worker-lo".into(), we.public_key(), &worker_sk);
+        let sealed = handle_secret_claim(&good_claim, &seals, &controller_sk, 60)
+            .expect("re-claim after re-registration must succeed");
+        // The recovered ephemeral secret can open the seal — proving the
+        // restored context carried the original secret bytes intact.
+        let opened = we
+            .open(
+                &sealed.epk_c,
+                exec,
+                "worker-lo",
+                &sealed.ciphertext,
+                &sealed.nonce,
+            )
+            .expect("open sealed secrets");
+        let recovered: HashMap<String, String> = serde_json::from_slice(&opened).unwrap();
+        assert_eq!(recovered.get("k").map(String::as_str), Some("v"));
+        // And single-claim still holds: the successful claim consumed it.
+        assert!(seals.is_empty(), "successful re-claim consumes the context");
     }
 
     #[test]

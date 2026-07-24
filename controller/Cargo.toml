@@ -36,8 +36,6 @@ talos-workflow-types = { path = "../talos-workflow-types" }
 talos-auth = { path = "../talos-auth" }
 talos-rate-limit = { path = "../talos-rate-limit" }
 talos-csrf = { path = "../talos-csrf" }
-talos-circuit-breaker = { path = "../talos-circuit-breaker" }
-talos-feature-flags = { path = "../talos-feature-flags" }
 talos-idempotency = { path = "../talos-idempotency" }
 talos-cost-attribution = { path = "../talos-cost-attribution" }
 talos-errors = { path = "../talos-errors" }

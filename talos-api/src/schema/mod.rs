@@ -43,6 +43,25 @@ pub struct IsTwoFactorVerified(pub bool);
 /// to only resources within this org (or owned by the user directly).
 pub struct ApiKeyOrgScope(pub Uuid);
 
+/// Cross-crate MCP bearer-token cache invalidation hook (2026-07-24).
+///
+/// The bcrypt verification cache lives in `talos-mcp-handlers::auth`
+/// (keyed by the token's SHA-256 lookup hash), and the workspace dep
+/// direction forbids talos-api from depending on that crate. The
+/// controller — which depends on BOTH — injects this wrapper into the
+/// GraphQL schema data at wiring time (`bootstrap/services.rs`) with a
+/// closure over `talos_mcp_handlers::auth::invalidate_agent_token_cache`.
+/// `revoke_mcp_agent` calls it after a successful DELETE so a revoked
+/// bearer token misses the cache immediately instead of surviving up to
+/// the ~10 s TTL (+ 3 s sweep).
+///
+/// The closure takes the revoked agent's UUID (the mutation never holds
+/// the token, so it can't compute the lookup hash itself) and returns the
+/// number of cache entries removed. Fail-safe by construction: when this
+/// isn't present in the schema data (`ctx.data_opt` → `None`), resolvers
+/// skip the call and the TTL + background sweep remain the backstop.
+pub struct McpTokenCacheInvalidator(pub std::sync::Arc<dyn Fn(Uuid) -> usize + Send + Sync>);
+
 /// Marker struct to indicate an error is safe to expose in production.
 pub struct SafeError;
 

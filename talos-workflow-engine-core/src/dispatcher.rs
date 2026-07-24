@@ -235,6 +235,15 @@ pub struct DispatchJob {
     /// [`crate::EgressScope`].
     pub egress_scope: Option<crate::EgressScope>,
 
+    // ── Idempotency ──────────────────────────────────────────────────
+    /// Opt-in idempotency key for a SEND node. `Some` when the node declared
+    /// idempotency (config key `__idempotency_key__`); the worker emits it as an
+    /// `Idempotency-Key` header on mutating outbound HTTP so a retried send is
+    /// deduped at the destination. Its presence is what lets the method-aware
+    /// retry default grant retries to an otherwise-non-idempotent send world.
+    /// `None` (the default + every non-declaring node) ships nothing on the wire.
+    pub idempotency_key: Option<String>,
+
     // ── Retry policy ─────────────────────────────────────────────────
     /// Max retries for transient failures. Timeouts do not retry.
     pub max_retries: u32,
@@ -310,6 +319,7 @@ impl Default for DispatchJob {
             encrypted_secrets_nonce: Vec::new(),
             plaintext_secrets: None,
             secret_paths: Vec::new(),
+            idempotency_key: None,
             priority: 100,
             dry_run: false,
             // SECURITY: default to Tier1 (local-only LLM egress). This
@@ -690,6 +700,7 @@ impl fmt::Debug for DispatchJob {
             .field("max_llm_tier", &self.max_llm_tier)
             .field("max_write_ceiling", &self.max_write_ceiling)
             .field("egress_scope", &self.egress_scope)
+            .field("idempotency_key", &self.idempotency_key)
             .field("max_retries", &self.max_retries)
             .field("backoff_ms", &self.backoff_ms)
             .field("retry_condition", &self.retry_condition)

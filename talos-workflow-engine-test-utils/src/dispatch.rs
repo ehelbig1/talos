@@ -142,6 +142,7 @@ mod tests {
             max_llm_tier: talos_workflow_engine_core::LlmTier::default(),
             max_write_ceiling: talos_workflow_engine_core::WriteCeiling::default(),
             egress_scope: None,
+            idempotency_key: None,
             max_retries: 0,
             backoff_ms: 0,
             retry_condition: None,

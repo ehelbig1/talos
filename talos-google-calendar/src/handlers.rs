@@ -1502,6 +1502,7 @@ pub async fn process_webhook_events(
             max_fuel: exec_info.max_fuel,
             dry_run: false,
             reply_topic: None,
+            idempotency_key: None,
             actor_id: resolved_actor,
             user_id,
         };
@@ -1616,9 +1617,9 @@ pub async fn process_webhook_events(
         // or route dynamically via edge node env var.
         // MCP-1065 (2026-05-15): canonical edge-routing resolver.
         let nats_topic = if talos_config::edge_routing_enabled() {
-            format!("talos.jobs.{}", user_id)
+            talos_workflow_job_protocol::subjects::jobs_for(user_id)
         } else {
-            "talos.jobs".to_string()
+            talos_workflow_job_protocol::subjects::JOBS.to_string()
         };
 
         match nats

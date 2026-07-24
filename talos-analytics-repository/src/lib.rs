@@ -394,6 +394,57 @@ pub struct TopFailureRow {
     pub latest_error_message: Option<String>,
 }
 
+/// Pure: failure rate as failed/(failed+completed) percent, rounded to
+/// 1 decimal. `None` (serialize as JSON null) when the window has no
+/// terminal executions at all — a rate over zero runs is meaningless and
+/// `0.0` would falsely read as "healthy". Negative inputs (impossible
+/// from COUNT(*), defensive against future delta-fed callers) are also
+/// `None`.
+///
+/// 2026-07-24: authoritative shared home for the computation, hoisted
+/// here (next to [`HealthSummaryCounts`], which produces its inputs) so
+/// the health dashboard (`talos-mcp-handlers::analytics`) and the
+/// operator digest (`talos-operator-digest`) agree on one definition.
+/// The mcp-handlers private copy predates this and should delegate here
+/// on its next touch.
+pub fn failure_rate_pct(failed: i64, completed: i64) -> Option<f64> {
+    let total = failed + completed;
+    if total <= 0 || failed < 0 || completed < 0 {
+        return None;
+    }
+    Some(((failed as f64 / total as f64) * 1000.0).round() / 10.0)
+}
+
+#[cfg(test)]
+mod failure_rate_tests {
+    use super::failure_rate_pct;
+
+    #[test]
+    fn none_when_no_terminal_executions() {
+        assert_eq!(failure_rate_pct(0, 0), None);
+    }
+
+    #[test]
+    fn zero_when_all_completed_hundred_when_all_failed() {
+        assert_eq!(failure_rate_pct(0, 245), Some(0.0));
+        assert_eq!(failure_rate_pct(125, 0), Some(100.0));
+    }
+
+    #[test]
+    fn rounds_to_one_decimal() {
+        // The motivating incident: 125 failed / 245 completed → 33.8%.
+        assert_eq!(failure_rate_pct(125, 245), Some(33.8));
+        assert_eq!(failure_rate_pct(1, 2), Some(33.3));
+        assert_eq!(failure_rate_pct(2, 1), Some(66.7));
+    }
+
+    #[test]
+    fn negative_counts_are_null_not_garbage() {
+        assert_eq!(failure_rate_pct(-1, 10), None);
+        assert_eq!(failure_rate_pct(10, -1), None);
+    }
+}
+
 /// One row of the global error report's per-workflow failure breakdown.
 #[derive(Debug)]
 pub struct WorkflowFailureCountRow {

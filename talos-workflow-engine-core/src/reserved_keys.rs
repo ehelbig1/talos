@@ -77,6 +77,51 @@ pub const ACTOR_CONTEXT: &str = "__actor_context__";
 /// after dispatch and commits the writes.
 pub const MEMORY_WRITE: &str = "__memory_write__";
 
+/// Per-node config key that OPTS a send node into idempotent retries. When
+/// present and truthy the engine stamps a stable idempotency key onto the
+/// dispatch (see [`resolve_idempotency_key`]); the worker then emits that key as
+/// an `Idempotency-Key` HTTP header on mutating outbound requests so a retried
+/// send is deduplicated at the destination. Its presence is ALSO what lets the
+/// method-aware retry default grant retries to a send world
+/// ([`crate::world_enables_idempotent_retry`]). Engine metadata — STRIPPED from
+/// the module input so it never reaches guest code.
+pub const IDEMPOTENCY_KEY: &str = "__idempotency_key__";
+
+/// Resolve the idempotency key for a node from its merged config, or `None`
+/// when idempotency is not declared.
+///
+/// Semantics of the `__idempotency_key__` config value:
+/// * a non-empty **string** → that literal is the key (the author controls it,
+///   e.g. a per-resource token). Not templated in the engine — a literal.
+/// * boolean `true`, or the string `"auto"`/`"true"` → an engine-derived
+///   STABLE key `"<execution_id>:<node_id>"`. Stable across retry attempts of
+///   the same dispatch (so the destination dedupes a retry) and unique per
+///   logical send per execution (a genuine re-run is a new operation).
+/// * `false`, `null`, empty string, or absent → `None` (not declared).
+#[must_use]
+pub fn resolve_idempotency_key(
+    config: Option<&serde_json::Value>,
+    execution_id: &uuid::Uuid,
+    node_id: &uuid::Uuid,
+) -> Option<String> {
+    let v = config.and_then(|c| c.get(IDEMPOTENCY_KEY))?;
+    let derived = || format!("{execution_id}:{node_id}");
+    match v {
+        serde_json::Value::String(s) => {
+            let s = s.trim();
+            if s.is_empty() {
+                None
+            } else if s.eq_ignore_ascii_case("auto") || s.eq_ignore_ascii_case("true") {
+                Some(derived())
+            } else {
+                Some(s.to_string())
+            }
+        }
+        serde_json::Value::Bool(true) => Some(derived()),
+        _ => None,
+    }
+}
+
 /// Per-node graph-json field: does this node consume the injected
 /// [`ACTOR_CONTEXT`]? Defaults to `true` (see
 /// [`node_needs_memory_from_config`]) so the field is fully
@@ -298,6 +343,34 @@ mod tests {
             explicit_needs_memory(Some(&json!({ "needs_memory": "yes" }))),
             None
         );
+    }
+
+    #[test]
+    fn idempotency_key_resolution() {
+        let ex = uuid::Uuid::nil();
+        let node = uuid::Uuid::from_u128(1);
+        let derived = format!("{ex}:{node}");
+        let r = |v: serde_json::Value| {
+            resolve_idempotency_key(Some(&json!({ IDEMPOTENCY_KEY: v })), &ex, &node)
+        };
+        // Literal string → used verbatim (trimmed).
+        assert_eq!(r(json!("order-42")).as_deref(), Some("order-42"));
+        assert_eq!(r(json!("  order-42  ")).as_deref(), Some("order-42"));
+        // Auto sentinels → engine-derived stable key.
+        assert_eq!(r(json!(true)).as_deref(), Some(derived.as_str()));
+        assert_eq!(r(json!("auto")).as_deref(), Some(derived.as_str()));
+        assert_eq!(r(json!("TRUE")).as_deref(), Some(derived.as_str()));
+        // Not declared / opted out → None.
+        assert_eq!(r(json!(false)), None);
+        assert_eq!(r(json!("")), None);
+        assert_eq!(r(json!(null)), None);
+        assert_eq!(r(json!(123)), None);
+        // Absent key / no config → None.
+        assert_eq!(
+            resolve_idempotency_key(Some(&json!({ "other": 1 })), &ex, &node),
+            None
+        );
+        assert_eq!(resolve_idempotency_key(None, &ex, &node), None);
     }
 
     #[test]

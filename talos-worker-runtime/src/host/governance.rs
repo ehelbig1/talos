@@ -66,7 +66,7 @@ impl governance::Host for TalosContext {
                 // ledger.append remains the WORM source-of-truth.
                 if let Err(e) = n
                     .publish(
-                        "talos.audit.ledger".to_string(),
+                        talos_workflow_job_protocol::subjects::AUDIT_LEDGER.to_string(),
                         serde_json::to_vec(&payload).unwrap_or_default().into(),
                     )
                     .await
@@ -123,7 +123,7 @@ impl governance::Host for TalosContext {
             }
         };
 
-        let reply_topic = format!("talos.approvals.wait.{}", exec_id);
+        let reply_topic = talos_workflow_job_protocol::subjects::approvals_wait_for(&exec_id);
 
         // 1. Subscribe to the reply topic FIRST so we don't miss the message
         let mut subscriber = match nats.subscribe(reply_topic.clone()).await {
@@ -186,7 +186,10 @@ impl governance::Host for TalosContext {
         .to_string();
 
         if let Err(e) = nats
-            .publish("talos.approvals.pending".to_string(), payload.into())
+            .publish(
+                talos_workflow_job_protocol::subjects::APPROVALS_PENDING.to_string(),
+                payload.into(),
+            )
             .await
         {
             tracing::error!("Failed to publish pending approval notification: {}", e);
@@ -249,7 +252,7 @@ impl governance::Host for TalosContext {
                         // the WORM source-of-truth.
                         if let Err(e) = n
                             .publish(
-                                "talos.audit.ledger".to_string(),
+                                talos_workflow_job_protocol::subjects::AUDIT_LEDGER.to_string(),
                                 serde_json::to_vec(&event).unwrap_or_default().into(),
                             )
                             .await

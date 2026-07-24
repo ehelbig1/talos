@@ -103,6 +103,7 @@ fn deterministic_job_request() -> JobRequest {
         max_fuel: 1_000_000,
         dry_run: false,
         reply_topic: None,
+        idempotency_key: None,
     }
 }
 
@@ -308,6 +309,8 @@ fn pipeline_job_request_json_snapshot() {
             allow_tier2_exposure: false,
             integration_name: None,
             expected_wasm_hash: Some("deadbeef".into()),
+            max_retries: 0,
+            retry_backoff_ms: 0,
         }],
         signature: vec![0xCA, 0xFE],
         job_nonce: "0:00000000000000000000000000000000".into(),

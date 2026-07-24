@@ -18,6 +18,10 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use uuid::Uuid;
 
+/// Canonical NATS subject registry — one authoritative name per `talos.*`
+/// subject shared across process boundaries.
+pub mod subjects;
+
 /// RFC 0010 P3 (D3b) — per-execution ephemeral secret-envelope sealing.
 pub mod envelope_seal;
 pub use envelope_seal::{
@@ -1063,6 +1067,23 @@ fn clear_job_nonce_cache_for_test() {
     if let Ok(mut g) = JOB_NONCE_CACHE.seen.lock() {
         g.clear();
     }
+}
+
+/// `skip_serializing_if` helpers for zero-default numeric fields —
+/// keeps default-valued wire messages byte-identical to the
+/// pre-field format (the wire-format stability rule).
+///
+/// The `&T` signature is REQUIRED by serde: `skip_serializing_if` calls
+/// the predicate as `fn(&FieldType) -> bool`. Clippy's
+/// `trivially_copy_pass_by_ref` would prefer by-value for these Copy
+/// types, but serde's contract dictates the reference — allow it.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_default_u32(v: &u32) -> bool {
+    *v == 0
+}
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_default_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 fn default_priority() -> u8 {
@@ -2541,6 +2562,26 @@ pub struct JobRequest {
     /// have the controller seal the secrets straight to them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_inbox: Option<String>,
+
+    /// Opt-in idempotency key for a SEND node (webhook / HTTP POST / messaging).
+    ///
+    /// When the workflow author declares idempotency on a node (config key
+    /// `__idempotency_key__`), the engine stamps a STABLE key here — stable
+    /// across retry attempts of the same dispatch, unique per logical send. The
+    /// worker emits it as an `Idempotency-Key` HTTP header on MUTATING outbound
+    /// requests (`fetch` / `webhook::send`) so a retried send is deduplicated at
+    /// the destination (the Stripe / RFC-draft industry pattern). Its presence is
+    /// ALSO what lets the engine's method-aware retry default grant retries to an
+    /// otherwise-non-idempotent send world — see
+    /// `talos_workflow_engine_core::default_max_retries_for_module`.
+    ///
+    /// HMAC-bound ONLY when `Some` (see [`Self::signing_payload`]): a `None`
+    /// value (every non-declaring node, and every legacy wire message) appends
+    /// NOTHING, so pre-existing signatures stay byte-identical and the field
+    /// ships inert. When `Some`, the `:idem=<key>` suffix is bound so an on-wire
+    /// attacker cannot strip the key (forcing a duplicate on retry) or swap it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 impl JobRequest {
@@ -2769,6 +2810,18 @@ impl JobRequest {
                 lp(&paths.join(",")),
                 lp(claim_inbox)
             );
+        }
+
+        // Idempotency key appended AT THE END, ONLY when `Some`, per the
+        // wire-format stability rule — a `None` (every non-declaring node +
+        // every legacy message) appends nothing, so pre-existing signatures are
+        // byte-identical and the field ships inert. When `Some`, binding the key
+        // stops an on-wire attacker from stripping it (which would let a retried
+        // send re-fire un-deduped) or swapping it for a colliding value.
+        // Length-prefixed because a user-supplied key is free-form.
+        if let Some(ref idem) = self.idempotency_key {
+            use std::fmt::Write as _;
+            let _ = write!(payload, ":idem={}", lp(idem));
         }
 
         payload.into_bytes()
@@ -3478,6 +3531,23 @@ pub struct PipelineStep {
     /// so it's per-step rather than at the pipeline level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integration_name: Option<String>,
+
+    /// Per-step retry ceiling for TRANSIENT application failures,
+    /// executed IN-WORKER by `execute_pipeline`'s step loop (the
+    /// pipeline claims its sealed secrets once per dispatch; in-worker
+    /// step retries reuse the already-claimed material, so no re-claim
+    /// races). 0 = no retries — the historical behavior and the serde
+    /// default, so legacy senders/readers are unaffected. The worker's
+    /// transient-error classifier still gates every retry on top of
+    /// this ceiling (auth/fuel/validation failures never re-run).
+    /// HMAC-bound via the conditional `:retries=` signing segment.
+    #[serde(default, skip_serializing_if = "is_default_u32")]
+    pub max_retries: u32,
+    /// Base backoff between step retry attempts in milliseconds
+    /// (exponential growth + jitter applied by the worker). 0 = use
+    /// the worker's default. Signed alongside `max_retries`.
+    #[serde(default, skip_serializing_if = "is_default_u64")]
+    pub retry_backoff_ms: u64,
 }
 
 /// A pipeline job dispatched by the Controller to a Worker via NATS.
@@ -3786,6 +3856,27 @@ impl PipelineJobRequest {
                 lp(&paths.join(",")),
                 lp(self.claim_inbox.as_deref().unwrap_or("-")),
             );
+        }
+
+        // Per-step retry policy (2026-07-24) appended AT THE END, ONLY when
+        // any step carries a non-zero value, so all-zero (legacy) pipelines
+        // stay byte-identical. Binding matters in both directions: a
+        // tamperer bumping `max_retries` amplifies side-effect re-fires and
+        // worker load; zeroing it silently strips an operator's declared
+        // resilience. Fixed-width decimals joined per step — no
+        // length-prefix needed for pure numerics.
+        if self
+            .steps
+            .iter()
+            .any(|s| s.max_retries != 0 || s.retry_backoff_ms != 0)
+        {
+            use std::fmt::Write as _;
+            let step_retries: Vec<String> = self
+                .steps
+                .iter()
+                .map(|s| format!("{}|{}", s.max_retries, s.retry_backoff_ms))
+                .collect();
+            let _ = write!(payload, ":retries={}", step_retries.join(";;"));
         }
 
         payload.into_bytes()
@@ -4728,6 +4819,7 @@ mod tests {
             max_fuel: 0,
             dry_run: false,
             reply_topic: None,
+            idempotency_key: None,
         };
         req.sign(&key).unwrap();
 
@@ -4782,6 +4874,7 @@ mod tests {
             max_fuel: 0,
             dry_run: false,
             reply_topic: None,
+            idempotency_key: None,
         };
 
         req.sign(&key).unwrap();
@@ -4828,6 +4921,7 @@ mod tests {
             max_fuel: 0,
             dry_run: false,
             reply_topic: None,
+            idempotency_key: None,
         };
         req.sign(&key).unwrap();
         req.module_uri = "wasm://evil-module/v1".to_string(); // tamper
@@ -5002,6 +5096,7 @@ mod tests {
             max_fuel: 0,
             dry_run: false,
             reply_topic: None,
+            idempotency_key: None,
         };
         req.sign(&key).unwrap();
         // An attacker cannot escalate from GET-only to POST by modifying the field.
@@ -5048,6 +5143,7 @@ mod tests {
             max_fuel: 0,
             dry_run: false,
             reply_topic: None,
+            idempotency_key: None,
         };
         req.sign(&key).unwrap();
         // Reordering must not affect verification (sorted before hashing).
@@ -5111,6 +5207,7 @@ mod tests {
             max_fuel: 0,
             dry_run: false,
             reply_topic: None,
+            idempotency_key: None,
         }
     }
 
@@ -6088,6 +6185,8 @@ mod tests {
             cancellation_token: None,
             expected_wasm_hash: None,
             integration_name: None,
+            max_retries: 0,
+            retry_backoff_ms: 0,
         }
     }
 

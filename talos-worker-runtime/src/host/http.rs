@@ -496,6 +496,23 @@ impl wit_http::Host for TalosContext {
                 .map_err(|_| wit_http::Error::Forbiddenhost)?;
             builder = builder.header(name.as_str(), resolved.as_ref());
         }
+        // Opt-in idempotency (Task 3): when the engine stamped a stable
+        // idempotency key for this dispatch (the node declared
+        // `__idempotency_key__`), emit it as the industry-standard
+        // `Idempotency-Key` header on MUTATING requests so a retried send is
+        // deduplicated at the destination (Stripe-style). Only for mutating
+        // verbs (a GET is already safe to retry and needs no key), and only when
+        // the guest hasn't set the header itself (respect an explicit override).
+        if http_method_mutates(&method) {
+            if let Some(ref idem) = self.idempotency_key {
+                let guest_set = headers
+                    .iter()
+                    .any(|(n, _)| n.eq_ignore_ascii_case("idempotency-key"));
+                if !guest_set {
+                    builder = builder.header("Idempotency-Key", idem.as_str());
+                }
+            }
+        }
         if !body.is_empty() {
             builder = builder.body(body.clone());
         }

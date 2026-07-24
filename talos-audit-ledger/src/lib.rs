@@ -720,7 +720,7 @@ pub async fn start_audit_ledger_subscriber(
 
     // Ensure the stream exists for guaranteed delivery
     let stream_name = "AUDIT_LEDGER";
-    let subject = "talos.audit.ledger";
+    let subject = talos_workflow_job_protocol::subjects::AUDIT_LEDGER;
     let _stream = js
         .get_or_create_stream(StreamConfig {
             name: stream_name.to_string(),

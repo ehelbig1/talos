@@ -48,6 +48,7 @@ fn make_job_request() -> JobRequest {
         max_fuel: 0,
         dry_run: false,
         reply_topic: None,
+        idempotency_key: None,
     }
 }
 
@@ -70,6 +71,8 @@ fn make_pipeline_step() -> PipelineStep {
         cancellation_token: None,
         expected_wasm_hash: None,
         integration_name: None,
+        max_retries: 0,
+        retry_backoff_ms: 0,
     }
 }
 

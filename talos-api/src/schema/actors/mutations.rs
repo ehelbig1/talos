@@ -1130,6 +1130,32 @@ impl ActorsMutations {
             );
         }
 
+        // 2026-07-24: proactively evict the revoked agent's bearer token(s)
+        // from the MCP auth bcrypt-verify cache so revocation is observable
+        // immediately instead of after the ~10 s TTL (+ 3 s sweep). The
+        // hook is injected by the controller at schema wiring time (see
+        // `McpTokenCacheInvalidator` docs); absent → fall back to the
+        // TTL + MCP-991 sweep behavior. Best-effort by design: the DELETE
+        // above already succeeded, so revocation itself is never blocked
+        // on the cache. Logs the agent id only — never token material.
+        match ctx.data_opt::<crate::schema::McpTokenCacheInvalidator>() {
+            Some(invalidator) => {
+                let removed = (invalidator.0)(id);
+                tracing::info!(
+                    agent_id = %id,
+                    removed,
+                    "revoke_mcp_agent: proactively invalidated bearer-token cache entries"
+                );
+            }
+            None => {
+                tracing::debug!(
+                    agent_id = %id,
+                    "revoke_mcp_agent: no token-cache invalidator wired — revocation \
+                     visibility bounded by cache TTL + background sweep"
+                );
+            }
+        }
+
         Ok(true)
     }
 }

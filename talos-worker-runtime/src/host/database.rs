@@ -264,7 +264,7 @@ impl wit_database::Host for TalosContext {
                     // (secrets_get) which already added this shape.
                     if let Err(e) = n
                         .publish(
-                            "talos.audit.ledger".to_string(),
+                            talos_workflow_job_protocol::subjects::AUDIT_LEDGER.to_string(),
                             serde_json::to_vec(&payload).unwrap_or_default().into(),
                         )
                         .await

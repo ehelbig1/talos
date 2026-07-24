@@ -2302,7 +2302,10 @@ pub(crate) fn spawn_nats_log_subscribers(
             // mysteriously stopped updating after a NATS hiccup."
             let mut backoff_secs: u64 = 1;
             'supervisor: loop {
-                let mut sub = match nats_for_results.subscribe("talos.results.*").await {
+                let mut sub = match nats_for_results
+                    .subscribe(talos_workflow_job_protocol::subjects::RESULTS_WILDCARD)
+                    .await
+                {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::error!(

@@ -955,10 +955,12 @@ pub(crate) async fn build_platform_services(
     //    no half-open recovery probe, no operator-visible state
     //    transition. The "Circuit breaker registry initialized" log
     //    line was the lie.
-    //    The `talos-circuit-breaker` crate itself works correctly
-    //    (MCP-446 fixed `Clone` to share `Arc<RwLock<_>>` state; MCP-485
-    //    fixed a lock-order deadlock; tests pass), but wiring it into
-    //    the real call sites is a separate effort.
+    //    2026-07-24: the `talos-circuit-breaker` placeholder crate +
+    //    the `controller/src/circuit_breaker.rs` shim were DELETED —
+    //    the only consumer was a self-test of the crate itself, and a
+    //    year of "wiring it in is a separate effort" never happened.
+    //    If Redis/NATS/DB fail-fast breakers are ever wanted, implement
+    //    against the real call sites from the start.
     //    The `webhooks::CircuitBreaker` instance allocated above (line
     //    ~680) is a DIFFERENT, narrower breaker that IS consumed via
     //    `WebhookRouter::new(..., circuit_breaker.clone(), ...)` and
@@ -991,8 +993,9 @@ pub(crate) async fn build_platform_services(
     //      ceiling. Currently default 1 replica → no gap. With
     //      replicas > 1 the gap opens.
     //
-    // Workspace crates + shim files left intact so wiring up either
-    // service later doesn't need re-import.
+    // The `distributed_ratelimit` module is left intact so wiring it
+    // up later doesn't need re-import; the circuit-breaker crate/shim
+    // are gone (see above).
 
     // Auth-specific rate limiter: uses auto() which is fail-closed in production
     // (rejects requests when Redis is unavailable) to prevent distributed brute-force.
@@ -1014,16 +1017,17 @@ pub(crate) async fn build_platform_services(
     // `feature_flags::FeatureFlagService::new(db_pool)` was bound to
     // `_feature_flags`, never used. Even if it WERE wired up,
     // `is_enabled` would return `Ok(false)` for every call because
-    // `load_flag` is a `// Placeholder - would query database; Ok(None)`
-    // stub — no migration shipped, no DB layer implemented. Operators
-    // and future developers seeing "Feature flags service initialized"
-    // would assume a working rollout system; in reality every
-    // percentage / user-list / tenant-list flag evaluation collapses to
-    // false. Higher-stakes than the MCP-704 four because a future
-    // gate-on-flag callsite would silently disable the feature it's
-    // supposed to gradually roll out. Removed the boot line; workspace
-    // crate + 3-LoC shim left intact so a real implementation can land
-    // later without re-import churn.
+    // `load_flag` was a placeholder stub returning `Ok(None)` — no
+    // migration shipped, no DB layer implemented. Operators and future
+    // developers seeing "Feature flags service initialized" would
+    // assume a working rollout system; in reality every percentage /
+    // user-list / tenant-list flag evaluation collapsed to false.
+    // 2026-07-24: the `talos-feature-flags` placeholder crate + shim
+    // were DELETED entirely (zero live call sites; the half-wired
+    // capability was misleading). If feature flags are ever needed,
+    // implement a real DB-backed service from scratch — the sibling
+    // `talos-circuit-breaker` placeholder was deleted the same day
+    // (the live breaker is `talos_webhooks::CircuitBreaker`).
 
     // ---------- Initialize Idempotency Service ----------
     let idempotency_service = redis_client.clone().map(|redis| {
@@ -1851,7 +1855,19 @@ pub(crate) fn build_schema_and_services(
         // Execution-orchestration service. Same instance shared with
         // MCP — the `triggerWorkflow` GraphQL mutation extracts this
         // Arc from context and calls `service.trigger(input)`.
-        .data(execution_orchestration_service.clone());
+        .data(execution_orchestration_service.clone())
+        // MCP bearer-token cache invalidation hook (2026-07-24). The
+        // bcrypt-verify cache is owned by talos-mcp-handlers::auth;
+        // talos-api can't depend on that crate (workspace dep direction),
+        // so the controller — which depends on both — bridges them with
+        // this closure. `revoke_mcp_agent` calls it after a successful
+        // DELETE so a revoked token misses the cache immediately instead
+        // of surviving the ~10 s TTL + 3 s sweep window. Process-local by
+        // nature; the MCP-991 sweep (bootstrap/background.rs) remains the
+        // fleet-wide backstop for multi-replica deployments.
+        .data(crate::api::schema::McpTokenCacheInvalidator(
+            std::sync::Arc::new(crate::mcp::auth::invalidate_agent_token_cache),
+        ));
 
     // GraphQL resolvers look up `ctx.data::<LlmClient>()` — pass a Clone of
     // the inner value. The Arc stays behind for the MCP state below.

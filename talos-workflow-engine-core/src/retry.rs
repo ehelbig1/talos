@@ -91,6 +91,68 @@ pub fn default_max_retries_for_module(
     }
 }
 
+/// Whether a declared idempotency key can safely UPGRADE a send node from 0
+/// retries to [`DEFAULT_TRANSIENT_RETRIES`].
+///
+/// [`default_max_retries_for_module`] fails closed to 0 for side-effect worlds
+/// because a blind retry re-fires a non-idempotent send. An OPT-IN idempotency
+/// key removes that hazard — but only where the enforcement mechanism actually
+/// reaches: the worker emits the key as an `Idempotency-Key` HTTP header on
+/// mutating outbound HTTP (`fetch` / `webhook::send`), so the destination
+/// deduplicates the retried request (Stripe-style). That covers the HTTP-egress
+/// worlds:
+///
+/// * `http` — the HTTP suite (fetch / webhook / graphql / email).
+/// * `network` — HTTP suite + raw sockets; HTTP sends still carry the header
+///   (a raw-socket send would not be deduped, a documented caveat).
+/// * `agent` — includes the HTTP suite.
+///
+/// Everything else stays at whatever it resolved to: the header CANNOT dedupe a
+/// NATS publish (`messaging`), a SQL DML (`database`), an approval re-fire
+/// (`governance`), a filesystem/cache write, or a pure-compute module (which
+/// already retries). Accepts bare and `-node`-suffixed spellings.
+#[must_use]
+pub fn world_enables_idempotent_retry(capability_world: &str) -> bool {
+    matches!(
+        capability_world.trim().trim_end_matches("-node"),
+        "http" | "network" | "agent"
+    )
+}
+
+/// The Task-3c decision, factored out so its SAFETY PROPERTY is unit-tested
+/// rather than only structurally guaranteed at the dispatch site: a send node
+/// that did NOT declare idempotency is NEVER granted retries here.
+///
+/// Given a node's already-resolved `base_max_retries` (from an explicit policy
+/// or the method-aware default) and whether the node declared an idempotency
+/// key, return the effective retry count:
+///
+/// * `idempotency_declared == false` → returns `base_max_retries` UNCHANGED.
+///   This is the safety line — a non-declaring send node keeps its 0.
+/// * declared, base is 0, and the world is HTTP-egress
+///   ([`world_enables_idempotent_retry`]) → upgrade to
+///   [`DEFAULT_TRANSIENT_RETRIES`] (the Idempotency-Key header dedupes the
+///   retried send at the destination).
+/// * declared but base is already non-zero → returns `base_max_retries`
+///   UNCHANGED (never LOWER an operator's explicit count).
+/// * declared but the world can't carry the header (messaging/database/…) →
+///   returns `base_max_retries` UNCHANGED.
+#[must_use]
+pub fn effective_retries_with_idempotency(
+    base_max_retries: u32,
+    capability_world: &str,
+    idempotency_declared: bool,
+) -> u32 {
+    if idempotency_declared
+        && base_max_retries == 0
+        && world_enables_idempotent_retry(capability_world)
+    {
+        DEFAULT_TRANSIENT_RETRIES
+    } else {
+        base_max_retries
+    }
+}
+
 impl RetryPolicy {
     /// Full [`RetryPolicy`] for a module with no explicit retry
     /// configuration — [`default_max_retries_for_module`] for the
@@ -185,6 +247,90 @@ mod default_for_module_tests {
             default_max_retries_for_module(&[], Some("http-node")),
             DEFAULT_TRANSIENT_RETRIES
         );
+    }
+
+    #[test]
+    fn idempotent_retry_only_for_http_egress_worlds() {
+        // HTTP-egress worlds: the Idempotency-Key header dedupes the retry.
+        for w in [
+            "http",
+            "http-node",
+            "network",
+            "network-node",
+            "agent",
+            "agent-node",
+        ] {
+            assert!(
+                world_enables_idempotent_retry(w),
+                "{w} should allow idempotent-send retries"
+            );
+        }
+        // The header cannot dedupe these side effects → no upgrade.
+        for w in [
+            "messaging",
+            "database",
+            "governance",
+            "filesystem",
+            "cache",
+            "minimal",
+            "secrets",
+            "trusted",
+            "automation",
+            "",
+            "bogus",
+        ] {
+            assert!(
+                !world_enables_idempotent_retry(w),
+                "{w} must NOT allow idempotent-send retries"
+            );
+        }
+    }
+
+    #[test]
+    fn non_declaring_send_node_never_gets_retries() {
+        // THE SAFETY PROPERTY (Task 3): a send node that did NOT declare
+        // idempotency keeps its 0 — the method-aware default is not weakened.
+        for w in [
+            "http",
+            "network",
+            "agent",
+            "messaging",
+            "database",
+            "governance",
+        ] {
+            assert_eq!(
+                effective_retries_with_idempotency(0, w, false),
+                0,
+                "{w}: non-declaring send node must stay at 0 retries"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_idempotency_upgrades_only_http_egress_from_zero() {
+        // Declared + HTTP-egress + base 0 → transient retries (header dedupes).
+        for w in ["http", "http-node", "network", "agent"] {
+            assert_eq!(
+                effective_retries_with_idempotency(0, w, true),
+                DEFAULT_TRANSIENT_RETRIES,
+                "{w}: declared idempotency should enable retries"
+            );
+        }
+        // Declared but the header can't dedupe these side effects → stays 0.
+        for w in ["messaging", "database", "governance", "filesystem", "cache"] {
+            assert_eq!(
+                effective_retries_with_idempotency(0, w, true),
+                0,
+                "{w}: header can't dedupe → no idempotent-retry upgrade"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_idempotency_never_lowers_explicit_count() {
+        // An operator's explicit non-zero count is respected, not clobbered.
+        assert_eq!(effective_retries_with_idempotency(5, "http", true), 5);
+        assert_eq!(effective_retries_with_idempotency(1, "messaging", true), 1);
     }
 
     #[test]

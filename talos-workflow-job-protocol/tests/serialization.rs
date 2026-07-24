@@ -39,6 +39,7 @@ fn job_request_roundtrip() {
         max_fuel: 0,
         dry_run: false,
         reply_topic: None,
+        idempotency_key: None,
         max_llm_tier: LlmTier::default(),
         max_write_ceiling: WriteCeiling::default(),
         egress_scope: None,
@@ -97,6 +98,8 @@ fn make_pipeline_step() -> PipelineStep {
         cancellation_token: None,
         expected_wasm_hash: None,
         integration_name: None,
+        max_retries: 0,
+        retry_backoff_ms: 0,
     }
 }
 

@@ -57,7 +57,7 @@ impl ParallelWorkflowEngine {
         // methods). Side-effect-capable modules fail closed to 0 so a
         // retry can never double-fire a send. Explicit per-node
         // `retry_count` (including 0) always wins.
-        let retry = self
+        let mut retry = self
             .node_meta
             .get(&node_id)
             .and_then(|(_, rp, _)| rp.clone())
@@ -169,6 +169,33 @@ impl ParallelWorkflowEngine {
         } else {
             module_config
         };
+
+        // Opt-in idempotency (Task 3). Resolve the node's declared idempotency
+        // key from its merged config, then STRIP `__idempotency_key__` so the
+        // engine-only directive never reaches guest code as module input. The
+        // key travels to the worker HMAC-bound on `JobRequest.idempotency_key`,
+        // not in the payload.
+        let mut module_config = module_config;
+        let idempotency_key = talos_workflow_engine_core::reserved_keys::resolve_idempotency_key(
+            Some(&module_config),
+            &execution_id,
+            &node_id,
+        );
+        if let Some(obj) = module_config.as_object_mut() {
+            obj.remove(talos_workflow_engine_core::reserved_keys::IDEMPOTENCY_KEY);
+        }
+
+        // When idempotency IS declared, a declared Idempotency-Key header makes
+        // an otherwise-non-idempotent send safe to retry at the HTTP boundary.
+        // The decision (upgrade 0→transient only for HTTP-egress worlds, never
+        // lower an explicit count, NEVER touch a non-declaring node) lives in
+        // `effective_retries_with_idempotency` so its safety property is unit
+        // tested there.
+        retry.max_retries = talos_workflow_engine_core::effective_retries_with_idempotency(
+            retry.max_retries,
+            &wasm_module.capability_world,
+            idempotency_key.is_some(),
+        );
 
         // Merge config and input into a flat object so templates can
         // find their fields at the top level (e.g., "text", "URL").
@@ -396,6 +423,7 @@ impl ParallelWorkflowEngine {
             max_llm_tier: self.max_llm_tier,
             max_write_ceiling: self.max_write_ceiling,
             egress_scope: self.egress_scope,
+            idempotency_key,
             max_retries: retry.max_retries,
             backoff_ms: retry.backoff_ms,
             retry_condition: retry.retry_condition.clone(),

@@ -4,8 +4,9 @@
 // labeled "Provider Stub" — they return "not implemented" errors and
 // are not instantiated anywhere. The trait + stubs are scaffolding for
 // future Enterprise-Vault / AWS-Secrets-Manager backend integration.
-// Same documented-placeholder rationale as talos-feature-flags /
-// talos-tenancy / talos-secrets-rotation. The `encrypt_dek_with_master`
+// Same documented-placeholder rationale as talos-tenancy /
+// talos-secrets-rotation (the former talos-feature-flags sibling was
+// deleted 2026-07-24). The `encrypt_dek_with_master`
 // dead method was a separate find — deleted in this commit because it
 // was a redundant 1-line wrapper, not a placeholder.
 #![allow(dead_code)]

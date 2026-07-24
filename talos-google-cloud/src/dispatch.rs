@@ -321,6 +321,7 @@ pub(crate) async fn dispatch_monitoring_incident(
         max_fuel: exec_info.max_fuel,
         dry_run: false,
         reply_topic: None,
+        idempotency_key: None,
         actor_id: resolved_actor,
         user_id,
     };
@@ -368,9 +369,9 @@ pub(crate) async fn dispatch_monitoring_incident(
 
     // Edge routing (per-user topic) when enabled, else shared talos.jobs.
     let topic = if talos_config::edge_routing_enabled() {
-        format!("talos.jobs.{}", user_id)
+        talos_workflow_job_protocol::subjects::jobs_for(user_id)
     } else {
-        "talos.jobs".to_string()
+        talos_workflow_job_protocol::subjects::JOBS.to_string()
     };
 
     let mut headers = async_nats::HeaderMap::new();

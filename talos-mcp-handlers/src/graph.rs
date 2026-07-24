@@ -44,6 +44,58 @@ fn validate_rhai_expression(field_name: &str, source: &str) -> Result<(), String
     Ok(())
 }
 
+/// Representative synthetic error payload used to dry-run `retry_condition`
+/// expressions at authoring time. Mirrors the minimal shape of an
+/// application-failure output payload (`{error, success: false}`) — the
+/// same payload class the engine's retry gate evaluates the condition
+/// against at runtime.
+fn synthetic_retry_probe() -> serde_json::Value {
+    json!({ "error": "synthetic validation probe", "success": false })
+}
+
+/// Authoring-time dry-run validation for `retry_condition`
+/// (update_node_config / update_retry, 2026-07).
+///
+/// Pre-fix, a condition referencing a nonexistent variable persisted
+/// silently and only surfaced at runtime — where an eval error defaults
+/// to RETRY (`try_eval_bool(...).unwrap_or(true)` in the NATS
+/// dispatcher), so a typo'd condition silently degraded to
+/// "always retry" with no signal to the author.
+///
+/// Two-stage policy:
+/// 1. PARSE — compile-only syntax check (`validate_rhai_expression`,
+///    the same check every expression field gets). Failure →
+///    `Err(message)`; the caller maps it to -32602. A condition that
+///    cannot parse can never gate a retry, so rejecting is strictly
+///    better than persisting a dead string.
+/// 2. EVAL — dry-run through the SAME evaluator the engine's retry gate
+///    uses at runtime (`talos_engine::rhai_helpers::
+///    evaluate_condition_with_error`, the `RhaiEvaluator::try_eval_bool`
+///    path, also backing the `test_condition` tool) against
+///    [`synthetic_retry_probe`]. An eval-time failure (unknown variable,
+///    non-bool result, ...) is NEVER a rejection — the real error
+///    payload may define variables the probe doesn't — so it returns
+///    `Ok(Some(warning))` for the response's `warning` field instead.
+fn dry_run_retry_condition(condition: &str) -> Result<Option<String>, String> {
+    validate_rhai_expression("retry_condition", condition)?;
+    match talos_engine::rhai_helpers::evaluate_condition_with_error(
+        condition,
+        &synthetic_retry_probe(),
+    ) {
+        Ok(_) => Ok(None),
+        Err(e) => Ok(Some(format!(
+            "retry_condition parsed but could not be proven evaluable: a dry-run against a \
+             synthetic error payload ({probe}) failed with: {e}. This usually means the \
+             expression references variables the probe doesn't define — if the real error \
+             payload defines them, the condition will evaluate fine. Note that at runtime an \
+             evaluation error defaults to RETRY (the condition exists to BLOCK retries in \
+             known-permanent-error scenarios), so an unevaluable condition behaves as if it \
+             were absent. Use test_condition with a representative payload to verify.",
+            probe = synthetic_retry_probe(),
+        ))),
+    }
+}
+
 /// Apply an RFC 7386 JSON Merge Patch to `target` in place.
 ///
 /// Backs the `merge_config` action on `update_node_config` (DX pain
@@ -629,7 +681,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "config": { "type": "object", "description": "For update_config: the full replacement config (existing keys not listed here are dropped). For merge_config: an RFC 7386 JSON Merge Patch applied onto the existing config — only the listed keys change; set a key to null to delete it." },
                     "retry_count": { "type": "number", "description": "Max retries on failure (for update_retry action)" },
                     "retry_backoff_ms": { "type": "number", "description": "Base backoff in ms (for update_retry action)" },
-                    "retry_condition": { "type": "string", "description": "Rhai expression: if false, skip retry and fail immediately (for update_retry action)" },
+                    "retry_condition": { "type": "string", "description": "Rhai expression: if false, skip retry and fail immediately (for update_retry action). Validated at authoring time: syntax errors are rejected; an expression that parses but fails a dry-run eval against a synthetic error payload is accepted with a 'warning' field in the response (runtime eval errors default to retry)." },
                     "retry_delay_expression": { "type": "string", "description": "Rhai expression returning delay in ms from error output. Overrides exponential backoff. Capped at 60000ms (for update_retry action)" },
                     "edge_source": { "type": "string", "description": "Source node ID (for remove_edge action)" },
                     "edge_target": { "type": "string", "description": "Target node ID (for remove_edge action)" }
@@ -1592,6 +1644,10 @@ async fn handle_update_node_config(
     // Populated only by the `update_config` (replace-semantics) arm —
     // see the "dropped_keys" response addition below.
     let mut dropped_keys: Option<Vec<String>> = None;
+    // Populated only by the `update_retry` arm when a retry_condition
+    // parses but fails the authoring-time dry-run eval — see
+    // `dry_run_retry_condition` and the "warning" response addition below.
+    let mut retry_condition_warning: Option<String> = None;
 
     match action {
         "update_config" => {
@@ -1864,8 +1920,16 @@ async fn handle_update_node_config(
                             if rcond.len() > 500 {
                                 return mcp_error(req_id, -32602, "retry_condition must be ≤500 characters");
                             }
-                            if let Err(msg) = validate_rhai_expression("retry_condition", rcond) {
-                                return mcp_error(req_id, -32602, &msg);
+                            // Authoring-time dry-run (2026-07): parse failure
+                            // rejects (-32602, with the parse error); an
+                            // expression that parses but can't be proven
+                            // evaluable against the synthetic error probe is
+                            // ACCEPTED with a `warning` field in the response
+                            // (the real payload may define the variables;
+                            // runtime eval errors default to retry).
+                            match dry_run_retry_condition(rcond) {
+                                Err(msg) => return mcp_error(req_id, -32602, &msg),
+                                Ok(warning) => retry_condition_warning = warning,
                             }
                             if let Some(obj) = node.as_object_mut() { obj.insert("retry_condition".to_string(), serde_json::json!(rcond)); } else { return mcp_error(req_id, -32602, "Invalid node structure"); }
                         }
@@ -2096,6 +2160,20 @@ async fn handle_update_node_config(
                 hint
             ));
             machine_block = Some(serde_json::json!({ "dropped_keys": dk, "hint": hint }));
+        }
+    }
+
+    // update_retry (2026-07): a retry_condition that parsed but failed the
+    // dry-run eval is persisted, with the caveat surfaced in the message
+    // AND as a machine-parsable "warning" field (additive — same envelope
+    // shape as the dropped_keys block above).
+    if let Some(w) = &retry_condition_warning {
+        msg.push_str(&format!("\n\nWarning: {}", w));
+        match machine_block.as_mut().and_then(|mb| mb.as_object_mut()) {
+            Some(obj) => {
+                obj.insert("warning".to_string(), serde_json::json!(w));
+            }
+            None => machine_block = Some(serde_json::json!({ "warning": w })),
         }
     }
 
@@ -5913,5 +5991,71 @@ mod auto_publish_decision_tests {
             .message_suffix()
             .contains("couldn't verify published-version status"));
         assert!(!AutoPublishOutcome::ProbeFailed.published());
+    }
+}
+
+#[cfg(test)]
+mod retry_condition_dry_run_tests {
+    use super::dry_run_retry_condition;
+
+    // Outcome 1 of 3: parse failure → Err (handler maps to -32602 with
+    // the parse error).
+    #[test]
+    fn parse_failure_is_rejected_with_parse_error() {
+        let err = dry_run_retry_condition("success ==").unwrap_err();
+        assert!(
+            err.contains("retry_condition Rhai syntax error"),
+            "must carry the field name + parse diagnostics: {err}"
+        );
+    }
+
+    // Outcome 2 of 3: parses AND evaluates against the synthetic probe →
+    // accepted, no warning.
+    #[test]
+    fn evaluable_condition_is_accepted_without_warning() {
+        // Probe-defined keys, plus the engine's is_error/error_message
+        // heuristics (the probe carries a non-empty `error` string, so
+        // the same evaluator the runtime retry gate uses sets is_error).
+        for cond in [
+            "success == false",
+            "is_error",
+            r#"error_message.contains("probe")"#,
+        ] {
+            assert_eq!(
+                dry_run_retry_condition(cond),
+                Ok(None),
+                "expected clean dry-run for {cond}"
+            );
+        }
+    }
+
+    // Outcome 3 of 3: parses but references a variable the probe doesn't
+    // define → ACCEPTED with a warning (never rejected — the real error
+    // payload may define it, and runtime eval errors default to retry).
+    #[test]
+    fn unknown_variable_is_accepted_with_warning() {
+        let warning = dry_run_retry_condition("attempts < 3")
+            .expect("eval-time unknowns must not reject")
+            .expect("warning expected for unknown variable");
+        assert!(
+            warning.contains("could not be proven evaluable"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("defaults to RETRY"),
+            "warning must explain the runtime default: {warning}"
+        );
+    }
+
+    // Non-bool results are also eval-time findings, not rejections.
+    #[test]
+    fn non_bool_result_is_accepted_with_warning() {
+        let warning = dry_run_retry_condition("error")
+            .expect("non-bool dry-run result must not reject")
+            .expect("warning expected for non-bool result");
+        assert!(
+            warning.contains("could not be proven evaluable"),
+            "{warning}"
+        );
     }
 }

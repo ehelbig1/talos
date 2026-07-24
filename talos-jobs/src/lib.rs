@@ -2,9 +2,9 @@
 // The crate is a documented placeholder per MCP-704 (controller/src/
 // main.rs around line 907): `JobQueue::new(db_pool.clone(), 10)` is
 // NOT wired into controller boot — the persistence layer was never
-// exercised because no caller pushed jobs. Sibling of
-// talos-feature-flags / talos-tenancy / talos-secrets-rotation
-// placeholder retentions.
+// exercised because no caller pushed jobs. Sibling of the
+// talos-tenancy / talos-secrets-rotation placeholder retentions (the
+// former talos-feature-flags sibling was deleted 2026-07-24).
 #![allow(dead_code)]
 //! Background job system for Talos controller.
 //!

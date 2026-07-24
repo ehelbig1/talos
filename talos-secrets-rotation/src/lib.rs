@@ -6,12 +6,26 @@
 // manually. The in-memory `KeyVersion` tracker never persists
 // anywhere. Removing the attribute would surface dead-field /
 // dead-method warnings without operator-actionable cleanup until a
-// real automatic-rotation implementation lands. Sibling of
-// talos-feature-flags / talos-tenancy placeholder retention.
+// real automatic-rotation implementation lands. Sibling of the
+// talos-tenancy placeholder retention (talos-feature-flags and
+// talos-circuit-breaker were deleted 2026-07-24 — this crate survives
+// because its rotation semantics are real and tested, even though the
+// boot wiring hasn't landed).
 #![allow(dead_code)]
-//! Automatic secrets rotation with zero-downtime transitions.
+//! Key-version rotation with zero-downtime transitions.
 //!
-//! Supports rotation of:
+//! # Status: in-memory placeholder — NOT wired into controller boot
+//!
+//! This crate is **not** instantiated anywhere in the controller (see
+//! MCP-704). The `KeyVersion` tracker is purely in-memory and never
+//! persists; production rotation today lives in
+//! `SecretsManager::rotate_master_key` / `rotate_dek` and runs only when
+//! invoked manually. What IS real here is the rotation *semantics* —
+//! primary demotion, grace-period expiry stamping, fail-closed expired
+//! primaries — locked in by unit tests so a future boot wiring inherits
+//! correct behavior.
+//!
+//! Intended to eventually support rotation of:
 //! - JWT signing keys
 //! - Encryption keys (DEKs, master key)
 //! - API keys
@@ -56,21 +70,39 @@ pub struct KeyVersion {
 /// Secrets rotation manager
 pub struct SecretsRotation {
     keys: HashMap<String, Vec<KeyVersion>>,
+    policy: RotationPolicy,
 }
 
 impl SecretsRotation {
     pub fn new() -> Self {
+        Self::with_policy(RotationPolicy::default())
+    }
+
+    /// Create a manager with an explicit rotation policy (grace period,
+    /// interval, auto-rotate). `new()` uses `RotationPolicy::default()`.
+    pub fn with_policy(policy: RotationPolicy) -> Self {
         Self {
             keys: HashMap::new(),
+            policy,
         }
     }
 
     /// Rotate JWT signing key
     pub fn rotate_jwt_key(&mut self) -> Result<KeyVersion> {
-        // Mark current as expiring
+        // Demote the current primary and stamp its grace-period expiry:
+        // the rotated-out key stays valid for verification for exactly
+        // `policy.grace_period`, then `get_primary_key`'s expiry gate
+        // (and any future verification path) treats it as expired.
+        // Only the key(s) that WERE primary get stamped — re-stamping
+        // previously-demoted versions would silently extend their
+        // validity window on every subsequent rotation.
+        let expires_at = Utc::now() + self.policy.grace_period;
         if let Some(versions) = self.keys.get_mut("jwt") {
             for v in versions.iter_mut() {
-                v.is_primary = false;
+                if v.is_primary {
+                    v.is_primary = false;
+                    v.expires_at = Some(expires_at);
+                }
             }
         }
 
@@ -296,29 +328,88 @@ mod tests {
         );
     }
 
-    /// GAP (documented placeholder behavior, not fixed here): `rotate_jwt_key`'s
-    /// comment says "Mark current as expiring", but it only clears `is_primary`
-    /// — it never stamps `expires_at` on the demoted key. Consequently
-    /// `RotationPolicy::grace_period` is never applied and rotated-out keys
-    /// remain non-expired (valid for verification) FOREVER, not just for the
-    /// grace window. Consistent with the crate-level MCP-704 placeholder note
-    /// (`SecretsRotation` is not wired into controller boot), but a real
-    /// implementation must stamp `expires_at = now + grace_period` on demotion.
-    /// This test locks in the CURRENT behavior so the gap is visible.
+    /// Grace-period enforcement (closed 2026-07-24; formerly the documented
+    /// gap `rotated_out_keys_are_never_expired_grace_period_unenforced`):
+    /// demotion stamps `expires_at = now + policy.grace_period` on the
+    /// rotated-out primary, so it stays valid for verification exactly for
+    /// the grace window instead of forever.
     #[test]
-    fn rotated_out_keys_are_never_expired_grace_period_unenforced() {
+    fn rotated_out_keys_expire_after_grace_period() {
         let mut rotation = SecretsRotation::new();
         let first = rotation.rotate_jwt_key().unwrap();
+        let before = Utc::now();
         rotation.rotate_jwt_key().unwrap();
+        let after = Utc::now();
 
         let old = rotation.keys["jwt"]
             .iter()
             .find(|v| v.id == first.id)
             .expect("demoted key retained");
         assert!(!old.is_primary, "demoted key loses primary");
+        let exp = old
+            .expires_at
+            .expect("demotion stamps expires_at (grace period enforced)");
+        let grace = RotationPolicy::default().grace_period;
         assert!(
-            old.expires_at.is_none(),
-            "current behavior: demotion does NOT stamp expires_at (grace period unenforced)"
+            exp >= before + grace && exp <= after + grace,
+            "expires_at is now + grace_period ({grace}); got {exp}"
+        );
+    }
+
+    /// The grace window comes from the manager's OWN policy, not a
+    /// hardcoded default — `with_policy` controls the stamped expiry.
+    #[test]
+    fn grace_period_stamp_uses_configured_policy() {
+        let mut rotation = SecretsRotation::with_policy(RotationPolicy {
+            interval: Duration::days(30),
+            grace_period: Duration::hours(1),
+            auto_rotate: false,
+        });
+        let first = rotation.rotate_jwt_key().unwrap();
+        rotation.rotate_jwt_key().unwrap();
+
+        let exp = rotation.keys["jwt"]
+            .iter()
+            .find(|v| v.id == first.id)
+            .unwrap()
+            .expires_at
+            .unwrap();
+        let delta = exp - Utc::now();
+        assert!(
+            delta > Duration::minutes(59) && delta <= Duration::hours(1),
+            "expiry ~1h out per the configured policy; got {delta}"
+        );
+    }
+
+    /// A second rotation must NOT re-stamp (extend) the expiry of a key
+    /// demoted by an earlier rotation — each rotated-out key keeps the
+    /// grace window it was given at ITS demotion.
+    #[test]
+    fn subsequent_rotations_do_not_extend_prior_demotions() {
+        let mut rotation = SecretsRotation::with_policy(RotationPolicy {
+            interval: Duration::days(90),
+            grace_period: Duration::days(7),
+            auto_rotate: true,
+        });
+        let first = rotation.rotate_jwt_key().unwrap();
+        rotation.rotate_jwt_key().unwrap();
+        let stamped = rotation.keys["jwt"]
+            .iter()
+            .find(|v| v.id == first.id)
+            .unwrap()
+            .expires_at
+            .unwrap();
+
+        rotation.rotate_jwt_key().unwrap();
+        let after_third = rotation.keys["jwt"]
+            .iter()
+            .find(|v| v.id == first.id)
+            .unwrap()
+            .expires_at
+            .unwrap();
+        assert_eq!(
+            stamped, after_third,
+            "a later rotation must not extend an already-demoted key's expiry"
         );
     }
 }

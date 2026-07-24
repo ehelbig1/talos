@@ -364,23 +364,13 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_workflow",
-            "description": "Get the full definition of a workflow including all nodes, their configs, and edges. Each node surfaces: module_name (human-readable, including built-in nodes like 'Collect (built-in)'), config, skip_condition (when set), continue_on_error (when set), description (when set), and retry_count/retry_backoff_ms/retry_condition (only when non-default retry settings are explicitly configured). Workflow-level fields include readiness_score, capabilities, and tags.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "workflow_id": { "type": "string" }
-                },
-                "required": ["workflow_id"]
-            }
-        }),
-        serde_json::json!({
-            "name": "get_workflow_raw_json",
-            "description": "Get the workflow's raw graph JSON exactly as the engine's parser sees it — `{nodes: [...], edges: [...]}` with each node carrying its `kind`, `data`, `position`, etc. fields verbatim. Useful for debugging parser-level issues (\"is the kind field set correctly?\", \"did the on_failure value persist?\") that get_workflow's structured view papers over. Source defaults to 'active' (the published version's graph); pass source: 'draft' for the editable working copy.",
+            "description": "Canonical workflow-read tool — the `view` parameter selects the output shape. view='full' (default): the full definition of a workflow including all nodes, their configs, and edges. Each node surfaces: module_name (human-readable, including built-in nodes like 'Collect (built-in)'), config, skip_condition (when set), continue_on_error (when set), description (when set), and retry_count/retry_backoff_ms/retry_condition (only when non-default retry settings are explicitly configured). Workflow-level fields include readiness_score, capabilities, and tags. view='summary': comprehensive one-call operational overview — workflow definition, execution stats (last 7 days), version info, module dependencies, active schedules count, and active webhooks count (replaces the deprecated get_workflow_summary; for authoring/debugging use get_workflow_identity instead). view='raw_json': the raw graph JSON exactly as the engine's parser sees it — `{nodes: [...], edges: [...]}` with each node carrying its `kind`, `data`, `position`, etc. fields verbatim; useful for debugging parser-level issues the structured view papers over (replaces the deprecated get_workflow_raw_json; honors the `source` parameter). Each view emits the same JSON its legacy tool produced; the deprecated names still dispatch with a deprecation notice.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "workflow_id": { "type": "string", "description": "UUID of the workflow" },
-                    "source": { "type": "string", "enum": ["active", "draft"], "description": "Which graph to fetch: 'active' (the active published version, default) or 'draft' (the editable working copy on workflows.graph_json)." }
+                    "view": { "type": "string", "enum": ["full", "summary", "raw_json"], "description": "Output shape (default: 'full'). full = complete node/edge definition; summary = operational overview (stats, versions, deps); raw_json = engine-parser-level graph JSON (honors 'source')." },
+                    "source": { "type": "string", "enum": ["active", "draft"], "description": "view='raw_json' only. Which graph to fetch: 'active' (the active published version, default) or 'draft' (the editable working copy on workflows.graph_json)." }
                 },
                 "required": ["workflow_id"]
             }
@@ -609,17 +599,6 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                 "properties": {
                     "workflow_id": { "type": "string", "description": "UUID of the workflow" },
                     "days": { "type": "number", "description": "Number of days to look back (default: 30, max: 90)" }
-                },
-                "required": ["workflow_id"]
-            }
-        }),
-        serde_json::json!({
-            "name": "get_workflow_summary",
-            "description": "Comprehensive one-call overview of a workflow. Combines workflow definition, execution stats (last 7 days), version info, module dependencies, active schedules count, and active webhooks count into a single response. For authoring/debugging (input schema, readiness score, output structure) use get_workflow_identity instead.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "workflow_id": { "type": "string", "description": "UUID of the workflow" }
                 },
                 "required": ["workflow_id"]
             }
@@ -993,7 +972,15 @@ pub async fn dispatch(
         "rename_workflow" => Some(handle_rename_workflow(req_id, args, state, agent).await),
         "get_workflow" => Some(handle_get_workflow(req_id, args, state, agent).await),
         "get_workflow_raw_json" => {
-            Some(handle_get_workflow_raw_json(req_id, args, state, agent).await)
+            // Deprecated alias (2026-07 consolidation) — identical output to
+            // get_workflow view='raw_json', with a deprecation notice
+            // injected. Removed from tool_schemas; dispatch-only.
+            let resp = handle_get_workflow_raw_json(req_id.clone(), args, state, agent).await;
+            Some(crate::actor::inject_deprecation_pub(
+                resp,
+                "get_workflow_raw_json",
+                "get_workflow (view: 'raw_json')",
+            ))
         }
         "validate_workflow" => handle_validate_workflow(req_id, args, state, agent).await,
         "clone_workflow" => handle_clone_workflow(req_id, args, state, agent).await,
@@ -1021,7 +1008,17 @@ pub async fn dispatch(
         "disable_workflow" => handle_disable_workflow(req_id, args, state, agent).await,
         "enable_workflow" => handle_enable_workflow(req_id, args, state, agent).await,
         "get_workflow_health" => handle_get_workflow_health(req_id, args, state, agent).await,
-        "get_workflow_summary" => handle_get_workflow_summary(req_id, args, state, agent).await,
+        "get_workflow_summary" => {
+            // Deprecated alias (2026-07 consolidation) — identical output to
+            // get_workflow view='summary', with a deprecation notice
+            // injected. Removed from tool_schemas; dispatch-only.
+            let resp = handle_get_workflow_summary(req_id.clone(), args, state, agent).await;
+            Some(crate::actor::inject_deprecation_pub(
+                resp,
+                "get_workflow_summary",
+                "get_workflow (view: 'summary')",
+            ))
+        }
         "create_workflow_from_description" => {
             handle_create_workflow_from_description(req_id, args, state, agent).await
         }
@@ -3356,7 +3353,66 @@ async fn handle_rename_workflow(
     }
 }
 
+/// The three output shapes of the consolidated `get_workflow` tool
+/// (2026-07 workflow-read consolidation). `Full` is the historical
+/// `get_workflow` body; the other two emit JSON byte-identical to the
+/// deprecated tools they absorbed (`get_workflow_summary` /
+/// `get_workflow_raw_json`, still dispatchable as aliases).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkflowView {
+    Full,
+    Summary,
+    RawJson,
+}
+
+/// Parse the optional `view` argument. Absent / null → `Full`
+/// (back-compat: pre-consolidation calls carry no `view`). Unknown values
+/// and wrong types reject loudly (-32602 at the handler) with the valid
+/// list + per-view argument hints — never silently default.
+fn parse_workflow_view(args: &serde_json::Value) -> Result<WorkflowView, String> {
+    match args.get("view") {
+        None | Some(serde_json::Value::Null) => Ok(WorkflowView::Full),
+        Some(serde_json::Value::String(s)) => match s.as_str() {
+            "full" => Ok(WorkflowView::Full),
+            "summary" => Ok(WorkflowView::Summary),
+            "raw_json" => Ok(WorkflowView::RawJson),
+            other => Err(format!(
+                "Invalid 'view' value '{other}': must be one of 'full', 'summary', \
+                 'raw_json'. All views take workflow_id. full (default) returns the \
+                 complete node/edge definition; summary returns the operational \
+                 overview (execution stats, versions, dependencies); raw_json returns \
+                 the engine-parser-level graph JSON (optional source: 'active' | \
+                 'draft')."
+            )),
+        },
+        Some(v) => Err(format!(
+            "'view' must be a string, got {}",
+            crate::utils::json_type_name(v)
+        )),
+    }
+}
+
+/// Canonical workflow-read entry point: route on `view` to the
+/// shape-specific implementation. Each implementation's output is
+/// byte-identical to the tool it previously backed.
 async fn handle_get_workflow(
+    req_id: Option<serde_json::Value>,
+    args: &serde_json::Value,
+    state: Arc<McpState>,
+    agent: Arc<auth::AgentIdentity>,
+) -> JsonRpcResponse {
+    let view = match parse_workflow_view(args) {
+        Ok(v) => v,
+        Err(msg) => return mcp_error(req_id, -32602, &msg),
+    };
+    match view {
+        WorkflowView::Full => handle_get_workflow_full(req_id, args, state, agent).await,
+        WorkflowView::Summary => handle_get_workflow_summary(req_id, args, state, agent).await,
+        WorkflowView::RawJson => handle_get_workflow_raw_json(req_id, args, state, agent).await,
+    }
+}
+
+async fn handle_get_workflow_full(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
     state: Arc<McpState>,
@@ -6618,7 +6674,7 @@ async fn handle_get_workflow_summary(
     args: &serde_json::Value,
     state: std::sync::Arc<McpState>,
     agent: std::sync::Arc<auth::AgentIdentity>,
-) -> Option<JsonRpcResponse> {
+) -> JsonRpcResponse {
     let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
     let wf_id: uuid::Uuid = match args
         .get("workflow_id")
@@ -6627,11 +6683,7 @@ async fn handle_get_workflow_summary(
     {
         Some(id) => id,
         None => {
-            return Some(mcp_error(
-                req_id.clone(),
-                -32602,
-                "Invalid or missing 'workflow_id'",
-            ))
+            return mcp_error(req_id.clone(), -32602, "Invalid or missing 'workflow_id'");
         }
     };
 
@@ -6639,15 +6691,15 @@ async fn handle_get_workflow_summary(
     let wf = match state.workflow_repo.get_workflow(wf_id, user_id).await {
         Ok(Some(w)) => w,
         Ok(None) => {
-            return Some(mcp_error(
+            return mcp_error(
                 req_id.clone(),
                 -32000,
                 "Workflow not found or access denied",
-            ))
+            );
         }
         Err(e) => {
             tracing::error!("get_workflow error: {}", e);
-            return Some(crate::utils::database_error(req_id.clone()));
+            return crate::utils::database_error(req_id.clone());
         }
     };
     let (id, wf_name, tags, wf_description, max_concurrent) = (
@@ -6798,10 +6850,10 @@ async fn handle_get_workflow_summary(
         }
     }
 
-    Some(mcp_text(
+    mcp_text(
         req_id.clone(),
         &serde_json::to_string_pretty(&summary).unwrap_or_default(),
-    ))
+    )
 }
 
 async fn handle_disable_workflow(
@@ -10870,5 +10922,62 @@ mod tests {
             hint.contains("get_execution_status"),
             "hint must point the caller at the poll path"
         );
+    }
+}
+
+#[cfg(test)]
+mod workflow_view_tests {
+    use super::{parse_workflow_view, WorkflowView};
+    use serde_json::json;
+
+    #[test]
+    fn absent_view_defaults_to_full() {
+        // Back-compat: every pre-consolidation get_workflow call carries
+        // no `view` and must keep producing the full-definition shape.
+        assert_eq!(
+            parse_workflow_view(&json!({"workflow_id": "x"})),
+            Ok(WorkflowView::Full)
+        );
+    }
+
+    #[test]
+    fn null_view_defaults_to_full() {
+        assert_eq!(
+            parse_workflow_view(&json!({"view": null})),
+            Ok(WorkflowView::Full)
+        );
+    }
+
+    #[test]
+    fn each_known_view_parses() {
+        for (name, expected) in [
+            ("full", WorkflowView::Full),
+            ("summary", WorkflowView::Summary),
+            ("raw_json", WorkflowView::RawJson),
+        ] {
+            assert_eq!(parse_workflow_view(&json!({ "view": name })), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn unknown_view_is_rejected_with_helpful_message() {
+        let err = parse_workflow_view(&json!({"view": "graph"})).unwrap_err();
+        // The handler maps this Err to -32602; the message must echo the
+        // bad value AND enumerate every valid view with its argument hint.
+        assert!(err.contains("Invalid 'view' value 'graph'"), "{err}");
+        for valid in ["'full'", "'summary'", "'raw_json'"] {
+            assert!(err.contains(valid), "message missing {valid}: {err}");
+        }
+        assert!(err.contains("workflow_id"), "{err}");
+        assert!(err.contains("source"), "{err}");
+    }
+
+    #[test]
+    fn wrong_type_view_is_rejected_loudly() {
+        // Direction-class rule (MCP-267 family): a wrong-typed opt-in must
+        // reject, not silently collapse to the default view.
+        let err = parse_workflow_view(&json!({"view": 3})).unwrap_err();
+        assert!(err.contains("'view' must be a string"), "{err}");
+        assert!(err.contains("number"), "{err}");
     }
 }

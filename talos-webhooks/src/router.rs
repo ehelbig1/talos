@@ -1184,6 +1184,7 @@ impl WebhookRouter {
                         max_fuel: exec_info.max_fuel,
                         dry_run: false,
                         reply_topic: None,
+                        idempotency_key: None,
                         actor_id: resolved_actor,
                         user_id,
                     };
@@ -1205,9 +1206,9 @@ impl WebhookRouter {
                     // Request-reply pattern via NATS.
                     // MCP-1065 (2026-05-15): canonical edge-routing resolver.
                     let topic_to_use = if talos_config::edge_routing_enabled() {
-                        format!("talos.jobs.{}", user_id)
+                        talos_workflow_job_protocol::subjects::jobs_for(user_id)
                     } else {
-                        "talos.jobs".to_string()
+                        talos_workflow_job_protocol::subjects::JOBS.to_string()
                     };
 
                     let response = tokio::time::timeout(
@@ -2749,6 +2750,7 @@ impl WebhookRouter {
                     max_fuel: exec_info.max_fuel,
                     dry_run: false,
                     reply_topic: None,
+                    idempotency_key: None,
                     actor_id: resolved_actor,
                     user_id,
                 };
@@ -2783,9 +2785,9 @@ impl WebhookRouter {
 
                 // MCP-1065 (2026-05-15): canonical edge-routing resolver.
                 let topic = if talos_config::edge_routing_enabled() {
-                    format!("talos.jobs.{}", user_id)
+                    talos_workflow_job_protocol::subjects::jobs_for(user_id)
                 } else {
-                    "talos.jobs".to_string()
+                    talos_workflow_job_protocol::subjects::JOBS.to_string()
                 };
 
                 if let Err(e) = nats.publish(topic, payload.into()).await {
