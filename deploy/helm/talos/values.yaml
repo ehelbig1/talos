@@ -1095,7 +1095,27 @@ security:
     # GitHub Actions OIDC identity that signs the releases.
     githubOrg: "OWNER"
     githubRepo: "talos"
-    # The refs allowed to sign (releases + main).
+    # PREFERRED identity: the CI WORKFLOW URI (Fulcio keyless via the
+    # workflow's OIDC token). Images published through the canonical
+    # `main-publish.yml` workflow_dispatch path (or `release.yml` tags)
+    # are signed by the WORKFLOW identity, not any human operator — so
+    # this pin stays stable across operator changes (no per-person
+    # widening). To pin to the exact publish workflows instead of the
+    # any-workflow-in-repo default below:
+    #   "^https://github\\.com/OWNER/talos/\\.github/workflows/(main-publish\\.yml|release\\.yml)@refs/(heads/main|tags/v.+)$"
+    # NOTE: if you drop the ref suffix, keep the trailing `@` after the
+    # workflow filename — `...main-publish\\.yml@` — without it a fork
+    # workflow named `main-publish.yml-evil.yml` also matches (see
+    # CLAUDE.md "Sigstore identity regexp").
+    #
+    # FALLBACK identity (local publishes via scripts/publish-images.sh):
+    # cosign binds the signature to the operator's PERSONAL GitHub OAuth
+    # identity — an email, not a workflow URI — and the issuer becomes
+    # "https://github.com/login/oauth" instead of the Actions issuer
+    # below. Admitting locally-signed images therefore requires BOTH an
+    # email-form certIdentityRegex (e.g. "^(alice|bob)@example\\.com$")
+    # AND the matching oidcIssuer — per human operator. Prefer the CI
+    # path; keep this only as a documented break-glass.
     certIdentityRegex: "^https://github\\.com/OWNER/talos/\\.github/workflows/.+@refs/(heads/main|tags/v.+)$"
     oidcIssuer: "https://token.actions.githubusercontent.com"
 

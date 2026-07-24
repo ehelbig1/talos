@@ -1633,15 +1633,20 @@ async fn handle_create_workflow(
         return resp;
     }
 
-    // Batch-fetch template max_retries for all regular module nodes so that catalog
-    // modules with max_retries=0 (e.g. human-approval) override the engine's
-    // unwrap_or(2) default — consistent with the add_node_to_workflow path.
+    // Batch-fetch the per-template retry default for all regular module
+    // nodes. `effective_max_retries()` is METHOD-AWARE: read-only /
+    // pure-compute modules stamp transient retries; side-effect-capable
+    // modules (governance approval gates, messaging senders,
+    // state-changing HTTP) stamp 0 — consistent with the
+    // add_node_to_workflow path. Pre-fix this stamped the raw
+    // `modules.max_retries` DB default (0) onto every node, disabling
+    // the engine's retry machinery fleet-wide.
     let template_max_retries_map: std::collections::HashMap<uuid::Uuid, i32> =
         if !module_ids.is_empty() {
             match state.workflow_repo.get_templates_by_ids(&module_ids).await {
                 Ok(templates) => templates
                     .into_iter()
-                    .map(|t| (t.id, t.max_retries))
+                    .map(|t| (t.id, t.effective_max_retries()))
                     .collect(),
                 Err(_) => std::collections::HashMap::new(), // non-fatal: fall back to engine default
             }
@@ -2252,8 +2257,9 @@ async fn handle_add_node_to_workflow(
 
     // ── Template lookup: config validation + max_retries default ─────────────
     // Fetch the template once for both purposes when a module_id is provided.
-    // max_retries is needed even when config is empty (e.g. human-approval with
-    // no config keys still needs retry_count: 0 to prevent retry storms on rejection).
+    // The retry default is method-aware (`effective_max_retries`): governance
+    // modules like human-approval resolve to 0 (no retry storms on rejection)
+    // while read-only fetchers resolve to transient retries.
     let mut template_max_retries: Option<i32> = None;
     if !module_id.is_empty() {
         if let Ok(tid) = module_id.parse::<uuid::Uuid>() {
@@ -2281,7 +2287,7 @@ async fn handle_add_node_to_workflow(
                 .await
             {
                 if let Some(template) = templates.first() {
-                    template_max_retries = Some(template.max_retries);
+                    template_max_retries = Some(template.effective_max_retries());
 
                     // Config shape validation (type / enum / required /
                     // array-items) against the node template's config_schema.

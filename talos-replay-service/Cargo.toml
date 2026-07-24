@@ -31,7 +31,7 @@ talos-capability-world = { path = "../talos-capability-world" }
 talos-replay-diff = { path = "../talos-replay-diff" }
 talos-workflow-engine = { path = "../talos-workflow-engine" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
-worker = { path = "../worker" }
+talos-worker-runtime = { path = "../talos-worker-runtime" }
 
 [lints]
 workspace = true

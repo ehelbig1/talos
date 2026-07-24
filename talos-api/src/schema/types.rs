@@ -4,9 +4,12 @@ use async_graphql::{ComplexObject, Context, InputObject, Result, SimpleObject};
 use talos_module_executions as module_executions;
 use uuid::Uuid;
 
+use crate::schema::SafeErrorExtensions;
+
 // Re-import types needed by DataLoaders and ComplexObject impls
 
 #[derive(SimpleObject, Clone)]
+#[graphql(complex)]
 pub struct Workflow {
     pub id: Uuid,
     pub name: String,
@@ -199,6 +202,7 @@ pub struct OAuthAuthUrl {
 }
 
 #[derive(SimpleObject, Clone)]
+#[graphql(complex)]
 pub struct WorkflowScheduleObj {
     pub id: Uuid,
     #[graphql(name = "workflowId")]
@@ -581,6 +585,378 @@ impl async_graphql::dataloader::Loader<Uuid> for ModuleExecutionLogLoader {
     }
 }
 
+/// Composite DataLoader key: `(user, workflow)`. The user id rides in the
+/// key so the batched lookup preserves the SAME per-user scoping the
+/// per-row query had (`WHERE id = ANY($1) AND user_id = $2`) — batching
+/// by bare workflow id would let two users' keys share one unscoped
+/// query. In practice one GraphQL request = one user, so the loader
+/// still collapses a page of parents into a single round-trip.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct WorkflowNameKey {
+    pub user_id: Uuid,
+    pub workflow_id: Uuid,
+}
+
+/// Batched `workflow_id → name` resolution for id-only child objects
+/// (`WorkflowScheduleObj`, `ExecutionApproval`, `WorkflowExecution`).
+///
+/// N+1 this closes: `mySchedules` returns up to 1000 rows carrying a bare
+/// `workflowId`; resolving a display name per row means 1000 point
+/// queries — the frontend's historical workaround was fetching the ENTIRE
+/// `workflows` list (every row carrying `graph_json`, up to 10 MiB each
+/// per the MCP-1189 note) just to build an id→name map client-side.
+///
+/// Tenancy: `WorkflowRepository::get_workflow_names_by_ids` filters
+/// `AND user_id = $2` (owner only). Org-shared workflows owned by a
+/// teammate resolve to `null` — under-permissive, never leaking.
+pub struct WorkflowNameLoader(pub sqlx::Pool<sqlx::Postgres>);
+
+impl async_graphql::dataloader::Loader<WorkflowNameKey> for WorkflowNameLoader {
+    type Value = String;
+    type Error = std::sync::Arc<anyhow::Error>;
+
+    async fn load(
+        &self,
+        keys: &[WorkflowNameKey],
+    ) -> std::result::Result<std::collections::HashMap<WorkflowNameKey, Self::Value>, Self::Error>
+    {
+        let repo = talos_workflow_repository::WorkflowRepository::new(self.0.clone());
+
+        // Group by user so each batched query keeps its own tenancy
+        // predicate (one group — one query — for the typical request).
+        let mut by_user: std::collections::HashMap<Uuid, Vec<Uuid>> =
+            std::collections::HashMap::new();
+        for key in keys {
+            by_user
+                .entry(key.user_id)
+                .or_default()
+                .push(key.workflow_id);
+        }
+
+        let mut out = std::collections::HashMap::new();
+        for (user_id, workflow_ids) in by_user {
+            let names = repo
+                .get_workflow_names_by_ids(&workflow_ids, user_id)
+                .await
+                .map_err(std::sync::Arc::new)?;
+            for (workflow_id, name) in names {
+                out.insert(
+                    WorkflowNameKey {
+                        user_id,
+                        workflow_id,
+                    },
+                    name,
+                );
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Composite DataLoader key: `(user, actor)` — same scoping rationale as
+/// [`WorkflowNameKey`]; actors are personal so `user_id` IS the tenancy
+/// predicate.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct ActorNameKey {
+    pub user_id: Uuid,
+    pub actor_id: Uuid,
+}
+
+/// Batched `actor_id → name` resolution for actor attribution on
+/// `Workflow` / `WorkflowExecution` rows.
+///
+/// N+1 this closes: `workflowExecutionHistory` returns up to 1000 rows
+/// each carrying a bare `actorId`; the only pre-existing way to show
+/// "which agent ran this" was a per-id `actor(id)` query — and that
+/// resolver runs the heavyweight `get_actor_details_scoped` COUNT
+/// aggregation per call. The loader collapses a page into one
+/// `WHERE id = ANY($1) AND user_id = $2` round-trip (and load_one
+/// dedupes: 1000 executions by 3 actors = 3 keys).
+pub struct ActorNameLoader(pub sqlx::Pool<sqlx::Postgres>);
+
+impl async_graphql::dataloader::Loader<ActorNameKey> for ActorNameLoader {
+    type Value = String;
+    type Error = std::sync::Arc<anyhow::Error>;
+
+    async fn load(
+        &self,
+        keys: &[ActorNameKey],
+    ) -> std::result::Result<std::collections::HashMap<ActorNameKey, Self::Value>, Self::Error>
+    {
+        let repo = talos_actor_repository::ActorRepository::new(self.0.clone());
+
+        let mut by_user: std::collections::HashMap<Uuid, Vec<Uuid>> =
+            std::collections::HashMap::new();
+        for key in keys {
+            by_user.entry(key.user_id).or_default().push(key.actor_id);
+        }
+
+        let mut out = std::collections::HashMap::new();
+        for (user_id, actor_ids) in by_user {
+            let names = repo
+                .get_actor_names_by_ids(&actor_ids, user_id)
+                .await
+                .map_err(std::sync::Arc::new)?;
+            for (actor_id, name) in names {
+                out.insert(ActorNameKey { user_id, actor_id }, name);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Composite DataLoader key for the latest-execution lookup. Carries the
+/// caller's org scope alongside the user so the batched query preserves
+/// the EXACT `we.user_id = $2 OR w.org_id = ANY($3)` predicate the
+/// top-level `latestWorkflowExecutions` query uses.
+///
+/// `org_scope` mirrors `user_accessible_org_ids`' `ApiKeyOrgScope`
+/// short-circuit: `Some(org)` = org-scoped API key (restrict to that one
+/// org even if the user belongs to others); `None` = session/user key
+/// (the loader resolves the full membership list itself, ONCE per batch —
+/// resolving it in the field resolver would re-introduce a per-parent
+/// `organization_members` query, since the `UserOrgIds` request cache is
+/// never populated).
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct LatestExecutionKey {
+    pub user_id: Uuid,
+    pub org_scope: Option<Uuid>,
+    pub workflow_id: Uuid,
+}
+
+/// Batched latest-execution-per-workflow resolution for `Workflow` rows.
+///
+/// N+1 this closes: a dashboard page of `workflows(limit)` (up to 1000
+/// rows) resolving "current status" per workflow. The pre-existing
+/// batched escape hatch is the top-level `latestWorkflowExecutions`
+/// query (≤200 ids) that clients must stitch manually; this field makes
+/// the single-request shape (`workflows { latestExecution { … } }`)
+/// resolve through ONE `DISTINCT ON` round-trip via
+/// `ExecutionRepository::list_latest_executions_for_workflows_scoped`,
+/// run on a tenant-scoped tx so the `workflow_executions` RLS policy
+/// backstops the app-layer predicate (same contract as the top-level
+/// query — the repo method's docs forbid routing through the bare pool).
+pub struct LatestExecutionLoader(pub sqlx::Pool<sqlx::Postgres>);
+
+impl async_graphql::dataloader::Loader<LatestExecutionKey> for LatestExecutionLoader {
+    type Value = WorkflowExecution;
+    type Error = std::sync::Arc<anyhow::Error>;
+
+    async fn load(
+        &self,
+        keys: &[LatestExecutionKey],
+    ) -> std::result::Result<std::collections::HashMap<LatestExecutionKey, Self::Value>, Self::Error>
+    {
+        let exec_repo = talos_execution_repository::ExecutionRepository::new(self.0.clone());
+
+        // Group by (user, org_scope) so each batched query carries its
+        // own tenancy scope — one group per request in practice.
+        let mut groups: std::collections::HashMap<(Uuid, Option<Uuid>), Vec<Uuid>> =
+            std::collections::HashMap::new();
+        for key in keys {
+            groups
+                .entry((key.user_id, key.org_scope))
+                .or_default()
+                .push(key.workflow_id);
+        }
+
+        let mut out = std::collections::HashMap::new();
+        for ((user_id, org_scope), workflow_ids) in groups {
+            // Resolve accessible orgs once per batch, mirroring
+            // `user_accessible_org_ids`: org-scoped API key → that single
+            // org; otherwise the user's full membership list, failing
+            // CLOSED to an empty list on DB error (reader sees only
+            // personally-owned executions; MCP-617 fail-mode).
+            let org_ids: Vec<Uuid> = match org_scope {
+                Some(org) => vec![org],
+                None => match talos_organizations::OrganizationService::list_user_org_ids(
+                    &self.0, user_id,
+                )
+                .await
+                {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        tracing::error!(
+                            user_id = %user_id,
+                            error = %e,
+                            "latest_execution loader: org membership read failed — falling back to empty (reader denied org-shared rows)"
+                        );
+                        Vec::new()
+                    }
+                },
+            };
+
+            let scope = talos_tenancy::TenantReadScope::new(user_id, org_ids);
+            let mut tx = talos_db::begin_tenant_read_scoped(&self.0, &scope)
+                .await
+                .map_err(|e| std::sync::Arc::new(anyhow::anyhow!(e)))?;
+            let rows = exec_repo
+                .list_latest_executions_for_workflows_scoped(
+                    &mut tx,
+                    &workflow_ids,
+                    user_id,
+                    &scope.accessible_org_ids,
+                )
+                .await
+                .map_err(std::sync::Arc::new)?;
+            tx.commit()
+                .await
+                .map_err(|e| std::sync::Arc::new(anyhow::anyhow!(e)))?;
+
+            for r in rows {
+                out.insert(
+                    LatestExecutionKey {
+                        user_id,
+                        org_scope,
+                        workflow_id: r.workflow_id,
+                    },
+                    // Same lean projection the top-level
+                    // `latestWorkflowExecutions` resolver returns —
+                    // duration/output/trigger stay None by design (the
+                    // DISTINCT ON row doesn't carry them).
+                    WorkflowExecution {
+                        id: r.id,
+                        workflow_id: r.workflow_id,
+                        status: r.status,
+                        started_at: r.started_at.to_rfc3339(),
+                        completed_at: r.completed_at.map(|d| d.to_rfc3339()),
+                        error_message: r.error_message,
+                        created_at: r.created_at.to_rfc3339(),
+                        duration_ms: None,
+                        output_data: None,
+                        trigger_type: None,
+                        actor_id: None,
+                    },
+                );
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Shared helper for the loader-backed ComplexObject fields below:
+/// authenticated user id or a safe error.
+fn loader_user_id(ctx: &Context<'_>) -> Result<Uuid> {
+    ctx.data_opt::<Uuid>()
+        .copied()
+        .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())
+}
+
+/// Map a DataLoader failure to a generic client-safe error (lint check
+/// 14): the underlying anyhow chain can carry SQL/schema detail that must
+/// not cross the GraphQL boundary.
+fn loader_err(
+    context: &'static str,
+) -> impl FnOnce(std::sync::Arc<anyhow::Error>) -> async_graphql::Error {
+    move |e| {
+        tracing::error!(error = %e, "graphql dataloader: {context} failed");
+        async_graphql::Error::new("Request could not be completed").extend_safe()
+    }
+}
+
+#[ComplexObject]
+impl Workflow {
+    /// Display name of the owning actor (null when unbound, or when the
+    /// actor belongs to another user). Batched via [`ActorNameLoader`].
+    async fn actor_name(&self, ctx: &Context<'_>) -> Result<Option<String>> {
+        let Some(actor_id) = self.actor_id else {
+            return Ok(None);
+        };
+        let user_id = loader_user_id(ctx)?;
+        let loader = ctx.data::<async_graphql::dataloader::DataLoader<ActorNameLoader>>()?;
+        loader
+            .load_one(ActorNameKey { user_id, actor_id })
+            .await
+            .map_err(loader_err("actor name"))
+    }
+
+    /// Most recent execution of this workflow (null when never run or
+    /// not visible to the caller). Batched via [`LatestExecutionLoader`]
+    /// with the same user/org predicate as `latestWorkflowExecutions`.
+    async fn latest_execution(&self, ctx: &Context<'_>) -> Result<Option<WorkflowExecution>> {
+        let user_id = loader_user_id(ctx)?;
+        let org_scope = ctx
+            .data::<crate::schema::ApiKeyOrgScope>()
+            .ok()
+            .map(|s| s.0);
+        let loader = ctx.data::<async_graphql::dataloader::DataLoader<LatestExecutionLoader>>()?;
+        loader
+            .load_one(LatestExecutionKey {
+                user_id,
+                org_scope,
+                workflow_id: self.id,
+            })
+            .await
+            .map_err(loader_err("latest execution"))
+    }
+}
+
+#[ComplexObject]
+impl WorkflowScheduleObj {
+    /// Display name of the scheduled workflow (null when the workflow is
+    /// owned by another user). Batched via [`WorkflowNameLoader`] — the
+    /// per-row alternative is a point query per schedule row.
+    async fn workflow_name(&self, ctx: &Context<'_>) -> Result<Option<String>> {
+        let user_id = loader_user_id(ctx)?;
+        let loader = ctx.data::<async_graphql::dataloader::DataLoader<WorkflowNameLoader>>()?;
+        loader
+            .load_one(WorkflowNameKey {
+                user_id,
+                workflow_id: self.workflow_id,
+            })
+            .await
+            .map_err(loader_err("workflow name"))
+    }
+}
+
+#[ComplexObject]
+impl ExecutionApproval {
+    /// Display name of the workflow awaiting approval (null when owned by
+    /// another user). Batched via [`WorkflowNameLoader`].
+    async fn workflow_name(&self, ctx: &Context<'_>) -> Result<Option<String>> {
+        let user_id = loader_user_id(ctx)?;
+        let loader = ctx.data::<async_graphql::dataloader::DataLoader<WorkflowNameLoader>>()?;
+        loader
+            .load_one(WorkflowNameKey {
+                user_id,
+                workflow_id: self.workflow_id,
+            })
+            .await
+            .map_err(loader_err("workflow name"))
+    }
+}
+
+#[ComplexObject]
+impl WorkflowExecution {
+    /// Display name of the executed workflow (null when owned by another
+    /// user). Batched via [`WorkflowNameLoader`].
+    async fn workflow_name(&self, ctx: &Context<'_>) -> Result<Option<String>> {
+        let user_id = loader_user_id(ctx)?;
+        let loader = ctx.data::<async_graphql::dataloader::DataLoader<WorkflowNameLoader>>()?;
+        loader
+            .load_one(WorkflowNameKey {
+                user_id,
+                workflow_id: self.workflow_id,
+            })
+            .await
+            .map_err(loader_err("workflow name"))
+    }
+
+    /// Display name of the actor that dispatched this execution (null for
+    /// non-actor executions). Batched via [`ActorNameLoader`].
+    async fn actor_name(&self, ctx: &Context<'_>) -> Result<Option<String>> {
+        let Some(actor_id) = self.actor_id else {
+            return Ok(None);
+        };
+        let user_id = loader_user_id(ctx)?;
+        let loader = ctx.data::<async_graphql::dataloader::DataLoader<ActorNameLoader>>()?;
+        loader
+            .load_one(ActorNameKey { user_id, actor_id })
+            .await
+            .map_err(loader_err("actor name"))
+    }
+}
+
 #[ComplexObject]
 impl WasmModule {
     async fn capability_description(&self) -> Option<String> {
@@ -608,6 +984,7 @@ impl WasmModule {
 }
 
 #[derive(SimpleObject, Clone)]
+#[graphql(complex)]
 pub struct WorkflowExecution {
     pub id: Uuid,
     pub workflow_id: Uuid,
@@ -1017,6 +1394,16 @@ pub struct ActorMemoryEntry {
     pub updated_at: String,
 }
 
+/// One actor's memory entries within a batched `actorsMemories` read.
+/// Groups are returned ONLY for actors the caller owns — a requested id
+/// that is unknown (or another tenant's) simply has no group, so its
+/// absence is indistinguishable from non-existence.
+#[derive(SimpleObject, Clone)]
+pub struct ActorMemoryGroup {
+    pub actor_id: Uuid,
+    pub memories: Vec<ActorMemoryEntry>,
+}
+
 #[derive(async_graphql::InputObject)]
 pub struct WriteActorMemoryInput {
     pub actor_id: Uuid,
@@ -1062,6 +1449,7 @@ pub struct DeadLetterEntry {
 
 /// A pending authorization request for a module execution.
 #[derive(SimpleObject, Clone)]
+#[graphql(complex)]
 pub struct ExecutionApproval {
     pub id: Uuid,
     pub workflow_id: Uuid,

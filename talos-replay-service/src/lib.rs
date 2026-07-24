@@ -232,7 +232,7 @@ pub struct ReplayService {
     /// its `max_llm_tier` so replay inherits the original ceiling.
     actor_repo: Arc<talos_actor_repository::ActorRepository>,
     secrets_manager: Arc<SecretsManager>,
-    runtime: Arc<worker::runtime::TalosRuntime>,
+    runtime: Arc<talos_worker_runtime::runtime::TalosRuntime>,
 }
 
 impl ReplayService {
@@ -242,7 +242,7 @@ impl ReplayService {
         module_repo: Arc<ModuleRepository>,
         actor_repo: Arc<talos_actor_repository::ActorRepository>,
         secrets_manager: Arc<SecretsManager>,
-        runtime: Arc<worker::runtime::TalosRuntime>,
+        runtime: Arc<talos_worker_runtime::runtime::TalosRuntime>,
     ) -> Self {
         Self {
             registry,
@@ -545,7 +545,7 @@ impl ReplayService {
                 "Template has no compiled WASM. Use compile_template first.".to_string(),
             )
         })?;
-        let inspection = worker::inspect_component(&wasm_bytes);
+        let inspection = talos_worker_runtime::inspect_component(&wasm_bytes);
         Ok(WasmModule {
             name: template.name,
             content_hash: format!("template:{}", module_id),
@@ -772,7 +772,7 @@ fn count(results: &[ReplayResultRow]) -> ReplayCounters {
 /// `max_changed_paths`). Each replay is wrapped in the supplied
 /// timeout so a stuck replay cannot stall the loop.
 async fn run_replays(
-    runtime: &worker::runtime::TalosRuntime,
+    runtime: &talos_worker_runtime::runtime::TalosRuntime,
     module: &WasmModule,
     samples: Vec<ReplaySample>,
     secrets: HashMap<String, String>,
@@ -802,9 +802,9 @@ async fn run_replays(
                 secrets.clone(),
                 None,
                 Duration::from_secs(timeout_secs),
-                worker::runtime::RetryPolicy::default(),
+                talos_worker_runtime::runtime::RetryPolicy::default(),
                 None,
-                worker::runtime::SecurityPolicy::default(),
+                talos_worker_runtime::runtime::SecurityPolicy::default(),
                 None,
                 None,
                 false,

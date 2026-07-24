@@ -68,6 +68,8 @@ members = [
     "talos-inline-compile-service",
     "talos-search-service",
     "talos-failure-analysis-service",
+    "talos-hygiene-service",
+    "talos-session-brief-service",
     "talos-evaluation",
     "talos-actor-lifecycle-service",
     "talos-hot-update-service",
@@ -122,6 +124,7 @@ members = [
     "talos-api-docs",
     "talos-ws-auth",
     "controller",
+    "talos-worker-runtime",
     "worker",
     "talos_sdk_macros",
     # Engine + protocol crates — formerly a sibling repository at

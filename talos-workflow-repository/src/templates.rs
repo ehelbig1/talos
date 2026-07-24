@@ -180,7 +180,8 @@ impl WorkflowRepository {
             return Ok(vec![]);
         }
         let rows = sqlx::query(
-            "SELECT id, name, config_schema, allowed_secrets, allowed_hosts, max_retries \
+            "SELECT id, name, config_schema, allowed_secrets, allowed_hosts, max_retries, \
+                    allowed_methods, capability_world \
              FROM modules \
              WHERE id = ANY($1)",
         )
@@ -202,6 +203,10 @@ impl WorkflowRepository {
                         .try_get::<Option<_>, _>("allowed_hosts")?
                         .unwrap_or_default(),
                     max_retries: r.try_get::<Option<_>, _>("max_retries")?.unwrap_or(0),
+                    allowed_methods: r
+                        .try_get::<Option<_>, _>("allowed_methods")?
+                        .unwrap_or_default(),
+                    capability_world: r.try_get::<Option<_>, _>("capability_world")?,
                 })
             })
             .collect()
@@ -242,9 +247,13 @@ impl WorkflowRepository {
                     .try_get::<Option<_>, _>("config_schema")?
                     .unwrap_or(serde_json::json!({})),
                 allowed_secrets: decode_allowed_secrets_row(&r, Some(id)),
-                // Not selected on this path (swap_node_module doesn't need egress hosts).
+                // Not selected on this path (swap_node_module doesn't need egress
+                // hosts or retry-default inputs; effective_max_retries() on this
+                // row fails closed to the explicit column value).
                 allowed_hosts: Vec::new(),
                 max_retries: r.try_get::<Option<_>, _>("max_retries")?.unwrap_or(0),
+                allowed_methods: Vec::new(),
+                capability_world: None,
             })
         })
         .transpose()
@@ -728,9 +737,43 @@ pub struct NodeTemplateRow {
     /// calls (side-effecting). Used by `validate_workflow` to surface the
     /// at-least-once crash-recovery contract for these nodes.
     pub allowed_hosts: Vec<String>,
-    /// Default max retries for nodes using this template (0 = no retries).
-    /// Applied by add_node_to_workflow when the caller doesn't provide retry_count.
+    /// Raw `modules.max_retries`. Nothing in the platform writes this
+    /// column, so `0` is the untouched DB default ("no opinion"), NOT an
+    /// explicit no-retry choice — consumers stamping node retry defaults
+    /// must go through [`Self::effective_max_retries`], which resolves 0
+    /// via the method-aware classifier. A value > 0 is an explicit
+    /// operator override and is honored verbatim.
     pub max_retries: i32,
+    /// HTTP method allowlist — input to the method-aware retry default.
+    pub allowed_methods: Vec<String>,
+    /// Capability world — input to the method-aware retry default.
+    pub capability_world: Option<String>,
+}
+
+impl NodeTemplateRow {
+    /// Default `retry_count` to stamp on a node created from this
+    /// template when the caller supplies none.
+    ///
+    /// `max_retries > 0` on the module row is an explicit override and
+    /// wins. The DB-default `0` resolves via
+    /// [`talos_workflow_engine_core::default_max_retries_for_module`]:
+    /// read-only / pure-compute modules get transient retries,
+    /// side-effect-capable modules (governance approval gates,
+    /// messaging senders, state-changing HTTP) stay at 0. Pre-fix,
+    /// the raw 0 was stamped verbatim onto every MCP-created node,
+    /// which disabled the engine's retry machinery fleet-wide — the
+    /// 2026-07-23 outage failed ~125 read-only Gmail fetches that
+    /// each ran exactly once.
+    pub fn effective_max_retries(&self) -> i32 {
+        if self.max_retries > 0 {
+            return self.max_retries;
+        }
+        i32::try_from(talos_workflow_engine_core::default_max_retries_for_module(
+            &self.allowed_methods,
+            self.capability_world.as_deref(),
+        ))
+        .unwrap_or(0)
+    }
 }
 
 /// The four per-module permission columns, fetched together for drift checks.

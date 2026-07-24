@@ -170,7 +170,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_health_dashboard",
-            "description": "Overview of workflow health: failing workflows, long-running executions, and summary counts.",
+            "description": "Overview of workflow health: failing workflows, long-running executions, and summary counts. The summary includes failure_rate_24h_pct (failed/(failed+completed) over 24h, null when no executions), and top_failures_24h lists up to 10 workflows grouped by 24h failure count with last_failed_at and a truncated representative error_message — this surfaces mass transient outages that the currently-failing heuristic misses.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -276,14 +276,14 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_error_report",
-            "description": "Comprehensive error analysis for a workflow: total failures, error fingerprints, node-level failure breakdown, and time-of-day failure patterns.",
+            "description": "Comprehensive error analysis. With workflow_id: per-workflow report — total failures, error fingerprints, node-level failure breakdown, and time-of-day failure patterns. Without workflow_id: platform-wide rollup across all your workflows — total failures, error fingerprints grouped across workflows, and per-workflow failure counts. Useful after a mass/transient outage where no single workflow is the culprit.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "workflow_id": { "type": "string", "description": "UUID of the workflow to analyze" },
-                    "days": { "type": "number", "description": "Number of days to look back (default: 7, max: 90)" }
-                },
-                "required": ["workflow_id"]
+                    "workflow_id": { "type": "string", "description": "UUID of the workflow to analyze. Omit for a platform-wide (user-scoped) rollup across all workflows." },
+                    "days": { "type": "number", "description": "Number of days to look back (default: 7, max: 90)" },
+                    "limit": { "type": "number", "description": "Global mode only: max workflows in the per-workflow failure breakdown (default: 20, max: 100)" }
+                }
             }
         }),
         serde_json::json!({
@@ -798,6 +798,36 @@ async fn handle_get_health_dashboard(
         })
         .collect();
 
+    // 2026-07-24: grouped 24h failure rollup. The `failing_workflows`
+    // heuristic above only surfaces workflows that are CURRENTLY failing,
+    // so a mass transient outage (many workflows each failing a few times,
+    // then recovering) showed `failing_workflow_count: 0` while the raw
+    // failed/completed counts said ~34% of runs died. `top_failures_24h`
+    // + `failure_rate_24h_pct` make that class of incident visible.
+    let top_failure_rows = match state.analytics_repo.get_top_failures_24h(user_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "get_top_failures_24h returned error");
+            Vec::new()
+        }
+    };
+
+    let top_failures: Vec<serde_json::Value> = top_failure_rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "workflow_id": r.workflow_id.to_string(),
+                "workflow_name": r.workflow_name,
+                "failed_count": r.failed_count,
+                "last_failed_at": r.last_failed_at.map(|t| t.to_rfc3339()),
+                "error_message": r
+                    .latest_error_message
+                    .as_deref()
+                    .map(truncate_error_message),
+            })
+        })
+        .collect();
+
     let summary = match state
         .analytics_repo
         .get_health_summary_counts(user_id)
@@ -815,6 +845,7 @@ async fn handle_get_health_dashboard(
             "currently_running": summary.running,
             "failed_last_24h": summary.failed_24h,
             "completed_last_24h": summary.completed_24h,
+            "failure_rate_24h_pct": failure_rate_pct(summary.failed_24h, summary.completed_24h),
             "failing_workflow_count": failing.len(),
             "long_running_execution_count": long_running.len(),
             "loop_capped_workflow_count": loop_capped.len(),
@@ -822,12 +853,95 @@ async fn handle_get_health_dashboard(
         "failing_workflows": failing,
         "long_running_executions": long_running,
         "loop_capped_workflows": loop_capped,
+        "top_failures_24h": top_failures,
     });
 
     mcp_text(
         req_id,
         &serde_json::to_string_pretty(&result).unwrap_or_default(),
     )
+}
+
+/// Pure: 24h failure rate as failed/(failed+completed) percent, rounded
+/// to 1 decimal. `None` (serialized as JSON null) when the window has no
+/// terminal executions at all — a rate over zero runs is meaningless and
+/// `0.0` would falsely read as "healthy".
+pub(crate) fn failure_rate_pct(failed: i64, completed: i64) -> Option<f64> {
+    let total = failed + completed;
+    if total <= 0 || failed < 0 || completed < 0 {
+        return None;
+    }
+    Some(((failed as f64 / total as f64) * 1000.0).round() / 10.0)
+}
+
+/// Representative error messages on the dashboard are previews, not full
+/// payloads — cap at ~200 bytes on a char boundary (delegates to
+/// `talos_text_util::bounded_preview`, which appends an ellipsis marker
+/// when it truncates).
+pub(crate) fn truncate_error_message(msg: &str) -> String {
+    talos_text_util::bounded_preview(msg, 200).into_owned()
+}
+
+#[cfg(test)]
+mod health_dashboard_summary_tests {
+    use super::{failure_rate_pct, truncate_error_message};
+
+    #[test]
+    fn failure_rate_none_when_no_executions() {
+        assert_eq!(failure_rate_pct(0, 0), None);
+    }
+
+    #[test]
+    fn failure_rate_zero_when_all_completed() {
+        assert_eq!(failure_rate_pct(0, 245), Some(0.0));
+    }
+
+    #[test]
+    fn failure_rate_hundred_when_all_failed() {
+        assert_eq!(failure_rate_pct(125, 0), Some(100.0));
+    }
+
+    #[test]
+    fn failure_rate_rounds_to_one_decimal() {
+        // The motivating incident: 125 failed / 245 completed → 33.8%.
+        assert_eq!(failure_rate_pct(125, 245), Some(33.8));
+        // 1/3 → 33.333... → 33.3
+        assert_eq!(failure_rate_pct(1, 2), Some(33.3));
+        // 2/3 → 66.666... → 66.7
+        assert_eq!(failure_rate_pct(2, 1), Some(66.7));
+    }
+
+    #[test]
+    fn failure_rate_negative_counts_are_null_not_garbage() {
+        // Defensive: COUNT(*) can't go negative, but a future refactor
+        // feeding a delta here shouldn't produce a nonsense percentage.
+        assert_eq!(failure_rate_pct(-1, 10), None);
+        assert_eq!(failure_rate_pct(10, -1), None);
+    }
+
+    #[test]
+    fn truncation_passes_short_messages_through() {
+        let msg = "connection refused by upstream";
+        assert_eq!(truncate_error_message(msg), msg);
+    }
+
+    #[test]
+    fn truncation_caps_long_messages() {
+        let msg = "x".repeat(1000);
+        let out = truncate_error_message(&msg);
+        assert!(out.len() <= 200, "expected <= 200 bytes, got {}", out.len());
+        assert!(out.ends_with('…'), "truncated preview carries a marker");
+    }
+
+    #[test]
+    fn truncation_respects_char_boundaries() {
+        // 4-byte scalar values: naive byte slicing at 200 would panic.
+        let msg = "🦀".repeat(100); // 400 bytes
+        let out = truncate_error_message(&msg);
+        assert!(out.len() <= 200);
+        // Must still be valid UTF-8 (implied by String) and non-empty.
+        assert!(!out.is_empty());
+    }
 }
 
 async fn handle_get_workflow_dependencies(
@@ -2173,14 +2287,107 @@ async fn handle_get_all_workflow_stats(
     }
 }
 
+/// Which report `get_error_report` should produce, derived from the
+/// (now-optional) `workflow_id` argument.
+///
+/// Kept as a pure parse step so the two modes' argument handling is unit-
+/// testable without a DB: absent/null → `Global`; a valid UUID →
+/// `PerWorkflow`; a malformed value is an ERROR (via
+/// `parse_optional_uuid_strict`), never a silent fall-through to the
+/// global rollup — a typo'd workflow_id silently widening the report to
+/// every workflow would be the same silent-drop class MCP-309 fixed.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ErrorReportMode {
+    Global,
+    PerWorkflow(Uuid),
+}
+
+pub(crate) fn parse_error_report_mode(
+    args: &serde_json::Value,
+    req_id: &Option<serde_json::Value>,
+) -> Result<ErrorReportMode, JsonRpcResponse> {
+    Ok(
+        match crate::utils::parse_optional_uuid_strict(args, "workflow_id", req_id)? {
+            Some(id) => ErrorReportMode::PerWorkflow(id),
+            None => ErrorReportMode::Global,
+        },
+    )
+}
+
+/// Pure: group raw `(error_message, started_at)` rows (most-recent first)
+/// into fingerprint buckets and return the top-`top_k` as JSON objects
+/// `{fingerprint, count, latest_message, latest_at}`.
+///
+/// Shared by BOTH `get_error_report` modes (per-workflow and global) so
+/// the fingerprinting behavior can never drift between them — this is the
+/// logic that previously lived inline in the per-workflow handler.
+/// Ordered by count desc with the fingerprint string as a deterministic
+/// tiebreaker (the inline version iterated a HashMap, so tie order was
+/// nondeterministic across runs).
+pub(crate) fn group_error_fingerprints(
+    error_rows: &[(String, chrono::DateTime<chrono::Utc>)],
+    top_k: usize,
+) -> Vec<serde_json::Value> {
+    // HashMap<fingerprint, (count, latest_message, latest_at)> — keeping
+    // the most-recent timestamp + message means the first row encountered
+    // (rows are DESC-sorted) wins, and later rows just bump count.
+    let mut fingerprint_groups: std::collections::HashMap<
+        String,
+        (usize, String, chrono::DateTime<chrono::Utc>),
+    > = std::collections::HashMap::new();
+    for (msg, started_at) in error_rows {
+        let fp = talos_analytics_repository::fingerprint_error_message(msg);
+        match fingerprint_groups.get_mut(&fp) {
+            Some(entry) => {
+                entry.0 += 1;
+                if *started_at > entry.2 {
+                    entry.2 = *started_at;
+                    entry.1 = msg.clone();
+                }
+            }
+            None => {
+                fingerprint_groups.insert(fp, (1, msg.clone(), *started_at));
+            }
+        }
+    }
+
+    let mut groups: Vec<(String, usize, String, chrono::DateTime<chrono::Utc>)> =
+        fingerprint_groups
+            .into_iter()
+            .map(|(fp, (count, latest_msg, latest_at))| (fp, count, latest_msg, latest_at))
+            .collect();
+    groups.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    groups.truncate(top_k);
+    groups
+        .into_iter()
+        .map(|(fp, count, latest_msg, latest_at)| {
+            serde_json::json!({
+                "fingerprint": fp,
+                "count": count,
+                "latest_message": latest_msg,
+                "latest_at": latest_at.to_rfc3339(),
+            })
+        })
+        .collect()
+}
+
+/// Source-row cap for the GLOBAL fingerprint rollup. Higher than the
+/// per-workflow 200 because it spans every workflow the user owns; still
+/// a hard bound so a pathological failure storm can't make the handler
+/// pull unbounded rows.
+const GLOBAL_ERROR_ROWS_CAP: i64 = 500;
+
 async fn handle_get_error_report(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
     state: &McpState,
     user_id: Uuid,
 ) -> JsonRpcResponse {
-    let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
-        Ok(id) => id,
+    let wf_id = match parse_error_report_mode(args, &req_id) {
+        Ok(ErrorReportMode::PerWorkflow(id)) => id,
+        Ok(ErrorReportMode::Global) => {
+            return handle_error_report_global(req_id, args, state, user_id).await;
+        }
         Err(resp) => return resp,
     };
 
@@ -2223,46 +2430,9 @@ async fn handle_get_error_report(
         .unwrap_or_default();
     let error_msgs: Vec<String> = error_rows.iter().map(|(m, _)| m.clone()).collect();
 
-    // HashMap<fingerprint, (count, latest_message, latest_at)> — keeping
-    // the most-recent timestamp + message means the first row encountered
-    // (rows are DESC-sorted) wins, and later rows just bump count.
-    let mut fingerprint_groups: std::collections::HashMap<
-        String,
-        (usize, String, chrono::DateTime<chrono::Utc>),
-    > = std::collections::HashMap::new();
-    for (msg, started_at) in &error_rows {
-        let fp = talos_analytics_repository::fingerprint_error_message(msg);
-        match fingerprint_groups.get_mut(&fp) {
-            Some(entry) => {
-                entry.0 += 1;
-                if *started_at > entry.2 {
-                    entry.2 = *started_at;
-                    entry.1 = msg.clone();
-                }
-            }
-            None => {
-                fingerprint_groups.insert(fp, (1, msg.clone(), *started_at));
-            }
-        }
-    }
-
-    let mut error_fingerprints: Vec<serde_json::Value> = fingerprint_groups
-        .into_iter()
-        .map(|(fp, (count, latest_msg, latest_at))| {
-            serde_json::json!({
-                "fingerprint": fp,
-                "count": count,
-                "latest_message": latest_msg,
-                "latest_at": latest_at.to_rfc3339(),
-            })
-        })
-        .collect();
-    error_fingerprints.sort_by(|a, b| {
-        let ca = a.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
-        let cb = b.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
-        cb.cmp(&ca)
-    });
-    error_fingerprints.truncate(10);
+    // Fingerprint grouping shared with the global mode — see
+    // `group_error_fingerprints`.
+    let error_fingerprints = group_error_fingerprints(&error_rows, 10);
 
     // Node-level failure breakdown from execution_events
     let node_failures = state
@@ -2368,6 +2538,192 @@ async fn handle_get_error_report(
         req_id,
         &serde_json::to_string_pretty(&result).unwrap_or_default(),
     )
+}
+
+/// Global (no `workflow_id`) mode of `get_error_report`: a user-scoped,
+/// platform-wide failure rollup for the window. Motivated by the same
+/// 2026-07-24 incident as `top_failures_24h` — a mass transient outage
+/// had no single workflow to point `get_error_report` at, and the
+/// per-workflow requirement forced operators to iterate every workflow
+/// by hand to see the blast radius.
+///
+/// Shares `group_error_fingerprints` with the per-workflow path so the
+/// fingerprinting semantics are identical in both modes.
+async fn handle_error_report_global(
+    req_id: Option<serde_json::Value>,
+    args: &serde_json::Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let days = match crate::utils::validate_range_i64(args, "days", 1, 90, 7, &req_id) {
+        Ok(v) => v as i32,
+        Err(resp) => return resp,
+    };
+    // Caller-clamped breadth of the per-workflow breakdown (lint check 12
+    // discipline — validated range, never a raw caller value into LIMIT).
+    let limit = match crate::utils::validate_range_i64(args, "limit", 1, 100, 20, &req_id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    // Total failures across all the user's workflows in the window.
+    let stats = state
+        .analytics_repo
+        .get_exec_stats_global(user_id, days)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "get_exec_stats_global failed for error report");
+            talos_analytics_repository::ExecStats::empty()
+        });
+
+    let error_rows = match state
+        .analytics_repo
+        .get_error_messages_with_started_at_global(user_id, days, GLOBAL_ERROR_ROWS_CAP)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, "global error-message query failed");
+            return mcp_error(req_id, -32000, "Failed to fetch error report");
+        }
+    };
+    let error_fingerprints = group_error_fingerprints(&error_rows, 10);
+
+    let per_workflow_rows = match state
+        .analytics_repo
+        .get_per_workflow_failure_counts(user_id, days, limit)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, "per-workflow failure-count query failed");
+            return mcp_error(req_id, -32000, "Failed to fetch error report");
+        }
+    };
+    let workflow_failure_counts: Vec<serde_json::Value> = per_workflow_rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "workflow_id": r.workflow_id.to_string(),
+                "workflow_name": r.workflow_name,
+                "failed_count": r.failed_count,
+                "last_failed_at": r.last_failed_at.map(|t| t.to_rfc3339()),
+            })
+        })
+        .collect();
+
+    let result = serde_json::json!({
+        "scope": "global",
+        "period_days": days,
+        "total_failures": stats.failed,
+        "error_fingerprints": error_fingerprints,
+        "workflow_failure_counts": workflow_failure_counts,
+    });
+
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&result).unwrap_or_default(),
+    )
+}
+
+#[cfg(test)]
+mod error_report_mode_tests {
+    use super::{group_error_fingerprints, parse_error_report_mode, ErrorReportMode};
+    use chrono::{Duration, TimeZone, Utc};
+
+    // -- argument parsing: the two modes -------------------------------
+
+    #[test]
+    fn missing_workflow_id_selects_global_mode() {
+        let args = serde_json::json!({});
+        assert_eq!(
+            parse_error_report_mode(&args, &None).unwrap(),
+            ErrorReportMode::Global
+        );
+    }
+
+    #[test]
+    fn null_workflow_id_selects_global_mode() {
+        let args = serde_json::json!({ "workflow_id": null });
+        assert_eq!(
+            parse_error_report_mode(&args, &None).unwrap(),
+            ErrorReportMode::Global
+        );
+    }
+
+    #[test]
+    fn valid_workflow_id_selects_per_workflow_mode() {
+        let id = uuid::Uuid::new_v4();
+        let args = serde_json::json!({ "workflow_id": id.to_string() });
+        assert_eq!(
+            parse_error_report_mode(&args, &None).unwrap(),
+            ErrorReportMode::PerWorkflow(id)
+        );
+    }
+
+    #[test]
+    fn malformed_workflow_id_is_an_error_not_global_fallthrough() {
+        // A typo'd workflow_id must NOT silently widen the report to
+        // every workflow (silent-drop class, MCP-309).
+        let args = serde_json::json!({ "workflow_id": "not-a-uuid" });
+        assert!(parse_error_report_mode(&args, &None).is_err());
+    }
+
+    #[test]
+    fn wrong_type_workflow_id_is_an_error() {
+        let args = serde_json::json!({ "workflow_id": 42 });
+        assert!(parse_error_report_mode(&args, &None).is_err());
+    }
+
+    // -- fingerprint grouping (shared by both modes) --------------------
+
+    fn ts(offset_secs: i64) -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 7, 24, 12, 0, 0).unwrap() + Duration::seconds(offset_secs)
+    }
+
+    #[test]
+    fn groups_equivalent_messages_under_one_fingerprint() {
+        let rows = vec![
+            ("timeout after 91".to_string(), ts(2)),
+            ("timeout after 32".to_string(), ts(1)),
+        ];
+        let out = group_error_fingerprints(&rows, 10);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["count"], 2);
+        // Most recent occurrence wins as the representative message.
+        assert_eq!(out[0]["latest_message"], "timeout after 91");
+        assert_eq!(out[0]["latest_at"], ts(2).to_rfc3339());
+    }
+
+    #[test]
+    fn orders_by_count_desc_with_fingerprint_tiebreaker() {
+        let rows = vec![
+            ("aaa distinct error".to_string(), ts(0)),
+            ("zzz frequent error".to_string(), ts(1)),
+            ("zzz frequent error".to_string(), ts(2)),
+            ("bbb distinct error".to_string(), ts(3)),
+        ];
+        let out = group_error_fingerprints(&rows, 10);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["fingerprint"], "zzz frequent error");
+        // Count ties break on fingerprint string, deterministically.
+        assert_eq!(out[1]["fingerprint"], "aaa distinct error");
+        assert_eq!(out[2]["fingerprint"], "bbb distinct error");
+    }
+
+    #[test]
+    fn truncates_to_top_k() {
+        let rows: Vec<(String, chrono::DateTime<Utc>)> = (0..15)
+            .map(|i| (format!("unique error kind {i} occurred"), ts(i)))
+            .collect();
+        let out = group_error_fingerprints(&rows, 10);
+        assert_eq!(out.len(), 10);
+    }
+
+    #[test]
+    fn empty_rows_produce_empty_fingerprints() {
+        assert!(group_error_fingerprints(&[], 10).is_empty());
+    }
 }
 
 /// Detect the "fuel-bump band-aid" anti-pattern from raw error messages.
@@ -5573,561 +5929,29 @@ async fn handle_bulk_tag_workflows(
     )
 }
 
+/// Thin wrapper (architectural-mandate extraction, 2026-07): parse the
+/// `fix_all` / `confirm` booleans, call `talos-hygiene-service`, format.
+/// Report assembly, the fix-candidate partition, and the fix mutations
+/// all live in `HygieneService` — output JSON is byte-identical to the
+/// pre-extraction handler.
 async fn handle_get_platform_hygiene_report(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
     state: &McpState,
     user_id: Uuid,
 ) -> JsonRpcResponse {
-    let h = match state.analytics_repo.get_hygiene_report(user_id).await {
-        Ok(r) => r,
+    let outcome = match state
+        .hygiene_service
+        .generate(talos_hygiene_service::HygieneReportInput { user_id })
+        .await
+    {
+        Ok(o) => o,
         Err(e) => {
             tracing::error!("get_platform_hygiene_report failed: {}", e);
-            return mcp_error(req_id, -32000, "Failed to generate hygiene report");
+            return mcp_error(req_id, e.jsonrpc_code(), &e.user_facing_message());
         }
     };
-
-    // Auto-classify workflows whose names start with known QA/test prefixes.
-    // These should be classified as workflow_type='test' but often aren't — exclude
-    // them from readiness warnings and surface them as a separate recommendation.
-    let test_name_prefixes = [
-        "QA-", "qa-", "QA_", "qa_", "test-", "test_", "Test-", "Test_", "TEST-", "TEST_",
-    ];
-    let is_test_like = |name: &str| test_name_prefixes.iter().any(|p| name.starts_with(p));
-
-    let auto_classified_count = h
-        .undescribed
-        .iter()
-        .chain(h.uncapabilized.iter())
-        .filter(|r| is_test_like(&r.name))
-        .map(|r| r.id)
-        .collect::<std::collections::HashSet<_>>()
-        .len();
-
-    let undescribed: Vec<serde_json::Value> = h
-        .undescribed
-        .iter()
-        .filter(|r| !is_test_like(&r.name))
-        .map(|r| {
-            serde_json::json!({
-                "id": r.id.to_string(),
-                "name": r.name,
-                "readiness_score": r.readiness_score,
-                "created_at": r.created_at.to_rfc3339(),
-            })
-        })
-        .collect();
-
-    let uncapabilized: Vec<serde_json::Value> = h
-        .uncapabilized
-        .iter()
-        .filter(|r| !is_test_like(&r.name))
-        .map(|r| {
-            serde_json::json!({
-                "id": r.id.to_string(),
-                "name": r.name,
-                "description": r.description,
-                "readiness_score": r.readiness_score,
-                "created_at": r.created_at.to_rfc3339(),
-            })
-        })
-        .collect();
-
-    let suppressed_count = h.suppressed_count;
-    let suppressed_low_score_count = h.suppressed_low_score_count;
-    let unembedded_count = h.unembedded_count;
-    let total_workflow_count = h.total_workflow_count;
-
-    // --- 4. Orphaned compiled modules ---
-    let orphaned_modules: Vec<serde_json::Value> = h
-        .orphaned_modules
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "id": r.id.to_string(),
-                "name": r.name,
-                "size_bytes": r.size_bytes,
-                "compiled_at": r.compiled_at.to_rfc3339(),
-            })
-        })
-        .collect();
-
-    // --- 5. Stale stuck executions ---
-    let stale_executions: Vec<serde_json::Value> = h
-        .stale_executions
-        .iter()
-        .map(|r| {
-            let hours_stuck = chrono::Utc::now()
-                .signed_duration_since(r.started_at)
-                .num_minutes() as f64
-                / 60.0;
-            serde_json::json!({
-                "id": r.id.to_string(),
-                "workflow_id": r.workflow_id.to_string(),
-                "workflow_name": r.workflow_name,
-                "status": r.status,
-                "started_at": r.started_at.to_rfc3339(),
-                "hours_stuck": format!("{:.1}", hours_stuck),
-            })
-        })
-        .collect();
-
-    // --- 6. Dormant enabled workflows ---
-    let dormant_workflows: Vec<serde_json::Value> = h
-        .dormant_workflows
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "id": r.id.to_string(),
-                "name": r.name,
-                "created_at": r.created_at.to_rfc3339(),
-                "last_execution": r.last_execution.map(|t| t.to_rfc3339()),
-            })
-        })
-        .collect();
-
-    let stale_draft_workflows: Vec<serde_json::Value> = h
-        .stale_draft_workflows
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "id": r.id.to_string(),
-                "name": r.name,
-                "created_at": r.created_at.to_rfc3339(),
-            })
-        })
-        .collect();
-
-    let idle_actors: Vec<serde_json::Value> = h
-        .idle_actors
-        .iter()
-        .map(|r| {
-            // MCP-6: emit a string-typed `last_active_label` ("never" or
-            // RFC3339) alongside the raw `last_active` Option. Keeps the
-            // semantic-correct null for programmatic null-check while
-            // giving ops dashboards a label that's always renderable
-            // without "missing field" confusion.
-            let last_active_label = match r.last_active {
-                Some(ref t) => t.to_rfc3339(),
-                None => "never".to_string(),
-            };
-            serde_json::json!({
-                "actor_id": r.id.to_string(),
-                "name": r.name,
-                "status": r.status,
-                "last_active": r.last_active.map(|t| t.to_rfc3339()),
-                "last_active_label": last_active_label,
-                "total_executions": r.total_executions,
-            })
-        })
-        .collect();
-
-    // --- 10. Orphaned secrets ---
-    let orphaned_secrets: Vec<serde_json::Value> = if h.has_wildcard_module {
-        Vec::new()
-    } else {
-        h.orphaned_secrets
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "name": r.name,
-                    "key_path": r.key_path,
-                    "namespace": r.namespace.as_deref().unwrap_or("default"),
-                    "created_at": r.created_at.to_rfc3339(),
-                    "has_expiry": r.expires_at.is_some(),
-                })
-            })
-            .collect()
-    };
-
-    // --- 11. Secrets missing expiry ---
-    let secrets_without_expiry: Vec<serde_json::Value> = h
-        .secrets_without_expiry
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "name": r.name,
-                "key_path": r.key_path,
-                "created_at": r.created_at.to_rfc3339(),
-            })
-        })
-        .collect();
-
-    // --- Actor memories expiring within 24 hours ---
-    let expiring_actor_memories: Vec<serde_json::Value> = h
-        .expiring_actor_memories
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "actor_id": r.actor_id.to_string(),
-                "actor_name": r.actor_name,
-                "key": r.key,
-                "memory_type": r.memory_type,
-                "expires_at": r.expires_at.to_rfc3339(),
-            })
-        })
-        .collect();
-
-    // --- Production workflows needing input_schema ---
-    let workflows_needing_schema: Vec<serde_json::Value> = h
-        .workflows_needing_schema
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "workflow_id": r.id.to_string(),
-                "name": r.name,
-                "execution_count": r.execution_count,
-                "last_run": r.last_run.map(|t| t.to_rfc3339()).unwrap_or_default(),
-            })
-        })
-        .collect();
-
-    // --- Build summary and recommendations ---
-    let mut recommendations: Vec<serde_json::Value> = Vec::new();
-
-    if !undescribed.is_empty() {
-        recommendations.push(serde_json::json!({
-            "priority": "high",
-            "category": "documentation",
-            "action": format!("Add descriptions to {} published workflow(s) using set_workflow_description. Undescribed workflows score poorly in readiness and are hard for agents to discover.", undescribed.len()),
-            "affected_count": undescribed.len(),
-        }));
-    }
-
-    if !uncapabilized.is_empty() {
-        recommendations.push(serde_json::json!({
-            "priority": "high",
-            "category": "discoverability",
-            "action": format!("Add capabilities to {} workflow(s) using set_workflow_capabilities or suggest_capabilities. Workflows without capabilities cannot be found by get_workflows_by_capability.", uncapabilized.len()),
-            "affected_count": uncapabilized.len(),
-        }));
-    }
-
-    if unembedded_count > 0 {
-        let pct = if total_workflow_count > 0 {
-            unembedded_count * 100 / total_workflow_count
-        } else {
-            0
-        };
-        recommendations.push(serde_json::json!({
-            "priority": "medium",
-            "category": "semantic_search",
-            "action": format!("{} of {} workflows ({pct}%) lack embeddings — semantic search falls back to keyword matching for these. Run generate_workflow_embeddings to index them for true vector search.", unembedded_count, total_workflow_count),
-            "affected_count": unembedded_count,
-        }));
-    }
-
-    if !orphaned_modules.is_empty() {
-        let total_size: i64 = orphaned_modules
-            .iter()
-            .filter_map(|m| m.get("size_bytes").and_then(|v| v.as_i64()))
-            .sum();
-        recommendations.push(serde_json::json!({
-            "priority": "low",
-            "category": "cleanup",
-            "action": format!("{} compiled module(s) are not used by any workflow ({}KB total). Use cleanup_modules to reclaim storage.", orphaned_modules.len(), total_size / 1024),
-            "affected_count": orphaned_modules.len(),
-        }));
-    }
-
-    if !stale_executions.is_empty() {
-        recommendations.push(serde_json::json!({
-            "priority": "critical",
-            "category": "operations",
-            "action": format!("{} execution(s) have been stuck in running/queued state for more than 2 hours. Use cleanup_stale_executions or cancel them individually.", stale_executions.len()),
-            "affected_count": stale_executions.len(),
-        }));
-    }
-
-    if !dormant_workflows.is_empty() {
-        recommendations.push(serde_json::json!({
-            "priority": "low",
-            "category": "cleanup",
-            "action": format!("{} enabled workflow(s) have had no executions in 30+ days. Consider disabling or deleting them with batch_delete_workflows to reduce registry noise.", dormant_workflows.len()),
-            "affected_count": dormant_workflows.len(),
-        }));
-    }
-
-    if !stale_draft_workflows.is_empty() {
-        recommendations.push(serde_json::json!({
-            "priority": "low",
-            "category": "cleanup",
-            "action": format!("{} draft workflow(s) have never been published or executed in 7+ days — likely scaffolding leftovers. Review with get_workflow_quickstart then publish_version or delete with batch_delete_workflows.", stale_draft_workflows.len()),
-            "affected_count": stale_draft_workflows.len(),
-        }));
-    }
-
-    if !idle_actors.is_empty() {
-        recommendations.push(serde_json::json!({
-            "priority": "low",
-            "category": "cleanup",
-            "action": format!("Terminate or archive {} idle actor(s) to reduce attack surface and noise in list_actors. Use archive_actor to preserve history or terminate_actor for full cleanup.", idle_actors.len()),
-            "affected_count": idle_actors.len(),
-        }));
-    }
-
-    // MCP-1208 (2026-05-17): recommendation text routes operators to
-    // the dashboard for both deletion and expiry-set actions. The
-    // previous text referenced the `delete_secret` / `set_secret` MCP
-    // tools that MCP-1201 removed — operators following the old text
-    // would call a tool that no longer exists. Same docs-drift class
-    // closed by MCP-1202 (CLAUDE.md + docs/*) but the hygiene-report
-    // recommendation generator was missed in that sweep.
-    if !orphaned_secrets.is_empty() {
-        recommendations.push(serde_json::json!({
-            "priority": "medium",
-            "category": "security",
-            "action": format!("{} secret(s) are not referenced by any module's allowed_secrets list. Delete them in the dashboard (Settings → Secrets) to reduce vault clutter and limit credential exposure — secret writes require 2FA and aren't available through MCP.", orphaned_secrets.len()),
-            "affected_count": orphaned_secrets.len(),
-        }));
-    }
-
-    if !secrets_without_expiry.is_empty() {
-        recommendations.push(serde_json::json!({
-            "priority": "medium",
-            "category": "security",
-            "action": format!("{} API key/token secret(s) have no expiry date set. Set an expiry in the dashboard (Settings → Secrets) to enforce rotation cadence — secret writes require 2FA and aren't available through MCP.", secrets_without_expiry.len()),
-            "affected_count": secrets_without_expiry.len(),
-        }));
-    }
-
-    // Wildcard secret grant: at least one installed module can read any vault path.
-    // This is a security risk — a single compromised workflow can exfiltrate the entire vault.
-    // Note: orphaned_secrets is suppressed when has_wildcard_module=true (every secret
-    // might be referenced), so this recommendation surfaces in that scenario.
-    if h.has_wildcard_module {
-        let names_str = if h.wildcard_module_names.is_empty() {
-            "unknown".to_string()
-        } else {
-            h.wildcard_module_names
-                .iter()
-                .map(|n| format!("'{}'", n))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        recommendations.push(serde_json::json!({
-            "priority": "medium",
-            "category": "security",
-            "wildcard_modules": h.wildcard_module_names,
-            "action": format!(
-                "{} module(s) have wildcard secret access (allowed_secrets: [\"*\"]): {}. \
-                 Each can read every secret in your vault — a single compromised or misbehaving \
-                 workflow can exfiltrate all credentials. Reinstall with explicit allowed_secrets \
-                 paths to limit blast radius. Use get_workflow_risk_assessment on workflows \
-                 containing these modules to identify affected nodes.",
-                h.wildcard_module_names.len(),
-                names_str
-            ),
-            "affected_count": h.wildcard_module_names.len(),
-        }));
-    }
-
-    if !expiring_actor_memories.is_empty() {
-        let keys_preview: Vec<&str> = expiring_actor_memories
-            .iter()
-            .take(3)
-            .filter_map(|m| m.get("key").and_then(|k| k.as_str()))
-            .collect();
-        recommendations.push(serde_json::json!({
-            "priority": "high",
-            "category": "actor_memory",
-            "action": format!(
-                "{} actor memory key(s) expire within 24 hours (e.g. {}). Use refresh_memory_ttl to extend TTL, or let them expire if the data is no longer needed.",
-                expiring_actor_memories.len(),
-                keys_preview.join(", ")
-            ),
-            "affected_count": expiring_actor_memories.len(),
-        }));
-    }
-
-    if !workflows_needing_schema.is_empty() {
-        let names_preview: Vec<&str> = workflows_needing_schema
-            .iter()
-            .take(3)
-            .filter_map(|w| w.get("name").and_then(|n| n.as_str()))
-            .collect();
-        recommendations.push(serde_json::json!({
-            "priority": "medium",
-            "category": "input_schema",
-            "action": format!(
-                "{} published workflow(s) have execution history but no input_schema (e.g. {}). Run infer_workflow_input_schema on each, then set_workflow_input_schema to lock the contract and enable input validation.",
-                workflows_needing_schema.len(),
-                names_preview.join(", ")
-            ),
-            "affected_count": workflows_needing_schema.len(),
-        }));
-    }
-
-    if auto_classified_count > 0 {
-        recommendations.push(serde_json::json!({
-            "priority": "low",
-            "category": "classification",
-            "action": format!(
-                "{} workflow(s) have test-like name prefixes (QA-, test-, Test-) but are classified as production type — excluded from readiness warnings automatically. Use set_workflow_type with type='test' to formally classify them and keep your production metrics clean.",
-                auto_classified_count
-            ),
-            "affected_count": auto_classified_count,
-        }));
-    }
-
-    // Untyped serde_json::Value parsing is a wasmtime fuel anti-pattern.
-    // Flag user modules whose source uses it and emit a ready-to-paste
-    // generate_typed_scaffold fix command per module, seeded with the real
-    // module_id so the capture path can pull a scrubbed sample from the
-    // most recent completed execution. This turns the lint into a
-    // one-click remediation: copy the command, review the generated
-    // structs, fill in the run body, compile.
-    if !h.untyped_value_modules.is_empty() {
-        let names_preview = h
-            .untyped_value_modules
-            .iter()
-            .take(5)
-            .map(|m| format!("'{}'", m.name))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let suffix = if h.untyped_value_modules.len() > 5 {
-            format!(" and {} more", h.untyped_value_modules.len() - 5)
-        } else {
-            String::new()
-        };
-        // Emit a fix command per flagged module. The commands are plain
-        // JSON-RPC-style argument blocks the operator can copy-paste into
-        // any MCP client; they reference source_module_id so the scaffold
-        // generator pulls real captured samples via the DLP-scrubbed path
-        // shipped in commit 1355e86 — no hand-crafted JSON required.
-        let fix_commands: Vec<serde_json::Value> = h
-            .untyped_value_modules
-            .iter()
-            .map(|m| {
-                serde_json::json!({
-                    "module_name": m.name,
-                    "module_id": m.id.to_string(),
-                    "tool": "generate_typed_scaffold",
-                    "arguments": {
-                        "name": format!("{}-typed", m.name),
-                        "source_module_id": m.id.to_string(),
-                    },
-                    "next": "Review generated structs, fill in run body, then call compile_custom_sandbox with a fuel_budget derived from expected payload shape, then hot_update_module on the original to swap the implementation.",
-                })
-            })
-            .collect();
-        // Serialize the HygieneReport struct's module list into a compact
-        // {id,name} array for the recommendation payload. Keeping the id
-        // surfaced makes the recommendation self-contained.
-        let flagged_modules: Vec<serde_json::Value> = h
-            .untyped_value_modules
-            .iter()
-            .map(|m| serde_json::json!({ "id": m.id.to_string(), "name": m.name }))
-            .collect();
-        recommendations.push(serde_json::json!({
-            "priority": "medium",
-            "category": "performance",
-            "untyped_value_modules": flagged_modules,
-            "fix_commands": fix_commands,
-            "action": format!(
-                "{} module(s) parse input via untyped serde_json::Value: {}{}. \
-                 Value parsing allocates HashMap<String, Value> per JSON object and dominates \
-                 wasmtime fuel on large payloads — 3–10× more expensive than typed #[derive(Deserialize)] \
-                 structs. Each flagged module has a ready-to-paste fix command in `fix_commands` that \
-                 calls generate_typed_scaffold with source_module_id pre-filled — the tool will pull a \
-                 real captured sample from the module's most recent completed execution (DLP-scrubbed) \
-                 and emit typed Deserialize structs for review. Reference incident: smart-email-drafts \
-                 fetch-threads exhausted 30M fuel on Value parsing; typed rewrite dropped it below 1M.",
-                h.untyped_value_modules.len(),
-                names_preview,
-                suffix
-            ),
-            "affected_count": h.untyped_value_modules.len(),
-        }));
-    }
-
-    let secret_issues = orphaned_secrets.len()
-        + secrets_without_expiry.len()
-        + if h.has_wildcard_module { 1 } else { 0 };
-    let issues_found = undescribed.len()
-        + uncapabilized.len()
-        + stale_executions.len()
-        + orphaned_modules.len()
-        + dormant_workflows.len()
-        + stale_draft_workflows.len()
-        + idle_actors.len()
-        + secret_issues
-        + expiring_actor_memories.len()
-        + workflows_needing_schema.len()
-        + if unembedded_count > 0 { 1 } else { 0 };
-
-    let note = {
-        let base = match (suppressed_count, auto_classified_count as i64) {
-            (0, 0) => String::new(),
-            (s, 0) => format!("{} internal/test workflow(s) excluded from readiness warnings (workflow_type=test/internal). Use set_workflow_type to classify QA fixtures.", s),
-            (0, a) => format!("{} workflow(s) auto-excluded: test-like name prefix (QA-/test-) but no formal type set. Use set_workflow_type with type='test' to classify them.", a),
-            (s, a) => format!("{} internal/test workflow(s) formally suppressed; {} more auto-excluded via name-prefix heuristic. Use set_workflow_type to normalize all test fixtures.", s, a),
-        };
-        if suppressed_low_score_count > 0 {
-            format!("{}{}{} draft(s) with readiness_score<10 suppressed from documentation recommendations.", base, if base.is_empty() { "" } else { " " }, suppressed_low_score_count)
-        } else {
-            base
-        }
-    };
-
-    // MCP-76 (2026-05-07): sort recommendations by priority desc so that
-    // medium / high / critical entries appear above low-priority cleanup
-    // items in the rendered output. Pre-fix, the order was insertion order
-    // and a medium-severity "API key without expiry" landed below
-    // low-priority "draft workflows" cleanup. Operators triaging would
-    // miss security-class gaps unless they manually re-sorted.
-    fn priority_rank(s: &str) -> u8 {
-        match s {
-            "critical" => 0,
-            "high" => 1,
-            "medium" => 2,
-            "low" => 3,
-            _ => 4,
-        }
-    }
-    recommendations.sort_by(|a, b| {
-        let ap = a.get("priority").and_then(|v| v.as_str()).unwrap_or("");
-        let bp = b.get("priority").and_then(|v| v.as_str()).unwrap_or("");
-        priority_rank(ap).cmp(&priority_rank(bp))
-    });
-
-    let report = serde_json::json!({
-        "generated_at": chrono::Utc::now().to_rfc3339(),
-        "summary": {
-            "total_issues": issues_found,
-            "critical": stale_executions.len(),
-            "high": undescribed.len() + uncapabilized.len() + expiring_actor_memories.len(),
-            "medium": (if unembedded_count > 0 { 1 } else { 0 }) + secret_issues + workflows_needing_schema.len(),
-            "low": orphaned_modules.len() + dormant_workflows.len() + stale_draft_workflows.len() + idle_actors.len(),
-            "total_workflows": total_workflow_count,
-            "idle_actors_count": idle_actors.len(),
-            "wildcard_secret_grant": h.has_wildcard_module,
-            "orphaned_secrets_count": orphaned_secrets.len(),
-            "secrets_without_expiry_count": secrets_without_expiry.len(),
-            "expiring_memories_count": expiring_actor_memories.len(),
-            "workflows_needing_schema_count": workflows_needing_schema.len(),
-            "suppressed_internal_test_workflows": suppressed_count,
-            "suppressed_low_score_count": suppressed_low_score_count,
-            "auto_classified_test_like_workflows": auto_classified_count,
-            "embedding_coverage_percent": if total_workflow_count > 0 {
-                (total_workflow_count - unembedded_count) * 100 / total_workflow_count
-            } else { 100 },
-            "note": note,
-        },
-        "stale_executions": stale_executions,
-        "undescribed_workflows": undescribed,
-        "uncapabilized_workflows": uncapabilized,
-        "unembedded_workflow_count": unembedded_count,
-        "orphaned_modules": orphaned_modules,
-        "dormant_workflows": dormant_workflows,
-        "stale_draft_workflows": stale_draft_workflows,
-        "idle_actors": idle_actors,
-        "orphaned_secrets": orphaned_secrets,
-        "secrets_without_expiry": secrets_without_expiry,
-        "expiring_actor_memories": expiring_actor_memories,
-        "workflows_needing_schema": workflows_needing_schema,
-        "recommendations": recommendations,
-    });
+    let mut report = outcome.report;
 
     // ── fix_all mode ──────────────────────────────────────────────────────────
     // When fix_all=true, return a dry-run preview of what would be cleaned up.
@@ -6152,119 +5976,18 @@ async fn handle_get_platform_hygiene_report(
         Err(resp) => return resp,
     };
 
-    // Build the list of actionable fixes.
-    //
-    // M-I (2026-05-06): partition stale_draft_workflows into
-    // auto-deletable vs substantive_skipped via the shared
-    // `crate::advanced::is_substantive_workflow` predicate. Pre-fix,
-    // ALL stale drafts went into `stale_draft_workflows_to_delete` —
-    // including drafts that `session_start` simultaneously surfaced as
-    // "ready for publish_version" (the unpublished_substantive_drafts
-    // list). An operator running `fix_all confirm=true` after seeing
-    // session_start's "5 substantive draft(s) ready to publish"
-    // message would have nuked exactly the workflows they were about
-    // to ship. Now: substantive drafts appear in `substantive_drafts_skipped`
-    // (informational; surfaces the safety net to the operator) and
-    // are EXCLUDED from auto-delete.
-    let (substantive_drafts_skipped, auto_deletable_drafts): (Vec<_>, Vec<_>) = h
-        .stale_draft_workflows
-        .iter()
-        .partition(|r| crate::advanced::is_substantive_workflow(r.graph_json.as_deref()));
-    let draft_ids: Vec<uuid::Uuid> = auto_deletable_drafts.iter().map(|r| r.id).collect();
-    let stale_exec_ids: Vec<uuid::Uuid> = h.stale_executions.iter().map(|r| r.id).collect();
-    let orphaned_module_ids: Vec<uuid::Uuid> = h.orphaned_modules.iter().map(|r| r.id).collect();
-
-    let fix_preview = serde_json::json!({
-        "stale_draft_workflows_to_delete": auto_deletable_drafts.iter().map(|r| serde_json::json!({
-            "id": r.id.to_string(), "name": r.name,
-        })).collect::<Vec<_>>(),
-        "substantive_drafts_skipped": substantive_drafts_skipped.iter().map(|r| serde_json::json!({
-            "id": r.id.to_string(),
-            "name": r.name,
-            "reason": "Has SYSTEM_PROMPT/OUTPUT_SCHEMA/retry/description markers — auto-delete refused. \
-                      Use publish_version, or delete explicitly via batch_delete_workflows.",
-        })).collect::<Vec<_>>(),
-        "stale_executions_to_cancel": h.stale_executions.iter().map(|r| serde_json::json!({
-            "id": r.id.to_string(),
-            "workflow_name": r.workflow_name,
-            "status": r.status,
-        })).collect::<Vec<_>>(),
-        "orphaned_modules_to_delete": h.orphaned_modules.iter().map(|r| serde_json::json!({
-            "id": r.id.to_string(), "name": r.name,
-        })).collect::<Vec<_>>(),
-        "total_fixable": draft_ids.len() + stale_exec_ids.len() + orphaned_module_ids.len(),
-    });
-
-    if !confirm {
+    report["fix_all"] = if confirm {
+        state
+            .hygiene_service
+            .apply_fixes(user_id, &outcome.fix_candidates)
+            .await
+    } else {
         // Dry-run: return the hygiene report + preview, no mutations.
-        let mut report_with_preview = report;
-        report_with_preview["fix_all"] = serde_json::json!({
-            "dry_run": true,
-            "preview": fix_preview,
-            "note": "Set confirm: true to execute these fixes. Items not listed (undescribed workflows, missing capabilities, expiring secrets) require manual attention.",
-        });
-        return mcp_text(
-            req_id,
-            &serde_json::to_string_pretty(&report_with_preview).unwrap_or_default(),
-        );
-    }
-
-    // ── Execute fixes ──────────────────────────────────────────────────────────
-    let mut fix_results = serde_json::json!({});
-
-    // 1. Delete stale draft workflows
-    if !draft_ids.is_empty() {
-        let (deleted, blocked) = state
-            .workflow_repo
-            .delete_workflows(&draft_ids, user_id)
-            .await
-            .unwrap_or((vec![], vec![]));
-        tracing::warn!(
-            user_id = %user_id,
-            deleted = deleted.len(),
-            blocked = blocked.len(),
-            "hygiene fix: deleted stale draft workflows"
-        );
-        fix_results["stale_drafts_deleted"] = serde_json::json!(deleted.len());
-        fix_results["stale_drafts_blocked"] = serde_json::json!(blocked.len());
-    }
-
-    // 2. Cancel/fail stale executions (mark as failed after >120 min stuck)
-    if !stale_exec_ids.is_empty() {
-        let cancelled = state
-            .execution_repo
-            .cleanup_stale_executions(120, user_id)
-            .await
-            .unwrap_or(0);
-        fix_results["stale_executions_cancelled"] = serde_json::json!(cancelled);
-    }
-
-    // 3. Delete orphaned compiled modules (not referenced by any workflow)
-    if !orphaned_module_ids.is_empty() {
-        let deleted_modules = state
-            .module_repo
-            .delete_orphaned_modules(&orphaned_module_ids, user_id)
-            .await
-            .unwrap_or(0);
-        tracing::warn!(
-            user_id = %user_id,
-            deleted = deleted_modules,
-            "hygiene fix: deleted orphaned modules"
-        );
-        fix_results["orphaned_modules_deleted"] = serde_json::json!(deleted_modules);
-    }
-
-    let mut report_with_results = report;
-    report_with_results["fix_all"] = serde_json::json!({
-        "dry_run": false,
-        "executed": true,
-        "preview": fix_preview,
-        "results": fix_results,
-        "note": "Fixes applied. Re-run get_platform_hygiene_report to verify the updated state.",
-    });
+        talos_hygiene_service::HygieneService::dry_run_envelope(&outcome.fix_candidates)
+    };
     mcp_text(
         req_id,
-        &serde_json::to_string_pretty(&report_with_results).unwrap_or_default(),
+        &serde_json::to_string_pretty(&report).unwrap_or_default(),
     )
 }
 

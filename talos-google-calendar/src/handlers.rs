@@ -19,8 +19,8 @@ use talos_workflow_engine_core::WorkerSharedKey;
 use talos_workflow_job_protocol::JobRequest;
 
 use std::sync::Arc;
+use talos_worker_runtime::runtime::TalosRuntime;
 use uuid::Uuid;
-use worker::runtime::TalosRuntime;
 
 #[derive(Serialize)]
 struct ApiResponse<T> {

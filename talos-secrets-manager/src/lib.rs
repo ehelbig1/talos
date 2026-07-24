@@ -28,10 +28,12 @@ pub mod kek_rewrap;
 pub mod provider;
 pub mod vault_kek_provider;
 
+mod format;
 mod identifier;
 mod manager;
 
 pub use errors::SecretsError;
+pub use format::{DecryptRoute, SecretFormat};
 pub use identifier::{SecretIdentifier, SecretResolveError};
 pub use manager::*;
 

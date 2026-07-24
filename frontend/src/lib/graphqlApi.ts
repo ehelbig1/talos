@@ -21,6 +21,7 @@ import {
   GetActorDocument,
   GetActorExecutionsSummaryDocument,
   GetActorMemoriesDocument,
+  GetActorsMemoriesDocument,
   GetActorWorkflowsDocument,
   GetMyCapabilityCeilingDocument,
   GetNodeTemplatesDocument,
@@ -302,6 +303,31 @@ export const listActorMemories = async (
     { actorId, memoryType: memoryType ?? null },
   );
   return response.actorMemories ?? [];
+};
+
+export interface ActorMemoryGroup {
+  actorId: string;
+  memories: ActorMemoryEntry[];
+}
+
+/**
+ * Batched sibling of `listActorMemories`: one request returns the
+ * memories of MANY owned actors, grouped per actor (max 100 ids per
+ * call — the server refuses larger batches). Ids that are unknown or
+ * not owned by the caller are silently skipped (no group).
+ */
+export const listActorsMemories = async (
+  actorIds: string[],
+  memoryType?: string,
+): Promise<ActorMemoryGroup[]> => {
+  if (actorIds.length === 0) return [];
+  const response = await graphqlRequest<{
+    actorsMemories: ActorMemoryGroup[];
+  }>(GetActorsMemoriesDocument, {
+    actorIds,
+    memoryType: memoryType ?? null,
+  });
+  return response.actorsMemories ?? [];
 };
 
 export const writeActorMemory = async (input: {

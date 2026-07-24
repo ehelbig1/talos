@@ -1,34 +1,62 @@
 name: Main Publish
 
-# Builds + pushes signed `:main-<sha>` and `:main-latest` images on every
-# push to main. Operators tracking HEAD point their `TALOS_*_DIGEST` env
-# vars at the digests emitted in the job summary, OR use the `:main-latest`
-# tag for "always pull latest main" deployments.
+# CANONICAL publish path (2026-07-24): workflow_dispatch-triggered CI
+# build that pushes signed `:main-<sha>` and `:main-latest` images to
+# GHCR and signs them with THIS WORKFLOW's OIDC identity (Fulcio
+# keyless). The signature binds to the workflow URI — NOT to any human's
+# GitHub OAuth identity — so clusters enforcing Sigstore admission pin
+# ONE stable identity regardless of which operator clicks "Run
+# workflow". This removes the per-operator identity-widening problem
+# that made the local publish path a bus-factor risk (any collaborator
+# with `gh workflow run` access can now cut a production image; see
+# docs/second-operator-publish-runbook.md).
+#
+# Fallback: scripts/publish-images.sh — local build + push + cosign
+# signed with the operator's PERSONAL GitHub OAuth identity. Same output
+# contract (tags, digests, TALOS_*_DIGEST block), but requires the
+# cluster's identity regexp to be widened per human operator. Use it
+# only when GHA is unavailable.
 #
 # Relationship to release.yml:
 #   - release.yml fires on `v*` tags, emits SLSA-L2 attestations,
-#     publishes a GitHub Release, signs by digest. THE production path.
-#   - main-publish.yml (this file) fires on every push to main, signs by
-#     digest, emits digests in the job summary. Lighter — no GitHub
-#     Release, no SLSA provenance attestation. Tagged-release verification
-#     contract is unaffected.
+#     publishes a GitHub Release, signs by digest. THE tagged-release path.
+#   - main-publish.yml (this file) is dispatch-only, signs by digest,
+#     emits digests in the job summary. Lighter — no GitHub Release, no
+#     SLSA provenance attestation. Tagged-release verification contract
+#     is unaffected.
 #
-# Verification (example):
+# Publish-gate parity with the local script: the `ci-gate` job requires
+# a green quality.yml run for the EXACT SHA being built (the CI analogue
+# of publish-images.sh's gh-run-list gate; the script's clean-tree check
+# is inherent here — a dispatch can only build a committed, pushed SHA).
+# Bypass mirrors the script's --skip-ci-check: the `skip_ci_check`
+# input — explicit and recorded in the run log, by design.
+#
+# Verification (example — the identity is the WORKFLOW URI):
 #   cosign verify \
-#     --certificate-identity-regexp "^https://github\\.com/ehelbig1/talos/\\.github/workflows/main-publish\\.yml@refs/heads/main$" \
+#     --certificate-identity-regexp "^https://github\\.com/OWNER/talos/\\.github/workflows/main-publish\\.yml@" \
 #     --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-#     ghcr.io/ehelbig1/talos-controller@sha256:<digest>
+#     ghcr.io/OWNER/talos-controller@sha256:<digest>
 #
-# Trigger filter intentionally narrow:
-#   - skips docs-only / workflow-config-only changes (no image impact)
-#   - runs on dispatch for force-rebuilds (image-pull issue, base-image bump)
+# The trailing `@` in the identity regexp is load-bearing: without it, a
+# fork workflow named `main-publish.yml-evil.yml` would also match (same
+# class as the template-publish.yml pin documented in CLAUDE.md). Append
+# `refs/heads/main$` after the `@` to additionally pin the ref.
 
-# Auto-trigger on push to main DISABLED in May-2026 — operator opted
-# out of paid GitHub Actions and publishes locally via
-# `scripts/publish-images.sh`. Workflow kept as reference for when GHA
-# is re-enabled. To restore the push trigger, uncomment the block below.
+# Auto-trigger on push to main stays DISABLED (deliberate May-2026
+# decision) — every publish is an explicit workflow_dispatch run. To
+# restore the push trigger, uncomment the block below.
 on:
   workflow_dispatch:
+    inputs:
+      skip_ci_check:
+        description: >-
+          Skip the green-quality.yml gate for this SHA (mirrors
+          publish-images.sh --skip-ci-check). Deliberate bypass only —
+          do not use for production publishes.
+        type: boolean
+        required: false
+        default: false
   # push:
   #   branches: [main]
   #   paths-ignore:
@@ -57,9 +85,50 @@ env:
   SHORT_SHA: ${{ github.sha }}
 
 jobs:
+  # ── Publish gate: require a green quality.yml run for this SHA ─────────
+  # CI analogue of publish-images.sh's gate: nothing else stands between
+  # this workflow and a production image, so refuse to build unless the
+  # heavy correctness gates (full test suite, integration tests, RUSTSEC
+  # scan) passed for the EXACT commit being published. quality.yml runs on
+  # push:main, so every squash-merged commit has a run bound to its own
+  # SHA. Bypass: the `skip_ci_check` dispatch input — explicit, visible in
+  # the run log.
+  ci-gate:
+    name: Publish gate (quality.yml green)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read # gh run list over this repo's workflow runs
+    steps:
+      - name: Require green quality.yml for ${{ github.sha }}
+        if: ${{ !inputs.skip_ci_check }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          GREEN_RUNS="$(gh run list --repo "${{ github.repository }}" \
+                          --workflow quality.yml --commit "${{ github.sha }}" \
+                          --json conclusion \
+                          --jq '[.[] | select(.conclusion == "success")] | length')"
+          if [[ "${GREEN_RUNS:-0}" -lt 1 ]]; then
+            echo "::error::no successful quality.yml run found for ${{ github.sha }}."
+            echo "Trigger one:  gh workflow run quality.yml --ref <this ref>"
+            echo "Then re-dispatch this workflow once it's green (gh run watch)."
+            echo "Deliberate bypass: re-run with the skip_ci_check input set."
+            exit 1
+          fi
+          echo "quality.yml green for ${{ github.sha }} (${GREEN_RUNS} successful run(s))"
+
+      - name: CI gate bypassed
+        if: ${{ inputs.skip_ci_check }}
+        run: |
+          echo "::warning::skip_ci_check=true — publishing WITHOUT a verified green quality.yml run for ${{ github.sha }}"
+
   # ── Build + push three service images in parallel ─────────────────────
   build:
     name: Build & Push (${{ matrix.service }})
+    needs: [ci-gate]
     runs-on: ubuntu-latest
     # 60 minutes — the cold cargo workspace build takes ~45 min on a
     # 16-CPU runner; warm builds with BuildKit cache hit ~15 min.
@@ -68,6 +137,22 @@ jobs:
       fail-fast: false
       matrix:
         service: [controller, worker, frontend]
+        # Per-service build context. controller/worker Dockerfiles expect
+        # the REPO ROOT as context (they COPY the whole cargo workspace);
+        # frontend/Dockerfile expects frontend/ as context (`COPY
+        # package.json`, `COPY nginx.conf` are frontend-relative — same
+        # shape as docker-compose.yml and publish-images.sh). The previous
+        # single `context: .` broke the frontend leg.
+        include:
+          - service: controller
+            context: .
+            dockerfile: controller/Dockerfile
+          - service: worker
+            context: .
+            dockerfile: worker/Dockerfile
+          - service: frontend
+            context: frontend
+            dockerfile: frontend/Dockerfile
     # NOTE: this matrix uses artifact upload (not `outputs:`) to hand off
     # digests to the downstream sign + summarise jobs. matrix-level
     # `outputs:` is a foot-gun — each matrix entry overwrites the job's
@@ -139,8 +224,12 @@ jobs:
         id: build
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
         with:
-          context: .
-          file: ${{ matrix.service }}/Dockerfile
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          # Explicit target platform — matches publish-images.sh's default
+          # and the production x86_64 k3s VM. (ubuntu-latest is amd64
+          # anyway; the pin makes the contract survive runner changes.)
+          platforms: linux/amd64
           tags: ${{ steps.tags.outputs.tags }}
           labels: ${{ steps.labels.outputs.labels }}
           # GHA cache backend — survives across runs on the same branch,

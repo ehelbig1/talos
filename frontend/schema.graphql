@@ -67,6 +67,17 @@ type ActorMemoryEntry {
 	updatedAt: String!
 }
 
+"""
+One actor's memory entries within a batched `actorsMemories` read.
+Groups are returned ONLY for actors the caller owns — a requested id
+that is unknown (or another tenant's) simply has no group, so its
+absence is indistinguishable from non-existence.
+"""
+type ActorMemoryGroup {
+	actorId: UUID!
+	memories: [ActorMemoryEntry!]!
+}
+
 type ActorSummary {
 	id: UUID!
 	name: String!
@@ -491,6 +502,11 @@ type ExecutionApproval {
 	decidedAt: String
 	decidedBy: UUID
 	reason: String
+	"""
+	Display name of the workflow awaiting approval (null when owned by
+	another user). Batched via [`WorkflowNameLoader`].
+	"""
+	workflowName: String
 }
 
 type ExecutionEvent {
@@ -1154,6 +1170,41 @@ type QueryRoot {
 		limit: Int
 	): [ActorMemoryEntry!]!
 	"""
+	Batched sibling of `actorMemories`: one request returns the
+	memories of MANY owned actors, grouped per actor.
+	
+	N+1 this closes: the Briefings page fanned out one
+	`actorMemories(actorId)` GraphQL round-trip PER actor after
+	`actors` (1 + N requests, each opening its own tenant-scoped tx
+	and ownership check). This resolver serves the same data in ONE
+	request: one per-user unit of work, ONE batched ownership read
+	(`actor_ids_owned_by_user_scoped`), then the per-actor listings
+	on the same connection/snapshot. (Collapsing the listings into a
+	single `actor_id = ANY($1)` query needs a batched read in
+	`talos-memory` — actor_memory access MUST go through
+	`talos_memory::*` — tracked as a follow-up; the request-level
+	fan-out and per-request auth/tx overhead are already collapsed
+	here.)
+	
+	Tenancy: ids that are unknown or another tenant's are silently
+	skipped (no group), so absence is indistinguishable from
+	non-existence. Duplicated ids collapse to one group.
+	"""
+	actorsMemories(
+		"""
+		Actors to read (max 100 ids)
+		"""
+		actorIds: [UUID!]!,
+		"""
+		Filter by type: working | episodic | semantic | scratchpad
+		"""
+		memoryType: String,
+		"""
+		Max rows PER ACTOR (default 1000, max 1000)
+		"""
+		limitPerActor: Int
+	): [ActorMemoryGroup!]!
+	"""
 	MCP-1190 (2026-05-17): `limit` arg added with default 100 and
 	hard cap of 1000. Pre-fix the query did `fetch_all` on
 	mcp_agents with NO LIMIT — no formal per-user MCP-agent cap
@@ -1674,6 +1725,17 @@ type Workflow {
 	Actor that owns this workflow, if any.
 	"""
 	actorId: UUID
+	"""
+	Display name of the owning actor (null when unbound, or when the
+	actor belongs to another user). Batched via [`ActorNameLoader`].
+	"""
+	actorName: String
+	"""
+	Most recent execution of this workflow (null when never run or
+	not visible to the caller). Batched via [`LatestExecutionLoader`]
+	with the same user/org predicate as `latestWorkflowExecutions`.
+	"""
+	latestExecution: WorkflowExecution
 }
 
 type WorkflowExecution {
@@ -1694,6 +1756,16 @@ type WorkflowExecution {
 	createdAt: String!
 	durationMs: Int
 	outputData: JSON
+	"""
+	Display name of the executed workflow (null when owned by another
+	user). Batched via [`WorkflowNameLoader`].
+	"""
+	workflowName: String
+	"""
+	Display name of the actor that dispatched this execution (null for
+	non-actor executions). Batched via [`ActorNameLoader`].
+	"""
+	actorName: String
 }
 
 type WorkflowExecutionEvent {
@@ -1715,6 +1787,12 @@ type WorkflowScheduleObj {
 	nextTriggerAt: String
 	createdAt: String!
 	updatedAt: String!
+	"""
+	Display name of the scheduled workflow (null when the workflow is
+	owned by another user). Batched via [`WorkflowNameLoader`] — the
+	per-row alternative is a point query per schedule row.
+	"""
+	workflowName: String
 }
 
 """

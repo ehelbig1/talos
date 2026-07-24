@@ -81,8 +81,10 @@ pub mod workflow_versions;
 pub mod ws_auth;
 pub mod yaml_workflows;
 
-// Re-export worker crate for tests
-pub use worker;
+// Re-export the worker runtime crate for tests (was `pub use worker;`
+// before the July-2026 lib extraction — controller consumes the library
+// crate, never the deployable worker bin).
+pub use talos_worker_runtime;
 
 /// Public schema type alias re-exported from the `talos-api` crate.
 /// Canonical home is `talos_api::TalosSchema`; this controller-side

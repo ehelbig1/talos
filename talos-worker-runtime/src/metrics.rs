@@ -555,7 +555,7 @@ pub fn init_telemetry() -> Result<(), Box<dyn std::error::Error>> {
 /// // Simple example without requiring external crates
 /// fn example() -> String {
 ///     // Directly obtain the Prometheus metrics string
-///     worker::metrics::get_prometheus_metrics()
+///     talos_worker_runtime::metrics::get_prometheus_metrics()
 /// }
 /// ```
 pub fn get_prometheus_metrics() -> String {

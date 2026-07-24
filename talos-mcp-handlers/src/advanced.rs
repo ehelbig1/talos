@@ -322,199 +322,11 @@ mod blocked_tables_tests {
     }
 }
 
-/// Substantive-draft predicate (M-I, 2026-05-06). Walks `graph_json`
-/// once and returns `true` iff the draft has any marker of authored
-/// intent — meaning the right next step is `publish_version`, NOT
-/// auto-deletion.
-///
-/// "Substantive" means any one of:
-///   * all non-structural nodes have non-empty `data` AND node_count > 0
-///   * any node has `SYSTEM_PROMPT` > 200 chars
-///   * any node has `OUTPUT_SCHEMA` configured
-///   * any node has `retry_count` / `retry_condition` / `retry_delay_expression`
-///   * any node has `description` / `skip_condition` / `continue_on_error` set
-///
-/// Both `session_start` (this file's session_start handler) AND
-/// `get_platform_hygiene_report fix_all` consult this helper so the
-/// two surfaces never disagree about which drafts are auto-deletable.
-/// Without this shared predicate, fix_all would recommend deleting
-/// drafts that session_start simultaneously flags as "ready for
-/// publish_version" (the M-I audit finding from 2026-05-06).
-/// MCP-2 / MCP-17: count non-structural nodes whose `data` field is
-/// missing or empty (`{}`). This is the *coarse, cheap* readiness
-/// signal used by `session_start` to summarise drafts in batch — it
-/// does NOT consult the per-module config schema, so a node with
-/// no required fields will still be counted as "configured" once
-/// `data` has any keys at all (or, conversely, will be counted as
-/// "unconfigured" if `data` is empty even when no schema fields are
-/// strictly required).
-///
-/// `get_workflow_quickstart` performs the strict per-schema
-/// required-fields check (and per-secret provisioning check). The
-/// two surfaces can disagree for the same workflow: session_start
-/// says "1 unconfigured node" while quickstart says "ready_to_run".
-/// Both are correct in their own mode; the divergence is documented
-/// inline at each call site (`unconfigured_check_mode` field) so
-/// operators reading either response know which mode is reporting.
-pub(crate) fn count_nodes_with_empty_data(nodes: &[serde_json::Value]) -> usize {
-    nodes
-        .iter()
-        .filter(|n| {
-            let is_structural = n
-                .get("type")
-                .and_then(|v| v.as_str())
-                .map(|t| t.starts_with("system:"))
-                .unwrap_or(false);
-            !is_structural
-                && n.get("data")
-                    .map(|d| d == &serde_json::json!({}))
-                    .unwrap_or(true)
-        })
-        .count()
-}
-
-pub(crate) fn is_substantive_workflow(graph_json: Option<&str>) -> bool {
-    let Some(g) = graph_json else { return false };
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(g) else {
-        return false;
-    };
-    let nodes = match parsed.get("nodes").and_then(|n| n.as_array()) {
-        Some(n) if !n.is_empty() => n,
-        _ => return false,
-    };
-
-    // Branch 1: all non-structural nodes are configured.
-    if count_nodes_with_empty_data(nodes) == 0 {
-        return true;
-    }
-
-    // Branch 2: any node has a thoughtful authored marker.
-    nodes.iter().any(|n| {
-        let data = n.get("data");
-        let prompt_len = data
-            .and_then(|d| d.get("SYSTEM_PROMPT"))
-            .and_then(|v| v.as_str())
-            .map(str::len)
-            .unwrap_or(0);
-        let has_output_schema = data
-            .and_then(|d| d.get("OUTPUT_SCHEMA"))
-            .map(|v| !v.is_null())
-            .unwrap_or(false);
-        let has_retry = n.get("retry_count").is_some()
-            || n.get("retry_condition").is_some()
-            || n.get("retry_delay_expression").is_some();
-        let has_per_node_meta = n.get("description").is_some()
-            || n.get("skip_condition").is_some()
-            || n.get("continue_on_error").is_some();
-        prompt_len > 200 || has_output_schema || has_retry || has_per_node_meta
-    })
-}
-
-#[cfg(test)]
-mod count_nodes_with_empty_data_tests {
-    use super::count_nodes_with_empty_data;
-
-    fn nodes(json: &str) -> Vec<serde_json::Value> {
-        serde_json::from_str(json).unwrap()
-    }
-
-    #[test]
-    fn empty_input_is_zero() {
-        assert_eq!(count_nodes_with_empty_data(&[]), 0);
-    }
-
-    #[test]
-    fn structural_nodes_never_count() {
-        let n = nodes(r#"[{"type":"system:collect"},{"type":"system:trigger"}]"#);
-        assert_eq!(count_nodes_with_empty_data(&n), 0);
-    }
-
-    #[test]
-    fn missing_data_field_counts() {
-        let n = nodes(r#"[{"type":"http"}]"#);
-        assert_eq!(count_nodes_with_empty_data(&n), 1);
-    }
-
-    #[test]
-    fn empty_data_object_counts() {
-        let n = nodes(r#"[{"type":"http","data":{}}]"#);
-        assert_eq!(count_nodes_with_empty_data(&n), 1);
-    }
-
-    #[test]
-    fn data_with_any_keys_does_not_count() {
-        let n = nodes(r#"[{"type":"http","data":{"url":"x"}}]"#);
-        assert_eq!(count_nodes_with_empty_data(&n), 0);
-    }
-
-    #[test]
-    fn divergence_with_quickstart_is_documented() {
-        // MCP-2 / MCP-17 regression test: a node whose schema has zero
-        // required fields and zero data → quickstart says ready_to_run=true,
-        // session_start says unconfigured_node_count=1. This is the
-        // documented divergence.
-        let n = nodes(r#"[{"type":"echo","data":{}}]"#);
-        assert_eq!(count_nodes_with_empty_data(&n), 1);
-    }
-}
-
-#[cfg(test)]
-mod is_substantive_workflow_tests {
-    use super::is_substantive_workflow;
-
-    #[test]
-    fn none_or_invalid_json_is_not_substantive() {
-        assert!(!is_substantive_workflow(None));
-        assert!(!is_substantive_workflow(Some("not json")));
-        assert!(!is_substantive_workflow(Some("{}")));
-        assert!(!is_substantive_workflow(Some(r#"{"nodes":[]}"#)));
-    }
-
-    #[test]
-    fn all_configured_nodes_are_substantive() {
-        let g = r#"{"nodes":[{"type":"http","data":{"url":"x"}},{"type":"system:collect"}]}"#;
-        assert!(is_substantive_workflow(Some(g)));
-    }
-
-    #[test]
-    fn long_system_prompt_is_substantive() {
-        let prompt = "x".repeat(250);
-        let g = format!(r#"{{"nodes":[{{"type":"llm","data":{{"SYSTEM_PROMPT":"{prompt}"}}}}]}}"#);
-        assert!(is_substantive_workflow(Some(&g)));
-    }
-
-    #[test]
-    fn short_prompt_with_no_other_marker_is_not_substantive() {
-        let g = r#"{"nodes":[{"type":"llm","data":{"SYSTEM_PROMPT":"short"}}]}"#;
-        // Node is configured (non-empty data) so this DOES count as substantive
-        // via the "all non-structural nodes configured" branch.
-        assert!(is_substantive_workflow(Some(g)));
-    }
-
-    #[test]
-    fn empty_data_only_node_is_not_substantive() {
-        let g = r#"{"nodes":[{"type":"llm","data":{}}]}"#;
-        assert!(!is_substantive_workflow(Some(g)));
-    }
-
-    #[test]
-    fn output_schema_marker_is_substantive() {
-        let g = r#"{"nodes":[{"type":"llm","data":{"OUTPUT_SCHEMA":{"foo":"bar"}}}]}"#;
-        assert!(is_substantive_workflow(Some(g)));
-    }
-
-    #[test]
-    fn retry_marker_is_substantive() {
-        let g = r#"{"nodes":[{"type":"llm","data":{},"retry_count":3}]}"#;
-        assert!(is_substantive_workflow(Some(g)));
-    }
-
-    #[test]
-    fn description_marker_is_substantive() {
-        let g = r#"{"nodes":[{"type":"llm","data":{},"description":"why"}]}"#;
-        assert!(is_substantive_workflow(Some(g)));
-    }
-}
+// Graph-JSON draft heuristics (`count_nodes_with_empty_data` /
+// `is_substantive_workflow`) moved to `talos-hygiene-service` in the
+// 2026-07 extraction so the session brief and the hygiene fix_all flow
+// consult ONE shared predicate (the M-I invariant) from their service
+// crates.
 
 pub fn tool_schemas() -> Vec<serde_json::Value> {
     let worlds_csv = crate::capability_worlds::compilable_worlds_csv();
@@ -1765,9 +1577,9 @@ async fn handle_run_scratch_session(
             std::collections::HashMap::new(),
             None,
             std::time::Duration::from_secs(30),
-            worker::runtime::RetryPolicy::default(),
+            talos_worker_runtime::runtime::RetryPolicy::default(),
             None,
-            worker::runtime::SecurityPolicy::default(),
+            talos_worker_runtime::runtime::SecurityPolicy::default(),
             None,                                             // capability_world_hint
             None,                                             // max_fuel_override
             false,                                            // dry_run
@@ -2311,7 +2123,11 @@ async fn handle_publish_to_marketplace(
                     // Derive capability_world by inspecting the WASM bytes.
                     let capability_world = wasm_bytes
                         .as_deref()
-                        .map(|b| worker::inspect_component(b).capability_world.to_string())
+                        .map(|b| {
+                            talos_worker_runtime::inspect_component(b)
+                                .capability_world
+                                .to_string()
+                        })
                         .unwrap_or_else(|| "unknown".to_string());
 
                     // module_marketplace.module_id has no FK constraint, so a node_templates.id is valid.
@@ -3161,6 +2977,13 @@ async fn handle_get_config_suggestions(
     })).unwrap_or_default())
 }
 
+/// Thin wrapper (architectural-mandate extraction, 2026-07): validate the
+/// `auto_archive_stale_days` arg, thread the compile-time identity
+/// (`env!`-stamped version / build time / live static tool count) into
+/// `talos-session-brief-service`, spawn the auto-heal background tasks the
+/// outcome requests, format. Output JSON is byte-identical to the
+/// pre-extraction handler. Backs `session_start` (canonical) and the
+/// deprecated `agent_session_start` alias.
 async fn handle_agent_session_start(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
@@ -3197,35 +3020,36 @@ async fn handle_agent_session_start(
         },
     };
 
-    // 1. Embedding coverage
-    let (total_wf, embedded_wf) = state
-        .advanced_repo
-        .get_embedding_coverage(user_id)
-        .await
-        .unwrap_or((0, 0));
-
-    let unembedded = total_wf - embedded_wf;
-    // When total_wf == 0 there are no workflows to embed — return null rather than
-    // the misleading "100%" that a zero-division guard would produce.
-    let embedding_pct: Option<i64> = if total_wf > 0 {
-        Some(embedded_wf * 100 / total_wf)
-    } else {
-        None
+    // Compile-time identity stays HERE: the env!s below are stamped by this
+    // crate's build script and `static_tool_count()` counts this crate's
+    // registered schemas — the service receives them as plain inputs.
+    let input = talos_session_brief_service::SessionBriefInput {
+        user_id,
+        auto_archive_days,
+        server_version: format!(
+            "{}+{}{}",
+            env!("CARGO_PKG_VERSION"),
+            env!("GIT_SHA"),
+            if env!("GIT_DIRTY") == "true" {
+                "-dirty"
+            } else {
+                ""
+            }
+        ),
+        build_time: env!("BUILD_TIME").to_string(),
+        static_tool_count: crate::static_tool_count(),
     };
 
-    // Auto-heal: spawn background embedding for any unembedded workflows.
-    // This runs every session start — idempotent because auto_embed_workflow checks before writing.
-    //
-    // Gate on provider availability (added 2026-04-28, r239). Pre-r239 we
-    // unconditionally spawned a per-workflow loop that all silently no-op'd
-    // at DEBUG level when EMBEDDING_API_KEY / EMBEDDING_API_URL were unset
-    // — operators saw "auto-embedding triggered in background" forever while
-    // coverage stayed at 0/N. Now we skip the spawn AND surface the gap in
-    // the response so the agent reports the misconfiguration instead of
-    // promising "fully operational within seconds".
-    let embedding_provider_available = crate::search::embedding_provider_available();
-    let auto_healing_embeddings = unembedded > 0 && embedding_provider_available;
-    if auto_healing_embeddings {
+    let outcome = match state.session_brief_service.build(input).await {
+        Ok(o) => o,
+        Err(e) => return mcp_error(req_id, e.jsonrpc_code(), &e.user_facing_message()),
+    };
+
+    // Auto-heal spawns stay handler-side (capability auto-tagging lives in
+    // this crate). Both loops are idempotent — auto_embed_workflow and
+    // auto_suggest_capabilities check before writing — and fire-and-forget,
+    // so response bytes don't depend on them.
+    if outcome.spawn_embedding_heal {
         let pool = state.db_pool.clone();
         let repo = state.advanced_repo.clone();
         tokio::spawn(async move {
@@ -3238,182 +3062,7 @@ async fn handle_agent_session_start(
             }
         });
     }
-
-    // 2. Draft workflows (unpublished, no executions) — recent first
-    let draft_rows = state
-        .advanced_repo
-        .get_draft_workflows(user_id)
-        .await
-        .unwrap_or_default();
-
-    // Auto-archive stale drafts if requested
-    let mut auto_archived_count = 0i64;
-    if let Some(stale_days) = auto_archive_days {
-        if let Ok(n) = state
-            .advanced_repo
-            .archive_stale_drafts(user_id, stale_days as i32)
-            .await
-        {
-            auto_archived_count = n as i64;
-        }
-    }
-
-    // Drafts split by substantive-ness (pain point #1, addressed r234):
-    //   * `unpublished_substantive_drafts` — workflows that are well-configured
-    //     but unpublished. The right next step is publish_version, not
-    //     get_workflow_quickstart. Pre-r234 these were lumped into
-    //     in_progress_drafts with a misleading "0 unconfigured nodes" hint.
-    //   * `in_progress_drafts` — true work-in-progress: empty graph, mostly
-    //     unconfigured nodes, recently-scaffolded skeletons. The right next
-    //     step is still get_workflow_quickstart.
-    //
-    // "Substantive" criteria (any one is enough):
-    //   - all non-structural nodes have non-empty data, AND node_count > 0
-    //   - any node has SYSTEM_PROMPT > 200 chars (LLM node thoughtfully prompted)
-    //   - any node has OUTPUT_SCHEMA configured (structured output authored)
-    //   - any node has retry_count / retry_condition / retry_delay_expression
-    //   - any node has description / skip_condition / continue_on_error set
-    let mut in_progress_drafts: Vec<serde_json::Value> = Vec::new();
-    let mut unpublished_substantive_drafts: Vec<serde_json::Value> = Vec::new();
-    for r in draft_rows.iter().take(5) {
-        let id = r.id.to_string();
-        let graph: serde_json::Value = r
-            .graph_json
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or(serde_json::json!({"nodes":[],"edges":[]}));
-        let nodes = graph
-            .get("nodes")
-            .and_then(|n| n.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let node_count = nodes.len();
-        let unconfigured_node_count = count_nodes_with_empty_data(&nodes);
-        let days_old = (chrono::Utc::now() - r.created_at).num_days();
-
-        // Substantive detection: walk graph_json once, look for any
-        // marker of authored intent. Cheap to compute (capped at 5 drafts).
-        let has_thoughtful_node = nodes.iter().any(|n| {
-            let data = n.get("data");
-            let prompt_len = data
-                .and_then(|d| d.get("SYSTEM_PROMPT"))
-                .and_then(|v| v.as_str())
-                .map(str::len)
-                .unwrap_or(0);
-            let has_output_schema = data
-                .and_then(|d| d.get("OUTPUT_SCHEMA"))
-                .map(|v| !v.is_null())
-                .unwrap_or(false);
-            let has_retry = n.get("retry_count").is_some()
-                || n.get("retry_condition").is_some()
-                || n.get("retry_delay_expression").is_some();
-            let has_per_node_meta = n.get("description").is_some()
-                || n.get("skip_condition").is_some()
-                || n.get("continue_on_error").is_some();
-            prompt_len > 200 || has_output_schema || has_retry || has_per_node_meta
-        });
-        let all_nodes_configured = node_count > 0 && unconfigured_node_count == 0;
-        let is_substantive = all_nodes_configured || has_thoughtful_node;
-
-        let next_step = if is_substantive {
-            format!("publish_version with workflow_id={}", id)
-        } else {
-            format!("get_workflow_quickstart with workflow_id={}", id)
-        };
-
-        let entry = serde_json::json!({
-            "workflow_id": id,
-            "name": r.name,
-            "node_count": node_count,
-            "unconfigured_node_count": unconfigured_node_count,
-            // MCP-2 / MCP-17: label the readiness mode so operators
-            // know this is the coarse data-presence check, not the
-            // strict schema-required check that get_workflow_quickstart
-            // runs. The two surfaces can disagree for the same workflow.
-            "unconfigured_check_mode": "data_presence_only",
-            "days_old": days_old,
-            "is_substantive": is_substantive,
-            "next_step": next_step,
-        });
-        if is_substantive {
-            unpublished_substantive_drafts.push(entry);
-        } else {
-            in_progress_drafts.push(entry);
-        }
-    }
-
-    // 2b. Duplicate-name ghost workflow detection.
-    // Multiple workflows with the same name indicate leftover test artifacts or
-    // deliberate force=true duplicates that weren't cleaned up. Surface the
-    // actual IDs + creation timestamps so the caller doesn't need a follow-up
-    // list_workflows + filter pass.
-    //
-    // Performance: a single GROUP BY query (earlier version) avoids N+1, but
-    // then forces a second query to resolve IDs. The current shape — select
-    // id/name/created_at for every row in duplicate groups via a subquery —
-    // stays O(duplicate_rows), which is tiny by definition (we only surface up
-    // to 10 *groups*, each typically 2-3 rows).
-    let duplicate_name_groups: Vec<serde_json::Value> = {
-        let rows = state
-            .advanced_repo
-            .find_workflow_duplicate_name_groups(user_id)
-            .await
-            .unwrap_or_default();
-
-        // Group rows by name. BTreeMap preserves alphabetical order for stable output.
-        let mut groups: std::collections::BTreeMap<
-            String,
-            Vec<(uuid::Uuid, chrono::DateTime<chrono::Utc>)>,
-        > = std::collections::BTreeMap::new();
-        for r in rows {
-            groups.entry(r.name).or_default().push((r.id, r.created_at));
-        }
-
-        groups
-            .into_iter()
-            .map(|(name, members)| {
-                // Oldest first; recommend deleting the older duplicates (the last
-                // force=true create is usually the one the author wanted to keep).
-                let workflows: Vec<serde_json::Value> = members
-                    .iter()
-                    .map(|(id, created_at)| {
-                        serde_json::json!({
-                            "id": id.to_string(),
-                            "created_at": created_at.to_rfc3339(),
-                        })
-                    })
-                    .collect();
-                let oldest_ids: Vec<String> = members
-                    .iter()
-                    .take(members.len().saturating_sub(1))
-                    .map(|(id, _)| id.to_string())
-                    .collect();
-                serde_json::json!({
-                    "name": name,
-                    "count": members.len(),
-                    "workflows": workflows,
-                    "suggested_cleanup": format!(
-                        "Consider deleting the {} older duplicate(s): {}. \
-                         The newest entry is typically the one the author wanted to keep.",
-                        oldest_ids.len(),
-                        oldest_ids.join(", "),
-                    ),
-                })
-            })
-            .collect()
-    };
-
-    // 3. Uncapabilized workflows
-    let uncap_count: i64 = state
-        .advanced_repo
-        .get_uncapabilized_count(user_id)
-        .await
-        .unwrap_or(0);
-
-    // Auto-heal: spawn background capability tagging for any uncapabilized workflows.
-    // Idempotent — auto_suggest_capabilities only applies when capabilities IS NULL or empty.
-    let auto_healing_caps = uncap_count > 0;
-    if auto_healing_caps {
+    if outcome.spawn_capability_heal {
         let pool = state.db_pool.clone();
         let repo = state.advanced_repo.clone();
         tokio::spawn(async move {
@@ -3427,498 +3076,9 @@ async fn handle_agent_session_start(
         });
     }
 
-    // 4. Next scheduled run.
-    //
-    // Pre-r234 this read from the wrong table (`schedules`) which was empty
-    // in prod, so the field was always null even when active schedules existed
-    // (pain point #8). Repo now queries `workflow_schedules` (the canonical
-    // table since 20260309000200) and includes `next_trigger_at` so callers
-    // can distinguish "no schedule" from "next firing is far out" without
-    // a follow-up list_schedules call.
-    let next_schedule = state
-        .advanced_repo
-        .get_next_scheduled_run(user_id)
-        .await
-        .ok()
-        .flatten()
-        .map(|s| {
-            serde_json::json!({
-                "workflow": s.workflow_name,
-                "cron": s.cron_expression,
-                "timezone": s.timezone,
-                "next_trigger_at": s.next_trigger_at.map(|t| t.to_rfc3339()),
-            })
-        });
-
-    // 4b. No-schedule health check: active workflows with no schedule
-    let active_wf_count: i64 = state
-        .advanced_repo
-        .get_active_workflow_count(user_id)
-        .await
-        .unwrap_or(0);
-
-    let active_schedule_count: i64 = state
-        .advanced_repo
-        .get_active_schedule_count(user_id)
-        .await
-        .unwrap_or(0);
-
-    // Count of active workflows that ACTUALLY have ≥1 enabled schedule attached
-    // — distinct from `active_wf_count` (every status='active' workflow) and
-    // `active_schedule_count` (schedule-row count; a workflow can have several).
-    // This is the field most callers think `active_workflows` means.
-    let active_workflows_with_schedule: i64 = state
-        .advanced_repo
-        .get_active_workflows_with_schedule_count(user_id)
-        .await
-        .unwrap_or(0);
-
-    let no_schedule_warning = active_wf_count > 0 && active_schedule_count == 0;
-
-    // 5. Detect frequently-executed workflows without a schedule.
-    // Condition: ≥3 executions in the last 60 days AND no active schedule
-    // AND not a sub-workflow of another workflow AND not tagged `interactive`.
-    // r242 renamed from `previously_scheduled_unscheduled` for honesty —
-    // workflow_schedules are hard-deleted (no audit trail), so we have no
-    // way to know if a workflow was ever scheduled. The pre-r242 name +
-    // "may have lost their trigger" framing produced false positives for
-    // pure manual-trigger utilities. The two new filters + the softer
-    // framing below cut the false-positive rate sharply.
-    // r243: surface query failures via tracing::warn so future schema/SQL
-    // regressions are visible — pre-r243 the bare `.unwrap_or_default()`
-    // swallowed the SQL error from r242's wrong JSONB path silently, and
-    // session_start reported "clean" coverage while the query was broken.
-    let prev_scheduled_rows = state
-        .advanced_repo
-        .get_frequently_executed_unscheduled(user_id)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(
-                error = %e,
-                "session_start: get_frequently_executed_unscheduled failed; \
-                 frequently_executed_unscheduled will be reported as empty"
-            );
-            Vec::new()
-        });
-
-    let frequently_executed_unscheduled: Vec<serde_json::Value> = prev_scheduled_rows
-        .iter()
-        .map(|r| {
-            let id = r.id.to_string();
-            serde_json::json!({
-                "workflow_id": id,
-                "name": r.name,
-                "recent_executions": r.exec_count,
-                "tip": format!(
-                    "If recurring is intended, schedule with create_schedule(workflow_id={}). \
-                     If this is an on-demand utility, suppress this signal with \
-                     tag_workflow(workflow_id={}, tag='interactive').",
-                    id, id
-                ),
-            })
-        })
-        .collect();
-
-    // 6. Pinned modules: check which are present vs need restore.
-    // IMPORTANT: check the user's actual wasm_modules row (installed copy), not just whether
-    // the system node_templates row has WASM. A deleted wasm_modules row must show as
-    // needs_restore even if the catalog template still has precompiled_wasm.
-    let pinned_rows = state
-        .advanced_repo
-        .list_pinned_modules_with_user_install_status(user_id, 200)
-        .await
-        .unwrap_or_default();
-
-    let mut pinned_present: Vec<String> = Vec::new();
-    let mut pinned_needs_restore: Vec<String> = Vec::new();
-    for r in pinned_rows {
-        if r.has_wasm {
-            pinned_present.push(r.module_name);
-        } else {
-            pinned_needs_restore.push(r.module_name);
-        }
-    }
-
-    let needs_restore_count = pinned_needs_restore.len();
-    let pinned_modules_field = serde_json::json!({
-        "present": pinned_present,
-        "needs_restore": pinned_needs_restore,
-        // Always surface the tool name so agents don't have to discover it.
-        // needs_restore being empty means nothing currently requires action.
-        "restore_tool": "restore_pinned_modules",
-        "restore_needed": needs_restore_count > 0,
-    });
-
-    // 7. Active actors — surface identity/persona context at session start so agents
-    //    know what actors exist without a separate list_actors call.
-    let actor_rows = state
-        .advanced_repo
-        .list_active_actors_with_memory_count(user_id, 20)
-        .await
-        .unwrap_or_default();
-
-    let active_actors: Vec<serde_json::Value> = actor_rows
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "actor_id": r.id.to_string(),
-                "name": r.name,
-                "description": r.description,
-                "status": r.status,
-                "max_capability_world": r.max_capability_world,
-                "memory_count": r.memory_count,
-                "tip": if r.memory_count == 0 {
-                    Some(format!(
-                        "No memories set — define a persona with actor_remember(actor_id: '{}', key: 'persona', value: {{...}}, memory_type: 'semantic')",
-                        r.id
-                    ))
-                } else {
-                    None
-                },
-            })
-        })
-        .collect();
-
-    // 8. Stuck executions: running > 1 hour
-    let stuck_rows = state
-        .advanced_repo
-        .list_stuck_executions(user_id, 1, 10)
-        .await
-        .unwrap_or_default();
-
-    let stuck_executions: Vec<serde_json::Value> = stuck_rows
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "execution_id": r.execution_id.to_string(),
-                "workflow_id": r.workflow_id.to_string(),
-                "hours_stuck": r.hours_stuck,
-                "tip": "cancel_execution or investigate with get_execution_status(detail: true)",
-            })
-        })
-        .collect();
-
-    // 8b. Recent execution activity for MCP-transport-drop awareness.
-    //
-    // Surfaces (a) currently-running executions of any age and
-    // (b) executions that completed within the last RECENT_EXEC_WINDOW_MIN
-    // minutes. The agent reads this on every session_start and can spot
-    // executions it kicked off but lost the response for — preventing the
-    // ghost-work pattern where a dropped MCP response is misread as
-    // "execution failed", the agent retries, and the LLM provider is
-    // double-billed for identical work.
-    //
-    // Window of 5 minutes is short enough not to be noisy on rapid
-    // reconnects but long enough to catch the typical 15–30s LLM
-    // workflow that the agent kicked off and immediately lost. Limit
-    // of 25 caps the response size at the noisiest extreme.
-    const RECENT_EXEC_WINDOW_MIN: i32 = 5;
-    let recent_exec_rows = state
-        .advanced_repo
-        .list_recent_executions_for_session_awareness(user_id, RECENT_EXEC_WINDOW_MIN, 25)
-        .await
-        .unwrap_or_default();
-
-    let recent_executions: Vec<serde_json::Value> = recent_exec_rows
-        .iter()
-        .map(|r| {
-            let tip = match r.status.as_str() {
-                "running" => "Still in flight. get_execution_status(execution_id: ...) for live state, \
-                              or watch_execution to stream events. cancel_execution if you need to stop it.",
-                "completed" => "Already finished. get_execution_output(execution_id: ...) for the full \
-                                output — your client may have lost the response while the workflow was \
-                                still running on the server.",
-                "failed" | "cancelled" | "timeout" => "Reached terminal failure state. \
-                                                       get_execution_status(execution_id: ..., detail: true) for the error.",
-                _ => "get_execution_status(execution_id: ...) to inspect.",
-            };
-            serde_json::json!({
-                "execution_id": r.execution_id.to_string(),
-                "workflow_id": r.workflow_id.to_string(),
-                "workflow_name": r.workflow_name,
-                "status": r.status,
-                "started_at": r.started_at.map(|t| t.to_rfc3339()),
-                "completed_at": r.completed_at.map(|t| t.to_rfc3339()),
-                "duration_ms": r.duration_ms,
-                "tip": tip,
-            })
-        })
-        .collect();
-    let recent_executions_count = recent_executions.len();
-    let recent_running_count = recent_exec_rows
-        .iter()
-        .filter(|r| r.status == "running")
-        .count();
-
-    // 8. Determine single most impactful action
-    //
-    // Priority order: pinned-restore (data loss risk) → embedding provider
-    // misconfigured (whole feature silently broken — surface ABOVE the
-    // auto-healing branches because we WON'T be auto-healing in that case)
-    // → auto-healing in progress → drafts → schedules.
-    let embedding_provider_misconfigured = unembedded > 0 && !embedding_provider_available;
-    let priority_action = if !pinned_needs_restore.is_empty() {
-        format!(
-            "{} pinned module(s) need WASM restore: {}. Call restore_pinned_modules.",
-            pinned_needs_restore.len(),
-            pinned_needs_restore.join(", ")
-        )
-    } else if embedding_provider_misconfigured {
-        format!(
-            "Embedding provider not configured — {} workflow(s) are unembedded and \
-             semantic search is degraded. Set EMBEDDING_API_KEY (or OPENAI_API_KEY) \
-             on the controller, or set EMBEDDING_API_URL to a keyless local \
-             endpoint (e.g. http://ollama:11434/v1/embeddings). Coverage will \
-             auto-heal on the next session_start once configured.",
-            unembedded
-        )
-    } else if auto_healing_embeddings && auto_healing_caps {
-        format!(
-            "{} workflow(s) had no embedding and {} had no capability tags — \
-             both auto-healing in background. Platform will be fully indexed within seconds.",
-            unembedded, uncap_count
-        )
-    } else if auto_healing_embeddings {
-        format!(
-            "{} workflow(s) had no embedding — auto-embedding triggered in background. \
-             Semantic search will be fully operational within seconds.",
-            unembedded
-        )
-    } else if auto_healing_caps {
-        format!(
-            "{} workflow(s) have no capability tags — auto-tagging triggered in background. \
-             Capability-based discovery will be available within seconds.",
-            uncap_count
-        )
-    } else if !unpublished_substantive_drafts.is_empty() {
-        // Substantive drafts dominate priority over stub-class drafts —
-        // the user has already done the work, just needs publish_version.
-        format!(
-            "You have {} substantive draft workflow(s) ready for publish_version. \
-             See unpublished_substantive_drafts for the list.",
-            unpublished_substantive_drafts.len()
-        )
-    } else if !in_progress_drafts.is_empty() {
-        format!(
-            "You have {} stub draft workflow(s) (mostly unconfigured nodes). \
-             Call get_workflow_quickstart on the first one to see what's needed.",
-            in_progress_drafts.len()
-        )
-    } else if !frequently_executed_unscheduled.is_empty() {
-        format!(
-            "{} active workflow(s) ran recently without a schedule — schedule with \
-             create_schedule if recurring is intended, or tag 'interactive' to suppress \
-             this signal for on-demand utilities. See frequently_executed_unscheduled \
-             for per-workflow tips.",
-            frequently_executed_unscheduled.len()
-        )
-    } else if no_schedule_warning {
-        format!(
-            "{} active workflow(s) have no scheduled trigger. \
-             Call deploy_workflow with a cron_expression to automate execution.",
-            active_wf_count
-        )
-    } else {
-        "Platform looks healthy. All workflows are embedded, capabilized, and scheduled."
-            .to_string()
-    };
-
-    let mut report = serde_json::json!({
-        "embedding_coverage": {
-            "total_workflows": total_wf,
-            "embedded": embedded_wf,
-            "unembedded": unembedded,
-            // null when total_workflows == 0 (no workflows exist yet — not a real gap)
-            "coverage_pct": embedding_pct,
-            "auto_healing": auto_healing_embeddings,
-            // "available" / "unavailable" — added r239 so the agent can
-            // distinguish "auto-heal still running" from "provider missing,
-            // nothing will ever heal". Pre-r239 the response always claimed
-            // auto-heal was running even when it was a guaranteed no-op.
-            "provider_status": if embedding_provider_available { "available" } else { "unavailable" },
-            // r241: surface the cached `last_error` from the provider probe so the
-            // agent can see "Voyage 429" or "DNS lookup failed" instead of just
-            // "unavailable". Pre-r241 we couldn't distinguish "env vars unset"
-            // from "URL unreachable" from "key revoked" — all collapsed to the
-            // same syntactic-check failure.
-            "provider_last_error": crate::search::embedding_provider_status().1,
-            "provider_tip": if embedding_provider_misconfigured {
-                Some("Set EMBEDDING_API_KEY (or OPENAI_API_KEY) on the controller, OR set EMBEDDING_API_URL to a reachable OpenAI-compatible endpoint. See provider_last_error for the actual failure mode the boot probe observed. Without a working provider, semantic_search and auto-embedding silently no-op.")
-            } else {
-                None
-            },
-            "note": if total_wf == 0 {
-                Some("No workflows created yet — create your first workflow to start tracking coverage.")
-            } else {
-                None
-            },
-            // MCP-113 (2026-05-08): inline `field_meanings` so operators
-            // reading the response don't have to guess what flags mean.
-            // Same pattern as `schedule_health.field_meanings` further
-            // down — applied here to embedding_coverage and below to
-            // capabilities_coverage.
-            "field_meanings": {
-                "auto_healing": "True when an auto-heal task is currently running to embed unembedded workflows in the background. False = no heal needed (coverage is complete) OR provider is unavailable (provider_status reports which). Look at provider_status + unembedded count to disambiguate.",
-                "coverage_pct": "Fraction (0–100) of workflows with usable embeddings. Below 100 means semantic_search will fall back to keyword/trigram matching for unembedded entries.",
-                "provider_status": "available = embedding provider responding to probes. unavailable = provider env vars unset OR endpoint unreachable OR key revoked. See provider_last_error for the specific failure mode.",
-                "unembedded": "Count of workflows whose vector embedding is missing or stale. While auto_healing is true, this number drops over time as the background task progresses.",
-            },
-        },
-        "capabilities_coverage": {
-            "uncapabilized_count": uncap_count,
-            "auto_healing": auto_healing_caps,
-            "tip": if uncap_count > 0 {
-                "Capability tags are being auto-applied in the background. \
-                 Call run_workflow_hygiene to see which workflows still lack tags, \
-                 or suggest_capabilities(workflow_id) to apply them manually."
-            } else {
-                "All workflows have capability tags."
-            },
-            // MCP-113 (2026-05-08): mirror field_meanings on the
-            // capabilities_coverage block.
-            "field_meanings": {
-                "auto_healing": "True when an auto-suggest task is currently running to populate capability tags for uncapabilized workflows in the background. False = no heal needed (every workflow has tags) OR auto-heal is disabled.",
-                "uncapabilized_count": "Number of workflows with no capability tags. Workflows without tags are invisible to capability-based search and dispatch routing.",
-            },
-        },
-        "in_progress_drafts": in_progress_drafts,
-        "unpublished_substantive_drafts": unpublished_substantive_drafts,
-        "duplicate_name_groups": duplicate_name_groups,
-        "uncapabilized_count": uncap_count,
-        "next_scheduled_run": next_schedule,
-        "frequently_executed_unscheduled": frequently_executed_unscheduled,
-        "schedule_health": {
-            // Total count of `workflows.status='active'` — INCLUDES workflows
-            // with no schedule attached (manual-trigger workflows, webhook-
-            // driven workflows, etc.). Misleading legacy field name kept for
-            // back-compat; prefer `workflows_with_active_schedules` for the
-            // intuitive "how many active workflows are actually scheduled"
-            // count.
-            "active_workflows": active_wf_count,
-            // Distinct count of active workflows that have at least one enabled
-            // workflow_schedules row. Always ≤ active_workflows.
-            "workflows_with_active_schedules": active_workflows_with_schedule,
-            // Total count of enabled `workflow_schedules` rows. May exceed
-            // workflows_with_active_schedules if a workflow has multiple
-            // schedules attached (e.g. weekday morning + weekend evening).
-            "active_schedules": active_schedule_count,
-            // True when at least one workflow is active but ZERO schedules
-            // are enabled across the user's namespace — a strong signal
-            // that scheduling was forgotten or accidentally disabled.
-            "no_schedule_warning": no_schedule_warning,
-            "field_meanings": {
-                "active_workflows": "All workflows with status='active' (includes manual-trigger / webhook-only workflows). Not 'workflows that have a schedule'.",
-                "workflows_with_active_schedules": "Active workflows that have ≥1 enabled schedule attached.",
-                "active_schedules": "Total enabled schedule rows. ≥ workflows_with_active_schedules when workflows have multiple schedules."
-            },
-        },
-        "pinned_modules": pinned_modules_field,
-        "stuck_executions": stuck_executions,
-        // Recent execution activity (running of any age + completed in last
-        // RECENT_EXEC_WINDOW_MIN minutes). Surfaces work that ran in the
-        // gap between MCP sessions so dropped tool-call responses don't
-        // translate to ghost retries. Empty when nothing recent.
-        "recent_executions": {
-            "count": recent_executions_count,
-            "running_count": recent_running_count,
-            "window_minutes": RECENT_EXEC_WINDOW_MIN,
-            "items": recent_executions,
-            "tip": if recent_executions_count == 0 {
-                None
-            } else if recent_running_count > 0 {
-                Some(format!(
-                    "{} execution(s) still running. If you kicked one off and lost the response, \
-                     do NOT retry — get_execution_status / watch_execution / get_execution_output \
-                     with the execution_id from the items array.",
-                    recent_running_count
-                ))
-            } else {
-                Some(format!(
-                    "{} execution(s) completed in the last {} minute(s). \
-                     If your client lost the response from a recent test_workflow / call_workflow / trigger_workflow, \
-                     pull get_execution_output(execution_id: ...) from the items array instead of retrying.",
-                    recent_executions_count, RECENT_EXEC_WINDOW_MIN
-                ))
-            },
-        },
-        "active_actors": active_actors,
-        "priority_action": priority_action,
-        // Schema staleness detection: compare this against your cached tools/list version.
-        // If the version differs from what you connected with, reconnect to re-fetch the schema.
-        // Composite version: pkg version + git SHA (+ "-dirty" if working
-        // tree had uncommitted changes at build time). Operators can grep
-        // for this exact string against `git log` to find the deployed
-        // commit. Build.rs captures GIT_SHA / GIT_DIRTY / BUILD_TIME from
-        // the source tree at compile time.
-        "server_version": format!(
-            "{}+{}{}",
-            env!("CARGO_PKG_VERSION"),
-            env!("GIT_SHA"),
-            if env!("GIT_DIRTY") == "true" { "-dirty" } else { "" }
-        ),
-        "build_time": env!("BUILD_TIME"),
-        // Client transport advisory: the server exposes 300+ tools via tools/list.
-        // Some MCP clients (claude.ai web connector, Claude Desktop with large tool sets)
-        // only make a FIXED SUBSET callable at session init, regardless of which tools appear
-        // in tools/list. The callable set is client-determined and cannot be expanded server-side.
-        // Symptoms: tool_search shows a tool schema but calling it returns "has not been loaded yet".
-        // Resolution: use Claude Code CLI (stdio transport) for full 300+ tool access.
-        // The tools/list ordering fix (session_start at index 0) ensures critical tools are
-        // callable on clients that truncate by position (Claude Desktop, narrow-context clients).
-        "client_compatibility": {
-            "full_tool_access": "Use Claude Code CLI (claude mcp add talos ...) for all tools callable via stdio transport",
-            "partial_access_clients": ["claude.ai web connector", "Claude Desktop with large tool sets"],
-            "symptom": "tool_search shows schema but tool call returns 'has not been loaded yet'",
-            "workaround": "Reconnect to server to reset callable set, or switch to Claude Code CLI"
-        },
-        // Stale-cache tripwire for the agent. The server registers this
-        // many static MCP tools right now. If the agent has observed
-        // fewer tools than this in `tools/list` / `tool_search`
-        // since connecting, the client's tool cache is stale relative
-        // to the server (the server was rebuilt with new tools after
-        // the client connected). Action: prompt the user to `/mcp`
-        // reconnect. See `mcp::static_tool_count` for the source of
-        // truth.
-        "static_tool_count": crate::static_tool_count(),
-    });
-
-    // DX #17: image staleness. BUILD_TIME is stamped at compile time; a dev
-    // stack whose controller predates recent merges is a recurring trap —
-    // "the fix is on main but the running image doesn't have it" cost two
-    // rebuild cycles on 2026-07-13 alone. Surface the age always, and an
-    // actionable tip once it exceeds a day.
-    if let Ok(built) = chrono::DateTime::parse_from_rfc3339(env!("BUILD_TIME")) {
-        let age_hours =
-            (chrono::Utc::now() - built.with_timezone(&chrono::Utc)).num_minutes() as f64 / 60.0;
-        report["build_age_hours"] = serde_json::json!((age_hours * 10.0).round() / 10.0);
-        if age_hours > 24.0 {
-            report["build_staleness_tip"] = serde_json::json!(format!(
-                "controller image was built {age_hours:.0}h ago — if code merged since, this \
-                 process doesn't have it; rebuild + recreate before live-testing \
-                 (make rebuild SERVICE=controller)"
-            ));
-        }
-    }
-
-    if auto_archive_days.is_some() {
-        report["auto_archived_stale_drafts"] = serde_json::json!(auto_archived_count);
-    }
-
-    // #7 — hint to enable auto_archive when in-progress drafts accumulate
-    let in_progress_count = report
-        .get("in_progress_drafts")
-        .and_then(|v| v.as_array())
-        .map(|a| a.len())
-        .unwrap_or(0);
-    if in_progress_count > 0 && auto_archive_days.is_none() {
-        report["auto_archive_hint"] = serde_json::json!(
-            "Pass auto_archive_stale_days: 14 to automatically clean up drafts older than 14 days on next session_start."
-        );
-    }
-
     mcp_text(
         req_id,
-        &serde_json::to_string_pretty(&report).unwrap_or_default(),
+        &serde_json::to_string_pretty(&outcome.report).unwrap_or_default(),
     )
 }
 

@@ -167,7 +167,7 @@ pub use operator_digest_reader::OperatorDigestReader;
 pub use ops_alerts_reader::OpsAlertsReader;
 pub use pending_approvals_reader::PendingApprovalsReader;
 pub use rate_limit::RateLimitStore;
-pub use retry::RetryPolicy;
+pub use retry::{default_max_retries_for_module, RetryPolicy, DEFAULT_TRANSIENT_RETRIES};
 pub use retry_classifier::RetryClassifier;
 pub use sanitizer::{ExecutionSanitizer, OutputSanitizer};
 pub use secret_envelope::{

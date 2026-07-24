@@ -8,124 +8,70 @@ edition = "2021"
 publish = false
 license = "MIT OR Apache-2.0"
 
+# The deployable worker BINARY. The library half (wasmtime WASM host:
+# TalosRuntime, TalosContext, host/ modules, module_fetcher, sql_validator,
+# wit_inspector, …) lives in `talos-worker-runtime`; `src/lib.rs` here is a
+# thin re-export shim so `worker::…` paths keep resolving. Only bin-side
+# modules remain: main.rs, metrics_server, secret_claim, self_register.
+
 [dependencies]
+# The extracted WASM host runtime — everything the bin executes jobs with.
+talos-worker-runtime = { path = "../talos-worker-runtime" }
+
 # Core async runtime
 tokio = { version = "1.41", features = ["full"] }
 async-nats = "0.47"
 talos-nats-tls = { path = "../talos-nats-tls" }
 
-# Wasmtime 43.0.2 — critical security updates. 43.0.1 covered:
-#   CVE-2026-34971 sandbox escape, CVE-2026-27572 HTTP headers DoS,
-#   CVE-2026-27195 call_async DoS, GHSA-6wgr-89rj-399p pooling allocator leak.
-# 43.0.2 adds RUSTSEC-2026-0114 fix.
-# 44.0.2 fixes RUSTSEC-2026-0149 (HIGH, CVSS 7.5): WASI path_open(TRUNCATE)
-#   bypasses the host FilePerms::WRITE restriction. Reachable here via the
-#   Database/Agent capability worlds' read-only preopen (FilePerms::READ) in
-#   context.rs — a guest could TRUNCATE files in its per-execution ephemeral
-#   tempdir despite the read-only ceiling. The 43.x line has no patched
-#   release; 44.0.2 is the first fixed version in the next major. Drop-in: no
-#   API changes (verified — worker compiles + full lib suite green).
-# Also brings: per-operator fuel costs, Store::try_new (OOM-safe), WASIp3 preview.
-# Pinning to the exact version ensures reproducible builds.
-wasmtime = { version = "45.0.3", features = ["async", "component-model", "parallel-compilation", "memory-protection-keys"] }
-wasmtime-wasi = "45.0.3"
-
 # Core utilities
 anyhow = "1.0"
-serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1.11", features = ["serde", "v4"] }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
-talos-dlp = { path = "../talos-dlp" }
-talos-dlp-provider = { path = "../talos-dlp-provider" }
-talos-secrets = { path = "../talos-secrets" }
 talos-memory = { path = "../talos-memory" }
-talos-ssrf-classify = { path = "../talos-ssrf-classify" }
-talos-capability-world = { path = "../talos-capability-world" }
-talos-sigstore-policy = { path = "../talos-sigstore-policy" }
-talos-wit-inspector = { path = "../talos-wit-inspector" }
-talos-trace = { path = "../talos-trace" }
-talos-trace-nats = { path = "../talos-trace-nats" }
 talos-shutdown = { path = "../talos-shutdown" }
 talos-config = { path = "../talos-config" }
-talos-audit-event = { path = "../talos-audit-event" }
-# MCP-1046: char-boundary-aware truncation for wit_logging.
-talos-text-util = { path = "../talos-text-util" }
-pgvector = { version = "0.4", features = ["sqlx"] }
-regex = "1.11"  # For error message sanitization
-wasmparser = "0.224"
-sqlparser = { version = "0.53", features = ["visitor"] }  # AST-based SQL validation (replaces pattern matching)
 
-# Security & sandboxing
-cap-std = "3.4"  # Capability-based filesystem security
-tempfile = "3"  # Ephemeral per-execution sandbox directories (auto-shredded on Drop)
-
-# HTTP client
+# HTTP client (self_register boot-time identity registration)
 reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "brotli", "deflate", "stream", "rustls-tls"] }
-url = "2.5"
 
 # Async utilities
 futures-util = "0.3"
 
-# Performance & caching
-dashmap = "6.1"  # Lock-free concurrent HashMap for component caches
-lru = "0.16.3"  # LRU cache for compiled WASM module instances
-sha2 = "0.10"  # For cache key hashing and crypto interface
+# Hashing / encoding (job-result signing + cache keys)
+sha2 = "0.10"
+hex = "0.4"
 
-# Cryptography (for host functions)
-md5 = "0.7"  # MD5 hashing (crypto interface)
-hmac = "0.12"  # HMAC operations (crypto interface)
-base64 = "0.22"  # Base64 encoding/decoding (crypto interface)
-hex = "0.4"  # Hex encoding/decoding (crypto interface)
-
-# Constant-time comparison (used for AOT HMAC verification)
+# Constant-time comparison (metrics-server auth token, result verification)
 subtle = "2.4"
 
-# Random number generation
+# Random number generation (secret-claim nonces, self-register jitter)
 rand = { version = "0.8", default-features = true, features = ["std"] }
 
-# Date/time operations
-chrono = { version = "0.4", features = ["serde"] }
-
-# Phase 3: Advanced capabilities (v3.0)
-# `fuel` feature gates per-render instruction budget (set_fuel) so a
-# guest template's CPU is bounded host-side (see wit_templates::render).
-minijinja = { version = "2.5", features = ["fuel"] }  # Jinja2-compatible template engine
-csv = "1.3"  # CSV parsing and generation
-quick-xml = { version = "0.41", features = ["serialize"] }  # XML parsing with security
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }  # Redis client; rustls for rediss:// (Upstash, ElastiCache TLS)
+# Redis (OCI module cache wiring in main.rs)
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }  # rustls for rediss:// (Upstash, ElastiCache TLS)
 # rustls direct dep so worker/main.rs can install the ring CryptoProvider
 # at startup — required since rustls 0.23 stopped auto-selecting one when
 # multiple crates pull rustls in (redis + reqwest in our case).
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-# 🔥 NEW: OpenTelemetry for production observability
+
+# Observability (OTLP trace-context propagation + Prometheus metrics endpoint)
 opentelemetry = { version = "0.32", features = ["metrics", "trace"] }
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "metrics", "trace"] }
-opentelemetry-prometheus = "0.32"
-# gRPC/tonic exporter only. `default-features = false` drops otlp's default
-# http-proto + reqwest-blocking-client (opentelemetry-http + reqwest 0.13, a
-# duplicate of the workspace's reqwest 0.12) for an HTTP path we never take.
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "metrics", "trace"] }
-prometheus = "0.14" # opentelemetry-prometheus 0.32 supports prometheus 0.14.x, which drops the
-                    # vulnerable protobuf 2.x dependency (prometheus 0.14 uses protobuf 3.x, optional).
-                    # This clears RUSTSEC-2024-0437 (protobuf recursion crash) — the deny.toml exemption
-                    # is removed. metrics_server.rs still enforces 4KB max request size, auth tokens, and
-                    # rate limiting as defence-in-depth.
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+prometheus = "0.14"
 tracing-opentelemetry = "0.33"
-wasmtime-wasi-http = "45.0.3"
-oci-distribution = "0.11.0"
+
 bytes = "1.11.1"
-thiserror = "2.0.18"
 
 [dev-dependencies]
+# Integration tests (tests/) compile guest fixtures and poke the runtime
+# directly; the runtime itself comes through talos-worker-runtime.
+wasmtime = { version = "45.0.3", features = ["async", "component-model", "parallel-compilation", "memory-protection-keys"] }
 wat = "1"  # Convert WAT text to a minimal component for AOT tests
 wit-component = "0.224"
 wit-parser = "0.224"  # Resolve the minimal-node world for kill-switch integration fixtures
-proptest = "1.6"  # Property-based testing for capability world lattice verification
 
 [features]
 default = []

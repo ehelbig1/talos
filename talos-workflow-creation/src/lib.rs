@@ -1244,6 +1244,8 @@ mod tests {
             allowed_secrets: defaults.iter().map(|s| s.to_string()).collect(),
             allowed_hosts: Vec::new(),
             max_retries: 0,
+            allowed_methods: Vec::new(),
+            capability_world: None,
         }
     }
 

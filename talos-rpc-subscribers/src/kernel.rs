@@ -40,10 +40,17 @@
 //!   reply; `talos.state.write` is fire-and-forget and never replies.
 //!   The kernel is deliberately agnostic — reply semantics are part of
 //!   the per-protocol handler, not a kernel mode switch.
-//! * The parse → `verify()` → `check_and_record_nonce` ordering and
-//!   every fail-closed rejection. This is Tier-0 security logic; it is
-//!   deliberately NOT genericized so each protocol's verify call site
-//!   stays greppable and reviewable in isolation.
+//! * Admission — but as of 2026-07-24 the parse → `verify()` →
+//!   cross-replica replay → process-local nonce ordering is
+//!   TYPE-ENFORCED via `admission.rs`: the `Admitted<T>` proof token's
+//!   only constructor is `admit_from_bytes`, which runs the full
+//!   Tier-0 sequence fail-closed, so a handler cannot compile with a
+//!   step missing or reordered. What stays per-protocol in each
+//!   handler is the surface around the gate: reply semantics, the
+//!   typed error reply / log wording / metric outcome tag for each
+//!   `AdmitError` arm, and the permit-acquisition point. Per-site
+//!   greppability is preserved via the `admit_from_bytes::<T>`
+//!   turbofish at each call site.
 //! * The permit acquisition POINT. Handlers acquire their permit AFTER
 //!   verify/nonce (and any pre-flight validation) and BEFORE DB/service
 //!   work — exactly where the pre-extraction subscribers acquired it.

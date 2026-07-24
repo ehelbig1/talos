@@ -453,6 +453,437 @@ mod tests {
         assert_eq!(seals.len(), 1, "rejected claim must not take the context");
     }
 
+    /// Serializes tests that mutate `TALOS_ENVELOPE_SEALING` — the env var is
+    /// process-global, so any future test reading it must hold this lock too.
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `from_env` parsing: case-insensitive, whitespace-trimmed, and
+    /// fail-safe — unknown values and unset both resolve to `Off` (today's
+    /// inline-WSK behavior), never accidentally to an enforcing mode.
+    #[test]
+    fn mode_from_env_parses_variants_and_fails_safe_to_off() {
+        let _g = ENV_TEST_LOCK.lock().unwrap();
+        let original = std::env::var("TALOS_ENVELOPE_SEALING").ok();
+
+        let cases = [
+            ("off", EnvelopeSealingMode::Off),
+            ("audit", EnvelopeSealingMode::Audit),
+            ("required", EnvelopeSealingMode::Required),
+            // Case-insensitive.
+            ("AUDIT", EnvelopeSealingMode::Audit),
+            ("Required", EnvelopeSealingMode::Required),
+            // Whitespace-trimmed.
+            ("  required  ", EnvelopeSealingMode::Required),
+            // Unknown values fail SAFE to Off — a typo'd value must not
+            // silently flip the fleet into refuse-inline enforcement.
+            ("enforce", EnvelopeSealingMode::Off),
+            ("1", EnvelopeSealingMode::Off),
+            ("", EnvelopeSealingMode::Off),
+        ];
+        for (raw, expected) in cases {
+            std::env::set_var("TALOS_ENVELOPE_SEALING", raw);
+            assert_eq!(
+                EnvelopeSealingMode::from_env(),
+                expected,
+                "TALOS_ENVELOPE_SEALING={raw:?}"
+            );
+        }
+
+        std::env::remove_var("TALOS_ENVELOPE_SEALING");
+        assert_eq!(
+            EnvelopeSealingMode::from_env(),
+            EnvelopeSealingMode::Off,
+            "unset must default to Off"
+        );
+
+        if let Some(v) = original {
+            std::env::set_var("TALOS_ENVELOPE_SEALING", v);
+        }
+    }
+
+    /// Single-claim atomicity under real concurrency: many tasks race
+    /// `take()` for the same exec_id; exactly one must win, on every trial.
+    /// Mirrors the nonce-cache TOCTOU tests in `talos-memory/src/rpc_auth.rs`
+    /// — races are timing-dependent, so a single trial can hide a window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_takes_admit_exactly_one_winner() {
+        const TRIALS: usize = 150;
+        const RACERS: usize = 4;
+        for trial in 0..TRIALS {
+            let seals = std::sync::Arc::new(InFlightSeals::new());
+            let exec = Uuid::new_v4();
+            seals.register(exec, ctx_of(&[("k", "v")]));
+
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(RACERS));
+            let mut handles = Vec::with_capacity(RACERS);
+            for _ in 0..RACERS {
+                let s = seals.clone();
+                let b = barrier.clone();
+                handles.push(tokio::spawn(async move {
+                    b.wait().await;
+                    s.take(exec).is_some()
+                }));
+            }
+            let mut winners = 0usize;
+            for h in handles {
+                if h.await.unwrap() {
+                    winners += 1;
+                }
+            }
+            assert_eq!(
+                winners, 1,
+                "trial {trial}: expected exactly one take() winner, got {winners} — \
+                 a >1 result means two workers could both receive sealed secrets"
+            );
+            assert!(seals.is_empty(), "trial {trial}: context must be consumed");
+        }
+    }
+
+    /// Re-registration (the M3 re-arm / re-dispatch path) OVERWRITES the
+    /// prior context: the map holds one entry per exec_id and a claim after
+    /// re-dispatch receives the NEW secrets, not the stale ones.
+    #[test]
+    fn re_registration_overwrites_prior_context() {
+        let seals = InFlightSeals::new();
+        let exec = Uuid::new_v4();
+        seals.register(exec, ctx_of(&[("api_key", "stale-value")]));
+        seals.register(exec, ctx_of(&[("api_key", "fresh-value")]));
+        assert_eq!(seals.len(), 1, "re-registration must not duplicate entries");
+
+        let ctx = seals
+            .take(exec)
+            .expect("context takeable after re-register");
+        let recovered: HashMap<String, String> = serde_json::from_slice(ctx.bytes()).unwrap();
+        assert_eq!(
+            recovered.get("api_key").map(String::as_str),
+            Some("fresh-value"),
+            "a claim after re-dispatch must see the superseding context"
+        );
+        assert!(
+            seals.take(exec).is_none(),
+            "still single-claim after re-arm"
+        );
+    }
+
+    /// `discard` after a successful `take` is a harmless no-op (the engine's
+    /// request/reply path always discards post-dispatch, even when the claim
+    /// already consumed the context), and discarding an unknown exec_id is
+    /// equally inert.
+    #[test]
+    fn discard_after_take_and_discard_unknown_are_noops() {
+        let seals = InFlightSeals::new();
+        let exec = Uuid::new_v4();
+        seals.register(exec, ctx_of(&[("k", "v")]));
+        assert!(seals.take(exec).is_some());
+
+        seals.discard(exec); // already taken — must not panic or resurrect
+        assert!(seals.is_empty());
+        assert!(
+            seals.take(exec).is_none(),
+            "discard must not re-arm the context"
+        );
+
+        seals.discard(Uuid::new_v4()); // never registered — inert
+        assert!(seals.is_empty());
+    }
+
+    /// `discard` on an UNCLAIMED context (job finished/cancelled before any
+    /// claim) removes it, and a late claim then finds nothing (fail-closed).
+    #[test]
+    fn discard_unclaimed_context_blocks_late_claim() {
+        let seals = InFlightSeals::new();
+        let exec = Uuid::new_v4();
+        seals.register(exec, ctx_of(&[("k", "v")]));
+        seals.discard(exec);
+        assert!(seals.is_empty());
+        assert!(
+            seals.take(exec).is_none(),
+            "late claim after discard gets nothing"
+        );
+    }
+
+    /// Sweep evicts only entries older than the TTL, leaving younger
+    /// registrations claimable. Generous sleep/TTL margins (4×) keep this
+    /// deterministic on slow CI.
+    #[test]
+    fn sweep_is_selective_by_age() {
+        let seals = InFlightSeals::new();
+        let old_exec = Uuid::new_v4();
+        let new_exec = Uuid::new_v4();
+        seals.register(old_exec, ctx_of(&[("k", "old")]));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        seals.register(new_exec, ctx_of(&[("k", "new")]));
+
+        let swept = seals.sweep_older_than(std::time::Duration::from_millis(100));
+        assert_eq!(swept, 1, "only the aged-out entry is swept");
+        assert!(seals.take(old_exec).is_none(), "orphan is gone");
+        assert!(
+            seals.take(new_exec).is_some(),
+            "fresh entry survives the sweep"
+        );
+    }
+
+    /// `SealContext`'s Debug impl must redact the secret bytes (lint check
+    /// 37): the rendered string carries the `<redacted>` marker and NEVER the
+    /// plaintext, for both constructors.
+    #[test]
+    fn seal_context_debug_redacts_plaintext() {
+        let ctx = ctx_of(&[("anthropic/api_key", "sk-ant-DO-NOT-PRINT")]);
+        let rendered = format!("{ctx:?}");
+        assert!(
+            rendered.contains("<redacted>"),
+            "Debug must show the redaction marker"
+        );
+        assert!(
+            !rendered.contains("sk-ant-DO-NOT-PRINT"),
+            "Debug must not leak the secret value"
+        );
+        assert!(
+            !rendered.contains("anthropic/api_key"),
+            "Debug must not leak secret names either"
+        );
+
+        let ctx2 = SealContext::from_bytes(br#"{"k":"from-bytes-SECRET"}"#.to_vec());
+        let rendered2 = format!("{ctx2:?}");
+        assert!(rendered2.contains("<redacted>"));
+        assert!(!rendered2.contains("from-bytes-SECRET"));
+    }
+
+    /// An EMPTY secrets map round-trips through the full claim → seal → open
+    /// path (the no-secret-node case under `required` mode).
+    #[test]
+    fn empty_secrets_map_round_trips() {
+        let _g = REGISTRY_LOCK.lock().unwrap();
+        let worker_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        set_dynamic_worker_public_keys(vec![(
+            "worker-empty".to_string(),
+            worker_sk.verifying_key(),
+        )]);
+        let controller_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+
+        let exec = Uuid::new_v4();
+        let seals = InFlightSeals::new();
+        seals.register(exec, SealContext::new(&HashMap::new()).unwrap());
+
+        let we = WorkerEphemeral::generate();
+        let claim =
+            SecretClaim::new_signed(exec, "worker-empty".into(), we.public_key(), &worker_sk);
+        let sealed = handle_secret_claim(&claim, &seals, &controller_sk, 60).expect("sealed");
+        let plaintext = we
+            .open(
+                &sealed.epk_c,
+                exec,
+                "worker-empty",
+                &sealed.ciphertext,
+                &sealed.nonce,
+            )
+            .expect("opens");
+        let recovered: HashMap<String, String> = serde_json::from_slice(&plaintext).unwrap();
+        assert!(recovered.is_empty());
+    }
+
+    /// Wrong-key failure on the full round-trip: the sealed payload only
+    /// opens under the EXACT ephemeral secret whose public half was in the
+    /// claim. An attacker holding a different ephemeral (or observing epk_w
+    /// on the bus) recovers nothing.
+    #[test]
+    fn sealed_secrets_do_not_open_under_wrong_ephemeral() {
+        let _g = REGISTRY_LOCK.lock().unwrap();
+        let worker_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        set_dynamic_worker_public_keys(vec![("worker-wk".to_string(), worker_sk.verifying_key())]);
+        let controller_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+
+        let exec = Uuid::new_v4();
+        let seals = InFlightSeals::new();
+        seals.register(exec, ctx_of(&[("k", "super-secret")]));
+
+        let we = WorkerEphemeral::generate();
+        let claim = SecretClaim::new_signed(exec, "worker-wk".into(), we.public_key(), &worker_sk);
+        let sealed = handle_secret_claim(&claim, &seals, &controller_sk, 60).expect("sealed");
+
+        // A DIFFERENT ephemeral (attacker's own keypair) must fail to open.
+        let attacker = WorkerEphemeral::generate();
+        assert!(
+            attacker
+                .open(
+                    &sealed.epk_c,
+                    exec,
+                    "worker-wk",
+                    &sealed.ciphertext,
+                    &sealed.nonce
+                )
+                .is_err(),
+            "wrong ephemeral secret must not open the seal"
+        );
+    }
+
+    /// Tamper rejection on the full round-trip: a flipped ciphertext byte
+    /// fails BOTH the controller signature check and the AEAD open; opening
+    /// under a different exec_id or worker_id fails the AAD binding.
+    #[test]
+    fn tampered_or_transposed_seal_is_rejected() {
+        let _g = REGISTRY_LOCK.lock().unwrap();
+        let worker_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        set_dynamic_worker_public_keys(vec![("worker-tam".to_string(), worker_sk.verifying_key())]);
+        let controller_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let controller_vk = controller_sk.verifying_key();
+
+        let exec = Uuid::new_v4();
+        let seals = InFlightSeals::new();
+        seals.register(exec, ctx_of(&[("k", "super-secret")]));
+
+        let we = WorkerEphemeral::generate();
+        let claim = SecretClaim::new_signed(exec, "worker-tam".into(), we.public_key(), &worker_sk);
+        let mut sealed = handle_secret_claim(&claim, &seals, &controller_sk, 60).expect("sealed");
+
+        // On-bus ciphertext bit-flip: the Ed25519 signature covers the
+        // ciphertext, so verify() fails first...
+        sealed.ciphertext[0] ^= 0x01;
+        assert!(
+            sealed.verify(&controller_vk, 60).is_err(),
+            "tampered ciphertext must fail the controller signature"
+        );
+        // ...and even a worker that skipped verify() fails the GCM tag.
+        assert!(
+            we.open(
+                &sealed.epk_c,
+                exec,
+                "worker-tam",
+                &sealed.ciphertext,
+                &sealed.nonce
+            )
+            .is_err(),
+            "tampered ciphertext must fail AEAD open"
+        );
+
+        // AAD transposition: a clean seal for exec A does not open as exec B
+        // or as a different worker (fresh flow — the ephemeral above was consumed).
+        let exec2 = Uuid::new_v4();
+        seals.register(exec2, ctx_of(&[("k", "super-secret")]));
+        let we2 = WorkerEphemeral::generate();
+        let claim2 =
+            SecretClaim::new_signed(exec2, "worker-tam".into(), we2.public_key(), &worker_sk);
+        let sealed2 = handle_secret_claim(&claim2, &seals, &controller_sk, 60).expect("sealed");
+        assert!(
+            we2.open(
+                &sealed2.epk_c,
+                Uuid::new_v4(), // wrong exec_id → AAD mismatch
+                "worker-tam",
+                &sealed2.ciphertext,
+                &sealed2.nonce
+            )
+            .is_err(),
+            "seal must be bound to its exec_id"
+        );
+    }
+
+    /// Key-rotation ring verify: with TWO keys registered for one worker_id
+    /// (old + new during rotation), a claim signed by EITHER authenticates.
+    #[test]
+    fn rotation_ring_accepts_either_registered_key() {
+        let _g = REGISTRY_LOCK.lock().unwrap();
+        let old_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let new_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        set_dynamic_worker_public_keys(vec![
+            ("worker-rot".to_string(), old_sk.verifying_key()),
+            ("worker-rot".to_string(), new_sk.verifying_key()),
+        ]);
+        let controller_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+
+        let seals = InFlightSeals::new();
+        for sk in [&old_sk, &new_sk] {
+            let exec = Uuid::new_v4();
+            seals.register(exec, ctx_of(&[("k", "v")]));
+            let we = WorkerEphemeral::generate();
+            let claim = SecretClaim::new_signed(exec, "worker-rot".into(), we.public_key(), sk);
+            handle_secret_claim(&claim, &seals, &controller_sk, 60)
+                .expect("claim signed with a registered ring key must seal");
+        }
+        assert!(seals.is_empty());
+    }
+
+    /// A claim whose worker_id was swapped post-signature (to another
+    /// REGISTERED worker) must fail auth — the id is inside the signed bytes
+    /// — and must NOT consume the seal context.
+    #[test]
+    fn claim_with_transposed_worker_id_rejected_without_taking_context() {
+        let _g = REGISTRY_LOCK.lock().unwrap();
+        let sk_a = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let sk_b = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        set_dynamic_worker_public_keys(vec![
+            ("worker-ta".to_string(), sk_a.verifying_key()),
+            ("worker-tb".to_string(), sk_b.verifying_key()),
+        ]);
+        let controller_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+
+        let exec = Uuid::new_v4();
+        let seals = InFlightSeals::new();
+        seals.register(exec, ctx_of(&[("k", "v")]));
+
+        let we = WorkerEphemeral::generate();
+        let mut claim = SecretClaim::new_signed(exec, "worker-ta".into(), we.public_key(), &sk_a);
+        claim.worker_id = "worker-tb".to_string(); // transpose to another real worker
+        assert_eq!(
+            handle_secret_claim(&claim, &seals, &controller_sk, 60).unwrap_err(),
+            ClaimError::Unauthorized
+        );
+        assert_eq!(seals.len(), 1, "context must survive the rejected claim");
+    }
+
+    /// A validly-signed claim for an exec_id this replica never dispatched
+    /// (or already swept) is `UnknownExecution` — fail-closed, no seal.
+    #[test]
+    fn valid_claim_for_undispatched_execution_rejected() {
+        let _g = REGISTRY_LOCK.lock().unwrap();
+        let worker_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        set_dynamic_worker_public_keys(vec![("worker-ud".to_string(), worker_sk.verifying_key())]);
+        let controller_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+
+        let seals = InFlightSeals::new(); // nothing registered
+        let we = WorkerEphemeral::generate();
+        let claim = SecretClaim::new_signed(
+            Uuid::new_v4(),
+            "worker-ud".into(),
+            we.public_key(),
+            &worker_sk,
+        );
+        assert_eq!(
+            handle_secret_claim(&claim, &seals, &controller_sk, 60).unwrap_err(),
+            ClaimError::UnknownExecution
+        );
+    }
+
+    /// A low-order (all-zero) ephemeral key from an AUTHENTICATED worker
+    /// fails the seal with `SealFailed` (non-contributory ECDH is rejected).
+    /// Documents current behavior: the context IS consumed before the seal
+    /// runs (take-then-seal), so the sabotaged execution cannot re-claim —
+    /// fail-closed against probing, at the cost of that job's secrets.
+    #[test]
+    fn low_order_ephemeral_key_fails_seal_closed() {
+        let _g = REGISTRY_LOCK.lock().unwrap();
+        let worker_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        set_dynamic_worker_public_keys(vec![("worker-lo".to_string(), worker_sk.verifying_key())]);
+        let controller_sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+
+        let exec = Uuid::new_v4();
+        let seals = InFlightSeals::new();
+        seals.register(exec, ctx_of(&[("k", "v")]));
+
+        // [0u8; 32] is the identity/low-order point: X25519 output is all-zero
+        // → `was_contributory()` is false → derive_seal_key fails closed.
+        let claim = SecretClaim::new_signed(exec, "worker-lo".into(), [0u8; 32], &worker_sk);
+        match handle_secret_claim(&claim, &seals, &controller_sk, 60) {
+            Err(ClaimError::SealFailed(_)) => {}
+            other => panic!("expected SealFailed for low-order epk_w, got {other:?}"),
+        }
+        // Current behavior: the context was atomically taken before sealing,
+        // so a retry claim finds nothing.
+        assert!(
+            seals.is_empty(),
+            "context is consumed by the failed seal (documented)"
+        );
+    }
+
     #[test]
     fn claim_with_wrong_signature_rejected_without_taking_context() {
         let _g = REGISTRY_LOCK.lock().unwrap();

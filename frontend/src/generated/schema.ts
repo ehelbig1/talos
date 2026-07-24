@@ -83,6 +83,18 @@ export type ActorMemoryEntry = {
   value: Scalars["String"]["output"];
 };
 
+/**
+ * One actor's memory entries within a batched `actorsMemories` read.
+ * Groups are returned ONLY for actors the caller owns — a requested id
+ * that is unknown (or another tenant's) simply has no group, so its
+ * absence is indistinguishable from non-existence.
+ */
+export type ActorMemoryGroup = {
+  __typename?: "ActorMemoryGroup";
+  actorId: Scalars["UUID"]["output"];
+  memories: Array<ActorMemoryEntry>;
+};
+
 export type ActorSummary = {
   __typename?: "ActorSummary";
   createdAt: Scalars["String"]["output"];
@@ -475,6 +487,11 @@ export type ExecutionApproval = {
   requiredFor: Array<Scalars["String"]["output"]>;
   status: Scalars["String"]["output"];
   workflowId: Scalars["UUID"]["output"];
+  /**
+   * Display name of the workflow awaiting approval (null when owned by
+   * another user). Batched via [`WorkflowNameLoader`].
+   */
+  workflowName?: Maybe<Scalars["String"]["output"]>;
 };
 
 export type ExecutionEvent = {
@@ -1351,6 +1368,28 @@ export type QueryRoot = {
   actorWorkflows: Array<ActorWorkflowItem>;
   actorWorkflowsSummary: ActorWorkflowsSummary;
   actors: Array<ActorSummary>;
+  /**
+   * Batched sibling of `actorMemories`: one request returns the
+   * memories of MANY owned actors, grouped per actor.
+   *
+   * N+1 this closes: the Briefings page fanned out one
+   * `actorMemories(actorId)` GraphQL round-trip PER actor after
+   * `actors` (1 + N requests, each opening its own tenant-scoped tx
+   * and ownership check). This resolver serves the same data in ONE
+   * request: one per-user unit of work, ONE batched ownership read
+   * (`actor_ids_owned_by_user_scoped`), then the per-actor listings
+   * on the same connection/snapshot. (Collapsing the listings into a
+   * single `actor_id = ANY($1)` query needs a batched read in
+   * `talos-memory` — actor_memory access MUST go through
+   * `talos_memory::*` — tracked as a follow-up; the request-level
+   * fan-out and per-request auth/tx overhead are already collapsed
+   * here.)
+   *
+   * Tenancy: ids that are unknown or another tenant's are silently
+   * skipped (no group), so absence is indistinguishable from
+   * non-existence. Duplicated ids collapse to one group.
+   */
+  actorsMemories: Array<ActorMemoryGroup>;
   analyzeRhai: AnalyzeCustomModuleResult;
   apiKeys: Array<ApiKeyInfo>;
   auditSettings?: Maybe<UserAuditSettings>;
@@ -1518,6 +1557,12 @@ export type QueryRootActorWorkflowsArgs = {
 
 export type QueryRootActorWorkflowsSummaryArgs = {
   actorId: Scalars["UUID"]["input"];
+};
+
+export type QueryRootActorsMemoriesArgs = {
+  actorIds: Array<Scalars["UUID"]["input"]>;
+  limitPerActor?: InputMaybe<Scalars["Int"]["input"]>;
+  memoryType?: InputMaybe<Scalars["String"]["input"]>;
 };
 
 export type QueryRootAnalyzeRhaiArgs = {
@@ -1990,11 +2035,22 @@ export type Workflow = {
   __typename?: "Workflow";
   /** Actor that owns this workflow, if any. */
   actorId?: Maybe<Scalars["UUID"]["output"]>;
+  /**
+   * Display name of the owning actor (null when unbound, or when the
+   * actor belongs to another user). Batched via [`ActorNameLoader`].
+   */
+  actorName?: Maybe<Scalars["String"]["output"]>;
   /** Serialized representation of the graph (flexible JSON). */
   graphJson: Scalars["String"]["output"];
   id: Scalars["UUID"]["output"];
   /** Optional structured intent metadata. */
   intent?: Maybe<Scalars["JSON"]["output"]>;
+  /**
+   * Most recent execution of this workflow (null when never run or
+   * not visible to the caller). Batched via [`LatestExecutionLoader`]
+   * with the same user/org predicate as `latestWorkflowExecutions`.
+   */
+  latestExecution?: Maybe<WorkflowExecution>;
   /** Maximum number of concurrent executions allowed (null = unlimited). */
   maxConcurrentExecutions?: Maybe<Scalars["Int"]["output"]>;
   name: Scalars["String"]["output"];
@@ -2004,6 +2060,11 @@ export type WorkflowExecution = {
   __typename?: "WorkflowExecution";
   /** Actor that dispatched this execution, if any. */
   actorId?: Maybe<Scalars["UUID"]["output"]>;
+  /**
+   * Display name of the actor that dispatched this execution (null for
+   * non-actor executions). Batched via [`ActorNameLoader`].
+   */
+  actorName?: Maybe<Scalars["String"]["output"]>;
   completedAt?: Maybe<Scalars["String"]["output"]>;
   createdAt: Scalars["String"]["output"];
   durationMs?: Maybe<Scalars["Int"]["output"]>;
@@ -2015,6 +2076,11 @@ export type WorkflowExecution = {
   /** How the execution was triggered: "manual", "scheduled", "webhook", "actor_dispatch", etc. */
   triggerType?: Maybe<Scalars["String"]["output"]>;
   workflowId: Scalars["UUID"]["output"];
+  /**
+   * Display name of the executed workflow (null when owned by another
+   * user). Batched via [`WorkflowNameLoader`].
+   */
+  workflowName?: Maybe<Scalars["String"]["output"]>;
 };
 
 export type WorkflowExecutionEvent = {
@@ -2038,6 +2104,12 @@ export type WorkflowScheduleObj = {
   timezone: Scalars["String"]["output"];
   updatedAt: Scalars["String"]["output"];
   workflowId: Scalars["UUID"]["output"];
+  /**
+   * Display name of the scheduled workflow (null when the workflow is
+   * owned by another user). Batched via [`WorkflowNameLoader`] — the
+   * per-row alternative is a point query per schedule row.
+   */
+  workflowName?: Maybe<Scalars["String"]["output"]>;
 };
 
 /**

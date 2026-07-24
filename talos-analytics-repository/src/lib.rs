@@ -375,6 +375,34 @@ pub struct HealthSummaryCounts {
     pub completed_24h: i64,
 }
 
+/// One row of the health-dashboard `top_failures_24h` rollup: a workflow
+/// with at least one failed execution in the last 24 hours, plus the most
+/// recent failure's error message as a representative sample.
+///
+/// Motivating incident (2026-07-24): a 3-hour network outage produced 125
+/// failed vs 245 completed executions in 24h, but the dashboard's
+/// `failing_workflow_count` heuristic (currently-failing only) showed 0 —
+/// mass transient failure was invisible. This row type backs the grouped
+/// failure view that makes such outages show up.
+#[derive(Debug)]
+pub struct TopFailureRow {
+    pub workflow_id: Uuid,
+    pub workflow_name: String,
+    pub failed_count: i64,
+    pub last_failed_at: Option<DateTime<Utc>>,
+    /// Most recent non-null `error_message` among the failed runs.
+    pub latest_error_message: Option<String>,
+}
+
+/// One row of the global error report's per-workflow failure breakdown.
+#[derive(Debug)]
+pub struct WorkflowFailureCountRow {
+    pub workflow_id: Uuid,
+    pub workflow_name: String,
+    pub failed_count: i64,
+    pub last_failed_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug)]
 pub struct UnusedSecretRow {
     pub name: String,
@@ -1494,6 +1522,55 @@ impl AnalyticsRepository {
         })
     }
 
+    /// Workflows with failed executions in the last 24 hours, grouped by
+    /// workflow, ordered by failure count. Unlike `get_failing_workflows`
+    /// (which feeds the "currently failing" heuristic), this is a raw
+    /// grouped rollup so a mass transient outage — many workflows each
+    /// failing a few times — is visible on the dashboard.
+    ///
+    /// `latest_error_message` is the most recent non-null error among the
+    /// group's failed runs (`ARRAY_AGG ... ORDER BY started_at DESC` with a
+    /// NULL filter). Archived workflows are excluded — same predicate
+    /// rationale as `get_failing_workflows` (only `archived` suppresses
+    /// observability; `draft` does not).
+    ///
+    /// ORDER BY carries `w.id` as the deterministic tiebreaker (lint
+    /// check 28 discipline). Capped at 10 rows.
+    pub async fn get_top_failures_24h(&self, user_id: Uuid) -> Result<Vec<TopFailureRow>> {
+        // RFC 0005 S3: self-scope (workflows + workflow_executions backstop).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
+        let rows = sqlx::query(
+            "SELECT w.id, w.name, \
+                    COUNT(*)::bigint AS failed_count, \
+                    MAX(we.started_at) AS last_failed_at, \
+                    (ARRAY_AGG(we.error_message ORDER BY we.started_at DESC) \
+                        FILTER (WHERE we.error_message IS NOT NULL))[1] AS latest_error_message \
+             FROM workflows w \
+             JOIN workflow_executions we ON we.workflow_id = w.id \
+             WHERE w.user_id = $1 AND we.status = 'failed' \
+               AND we.started_at > NOW() - INTERVAL '24 hours' \
+               AND (w.status IS NULL OR w.status != 'archived') \
+             GROUP BY w.id, w.name \
+             ORDER BY failed_count DESC, w.id \
+             LIMIT 10",
+        )
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.into_iter()
+            .map(|r| -> Result<TopFailureRow> {
+                Ok(TopFailureRow {
+                    workflow_id: r.try_get("id")?,
+                    workflow_name: r.try_get("name")?,
+                    failed_count: r.try_get::<Option<_>, _>("failed_count")?.unwrap_or(0),
+                    last_failed_at: r.try_get::<Option<_>, _>("last_failed_at")?,
+                    latest_error_message: r.try_get::<Option<_>, _>("latest_error_message")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+    }
+
     // -- Latency ----------------------------------------------------------
 
     /// Compact stats for SLA threshold evaluation: total execution count,
@@ -1870,6 +1947,90 @@ impl AnalyticsRepository {
                     r.try_get::<Option<DateTime<Utc>>, _>("started_at")?
                         .unwrap_or_else(Utc::now),
                 ))
+            })
+            .collect::<Result<Vec<_>>>()
+    }
+
+    /// Global sibling of `get_error_messages_with_started_at`: failed-run
+    /// error messages across ALL of the user's workflows in the window,
+    /// most recent first. Feeds the platform-wide fingerprint rollup in
+    /// `get_error_report` when no `workflow_id` is given.
+    ///
+    /// `id DESC` tiebreaker keeps ordering deterministic when many rows
+    /// share a `started_at` (lint check 28 discipline).
+    pub async fn get_error_messages_with_started_at_global(
+        &self,
+        user_id: Uuid,
+        days: i32,
+        limit: i64,
+    ) -> Result<Vec<(String, DateTime<Utc>)>> {
+        // RFC 0005 S3: self-scope (workflow_executions backstop).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
+        let rows = sqlx::query(
+            "SELECT error_message, started_at FROM workflow_executions \
+             WHERE user_id = $1 AND status = 'failed' \
+               AND error_message IS NOT NULL \
+               AND started_at IS NOT NULL \
+               AND started_at > NOW() - make_interval(days => $2::int) \
+             ORDER BY started_at DESC, id DESC LIMIT $3",
+        )
+        .bind(user_id)
+        .bind(days)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.into_iter()
+            .map(|r| -> Result<(String, DateTime<Utc>)> {
+                Ok((
+                    r.try_get::<Option<String>, _>("error_message")?
+                        .unwrap_or_default(),
+                    r.try_get::<Option<DateTime<Utc>>, _>("started_at")?
+                        .unwrap_or_else(Utc::now),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()
+    }
+
+    /// Per-workflow failure counts across ALL of the user's workflows in
+    /// the window — the "which workflows are failing and how much" leg of
+    /// the global error report. Ordered by failure count with `w.id` as
+    /// the deterministic tiebreaker; caller-supplied `limit` must already
+    /// be clamped at the handler boundary.
+    pub async fn get_per_workflow_failure_counts(
+        &self,
+        user_id: Uuid,
+        days: i32,
+        limit: i64,
+    ) -> Result<Vec<WorkflowFailureCountRow>> {
+        // RFC 0005 S3: self-scope (workflows + workflow_executions backstop).
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
+        let rows = sqlx::query(
+            "SELECT w.id, w.name, \
+                    COUNT(*)::bigint AS failed_count, \
+                    MAX(we.started_at) AS last_failed_at \
+             FROM workflows w \
+             JOIN workflow_executions we ON we.workflow_id = w.id \
+             WHERE w.user_id = $1 AND we.status = 'failed' \
+               AND we.started_at > NOW() - make_interval(days => $2::int) \
+             GROUP BY w.id, w.name \
+             ORDER BY failed_count DESC, w.id \
+             LIMIT $3",
+        )
+        .bind(user_id)
+        .bind(days)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        rows.into_iter()
+            .map(|r| -> Result<WorkflowFailureCountRow> {
+                Ok(WorkflowFailureCountRow {
+                    workflow_id: r.try_get("id")?,
+                    workflow_name: r.try_get("name")?,
+                    failed_count: r.try_get::<Option<_>, _>("failed_count")?.unwrap_or(0),
+                    last_failed_at: r.try_get::<Option<_>, _>("last_failed_at")?,
+                })
             })
             .collect::<Result<Vec<_>>>()
     }
