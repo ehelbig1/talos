@@ -3548,6 +3548,20 @@ pub struct PipelineStep {
     /// the worker's default. Signed alongside `max_retries`.
     #[serde(default, skip_serializing_if = "is_default_u64")]
     pub retry_backoff_ms: u64,
+
+    /// Opt-in idempotency key for THIS pipeline step (config key
+    /// `__idempotency_key__` on the step's node, resolved + stripped by the
+    /// engine). When `Some`, the worker emits it as an `Idempotency-Key`
+    /// header on the step's mutating outbound HTTP so a retried step send is
+    /// deduped at the destination — the per-step twin of
+    /// `JobRequest::idempotency_key`. Its presence is ALSO what lets the
+    /// engine grant transient retries to an otherwise-non-idempotent send
+    /// step (`effective_retries_with_idempotency`). `None` (the default +
+    /// every non-declaring step + every legacy sender) ships nothing on the
+    /// wire — HMAC-bound via the conditional `:idem=` signing segment so a
+    /// tamperer can't strip it (un-deduping a retried send) or swap it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 /// A pipeline job dispatched by the Controller to a Worker via NATS.
@@ -3877,6 +3891,29 @@ impl PipelineJobRequest {
                 .map(|s| format!("{}|{}", s.max_retries, s.retry_backoff_ms))
                 .collect();
             let _ = write!(payload, ":retries={}", step_retries.join(";;"));
+        }
+
+        // Per-step idempotency keys (Task 1 follow-up, 2026-07) appended AT
+        // THE END, AFTER `:retries=`, ONLY when ANY step declares one — so an
+        // all-`None` pipeline (every legacy sender + every non-declaring
+        // pipeline) stays byte-identical to the pre-idempotency wire format
+        // and the segment ships inert. Binding matters both ways: stripping a
+        // step's key lets a retried step re-fire un-deduped; swapping it points
+        // the destination's dedup at the wrong logical operation. Each step
+        // contributes a `1`+length-prefixed-key segment when `Some` (keys are
+        // free-form) or a bare `0` when `None`, so `None` is distinguishable
+        // from `Some("")` and the whole per-step vector is collision-resistant.
+        if self.steps.iter().any(|s| s.idempotency_key.is_some()) {
+            use std::fmt::Write as _;
+            let step_idem: Vec<String> = self
+                .steps
+                .iter()
+                .map(|s| match &s.idempotency_key {
+                    Some(k) => format!("1{}", lp(k)),
+                    None => "0".to_string(),
+                })
+                .collect();
+            let _ = write!(payload, ":idem={}", step_idem.join(";;"));
         }
 
         payload.into_bytes()
@@ -6187,6 +6224,7 @@ mod tests {
             integration_name: None,
             max_retries: 0,
             retry_backoff_ms: 0,
+            idempotency_key: None,
         }
     }
 
@@ -6391,6 +6429,103 @@ mod tests {
         req.steps[0].allowed_hosts = vec!["a.com".to_string(), "b.com".to_string()];
         req.verify(&key, 300)
             .expect("re-ordered allowed_hosts must still verify");
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Task 1 follow-up (2026-07): per-step idempotency signing binding.
+    // ────────────────────────────────────────────────────────────────
+
+    /// Default all-`None` idempotency keys must produce a signing payload
+    /// byte-identical to a pipeline built before the field existed — the
+    /// wire-format stability invariant. The `:idem=` segment is skipped
+    /// entirely when no step declares a key.
+    #[test]
+    fn pipeline_default_idempotency_signing_byte_identical() {
+        let step = make_test_pipeline_step();
+        assert!(step.idempotency_key.is_none());
+        let req = make_test_pipeline(vec![step]);
+        // The append is guarded on `any(is_some)`, so an all-None pipeline's
+        // payload contains no `:idem=` marker.
+        let payload = String::from_utf8(req.signing_payload()).unwrap();
+        assert!(
+            !payload.contains(":idem="),
+            "all-None idempotency must not emit a :idem= signing segment"
+        );
+    }
+
+    /// A declared per-step idempotency key round-trips: a clean signed
+    /// pipeline verifies.
+    #[test]
+    fn pipeline_idempotency_key_round_trip() {
+        let key = test_key();
+        let mut step = make_test_pipeline_step();
+        step.idempotency_key = Some("order-42:send".to_string());
+        let mut req = make_test_pipeline(vec![step]);
+        req.sign(&key).unwrap();
+        req.verify(&key, 300)
+            .expect("clean pipeline with a per-step idempotency key must verify");
+        let payload = String::from_utf8(req.signing_payload()).unwrap();
+        assert!(payload.contains(":idem="));
+    }
+
+    /// Stripping a step's idempotency key on the wire (Some → None) must
+    /// invalidate the signature — otherwise a retried step re-fires
+    /// un-deduped.
+    #[test]
+    fn pipeline_stripped_idempotency_key_fails_verification() {
+        let key = test_key();
+        let mut step = make_test_pipeline_step();
+        step.idempotency_key = Some("order-42:send".to_string());
+        let mut req = make_test_pipeline(vec![step]);
+        req.sign(&key).unwrap();
+
+        req.steps[0].idempotency_key = None;
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "stripping a step's idempotency key must fail verification"
+        );
+    }
+
+    /// Swapping a step's idempotency key for a different value must
+    /// invalidate the signature — otherwise a tamperer redirects the
+    /// destination's dedup at the wrong logical operation.
+    #[test]
+    fn pipeline_swapped_idempotency_key_fails_verification() {
+        let key = test_key();
+        let mut step = make_test_pipeline_step();
+        step.idempotency_key = Some("order-42:send".to_string());
+        let mut req = make_test_pipeline(vec![step]);
+        req.sign(&key).unwrap();
+
+        req.steps[0].idempotency_key = Some("order-99:send".to_string());
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "swapping a step's idempotency key must fail verification"
+        );
+    }
+
+    /// Per-step independence + None/Some distinguishability: two steps where
+    /// only the SECOND declares a key must verify, and moving the key from
+    /// step 1 to step 0 (same set of keys, different positions) must fail —
+    /// proving the per-step position is bound, not just the multiset.
+    #[test]
+    fn pipeline_idempotency_key_position_is_bound() {
+        let key = test_key();
+        let s0 = make_test_pipeline_step();
+        let mut s1 = make_test_pipeline_step();
+        s1.idempotency_key = Some("k".to_string());
+        let mut req = make_test_pipeline(vec![s0, s1]);
+        req.sign(&key).unwrap();
+        req.verify(&key, 300)
+            .expect("second-step-only idempotency must verify");
+
+        // Move the key to step 0 instead of step 1.
+        req.steps[0].idempotency_key = Some("k".to_string());
+        req.steps[1].idempotency_key = None;
+        assert!(
+            req.verify(&key, 300).is_err(),
+            "moving the key to a different step must fail verification"
+        );
     }
 
     // ────────────────────────────────────────────────────────────────

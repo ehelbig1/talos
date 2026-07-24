@@ -311,6 +311,7 @@ fn pipeline_job_request_json_snapshot() {
             expected_wasm_hash: Some("deadbeef".into()),
             max_retries: 0,
             retry_backoff_ms: 0,
+            idempotency_key: None,
         }],
         signature: vec![0xCA, 0xFE],
         job_nonce: "0:00000000000000000000000000000000".into(),

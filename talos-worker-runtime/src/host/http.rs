@@ -3,6 +3,40 @@
 
 use super::*;
 
+use talos_idempotency::{DedupCheck, DedupResponse, InMemoryIdempotencyStore};
+
+/// Process-global worker-side idempotency dedup store. Belt-and-suspenders ON
+/// TOP OF the `Idempotency-Key` HTTP header (which is the primary dedup
+/// mechanism): once a mutating send under a declared key completes with a 2xx
+/// in THIS worker process, a subsequent send under the same key within the TTL
+/// is short-circuited to the cached response instead of re-firing — covering
+/// destinations that don't honor the header. Only engaged when the dispatch
+/// carries an `idempotency_key` (opt-in); a non-declaring send never touches it.
+///
+/// Shared by `http::fetch` and `webhook::send` so a key used across both paths
+/// dedupes consistently. TTL + entry cap are env-tunable
+/// (`TALOS_WORKER_IDEMPOTENCY_TTL_SECS`, default 900;
+/// `TALOS_WORKER_IDEMPOTENCY_MAX_ENTRIES`, default 10_000).
+pub(crate) fn get_global_idempotency_store() -> &'static InMemoryIdempotencyStore {
+    static STORE: std::sync::OnceLock<InMemoryIdempotencyStore> = std::sync::OnceLock::new();
+    STORE.get_or_init(|| {
+        let ttl_secs =
+            talos_config::positive_env_or_default::<u64>("TALOS_WORKER_IDEMPOTENCY_TTL_SECS", 900);
+        let max_entries = talos_config::positive_env_or_default::<usize>(
+            "TALOS_WORKER_IDEMPOTENCY_MAX_ENTRIES",
+            10_000,
+        );
+        InMemoryIdempotencyStore::new(std::time::Duration::from_secs(ttl_secs), max_entries)
+    })
+}
+
+/// Whether an HTTP status represents a success worth caching for dedup. Only
+/// 2xx: a non-2xx (4xx/5xx) must stay retryable, so we never cache it — a
+/// retry re-fires and the transient classifier decides.
+pub(crate) fn dedup_cacheable_status(status: u16) -> bool {
+    (200..300).contains(&status)
+}
+
 /// Whether an HTTP method mutates server state — the write-ceiling axis.
 /// `GET` is the only read verb in `wit_http::Method`; every other verb
 /// (`POST` / `PUT` / `PATCH` / `DELETE`) can mutate, so a read-only actor
@@ -503,6 +537,13 @@ impl wit_http::Host for TalosContext {
         // deduplicated at the destination (Stripe-style). Only for mutating
         // verbs (a GET is already safe to retry and needs no key), and only when
         // the guest hasn't set the header itself (respect an explicit override).
+        //
+        // `dedup_key` mirrors that decision: when set, this send participates in
+        // the worker-side in-memory dedup store (Task 2) as belt-and-suspenders
+        // for destinations that don't honor the header. We do NOT engage the
+        // store when the guest set its own key (we don't know its dedup
+        // semantics) — only for the engine-stamped, header-emitting case.
+        let mut dedup_key: Option<String> = None;
         if http_method_mutates(&method) {
             if let Some(ref idem) = self.idempotency_key {
                 let guest_set = headers
@@ -510,7 +551,30 @@ impl wit_http::Host for TalosContext {
                     .any(|(n, _)| n.eq_ignore_ascii_case("idempotency-key"));
                 if !guest_set {
                     builder = builder.header("Idempotency-Key", idem.as_str());
+                    dedup_key = Some(idem.clone());
                 }
+            }
+        }
+        // Task 2: short-circuit a mutating send whose engine-stamped key already
+        // COMPLETED successfully in this process — return the cached response
+        // instead of re-firing. Covers destinations with no Idempotency-Key
+        // support. A miss (or a non-declaring send) proceeds normally.
+        if let Some(ref k) = dedup_key {
+            if let DedupCheck::Completed(cached) = get_global_idempotency_store().check(k) {
+                tracing::info!(
+                    host = %host_str,
+                    "idempotent send short-circuited: returning cached response for a \
+                     previously-completed idempotency key (worker-side dedup)"
+                );
+                // `return` here resolves the enclosing `async move` block (whose
+                // value the outer fn records metrics for and returns) — NOT the
+                // outer fn, so metrics are still recorded once at the tail.
+                self.consume_async_fuel(async_start.elapsed(), "http::fetch");
+                return Ok(wit_http::Response {
+                    status: cached.status,
+                    headers: cached.headers,
+                    body: cached.body,
+                });
             }
         }
         if !body.is_empty() {
@@ -651,6 +715,23 @@ impl wit_http::Host for TalosContext {
         // Approximate: 1ms ≈ 10,000 WASM instructions
         let async_elapsed = async_start.elapsed();
         self.consume_async_fuel(async_elapsed, "http::fetch");
+
+        // Task 2: on a SUCCESSFUL (2xx) idempotent send, record the response so a
+        // later send under the same engine-stamped key is short-circuited. Only
+        // 2xx is cached — a 4xx/5xx must stay retryable. Non-declaring sends
+        // (`dedup_key == None`) never touch the store.
+        if let Some(ref k) = dedup_key {
+            if dedup_cacheable_status(status) {
+                get_global_idempotency_store().complete(
+                    k,
+                    DedupResponse {
+                        status,
+                        headers: resp_headers.clone(),
+                        body: resp_body.clone(),
+                    },
+                );
+            }
+        }
 
         Ok(wit_http::Response {
             status,

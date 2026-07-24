@@ -163,6 +163,7 @@ async fn main() -> Result<()> {
             expected_wasm_hash: None,
             max_retries: 0,
             retry_backoff_ms: 0,
+            idempotency_key: None,
         }],
         signature: vec![],
         job_nonce: String::new(),
