@@ -206,7 +206,7 @@ pub struct McpState {
     /// Per-agent SSE channels keyed by agent_id string.
     /// Each agent gets its own broadcast channel to prevent cross-agent data leakage.
     pub agent_channels: std::sync::Arc<DashMap<String, broadcast::Sender<Event>>>,
-    pub runtime: std::sync::Arc<worker::runtime::TalosRuntime>,
+    pub runtime: std::sync::Arc<talos_worker_runtime::runtime::TalosRuntime>,
     pub compiler: std::sync::Arc<CompilationService>,
     /// Shared NATS client (authenticated, reused across all MCP requests).
     pub nats_client: Option<std::sync::Arc<async_nats::Client>>,
@@ -313,12 +313,25 @@ pub struct McpState {
     /// stable `jsonrpc_code()` mappings.
     pub actor_lifecycle_service:
         std::sync::Arc<talos_actor_lifecycle_service::ActorLifecycleService>,
+    /// Platform-hygiene service — backs `get_platform_hygiene_report`
+    /// (report assembly + the fix_all dry-run/execute flow). Constructed
+    /// in `create_router` from the shared repository Arcs (same wiring
+    /// shape as `policy_evaluator`). Cross-protocol-ready: typed input +
+    /// outcome, `HygieneError` with stable `jsonrpc_code()` mapping and
+    /// generic-string internal-error collapse.
+    pub hygiene_service: std::sync::Arc<talos_hygiene_service::HygieneService>,
+    /// Session-brief service — backs `session_start` (and the deprecated
+    /// `agent_session_start` alias). Owns the coverage / drafts /
+    /// schedules / actors / recent-executions assembly; the handler keeps
+    /// only protocol parsing, compile-time identity (env!-stamped
+    /// version), and the auto-heal background spawns.
+    pub session_brief_service: std::sync::Arc<talos_session_brief_service::SessionBriefService>,
 }
 
 pub fn create_router(
     registry: std::sync::Arc<ModuleRegistry>,
     db_pool: sqlx::PgPool,
-    runtime: std::sync::Arc<worker::runtime::TalosRuntime>,
+    runtime: std::sync::Arc<talos_worker_runtime::runtime::TalosRuntime>,
     compiler: std::sync::Arc<CompilationService>,
     nats_client: Option<std::sync::Arc<async_nats::Client>>,
     llm_client: Option<std::sync::Arc<talos_llm::LlmClient>>,
@@ -360,6 +373,21 @@ pub fn create_router(
     );
     policy_evaluator.clone().spawn_sweeper();
 
+    // Hygiene + session-brief services are pure compositions of the
+    // repository Arcs already threaded in here, so they're constructed
+    // in-place (same wiring shape as `policy_evaluator`) — no
+    // controller/main.rs change required. If a GraphQL consumer appears,
+    // lift construction to main.rs and thread the shared Arc through.
+    let hygiene_service = std::sync::Arc::new(talos_hygiene_service::HygieneService::new(
+        analytics_repo.clone(),
+        workflow_repo.clone(),
+        execution_repo.clone(),
+        module_repo.clone(),
+    ));
+    let session_brief_service = std::sync::Arc::new(
+        talos_session_brief_service::SessionBriefService::new(advanced_repo.clone()),
+    );
+
     // The workflow-creation service is constructed in main.rs (so
     // GraphQL and MCP share one instance) and threaded in here.
 
@@ -391,6 +419,8 @@ pub fn create_router(
         search_service,
         failure_analysis_service,
         actor_lifecycle_service,
+        hygiene_service,
+        session_brief_service,
     };
 
     // Authenticated routes (Bearer token required)

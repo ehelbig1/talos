@@ -1846,18 +1846,18 @@ async fn handle_run_sandbox(
         .runtime
         .execute_job_with_full_features(
             &wasm_bytes,
-            allowed_hosts,                           // allowed_hosts
-            vec![],                                  // allowed_methods
-            128,                                     // max_memory_mb
-            payload,                                 // input
-            None,                                    // execution_fs_dir
-            None,                                    // execution_context
-            secrets,                                 // secrets from vault
-            None,                                    // token_sender
-            Duration::from_secs(30),                 // timeout
-            worker::runtime::RetryPolicy::default(), // retry_policy
-            None,                                    // result_cache_ttl_secs
-            worker::runtime::SecurityPolicy::default(),
+            allowed_hosts,                                         // allowed_hosts
+            vec![],                                                // allowed_methods
+            128,                                                   // max_memory_mb
+            payload,                                               // input
+            None,                                                  // execution_fs_dir
+            None,                                                  // execution_context
+            secrets,                                               // secrets from vault
+            None,                                                  // token_sender
+            Duration::from_secs(30),                               // timeout
+            talos_worker_runtime::runtime::RetryPolicy::default(), // retry_policy
+            None,                                                  // result_cache_ttl_secs
+            talos_worker_runtime::runtime::SecurityPolicy::default(),
             None,  // capability_world_hint
             None,  // max_fuel_override
             false, // dry_run
@@ -2039,7 +2039,7 @@ async fn handle_compile_template(
                 }
             };
 
-            let inspection = worker::inspect_component(&wasm_bytes);
+            let inspection = talos_worker_runtime::inspect_component(&wasm_bytes);
             // Normalize to the "-node" suffix form used throughout the platform.
             // The WIT inspector returns bare names ("minimal", "trusted", etc.).
             let cap_world = {
@@ -3035,7 +3035,7 @@ async fn handle_test_module(
                             ))
                         }
                     };
-                    let inspection = worker::inspect_component(&wasm_bytes);
+                    let inspection = talos_worker_runtime::inspect_component(&wasm_bytes);
                     talos_registry::WasmModule {
                         name: template.name,
                         content_hash: format!("template:{}", module_id),
@@ -3075,8 +3075,8 @@ async fn handle_test_module(
     // Unknown means the WIT inspector couldn't identify the world — also unrunnable.
     if matches!(
         module.capability_world,
-        worker::wit_inspector::CapabilityWorld::Governance
-            | worker::wit_inspector::CapabilityWorld::Unknown
+        talos_worker_runtime::wit_inspector::CapabilityWorld::Governance
+            | talos_worker_runtime::wit_inspector::CapabilityWorld::Unknown
     ) {
         return Some(mcp_error(
             req_id.clone(),
@@ -3201,7 +3201,7 @@ async fn handle_test_module(
             .unwrap_or(talos_workflow_job_protocol::LlmTier::Tier1),
         None => talos_workflow_job_protocol::LlmTier::Tier1,
     };
-    let security_policy = worker::runtime::SecurityPolicy {
+    let security_policy = talos_worker_runtime::runtime::SecurityPolicy {
         allowed_secrets: module.allowed_secrets.clone(),
         integration_name: module.integration_name.clone(),
         ..Default::default()
@@ -3220,7 +3220,7 @@ async fn handle_test_module(
             secrets,
             None,
             std::time::Duration::from_secs(timeout_secs),
-            worker::runtime::RetryPolicy::default(),
+            talos_worker_runtime::runtime::RetryPolicy::default(),
             None,
             security_policy,
             None, // capability_world_hint

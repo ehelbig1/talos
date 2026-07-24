@@ -132,15 +132,25 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "compare_executions",
-            "description": "Compare two workflow executions side-by-side. Shows per-node output differences, timing, and status. Per-value byte cap defaults to 8 KiB to keep responses under MCP-client request timeouts; set max_bytes_per_value to override (max 65536). Truncated values are replaced with a {__truncated, original_byte_size, preview} envelope; truncated_value_count reports how many fired.",
+            "description": "Canonical execution-comparison tool — the `view` parameter selects the output shape. view='summary' (default): compare two executions side-by-side with per-node output differences, timing, and status (requires execution_id_a + execution_id_b). view='diff': detailed field-level diffs per node between two executions, optionally focused on one node via node_id (requires execution_id_a + execution_id_b; replaces the deprecated get_execution_diff). view='delta': field-level diff between each consecutive pair of the last N executions of a workflow, plus a stability rating (requires workflow_id; optional n + node_label; replaces the deprecated get_execution_delta). view='report': multi-execution side-by-side summary — status breakdown, duration spread, common/divergent output keys (requires execution_ids array, max 10; replaces the deprecated get_execution_comparison_report). Each view emits the same JSON its legacy tool produced; the deprecated names still dispatch with a deprecation notice. Per-value byte cap (summary/diff views) defaults to 8 KiB to keep responses under MCP-client request timeouts; set max_bytes_per_value to override (max 65536). Truncated values are replaced with a {__truncated, original_byte_size, preview} envelope; truncated_value_count reports how many fired.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "execution_id_a": { "type": "string", "description": "UUID of the first execution" },
-                    "execution_id_b": { "type": "string", "description": "UUID of the second execution" },
-                    "max_bytes_per_value": { "type": "number", "description": "Per-value cap for inline value_a/value_b in the response (default 8192, max 65536, min 1024). Values exceeding this are replaced with a truncation envelope." }
+                    "view": { "type": "string", "enum": ["summary", "diff", "delta", "report"], "description": "Output shape (default: 'summary'). summary/diff compare two executions (execution_id_a + execution_id_b); delta walks the last N executions of one workflow (workflow_id); report summarizes up to 10 executions (execution_ids)." },
+                    "execution_id_a": { "type": "string", "description": "UUID of the first execution (views: summary, diff)" },
+                    "execution_id_b": { "type": "string", "description": "UUID of the second execution (views: summary, diff)" },
+                    "max_bytes_per_value": { "type": "number", "description": "Per-value cap for inline value_a/value_b in the response (default 8192, max 65536, min 1024). Values exceeding this are replaced with a truncation envelope. Views: summary, diff." },
+                    "node_id": { "type": "string", "description": "view='diff' only. Optional: focus diff on a specific node. Use the graph node_id string (e.g. 'fetch', 'validate-input') as defined when the node was added — NOT the module display label and NOT a UUID. Find node IDs via get_workflow_graph." },
+                    "workflow_id": { "type": "string", "description": "view='delta' only (required for that view). UUID of the workflow to inspect." },
+                    "n": { "type": "number", "description": "view='delta' only. Number of recent executions to compare (default: 5, min: 2, max: 10)" },
+                    "node_label": { "type": "string", "description": "view='delta' only. Optional: focus delta on a single node's output. Matched against the node's display label (module name), NOT its node_id string — passing an actual node_id UUID will match nothing. Use get_workflow_graph to see node labels." },
+                    "execution_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "view='report' only (required for that view). Array of execution UUIDs to compare (max 10)."
+                    }
                 },
-                "required": ["execution_id_a", "execution_id_b"]
+                "required": []
             }
         }),
         serde_json::json!({
@@ -297,20 +307,13 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                 "required": ["execution_id"]
             }
         }),
-        serde_json::json!({
-            "name": "get_execution_diff",
-            "description": "Compare outputs of two executions with detailed field-level diffs per node. Shows which fields were added, removed, or changed (with both values). More detailed than compare_executions. Per-value byte cap defaults to 8 KiB to keep responses under MCP-client request timeouts; set max_bytes_per_value to override (max 65536).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "execution_id_a": { "type": "string", "description": "UUID of the first execution" },
-                    "execution_id_b": { "type": "string", "description": "UUID of the second execution" },
-                    "node_id": { "type": "string", "description": "Optional: focus diff on a specific node. Use the graph node_id string (e.g. 'fetch', 'validate-input') as defined when the node was added — NOT the module display label and NOT a UUID. Find node IDs via get_workflow_graph." },
-                    "max_bytes_per_value": { "type": "number", "description": "Per-value cap for inline value_a/value_b in the response (default 8192, max 65536, min 1024). Values exceeding this are replaced with a truncation envelope." }
-                },
-                "required": ["execution_id_a", "execution_id_b"]
-            }
-        }),
+        // `get_execution_diff` / `get_execution_comparison_report` /
+        // `get_execution_delta` were consolidated into
+        // `compare_executions` (view: diff / report / delta) in the
+        // 2026-07 execution-comparison consolidation. Their schemas are
+        // no longer advertised; the names remain dispatch-only deprecated
+        // aliases (see `dispatch` below) that emit the identical JSON plus
+        // an injected deprecation notice.
         serde_json::json!({
             "name": "get_node_execution_history",
             "description": "Get execution history for a specific node across multiple workflow runs. Shows which executions the node succeeded/failed in.",
@@ -355,34 +358,6 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "execution_id": { "type": "string", "description": "UUID of the execution to trace" }
                 },
                 "required": ["execution_id"]
-            }
-        }),
-        serde_json::json!({
-            "name": "get_execution_comparison_report",
-            "description": "Compare multiple executions side-by-side: status, duration, output keys, and divergences. Useful for debugging flaky workflows.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "execution_ids": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Array of execution UUIDs to compare (max 10)"
-                    }
-                },
-                "required": ["execution_ids"]
-            }
-        }),
-        serde_json::json!({
-            "name": "get_execution_delta",
-            "description": "Show what changed in node outputs across the last N executions of a workflow. Fetches up to N recent completed/failed executions, then computes a field-level diff between each consecutive pair (run K vs run K+1). Returns per-node change summaries, identical-count, and a stability rating. Useful for spotting regressions or intermittent failures without manually comparing individual executions.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "workflow_id": { "type": "string", "description": "UUID of the workflow to inspect" },
-                    "n": { "type": "number", "description": "Number of recent executions to compare (default: 5, min: 2, max: 10)" },
-                    "node_label": { "type": "string", "description": "Optional: focus delta on a single node's output. Matched against the node's display label (module name), NOT its node_id string — passing an actual node_id UUID will match nothing. Use get_workflow_graph to see node labels." }
-                },
-                "required": ["workflow_id"]
             }
         }),
         serde_json::json!({
@@ -510,7 +485,17 @@ pub async fn dispatch(
         "get_execution_output" => {
             Some(handle_get_execution_output(req_id, args, state, user_id).await)
         }
-        "get_execution_diff" => Some(handle_get_execution_diff(req_id, args, state, user_id).await),
+        "get_execution_diff" => {
+            // Deprecated alias (2026-07 consolidation) — identical output to
+            // compare_executions view='diff', with a deprecation notice
+            // injected. Removed from tool_schemas; dispatch-only.
+            let resp = handle_get_execution_diff(req_id.clone(), args, state, user_id).await;
+            Some(crate::actor::inject_deprecation_pub(
+                resp,
+                "get_execution_diff",
+                "compare_executions (view: 'diff')",
+            ))
+        }
         "get_node_execution_history" => {
             Some(handle_get_node_execution_history(req_id, args, state, user_id).await)
         }
@@ -522,13 +507,30 @@ pub async fn dispatch(
             Some(handle_get_execution_replay_chain(req_id, args, state, user_id).await)
         }
         "get_execution_comparison_report" => {
-            Some(handle_get_execution_comparison_report(req_id, args, state, user_id).await)
+            // Deprecated alias (2026-07 consolidation) — identical output to
+            // compare_executions view='report', with a deprecation notice
+            // injected. Removed from tool_schemas; dispatch-only.
+            let resp =
+                handle_get_execution_comparison_report(req_id.clone(), args, state, user_id).await;
+            Some(crate::actor::inject_deprecation_pub(
+                resp,
+                "get_execution_comparison_report",
+                "compare_executions (view: 'report')",
+            ))
         }
         "get_execution_trace" => {
             Some(handle_get_execution_trace(req_id, args, state, user_id).await)
         }
         "get_execution_delta" => {
-            Some(handle_get_execution_delta(req_id, args, state, user_id).await)
+            // Deprecated alias (2026-07 consolidation) — identical output to
+            // compare_executions view='delta', with a deprecation notice
+            // injected. Removed from tool_schemas; dispatch-only.
+            let resp = handle_get_execution_delta(req_id.clone(), args, state, user_id).await;
+            Some(crate::actor::inject_deprecation_pub(
+                resp,
+                "get_execution_delta",
+                "compare_executions (view: 'delta')",
+            ))
         }
         "analyze_execution_failure" => {
             Some(handle_analyze_execution_failure(req_id, args, state, user_id).await)
@@ -1670,7 +1672,73 @@ fn cap_value_for_inline_response(v: &Value, max_bytes: usize) -> (Value, bool) {
     )
 }
 
+/// The four output shapes of the consolidated `compare_executions` tool
+/// (2026-07 execution-comparison consolidation). `Summary` is the
+/// historical `compare_executions` body; the other three emit JSON
+/// byte-identical to the deprecated tools they absorbed
+/// (`get_execution_diff` / `get_execution_delta` /
+/// `get_execution_comparison_report`, still dispatchable as aliases).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComparisonView {
+    Summary,
+    Diff,
+    Delta,
+    Report,
+}
+
+/// Parse the optional `view` argument. Absent / null → `Summary`
+/// (back-compat: pre-consolidation calls carry no `view`). Unknown values
+/// and wrong types reject loudly (-32602 at the handler) with the valid
+/// list + per-view argument hints — never silently default.
+fn parse_comparison_view(args: &Value) -> Result<ComparisonView, String> {
+    match args.get("view") {
+        None | Some(Value::Null) => Ok(ComparisonView::Summary),
+        Some(Value::String(s)) => match s.as_str() {
+            "summary" => Ok(ComparisonView::Summary),
+            "diff" => Ok(ComparisonView::Diff),
+            "delta" => Ok(ComparisonView::Delta),
+            "report" => Ok(ComparisonView::Report),
+            other => Err(format!(
+                "Invalid 'view' value '{other}': must be one of 'summary', 'diff', 'delta', \
+                 'report'. summary/diff compare two executions (execution_id_a + \
+                 execution_id_b); delta walks the last N executions of one workflow \
+                 (workflow_id, optional n + node_label); report summarizes up to 10 \
+                 executions (execution_ids)."
+            )),
+        },
+        Some(v) => Err(format!(
+            "'view' must be a string, got {}",
+            crate::utils::json_type_name(v)
+        )),
+    }
+}
+
+/// Canonical comparison entry point: route on `view` to the shape-specific
+/// implementation. Each implementation's output is byte-identical to the
+/// tool it previously backed.
 async fn handle_compare_executions(
+    req_id: Option<serde_json::Value>,
+    args: &Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let view = match parse_comparison_view(args) {
+        Ok(v) => v,
+        Err(msg) => return mcp_error(req_id, -32602, &msg),
+    };
+    match view {
+        ComparisonView::Summary => {
+            handle_compare_executions_summary(req_id, args, state, user_id).await
+        }
+        ComparisonView::Diff => handle_get_execution_diff(req_id, args, state, user_id).await,
+        ComparisonView::Delta => handle_get_execution_delta(req_id, args, state, user_id).await,
+        ComparisonView::Report => {
+            handle_get_execution_comparison_report(req_id, args, state, user_id).await
+        }
+    }
+}
+
+async fn handle_compare_executions_summary(
     req_id: Option<serde_json::Value>,
     args: &Value,
     state: &McpState,
@@ -6020,5 +6088,67 @@ mod redact_actor_context_tests {
         let s = serde_json::to_string(&payload).unwrap();
         let out = redact_actor_context_in_log(&s);
         assert_eq!(out, s);
+    }
+}
+
+#[cfg(test)]
+mod comparison_view_tests {
+    use super::{parse_comparison_view, ComparisonView};
+    use serde_json::json;
+
+    #[test]
+    fn absent_view_defaults_to_summary() {
+        // Back-compat: every pre-consolidation compare_executions call
+        // carries no `view` and must keep producing the summary shape.
+        assert_eq!(
+            parse_comparison_view(&json!({"execution_id_a": "x"})),
+            Ok(ComparisonView::Summary)
+        );
+    }
+
+    #[test]
+    fn null_view_defaults_to_summary() {
+        assert_eq!(
+            parse_comparison_view(&json!({"view": null})),
+            Ok(ComparisonView::Summary)
+        );
+    }
+
+    #[test]
+    fn each_known_view_parses() {
+        for (name, expected) in [
+            ("summary", ComparisonView::Summary),
+            ("diff", ComparisonView::Diff),
+            ("delta", ComparisonView::Delta),
+            ("report", ComparisonView::Report),
+        ] {
+            assert_eq!(
+                parse_comparison_view(&json!({ "view": name })),
+                Ok(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_view_is_rejected_with_helpful_message() {
+        let err = parse_comparison_view(&json!({"view": "timeline"})).unwrap_err();
+        // The handler maps this Err to -32602; the message must echo the
+        // bad value AND enumerate every valid view with its argument hint.
+        assert!(err.contains("Invalid 'view' value 'timeline'"), "{err}");
+        for valid in ["'summary'", "'diff'", "'delta'", "'report'"] {
+            assert!(err.contains(valid), "message missing {valid}: {err}");
+        }
+        assert!(err.contains("execution_id_a"), "{err}");
+        assert!(err.contains("workflow_id"), "{err}");
+        assert!(err.contains("execution_ids"), "{err}");
+    }
+
+    #[test]
+    fn wrong_type_view_is_rejected_loudly() {
+        // Direction-class rule (MCP-267 family): a wrong-typed opt-in must
+        // reject, not silently collapse to the default view.
+        let err = parse_comparison_view(&json!({"view": 3})).unwrap_err();
+        assert!(err.contains("'view' must be a string"), "{err}");
+        assert!(err.contains("number"), "{err}");
     }
 }

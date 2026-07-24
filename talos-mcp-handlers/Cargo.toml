@@ -68,6 +68,8 @@ talos-replay-service = { path = "../talos-replay-service" }
 talos-inline-compile-service = { path = "../talos-inline-compile-service" }
 talos-search-service = { path = "../talos-search-service" }
 talos-failure-analysis-service = { path = "../talos-failure-analysis-service" }
+talos-hygiene-service = { path = "../talos-hygiene-service" }
+talos-session-brief-service = { path = "../talos-session-brief-service" }
 talos-actor-lifecycle-service = { path = "../talos-actor-lifecycle-service" }
 talos-schedule-repo = { path = "../talos-schedule-repo" }
 talos-ops-alerts-repository = { path = "../talos-ops-alerts-repository" }
@@ -105,7 +107,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tracing.workspace = true
 urlencoding = "2.1"
 uuid = { version = "1.20", features = ["serde", "v4", "v5"] }
-worker = { path = "../worker" }
+talos-worker-runtime = { path = "../talos-worker-runtime" }
 
 [lints]
 workspace = true

@@ -1,0 +1,27 @@
+[package]
+name = "talos-session-brief-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono = { version = "0.4", features = ["serde"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Talos crates — repositories
+talos-advanced-repository = { path = "../talos-advanced-repository" }
+
+# Talos crates — services (embedding-provider health probe; shared
+# draft-substantiveness heuristics live in talos-hygiene-service so
+# session_start and hygiene fix_all can never disagree)
+talos-hygiene-service = { path = "../talos-hygiene-service" }
+talos-search-service = { path = "../talos-search-service" }
+
+[lints]
+workspace = true
