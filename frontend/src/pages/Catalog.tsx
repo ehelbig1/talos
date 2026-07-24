@@ -1,6 +1,6 @@
 import React, { useState, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router";
 import { getNodeTemplates, type NodeTemplate } from "@/lib/graphqlApi";
 import { useCreateModuleFromTemplateMutation } from "@/generated/graphql";
 import { cn } from "@/lib/utils";

@@ -6,7 +6,7 @@ import {
   NavLink,
   Navigate,
   useLocation,
-} from "react-router-dom";
+} from "react-router";
 import { TooltipProvider } from "@radix-ui/react-tooltip";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui";
 import { AuthProvider, useAuth } from "@/contexts/AuthContext";

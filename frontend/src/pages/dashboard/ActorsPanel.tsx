@@ -1,4 +1,4 @@
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router";
 import type { ListActorsQuery } from "@/generated/graphql";
 import { useListActorsQuery } from "@/generated/graphql";
 import { Bot, Zap, ArrowRight } from "lucide-react";
