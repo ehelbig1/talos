@@ -1776,6 +1776,9 @@ impl ExecutionRepository {
             .await?
         };
         if result.rows_affected() > 0 {
+            // talos_workflow_executions_total{status="success"} — feeds the
+            // TalosWorkflowFailureRateHigh alert (only on a real transition).
+            talos_metrics::record_workflow_outcome("success");
             if let Some(ref tx) = self.workflow_execution_tx {
                 // Fetch user_id and workflow_id to broadcast properly
                 let row = sqlx::query!("SELECT user_id, workflow_id, started_at FROM workflow_executions WHERE id = $1", exec_id)
@@ -1876,6 +1879,9 @@ impl ExecutionRepository {
             .await?
         };
         if result.rows_affected() > 0 {
+            // talos_workflow_executions_total{status="failure"} — feeds the
+            // TalosWorkflowFailureRateHigh alert (only on a real transition).
+            talos_metrics::record_workflow_outcome("failure");
             if let Some(ref tx) = self.workflow_execution_tx {
                 let row = sqlx::query!("SELECT user_id, workflow_id, started_at FROM workflow_executions WHERE id = $1", exec_id)
                     .fetch_one(&self.db_pool).await;
