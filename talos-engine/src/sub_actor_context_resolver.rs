@@ -80,42 +80,52 @@ impl SubworkflowActorContextResolver for ControllerSubActorContextResolver {
         ))
     }
 
-    async fn resolve_ceilings(
+    async fn resolve_binding(
         &self,
         workflow_id: Uuid,
         user_id: Uuid,
-    ) -> Option<(
-        talos_workflow_engine_core::LlmTier,
-        talos_workflow_engine_core::WriteCeiling,
-        Option<talos_workflow_engine_core::EgressScope>,
-    )> {
-        // ONE narrow joined query (workflows ⋈ actors, two small columns, no
+    ) -> Option<talos_workflow_engine_core::SubworkflowBinding> {
+        // ONE narrow joined query (workflows ⋈ actors, a few small columns, no
         // graph_json, tenancy-scoped on both sides). The first cut called
         // `get_workflow` (full row incl. the graph, in an RLS tx) just for
         // `actor_id` plus a second ceilings query — a per-sub-dispatch double
-        // fetch a perf review caught.
+        // fetch a perf review caught. Now returns identity + ceilings in the
+        // same round-trip so the executor can bind both atomically.
         match self
             .workflow_repo
-            .get_workflow_actor_ceilings(workflow_id, user_id)
+            .get_workflow_actor_binding(workflow_id, user_id)
             .await
         {
-            // Workflow visible + actor bound + owned → the real pair.
-            Ok(Some(pair)) => Some(pair),
+            // Workflow visible + actor bound + owned → the real binding.
+            // `actor_id` is present so the sub-engine adopts the sub-workflow's
+            // OWN memory scope; ceilings are the sub-actor's RAW values (the
+            // executor narrows them against the parent).
+            Ok(Some((actor_id, tier, write, egress))) => {
+                Some(talos_workflow_engine_core::SubworkflowBinding {
+                    actor_id: Some(actor_id),
+                    max_llm_tier: tier,
+                    max_write_ceiling: write,
+                    egress_scope: egress,
+                })
+            }
             // Workflow not visible / no bound actor / actor not owned →
-            // `None` keeps the parent's inherited ceiling. Safe: the executor
-            // only ever NARROWS, the parent ceiling is already the caller's
-            // authorized bound, and a not-visible workflow fails the graph
-            // fetch in lockstep anyway.
+            // `None` keeps the parent's inherited identity + ceilings. Safe:
+            // the executor only ever NARROWS ceilings, the parent bound is
+            // already the caller's authorized one, and a not-visible workflow
+            // fails the graph fetch in lockstep anyway.
             Ok(None) => None,
-            // DB error → fail CLOSED to the most-restrictive pair rather than
-            // `None`-ing back to the parent ceiling. A security review flagged
-            // the original `.ok()` here: with the sub-workflow's graph served
-            // from the engine's cache, a transient DB error on THIS query was
-            // the one path where a stricter sub-actor's bound was silently
-            // skipped (fail-open w.r.t. the sub-actor's intent — the same
-            // class #503 converted to fail-closed elsewhere). Matches the
+            // DB error → fail CLOSED to the most-restrictive ceilings rather
+            // than `None`-ing back to the parent ceiling. A security review
+            // flagged the original `.ok()` here: with the sub-workflow's graph
+            // served from the engine's cache, a transient DB error on THIS
+            // query was the one path where a stricter sub-actor's bound was
+            // silently skipped (fail-open w.r.t. the sub-actor's intent — the
+            // same class #503 converted to fail-closed elsewhere). Matches the
             // `apply_actor_to_engine` precedent: on DB error, stamp
-            // restrictive. Cost: during a DB blip a sub-workflow runs
+            // restrictive. `actor_id: None` — we couldn't resolve the identity,
+            // so the executor KEEPS the parent's identity (the caller's
+            // authorized bound) rather than guessing a scope; the fail-closed
+            // ceilings still apply. Cost: during a DB blip a sub-workflow runs
             // local-only/read-only (and likely fails loudly) instead of
             // running at the looser parent ceiling.
             Err(e) => {
@@ -123,15 +133,16 @@ impl SubworkflowActorContextResolver for ControllerSubActorContextResolver {
                     target: "talos_security",
                     %workflow_id,
                     error = %e,
-                    "resolve_ceilings: DB error resolving sub-workflow actor ceilings; \
-                     failing closed to (Tier1, ReadOnly)"
+                    "resolve_binding: DB error resolving sub-workflow actor binding; \
+                     failing closed to (Tier1, ReadOnly), keeping parent identity"
                 );
-                Some((
-                    talos_workflow_engine_core::LlmTier::Tier1,
-                    talos_workflow_engine_core::WriteCeiling::ReadOnly,
+                Some(talos_workflow_engine_core::SubworkflowBinding {
+                    actor_id: None,
+                    max_llm_tier: talos_workflow_engine_core::LlmTier::Tier1,
+                    max_write_ceiling: talos_workflow_engine_core::WriteCeiling::ReadOnly,
                     // Fail closed on the egress axis too: no public egress.
-                    Some(talos_workflow_engine_core::EgressScope::Local),
-                ))
+                    egress_scope: Some(talos_workflow_engine_core::EgressScope::Local),
+                })
             }
         }
     }
