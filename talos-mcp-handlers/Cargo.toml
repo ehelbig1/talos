@@ -42,6 +42,7 @@ talos-actor-policies = { path = "../talos-actor-policies" }
 talos-actor-repository = { path = "../talos-actor-repository" }
 talos-advanced-repository = { path = "../talos-advanced-repository" }
 talos-analytics-repository = { path = "../talos-analytics-repository" }
+talos-operator-digest = { path = "../talos-operator-digest" }
 talos-capability-world = { path = "../talos-capability-world" }
 talos-compilation = { path = "../talos-compilation" }
 talos-config = { path = "../talos-config" }

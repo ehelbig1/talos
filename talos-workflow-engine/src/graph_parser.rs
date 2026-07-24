@@ -191,6 +191,14 @@ pub(crate) fn parse_system_node_kind(k: &str, node: &JsonValue) -> Option<System
             .and_then(serde_json::Value::as_u64)
             .map_or(7u32, |v| v.clamp(1, 31) as u32);
         Some(SystemNodeKind::AssistantReport { days })
+    } else if k == "operator_digest" {
+        // Clamp defensively (default 7 days, cap one month).
+        let days = node
+            .get("data")
+            .and_then(|d| d.get("days"))
+            .and_then(serde_json::Value::as_u64)
+            .map_or(7u32, |v| v.clamp(1, 31) as u32);
+        Some(SystemNodeKind::OperatorDigest { days })
     } else if k == "ops_alerts_digest" {
         // Clamp defensively at parse time so a hand-authored graph can't
         // request an unbounded verbatim-alert list (default 10, cap 25).

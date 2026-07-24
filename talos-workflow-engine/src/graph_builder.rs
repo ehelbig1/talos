@@ -532,6 +532,7 @@ fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue
             ("pending_approvals", json!({ "limit": limit }))
         }
         SystemNodeKind::AssistantReport { days } => ("assistant_report", json!({ "days": days })),
+        SystemNodeKind::OperatorDigest { days } => ("operator_digest", json!({ "days": days })),
         SystemNodeKind::Synthesize { synthesis_expr } => (
             "synthesize",
             match synthesis_expr {

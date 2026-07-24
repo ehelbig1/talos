@@ -149,6 +149,19 @@ pub enum SystemNodeKind {
         /// Trailing window in days (clamped 1..=31).
         days: u32,
     },
+    /// Controller-side AUTONOMY-COCKPIT snapshot: what the autonomous
+    /// machinery ran (executions by `trigger_type` + schedule health),
+    /// learned (memory writes by kind, rank-weight fits, ML loop health),
+    /// and needs the operator to decide (unified approvals + ops-alert
+    /// corrections + autonomous failures). A superset of
+    /// [`Self::AssistantReport`] focused on oversight. Output feeds a
+    /// digest compose node → the overnight-autonomy email. Executes via the
+    /// injected [`crate::OperatorDigestReader`] — no worker dispatch, no
+    /// secrets.
+    OperatorDigest {
+        /// Trailing window in days (clamped 1..=31; 1 = overnight).
+        days: u32,
+    },
     /// Controller-side read of the caller's pending human approvals,
     /// each carrying a freshly-minted one-click approve/reject
     /// capability URL. Output flows downstream as ordinary graph data

@@ -7621,6 +7621,7 @@ dependencies = [
  "talos-module-executions",
  "talos-module-payload-encryption",
  "talos-oauth",
+ "talos-operator-digest",
  "talos-ops-alerts-repository",
  "talos-public-url",
  "talos-registry",
@@ -8279,6 +8280,7 @@ dependencies = [
  "talos-ml",
  "talos-module-repository",
  "talos-oauth",
+ "talos-operator-digest",
  "talos-ops-alerts-repository",
  "talos-public-url",
  "talos-rate-limit",
@@ -8541,6 +8543,24 @@ dependencies = [
  "talos-text-util",
  "talos-workflow-engine-core",
  "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "talos-operator-digest"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde_json",
+ "sqlx",
+ "talos-actor-repository",
+ "talos-execution-repository",
+ "talos-memory",
+ "talos-ml",
+ "talos-ops-alerts-repository",
+ "talos-schedule-repo",
  "tracing",
  "uuid",
 ]

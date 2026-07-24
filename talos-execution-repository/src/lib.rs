@@ -1200,6 +1200,41 @@ impl ExecutionRepository {
         .await?)
     }
 
+    /// Execution counts grouped by `trigger_type` over the trailing `days` for
+    /// one user — the autonomy run ledger behind the operator digest. The
+    /// trigger type lives in `provenance->>'trigger_type'` (NULL/absent →
+    /// `'manual'`), so the digest can separate AUTONOMOUS runs (`scheduled` /
+    /// `webhook` / `actor_dispatch`) from operator-initiated `manual` ones —
+    /// something no existing aggregate surfaces. Test executions
+    /// (`is_test_execution`) are excluded: the ledger is about real autonomous
+    /// activity, not `test_workflow` probes. Returns
+    /// `(trigger_type, total, completed, failed)`, busiest first. Tenancy via
+    /// the workflows join.
+    pub async fn execution_counts_by_trigger_type(
+        &self,
+        user_id: Uuid,
+        days: i32,
+    ) -> Result<Vec<(String, i64, i64, i64)>> {
+        let days = days.clamp(1, 31);
+        Ok(sqlx::query_as(
+            "SELECT COALESCE(e.provenance->>'trigger_type', 'manual') AS trigger_type, \
+                    COUNT(*)::bigint, \
+                    COUNT(*) FILTER (WHERE e.status = 'completed')::bigint, \
+                    COUNT(*) FILTER (WHERE e.status = 'failed')::bigint \
+             FROM workflow_executions e \
+             JOIN workflows w ON w.id = e.workflow_id \
+             WHERE w.user_id = $1 \
+               AND COALESCE(e.is_test_execution, false) = false \
+               AND e.created_at > NOW() - make_interval(days => $2::int) \
+             GROUP BY COALESCE(e.provenance->>'trigger_type', 'manual') \
+             ORDER BY COUNT(*) DESC",
+        )
+        .bind(user_id)
+        .bind(days)
+        .fetch_all(&self.db_pool)
+        .await?)
+    }
+
     /// Total fuel + wall-time over the trailing `days` for one user —
     /// the report's cost line. Tenancy via the workflows join.
     pub async fn weekly_fuel_totals(&self, user_id: Uuid, days: i32) -> Result<(i64, i64)> {
