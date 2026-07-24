@@ -3666,8 +3666,8 @@ impl TalosRuntime {
 
                 let step_start = std::time::Instant::now();
 
-                let attempt: anyhow::Result<(JsonValue, Option<u64>)> =
-                    self.execute_pipeline_step_attempt(
+                let attempt: anyhow::Result<(JsonValue, Option<u64>)> = self
+                    .execute_pipeline_step_attempt(
                         step,
                         &instance_pre,
                         &cap,
@@ -3688,10 +3688,8 @@ impl TalosRuntime {
                     Ok((out, fuel)) => break (out, fuel, step_start),
                     Err(e) => {
                         completed_attempts += 1;
-                        let backoff_ms = pipeline_retry_backoff_ms(
-                            step.retry_backoff_ms,
-                            completed_attempts,
-                        );
+                        let backoff_ms =
+                            pipeline_retry_backoff_ms(step.retry_backoff_ms, completed_attempts);
                         let remaining =
                             deadline.saturating_duration_since(std::time::Instant::now());
                         if step.max_retries > 0
@@ -3711,8 +3709,7 @@ impl TalosRuntime {
                                 backoff_ms,
                                 "pipeline step failed with transient error; retrying: {e}"
                             );
-                            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms))
-                                .await;
+                            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                             continue;
                         }
                         return Err(e);
@@ -4590,7 +4587,9 @@ mod pipeline_step_retry_tests {
     fn transient_text_matches_both_timeout_spellings() {
         // The worker's own step-timeout message uses "timed out"; the
         // classifier must catch both spellings (the 2026-07-24 gate bug).
-        assert!(is_transient_error_text("Pipeline step 'fetch' timed out after 30s"));
+        assert!(is_transient_error_text(
+            "Pipeline step 'fetch' timed out after 30s"
+        ));
         assert!(is_transient_error_text("connection timeout"));
         assert!(is_transient_error_text("networkerror: connection reset"));
         assert!(is_transient_error_text("503 service unavailable"));
@@ -4599,7 +4598,9 @@ mod pipeline_step_retry_tests {
     #[test]
     fn permanent_errors_are_not_transient() {
         assert!(!is_transient_error_text("401 unauthorized"));
-        assert!(!is_transient_error_text("fuel exhausted after 6000000 instructions"));
+        assert!(!is_transient_error_text(
+            "fuel exhausted after 6000000 instructions"
+        ));
         assert!(!is_transient_error_text("invalid json: expected value"));
         assert!(!is_transient_error_text("missing AUTH_HEADER config"));
     }
@@ -4609,11 +4610,29 @@ mod pipeline_step_retry_tests {
         let ten_s = Duration::from_secs(10);
         let short_backoff = Duration::from_millis(100);
         // Happy path: budget left, transient, deadline roomy.
-        assert!(should_retry_pipeline_step(1, 2, "timed out", ten_s, short_backoff));
+        assert!(should_retry_pipeline_step(
+            1,
+            2,
+            "timed out",
+            ten_s,
+            short_backoff
+        ));
         // Budget exhausted (completed_attempts > max_retries).
-        assert!(!should_retry_pipeline_step(3, 2, "timed out", ten_s, short_backoff));
+        assert!(!should_retry_pipeline_step(
+            3,
+            2,
+            "timed out",
+            ten_s,
+            short_backoff
+        ));
         // Non-transient never retries even with budget.
-        assert!(!should_retry_pipeline_step(1, 2, "401 unauthorized", ten_s, short_backoff));
+        assert!(!should_retry_pipeline_step(
+            1,
+            2,
+            "401 unauthorized",
+            ten_s,
+            short_backoff
+        ));
         // Deadline can't absorb backoff + a meaningful attempt.
         assert!(!should_retry_pipeline_step(
             1,
@@ -4629,7 +4648,10 @@ mod pipeline_step_retry_tests {
         // completed_attempts=1 → base*2^0 = base (+ up to 25% jitter).
         for _ in 0..8 {
             let b = pipeline_retry_backoff_ms(1000, 1);
-            assert!((1000..=1250).contains(&b), "attempt1 backoff {b} out of range");
+            assert!(
+                (1000..=1250).contains(&b),
+                "attempt1 backoff {b} out of range"
+            );
         }
         // Growth: attempt 2 ≈ 2000, attempt 3 ≈ 4000 (+ jitter).
         assert!(pipeline_retry_backoff_ms(1000, 2) >= 2000);
