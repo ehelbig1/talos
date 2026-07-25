@@ -444,6 +444,12 @@ pub struct ParallelWorkflowEngine {
     /// [`talos_workflow_engine_core::SubworkflowActorContextResolver`].
     pub(crate) sub_actor_context_resolver:
         Option<Arc<dyn talos_workflow_engine_core::SubworkflowActorContextResolver>>,
+    /// Pluggable actor-memory freshness probe. Consulted ONLY for a node that
+    /// declares `requires_fresh`, so a graph with no freshness contracts issues
+    /// zero extra queries. Absent → nodes with a contract get an explicitly
+    /// `verified: false` report rather than a silent pass.
+    pub(crate) memory_freshness_resolver:
+        Option<Arc<dyn talos_workflow_engine_core::MemoryFreshnessResolver>>,
     /// Pluggable secret resolver. All module-secret, vault-path, and LLM-key
     /// lookups — plus the pre-resolution OAuth refresh hook — flow through
     /// this trait object, which in production wraps a `SecretsManager`.
@@ -703,6 +709,7 @@ pub struct AdapterSet {
     graph_store: Option<Arc<dyn WorkflowGraphStore>>,
     sub_actor_context_resolver:
         Option<Arc<dyn talos_workflow_engine_core::SubworkflowActorContextResolver>>,
+    memory_freshness_resolver: Option<Arc<dyn talos_workflow_engine_core::MemoryFreshnessResolver>>,
     secrets_resolver: Option<Arc<dyn SecretsResolver>>,
     expression_evaluator: Option<Arc<dyn talos_workflow_engine_core::ExpressionEvaluator>>,
     output_sanitizer: Option<Arc<dyn talos_workflow_engine_core::OutputSanitizer>>,
@@ -777,6 +784,7 @@ impl AdapterSet {
         engine.node_hook = self.node_hook;
         engine.graph_store = self.graph_store;
         engine.sub_actor_context_resolver = self.sub_actor_context_resolver;
+        engine.memory_freshness_resolver = self.memory_freshness_resolver;
         engine.secrets_resolver = self.secrets_resolver;
         engine.expression_evaluator = self.expression_evaluator;
         engine.output_sanitizer = self.output_sanitizer;
@@ -850,6 +858,7 @@ impl ParallelWorkflowEngine {
             checkpoint: None,
             graph_store: None,
             sub_actor_context_resolver: None,
+            memory_freshness_resolver: None,
             secrets_resolver: None,
             user_id: None,
             node_meta: HashMap::new(),
@@ -917,6 +926,7 @@ impl ParallelWorkflowEngine {
             node_hook: self.node_hook.clone(),
             graph_store: self.graph_store.clone(),
             sub_actor_context_resolver: self.sub_actor_context_resolver.clone(),
+            memory_freshness_resolver: self.memory_freshness_resolver.clone(),
             secrets_resolver: self.secrets_resolver.clone(),
             expression_evaluator: self.expression_evaluator.clone(),
             output_sanitizer: self.output_sanitizer.clone(),

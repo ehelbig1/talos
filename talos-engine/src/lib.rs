@@ -10,6 +10,7 @@ pub mod events;
 pub mod expression_evaluator;
 pub mod fence;
 pub mod judge_score_recorder;
+pub mod memory_freshness_resolver;
 pub mod module_execution_store;
 pub mod module_fetcher;
 pub mod nats_run;

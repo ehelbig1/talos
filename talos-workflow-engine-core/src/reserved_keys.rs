@@ -25,6 +25,10 @@
 //! * **Actor memory** — [`MEMORY_WRITE`], [`ACTOR_CONTEXT`] ferry
 //!   agent-memory hints between a dispatcher-configured memory
 //!   backend and the module payload.
+//! * **Input freshness** — [`REQUIRES_FRESH`] / [`ON_STALE`] declare a
+//!   per-node max-age contract on the actor-memory keys the node reads;
+//!   the engine answers with a [`STALENESS`] report on the node's input
+//!   so a reader can never silently present stale data as current.
 //! * **Sub-workflow output** — keys prefixed `__judge_*`,
 //!   `__confidence_*`, `__ensemble_*`, `__verification_*`,
 //!   `__reflective_retry_*` are written by the corresponding
@@ -120,6 +124,188 @@ pub fn resolve_idempotency_key(
         serde_json::Value::Bool(true) => Some(derived()),
         _ => None,
     }
+}
+
+/// Engine-written onto node input: the freshness report for the
+/// actor-memory keys the node declared via [`REQUIRES_FRESH`].
+///
+/// Shape:
+/// ```json
+/// { "any_stale": true,
+///   "entries": [
+///     {"key":"meeting_prep/today","age_hours":32.1,"max_age_hours":6.0,
+///      "stale":true,"present":true}
+///   ] }
+/// ```
+///
+/// **Why this exists.** A workflow that synthesizes from actor memory has no
+/// way to know its inputs are old: if an upstream writer failed (or simply
+/// hasn't run yet), the reader confidently presents yesterday's data as
+/// today's. This was observed live on the cross-domain briefing workflow —
+/// 32-hour-old meeting data rendered as "today", with a passing judge,
+/// because nothing in the pipeline measured input age. Declaring
+/// [`REQUIRES_FRESH`] makes the age VISIBLE to the node (annotate) or stops
+/// the run (fail), converting a silent-wrong into a visible-correct.
+///
+/// Engine-authored, so it is STRIPPED from inbound trigger/test payloads —
+/// a caller-supplied `__staleness__` would be a trust-signal spoof.
+pub const STALENESS: &str = "__staleness__";
+
+/// Per-node graph-json field declaring the maximum acceptable age of the
+/// actor-memory keys this node reads: `{"<key>": <max_age_hours>}`, e.g.
+/// `{"requires_fresh": {"meeting_prep/today": 6, "daily_brief/latest": 6}}`.
+/// The engine resolves each key's age against the node's bound actor and
+/// injects a [`STALENESS`] report. Absent → no freshness contract (the
+/// pre-feature behavior; fully backward-compatible).
+pub const REQUIRES_FRESH: &str = "requires_fresh";
+
+/// Per-node graph-json field selecting what happens when a
+/// [`REQUIRES_FRESH`] requirement is violated: `"annotate"` (default —
+/// inject [`STALENESS`] and let the node/downstream render the warning) or
+/// `"fail"` (refuse to dispatch, so a stale-input run surfaces as a real
+/// failure instead of a plausible-looking wrong answer).
+pub const ON_STALE: &str = "on_stale";
+
+/// What to do when a declared freshness requirement is violated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OnStale {
+    /// Inject the [`STALENESS`] report and continue. The default: visible,
+    /// non-breaking, and lets a composer render "data is 32h old".
+    #[default]
+    Annotate,
+    /// Fail the node. For pipelines where acting on stale data is worse
+    /// than not acting (a send that would state something false).
+    Fail,
+}
+
+/// A node's parsed freshness contract.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FreshnessPolicy {
+    /// `(memory_key, max_age_hours)` pairs, in declaration order.
+    pub requirements: Vec<(String, f64)>,
+    /// Violation behavior.
+    pub on_stale: OnStale,
+}
+
+/// Parse a node's freshness contract from its merged config/`data`.
+///
+/// Returns `None` when [`REQUIRES_FRESH`] is absent, empty, or not an object
+/// — i.e. "no contract", the backward-compatible default. Non-positive and
+/// non-numeric max-ages are skipped (a `0`/garbage bound would make every
+/// read permanently stale, which is a footgun, not a contract).
+#[must_use]
+pub fn resolve_freshness_policy(config: Option<&serde_json::Value>) -> Option<FreshnessPolicy> {
+    let obj = config.and_then(|c| c.get(REQUIRES_FRESH))?.as_object()?;
+    let requirements: Vec<(String, f64)> = obj
+        .iter()
+        .filter_map(|(k, v)| {
+            let hours = v.as_f64()?;
+            if hours.is_finite() && hours > 0.0 {
+                Some((k.clone(), hours))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if requirements.is_empty() {
+        return None;
+    }
+    let on_stale = match config
+        .and_then(|c| c.get(ON_STALE))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+    {
+        Some(s) if s.eq_ignore_ascii_case("fail") => OnStale::Fail,
+        _ => OnStale::Annotate,
+    };
+    Some(FreshnessPolicy {
+        requirements,
+        on_stale,
+    })
+}
+
+/// Build the [`STALENESS`] payload for a policy given each key's resolved
+/// age in hours (`None` = the key is ABSENT from the actor's memory).
+///
+/// An absent key counts as STALE: "no data" is not "fresh data", and the
+/// fail-closed reading is the trustworthy one for a report the user will act
+/// on. Returns `(payload, any_stale)`.
+#[must_use]
+pub fn build_staleness_report<S: std::hash::BuildHasher>(
+    policy: &FreshnessPolicy,
+    ages_hours: &std::collections::HashMap<String, Option<f64>, S>,
+) -> (serde_json::Value, bool) {
+    let mut any_stale = false;
+    let entries: Vec<serde_json::Value> = policy
+        .requirements
+        .iter()
+        .map(|(key, max_age)| {
+            let age = ages_hours.get(key).copied().flatten();
+            let (present, stale) = match age {
+                Some(a) => (true, a > *max_age),
+                None => (false, true),
+            };
+            if stale {
+                any_stale = true;
+            }
+            serde_json::json!({
+                "key": key,
+                "age_hours": age,
+                "max_age_hours": max_age,
+                "present": present,
+                "stale": stale,
+            })
+        })
+        .collect();
+    (
+        serde_json::json!({ "verified": true, "any_stale": any_stale, "entries": entries }),
+        any_stale,
+    )
+}
+
+/// The report injected when freshness could NOT be determined — no
+/// [`crate::MemoryFreshnessResolver`] wired, or the store declined the lookup.
+///
+/// `verified: false` is deliberately explicit: the alternative (injecting
+/// nothing, or an empty all-fresh report) would let a node believe its inputs
+/// were checked when they weren't — reintroducing the silent-wrong this whole
+/// mechanism exists to remove. A violation cannot be asserted either, so
+/// `any_stale` is `false` and an `on_stale: "fail"` node does NOT fail on an
+/// unverifiable check: a transient store blip must not take down a pipeline
+/// (freshness is a trust signal, not a security boundary).
+#[must_use]
+pub fn unverified_staleness_report(reason: &str) -> serde_json::Value {
+    serde_json::json!({
+        "verified": false,
+        "any_stale": false,
+        "reason": reason,
+        "entries": [],
+    })
+}
+
+/// Human-readable one-line summary of a stale set, for a node failure
+/// message or a rendered warning banner.
+#[must_use]
+pub fn describe_stale_entries(report: &serde_json::Value) -> String {
+    let Some(entries) = report.get("entries").and_then(|e| e.as_array()) else {
+        return String::new();
+    };
+    let parts: Vec<String> = entries
+        .iter()
+        .filter(|e| {
+            e.get("stale")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })
+        .map(|e| {
+            let key = e.get("key").and_then(|v| v.as_str()).unwrap_or("?");
+            match e.get("age_hours").and_then(serde_json::Value::as_f64) {
+                Some(a) => format!("{key} is {a:.1}h old"),
+                None => format!("{key} is missing"),
+            }
+        })
+        .collect();
+    parts.join("; ")
 }
 
 /// Per-node graph-json field: does this node consume the injected
@@ -384,5 +570,151 @@ mod tests {
     fn inject_gate_on_respects_needs_memory() {
         assert!(should_inject_actor_context(true, true));
         assert!(!should_inject_actor_context(true, false));
+    }
+
+    #[test]
+    fn freshness_policy_absent_or_empty_is_none() {
+        assert_eq!(resolve_freshness_policy(None), None);
+        assert_eq!(resolve_freshness_policy(Some(&json!({}))), None);
+        assert_eq!(
+            resolve_freshness_policy(Some(&json!({ "requires_fresh": {} }))),
+            None
+        );
+        // Non-object value → no contract.
+        assert_eq!(
+            resolve_freshness_policy(Some(&json!({ "requires_fresh": "6h" }))),
+            None
+        );
+        // Non-positive / non-numeric bounds are skipped; all-skipped → None.
+        assert_eq!(
+            resolve_freshness_policy(Some(
+                &json!({ "requires_fresh": {"a": 0, "b": -3, "c": "x"} })
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn freshness_policy_parses_keys_and_mode() {
+        let p = resolve_freshness_policy(Some(&json!({
+            "requires_fresh": { "daily_brief/latest": 6 },
+            "on_stale": "fail"
+        })))
+        .expect("policy");
+        assert_eq!(
+            p.requirements,
+            vec![("daily_brief/latest".to_string(), 6.0)]
+        );
+        assert_eq!(p.on_stale, OnStale::Fail);
+
+        // Default mode is Annotate; case/whitespace tolerated on "fail".
+        let d = resolve_freshness_policy(Some(&json!({ "requires_fresh": {"k": 1} }))).unwrap();
+        assert_eq!(d.on_stale, OnStale::Annotate);
+        let f = resolve_freshness_policy(Some(&json!({
+            "requires_fresh": {"k": 1}, "on_stale": "  FAIL "
+        })))
+        .unwrap();
+        assert_eq!(f.on_stale, OnStale::Fail);
+        // Unknown mode falls back to the safe, non-breaking default.
+        let u = resolve_freshness_policy(Some(&json!({
+            "requires_fresh": {"k": 1}, "on_stale": "explode"
+        })))
+        .unwrap();
+        assert_eq!(u.on_stale, OnStale::Annotate);
+    }
+
+    #[test]
+    fn staleness_report_flags_old_and_missing_keys() {
+        let policy = FreshnessPolicy {
+            requirements: vec![
+                ("fresh_key".to_string(), 6.0),
+                ("old_key".to_string(), 6.0),
+                ("absent_key".to_string(), 6.0),
+            ],
+            on_stale: OnStale::Annotate,
+        };
+        let mut ages = std::collections::HashMap::new();
+        ages.insert("fresh_key".to_string(), Some(1.5));
+        ages.insert("old_key".to_string(), Some(32.1));
+        ages.insert("absent_key".to_string(), None);
+
+        let (report, any_stale) = build_staleness_report(&policy, &ages);
+        assert!(any_stale);
+        let entries = report["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        // fresh
+        assert_eq!(entries[0]["stale"], json!(false));
+        assert_eq!(entries[0]["present"], json!(true));
+        // too old
+        assert_eq!(entries[1]["stale"], json!(true));
+        assert_eq!(entries[1]["age_hours"], json!(32.1));
+        // absent counts as stale, and is marked not-present
+        assert_eq!(entries[2]["stale"], json!(true));
+        assert_eq!(entries[2]["present"], json!(false));
+        assert_eq!(entries[2]["age_hours"], json!(null));
+        assert_eq!(report["any_stale"], json!(true));
+    }
+
+    #[test]
+    fn staleness_report_all_fresh_is_not_stale() {
+        let policy = FreshnessPolicy {
+            requirements: vec![("k".to_string(), 6.0)],
+            on_stale: OnStale::Annotate,
+        };
+        let mut ages = std::collections::HashMap::new();
+        ages.insert("k".to_string(), Some(5.9));
+        let (report, any_stale) = build_staleness_report(&policy, &ages);
+        assert!(!any_stale);
+        assert_eq!(report["any_stale"], json!(false));
+        // Boundary: exactly at the bound is NOT stale (age > max is stale).
+        let mut at_bound = std::collections::HashMap::new();
+        at_bound.insert("k".to_string(), Some(6.0));
+        let (_, stale_at_bound) = build_staleness_report(&policy, &at_bound);
+        assert!(!stale_at_bound);
+    }
+
+    #[test]
+    fn describe_stale_entries_summarizes_only_stale() {
+        let policy = FreshnessPolicy {
+            requirements: vec![
+                ("ok".to_string(), 6.0),
+                ("old".to_string(), 6.0),
+                ("gone".to_string(), 6.0),
+            ],
+            on_stale: OnStale::Fail,
+        };
+        let mut ages = std::collections::HashMap::new();
+        ages.insert("ok".to_string(), Some(1.0));
+        ages.insert("old".to_string(), Some(32.14));
+        ages.insert("gone".to_string(), None);
+        let (report, _) = build_staleness_report(&policy, &ages);
+        let desc = describe_stale_entries(&report);
+        assert!(desc.contains("old is 32.1h old"), "got: {desc}");
+        assert!(desc.contains("gone is missing"), "got: {desc}");
+        assert!(!desc.contains("ok is"), "fresh key must not appear: {desc}");
+        // Malformed input yields an empty summary rather than panicking.
+        assert_eq!(describe_stale_entries(&json!({})), "");
+    }
+
+    #[test]
+    fn reports_carry_explicit_verified_flag() {
+        let policy = FreshnessPolicy {
+            requirements: vec![("k".to_string(), 6.0)],
+            on_stale: OnStale::Annotate,
+        };
+        let mut ages = std::collections::HashMap::new();
+        ages.insert("k".to_string(), Some(1.0));
+        let (verified, _) = build_staleness_report(&policy, &ages);
+        assert_eq!(verified["verified"], json!(true));
+
+        // Unverifiable: explicitly flagged, asserts NO staleness (so an
+        // on_stale=fail node is not tripped by a store blip), carries a reason.
+        let u = unverified_staleness_report("no resolver wired");
+        assert_eq!(u["verified"], json!(false));
+        assert_eq!(u["any_stale"], json!(false));
+        assert_eq!(u["reason"], json!("no resolver wired"));
+        assert_eq!(u["entries"].as_array().unwrap().len(), 0);
+        // describe over an unverified report is empty, not a panic.
+        assert_eq!(describe_stale_entries(&u), "");
     }
 }

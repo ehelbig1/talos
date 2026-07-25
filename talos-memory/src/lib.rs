@@ -1144,6 +1144,59 @@ pub async fn recall_entry(
     }))
 }
 
+/// Batched, METADATA-ONLY freshness probe: for `keys`, return each present
+/// key's `updated_at` in ONE query.
+///
+/// Backs the per-node input-freshness contract (`requires_fresh` →
+/// `__staleness__`, see `talos_workflow_engine_core::reserved_keys`). A memory
+/// reader otherwise cannot tell that its inputs are old — on 2026-07-25 the
+/// cross-domain briefing rendered 32-hour-old `meeting_prep/today` as "today"
+/// with a passing judge, because nothing measured input age.
+///
+/// Deliberately projects ONLY `key, updated_at` — never `value_enc`. That keeps
+/// the probe outside the MCP-S2 AAD/decrypt contract every value-bearing read
+/// must satisfy (no `value_format` dispatch, no per-row KDF), so it stays cheap
+/// enough to run at dispatch time.
+///
+/// Carries the SAME liveness predicate as `recall_exact` / `recall_entry`, so
+/// the freshness view matches what a reader can actually see: an EXPIRED row is
+/// absent here, exactly as it is to `recall_*`. Callers therefore treat a
+/// missing key as "not fresh" rather than reporting an age for a row the module
+/// could not have read (`build_staleness_report` marks it `present: false,
+/// stale: true`).
+///
+/// One `key = ANY($2)` bind — no N+1 for a multi-key contract. Returns only
+/// present keys; the caller diffs against its declared set.
+pub async fn key_freshness(
+    pool: &Pool<Postgres>,
+    actor_id: Uuid,
+    keys: &[String],
+) -> Result<std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>> {
+    if keys.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let rows = sqlx::query(
+        "SELECT key, updated_at \
+         FROM actor_memory \
+         WHERE actor_id = $1 AND key = ANY($2) \
+           AND (expires_at IS NULL OR expires_at > now())",
+    )
+    .bind(actor_id)
+    .bind(keys)
+    .fetch_all(pool)
+    .await
+    .context("key_freshness")?;
+
+    // Fail-loud `try_get(...)?` on both columns (lint checks 52/55).
+    let mut out = std::collections::HashMap::with_capacity(rows.len());
+    for r in rows {
+        let key: String = r.try_get("key")?;
+        let updated_at: chrono::DateTime<chrono::Utc> = r.try_get("updated_at")?;
+        out.insert(key, updated_at);
+    }
+    Ok(out)
+}
+
 pub async fn key_exists_at_all(pool: &Pool<Postgres>, actor_id: Uuid, key: &str) -> Result<bool> {
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM actor_memory WHERE actor_id = $1 AND key = $2)",
