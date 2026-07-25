@@ -453,7 +453,8 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "workflow_id": { "type": "string", "description": "UUID of the workflow to execute" },
                     "input": { "type": "object", "description": "Optional input data passed to the first node(s)" },
                     "timeout_secs": { "type": "number", "description": "Maximum time to wait synchronously for completion in seconds (default: 30, max: 120). This bounds only how long the call blocks — it does NOT cap the workflow, which runs to its own execution_timeout_secs in the background. Sync MCP responses can't tie up the connection for >2 min; if the window elapses you get status='running' + execution_id, so for longer workflows prefer trigger_workflow (async) and poll get_execution_status." },
-                    "dry_run": { "type": "boolean", "description": "When true, non-GET HTTP requests, webhook sends, and messaging publishes are mocked. Useful for testing workflow logic without side effects." }
+                    "dry_run": { "type": "boolean", "description": "When true, non-GET HTTP requests, webhook sends, and messaging publishes are mocked. Useful for testing workflow logic without side effects." },
+                    "output_mode": { "type": "string", "enum": ["full", "terminal_only", "summary"], "description": "Shape the returned per-node output (default 'full'). 'terminal_only' keeps only terminal (leaf) node outputs verbatim and elides intermediates to {__elided__, bytes}. 'summary' keeps every node but elides any single node output over 4KB. Use these when a workflow's intermediate nodes (fan-in / memory dumps) make 'full' output huge." }
                 },
                 "required": ["workflow_id"]
             }
@@ -491,7 +492,8 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "dry_run": { "type": "boolean", "description": "When true, non-GET HTTP requests, webhook sends, and messaging publishes are mocked. Useful for testing workflow logic without side effects." },
                     "actor_id": { "type": "string", "description": "Optional UUID of an actor to run the test as. Overrides the workflow's bound actor_id for both engine identity (memory writes / tier ceiling) and __actor_context__ injection. Validated for ownership + non-terminal status; budget and capability-ceiling checks are skipped (test path)." },
                     "inject_memory_context": { "type": "boolean", "description": "When actor_id is set, controls whether the actor's recent working/episodic memories are injected into the input as __actor_context__ (default: false). Pass true only when the memories are known to be non-sensitive — they appear inline in the execution trace once injected." },
-                    "max_context_memories": { "type": "integer", "description": "Maximum number of working/episodic memories to inject when inject_memory_context=true (default: 10, max: 50)." }
+                    "max_context_memories": { "type": "integer", "description": "Maximum number of working/episodic memories to inject when inject_memory_context=true (default: 10, max: 50)." },
+                    "output_mode": { "type": "string", "enum": ["full", "terminal_only", "summary"], "description": "Shape the returned per-node output (default 'full'). 'terminal_only' keeps only terminal (leaf) node outputs and elides intermediates; 'summary' elides any single node output over 4KB. Assertions still run against the FULL output — this only shapes what's returned." }
                 },
                 "required": ["workflow_id"]
             }
@@ -4184,6 +4186,18 @@ async fn handle_call_workflow(
             return Some(crate::utils::database_error(req_id.clone()));
         }
     };
+    // Output shaping (IMP-5): resolved up front so it survives graph_json
+    // moving into the run task. Applied to the RETURNED copy only — the full
+    // output is still projected + persisted below.
+    let output_mode = args
+        .get("output_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("full")
+        .to_string();
+    let terminal_nodes = serde_json::from_str::<serde_json::Value>(&graph_json)
+        .ok()
+        .map(|g| crate::utils::terminal_node_ids(&g))
+        .unwrap_or_default();
     let exec_id = uuid::Uuid::new_v4();
     // M T5-1: enforce max_concurrent_executions on call_workflow.
     // Pre-fix this used `create_execution` (the bypass path), so an
@@ -4389,16 +4403,19 @@ async fn handle_call_workflow(
     });
 
     match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), spawn_handle).await {
-        // Within-deadline success — EXACT pre-fix response shape.
-        Ok(Ok(Ok((status, output_json)))) => Some(mcp_text(
-            req_id.clone(),
-            &serde_json::to_string_pretty(&call_workflow_terminal_body(
-                exec_id,
-                &status,
-                &output_json,
+        // Within-deadline success — EXACT pre-fix response shape (output_mode
+        // 'full' is byte-identical; the shaping only elides on opt-in).
+        Ok(Ok(Ok((status, output_json)))) => {
+            let shaped =
+                crate::utils::shape_response_output(&output_json, &terminal_nodes, &output_mode);
+            Some(mcp_text(
+                req_id.clone(),
+                &serde_json::to_string_pretty(&call_workflow_terminal_body(
+                    exec_id, &status, &shaped,
+                ))
+                .unwrap_or_default(),
             ))
-            .unwrap_or_default(),
-        )),
+        }
         // Within-deadline genuine failure — EXACT pre-fix error shape. The
         // detached task already marked the row failed + fired alert/webhook.
         Ok(Ok(Err(err_str))) => Some(mcp_error(
@@ -6289,6 +6306,18 @@ async fn handle_test_workflow(
         }
     };
 
+    // Output shaping (IMP-5): assertions always run against the FULL output;
+    // this only shapes the `output` field returned in the response.
+    let output_mode = args
+        .get("output_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("full")
+        .to_string();
+    let terminal_nodes = serde_json::from_str::<serde_json::Value>(&graph_json)
+        .ok()
+        .map(|g| crate::utils::terminal_node_ids(&g))
+        .unwrap_or_default();
+
     // Create execution record with test flag
     let exec_id = uuid::Uuid::new_v4();
     let priority_str = serde_json::from_str::<serde_json::Value>(&graph_json)
@@ -6546,12 +6575,16 @@ async fn handle_test_workflow(
         assert_output_contains.as_ref(),
     );
 
+    // Shape only the RETURNED output (assertions above already ran against the
+    // full `output_json`). 'full' is byte-identical.
+    let shaped_output =
+        crate::utils::shape_response_output(&output_json, &terminal_nodes, &output_mode);
     let test_result = serde_json::json!({
         "passed": all_passed,
         "execution_id": exec_id.to_string(),
         "assertions": assertions,
         "duration_ms": duration_ms,
-        "output": output_json,
+        "output": shaped_output,
     });
 
     Some(mcp_text(
@@ -8942,15 +8975,42 @@ async fn handle_swap_node_module(
         .cloned()
         .unwrap_or_default();
 
+    // Engine hints live in the same flat `data` map as module config keys but
+    // are module-agnostic node tuning that no module's `config_schema` declares.
+    // Carry them across a swap so a module change can't silently reset them —
+    // most importantly `max_fuel`: the new module may need MORE fuel than the
+    // 2M default (e.g. an email sender that base64-encodes the whole message),
+    // and dropping it means the node fuel-exhausts only on its NEXT scheduled
+    // run — a silent, delayed failure. `skip_condition` is likewise load-bearing
+    // (dropping it turns a gated send into an always-send).
+    const ENGINE_HINT_KEYS: &[&str] = &[
+        "max_fuel",
+        "retry_count",
+        "retry_backoff_ms",
+        "retry_condition",
+        "needs_memory",
+        "timeout_secs",
+        "skip_condition",
+    ];
+    let is_engine_hint = |k: &str| ENGINE_HINT_KEYS.contains(&k);
+
     let preserved_keys: Vec<String> = old_data
         .keys()
         .filter(|k| new_schema_keys.contains(*k))
         .cloned()
         .collect();
 
+    // Not declared by the new module's schema, but preserved anyway because
+    // they're engine hints (reported separately so the caller sees the carry).
+    let preserved_engine_hints: Vec<String> = old_data
+        .keys()
+        .filter(|k| !new_schema_keys.contains(*k) && is_engine_hint(k))
+        .cloned()
+        .collect();
+
     let dropped_keys: Vec<String> = old_data
         .keys()
-        .filter(|k| !new_schema_keys.contains(*k))
+        .filter(|k| !new_schema_keys.contains(*k) && !is_engine_hint(k))
         .cloned()
         .collect();
 
@@ -8960,10 +9020,10 @@ async fn handle_swap_node_module(
         .cloned()
         .collect();
 
-    // Build new data from preserved keys only
+    // Build new data from preserved schema keys PLUS carried-forward engine hints.
     let new_data: serde_json::Map<String, serde_json::Value> = old_data
         .iter()
-        .filter(|(k, _)| new_schema_keys.contains(*k))
+        .filter(|(k, _)| new_schema_keys.contains(k.as_str()) || is_engine_hint(k))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
@@ -9016,10 +9076,16 @@ async fn handle_swap_node_module(
         "new_module": new_display_name,
         "new_template_id": new_template_id.to_string(),
         "preserved_config_keys": preserved_keys,
+        "preserved_engine_hints": preserved_engine_hints,
         "dropped_config_keys": dropped_keys,
         "new_required_fields": new_required_fields,
         "new_required_secrets": new_required_secrets,
         "auto_publish_note": auto_publish_note.trim(),
+        "fuel_note": if preserved_engine_hints.iter().any(|k| k == "max_fuel") {
+            "Carried the node's max_fuel across the swap.".to_string()
+        } else {
+            "No explicit max_fuel on this node — it runs at the engine default. If the new module transforms large payloads (e.g. base64-encoding a big body), set max_fuel via update_node_config to avoid fuel exhaustion on scheduled runs.".to_string()
+        },
         "next_steps": [
             {
                 "step": 1,

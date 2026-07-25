@@ -3899,6 +3899,49 @@ else
 fi
 echo
 
+# ── 59. Email-sender template Subject must be RFC 2047-encoded ─────────
+# An email module that builds a raw `Subject: {}` header from an un-encoded
+# string mojibakes non-ASCII subjects: an LLM-authored em-dash (UTF-8 E2 80 94)
+# double-encoded to `Ã¢Â€Â"` in the delivered header — the 2026-07 send-module
+# bug that was un-fixable in place because the module was a source-less DB blob.
+# The header MUST route through the `encode_subject` RFC 2047 helper
+# (`=?UTF-8?B?..?=`, ASCII passes through byte-identical), never interpolate the
+# raw field. A shared helper CRATE is impossible here (the compile service
+# regenerates a fixed Cargo.toml, mounts only the single template source, and
+# rejects path deps — so `send-html-email` + `send-gmail` each carry their own
+# copy); this lint is the enforceable equivalent that keeps the class dead.
+# Detection: a template.rs that interpolates a `Subject: {` header line MUST
+# also call `encode_subject(`. Opt out (a genuinely ASCII-only pinned subject)
+# with `// allow-raw-subject: <reason>` in the template.
+bold "▶ check 59: email-sender template Subject must route through encode_subject (RFC 2047)"
+RAW_SUBJECT_VIOLATIONS=0
+for rs in "$ROOT"/module-templates/*/template.rs; do
+    [ -f "$rs" ] || continue
+    # Only templates that actually ASSEMBLE an RFC822 email message: a
+    # `Subject: {` interpolation AND a `MIME-Version` header in the same file.
+    # This excludes classifiers/parsers that merely reference "Subject:" in
+    # prompt/field text (they have no MIME-Version).
+    if grep -qE 'Subject: \{' "$rs" && grep -q 'MIME-Version' "$rs"; then
+        if grep -q 'allow-raw-subject' "$rs"; then
+            continue
+        fi
+        if ! grep -q 'encode_subject(' "$rs"; then
+            red "  ✗ ${rs#"$ROOT"/}: builds a Subject header without encode_subject()"
+            RAW_SUBJECT_VIOLATIONS=$((RAW_SUBJECT_VIOLATIONS + 1))
+        fi
+    fi
+done
+if [ "$RAW_SUBJECT_VIOLATIONS" -gt 0 ]; then
+    red "✗ $RAW_SUBJECT_VIOLATIONS email template(s) build a raw Subject header (RFC 2047 mojibake risk)"
+    yellow "  → route the subject through encode_subject(...) into a subject_header local"
+    yellow "    before the format!(\"...Subject: {}...\") message assembly."
+    yellow "  → ASCII-only pinned subject? // allow-raw-subject: <reason>"
+    EXIT_CODE=1
+else
+    green "✓ email-sender templates route Subject through encode_subject"
+fi
+echo
+
 # ── 54. Lint self-consistency (meta-check) ────────────────────────────
 # The system whose purpose is catching drift drifted from its own docs:
 # by 2026-07-01 the script had 49 checks while CLAUDE.md said 43 and the

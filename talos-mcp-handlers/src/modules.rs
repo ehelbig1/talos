@@ -95,6 +95,17 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "get_module_source",
+            "description": "Return a module's stored SOURCE CODE (for your own modules or catalog templates). Complements get_module_info, which only reports whether source exists (has_source_code) without returning it. Use this to inspect, maintain, or fix a DB-resident module in place, or to see how a catalog template is implemented. Returns {source, language, capability_world, kind, has_source}. A bytes-only imported module returns has_source=false with a null source.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "module_id": { "type": "string", "description": "UUID of the module whose source to retrieve" }
+                },
+                "required": ["module_id"]
+            }
+        }),
+        serde_json::json!({
             "name": "get_module_unification_status",
             "description": "Operator health surface for the unified `modules` table (the single store backing every dispatch). Returns: (1) module counts by kind, (2) drift counters between dispatch reads and the modules table — non-zero values indicate a regression worth investigating, (3) backfill progress on optional metadata columns (dependencies, imported_interfaces), (4) read-path counters (`hit_new` should track total reads; non-zero `miss_new` indicates a dispatch lookup failure).\n\nNo arguments. Read-only. Useful for ongoing health monitoring.",
             "inputSchema": { "type": "object", "properties": {} }
@@ -357,6 +368,7 @@ pub async fn dispatch(
         "delete_module" => Some(handle_delete_module(req_id, args, state, agent).await),
         "cleanup_modules" => Some(handle_cleanup_modules(req_id, args, state, agent).await),
         "get_module_info" => Some(handle_get_module_info(req_id, args, state, agent).await),
+        "get_module_source" => Some(handle_get_module_source(req_id, args, state, agent).await),
         "test_secret_access" => Some(handle_test_secret_access(req_id, args, state, agent).await),
         "cleanup_module_versions" => {
             Some(handle_cleanup_module_versions(req_id, args, state, agent).await)
@@ -2079,6 +2091,55 @@ async fn handle_get_module_history(
 }
 
 // ── get_module_dependents ─────────────────────────────────────────────────
+
+/// Return a module's stored source code (owned or catalog). `get_module_info`
+/// reports `has_source_code: true` but there was no way to retrieve it, which
+/// is exactly why a DB-resident module became an unmaintainable black box.
+/// Scoping is IDOR-safe (owned or `user_id IS NULL`) via the repo query.
+async fn handle_get_module_source(
+    req_id: Option<serde_json::Value>,
+    args: &serde_json::Value,
+    state: &McpState,
+    agent: Arc<auth::AgentIdentity>,
+) -> JsonRpcResponse {
+    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+
+    let module_id = match crate::utils::require_uuid(args, "module_id", req_id.clone()) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
+    match state
+        .module_repo
+        .get_module_source(module_id, user_id)
+        .await
+    {
+        Ok(Some(src)) => {
+            let result = serde_json::json!({
+                "module_id": module_id.to_string(),
+                "language": src.language,
+                "capability_world": src.capability_world,
+                "kind": src.kind,
+                "has_source": src.source_code.is_some(),
+                "source": src.source_code,
+                "note": if src.source_code.is_none() {
+                    "This module has no stored source (bytes-only import)."
+                } else {
+                    ""
+                },
+            });
+            mcp_text(
+                req_id,
+                &serde_json::to_string_pretty(&result).unwrap_or_default(),
+            )
+        }
+        Ok(None) => mcp_error(req_id, -32000, "Module not found or access denied"),
+        Err(e) => {
+            tracing::error!("get_module_source failed: {:#}", e);
+            mcp_error(req_id, -32000, "Failed to fetch module source")
+        }
+    }
+}
 
 async fn handle_get_module_dependents(
     req_id: Option<serde_json::Value>,
