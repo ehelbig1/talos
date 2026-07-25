@@ -195,6 +195,19 @@ pub struct WorkflowRef {
     pub name: String,
 }
 
+/// A module's stored source, returned by `get_module_source`.
+#[derive(Debug)]
+pub struct ModuleSourceCode {
+    /// The stored source code, or `None` for a bytes-only module (imported
+    /// WASM with no source).
+    pub source_code: Option<String>,
+    pub language: String,
+    pub capability_world: String,
+    /// `catalog` | `sandbox` | `extracted` — a `catalog` module's source is a
+    /// versioned template; `sandbox`/`extracted` are user-compiled.
+    pub kind: Option<String>,
+}
+
 /// Unreferenced module row returned by `find_unreferenced_modules`.
 #[derive(Debug)]
 pub struct UnreferencedModule {
@@ -1000,6 +1013,48 @@ impl ModuleRepository {
                     .try_get::<Option<_>, _>("has_source_code")?
                     .unwrap_or(false),
                 rate_limit_per_minute: r.try_get::<Option<_>, _>("rate_limit_per_minute")?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Fetch a module's stored SOURCE CODE, scoped to the caller (owned or
+    /// catalog `user_id IS NULL`, mirroring `get_wasm_module_info`'s IDOR-safe
+    /// scoping). Returns `None` when the module isn't visible to `user_id`.
+    /// `ModuleSource.source_code` is `None` for a bytes-only module.
+    ///
+    /// Enables the `get_module_source` MCP tool: `get_module_info` reports
+    /// `has_source_code: true` but there was no way to RETRIEVE it, so a
+    /// DB-resident module was an unmaintainable black box (the delivery-pattern
+    /// send module's RFC 2047 subject bug couldn't be fixed in place for
+    /// exactly this reason — its source wasn't recoverable).
+    pub async fn get_module_source(
+        &self,
+        module_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<ModuleSourceCode>> {
+        let row = sqlx::query(
+            "SELECT source_code, language, capability_world, kind \
+             FROM modules \
+             WHERE id = $1 \
+               AND (user_id = $2 OR user_id IS NULL) \
+             ORDER BY compiled_at DESC NULLS LAST LIMIT 1",
+        )
+        .bind(module_id)
+        .bind(user_id)
+        .fetch_optional(&self.db_pool)
+        .await?;
+
+        row.map(|r| -> Result<ModuleSourceCode> {
+            Ok(ModuleSourceCode {
+                source_code: r.try_get::<Option<String>, _>("source_code")?,
+                language: r
+                    .try_get::<Option<String>, _>("language")?
+                    .unwrap_or_else(|| "rust".to_string()),
+                capability_world: r
+                    .try_get::<Option<String>, _>("capability_world")?
+                    .unwrap_or_else(|| "unknown".to_string()),
+                kind: r.try_get::<Option<String>, _>("kind")?,
             })
         })
         .transpose()

@@ -1618,6 +1618,92 @@ pub fn project_engine_results_to_output(
     output
 }
 
+/// The set of terminal (leaf) node ids in a workflow graph — nodes that are
+/// never the `source` of an edge. These are the outputs a caller usually cares
+/// about; intermediate nodes are plumbing.
+pub fn terminal_node_ids(graph_json: &serde_json::Value) -> std::collections::HashSet<String> {
+    let Some(nodes) = graph_json.get("nodes").and_then(|n| n.as_array()) else {
+        return std::collections::HashSet::new();
+    };
+    let mut ids: std::collections::HashSet<String> = nodes
+        .iter()
+        .filter_map(|n| n.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .collect();
+    if let Some(edges) = graph_json.get("edges").and_then(|e| e.as_array()) {
+        for e in edges {
+            if let Some(src) = e.get("source").and_then(|v| v.as_str()) {
+                ids.remove(src);
+            }
+        }
+    }
+    ids
+}
+
+/// Reshape a projected per-node output map for a requested `output_mode`, so a
+/// big workflow doesn't return 60 KB+ (intermediate fan-in / memory-dump nodes
+/// were the real offenders). Byte counts use the serialized length.
+///
+/// * `"full"` (default / unknown): unchanged.
+/// * `"terminal_only"`: terminal-node outputs kept verbatim; every non-terminal
+///   node's output replaced with a compact `{"__elided__": true, "bytes": N}`
+///   marker.
+/// * `"summary"`: every node kept, but any single node output larger than
+///   `SUMMARY_ELIDE_BYTES` is replaced with the same marker.
+pub fn shape_output_for_mode(
+    output: serde_json::Map<String, serde_json::Value>,
+    terminals: &std::collections::HashSet<String>,
+    mode: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    const SUMMARY_ELIDE_BYTES: usize = 4096;
+    let elide = |v: &serde_json::Value| {
+        let bytes = serde_json::to_string(v).map(|s| s.len()).unwrap_or(0);
+        serde_json::json!({ "__elided__": true, "bytes": bytes })
+    };
+    match mode {
+        "terminal_only" => output
+            .into_iter()
+            .map(|(k, v)| {
+                if terminals.contains(&k) {
+                    (k, v)
+                } else {
+                    let e = elide(&v);
+                    (k, e)
+                }
+            })
+            .collect(),
+        "summary" => output
+            .into_iter()
+            .map(|(k, v)| {
+                let bytes = serde_json::to_string(&v).map(|s| s.len()).unwrap_or(0);
+                if bytes > SUMMARY_ELIDE_BYTES {
+                    let e = elide(&v);
+                    (k, e)
+                } else {
+                    (k, v)
+                }
+            })
+            .collect(),
+        _ => output,
+    }
+}
+
+/// Apply [`shape_output_for_mode`] to a response's output `Value` for the given
+/// `output_mode`. `"full"` (or a non-object output) is returned unchanged. This
+/// shapes only the RETURNED copy — callers persist the full output separately.
+pub fn shape_response_output(
+    output: &serde_json::Value,
+    terminals: &std::collections::HashSet<String>,
+    mode: &str,
+) -> serde_json::Value {
+    if mode == "full" {
+        return output.clone();
+    }
+    match output.as_object() {
+        Some(map) => serde_json::Value::Object(shape_output_for_mode(map.clone(), terminals, mode)),
+        None => output.clone(),
+    }
+}
+
 /// Spawn the two best-effort post-create background tasks for a newly
 /// inserted workflow:
 ///   * `crate::search::auto_embed_workflow` — generates an embedding so
@@ -3176,5 +3262,93 @@ mod ensure_graph_within_caps_tests {
         // surface the parse error elsewhere). Validator returns Ok
         // for unparseable input.
         assert!(ensure_graph_within_caps("{not json", &None).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod output_shaping_tests {
+    use super::{shape_output_for_mode, terminal_node_ids};
+
+    fn graph() -> serde_json::Value {
+        // a → b → c ; b → d.  Terminals: c, d.
+        serde_json::json!({
+            "nodes": [{"id":"a"},{"id":"b"},{"id":"c"},{"id":"d"}],
+            "edges": [
+                {"source":"a","target":"b"},
+                {"source":"b","target":"c"},
+                {"source":"b","target":"d"}
+            ]
+        })
+    }
+
+    #[test]
+    fn terminals_are_nodes_with_no_outgoing_edge() {
+        let t = terminal_node_ids(&graph());
+        assert!(t.contains("c"));
+        assert!(t.contains("d"));
+        assert!(!t.contains("a"));
+        assert!(!t.contains("b"));
+        assert_eq!(t.len(), 2);
+    }
+
+    #[test]
+    fn empty_or_malformed_graph_yields_no_terminals() {
+        assert!(terminal_node_ids(&serde_json::json!({})).is_empty());
+        assert!(terminal_node_ids(&serde_json::json!({"nodes": "oops"})).is_empty());
+    }
+
+    #[test]
+    fn full_mode_is_identity() {
+        let mut m = serde_json::Map::new();
+        m.insert("a".into(), serde_json::json!({"big": "x".repeat(9000)}));
+        m.insert("c".into(), serde_json::json!({"ok": true}));
+        let terminals = terminal_node_ids(&graph());
+        let out = shape_output_for_mode(m.clone(), &terminals, "full");
+        assert_eq!(out, m);
+        // unknown mode also falls through to identity
+        let out2 = shape_output_for_mode(m.clone(), &terminals, "bogus");
+        assert_eq!(out2, m);
+    }
+
+    #[test]
+    fn terminal_only_keeps_terminals_and_elides_intermediates() {
+        let mut m = serde_json::Map::new();
+        m.insert("a".into(), serde_json::json!({"intermediate": "data"}));
+        m.insert("b".into(), serde_json::json!({"intermediate": "more"}));
+        m.insert("c".into(), serde_json::json!({"answer": 42}));
+        let terminals = terminal_node_ids(&graph());
+        let out = shape_output_for_mode(m, &terminals, "terminal_only");
+        // terminal node kept verbatim
+        assert_eq!(out.get("c").unwrap(), &serde_json::json!({"answer": 42}));
+        // intermediates elided to a compact marker
+        assert_eq!(
+            out.get("a").unwrap().get("__elided__").unwrap(),
+            &serde_json::json!(true)
+        );
+        assert!(
+            out.get("b")
+                .unwrap()
+                .get("bytes")
+                .unwrap()
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+    }
+
+    #[test]
+    fn summary_elides_only_large_outputs() {
+        let mut m = serde_json::Map::new();
+        m.insert("small".into(), serde_json::json!({"k": "v"}));
+        m.insert("big".into(), serde_json::json!({"blob": "x".repeat(9000)}));
+        let terminals = std::collections::HashSet::new();
+        let out = shape_output_for_mode(m, &terminals, "summary");
+        // small kept verbatim
+        assert_eq!(out.get("small").unwrap(), &serde_json::json!({"k": "v"}));
+        // big elided (over the 4KB cap)
+        assert_eq!(
+            out.get("big").unwrap().get("__elided__").unwrap(),
+            &serde_json::json!(true)
+        );
     }
 }
