@@ -572,6 +572,18 @@ pub struct OrphanedModuleRow {
     pub compiled_at: DateTime<Utc>,
 }
 
+/// A user-compiled (DB-resident) module referenced by many workflows — a
+/// candidate for promotion to a versioned catalog template. High fan-out
+/// compiled modules are unmaintainable black boxes: no version control, no
+/// shared fix (the delivery-pattern send module's RFC 2047 bug was un-fixable
+/// in place for exactly this reason).
+#[derive(Debug)]
+pub struct PromotableModuleRow {
+    pub id: Uuid,
+    pub name: String,
+    pub dependent_count: i64,
+}
+
 #[derive(Debug)]
 pub struct StaleExecutionRow {
     pub id: Uuid,
@@ -654,6 +666,9 @@ pub struct HygieneReport {
     pub unembedded_count: i64,
     pub total_workflow_count: i64,
     pub orphaned_modules: Vec<OrphanedModuleRow>,
+    /// User-compiled modules with >=3 workflow dependents — promote-to-template
+    /// candidates.
+    pub promotable_modules: Vec<PromotableModuleRow>,
     pub stale_executions: Vec<StaleExecutionRow>,
     pub dormant_workflows: Vec<DormantWorkflowRow>,
     pub stale_draft_workflows: Vec<StaleDraftRow>,
@@ -3751,6 +3766,46 @@ impl AnalyticsRepository {
             Ok(rows)
         };
 
+        // 6b. Promotable modules — user-compiled (kind sandbox/extracted)
+        // modules referenced by >=3 non-archived workflows. The inverse of the
+        // orphaned query: high fan-out DB-resident modules are unmaintainable
+        // black boxes (no version control, no shared fix), so surface them as
+        // promote-to-template candidates. The correlated `graph_json LIKE` count
+        // is a full scan like the orphaned query; capped + bounded by the user
+        // scope. The alias can't be filtered in WHERE (Postgres), so the count
+        // is computed in a subselect and filtered in the outer query.
+        let promotable_modules_fut = async {
+            let rows: Vec<PromotableModuleRow> = sqlx::query(
+                "SELECT id, name, dependent_count FROM ( \
+                     SELECT m.id, m.name, \
+                            (SELECT COUNT(*) FROM workflows w \
+                              WHERE w.user_id = $1 \
+                                AND (w.status IS NULL OR w.status != 'archived') \
+                                AND w.graph_json LIKE '%' || m.id::text || '%') AS dependent_count \
+                       FROM modules m \
+                      WHERE m.user_id = $1 \
+                        AND m.kind IN ('sandbox', 'extracted') \
+                        AND m.compiled_at IS NOT NULL \
+                 ) sub \
+                 WHERE dependent_count >= 3 \
+                 ORDER BY dependent_count DESC LIMIT 25",
+            )
+            .bind(user_id)
+            .fetch_all(&self.db_pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| -> Result<PromotableModuleRow> {
+                Ok(PromotableModuleRow {
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
+                    dependent_count: r.try_get("dependent_count")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+            Ok(rows)
+        };
+
         // 7. Stale executions
         let stale_executions_fut = async {
             let rows: Vec<StaleExecutionRow> = sqlx::query(
@@ -3899,6 +3954,7 @@ impl AnalyticsRepository {
         // (orphaned_secrets) in Batch C below.
         let (
             orphaned_modules,
+            promotable_modules,
             stale_executions,
             dormant_workflows,
             stale_draft_workflows,
@@ -3906,6 +3962,7 @@ impl AnalyticsRepository {
             wildcard_module_names,
         ): (
             anyhow::Result<Vec<OrphanedModuleRow>>,
+            anyhow::Result<Vec<PromotableModuleRow>>,
             anyhow::Result<Vec<StaleExecutionRow>>,
             anyhow::Result<Vec<DormantWorkflowRow>>,
             anyhow::Result<Vec<StaleDraftRow>>,
@@ -3913,6 +3970,7 @@ impl AnalyticsRepository {
             Vec<String>,
         ) = tokio::join!(
             orphaned_modules_fut,
+            promotable_modules_fut,
             stale_executions_fut,
             dormant_workflows_fut,
             stale_draft_workflows_fut,
@@ -3920,6 +3978,7 @@ impl AnalyticsRepository {
             wildcard_module_names_fut,
         );
         let orphaned_modules = orphaned_modules?;
+        let promotable_modules = promotable_modules?;
         let stale_executions = stale_executions?;
         let dormant_workflows = dormant_workflows?;
         let stale_draft_workflows = stale_draft_workflows?;
@@ -4198,6 +4257,7 @@ impl AnalyticsRepository {
             unembedded_count,
             total_workflow_count,
             orphaned_modules,
+            promotable_modules,
             stale_executions,
             dormant_workflows,
             stale_draft_workflows,
