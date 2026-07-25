@@ -176,6 +176,19 @@ impl HygieneService {
             })
             .collect();
 
+        // --- 4b. Promote-to-template candidates (high fan-out DB modules) ---
+        let promotable_modules: Vec<serde_json::Value> = h
+            .promotable_modules
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id.to_string(),
+                    "name": r.name,
+                    "dependent_count": r.dependent_count,
+                })
+            })
+            .collect();
+
         // --- 5. Stale stuck executions ---
         let stale_executions: Vec<serde_json::Value> = h
             .stale_executions
@@ -351,6 +364,30 @@ impl HygieneService {
                 "category": "cleanup",
                 "action": format!("{} compiled module(s) are not used by any workflow ({}KB total). Use cleanup_modules to reclaim storage.", orphaned_modules.len(), total_size / 1024),
                 "affected_count": orphaned_modules.len(),
+            }));
+        }
+
+        if !promotable_modules.is_empty() {
+            let names: Vec<String> = promotable_modules
+                .iter()
+                .filter_map(|m| {
+                    let n = m.get("name").and_then(|v| v.as_str())?;
+                    let c = m
+                        .get("dependent_count")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    Some(format!("{n} ({c} workflows)"))
+                })
+                .collect();
+            recommendations.push(serde_json::json!({
+                "priority": "medium",
+                "category": "maintainability",
+                "action": format!(
+                    "{} custom module(s) are used by 3+ workflows but live only as DB-resident compiled blobs (no version control, no shared fix): {}. Promote each to a versioned catalog template under module-templates/ so its source is reviewable and a fix applies everywhere. Retrieve the current source with get_module_source.",
+                    promotable_modules.len(),
+                    names.join(", ")
+                ),
+                "affected_count": promotable_modules.len(),
             }));
         }
 
@@ -630,6 +667,7 @@ impl HygieneService {
                 "secrets_without_expiry_count": secrets_without_expiry.len(),
                 "expiring_memories_count": expiring_actor_memories.len(),
                 "workflows_needing_schema_count": workflows_needing_schema.len(),
+                "promotable_modules_count": promotable_modules.len(),
                 "suppressed_internal_test_workflows": suppressed_count,
                 "suppressed_low_score_count": suppressed_low_score_count,
                 "auto_classified_test_like_workflows": auto_classified_count,
@@ -643,6 +681,7 @@ impl HygieneService {
             "uncapabilized_workflows": uncapabilized,
             "unembedded_workflow_count": unembedded_count,
             "orphaned_modules": orphaned_modules,
+            "promotable_modules": promotable_modules,
             "dormant_workflows": dormant_workflows,
             "stale_draft_workflows": stale_draft_workflows,
             "idle_actors": idle_actors,
