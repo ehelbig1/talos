@@ -1,0 +1,66 @@
+{
+  "name": "send-html-email",
+  "version": "v1.0.0",
+  "display_name": "Send HTML Email (Gmail)",
+  "description": "Delivery-pattern HTML email sender. Reads {html, subject} from the upstream node's output, RFC 2047-encodes non-ASCII subjects, and POSTs an HTML message to the Gmail API using a Bearer token (a vault:// reference in AUTH_HEADER is resolved host-side). DRY_RUN gates the send. Pair with a compose node (memory, no network) per the two-node delivery pattern.",
+  "category": "Communication",
+  "capability_world": "http-node",
+  "allowed_hosts": ["gmail.googleapis.com"],
+  "requires_secrets": ["oauth/gmail/*"],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "required": ["AUTH_HEADER", "TO"],
+    "properties": {
+      "AUTH_HEADER": {
+        "type": "string",
+        "description": "Authorization header value, e.g. 'Bearer vault://oauth/gmail/<account>/<email>/access_token'. A vault:// reference is resolved host-side and never exposed to the guest."
+      },
+      "TO": {
+        "type": "string",
+        "description": "Recipient email address."
+      },
+      "FROM": {
+        "type": "string",
+        "description": "Sender address; defaults to 'me' (the authenticated account)."
+      },
+      "DRY_RUN": {
+        "type": "boolean",
+        "description": "When true, build the message but do not call Gmail; returns {sent:false, dry_run:true, rfc822_bytes}. Default false."
+      }
+    }
+  },
+  "input_contract": {
+    "description": "Content is taken from the upstream node's output (the compose leg of the delivery pattern).",
+    "properties": {
+      "subject": "Email subject line (RFC 2047-encoded automatically if non-ASCII).",
+      "html": "HTML email body (sent as text/html; charset=UTF-8)."
+    }
+  },
+  "output": {
+    "sent": "boolean",
+    "dry_run": "boolean",
+    "message_id": "Gmail message id (when sent)",
+    "thread_id": "Gmail thread id (when sent)",
+    "to": "recipient",
+    "subject": "the original (un-encoded) subject",
+    "rfc822_bytes": "size of the built message (DRY_RUN only)"
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Grant the Gmail OAuth token to the sending actor",
+      "detail": "Store/authorize a Gmail OAuth access token at a vault path such as oauth/gmail/<account>/<email>/access_token and grant the actor access to it."
+    },
+    {
+      "step": 2,
+      "title": "Reference it in AUTH_HEADER",
+      "detail": "Set the node config AUTH_HEADER to 'Bearer vault://<that path>'. The host substitutes the token into the outbound Authorization header and zeroizes the plaintext after the request."
+    },
+    {
+      "step": 3,
+      "title": "Wire a compose node upstream",
+      "detail": "Connect a compose node that emits {html, subject}. Keep memory access on the compose node and network access on this send node (privilege separation)."
+    }
+  ]
+}

@@ -45,12 +45,16 @@ fn run(input: String) -> Result<String, String> {
         logging::log(Level::Info, &format!("Sending Gmail to: {}", to));
 
         // Construct an RFC 2822 message.
-        // The `Date` header is REQUIRED by RFC 5322 §3.6.1.
+        // - The Subject is RFC 2047-encoded when it carries non-ASCII, so an
+        //   un-encoded UTF-8 header can't mojibake in the recipient's client.
+        // - No Date header is emitted: the Gmail API populates a correct one on
+        //   send. (This template previously hardcoded a fixed 2024 date, which
+        //   stamped every message with the wrong date.)
         // Gmail API requires base64url encoding (no padding) of the raw message.
-        let date_str = rfc2822_date_now();
+        let subject_header = encode_subject(subject);
         let raw_message = format!(
-            "From: {}\r\nTo: {}\r\nDate: {}\r\nSubject: {}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n{}",
-            from, to, date_str, subject, body_text
+            "From: {}\r\nTo: {}\r\nSubject: {}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n{}",
+            from, to, subject_header, body_text
         );
 
         let encoded = base64url_encode(raw_message.as_bytes());
@@ -105,10 +109,57 @@ fn reject_crlf(val: &str, field: &str) -> Result<(), String> {
     }
 }
 
-fn rfc2822_date_now() -> String {
-    // A mock since we don't have chrono in WASM by default easily, or we can use datetime
-    // Using an arbitrary valid RFC2822 date for the template or you can use talos::core::datetime
-    "Tue, 1 Jul 2024 10:00:00 +0000".to_string()
+// RFC 2047 "encoded-word" for the Subject header. ASCII subjects pass through
+// unchanged (byte-identical to the old behavior). Non-ASCII subjects become
+// =?UTF-8?B?..?= words, each <= 75 chars and never splitting a multi-byte
+// character, folded with CRLF+space (the whitespace between words is elided by
+// the reader).
+fn encode_subject(subject: &str) -> String {
+    if subject.is_ascii() {
+        return subject.to_string();
+    }
+    let mut words: Vec<String> = Vec::new();
+    let mut buf: Vec<u8> = Vec::new();
+    for ch in subject.chars() {
+        let mut tmp = [0u8; 4];
+        let bytes = ch.encode_utf8(&mut tmp).as_bytes();
+        // Keep each word's payload <= 45 bytes => <= 60 base64 chars, comfortably
+        // under the 75-char encoded-word limit incl. the 12-char envelope.
+        if buf.len() + bytes.len() > 45 && !buf.is_empty() {
+            words.push(format!("=?UTF-8?B?{}?=", base64_standard(&buf)));
+            buf.clear();
+        }
+        buf.extend_from_slice(bytes);
+    }
+    if !buf.is_empty() {
+        words.push(format!("=?UTF-8?B?{}?=", base64_standard(&buf)));
+    }
+    words.join("\r\n ")
+}
+
+// Standard base64 (RFC 4648, WITH padding) — required by RFC 2047 encoded-words.
+fn base64_standard(input: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[((n >> 6) & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(n & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }
 
 fn base64url_encode(input: &[u8]) -> String {
