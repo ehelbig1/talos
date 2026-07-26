@@ -447,7 +447,7 @@ impl HygieneService {
             recommendations.push(serde_json::json!({
                 "priority": "medium",
                 "category": "security",
-                "action": format!("{} API key/token secret(s) have no expiry date set. Set an expiry in the dashboard (Settings → Secrets) to enforce rotation cadence — secret writes require 2FA and aren't available through MCP.", secrets_without_expiry.len()),
+                "action": format!("{} STATIC API key/token secret(s) have no expiry date set — nothing rotates them. Set an expiry in the dashboard (Settings → Secrets) to enforce a rotation cadence — secret writes require 2FA and aren't available through MCP. (Platform-managed `oauth/*` credentials are excluded: refresh_oauth_token already rotates those, and hand-expiring one breaks the integration until its next refresh.)", secrets_without_expiry.len()),
                 "affected_count": secrets_without_expiry.len(),
             }));
         }

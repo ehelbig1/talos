@@ -4074,9 +4074,22 @@ impl AnalyticsRepository {
 
         // 13. Secrets without expiry
         let secrets_without_expiry_fut = async {
+            // `oauth/%` is EXCLUDED deliberately (2026-07-26). The `%token%`
+            // predicate matches every `oauth/<provider>/<user>/<acct>/
+            // {access,refresh}_token` — precisely the credentials the platform
+            // rotates ITSELF via `refresh_oauth_token`. Advising an operator to
+            // hand-set an expiry on those is wrong twice over: the rotation
+            // cadence this check exists to enforce is already automated, and a
+            // manually-expired OAuth access token breaks the integration until
+            // the next refresh. Before this exclusion the finding was 100%
+            // OAuth on the reference deployment (14/14) — a check that can only
+            // fire on the one credential class it does not apply to trains the
+            // operator to ignore it, and takes the real signal (a static,
+            // never-rotated API key / PAT) down with it.
             let rows: Vec<SecretWithoutExpiryRow> = sqlx::query(
                 "SELECT name, key_path, created_at FROM secrets \
              WHERE created_by = $1 AND expires_at IS NULL \
+               AND key_path NOT ILIKE 'oauth/%' \
                AND (key_path ILIKE '%key%' OR key_path ILIKE '%token%' OR key_path ILIKE '%api%' \
                     OR key_path ILIKE '%pat%' OR key_path ILIKE '%secret%') \
              ORDER BY created_at ASC LIMIT 25",
