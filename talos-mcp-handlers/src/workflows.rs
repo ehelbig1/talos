@@ -234,7 +234,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                         "type": "object",
                         "description": "Optional map of crate name → version string for the inline compile (e.g. {\"chrono\": \"0.4\", \"url\": \"2\"}). serde and serde_json are pre-bundled. Only allowlisted crates are accepted — see compile_custom_sandbox.dependencies for the full list. Mirrors compile_custom_sandbox semantics so inline-compiled nodes don't have to be compiled separately just to pull a dependency."
                     },
-                    "config": { "type": "object", "description": "Per-node module config key/value pairs merged with the module's default config." },
+                    "config": { "type": "object", "description": "Per-node module config key/value pairs merged with the module's default config. Also carries per-node ENGINE HINTS, chiefly `max_fuel` (integer): a node-level fuel budget that OVERRIDES the module row's default at dispatch. Set it when this node sees a bigger payload than the module's typical one (e.g. a fan-in collect payload). The response echoes it back as `node_max_fuel_override`, and `effective_max_fuel` reports what the node will actually run with — note `applied_max_fuel` is the MODULE row and is expected to differ." },
                     "skip_condition": { "type": "string", "description": "Rhai expression evaluated before the node runs — if it returns true the node is skipped and execution continues with the next node. Example: \"input.dry_run == true\"." },
                     "continue_on_error": { "type": "boolean", "description": "If true, a node failure does not halt the workflow — execution continues with downstream nodes. Use with care: downstream nodes receive error output. Default: false." },
                     "timeout_secs": { "type": "number", "description": "Per-node execution timeout in seconds (default: 60). Nodes that exceed this limit are treated as timed-out failures. Set higher when a node calls an LLM (Ollama synthesis typically 20-45s), performs large HTTP fetches, or runs expensive SQL. Use the global set_wasm_config `execution_timeout_secs` to change the default for nodes that don't specify one." },
@@ -1907,6 +1907,28 @@ async fn handle_create_workflow(
     }
 }
 
+/// Extract a node-level `max_fuel` override out of an `add_node_to_workflow`
+/// `config` argument. This is the value that lands in the node's graph-JSON
+/// `data` and that the engine prefers over the module-row default
+/// (`engine_config::resolve_node_max_fuel`). Non-numeric / absent → `None`.
+pub(crate) fn node_max_fuel_override(config: &serde_json::Value) -> Option<u64> {
+    config.get("max_fuel").and_then(serde_json::Value::as_u64)
+}
+
+/// The budget the node will actually run with: the node-level override when the
+/// caller supplied one, else the module row's post-upsert `max_fuel`.
+///
+/// Exists because reporting only the module row under the name
+/// `applied_max_fuel` made a *live* node override look silently dropped.
+pub(crate) fn effective_max_fuel(
+    node_override: Option<u64>,
+    module_max_fuel: Option<i64>,
+) -> Option<i64> {
+    node_override
+        .map(|v| v.min(i64::MAX as u64) as i64)
+        .or(module_max_fuel)
+}
+
 async fn handle_add_node_to_workflow(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
@@ -2491,6 +2513,19 @@ async fn handle_add_node_to_workflow(
         None
     };
 
+    // 2026-07-26: `applied_max_fuel` above is the MODULE ROW's budget, which is
+    // a DIFFERENT quantity from a node-level `config.max_fuel` override — but
+    // the name reads as "the max_fuel you just set", so a caller who passes
+    // `config: { max_fuel: 12000000 }` and reads back `applied_max_fuel:
+    // 1380000` concludes their value was dropped and "fixes" it with a
+    // redundant update_node_config call. It was never dropped: `config` is
+    // persisted verbatim as the node's `data` (build_add_node_payload), and the
+    // engine prefers the node override over the module default
+    // (engine_config::resolve_node_max_fuel). Report both, plus the number the
+    // caller actually cares about, so the response can't imply a silent drop.
+    let node_max_fuel_override = node_max_fuel_override(&config);
+    let effective_max_fuel = effective_max_fuel(node_max_fuel_override, applied_max_fuel);
+
     mcp_text(
         req_id,
         &serde_json::to_string_pretty(&serde_json::json!({
@@ -2502,7 +2537,8 @@ async fn handle_add_node_to_workflow(
                 "connect_from": connect_from,
                 "connect_to": connect_to,
             },
-            // Effective fuel budget on the resulting module, post-upsert.
+            // MODULE-ROW fuel budget, post-upsert. NOT the node's effective
+            // budget when `config.max_fuel` is set — see effective_max_fuel.
             // For inline-compile + fuel_budget callers: this reflects the
             // computed value from the formula (clamped [1M, 50M]). If you
             // bumped fuel_budget but this number didn't move, the args
@@ -2510,6 +2546,12 @@ async fn handle_add_node_to_workflow(
             // expected_items / bytes_per_item / safety_multiplier / optional
             // llm_output_bytes — NOT a single number).
             "applied_max_fuel": applied_max_fuel,
+            // Node-level `config.max_fuel` override as persisted into the
+            // node's graph-JSON `data` (null when the caller supplied none).
+            "node_max_fuel_override": node_max_fuel_override,
+            // What this node will ACTUALLY run with: the node override when
+            // present, else the module-row default. Read this one.
+            "effective_max_fuel": effective_max_fuel,
             "template_interpolation_warnings": template_warnings,
             "auto_publish_note": auto_publish_note.trim(),
             "next_steps_checklist": checklist,
@@ -10881,7 +10923,71 @@ async fn handle_export_yaml_workflow(
 #[cfg(test)]
 mod tests {
 
+    use super::{effective_max_fuel, node_max_fuel_override};
     use talos_workflow_creation_helpers::detect_tool_call_xml_leak;
+
+    /// The 2026-07-26 confusion: a caller passed `config.max_fuel = 12_000_000`
+    /// and read back `applied_max_fuel: 1_380_000` (the MODULE row), concluding
+    /// their override had been silently dropped. It had not — the override is
+    /// persisted into node `data` and wins at dispatch. `effective_max_fuel`
+    /// must report the override, not the module default.
+    #[test]
+    fn node_override_beats_module_row_in_reported_fuel() {
+        let config = serde_json::json!({ "max_fuel": 12_000_000 });
+        let over = node_max_fuel_override(&config);
+        assert_eq!(over, Some(12_000_000));
+        assert_eq!(
+            effective_max_fuel(over, Some(1_380_000)),
+            Some(12_000_000),
+            "reported fuel must be the node override, not the module row"
+        );
+    }
+
+    /// No override supplied → fall back to the module row, preserving the
+    /// pre-change reporting behavior byte-for-byte.
+    #[test]
+    fn absent_override_falls_back_to_module_row() {
+        let config = serde_json::json!({ "some_other_key": 1 });
+        assert_eq!(node_max_fuel_override(&config), None);
+        assert_eq!(effective_max_fuel(None, Some(1_380_000)), Some(1_380_000));
+        assert_eq!(effective_max_fuel(None, None), None);
+    }
+
+    /// A non-numeric or negative `max_fuel` is not an override — it must not be
+    /// coerced into one, or the response would promise a budget the engine
+    /// (which requires `as_u64`) will never apply.
+    #[test]
+    fn non_numeric_max_fuel_is_not_an_override() {
+        for bad in [
+            serde_json::json!({ "max_fuel": "12000000" }),
+            serde_json::json!({ "max_fuel": -5 }),
+            serde_json::json!({ "max_fuel": 1.5 }),
+            serde_json::json!({ "max_fuel": null }),
+        ] {
+            assert_eq!(
+                node_max_fuel_override(&bad),
+                None,
+                "non-u64 max_fuel must not be reported as an override: {bad}"
+            );
+            // …and the module row still gets reported, unchanged.
+            assert_eq!(
+                effective_max_fuel(node_max_fuel_override(&bad), Some(1_380_000)),
+                Some(1_380_000)
+            );
+        }
+    }
+
+    /// Guard the u64 → i64 narrowing: a huge override must saturate rather than
+    /// wrap to a negative "budget" in the JSON response.
+    #[test]
+    fn oversized_override_saturates_instead_of_wrapping() {
+        let reported = effective_max_fuel(Some(u64::MAX), Some(1_380_000)).unwrap();
+        assert!(
+            reported > 0,
+            "narrowing must not wrap negative, got {reported}"
+        );
+        assert_eq!(reported, i64::MAX);
+    }
 
     /// Exact prod-incident artifact from discovery-call-synthesizer (2026-04-29).
     /// MUST trigger detection — the leaked actor_id directive embedded in description.
