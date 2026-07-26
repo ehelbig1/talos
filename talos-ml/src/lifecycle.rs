@@ -512,6 +512,53 @@ pub struct PendingDisagreement {
     pub llm_label: String,
     pub kind: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Other PENDING rows whose decrypted `features_text` and label pair are
+    /// byte-identical to this one — the same message re-delivered, or one
+    /// message fanned out to several recipients. Empty in the common case.
+    ///
+    /// The review queue is the operator's scarcest resource, so N copies of one
+    /// email must cost ONE decision, not N. Callers resolving this row should
+    /// resolve these siblings with the same label (see `duplicate_count` in the
+    /// digest payload).
+    pub duplicate_ids: Vec<Uuid>,
+}
+
+/// Collapse exact-duplicate pending divergences into one reviewable row,
+/// carrying the collapsed ids on the survivor.
+///
+/// Duplicates are NORMAL: a recurring notification, or — observed 2026-07-26 —
+/// four copies of the same Chief-of-Staff briefing generated while testing,
+/// which occupied half the visible review queue. Two costs, both real:
+/// the operator is asked the same question N times, and resolving each copy
+/// appends N identical gold corrections, over-weighting one decision in
+/// training and manufacturing the exact-duplicate embeddings that made the
+/// kNN neighbour vote tie-dependent in the first place (see `knn_search`).
+///
+/// Keyed on `(features_text, fast_label, llm_labelmarker)` so that the same
+/// text is only collapsed when the models disagreed about it in the same way —
+/// a genuinely different verdict on identical text is a different question and
+/// stays its own row. Order is preserved: the first occurrence (newest, since
+/// the query sorts `created_at DESC`) survives.
+pub fn dedupe_pending_disagreements(rows: Vec<PendingDisagreement>) -> Vec<PendingDisagreement> {
+    let mut out: Vec<PendingDisagreement> = Vec::with_capacity(rows.len());
+    // Index into `out` for each distinct (text, fast_label, llm_label) key.
+    let mut seen: std::collections::HashMap<(String, Option<String>, String), usize> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let key = (
+            row.features_text.clone(),
+            row.fast_label.clone(),
+            row.llm_label.clone(),
+        );
+        match seen.get(&key) {
+            Some(&idx) => out[idx].duplicate_ids.push(row.id),
+            None => {
+                seen.insert(key, out.len());
+                out.push(row);
+            }
+        }
+    }
+    out
 }
 
 impl LifecycleService {
@@ -784,9 +831,14 @@ impl LifecycleService {
                 llm_label,
                 kind,
                 created_at,
+                duplicate_ids: Vec::new(),
             });
         }
-        Ok(out)
+        // Collapse re-deliveries of the same message AFTER decryption — the
+        // per-row AEAD nonce makes identical plaintext produce distinct
+        // ciphertext, so this cannot be a SQL DISTINCT or a unique index
+        // without persisting a plaintext-derived fingerprint at rest.
+        Ok(dedupe_pending_disagreements(out))
     }
 
     /// Fetch ONE pending disagreement decrypted, owner-scoped — the
@@ -851,6 +903,9 @@ impl LifecycleService {
                 llm_label,
                 kind,
                 created_at,
+                // Single-row fetch on the resolve path: siblings are a
+                // property of the QUEUE view, not of one row read by id.
+                duplicate_ids: Vec::new(),
             },
         )))
     }
@@ -885,6 +940,93 @@ impl LifecycleService {
 mod tests {
     use super::*;
     use crate::eval::{ClassMetrics, CoveragePoint};
+
+    fn pending(text: &str, fast: Option<&str>, llm: &str) -> PendingDisagreement {
+        PendingDisagreement {
+            id: Uuid::new_v4(),
+            example_key: None,
+            features_text: text.to_string(),
+            fast_label: fast.map(str::to_string),
+            fast_confidence: Some(0.43),
+            llm_label: llm.to_string(),
+            kind: "divergence".to_string(),
+            created_at: chrono::Utc::now(),
+            duplicate_ids: Vec::new(),
+        }
+    }
+
+    /// The motivating case: four copies of the SAME Chief-of-Staff briefing
+    /// occupied half the visible review queue. One decision, not four.
+    #[test]
+    fn identical_redeliveries_collapse_to_one_row() {
+        const BRIEF: &str = "Subject: [STALE DATA] Chief of Staff\nFrom: Evan";
+        let rows = vec![
+            pending(BRIEF, Some("to_read"), "follow_up"),
+            pending(BRIEF, Some("to_read"), "follow_up"),
+            pending(BRIEF, Some("to_read"), "follow_up"),
+            pending(BRIEF, Some("to_read"), "follow_up"),
+        ];
+        let survivor_id = rows[0].id;
+        let out = dedupe_pending_disagreements(rows);
+        assert_eq!(out.len(), 1, "four copies must cost one review");
+        assert_eq!(out[0].id, survivor_id, "the first (newest) row survives");
+        assert_eq!(
+            out[0].duplicate_ids.len(),
+            3,
+            "the collapsed ids must be carried so the caller can resolve them together"
+        );
+    }
+
+    /// Distinct emails must never be merged — the whole queue collapsing to one
+    /// row would be a far worse bug than the duplicates it fixes.
+    #[test]
+    fn distinct_texts_are_never_merged() {
+        let rows = vec![
+            pending("Subject: A", Some("archive"), "follow_up"),
+            pending("Subject: B", Some("archive"), "follow_up"),
+            pending("Subject: C", None, "archive"),
+        ];
+        let out = dedupe_pending_disagreements(rows);
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|r| r.duplicate_ids.is_empty()));
+    }
+
+    /// Same text but a DIFFERENT disagreement is a different question, so it
+    /// keeps its own row — collapsing it would hide one of the two verdicts.
+    #[test]
+    fn same_text_with_different_verdicts_stays_separate() {
+        const T: &str = "Subject: Run failed";
+        let rows = vec![
+            pending(T, Some("archive"), "to_read"),
+            pending(T, Some("to_read"), "archive"),
+            pending(T, None, "to_read"),
+        ];
+        let out = dedupe_pending_disagreements(rows);
+        assert_eq!(out.len(), 3, "differing label pairs are distinct questions");
+    }
+
+    /// Interleaved duplicates must attach to their own group, not the nearest.
+    #[test]
+    fn interleaved_duplicates_group_correctly() {
+        let rows = vec![
+            pending("A", Some("archive"), "to_read"),
+            pending("B", Some("archive"), "to_read"),
+            pending("A", Some("archive"), "to_read"),
+            pending("B", Some("archive"), "to_read"),
+            pending("A", Some("archive"), "to_read"),
+        ];
+        let out = dedupe_pending_disagreements(rows);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].features_text, "A");
+        assert_eq!(out[0].duplicate_ids.len(), 2);
+        assert_eq!(out[1].features_text, "B");
+        assert_eq!(out[1].duplicate_ids.len(), 1);
+    }
+
+    #[test]
+    fn empty_input_is_empty_output() {
+        assert!(dedupe_pending_disagreements(Vec::new()).is_empty());
+    }
 
     fn report(per_class: &[(&str, f64)], curve: &[(f64, f64, Option<f64>)]) -> EvalReport {
         EvalReport {
