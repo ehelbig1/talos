@@ -980,6 +980,24 @@ impl DatasetService {
     /// caller to be inside a transaction (every tenant-scoped path is;
     /// `set_config(..., true)` is transaction-local so nothing leaks to
     /// the pooled connection).
+    ///
+    /// The `ORDER BY … <=> $2, id` tiebreaker is LOAD-BEARING, not tidiness
+    /// (2026-07-26). `ml_examples` legitimately holds exact-duplicate feature
+    /// text with CONFLICTING labels — the same GitHub "Run failed" notification
+    /// appears bootstrap-labelled `archive` and human-corrected `to_read`.
+    /// Duplicate text means duplicate embeddings, so those rows tie exactly on
+    /// distance, and without a unique tiebreaker Postgres breaks the tie by
+    /// whatever heap order the scan happens to produce. The k-neighbour vote
+    /// then flips between runs on identical data.
+    ///
+    /// Observed: two evals of the SAME model with the SAME policy returned
+    /// macro_f1 0.7065 vs 0.6152 and selected a DIFFERENT backend, while the
+    /// logistic-regression arm was bit-identical across both runs — isolating
+    /// the nondeterminism to this query. That makes the promotion gate a
+    /// coin-flip, and with `auto_advance` a model can promote on a lucky draw.
+    ///
+    /// Same defect as structural lint check 28 (OFFSET pagination needs a
+    /// unique ORDER BY tiebreaker), in the ANN path.
     pub async fn knn_search(
         &self,
         conn: &mut PgConnection,
@@ -998,7 +1016,7 @@ impl DatasetService {
                AND embedding_model = $5 \
                AND label_json ? 'label' \
                AND (NOT $4 OR split IS DISTINCT FROM 'holdout') \
-             ORDER BY embedding <=> $2 LIMIT $3",
+             ORDER BY embedding <=> $2, id LIMIT $3",
         )
         .bind(dataset_id)
         .bind(&qvec)

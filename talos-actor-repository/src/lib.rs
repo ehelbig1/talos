@@ -3609,7 +3609,7 @@ impl ActorRepository {
                     OR metadata IS NULL \
                     OR metadata->>'kind' IS NULL \
                     OR metadata->>'kind' != ALL($6::text[])) \
-             ORDER BY embedding <=> $2::vector \
+             ORDER BY embedding <=> $2::vector, id \
              LIMIT $5",
         )
         .bind(actor_id)
