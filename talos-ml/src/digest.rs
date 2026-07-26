@@ -232,6 +232,11 @@ async fn deliver_one(
                 "fast_confidence": d.fast_confidence,
                 "llm_label": d.llm_label,
                 "preview": preview(&d.features_text),
+                // >1 means this exact message (same text, same disagreement)
+                // arrived several times — one decision covers them all.
+                "occurrences": d.duplicate_ids.len() + 1,
+                "duplicate_ids": d.duplicate_ids
+                    .iter().map(|i| i.to_string()).collect::<Vec<_>>(),
             })
         })
         .collect();
