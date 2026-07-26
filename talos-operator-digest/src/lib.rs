@@ -198,12 +198,13 @@ impl OperatorDigestService {
 
         // ML loop health (per-model lifecycle, promoted version, shadow
         // agreement) — reused verbatim from the assistant report's source.
-        let ml = talos_ml::loop_health(&self.pool, user_id)
+        let mut ml = talos_ml::loop_health(&self.pool, user_id)
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!(%user_id, error = %e, "operator_digest: ml loop_health failed");
                 json!({ "available": false })
             });
+        annotate_correction_loop(&mut ml);
 
         let judge_scores = self
             .executions
@@ -212,12 +213,17 @@ impl OperatorDigestService {
             .unwrap_or_default()
             .into_iter()
             .map(|s| {
+                let signal = judge_signal(s.runs, s.avg_score, s.worst_score);
                 json!({
                     "name": s.workflow_name,
                     "runs": s.runs,
                     "avg_score": s.avg_score,
                     "pass_rate": s.pass_rate,
                     "worst_score": s.worst_score,
+                    // A judge whose score never varies is not evidence of
+                    // quality — it may be a shape check that cannot fail.
+                    "signal": signal,
+                    "signal_note": judge_signal_note(signal),
                 })
             })
             .collect::<Vec<_>>();
@@ -264,6 +270,13 @@ impl OperatorDigestService {
                     "severity": a.severity,
                     "source": a.source,
                     "occurrence_count": a.occurrence_count,
+                    // Without this the name reads as "these 5 alerts are
+                    // miscategorised". They are not: they are simply the
+                    // highest-leverage alerts never taught to the classifier.
+                    "why_listed": "recurring and never corrected - the highest-leverage \
+                                   alert to teach next, not a miscategorised one. \
+                                   correct_ops_alert_severity once and every future \
+                                   occurrence of this dedup_key inherits it",
                 })
             })
             .collect::<Vec<_>>();
@@ -430,9 +443,293 @@ fn build_reliability_section(
     })
 }
 
+// ────────────────────────────────────────────────────────────────────
+// Metric legibility (2026-07-26)
+//
+// Every panel below prints numbers whose NAMES imply a verdict the number
+// doesn't actually carry. Three real misreads, all by an experienced reader:
+//   * `gold: 0.15` reads as "the model is broken". Gold is the held-out slice
+//     of the USER'S OWN CORRECTIONS — adversarial by construction. It measures
+//     "has the model learned my overrides", not "is the model any good"
+//     (that's the holdout accuracy, 0.84 for the same model).
+//   * `ops_alert_corrections` reads as "5 alerts are miscategorised". The query
+//     is `status<>'resolved' AND corrected_severity IS NULL ORDER BY
+//     occurrence_count DESC` — i.e. the highest-LEVERAGE alerts you have never
+//     taught the system about. Nothing is wrong with them.
+//   * A judge pinned at 1.000 across every run reads as "quality is perfect".
+//     It equally means the verdict is a shape check that cannot fail — which is
+//     exactly what `pa-inbox-organizer-work` and `pa-chief-of-staff` both had.
+//
+// A number the reader must already know the provenance of is a number that
+// will be misread. These helpers attach that provenance to the payload, so the
+// cockpit reports what it MEASURED rather than a bare score. Same defect class
+// as the `applied_max_fuel` reporting fix — see the MCP add-node handler.
+// ────────────────────────────────────────────────────────────────────
+
+/// Minimum runs before a judge's score spread is worth interpreting. Below
+/// this, "every run scored 1.0" is small-sample noise, not saturation.
+const JUDGE_MIN_RUNS_FOR_SIGNAL: i64 = 5;
+
+/// Classify what a judge's score distribution actually tells the operator.
+///
+/// `avg == worst` is an EXACT zero-spread test, not an approximation: `worst`
+/// is the minimum and `avg` the mean, and a mean can equal a minimum only when
+/// every observation is identical. So this needs no variance column.
+///
+/// A judge whose score never moves is the quality-signal twin of a registered
+/// Prometheus metric that is never incremented (structural lint check 58): it
+/// renders a dashboard that can never report a problem. Flagging it is the
+/// whole point — a saturated judge is not evidence of quality.
+pub fn judge_signal(runs: i64, avg_score: Option<f64>, worst_score: Option<f64>) -> &'static str {
+    if runs < JUDGE_MIN_RUNS_FOR_SIGNAL {
+        return "insufficient_runs";
+    }
+    // Absent scores are not zero — report unknown rather than inventing a
+    // verdict from a missing aggregate.
+    let (Some(avg_score), Some(worst_score)) = (avg_score, worst_score) else {
+        return "unknown";
+    };
+    if !avg_score.is_finite() || !worst_score.is_finite() {
+        return "unknown";
+    }
+    if (avg_score - worst_score).abs() > f64::EPSILON {
+        return "discriminating";
+    }
+    // Zero spread across enough runs: the verdict never varied.
+    if avg_score >= 1.0 - f64::EPSILON {
+        "saturated_pass"
+    } else if avg_score <= f64::EPSILON {
+        "saturated_fail"
+    } else {
+        "saturated_constant"
+    }
+}
+
+/// One-line reading guide for a judge signal — shipped alongside the score so
+/// the email/UI can render "why am I looking at this".
+pub fn judge_signal_note(signal: &str) -> &'static str {
+    match signal {
+        "saturated_pass" => {
+            "every run scored identically at the maximum — this judge has not been \
+             observed to fail anything, so it may be a shape check rather than a \
+             quality gate; verify it in the FAILURE direction before trusting the trend"
+        }
+        "saturated_fail" => {
+            "every run scored identically at zero — the verdict is likely erroring or \
+             inverted rather than measuring quality"
+        }
+        "saturated_constant" => {
+            "every run returned the same non-extreme score — the verdict is probably \
+             constant-valued and carries no signal"
+        }
+        "insufficient_runs" => "too few runs to interpret the spread yet",
+        "discriminating" => "scores vary across runs — the trend is meaningful",
+        _ => "score distribution could not be interpreted",
+    }
+}
+
+/// State of a model's human-correction loop, derived from the gold slice.
+///
+/// `gold_accuracy` is accuracy on HELD-OUT CORRECTIONS, so a low value does not
+/// mean "bad model" — it means the model still predicts what the user overrode.
+/// Returns `None` when there is no gold slice to read (never claim a verdict
+/// from a check that did not run — same rule as the freshness contracts).
+pub fn correction_loop_state(
+    corrections_banked: i64,
+    gold_accuracy: Option<f64>,
+) -> Option<&'static str> {
+    let acc = gold_accuracy?;
+    if !acc.is_finite() {
+        return None;
+    }
+    if corrections_banked <= 0 {
+        return Some("no_corrections_yet");
+    }
+    if acc < 0.5 {
+        Some("not_converging")
+    } else if acc < 0.8 {
+        Some("partially_learned")
+    } else {
+        Some("converged")
+    }
+}
+
+/// Stamp `correction_loop` + `correction_loop_note` onto every model in a
+/// `loop_health` payload, in place. Best-effort by design: an unexpected shape
+/// (or a model with no gold slice) is left untouched rather than erroring —
+/// this is a legibility annotation, and it must never be able to sink the
+/// digest that carries it.
+pub fn annotate_correction_loop(ml: &mut JsonValue) {
+    let Some(models) = ml.get_mut("models").and_then(JsonValue::as_array_mut) else {
+        return;
+    };
+    for m in models {
+        let banked = m
+            .get("corrections_banked")
+            .and_then(JsonValue::as_i64)
+            .unwrap_or(0);
+        let gold_acc = m
+            .get("gold")
+            .and_then(|g| g.get("accuracy"))
+            .and_then(JsonValue::as_f64);
+        let Some(state) = correction_loop_state(banked, gold_acc) else {
+            continue;
+        };
+        let Some(obj) = m.as_object_mut() else {
+            continue;
+        };
+        obj.insert("correction_loop".into(), json!(state));
+        obj.insert(
+            "correction_loop_note".into(),
+            json!(correction_loop_note(state)),
+        );
+    }
+}
+
+/// Reading guide for [`correction_loop_state`].
+pub fn correction_loop_note(state: &str) -> &'static str {
+    match state {
+        "not_converging" => {
+            "gold = held-out USER CORRECTIONS, so this measures whether the model has \
+             learned your overrides — NOT general quality (see holdout accuracy for \
+             that). Below 0.5 the corrections are not moving the model; they are \
+             likely outnumbered by LLM-labelled rows encoding the pre-correction \
+             opinion. Consider raising correction_weight or banking more corrections."
+        }
+        "partially_learned" => {
+            "the model agrees with a majority of your held-out corrections but not yet \
+             reliably; keep correcting"
+        }
+        "converged" => "the model reproduces your corrections on held-out examples",
+        "no_corrections_yet" => "no corrections banked — nothing to learn from yet",
+        _ => "correction-loop state could not be interpreted",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The motivating case: `pa-chief-of-staff` scored 1.0 on all 11 runs and
+    /// `pa-inbox-organizer` on all 9. Both read as "perfect quality"; both were
+    /// judges that had never been observed to fail anything.
+    #[test]
+    fn judge_pinned_at_max_is_flagged_saturated_not_perfect() {
+        assert_eq!(judge_signal(11, Some(1.0), Some(1.0)), "saturated_pass");
+        assert_eq!(judge_signal(9, Some(1.0), Some(1.0)), "saturated_pass");
+        assert!(judge_signal_note("saturated_pass").contains("FAILURE direction"));
+    }
+
+    /// `pa-inbox-organizer-work`: avg 0.556, worst 0.2 — a judge that genuinely
+    /// varies. It must NOT be flagged, or the flag becomes noise.
+    #[test]
+    fn varying_judge_is_discriminating() {
+        assert_eq!(
+            judge_signal(9, Some(0.5555555555555557), Some(0.2)),
+            "discriminating"
+        );
+    }
+
+    /// Small samples must not be called saturated — three 1.0s is not evidence
+    /// that a judge cannot fail.
+    #[test]
+    fn small_sample_is_not_saturation() {
+        assert_eq!(judge_signal(1, Some(1.0), Some(1.0)), "insufficient_runs");
+        assert_eq!(judge_signal(4, Some(1.0), Some(1.0)), "insufficient_runs");
+        assert_eq!(judge_signal(5, Some(1.0), Some(1.0)), "saturated_pass");
+    }
+
+    /// A judge stuck at zero is broken, not "strict" — distinguish it from a
+    /// judge stuck at max, since the operator actions differ.
+    #[test]
+    fn stuck_at_zero_is_distinct_from_stuck_at_max() {
+        assert_eq!(judge_signal(10, Some(0.0), Some(0.0)), "saturated_fail");
+        assert_eq!(judge_signal(10, Some(0.5), Some(0.5)), "saturated_constant");
+    }
+
+    /// NaN/inf must not be reported as a verdict.
+    #[test]
+    fn non_finite_scores_are_unknown() {
+        assert_eq!(judge_signal(10, Some(f64::NAN), Some(0.0)), "unknown");
+        assert_eq!(judge_signal(10, Some(1.0), Some(f64::INFINITY)), "unknown");
+        assert_eq!(judge_signal(10, None, Some(1.0)), "unknown");
+        assert_eq!(judge_signal(10, Some(1.0), None), "unknown");
+    }
+
+    /// The `inbox-classifier-personal` case: 108 corrections banked, gold
+    /// accuracy 0.09. Must read as "corrections not learned", never as a
+    /// general quality verdict.
+    #[test]
+    fn low_gold_with_banked_corrections_is_not_converging() {
+        assert_eq!(
+            correction_loop_state(108, Some(0.09375)),
+            Some("not_converging")
+        );
+        let note = correction_loop_note("not_converging");
+        assert!(note.contains("USER CORRECTIONS"));
+        assert!(
+            note.contains("NOT general quality"),
+            "the note must actively prevent the misread it exists to fix"
+        );
+    }
+
+    /// No gold slice → no verdict. Never synthesise one from absence.
+    #[test]
+    fn absent_gold_yields_no_state() {
+        assert_eq!(correction_loop_state(108, None), None);
+        assert_eq!(correction_loop_state(0, None), None);
+        assert_eq!(correction_loop_state(108, Some(f64::NAN)), None);
+    }
+
+    /// End-to-end over the real `loop_health` shape observed 2026-07-26: one
+    /// model with a gold slice, one (`ops-severity`, llm_only) without.
+    #[test]
+    fn annotation_stamps_only_models_with_gold() {
+        let mut ml = json!({"models": [
+            {"name": "inbox-classifier-personal", "corrections_banked": 108,
+             "gold": {"accuracy": 0.09375, "total": 32}},
+            {"name": "ops-severity", "corrections_banked": 7, "gold": null},
+        ]});
+        annotate_correction_loop(&mut ml);
+        let models = ml["models"].as_array().unwrap();
+        assert_eq!(models[0]["correction_loop"], "not_converging");
+        assert!(models[0]["correction_loop_note"]
+            .as_str()
+            .unwrap()
+            .contains("NOT general quality"));
+        assert!(
+            models[1].get("correction_loop").is_none(),
+            "a model with no gold slice must get NO verdict, not a default one"
+        );
+    }
+
+    /// The annotation is decoration on a best-effort panel — every malformed
+    /// shape must be a no-op, never a panic.
+    #[test]
+    fn annotation_tolerates_malformed_payloads() {
+        for mut v in [
+            json!({"available": false}),
+            json!({"models": "not-an-array"}),
+            json!({"models": [42, null, "x"]}),
+            json!({"models": [{"gold": {"accuracy": "high"}}]}),
+            json!(null),
+        ] {
+            annotate_correction_loop(&mut v); // must not panic
+        }
+    }
+
+    #[test]
+    fn correction_loop_bands() {
+        assert_eq!(
+            correction_loop_state(0, Some(0.1)),
+            Some("no_corrections_yet")
+        );
+        assert_eq!(
+            correction_loop_state(5, Some(0.6)),
+            Some("partially_learned")
+        );
+        assert_eq!(correction_loop_state(5, Some(0.95)), Some("converged"));
+    }
 
     #[test]
     fn autonomous_classification() {
