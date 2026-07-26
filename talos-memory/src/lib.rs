@@ -1934,7 +1934,7 @@ pub async fn recall_semantic_filtered(
                           OR metadata IS NULL \
                           OR metadata->>'kind' IS NULL \
                           OR metadata->>'kind' != ALL($6::text[])) \
-                   ORDER BY embedding <=> $2 \
+                   ORDER BY embedding <=> $2, id \
                    LIMIT $4";
         let rows = sqlx::query(sql)
             .bind(actor_id)

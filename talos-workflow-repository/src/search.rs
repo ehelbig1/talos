@@ -71,7 +71,7 @@ impl WorkflowRepository {
                AND input_embedding IS NOT NULL \
                AND (expires_at IS NULL OR expires_at > now()) \
                AND (1.0 - (input_embedding <=> $2::vector)) >= $3 \
-             ORDER BY input_embedding <=> $2::vector \
+             ORDER BY input_embedding <=> $2::vector, id \
              LIMIT 1",
         )
         .bind(workflow_id)
@@ -634,7 +634,7 @@ impl WorkflowRepository {
                  FROM workflows WHERE user_id = $1 AND embedding IS NOT NULL \
                     AND ($5 OR COALESCE(status, '') != 'archived') \
                     AND $4 = ANY(tags) \
-                 ORDER BY embedding <=> $2::vector \
+                 ORDER BY embedding <=> $2::vector, id \
                  LIMIT $3",
             )
             .bind(user_id)
@@ -650,7 +650,7 @@ impl WorkflowRepository {
                         1 - (embedding <=> $2::vector) AS match_score \
                  FROM workflows WHERE user_id = $1 AND embedding IS NOT NULL \
                     AND ($4 OR COALESCE(status, '') != 'archived') \
-                 ORDER BY embedding <=> $2::vector \
+                 ORDER BY embedding <=> $2::vector, id \
                  LIMIT $3",
             )
             .bind(user_id)

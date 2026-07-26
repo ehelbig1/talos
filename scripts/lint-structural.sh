@@ -3942,6 +3942,66 @@ else
 fi
 echo
 
+# ── 60. Vector-similarity ORDER BY needs a unique tiebreaker ──────────
+# (2026-07-26) `ORDER BY <col> <=> $n LIMIT $k` is a PARTIAL order whenever two
+# rows have equal distance — and duplicate embeddings are NORMAL, not
+# pathological: the same email/notification text is ingested repeatedly, so the
+# vectors are byte-identical. Postgres then breaks the tie by whatever heap
+# order the scan produced, which changes as rows are inserted, updated, or
+# vacuumed. The query returns a DIFFERENT top-k on identical data.
+#
+# The motivating incident: two `ml_eval_model` runs of the same model under the
+# same policy returned knn macro_f1 0.7065 vs 0.6152 and selected a DIFFERENT
+# backend, while the logistic-regression arm was bit-identical across both runs
+# — isolating the nondeterminism to the kNN neighbour query. `ml_examples`
+# holds exact-duplicate feature text with CONFLICTING labels (a bootstrap
+# `archive` and a human-corrected `to_read` for the same GitHub notification),
+# so a tie flips the k-neighbour vote. That made a PROMOTION GATE a coin-flip,
+# and with `auto_advance` a model can promote on a lucky draw. The same class
+# silently reorders semantic memory recall and can return a different row from
+# the semantic execution cache.
+#
+# This is structural check 28's principle (OFFSET pagination needs a unique
+# ORDER BY tiebreaker) applied to the ANN path. Fix: append the PK —
+#   ORDER BY embedding <=> $2, id
+# Opt out with `// allow-vector-order-no-tiebreaker: <reason>` when the caller
+# provably cannot have duplicate vectors.
+bold "▶ check 60: vector-similarity ORDER BY needs a unique tiebreaker"
+
+VECTOR_ORDER_VIOLATIONS=0
+vec_files=$(grep -rlE "ORDER BY [A-Za-z_]+ <=>" --include='*.rs' talos-* controller worker 2>/dev/null \
+    | grep -vE '/tests/|_tests\.rs' || true)
+
+for file in $vec_files; do
+    [ -f "$file" ] || continue
+    for lineno in $(grep -nE "ORDER BY [A-Za-z_]+ <=>" "$file" | cut -d: -f1); do
+        line=$(sed -n "${lineno}p" "$file")
+        start=$((lineno > 3 ? lineno - 3 : 1))
+        if sed -n "${start},${lineno}p" "$file" | grep -q '// allow-vector-order-no-tiebreaker:'; then
+            continue
+        fi
+        # A standalone `id` token AFTER the distance operator on the same line
+        # is the tiebreaker (e.g. "ORDER BY embedding <=> $2::vector, id").
+        after=${line#*<=>}
+        if echo "$after" | grep -qE '(^|[^a-z_])id([^a-z_]|$)'; then
+            continue
+        fi
+        red "✗ ${file}:${lineno}: vector ORDER BY without a unique tiebreaker"
+        yellow "    ${line}"
+        VECTOR_ORDER_VIOLATIONS=$((VECTOR_ORDER_VIOLATIONS + 1))
+    done
+done
+
+if [ "$VECTOR_ORDER_VIOLATIONS" -gt 0 ]; then
+    red "✗ ${VECTOR_ORDER_VIOLATIONS} vector-similarity ORDER BY site(s) can return a different top-k on identical data"
+    yellow "  → append the PK: ORDER BY <col> <=> \$N, id"
+    yellow "  → or mark '// allow-vector-order-no-tiebreaker: <reason>' if duplicate vectors are impossible"
+    EXIT_CODE=1
+else
+    green "✓ every vector-similarity ORDER BY carries a unique tiebreaker"
+fi
+echo
+
 # ── 54. Lint self-consistency (meta-check) ────────────────────────────
 # The system whose purpose is catching drift drifted from its own docs:
 # by 2026-07-01 the script had 49 checks while CLAUDE.md said 43 and the
