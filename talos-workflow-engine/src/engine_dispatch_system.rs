@@ -58,6 +58,69 @@ impl ParallelWorkflowEngine {
         .unwrap_or_else(|| !talos_capability_world::world_defaults_no_memory(capability_world))
     }
 
+    /// Resolve the `__staleness__` report for `node_id`, or `None` when the node
+    /// declares NO freshness contract.
+    ///
+    /// `None` is the overwhelmingly common case and costs nothing: the config
+    /// parse short-circuits before any await, so a graph without
+    /// `requires_fresh` issues zero extra queries on the dispatch path.
+    ///
+    /// Returns `(report, must_fail)`. `must_fail` is true only when a
+    /// requirement is genuinely violated AND the node opted into
+    /// `on_stale: "fail"`. An UNVERIFIABLE check (no resolver wired, no bound
+    /// actor, store error) never fails the node — it reports
+    /// `verified: false` so the condition is visible without a transient blip
+    /// taking down a pipeline. See
+    /// [`talos_workflow_engine_core::reserved_keys::unverified_staleness_report`].
+    pub(crate) async fn resolve_node_staleness(&self, node_id: Uuid) -> Option<(JsonValue, bool)> {
+        use talos_workflow_engine_core::reserved_keys as rk;
+
+        // No contract → nothing to check (zero-cost fast path).
+        let policy = rk::resolve_freshness_policy(self.node_configs.get(&node_id))?;
+
+        // A contract needs an actor to resolve keys against. Gate on actor_id
+        // (NOT actor_context): a node can declare `requires_fresh` without
+        // consuming the curated memory view.
+        let Some(actor_id) = self.actor_id else {
+            return Some((
+                rk::unverified_staleness_report("no actor bound to this execution"),
+                false,
+            ));
+        };
+        let Some(resolver) = self.memory_freshness_resolver.as_ref() else {
+            return Some((
+                rk::unverified_staleness_report("no memory-freshness resolver wired"),
+                false,
+            ));
+        };
+
+        let keys: Vec<String> = policy.requirements.iter().map(|(k, _)| k.clone()).collect();
+        let Some(ages) = resolver.resolve_ages_hours(actor_id, &keys).await else {
+            return Some((
+                rk::unverified_staleness_report("freshness lookup declined or failed"),
+                false,
+            ));
+        };
+
+        // Present keys carry an age; declared-but-absent keys map to None and
+        // are reported stale by the builder ("no data" is not "fresh data").
+        let ages_opt: std::collections::HashMap<String, Option<f64>> = keys
+            .iter()
+            .map(|k| (k.clone(), ages.get(k).copied()))
+            .collect();
+        let (report, any_stale) = rk::build_staleness_report(&policy, &ages_opt);
+        let must_fail = any_stale && policy.on_stale == rk::OnStale::Fail;
+        if any_stale {
+            tracing::warn!(
+                target: "talos_freshness",
+                %node_id, %actor_id, must_fail,
+                stale = %rk::describe_stale_entries(&report),
+                "node input freshness contract violated"
+            );
+        }
+        Some((report, must_fail))
+    }
+
     /// Gather inputs for a node based on completed parent results.
     ///
     /// - **Single parent**: passes the parent output directly (unwrapped)

@@ -291,6 +291,10 @@ pub async fn inject_actor_context_into_input(
             talos_workflow_engine_core::reserved_keys::ACTOR_CONTEXT,
             talos_workflow_engine_core::reserved_keys::ACCUMULATED,
             talos_workflow_engine_core::reserved_keys::TRIGGER_INPUT,
+            // Engine-authored freshness verdict: a caller-supplied copy would
+            // be a trust-signal spoof — claiming "inputs verified fresh" on
+            // data the engine never checked.
+            talos_workflow_engine_core::reserved_keys::STALENESS,
         ] {
             obj.remove(reserved);
         }

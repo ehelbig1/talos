@@ -589,6 +589,16 @@ impl ParallelWorkflowEngine {
         self.sub_actor_context_resolver = Some(resolver);
     }
 
+    /// Wire the actor-memory freshness probe backing the per-node
+    /// `requires_fresh` contract. Optional: without it, a node that declares a
+    /// contract receives an explicitly unverified `__staleness__` report.
+    pub fn set_memory_freshness_resolver(
+        &mut self,
+        resolver: Arc<dyn talos_workflow_engine_core::MemoryFreshnessResolver>,
+    ) {
+        self.memory_freshness_resolver = Some(resolver);
+    }
+
     /// Replace the default secrets resolver. Consumers that don't
     /// have a purpose-built secrets manager plug in their own impl
     /// here. Callers using `with_services` / `with_services_and_resolver`

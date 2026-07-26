@@ -248,6 +248,24 @@ impl ParallelWorkflowEngine {
                     merged.insert("__actor_context__".to_string(), ctx.clone());
                 }
             }
+            // Input-freshness contract: when this node declares `requires_fresh`,
+            // answer with a `__staleness__` report so it can never present stale
+            // memory as current. `None` = no contract (zero cost, unchanged
+            // behavior). `on_stale: "fail"` short-circuits the dispatch with a
+            // real error instead of a plausible-looking wrong answer.
+            if let Some((report, must_fail)) = self.resolve_node_staleness(node_id).await {
+                if must_fail {
+                    let detail =
+                        talos_workflow_engine_core::reserved_keys::describe_stale_entries(&report);
+                    return (
+                        node_idx,
+                        Err(format!(
+                            "input freshness contract violated (on_stale=fail): {detail}"
+                        )),
+                    );
+                }
+                merged.insert("__staleness__".to_string(), report);
+            }
             // `__trigger_input__` survives every hop — including across
             // sub-workflow boundaries when the dispatcher wraps the child
             // trigger with `__trigger_input__: parent_ti`. Injecting it

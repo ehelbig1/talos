@@ -454,6 +454,59 @@ impl ParallelWorkflowEngine {
                     }
                 }
             }
+            // Input-freshness contracts across the chain. Unlike actor-context
+            // (keyed on the head), freshness is checked for EVERY node in the
+            // chain: a chain is any linear in=out=1 run, so the memory-reading
+            // node is often NOT the head (the delivery pattern's
+            // compose → send is exactly this shape). Keying on the head alone
+            // would silently ignore a declared contract — the same silent-miss
+            // class this mechanism exists to remove. Reports merge by entry
+            // union; the chain fails if ANY node opted into on_stale=fail and
+            // is genuinely violated.
+            let mut merged_entries: Vec<JsonValue> = Vec::new();
+            let mut merged_any_stale = false;
+            let mut merged_verified = true;
+            let mut declared = false;
+            for &nid in &chain_node_ids {
+                if let Some((report, must_fail)) = self.resolve_node_staleness(nid).await {
+                    declared = true;
+                    if must_fail {
+                        let detail =
+                            talos_workflow_engine_core::reserved_keys::describe_stale_entries(
+                                &report,
+                            );
+                        return (
+                            chain_tail,
+                            Err(format!(
+                                "input freshness contract violated (on_stale=fail): {detail}"
+                            )),
+                        );
+                    }
+                    merged_any_stale |= report
+                        .get("any_stale")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    merged_verified &= report
+                        .get("verified")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if let Some(entries) = report.get("entries").and_then(|e| e.as_array()) {
+                        merged_entries.extend(entries.iter().cloned());
+                    }
+                }
+            }
+            if declared {
+                if let Some(obj) = wrapped.as_object_mut() {
+                    obj.insert(
+                        "__staleness__".to_string(),
+                        serde_json::json!({
+                            "verified": merged_verified,
+                            "any_stale": merged_any_stale,
+                            "entries": merged_entries,
+                        }),
+                    );
+                }
+            }
             first.input_payload = wrapped;
         }
 

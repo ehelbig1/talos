@@ -68,6 +68,14 @@ pub(super) fn build_controller_engine_registry_only(
             workflow_repo,
         ),
     ));
+    // Per-node input-freshness probe (`requires_fresh` → `__staleness__`).
+    // Consulted only for nodes that declare a contract, so wiring it costs
+    // nothing for graphs that don't use it.
+    engine.set_memory_freshness_resolver(Arc::new(
+        crate::memory_freshness_resolver::ControllerMemoryFreshnessResolver::from_pool(
+            pool.clone(),
+        ),
+    ));
     engine.set_event_sink(Arc::new(PostgresEventSink::new(pool.clone())));
     engine.set_node_hook(Arc::new(ControllerNodeHook::new(pool.clone())));
     engine.set_module_execution_store(Arc::new(PostgresModuleExecutionStore::new(pool.clone())));
