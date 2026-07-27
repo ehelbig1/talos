@@ -2347,10 +2347,12 @@ impl EncryptedSecrets {
 ///
 /// # Invariant: `raw` and `value` are never supplied independently
 ///
-/// There is deliberately NO constructor that accepts both halves. A caller who
-/// could set `raw` and `value` separately could desync them — signing one
-/// payload while the module executes another — which is precisely the bug class
-/// this type exists to make unrepresentable. Construct from a
+/// There is deliberately NO constructor that accepts both halves, and NO
+/// mutable accessor (`&mut Value`, `raw_mut`, …). A caller who could set — or
+/// mutate — `raw` and `value` independently could desync them, signing one
+/// payload while the module executes another, which is precisely the bug class
+/// this type exists to make unrepresentable. Do not add one: mutate the
+/// `Value` you own and build a fresh `SignedJson` from it. Construct from a
 /// [`serde_json::Value`] (send side) or by deserialising (receive side).
 ///
 /// Note the two halves are semantically equal but need not be bit-equal: on the
@@ -2359,8 +2361,51 @@ impl EncryptedSecrets {
 /// nothing security-relevant is ever derived from `value` — see
 /// [`Self::raw_bytes`].
 ///
+/// # Why exotic JSON text is not an attack surface
+///
+/// `raw` can hold text a `Value` can never round-trip back to: duplicate keys
+/// (`{"a":1,"a":2}`, which parses last-wins), interior padding, non-shortest
+/// float spellings, redundant `\u` escapes. The signature covers that text
+/// while every consumer reads the deduplicated `value` — so it is worth being
+/// explicit about who can put such text there:
+///
+/// * Both sides only ever MINT raw text through `From<Value>`, i.e.
+///   `Value::to_string()`, which cannot emit duplicate keys or padding.
+/// * The only other way raw text enters is deserialisation of a message that
+///   ALREADY VERIFIES under a signing key — the digest covers the exact bytes,
+///   so an on-path attacker who rewrites the payload text (even into a
+///   semantically identical form) invalidates the signature and the message is
+///   refused before anything reads `value`.
+/// * Worker output never becomes controller-signed request text verbatim: the
+///   engine takes `into_value()`/`value().clone()` and a fresh `From<Value>`
+///   re-mints the bytes, so exotic text cannot be laundered across a signing
+///   boundary by a keyless component.
+///
+/// Consequently duplicate-key smuggling requires the signing key, and a key
+/// holder can already send whatever it likes. Pinned by
+/// `signature_binds_payload_text_not_meaning`. Corollary worth knowing before
+/// anyone "helpfully" normalises: because the binding is textual, ANY
+/// semantics-preserving reformatting between signer and verifier now fails
+/// closed. Nothing reformats today (NATS delivers bytes verbatim) — do not
+/// introduce a JSON-rewriting hop, and do not re-canonicalise to tolerate one.
+///
+/// # Cost, and deploy ordering
+///
 /// Memory cost is ≈2× the payload text (raw + parsed view), bounded by the NATS
-/// `max_payload` limit that already bounds every message.
+/// `max_payload` limit that already bounds every message; deserialisation also
+/// walks the payload twice (raw capture, then parse), which — like the single
+/// parse it replaces — happens BEFORE signature verification. Both are bounded
+/// by the transport cap and the worker's own pre-deserialise size check.
+///
+/// Controllers and workers must roll TOGETHER. A mixed fleet fails closed (a
+/// verification error, never an accept or a panic) in both directions — the
+/// wire BYTES are unchanged, only the digest formula moved — but it fails MORE
+/// often than the pre-fix code did, not less. An old peer hashes the
+/// once-normalised form, so a mixed pair diverges for EVERY payload whose float
+/// spelling is unstable at all (39_495 + 19_721 of 199_902 sampled f64),
+/// whereas the pre-fix pair only diverged for those still unstable after one
+/// pass (19_721) — roughly 3× the failure surface. Expect elevated dispatch
+/// failures for the duration of a staggered rollout, and keep the window short.
 #[derive(Debug, Clone)]
 pub struct SignedJson {
     /// The authoritative form: the exact JSON text that is (or was) on the wire.
@@ -5655,10 +5700,14 @@ mod tests {
     /// hold instead is that the payload text the sender hashed is EXACTLY the
     /// text the receiver hashes, for arbitrary JSON.
     ///
-    /// Asserted at both levels the signature depends on: the raw bytes
-    /// themselves, and the SHA-256 the signing payload embeds. Checking the
-    /// digest and not just the bytes is deliberate — it is the digest that a
-    /// future refactor could quietly re-derive from the parsed value.
+    /// Asserted at all three levels the signature depends on: the raw bytes,
+    /// their SHA-256, and — load-bearing — that the digest the REAL
+    /// `signing_payload()` embeds is that same one. The third assertion is the
+    /// one with teeth: without it the first two are self-referential (the test
+    /// would hash `raw_bytes()` itself and prove nothing about the production
+    /// hash site), so a refactor that quietly re-derived the digest from the
+    /// parsed value would sail past. Verified by mutation: flipping
+    /// `signing_payload`'s input hash to `value().to_string()` fails this test.
     #[test]
     fn signed_payload_bytes_survive_the_wire_for_arbitrary_json() {
         use sha2::Digest;
@@ -5669,6 +5718,7 @@ mod tests {
 
             let sent_bytes = req.input_payload.raw_bytes().to_vec();
             let sent_hash = Sha256::digest(&sent_bytes);
+            let sent_hash_hex = hex::encode(sent_hash);
 
             let wire = serde_json::to_vec(&req).expect("serialise");
             let received: JobRequest = serde_json::from_slice(&wire).expect("deserialise");
@@ -5685,6 +5735,19 @@ mod tests {
                 sent_hash,
                 "iter {i}: signed payload DIGEST changed across the wire"
             );
+            // The digest the signature actually commits to must be the
+            // wire-bytes digest, on BOTH sides of the hop.
+            for (side, req) in [("sender", &req), ("receiver", &received)] {
+                let signed = req.signing_payload();
+                // Lossy on purpose: the assertion is an ASCII-hex substring
+                // search, so a future non-UTF-8 field must not turn this into
+                // an unrelated panic.
+                assert!(
+                    String::from_utf8_lossy(&signed).contains(&sent_hash_hex),
+                    "iter {i}: {side}'s signing payload does not commit to the \
+                     wire-bytes digest — it is hashing a re-derived form"
+                );
+            }
         }
     }
 
@@ -5849,6 +5912,73 @@ mod tests {
             "if this ever starts preserving bytes, serde_json changed — relax \
              the rule deliberately rather than by accident"
         );
+    }
+
+    /// The signature binds the payload's exact TEXT, not its meaning — the
+    /// security consequence of [`SignedJson`] carrying raw bytes.
+    ///
+    /// `SignedJson` can hold text no `Value` would ever emit: duplicate keys,
+    /// padding, non-shortest number spellings. Consumers read the deduplicated
+    /// parse, so the natural worry is a signed/executed split. This pins both
+    /// halves of why there isn't one:
+    ///
+    /// 1. A KEYLESS on-path attacker cannot exploit it. Every rewrite below is
+    ///    semantics-preserving — each parses to the very `Value` the sender
+    ///    signed, so a "canonical form" signature would have ACCEPTED them —
+    ///    and every one is refused, because the digest covers the bytes.
+    /// 2. A KEY HOLDER can of course sign exotic text, and when it does the
+    ///    two halves stay consistent: the verifier checks the exact bytes and
+    ///    the module executes the last-wins parse of those same bytes. There is
+    ///    no view of the message that disagrees with the one that was signed.
+    #[test]
+    fn signature_binds_payload_text_not_meaning() {
+        let key = test_key();
+        let mut req = minimal_req();
+        req.input_payload = serde_json::json!({"a": 1}).into();
+        req.sign(&key).unwrap();
+        let wire = String::from_utf8(serde_json::to_vec(&req).unwrap()).unwrap();
+        let sent = r#""input_payload":{"a":1}"#;
+        assert!(wire.contains(sent), "payload text not found on the wire");
+
+        // 1. Keyless rewrites: same meaning, different bytes → all refused.
+        for rewrite in [
+            r#""input_payload":{"a" : 1}"#,     // interior padding
+            r#""input_payload":{"a":0,"a":1}"#, // duplicate key, last-wins
+            r#""input_payload":{"a":1.0}"#,     // different number spelling
+            // escaped key spelling: same key name, different bytes
+            r#""input_payload":{"\u0061":1}"#,
+        ] {
+            let tampered: JobRequest = serde_json::from_str(&wire.replace(sent, rewrite))
+                .unwrap_or_else(|e| panic!("rewrite {rewrite} must still be valid JSON: {e}"));
+            assert_eq!(
+                tampered.input_payload.value().get("a").unwrap().as_f64(),
+                Some(1.0),
+                "precondition: {rewrite} must be semantics-preserving, or the \
+                 test proves nothing about text-vs-meaning"
+            );
+            assert!(
+                tampered.verify_no_replay(&key, 300).is_err(),
+                "rewriting the payload text to {rewrite} must invalidate the \
+                 signature — duplicate-key smuggling requires the signing key"
+            );
+        }
+
+        // 2. Key holder signs duplicate-key text: raw survives the wire and
+        //    the parsed view is the last-wins reading of those same bytes.
+        let dup = r#""input_payload":{"a":9,"a":1}"#;
+        let mut exotic: JobRequest = serde_json::from_str(&wire.replace(sent, dup)).unwrap();
+        exotic.sign(&key).unwrap();
+        let received: JobRequest =
+            serde_json::from_slice(&serde_json::to_vec(&exotic).unwrap()).unwrap();
+        assert_eq!(
+            received.input_payload.raw_bytes(),
+            br#"{"a":9,"a":1}"#,
+            "the exotic text must survive the wire verbatim"
+        );
+        assert_eq!(received.input_payload.value(), &serde_json::json!({"a": 1}));
+        received
+            .verify_no_replay(&key, 300)
+            .expect("text the key holder actually signed must verify");
     }
 
     fn ed_keypair() -> DispatchSigningKey {
