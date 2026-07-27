@@ -64,7 +64,8 @@ pub fn tool_schemas() -> Vec<Value> {
             "description": "Collapse CONTENT-duplicate training examples to one row per distinct content, keeping the highest-precedence label (correction > llm_production > everything else, newest first). DEFAULTS TO DRY-RUN: pass apply=true to actually delete. Distinct emails can carry byte-identical Subject/From/Snippet (e.g. a scheduled CI workflow re-failing on one commit), which the (dataset_id, example_key) upsert cannot collapse because the message ids genuinely differ. Those rows are an irreducible contradiction in feature space — identical features with different labels — so a majority of stale teacher labels silently outvotes a human correction, and they mint the duplicate embeddings that make kNN neighbour votes tie-dependent. Reports duplicate_groups, conflicting_groups (groups carrying more than one label), rows_removable, and corrections_superseded (duplicate corrections where only the newest survives — this decrements corrections_banked and can move the min_corrections_per_class gate). Destructive when applied; training data is not trivially reconstructible, so run the dry-run first and re-run ml_eval_model after.",
             "inputSchema": { "type": "object", "properties": {
                 "dataset_id": { "type": "string" },
-                "apply": { "type": "boolean", "description": "false/omitted = dry-run (default): report what would be removed, delete nothing. true = perform the deletion." }
+                "apply": { "type": "boolean", "description": "false/omitted = dry-run (default): report what would be removed, delete nothing. true = perform the deletion." },
+                "include_corrections": { "type": "boolean", "description": "false/omitted (default) PROTECTS human corrections — duplicate correction rows are kept even when they are content-duplicates. true also collapses duplicate corrections to the newest per content, which is semantically right but DECREMENTS corrections_banked and can move the min_corrections_per_class promotion gate. The append-path auto-dedupe always protects." }
             }, "required": ["dataset_id"] }
         }),
         serde_json::json!({
@@ -470,6 +471,12 @@ async fn handle_dedupe_dataset(
     // Absent / non-boolean `apply` is a dry-run: an unparseable argument must
     // never be the one that deletes rows.
     let apply = args.get("apply").and_then(Value::as_bool).unwrap_or(false);
+    // Same fail-safe reading as `apply`: absent or non-boolean protects the
+    // human-authored rows.
+    let include_corrections = args
+        .get("include_corrections")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let svc = dataset_service(state);
     let mut tx = match user_tx(state, user_id).await {
         Ok(tx) => tx,
@@ -478,7 +485,10 @@ async fn handle_dedupe_dataset(
     if let Err(m) = require_dataset_owner(&svc, &mut tx, dataset_id, user_id).await {
         return mcp_error(req_id, -32000, &m);
     }
-    match svc.dedupe_by_content(&mut tx, dataset_id, !apply).await {
+    match svc
+        .dedupe_by_content(&mut tx, dataset_id, !apply, !include_corrections)
+        .await
+    {
         Ok(outcome) => {
             // A dry-run must not hold a write tx open past its usefulness;
             // committing an unchanged tx is also correct and keeps one path.
@@ -1285,20 +1295,68 @@ async fn handle_disagreements(
     let Ok(Some(model)) = ModelRegistry::resolve_by_name(&mut tx, name, user_id).await else {
         return mcp_error(req_id, -32000, "Model not found");
     };
+    // Which classes are actually blocking promotion, so the queue can lead
+    // with rows that can move a gate. Best-effort: no policy, no eval yet, or
+    // a read failure simply means no prioritisation — never a failed review.
+    let blocking = match ModelRegistry::list_versions(&mut tx, model.model_id).await {
+        Ok(versions) => {
+            let latest = versions.first().map(|v| &v.metrics_json);
+            match model
+                .policy_json
+                .as_ref()
+                .and_then(|p| talos_ml::PolicyJson::parse(p).ok())
+            {
+                Some(policy) => talos_ml::classes_below_recall_floor(
+                    &policy,
+                    latest.and_then(|m| m.pointer("/report/per_class")),
+                ),
+                None => Vec::new(),
+            }
+        }
+        Err(_) => Vec::new(),
+    };
     match svc
         .pending_disagreements(&mut tx, model.model_id, user_id, limit)
         .await
     {
-        Ok(items) => mcp_text(
-            req_id,
-            &serde_json::to_string_pretty(&serde_json::json!({
-                "model_id": model.model_id.to_string(),
-                "lifecycle_state": model.lifecycle_state,
-                "pending": items,
-                "next_step": "for each: ml_resolve_disagreement with correct_label (appends a gold correction) or without (dismiss)",
-            }))
-            .unwrap_or_default(),
-        ),
+        Ok(items) => {
+            let total = items.len();
+            let items = talos_ml::prioritize_disagreements(items, &blocking);
+            let leading = items
+                .iter()
+                .filter(|r| {
+                    blocking
+                        .iter()
+                        .any(|c| r.llm_label == *c || r.fast_label.as_deref() == Some(c.as_str()))
+                })
+                .count();
+            let next_step = if blocking.is_empty() {
+                "for each: ml_resolve_disagreement with correct_label (appends a gold \
+                 correction) or without (dismiss)"
+                    .to_string()
+            } else {
+                format!(
+                    "{leading} of {total} rows below touch a class that is BLOCKING promotion \
+                     ({}) and are listed first — labelling those moves a gate; the rest do not. \
+                     For each: ml_resolve_disagreement with correct_label (appends a gold \
+                     correction) or without (dismiss).",
+                    blocking.join(", ")
+                )
+            };
+            mcp_text(
+                req_id,
+                &serde_json::to_string_pretty(&serde_json::json!({
+                    "model_id": model.model_id.to_string(),
+                    "lifecycle_state": model.lifecycle_state,
+                    // Classes whose latest-eval recall is under the policy floor.
+                    // Empty = no per-class gate is currently unmet.
+                    "blocking_classes": blocking,
+                    "pending": items,
+                    "next_step": next_step,
+                }))
+                .unwrap_or_default(),
+            )
+        }
         Err(e) => internal(req_id, "disagreements", &e),
     }
 }

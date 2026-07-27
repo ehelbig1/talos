@@ -523,6 +523,73 @@ pub struct PendingDisagreement {
     pub duplicate_ids: Vec<Uuid>,
 }
 
+/// Classes whose latest-eval recall sits BELOW the policy's floor — i.e. the
+/// classes actually blocking promotion.
+///
+/// Review attention is the scarcest input to the whole loop, and the gray band
+/// spends it in proportion to TRAFFIC. That is the wrong denominator: after the
+/// content-dedupe, `archive` was still 58% of the dataset while the only unmet
+/// per-class gate was `to_read` recall (0.679 against a 0.85 floor). Labelling
+/// more `archive` cannot move a `to_read` floor, so an operator working the
+/// queue top-down makes no promotion progress however diligent they are.
+///
+/// `per_class` is the raw `metrics_json.report.per_class` object; a class named
+/// in the floors but ABSENT from the report counts as blocking — the same
+/// fail-closed reading `evaluate_policy` uses, since an unmeasurable gate is
+/// not a satisfied one. Returned sorted for deterministic output.
+pub fn classes_below_recall_floor(
+    policy: &PolicyJson,
+    per_class: Option<&serde_json::Value>,
+) -> Vec<String> {
+    let Some(floors) = policy.recall_floors.as_ref() else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = floors
+        .iter()
+        .filter(|(class, floor)| {
+            match per_class
+                .and_then(|pc| pc.get(class.as_str()))
+                .and_then(|m| m.get("recall"))
+                .and_then(serde_json::Value::as_f64)
+            {
+                Some(recall) => recall < **floor,
+                // Absent / unparseable: fail closed, same as evaluate_policy.
+                None => true,
+            }
+        })
+        .map(|(class, _)| class.clone())
+        .collect();
+    out.sort();
+    out
+}
+
+/// Stable-partition review rows so those about a promotion-blocking class come
+/// first, preserving the existing order within each partition.
+///
+/// A row is "about" a class when EITHER model proposed it: the fast label is
+/// what a correction would overturn, and the teacher label is what it would
+/// confirm — either way, labelling that row informs the blocked class.
+///
+/// Stability matters: the recency order the queue is built with (and the
+/// duplicate grouping already applied over it) must survive this reordering, so
+/// prioritisation stays a presentation concern and never changes which row
+/// survives a group.
+pub fn prioritize_disagreements(
+    rows: Vec<PendingDisagreement>,
+    blocking: &[String],
+) -> Vec<PendingDisagreement> {
+    if blocking.is_empty() {
+        return rows;
+    }
+    let touches = |r: &PendingDisagreement| {
+        blocking
+            .iter()
+            .any(|c| r.llm_label == *c || r.fast_label.as_deref() == Some(c.as_str()))
+    };
+    let (hot, cold): (Vec<_>, Vec<_>) = rows.into_iter().partition(touches);
+    hot.into_iter().chain(cold).collect()
+}
+
 /// Collapse exact-duplicate pending divergences into one reviewable row,
 /// carrying the collapsed ids on the survivor.
 ///
@@ -953,6 +1020,83 @@ mod tests {
             created_at: chrono::Utc::now(),
             duplicate_ids: Vec::new(),
         }
+    }
+
+    fn policy_with_floors(floors: &[(&str, f64)]) -> PolicyJson {
+        let mut p = PolicyJson::default();
+        p.recall_floors = Some(floors.iter().map(|(c, f)| ((*c).to_string(), *f)).collect());
+        p
+    }
+
+    /// The live case: `to_read` recall 0.679 against a 0.85 floor was the only
+    /// unmet per-class gate, while `archive` (58% of the data) was comfortably
+    /// over its own.
+    #[test]
+    fn only_classes_under_their_floor_are_blocking() {
+        let policy = policy_with_floors(&[("to_read", 0.85), ("follow_up", 0.75)]);
+        let per_class = serde_json::json!({
+            "archive":   {"recall": 0.885},
+            "to_read":   {"recall": 0.679},
+            "follow_up": {"recall": 0.75},
+        });
+        assert_eq!(
+            classes_below_recall_floor(&policy, Some(&per_class)),
+            vec!["to_read".to_string()],
+            "a floor met EXACTLY (follow_up 0.75) is met, not blocking"
+        );
+    }
+
+    /// A class named in the floors but missing from the report is unmeasurable,
+    /// and an unmeasurable gate is not a satisfied one.
+    #[test]
+    fn absent_or_unparseable_class_fails_closed() {
+        let policy = policy_with_floors(&[("to_read", 0.85)]);
+        assert_eq!(
+            classes_below_recall_floor(&policy, Some(&serde_json::json!({}))),
+            vec!["to_read".to_string()]
+        );
+        assert_eq!(
+            classes_below_recall_floor(&policy, None),
+            vec!["to_read".to_string()]
+        );
+        let bad = serde_json::json!({"to_read": {"recall": "high"}});
+        assert_eq!(
+            classes_below_recall_floor(&policy, Some(&bad)),
+            vec!["to_read".to_string()]
+        );
+    }
+
+    #[test]
+    fn no_floors_means_nothing_blocking() {
+        assert!(classes_below_recall_floor(&PolicyJson::default(), None).is_empty());
+    }
+
+    #[test]
+    fn prioritization_moves_blocking_rows_first_and_is_stable() {
+        let a = pending("A", Some("archive"), "archive");
+        let b = pending("B", Some("archive"), "to_read"); // teacher says to_read
+        let c = pending("C", Some("to_read"), "archive"); // fast says to_read
+        let d = pending("D", Some("archive"), "archive");
+        let (ia, ib, ic, id) = (a.id, b.id, c.id, d.id);
+        let out = prioritize_disagreements(vec![a, b, c, d], &["to_read".to_string()]);
+        assert_eq!(
+            out.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![ib, ic, ia, id],
+            "blocking rows first, original relative order preserved in both halves"
+        );
+    }
+
+    /// No blocking classes → the queue must come back untouched, not reordered
+    /// by some incidental partition.
+    #[test]
+    fn empty_blocking_set_is_identity() {
+        let rows = vec![
+            pending("A", Some("archive"), "archive"),
+            pending("B", Some("to_read"), "to_read"),
+        ];
+        let ids: Vec<_> = rows.iter().map(|r| r.id).collect();
+        let out = prioritize_disagreements(rows, &[]);
+        assert_eq!(out.iter().map(|r| r.id).collect::<Vec<_>>(), ids);
     }
 
     /// The motivating case: four copies of the SAME Chief-of-Staff briefing
