@@ -239,11 +239,19 @@ export default function ModelReview() {
     onError: () => toast.error("Could not resolve disagreement"),
   });
 
-  // The model's label vocabulary, derived from the candidate labels in the
-  // feed (no hardcoded bucket set — works for any classifier). The LLM's
-  // label is the usual "correct" answer, so it's visually emphasized.
+  // The model's label vocabulary. Server-supplied from the DATASET, not
+  // inferred from the feed: a feed-derived list omits any class no pending row
+  // happens to propose, and the reviewer then cannot record that answer at all
+  // — which is exactly the most informative correction, since both models
+  // being wrong is a stronger signal than either alone. (Observed: a CI-failure
+  // row with fast=to_read / llm=archive that the reviewer judged follow_up, and
+  // no follow_up button existed.)
+  //
+  // The feed labels are still unioned in as a fallback, so an older server that
+  // does not send `labelVocabulary` degrades to the previous behaviour rather
+  // than rendering no buttons at all.
   const labelOptions = useMemo(() => {
-    const s = new Set<string>();
+    const s = new Set<string>(feed?.labelVocabulary ?? []);
     // Depend on the cached array reference (feed?.pending), not the
     // per-render `?? []` fallback, so this only recomputes on real change.
     for (const d of feed?.pending ?? []) {
@@ -251,7 +259,7 @@ export default function ModelReview() {
       s.add(d.llmLabel);
     }
     return [...s].sort();
-  }, [feed?.pending]);
+  }, [feed?.pending, feed?.labelVocabulary]);
 
   const busyId =
     resolve.isPending && resolve.variables
