@@ -48,9 +48,30 @@ up: ## Build + start the full dev stack, wait for health
 	    printf '\033[1;31m✗ no .env found.\033[0m Run `make setup` to generate one (or see QUICKSTART.md).\n'; \
 	    exit 1; \
 	}
-	@GIT_SHA_OVERRIDE="$$(git rev-parse --short=7 HEAD 2>/dev/null || echo unknown)" \
+	@dirty="$$(git status --porcelain 2>/dev/null | head -5)"; \
+	 if [ -n "$$dirty" ]; then \
+	    printf '\033[1;33m⚠ working tree is DIRTY — images will be stamped `-dirty` and correspond to NO commit.\033[0m\n'; \
+	    printf '\033[1;33m  Nobody (including you, later) can reason about what is in them. Modified:\033[0m\n'; \
+	    git status --porcelain 2>/dev/null | head -5 | sed 's/^/    /'; \
+	 fi
+	@before_c="$$(docker image inspect -f '{{.Id}}' talos-controller 2>/dev/null || echo none)"; \
+	 before_w="$$(docker image inspect -f '{{.Id}}' talos-worker 2>/dev/null || echo none)"; \
+	 GIT_SHA_OVERRIDE="$$(git rev-parse --short=7 HEAD 2>/dev/null || echo unknown)" \
 	 GIT_DIRTY_OVERRIDE="$$([ -n "$$(git status --porcelain 2>/dev/null)" ] && echo true || echo false)" \
-	 docker compose build controller worker migrate
+	 docker compose build controller worker migrate; \
+	 after_c="$$(docker image inspect -f '{{.Id}}' talos-controller 2>/dev/null || echo none)"; \
+	 after_w="$$(docker image inspect -f '{{.Id}}' talos-worker 2>/dev/null || echo none)"; \
+	 changed=""; \
+	 [ "$$before_c" != "$$after_c" ] && changed="$$changed controller"; \
+	 [ "$$before_w" != "$$after_w" ] && changed="$$changed worker"; \
+	 if [ -n "$$changed" ]; then \
+	    printf '\033[1;32m✓ rebuilt:%s\033[0m\n' "$$changed"; \
+	 else \
+	    printf '\033[1;33m⚠ NOTHING REBUILT — controller and worker images are byte-identical to before.\033[0m\n'; \
+	    printf '\033[1;33m  Every layer was cached, so this deploy ships the SAME code you were already running.\033[0m\n'; \
+	    printf '\033[1;33m  If you expected a change: docker builder prune -f --filter type=exec.cachemount\033[0m\n'; \
+	 fi
+	@printf '\033[1;36m→ controller/worker must roll TOGETHER: signed wire formats are version-coupled\033[0m\n'
 	@if grep -Eq '^NGROK_AUTHTOKEN=.+' .env 2>/dev/null; then \
 	    printf '\033[1;36m→ NGROK_AUTHTOKEN present — starting public tunnel (compose profile: public)\033[0m\n'; \
 	    COMPOSE_PROFILES=public docker compose up -d --scale worker=1; \
