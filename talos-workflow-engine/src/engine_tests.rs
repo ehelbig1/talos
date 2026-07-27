@@ -1187,6 +1187,40 @@ fn extract_judge_score_defaults_passed_false_when_absent() {
     assert_eq!(extract_judge_score(&out), Some((0.10, false)));
 }
 
+/// A verdict that declared itself NOT APPLICABLE must contribute NO datapoint.
+/// Recording it as a pass is the mirror of the bug it replaced: scoring a run
+/// with nothing to judge as 1.0 stopped the false failures but inflated the
+/// average and saturated the signal (pa-inbox-organizer-work read 1.0 across 17
+/// runs, almost all empty inboxes).
+#[test]
+fn extract_judge_score_skips_not_applicable_runs() {
+    let out = serde_json::json!({
+        "__judge_score__": 1.0,
+        "__judge_passed__": true,
+        "__judge_not_applicable__": true,
+        "__judge_reasoning__": "no messages to classify",
+    });
+    assert_eq!(extract_judge_score(&out), None);
+}
+
+/// The marker only suppresses when it is genuinely true — `false` or a
+/// non-boolean must not silently drop a real quality datapoint.
+#[test]
+fn extract_judge_score_records_when_not_applicable_is_false_or_malformed() {
+    let explicit_false = serde_json::json!({
+        "__judge_score__": 0.4,
+        "__judge_passed__": false,
+        "__judge_not_applicable__": false,
+    });
+    assert_eq!(extract_judge_score(&explicit_false), Some((0.4, false)));
+    let malformed = serde_json::json!({
+        "__judge_score__": 0.4,
+        "__judge_passed__": true,
+        "__judge_not_applicable__": "yes",
+    });
+    assert_eq!(extract_judge_score(&malformed), Some((0.4, true)));
+}
+
 #[test]
 fn extract_judge_score_none_without_score() {
     // Non-judge node output (no `__judge_score__`) → nothing to record.

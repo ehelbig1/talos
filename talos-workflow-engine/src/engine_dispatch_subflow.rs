@@ -207,6 +207,20 @@ impl JudgeVerdict {
 /// without a runtime. DLP: intentionally reads only the score + pass
 /// boolean, never the reasoning/feedback text.
 pub(crate) fn extract_judge_score(output: &JsonValue) -> Option<(f64, bool)> {
+    // A verdict that declared itself NOT APPLICABLE contributes no datapoint.
+    // Recording it as a pass is the mirror of the bug it replaced: scoring a
+    // run with nothing to judge as 1.0 stopped the false failures but inflated
+    // the average and saturated the signal — `pa-inbox-organizer-work` read
+    // 1.0 across 17 runs purely because most were empty inboxes. "Nothing to
+    // measure" is not evidence of quality, exactly as it is not evidence of
+    // failure; the honest record is no row at all.
+    if output
+        .get("__judge_not_applicable__")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return None;
+    }
     let score = output.get("__judge_score__").and_then(|v| v.as_f64())?;
     let passed = output
         .get("__judge_passed__")
@@ -1044,6 +1058,15 @@ impl ParallelWorkflowEngine {
                 });
             }
         };
+        // Optional 5th verdict field, read from the raw map because
+        // `JudgeVerdict` is a fixed four-field shape: a verdict may declare
+        // that this run had nothing to judge (a quiet inbox, an empty batch).
+        // Such a run is EXCLUDED from the quality trend rather than counted as
+        // a pass — see `extract_judge_score`.
+        let not_applicable = raw_verdict
+            .get("not_applicable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let verdict = JudgeVerdict::from_collapsed(&raw_verdict);
         let JudgeVerdict {
             score,
@@ -1076,6 +1099,12 @@ impl ParallelWorkflowEngine {
             };
             out.insert("__judge_score__".to_string(), serde_json::json!(score));
             out.insert("__judge_passed__".to_string(), serde_json::json!(true));
+            if not_applicable {
+                out.insert(
+                    "__judge_not_applicable__".to_string(),
+                    serde_json::json!(true),
+                );
+            }
             out.insert(
                 "__judge_reasoning__".to_string(),
                 serde_json::json!(reasoning),
@@ -1094,6 +1123,12 @@ impl ParallelWorkflowEngine {
             out.insert("__judge_score__".to_string(), serde_json::json!(score));
             out.insert("__judge_passed__".to_string(), serde_json::json!(false));
             out.insert("__judge_rejected__".to_string(), serde_json::json!(true));
+            if not_applicable {
+                out.insert(
+                    "__judge_not_applicable__".to_string(),
+                    serde_json::json!(true),
+                );
+            }
             out.insert(
                 "__judge_reasoning__".to_string(),
                 serde_json::json!(reasoning),
