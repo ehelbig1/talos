@@ -89,6 +89,15 @@ impl MlMutations {
             Err(talos_ml::ResolveError::NoDataset) => {
                 Err(async_graphql::Error::new("Model has no dataset to correct into").extend_safe())
             }
+            // Safe to echo: these are the caller's OWN dataset's class names,
+            // already returned to this same client as `labelVocabulary`.
+            Err(talos_ml::ResolveError::UnknownLabel { provided, known }) => {
+                Err(async_graphql::Error::new(format!(
+                    "'{provided}' is not a class of this model's dataset. Valid labels: {}.",
+                    known.join(", ")
+                ))
+                .extend_safe())
+            }
             Err(talos_ml::ResolveError::Internal(e)) => {
                 tracing::error!(target: "talos_ml", error = %e, "resolve_ml_disagreement failed");
                 Err(async_graphql::Error::new("Could not resolve disagreement").extend_safe())
