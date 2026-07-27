@@ -207,64 +207,6 @@ export type RotateEncryptionKeyMutationVariables = Exact<{
 
 export type RotateEncryptionKeyMutation = { rotateEncryptionKey: number };
 
-export type ListApiKeysQueryVariables = Exact<{
-  pagination?: PaginationInput | null | undefined;
-}>;
-
-export type ListApiKeysQuery = {
-  apiKeys: Array<{
-    id: string;
-    name: string;
-    keyPrefix: string;
-    scopes: Array<string>;
-    createdAt: string;
-    expiresAt: string | null;
-    lastUsedAt: string | null;
-    isActive: boolean;
-    usageCount: number;
-  }>;
-};
-
-export type CreateApiKeyMutationVariables = Exact<{
-  input: CreateApiKeyInput;
-}>;
-
-export type CreateApiKeyMutation = {
-  createApiKey: {
-    id: string;
-    name: string;
-    key: string;
-    scopes: Array<string>;
-    expiresAt: string | null;
-  };
-};
-
-export type RevokeApiKeyMutationVariables = Exact<{
-  keyId: string;
-}>;
-
-export type RevokeApiKeyMutation = { revokeApiKey: boolean };
-
-export type RotateApiKeyMutationVariables = Exact<{
-  keyId: string;
-}>;
-
-export type RotateApiKeyMutation = {
-  rotateApiKey: {
-    id: string;
-    name: string;
-    key: string;
-    scopes: Array<string>;
-    expiresAt: string | null;
-  };
-};
-
-export type DeleteApiKeyMutationVariables = Exact<{
-  keyId: string;
-}>;
-
-export type DeleteApiKeyMutation = { deleteApiKey: boolean };
-
 export type GetDeadLetterQueueQueryVariables = Exact<{ [key: string]: never }>;
 
 export type GetDeadLetterQueueQuery = {
@@ -370,6 +312,64 @@ export type Enable2FaMutation = {
 export type Disable2FaMutationVariables = Exact<{ [key: string]: never }>;
 
 export type Disable2FaMutation = { disableTwoFactor: boolean };
+
+export type ListApiKeysQueryVariables = Exact<{
+  pagination?: PaginationInput | null | undefined;
+}>;
+
+export type ListApiKeysQuery = {
+  apiKeys: Array<{
+    id: string;
+    name: string;
+    keyPrefix: string;
+    scopes: Array<string>;
+    createdAt: string;
+    expiresAt: string | null;
+    lastUsedAt: string | null;
+    isActive: boolean;
+    usageCount: number;
+  }>;
+};
+
+export type CreateApiKeyMutationVariables = Exact<{
+  input: CreateApiKeyInput;
+}>;
+
+export type CreateApiKeyMutation = {
+  createApiKey: {
+    id: string;
+    name: string;
+    key: string;
+    scopes: Array<string>;
+    expiresAt: string | null;
+  };
+};
+
+export type RevokeApiKeyMutationVariables = Exact<{
+  keyId: string;
+}>;
+
+export type RevokeApiKeyMutation = { revokeApiKey: boolean };
+
+export type RotateApiKeyMutationVariables = Exact<{
+  keyId: string;
+}>;
+
+export type RotateApiKeyMutation = {
+  rotateApiKey: {
+    id: string;
+    name: string;
+    key: string;
+    scopes: Array<string>;
+    expiresAt: string | null;
+  };
+};
+
+export type DeleteApiKeyMutationVariables = Exact<{
+  keyId: string;
+}>;
+
+export type DeleteApiKeyMutation = { deleteApiKey: boolean };
 
 export type ListOrgsQueryVariables = Exact<{ [key: string]: never }>;
 
@@ -951,6 +951,7 @@ export type MlModelDisagreementsQuery = {
     shadowObservations: number;
     shadowEpoch: number;
     teacherAudit: unknown;
+    labelVocabulary: Array<string>;
     pending: Array<{
       id: string;
       exampleKey: string | null;
@@ -1792,174 +1793,6 @@ export const useRotateEncryptionKeyMutation = <
   });
 };
 
-export const ListApiKeysDocument = new TypedDocumentString(`
-    query ListApiKeys($pagination: PaginationInput) {
-  apiKeys(pagination: $pagination) {
-    id
-    name
-    keyPrefix
-    scopes
-    createdAt
-    expiresAt
-    lastUsedAt
-    isActive
-    usageCount
-  }
-}
-    `);
-
-export const useListApiKeysQuery = <TData = ListApiKeysQuery, TError = unknown>(
-  variables?: ListApiKeysQueryVariables,
-  options?: Omit<
-    UseQueryOptions<ListApiKeysQuery, TError, TData>,
-    "queryKey"
-  > & {
-    queryKey?: UseQueryOptions<ListApiKeysQuery, TError, TData>["queryKey"];
-  },
-) => {
-  return useQuery<ListApiKeysQuery, TError, TData>({
-    queryKey:
-      variables === undefined ? ["ListApiKeys"] : ["ListApiKeys", variables],
-    queryFn: graphqlFetcher<ListApiKeysQuery, ListApiKeysQueryVariables>(
-      ListApiKeysDocument,
-      variables,
-    ),
-    ...options,
-  });
-};
-
-export const CreateApiKeyDocument = new TypedDocumentString(`
-    mutation CreateApiKey($input: CreateApiKeyInput!) {
-  createApiKey(input: $input) {
-    id
-    name
-    key
-    scopes
-    expiresAt
-  }
-}
-    `);
-
-export const useCreateApiKeyMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<
-    CreateApiKeyMutation,
-    TError,
-    CreateApiKeyMutationVariables,
-    TContext
-  >,
-) => {
-  return useMutation<
-    CreateApiKeyMutation,
-    TError,
-    CreateApiKeyMutationVariables,
-    TContext
-  >({
-    mutationKey: ["CreateApiKey"],
-    mutationFn: (variables?: CreateApiKeyMutationVariables) =>
-      graphqlFetcher<CreateApiKeyMutation, CreateApiKeyMutationVariables>(
-        CreateApiKeyDocument,
-        variables,
-      )(),
-    ...options,
-  });
-};
-
-export const RevokeApiKeyDocument = new TypedDocumentString(`
-    mutation RevokeApiKey($keyId: UUID!) {
-  revokeApiKey(keyId: $keyId)
-}
-    `);
-
-export const useRevokeApiKeyMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<
-    RevokeApiKeyMutation,
-    TError,
-    RevokeApiKeyMutationVariables,
-    TContext
-  >,
-) => {
-  return useMutation<
-    RevokeApiKeyMutation,
-    TError,
-    RevokeApiKeyMutationVariables,
-    TContext
-  >({
-    mutationKey: ["RevokeApiKey"],
-    mutationFn: (variables?: RevokeApiKeyMutationVariables) =>
-      graphqlFetcher<RevokeApiKeyMutation, RevokeApiKeyMutationVariables>(
-        RevokeApiKeyDocument,
-        variables,
-      )(),
-    ...options,
-  });
-};
-
-export const RotateApiKeyDocument = new TypedDocumentString(`
-    mutation RotateApiKey($keyId: UUID!) {
-  rotateApiKey(keyId: $keyId) {
-    id
-    name
-    key
-    scopes
-    expiresAt
-  }
-}
-    `);
-
-export const useRotateApiKeyMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<
-    RotateApiKeyMutation,
-    TError,
-    RotateApiKeyMutationVariables,
-    TContext
-  >,
-) => {
-  return useMutation<
-    RotateApiKeyMutation,
-    TError,
-    RotateApiKeyMutationVariables,
-    TContext
-  >({
-    mutationKey: ["RotateApiKey"],
-    mutationFn: (variables?: RotateApiKeyMutationVariables) =>
-      graphqlFetcher<RotateApiKeyMutation, RotateApiKeyMutationVariables>(
-        RotateApiKeyDocument,
-        variables,
-      )(),
-    ...options,
-  });
-};
-
-export const DeleteApiKeyDocument = new TypedDocumentString(`
-    mutation DeleteApiKey($keyId: UUID!) {
-  deleteApiKey(keyId: $keyId)
-}
-    `);
-
-export const useDeleteApiKeyMutation = <TError = unknown, TContext = unknown>(
-  options?: UseMutationOptions<
-    DeleteApiKeyMutation,
-    TError,
-    DeleteApiKeyMutationVariables,
-    TContext
-  >,
-) => {
-  return useMutation<
-    DeleteApiKeyMutation,
-    TError,
-    DeleteApiKeyMutationVariables,
-    TContext
-  >({
-    mutationKey: ["DeleteApiKey"],
-    mutationFn: (variables?: DeleteApiKeyMutationVariables) =>
-      graphqlFetcher<DeleteApiKeyMutation, DeleteApiKeyMutationVariables>(
-        DeleteApiKeyDocument,
-        variables,
-      )(),
-    ...options,
-  });
-};
-
 export const GetDeadLetterQueueDocument = new TypedDocumentString(`
     query GetDeadLetterQueue {
   deadLetterQueue {
@@ -2344,6 +2177,174 @@ export const useDisable2FaMutation = <TError = unknown, TContext = unknown>(
     mutationFn: (variables?: Disable2FaMutationVariables) =>
       graphqlFetcher<Disable2FaMutation, Disable2FaMutationVariables>(
         Disable2FaDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const ListApiKeysDocument = new TypedDocumentString(`
+    query ListApiKeys($pagination: PaginationInput) {
+  apiKeys(pagination: $pagination) {
+    id
+    name
+    keyPrefix
+    scopes
+    createdAt
+    expiresAt
+    lastUsedAt
+    isActive
+    usageCount
+  }
+}
+    `);
+
+export const useListApiKeysQuery = <TData = ListApiKeysQuery, TError = unknown>(
+  variables?: ListApiKeysQueryVariables,
+  options?: Omit<
+    UseQueryOptions<ListApiKeysQuery, TError, TData>,
+    "queryKey"
+  > & {
+    queryKey?: UseQueryOptions<ListApiKeysQuery, TError, TData>["queryKey"];
+  },
+) => {
+  return useQuery<ListApiKeysQuery, TError, TData>({
+    queryKey:
+      variables === undefined ? ["ListApiKeys"] : ["ListApiKeys", variables],
+    queryFn: graphqlFetcher<ListApiKeysQuery, ListApiKeysQueryVariables>(
+      ListApiKeysDocument,
+      variables,
+    ),
+    ...options,
+  });
+};
+
+export const CreateApiKeyDocument = new TypedDocumentString(`
+    mutation CreateApiKey($input: CreateApiKeyInput!) {
+  createApiKey(input: $input) {
+    id
+    name
+    key
+    scopes
+    expiresAt
+  }
+}
+    `);
+
+export const useCreateApiKeyMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    CreateApiKeyMutation,
+    TError,
+    CreateApiKeyMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    CreateApiKeyMutation,
+    TError,
+    CreateApiKeyMutationVariables,
+    TContext
+  >({
+    mutationKey: ["CreateApiKey"],
+    mutationFn: (variables?: CreateApiKeyMutationVariables) =>
+      graphqlFetcher<CreateApiKeyMutation, CreateApiKeyMutationVariables>(
+        CreateApiKeyDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const RevokeApiKeyDocument = new TypedDocumentString(`
+    mutation RevokeApiKey($keyId: UUID!) {
+  revokeApiKey(keyId: $keyId)
+}
+    `);
+
+export const useRevokeApiKeyMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    RevokeApiKeyMutation,
+    TError,
+    RevokeApiKeyMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    RevokeApiKeyMutation,
+    TError,
+    RevokeApiKeyMutationVariables,
+    TContext
+  >({
+    mutationKey: ["RevokeApiKey"],
+    mutationFn: (variables?: RevokeApiKeyMutationVariables) =>
+      graphqlFetcher<RevokeApiKeyMutation, RevokeApiKeyMutationVariables>(
+        RevokeApiKeyDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const RotateApiKeyDocument = new TypedDocumentString(`
+    mutation RotateApiKey($keyId: UUID!) {
+  rotateApiKey(keyId: $keyId) {
+    id
+    name
+    key
+    scopes
+    expiresAt
+  }
+}
+    `);
+
+export const useRotateApiKeyMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    RotateApiKeyMutation,
+    TError,
+    RotateApiKeyMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    RotateApiKeyMutation,
+    TError,
+    RotateApiKeyMutationVariables,
+    TContext
+  >({
+    mutationKey: ["RotateApiKey"],
+    mutationFn: (variables?: RotateApiKeyMutationVariables) =>
+      graphqlFetcher<RotateApiKeyMutation, RotateApiKeyMutationVariables>(
+        RotateApiKeyDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const DeleteApiKeyDocument = new TypedDocumentString(`
+    mutation DeleteApiKey($keyId: UUID!) {
+  deleteApiKey(keyId: $keyId)
+}
+    `);
+
+export const useDeleteApiKeyMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    DeleteApiKeyMutation,
+    TError,
+    DeleteApiKeyMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    DeleteApiKeyMutation,
+    TError,
+    DeleteApiKeyMutationVariables,
+    TContext
+  >({
+    mutationKey: ["DeleteApiKey"],
+    mutationFn: (variables?: DeleteApiKeyMutationVariables) =>
+      graphqlFetcher<DeleteApiKeyMutation, DeleteApiKeyMutationVariables>(
+        DeleteApiKeyDocument,
         variables,
       )(),
     ...options,
@@ -4005,6 +4006,7 @@ export const MlModelDisagreementsDocument = new TypedDocumentString(`
     shadowObservations
     shadowEpoch
     teacherAudit
+    labelVocabulary
     pending {
       id
       exampleKey

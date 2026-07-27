@@ -26,6 +26,11 @@ query MlModelDisagreements($modelName: String!, $limit: Int) {
     # `status` (running/failed/complete). Null until ml_teacher_audit has
     # run at least once. See ModelReview.tsx's TeacherAudit type.
     teacherAudit
+    # Authoritative class list from the DATASET. Derived from the feed before,
+    # which silently hid any class no pending row proposed — leaving the
+    # reviewer unable to record the most informative correction of all (both
+    # models wrong).
+    labelVocabulary
     pending {
       id
       exampleKey

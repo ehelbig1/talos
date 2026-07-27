@@ -648,6 +648,17 @@ export type MlDisagreement = {
  */
 export type MlDisagreementFeed = {
   __typename?: "MlDisagreementFeed";
+  /**
+   * Every class this model's dataset carries, sorted — the correct-label
+   * options the reviewer may choose from.
+   *
+   * Comes from the DATASET, not from the labels present in `pending`. A
+   * feed-derived list silently omits any class no pending row proposes, and
+   * the reviewer then cannot record the answer at all — which is precisely
+   * the most informative correction, since both models being wrong beats
+   * either being wrong alone.
+   */
+  labelVocabulary: Array<Scalars["String"]["output"]>;
   lifecycleState: Scalars["String"]["output"];
   modelId: Scalars["UUID"]["output"];
   pending: Array<MlDisagreement>;

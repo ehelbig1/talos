@@ -670,6 +670,38 @@ impl DatasetService {
         }
     }
 
+    /// The dataset's label vocabulary — every distinct class it has ever
+    /// carried, sorted.
+    ///
+    /// The review UI needs this to offer a correct-label button per class.
+    /// Deriving that list from the labels PRESENT IN THE FEED (what it did
+    /// before) silently omits any class no pending row happens to propose, and
+    /// the reviewer then cannot express the answer at all. That case is not an
+    /// edge case — it is the MOST informative correction available, because
+    /// both models being wrong is a stronger signal than either being wrong
+    /// alone. Observed 2026-07-27: a CI-failure row where fast said `to_read`
+    /// and the teacher said `archive`, while the reviewer judged it
+    /// `follow_up`; no button existed.
+    ///
+    /// Reads the dataset, not a sample, so a class stays offerable even when
+    /// nothing in the current queue proposes it.
+    pub async fn label_vocabulary(
+        &self,
+        conn: &mut PgConnection,
+        dataset_id: Uuid,
+    ) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT label_json->>'label' AS label FROM ml_examples \
+             WHERE dataset_id = $1 AND label_json ? 'label' \
+             ORDER BY label",
+        )
+        .bind(dataset_id)
+        .fetch_all(&mut *conn)
+        .await
+        .context("read dataset label vocabulary")?;
+        Ok(rows.into_iter().map(|(l,)| l).collect())
+    }
+
     /// Human-correction counts per class (`source = 'correction'`) —
     /// the lifecycle policy's human-in-the-loop gate input.
     pub async fn corrections_per_class(

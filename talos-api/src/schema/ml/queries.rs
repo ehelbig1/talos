@@ -57,6 +57,15 @@ pub struct MlDisagreementFeed {
     /// display context for the agreement figure.
     pub shadow_epoch: i32,
     pub pending: Vec<MlDisagreement>,
+    /// Every class this model's dataset carries, sorted — the correct-label
+    /// options the reviewer may choose from.
+    ///
+    /// Comes from the DATASET, not from the labels present in `pending`. A
+    /// feed-derived list silently omits any class no pending row proposes, and
+    /// the reviewer then cannot record the answer at all — which is precisely
+    /// the most informative correction, since both models being wrong beats
+    /// either being wrong alone.
+    pub label_vocabulary: Vec<String>,
     /// The latest teacher-vs-gold audit report (RFC 0011 R3), `ml_models
     /// .teacher_audit` passed through verbatim — `null` until
     /// `ml_teacher_audit` has run at least once for this model. Polymorphic
@@ -166,8 +175,31 @@ impl MlQueries {
                 async_graphql::Error::new("Could not load model status").extend_safe()
             })?;
 
+        // Authoritative class list for the correct-label buttons. Best-effort:
+        // a model with no dataset, or a read failure, degrades to the labels
+        // observable in the feed rather than failing the whole review page.
+        let mut label_vocabulary: Vec<String> = match model.dataset_id {
+            Some(ds) => talos_ml::DatasetService::new(secrets.clone())
+                .label_vocabulary(&mut tx, ds)
+                .await
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        for d in &pending {
+            if let Some(f) = d.fast_label.as_ref() {
+                if !label_vocabulary.contains(f) {
+                    label_vocabulary.push(f.clone());
+                }
+            }
+            if !label_vocabulary.contains(&d.llm_label) {
+                label_vocabulary.push(d.llm_label.clone());
+            }
+        }
+        label_vocabulary.sort();
+
         Ok(MlDisagreementFeed {
             model_id: model.model_id,
+            label_vocabulary,
             lifecycle_state: model.lifecycle_state,
             shadow_agreement: shadow.map(|(a, _)| a),
             shadow_observations: shadow

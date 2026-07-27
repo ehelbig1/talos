@@ -31,6 +31,9 @@ function feed(teacherAudit: unknown = null) {
     shadowObservations: 121,
     shadowEpoch: 2,
     teacherAudit,
+    // Server-supplied class list. `follow_up` appears NOWHERE in `pending` —
+    // that is the point: it must still be offerable.
+    labelVocabulary: ["archive", "follow_up", "to_read"],
     pending: [
       {
         id: "d-1",
@@ -121,6 +124,63 @@ describe("ModelReview", () => {
     });
   });
 
+  it("offers a class the feed never proposes, and posts it", async () => {
+    // The reported bug: fast said to_read, the teacher said archive, and the
+    // reviewer judged follow_up — but the buttons were derived from the feed,
+    // so no follow_up button existed and the most informative correction
+    // available (BOTH models wrong) could not be recorded at all.
+    let captured: Record<string, unknown> | null = null;
+    mockGraphql({
+      resolveMlDisagreement: (vars) => {
+        captured = vars;
+        return {
+          data: {
+            resolveMlDisagreement: {
+              disagreementId: "d-1",
+              status: "resolved",
+              correctionAppended: true,
+            },
+          },
+        };
+      },
+      mlModelDisagreements: () => ({ data: { mlModelDisagreements: feed() } }),
+      mlModels: () => ({ data: { mlModels: models() } }),
+    });
+
+    render(<ModelReview />);
+    const followUpBtn = await screen.findByRole("button", {
+      name: /follow_up/i,
+    });
+    fireEvent.click(followUpBtn);
+
+    await waitFor(() => expect(captured).not.toBeNull());
+    expect(captured).toMatchObject({
+      disagreementId: "d-1",
+      correctLabel: "follow_up",
+    });
+  });
+
+  it("still renders label buttons when the server sends no vocabulary", async () => {
+    // Back-compat: an older server omitting labelVocabulary must degrade to
+    // the feed-derived labels, not to a card with no way to act on it.
+    mockGraphql({
+      mlModelDisagreements: () => ({
+        data: {
+          mlModelDisagreements: { ...feed(), labelVocabulary: [] },
+        },
+      }),
+      mlModels: () => ({ data: { mlModels: models() } }),
+    });
+
+    render(<ModelReview />);
+    expect(
+      await screen.findByRole("button", { name: /archive/i }),
+    ).toBeInTheDocument();
+    expect(
+      await screen.findByRole("button", { name: /to_read/i }),
+    ).toBeInTheDocument();
+  });
+
   it("shows an error state (never 'all caught up') when the queue query fails", async () => {
     mockGraphql({
       // Feed query errors — e.g. schema/query version skew or a decrypt
@@ -202,7 +262,14 @@ describe("ModelReview", () => {
 
     expect(await screen.findByText("85.0%")).toBeInTheDocument();
     expect(screen.getByText(/parse failed/i)).toBeInTheDocument();
-    expect(screen.getByText("follow_up")).toBeInTheDocument(); // per-class row label
+    // Per-class row label. Disambiguated from the correct-label BUTTON of the
+    // same name, which now renders because `follow_up` is in the model's
+    // vocabulary — assert a non-button node carries the text.
+    expect(
+      screen
+        .getAllByText("follow_up")
+        .some((n) => n.closest("button") === null),
+    ).toBe(true);
     expect(screen.getByText("18/20")).toBeInTheDocument();
     expect(screen.getByText(/qwen3\.6/)).toBeInTheDocument();
   });

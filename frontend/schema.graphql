@@ -691,6 +691,17 @@ type MlDisagreementFeed {
 	shadowEpoch: Int!
 	pending: [MlDisagreement!]!
 	"""
+	Every class this model's dataset carries, sorted — the correct-label
+	options the reviewer may choose from.
+	
+	Comes from the DATASET, not from the labels present in `pending`. A
+	feed-derived list silently omits any class no pending row proposes, and
+	the reviewer then cannot record the answer at all — which is precisely
+	the most informative correction, since both models being wrong beats
+	either being wrong alone.
+	"""
+	labelVocabulary: [String!]!
+	"""
 	The latest teacher-vs-gold audit report (RFC 0011 R3), `ml_models
 	.teacher_audit` passed through verbatim — `null` until
 	`ml_teacher_audit` has run at least once for this model. Polymorphic
