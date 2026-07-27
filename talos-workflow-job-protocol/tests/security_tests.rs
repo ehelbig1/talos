@@ -23,7 +23,7 @@ fn make_job_request() -> JobRequest {
         job_id: Uuid::new_v4(),
         workflow_execution_id: Uuid::new_v4(),
         module_uri: "file://tmp/module.wasm".to_string(),
-        input_payload: json!({"key": "value"}),
+        input_payload: json!({"key": "value"}).into(),
         encrypted_secrets: EncryptedSecrets::empty(),
         timeout_ms: 5000,
         allowed_hosts: vec!["example.com".to_string()],
@@ -57,7 +57,7 @@ fn make_pipeline_step() -> PipelineStep {
         module_id: Uuid::new_v4(),
         module_uri: "file://tmp/module.wasm".to_string(),
         wasm_bytes: Some(vec![0x00, 0x61, 0x73, 0x6d]),
-        config: json!({"setting": "value"}),
+        config: json!({"setting": "value"}).into(),
         allowed_hosts: vec!["api.example.com".to_string()],
         allowed_methods: vec!["GET".to_string()],
         encrypted_secrets: EncryptedSecrets::empty(),
@@ -231,7 +231,7 @@ fn tampered_input_payload_fails_verification() {
     req.sign(&key).unwrap();
 
     // Tamper: change the input payload.
-    req.input_payload = json!({"injected": "malicious_data"});
+    req.input_payload = json!({"injected": "malicious_data"}).into();
 
     let result = req.verify(&key, 300);
     assert!(
@@ -448,7 +448,7 @@ fn tampered_job_result_status_fails() {
         crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         status: JobStatus::Failed,
-        output_payload: json!({"error": "something went wrong"}),
+        output_payload: json!({"error": "something went wrong"}).into(),
         logs: vec![],
         execution_time_ms: 100,
         signature: vec![],
@@ -474,7 +474,7 @@ fn tampered_job_result_execution_time_fails() {
         crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         status: JobStatus::Success,
-        output_payload: json!({}),
+        output_payload: json!({}).into(),
         logs: vec![],
         execution_time_ms: 100,
         signature: vec![],
@@ -618,7 +618,7 @@ fn signed_job_result(key: &[u8]) -> JobResult {
         crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         status: JobStatus::Success,
-        output_payload: json!({"ok": true}),
+        output_payload: json!({"ok": true}).into(),
         logs: vec![],
         execution_time_ms: 42,
         signature: vec![],
@@ -751,7 +751,7 @@ fn signed_pipeline_result(key: &[u8]) -> talos_workflow_job_protocol::PipelineJo
         job_id: Uuid::new_v4(),
         overall_status: JobStatus::Success,
         step_results: vec![],
-        final_output: json!({"ok": true}),
+        final_output: json!({"ok": true}).into(),
         total_time_ms: 42,
         signature: vec![],
         result_nonce: String::new(),
@@ -867,7 +867,7 @@ fn tampered_job_result_worker_id_fails() {
         crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         status: JobStatus::Success,
-        output_payload: json!({"ok": true}),
+        output_payload: json!({"ok": true}).into(),
         logs: vec![],
         execution_time_ms: 7,
         signature: vec![],
@@ -895,7 +895,7 @@ fn tampered_pipeline_result_worker_id_fails() {
         crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         step_results: vec![],
-        final_output: json!({"step": "ok"}),
+        final_output: json!({"step": "ok"}).into(),
         overall_status: JobStatus::Success,
         total_time_ms: 7,
         signature: vec![],
@@ -922,7 +922,7 @@ fn worker_id_invalid_chars_rejected_at_sign_time() {
         crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         status: JobStatus::Success,
-        output_payload: json!({"ok": true}),
+        output_payload: json!({"ok": true}).into(),
         logs: vec![],
         execution_time_ms: 7,
         signature: vec![],
@@ -955,7 +955,7 @@ fn worker_id_empty_passes_for_backcompat() {
         crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         status: JobStatus::Success,
-        output_payload: json!({"ok": true}),
+        output_payload: json!({"ok": true}).into(),
         logs: vec![],
         execution_time_ms: 7,
         signature: vec![],

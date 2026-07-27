@@ -407,6 +407,7 @@ pub(crate) async fn execute_job_with_retry(
                 // retryable application error.
                 let payload_success_false = job_result
                     .output_payload
+                    .value()
                     .get("success")
                     .and_then(|v| v.as_bool())
                     == Some(false);
@@ -415,7 +416,7 @@ pub(crate) async fn execute_job_with_retry(
                     matches!(job_result.status, JobStatus::Success) && !payload_success_false;
 
                 if is_success {
-                    return Ok(job_result.output_payload);
+                    return Ok(job_result.output_payload.into_value());
                 } else {
                     // Application-level failure — check retry_condition before retrying.
                     // Default to retry (true) on evaluation error: retry_condition is meant to
@@ -424,15 +425,16 @@ pub(crate) async fn execute_job_with_retry(
                     // safer default is to let the retry happen rather than silently dropping it.
                     if let Some(cond) = retry_condition {
                         let should_retry = expression_evaluator
-                            .try_eval_bool(cond, &job_result.output_payload)
+                            .try_eval_bool(cond, job_result.output_payload.value())
                             .unwrap_or(true);
                         if !should_retry {
                             let err_msg = job_result
                                 .output_payload
+                                .value()
                                 .get("error")
                                 .and_then(|e| e.as_str())
                                 .map(String::from)
-                                .unwrap_or_else(|| job_result.output_payload.to_string());
+                                .unwrap_or_else(|| job_result.output_payload.value().to_string());
                             tracing::info!(
                                 retry_condition = cond,
                                 "Retry condition evaluated to false — skipping retries"
@@ -450,6 +452,7 @@ pub(crate) async fn execute_job_with_retry(
                     if retry_condition.is_none() && max_retries > 0 {
                         let err_for_classify = job_result
                             .output_payload
+                            .value()
                             .get("error")
                             .and_then(|e| e.as_str())
                             .unwrap_or("");
@@ -486,10 +489,11 @@ pub(crate) async fn execute_job_with_retry(
                     if attempts > max_retries {
                         let err_msg = job_result
                             .output_payload
+                            .value()
                             .get("error")
                             .and_then(|e| e.as_str())
                             .map(String::from)
-                            .unwrap_or_else(|| job_result.output_payload.to_string());
+                            .unwrap_or_else(|| job_result.output_payload.value().to_string());
                         // MCP-1212 (2026-05-18): include the failure
                         // payload's `diag` object (when present) in the
                         // returned error so operators can identify the
@@ -499,7 +503,7 @@ pub(crate) async fn execute_job_with_retry(
                         // output_payload.diag with worker-side hashes;
                         // pre-fix this path only kept the opaque
                         // "error" string and threw the diag away.
-                        let diag_suffix = match job_result.output_payload.get("diag") {
+                        let diag_suffix = match job_result.output_payload.value().get("diag") {
                             Some(d) => format!(" | diag: {}", d),
                             None => String::new(),
                         };
@@ -511,7 +515,8 @@ pub(crate) async fn execute_job_with_retry(
 
                     // Compute delay: try retry_delay_expression first, fall back to exponential backoff
                     let delay = if let Some(expr) = retry_delay_expr {
-                        match expression_evaluator.eval_i64(expr, &job_result.output_payload) {
+                        match expression_evaluator.eval_i64(expr, job_result.output_payload.value())
+                        {
                             Some(ms) if ms > 0 => (ms as u64).min(60_000),
                             _ => {
                                 let backoff =
@@ -539,6 +544,7 @@ pub(crate) async fn execute_job_with_retry(
 
                     let err_msg = job_result
                         .output_payload
+                        .value()
                         .get("error")
                         .and_then(|e| e.as_str())
                         .unwrap_or("unknown error");
@@ -645,6 +651,13 @@ pub(crate) async fn execute_job_with_retry(
 /// is the pre-fix behavior: retry deterministically fails nonce-replay,
 /// no worse than before). Cheap: serde_json over a JobRequest is fast
 /// and retries are not on the hot path.
+///
+/// Byte-based on purpose: `from_slice` hands `SignedJson` the exact received
+/// payload text and `to_vec` emits it back verbatim, so the re-signed request
+/// covers the SAME input-payload bytes as the original. Only the nonce (and
+/// hence the signature) changes. Routing this through
+/// `serde_json::to_value`/`from_value` instead would re-derive the payload text
+/// and could change the hash — see `SignedJson`'s docs.
 fn resign_payload_for_retry(payload: &[u8], key: &[u8]) -> Option<Vec<u8>> {
     let mut req: JobRequest = match serde_json::from_slice(payload) {
         Ok(r) => r,
@@ -681,6 +694,84 @@ fn resign_payload_for_retry(payload: &[u8], key: &[u8]) -> Option<Vec<u8>> {
             );
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod resign_payload_tests {
+    use super::*;
+    use talos_workflow_job_protocol::{EncryptedSecrets, LlmTier, WriteCeiling};
+
+    /// Payload deliberately carries a float with NO round-trip fixed point
+    /// (`5.455171886890906e-115` cycles forever under repeated
+    /// serialize→parse→serialize). Any re-derivation of the payload text on
+    /// the way through `resign_payload_for_retry` would show up here.
+    fn signed_request(key: &[u8]) -> Vec<u8> {
+        let mut req = JobRequest {
+            crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
+            claim_inbox: None,
+            job_id: uuid::Uuid::new_v4(),
+            workflow_execution_id: uuid::Uuid::new_v4(),
+            module_uri: "test:noop".to_string(),
+            input_payload: serde_json::json!({ "ratio": 5.455171886890906e-115 }).into(),
+            encrypted_secrets: EncryptedSecrets::empty(),
+            timeout_ms: 1000,
+            priority: 100,
+            deadline_unix_secs: 0,
+            cancellation_token: None,
+            allowed_hosts: vec![],
+            allowed_methods: vec![],
+            allowed_secrets: vec![],
+            allowed_sql_operations: vec![],
+            allow_tier2_exposure: false,
+            signature: vec![],
+            job_nonce: String::new(),
+            actor_id: None,
+            wasm_bytes: None,
+            capability_world: None,
+            integration_name: None,
+            expected_wasm_hash: None,
+            max_fuel: 0,
+            user_id: uuid::Uuid::new_v4(),
+            max_llm_tier: LlmTier::Tier2,
+            max_write_ceiling: WriteCeiling::Write,
+            egress_scope: None,
+            dry_run: false,
+            reply_topic: None,
+            idempotency_key: None,
+        };
+        req.sign(key).expect("sign");
+        serde_json::to_vec(&req).expect("serialize")
+    }
+
+    /// The retry re-sign must change ONLY the nonce/signature. The
+    /// input-payload wire text has to survive the parse verbatim, or the
+    /// worker would hash different bytes than the ones the controller just
+    /// signed — the exact divergence `SignedJson` exists to prevent.
+    #[test]
+    fn resign_preserves_payload_wire_bytes_and_refreshes_only_the_nonce() {
+        let key = [7u8; 32];
+        let original_bytes = signed_request(&key);
+        let original: JobRequest = serde_json::from_slice(&original_bytes).unwrap();
+
+        let resigned_bytes = resign_payload_for_retry(&original_bytes, &key).expect("re-sign");
+        let resigned: JobRequest = serde_json::from_slice(&resigned_bytes).unwrap();
+
+        assert_eq!(
+            original.input_payload.raw_bytes(),
+            resigned.input_payload.raw_bytes(),
+            "re-signing must not re-derive the payload text"
+        );
+        assert_ne!(
+            original.job_nonce, resigned.job_nonce,
+            "the whole point of re-signing is a fresh nonce"
+        );
+        // And the fresh message is genuinely verifiable under the same key.
+        resigned
+            .verify_no_replay(&key, 300)
+            .expect("re-signed request verifies");
     }
 }
 
@@ -906,7 +997,9 @@ impl NodeDispatcher for NatsNodeDispatcher {
             job_id,
             workflow_execution_id: job.execution_id,
             module_uri: job.module_uri,
-            input_payload: job.input_payload,
+            // Send-side construction point: fixes this payload's wire text
+            // once, and the signature below covers exactly those bytes.
+            input_payload: job.input_payload.into(),
             encrypted_secrets: EncryptedSecrets {
                 ciphertext: job.encrypted_secrets_ciphertext,
                 nonce: job.encrypted_secrets_nonce,
@@ -1175,7 +1268,10 @@ impl NodeDispatcher for NatsNodeDispatcher {
                 module_id: job.module_id,
                 module_uri: job.module_uri.clone(),
                 wasm_bytes: job.wasm_bytes.clone(),
-                config: job.input_payload.clone(),
+                // Each step carries its OWN payload, so this is one send-side
+                // conversion per step (not a repeated conversion of the same
+                // value) — the step signature covers the bytes fixed here.
+                config: job.input_payload.clone().into(),
                 allowed_hosts: job.allowed_hosts.clone(),
                 allowed_methods: job.allowed_methods.clone(),
                 allowed_secrets: job.allowed_secrets.clone(),
@@ -1391,7 +1487,7 @@ impl NodeDispatcher for NatsNodeDispatcher {
             .map(|sr| ChainStepResult {
                 module_id: sr.module_id,
                 status: map_job_status(sr.status),
-                output: sr.output,
+                output: sr.output.into_value(),
                 error: sr.error,
                 execution_time_ms: sr.execution_time_ms,
             })
@@ -1399,7 +1495,7 @@ impl NodeDispatcher for NatsNodeDispatcher {
 
         Ok(ChainDispatchResult {
             steps,
-            final_output: result.final_output,
+            final_output: result.final_output.into_value(),
             overall_status: map_job_status(result.overall_status),
         })
     }
@@ -1619,7 +1715,7 @@ mod p3_full_loop_tests {
                     llm_usage: vec![],
                     job_id: req.job_id,
                     status: JobStatus::Success,
-                    output_payload: serde_json::json!({"ok": true}),
+                    output_payload: serde_json::json!({"ok": true}).into(),
                     logs: vec![],
                     execution_time_ms: 1,
                     signature: vec![],
@@ -1809,7 +1905,7 @@ mod p3_full_loop_tests {
                     job_id: req.job_id,
                     overall_status: talos_workflow_job_protocol::JobStatus::Success,
                     step_results: vec![],
-                    final_output: serde_json::json!({"ok": true}),
+                    final_output: serde_json::json!({"ok": true}).into(),
                     total_time_ms: 1,
                     signature: vec![],
                     result_nonce: String::new(),

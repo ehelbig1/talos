@@ -399,7 +399,7 @@ mod dispatch_delivery_tests {
             job_id: exec,
             workflow_execution_id: exec,
             module_uri: String::new(),
-            input_payload: serde_json::json!({}),
+            input_payload: serde_json::json!({}).into(),
             encrypted_secrets: EncryptedSecrets::empty(),
             timeout_ms: 0,
             allowed_hosts: Vec::new(),

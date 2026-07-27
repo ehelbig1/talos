@@ -4002,7 +4002,7 @@ else
 fi
 echo
 
-# ── 61. Signed JSON must be hashed at its round-trip fixed point ──────
+# ── 61. Signed JSON must be hashed as its exact wire bytes ────────────
 # (2026-07-27) `serde_json`'s f64 round-trip is NOT idempotent: for ~10% of
 # ordinary computed ratios `parse(write(x))` is a DIFFERENT f64 (one ULP off),
 # so `write(parse(write(x)))` differs in content AND length. Hashing a signed
@@ -4013,16 +4013,20 @@ echo
 # verification. `pa-autonomy-digest` (~30 computed ratios) failed 100% of runs
 # while text-heavy payloads passed for weeks — a latent, fleet-wide lottery.
 #
-# The fix is `canonical_signed_json()`, which normalises to the fixed point
-# (the second round trip IS stable). This check keeps a NEW signed field from
-# reintroducing the raw form: inside the job-protocol crate, a Sha256 over a
-# `.to_string()` must go through the canonicaliser.
+# Normalising to a "fixed point" was the FIRST fix and it was insufficient:
+# some floats have NO fixed point at all (`5.455171886890906e-115` enters a
+# permanent 2-cycle under repeated round trips), so no number of normalisation
+# passes converges. The real fix is to stop re-deriving: every signed payload
+# field is a `SignedJson`, which keeps the exact wire text and hashes THAT via
+# `raw_bytes()`. This check keeps a NEW signed field from reintroducing the
+# re-derived form: inside the job-protocol crate, a Sha256 must not be taken
+# over a `.to_string()` (with or without an intervening `.value()`).
 #
 # Only `<expr>.to_string()` fed straight to a digest is flagged — hashing a
 # String field (`logs.join`, `module_uri.as_bytes()`) is unaffected, since a
-# String has no serialisation ambiguity to normalise.
+# String is already the exact bytes and has no re-derivation step.
 # Opt-out: `// allow-raw-json-hash: <reason>`.
-bold "▶ check 61: signed JSON must be hashed at its round-trip fixed point"
+bold "▶ check 61: signed JSON must be hashed as its exact wire bytes"
 
 RAW_JSON_HASH=0
 jp_file="talos-workflow-job-protocol/src/lib.rs"
@@ -4037,17 +4041,19 @@ if [ -f "$jp_file" ]; then
         yellow "    $(sed -n "${lineno}p" "$jp_file" | sed 's/^ *//')"
         RAW_JSON_HASH=$((RAW_JSON_HASH + 1))
     done <<EOF
-$(grep -nE "Sha256::digest\((self|s)\.[A-Za-z_]+\.to_string\(\)" "$jp_file" || true)
+$(grep -nE "Sha256::digest\((self|s)\.[A-Za-z_]+(\.value\(\))?\.to_string\(\)" "$jp_file" || true)
 EOF
 fi
 
 if [ "$RAW_JSON_HASH" -gt 0 ]; then
-    red "✗ ${RAW_JSON_HASH} signed-JSON hash site(s) bypass canonical_signed_json()"
-    yellow "  → wrap the value: Sha256::digest(canonical_signed_json(&self.field).as_bytes())"
-    yellow "  → serde_json f64 round-trip is not idempotent; the raw form differs per side"
+    red "✗ ${RAW_JSON_HASH} signed-JSON hash site(s) re-derive the payload text"
+    yellow "  → make the field a SignedJson and hash its wire bytes:"
+    yellow "      Sha256::digest(self.field.raw_bytes())"
+    yellow "  → serde_json's f64 round-trip is not idempotent and has no fixed"
+    yellow "    point for some values, so ANY re-serialised form can differ per side"
     EXIT_CODE=1
 else
-    green "✓ every signed-JSON hash uses the round-trip fixed point"
+    green "✓ every signed-JSON hash covers the exact wire bytes"
 fi
 echo
 

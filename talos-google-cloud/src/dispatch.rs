@@ -298,7 +298,8 @@ pub(crate) async fn dispatch_monitoring_incident(
         job_id: execution_id,
         workflow_execution_id: execution_id,
         module_uri: exec_info.module_uri.clone(),
-        input_payload,
+        // Send-side construction: fixes the wire text this dispatch signs.
+        input_payload: input_payload.into(),
         encrypted_secrets: talos_workflow_job_protocol::EncryptedSecrets::empty(),
         timeout_ms: 30_000,
         allowed_hosts: exec_info.allowed_hosts.clone(),
