@@ -14,6 +14,10 @@ pub struct MlResolveResult {
     /// `"resolved"` (a gold correction was appended) or `"dismissed"`.
     pub status: String,
     pub correction_appended: bool,
+    /// Exact-duplicate copies of the same message closed by this one decision
+    /// (0 for a unique row). Exactly ONE gold correction is appended for the
+    /// whole group, never one per copy.
+    pub siblings_resolved: i32,
 }
 
 /// Outcome of provisioning a classifier.
@@ -76,6 +80,7 @@ impl MlMutations {
                 disagreement_id,
                 status: outcome.status.to_string(),
                 correction_appended: outcome.correction_appended,
+                siblings_resolved: i32::try_from(outcome.siblings_resolved).unwrap_or(i32::MAX),
             }),
             Err(talos_ml::ResolveError::NotFound) => Err(async_graphql::Error::new(
                 "Disagreement not found or already handled",

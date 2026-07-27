@@ -1274,6 +1274,10 @@ async fn handle_resolve_disagreement(
                 "disagreement_id": id.to_string(),
                 "status": outcome.status,
                 "correction_appended": outcome.correction_appended,
+                // Exact-duplicate copies of the same message closed by this
+                // one decision. Exactly ONE correction is appended for the
+                // whole group.
+                "siblings_resolved": outcome.siblings_resolved,
             })
             .to_string(),
         ),
