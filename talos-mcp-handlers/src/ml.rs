@@ -116,7 +116,7 @@ pub fn tool_schemas() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "ml_set_policy",
-            "description": "Set a model's lifecycle transition policy (RFC 0011 P2d). Typed + strict: unknown keys are rejected. Keys: min_examples, min_corrections_per_class, accuracy_at_coverage {min_accuracy, min_coverage}, recall_floors {class: floor}, auto_advance (default false — evaluator reports but a human promotes), demote_below_agreement, min_shadow_total. The scheduled evaluator re-judges on every dataset change.",
+            "description": "Set a model's lifecycle transition policy (RFC 0011 P2d). Typed + strict: unknown keys are rejected, so a key absent from this list cannot be set. PROMOTION GATES: min_examples, min_corrections_per_class, accuracy_at_coverage {min_accuracy, min_coverage}, recall_floors {class: floor}, auto_advance (default false — evaluator reports but a human promotes), demote_below_agreement, min_shadow_total. CORRECTIONS-AS-TRAINING: correction_weight (per-sample training emphasis for source=correction rows; default 3.0, range 1.0-10.0 — raising it trades holdout accuracy for agreement with your corrections, so measure both), gold_fraction (share of corrections held out as the GOLD eval slice; default 0.3, range 0.1-0.5), min_gold (floor on the gold slice; default 8, range 0-100). ACTIVE LEARNING: gray_band (width of the review band above the serving threshold; 0.0 disables, default 0.1, range 0.0-0.3), gray_band_daily_cap (daily cap on gray-band review rows; default 20, range 1-200). NOTE gold accuracy measures agreement with HELD-OUT USER CORRECTIONS, not general quality — read it next to the holdout accuracy, never instead of it. The scheduled evaluator re-judges on every dataset change.",
             "inputSchema": { "type": "object", "properties": {
                 "model_id": { "type": "string" },
                 "policy": { "type": "object", "description": "The policy document; {} clears it (evaluator skips the model)" }
@@ -1415,5 +1415,66 @@ async fn handle_delete_model(
             ),
         ),
         Err(talos_ml::DeleteError::Internal(e)) => internal(req_id, "delete_model", &e),
+    }
+}
+
+#[cfg(test)]
+mod policy_schema_tests {
+    /// `PolicyJson` is `deny_unknown_fields`, so a key the tool description
+    /// omits is effectively unsettable: an operator reading the schema cannot
+    /// discover it, and guessing a name fails loudly, which reads as "not
+    /// supported".
+    ///
+    /// That is how `correction_weight`, `gold_fraction`, `min_gold`,
+    /// `gray_band` and `gray_band_daily_cap` — 5 of 12 real fields — stayed
+    /// invisible on the tool surface while being fully honored by the type
+    /// (found 2026-07-26 while tuning correction_weight, which the description
+    /// implied could not be set at all). Same class as the `config.max_fuel`
+    /// omission fixed in #579: honored but undocumented is a defect, because
+    /// the reader's only map is the schema.
+    ///
+    /// This asserts the description names EVERY serde field of `PolicyJson`,
+    /// so adding a policy knob without documenting it fails here rather than
+    /// silently shipping an undiscoverable feature. Fully-populated
+    /// serialization is the source of truth: `skip_serializing_if` hides
+    /// `None`s, so every field is set to Some(..) to enumerate them.
+    #[test]
+    fn set_policy_description_documents_every_policy_field() {
+        let mut all = talos_ml::PolicyJson::default();
+        all.min_examples = Some(1);
+        all.min_corrections_per_class = Some(1);
+        all.recall_floors = Some(Default::default());
+        all.demote_below_agreement = Some(0.5);
+        all.min_shadow_total = Some(1);
+        all.correction_weight = Some(3.0);
+        all.gold_fraction = Some(0.3);
+        all.min_gold = Some(8);
+        all.gray_band = Some(0.1);
+        all.gray_band_daily_cap = Some(20);
+        // accuracy_at_coverage is a struct; serialize via its own Default.
+        let mut json = serde_json::to_value(&all).expect("PolicyJson serializes");
+        json.as_object_mut()
+            .expect("policy serializes to an object")
+            .insert("accuracy_at_coverage".into(), serde_json::json!({}));
+
+        let schema = super::tool_schemas();
+        let desc = schema
+            .iter()
+            .find(|t| t["name"] == "ml_set_policy")
+            .and_then(|t| t["description"].as_str())
+            .expect("ml_set_policy tool is registered with a description");
+
+        let missing: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .filter(|k| !desc.contains(*k))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "ml_set_policy description omits settable policy key(s): {missing:?} — \
+             deny_unknown_fields makes an undocumented key undiscoverable"
+        );
     }
 }
