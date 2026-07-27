@@ -1024,8 +1024,15 @@ impl NodeDispatcher for NatsNodeDispatcher {
         // per job in steady state, drowning real WARNs. It's a break-glass
         // aid for an active signature-mismatch incident, not steady-state
         // telemetry; enable the env var while investigating, then unset it.
-        // The worker's enriched failure JobResult still carries the same
-        // fields unconditionally, so the primary diagnostic is unaffected.
+        // CORRECTION (2026-07-27): this previously claimed the worker's
+        // enriched failure JobResult "still carries the same fields
+        // unconditionally, so the primary diagnostic is unaffected". It does
+        // not — the worker gates its rich dump behind the SAME env var, so
+        // with this unset BOTH sides are dark and an operator following this
+        // note goes looking for a diagnostic that was never emitted. The
+        // ungated worker payload now carries a coarse `reason_class` (replay /
+        // key_config / scheme_mismatch / stale_timestamp / mismatch); the
+        // per-field hashes still require the env var on BOTH processes.
         if *SIGNATURE_DIAG_ENABLED {
             let (controller_input_hash, controller_secrets_hash, controller_input_byte_len) =
                 req.diag_hashes();
