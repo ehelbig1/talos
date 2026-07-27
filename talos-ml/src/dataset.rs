@@ -44,6 +44,11 @@ pub(crate) fn expected_embedding_dims() -> usize {
 /// under Postgres' 65535-bind limit with headroom).
 const INSERT_CHUNK: usize = 200;
 
+/// Row ceiling for the inline dedupe on the append path. Above this the append
+/// declines and logs, so a growing dataset can never quietly turn every ingest
+/// into an O(N) hash-and-sort; the operator tool is unbounded by design.
+const AUTO_DEDUPE_MAX_ROWS: i64 = 20_000;
+
 /// Concurrent embedding requests during `prepare_examples`. Local
 /// Ollama; modest parallelism cuts wall time without saturating it.
 const EMBED_CONCURRENCY: usize = 8;
@@ -394,6 +399,10 @@ impl DatasetService {
             .await
             .context("touch ml_dataset")?;
         self.enforce_growth_cap(conn, dataset_id).await?;
+        // After the cap, so the two never fight over which rows go: the cap
+        // evicts by age, this collapses by content, and running it second means
+        // the cap's count reflects rows that actually earned their place.
+        self.auto_dedupe_after_append(conn, dataset_id).await;
         Ok(stored)
     }
 
@@ -518,6 +527,15 @@ impl DatasetService {
     /// deleting nothing — the intended first call, since this is destructive
     /// and training data is not trivially reconstructible.
     ///
+    /// `protect_corrections` exempts `source = 'correction'` rows from removal.
+    /// The UNATTENDED path (see [`Self::auto_dedupe_after_append`]) always sets
+    /// it: collapsing duplicate corrections is semantically right — the newest
+    /// carries the human's latest intent for identical content — but it also
+    /// decrements `corrections_banked` and can move the
+    /// `min_corrections_per_class` promotion gate, and a background task must
+    /// not silently delete human-authored data or move a gate nobody asked it
+    /// to move. An operator can still opt in explicitly.
+    ///
     /// Caller must supply a tenant-scoped connection; `dataset_id` is
     /// additionally re-asserted on the delete as a belt-and-braces predicate.
     pub async fn dedupe_by_content(
@@ -525,13 +543,18 @@ impl DatasetService {
         conn: &mut PgConnection,
         dataset_id: Uuid,
         dry_run: bool,
+        protect_corrections: bool,
     ) -> Result<ContentDedupeOutcome> {
+        // `$2` = protect_corrections. A protected run reports what IT would
+        // remove, not what an unprotected run could — the preview must match
+        // the delete that follows it, not a hypothetical one.
         let survey_sql = format!(
             "{}SELECT \
-                 COUNT(*) FILTER (WHERE rn > 1) AS rows_removable, \
+                 COUNT(*) FILTER (WHERE rn > 1 AND (NOT $2 OR source <> 'correction')) \
+                     AS rows_removable, \
                  COUNT(*) FILTER (WHERE rn = 1 AND grp_size > 1) AS duplicate_groups, \
                  COUNT(*) FILTER (WHERE rn = 1 AND has_conflict) AS conflicting_groups, \
-                 COUNT(*) FILTER (WHERE rn > 1 AND source = 'correction') \
+                 COUNT(*) FILTER (WHERE rn > 1 AND source = 'correction' AND NOT $2) \
                      AS corrections_superseded \
              FROM ranked",
             Self::CONTENT_RANK_CTE
@@ -543,6 +566,7 @@ impl DatasetService {
             i64,
         ) = sqlx::query_as(&survey_sql)
             .bind(dataset_id)
+            .bind(protect_corrections)
             .fetch_one(&mut *conn)
             .await
             .context("survey content-duplicate examples")?;
@@ -561,11 +585,13 @@ impl DatasetService {
 
         let delete_sql = format!(
             "{}DELETE FROM ml_examples e USING ranked r \
-             WHERE e.id = r.id AND r.rn > 1 AND e.dataset_id = $1",
+             WHERE e.id = r.id AND r.rn > 1 AND e.dataset_id = $1 \
+               AND (NOT $2 OR r.source <> 'correction')",
             Self::CONTENT_RANK_CTE
         );
         let res = sqlx::query(&delete_sql)
             .bind(dataset_id)
+            .bind(protect_corrections)
             .execute(&mut *conn)
             .await
             .context("delete content-duplicate examples")?;
@@ -586,6 +612,62 @@ impl DatasetService {
             "ml dataset content-dedupe applied"
         );
         Ok(outcome)
+    }
+
+    /// Keep the dataset content-clean as it grows, on the append path.
+    ///
+    /// Every ingest cycle re-delivers templated mail (the CI alert that fires
+    /// again on the same commit), so duplicates REACCUMULATE after a one-off
+    /// sweep. Left alone they resume acting as unearned vote weight: 803 of
+    /// 1800 rows (45%) had built up before the first manual dedupe, and the
+    /// stale majority was outvoting human corrections.
+    ///
+    /// Deliberately conservative next to the operator-invoked tool:
+    /// * corrections are PROTECTED — a background task never deletes
+    ///   human-authored rows, nor silently moves the
+    ///   `min_corrections_per_class` gate;
+    /// * it is best-effort — a dedupe failure must not fail the append that
+    ///   just did the expensive encrypt + embed work, so the error is logged
+    ///   and swallowed (same posture as the growth cap's eviction);
+    /// * above [`AUTO_DEDUPE_MAX_ROWS`] it declines and says so, rather than
+    ///   silently adding an O(N) hash-and-sort to every append. The whole-table
+    ///   scan is a few tens of ms at the scale this runs at, but that is a
+    ///   property of the current size, not a guarantee — the operator tool has
+    ///   no such bound and stays the right call for a large backlog.
+    async fn auto_dedupe_after_append(&self, conn: &mut PgConnection, dataset_id: Uuid) {
+        let total: i64 =
+            match sqlx::query_scalar("SELECT COUNT(*) FROM ml_examples WHERE dataset_id = $1")
+                .bind(dataset_id)
+                .fetch_one(&mut *conn)
+                .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(%dataset_id, error = %e, "auto-dedupe: count failed; skipped");
+                    return;
+                }
+            };
+        if total > AUTO_DEDUPE_MAX_ROWS {
+            tracing::warn!(
+                %dataset_id,
+                total,
+                limit = AUTO_DEDUPE_MAX_ROWS,
+                "auto-dedupe skipped: dataset above the inline bound — run ml_dedupe_dataset"
+            );
+            return;
+        }
+        match self.dedupe_by_content(conn, dataset_id, false, true).await {
+            Ok(o) if o.rows_removed > 0 => tracing::info!(
+                %dataset_id,
+                rows_removed = o.rows_removed,
+                conflicting_groups = o.conflicting_groups,
+                "auto-dedupe collapsed content duplicates on append"
+            ),
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(%dataset_id, error = %e, "auto-dedupe failed; append kept")
+            }
+        }
     }
 
     /// Human-correction counts per class (`source = 'correction'`) —
