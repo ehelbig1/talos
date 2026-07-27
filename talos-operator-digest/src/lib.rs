@@ -466,6 +466,11 @@ fn build_reliability_section(
 // as the `applied_max_fuel` reporting fix — see the MCP add-node handler.
 // ────────────────────────────────────────────────────────────────────
 
+/// Gold rows required before the band labels mean anything. Below this the
+/// interval is wider than the bands themselves, so the honest answer is that
+/// the slice cannot decide.
+const MIN_GOLD_FOR_BAND_VERDICT: i64 = 40;
+
 /// Minimum runs before a judge's score spread is worth interpreting. Below
 /// this, "every run scored 1.0" is small-sample noise, not saturation.
 const JUDGE_MIN_RUNS_FOR_SIGNAL: i64 = 5;
@@ -537,6 +542,7 @@ pub fn judge_signal_note(signal: &str) -> &'static str {
 pub fn correction_loop_state(
     corrections_banked: i64,
     gold_accuracy: Option<f64>,
+    gold_total: Option<i64>,
 ) -> Option<&'static str> {
     let acc = gold_accuracy?;
     if !acc.is_finite() {
@@ -545,6 +551,13 @@ pub fn correction_loop_state(
     if corrections_banked <= 0 {
         return Some("no_corrections_yet");
     }
+    // A gold slice this small cannot separate the bands. At n=35 the 95%
+    // interval spans roughly +/-0.17, so a value of 0.486 sits astride the 0.5
+    // cut and ONE example flips the verdict — reporting a confident label there
+    // is the same over-reading this module exists to prevent.
+    if gold_total.is_some_and(|n| n < MIN_GOLD_FOR_BAND_VERDICT) {
+        return Some("too_few_gold_to_judge");
+    }
     if acc < 0.5 {
         Some("not_converging")
     } else if acc < 0.8 {
@@ -552,6 +565,25 @@ pub fn correction_loop_state(
     } else {
         Some("converged")
     }
+}
+
+/// Wilson score interval (95%) for a proportion — the standard small-sample
+/// interval, and correct where the normal approximation is not: it never leaves
+/// [0, 1] and stays sane at 0 or 1 successes, both of which occur here (gold
+/// `archive` recall was a literal 0/16 for weeks).
+pub fn wilson_interval_95(accuracy: f64, n: i64) -> Option<(f64, f64)> {
+    if n <= 0 || !accuracy.is_finite() || !(0.0..=1.0).contains(&accuracy) {
+        return None;
+    }
+    const Z: f64 = 1.959_963_984_540_054;
+    let n = n as f64;
+    let denom = 1.0 + Z * Z / n;
+    let centre = accuracy + Z * Z / (2.0 * n);
+    let margin = Z * ((accuracy * (1.0 - accuracy) / n) + (Z * Z / (4.0 * n * n))).sqrt();
+    Some((
+        ((centre - margin) / denom).clamp(0.0, 1.0),
+        ((centre + margin) / denom).clamp(0.0, 1.0),
+    ))
 }
 
 /// Stamp `correction_loop` + `correction_loop_note` onto every model in a
@@ -572,9 +604,16 @@ pub fn annotate_correction_loop(ml: &mut JsonValue) {
             .get("gold")
             .and_then(|g| g.get("accuracy"))
             .and_then(JsonValue::as_f64);
-        let Some(state) = correction_loop_state(banked, gold_acc) else {
+        let gold_total = m
+            .get("gold")
+            .and_then(|g| g.get("total"))
+            .and_then(JsonValue::as_i64);
+        let Some(state) = correction_loop_state(banked, gold_acc, gold_total) else {
             continue;
         };
+        let ci = gold_acc
+            .zip(gold_total)
+            .and_then(|(a, n)| wilson_interval_95(a, n));
         let Some(obj) = m.as_object_mut() else {
             continue;
         };
@@ -583,6 +622,11 @@ pub fn annotate_correction_loop(ml: &mut JsonValue) {
             "correction_loop_note".into(),
             json!(correction_loop_note(state)),
         );
+        // Ship the interval next to the point estimate so nobody (including a
+        // future me) reads a 35-row gold accuracy as a precise figure.
+        if let Some((lo, hi)) = ci {
+            obj.insert("gold_accuracy_ci95".into(), json!([lo, hi]));
+        }
     }
 }
 
@@ -592,9 +636,19 @@ pub fn correction_loop_note(state: &str) -> &'static str {
         "not_converging" => {
             "gold = held-out USER CORRECTIONS, so this measures whether the model has \
              learned your overrides — NOT general quality (see holdout accuracy for \
-             that). Below 0.5 the corrections are not moving the model; they are \
-             likely outnumbered by LLM-labelled rows encoding the pre-correction \
-             opinion. Consider raising correction_weight or banking more corrections."
+             that). Below 0.5 the corrections are not moving the model, usually \
+             because identical-content rows carrying the pre-correction label are \
+             outvoting them. MEASURED ORDER OF LEVERS (2026-07-27): (1) dedupe the \
+             dataset — removing content duplicates moved gold 0.227 -> 0.486 while \
+             holdout ALSO rose 0.723 -> 0.802; (2) bank more corrections — 108 -> 143 \
+             moved gold 0.094 -> 0.227. Raising correction_weight is NOT recommended \
+             first: it was measured as a straight trade, buying gold 0.094 -> 0.219 by \
+             giving up holdout 0.712 -> 0.617."
+        }
+        "too_few_gold_to_judge" => {
+            "the gold slice is too small for the band labels to mean anything — its \
+             confidence interval is wider than the bands. Read gold_accuracy_ci95, not \
+             the point estimate, and bank more corrections to narrow it."
         }
         "partially_learned" => {
             "the model agrees with a majority of your held-out corrections but not yet \
@@ -662,7 +716,7 @@ mod tests {
     #[test]
     fn low_gold_with_banked_corrections_is_not_converging() {
         assert_eq!(
-            correction_loop_state(108, Some(0.09375)),
+            correction_loop_state(108, Some(0.09375), Some(44)),
             Some("not_converging")
         );
         let note = correction_loop_note("not_converging");
@@ -676,9 +730,71 @@ mod tests {
     /// No gold slice → no verdict. Never synthesise one from absence.
     #[test]
     fn absent_gold_yields_no_state() {
-        assert_eq!(correction_loop_state(108, None), None);
-        assert_eq!(correction_loop_state(0, None), None);
-        assert_eq!(correction_loop_state(108, Some(f64::NAN)), None);
+        assert_eq!(correction_loop_state(108, None, None), None);
+        assert_eq!(correction_loop_state(0, None, None), None);
+        assert_eq!(correction_loop_state(108, Some(f64::NAN), Some(44)), None);
+    }
+
+    /// The live 2026-07-27 reading: gold 0.486 on n=35 sat astride the 0.5 band
+    /// cut, where ONE example flips the verdict. Refuse to call it.
+    #[test]
+    fn small_gold_slice_refuses_a_band_verdict() {
+        assert_eq!(
+            correction_loop_state(113, Some(0.4857), Some(35)),
+            Some("too_few_gold_to_judge")
+        );
+        // Same accuracy, enough rows to mean something -> a real verdict.
+        assert_eq!(
+            correction_loop_state(113, Some(0.4857), Some(120)),
+            Some("not_converging")
+        );
+    }
+
+    /// The advice must reflect what was MEASURED, not the original guess:
+    /// correction_weight was a straight trade, dedupe was a Pareto win.
+    #[test]
+    fn not_converging_note_does_not_recommend_correction_weight_first() {
+        let note = correction_loop_note("not_converging");
+        assert!(
+            note.contains("dedupe"),
+            "the measured first lever must lead"
+        );
+        assert!(
+            note.contains("NOT recommended first"),
+            "the disproven lever must be marked as such"
+        );
+    }
+
+    #[test]
+    fn wilson_interval_brackets_the_estimate_and_stays_in_range() {
+        let (lo, hi) = wilson_interval_95(0.4857, 35).unwrap();
+        assert!(
+            lo < 0.4857 && hi > 0.4857,
+            "interval must bracket the point"
+        );
+        assert!(
+            lo > 0.32 && hi < 0.66,
+            "n=35 is roughly +/-0.17, got [{lo},{hi}]"
+        );
+        // The degenerate cases the normal approximation gets wrong.
+        let (zlo, zhi) = wilson_interval_95(0.0, 16).unwrap();
+        assert_eq!(zlo, 0.0);
+        assert!(zhi > 0.0 && zhi < 0.3, "0/16 is not 'exactly zero forever'");
+        let (olo, ohi) = wilson_interval_95(1.0, 5).unwrap();
+        assert_eq!(ohi, 1.0);
+        assert!(olo < 1.0);
+        // More rows must narrow it.
+        let (wlo, whi) = wilson_interval_95(0.5, 35).unwrap();
+        let (nlo, nhi) = wilson_interval_95(0.5, 350).unwrap();
+        assert!((nhi - nlo) < (whi - wlo));
+    }
+
+    #[test]
+    fn wilson_rejects_nonsense_inputs() {
+        assert!(wilson_interval_95(0.5, 0).is_none());
+        assert!(wilson_interval_95(0.5, -3).is_none());
+        assert!(wilson_interval_95(f64::NAN, 10).is_none());
+        assert!(wilson_interval_95(1.5, 10).is_none());
     }
 
     /// End-to-end over the real `loop_health` shape observed 2026-07-26: one
@@ -692,11 +808,10 @@ mod tests {
         ]});
         annotate_correction_loop(&mut ml);
         let models = ml["models"].as_array().unwrap();
-        assert_eq!(models[0]["correction_loop"], "not_converging");
-        assert!(models[0]["correction_loop_note"]
-            .as_str()
-            .unwrap()
-            .contains("NOT general quality"));
+        // n=32 is below the band-verdict floor, so the honest label is the
+        // refusal — and the CI must ride along with it.
+        assert_eq!(models[0]["correction_loop"], "too_few_gold_to_judge");
+        assert!(models[0]["gold_accuracy_ci95"].is_array());
         assert!(
             models[1].get("correction_loop").is_none(),
             "a model with no gold slice must get NO verdict, not a default one"
@@ -721,14 +836,17 @@ mod tests {
     #[test]
     fn correction_loop_bands() {
         assert_eq!(
-            correction_loop_state(0, Some(0.1)),
+            correction_loop_state(0, Some(0.1), Some(44)),
             Some("no_corrections_yet")
         );
         assert_eq!(
-            correction_loop_state(5, Some(0.6)),
+            correction_loop_state(5, Some(0.6), Some(44)),
             Some("partially_learned")
         );
-        assert_eq!(correction_loop_state(5, Some(0.95)), Some("converged"));
+        assert_eq!(
+            correction_loop_state(5, Some(0.95), Some(44)),
+            Some("converged")
+        );
     }
 
     #[test]
