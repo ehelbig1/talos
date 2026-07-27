@@ -1148,7 +1148,8 @@ impl WebhookRouter {
                         job_id,
                         workflow_execution_id: job_id, // Standalone webhook uses same ID
                         module_uri: exec_info.module_uri,
-                        input_payload,
+                        // Send-side construction: fixes the wire text this dispatch signs.
+                        input_payload: input_payload.into(),
                         encrypted_secrets: talos_workflow_job_protocol::EncryptedSecrets::empty(),
                         timeout_ms: 3_000,
                         allowed_hosts: exec_info.allowed_hosts,
@@ -1304,11 +1305,11 @@ impl WebhookRouter {
 
                     match result.status {
                         talos_workflow_job_protocol::JobStatus::Success => {
-                            Ok(result.output_payload.to_string())
+                            Ok(result.output_payload.value().to_string())
                         }
                         _ => Err(anyhow::anyhow!(
                             "Execution failed: {}",
-                            result.output_payload
+                            result.output_payload.value()
                         )),
                     }
                 }
@@ -2722,7 +2723,7 @@ impl WebhookRouter {
                     job_id,
                     workflow_execution_id: job_id,
                     module_uri: exec_info.module_uri,
-                    input_payload: wrapped_input,
+                    input_payload: wrapped_input.into(),
                     encrypted_secrets: talos_workflow_job_protocol::EncryptedSecrets::empty(),
                     timeout_ms: 3_000,
                     allowed_hosts: exec_info.allowed_hosts,

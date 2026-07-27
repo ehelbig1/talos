@@ -70,7 +70,7 @@ fn deterministic_job_request() -> JobRequest {
         job_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0001),
         workflow_execution_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0002),
         module_uri: "redis:wasm:00000000-0000-0000-0000-000000000003".into(),
-        input_payload: json!({"key": "value"}),
+        input_payload: json!({"key": "value"}).into(),
         encrypted_secrets: EncryptedSecrets {
             ciphertext: vec![0xAA, 0xBB, 0xCC],
             nonce: vec![0x01; 12],
@@ -120,7 +120,10 @@ fn sign_request_with_fixed_nonce(req: &mut JobRequest, key: &[u8]) {
     // protocol change behind an updated expected_hex; production
     // verify will then fail at the round-trip assertion below.
     use sha2::Digest;
-    let input_hash = hex::encode(Sha256::digest(req.input_payload.to_string().as_bytes()));
+    // `raw_bytes()` — the exact wire text, mirroring production. Hashing a
+    // re-serialised value here would drift from `signing_payload` for any
+    // payload containing a round-trip-unstable float (see `SignedJson`).
+    let input_hash = hex::encode(Sha256::digest(req.input_payload.raw_bytes()));
     let secrets_hash = hex::encode(Sha256::digest(&req.encrypted_secrets.ciphertext));
     let mut hosts = req.allowed_hosts.clone();
     hosts.sort_unstable();
@@ -259,7 +262,7 @@ fn job_result_json_snapshot() {
         crypto_scheme: 0,
         job_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0001),
         status: JobStatus::Success,
-        output_payload: json!({"out": 42}),
+        output_payload: json!({"out": 42}).into(),
         logs: vec!["info: ok".into()],
         execution_time_ms: 7,
         signature: vec![0xDE, 0xAD, 0xBE, 0xEF],
@@ -292,7 +295,7 @@ fn pipeline_job_request_json_snapshot() {
             module_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0013),
             module_uri: "redis:wasm:00000000-0000-0000-0000-000000000013".into(),
             wasm_bytes: Some(vec![0x00, 0x61, 0x73, 0x6D]),
-            config: json!({"setting": "value"}),
+            config: json!({"setting": "value"}).into(),
             allowed_hosts: vec!["api.example.com".into()],
             allowed_methods: vec!["GET".into()],
             allowed_secrets: vec![],
@@ -339,11 +342,11 @@ fn pipeline_job_result_json_snapshot() {
         step_results: vec![PipelineStepResult {
             module_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0013),
             status: JobStatus::Success,
-            output: json!({"step": "ok"}),
+            output: json!({"step": "ok"}).into(),
             error: None,
             execution_time_ms: 12,
         }],
-        final_output: json!({"step": "ok"}),
+        final_output: json!({"step": "ok"}).into(),
         overall_status: JobStatus::Success,
         total_time_ms: 12,
         signature: vec![0xBA, 0xAD],

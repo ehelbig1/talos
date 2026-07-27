@@ -2405,7 +2405,10 @@ pub(crate) fn spawn_nats_log_subscribers(
                                     if let Err(e) = exec_service_for_results
                                         .complete_execution_from_worker(
                                             job_id,
-                                            Some(result.output_payload),
+                                            // Storage takes the PARSED payload; the
+                                            // signature that covered the raw wire text
+                                            // was already verified above.
+                                            Some(result.output_payload.into_value()),
                                         )
                                         .await
                                     {
@@ -2426,6 +2429,7 @@ pub(crate) fn spawn_nats_log_subscribers(
                                 | talos_workflow_job_protocol::JobStatus::TimedOut => {
                                     let error_msg = result
                                         .output_payload
+                                        .value()
                                         .get("error")
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("Worker reported failure")

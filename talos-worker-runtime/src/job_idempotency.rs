@@ -304,7 +304,7 @@ mod tests {
             crypto_scheme: 0,
             job_id,
             status: talos_workflow_job_protocol::JobStatus::Success,
-            output_payload: json!({"ok": true}),
+            output_payload: json!({"ok": true}).into(),
             logs: vec![],
             execution_time_ms: 1,
             signature: vec![],

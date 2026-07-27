@@ -315,7 +315,8 @@ fn truncate_oversized_job_result(
                          under WORKER_MAX_JOB_RESULT_BYTES. Reduce module \
                          output size or raise the cap if this is legitimate."
             }
-        }),
+        })
+        .into(),
         logs: vec![format!(
             "[host] dropped {serialized_len}-byte result (cap {cap})"
         )],
@@ -391,7 +392,7 @@ fn failed_result(job_id: uuid::Uuid, start: &std::time::Instant, msg: &str) -> J
         crypto_scheme: 0,
         job_id,
         status: JobStatus::Failed,
-        output_payload: json!({ "error": msg }),
+        output_payload: json!({ "error": msg }).into(),
         logs: vec![],
         execution_time_ms: start.elapsed().as_millis() as u64,
         signature: vec![],
@@ -554,7 +555,7 @@ mod signature_failure_payload_tests {
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://attacker-chosen/v1".to_string(),
-            input_payload: serde_json::json!({"x": 1}),
+            input_payload: serde_json::json!({"x": 1}).into(),
             encrypted_secrets: EncryptedSecrets::empty(),
             timeout_ms: 30000,
             priority: 100,
@@ -822,7 +823,8 @@ async fn execute_job(
             crypto_scheme: 0,
             job_id: req.job_id,
             status: JobStatus::Failed,
-            output_payload: signature_failure_payload(*WORKER_SIGNATURE_DIAG_ENABLED, &req, &e),
+            output_payload: signature_failure_payload(*WORKER_SIGNATURE_DIAG_ENABLED, &req, &e)
+                .into(),
             logs: vec![],
             execution_time_ms: start.elapsed().as_millis() as u64,
             signature: vec![],
@@ -1103,7 +1105,10 @@ async fn execute_job(
             req.allowed_hosts.clone(),
             req.allowed_methods.clone(),
             128,
-            req.input_payload.clone(),
+            // The guest sees the PARSED payload; the signature (already
+            // verified above) covers the raw wire text, which stays with the
+            // `SignedJson` on `req`.
+            req.input_payload.value().clone(),
             None, // No custom file sandbox
             execution_context,
             secrets,
@@ -1139,7 +1144,9 @@ async fn execute_job(
                 crypto_scheme: 0,
                 job_id: req.job_id,
                 status: JobStatus::Success,
-                output_payload: output,
+                // Send-side construction: fixes the result's wire text once,
+                // and `sign()` below hashes exactly those bytes.
+                output_payload: output.into(),
                 logs: vec![],
                 execution_time_ms: duration_ms,
                 signature: vec![],
@@ -1160,7 +1167,7 @@ async fn execute_job(
                 crypto_scheme: 0,
                 job_id: req.job_id,
                 status: JobStatus::Failed,
-                output_payload: json!({"error": sanitized_error}),
+                output_payload: json!({"error": sanitized_error}).into(),
                 logs: vec![],
                 execution_time_ms: duration_ms,
                 signature: vec![],
@@ -1185,7 +1192,7 @@ async fn execute_job(
                 crypto_scheme: 0,
                 job_id: req.job_id,
                 status: JobStatus::Failed,
-                output_payload: json!({"error": error_msg}),
+                output_payload: json!({"error": error_msg}).into(),
                 logs: vec![],
                 execution_time_ms: duration_ms,
                 signature: vec![],
@@ -1233,7 +1240,8 @@ async fn execute_pipeline_job(
             job_id: req.job_id,
             overall_status: JobStatus::Failed,
             step_results: vec![],
-            final_output: serde_json::json!({"error": "pipeline signature verification failed"}),
+            final_output: serde_json::json!({"error": "pipeline signature verification failed"})
+                .into(),
             total_time_ms: start.elapsed().as_millis() as u64,
             signature: vec![],
             result_nonce: String::new(),
@@ -1248,7 +1256,7 @@ async fn execute_pipeline_job(
         job_id: req.job_id,
         overall_status: JobStatus::Failed,
         step_results: vec![],
-        final_output: serde_json::json!({ "error": msg }),
+        final_output: serde_json::json!({ "error": msg }).into(),
         total_time_ms: start.elapsed().as_millis() as u64,
         signature: vec![],
         result_nonce: String::new(),
@@ -1297,7 +1305,7 @@ async fn execute_pipeline_job(
             job_id: req.job_id,
             overall_status: JobStatus::Failed,
             step_results: vec![],
-            final_output: serde_json::json!({"error": format!("Requested total timeout ({}ms) exceeds maximum allowed ({}ms)", req.total_timeout_ms, max_timeout_ms)}),
+            final_output: serde_json::json!({"error": format!("Requested total timeout ({}ms) exceeds maximum allowed ({}ms)", req.total_timeout_ms, max_timeout_ms)}).into(),
             total_time_ms: start.elapsed().as_millis() as u64,
             signature: vec![],
             result_nonce: String::new(),
@@ -1377,7 +1385,8 @@ async fn execute_pipeline_job(
                         job_id: req.job_id,
                         overall_status: JobStatus::Failed,
                         step_results: vec![],
-                        final_output: serde_json::json!({"error": "failed to decrypt step secrets"}),
+                        final_output:
+                            serde_json::json!({"error": "failed to decrypt step secrets"}).into(),
                         total_time_ms: start.elapsed().as_millis() as u64,
                         signature: vec![],
                         result_nonce: String::new(),
@@ -1390,7 +1399,9 @@ async fn execute_pipeline_job(
         step_specs.push(PipelineStepSpec {
             module_id: step.module_id.to_string(),
             wasm_bytes: step.wasm_bytes.clone().unwrap_or_default(),
-            config: step.config.clone(),
+            // The step runtime consumes the PARSED config; the verified
+            // pipeline signature covers the raw text, kept on `step.config`.
+            config: step.config.value().clone(),
             allowed_hosts: step.allowed_hosts.clone(),
             allowed_methods: step.allowed_methods.clone(),
             secrets,
@@ -1452,7 +1463,7 @@ async fn execute_pipeline_job(
                 .map(|((step, output), &time_ms)| PipelineStepResult {
                     module_id: step.module_id,
                     status: JobStatus::Success,
-                    output: output.clone(),
+                    output: output.clone().into(),
                     execution_time_ms: time_ms,
                     error: None,
                 })
@@ -1464,7 +1475,7 @@ async fn execute_pipeline_job(
                 job_id: req.job_id,
                 overall_status: JobStatus::Success,
                 step_results,
-                final_output: pipeline_result.final_output,
+                final_output: pipeline_result.final_output.into(),
                 total_time_ms,
                 signature: vec![],
                 result_nonce: String::new(),
@@ -1485,7 +1496,7 @@ async fn execute_pipeline_job(
                 job_id: req.job_id,
                 overall_status: JobStatus::Failed,
                 step_results: vec![],
-                final_output: serde_json::json!({"error": sanitized_error}),
+                final_output: serde_json::json!({"error": sanitized_error}).into(),
                 total_time_ms,
                 signature: vec![],
                 result_nonce: String::new(),
@@ -2651,7 +2662,8 @@ async fn main() -> anyhow::Result<()> {
                                                          under WORKER_MAX_JOB_RESULT_BYTES. Reduce per-step output size or \
                                                          raise the cap if this is legitimate."
                                             }
-                                        }),
+                                        })
+                                        .into(),
                                         total_time_ms: result.total_time_ms,
                                         signature: vec![],
                                         result_nonce: String::new(),
@@ -2793,7 +2805,7 @@ mod result_publish_tests {
             crypto_scheme: 0,
             job_id: uuid::Uuid::new_v4(),
             status: JobStatus::Success,
-            output_payload: serde_json::json!({"huge": "x".repeat(10_000)}),
+            output_payload: serde_json::json!({"huge": "x".repeat(10_000)}).into(),
             logs: vec!["a".to_string(); 1000],
             execution_time_ms: 42,
             signature: vec![0; 32],
@@ -2808,8 +2820,8 @@ mod result_publish_tests {
         // controller.
         assert_eq!(replacement.status, JobStatus::Failed);
         // Payload replaced with a small diagnostic blob.
-        assert!(replacement.output_payload.get("error").is_some());
-        assert!(replacement.output_payload.get("diag").is_some());
+        assert!(replacement.output_payload.value().get("error").is_some());
+        assert!(replacement.output_payload.value().get("diag").is_some());
         // Logs and execution time preserved for correlation.
         assert!(!replacement.logs.is_empty());
         assert_eq!(replacement.execution_time_ms, 42);
@@ -2829,7 +2841,7 @@ mod result_publish_tests {
             crypto_scheme: 0,
             job_id: uuid::Uuid::new_v4(),
             status: JobStatus::Success,
-            output_payload: serde_json::json!({"huge": "x".repeat(10_000_000)}),
+            output_payload: serde_json::json!({"huge": "x".repeat(10_000_000)}).into(),
             logs: vec![],
             execution_time_ms: 0,
             signature: vec![],

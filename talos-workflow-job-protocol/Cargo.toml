@@ -19,7 +19,11 @@ talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version =
 arc-swap = "1.7"
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# `raw_value` powers `SignedJson`: signatures cover the exact wire text, so the
+# protocol must be able to carry JSON verbatim rather than re-serialising a
+# parsed `Value` (which is not idempotent for floats). Feature flag on an
+# existing dependency — no new crate enters the tree.
+serde_json = { version = "1.0", features = ["raw_value"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 
 # Encryption and signing (for secure secret transport and job authentication)

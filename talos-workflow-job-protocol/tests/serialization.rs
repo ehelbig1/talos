@@ -17,7 +17,7 @@ fn job_request_roundtrip() {
         job_id: Uuid::new_v4(),
         workflow_execution_id: Uuid::new_v4(),
         module_uri: "file://tmp/module.wasm".to_string(),
-        input_payload: json!({"key": "value"}),
+        input_payload: json!({"key": "value"}).into(),
         encrypted_secrets: EncryptedSecrets::empty(),
         timeout_ms: 5000,
         allowed_hosts: vec!["example.com".to_string()],
@@ -57,7 +57,7 @@ fn job_result_roundtrip() {
         crypto_scheme: 0,
         job_id: Uuid::new_v4(),
         status: JobStatus::Success,
-        output_payload: json!({"out": 42}),
+        output_payload: json!({"out": 42}).into(),
         logs: vec!["log entry".to_string()],
         execution_time_ms: 123,
         signature: vec![],
@@ -84,7 +84,7 @@ fn make_pipeline_step() -> PipelineStep {
         // Provide a placeholder URI; the actual WASM bytes are supplied via `wasm_bytes`.
         module_uri: "file://tmp/module.wasm".to_string(),
         wasm_bytes: Some(vec![0x00, 0x61, 0x73, 0x6d]), // minimal WASM magic bytes
-        config: json!({"setting": "value"}),
+        config: json!({"setting": "value"}).into(),
         allowed_hosts: vec!["api.example.com".to_string()],
         allowed_methods: vec!["GET".to_string()],
         encrypted_secrets: EncryptedSecrets::empty(),
@@ -209,11 +209,11 @@ fn pipeline_job_result_roundtrip() {
         step_results: vec![PipelineStepResult {
             module_id: step_id,
             status: JobStatus::Success,
-            output: json!({"value": 42}),
+            output: json!({"value": 42}).into(),
             execution_time_ms: 50,
             error: None,
         }],
-        final_output: json!({"value": 42}),
+        final_output: json!({"value": 42}).into(),
         total_time_ms: 100,
         signature: vec![],
         result_nonce: String::new(),
@@ -238,7 +238,7 @@ fn pipeline_job_result_sign_and_verify() {
         job_id: Uuid::new_v4(),
         overall_status: JobStatus::Success,
         step_results: vec![],
-        final_output: json!({"answer": 84}),
+        final_output: json!({"answer": 84}).into(),
         total_time_ms: 150,
         signature: vec![],
         result_nonce: String::new(),
@@ -261,7 +261,7 @@ fn pipeline_job_result_tampered_output_fails() {
         job_id: Uuid::new_v4(),
         overall_status: JobStatus::Success,
         step_results: vec![],
-        final_output: json!({"answer": 84}),
+        final_output: json!({"answer": 84}).into(),
         total_time_ms: 150,
         signature: vec![],
         result_nonce: String::new(),
@@ -270,7 +270,7 @@ fn pipeline_job_result_tampered_output_fails() {
     res.sign(&key).unwrap();
 
     // Tamper: replace the final output.
-    res.final_output = json!({"answer": 999});
+    res.final_output = json!({"answer": 999}).into();
 
     assert!(
         res.verify(&key, 300).is_err(),

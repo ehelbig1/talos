@@ -2311,6 +2311,191 @@ impl EncryptedSecrets {
 }
 
 // ============================================================================
+// Signed JSON payloads
+// ============================================================================
+
+/// A JSON payload whose SIGNED representation is the exact text that travels on
+/// the wire: produced ONCE on the sending side (in [`From<serde_json::Value>`])
+/// and captured VERBATIM from the received bytes on the verifying side (in
+/// `Deserialize`). It is never re-derived, so signer and verifier hash the same
+/// bytes by construction.
+///
+/// # Why this type exists
+///
+/// `serde_json`'s f64 round-trip is NOT idempotent, and no finite number of
+/// normalisation passes makes it so — some values CYCLE. The counterexample
+/// pinned by `some_floats_have_no_round_trip_fixed_point_known_gap`:
+///
+/// ```text
+///   5.455171886890906e-115   (as written by the controller)
+///     -> 5.455171886890905e-115
+///     -> 5.4551718868909045e-115
+///     -> 5.455171886890905e-115   <- back to the 2nd form: a permanent 2-cycle
+/// ```
+///
+/// Any signature derived by RE-SERIALISING a parsed `Value` therefore depends
+/// on how many round trips that particular `Value` happened to have made. The
+/// controller hashed `write(x)`; the worker parsed the wire bytes into the
+/// drifted f64 and hashed `write(parse(write(x)))`; the two digests differed
+/// and the job failed dispatch verification. It presented as a LOTTERY — a job
+/// failed only if its payload happened to contain an unstable float — which is
+/// why `pa-autonomy-digest` (≈30 computed ratios) failed every run while
+/// text-only payloads verified fine for weeks (2026-07-27 incident, #595/#597).
+///
+/// Hashing the raw text removes the re-derivation entirely: there is exactly
+/// one byte string per payload per direction, and it is the one on the wire.
+///
+/// # Invariant: `raw` and `value` are never supplied independently
+///
+/// There is deliberately NO constructor that accepts both halves, and NO
+/// mutable accessor (`&mut Value`, `raw_mut`, …). A caller who could set — or
+/// mutate — `raw` and `value` independently could desync them, signing one
+/// payload while the module executes another, which is precisely the bug class
+/// this type exists to make unrepresentable. Do not add one: mutate the
+/// `Value` you own and build a fresh `SignedJson` from it. Construct from a
+/// [`serde_json::Value`] (send side) or by deserialising (receive side).
+///
+/// Note the two halves are semantically equal but need not be bit-equal: on the
+/// send side `value` is the caller's original `Value`, and re-parsing `raw`
+/// could land one ULP away for an unstable float. That is harmless *because*
+/// nothing security-relevant is ever derived from `value` — see
+/// [`Self::raw_bytes`].
+///
+/// # Why exotic JSON text is not an attack surface
+///
+/// `raw` can hold text a `Value` can never round-trip back to: duplicate keys
+/// (`{"a":1,"a":2}`, which parses last-wins), interior padding, non-shortest
+/// float spellings, redundant `\u` escapes. The signature covers that text
+/// while every consumer reads the deduplicated `value` — so it is worth being
+/// explicit about who can put such text there:
+///
+/// * Both sides only ever MINT raw text through `From<Value>`, i.e.
+///   `Value::to_string()`, which cannot emit duplicate keys or padding.
+/// * The only other way raw text enters is deserialisation of a message that
+///   ALREADY VERIFIES under a signing key — the digest covers the exact bytes,
+///   so an on-path attacker who rewrites the payload text (even into a
+///   semantically identical form) invalidates the signature and the message is
+///   refused before anything reads `value`.
+/// * Worker output never becomes controller-signed request text verbatim: the
+///   engine takes `into_value()`/`value().clone()` and a fresh `From<Value>`
+///   re-mints the bytes, so exotic text cannot be laundered across a signing
+///   boundary by a keyless component.
+///
+/// Consequently duplicate-key smuggling requires the signing key, and a key
+/// holder can already send whatever it likes. Pinned by
+/// `signature_binds_payload_text_not_meaning`. Corollary worth knowing before
+/// anyone "helpfully" normalises: because the binding is textual, ANY
+/// semantics-preserving reformatting between signer and verifier now fails
+/// closed. Nothing reformats today (NATS delivers bytes verbatim) — do not
+/// introduce a JSON-rewriting hop, and do not re-canonicalise to tolerate one.
+///
+/// # Cost, and deploy ordering
+///
+/// Memory cost is ≈2× the payload text (raw + parsed view), bounded by the NATS
+/// `max_payload` limit that already bounds every message; deserialisation also
+/// walks the payload twice (raw capture, then parse), which — like the single
+/// parse it replaces — happens BEFORE signature verification. Both are bounded
+/// by the transport cap and the worker's own pre-deserialise size check.
+///
+/// Controllers and workers must roll TOGETHER. A mixed fleet fails closed (a
+/// verification error, never an accept or a panic) in both directions — the
+/// wire BYTES are unchanged, only the digest formula moved — but it fails MORE
+/// often than the pre-fix code did, not less. An old peer hashes the
+/// once-normalised form, so a mixed pair diverges for EVERY payload whose float
+/// spelling is unstable at all (39_495 + 19_721 of 199_902 sampled f64),
+/// whereas the pre-fix pair only diverged for those still unstable after one
+/// pass (19_721) — roughly 3× the failure surface. Expect elevated dispatch
+/// failures for the duration of a staggered rollout, and keep the window short.
+#[derive(Debug, Clone)]
+pub struct SignedJson {
+    /// The authoritative form: the exact JSON text that is (or was) on the wire.
+    /// Everything security-relevant hashes THIS.
+    raw: Box<serde_json::value::RawValue>,
+    /// Parsed view for consumers, who overwhelmingly want a `Value`. Derived
+    /// once, alongside `raw`, at the single construction point per side.
+    value: serde_json::Value,
+}
+
+impl SignedJson {
+    /// The parsed payload — what module dispatch, judges, and every other
+    /// consumer read. NOT what gets signed; see [`Self::raw_bytes`].
+    pub fn value(&self) -> &serde_json::Value {
+        &self.value
+    }
+
+    /// Consume the wrapper and take the parsed payload.
+    pub fn into_value(self) -> serde_json::Value {
+        self.value
+    }
+
+    /// The bytes covered by the signature: the exact JSON text of this payload
+    /// as it appears on the wire. Every `Sha256::digest` over a signed payload
+    /// MUST use this — hashing `value().to_string()` re-introduces the
+    /// non-idempotent round trip documented on the type.
+    pub fn raw_bytes(&self) -> &[u8] {
+        self.raw.get().as_bytes()
+    }
+
+    /// Length of [`Self::raw_bytes`]. Used by the signature diagnostics so the
+    /// reported length describes the same bytes the signature covers.
+    pub fn raw_len(&self) -> usize {
+        self.raw.get().len()
+    }
+}
+
+impl From<serde_json::Value> for SignedJson {
+    /// The ONLY way to build a `SignedJson` from a `Value` — the send-side
+    /// construction point that fixes the wire text once and for all.
+    fn from(value: serde_json::Value) -> Self {
+        // `expect` is unreachable: `Value::to_string` always emits valid JSON
+        // (NaN/Inf cannot exist inside a `Value` — `Number::from_f64` rejects
+        // them), and `RawValue::from_string` only rejects invalid JSON.
+        let raw = serde_json::value::RawValue::from_string(value.to_string())
+            .expect("serde_json::Value always serialises to valid JSON");
+        Self { raw, value }
+    }
+}
+
+impl Default for SignedJson {
+    fn default() -> Self {
+        Self::from(serde_json::Value::Null)
+    }
+}
+
+/// Semantic equality: compares the PARSED values, so two payloads that differ
+/// only in whitespace or key order compare equal. Signing does NOT use this —
+/// signatures cover [`SignedJson::raw_bytes`], which is byte-exact. A test
+/// asserting `a == b` therefore proves nothing about their signatures.
+impl PartialEq for SignedJson {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl Serialize for SignedJson {
+    /// Forwards to the raw text, which `serde_json` emits verbatim — so the
+    /// bytes that were signed are the bytes that go out.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.raw.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SignedJson {
+    /// Captures the received text VERBATIM, then derives the parsed view from
+    /// it. The verifier consequently hashes exactly what the sender hashed,
+    /// whatever the sender's float formatting happened to be.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+        // A parse failure here is a malformed message, not a signing concern:
+        // `RawValue` guarantees syntactic JSON, so this only trips on limits
+        // (e.g. the 128-deep recursion cap) — surface it as a deserialize error
+        // rather than panicking on untrusted input.
+        let value = serde_json::from_str(raw.get()).map_err(serde::de::Error::custom)?;
+        Ok(Self { raw, value })
+    }
+}
+
+// ============================================================================
 // Job request / result
 // ============================================================================
 
@@ -2320,7 +2505,10 @@ pub struct JobRequest {
     pub job_id: Uuid,
     pub workflow_execution_id: Uuid,
     pub module_uri: String,
-    pub input_payload: serde_json::Value,
+    /// Node input. [`SignedJson`], not `Value`: the dispatch signature covers
+    /// the exact wire text of this payload (see the type's docs for why
+    /// re-serialising cannot be made safe).
+    pub input_payload: SignedJson,
 
     /// AES-256-GCM encrypted `HashMap<String, String>` of secret values.
     /// Encrypted with the pre-shared `WORKER_SHARED_KEY`.
@@ -2584,35 +2772,6 @@ pub struct JobRequest {
     pub idempotency_key: Option<String>,
 }
 
-/// Serialize a signed JSON payload to its ROUND-TRIP FIXED POINT.
-///
-/// `serde_json`'s f64 round-trip is NOT idempotent: for ~10% of ordinary
-/// computed ratios, `parse(write(x))` yields a DIFFERENT f64 (off by one ULP),
-/// so `write(parse(write(x)))` is a different string of a different length.
-/// Measured 2026-07-27: `2.0723360413348367e-142` (bits ...0f) reparses to
-/// bits ...10 and rewrites as `2.072336041334837e-142` — one byte shorter.
-/// 16837 of 160000 ratios n/d (n,d <= 400) are unstable this way.
-///
-/// This broke dispatch signing outright. The controller hashed `write(x)`; the
-/// worker parsed the wire bytes into the drifted f64 and hashed
-/// `write(parse(write(x)))`; the hashes differed and the job failed Ed25519
-/// verification. It presented as a LOTTERY — a job failed only if its payload
-/// happened to contain an unstable float — which is why `pa-autonomy-digest`
-/// (~30 computed ratios, incl. Wilson intervals) failed every run while
-/// smaller text-only payloads verified fine for weeks.
-///
-/// The SECOND round-trip is stable (verified), so one normalization pass
-/// reaches the fixed point; hashing that form makes both sides agree whichever
-/// representation they hold. Falls back to the raw string on a re-parse error,
-/// which cannot happen for a Value we just serialized.
-fn canonical_signed_json(v: &serde_json::Value) -> String {
-    let once = v.to_string();
-    match serde_json::from_str::<serde_json::Value>(&once) {
-        Ok(reparsed) => reparsed.to_string(),
-        Err(_) => once,
-    }
-}
-
 impl JobRequest {
     /// Canonical byte string signed / verified by HMAC-SHA256.
     ///
@@ -2634,9 +2793,11 @@ impl JobRequest {
         // Hash large/variable fields to fixed-size hex representations.
         // This prevents payload-substitution attacks where an attacker could
         // replace input_payload, secrets, or wasm_bytes with malicious content.
-        let input_hash = hex::encode(Sha256::digest(
-            canonical_signed_json(&self.input_payload).as_bytes(),
-        ));
+        //
+        // `raw_bytes()`, never `to_string()` on the parsed value: the digest
+        // must cover the exact wire text, because re-serialising a parsed
+        // payload is not idempotent for floats (see [`SignedJson`]).
+        let input_hash = hex::encode(Sha256::digest(self.input_payload.raw_bytes()));
         let secrets_hash = hex::encode(Sha256::digest(&self.encrypted_secrets.ciphertext));
 
         // Sort allowed_hosts so the signature is stable regardless of array order.
@@ -2869,10 +3030,13 @@ impl JobRequest {
     /// security-sensitive (the same hashes already go into the signature).
     pub fn diag_hashes(&self) -> (String, String, usize) {
         use sha2::Digest;
-        let input_str = canonical_signed_json(&self.input_payload);
-        let input_hash = hex::encode(Sha256::digest(input_str.as_bytes()));
+        // MUST hash the same bytes as `signing_payload` — a diagnostic that
+        // reports a different digest than the signature covers sends operators
+        // chasing the wrong difference. (Reporting the SAME bytes on both sides
+        // is what made the 2026-07-27 root cause findable at all.)
+        let input_hash = hex::encode(Sha256::digest(self.input_payload.raw_bytes()));
         let secrets_hash = hex::encode(Sha256::digest(&self.encrypted_secrets.ciphertext));
-        (input_hash, secrets_hash, input_str.len())
+        (input_hash, secrets_hash, self.input_payload.raw_len())
     }
 
     /// Sign the request using the pre-shared `key`.
@@ -3142,7 +3306,10 @@ fn llm_usage_signing_hash(entries: &[LlmUsageEntry]) -> Option<String> {
 pub struct JobResult {
     pub job_id: Uuid,
     pub status: JobStatus,
-    pub output_payload: serde_json::Value,
+    /// Node output. [`SignedJson`] for the same reason as
+    /// [`JobRequest::input_payload`] — the result signature covers its exact
+    /// wire text, in the worker→controller direction.
+    pub output_payload: SignedJson,
     pub logs: Vec<String>,
     pub execution_time_ms: u64,
     /// HMAC-SHA256 signature over canonical result fields (see [`JobResult::sign`]).
@@ -3216,9 +3383,8 @@ impl JobResult {
             JobStatus::Failed => "failed",
             JobStatus::TimedOut => "timedout",
         };
-        let output_hash = hex::encode(Sha256::digest(
-            canonical_signed_json(&self.output_payload).as_bytes(),
-        ));
+        // Exact wire text, never a re-serialisation — see [`SignedJson`].
+        let output_hash = hex::encode(Sha256::digest(self.output_payload.raw_bytes()));
         // Canonicalise logs by joining with `\n` (a stable separator
         // that no individual log line can contain — Vec<String> elements
         // are pre-split on newlines by the worker). Hash to a fixed
@@ -3522,7 +3688,8 @@ pub struct PipelineStep {
     /// Optional WASM module bytes for this step (overrides module_uri if provided).
     pub wasm_bytes: Option<Vec<u8>>,
     /// Module configuration (merged into input as `{"config": ..., "input": ...}`).
-    pub config: serde_json::Value,
+    /// [`SignedJson`]: the pipeline signature covers this step's exact wire text.
+    pub config: SignedJson,
     pub allowed_hosts: Vec<String>,
     pub allowed_methods: Vec<String>,
     /// Secret allowlist. Empty = deny all. `["*"]` = allow all.
@@ -3801,8 +3968,8 @@ impl PipelineJobRequest {
             .steps
             .iter()
             .map(|s| {
-                let config_hash =
-                    hex::encode(Sha256::digest(canonical_signed_json(&s.config).as_bytes()));
+                // Exact wire text — see [`SignedJson`].
+                let config_hash = hex::encode(Sha256::digest(s.config.raw_bytes()));
                 let secrets_ct_hash = hex::encode(Sha256::digest(&s.encrypted_secrets.ciphertext));
                 let mut hosts = s.allowed_hosts.clone();
                 hosts.sort_unstable();
@@ -4071,7 +4238,9 @@ impl SignedMessage for PipelineJobRequest {
 pub struct PipelineStepResult {
     pub module_id: Uuid,
     pub status: JobStatus,
-    pub output: serde_json::Value,
+    /// This step's output. [`SignedJson`] — bound into the pipeline-result
+    /// signature by its exact wire text, same as [`JobResult::output_payload`].
+    pub output: SignedJson,
     pub execution_time_ms: u64,
     pub error: Option<String>,
 }
@@ -4106,7 +4275,9 @@ pub struct PipelineJobResult {
     pub job_id: Uuid,
     pub overall_status: JobStatus,
     pub step_results: Vec<PipelineStepResult>,
-    pub final_output: serde_json::Value,
+    /// Collapsed pipeline output. [`SignedJson`] — see
+    /// [`JobResult::output_payload`].
+    pub final_output: SignedJson,
     pub total_time_ms: u64,
     /// HMAC-SHA256 signature over the canonical result fields.
     pub signature: Vec<u8>,
@@ -4151,9 +4322,8 @@ impl PipelineJobResult {
             JobStatus::Failed => "failed",
             JobStatus::TimedOut => "timedout",
         };
-        let output_hash = hex::encode(Sha256::digest(
-            canonical_signed_json(&self.final_output).as_bytes(),
-        ));
+        // Exact wire text — see [`SignedJson`].
+        let output_hash = hex::encode(Sha256::digest(self.final_output.raw_bytes()));
 
         // Canonical per-step digest: each step contributes a fixed-shape
         // line; the complete sequence is hashed once.
@@ -4166,8 +4336,7 @@ impl PipelineJobResult {
                     JobStatus::Failed => "failed",
                     JobStatus::TimedOut => "timedout",
                 };
-                let s_output =
-                    hex::encode(Sha256::digest(canonical_signed_json(&s.output).as_bytes()));
+                let s_output = hex::encode(Sha256::digest(s.output.raw_bytes()));
                 let s_error = match s.error.as_deref() {
                     Some(e) => hex::encode(Sha256::digest(e.as_bytes())),
                     None => "none".to_string(),
@@ -4868,7 +5037,7 @@ mod tests {
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://module/v1".to_string(),
-            input_payload: serde_json::json!({"replay_test": true}),
+            input_payload: serde_json::json!({"replay_test": true}).into(),
             encrypted_secrets: EncryptedSecrets::empty(),
             timeout_ms: 30000,
             priority: 100,
@@ -4923,7 +5092,7 @@ mod tests {
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://module/v1".to_string(),
-            input_payload: serde_json::json!({}),
+            input_payload: serde_json::json!({}).into(),
             encrypted_secrets: EncryptedSecrets::empty(),
             timeout_ms: 30000,
             priority: 100,
@@ -4970,7 +5139,7 @@ mod tests {
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://module/v1".to_string(),
-            input_payload: serde_json::json!({}),
+            input_payload: serde_json::json!({}).into(),
             encrypted_secrets: EncryptedSecrets::empty(),
             timeout_ms: 30000,
             priority: 100,
@@ -5011,7 +5180,7 @@ mod tests {
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
-            output_payload: serde_json::json!({"answer": 42}),
+            output_payload: serde_json::json!({"answer": 42}).into(),
             logs: vec![],
             execution_time_ms: 150,
             signature: vec![],
@@ -5034,7 +5203,7 @@ mod tests {
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
-            output_payload: serde_json::json!({"answer": 42}),
+            output_payload: serde_json::json!({"answer": 42}).into(),
             logs: vec![],
             execution_time_ms: 150,
             signature: vec![],
@@ -5042,7 +5211,7 @@ mod tests {
             worker_id: String::new(),
         };
         result.sign(&key).unwrap();
-        result.output_payload = serde_json::json!({"answer": 99}); // tamper
+        result.output_payload = serde_json::json!({"answer": 99}).into(); // tamper
         assert!(result.verify(&key, 300).is_err());
     }
 
@@ -5061,7 +5230,7 @@ mod tests {
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
-            output_payload: serde_json::json!({}),
+            output_payload: serde_json::json!({}).into(),
             logs: vec![],
             execution_time_ms: 1,
             signature: vec![],
@@ -5100,7 +5269,7 @@ mod tests {
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
-            output_payload: serde_json::json!({}),
+            output_payload: serde_json::json!({}).into(),
             logs: vec![],
             execution_time_ms: 1,
             signature: vec![],
@@ -5121,7 +5290,7 @@ mod tests {
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
-            output_payload: serde_json::json!({"answer": 42}),
+            output_payload: serde_json::json!({"answer": 42}).into(),
             logs: vec![],
             execution_time_ms: 1,
             signature: vec![],
@@ -5129,7 +5298,7 @@ mod tests {
             worker_id: String::new(),
         };
         a.sign(&key).unwrap();
-        a.output_payload = serde_json::json!({"answer": 99});
+        a.output_payload = serde_json::json!({"answer": 99}).into();
         assert!(a.verify_as(&key, 300, Verifier::Observer).is_err());
         assert!(a.verify_as(&key, 300, Verifier::Primary).is_err());
     }
@@ -5145,7 +5314,7 @@ mod tests {
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://module/v1".to_string(),
-            input_payload: serde_json::json!({}),
+            input_payload: serde_json::json!({}).into(),
             encrypted_secrets: EncryptedSecrets::empty(),
             timeout_ms: 30000,
             priority: 100,
@@ -5192,7 +5361,7 @@ mod tests {
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://module/v1".to_string(),
-            input_payload: serde_json::json!({}),
+            input_payload: serde_json::json!({}).into(),
             encrypted_secrets: EncryptedSecrets::empty(),
             timeout_ms: 30000,
             priority: 100,
@@ -5234,7 +5403,7 @@ mod tests {
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
-            output_payload: serde_json::json!({}),
+            output_payload: serde_json::json!({}).into(),
             logs: vec![],
             execution_time_ms: 0,
             signature: vec![],
@@ -5256,7 +5425,7 @@ mod tests {
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "wasm://m/v1".to_string(),
-            input_payload: serde_json::json!({}),
+            input_payload: serde_json::json!({}).into(),
             encrypted_secrets: EncryptedSecrets::empty(),
             timeout_ms: 30000,
             priority: 100,
@@ -5320,7 +5489,7 @@ mod tests {
             }),
         ] {
             let mut req = minimal_req();
-            req.input_payload = payload;
+            req.input_payload = payload.into();
             req.sign_ed25519(&sk).unwrap();
 
             // The wire hop: the worker re-parses, landing on the DRIFTED
@@ -5372,7 +5541,7 @@ mod tests {
                 job_id: Uuid::new_v4(),
                 workflow_execution_id: Uuid::new_v4(),
                 module_uri: "redis:wasm:tenant:module".to_string(),
-                input_payload: payload,
+                input_payload: payload.into(),
                 encrypted_secrets: EncryptedSecrets::empty(),
                 timeout_ms: 120_000,
                 priority: 100,
@@ -5405,8 +5574,10 @@ mod tests {
             let wire = serde_json::to_vec(&req).expect("serialise");
             let received: JobRequest = serde_json::from_slice(&wire).expect("deserialise");
 
+            // The RAW length, which is now what the signature covers — the
+            // received payload's text must be the transmitted text byte-for-byte.
             assert_eq!(
-                received.input_payload.to_string().len(),
+                received.input_payload.raw_len(),
                 byte_len,
                 "input length changed across the wire at {target_kb} KB"
             );
@@ -5426,7 +5597,7 @@ mod tests {
             job_id: Uuid::new_v4(),
             workflow_execution_id: Uuid::new_v4(),
             module_uri: "redis:wasm:tenant:module".to_string(),
-            input_payload: serde_json::json!({}),
+            input_payload: serde_json::json!({}).into(),
             encrypted_secrets: EncryptedSecrets::empty(),
             timeout_ms: 120_000,
             priority: 100,
@@ -5520,28 +5691,63 @@ mod tests {
         }
     }
 
-    /// INVARIANT 1: the canonical form is a FIXED POINT.
+    /// INVARIANT 1: the SIGNED BYTES survive the wire unchanged.
     ///
-    /// This is the property the signing fix depends on. If it ever fails,
-    /// signing is broken again — one normalisation pass would no longer be
-    /// enough — so this is the load-bearing assertion, not a nicety.
+    /// The load-bearing property, and the one that replaced "the canonical form
+    /// is a fixed point" (#595): no fixed point exists — some floats cycle
+    /// forever (see `some_floats_have_no_round_trip_fixed_point_known_gap`) —
+    /// so the fix stopped re-deriving the signed form altogether. What must
+    /// hold instead is that the payload text the sender hashed is EXACTLY the
+    /// text the receiver hashes, for arbitrary JSON.
+    ///
+    /// Asserted at all three levels the signature depends on: the raw bytes,
+    /// their SHA-256, and — load-bearing — that the digest the REAL
+    /// `signing_payload()` embeds is that same one. The third assertion is the
+    /// one with teeth: without it the first two are self-referential (the test
+    /// would hash `raw_bytes()` itself and prove nothing about the production
+    /// hash site), so a refactor that quietly re-derived the digest from the
+    /// parsed value would sail past. Verified by mutation: flipping
+    /// `signing_payload`'s input hash to `value().to_string()` fails this test.
     #[test]
-    #[ignore = "OPEN GAP: one-pass canonicalisation (#595) is insufficient — some \
-                floats CYCLE between two representations and have NO fixed point. \
-                Un-ignore when dispatch signing covers the RAW WIRE BYTES. \
-                Run with: cargo test -p talos-workflow-job-protocol -- --ignored"]
-    fn canonical_form_is_a_fixed_point_for_arbitrary_json() {
+    fn signed_payload_bytes_survive_the_wire_for_arbitrary_json() {
+        use sha2::Digest;
         let mut seed = 0x5eed_1234_abcd_0001_u64;
         for i in 0..20_000 {
-            let v = arbitrary_json(&mut seed, 4);
-            let once = canonical_signed_json(&v);
-            let reparsed: serde_json::Value = serde_json::from_str(&once)
-                .unwrap_or_else(|e| panic!("iter {i}: canonical form must reparse: {e}"));
-            let twice = canonical_signed_json(&reparsed);
+            let mut req = minimal_req();
+            req.input_payload = arbitrary_json(&mut seed, 4).into();
+
+            let sent_bytes = req.input_payload.raw_bytes().to_vec();
+            let sent_hash = Sha256::digest(&sent_bytes);
+            let sent_hash_hex = hex::encode(sent_hash);
+
+            let wire = serde_json::to_vec(&req).expect("serialise");
+            let received: JobRequest = serde_json::from_slice(&wire).expect("deserialise");
+
             assert_eq!(
-                once, twice,
-                "iter {i}: canonical form is NOT a fixed point — signing would break"
+                received.input_payload.raw_bytes(),
+                sent_bytes.as_slice(),
+                "iter {i}: signed payload bytes changed across the wire — \
+                 signing would break for {}",
+                req.input_payload.value()
             );
+            assert_eq!(
+                Sha256::digest(received.input_payload.raw_bytes()),
+                sent_hash,
+                "iter {i}: signed payload DIGEST changed across the wire"
+            );
+            // The digest the signature actually commits to must be the
+            // wire-bytes digest, on BOTH sides of the hop.
+            for (side, req) in [("sender", &req), ("receiver", &received)] {
+                let signed = req.signing_payload();
+                // Lossy on purpose: the assertion is an ASCII-hex substring
+                // search, so a future non-UTF-8 field must not turn this into
+                // an unrelated panic.
+                assert!(
+                    String::from_utf8_lossy(&signed).contains(&sent_hash_hex),
+                    "iter {i}: {side}'s signing payload does not commit to the \
+                     wire-bytes digest — it is hashing a re-derived form"
+                );
+            }
         }
     }
 
@@ -5551,24 +5757,20 @@ mod tests {
     /// the worker verifies a value it PARSED, never the one the controller
     /// held.
     #[test]
-    #[ignore = "OPEN GAP: one-pass canonicalisation (#595) is insufficient — some \
-                floats CYCLE between two representations and have NO fixed point. \
-                Un-ignore when dispatch signing covers the RAW WIRE BYTES. \
-                Run with: cargo test -p talos-workflow-job-protocol -- --ignored"]
     fn job_request_survives_the_wire_for_arbitrary_payloads() {
         let sk = ed_keypair();
         let vk = sk.verifying_key();
         let mut seed = 0x5eed_1234_abcd_0002_u64;
         for i in 0..2_000 {
             let mut req = minimal_req();
-            req.input_payload = arbitrary_json(&mut seed, 4);
+            req.input_payload = arbitrary_json(&mut seed, 4).into();
             req.sign_ed25519(&sk).unwrap();
             let wire = serde_json::to_vec(&req).expect("serialise");
             let received: JobRequest = serde_json::from_slice(&wire).expect("deserialise");
             received.verify_ed25519(&[vk], 300).unwrap_or_else(|e| {
                 panic!(
                     "iter {i}: verify failed for payload {}: {e}",
-                    req.input_payload
+                    req.input_payload.value()
                 )
             });
         }
@@ -5581,10 +5783,6 @@ mod tests {
     /// result verification identically. Covered explicitly rather than
     /// assumed, since the request path is the only one the outage exercised.
     #[test]
-    #[ignore = "OPEN GAP: one-pass canonicalisation (#595) is insufficient — some \
-                floats CYCLE between two representations and have NO fixed point. \
-                Un-ignore when dispatch signing covers the RAW WIRE BYTES. \
-                Run with: cargo test -p talos-workflow-job-protocol -- --ignored"]
     fn job_result_survives_the_wire_for_arbitrary_payloads() {
         let sk = ed_keypair();
         let vk = sk.verifying_key();
@@ -5593,7 +5791,7 @@ mod tests {
             let mut res = JobResult {
                 job_id: Uuid::new_v4(),
                 status: JobStatus::Success,
-                output_payload: arbitrary_json(&mut seed, 4),
+                output_payload: arbitrary_json(&mut seed, 4).into(),
                 logs: vec!["line".to_string()],
                 execution_time_ms: 12,
                 signature: Vec::new(),
@@ -5633,9 +5831,10 @@ mod tests {
         );
     }
 
-    /// Pins the OPEN GAP as an executable fact rather than a comment.
+    /// Pins the REASON [`SignedJson`] exists as an executable fact rather than
+    /// a comment.
     ///
-    /// #595 normalises signed JSON to its round-trip "fixed point", which
+    /// #595 normalised signed JSON to its round-trip "fixed point", which
     /// closed the observed outage because the digest's floats happened to
     /// settle after one pass. This value does NOT settle — it cycles between
     /// two representations forever, so no finite number of passes canonicalises
@@ -5644,10 +5843,11 @@ mod tests {
     /// Measured over 199_902 random finite f64: 39_495 settle after one pass,
     /// 19_721 need more than one, and some (like this) never do.
     ///
-    /// The only complete fix is to stop re-deriving: sign the bytes sent and
-    /// verify the bytes received. When that lands, this test should be
-    /// REPLACED by the un-ignored property tests above — not deleted, because
-    /// its counterexample is what proves they are not vacuous.
+    /// The complete fix was to stop re-deriving: [`SignedJson`] signs the bytes
+    /// sent and verifies the bytes received, so the cycle below is simply never
+    /// entered. This test is KEPT rather than deleted — its counterexample is
+    /// what proves the wire-invariant property tests above are not vacuous, and
+    /// what would flag a "simplification" back to hashing a re-serialised value.
     #[test]
     fn some_floats_have_no_round_trip_fixed_point_known_gap() {
         let step = |s: &str| {
@@ -5672,6 +5872,115 @@ mod tests {
         );
     }
 
+    /// Transcoding a signed message through `serde_json::Value`
+    /// (`to_value` → `from_value`) SILENTLY BREAKS ITS SIGNATURE.
+    ///
+    /// This is a trap worth an executable warning, because it does not fail
+    /// loudly anywhere else: the transcode compiles, runs, and produces a
+    /// structurally-identical message — but it re-parses and re-serialises the
+    /// payload, so a round-trip-unstable float lands on different bytes than
+    /// the ones the sender signed. Serialising to TEXT (what NATS actually
+    /// carries) preserves the bytes exactly, which is why the wire path is
+    /// safe and the `Value` detour is not.
+    ///
+    /// Rule for callers: move `JobRequest` / `JobResult` / the pipeline types
+    /// over the wire as bytes or a string, never via `serde_json::Value`.
+    #[test]
+    fn value_transcoding_loses_signed_bytes_but_text_round_trip_does_not() {
+        // The known 2-cycle counterexample — see
+        // `some_floats_have_no_round_trip_fixed_point_known_gap`.
+        let v: serde_json::Value = serde_json::from_str(r#"{"x":5.455171886890906e-115}"#).unwrap();
+        let mut r = make_test_result();
+        r.output_payload = v.into();
+        let signed_bytes = r.output_payload.raw_bytes().to_vec();
+
+        // Text round trip: byte-preserving, so the signature still verifies.
+        let wire = serde_json::to_string(&r).unwrap();
+        let via_text: JobResult = serde_json::from_str(&wire).unwrap();
+        assert_eq!(
+            via_text.output_payload.raw_bytes(),
+            signed_bytes.as_slice(),
+            "the wire path MUST preserve the signed bytes"
+        );
+
+        // Value transcode: re-derives the text, and the float drifts.
+        let as_value = serde_json::to_value(&r).unwrap();
+        let via_value: JobResult = serde_json::from_value(as_value).unwrap();
+        assert_ne!(
+            via_value.output_payload.raw_bytes(),
+            signed_bytes.as_slice(),
+            "if this ever starts preserving bytes, serde_json changed — relax \
+             the rule deliberately rather than by accident"
+        );
+    }
+
+    /// The signature binds the payload's exact TEXT, not its meaning — the
+    /// security consequence of [`SignedJson`] carrying raw bytes.
+    ///
+    /// `SignedJson` can hold text no `Value` would ever emit: duplicate keys,
+    /// padding, non-shortest number spellings. Consumers read the deduplicated
+    /// parse, so the natural worry is a signed/executed split. This pins both
+    /// halves of why there isn't one:
+    ///
+    /// 1. A KEYLESS on-path attacker cannot exploit it. Every rewrite below is
+    ///    semantics-preserving — each parses to the very `Value` the sender
+    ///    signed, so a "canonical form" signature would have ACCEPTED them —
+    ///    and every one is refused, because the digest covers the bytes.
+    /// 2. A KEY HOLDER can of course sign exotic text, and when it does the
+    ///    two halves stay consistent: the verifier checks the exact bytes and
+    ///    the module executes the last-wins parse of those same bytes. There is
+    ///    no view of the message that disagrees with the one that was signed.
+    #[test]
+    fn signature_binds_payload_text_not_meaning() {
+        let key = test_key();
+        let mut req = minimal_req();
+        req.input_payload = serde_json::json!({"a": 1}).into();
+        req.sign(&key).unwrap();
+        let wire = String::from_utf8(serde_json::to_vec(&req).unwrap()).unwrap();
+        let sent = r#""input_payload":{"a":1}"#;
+        assert!(wire.contains(sent), "payload text not found on the wire");
+
+        // 1. Keyless rewrites: same meaning, different bytes → all refused.
+        for rewrite in [
+            r#""input_payload":{"a" : 1}"#,     // interior padding
+            r#""input_payload":{"a":0,"a":1}"#, // duplicate key, last-wins
+            r#""input_payload":{"a":1.0}"#,     // different number spelling
+            // escaped key spelling: same key name, different bytes
+            r#""input_payload":{"\u0061":1}"#,
+        ] {
+            let tampered: JobRequest = serde_json::from_str(&wire.replace(sent, rewrite))
+                .unwrap_or_else(|e| panic!("rewrite {rewrite} must still be valid JSON: {e}"));
+            assert_eq!(
+                tampered.input_payload.value().get("a").unwrap().as_f64(),
+                Some(1.0),
+                "precondition: {rewrite} must be semantics-preserving, or the \
+                 test proves nothing about text-vs-meaning"
+            );
+            assert!(
+                tampered.verify_no_replay(&key, 300).is_err(),
+                "rewriting the payload text to {rewrite} must invalidate the \
+                 signature — duplicate-key smuggling requires the signing key"
+            );
+        }
+
+        // 2. Key holder signs duplicate-key text: raw survives the wire and
+        //    the parsed view is the last-wins reading of those same bytes.
+        let dup = r#""input_payload":{"a":9,"a":1}"#;
+        let mut exotic: JobRequest = serde_json::from_str(&wire.replace(sent, dup)).unwrap();
+        exotic.sign(&key).unwrap();
+        let received: JobRequest =
+            serde_json::from_slice(&serde_json::to_vec(&exotic).unwrap()).unwrap();
+        assert_eq!(
+            received.input_payload.raw_bytes(),
+            br#"{"a":9,"a":1}"#,
+            "the exotic text must survive the wire verbatim"
+        );
+        assert_eq!(received.input_payload.value(), &serde_json::json!({"a": 1}));
+        received
+            .verify_no_replay(&key, 300)
+            .expect("text the key holder actually signed must verify");
+    }
+
     fn ed_keypair() -> DispatchSigningKey {
         DispatchSigningKey::generate(&mut rand::rngs::OsRng)
     }
@@ -5688,7 +5997,7 @@ mod tests {
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
-            output_payload: serde_json::json!({"ok": true}),
+            output_payload: serde_json::json!({"ok": true}).into(),
             logs: vec![],
             execution_time_ms: 12,
             signature: vec![],
@@ -5739,7 +6048,7 @@ mod tests {
         let pk = sk.verifying_key();
         let mut r = make_test_result();
         r.sign_ed25519_with_worker_id(&sk, "worker-a").unwrap();
-        r.output_payload = serde_json::json!({"ok": false});
+        r.output_payload = serde_json::json!({"ok": false}).into();
         assert!(r.verify_no_replay_ed25519(&[pk], 300).is_err());
     }
 
@@ -6360,7 +6669,7 @@ mod tests {
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
-            output_payload: serde_json::json!({"answer": 42}),
+            output_payload: serde_json::json!({"answer": 42}).into(),
             logs: vec!["legit log line".to_string()],
             execution_time_ms: 100,
             signature: vec![],
@@ -6469,7 +6778,7 @@ mod tests {
             crypto_scheme: 0,
             job_id: Uuid::new_v4(),
             status: JobStatus::Success,
-            output_payload: serde_json::json!({}),
+            output_payload: serde_json::json!({}).into(),
             logs: vec![],
             execution_time_ms: 0,
             signature: vec![],
@@ -6630,7 +6939,7 @@ mod tests {
             module_id: Uuid::new_v4(),
             module_uri: "wasm://m/v1".to_string(),
             wasm_bytes: None,
-            config: serde_json::json!({"input": "original"}),
+            config: serde_json::json!({"input": "original"}).into(),
             allowed_hosts: vec!["api.example.com".to_string()],
             allowed_methods: vec!["GET".to_string()],
             allowed_secrets: vec!["slack/token".to_string()],
@@ -6680,7 +6989,7 @@ mod tests {
         let mut req = make_test_pipeline(vec![make_test_pipeline_step()]);
         req.sign(&key).unwrap();
 
-        req.steps[0].config = serde_json::json!({"input": "tampered"});
+        req.steps[0].config = serde_json::json!({"input": "tampered"}).into();
         assert!(
             req.verify(&key, 300).is_err(),
             "tampered pipeline step config must fail verification (C-2)"
@@ -6809,7 +7118,7 @@ mod tests {
     fn pipeline_signing_round_trip() {
         let key = test_key();
         let mut step = make_test_pipeline_step();
-        step.config = serde_json::json!({"k": "v", "n": 42});
+        step.config = serde_json::json!({"k": "v", "n": 42}).into();
         step.cancellation_token = Some("tok-xyz".to_string());
         let mut req = make_test_pipeline(vec![step]);
         req.sign(&key).unwrap();
@@ -6825,12 +7134,12 @@ mod tests {
         let key = test_key();
         let s0 = make_test_pipeline_step();
         let mut s1 = make_test_pipeline_step();
-        s1.config = serde_json::json!({"step": 1});
+        s1.config = serde_json::json!({"step": 1}).into();
         let mut req = make_test_pipeline(vec![s0, s1]);
         req.sign(&key).unwrap();
 
         // Tamper the SECOND step's config.
-        req.steps[1].config = serde_json::json!({"step": "tampered"});
+        req.steps[1].config = serde_json::json!({"step": "tampered"}).into();
         assert!(
             req.verify(&key, 300).is_err(),
             "tampering a non-first step's config must still fail (C-2)"
@@ -7150,14 +7459,18 @@ mod tests {
         let key = test_key();
         let mut result = make_test_result();
         result.sign(&key).unwrap();
-        let mut wire: serde_json::Value = serde_json::to_value(&result).unwrap();
-        // Assert the key truly isn't on the wire, then re-parse as if the
-        // JSON came from an old worker.
-        assert!(wire.get("llm_usage").is_none());
-        // Belt-and-braces: explicitly remove in case a future serde change
-        // starts emitting it.
-        wire.as_object_mut().unwrap().remove("llm_usage");
-        let back: JobResult = serde_json::from_value(wire).unwrap();
+        // TEXT round trip, never `to_value`/`from_value`: transcoding a
+        // message through `Value` re-derives the payload text and silently
+        // drops the signed bytes (pinned by
+        // `value_transcoding_loses_signed_bytes_but_text_round_trip_does_not`).
+        // Parsing the emitted text into a `Value` is only for the assertion
+        // below; the `JobResult` is rebuilt from the ORIGINAL text.
+        let wire = serde_json::to_string(&result).unwrap();
+        // The key truly isn't on the wire (it's `skip_serializing_if` empty),
+        // so the text below IS an old-worker message, byte for byte.
+        let as_value: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        assert!(as_value.get("llm_usage").is_none());
+        let back: JobResult = serde_json::from_str(&wire).unwrap();
         back.verify_no_replay(&key, 300).unwrap();
     }
 
@@ -7217,7 +7530,7 @@ mod tests {
             job_id: Uuid::new_v4(),
             overall_status: JobStatus::Success,
             step_results: vec![],
-            final_output: serde_json::json!({"ok": true}),
+            final_output: serde_json::json!({"ok": true}).into(),
             total_time_ms: 5,
             signature: vec![],
             result_nonce: String::new(),
