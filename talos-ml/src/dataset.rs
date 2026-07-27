@@ -154,6 +154,28 @@ pub struct HoldoutExample {
     pub embedding: Option<Vec<f32>>,
 }
 
+/// Outcome of [`DatasetService::dedupe_by_content`]. Every field is reported in
+/// BOTH dry-run and executed mode so the preview a caller approves is the same
+/// arithmetic the delete performs.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ContentDedupeOutcome {
+    pub dry_run: bool,
+    /// Groups of >=2 rows whose embeddings are byte-identical.
+    pub duplicate_groups: i64,
+    /// Duplicate groups carrying MORE THAN ONE label — the rows that were
+    /// actively teaching the model contradictory things.
+    pub conflicting_groups: i64,
+    /// Rows the precedence order would drop (survivors excluded).
+    pub rows_removable: i64,
+    /// Removable rows that are themselves corrections — a human labelled the
+    /// same content twice, so only the newest survives. Reported separately
+    /// because it decrements `corrections_banked` and can move the
+    /// `min_corrections_per_class` gate.
+    pub corrections_superseded: i64,
+    /// Rows actually deleted (0 in dry-run).
+    pub rows_removed: u64,
+}
+
 pub struct DatasetService {
     secrets: Arc<SecretsManager>,
 }
@@ -432,6 +454,138 @@ impl DatasetService {
             "ml dataset growth cap enforced (corrections pinned)"
         );
         Ok(())
+    }
+
+    /// Precedence-ranked duplicate groups within ONE dataset, keyed on
+    /// embedding identity.
+    ///
+    /// Identical `features_text` deterministically yields an identical
+    /// embedding, so the vector IS a usable content key — which lets this run
+    /// entirely in SQL with **no decryption** and, critically, **without
+    /// persisting any plaintext-derived fingerprint** next to the ciphertext
+    /// (the confidentiality trade-off rejected for the same reason in the
+    /// disagreement-queue dedup). `md5` here is a GROUPING key over a column
+    /// already stored in the row — not a security primitive.
+    ///
+    /// Two windows are required, not one: attaching `ORDER BY` to a window
+    /// changes its default frame to `RANGE UNBOUNDED PRECEDING AND CURRENT
+    /// ROW`, which would silently make `COUNT`/`MIN`/`MAX` running aggregates
+    /// over a partial partition instead of whole-group facts.
+    ///
+    /// The ordering ends in `id` for the same reason as the kNN neighbour
+    /// query: without a unique tiebreaker the survivor of a tie is chosen by
+    /// heap order and can differ between the preview and the delete.
+    const CONTENT_RANK_CTE: &'static str = "\
+        WITH grouped AS ( \
+            SELECT id, source, label_json->>'label' AS label, created_at, \
+                   md5(embedding::text) AS content_key \
+            FROM ml_examples \
+            WHERE dataset_id = $1 AND embedding IS NOT NULL \
+        ), ranked AS ( \
+            SELECT id, source, \
+                   ROW_NUMBER() OVER wo AS rn, \
+                   COUNT(*) OVER wp AS grp_size, \
+                   (MIN(label) OVER wp) IS DISTINCT FROM (MAX(label) OVER wp) \
+                       AS has_conflict \
+            FROM grouped \
+            WINDOW wo AS ( \
+                       PARTITION BY content_key \
+                       ORDER BY CASE source \
+                                  WHEN 'correction' THEN 0 \
+                                  WHEN 'llm_production' THEN 1 \
+                                  ELSE 2 END, \
+                                created_at DESC, id), \
+                   wp AS (PARTITION BY content_key) \
+        ) ";
+
+    /// Collapse content-duplicate examples to one row per distinct content,
+    /// keeping the highest-precedence label: `correction` > `llm_production`
+    /// > everything else (i.e. `llm_bootstrap`), newest first, `id` last.
+    ///
+    /// WHY this exists (observed 2026-07-27 on inbox-classifier-personal): a
+    /// scheduled CI workflow re-failing on the same commit emits many DISTINCT
+    /// emails whose `Subject`/`From`/`Snippet` are byte-identical. The
+    /// `(dataset_id, example_key)` upsert cannot collapse them — the message
+    /// ids genuinely differ — so the dataset accumulated one email template as
+    /// ~72% of the `archive` class, including NINE copies of a single alert
+    /// carrying FIVE `archive` labels and FOUR human `to_read` corrections.
+    /// That is an irreducible contradiction in feature space: no model or
+    /// feature can separate rows that are identical, so the majority simply
+    /// outvotes the human. It also mints the duplicate embeddings that made
+    /// the kNN neighbour vote tie-dependent.
+    ///
+    /// `dry_run` performs the identical grouping and reports what WOULD go,
+    /// deleting nothing — the intended first call, since this is destructive
+    /// and training data is not trivially reconstructible.
+    ///
+    /// Caller must supply a tenant-scoped connection; `dataset_id` is
+    /// additionally re-asserted on the delete as a belt-and-braces predicate.
+    pub async fn dedupe_by_content(
+        &self,
+        conn: &mut PgConnection,
+        dataset_id: Uuid,
+        dry_run: bool,
+    ) -> Result<ContentDedupeOutcome> {
+        let survey_sql = format!(
+            "{}SELECT \
+                 COUNT(*) FILTER (WHERE rn > 1) AS rows_removable, \
+                 COUNT(*) FILTER (WHERE rn = 1 AND grp_size > 1) AS duplicate_groups, \
+                 COUNT(*) FILTER (WHERE rn = 1 AND has_conflict) AS conflicting_groups, \
+                 COUNT(*) FILTER (WHERE rn > 1 AND source = 'correction') \
+                     AS corrections_superseded \
+             FROM ranked",
+            Self::CONTENT_RANK_CTE
+        );
+        let (rows_removable, duplicate_groups, conflicting_groups, corrections_superseded): (
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = sqlx::query_as(&survey_sql)
+            .bind(dataset_id)
+            .fetch_one(&mut *conn)
+            .await
+            .context("survey content-duplicate examples")?;
+
+        let mut outcome = ContentDedupeOutcome {
+            dry_run,
+            duplicate_groups,
+            conflicting_groups,
+            rows_removable,
+            corrections_superseded,
+            rows_removed: 0,
+        };
+        if dry_run || rows_removable == 0 {
+            return Ok(outcome);
+        }
+
+        let delete_sql = format!(
+            "{}DELETE FROM ml_examples e USING ranked r \
+             WHERE e.id = r.id AND r.rn > 1 AND e.dataset_id = $1",
+            Self::CONTENT_RANK_CTE
+        );
+        let res = sqlx::query(&delete_sql)
+            .bind(dataset_id)
+            .execute(&mut *conn)
+            .await
+            .context("delete content-duplicate examples")?;
+        outcome.rows_removed = res.rows_affected();
+
+        sqlx::query("UPDATE ml_datasets SET updated_at = NOW() WHERE id = $1")
+            .bind(dataset_id)
+            .execute(&mut *conn)
+            .await
+            .context("touch ml_dataset after dedupe")?;
+
+        tracing::info!(
+            %dataset_id,
+            duplicate_groups,
+            conflicting_groups,
+            corrections_superseded,
+            rows_removed = outcome.rows_removed,
+            "ml dataset content-dedupe applied"
+        );
+        Ok(outcome)
     }
 
     /// Human-correction counts per class (`source = 'correction'`) —

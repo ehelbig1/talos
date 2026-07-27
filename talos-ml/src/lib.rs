@@ -36,8 +36,8 @@ pub mod teacher_ceilings;
 
 pub use correction::{resolve_disagreement, ResolveError, ResolveOutcome};
 pub use dataset::{
-    AppendExample, DatasetService, DatasetStats, DatasetTenancy, ExampleSource, GoldExample,
-    HoldoutExample, PreparedExample, SampledExample,
+    AppendExample, ContentDedupeOutcome, DatasetService, DatasetStats, DatasetTenancy,
+    ExampleSource, GoldExample, HoldoutExample, PreparedExample, SampledExample,
 };
 pub use delete::{delete_model, DeleteError, DeleteOutcome};
 pub use digest::{run_digest_tick, spawn_disagreement_digest};
