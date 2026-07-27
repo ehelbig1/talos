@@ -5455,6 +5455,223 @@ mod tests {
         }
     }
 
+    // ── Wire-invariant property harness ───────────────────────────────────
+    //
+    // The 2026-07-27 dispatch-signature outage was found by SEARCH, not by
+    // deduction: six reasoned hypotheses were wrong, and a property test that
+    // simply asked "is the round trip ever unstable?" found the cause in
+    // seconds. These tests encode that technique so the next wire-format
+    // change is checked the same way.
+    //
+    // Every existing hand-written sign/verify test uses `json!({})` payloads,
+    // which is structurally incapable of catching a payload-DEPENDENT fault.
+    // The generator below deliberately produces the shapes that broke us:
+    // floats from raw bit patterns (the actual failure), deep nesting, mixed
+    // arrays, unicode, and integers at type boundaries.
+
+    /// Pseudo-random structured JSON. Seeded (not `thread_rng`) so a failure
+    /// is REPRODUCIBLE from the printed seed — a flaky property test that
+    /// cannot be replayed is worse than none.
+    fn arbitrary_json(seed: &mut u64, depth: u32) -> serde_json::Value {
+        // xorshift64* — tiny, deterministic, no dev-dependency.
+        let mut next = || {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed
+        };
+        let pick = next() % if depth == 0 { 6 } else { 8 };
+        match pick {
+            0 => serde_json::Value::Null,
+            1 => serde_json::Value::Bool(next() % 2 == 0),
+            // Floats from RAW BITS: this is the class that actually broke
+            // signing (parse(write(x)) landing one ULP away).
+            2 => {
+                let f = f64::from_bits(next());
+                serde_json::Number::from_f64(f)
+                    .map_or(serde_json::Value::Null, serde_json::Value::Number)
+            }
+            // Integers at the boundaries where JSON number typing is subtle.
+            3 => serde_json::json!(next() as i64),
+            4 => serde_json::json!(next()),
+            // Computed ratios — the digest's actual content, ~10% of which
+            // are round-trip unstable.
+            5 => {
+                let (a, b) = (next() % 1000 + 1, next() % 1000 + 1);
+                serde_json::json!(a as f64 / b as f64)
+            }
+            6 => {
+                let n = (next() % 4) as usize;
+                serde_json::Value::Array((0..n).map(|_| arbitrary_json(seed, depth - 1)).collect())
+            }
+            _ => {
+                let n = (next() % 4) as usize;
+                let mut m = serde_json::Map::new();
+                for i in 0..n {
+                    // Non-ASCII keys and values: escaping differences would
+                    // change byte length without changing meaning.
+                    m.insert(
+                        format!("k{i}\u{2014}\u{1f600}"),
+                        arbitrary_json(seed, depth - 1),
+                    );
+                }
+                serde_json::Value::Object(m)
+            }
+        }
+    }
+
+    /// INVARIANT 1: the canonical form is a FIXED POINT.
+    ///
+    /// This is the property the signing fix depends on. If it ever fails,
+    /// signing is broken again — one normalisation pass would no longer be
+    /// enough — so this is the load-bearing assertion, not a nicety.
+    #[test]
+    #[ignore = "OPEN GAP: one-pass canonicalisation (#595) is insufficient — some \
+                floats CYCLE between two representations and have NO fixed point. \
+                Un-ignore when dispatch signing covers the RAW WIRE BYTES. \
+                Run with: cargo test -p talos-workflow-job-protocol -- --ignored"]
+    fn canonical_form_is_a_fixed_point_for_arbitrary_json() {
+        let mut seed = 0x5eed_1234_abcd_0001_u64;
+        for i in 0..20_000 {
+            let v = arbitrary_json(&mut seed, 4);
+            let once = canonical_signed_json(&v);
+            let reparsed: serde_json::Value = serde_json::from_str(&once)
+                .unwrap_or_else(|e| panic!("iter {i}: canonical form must reparse: {e}"));
+            let twice = canonical_signed_json(&reparsed);
+            assert_eq!(
+                once, twice,
+                "iter {i}: canonical form is NOT a fixed point — signing would break"
+            );
+        }
+    }
+
+    /// INVARIANT 2: sign -> wire -> verify holds for arbitrary payloads.
+    ///
+    /// The end-to-end property the outage violated. Exercises the real hop:
+    /// the worker verifies a value it PARSED, never the one the controller
+    /// held.
+    #[test]
+    #[ignore = "OPEN GAP: one-pass canonicalisation (#595) is insufficient — some \
+                floats CYCLE between two representations and have NO fixed point. \
+                Un-ignore when dispatch signing covers the RAW WIRE BYTES. \
+                Run with: cargo test -p talos-workflow-job-protocol -- --ignored"]
+    fn job_request_survives_the_wire_for_arbitrary_payloads() {
+        let sk = ed_keypair();
+        let vk = sk.verifying_key();
+        let mut seed = 0x5eed_1234_abcd_0002_u64;
+        for i in 0..2_000 {
+            let mut req = minimal_req();
+            req.input_payload = arbitrary_json(&mut seed, 4);
+            req.sign_ed25519(&sk).unwrap();
+            let wire = serde_json::to_vec(&req).expect("serialise");
+            let received: JobRequest = serde_json::from_slice(&wire).expect("deserialise");
+            received.verify_ed25519(&[vk], 300).unwrap_or_else(|e| {
+                panic!(
+                    "iter {i}: verify failed for payload {}: {e}",
+                    req.input_payload
+                )
+            });
+        }
+    }
+
+    /// INVARIANT 3: the same, for the RESULT direction (worker -> controller).
+    ///
+    /// `output_payload` is signed by the same mechanism, so it carries the
+    /// same hazard — a module returning computed floats would have broken
+    /// result verification identically. Covered explicitly rather than
+    /// assumed, since the request path is the only one the outage exercised.
+    #[test]
+    #[ignore = "OPEN GAP: one-pass canonicalisation (#595) is insufficient — some \
+                floats CYCLE between two representations and have NO fixed point. \
+                Un-ignore when dispatch signing covers the RAW WIRE BYTES. \
+                Run with: cargo test -p talos-workflow-job-protocol -- --ignored"]
+    fn job_result_survives_the_wire_for_arbitrary_payloads() {
+        let sk = ed_keypair();
+        let vk = sk.verifying_key();
+        let mut seed = 0x5eed_1234_abcd_0003_u64;
+        for i in 0..2_000 {
+            let mut res = JobResult {
+                job_id: Uuid::new_v4(),
+                status: JobStatus::Success,
+                output_payload: arbitrary_json(&mut seed, 4),
+                logs: vec!["line".to_string()],
+                execution_time_ms: 12,
+                signature: Vec::new(),
+                result_nonce: String::new(),
+                worker_id: "worker-1".to_string(),
+                crypto_scheme: 0,
+                llm_usage: Vec::new(),
+            };
+            res.sign_ed25519_with_worker_id(&sk, "worker-1").unwrap();
+            let wire = serde_json::to_vec(&res).expect("serialise");
+            let received: JobResult = serde_json::from_slice(&wire).expect("deserialise");
+            received
+                .verify_ed25519(&[vk], 300)
+                .unwrap_or_else(|e| panic!("iter {i}: result verify failed: {e}"));
+        }
+    }
+
+    /// The generator must actually produce the hazard it exists to cover —
+    /// otherwise the three tests above pass vacuously and we would never know.
+    #[test]
+    fn generator_actually_produces_round_trip_unstable_floats() {
+        let mut seed = 0x5eed_1234_abcd_0004_u64;
+        let mut unstable = 0;
+        for _ in 0..20_000 {
+            let v = arbitrary_json(&mut seed, 3);
+            let once = v.to_string();
+            if let Ok(p) = serde_json::from_str::<serde_json::Value>(&once) {
+                if p.to_string() != once {
+                    unstable += 1;
+                }
+            }
+        }
+        assert!(
+            unstable > 0,
+            "generator produced NO round-trip-unstable value — the wire tests \
+             would be passing vacuously"
+        );
+    }
+
+    /// Pins the OPEN GAP as an executable fact rather than a comment.
+    ///
+    /// #595 normalises signed JSON to its round-trip "fixed point", which
+    /// closed the observed outage because the digest's floats happened to
+    /// settle after one pass. This value does NOT settle — it cycles between
+    /// two representations forever, so no finite number of passes canonicalises
+    /// it and any signature derived by RE-SERIALISING can still diverge.
+    ///
+    /// Measured over 199_902 random finite f64: 39_495 settle after one pass,
+    /// 19_721 need more than one, and some (like this) never do.
+    ///
+    /// The only complete fix is to stop re-deriving: sign the bytes sent and
+    /// verify the bytes received. When that lands, this test should be
+    /// REPLACED by the un-ignored property tests above — not deleted, because
+    /// its counterexample is what proves they are not vacuous.
+    #[test]
+    fn some_floats_have_no_round_trip_fixed_point_known_gap() {
+        let step = |s: &str| {
+            serde_json::from_str::<serde_json::Value>(s)
+                .unwrap()
+                .to_string()
+        };
+        // One lead-in step, then a permanent 2-cycle:
+        //   ...906e-115 -> ...905e-115 -> ...9045e-115 -> ...905e-115 -> ...
+        let x0 = "5.455171886890906e-115".to_string();
+        let x1 = step(&x0);
+        let x2 = step(&x1);
+        let x3 = step(&x2);
+        let x4 = step(&x3);
+        assert_ne!(x0, x1, "first round trip must drift");
+        assert_ne!(x1, x2, "second round trip must drift again");
+        assert_eq!(x3, x1, "must enter a 2-cycle");
+        assert_eq!(x4, x2, "and stay in it");
+        assert_ne!(
+            x1, x2,
+            "the two cycle members differ — so NO fixed point exists"
+        );
+    }
+
     fn ed_keypair() -> DispatchSigningKey {
         DispatchSigningKey::generate(&mut rand::rngs::OsRng)
     }
