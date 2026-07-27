@@ -1407,6 +1407,16 @@ async fn handle_resolve_disagreement(
         Err(talos_ml::ResolveError::NoDataset) => {
             mcp_error(req_id, -32000, "Model has no dataset to correct into")
         }
+        // Name the valid classes: the caller is a human or an agent typing a
+        // label, and a bare rejection would leave them guessing.
+        Err(talos_ml::ResolveError::UnknownLabel { provided, known }) => mcp_error(
+            req_id,
+            -32602,
+            &format!(
+                "'{provided}' is not a class of this model's dataset. Valid labels: {}.                  A correction re-labels an existing class; to introduce a NEW class use                  ml_append_examples.",
+                known.join(", ")
+            ),
+        ),
         Err(talos_ml::ResolveError::Internal(e)) => internal(req_id, "resolve_disagreement", &e),
     }
 }

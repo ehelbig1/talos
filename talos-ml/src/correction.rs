@@ -30,6 +30,18 @@ pub enum ResolveError {
     /// A correction was requested but the model has no dataset to write
     /// the gold example into.
     NoDataset,
+    /// `correct_label` is not one of the dataset's existing classes.
+    ///
+    /// Corrections are human-authored TRAINING data, so a typo does not fail
+    /// loudly on its own — it silently mints a phantom class that pollutes the
+    /// label distribution, never matches a `recall_floors` entry, and counts
+    /// toward `min_corrections_per_class` for a class that does not exist.
+    /// Rejecting is the fail-loud choice; genuinely introducing a new class is
+    /// a different operation (`ml_append_examples`).
+    UnknownLabel {
+        provided: String,
+        known: Vec<String>,
+    },
     Internal(anyhow::Error),
 }
 
@@ -111,6 +123,20 @@ pub async fn resolve_disagreement(
                     Ok(t) if t.user_id == user_id => t,
                     _ => return Err(ResolveError::NotFound),
                 };
+                // Reject a label outside the dataset's vocabulary. An EMPTY
+                // vocabulary accepts anything — a dataset with no labelled rows
+                // yet has no vocabulary to violate, and refusing there would
+                // make the first correction impossible.
+                let known = dataset
+                    .label_vocabulary(&mut tx, dataset_id)
+                    .await
+                    .map_err(ResolveError::Internal)?;
+                if !label_in_vocabulary(label, &known) {
+                    return Err(ResolveError::UnknownLabel {
+                        provided: label.to_string(),
+                        known,
+                    });
+                }
                 Some((dataset_id, tenancy, label.to_string()))
             }
             None => None,
@@ -229,6 +255,19 @@ fn siblings_from_groups(groups: Vec<crate::lifecycle::PendingDisagreement>, id: 
     Vec::new()
 }
 
+/// Whether `label` is acceptable for a correction against a dataset whose
+/// classes are `known`.
+///
+/// An EMPTY vocabulary accepts anything: a dataset with no labelled rows yet
+/// has no vocabulary to violate, and refusing there would make the very first
+/// correction impossible. Otherwise membership is exact — no case-folding or
+/// trimming beyond what the caller already did, because a label that differs
+/// by case IS a different class to every downstream consumer (`recall_floors`
+/// keys, `by_label` counts, `min_corrections_per_class`).
+pub(crate) fn label_in_vocabulary(label: &str, known: &[String]) -> bool {
+    known.is_empty() || known.iter().any(|k| k == label)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +285,30 @@ mod tests {
             created_at: chrono::Utc::now(),
             duplicate_ids: dups.to_vec(),
         }
+    }
+
+    /// The typo case this guard exists for: `follwo_up` must not silently
+    /// become a fourth class.
+    #[test]
+    fn unknown_label_is_rejected_against_a_known_vocabulary() {
+        let vocab = vec![
+            "archive".to_string(),
+            "follow_up".to_string(),
+            "to_read".to_string(),
+        ];
+        assert!(label_in_vocabulary("follow_up", &vocab));
+        assert!(!label_in_vocabulary("follwo_up", &vocab));
+        // Case and whitespace variants are DIFFERENT classes downstream
+        // (recall_floors keys, by_label counts), so they must be rejected too.
+        assert!(!label_in_vocabulary("Follow_Up", &vocab));
+        assert!(!label_in_vocabulary("follow_up ", &vocab));
+    }
+
+    /// A dataset with no labelled rows has no vocabulary to violate — refusing
+    /// there would make the first correction impossible.
+    #[test]
+    fn empty_vocabulary_accepts_anything() {
+        assert!(label_in_vocabulary("anything", &[]));
     }
 
     #[test]
