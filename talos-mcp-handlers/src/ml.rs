@@ -60,6 +60,14 @@ pub fn tool_schemas() -> Vec<Value> {
             }, "required": ["dataset_id"] }
         }),
         serde_json::json!({
+            "name": "ml_dedupe_dataset",
+            "description": "Collapse CONTENT-duplicate training examples to one row per distinct content, keeping the highest-precedence label (correction > llm_production > everything else, newest first). DEFAULTS TO DRY-RUN: pass apply=true to actually delete. Distinct emails can carry byte-identical Subject/From/Snippet (e.g. a scheduled CI workflow re-failing on one commit), which the (dataset_id, example_key) upsert cannot collapse because the message ids genuinely differ. Those rows are an irreducible contradiction in feature space — identical features with different labels — so a majority of stale teacher labels silently outvotes a human correction, and they mint the duplicate embeddings that make kNN neighbour votes tie-dependent. Reports duplicate_groups, conflicting_groups (groups carrying more than one label), rows_removable, and corrections_superseded (duplicate corrections where only the newest survives — this decrements corrections_banked and can move the min_corrections_per_class gate). Destructive when applied; training data is not trivially reconstructible, so run the dry-run first and re-run ml_eval_model after.",
+            "inputSchema": { "type": "object", "properties": {
+                "dataset_id": { "type": "string" },
+                "apply": { "type": "boolean", "description": "false/omitted = dry-run (default): report what would be removed, delete nothing. true = perform the deletion." }
+            }, "required": ["dataset_id"] }
+        }),
+        serde_json::json!({
             "name": "ml_sample_examples",
             "description": "Decrypt up to N random examples per label for human spot-checking (the review step of the bootstrap→review→train→deploy loop).",
             "inputSchema": { "type": "object", "properties": {
@@ -210,6 +218,7 @@ pub async fn dispatch(
         "ml_create_dataset" => Some(handle_create_dataset(req_id, args, state, user_id).await),
         "ml_append_examples" => Some(handle_append_examples(req_id, args, state, user_id).await),
         "ml_dataset_stats" => Some(handle_dataset_stats(req_id, args, state, user_id).await),
+        "ml_dedupe_dataset" => Some(handle_dedupe_dataset(req_id, args, state, user_id).await),
         "ml_sample_examples" => Some(handle_sample_examples(req_id, args, state, user_id).await),
         "ml_create_model" => Some(handle_create_model(req_id, args, state, user_id).await),
         "ml_eval_model" => Some(handle_eval_model(req_id, args, state, user_id).await),
@@ -442,6 +451,59 @@ async fn handle_dataset_stats(
             &serde_json::to_string_pretty(&stats).unwrap_or_default(),
         ),
         Err(e) => internal(req_id, "dataset_stats", &e),
+    }
+}
+
+/// Content-dedupe a dataset. DRY-RUN unless `apply: true` — the default
+/// is deliberately the non-destructive one: this deletes training rows,
+/// and a dataset is not trivially reconstructible.
+async fn handle_dedupe_dataset(
+    req_id: Option<Value>,
+    args: &Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let dataset_id = match parse_uuid(args, "dataset_id") {
+        Ok(v) => v,
+        Err(m) => return mcp_error(req_id, -32602, &m),
+    };
+    // Absent / non-boolean `apply` is a dry-run: an unparseable argument must
+    // never be the one that deletes rows.
+    let apply = args.get("apply").and_then(Value::as_bool).unwrap_or(false);
+    let svc = dataset_service(state);
+    let mut tx = match user_tx(state, user_id).await {
+        Ok(tx) => tx,
+        Err(e) => return internal(req_id, "dedupe_dataset", &e),
+    };
+    if let Err(m) = require_dataset_owner(&svc, &mut tx, dataset_id, user_id).await {
+        return mcp_error(req_id, -32000, &m);
+    }
+    match svc.dedupe_by_content(&mut tx, dataset_id, !apply).await {
+        Ok(outcome) => {
+            // A dry-run must not hold a write tx open past its usefulness;
+            // committing an unchanged tx is also correct and keeps one path.
+            if let Err(e) = tx.commit().await {
+                return internal(req_id, "dedupe_dataset", &anyhow::anyhow!(e));
+            }
+            let mut body = serde_json::to_value(&outcome).unwrap_or_default();
+            if let Some(o) = body.as_object_mut() {
+                o.insert(
+                    "next_step".into(),
+                    serde_json::json!(if outcome.dry_run {
+                        "dry-run only, nothing deleted. Re-run with apply=true to perform it, \
+                         then ml_eval_model — class balance and every accuracy number will move."
+                    } else {
+                        "rows deleted. Re-run ml_eval_model: the holdout split, class balance \
+                         and gold slice are all recomputed from the surviving rows."
+                    }),
+                );
+            }
+            mcp_text(
+                req_id,
+                &serde_json::to_string_pretty(&body).unwrap_or_default(),
+            )
+        }
+        Err(e) => internal(req_id, "dedupe_dataset", &e),
     }
 }
 
