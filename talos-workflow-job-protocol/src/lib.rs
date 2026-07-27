@@ -2584,6 +2584,35 @@ pub struct JobRequest {
     pub idempotency_key: Option<String>,
 }
 
+/// Serialize a signed JSON payload to its ROUND-TRIP FIXED POINT.
+///
+/// `serde_json`'s f64 round-trip is NOT idempotent: for ~10% of ordinary
+/// computed ratios, `parse(write(x))` yields a DIFFERENT f64 (off by one ULP),
+/// so `write(parse(write(x)))` is a different string of a different length.
+/// Measured 2026-07-27: `2.0723360413348367e-142` (bits ...0f) reparses to
+/// bits ...10 and rewrites as `2.072336041334837e-142` — one byte shorter.
+/// 16837 of 160000 ratios n/d (n,d <= 400) are unstable this way.
+///
+/// This broke dispatch signing outright. The controller hashed `write(x)`; the
+/// worker parsed the wire bytes into the drifted f64 and hashed
+/// `write(parse(write(x)))`; the hashes differed and the job failed Ed25519
+/// verification. It presented as a LOTTERY — a job failed only if its payload
+/// happened to contain an unstable float — which is why `pa-autonomy-digest`
+/// (~30 computed ratios, incl. Wilson intervals) failed every run while
+/// smaller text-only payloads verified fine for weeks.
+///
+/// The SECOND round-trip is stable (verified), so one normalization pass
+/// reaches the fixed point; hashing that form makes both sides agree whichever
+/// representation they hold. Falls back to the raw string on a re-parse error,
+/// which cannot happen for a Value we just serialized.
+fn canonical_signed_json(v: &serde_json::Value) -> String {
+    let once = v.to_string();
+    match serde_json::from_str::<serde_json::Value>(&once) {
+        Ok(reparsed) => reparsed.to_string(),
+        Err(_) => once,
+    }
+}
+
 impl JobRequest {
     /// Canonical byte string signed / verified by HMAC-SHA256.
     ///
@@ -2605,7 +2634,9 @@ impl JobRequest {
         // Hash large/variable fields to fixed-size hex representations.
         // This prevents payload-substitution attacks where an attacker could
         // replace input_payload, secrets, or wasm_bytes with malicious content.
-        let input_hash = hex::encode(Sha256::digest(self.input_payload.to_string().as_bytes()));
+        let input_hash = hex::encode(Sha256::digest(
+            canonical_signed_json(&self.input_payload).as_bytes(),
+        ));
         let secrets_hash = hex::encode(Sha256::digest(&self.encrypted_secrets.ciphertext));
 
         // Sort allowed_hosts so the signature is stable regardless of array order.
@@ -2838,7 +2869,7 @@ impl JobRequest {
     /// security-sensitive (the same hashes already go into the signature).
     pub fn diag_hashes(&self) -> (String, String, usize) {
         use sha2::Digest;
-        let input_str = self.input_payload.to_string();
+        let input_str = canonical_signed_json(&self.input_payload);
         let input_hash = hex::encode(Sha256::digest(input_str.as_bytes()));
         let secrets_hash = hex::encode(Sha256::digest(&self.encrypted_secrets.ciphertext));
         (input_hash, secrets_hash, input_str.len())
@@ -3185,7 +3216,9 @@ impl JobResult {
             JobStatus::Failed => "failed",
             JobStatus::TimedOut => "timedout",
         };
-        let output_hash = hex::encode(Sha256::digest(self.output_payload.to_string().as_bytes()));
+        let output_hash = hex::encode(Sha256::digest(
+            canonical_signed_json(&self.output_payload).as_bytes(),
+        ));
         // Canonicalise logs by joining with `\n` (a stable separator
         // that no individual log line can contain — Vec<String> elements
         // are pre-split on newlines by the worker). Hash to a fixed
@@ -3768,7 +3801,8 @@ impl PipelineJobRequest {
             .steps
             .iter()
             .map(|s| {
-                let config_hash = hex::encode(Sha256::digest(s.config.to_string().as_bytes()));
+                let config_hash =
+                    hex::encode(Sha256::digest(canonical_signed_json(&s.config).as_bytes()));
                 let secrets_ct_hash = hex::encode(Sha256::digest(&s.encrypted_secrets.ciphertext));
                 let mut hosts = s.allowed_hosts.clone();
                 hosts.sort_unstable();
@@ -4117,7 +4151,9 @@ impl PipelineJobResult {
             JobStatus::Failed => "failed",
             JobStatus::TimedOut => "timedout",
         };
-        let output_hash = hex::encode(Sha256::digest(self.final_output.to_string().as_bytes()));
+        let output_hash = hex::encode(Sha256::digest(
+            canonical_signed_json(&self.final_output).as_bytes(),
+        ));
 
         // Canonical per-step digest: each step contributes a fixed-shape
         // line; the complete sequence is hashed once.
@@ -4130,7 +4166,8 @@ impl PipelineJobResult {
                     JobStatus::Failed => "failed",
                     JobStatus::TimedOut => "timedout",
                 };
-                let s_output = hex::encode(Sha256::digest(s.output.to_string().as_bytes()));
+                let s_output =
+                    hex::encode(Sha256::digest(canonical_signed_json(&s.output).as_bytes()));
                 let s_error = match s.error.as_deref() {
                     Some(e) => hex::encode(Sha256::digest(e.as_bytes())),
                     None => "none".to_string(),
@@ -5250,6 +5287,52 @@ mod tests {
 
     // ── RFC 0010 P1: Ed25519 dispatch scheme tests ────────────────────────
 
+    /// The ACTUAL 2026-07-27 root cause: `serde_json`'s f64 round-trip is not
+    /// idempotent, so a payload carrying an unstable float hashed differently
+    /// on each side and every such dispatch failed Ed25519 verification.
+    ///
+    /// Uses the exact bit pattern found by the search, plus a computed ratio
+    /// of the kind the operator digest is full of (pass_rate, agreement,
+    /// Wilson bounds) — ~10% of which are unstable.
+    #[test]
+    fn signing_survives_floats_whose_json_round_trip_is_not_idempotent() {
+        // Precondition: this float really does drift through a round trip.
+        // If serde_json ever fixes this, the assert below documents why the
+        // canonicalisation existed rather than silently becoming dead weight.
+        let drifty = f64::from_bits(0x2284_3773_1ab4_9c0f);
+        let once = serde_json::json!({ "x": drifty }).to_string();
+        let twice = serde_json::from_str::<serde_json::Value>(&once)
+            .unwrap()
+            .to_string();
+        assert_ne!(once, twice, "expected a non-idempotent float round trip");
+
+        let sk = ed_keypair();
+        let vk = sk.verifying_key();
+        for payload in [
+            serde_json::json!({ "avg_score": drifty }),
+            // A digest-shaped body: computed ratios at several magnitudes.
+            serde_json::json!({
+                "judge_scores": (1..40).map(|i| serde_json::json!({
+                    "avg_score": f64::from(i) / 37.0,
+                    "pass_rate": f64::from(i) / 91.0,
+                    "ci95": [f64::from(i) / 7.0, f64::from(i) / 13.0],
+                })).collect::<Vec<_>>(),
+            }),
+        ] {
+            let mut req = minimal_req();
+            req.input_payload = payload;
+            req.sign_ed25519(&sk).unwrap();
+
+            // The wire hop: the worker re-parses, landing on the DRIFTED
+            // float, and must still verify.
+            let wire = serde_json::to_vec(&req).unwrap();
+            let received: JobRequest = serde_json::from_slice(&wire).unwrap();
+            received
+                .verify_ed25519(&[vk], 300)
+                .expect("signature must survive a non-idempotent float round trip");
+        }
+    }
+
     /// Reproduction attempt for the 2026-07-27 `pa-autonomy-digest` incident:
     /// Ed25519 dispatch verification fails reproducibly for one node whose
     /// `input_payload` is 50-61 KB, while a comparable node at ~21 KB verifies.
@@ -5330,6 +5413,45 @@ mod tests {
             received.verify_ed25519(&[vk], 300).unwrap_or_else(|e| {
                 panic!("Ed25519 verify FAILED at ~{target_kb} KB ({byte_len} bytes): {e}")
             });
+        }
+    }
+
+    /// Minimal signable JobRequest for signing tests.
+    fn minimal_req() -> JobRequest {
+        JobRequest {
+            crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
+            claim_inbox: None,
+            job_id: Uuid::new_v4(),
+            workflow_execution_id: Uuid::new_v4(),
+            module_uri: "redis:wasm:tenant:module".to_string(),
+            input_payload: serde_json::json!({}),
+            encrypted_secrets: EncryptedSecrets::empty(),
+            timeout_ms: 120_000,
+            priority: 100,
+            deadline_unix_secs: 0,
+            cancellation_token: None,
+            allowed_hosts: vec![],
+            allowed_methods: vec![],
+            allowed_secrets: vec![],
+            allowed_sql_operations: vec![],
+            allow_tier2_exposure: false,
+            signature: vec![],
+            max_llm_tier: LlmTier::default(),
+            max_write_ceiling: WriteCeiling::default(),
+            egress_scope: None,
+            job_nonce: String::new(),
+            actor_id: Some(Uuid::new_v4()),
+            wasm_bytes: None,
+            capability_world: Some("secrets-node".to_string()),
+            integration_name: None,
+            user_id: Uuid::new_v4(),
+            expected_wasm_hash: None,
+            max_fuel: 12_000_000,
+            dry_run: false,
+            reply_topic: None,
+            idempotency_key: None,
         }
     }
 
