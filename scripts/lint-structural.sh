@@ -4002,6 +4002,55 @@ else
 fi
 echo
 
+# ── 61. Signed JSON must be hashed at its round-trip fixed point ──────
+# (2026-07-27) `serde_json`'s f64 round-trip is NOT idempotent: for ~10% of
+# ordinary computed ratios `parse(write(x))` is a DIFFERENT f64 (one ULP off),
+# so `write(parse(write(x)))` differs in content AND length. Hashing a signed
+# JSON field as `Sha256(value.to_string())` therefore hashes a form that is
+# RE-DERIVED independently on each side: the controller hashed write(x), the
+# worker hashed write(parse(write(x))), the hashes differed, and every job
+# whose payload happened to carry an unstable float failed Ed25519
+# verification. `pa-autonomy-digest` (~30 computed ratios) failed 100% of runs
+# while text-heavy payloads passed for weeks — a latent, fleet-wide lottery.
+#
+# The fix is `canonical_signed_json()`, which normalises to the fixed point
+# (the second round trip IS stable). This check keeps a NEW signed field from
+# reintroducing the raw form: inside the job-protocol crate, a Sha256 over a
+# `.to_string()` must go through the canonicaliser.
+#
+# Only `<expr>.to_string()` fed straight to a digest is flagged — hashing a
+# String field (`logs.join`, `module_uri.as_bytes()`) is unaffected, since a
+# String has no serialisation ambiguity to normalise.
+# Opt-out: `// allow-raw-json-hash: <reason>`.
+bold "▶ check 61: signed JSON must be hashed at its round-trip fixed point"
+
+RAW_JSON_HASH=0
+jp_file="talos-workflow-job-protocol/src/lib.rs"
+if [ -f "$jp_file" ]; then
+    while IFS=: read -r lineno _; do
+        [ -n "$lineno" ] || continue
+        start=$((lineno > 3 ? lineno - 3 : 1))
+        if sed -n "${start},${lineno}p" "$jp_file" | grep -q '// allow-raw-json-hash:'; then
+            continue
+        fi
+        red "✗ ${jp_file}:${lineno}: Sha256 over a re-derived .to_string() of signed JSON"
+        yellow "    $(sed -n "${lineno}p" "$jp_file" | sed 's/^ *//')"
+        RAW_JSON_HASH=$((RAW_JSON_HASH + 1))
+    done <<EOF
+$(grep -nE "Sha256::digest\((self|s)\.[A-Za-z_]+\.to_string\(\)" "$jp_file" || true)
+EOF
+fi
+
+if [ "$RAW_JSON_HASH" -gt 0 ]; then
+    red "✗ ${RAW_JSON_HASH} signed-JSON hash site(s) bypass canonical_signed_json()"
+    yellow "  → wrap the value: Sha256::digest(canonical_signed_json(&self.field).as_bytes())"
+    yellow "  → serde_json f64 round-trip is not idempotent; the raw form differs per side"
+    EXIT_CODE=1
+else
+    green "✓ every signed-JSON hash uses the round-trip fixed point"
+fi
+echo
+
 # ── 54. Lint self-consistency (meta-check) ────────────────────────────
 # The system whose purpose is catching drift drifted from its own docs:
 # by 2026-07-01 the script had 49 checks while CLAUDE.md said 43 and the
