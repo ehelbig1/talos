@@ -5250,6 +5250,89 @@ mod tests {
 
     // ── RFC 0010 P1: Ed25519 dispatch scheme tests ────────────────────────
 
+    /// Reproduction attempt for the 2026-07-27 `pa-autonomy-digest` incident:
+    /// Ed25519 dispatch verification fails reproducibly for one node whose
+    /// `input_payload` is 50-61 KB, while a comparable node at ~21 KB verifies.
+    ///
+    /// Exercises the FULL wire path — sign, serialise to JSON as the dispatcher
+    /// publishes, deserialise as the worker receives, verify — across sizes
+    /// spanning both cases, with a nested/heterogeneous shape resembling the
+    /// operator digest (floats with long mantissas, prose strings, arrays of
+    /// objects) rather than one flat blob, since a size-dependent fault is more
+    /// likely to live in structure than in raw length.
+    #[test]
+    fn ed25519_dispatch_verifies_across_realistic_input_sizes() {
+        let sk = ed_keypair();
+        let vk = sk.verifying_key();
+
+        for target_kb in [1usize, 21, 50, 61, 80, 130] {
+            // Build a digest-shaped payload until it exceeds target_kb.
+            let mut rows = Vec::new();
+            while serde_json::to_string(&rows).unwrap().len() < target_kb * 1024 {
+                let i = rows.len();
+                rows.push(serde_json::json!({
+                    "name": format!("workflow-{i}"),
+                    "avg_score": 0.927_272_727_272_727_2_f64,
+                    "ci95": [0.329_942_360_025_097_3_f64, 0.644_311_954_041_314_1_f64],
+                    "note": "every run scored identically at the maximum — this judge                              has not been observed to fail anything, so it may be a                              shape check rather than a quality gate",
+                    "nested": { "by_label": [["archive", 538], ["to_read", 409]] },
+                }));
+            }
+            let payload = serde_json::json!({ "rows": rows, "days": 1 });
+            let byte_len = payload.to_string().len();
+
+            let mut req = JobRequest {
+                crypto_scheme: 0,
+                sealing: 0,
+                secret_paths: Vec::new(),
+                claim_inbox: None,
+                job_id: Uuid::new_v4(),
+                workflow_execution_id: Uuid::new_v4(),
+                module_uri: "redis:wasm:tenant:module".to_string(),
+                input_payload: payload,
+                encrypted_secrets: EncryptedSecrets::empty(),
+                timeout_ms: 120_000,
+                priority: 100,
+                deadline_unix_secs: 0,
+                cancellation_token: None,
+                allowed_hosts: vec![],
+                allowed_methods: vec![],
+                allowed_secrets: vec![],
+                allowed_sql_operations: vec![],
+                allow_tier2_exposure: false,
+                signature: vec![],
+                max_llm_tier: LlmTier::default(),
+                max_write_ceiling: WriteCeiling::default(),
+                egress_scope: None,
+                job_nonce: String::new(),
+                actor_id: Some(Uuid::new_v4()),
+                wasm_bytes: None,
+                capability_world: Some("secrets-node".to_string()),
+                integration_name: None,
+                user_id: Uuid::new_v4(),
+                expected_wasm_hash: None,
+                max_fuel: 12_000_000,
+                dry_run: false,
+                reply_topic: None,
+                idempotency_key: None,
+            };
+            req.sign_ed25519(&sk).unwrap();
+
+            // The wire hop the dispatcher/worker actually perform.
+            let wire = serde_json::to_vec(&req).expect("serialise");
+            let received: JobRequest = serde_json::from_slice(&wire).expect("deserialise");
+
+            assert_eq!(
+                received.input_payload.to_string().len(),
+                byte_len,
+                "input length changed across the wire at {target_kb} KB"
+            );
+            received.verify_ed25519(&[vk], 300).unwrap_or_else(|e| {
+                panic!("Ed25519 verify FAILED at ~{target_kb} KB ({byte_len} bytes): {e}")
+            });
+        }
+    }
+
     fn ed_keypair() -> DispatchSigningKey {
         DispatchSigningKey::generate(&mut rand::rngs::OsRng)
     }
