@@ -414,6 +414,31 @@ static WORKER_SIGNATURE_DIAG_ENABLED: std::sync::LazyLock<bool> = std::sync::Laz
     )
 });
 
+/// Coarse, non-sensitive classification of a verify failure.
+///
+/// Matches on the verifier's own error text (job-protocol) and returns a
+/// stable token. Deliberately NOT the raw error and NOT any request field:
+/// safe to publish on an unverified request, which is exactly when it is
+/// needed. Distinct classes because the operator action differs —
+/// `key_config` is a deploy/env problem, `scheme_mismatch` is version skew
+/// between controller and worker, `replay` is a nonce-cache interaction, and
+/// `mismatch` is a genuine signing-payload divergence.
+fn classify_verify_failure(verify_error: &str) -> &'static str {
+    let e = verify_error.to_ascii_lowercase();
+    if e.contains("already seen") || e.contains("replay") {
+        "replay"
+    } else if e.contains("crypto_scheme") {
+        "scheme_mismatch"
+    } else if e.contains("verifying key") || e.contains("key configured") || e.contains("key ring")
+    {
+        "key_config"
+    } else if e.contains("too old") || e.contains("future") || e.contains("freshness") {
+        "stale_timestamp"
+    } else {
+        "mismatch"
+    }
+}
+
 /// Build the `output_payload` for a signature-verification failure.
 ///
 /// `diag_enabled == false` (production default): a generic error only —
@@ -427,7 +452,21 @@ fn signature_failure_payload(
     verify_error: &str,
 ) -> serde_json::Value {
     if !diag_enabled {
-        return json!({ "error": "signature verification failed" });
+        // Always carry the coarse CLASS of failure. Pre-2026-07-27 this arm
+        // returned the bare string, which left a live incident with no signal
+        // at all: replay, an unconfigured key, a scheme mismatch and a genuine
+        // HMAC divergence are entirely different faults with entirely
+        // different fixes, and they were indistinguishable to the operator.
+        //
+        // The class is derived from OUR OWN verifier's error text, never from
+        // request fields — that distinction is the whole security rationale
+        // for gating the rich dump, since those fields are attacker-
+        // controllable on an UNVERIFIED request and get echoed into a result
+        // the worker then signs.
+        return json!({
+            "error": "signature verification failed",
+            "reason_class": classify_verify_failure(verify_error),
+        });
     }
     let (worker_input_hash, worker_secrets_hash, worker_input_byte_len) = req.diag_hashes();
     json!({
@@ -460,6 +499,51 @@ mod signature_failure_payload_tests {
     use super::*;
     use talos_workflow_job_protocol::{EncryptedSecrets, LlmTier};
     use uuid::Uuid;
+
+    /// Each class implies a DIFFERENT operator action, so they must not
+    /// collapse: key_config is a deploy/env fault, scheme_mismatch is
+    /// controller/worker version skew, replay is a nonce-cache interaction,
+    /// and mismatch is a genuine signing-payload divergence.
+    #[test]
+    fn verify_failures_classify_into_distinct_actionable_classes() {
+        assert_eq!(
+            classify_verify_failure("job_nonce already seen (replay attempt within 300s)"),
+            "replay"
+        );
+        assert_eq!(
+            classify_verify_failure("unknown dispatch crypto_scheme: ed25519"),
+            "scheme_mismatch"
+        );
+        assert_eq!(
+            classify_verify_failure("no controller Ed25519 verifying key configured"),
+            "key_config"
+        );
+        assert_eq!(
+            classify_verify_failure("timestamp too old (max_age 60s)"),
+            "stale_timestamp"
+        );
+        assert_eq!(classify_verify_failure("HMAC mismatch"), "mismatch");
+        // Unrecognised text must still yield a usable class, never panic or
+        // echo the input.
+        assert_eq!(classify_verify_failure(""), "mismatch");
+    }
+
+    /// The gated-OFF payload must carry the class but NOTHING derived from the
+    /// unverified request — that echo is the security reason the rich dump is
+    /// gated in the first place.
+    #[test]
+    fn ungated_payload_carries_class_but_no_request_fields() {
+        let req = unauthenticated_req();
+        let v = signature_failure_payload(false, &req, "HMAC mismatch");
+        assert_eq!(v["error"], "signature verification failed");
+        assert_eq!(v["reason_class"], "mismatch");
+        assert!(v.get("diag").is_none(), "no rich dump when gated off");
+        let rendered = v.to_string();
+        assert!(
+            !rendered.contains("worker_input_hash") && !rendered.contains("module_uri"),
+            "must not leak request-derived fields: {rendered}"
+        );
+    }
 
     fn unauthenticated_req() -> JobRequest {
         JobRequest {
@@ -500,13 +584,31 @@ mod signature_failure_payload_tests {
     }
 
     /// Default (diag OFF): no attacker-supplied byte may reach the payload
-    /// the worker will sign and publish — generic error only.
+    /// the worker will sign and publish. Asserted as a PROPERTY rather than
+    /// byte-equality — the payload gained a coarse `reason_class` (2026-07-27)
+    /// because the bare string left a live incident with no signal at all, and
+    /// pinning the exact object would fail on that improvement while proving
+    /// nothing extra about the leak this test actually guards.
     #[test]
     fn diag_disabled_emits_generic_error_only() {
         let payload = signature_failure_payload(false, &unauthenticated_req(), "hmac mismatch");
-        assert_eq!(
-            payload,
-            serde_json::json!({ "error": "signature verification failed" })
+        assert_eq!(payload["error"], "signature verification failed");
+        // The class is one of OUR tokens, never the verifier's raw text.
+        assert!(
+            [
+                "replay",
+                "scheme_mismatch",
+                "key_config",
+                "stale_timestamp",
+                "mismatch"
+            ]
+            .contains(&payload["reason_class"].as_str().unwrap_or_default()),
+            "reason_class must be a known token, got {:?}",
+            payload["reason_class"]
+        );
+        assert!(
+            payload.get("diag").is_none(),
+            "rich dump must stay gated when diag is off"
         );
         let raw = payload.to_string();
         for tainted in ["attacker-chosen", "hmac mismatch"] {
