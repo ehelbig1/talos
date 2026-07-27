@@ -149,7 +149,7 @@ pub fn tool_schemas() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "ml_resolve_disagreement",
-            "description": "One-tap digest verdict. With correct_label: appends a human CORRECTION example (gold truth, replaces the production row via example_key) and marks the disagreement resolved. Without: marks it dismissed.",
+            "description": "One-tap digest verdict. With correct_label: appends a human CORRECTION example (gold truth, replaces the production row via example_key) and marks the disagreement resolved. Without: marks it dismissed. correct_label MUST be one of the dataset's existing classes — see label_vocabulary in the ml_disagreements response. An unknown label is REJECTED rather than silently creating a new class, because a typo would pollute the label distribution, never match a recall_floors key, and count toward min_corrections_per_class for a class that does not exist. Note the correct label need NOT be either model's proposal: when both the fast model and the teacher are wrong, that correction is the most informative row in the queue. To introduce a genuinely NEW class, use ml_append_examples.",
             "inputSchema": { "type": "object", "properties": {
                 "disagreement_id": { "type": "string" },
                 "correct_label": { "type": "string", "description": "The human-verified label; omit to dismiss" }
@@ -1315,6 +1315,19 @@ async fn handle_disagreements(
         }
         Err(_) => Vec::new(),
     };
+    // Cross-protocol parity with `MlDisagreementFeed.labelVocabulary`. Since
+    // an unknown label is now a hard rejection, a caller that cannot see the
+    // valid classes can only discover them by failing — and an MCP caller is
+    // typically an agent typing a label, i.e. exactly who needs the list up
+    // front. Best-effort: a missing dataset or read failure omits the hint
+    // rather than failing the review.
+    let label_vocabulary: Vec<String> = match model.dataset_id {
+        Some(ds) => dataset_service(state)
+            .label_vocabulary(&mut tx, ds)
+            .await
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
     match svc
         .pending_disagreements(&mut tx, model.model_id, user_id, limit)
         .await
@@ -1351,6 +1364,9 @@ async fn handle_disagreements(
                     // Classes whose latest-eval recall is under the policy floor.
                     // Empty = no per-class gate is currently unmet.
                     "blocking_classes": blocking,
+                    // The dataset's classes — the ONLY values
+                    // ml_resolve_disagreement accepts for correct_label.
+                    "label_vocabulary": label_vocabulary,
                     "pending": items,
                     "next_step": next_step,
                 }))
