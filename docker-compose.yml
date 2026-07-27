@@ -637,6 +637,7 @@ services:
       # TALOS_REPLAY_FAIL_CLOSED=true to refuse RPC when Redis is down.
       TALOS_DISTRIBUTED_REPLAY: ${TALOS_DISTRIBUTED_REPLAY:-true}
       TALOS_REPLAY_FAIL_CLOSED: ${TALOS_REPLAY_FAIL_CLOSED:-false}
+      TALOS_SIGNATURE_DIAG: ${TALOS_SIGNATURE_DIAG:-}
     ports:
       - "8000:8000"
     volumes:
@@ -771,6 +772,7 @@ services:
       # Keep in lockstep with the controller's TALOS_ENVELOPE_SEALING; the
       # worker enforces the downgrade guard only under "required".
       TALOS_ENVELOPE_SEALING: ${TALOS_ENVELOPE_SEALING:-off}
+      TALOS_SIGNATURE_DIAG: ${TALOS_SIGNATURE_DIAG:-}
     depends_on:
       nats:
         condition: service_healthy
