@@ -150,16 +150,20 @@ impl GraphSearchRequest {
         })
     }
 
-    pub fn verify(&self) -> bool {
+    /// See `memory_rpc::MemoryRpcRequest::verify` for the classification
+    /// contract: the [`rpc_auth::VerifyFailure`] is controller-side diagnosis
+    /// only, and the gate order (cheap checks before crypto) is unchanged.
+    pub fn verify(&self) -> Result<(), rpc_auth::VerifyFailure> {
+        use rpc_auth::VerifyFailure;
         if !rpc_auth::verify_freshness(self.timestamp_ms) {
-            return false;
+            return Err(VerifyFailure::Stale);
         }
         // MCP-1025 (2026-05-15): structural caps inside verify(). Same
         // sibling pattern as state_rpc (MCP-1024) and
         // integration_state_rpc::validate_op. Cheap-gate-first so an
         // oversized query short-circuits before the HMAC compute.
         if !validate_structure(&self.query, self.max_depth, self.limit) {
-            return false;
+            return Err(VerifyFailure::OversizedStructure);
         }
         let body_bytes =
             sign_body_bytes(&self.query, self.max_depth, self.limit, self.timestamp_ms);

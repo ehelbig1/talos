@@ -190,13 +190,15 @@ impl MlPredictRequest {
 
     /// Signature + freshness + structural caps. Cheap gates first. The
     /// subscriber ALSO calls `rpc_auth::check_and_record_nonce` after
-    /// this (verify/nonce split, family convention).
-    pub fn verify(&self) -> bool {
+    /// this (verify/nonce split, family convention). See
+    /// `memory_rpc::MemoryRpcRequest::verify` for the classification contract.
+    pub fn verify(&self) -> Result<(), rpc_auth::VerifyFailure> {
+        use rpc_auth::VerifyFailure;
         if !rpc_auth::verify_freshness(self.timestamp_ms) {
-            return false;
+            return Err(VerifyFailure::Stale);
         }
         if !validate_structure(&self.model_name, &self.inputs) {
-            return false;
+            return Err(VerifyFailure::OversizedStructure);
         }
         let body_bytes = sign_body_bytes(
             self.user_id,
@@ -361,13 +363,15 @@ impl MlFewShotRequest {
     }
 
     /// Signature + freshness + structural caps. Cheap gates first; the
-    /// subscriber ALSO calls `check_and_record_nonce` after this.
-    pub fn verify(&self) -> bool {
+    /// subscriber ALSO calls `check_and_record_nonce` after this. See
+    /// `memory_rpc::MemoryRpcRequest::verify` for the classification contract.
+    pub fn verify(&self) -> Result<(), rpc_auth::VerifyFailure> {
+        use rpc_auth::VerifyFailure;
         if !rpc_auth::verify_freshness(self.timestamp_ms) {
-            return false;
+            return Err(VerifyFailure::Stale);
         }
         if !validate_fewshot_structure(&self.model_name, self.k) {
-            return false;
+            return Err(VerifyFailure::OversizedStructure);
         }
         let body_bytes =
             fewshot_sign_body_bytes(self.user_id, &self.model_name, self.k, self.timestamp_ms);
@@ -426,7 +430,7 @@ mod tests {
     #[test]
     fn round_trip_verifies() {
         setup_key();
-        assert!(req().verify());
+        assert!(req().verify().is_ok());
     }
 
     #[test]
@@ -461,23 +465,23 @@ mod tests {
         // user_id (tenancy) is signed.
         let mut r = req();
         r.user_id = Uuid::from_u128(99);
-        assert!(!r.verify(), "user_id swap must fail");
+        assert!(r.verify().is_err(), "user_id swap must fail");
         // model_name (routing) is signed.
         let mut r = req();
         r.model_name = "someone-elses-model".into();
-        assert!(!r.verify(), "model_name swap must fail");
+        assert!(r.verify().is_err(), "model_name swap must fail");
         // inputs are signed.
         let mut r = req();
         r.inputs[0] = "Subject: different".into();
-        assert!(!r.verify(), "input swap must fail");
+        assert!(r.verify().is_err(), "input swap must fail");
         // appending an input is caught (count is signed).
         let mut r = req();
         r.inputs.push("extra".into());
-        assert!(!r.verify(), "input append must fail");
+        assert!(r.verify().is_err(), "input append must fail");
         // actor swap is caught at the rpc_auth layer.
         let mut r = req();
         r.actor_id = Uuid::from_u128(42);
-        assert!(!r.verify(), "actor swap must fail");
+        assert!(r.verify().is_err(), "actor swap must fail");
     }
 
     fn fewshot_req() -> MlFewShotRequest {
@@ -493,7 +497,7 @@ mod tests {
     #[test]
     fn fewshot_round_trip_verifies() {
         setup_key();
-        assert!(fewshot_req().verify());
+        assert!(fewshot_req().verify().is_ok());
     }
 
     #[test]
@@ -515,19 +519,19 @@ mod tests {
         // user_id (tenancy) is signed.
         let mut r = fewshot_req();
         r.user_id = Uuid::from_u128(99);
-        assert!(!r.verify(), "user_id swap must fail");
+        assert!(r.verify().is_err(), "user_id swap must fail");
         // model_name (routing) is signed.
         let mut r = fewshot_req();
         r.model_name = "someone-elses-model".into();
-        assert!(!r.verify(), "model_name swap must fail");
+        assert!(r.verify().is_err(), "model_name swap must fail");
         // k is signed (an attacker must not inflate the fetch).
         let mut r = fewshot_req();
         r.k = 8;
-        assert!(!r.verify(), "k swap must fail");
+        assert!(r.verify().is_err(), "k swap must fail");
         // actor swap is caught at the rpc_auth layer.
         let mut r = fewshot_req();
         r.actor_id = Uuid::from_u128(42);
-        assert!(!r.verify(), "actor swap must fail");
+        assert!(r.verify().is_err(), "actor swap must fail");
     }
 
     #[test]
@@ -545,7 +549,10 @@ mod tests {
         f.signature = p.signature.clone();
         f.worker_id = p.worker_id.clone();
         f.crypto_scheme = p.crypto_scheme;
-        assert!(!f.verify(), "cross-op signature transplant must fail");
+        assert!(
+            f.verify().is_err(),
+            "cross-op signature transplant must fail"
+        );
         // And the canonical bytes themselves cannot collide (tag byte).
         let pb = sign_body_bytes(Uuid::from_u128(2), "m", &[], 7);
         let fb = fewshot_sign_body_bytes(Uuid::from_u128(2), "m", 0, 7);

@@ -35,6 +35,13 @@ talos-memory-ranking = { path = "../talos-memory-ranking" }
 talos-ml = { path = "../talos-ml" }
 talos-replay-guard = { path = "../talos-replay-guard" }
 talos-tenancy = { path = "../talos-tenancy" }
+# #603: `build_suffix` / `builds_match` / `build_is_verifiable` for the
+# rejection-path build-skew hint. REUSED, never re-implemented — the MCP
+# fleet view and the registration WARN already compare builds with these,
+# and three surfaces disagreeing about whether the fleet is skewed would be
+# worse than any one of them being wrong. Leaf crate (anyhow/chrono/sqlx/
+# serde_json/uuid only), so this edge cannot form a cycle.
+talos-worker-identity-repository = { path = "../talos-worker-identity-repository" }
 # Wasm-security review 2026-05-22 (MEDIUM-1): canonical SQL function
 # deny-list lives here so worker + controller subscriber agree byte-
 # identically. Same single-source-of-truth pattern as

@@ -8731,6 +8731,7 @@ dependencies = [
  "talos-ml",
  "talos-replay-guard",
  "talos-tenancy",
+ "talos-worker-identity-repository",
  "talos-workflow-job-protocol",
  "tokio",
  "tracing",

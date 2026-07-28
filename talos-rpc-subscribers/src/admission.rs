@@ -44,10 +44,21 @@ pub(crate) trait AdmittableRpc: DeserializeOwned {
     /// process-local two-generation nonce-cache key. Distinct from the
     /// wire subject by design; see `talos_memory::rpc_auth`.
     const SIGNING_SUBJECT: &'static str;
-    /// Per-protocol HMAC + freshness verification.
-    fn verify_signature(&self) -> bool;
+    /// Per-protocol HMAC/Ed25519 + freshness + structural verification.
+    ///
+    /// Named `verify_classified` (not `verify_signature`) since #603: the
+    /// return type changed from `bool` to a `Result`, and renaming forces
+    /// every implementation and every caller through the compiler rather
+    /// than letting some future `bool`-shaped helper slot in silently.
+    fn verify_classified(&self) -> Result<(), talos_memory::rpc_auth::VerifyFailure>;
     fn actor_id(&self) -> uuid::Uuid;
     fn nonce(&self) -> &str;
+    /// Self-reported signer identity — empty under the legacy HMAC scheme,
+    /// the worker's id under Ed25519. Used ONLY to look up that worker's
+    /// reported build for the rejection log's skew hint. Untrusted by
+    /// definition (it is the claim under test), which is fine: a forged id
+    /// simply misses the cache and yields the "unverifiable" wording.
+    fn worker_id(&self) -> &str;
 }
 
 /// Proof that a request passed parse → verify → cross-replica replay →
@@ -71,6 +82,43 @@ impl<T> std::ops::Deref for Admitted<T> {
     }
 }
 
+/// The controller-side classification of an `Unauthorized` admission
+/// failure. See [`AdmitError::Unauthorized`] for where it may and may not
+/// travel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RejectReason {
+    /// One of the per-protocol `verify()` gates rejected the request.
+    Verify(talos_memory::rpc_auth::VerifyFailure),
+    /// The request verified, but another controller replica had already seen
+    /// this nonce (the shared-store replay guard).
+    CrossReplicaReplay,
+}
+
+impl RejectReason {
+    /// Stable snake_case token for the rejection log. Same contract as
+    /// `VerifyFailure::as_str` — append, never rename.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Verify(f) => f.as_str(),
+            Self::CrossReplicaReplay => "cross_replica_replay",
+        }
+    }
+
+    /// Whether a build-skew hint is worth computing for this reason.
+    ///
+    /// ONLY `bad_signature`. Stale is a clock, oversized/non-finite is a
+    /// malformed payload, unknown-signer is a key-registration gap, and a
+    /// cross-replica replay is by definition a request that ALREADY verified
+    /// — attaching a skew sentence to any of them would manufacture the
+    /// false lead this change exists to remove.
+    pub(crate) fn is_skew_candidate(self) -> bool {
+        matches!(
+            self,
+            Self::Verify(talos_memory::rpc_auth::VerifyFailure::BadSignature)
+        )
+    }
+}
+
 /// Why admission failed. Each subscriber maps these to its protocol's
 /// typed error reply and metric outcome tag (`"invalid"` /
 /// `"unauthorized"` / `"replay"`) at the call site.
@@ -84,9 +132,86 @@ pub(crate) enum AdmitError {
     /// the pre-extraction sites logged and replied identically for
     /// both, and distinguishing them for a caller would give an
     /// on-wire attacker an oracle.
-    Unauthorized,
+    ///
+    /// **`reason` DOES NOT CHANGE THAT.** It is a CONTROLLER-SIDE LOG FIELD
+    /// and nothing else. The collapse above is still deliberate and still
+    /// load-bearing: the wire reply is byte-identical for every reason (a
+    /// caller cannot tell `stale` from `bad_signature` from
+    /// `cross_replica_replay`), because splitting them for a caller hands an
+    /// on-wire attacker an oracle — they could map the freshness window and
+    /// confirm key validity as two independent probes. `reason` exists only
+    /// because the OPERATOR, reading the controller's own logs, was
+    /// previously given the same zero information as the attacker. Every
+    /// caller-facing value on this path routes through
+    /// `crate::caller_facing_unauthorized`, which takes the reason and drops
+    /// it; `unauthorized_reply_bytes_are_reason_independent` pins that.
+    Unauthorized { reason: RejectReason },
     /// Process-local nonce cache saw this nonce already.
     Replay,
+}
+
+/// The extra fields every `Unauthorized` rejection log gains. Built once per
+/// rejection, on the rejection path only.
+pub(crate) struct RejectDiagnostics {
+    /// Our own stable taxonomy token — never anything derived from the
+    /// sender's bytes.
+    pub(crate) reason: &'static str,
+    /// The SELF-REPORTED signer id, sanitised (see [`sanitize_worker_id`]).
+    /// Unverified by definition — this log line exists precisely because the
+    /// claim did not check out — so it is bounded and charset-filtered before
+    /// it reaches the log.
+    pub(crate) worker_id: String,
+    /// One sentence an operator can act on, or an explicit "not applicable".
+    pub(crate) skew_hint: String,
+}
+
+/// Placeholder for classes where build skew is not a plausible explanation.
+/// Spelled out rather than omitted so a log reader never has to wonder
+/// whether the hint was computed and came back empty.
+const HINT_NOT_APPLICABLE: &str = "n/a — not a build-skew class";
+
+/// Bound and charset-filter the self-reported `worker_id` before logging it.
+///
+/// It is the one attacker-influenceable string in the new log fields (the
+/// signature that would have vouched for it is the thing that just failed),
+/// so it gets the same treatment the registration endpoint gives it:
+/// `[A-Za-z0-9._-]` only, truncated. An empty or fully-filtered value renders
+/// as `none`, which is also the honest rendering for a legacy-HMAC request
+/// (that scheme carries no worker id at all).
+fn sanitize_worker_id(worker_id: &str) -> String {
+    const MAX: usize = 64;
+    let cleaned: String = worker_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .take(MAX)
+        .collect();
+    if cleaned.is_empty() {
+        "none".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Assemble the rejection-log fields for one refused request.
+///
+/// Takes the request through [`AdmittableRpc`] rather than a bare `&str` so
+/// every protocol reads its signer id from the ONE declared accessor — a new
+/// subscriber cannot quietly log a different field (or forget the id) and
+/// still compile against this helper.
+pub(crate) fn reject_diagnostics<T: AdmittableRpc>(
+    reason: RejectReason,
+    req: &T,
+) -> RejectDiagnostics {
+    let worker_id = sanitize_worker_id(req.worker_id());
+    RejectDiagnostics {
+        reason: reason.as_str(),
+        skew_hint: if reason.is_skew_candidate() {
+            crate::build_skew::skew_hint(&worker_id)
+        } else {
+            HINT_NOT_APPLICABLE.to_string()
+        },
+        worker_id,
+    }
 }
 
 /// THE admission chokepoint. Parse the payload, verify HMAC +
@@ -98,10 +223,20 @@ pub(crate) async fn admit_from_bytes<T: AdmittableRpc>(
 ) -> Result<Admitted<T>, AdmitError> {
     let req: T =
         serde_json::from_slice(payload).map_err(|e| AdmitError::Malformed(e.to_string()))?;
-    if !req.verify_signature()
-        || !crate::crossreplica_replay_ok(T::WIRE_SUBJECT, req.actor_id(), req.nonce()).await
-    {
-        return Err(AdmitError::Unauthorized);
+    // Short-circuit order preserved verbatim: per-protocol verify first (its
+    // own cheap gates run before its crypto), and the cross-replica guard —
+    // which costs a shared-store round trip — only for a request that already
+    // verified. The two failures land in the SAME `Unauthorized` arm as
+    // before; only the log-side classification is new.
+    if let Err(failure) = req.verify_classified() {
+        return Err(AdmitError::Unauthorized {
+            reason: RejectReason::Verify(failure),
+        });
+    }
+    if !crate::crossreplica_replay_ok(T::WIRE_SUBJECT, req.actor_id(), req.nonce()).await {
+        return Err(AdmitError::Unauthorized {
+            reason: RejectReason::CrossReplicaReplay,
+        });
     }
     if !talos_memory::rpc_auth::check_and_record_nonce(
         T::SIGNING_SUBJECT,
@@ -117,27 +252,71 @@ pub(crate) async fn admit_from_bytes<T: AdmittableRpc>(
 mod admission_tests {
     use super::*;
 
+    use talos_memory::rpc_auth::VerifyFailure;
+
     // A minimal in-crate protocol standing in for the real ones, so the
     // gate's ordering and fail-closed arms are pinned without NATS or a
     // registered HMAC key.
+    //
+    // `failure_index` selects which classification the stand-in `verify()`
+    // reports (`None` = admit), carried as an INDEX rather than the enum
+    // itself: `VerifyFailure` deliberately implements neither `Serialize` nor
+    // `Deserialize`, which is a small structural guarantee that it cannot be
+    // dropped into a wire reply by accident. Keeping the test harness honest
+    // to that is worth one lookup table.
+    const FAILURE_CLASSES: [VerifyFailure; 5] = [
+        VerifyFailure::Stale,
+        VerifyFailure::NonFinite,
+        VerifyFailure::OversizedStructure,
+        VerifyFailure::UnknownSignerKey,
+        VerifyFailure::BadSignature,
+    ];
+
     #[derive(serde::Serialize, serde::Deserialize)]
     struct FakeReq {
         actor_id: uuid::Uuid,
         nonce: String,
-        valid: bool,
+        failure_index: Option<usize>,
+        #[serde(default)]
+        worker_id: String,
+    }
+
+    impl FakeReq {
+        fn admitting() -> Self {
+            Self {
+                actor_id: uuid::Uuid::new_v4(),
+                nonce: canonical_nonce(),
+                failure_index: None,
+                worker_id: "fake-worker".to_string(),
+            }
+        }
+        fn failing(failure: VerifyFailure) -> Self {
+            let failure_index = FAILURE_CLASSES.iter().position(|f| *f == failure);
+            assert!(failure_index.is_some(), "unmapped VerifyFailure variant");
+            Self {
+                failure_index,
+                ..Self::admitting()
+            }
+        }
     }
 
     impl AdmittableRpc for FakeReq {
         const WIRE_SUBJECT: &'static str = "talos.test.admission";
         const SIGNING_SUBJECT: &'static str = "admission_test_rpc";
-        fn verify_signature(&self) -> bool {
-            self.valid
+        fn verify_classified(&self) -> Result<(), VerifyFailure> {
+            match self.failure_index {
+                Some(i) => Err(FAILURE_CLASSES[i]),
+                None => Ok(()),
+            }
         }
         fn actor_id(&self) -> uuid::Uuid {
             self.actor_id
         }
         fn nonce(&self) -> &str {
             &self.nonce
+        }
+        fn worker_id(&self) -> &str {
+            &self.worker_id
         }
     }
 
@@ -163,23 +342,50 @@ mod admission_tests {
 
     #[tokio::test]
     async fn failed_verification_is_unauthorized() {
-        let req = FakeReq {
-            actor_id: uuid::Uuid::new_v4(),
-            nonce: canonical_nonce(),
-            valid: false,
-        };
+        let req = FakeReq::failing(VerifyFailure::BadSignature);
         let bytes = serde_json::to_vec(&req).expect("serialize");
         let err = admit_from_bytes::<FakeReq>(&bytes).await;
-        assert!(matches!(err, Err(AdmitError::Unauthorized)));
+        assert!(matches!(err, Err(AdmitError::Unauthorized { .. })));
+    }
+
+    /// EVERY verify class lands in the SAME `Unauthorized` arm — the collapse
+    /// is unchanged — while the carried `reason` faithfully reports which
+    /// gate fired. Both halves matter: the first is the anti-oracle property,
+    /// the second is the whole point of the change.
+    #[tokio::test]
+    async fn every_verify_class_is_unauthorized_and_reports_itself() {
+        for class in FAILURE_CLASSES {
+            let bytes = serde_json::to_vec(&FakeReq::failing(class)).expect("serialize");
+            match admit_from_bytes::<FakeReq>(&bytes).await {
+                Err(AdmitError::Unauthorized { reason }) => {
+                    assert_eq!(reason, RejectReason::Verify(class));
+                    assert_eq!(reason.as_str(), class.as_str());
+                }
+                _ => panic!("{class} must admit-fail as Unauthorized"),
+            }
+        }
+    }
+
+    /// The skew hint is attached to `bad_signature` and nothing else.
+    #[test]
+    fn only_bad_signature_is_a_skew_candidate() {
+        for class in FAILURE_CLASSES {
+            assert_eq!(
+                RejectReason::Verify(class).is_skew_candidate(),
+                class == VerifyFailure::BadSignature,
+                "{class} skew-candidacy is wrong"
+            );
+        }
+        assert!(!RejectReason::CrossReplicaReplay.is_skew_candidate());
+        assert_eq!(
+            RejectReason::CrossReplicaReplay.as_str(),
+            "cross_replica_replay"
+        );
     }
 
     #[tokio::test]
     async fn admitted_once_then_replay_rejected() {
-        let req = FakeReq {
-            actor_id: uuid::Uuid::new_v4(),
-            nonce: canonical_nonce(),
-            valid: true,
-        };
+        let req = FakeReq::admitting();
         let bytes = serde_json::to_vec(&req).expect("serialize");
         let first = admit_from_bytes::<FakeReq>(&bytes).await;
         assert!(first.is_ok(), "first presentation must be admitted");
@@ -193,22 +399,17 @@ mod admission_tests {
         // A forged message must not be able to pre-poison the nonce
         // cache and DoS the legitimate sender: verification failure
         // returns BEFORE the nonce is recorded.
-        let nonce = canonical_nonce();
-        let actor = uuid::Uuid::new_v4();
-        let forged = FakeReq {
-            actor_id: actor,
-            nonce: nonce.clone(),
-            valid: false,
-        };
+        let forged = FakeReq::failing(VerifyFailure::BadSignature);
+        let (actor, nonce) = (forged.actor_id, forged.nonce.clone());
         let bytes = serde_json::to_vec(&forged).expect("serialize");
         assert!(matches!(
             admit_from_bytes::<FakeReq>(&bytes).await,
-            Err(AdmitError::Unauthorized)
+            Err(AdmitError::Unauthorized { .. })
         ));
         let genuine = FakeReq {
             actor_id: actor,
             nonce,
-            valid: true,
+            ..FakeReq::admitting()
         };
         let bytes = serde_json::to_vec(&genuine).expect("serialize");
         assert!(
@@ -220,18 +421,32 @@ mod admission_tests {
 
     #[tokio::test]
     async fn into_inner_and_deref_expose_the_request() {
-        let req = FakeReq {
-            actor_id: uuid::Uuid::new_v4(),
-            nonce: canonical_nonce(),
-            valid: true,
-        };
+        let req = FakeReq::admitting();
         let bytes = serde_json::to_vec(&req).expect("serialize");
         let admitted = admit_from_bytes::<FakeReq>(&bytes)
             .await
             .ok()
             .expect("admitted");
         assert_eq!(admitted.actor_id(), req.actor_id); // Deref
+        assert_eq!(admitted.worker_id(), req.worker_id); // Deref
         let owned = admitted.into_inner();
         assert_eq!(owned.nonce, req.nonce);
+    }
+
+    /// ORDERING pin. `Malformed` must win over verification (an unparseable
+    /// payload never reaches `verify()`), and the process-local nonce record
+    /// must come strictly AFTER verification and the cross-replica guard —
+    /// otherwise a forged message could burn a legitimate sender's nonce.
+    /// The second half is covered by
+    /// `rejected_verification_does_not_burn_the_nonce`; this pins the first
+    /// half plus the reason a malformed payload carries (parse text, which
+    /// describes the caller's OWN bytes — the one thing that legitimately
+    /// goes back on the wire).
+    #[tokio::test]
+    async fn parse_precedes_verification() {
+        // Well-formed JSON, wrong shape: still Malformed, and no classified
+        // reason is produced because `verify()` never ran.
+        let err = admit_from_bytes::<FakeReq>(br#"{"actor_id":"not-a-uuid"}"#).await;
+        assert!(matches!(err, Err(AdmitError::Malformed(_))));
     }
 }
