@@ -40,6 +40,30 @@ use talos_workflow_job_protocol::{sign_worker_registration_proof, DispatchSignin
 
 const MAX_ATTEMPTS: u32 = 5;
 
+/// This worker's build string, in the SAME composite shape the controller
+/// stamps for itself (`get_platform_info` / `session_start.server_version`):
+/// `TALOS_VERSION` verbatim when set (docker-compose / CI override), else
+/// `{cargo_pkg_version}+{git_sha}{-dirty?}` from `worker/build.rs`.
+///
+/// Mirroring the controller's composition exactly is the whole point — the
+/// controller compares the `+sha[-dirty]` suffix of the two strings to decide
+/// whether the fleet is on one build. A different composition here would make
+/// every healthy registration look like skew.
+pub(crate) fn worker_build_version() -> String {
+    std::env::var("TALOS_VERSION").unwrap_or_else(|_| {
+        format!(
+            "{}+{}{}",
+            env!("CARGO_PKG_VERSION"),
+            env!("GIT_SHA"),
+            if env!("GIT_DIRTY") == "true" {
+                "-dirty"
+            } else {
+                ""
+            }
+        )
+    })
+}
+
 /// Build the JSON registration body, signing a proof-of-possession over the
 /// canonical message so every field is bound to the worker's private key. Pure
 /// and deterministic given its inputs — unit-testable without a network.
@@ -49,6 +73,7 @@ pub(crate) fn build_registration_body(
     supports_sealing: bool,
     issued_at_ms: u64,
     nonce: &str,
+    build_version: &str,
     signing_key: &DispatchSigningKey,
 ) -> serde_json::Value {
     let proof = sign_worker_registration_proof(
@@ -66,6 +91,23 @@ pub(crate) fn build_registration_body(
         "issued_at_ms": issued_at_ms,
         "nonce": nonce,
         "proof": hex::encode(proof),
+        // DIAGNOSTIC ONLY, and deliberately NOT bound into the
+        // proof-of-possession above.
+        //
+        // Why not sign it: (a) binding it would dress a self-reported,
+        // unverifiable string up as a security claim — the signature would
+        // prove "the key-holder said this", never "this is the running
+        // build", so it buys no trust it doesn't already have; and (b) the
+        // PoP message is a fixed wire format shared with older controllers,
+        // so extending it would break proof compatibility during any mixed
+        // deploy for exactly zero gain. Nothing on the controller side is
+        // allowed to BRANCH on this value — it is logged, compared for a
+        // WARN, and reported in get_platform_info. That is the full list.
+        //
+        // An old controller ignores the extra field (the request struct
+        // carries no `deny_unknown_fields`), so this is safe to send at any
+        // point in a rollout.
+        "build_version": build_version,
     })
 }
 
@@ -123,6 +165,7 @@ pub async fn register_worker_identity_at_boot(signing_key: &'static DispatchSign
     let worker_id = crate::worker_identity::worker_identity();
     let supports_sealing = bool_env("TALOS_WORKER_SUPPORTS_SEALING");
     let public_key = signing_key.verifying_key().to_bytes();
+    let build_version = worker_build_version();
     let url = format!("{}/internal/worker-key", base_url.trim_end_matches('/'));
 
     // Explicit redirect policy (lint check 32) + bounded timeouts; the target is
@@ -156,6 +199,7 @@ pub async fn register_worker_identity_at_boot(signing_key: &'static DispatchSign
             supports_sealing,
             issued_at_ms,
             &nonce,
+            &build_version,
             signing_key,
         );
 
@@ -171,6 +215,7 @@ pub async fn register_worker_identity_at_boot(signing_key: &'static DispatchSign
                     target: "talos_security",
                     worker_id = %worker_id,
                     supports_sealing,
+                    build_version = %build_version,
                     "worker self-registered its Ed25519 identity (RFC 0010 P2 inc.4)"
                 );
                 return;
@@ -229,14 +274,22 @@ mod tests {
     fn registration_body_shape_and_proof_verify() {
         let sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
         let pk = sk.verifying_key().to_bytes();
-        let body =
-            build_registration_body("worker-42", &pk, true, 1_700_000_000_000, "nonce-1", &sk);
+        let body = build_registration_body(
+            "worker-42",
+            &pk,
+            true,
+            1_700_000_000_000,
+            "nonce-1",
+            "0.1.0+abc1234",
+            &sk,
+        );
 
         // Shape: hex fields, echoed scalars.
         assert_eq!(body["worker_id"], "worker-42");
         assert_eq!(body["public_key"], hex::encode(pk));
         assert_eq!(body["supports_sealing"], true);
         assert_eq!(body["issued_at_ms"], 1_700_000_000_000u64);
+        assert_eq!(body["build_version"], "0.1.0+abc1234");
 
         // The proof in the body verifies against the body's own fields — i.e. the
         // controller would accept it — and binds supports_sealing (flipping it
@@ -260,6 +313,81 @@ mod tests {
             &proof
         )
         .is_err());
+    }
+
+    /// The build-identity handshake must be invisible to the SECURITY layer:
+    /// the proof-of-possession is over `(worker_id, key, sealing, ts, nonce)`
+    /// only, so two bodies that differ ONLY in `build_version` must carry
+    /// byte-identical proofs — which is exactly what makes a new worker's body
+    /// verifiable by an OLD controller that has never heard of the field.
+    ///
+    /// If someone later "improves" this by binding build_version into the PoP,
+    /// this test fails loudly and names the compatibility break.
+    #[test]
+    fn build_version_does_not_affect_the_proof() {
+        let sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let pk = sk.verifying_key().to_bytes();
+
+        let mk = |bv: &str| {
+            build_registration_body(
+                "worker-42",
+                &pk,
+                true,
+                1_700_000_000_000,
+                "nonce-1",
+                bv,
+                &sk,
+            )
+        };
+        let a = mk("0.1.0+aaaaaaa");
+        let b = mk("9.9.9+bbbbbbb-dirty");
+        let empty = mk("");
+
+        assert_eq!(a["proof"], b["proof"], "proof must not bind build_version");
+        assert_eq!(a["proof"], empty["proof"]);
+
+        // ...and every OTHER field is identical too, so the only wire delta an
+        // old controller sees is one unknown key it ignores.
+        for field in [
+            "worker_id",
+            "public_key",
+            "supports_sealing",
+            "issued_at_ms",
+            "nonce",
+        ] {
+            assert_eq!(a[field], b[field], "field {field} must be unchanged");
+        }
+
+        // The proof still verifies standalone — i.e. an old controller, which
+        // never reads build_version, accepts the new body.
+        let proof = hex::decode(b["proof"].as_str().unwrap()).unwrap();
+        verify_worker_registration_proof(
+            &pk,
+            "worker-42",
+            true,
+            1_700_000_000_000,
+            "nonce-1",
+            &proof,
+        )
+        .expect("old controller must accept a new worker's body");
+    }
+
+    /// The composed string must be parseable by the controller's suffix
+    /// comparison: exactly one `+`, non-empty on both sides.
+    #[test]
+    fn worker_build_version_has_the_composite_shape() {
+        // TALOS_VERSION unset → composite. (Set-then-remove so a stray value in
+        // the ambient env can't make this test lie.)
+        std::env::remove_var("TALOS_VERSION");
+        let v = worker_build_version();
+        let (pkg, sha) = v.split_once('+').expect("composite is `{pkg}+{sha}`");
+        assert!(!pkg.is_empty(), "package version must be present");
+        assert!(!sha.is_empty(), "sha (or `unknown`) must be present");
+
+        // The override wins verbatim — this is how compose/CI pins a version.
+        std::env::set_var("TALOS_VERSION", "1.2.3+deadbee");
+        assert_eq!(worker_build_version(), "1.2.3+deadbee");
+        std::env::remove_var("TALOS_VERSION");
     }
 
     #[test]

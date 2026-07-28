@@ -19,6 +19,18 @@ RUN apt-get update && apt-get install -y mold && rm -rf /var/lib/apt/lists/*
 ENV CARGO_BUILD_JOBS=8
 ENV RUSTFLAGS="-C link-arg=-fuse-ld=mold --cfg rustix_use_libc"
 
+# Build-time git SHA + dirty flag passed by docker-compose.yml (and by
+# main-publish.yml's build-args, which apply to every matrix service).
+# Captured by worker/build.rs and exposed as `GIT_SHA` / `GIT_DIRTY` env!
+# constants at compile time so the worker's boot-time self-registration
+# reports the deployed commit. MUST mirror controller/Dockerfile exactly —
+# if only one side gets the override, a same-tree controller and worker
+# report different strings and the build-skew WARN fires on a healthy fleet.
+ARG GIT_SHA_OVERRIDE=unknown
+ARG GIT_DIRTY_OVERRIDE=false
+ENV GIT_SHA_OVERRIDE=${GIT_SHA_OVERRIDE}
+ENV GIT_DIRTY_OVERRIDE=${GIT_DIRTY_OVERRIDE}
+
 # Copy the entire workspace in one shot. .dockerignore is the contract:
 # it excludes **/target, .env*, private keys, frontend node_modules, .git,
 # etc. — keep that file conservative.

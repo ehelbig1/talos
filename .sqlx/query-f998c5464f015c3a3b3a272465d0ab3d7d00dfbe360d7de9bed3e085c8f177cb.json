@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO worker_identities (worker_id, public_key, supports_sealing, build_version)\n         SELECT $1, $2, $3, $5\n         WHERE (SELECT count(*) FROM worker_identities\n                WHERE worker_id = $1 AND active) < $4\n            OR EXISTS (SELECT 1 FROM worker_identities\n                       WHERE worker_id = $1 AND public_key = $2)\n         ON CONFLICT (worker_id, public_key) DO UPDATE\n            SET active = true,\n                supports_sealing = EXCLUDED.supports_sealing,\n                build_version = EXCLUDED.build_version,\n                last_seen_at = now()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea",
+        "Bool",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f998c5464f015c3a3b3a272465d0ab3d7d00dfbe360d7de9bed3e085c8f177cb"
+}

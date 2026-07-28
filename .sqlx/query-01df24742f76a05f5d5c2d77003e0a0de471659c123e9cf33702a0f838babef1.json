@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT worker_id, build_version, supports_sealing, last_seen_at\n             FROM worker_identities\n             WHERE active\n             ORDER BY worker_id, public_key\n             LIMIT $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "worker_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "build_version",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "supports_sealing",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 3,
+        "name": "last_seen_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "01df24742f76a05f5d5c2d77003e0a0de471659c123e9cf33702a0f838babef1"
+}

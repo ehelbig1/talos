@@ -68,7 +68,83 @@ pub struct WorkerIdentityRow {
     pub active: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub last_seen_at: chrono::DateTime<chrono::Utc>,
+    /// Worker-reported build string (`{pkg}+{sha}[-dirty]`). `None` = the row
+    /// was written by a pre-handshake worker that never sent the field.
+    ///
+    /// DIAGNOSTIC ONLY — see the column comment in migration
+    /// `20260728120000_worker_identities_build_version.sql`. It is NOT covered
+    /// by the registration proof-of-possession, so nothing may branch on it
+    /// beyond logging and operator reporting.
+    pub build_version: Option<String>,
 }
+
+/// One row of the fleet build-identity listing surfaced by
+/// `get_platform_info.fleet`. Deliberately a SEPARATE, narrower shape from
+/// [`WorkerIdentityRow`]: this one omits `public_key` because the MCP surface
+/// has no use for key material (public or not) and dumping 64 hex chars per
+/// worker into every platform-info response is noise, not information.
+#[derive(Debug, Clone)]
+pub struct WorkerBuildRow {
+    pub worker_id: String,
+    /// `None` = pre-handshake worker (never reported a build).
+    pub build_version: Option<String>,
+    pub supports_sealing: bool,
+    pub last_seen_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The `+sha[-dirty]` half of a composite build string (`{pkg}+{sha}[-dirty]`),
+/// or `None` when there is no `+` (a bare `TALOS_VERSION=1.2.3` override) or the
+/// suffix is empty.
+///
+/// Comparing SUFFIXES, not whole strings, is the point: the controller and
+/// worker crates carry independent `CARGO_PKG_VERSION`s (worker `0.1.0` vs a
+/// controller release `1.0.0-rN`), so a whole-string compare would report skew
+/// on every healthy fleet. The commit sha is what actually has to agree.
+///
+/// Lives in this crate — not at either call site — because BOTH consumers of the
+/// build-identity handshake need it: the controller's registration WARN and the
+/// MCP `get_platform_info.fleet` skew flag. Two copies would drift, and the two
+/// surfaces disagreeing about whether the fleet is skewed is worse than either
+/// being wrong alone.
+#[must_use]
+pub fn build_suffix(version: &str) -> Option<&str> {
+    version
+        .split_once('+')
+        .map(|(_, suffix)| suffix)
+        .filter(|s| !s.is_empty())
+}
+
+/// Whether two build strings provably came from the SAME commit.
+///
+/// Fails closed on anything it cannot prove: a missing suffix, or a suffix of
+/// `unknown` / `unknown-dirty` (what `build.rs` stamps outside a git checkout —
+/// e.g. a Docker build with no `GIT_SHA_OVERRIDE`). Two `unknown`s are not
+/// evidence of agreement; that is the input-freshness lesson restated (#578,
+/// unverifiable ≠ verified-same), and callers must word their output
+/// accordingly rather than rendering `false` as "skew".
+#[must_use]
+pub fn builds_match(a: &str, b: &str) -> bool {
+    let (Some(sa), Some(sb)) = (build_suffix(a), build_suffix(b)) else {
+        return false;
+    };
+    let known = |s: &str| s != "unknown" && s != "unknown-dirty";
+    known(sa) && known(sb) && sa == sb
+}
+
+/// Whether a build string carries a usable, non-placeholder commit sha — i.e.
+/// whether it can participate in a [`builds_match`] verdict at all. Lets a
+/// caller tell "different commits" (actionable skew) apart from "one side never
+/// reported a real sha" (unverifiable), which must not be reported the same way.
+#[must_use]
+pub fn build_is_verifiable(version: &str) -> bool {
+    build_suffix(version).is_some_and(|s| s != "unknown" && s != "unknown-dirty")
+}
+
+/// Hard ceiling on rows returned by [`WorkerIdentityRepository::list_active_builds`].
+/// The table is fleet-sized (tens of rows in the largest deployment we plan
+/// for), so this is a runaway guard, not pagination — a fleet past this size
+/// has a bigger problem than a truncated report, and the caller says so.
+pub const MAX_FLEET_BUILD_ROWS: i64 = 200;
 
 /// Outcome of a [`WorkerIdentityRepository::register`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,15 +239,24 @@ async fn advisory_lock_worker(
 /// always allowed). A new key at the cap yields zero rows — no insert, no
 /// ON CONFLICT — read back as `CapReached`. Atomic; no separate
 /// count-then-insert window.
+///
+/// `build_version` is the registrant's self-reported build string, or `None`
+/// when the registrant did not report one (a pre-handshake worker, or the
+/// operator CLI, which knows nothing about the pod's build). It is written
+/// UNCONDITIONALLY — including back to NULL — because the column means "what
+/// the LATEST registration reported", and preserving a previous value across a
+/// silent re-registration would leave a stale claim standing as if it were
+/// current. Diagnostic only; never an authorization input.
 async fn register_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     worker_id: &str,
     public_key: &[u8; 32],
     supports_sealing: bool,
+    build_version: Option<&str>,
 ) -> Result<RegisterOutcome> {
     let res = sqlx::query!(
-        "INSERT INTO worker_identities (worker_id, public_key, supports_sealing)
-         SELECT $1, $2, $3
+        "INSERT INTO worker_identities (worker_id, public_key, supports_sealing, build_version)
+         SELECT $1, $2, $3, $5
          WHERE (SELECT count(*) FROM worker_identities
                 WHERE worker_id = $1 AND active) < $4
             OR EXISTS (SELECT 1 FROM worker_identities
@@ -179,11 +264,13 @@ async fn register_in_tx(
          ON CONFLICT (worker_id, public_key) DO UPDATE
             SET active = true,
                 supports_sealing = EXCLUDED.supports_sealing,
+                build_version = EXCLUDED.build_version,
                 last_seen_at = now()",
         worker_id,
         &public_key[..],
         supports_sealing,
         MAX_ACTIVE_KEYS_PER_WORKER,
+        build_version,
     )
     .execute(&mut **tx)
     .await
@@ -199,11 +286,14 @@ async fn register_in_tx(
 /// Trust-on-first-use registration body (see
 /// [`WorkerIdentityRepository::register_tofu`] for semantics). Runs inside the
 /// caller's transaction; the caller must hold the per-worker advisory lock.
+/// `build_version` follows the same write rule as [`register_in_tx`]: the
+/// latest registration's report wins, including `None` → NULL.
 async fn register_tofu_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     worker_id: &str,
     public_key: &[u8; 32],
     supports_sealing: bool,
+    build_version: Option<&str>,
 ) -> Result<TofuOutcome> {
     // Exact-row lookup: does this (worker_id, key) pair already exist, and is
     // it live? Compile-checked query! — `active` is a NOT NULL column so the
@@ -223,11 +313,12 @@ async fn register_tofu_in_tx(
         Some(true) => {
             sqlx::query!(
                 "UPDATE worker_identities
-                 SET supports_sealing = $3, last_seen_at = now()
+                 SET supports_sealing = $3, build_version = $4, last_seen_at = now()
                  WHERE worker_id = $1 AND public_key = $2",
                 worker_id,
                 &public_key[..],
                 supports_sealing,
+                build_version,
             )
             .execute(&mut **tx)
             .await
@@ -250,11 +341,13 @@ async fn register_tofu_in_tx(
             .context("tofu history count")?;
             if history == 0 {
                 sqlx::query!(
-                    "INSERT INTO worker_identities (worker_id, public_key, supports_sealing)
-                     VALUES ($1, $2, $3)",
+                    "INSERT INTO worker_identities
+                     (worker_id, public_key, supports_sealing, build_version)
+                     VALUES ($1, $2, $3, $4)",
                     worker_id,
                     &public_key[..],
                     supports_sealing,
+                    build_version,
                 )
                 .execute(&mut **tx)
                 .await
@@ -284,15 +377,27 @@ impl WorkerIdentityRepository {
     /// serialises concurrent registrations so two racing NEW-key inserts cannot
     /// both slip past the cap (the TOCTOU the webhook repo's `try_create_under_cap`
     /// closes the same way).
+    ///
+    /// `build_version`: the registrant's self-reported build string, `None`
+    /// from the operator CLI (which has no visibility into the pod's build).
+    /// Diagnostic only — never an authorization input.
     pub async fn register(
         &self,
         worker_id: &str,
         public_key: &[u8; 32],
         supports_sealing: bool,
+        build_version: Option<&str>,
     ) -> Result<RegisterOutcome> {
         let mut tx = self.db_pool.begin().await.context("begin register tx")?;
         advisory_lock_worker(&mut tx, worker_id).await?;
-        let outcome = register_in_tx(&mut tx, worker_id, public_key, supports_sealing).await?;
+        let outcome = register_in_tx(
+            &mut tx,
+            worker_id,
+            public_key,
+            supports_sealing,
+            build_version,
+        )
+        .await?;
         tx.commit().await.context("commit register tx")?;
         Ok(outcome)
     }
@@ -314,15 +419,27 @@ impl WorkerIdentityRepository {
     ///
     /// Same advisory-lock serialisation as [`Self::register`], so a concurrent
     /// first-use race on one `worker_id` admits exactly one key.
+    ///
+    /// `build_version`: see [`Self::register`] — diagnostic only, written
+    /// verbatim (including `None`) on both the first-use insert and the
+    /// idempotent refresh, so a redeployed worker's new build shows up.
     pub async fn register_tofu(
         &self,
         worker_id: &str,
         public_key: &[u8; 32],
         supports_sealing: bool,
+        build_version: Option<&str>,
     ) -> Result<TofuOutcome> {
         let mut tx = self.db_pool.begin().await.context("begin tofu tx")?;
         advisory_lock_worker(&mut tx, worker_id).await?;
-        let outcome = register_tofu_in_tx(&mut tx, worker_id, public_key, supports_sealing).await?;
+        let outcome = register_tofu_in_tx(
+            &mut tx,
+            worker_id,
+            public_key,
+            supports_sealing,
+            build_version,
+        )
+        .await?;
         tx.commit().await.context("commit tofu tx")?;
         Ok(outcome)
     }
@@ -351,6 +468,9 @@ impl WorkerIdentityRepository {
     /// `token_hash` is the SHA-256 hex of the raw bearer token — the raw value
     /// is never stored or compared in SQL (lint check 41 discipline; hashing
     /// happens at the endpoint, so this layer never sees the credential).
+    ///
+    /// `build_version`: see [`Self::register`] — diagnostic only, persisted on
+    /// whichever registration arm the token's binding selects.
     pub async fn register_with_provisioning_token(
         &self,
         token_hash: &str,
@@ -358,6 +478,7 @@ impl WorkerIdentityRepository {
         public_key: &[u8; 32],
         supports_sealing: bool,
         require_bound: bool,
+        build_version: Option<&str>,
     ) -> Result<TokenRegisterOutcome> {
         let mut tx = self.db_pool.begin().await.context("begin token tx")?;
         advisory_lock_worker(&mut tx, worker_id).await?;
@@ -392,12 +513,28 @@ impl WorkerIdentityRepository {
         };
 
         let outcome = if binding.is_some() {
-            match register_in_tx(&mut tx, worker_id, public_key, supports_sealing).await? {
+            match register_in_tx(
+                &mut tx,
+                worker_id,
+                public_key,
+                supports_sealing,
+                build_version,
+            )
+            .await?
+            {
                 RegisterOutcome::Registered => TokenRegisterOutcome::Registered,
                 RegisterOutcome::CapReached => TokenRegisterOutcome::CapReached,
             }
         } else {
-            match register_tofu_in_tx(&mut tx, worker_id, public_key, supports_sealing).await? {
+            match register_tofu_in_tx(
+                &mut tx,
+                worker_id,
+                public_key,
+                supports_sealing,
+                build_version,
+            )
+            .await?
+            {
                 TofuOutcome::Registered => TokenRegisterOutcome::Registered,
                 TofuOutcome::IdentityConflict => TokenRegisterOutcome::IdentityConflict,
             }
@@ -579,7 +716,8 @@ impl WorkerIdentityRepository {
         // `public_key` bytea narrows to the domain `[u8; 32]` in Rust. All other
         // columns are NOT NULL, so the macro binds them non-optionally.
         let rows = sqlx::query!(
-            "SELECT worker_id, public_key, supports_sealing, active, created_at, last_seen_at
+            "SELECT worker_id, public_key, supports_sealing, active, created_at, last_seen_at,
+                    build_version
              FROM worker_identities
              ORDER BY worker_id, created_at, public_key",
         )
@@ -597,9 +735,44 @@ impl WorkerIdentityRepository {
                     active: r.active,
                     created_at: r.created_at,
                     last_seen_at: r.last_seen_at,
+                    build_version: r.build_version,
                 })
             })
             .collect()
+    }
+
+    /// Fleet build-identity listing for `get_platform_info.fleet` — one row per
+    /// ACTIVE worker identity with the build it last reported.
+    ///
+    /// One row per (worker_id, key), not per worker: a worker mid-rotation
+    /// legitimately holds two active keys, and collapsing them here would hide
+    /// the case where the two rows disagree — exactly the skew this feature
+    /// exists to surface. The caller labels them by worker_id.
+    ///
+    /// Bounded + deterministically ordered: `LIMIT` is a runaway guard (see
+    /// [`MAX_FLEET_BUILD_ROWS`]) and the ORDER BY carries `public_key` as a
+    /// unique tiebreaker after `worker_id` (check 28 — a plain `ORDER BY
+    /// worker_id` leaves two same-worker rows in heap order, so a truncated or
+    /// re-run report could disagree with itself on identical data).
+    pub async fn list_active_builds(&self) -> Result<Vec<WorkerBuildRow>> {
+        // `query_as!` compile-checks name + SQL type + nullability against the
+        // struct: `build_version` is the schema's only nullable column here, so
+        // a future NOT NULL / rename drift is a build error rather than a
+        // silent default (checks 52/55 — no `try_get(...).unwrap_or(...)`
+        // anywhere on this path).
+        let rows = sqlx::query_as!(
+            WorkerBuildRow,
+            "SELECT worker_id, build_version, supports_sealing, last_seen_at
+             FROM worker_identities
+             WHERE active
+             ORDER BY worker_id, public_key
+             LIMIT $1",
+            MAX_FLEET_BUILD_ROWS,
+        )
+        .fetch_all(&self.db_pool)
+        .await
+        .context("list active worker builds")?;
+        Ok(rows)
     }
 }
 
@@ -614,6 +787,70 @@ fn decode_pubkey_bytes(bytes: &[u8], worker_id: &str) -> Result<[u8; 32]> {
     <[u8; 32]>::try_from(bytes).map_err(|_| {
         anyhow!("worker_identities.public_key for {worker_id} is {len} bytes, expected 32")
     })
+}
+
+/// Build-identity comparison — pure, so these run everywhere (unlike the DB
+/// tests below, which skip without `DATABASE_URL`).
+#[cfg(test)]
+mod build_identity_tests {
+    use super::{build_is_verifiable, build_suffix, builds_match};
+
+    #[test]
+    fn suffix_is_the_part_after_the_first_plus() {
+        assert_eq!(build_suffix("0.1.0+ab85eb2"), Some("ab85eb2"));
+        assert_eq!(build_suffix("0.1.0+ab85eb2-dirty"), Some("ab85eb2-dirty"));
+        // A bare TALOS_VERSION override has no suffix to compare.
+        assert_eq!(build_suffix("1.2.3"), None);
+        assert_eq!(build_suffix("1.2.3+"), None);
+        assert_eq!(build_suffix(""), None);
+        // First '+' wins, so a suffix containing one is still stable.
+        assert_eq!(build_suffix("1.2.3+a+b"), Some("a+b"));
+    }
+
+    #[test]
+    fn matches_across_differing_package_versions() {
+        // The whole reason we compare suffixes: worker `0.1.0` vs controller
+        // `1.0.0-r304` is the NORMAL case, not skew.
+        assert!(builds_match("1.0.0-r304+ab85eb2", "0.1.0+ab85eb2"));
+        assert!(builds_match("0.1.0+ab85eb2-dirty", "9.9.9+ab85eb2-dirty"));
+        assert!(builds_match("0.1.0+ab85eb2", "0.1.0+ab85eb2"));
+    }
+
+    #[test]
+    fn different_commits_do_not_match() {
+        assert!(!builds_match("0.1.0+ab85eb2", "0.1.0+f099158"));
+        // A dirty tree on ONE side is a real difference: the two binaries were
+        // built from different bytes even at the same commit.
+        assert!(!builds_match("0.1.0+ab85eb2", "0.1.0+ab85eb2-dirty"));
+        // Case-sensitive: shas are lowercase hex, a case flip is not the same
+        // string and we do not guess.
+        assert!(!builds_match("0.1.0+AB85EB2", "0.1.0+ab85eb2"));
+    }
+
+    #[test]
+    fn unverifiable_never_reads_as_a_match() {
+        // "unknown" is what build.rs stamps outside a git checkout. Two
+        // unknowns are NOT evidence of agreement (#578: unverifiable ≠ same).
+        assert!(!builds_match("0.1.0+unknown", "1.0.0+unknown"));
+        assert!(!builds_match("0.1.0+unknown-dirty", "1.0.0+unknown-dirty"));
+        assert!(!builds_match("0.1.0+unknown", "1.0.0+ab85eb2"));
+        // No suffix on either side → nothing to compare, even when identical.
+        assert!(!builds_match("1.2.3", "1.2.3"));
+        assert!(!builds_match("1.2.3", "0.1.0+ab85eb2"));
+    }
+
+    #[test]
+    fn verifiability_separates_real_skew_from_no_information() {
+        assert!(build_is_verifiable("0.1.0+ab85eb2"));
+        assert!(build_is_verifiable("0.1.0+ab85eb2-dirty"));
+        assert!(!build_is_verifiable("0.1.0+unknown"));
+        assert!(!build_is_verifiable("0.1.0+unknown-dirty"));
+        assert!(!build_is_verifiable("1.2.3"));
+        // Both non-matching, but only ONE of these is actionable skew — the
+        // distinction callers must preserve in their wording.
+        assert!(!builds_match("0.1.0+aaaaaaa", "0.1.0+bbbbbbb"));
+        assert!(build_is_verifiable("0.1.0+aaaaaaa") && build_is_verifiable("0.1.0+bbbbbbb"));
+    }
 }
 
 #[cfg(test)]
@@ -665,12 +902,12 @@ mod tests {
         clean(&repo.db_pool, wid).await;
 
         assert_eq!(
-            repo.register(wid, &key(1), false).await.unwrap(),
+            repo.register(wid, &key(1), false, None).await.unwrap(),
             RegisterOutcome::Registered
         );
         // Re-register the SAME key: idempotent, still one active key.
         assert_eq!(
-            repo.register(wid, &key(1), true).await.unwrap(),
+            repo.register(wid, &key(1), true, None).await.unwrap(),
             RegisterOutcome::Registered
         );
 
@@ -680,6 +917,83 @@ mod tests {
         assert_eq!(mine[0].public_key, key(1));
         // The re-register updated the capability bit.
         assert!(repo.worker_supports_sealing(wid).await.unwrap());
+    }
+
+    /// The build-identity handshake's persistence contract: the column always
+    /// reflects the LATEST registration's report, on the insert arm AND the
+    /// idempotent re-register arm (a redeployed worker keeps its key and gets a
+    /// new build), and a registrant that reports nothing clears it rather than
+    /// leaving a stale claim standing as if it were current.
+    #[tokio::test]
+    async fn build_version_round_trips_and_refreshes_on_re_register() {
+        let Some(pool) = pool_or_skip().await else {
+            return;
+        };
+        let repo = WorkerIdentityRepository::new(pool);
+        let wid = "test-buildver-worker";
+        clean(&repo.db_pool, wid).await;
+
+        let build_of = |repo: &WorkerIdentityRepository| {
+            let wid = wid.to_string();
+            let repo = WorkerIdentityRepository::new(repo.db_pool.clone());
+            async move {
+                repo.list_active_builds()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|r| r.worker_id == wid)
+                    .expect("registered worker must list")
+                    .build_version
+            }
+        };
+
+        // TOFU first use carries the report through.
+        assert_eq!(
+            repo.register_tofu(wid, &key(1), false, Some("0.1.0+aaaaaaa"))
+                .await
+                .unwrap(),
+            TofuOutcome::Registered
+        );
+        assert_eq!(build_of(&repo).await.as_deref(), Some("0.1.0+aaaaaaa"));
+
+        // Redeploy: same key, new build → the refresh arm updates it.
+        assert_eq!(
+            repo.register_tofu(wid, &key(1), false, Some("0.1.0+bbbbbbb-dirty"))
+                .await
+                .unwrap(),
+            TofuOutcome::Registered
+        );
+        assert_eq!(
+            build_of(&repo).await.as_deref(),
+            Some("0.1.0+bbbbbbb-dirty")
+        );
+
+        // A registrant that reports nothing (pre-handshake worker, or the
+        // operator CLI) clears the column — "unreported", not "still on b".
+        assert_eq!(
+            repo.register_tofu(wid, &key(1), false, None).await.unwrap(),
+            TofuOutcome::Registered
+        );
+        assert_eq!(build_of(&repo).await, None);
+
+        // Operator-grade insert arm carries it too.
+        assert_eq!(
+            repo.register(wid, &key(2), false, Some("9.9.9+ccccccc"))
+                .await
+                .unwrap(),
+            RegisterOutcome::Registered
+        );
+        let builds: Vec<_> = repo
+            .list_active_builds()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.worker_id == wid)
+            .map(|r| r.build_version)
+            .collect();
+        assert_eq!(builds.len(), 2, "both active keys list");
+        assert!(builds.contains(&Some("9.9.9+ccccccc".to_string())));
+        assert!(builds.contains(&None));
     }
 
     #[tokio::test]
@@ -693,12 +1007,12 @@ mod tests {
 
         // First use: no history → key(1) becomes the trusted identity.
         assert_eq!(
-            repo.register_tofu(wid, &key(1), false).await.unwrap(),
+            repo.register_tofu(wid, &key(1), false, None).await.unwrap(),
             TofuOutcome::Registered
         );
         // Idempotent same-key refresh, updating the capability bit.
         assert_eq!(
-            repo.register_tofu(wid, &key(1), true).await.unwrap(),
+            repo.register_tofu(wid, &key(1), true, None).await.unwrap(),
             TofuOutcome::Registered
         );
         assert!(repo.worker_supports_sealing(wid).await.unwrap());
@@ -706,7 +1020,7 @@ mod tests {
         // A DIFFERENT key for the same worker_id is refused (the gap this
         // closes: shared-token impersonation).
         assert_eq!(
-            repo.register_tofu(wid, &key(2), false).await.unwrap(),
+            repo.register_tofu(wid, &key(2), false, None).await.unwrap(),
             TofuOutcome::IdentityConflict
         );
         // ...and the refusal wrote nothing.
@@ -731,7 +1045,7 @@ mod tests {
         clean(&repo.db_pool, wid).await;
 
         assert_eq!(
-            repo.register_tofu(wid, &key(1), false).await.unwrap(),
+            repo.register_tofu(wid, &key(1), false, None).await.unwrap(),
             TofuOutcome::Registered
         );
         // Operator revokes the key (compromise / decommission).
@@ -739,23 +1053,23 @@ mod tests {
 
         // The revoked key cannot re-activate itself over the network path.
         assert_eq!(
-            repo.register_tofu(wid, &key(1), false).await.unwrap(),
+            repo.register_tofu(wid, &key(1), false, None).await.unwrap(),
             TofuOutcome::IdentityConflict
         );
         // Nor can a NEW key claim the retired worker_id (history exists).
         assert_eq!(
-            repo.register_tofu(wid, &key(2), false).await.unwrap(),
+            repo.register_tofu(wid, &key(2), false, None).await.unwrap(),
             TofuOutcome::IdentityConflict
         );
 
         // The OPERATOR path still rotates freely: register a new key, and the
         // worker's subsequent boot-time TOFU refresh of that key succeeds.
         assert_eq!(
-            repo.register(wid, &key(2), false).await.unwrap(),
+            repo.register(wid, &key(2), false, None).await.unwrap(),
             RegisterOutcome::Registered
         );
         assert_eq!(
-            repo.register_tofu(wid, &key(2), true).await.unwrap(),
+            repo.register_tofu(wid, &key(2), true, None).await.unwrap(),
             TofuOutcome::Registered
         );
     }
@@ -806,7 +1120,7 @@ mod tests {
 
         // Worker already has a TOFU-bound identity...
         assert_eq!(
-            repo.register_tofu(wid, &key(1), false).await.unwrap(),
+            repo.register_tofu(wid, &key(1), false, None).await.unwrap(),
             TofuOutcome::Registered
         );
         // ...so a NEW key would be an IdentityConflict on the shared path. A
@@ -816,7 +1130,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            repo.register_with_provisioning_token(&th, wid, &key(2), false, true)
+            repo.register_with_provisioning_token(&th, wid, &key(2), false, true, None)
                 .await
                 .unwrap(),
             TokenRegisterOutcome::Registered
@@ -825,7 +1139,7 @@ mod tests {
 
         // Single use: a second redemption is refused even for a valid request.
         assert_eq!(
-            repo.register_with_provisioning_token(&th, wid, &key(3), false, true)
+            repo.register_with_provisioning_token(&th, wid, &key(3), false, true, None)
                 .await
                 .unwrap(),
             TokenRegisterOutcome::InvalidToken
@@ -853,7 +1167,7 @@ mod tests {
                 let repo = repo.clone();
                 let th = th.clone();
                 async move {
-                    repo.register_with_provisioning_token(&th, wid, &key(10), false, true)
+                    repo.register_with_provisioning_token(&th, wid, &key(10), false, true, None)
                         .await
                         .unwrap()
                 }
@@ -862,7 +1176,7 @@ mod tests {
                 let repo = repo.clone();
                 let th = th.clone();
                 async move {
-                    repo.register_with_provisioning_token(&th, wid, &key(11), false, true)
+                    repo.register_with_provisioning_token(&th, wid, &key(11), false, true, None)
                         .await
                         .unwrap()
                 }
@@ -911,7 +1225,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            repo.register_with_provisioning_token(&th_expired, wid, &key(1), false, true)
+            repo.register_with_provisioning_token(&th_expired, wid, &key(1), false, true, None)
                 .await
                 .unwrap(),
             TokenRegisterOutcome::InvalidToken
@@ -926,7 +1240,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            repo.register_with_provisioning_token(&th_other, wid, &key(1), false, true)
+            repo.register_with_provisioning_token(&th_other, wid, &key(1), false, true, None)
                 .await
                 .unwrap(),
             TokenRegisterOutcome::InvalidToken
@@ -946,7 +1260,7 @@ mod tests {
             "second revoke is a no-op"
         );
         assert_eq!(
-            repo.register_with_provisioning_token(&th_revoked, wid, &key(1), false, true)
+            repo.register_with_provisioning_token(&th_revoked, wid, &key(1), false, true, None)
                 .await
                 .unwrap(),
             TokenRegisterOutcome::InvalidToken
@@ -978,7 +1292,7 @@ mod tests {
 
         // Enforcement ON → wildcard refused outright, NOT consumed.
         assert_eq!(
-            repo.register_with_provisioning_token(&th, wid, &key(1), false, true)
+            repo.register_with_provisioning_token(&th, wid, &key(1), false, true, None)
                 .await
                 .unwrap(),
             TokenRegisterOutcome::InvalidToken
@@ -987,7 +1301,7 @@ mod tests {
 
         // Enforcement OFF → accepted, TOFU semantics, consumed.
         assert_eq!(
-            repo.register_with_provisioning_token(&th, wid, &key(1), false, false)
+            repo.register_with_provisioning_token(&th, wid, &key(1), false, false, None)
                 .await
                 .unwrap(),
             TokenRegisterOutcome::Registered
@@ -1004,7 +1318,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            repo.register_with_provisioning_token(&th2, wid, &key(2), false, false)
+            repo.register_with_provisioning_token(&th2, wid, &key(2), false, false, None)
                 .await
                 .unwrap(),
             TokenRegisterOutcome::IdentityConflict
@@ -1029,7 +1343,7 @@ mod tests {
         // Fill the worker to its active-key cap via the operator path.
         for i in 0..MAX_ACTIVE_KEYS_PER_WORKER as u8 {
             assert_eq!(
-                repo.register(wid, &key(i), false).await.unwrap(),
+                repo.register(wid, &key(i), false, None).await.unwrap(),
                 RegisterOutcome::Registered
             );
         }
@@ -1040,7 +1354,7 @@ mod tests {
 
         // Bound-token redemption hits the cap → refused, token survives.
         assert_eq!(
-            repo.register_with_provisioning_token(&th, wid, &key(100), false, true)
+            repo.register_with_provisioning_token(&th, wid, &key(100), false, true, None)
                 .await
                 .unwrap(),
             TokenRegisterOutcome::CapReached
@@ -1050,7 +1364,7 @@ mod tests {
         // Operator frees a slot; the SAME token now redeems.
         assert!(repo.deactivate(wid, &key(0)).await.unwrap());
         assert_eq!(
-            repo.register_with_provisioning_token(&th, wid, &key(100), false, true)
+            repo.register_with_provisioning_token(&th, wid, &key(100), false, true, None)
                 .await
                 .unwrap(),
             TokenRegisterOutcome::Registered
@@ -1069,18 +1383,18 @@ mod tests {
         // Fill up to the cap with distinct keys — all admitted.
         for i in 0..MAX_ACTIVE_KEYS_PER_WORKER as u8 {
             assert_eq!(
-                repo.register(wid, &key(i), false).await.unwrap(),
+                repo.register(wid, &key(i), false, None).await.unwrap(),
                 RegisterOutcome::Registered
             );
         }
         // One more NEW key is refused.
         assert_eq!(
-            repo.register(wid, &key(200), false).await.unwrap(),
+            repo.register(wid, &key(200), false, None).await.unwrap(),
             RegisterOutcome::CapReached
         );
         // But re-registering an EXISTING key is still allowed at the cap.
         assert_eq!(
-            repo.register(wid, &key(0), false).await.unwrap(),
+            repo.register(wid, &key(0), false, None).await.unwrap(),
             RegisterOutcome::Registered
         );
 
@@ -1091,7 +1405,7 @@ mod tests {
             "second deactivate is a no-op"
         );
         assert_eq!(
-            repo.register(wid, &key(200), false).await.unwrap(),
+            repo.register(wid, &key(200), false, None).await.unwrap(),
             RegisterOutcome::Registered
         );
 
