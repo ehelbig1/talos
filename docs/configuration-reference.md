@@ -148,7 +148,7 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `TALOS_WORKFLOW_SIGNING_KEY` | none | both | Key for workflow-definition signatures | 🔒 |
 | `TALOS_WORKFLOW_SIGNING_STRICT` | `false` | both | Reject unsigned workflows | 🔒 |
 | `TALOS_WORKER_REGISTRATION_TOKEN` | none (optional) | both | Shared token for worker self-registration — the SAME value on controller (gate) and worker (bearer); unset on either side disables the handshake | 🔒 |
-| `TALOS_CONTROLLER_URL` | none (optional) | worker | Controller base URL the worker self-registers against; with the token above, enables build reporting into `get_platform_info.fleet` | |
+| `TALOS_CONTROLLER_URL` | none (dev compose: `http://controller:8000`) | worker | Controller base URL the worker self-registers against — not a secret. Registration also requires the token above **and** `TALOS_WORKER_SIGNING_KEY`; with all three, the worker reports its build into `get_platform_info.fleet` | |
 | `TALOS_WORKER_REG_REQUIRE_BOUND_TOKEN` | unset | controller | Require a bound registration token | 🔒 |
 | `TALOS_WORKER_KEY_REFRESH_SECS` | `60` | controller | Worker key refresh sweep interval | |
 | `TALOS_ENVELOPE_SEALING` | unset (OFF = legacy inline WSK envelope) | both | Per-execution secret-envelope sealing mode (`audit` / `required`; RFC 0010 P3) | 🔒 |
