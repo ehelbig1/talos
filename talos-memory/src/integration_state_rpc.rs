@@ -193,15 +193,22 @@ impl IntegrationStateRequest {
         })
     }
 
-    pub fn verify(&self) -> bool {
+    /// See `memory_rpc::MemoryRpcRequest::verify` for the classification
+    /// contract: controller-side diagnosis only, gate order unchanged.
+    /// `integration_name` and the op's caps both classify as
+    /// `OversizedStructure` — they are the same cheap shape gate, and the
+    /// taxonomy deliberately stays coarse (one token per gate KIND, never one
+    /// per field, which would start describing the caller's bytes).
+    pub fn verify(&self) -> Result<(), rpc_auth::VerifyFailure> {
+        use rpc_auth::VerifyFailure;
         if !rpc_auth::verify_freshness(self.timestamp_ms) {
-            return false;
+            return Err(VerifyFailure::Stale);
         }
         if !validate_integration_name(&self.integration_name) {
-            return false;
+            return Err(VerifyFailure::OversizedStructure);
         }
         if validate_op(self.op.get()).is_none() {
-            return false;
+            return Err(VerifyFailure::OversizedStructure);
         }
         let body = sign_body_bytes(
             &self.integration_name,
@@ -486,7 +493,7 @@ mod tests {
         let mut forged = a.clone();
         forged.signature = b.signature.clone();
         assert!(
-            !forged.verify(),
+            forged.verify().is_err(),
             "cross-integration replay must be rejected"
         );
     }
@@ -503,7 +510,10 @@ mod tests {
 
         let mut forged = a.clone();
         forged.signature = b.signature.clone();
-        assert!(!forged.verify(), "cross-user replay must be rejected");
+        assert!(
+            forged.verify().is_err(),
+            "cross-user replay must be rejected"
+        );
     }
 
     #[test]

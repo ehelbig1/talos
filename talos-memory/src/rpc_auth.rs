@@ -868,12 +868,99 @@ pub fn rpc_accept_legacy_hmac() -> bool {
     })
 }
 
+/// Why a signed-RPC request failed its protocol's `verify()`.
+///
+/// ## This is a CONTROLLER-SIDE DIAGNOSTIC taxonomy, not a reply
+///
+/// Every variant names one of OUR OWN gates. Nothing here is derived from the
+/// sender's bytes, so the token is safe to put in a controller log (the #594
+/// safe-taxonomy rule). It must NEVER reach the caller: the admission gate in
+/// `talos-rpc-subscribers` collapses all of these into a single
+/// indistinguishable `Unauthorized` wire reply, because telling an on-wire
+/// attacker WHICH gate they tripped is an oracle — `Stale` vs `BadSignature`
+/// alone would let them map the freshness window and confirm key validity as
+/// two independent probes.
+///
+/// ## Why it exists
+///
+/// Pre-#603 every `verify()` returned a bare `bool`, so "the whole fleet's
+/// memory RPC is failing because the signed-body formula moved" (#600, a
+/// mixed-fleet outage) logged exactly like "one worker's clock drifted by a
+/// minute". That undifferentiated reject is the blind spot that cost twelve
+/// hypotheses in the 2026-07-27 dispatch outage; #594 closed it for dispatch,
+/// this closes it for the RPC surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyFailure {
+    /// `timestamp_ms` fell outside the asymmetric freshness window
+    /// ([`PAST_WINDOW_MS`] past / [`FUTURE_WINDOW_MS`] future). Clock drift,
+    /// a long NATS stall, or a captured request replayed late.
+    Stale,
+    /// A signed numeric field was NaN or Inf. Rejected because IEEE 754 NaN
+    /// has many bit patterns, so the encoding — and therefore the signature —
+    /// would be non-deterministic. Only `memory_rpc` carries bare `f64`s
+    /// today (`ttl_hours`, `min_score`).
+    NonFinite,
+    /// A structural cap was exceeded or a shape rule violated (oversized key /
+    /// query / SQL / params, bad `memory_type`, malformed `integration_name`,
+    /// out-of-range limit). The cheap gates that deliberately run BEFORE the
+    /// crypto.
+    OversizedStructure,
+    /// No verification key is available for this signer under the scheme it
+    /// declared — an operator CONFIG or ROTATION problem, not a wire-format
+    /// one. Covers: Ed25519 with an empty `worker_id` or a `worker_id` absent
+    /// from the public-key registry; and legacy HMAC when no shared ring is
+    /// registered or `TALOS_RPC_REQUIRE_ED25519` has retired HMAC. Kept
+    /// distinct from [`Self::BadSignature`] because the remedies are
+    /// opposites: register/rotate a key, versus roll the fleet.
+    UnknownSignerKey,
+    /// Key material WAS available and the MAC/Ed25519 check still failed —
+    /// the signer and verifier disagree about the signed bytes. The single
+    /// highest-value class: a fleet-wide burst of these is the signature of a
+    /// signed-wire-format change deployed to only one side (#598/#600), which
+    /// is why the admission gate attaches a build-skew hint to this class and
+    /// only to this class.
+    BadSignature,
+}
+
+impl VerifyFailure {
+    /// Stable snake_case token for structured logs. Operators, greps, and
+    /// dashboards key on these strings — treat them as a wire format FOR
+    /// LOGS: add variants, never rename existing tokens.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stale => "stale",
+            Self::NonFinite => "non_finite",
+            Self::OversizedStructure => "oversized_structure",
+            Self::UnknownSignerKey => "unknown_signer_key",
+            Self::BadSignature => "bad_signature",
+        }
+    }
+}
+
+impl std::fmt::Display for VerifyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Verify an RPC signature under the request's declared `crypto_scheme`
 /// (controller side). Ed25519 (scheme 1) against the keys registered for
 /// `worker_id`; legacy HMAC (scheme 0) against the shared ring, gated by
 /// `rpc_accept_legacy_hmac()`. Unknown scheme fails closed. Does NOT check
 /// freshness/replay — the caller runs `verify_freshness` + the nonce cache
 /// exactly as before, identically across schemes.
+///
+/// Returns `Err(VerifyFailure)` rather than `false` so the controller can log
+/// WHICH failure it was (see [`VerifyFailure`] for the oracle constraint on
+/// where that classification may travel). The accept/reject decision is
+/// byte-for-byte the one the pre-#603 `bool` version made: `Ok(())` exactly
+/// where it returned `true`.
+///
+/// An unrecognised `crypto_scheme` maps to [`VerifyFailure::BadSignature`],
+/// not `UnknownSignerKey`: a scheme byte this binary does not implement is
+/// most likely a NEWER worker talking to an OLDER controller, which is
+/// version skew — precisely the class the `BadSignature` hint is for.
 pub fn verify_rpc(
     subject: &str,
     actor_id: Uuid,
@@ -882,15 +969,27 @@ pub fn verify_rpc(
     worker_id: &str,
     signature: &[u8],
     crypto_scheme: u8,
-) -> bool {
+) -> Result<(), VerifyFailure> {
     match crypto_scheme {
         RPC_CRYPTO_SCHEME_ED25519 => {
-            verify_ed25519(subject, actor_id, nonce, body, worker_id, signature)
+            verify_ed25519_classified(subject, actor_id, nonce, body, worker_id, signature)
         }
         RPC_CRYPTO_SCHEME_HMAC => {
-            rpc_accept_legacy_hmac() && verify(subject, actor_id, nonce, body, signature)
+            // No ring registered, or HMAC retired by the P4 enforcement flip:
+            // there is no key material we are willing to check this signer
+            // against. That is a config/policy state, not a bytes mismatch —
+            // reporting it as `BadSignature` would send an operator hunting a
+            // wire-format bug that isn't there.
+            if !rpc_accept_legacy_hmac() || !is_ready() {
+                return Err(VerifyFailure::UnknownSignerKey);
+            }
+            if verify(subject, actor_id, nonce, body, signature) {
+                Ok(())
+            } else {
+                Err(VerifyFailure::BadSignature)
+            }
         }
-        _ => false,
+        _ => Err(VerifyFailure::BadSignature),
     }
 }
 
@@ -936,8 +1035,38 @@ pub fn verify_ed25519(
     worker_id: &str,
     signature: &[u8],
 ) -> bool {
+    verify_ed25519_classified(subject, actor_id, nonce, body, worker_id, signature).is_ok()
+}
+
+/// [`verify_ed25519`] with the failure SPLIT into "we had no key for this
+/// signer" versus "we had a key and the signature did not match".
+///
+/// The split is the whole point of the classification: key resolution failing
+/// is an operator config/rotation problem (an unregistered worker, a revoked
+/// key, an empty `worker_id` because the worker fell back to the HMAC path
+/// mid-flight), while a resolved key that then rejects the bytes means signer
+/// and verifier disagree about the signed FORMULA — the deploy-skew class.
+/// Same accept decision as before; only the failure detail is new.
+fn verify_ed25519_classified(
+    subject: &str,
+    actor_id: Uuid,
+    nonce: &str,
+    body: &[u8],
+    worker_id: &str,
+    signature: &[u8],
+) -> Result<(), VerifyFailure> {
     let keys = talos_workflow_job_protocol::worker_public_keys(worker_id);
-    verify_ed25519_with_keys(subject, actor_id, nonce, body, worker_id, signature, &keys)
+    // Mirrors `verify_ed25519_with_keys`'s own fail-closed preconditions —
+    // checked here so the two "no usable key" cases classify together rather
+    // than one of them arriving as a bytes mismatch.
+    if worker_id.is_empty() || keys.is_empty() {
+        return Err(VerifyFailure::UnknownSignerKey);
+    }
+    if verify_ed25519_with_keys(subject, actor_id, nonce, body, worker_id, signature, &keys) {
+        Ok(())
+    } else {
+        Err(VerifyFailure::BadSignature)
+    }
 }
 
 /// Build the canonical signing payload for an RPC request.
@@ -1541,6 +1670,60 @@ mod ed25519_rpc_tests {
             b"short",
             &[pk]
         ));
+    }
+
+    /// The classification split at its source. `verify_ed25519_classified`
+    /// is the only place that can tell "no key for this signer" apart from
+    /// "key present, bytes disagree", and the two verdicts send an operator
+    /// in opposite directions (register/rotate a key vs. roll the fleet), so
+    /// the split is pinned against the REAL registry rather than the
+    /// key-explicit core.
+    ///
+    /// Registers a key under a test-only `worker_id`; the registry setter
+    /// merges over the env base and other tests here never consult it, so
+    /// this cannot perturb them.
+    #[test]
+    fn classified_ed25519_splits_unknown_signer_from_bad_signature() {
+        const WID: &str = "rpc-classification-test-worker";
+        let sk = keypair();
+        talos_workflow_job_protocol::set_dynamic_worker_public_keys([(
+            WID.to_string(),
+            sk.verifying_key(),
+        )]);
+        let actor = Uuid::new_v4();
+        let nonce = random_nonce();
+        let sig = sign_ed25519_with_key(&sk, "memory_rpc", actor, &nonce, b"body", WID);
+
+        assert_eq!(
+            verify_ed25519_classified("memory_rpc", actor, &nonce, b"body", WID, &sig),
+            Ok(())
+        );
+
+        // Key present, bytes disagree → the deploy-skew class.
+        assert_eq!(
+            verify_ed25519_classified("memory_rpc", actor, &nonce, b"other-body", WID, &sig),
+            Err(VerifyFailure::BadSignature)
+        );
+
+        // Same signature, a signer we hold no key for → the config class.
+        assert_eq!(
+            verify_ed25519_classified(
+                "memory_rpc",
+                actor,
+                &nonce,
+                b"body",
+                "some-other-worker",
+                &sig
+            ),
+            Err(VerifyFailure::UnknownSignerKey)
+        );
+
+        // A malformed (wrong-width) signature from a KNOWN signer is a bytes
+        // problem, not a key-resolution one.
+        assert_eq!(
+            verify_ed25519_classified("memory_rpc", actor, &nonce, b"body", WID, b"short"),
+            Err(VerifyFailure::BadSignature)
+        );
     }
 
     #[test]

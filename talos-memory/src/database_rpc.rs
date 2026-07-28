@@ -164,16 +164,20 @@ impl DatabaseRpcRequest {
         })
     }
 
-    pub fn verify(&self) -> bool {
+    /// See `memory_rpc::MemoryRpcRequest::verify` for the classification
+    /// contract. NOTE the gate order here is structure-BEFORE-freshness (the
+    /// MCP-1033 shape below), unlike its siblings — preserved verbatim.
+    pub fn verify(&self) -> Result<(), rpc_auth::VerifyFailure> {
+        use rpc_auth::VerifyFailure;
         // MCP-1033: cheap-gate-first — reject malformed shape before
         // freshness/HMAC. Mirrors the worker's pre-dispatch caps so a
         // compromised worker can't slip multi-MB SQL through to the
         // controller's sqlparser re-parse (O(N) on the SQL string).
         if validate_structure(&self.sql, &self.params).is_err() {
-            return false;
+            return Err(VerifyFailure::OversizedStructure);
         }
         if !rpc_auth::verify_freshness(self.timestamp_ms) {
-            return false;
+            return Err(VerifyFailure::Stale);
         }
         let body_bytes = sign_body_bytes(&self.sql, &self.params, self.is_fetch, self.timestamp_ms);
         rpc_auth::verify_rpc(
@@ -312,7 +316,7 @@ mod tests {
             worker_id: String::new(),
             crypto_scheme: 0,
         };
-        assert!(!req.verify());
+        assert!(req.verify().is_err());
 
         // Oversized SQL with otherwise-valid shape: same rejection path.
         let req_big = DatabaseRpcRequest {
@@ -326,6 +330,6 @@ mod tests {
             worker_id: String::new(),
             crypto_scheme: 0,
         };
-        assert!(!req_big.verify());
+        assert!(req_big.verify().is_err());
     }
 }

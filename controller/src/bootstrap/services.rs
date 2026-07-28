@@ -1517,6 +1517,15 @@ pub(crate) fn wire_rpc_subscribers(
     let (rpc_shutdown_tx, rpc_shutdown_rx) = tokio::sync::watch::channel::<bool>(false);
     let rpc_shutdown_tx = std::sync::Arc::new(rpc_shutdown_tx);
 
+    // #603: stamp our own build so a signature rejection can say whether the
+    // two sides were built from the same commit. Set here — unconditionally,
+    // before any subscriber can accept a message — rather than inside the
+    // worker-key refresh task, which an operator can disable
+    // (`TALOS_WORKER_KEY_REFRESH_SECS=0`). Without the controller half the
+    // hint degrades honestly to "unverifiable"; with it, a mixed fleet says
+    // so at the moment of failure.
+    talos_rpc_subscribers::set_controller_build(controller_build_version());
+
     // MCP-911: each of these subscribers verifies HMAC on every
     // incoming message; spawning them when the key isn't registered
     // turns every RPC into an Unauthorized rejection storm. Gate on

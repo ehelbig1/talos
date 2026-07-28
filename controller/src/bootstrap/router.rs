@@ -35,7 +35,38 @@ pub(crate) async fn refresh_worker_key_overlay(
     }
     let installed = mapped.len();
     talos_workflow_job_protocol::set_dynamic_worker_public_keys(mapped);
+    refresh_worker_build_cache(repo).await;
     Ok(installed)
+}
+
+/// #603: republish the `worker_id → build_version` map the RPC admission gate
+/// consults when a signature fails to check out.
+///
+/// Rides along with the verifying-key overlay refresh so the two snapshots are
+/// always the same age — a build hint computed from a stale map would be worse
+/// than none. It uses `list_active_builds` (already compile-checked, already
+/// LIMIT-bounded to the fleet size) rather than widening the key query, so no
+/// SQL or `.sqlx` metadata changes.
+///
+/// **Best effort by design.** The hint is diagnostic; a failure here must not
+/// fail the key install, which IS load-bearing. On error the previous
+/// generation stays in place and the next refresh retries — and the hint's
+/// honesty rule means an out-of-date map degrades to "cannot rule skew in or
+/// out", never to a false "builds match".
+async fn refresh_worker_build_cache(
+    repo: &talos_worker_identity_repository::WorkerIdentityRepository,
+) {
+    match repo.list_active_builds().await {
+        Ok(rows) => talos_rpc_subscribers::set_worker_build_cache(
+            rows.into_iter().map(|r| (r.worker_id, r.build_version)),
+        ),
+        Err(e) => tracing::warn!(
+            target: "talos_engine",
+            error = %e,
+            "worker build-identity cache refresh failed; RPC rejection logs will \
+             report build skew as unverifiable until the next refresh"
+        ),
+    }
 }
 
 // ===== RFC 0010 P2 inc.4c: in-cluster worker self-registration endpoint =====
@@ -218,7 +249,7 @@ fn sanitize_build_version(raw: Option<String>) -> Option<String> {
 /// is ever compared — and why [`log_build_identity`] also logs the compared
 /// commit explicitly, so an operator reading two visibly different strings on a
 /// "matches" line can see what the verdict was actually based on.
-fn controller_build_version() -> String {
+pub(crate) fn controller_build_version() -> String {
     std::env::var("TALOS_VERSION").unwrap_or_else(|_| {
         format!(
             "{}+{}{}",

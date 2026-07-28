@@ -163,9 +163,12 @@ impl StateWriteRequest {
         })
     }
 
-    pub fn verify(&self) -> bool {
+    /// See `memory_rpc::MemoryRpcRequest::verify` for the classification
+    /// contract: controller-side diagnosis only, gate order unchanged.
+    pub fn verify(&self) -> Result<(), rpc_auth::VerifyFailure> {
+        use rpc_auth::VerifyFailure;
         if !rpc_auth::verify_freshness(self.timestamp_ms) {
-            return false;
+            return Err(VerifyFailure::Stale);
         }
         // MCP-1024 (2026-05-15): structural caps inside verify() so any
         // cross-process consumer that trusts verify() as "well-formed
@@ -175,7 +178,7 @@ impl StateWriteRequest {
         // depth + metric tagging); a compromised worker that bypassed
         // its own caps fails both gates.
         if !validate_structure(&self.key, &self.value, self.is_delete) {
-            return false;
+            return Err(VerifyFailure::OversizedStructure);
         }
         let body_bytes = sign_body_bytes(
             self.execution_id,

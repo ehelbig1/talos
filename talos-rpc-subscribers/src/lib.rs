@@ -25,8 +25,11 @@
 //! preserved byte-for-byte.
 
 mod admission;
+mod build_skew;
 mod kernel;
 use kernel::record_rpc_metric;
+
+pub use build_skew::{set_controller_build, set_worker_build_cache};
 
 use talos_actor_memory_service as actor_memory_service;
 
@@ -82,7 +85,7 @@ pub(crate) async fn crossreplica_replay_ok(
 //
 // One `AdmittableRpc` impl per signed-RPC protocol, grouped here so the
 // full (wire subject, signing subject) table is reviewable in one
-// screen. Each impl is pure delegation: `verify_signature` calls the
+// screen. Each impl is pure delegation: `verify_classified` calls the
 // protocol's existing `verify()` in `talos_memory::*_rpc`; the two
 // subject consts are the SAME constants the subscriber's spec and
 // metrics use (pinned by `admission_identity_tests` below).
@@ -90,7 +93,7 @@ pub(crate) async fn crossreplica_replay_ok(
 impl admission::AdmittableRpc for talos_memory::graph_rpc::GraphSearchRequest {
     const WIRE_SUBJECT: &'static str = talos_memory::graph_rpc::SUBJECT_GRAPH_SEARCH;
     const SIGNING_SUBJECT: &'static str = talos_memory::graph_rpc::SUBJECT_NAME;
-    fn verify_signature(&self) -> bool {
+    fn verify_classified(&self) -> Result<(), talos_memory::rpc_auth::VerifyFailure> {
         self.verify()
     }
     fn actor_id(&self) -> uuid::Uuid {
@@ -98,13 +101,16 @@ impl admission::AdmittableRpc for talos_memory::graph_rpc::GraphSearchRequest {
     }
     fn nonce(&self) -> &str {
         &self.nonce
+    }
+    fn worker_id(&self) -> &str {
+        &self.worker_id
     }
 }
 
 impl admission::AdmittableRpc for talos_memory::ml_rpc::MlPredictRequest {
     const WIRE_SUBJECT: &'static str = talos_memory::ml_rpc::SUBJECT_ML_PREDICT;
     const SIGNING_SUBJECT: &'static str = talos_memory::ml_rpc::SUBJECT_NAME;
-    fn verify_signature(&self) -> bool {
+    fn verify_classified(&self) -> Result<(), talos_memory::rpc_auth::VerifyFailure> {
         self.verify()
     }
     fn actor_id(&self) -> uuid::Uuid {
@@ -112,13 +118,16 @@ impl admission::AdmittableRpc for talos_memory::ml_rpc::MlPredictRequest {
     }
     fn nonce(&self) -> &str {
         &self.nonce
+    }
+    fn worker_id(&self) -> &str {
+        &self.worker_id
     }
 }
 
 impl admission::AdmittableRpc for talos_memory::ml_rpc::MlFewShotRequest {
     const WIRE_SUBJECT: &'static str = talos_memory::ml_rpc::SUBJECT_ML_FEWSHOT;
     const SIGNING_SUBJECT: &'static str = talos_memory::ml_rpc::SUBJECT_NAME_FEWSHOT;
-    fn verify_signature(&self) -> bool {
+    fn verify_classified(&self) -> Result<(), talos_memory::rpc_auth::VerifyFailure> {
         self.verify()
     }
     fn actor_id(&self) -> uuid::Uuid {
@@ -126,13 +135,16 @@ impl admission::AdmittableRpc for talos_memory::ml_rpc::MlFewShotRequest {
     }
     fn nonce(&self) -> &str {
         &self.nonce
+    }
+    fn worker_id(&self) -> &str {
+        &self.worker_id
     }
 }
 
 impl admission::AdmittableRpc for talos_memory::memory_rpc::MemoryRpcRequest {
     const WIRE_SUBJECT: &'static str = talos_memory::memory_rpc::SUBJECT_MEMORY_OP;
     const SIGNING_SUBJECT: &'static str = talos_memory::memory_rpc::SUBJECT_NAME;
-    fn verify_signature(&self) -> bool {
+    fn verify_classified(&self) -> Result<(), talos_memory::rpc_auth::VerifyFailure> {
         self.verify()
     }
     fn actor_id(&self) -> uuid::Uuid {
@@ -140,13 +152,16 @@ impl admission::AdmittableRpc for talos_memory::memory_rpc::MemoryRpcRequest {
     }
     fn nonce(&self) -> &str {
         &self.nonce
+    }
+    fn worker_id(&self) -> &str {
+        &self.worker_id
     }
 }
 
 impl admission::AdmittableRpc for talos_memory::database_rpc::DatabaseRpcRequest {
     const WIRE_SUBJECT: &'static str = talos_memory::database_rpc::SUBJECT_DATABASE_QUERY;
     const SIGNING_SUBJECT: &'static str = talos_memory::database_rpc::SUBJECT_NAME;
-    fn verify_signature(&self) -> bool {
+    fn verify_classified(&self) -> Result<(), talos_memory::rpc_auth::VerifyFailure> {
         self.verify()
     }
     fn actor_id(&self) -> uuid::Uuid {
@@ -154,13 +169,16 @@ impl admission::AdmittableRpc for talos_memory::database_rpc::DatabaseRpcRequest
     }
     fn nonce(&self) -> &str {
         &self.nonce
+    }
+    fn worker_id(&self) -> &str {
+        &self.worker_id
     }
 }
 
 impl admission::AdmittableRpc for talos_memory::state_rpc::StateWriteRequest {
     const WIRE_SUBJECT: &'static str = talos_memory::state_rpc::SUBJECT_STATE_WRITE;
     const SIGNING_SUBJECT: &'static str = talos_memory::state_rpc::SUBJECT_NAME;
-    fn verify_signature(&self) -> bool {
+    fn verify_classified(&self) -> Result<(), talos_memory::rpc_auth::VerifyFailure> {
         self.verify()
     }
     fn actor_id(&self) -> uuid::Uuid {
@@ -168,6 +186,9 @@ impl admission::AdmittableRpc for talos_memory::state_rpc::StateWriteRequest {
     }
     fn nonce(&self) -> &str {
         &self.nonce
+    }
+    fn worker_id(&self) -> &str {
+        &self.worker_id
     }
 }
 
@@ -175,7 +196,7 @@ impl admission::AdmittableRpc for talos_memory::integration_state_rpc::Integrati
     const WIRE_SUBJECT: &'static str =
         talos_memory::integration_state_rpc::SUBJECT_INTEGRATION_STATE_OP;
     const SIGNING_SUBJECT: &'static str = talos_memory::integration_state_rpc::SUBJECT_NAME;
-    fn verify_signature(&self) -> bool {
+    fn verify_classified(&self) -> Result<(), talos_memory::rpc_auth::VerifyFailure> {
         self.verify()
     }
     fn actor_id(&self) -> uuid::Uuid {
@@ -183,6 +204,9 @@ impl admission::AdmittableRpc for talos_memory::integration_state_rpc::Integrati
     }
     fn nonce(&self) -> &str {
         &self.nonce
+    }
+    fn worker_id(&self) -> &str {
+        &self.worker_id
     }
 }
 
@@ -198,6 +222,27 @@ impl admission::AdmittableRpc for talos_memory::integration_state_rpc::Integrati
 /// whose reply publish failed.
 fn reparse_for_rejection<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Option<T> {
     serde_json::from_slice(payload).ok()
+}
+
+/// THE reason-blinding chokepoint for caller-facing values on the
+/// `Unauthorized` path.
+///
+/// **ANTI-ORACLE — restating [`admission::AdmitError::Unauthorized`].** The
+/// admission gate now knows exactly WHY a request was refused (stale, bad
+/// signature, unknown signer, oversized, cross-replica replay). That
+/// knowledge is for the CONTROLLER'S OWN LOGS and nowhere else. A caller that
+/// could tell those apart could map the freshness window and confirm key
+/// validity as independent probes — which is why the seven subscribers have
+/// always replied with one undifferentiated `Unauthorized`, and still do.
+///
+/// Every one of them routes its reply value through here: the reason goes IN
+/// and is DROPPED, the caller-facing value comes out untouched. That makes
+/// the invariant a thing a test can hold — see
+/// `unauthorized_reply_bytes_are_reason_independent` — instead of a comment
+/// someone has to remember. If you find yourself wanting to branch on
+/// `reason` here, that is the oracle; put it in the `tracing::warn!` instead.
+fn caller_facing_unauthorized<T>(_reason: admission::RejectReason, reply: T) -> T {
+    reply
 }
 
 #[cfg(test)]
@@ -746,18 +791,25 @@ pub fn spawn_graph_rpc_subscriber(
                     );
                     return;
                 }
-                Err(admission::AdmitError::Unauthorized) => {
+                Err(admission::AdmitError::Unauthorized { reason }) => {
                     let Some(req) = reparse_for_rejection::<GraphSearchRequest>(&msg.payload)
                     else {
                         return;
                     };
+                    let diag = admission::reject_diagnostics(reason, &req);
                     tracing::warn!(
                         actor_id = %req.actor_id,
+                        reason = diag.reason,
+                        claimed_worker_id = %diag.claimed_worker_id,
+                        skew_hint = %diag.skew_hint,
                         "graph-search RPC: HMAC or freshness verification failed"
                     );
-                    let reply = GraphSearchReply {
-                        result: Err(GraphRpcError::Unauthorized),
-                    };
+                    let reply = caller_facing_unauthorized(
+                        reason,
+                        GraphSearchReply {
+                            result: Err(GraphRpcError::Unauthorized),
+                        },
+                    );
                     let _ = nats_client
                         .publish(
                             reply_to,
@@ -1043,18 +1095,25 @@ pub fn spawn_ml_rpc_subscriber(
                     );
                     return;
                 }
-                Err(admission::AdmitError::Unauthorized) => {
+                Err(admission::AdmitError::Unauthorized { reason }) => {
                     let Some(req) = reparse_for_rejection::<MlPredictRequest>(&msg.payload) else {
                         return;
                     };
+                    let diag = admission::reject_diagnostics(reason, &req);
                     tracing::warn!(
                         actor_id = %req.actor_id,
+                        reason = diag.reason,
+                        claimed_worker_id = %diag.claimed_worker_id,
+                        skew_hint = %diag.skew_hint,
                         "ml-predict RPC: HMAC or freshness verification failed"
                     );
                     publish_reply(
                         &nats_client,
                         reply_to,
-                        &MlPredictResponse::Err(MlRpcError::Unauthorized),
+                        &caller_facing_unauthorized(
+                            reason,
+                            MlPredictResponse::Err(MlRpcError::Unauthorized),
+                        ),
                     )
                     .await;
                     record_rpc_metric(
@@ -1312,18 +1371,25 @@ pub fn spawn_ml_fewshot_subscriber(
                     );
                     return;
                 }
-                Err(admission::AdmitError::Unauthorized) => {
+                Err(admission::AdmitError::Unauthorized { reason }) => {
                     let Some(req) = reparse_for_rejection::<MlFewShotRequest>(&msg.payload) else {
                         return;
                     };
+                    let diag = admission::reject_diagnostics(reason, &req);
                     tracing::warn!(
                         actor_id = %req.actor_id,
+                        reason = diag.reason,
+                        claimed_worker_id = %diag.claimed_worker_id,
+                        skew_hint = %diag.skew_hint,
                         "ml-fewshot RPC: HMAC or freshness verification failed"
                     );
                     publish_reply(
                         &nats_client,
                         reply_to,
-                        &MlFewShotResponse::Err(MlRpcError::Unauthorized),
+                        &caller_facing_unauthorized(
+                            reason,
+                            MlFewShotResponse::Err(MlRpcError::Unauthorized),
+                        ),
                     )
                     .await;
                     record_rpc_metric(
@@ -1564,15 +1630,23 @@ pub fn spawn_memory_rpc_subscriber(
                     );
                     return;
                 }
-                Err(admission::AdmitError::Unauthorized) => {
+                Err(admission::AdmitError::Unauthorized { reason }) => {
                     let Some(req) = reparse_for_rejection::<MemoryRpcRequest>(&msg.payload) else {
                         return;
                     };
+                    let diag = admission::reject_diagnostics(reason, &req);
                     tracing::warn!(
                         actor_id = %req.actor_id,
+                        reason = diag.reason,
+                        claimed_worker_id = %diag.claimed_worker_id,
+                        skew_hint = %diag.skew_hint,
                         "memory RPC: HMAC or freshness verification failed"
                     );
-                    send_err(MemoryRpcError::Unauthorized).await;
+                    send_err(caller_facing_unauthorized(
+                        reason,
+                        MemoryRpcError::Unauthorized,
+                    ))
+                    .await;
                     record_rpc_metric(
                         SUBJECT_MEMORY_OP,
                         req.actor_id,
@@ -1966,16 +2040,24 @@ pub fn spawn_database_rpc_subscriber(
                     );
                     return;
                 }
-                Err(admission::AdmitError::Unauthorized) => {
+                Err(admission::AdmitError::Unauthorized { reason }) => {
                     let Some(req) = reparse_for_rejection::<DatabaseRpcRequest>(&msg.payload)
                     else {
                         return;
                     };
+                    let diag = admission::reject_diagnostics(reason, &req);
                     tracing::warn!(
                         actor_id = %req.actor_id,
+                        reason = diag.reason,
+                        claimed_worker_id = %diag.claimed_worker_id,
+                        skew_hint = %diag.skew_hint,
                         "database RPC: HMAC or freshness verification failed"
                     );
-                    send(Err(DatabaseRpcError::Unauthorized)).await;
+                    send(caller_facing_unauthorized(
+                        reason,
+                        Err(DatabaseRpcError::Unauthorized),
+                    ))
+                    .await;
                     record_rpc_metric(
                         SUBJECT_DATABASE_QUERY,
                         req.actor_id,
@@ -2375,13 +2457,20 @@ pub fn spawn_state_write_subscriber(
                     );
                     return;
                 }
-                Err(admission::AdmitError::Unauthorized) => {
+                Err(admission::AdmitError::Unauthorized { reason }) => {
                     let Some(req) = reparse_for_rejection::<StateWriteRequest>(&msg.payload) else {
                         return;
                     };
+                    // Fire-and-forget subject: there is NO reply, so this arm
+                    // has no caller-facing value to blind — the oracle
+                    // surface is empty here by construction.
+                    let diag = admission::reject_diagnostics(reason, &req);
                     tracing::warn!(
                         actor_id = %req.actor_id,
                         execution_id = %req.execution_id,
+                        reason = diag.reason,
+                        claimed_worker_id = %diag.claimed_worker_id,
+                        skew_hint = %diag.skew_hint,
                         "state-write: HMAC or freshness verification failed — request dropped"
                     );
                     record_rpc_metric(
@@ -2674,17 +2763,25 @@ pub fn spawn_integration_state_subscriber(
                     );
                     return;
                 }
-                Err(admission::AdmitError::Unauthorized) => {
+                Err(admission::AdmitError::Unauthorized { reason }) => {
                     let Some(req) = reparse_for_rejection::<IntegrationStateRequest>(&msg.payload)
                     else {
                         return;
                     };
+                    let diag = admission::reject_diagnostics(reason, &req);
                     tracing::warn!(
                         actor_id = %req.actor_id,
                         integration = %req.integration_name,
+                        reason = diag.reason,
+                        claimed_worker_id = %diag.claimed_worker_id,
+                        skew_hint = %diag.skew_hint,
                         "integration-state RPC: HMAC or freshness verification failed"
                     );
-                    send_err(IntegrationStateError::Unauthorized).await;
+                    send_err(caller_facing_unauthorized(
+                        reason,
+                        IntegrationStateError::Unauthorized,
+                    ))
+                    .await;
                     record_rpc_metric(
                         SUBJECT_INTEGRATION_STATE_OP,
                         req.actor_id,
@@ -3180,6 +3277,194 @@ mod controller_function_deny_tests {
             assert!(
                 controller_side_denied_function(&stmt).is_some(),
                 "canonical deny-list entry `{fn_name}` not caught by controller walker"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod unauthorized_reply_pins {
+    //! THE oracle pin (#603).
+    //!
+    //! The admission gate now carries a classified `reason` for every
+    //! `Unauthorized` refusal. That classification is controller-side
+    //! diagnosis; the CALLER must still be unable to tell one refusal from
+    //! another. This module holds that invariant two ways:
+    //!
+    //! 1. **Reason-independence.** Every caller-facing value on the
+    //!    `Unauthorized` path is produced by
+    //!    [`crate::caller_facing_unauthorized`], which takes the reason and
+    //!    drops it. Serialising its output under all seven reasons must give
+    //!    byte-identical results — for every protocol.
+    //! 2. **Shape stability.** Those bytes are also pinned to the literal the
+    //!    subscribers emit today. If someone ever widens a reply enum to
+    //!    carry a detail, these literals change and the diff is impossible to
+    //!    merge by accident.
+    //!
+    //! `talos.state.write` is absent on purpose: it is fire-and-forget and
+    //! sends no reply at all, so it has no caller-facing surface to pin.
+
+    use crate::admission::RejectReason;
+    use talos_memory::rpc_auth::VerifyFailure;
+
+    /// Every reason the gate can attach — including the cross-replica arm,
+    /// which is NOT a `VerifyFailure`.
+    fn all_reasons() -> Vec<RejectReason> {
+        let mut v: Vec<RejectReason> = [
+            VerifyFailure::Stale,
+            VerifyFailure::NonFinite,
+            VerifyFailure::OversizedStructure,
+            VerifyFailure::UnknownSignerKey,
+            VerifyFailure::BadSignature,
+        ]
+        .into_iter()
+        .map(RejectReason::Verify)
+        .collect();
+        v.push(RejectReason::CrossReplicaReplay);
+        v
+    }
+
+    /// Serialise the caller-facing value under EVERY reason, assert all the
+    /// byte strings agree, assert they match the pinned current shape, and
+    /// return them so the caller can eyeball the literal in the failure.
+    fn assert_reason_blind<T, F>(build: F, pinned: &str)
+    where
+        T: serde::Serialize,
+        F: Fn(RejectReason) -> T,
+    {
+        // Reason-independence is checked FIRST and shape-stability second:
+        // the two failures mean different things, and an operator reading a
+        // red build should see "you opened an oracle" before "you changed a
+        // wire shape".
+        let mut seen: Option<Vec<u8>> = None;
+        for reason in all_reasons() {
+            let value = crate::caller_facing_unauthorized(reason, build(reason));
+            let bytes = serde_json::to_vec(&value).expect("reply serialises");
+            match &seen {
+                None => seen = Some(bytes),
+                Some(first) => assert_eq!(
+                    first,
+                    &bytes,
+                    "reply bytes differ between reasons — an on-wire attacker \
+                     can now distinguish `{}` from the first reason tried, \
+                     which is the oracle the collapse exists to prevent",
+                    reason.as_str()
+                ),
+            }
+        }
+        let bytes = seen.expect("no reasons exercised — test is vacuous");
+        assert_eq!(
+            String::from_utf8_lossy(&bytes),
+            pinned,
+            "the Unauthorized reply drifted from its pinned wire shape"
+        );
+    }
+
+    #[test]
+    fn unauthorized_reply_bytes_are_reason_independent() {
+        use talos_memory::database_rpc::{DatabaseRpcError, DatabaseRpcReply};
+        use talos_memory::graph_rpc::{GraphRpcError, GraphSearchReply};
+        use talos_memory::integration_state_rpc::{IntegrationStateError, IntegrationStateReply};
+        use talos_memory::memory_rpc::{MemoryRpcError, MemoryRpcReply};
+        use talos_memory::ml_rpc::{MlFewShotResponse, MlPredictResponse, MlRpcError};
+
+        assert_reason_blind(
+            |_| GraphSearchReply {
+                result: Err(GraphRpcError::Unauthorized),
+            },
+            r#"{"result":{"Err":"Unauthorized"}}"#,
+        );
+        assert_reason_blind(
+            |_| MemoryRpcReply {
+                result: Err(MemoryRpcError::Unauthorized),
+            },
+            r#"{"result":{"Err":"Unauthorized"}}"#,
+        );
+        assert_reason_blind(
+            |_| DatabaseRpcReply {
+                result: Err(DatabaseRpcError::Unauthorized),
+            },
+            r#"{"result":{"Err":"Unauthorized"}}"#,
+        );
+        assert_reason_blind(
+            |_| IntegrationStateReply {
+                result: Err(IntegrationStateError::Unauthorized),
+            },
+            r#"{"result":{"Err":"Unauthorized"}}"#,
+        );
+        assert_reason_blind(
+            |_| MlPredictResponse::Err(MlRpcError::Unauthorized),
+            r#"{"Err":"Unauthorized"}"#,
+        );
+        assert_reason_blind(
+            |_| MlFewShotResponse::Err(MlRpcError::Unauthorized),
+            r#"{"Err":"Unauthorized"}"#,
+        );
+    }
+
+    /// Anti-vacuousness: `assert_reason_blind` must actually FAIL when a
+    /// reply is made reason-dependent. Without this, a future refactor that
+    /// turns `caller_facing_unauthorized` into something that never runs
+    /// would leave the pin above green and useless.
+    #[test]
+    #[should_panic(expected = "reply bytes differ between reasons")]
+    fn the_pin_catches_a_reason_dependent_reply() {
+        assert_reason_blind(
+            |reason| serde_json::json!({ "leak": reason.as_str() }),
+            r#"{"leak":"stale"}"#,
+        );
+    }
+
+    /// THE OTHER HALF of the oracle pin — the one the value-level test above
+    /// structurally cannot cover.
+    ///
+    /// `unauthorized_reply_bytes_are_reason_independent` proves the blinding
+    /// helper is reason-blind. It cannot prove the seven subscribers USE it,
+    /// and that gap is not theoretical: rewriting one arm's
+    /// `send_err(caller_facing_unauthorized(reason, MemoryRpcError::
+    /// Unauthorized))` as `send_err(match reason { Stale => Timeout, _ =>
+    /// Unauthorized })` compiles, passes every other test in this crate, and
+    /// hands an on-wire attacker a clean freshness oracle — probe with a
+    /// backdated timestamp, read the reply, and you have mapped the window
+    /// without ever holding a key. (Verified by mutation during the #603
+    /// review: the suite was green.)
+    ///
+    /// So the chokepoint is enforced where it lives — in the source. Every
+    /// `Unauthorized { reason }` arm must reach either the blinding helper or
+    /// the explicit no-reply marker before it records its metric. A source
+    /// scan is blunt, but it is the only thing that binds a CALL SITE, and
+    /// the alternative (trusting a comment) is what the mutation defeated.
+    #[test]
+    fn every_unauthorized_arm_blinds_its_reply() {
+        const SRC: &str = include_str!("lib.rs");
+        // Assembled at runtime so this test's own source is not a match.
+        let arm = format!(
+            "{}{}",
+            "Err(admission::AdmitError::Unauthorized ", "{ reason }) => {"
+        );
+        let arms: Vec<&str> = SRC.split(arm.as_str()).skip(1).collect();
+        assert_eq!(
+            arms.len(),
+            7,
+            "expected one Unauthorized arm per signed-RPC subscriber; if a \
+             protocol was added or removed, update this count deliberately"
+        );
+        for (i, chunk) in arms.iter().enumerate() {
+            // The arm ends at its `record_rpc_metric` call, which every
+            // subscriber emits last. Bounding the search there keeps the scan
+            // from reading a NEIGHBOURING arm's blinding as this one's.
+            let body = chunk
+                .split_once("record_rpc_metric(")
+                .unwrap_or_else(|| panic!("Unauthorized arm #{i} has no metric call to bound it"))
+                .0;
+            assert!(
+                body.contains("caller_facing_unauthorized")
+                    || body.contains("no caller-facing value"),
+                "Unauthorized arm #{i} builds a caller-facing value without routing it \
+                 through `caller_facing_unauthorized` (and is not marked as a \
+                 fire-and-forget subject with no reply). A reply that varies with the \
+                 rejection reason is the oracle the collapse exists to prevent.\n\
+                 arm body:\n{body}"
             );
         }
     }

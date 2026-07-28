@@ -167,14 +167,23 @@ impl MemoryRpcRequest {
         })
     }
 
-    /// Verify signature + freshness. Returns false on any failure so
-    /// unsigned, tampered, or stale requests are rejected uniformly.
-    pub fn verify(&self) -> bool {
+    /// Verify signature + freshness. Every failure is fail-closed and
+    /// uniform to the CALLER — the returned [`rpc_auth::VerifyFailure`] is a
+    /// controller-side diagnostic that the admission gate collapses into one
+    /// indistinguishable wire reply (see the type's docs for the oracle
+    /// constraint).
+    ///
+    /// Gate ORDER is load-bearing and unchanged from the pre-classification
+    /// version: freshness → finiteness → structural caps → crypto, so a
+    /// malformed or stale request never pays the HMAC/Ed25519 compute
+    /// (MCP-1026 / MCP-1149).
+    pub fn verify(&self) -> Result<(), rpc_auth::VerifyFailure> {
+        use rpc_auth::VerifyFailure;
         if !rpc_auth::verify_freshness(self.timestamp_ms) {
-            return false;
+            return Err(VerifyFailure::Stale);
         }
         if validate_finite(self.op.get()).is_none() {
-            return false;
+            return Err(VerifyFailure::NonFinite);
         }
         // MCP-1026 (2026-05-15): structural caps inside verify(). Same
         // sibling pattern as state_rpc (MCP-1024), graph_rpc (MCP-1025),
@@ -182,7 +191,7 @@ impl MemoryRpcRequest {
         // an oversized field short-circuits before the HMAC compute —
         // reads the already-parsed op, no re-serialisation.
         if validate_structure(self.op.get()).is_none() {
-            return false;
+            return Err(VerifyFailure::OversizedStructure);
         }
         let body = sign_body_bytes(&self.op, self.timestamp_ms);
         rpc_auth::verify_rpc(
