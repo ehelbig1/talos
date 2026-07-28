@@ -229,27 +229,6 @@ impl JudgeVerdict {
     }
 }
 
-/// Pull the observe-only `(score, passed, not_applicable)` triple out of a
-/// judge node's enriched output envelope, for the `JudgeScoreRecorder` hook.
-/// Returns `None` when the output carries no `__judge_score__` (not a judge
-/// verdict) — the score is the gate, `__judge_passed__` defaults to
-/// `false` when absent. Kept pure (no engine state) so it is unit-tested
-/// without a runtime. DLP: intentionally reads only the score + the two
-/// booleans, never the reasoning/feedback text.
-///
-/// A verdict that declared itself NOT APPLICABLE contributes no SCORED
-/// datapoint. Recording it as a pass is the mirror of the bug it replaced:
-/// scoring a run with nothing to judge as 1.0 stopped the false failures but
-/// inflated the average and saturated the signal — `pa-inbox-organizer-work`
-/// read 1.0 across 17 runs purely because most were empty inboxes. "Nothing
-/// to measure" is not evidence of quality, exactly as it is not evidence of
-/// failure.
-///
-/// It is still returned (flagged) rather than dropped: writing the row with
-/// `not_applicable = true` makes the exclusion STRUCTURAL at the DB layer
-/// (`FILTER (WHERE NOT not_applicable)`) *and* recovers the abstention rate,
-/// so "judge ran 17×, 12 abstained" stops being indistinguishable from
-/// "judge ran 5×".
 /// Score one `best_of_n` ensemble candidate from its judge's collapsed
 /// output. `None` means "this candidate is not eligible to win".
 ///
@@ -323,6 +302,35 @@ pub(crate) fn pick_best_candidate(
 /// decision D2). An abstention must not silently invert an author's
 /// `passed: false`; it only tells the recorder that this run contributed no
 /// scored datapoint.
+///
+/// # Every judge-owned key is written UNCONDITIONALLY
+///
+/// The pass / passthrough branches build their output *on top of the parent
+/// node's output map*, which is caller data: an upstream WASM module's JSON,
+/// a trigger payload, or — the non-adversarial case — the envelope of an
+/// EARLIER judge in a chain. So a `__judge_*` key that is only *conditionally*
+/// inserted is inherited from the parent whenever the condition is false, and
+/// the parent gets to author this judge's verdict metadata:
+///
+/// - `__judge_not_applicable__` would let any upstream node emit
+///   `{"__judge_not_applicable__": true}` and have the downstream judge's
+///   REAL verdict silently recorded as an abstention — suppressing a genuine
+///   failure datapoint from the quality trend, which is precisely the
+///   inflation this change exists to prevent, pointed the other way.
+/// - `__judge_rejected__` would let a parent (or a rejecting upstream judge)
+///   mark a PASSING verdict as rejected, misrouting every downstream edge
+///   that conditional-routes on it.
+///
+/// `__judge_score__` / `__judge_passed__` / `__judge_reasoning__` /
+/// `__judge_feedback__` were never exposed because they are always inserted.
+/// The two conditional keys are therefore explicitly REMOVED when they do not
+/// apply, so the envelope's judge metadata is a total function of THIS
+/// verdict. Removal (rather than writing `false`) keeps the emitted shape
+/// byte-identical to the pre-change envelope for every honest producer.
+///
+/// This is the judge-envelope analogue of the reserved-key strip
+/// `inject_actor_context_into_input` performs on inbound trigger payloads:
+/// engine-authored keys must never be caller-authorable.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_judge_envelope(
     label: &str,
@@ -341,14 +349,21 @@ pub(crate) fn build_judge_envelope(
         };
         out.insert("__judge_score__".to_string(), serde_json::json!(score));
         out.insert("__judge_passed__".to_string(), serde_json::json!(passed));
+        // Insert-OR-REMOVE, never insert-or-inherit: `out` started life as the
+        // PARENT's output map, so leaving either key untouched hands its
+        // authorship to caller data. See the doc comment above.
         if !passed {
             out.insert("__judge_rejected__".to_string(), serde_json::json!(true));
+        } else {
+            out.remove("__judge_rejected__");
         }
         if not_applicable {
             out.insert(
                 reserved_keys::JUDGE_NOT_APPLICABLE.to_string(),
                 serde_json::json!(true),
             );
+        } else {
+            out.remove(reserved_keys::JUDGE_NOT_APPLICABLE);
         }
         out.insert(
             "__judge_reasoning__".to_string(),
@@ -373,6 +388,32 @@ pub(crate) fn build_judge_envelope(
     out
 }
 
+/// Pull the observe-only `(score, passed, not_applicable)` triple out of a
+/// judge node's enriched output envelope, for the `JudgeScoreRecorder` hook.
+/// Returns `None` when the output carries no `__judge_score__` (not a judge
+/// verdict) — the score is the gate, `__judge_passed__` defaults to
+/// `false` when absent. Kept pure (no engine state) so it is unit-tested
+/// without a runtime. DLP: intentionally reads only the score + the two
+/// booleans, never the reasoning/feedback text.
+///
+/// The envelope this reads is always produced by [`build_judge_envelope`],
+/// which writes every judge-owned key unconditionally — so the flag read here
+/// is THIS judge's verdict and never a value inherited from the parent output
+/// the envelope was built on top of.
+///
+/// A verdict that declared itself NOT APPLICABLE contributes no SCORED
+/// datapoint. Recording it as a pass is the mirror of the bug it replaced:
+/// scoring a run with nothing to judge as 1.0 stopped the false failures but
+/// inflated the average and saturated the signal — `pa-inbox-organizer-work`
+/// read 1.0 across 17 runs purely because most were empty inboxes. "Nothing
+/// to measure" is not evidence of quality, exactly as it is not evidence of
+/// failure.
+///
+/// It is still returned (flagged) rather than dropped: writing the row with
+/// `not_applicable = true` makes the exclusion STRUCTURAL at the DB layer
+/// (`FILTER (WHERE NOT not_applicable)`) *and* recovers the abstention rate,
+/// so "judge ran 17×, 12 abstained" stops being indistinguishable from
+/// "judge ran 5×".
 pub(crate) fn extract_judge_score(output: &JsonValue) -> Option<(f64, bool, bool)> {
     let score = output.get("__judge_score__").and_then(|v| v.as_f64())?;
     let passed = output

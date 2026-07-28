@@ -1342,7 +1342,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "add_ensemble_node",
-            "description": "Add an ensemble (self-consistency) node that runs the same child workflow N times concurrently and applies a consensus strategy. Use majority_vote for classification tasks where reliability matters. Use best_of_n with a judge_workflow_id to pick the highest-quality output. Use first_pass for simple parallel diversity checks. Output includes __ensemble_method__, __ensemble_size__, and __ensemble_votes__ metadata.",
+            "description": "Add an ensemble (self-consistency) node that runs the same child workflow N times concurrently and applies a consensus strategy. Use majority_vote for classification tasks where reliability matters. Use best_of_n with a judge_workflow_id to pick the highest-quality output. Use first_pass for simple parallel diversity checks. Output includes __ensemble_method__, __ensemble_size__, and __ensemble_votes__ metadata. best_of_n note: a judge that ABSTAINS on a candidate (not_applicable: true) makes that candidate INELIGIBLE to win — its score means 'nothing to judge', not 'this is good' — exactly as a judge dispatch failure does. If every candidate is abstained-on or errored, selection falls back to the first candidate, same as the all-failed path.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
