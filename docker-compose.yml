@@ -622,7 +622,19 @@ services:
       TALOS_CONTROLLER_SIGNING_KEY: ${TALOS_CONTROLLER_SIGNING_KEY:-}
       # Comma-separated worker_id=pubkey_hex pairs (the static alternative to
       # boot-time self-registration; fine for a fixed-size dev fleet).
+      # NOTE: a worker known ONLY through this ring never registers, so it has
+      # no worker_identities row and cannot report its build —
+      # get_platform_info.fleet lists it as source:"static-env" /
+      # build_status:"unverifiable". Set the registration token below to get the
+      # real handshake (and real build reporting) on this stack.
       TALOS_WORKER_PUBLIC_KEYS: ${TALOS_WORKER_PUBLIC_KEYS:-}
+      # Shared bearer for worker boot-time self-registration (RFC 0010 P2
+      # inc.4d, POST /internal/worker-key). SAME value on the worker service
+      # below — that is the whole handshake. Unset/empty = the endpoint stays
+      # disabled and workers rely on the static ring above, byte-identical to
+      # the pre-2026-07-28 dev stack. Generate one with `openssl rand -hex 32`
+      # and put it in .env (scripts/setup-dev.sh does this for a fresh clone).
+      TALOS_WORKER_REGISTRATION_TOKEN: ${TALOS_WORKER_REGISTRATION_TOKEN:-}
       # off | audit | required — RFC 0010 P3 secret-envelope sealing mode.
       # audit/required seal per-execution to the worker's ephemeral key via
       # the claim protocol; required additionally makes workers refuse an
@@ -776,6 +788,19 @@ services:
       TALOS_CONTROLLER_PUBLIC_KEY: ${TALOS_CONTROLLER_PUBLIC_KEY:-}
       TALOS_WORKER_SIGNING_KEY: ${TALOS_WORKER_SIGNING_KEY:-}
       TALOS_WORKER_ID: ${TALOS_WORKER_ID:-}
+      # Boot-time self-registration (RFC 0010 P2 inc.4d). BOTH of these must be
+      # set for the worker to register; with only the static ring above, the
+      # worker is invisible to get_platform_info.fleet's registered listing and
+      # never reports the build it is running — which is how the dev stack's
+      # only worker went missing from the fleet view (2026-07-28).
+      #
+      # The URL is the in-cluster compose service (name + container port from
+      # the controller service above), not a secret, so it is safe to default:
+      # registration still no-ops until the token is also present.
+      TALOS_CONTROLLER_URL: ${TALOS_CONTROLLER_URL:-http://controller:8000}
+      # Must equal the controller's TALOS_WORKER_REGISTRATION_TOKEN — same .env
+      # variable, referenced (never inlined) so no token literal lives in the repo.
+      TALOS_WORKER_REGISTRATION_TOKEN: ${TALOS_WORKER_REGISTRATION_TOKEN:-}
       # Keep in lockstep with the controller's TALOS_ENVELOPE_SEALING; the
       # worker enforces the downgrade guard only under "required".
       TALOS_ENVELOPE_SEALING: ${TALOS_ENVELOPE_SEALING:-off}

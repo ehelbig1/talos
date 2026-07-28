@@ -860,6 +860,17 @@ mod tests {
     // These tests require a migrated Postgres reachable via DATABASE_URL. They
     // no-op (skip) when it is unset so the crate's `cargo test` stays green in
     // environments without a DB; CI's integration lane provides one.
+    //
+    // RESIDUE-FREE IS MANDATORY, not tidiness. `DATABASE_URL` points at whatever
+    // DB the developer has configured, and in this repo the dev value is the
+    // LIVE compose Postgres — these tests write into the same table the running
+    // controller reads. On 2026-07-28 that bit: `get_platform_info.fleet` (new,
+    // and the whole point of which is to be trusted during an incident) listed
+    // 22 `test-*` fixtures as the fleet and raised `build_skew: true` off their
+    // fake shas, while the one real worker was nowhere in it. A test fixture
+    // that outlives its test is not inert — it is a lie told to an operator by a
+    // production surface. Hence [`cleanup_worker_rows`] at BOTH ends of every
+    // DB-backed test below.
     async fn pool_or_skip() -> Option<PgPool> {
         let url = std::env::var("DATABASE_URL").ok()?;
         Some(
@@ -871,16 +882,38 @@ mod tests {
         )
     }
 
-    // Remove any rows a prior run left for this worker_id so each test starts
-    // from a known-empty state (distinct worker_ids keep tests mutually isolated).
-    async fn clean(pool: &PgPool, worker_id: &str) {
-        sqlx::query!(
-            "DELETE FROM worker_identities WHERE worker_id = $1",
-            worker_id
-        )
-        .execute(pool)
-        .await
-        .expect("test cleanup delete");
+    /// Delete exactly the rows a test owns: `worker_identities` for
+    /// `worker_ids`, `worker_provisioning_tokens` for `token_hashes`. Distinct
+    /// per-test ids keep tests mutually isolated, so this never touches another
+    /// test's (or an operator's) data — no blanket `DELETE FROM`.
+    ///
+    /// Call it at the START of every DB-backed test (a previous run that panicked
+    /// mid-test leaves rows, and a test must not inherit them) AND at the END
+    /// (leave no trace — see the [`pool_or_skip`] note for what residue cost).
+    /// The start call is the backstop for the one case the end call cannot cover:
+    /// a FAILING test panics before reaching it.
+    async fn cleanup_worker_rows(pool: &PgPool, worker_ids: &[&str], token_hashes: &[&str]) {
+        // Per-id statements rather than `= ANY($1)`: identical SQL text to what
+        // the offline `.sqlx` cache already holds, so test hygiene never forces a
+        // `cargo sqlx prepare` regeneration.
+        for worker_id in worker_ids {
+            sqlx::query!(
+                "DELETE FROM worker_identities WHERE worker_id = $1",
+                worker_id
+            )
+            .execute(pool)
+            .await
+            .expect("test cleanup delete");
+        }
+        for token_hash in token_hashes {
+            sqlx::query!(
+                "DELETE FROM worker_provisioning_tokens WHERE token_hash = $1",
+                token_hash
+            )
+            .execute(pool)
+            .await
+            .expect("test token cleanup delete");
+        }
     }
 
     // A distinct worker_id per test so a shared DB stays isolated without a
@@ -899,7 +932,7 @@ mod tests {
         };
         let repo = WorkerIdentityRepository::new(pool);
         let wid = "test-idem-worker";
-        clean(&repo.db_pool, wid).await;
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
 
         assert_eq!(
             repo.register(wid, &key(1), false, None).await.unwrap(),
@@ -917,6 +950,8 @@ mod tests {
         assert_eq!(mine[0].public_key, key(1));
         // The re-register updated the capability bit.
         assert!(repo.worker_supports_sealing(wid).await.unwrap());
+
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
     }
 
     /// The build-identity handshake's persistence contract: the column always
@@ -931,7 +966,7 @@ mod tests {
         };
         let repo = WorkerIdentityRepository::new(pool);
         let wid = "test-buildver-worker";
-        clean(&repo.db_pool, wid).await;
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
 
         let build_of = |repo: &WorkerIdentityRepository| {
             let wid = wid.to_string();
@@ -994,6 +1029,8 @@ mod tests {
         assert_eq!(builds.len(), 2, "both active keys list");
         assert!(builds.contains(&Some("9.9.9+ccccccc".to_string())));
         assert!(builds.contains(&None));
+
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
     }
 
     /// The security-relevant half of the same contract: a REFUSED registration
@@ -1026,9 +1063,9 @@ mod tests {
 
         // --- TOFU conflict + ineligible token, on a worker with a recorded build.
         let wid = "test-refused-buildver";
-        clean(&repo.db_pool, wid).await;
+        let capped = "test-refused-buildver-cap";
         let th = hash("refusedbuild");
-        clean_token(&repo.db_pool, &th).await;
+        cleanup_worker_rows(&repo.db_pool, &[wid, capped], &[&th]).await;
 
         assert_eq!(
             repo.register_tofu(wid, &key(1), false, Some("0.1.0+goodaaa"))
@@ -1067,8 +1104,6 @@ mod tests {
         assert_eq!(builds_for(&repo, wid).await, baseline, "bad token wrote");
 
         // --- Cap-reached, on its own worker so the assertions stay exact.
-        let capped = "test-refused-buildver-cap";
-        clean(&repo.db_pool, capped).await;
         for i in 0..MAX_ACTIVE_KEYS_PER_WORKER as u8 {
             assert_eq!(
                 repo.register(capped, &key(i), false, Some(&format!("0.1.0+ok{i:05}")))
@@ -1089,6 +1124,8 @@ mod tests {
             !at_cap.contains(&Some("9.9.9+evilddd".to_string())),
             "refused build string must appear nowhere"
         );
+
+        cleanup_worker_rows(&repo.db_pool, &[wid, capped], &[&th]).await;
     }
 
     #[tokio::test]
@@ -1098,7 +1135,7 @@ mod tests {
         };
         let repo = WorkerIdentityRepository::new(pool);
         let wid = "test-tofu-worker";
-        clean(&repo.db_pool, wid).await;
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
 
         // First use: no history → key(1) becomes the trusted identity.
         assert_eq!(
@@ -1128,6 +1165,8 @@ mod tests {
             .collect();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].public_key, key(1));
+
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
     }
 
     #[tokio::test]
@@ -1137,7 +1176,7 @@ mod tests {
         };
         let repo = WorkerIdentityRepository::new(pool);
         let wid = "test-tofu-revoked-worker";
-        clean(&repo.db_pool, wid).await;
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
 
         assert_eq!(
             repo.register_tofu(wid, &key(1), false, None).await.unwrap(),
@@ -1167,22 +1206,14 @@ mod tests {
             repo.register_tofu(wid, &key(2), true, None).await.unwrap(),
             TofuOutcome::Registered
         );
+
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
     }
 
     // Provisioning-token helpers: the repo treats token_hash as opaque (the
     // endpoint owns SHA-256), so tests can mint with any distinct 64-char id.
     fn hash(tag: &str) -> String {
         format!("{tag:0<64}")
-    }
-
-    async fn clean_token(pool: &PgPool, token_hash: &str) {
-        sqlx::query!(
-            "DELETE FROM worker_provisioning_tokens WHERE token_hash = $1",
-            token_hash
-        )
-        .execute(pool)
-        .await
-        .expect("test token cleanup delete");
     }
 
     fn in_one_hour() -> chrono::DateTime<chrono::Utc> {
@@ -1210,8 +1241,7 @@ mod tests {
         let repo = WorkerIdentityRepository::new(pool);
         let wid = "test-token-bound-worker";
         let th = hash("bound-rotation");
-        clean(&repo.db_pool, wid).await;
-        clean_token(&repo.db_pool, &th).await;
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[&th]).await;
 
         // Worker already has a TOFU-bound identity...
         assert_eq!(
@@ -1239,6 +1269,8 @@ mod tests {
                 .unwrap(),
             TokenRegisterOutcome::InvalidToken
         );
+
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[&th]).await;
     }
 
     #[tokio::test]
@@ -1249,8 +1281,7 @@ mod tests {
         let repo = std::sync::Arc::new(WorkerIdentityRepository::new(pool));
         let wid = "test-token-race-worker";
         let th = hash("race");
-        clean(&repo.db_pool, wid).await;
-        clean_token(&repo.db_pool, &th).await;
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[&th]).await;
         repo.create_provisioning_token(&th, Some(wid), in_one_hour(), None)
             .await
             .unwrap();
@@ -1296,6 +1327,8 @@ mod tests {
             .filter(|e| e.worker_id == wid)
             .collect();
         assert_eq!(mine.len(), 1);
+
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[&th]).await;
     }
 
     #[tokio::test]
@@ -1305,11 +1338,17 @@ mod tests {
         };
         let repo = WorkerIdentityRepository::new(pool);
         let wid = "test-token-refusals-worker";
-        clean(&repo.db_pool, wid).await;
+        let th_expired = hash("expired");
+        let th_other = hash("otherbound");
+        let th_revoked = hash("revoked");
+        cleanup_worker_rows(
+            &repo.db_pool,
+            &[wid],
+            &[&th_expired, &th_other, &th_revoked],
+        )
+        .await;
 
         // Expired.
-        let th_expired = hash("expired");
-        clean_token(&repo.db_pool, &th_expired).await;
         let id_expired = repo
             .create_provisioning_token(
                 &th_expired,
@@ -1328,8 +1367,6 @@ mod tests {
         assert!(token_used_at(&repo, id_expired).await.is_none());
 
         // Bound to a DIFFERENT worker_id.
-        let th_other = hash("otherbound");
-        clean_token(&repo.db_pool, &th_other).await;
         let id_other = repo
             .create_provisioning_token(&th_other, Some("some-other-worker"), in_one_hour(), None)
             .await
@@ -1343,8 +1380,6 @@ mod tests {
         assert!(token_used_at(&repo, id_other).await.is_none());
 
         // Revoked.
-        let th_revoked = hash("revoked");
-        clean_token(&repo.db_pool, &th_revoked).await;
         let id_revoked = repo
             .create_provisioning_token(&th_revoked, Some(wid), in_one_hour(), None)
             .await
@@ -1368,6 +1403,13 @@ mod tests {
             .unwrap()
             .iter()
             .any(|e| e.worker_id == wid));
+
+        cleanup_worker_rows(
+            &repo.db_pool,
+            &[wid],
+            &[&th_expired, &th_other, &th_revoked],
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1378,8 +1420,8 @@ mod tests {
         let repo = WorkerIdentityRepository::new(pool);
         let wid = "test-token-wildcard-worker";
         let th = hash("wildcard");
-        clean(&repo.db_pool, wid).await;
-        clean_token(&repo.db_pool, &th).await;
+        let th2 = hash("wildcard-second");
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[&th, &th2]).await;
         let id = repo
             .create_provisioning_token(&th, None, in_one_hour(), Some("migration compat"))
             .await
@@ -1406,8 +1448,6 @@ mod tests {
         // A second wildcard token cannot re-bind the now-taken worker_id to a
         // different key (TOFU applies to wildcards) — and the refusal does not
         // burn the new token.
-        let th2 = hash("wildcard-second");
-        clean_token(&repo.db_pool, &th2).await;
         let id2 = repo
             .create_provisioning_token(&th2, None, in_one_hour(), None)
             .await
@@ -1422,6 +1462,8 @@ mod tests {
             token_used_at(&repo, id2).await.is_none(),
             "refusal rolls back"
         );
+
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[&th, &th2]).await;
     }
 
     #[tokio::test]
@@ -1432,8 +1474,7 @@ mod tests {
         let repo = WorkerIdentityRepository::new(pool);
         let wid = "test-token-cap-worker";
         let th = hash("capbound");
-        clean(&repo.db_pool, wid).await;
-        clean_token(&repo.db_pool, &th).await;
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[&th]).await;
 
         // Fill the worker to its active-key cap via the operator path.
         for i in 0..MAX_ACTIVE_KEYS_PER_WORKER as u8 {
@@ -1464,6 +1505,8 @@ mod tests {
                 .unwrap(),
             TokenRegisterOutcome::Registered
         );
+
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[&th]).await;
     }
 
     #[tokio::test]
@@ -1473,7 +1516,7 @@ mod tests {
         };
         let repo = WorkerIdentityRepository::new(pool);
         let wid = "test-rotation-worker";
-        clean(&repo.db_pool, wid).await;
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
 
         // Fill up to the cap with distinct keys — all admitted.
         for i in 0..MAX_ACTIVE_KEYS_PER_WORKER as u8 {
@@ -1516,5 +1559,7 @@ mod tests {
             !active.iter().any(|e| e.public_key == key(0)),
             "deactivated key must not load"
         );
+
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
     }
 }

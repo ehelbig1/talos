@@ -28,6 +28,13 @@ else
 TALOS_MASTER_KEY=$(openssl rand -hex 32)
 WORKER_SHARED_KEY=$(openssl rand -hex 32)
 JWT_SECRET=$(openssl rand -hex 32)
+# Shared bearer for worker boot-time self-registration (RFC 0010 P2 inc.4d).
+# docker-compose.yml hands the SAME value to the controller and the worker; with
+# it set, workers register their identity + the build they are running, so
+# get_platform_info.fleet can answer "is the fleet on my build?". Leave it out
+# and workers must be pinned in TALOS_WORKER_PUBLIC_KEYS instead, which cannot
+# report a build.
+TALOS_WORKER_REGISTRATION_TOKEN=$(openssl rand -hex 32)
 
 # ─── Datastore credentials ──────────────────────────────────────────────────
 POSTGRES_PASSWORD=$(openssl rand -hex 16)
