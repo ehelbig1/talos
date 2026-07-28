@@ -78,7 +78,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_platform_info",
-            "description": "Get Talos platform metadata: version, tool count, database status, uptime, and feature capabilities.",
+            "description": "Get Talos platform metadata: version, tool count, database status, uptime, feature capabilities, and a 'fleet' section — every ACTIVE registered worker with the build it reported at registration, plus a build_skew flag when a worker's commit provably differs from the controller's. Use it to answer 'are the controller and workers running the same build?' before chasing a signature-verification failure. build_version is worker-self-reported and diagnostic only (never an authorization input); null means a pre-handshake worker, and build_status 'unverifiable' is not the same as 'match'.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -888,6 +888,96 @@ fn handle_get_public_url_status(req_id: Option<serde_json::Value>) -> JsonRpcRes
     )
 }
 
+/// Assemble `get_platform_info.fleet` — the controller↔worker build-identity
+/// report. Reads the ACTIVE `worker_identities` rows through the repository
+/// (bounded + deterministically ordered there) and classifies each against this
+/// controller's build.
+///
+/// THREE states per worker, deliberately kept apart:
+/// * `"match"`      — same commit sha; the fleet agrees here.
+/// * `"skew"`       — both sides report a real sha and they DIFFER (including
+///                    a `-dirty` suffix on one side only: same commit, but a
+///                    dirty tree corresponds to no commit, so the bytes differ).
+///                    The actionable one: version-coupled signed wire formats
+///                    (job dispatch, memory RPC, envelope sealing) break in
+///                    ways that look like signature bugs.
+/// * `"unverifiable"` — one side reported nothing (a pre-handshake worker), or
+///                    an `unknown` sha (built with no git checkout and no
+///                    `GIT_SHA_OVERRIDE`). NOT a match: absence of evidence is
+///                    not evidence of agreement (#578). `build_skew` therefore
+///                    counts only the PROVEN differences, and
+///                    `unverifiable_workers` is reported alongside it so an
+///                    operator never reads a clean `build_skew: false` as
+///                    "everything checked out".
+///
+/// A DB failure degrades to an `error` field rather than failing the whole
+/// platform-info call — the rest of the response is still useful, and this
+/// section is diagnostic. The message is the generic one; details go to the log.
+async fn build_fleet_report(db_pool: &sqlx::PgPool, controller_build: &str) -> serde_json::Value {
+    use talos_worker_identity_repository::{
+        build_is_verifiable, builds_match, WorkerIdentityRepository, MAX_FLEET_BUILD_ROWS,
+    };
+
+    let repo = WorkerIdentityRepository::new(db_pool.clone());
+    let rows = match repo.list_active_builds().await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("fleet build-identity listing failed: {:#}", e);
+            return serde_json::json!({
+                "controller_build": controller_build,
+                "error": "fleet registry unavailable",
+            });
+        }
+    };
+
+    let controller_verifiable = build_is_verifiable(controller_build);
+    let mut skew = 0usize;
+    let mut unverifiable = 0usize;
+    let workers: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            let status = match r.build_version.as_deref() {
+                Some(wb) if builds_match(controller_build, wb) => "match",
+                Some(wb) if controller_verifiable && build_is_verifiable(wb) => {
+                    skew += 1;
+                    "skew"
+                }
+                _ => {
+                    unverifiable += 1;
+                    "unverifiable"
+                }
+            };
+            serde_json::json!({
+                "worker_id": r.worker_id,
+                // null = this worker registered before the build-identity
+                // handshake existed (or through the operator CLI, which has no
+                // build to report) — NOT "unknown build of a new worker".
+                "build_version": r.build_version,
+                "build_status": status,
+                "supports_sealing": r.supports_sealing,
+                "last_seen_at": r.last_seen_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "controller_build": controller_build,
+        "workers": workers,
+        "worker_count": workers.len(),
+        // Only PROVEN disagreement. Read it together with unverifiable_workers.
+        "build_skew": skew > 0,
+        "skewed_workers": skew,
+        "unverifiable_workers": unverifiable,
+        "truncated": workers.len() as i64 >= MAX_FLEET_BUILD_ROWS,
+        "note": "One entry per ACTIVE registered (worker_id, signing key) — a worker mid key-rotation \
+                 appears twice by design. build_version is worker-self-reported and NOT covered by the \
+                 registration proof-of-possession: it is diagnostic only and never gates authorization. \
+                 null build_version = a pre-handshake worker (or an operator-CLI registration) that never \
+                 reported one. build_status 'unverifiable' means one side has no usable commit sha — that \
+                 is not the same as 'match'.",
+    })
+}
+
 async fn handle_get_platform_info(
     req_id: Option<serde_json::Value>,
     state: &McpState,
@@ -966,6 +1056,18 @@ async fn handle_get_platform_info(
         )
     });
 
+    // Fleet build-identity handshake: which build is each registered worker
+    // actually running, and does it agree with this controller?
+    //
+    // "Are the controller and worker on the same build?" was unanswerable
+    // during the 2026-07-27 signing outage without comparing image digests by
+    // hand — it cost a wrong hypothesis and several diagnostic turns. Signed
+    // wire formats are version-coupled three ways (job dispatch #598, memory
+    // RPC #600, envelope sealing), so this belongs next to `build_version`.
+    //
+    // The read goes through the repository (no raw sqlx in a handler — check 6).
+    let fleet = build_fleet_report(&state.db_pool, &build_version).await;
+
     let features = vec![
         "talos_workflow_engine",
         "parallel_execution",
@@ -995,6 +1097,7 @@ async fn handle_get_platform_info(
         "uptime_seconds": uptime_secs,
         "uptime_human": format!("{}h {}m {}s", uptime_secs / 3600, (uptime_secs % 3600) / 60, uptime_secs % 60),
         "features": features,
+        "fleet": fleet,
     });
     mcp_text(
         req_id,

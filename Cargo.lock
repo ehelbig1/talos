@@ -8292,6 +8292,7 @@ dependencies = [
  "talos-validation",
  "talos-webhook-repository",
  "talos-webhooks",
+ "talos-worker-identity-repository",
  "talos-worker-runtime",
  "talos-workflow-authorization",
  "talos-workflow-creation",

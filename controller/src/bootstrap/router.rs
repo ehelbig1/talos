@@ -143,6 +143,94 @@ pub(crate) struct WorkerKeyRegistrationRequest {
     nonce: String,
     /// Hex Ed25519 signature (64 bytes) over the canonical PoP message.
     proof: String,
+    /// Worker-reported build string (`{pkg}+{sha}[-dirty]`), for the
+    /// build-identity handshake. `#[serde(default)]` so a PRE-handshake worker
+    /// (which sends no such field) still deserializes — the two sides roll in
+    /// any order.
+    ///
+    /// UNTRUSTED AND UNSIGNED: it is deliberately NOT part of the
+    /// proof-of-possession message, so a registrant can put anything here.
+    /// That is fine because nothing branches on it — it is sanitized
+    /// ([`sanitize_build_version`]), logged, compared for a skew WARN, and
+    /// reported in `get_platform_info`. Adding a decision that reads it would
+    /// turn a diagnostic into a spoofable authorization input.
+    #[serde(default)]
+    build_version: Option<String>,
+}
+
+/// Longest build string we accept. The real shape is `0.1.0+ab85eb2` (~15
+/// bytes); 128 leaves headroom for a long `TALOS_VERSION` override while
+/// bounding what a hostile registrant can push into logs, the DB, and every
+/// `get_platform_info` response.
+const MAX_BUILD_VERSION_BYTES: usize = 128;
+
+/// Make an untrusted, unsigned build string safe for the three sinks it reaches
+/// — WARN logs, a DB column, and MCP JSON output. Pure, so the hostile cases are
+/// unit-testable without a live server.
+///
+/// Rules, in order:
+/// * keep only ASCII GRAPHIC characters — no whitespace of any kind, no
+///   control characters, no non-ASCII. Two separate injection primitives die
+///   here:
+///     - `\n` / `\r` would let a registrant forge whole log lines in an
+///       operator's terminal (and in anything tailing structured logs as text);
+///       `\x1b` would let it repaint one. Both are control characters.
+///     - the plain SPACE is the field separator in `tracing`'s default text
+///       formatter, which renders `%`-recorded values unquoted. A build string
+///       of `x controller_build=0.1.0+deadbee` would otherwise emit a SECOND,
+///       forged `controller_build=` field on the WARN line, right next to the
+///       real one — a registrant editing the operator's own diagnostic. A
+///       version string never legitimately contains a space (the composite is
+///       `{pkg}+{sha}[-dirty]`, and a `TALOS_VERSION` override is a version),
+///       so allowing it bought nothing. Whitespace-only input therefore also
+///       collapses to `None` without a separate trim step.
+///   Dropping rather than rejecting keeps a merely-odd string usable.
+/// * cap at [`MAX_BUILD_VERSION_BYTES`] — after filtering, so the cap counts
+///   what is actually stored. Every retained character is one ASCII byte, so
+///   truncating by count cannot split a multi-byte sequence.
+/// * an empty result (absent, blank, or entirely-filtered-away) collapses to
+///   `None`: "reported nothing" and "reported only garbage" are the same
+///   diagnostic fact, and both must read as "unverifiable", never as a match.
+fn sanitize_build_version(raw: Option<String>) -> Option<String> {
+    let cleaned: String = raw?
+        .chars()
+        .filter(char::is_ascii_graphic)
+        .take(MAX_BUILD_VERSION_BYTES)
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+// `build_suffix` / `builds_match` / `build_is_verifiable` live in
+// `talos_worker_identity_repository` — the MCP `get_platform_info.fleet` skew
+// flag needs the SAME comparison, and two surfaces disagreeing about whether the
+// fleet is skewed would be worse than either being wrong alone.
+
+/// The controller's own build string — same COMPOSITION as
+/// `get_platform_info.build_version` and the worker's `worker_build_version()`.
+/// Composed locally (from this crate's own `build.rs` constants) rather than
+/// reaching into `talos-mcp-handlers` internals.
+///
+/// Note the package halves legitimately differ per surface: this crate is
+/// versioned `1.0.0-rN` while `talos-mcp-handlers` (which composes the string in
+/// `get_platform_info`) takes the workspace `0.1.0`. So ONE controller process
+/// describes itself two ways, and a worker (also `0.1.0`) matches the reported
+/// string but not this one. That is exactly why only the `+sha[-dirty]` SUFFIX
+/// is ever compared — and why [`log_build_identity`] also logs the compared
+/// commit explicitly, so an operator reading two visibly different strings on a
+/// "matches" line can see what the verdict was actually based on.
+fn controller_build_version() -> String {
+    std::env::var("TALOS_VERSION").unwrap_or_else(|_| {
+        format!(
+            "{}+{}{}",
+            env!("CARGO_PKG_VERSION"),
+            env!("GIT_SHA"),
+            if env!("GIT_DIRTY") == "true" {
+                "-dirty"
+            } else {
+                ""
+            }
+        )
+    })
 }
 
 /// Freshness tolerances for a registration request. Asymmetric like `rpc_auth`:
@@ -262,6 +350,14 @@ pub(crate) async fn register_worker_key_handler(
     //    token: bound tokens carry operator-grade rotation semantics, wildcard
     //    tokens carry TOFU semantics and are refused entirely under
     //    TALOS_WORKER_REG_REQUIRE_BOUND_TOKEN=1.
+    // Sanitize BEFORE the value touches ANY sink (DB, logs, MCP JSON). It is
+    // unsigned and attacker-controllable; everything downstream assumes this
+    // ran. Persistence rides the registration write below, so it lands only if
+    // bearer + freshness + PoP + the registration rule all pass.
+    // (partial move: no later site reads `req` as a whole, and a hostile 10 KB
+    // payload should not be cloned before it is capped)
+    let build_version = sanitize_build_version(req.build_version);
+
     let repo = talos_worker_identity_repository::WorkerIdentityRepository::new(db_pool);
     let path = classify_registration_bearer(
         provided_bearer,
@@ -281,7 +377,12 @@ pub(crate) async fn register_worker_key_handler(
             return worker_reg_error(StatusCode::UNAUTHORIZED, "invalid registration token");
         }
         RegBearerPath::LegacyShared => repo
-            .register_tofu(&req.worker_id, &public_key, req.supports_sealing)
+            .register_tofu(
+                &req.worker_id,
+                &public_key,
+                req.supports_sealing,
+                build_version.as_deref(),
+            )
             .await
             .map(|o| match o {
                 talos_worker_identity_repository::TofuOutcome::Registered => {
@@ -302,6 +403,7 @@ pub(crate) async fn register_worker_key_handler(
                 &public_key,
                 req.supports_sealing,
                 auth.require_bound,
+                build_version.as_deref(),
             )
             .await
         }
@@ -325,6 +427,7 @@ pub(crate) async fn register_worker_key_handler(
                 auth_path = ?path,
                 "worker self-registered an Ed25519 identity key"
             );
+            log_build_identity(&req.worker_id, build_version.as_deref());
             (
                 StatusCode::OK,
                 axum::Json(serde_json::json!({ "status": "registered" })),
@@ -382,6 +485,85 @@ pub(crate) async fn register_worker_key_handler(
                 "registration failed (see server logs)",
             )
         }
+    }
+}
+
+/// Emit the build-identity handshake result for one successful registration.
+///
+/// Structured and greppable on purpose: `target: "worker_registry"` with
+/// `controller_build` / `worker_build` / `worker_id` fields, so "is the fleet on
+/// one build?" is a log query instead of a digest archaeology session (the
+/// question that cost several turns during the 2026-07-27 signing outage).
+///
+/// Three outcomes, deliberately worded apart:
+/// * match → INFO. The fleet agrees on this worker.
+/// * both sides known and DIFFERENT → WARN "build skew". Signed wire formats
+///   are version-coupled (job dispatch, memory RPC, envelope sealing), so this
+///   is the shape that breaks jobs in ways that look like signature bugs.
+///   "Different" covers a `-dirty` suffix on only one side: same commit, but a
+///   dirty tree corresponds to no commit at all, so the two binaries were built
+///   from different bytes. The wording says "different builds", not "different
+///   commits", so that case is not misreported.
+/// * either side unknown / unreported → WARN "unverifiable". NOT "match" — a
+///   pre-handshake worker and an `unknown` sha prove nothing, and reporting
+///   absence of evidence as agreement is precisely the failure mode the
+///   input-freshness work (#578) was about.
+///
+/// Logs only; nothing here influences whether the registration succeeded — it
+/// already did.
+fn log_build_identity(worker_id: &str, worker_build: Option<&str>) {
+    use talos_worker_identity_repository::{build_is_verifiable, build_suffix, builds_match};
+
+    let controller_build = controller_build_version();
+    // The two halves the verdict is ACTUALLY based on, logged next to the full
+    // strings. The package halves differ per crate by design (see
+    // `controller_build_version`), so a "matches" line whose two version strings
+    // look nothing alike is normal — these fields say why.
+    let controller_commit = build_suffix(&controller_build).unwrap_or("none");
+    match worker_build {
+        Some(wb) if builds_match(&controller_build, wb) => tracing::info!(
+            target: "worker_registry",
+            event_kind = "worker_build_identity",
+            worker_id = %worker_id,
+            controller_build = %controller_build,
+            worker_build = %wb,
+            commit = %controller_commit,
+            "worker build matches the controller (compared on the commit suffix; \
+             the package halves differ per crate by design)"
+        ),
+        Some(wb) if build_is_verifiable(wb) && build_is_verifiable(&controller_build) => {
+            tracing::warn!(
+                target: "worker_registry",
+                event_kind = "worker_build_skew",
+                worker_id = %worker_id,
+                controller_build = %controller_build,
+                worker_build = %wb,
+                controller_commit = %controller_commit,
+                worker_commit = %build_suffix(wb).unwrap_or("none"),
+                "BUILD SKEW: worker and controller are running different builds \
+                 (differing commit sha, or a -dirty working tree on one side only). \
+                 Signed wire formats (job dispatch, memory RPC, envelope sealing) are \
+                 version-coupled — verify both images were published from the same tree."
+            )
+        }
+        Some(wb) => tracing::warn!(
+            target: "worker_registry",
+            event_kind = "worker_build_unverifiable",
+            worker_id = %worker_id,
+            controller_build = %controller_build,
+            worker_build = %wb,
+            "build identity UNVERIFIABLE: one side reports no usable commit sha \
+             (built outside a git checkout, or without GIT_SHA_OVERRIDE). This is \
+             not evidence the builds agree."
+        ),
+        None => tracing::warn!(
+            target: "worker_registry",
+            event_kind = "worker_build_unreported",
+            worker_id = %worker_id,
+            controller_build = %controller_build,
+            "build identity UNVERIFIABLE: worker reported no build_version \
+             (pre-handshake worker image). Not evidence the builds agree."
+        ),
     }
 }
 
@@ -1821,6 +2003,125 @@ mod worker_registration_auth_tests {
             provisioning_token_hash("wpt_test"),
             "137e7e89843ad7a07606e9cf6fc91eb2e95f9be2612a320c3945dd2e22227da0"
         );
+    }
+}
+
+/// Build-identity handshake — the pure halves. `build_version` arrives
+/// UNSIGNED and attacker-controllable on a public-to-the-cluster endpoint, so
+/// the sanitizer is a security boundary (log injection → DB → MCP JSON), and
+/// the comparison is a diagnostic whose only failure mode is lying to an
+/// operator about whether the fleet agrees.
+#[cfg(test)]
+mod worker_build_identity_tests {
+    use super::{controller_build_version, sanitize_build_version, MAX_BUILD_VERSION_BYTES};
+    use talos_worker_identity_repository::{build_suffix, builds_match};
+
+    fn san(s: &str) -> Option<String> {
+        sanitize_build_version(Some(s.to_string()))
+    }
+
+    #[test]
+    fn keeps_a_well_formed_build_string_verbatim() {
+        assert_eq!(san("0.1.0+ab85eb2").as_deref(), Some("0.1.0+ab85eb2"));
+        assert_eq!(
+            san("  1.0.0-r304+deadbee-dirty  ").as_deref(),
+            Some("1.0.0-r304+deadbee-dirty")
+        );
+    }
+
+    #[test]
+    fn absent_blank_and_all_garbage_collapse_to_none() {
+        assert_eq!(sanitize_build_version(None), None);
+        assert_eq!(san(""), None);
+        assert_eq!(san("   \t\n  "), None);
+        // Nothing survives the filter → indistinguishable from "not reported",
+        // and both must read as unverifiable rather than as a value.
+        assert_eq!(san("\u{7}\u{0}\u{1b}"), None);
+        assert_eq!(san("日本語"), None);
+    }
+
+    #[test]
+    fn strips_the_log_injection_primitives() {
+        // A newline would let a registrant forge whole log lines.
+        let forged = san("0.1.0+aaa\nERROR forged line: fleet compromised").unwrap();
+        assert!(!forged.contains('\n'));
+        assert!(!forged.contains('\r'));
+        // CRLF variant.
+        assert!(!san("x+1\r\nfake").unwrap().contains('\r'));
+        // ANSI escape (terminal control / colour spoofing in an operator tail).
+        let ansi = san("0.1.0+aaa\u{1b}[31mFAKE\u{1b}[0m").unwrap();
+        assert!(!ansi.contains('\u{1b}'));
+        assert_eq!(ansi, "0.1.0+aaa[31mFAKE[0m");
+        // NUL and other C0 controls.
+        assert_eq!(san("a+b\u{0}c").as_deref(), Some("a+bc"));
+        // JSON metacharacters are harmless (serde_json escapes them) and stay,
+        // so a weird-but-real version is still legible.
+        assert_eq!(san("a+b\"c").as_deref(), Some("a+b\"c"));
+    }
+
+    /// The SECOND injection primitive, and the subtler one: `tracing`'s default
+    /// text formatter renders `%`-recorded values UNQUOTED as `key=value`
+    /// pairs separated by spaces. A build string containing a space would
+    /// therefore emit a forged extra field on the WARN line — here, a second
+    /// `controller_build=` sitting next to the real one, letting a registrant
+    /// edit the operator's own build-skew diagnostic. No whitespace survives.
+    #[test]
+    fn strips_the_tracing_field_separator() {
+        let forged = san("x controller_build=0.1.0+deadbee worker_id=someone-else").unwrap();
+        assert!(
+            !forged.contains(char::is_whitespace),
+            "no whitespace may survive: {forged}"
+        );
+        assert_eq!(
+            forged,
+            "xcontroller_build=0.1.0+deadbeeworker_id=someone-else"
+        );
+        // Tabs and vertical whitespace go the same way (they are not graphic).
+        assert_eq!(san("a\tb\u{b}c\u{c}d").as_deref(), Some("abcd"));
+        // Unicode spaces are non-ASCII, so they never survive either — a NBSP
+        // rendering as a separator in a terminal would be the same attack.
+        assert_eq!(san("a\u{a0}b").as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn caps_a_hostile_10kb_payload() {
+        let huge = format!("0.1.0+{}", "a".repeat(10_000));
+        let out = san(&huge).unwrap();
+        assert_eq!(out.len(), MAX_BUILD_VERSION_BYTES);
+        // ASCII-only after filtering, so a byte cap is also a char cap and can
+        // never split a multi-byte sequence.
+        assert!(out.is_ascii());
+        // A payload that is 10 KB of control characters costs one allocation
+        // and yields nothing.
+        assert_eq!(san(&"\n".repeat(10_000)), None);
+    }
+
+    /// The suffix/compare semantics themselves are owned + exhaustively tested
+    /// in `talos_worker_identity_repository`. What matters HERE is that the
+    /// controller's own composed string is something those fns can act on —
+    /// otherwise every registration would log "unverifiable" and the whole
+    /// handshake would be decorative.
+    #[test]
+    fn controller_build_string_is_comparable_and_self_matching() {
+        std::env::remove_var("TALOS_VERSION");
+        let cb = controller_build_version();
+        let suffix = build_suffix(&cb).expect("controller build must expose a sha suffix");
+        assert!(!suffix.is_empty());
+
+        // A worker built from the same tree — different package version, same
+        // sha — must read as a MATCH, not skew.
+        let worker = format!("0.1.0+{suffix}");
+        assert_eq!(
+            builds_match(&cb, &worker),
+            // Only `unknown` (no git checkout, no override) is exempt; in a
+            // real build this arm is the interesting one.
+            suffix != "unknown" && suffix != "unknown-dirty",
+        );
+
+        // The override path stays comparable too.
+        std::env::set_var("TALOS_VERSION", "1.0.0-r304+ab85eb2");
+        assert!(builds_match(&controller_build_version(), "0.1.0+ab85eb2"));
+        std::env::remove_var("TALOS_VERSION");
     }
 }
 

@@ -80,6 +80,9 @@ talos-db = { path = "../talos-db" }
 talos-tenancy = { path = "../talos-tenancy" }
 talos-subworkflow-contract = { path = "../talos-subworkflow-contract" }
 talos-system-repo = { path = "../talos-system-repo" }
+# Fleet build-identity listing for get_platform_info.fleet — the read goes
+# through the repository so the handler stays raw-sqlx-free (lint check 6).
+talos-worker-identity-repository = { path = "../talos-worker-identity-repository" }
 talos-text-util = { path = "../talos-text-util" }
 # Canonical cross-protocol field validators shared with talos-api.
 talos-validation = { path = "../talos-validation" }

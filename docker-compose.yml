@@ -698,6 +698,13 @@ services:
     build:
       context: .
       dockerfile: worker/Dockerfile
+      args:
+        # Same build-time git state the controller image gets — worker/build.rs
+        # stamps GIT_SHA/GIT_DIRTY so the worker's self-registration reports the
+        # build it is running. Both images MUST receive the same values, or the
+        # controller's build-skew WARN fires on a healthy same-tree fleet.
+        GIT_SHA_OVERRIDE: ${GIT_SHA_OVERRIDE:-unknown}
+        GIT_DIRTY_OVERRIDE: ${GIT_DIRTY_OVERRIDE:-false}
     environment:
       # Injection audit 2026-07-20: the per-actor write-ceiling gate
       # (readonly vs write) was inert without this — ceilings in the DB

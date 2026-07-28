@@ -67,7 +67,11 @@ pub(crate) async fn run_worker_identity_cli(sub: &str, args: &[String]) -> anyho
     match sub {
         "register-worker-identity" => {
             let (wid, pk) = resolve_key(&worker_id, &public_key_hex)?;
-            match repo.register(&wid, &pk, supports_sealing).await? {
+            // `build_version: None` — the operator registering a key from a
+            // shell knows nothing about the pod's build, and inventing a value
+            // here would put a false claim in the fleet report. The worker
+            // stamps the real one on its next self-registration.
+            match repo.register(&wid, &pk, supports_sealing, None).await? {
                 RegisterOutcome::Registered => {
                     println!("registered worker '{wid}' (supports_sealing={supports_sealing})");
                 }
@@ -93,12 +97,15 @@ pub(crate) async fn run_worker_identity_cli(sub: &str, args: &[String]) -> anyho
             }
             for r in rows {
                 println!(
-                    "{wid}\t{key}\tsealing={sealing}\tactive={active}\tlast_seen={seen}",
+                    "{wid}\t{key}\tsealing={sealing}\tactive={active}\tlast_seen={seen}\tbuild={build}",
                     wid = r.worker_id,
                     key = hex::encode(r.public_key),
                     sealing = r.supports_sealing,
                     active = r.active,
                     seen = r.last_seen_at.to_rfc3339(),
+                    // "-" reads as "never reported", distinct from a real
+                    // string; a pre-handshake worker legitimately has none.
+                    build = r.build_version.as_deref().unwrap_or("-"),
                 );
             }
         }
