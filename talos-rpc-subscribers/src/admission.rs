@@ -144,7 +144,43 @@ pub(crate) enum AdmitError {
     /// previously given the same zero information as the attacker. Every
     /// caller-facing value on this path routes through
     /// `crate::caller_facing_unauthorized`, which takes the reason and drops
-    /// it; `unauthorized_reply_bytes_are_reason_independent` pins that.
+    /// it; `unauthorized_reply_bytes_are_reason_independent` pins the value
+    /// and `every_unauthorized_arm_blinds_its_reply` pins that every arm
+    /// actually goes through it.
+    ///
+    /// ## The TIMING side of the same question
+    ///
+    /// Byte-identical replies are not the whole oracle surface — an attacker
+    /// who can time the reply sees whatever the code did before sending it.
+    /// Two things are true here, and they are worth writing down because the
+    /// intuition ("classification leaks the class through timing") points the
+    /// wrong way:
+    ///
+    /// 1. **The class-dependent timing signal is PRE-EXISTING and much larger
+    ///    than anything this change adds.** Every protocol's `verify()` runs
+    ///    its cheap gates BEFORE the crypto, on purpose (MCP-1026/1149, a DoS
+    ///    defence). So a stale timestamp, an oversized field, a non-finite
+    ///    float, and an unresolvable `worker_id` all return WITHOUT paying an
+    ///    HMAC/Ed25519 verification, while `bad_signature` by definition pays
+    ///    it in full. That difference — a signature verification, tens of
+    ///    microseconds — was observable before #603 and is inherent to the
+    ///    ordering, which we are not going to give up: reversing it would let
+    ///    an unauthenticated sender spend controller crypto on multi-MB junk.
+    /// 2. **The new work does not add a distinguishing axis.** The only
+    ///    reason-dependent extra work is the skew hint, and it is computed for
+    ///    `bad_signature` ALONE — i.e. it is added to the arm that is already
+    ///    the slowest, deepening a signal that exists rather than creating a
+    ///    new one. Its cost (one `OnceLock` read, one short read guard + `Arc`
+    ///    clone, one `HashMap` lookup, one `format!`) is sub-microsecond and
+    ///    sits beneath the jitter of the NATS round trip the attacker must
+    ///    measure through. Every other class pays a single `&'static str`
+    ///    clone.
+    ///
+    /// The conclusion to preserve on edit: keep reason-dependent work OFF the
+    /// cheap classes rather than trying to equalise it. Adding a hint (or any
+    /// other per-class computation) to `stale`/`oversized`/`unknown_signer`
+    /// would be the change that manufactures a NEW timing distinction among
+    /// the arms that currently all return at the same point.
     Unauthorized { reason: RejectReason },
     /// Process-local nonce cache saw this nonce already.
     Replay,
@@ -160,7 +196,15 @@ pub(crate) struct RejectDiagnostics {
     /// Unverified by definition — this log line exists precisely because the
     /// claim did not check out — so it is bounded and charset-filtered before
     /// it reaches the log.
-    pub(crate) worker_id: String,
+    ///
+    /// Named `claimed_` on purpose, and logged under that key. On a line
+    /// whose whole subject is "this request was refused", a bare `worker_id`
+    /// field reads like an established identity; under `unknown_signer_key`
+    /// or `bad_signature` it is precisely the claim that FAILED, and an
+    /// operator must not build an incident timeline on it as if the sender
+    /// were authenticated. Same discipline as "unverifiable ≠ match" one
+    /// field over: say what is actually known.
+    pub(crate) claimed_worker_id: String,
     /// One sentence an operator can act on, or an explicit "not applicable".
     pub(crate) skew_hint: String,
 }
@@ -178,8 +222,18 @@ const HINT_NOT_APPLICABLE: &str = "n/a — not a build-skew class";
 /// `[A-Za-z0-9._-]` only, truncated. An empty or fully-filtered value renders
 /// as `none`, which is also the honest rendering for a legacy-HMAC request
 /// (that scheme carries no worker id at all).
+///
+/// The cap is [`talos_workflow_job_protocol::MAX_WORKER_ID_LEN`] — the SAME
+/// bound `validate_worker_id` enforces — and the charset is that function's
+/// charset exactly, which makes this filter the IDENTITY on every legal
+/// `worker_id`. That equality is load-bearing, not cosmetic: the sanitized
+/// string is also the key the build cache is looked up under, so a shorter
+/// local cap would make a legal-but-long id miss the cache and report
+/// "unverifiable" for a worker whose build the controller actually knows —
+/// a diagnostic that silently degrades for exactly one class of deployment.
+/// A hostile over-long id is still bounded, just at the protocol's own bound.
 fn sanitize_worker_id(worker_id: &str) -> String {
-    const MAX: usize = 64;
+    const MAX: usize = talos_workflow_job_protocol::MAX_WORKER_ID_LEN;
     let cleaned: String = worker_id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
@@ -202,15 +256,15 @@ pub(crate) fn reject_diagnostics<T: AdmittableRpc>(
     reason: RejectReason,
     req: &T,
 ) -> RejectDiagnostics {
-    let worker_id = sanitize_worker_id(req.worker_id());
+    let claimed_worker_id = sanitize_worker_id(req.worker_id());
     RejectDiagnostics {
         reason: reason.as_str(),
         skew_hint: if reason.is_skew_candidate() {
-            crate::build_skew::skew_hint(&worker_id)
+            crate::build_skew::skew_hint(&claimed_worker_id)
         } else {
             HINT_NOT_APPLICABLE.to_string()
         },
-        worker_id,
+        claimed_worker_id,
     }
 }
 
@@ -381,6 +435,44 @@ mod admission_tests {
             RejectReason::CrossReplicaReplay.as_str(),
             "cross_replica_replay"
         );
+    }
+
+    /// The signer-id filter must be the IDENTITY on every LEGAL `worker_id`
+    /// and a bound on everything else.
+    ///
+    /// Identity is the load-bearing half. The sanitized string is what the
+    /// build cache is keyed on, so any legal id this function alters would
+    /// miss the cache and report "build identity unverifiable" for a worker
+    /// whose build the controller demonstrably knows — a diagnostic that
+    /// silently degrades for one deployment's naming convention. That is why
+    /// the cap is `MAX_WORKER_ID_LEN` and not a local number.
+    #[test]
+    fn worker_id_sanitizer_is_identity_on_legal_ids_and_bounds_the_rest() {
+        for legal in [
+            "talos-worker-abc-12345",
+            "ab12cd34-ef56-7890-1234-567890abcdef",
+            "worker.pod_1",
+            &"w".repeat(talos_workflow_job_protocol::MAX_WORKER_ID_LEN),
+        ] {
+            talos_workflow_job_protocol::validate_worker_id(legal)
+                .expect("fixture must be a legal worker_id");
+            assert_eq!(
+                sanitize_worker_id(legal),
+                legal,
+                "a legal worker_id must survive the filter unchanged"
+            );
+        }
+
+        // Hostile shapes: the two log-injection primitives plus a flood.
+        assert_eq!(sanitize_worker_id("w\nWARN forged=1"), "wWARNforged1");
+        assert_eq!(sanitize_worker_id("w\u{1b}[2Jx"), "w2Jx");
+        assert_eq!(
+            sanitize_worker_id(&"x".repeat(10_000)).len(),
+            talos_workflow_job_protocol::MAX_WORKER_ID_LEN
+        );
+        // Legacy HMAC carries no signer id at all; so does an all-garbage one.
+        assert_eq!(sanitize_worker_id(""), "none");
+        assert_eq!(sanitize_worker_id("💥 💥"), "none");
     }
 
     #[tokio::test]

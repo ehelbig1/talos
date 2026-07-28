@@ -85,7 +85,7 @@ pub(crate) async fn crossreplica_replay_ok(
 //
 // One `AdmittableRpc` impl per signed-RPC protocol, grouped here so the
 // full (wire subject, signing subject) table is reviewable in one
-// screen. Each impl is pure delegation: `verify_signature` calls the
+// screen. Each impl is pure delegation: `verify_classified` calls the
 // protocol's existing `verify()` in `talos_memory::*_rpc`; the two
 // subject consts are the SAME constants the subscriber's spec and
 // metrics use (pinned by `admission_identity_tests` below).
@@ -800,7 +800,7 @@ pub fn spawn_graph_rpc_subscriber(
                     tracing::warn!(
                         actor_id = %req.actor_id,
                         reason = diag.reason,
-                        worker_id = %diag.worker_id,
+                        claimed_worker_id = %diag.claimed_worker_id,
                         skew_hint = %diag.skew_hint,
                         "graph-search RPC: HMAC or freshness verification failed"
                     );
@@ -1103,7 +1103,7 @@ pub fn spawn_ml_rpc_subscriber(
                     tracing::warn!(
                         actor_id = %req.actor_id,
                         reason = diag.reason,
-                        worker_id = %diag.worker_id,
+                        claimed_worker_id = %diag.claimed_worker_id,
                         skew_hint = %diag.skew_hint,
                         "ml-predict RPC: HMAC or freshness verification failed"
                     );
@@ -1379,7 +1379,7 @@ pub fn spawn_ml_fewshot_subscriber(
                     tracing::warn!(
                         actor_id = %req.actor_id,
                         reason = diag.reason,
-                        worker_id = %diag.worker_id,
+                        claimed_worker_id = %diag.claimed_worker_id,
                         skew_hint = %diag.skew_hint,
                         "ml-fewshot RPC: HMAC or freshness verification failed"
                     );
@@ -1638,7 +1638,7 @@ pub fn spawn_memory_rpc_subscriber(
                     tracing::warn!(
                         actor_id = %req.actor_id,
                         reason = diag.reason,
-                        worker_id = %diag.worker_id,
+                        claimed_worker_id = %diag.claimed_worker_id,
                         skew_hint = %diag.skew_hint,
                         "memory RPC: HMAC or freshness verification failed"
                     );
@@ -2049,7 +2049,7 @@ pub fn spawn_database_rpc_subscriber(
                     tracing::warn!(
                         actor_id = %req.actor_id,
                         reason = diag.reason,
-                        worker_id = %diag.worker_id,
+                        claimed_worker_id = %diag.claimed_worker_id,
                         skew_hint = %diag.skew_hint,
                         "database RPC: HMAC or freshness verification failed"
                     );
@@ -2469,7 +2469,7 @@ pub fn spawn_state_write_subscriber(
                         actor_id = %req.actor_id,
                         execution_id = %req.execution_id,
                         reason = diag.reason,
-                        worker_id = %diag.worker_id,
+                        claimed_worker_id = %diag.claimed_worker_id,
                         skew_hint = %diag.skew_hint,
                         "state-write: HMAC or freshness verification failed — request dropped"
                     );
@@ -2773,7 +2773,7 @@ pub fn spawn_integration_state_subscriber(
                         actor_id = %req.actor_id,
                         integration = %req.integration_name,
                         reason = diag.reason,
-                        worker_id = %diag.worker_id,
+                        claimed_worker_id = %diag.claimed_worker_id,
                         skew_hint = %diag.skew_hint,
                         "integration-state RPC: HMAC or freshness verification failed"
                     );
@@ -3413,5 +3413,59 @@ mod unauthorized_reply_pins {
             |reason| serde_json::json!({ "leak": reason.as_str() }),
             r#"{"leak":"stale"}"#,
         );
+    }
+
+    /// THE OTHER HALF of the oracle pin — the one the value-level test above
+    /// structurally cannot cover.
+    ///
+    /// `unauthorized_reply_bytes_are_reason_independent` proves the blinding
+    /// helper is reason-blind. It cannot prove the seven subscribers USE it,
+    /// and that gap is not theoretical: rewriting one arm's
+    /// `send_err(caller_facing_unauthorized(reason, MemoryRpcError::
+    /// Unauthorized))` as `send_err(match reason { Stale => Timeout, _ =>
+    /// Unauthorized })` compiles, passes every other test in this crate, and
+    /// hands an on-wire attacker a clean freshness oracle — probe with a
+    /// backdated timestamp, read the reply, and you have mapped the window
+    /// without ever holding a key. (Verified by mutation during the #603
+    /// review: the suite was green.)
+    ///
+    /// So the chokepoint is enforced where it lives — in the source. Every
+    /// `Unauthorized { reason }` arm must reach either the blinding helper or
+    /// the explicit no-reply marker before it records its metric. A source
+    /// scan is blunt, but it is the only thing that binds a CALL SITE, and
+    /// the alternative (trusting a comment) is what the mutation defeated.
+    #[test]
+    fn every_unauthorized_arm_blinds_its_reply() {
+        const SRC: &str = include_str!("lib.rs");
+        // Assembled at runtime so this test's own source is not a match.
+        let arm = format!(
+            "{}{}",
+            "Err(admission::AdmitError::Unauthorized ", "{ reason }) => {"
+        );
+        let arms: Vec<&str> = SRC.split(arm.as_str()).skip(1).collect();
+        assert_eq!(
+            arms.len(),
+            7,
+            "expected one Unauthorized arm per signed-RPC subscriber; if a \
+             protocol was added or removed, update this count deliberately"
+        );
+        for (i, chunk) in arms.iter().enumerate() {
+            // The arm ends at its `record_rpc_metric` call, which every
+            // subscriber emits last. Bounding the search there keeps the scan
+            // from reading a NEIGHBOURING arm's blinding as this one's.
+            let body = chunk
+                .split_once("record_rpc_metric(")
+                .unwrap_or_else(|| panic!("Unauthorized arm #{i} has no metric call to bound it"))
+                .0;
+            assert!(
+                body.contains("caller_facing_unauthorized")
+                    || body.contains("no caller-facing value"),
+                "Unauthorized arm #{i} builds a caller-facing value without routing it \
+                 through `caller_facing_unauthorized` (and is not marked as a \
+                 fire-and-forget subject with no reply). A reply that varies with the \
+                 rejection reason is the oracle the collapse exists to prevent.\n\
+                 arm body:\n{body}"
+            );
+        }
     }
 }
