@@ -85,12 +85,27 @@ pub struct ExecutionEvent {
 /// `avg_score` / `pass_rate` / `worst_score` are `Option` so a schema
 /// drift on the aggregate columns surfaces as an error (via `try_get?`)
 /// rather than a silent default.
+///
+/// **Populations differ between the fields — do not sum them mentally.**
+/// `runs`, `avg_score`, `pass_rate` and `worst_score` are computed over
+/// SCORED verdicts only; verdicts where the judge abstained
+/// (`not_applicable`) are excluded from all four and counted separately in
+/// `na_runs`. Total judge invocations = `runs + na_runs`. Any renderer of
+/// these numbers must say which population it is showing.
 #[derive(Debug)]
 pub struct JudgeScoreStat {
     pub workflow_name: String,
+    /// SCORED verdicts in the window (abstentions excluded).
     pub runs: i64,
+    /// Verdicts where the judge declared it had nothing to judge. These
+    /// contribute to NO other field on this struct.
+    pub na_runs: i64,
+    /// Mean score over the `runs` scored verdicts.
     pub avg_score: Option<f64>,
+    /// Passing share of the `runs` scored verdicts (denominator = `runs`,
+    /// NOT `runs + na_runs`).
     pub pass_rate: Option<f64>,
+    /// Minimum score over the `runs` scored verdicts.
     pub worst_score: Option<f64>,
 }
 
@@ -1258,9 +1273,14 @@ impl ExecutionRepository {
     /// Record one observe-only judge verdict into `judge_scores`.
     /// Conn-taking (lint-50 shape) so the caller owns the executor — the
     /// best-effort recorder acquires a pooled connection and calls this,
-    /// swallowing any error. Scores + the pass boolean ONLY: the judge
+    /// swallowing any error. Scores + the two booleans ONLY: the judge
     /// reasoning/feedback text is never persisted here (it can quote
     /// email-derived content — DLP).
+    ///
+    /// An ABSTENTION (`not_applicable = true`) is recorded as a row like any
+    /// other, not skipped: aggregates exclude it structurally, and the row
+    /// is what makes the abstention RATE recoverable. `score`/`passed` are
+    /// stored as the judge authored them and carry no meaning for such a row.
     pub async fn record_judge_score(
         conn: &mut sqlx::PgConnection,
         workflow_id: Uuid,
@@ -1268,17 +1288,19 @@ impl ExecutionRepository {
         execution_id: Uuid,
         score: f64,
         passed: bool,
+        not_applicable: bool,
     ) -> Result<()> {
         sqlx::query(
             "INSERT INTO judge_scores \
-                 (workflow_id, node_id, execution_id, score, passed) \
-             VALUES ($1, $2, $3, $4, $5)",
+                 (workflow_id, node_id, execution_id, score, passed, not_applicable) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(workflow_id)
         .bind(node_id)
         .bind(execution_id)
         .bind(score)
         .bind(passed)
+        .bind(not_applicable)
         .execute(&mut *conn)
         .await?;
         Ok(())
@@ -1289,6 +1311,16 @@ impl ExecutionRepository {
     /// score, pass rate, and worst (min) score per judged workflow.
     /// Tenancy via the workflows join (`w.user_id = $1`), which also drops
     /// rows whose workflow was deleted.
+    ///
+    /// **Abstentions are excluded structurally.** Every quality aggregate
+    /// carries `FILTER (WHERE NOT js.not_applicable)`, so `runs` /
+    /// `avg_score` / `pass_rate` / `worst_score` describe SCORED verdicts
+    /// only, and the pass-rate denominator is the scored count. The
+    /// abstentions are not discarded — they are returned as `na_runs`, so a
+    /// judge that ran often but abstained on most runs is legible instead of
+    /// looking like a judge that barely ran. A workflow whose verdicts were
+    /// ALL abstentions still appears, with `runs = 0` and the aggregates
+    /// `NULL` (there is nothing to average) — the honest shape.
     pub async fn weekly_judge_scores(
         &self,
         user_id: Uuid,
@@ -1297,17 +1329,21 @@ impl ExecutionRepository {
         let days = days.clamp(1, 31);
         let rows = sqlx::query(
             "SELECT w.name AS workflow_name, \
-                    COUNT(*)::bigint AS runs, \
-                    AVG(js.score)::float8 AS avg_score, \
-                    (COUNT(*) FILTER (WHERE js.passed))::float8 \
-                        / NULLIF(COUNT(*), 0) AS pass_rate, \
-                    MIN(js.score)::float8 AS worst_score \
+                    (COUNT(*) FILTER (WHERE NOT js.not_applicable))::bigint AS runs, \
+                    (COUNT(*) FILTER (WHERE js.not_applicable))::bigint AS na_runs, \
+                    (AVG(js.score) FILTER (WHERE NOT js.not_applicable))::float8 \
+                        AS avg_score, \
+                    (COUNT(*) FILTER (WHERE js.passed AND NOT js.not_applicable))::float8 \
+                        / NULLIF(COUNT(*) FILTER (WHERE NOT js.not_applicable), 0) \
+                        AS pass_rate, \
+                    (MIN(js.score) FILTER (WHERE NOT js.not_applicable))::float8 \
+                        AS worst_score \
              FROM judge_scores js \
              JOIN workflows w ON w.id = js.workflow_id \
              WHERE w.user_id = $1 \
                AND js.created_at > NOW() - make_interval(days => $2::int) \
              GROUP BY w.name \
-             ORDER BY runs DESC, w.name LIMIT 50",
+             ORDER BY runs DESC, na_runs DESC, w.name LIMIT 50",
         )
         .bind(user_id)
         .bind(days)
@@ -1321,6 +1357,7 @@ impl ExecutionRepository {
                         .try_get::<Option<String>, _>("workflow_name")?
                         .unwrap_or_default(),
                     runs: r.try_get::<Option<i64>, _>("runs")?.unwrap_or(0),
+                    na_runs: r.try_get::<Option<i64>, _>("na_runs")?.unwrap_or(0),
                     avg_score: r.try_get::<Option<f64>, _>("avg_score")?,
                     pass_rate: r.try_get::<Option<f64>, _>("pass_rate")?,
                     worst_score: r.try_get::<Option<f64>, _>("worst_score")?,

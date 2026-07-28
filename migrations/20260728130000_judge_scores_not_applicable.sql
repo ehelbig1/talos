@@ -1,0 +1,43 @@
+-- Three-valued judge verdicts: record ABSTENTIONS instead of dropping them.
+--
+-- A judge verdict has always been two-valued in this table (a score plus a
+-- pass boolean), but real judges have a third outcome: "there was nothing to
+-- judge on this run" — a quiet inbox, an empty batch, a day with no meetings.
+-- Counting such a run as a pass inflates the average and saturates the signal
+-- (`pa-inbox-organizer-work` read avg 1.0 across 17 runs purely because most
+-- were empty inboxes); counting it as a failure drags the trend down for a run
+-- that measured nothing. Both are wrong for the same reason: "nothing to
+-- measure" is evidence of neither quality nor its absence.
+--
+-- The previous fix simply skipped the INSERT for such runs. That excluded the
+-- bad datapoint but destroyed the abstention rate with it — "this judge ran 17
+-- times and abstained 12 of them" became indistinguishable from "this judge ran
+-- 5 times", so a heavily-abstaining judge silently collapsed to
+-- `insufficient_runs` in the operator digest with no cause shown. Recording the
+-- row WITH a flag makes the exclusion structural (every aggregate carries
+-- `FILTER (WHERE NOT not_applicable)`) AND keeps the abstention count legible.
+--
+-- NOT NULL DEFAULT false, so the rewrite is a metadata-only catalog update on
+-- PG 11+ (no table rewrite, brief ACCESS EXCLUSIVE only).
+ALTER TABLE judge_scores
+    ADD COLUMN IF NOT EXISTS not_applicable boolean NOT NULL DEFAULT false;
+
+-- NO BACKFILL — deliberate.
+--
+-- `false` is the CORRECT value for every historical scored row. It is also the
+-- value historical LEAKED abstentions get, and those cannot be distinguished
+-- retroactively: the abstention marker lived only in the (encrypted) node
+-- output envelope, never in this table, and the runs that leaked did so
+-- precisely because the marker was dropped before the insert. Inventing a
+-- backfill heuristic (e.g. "score == 1.0 and workflow looks like an organizer")
+-- would fabricate a distinction the data does not support — the same
+-- over-reading this whole change exists to prevent. Pre-migration rows are
+-- therefore reported as scored; the abstention rate is only trustworthy from
+-- this migration forward.
+
+-- Every aggregate over this table filters on `not_applicable`, and the
+-- weekly/digest reads already window on (workflow_id, created_at). Adding the
+-- flag to the leading index would not help those scans (the filter is highly
+-- non-selective in the common all-false case and PG can apply it as a filter
+-- on the heap tuple it must visit anyway for `score`/`passed`), so no new
+-- index is created here.

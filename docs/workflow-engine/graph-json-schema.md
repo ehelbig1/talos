@@ -288,6 +288,8 @@ bounds (e.g. `max_iterations` caps at 50 for agent loops).
 
 ### `judge` *(llm-primitives)*
 ```jsonc
+// The judge sub-workflow must return `{score, passed, reasoning, feedback}`
+// and MAY return a fifth field `not_applicable: bool` — see below.
 { "judge_workflow_id": "uuid",
   "rubric": "rate helpfulness 0-1",
   "pass_threshold": 0.7,
@@ -298,16 +300,42 @@ bounds (e.g. `max_iterations` caps at 50 for agent loops).
 ```jsonc
 // Evaluates a verdict expression in-process — no sub-workflow dispatch.
 // The expression must return a verdict object (`{score, passed, reasoning,
-// feedback}`); `pass_threshold`, when present, overrides the expression's
-// own `passed` field for gating. Reach for `inline_judge` when the rubric
-// is a one-line scoring expression; promote to `judge` once it grows its
-// own prompt or model call.
+// feedback}`, optionally `not_applicable`); `pass_threshold`, when present,
+// overrides the expression's own `passed` field for gating. Reach for
+// `inline_judge` when the rubric is a one-line scoring expression; promote
+// to `judge` once it grows its own prompt or model call.
 //
 // `verdict_expr` is required and must be non-empty; parsing rejects
 // missing/empty expressions at load time.
 { "verdict_expr": "{score: input.confidence, passed: input.confidence > 0.5}",
   "pass_threshold": 0.5 }
 ```
+
+#### Judge verdicts are three-valued: `not_applicable`
+
+Both judge kinds accept an optional fifth verdict field,
+`not_applicable: bool`, for the third outcome a judge really has:
+**there was nothing to judge on this run** (a quiet inbox, an empty
+batch). Such a verdict is recorded as an ABSTENTION and excluded from
+the workflow's quality trend — not averaged in, not counted in the pass
+rate, not the minimum. Scoring an empty run 1.0 inflates the average
+and saturates the signal; scoring it 0.2 drags the trend down for a run
+that measured nothing. Abstentions are still counted, as `na_runs`
+beside the scored `runs`, so a heavily-abstaining judge stays visible.
+
+**It affects RECORDING only, never routing.** `passed` drives the gate
+exactly as authored under every `on_failure` mode, so an abstaining
+verdict should also set `passed` — usually `true`, so an empty run
+doesn't fail the workflow:
+
+```jsonc
+{ "verdict_expr": "#{ score: 1.0, passed: true, not_applicable: count == 0, \
+                      reasoning: \"nothing to classify\", feedback: \"\" }" }
+```
+
+Absent → `false` (unchanged behavior). Present but not a boolean →
+`false` **and** `malformed_field_count` increments, so a typo surfaces
+as a broken judge instead of silently discarding every abstention.
 
 ### `ensemble` *(llm-primitives)*
 ```jsonc

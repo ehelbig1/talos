@@ -216,14 +216,25 @@ impl OperatorDigestService {
                 let signal = judge_signal(s.runs, s.avg_score, s.worst_score);
                 json!({
                     "name": s.workflow_name,
+                    // POPULATION: scored verdicts only. `runs + na_runs` is
+                    // the number of times the judge actually fired — the two
+                    // are reported separately (and named so) because every
+                    // score below is over the scored population alone.
                     "runs": s.runs,
+                    "scored_runs": s.runs,
+                    "na_runs": s.na_runs,
+                    "total_verdicts": s.runs + s.na_runs,
                     "avg_score": s.avg_score,
                     "pass_rate": s.pass_rate,
                     "worst_score": s.worst_score,
+                    "population_note": "runs/avg_score/pass_rate/worst_score cover SCORED \
+                                        verdicts only; na_runs counts runs where the judge \
+                                        reported nothing to judge and which are excluded \
+                                        from every score above",
                     // A judge whose score never varies is not evidence of
                     // quality — it may be a shape check that cannot fail.
                     "signal": signal,
-                    "signal_note": judge_signal_note(signal),
+                    "signal_note": judge_signal_note(signal, s.runs, s.na_runs),
                 })
             })
             .collect::<Vec<_>>();
@@ -485,6 +496,14 @@ const JUDGE_MIN_RUNS_FOR_SIGNAL: i64 = 5;
 /// Prometheus metric that is never incremented (structural lint check 58): it
 /// renders a dashboard that can never report a problem. Flagging it is the
 /// whole point — a saturated judge is not evidence of quality.
+///
+/// `runs` is the SCORED population — verdicts where the judge abstained
+/// (`not_applicable`) are already excluded upstream and never reach the
+/// aggregates here. That is deliberate: an abstention says nothing about
+/// score spread, so it must not dilute a saturation verdict. It does mean
+/// `insufficient_runs` can be reported for a judge that fired many times,
+/// which is why [`judge_signal_note`] takes the abstention count and states
+/// it — the number alone would be misread as "this judge barely ran".
 pub fn judge_signal(runs: i64, avg_score: Option<f64>, worst_score: Option<f64>) -> &'static str {
     if runs < JUDGE_MIN_RUNS_FOR_SIGNAL {
         return "insufficient_runs";
@@ -512,7 +531,39 @@ pub fn judge_signal(runs: i64, avg_score: Option<f64>, worst_score: Option<f64>)
 
 /// One-line reading guide for a judge signal — shipped alongside the score so
 /// the email/UI can render "why am I looking at this".
-pub fn judge_signal_note(signal: &str) -> &'static str {
+///
+/// Takes the two populations because the signal alone is ambiguous once a
+/// judge can abstain: `insufficient_runs` on `(runs = 2, na_runs = 0)` means
+/// "this judge has barely fired", while the same signal on
+/// `(runs = 2, na_runs = 15)` means "this judge fires constantly and almost
+/// always has nothing to judge" — a completely different thing to go fix.
+/// Reporting the bare signal would let the second case read as the first,
+/// which is the defect this whole module exists to prevent.
+pub fn judge_signal_note(signal: &str, runs: i64, na_runs: i64) -> String {
+    let base = judge_signal_note_base(signal);
+    if na_runs <= 0 {
+        return base.to_string();
+    }
+    // State BOTH populations explicitly — `runs` counts scored verdicts only,
+    // and a reader who assumes it counts invocations will misread every
+    // number next to it.
+    format!(
+        "{base} ({runs} scored {}, {na_runs} abstained — the judge reported \
+         nothing to judge on {}; scores and pass rate are over the scored \
+         {} only)",
+        if runs == 1 { "run" } else { "runs" },
+        if na_runs == 1 {
+            "that run"
+        } else {
+            "those runs"
+        },
+        if runs == 1 { "run" } else { "runs" },
+    )
+}
+
+/// The signal-only half of [`judge_signal_note`]. Split out so the wording of
+/// each verdict lives in exactly one place.
+fn judge_signal_note_base(signal: &str) -> &'static str {
     match signal {
         "saturated_pass" => {
             "every run scored identically at the maximum — this judge has not been \
@@ -671,7 +722,65 @@ mod tests {
     fn judge_pinned_at_max_is_flagged_saturated_not_perfect() {
         assert_eq!(judge_signal(11, Some(1.0), Some(1.0)), "saturated_pass");
         assert_eq!(judge_signal(9, Some(1.0), Some(1.0)), "saturated_pass");
-        assert!(judge_signal_note("saturated_pass").contains("FAILURE direction"));
+        assert!(judge_signal_note("saturated_pass", 11, 0).contains("FAILURE direction"));
+    }
+
+    /// A judge that fires constantly but almost always has nothing to judge
+    /// collapses to `insufficient_runs` on the SCORED count. The bare signal
+    /// would read as "this judge barely ran" — the opposite of the truth —
+    /// so the note must state both populations and name the cause.
+    #[test]
+    fn heavily_abstaining_judge_states_its_abstentions() {
+        // 3 scored runs, 9 abstentions: 12 invocations, not 3.
+        assert_eq!(judge_signal(3, Some(1.0), Some(1.0)), "insufficient_runs");
+        let note = judge_signal_note("insufficient_runs", 3, 9);
+        assert!(note.contains("3 scored runs"), "{note}");
+        assert!(note.contains("9 abstained"), "{note}");
+        assert!(note.contains("nothing to judge"), "{note}");
+        // The base wording survives so the signal is still explained.
+        assert!(note.contains("too few runs"), "{note}");
+    }
+
+    /// With no abstentions the note is byte-identical to the pre-feature
+    /// wording — no reader of a normal judge sees new noise.
+    #[test]
+    fn note_is_unchanged_when_nothing_abstained() {
+        for signal in [
+            "saturated_pass",
+            "saturated_fail",
+            "saturated_constant",
+            "insufficient_runs",
+            "discriminating",
+            "bogus",
+        ] {
+            assert_eq!(
+                judge_signal_note(signal, 7, 0),
+                judge_signal_note_base(signal),
+                "{signal}"
+            );
+        }
+    }
+
+    /// Abstentions do not change the SIGNAL — only its explanation. A judge
+    /// that saturated across enough scored runs is still saturated no matter
+    /// how often it abstained; `runs` is already the scored population.
+    #[test]
+    fn abstentions_do_not_change_the_signal() {
+        assert_eq!(judge_signal(9, Some(1.0), Some(1.0)), "saturated_pass");
+        let note = judge_signal_note("saturated_pass", 9, 40);
+        assert!(note.contains("FAILURE direction"), "{note}");
+        assert!(note.contains("40 abstained"), "{note}");
+    }
+
+    /// Singular/plural, because these strings go into an operator email.
+    #[test]
+    fn note_counts_read_grammatically() {
+        let one = judge_signal_note("insufficient_runs", 1, 1);
+        assert!(one.contains("1 scored run,"), "{one}");
+        assert!(one.contains("nothing to judge on that run"), "{one}");
+        let many = judge_signal_note("insufficient_runs", 2, 3);
+        assert!(many.contains("2 scored runs,"), "{many}");
+        assert!(many.contains("nothing to judge on those runs"), "{many}");
     }
 
     /// `pa-inbox-organizer-work`: avg 0.556, worst 0.2 — a judge that genuinely

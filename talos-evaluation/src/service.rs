@@ -58,7 +58,14 @@ fn judge_schema() -> Value {
         "properties": {
             "score": { "type": "number", "description": "Quality in [0,1]." },
             "passed": { "type": "boolean" },
-            "reasoning": { "type": "string", "description": "One short sentence." }
+            "reasoning": { "type": "string", "description": "One short sentence." },
+            "not_applicable": {
+                "type": "boolean",
+                "description": "True when this task gave you nothing to judge \
+                                (the response had no subject matter to be grounded in). \
+                                Such a task is EXCLUDED from the comparison rather \
+                                than scored — do not guess a score for it."
+            }
         },
         "required": ["score", "passed", "reasoning"]
     })
@@ -94,6 +101,11 @@ pub struct ArmResult {
     pub score: f64,
     pub passed: bool,
     pub reasoning: String,
+    /// The judge declared this arm gave it nothing to judge. `score` and
+    /// `passed` carry no meaning for such an arm, and the task is dropped
+    /// from the paired aggregate (reported under `skipped`) rather than
+    /// scored.
+    pub not_applicable: bool,
 }
 
 /// A task evaluated under both arms.
@@ -229,6 +241,34 @@ impl EvaluationService {
             }
         }
 
+        // A task whose judge ABSTAINED on either arm is not a comparison: the
+        // judge said one side had nothing to judge, so its score is not a
+        // measurement of that arm's quality. Pairing it would move the A/B
+        // verdict on non-evidence — the same defect as counting an abstaining
+        // judge's verdict in a quality trend. Record it as skipped (with the
+        // reason) so the drop is visible rather than silent, and so the pair
+        // set stays balanced.
+        let mut per_task_scored = Vec::with_capacity(per_task.len());
+        for t in per_task {
+            if t.on.not_applicable || t.off.not_applicable {
+                let arms = match (t.on.not_applicable, t.off.not_applicable) {
+                    (true, true) => "both arms",
+                    (true, false) => "the memory-ON arm",
+                    _ => "the memory-OFF arm",
+                };
+                skipped.push(SkippedTask {
+                    label: t.label.clone(),
+                    reason: format!(
+                        "judge abstained on {arms} (nothing to judge) — excluded from \
+                         the paired comparison rather than scored"
+                    ),
+                });
+            } else {
+                per_task_scored.push(t);
+            }
+        }
+        let per_task = per_task_scored;
+
         let paired: Vec<PairedResult> = per_task
             .iter()
             .map(|t| PairedResult {
@@ -334,11 +374,12 @@ impl EvaluationService {
             tokio::time::sleep(POLL_INTERVAL).await;
         };
 
-        let (score, passed, reasoning) = match &output {
+        let (score, passed, reasoning, not_applicable) = match &output {
             Some(v) => self.judge(backend, task, v).await?,
             // Terminal but no output (failed / cancelled / timed_out) is a real
-            // quality signal — score 0.
-            None => (0.0, false, format!("no output (status={status})")),
+            // quality signal — score 0. NOT an abstention: the arm produced
+            // nothing, which is a result, not an absence of subject matter.
+            None => (0.0, false, format!("no output (status={status})"), false),
         };
 
         Ok(ArmResult {
@@ -347,6 +388,7 @@ impl EvaluationService {
             score,
             passed,
             reasoning,
+            not_applicable,
         })
     }
 
@@ -356,7 +398,7 @@ impl EvaluationService {
         backend: &JudgeBackend,
         task: &EvalTask,
         output: &Value,
-    ) -> Result<(f64, bool, String), EvaluationError> {
+    ) -> Result<(f64, bool, String, bool), EvaluationError> {
         let user = build_judge_user(&task.label, &task.trigger_input, output);
         let raw = match backend {
             JudgeBackend::Local(model) => {
@@ -432,7 +474,14 @@ fn cap_utf8(s: &str, max: usize) -> String {
 /// outermost `{...}` slice (behind the structured-output guarantee this is
 /// belt-and-suspenders). `passed` defaults to `score >= 0.6` when absent;
 /// `score` is clamped to [0,1]. Returns `None` when no score can be recovered.
-fn parse_judgment(raw: &str) -> Option<(f64, bool, String)> {
+///
+/// The fourth element is the judge's ABSTENTION flag (`not_applicable`):
+/// the task gave it nothing to judge. Absent or non-boolean → `false`, so a
+/// judge that never emits the field behaves exactly as before. An abstaining
+/// arm is dropped from the paired comparison rather than scored — a pair
+/// where one side had nothing to judge is not a comparison, and scoring it
+/// either way would move the A/B verdict on non-evidence.
+fn parse_judgment(raw: &str) -> Option<(f64, bool, String, bool)> {
     let val = parse_object(raw)?;
     let score = val.get("score").and_then(|v| v.as_f64())?.clamp(0.0, 1.0);
     let passed = val
@@ -444,7 +493,11 @@ fn parse_judgment(raw: &str) -> Option<(f64, bool, String)> {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    Some((score, passed, reasoning))
+    let not_applicable = val
+        .get("not_applicable")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Some((score, passed, reasoning, not_applicable))
 }
 
 fn parse_object(raw: &str) -> Option<Value> {
@@ -498,30 +551,60 @@ mod tests {
 
     #[test]
     fn parse_judgment_direct() {
-        let (s, p, r) =
+        let (s, p, r, na) =
             parse_judgment(r#"{"score":0.8,"passed":true,"reasoning":"grounded"}"#).unwrap();
         assert!((s - 0.8).abs() < 1e-9);
         assert!(p);
         assert_eq!(r, "grounded");
+        // Absent `not_applicable` reads false — a judge that never emits the
+        // field behaves exactly as it did before the field existed.
+        assert!(!na);
     }
 
     #[test]
     fn parse_judgment_derives_passed_and_clamps() {
         // passed absent → derived from score; score >1 clamped.
-        let (s, p, _) = parse_judgment(r#"{"score":1.5,"reasoning":"x"}"#).unwrap();
+        let (s, p, _, _) = parse_judgment(r#"{"score":1.5,"reasoning":"x"}"#).unwrap();
         assert_eq!(s, 1.0);
         assert!(p);
-        let (s2, p2, _) = parse_judgment(r#"{"score":0.3}"#).unwrap();
+        let (s2, p2, _, _) = parse_judgment(r#"{"score":0.3}"#).unwrap();
         assert_eq!(s2, 0.3);
         assert!(!p2);
     }
 
     #[test]
     fn parse_judgment_recovers_fenced() {
-        let (s, _, _) =
+        let (s, _, _, _) =
             parse_judgment("```json\n{\"score\":0.5,\"passed\":false,\"reasoning\":\"meh\"}\n```")
                 .unwrap();
         assert!((s - 0.5).abs() < 1e-9);
+    }
+
+    /// The judge can abstain: a task that gave it nothing to judge is flagged
+    /// so the arm is dropped from the paired comparison rather than scored.
+    #[test]
+    fn parse_judgment_reads_not_applicable() {
+        let (_, _, _, na) = parse_judgment(
+            r#"{"score":1.0,"passed":true,"reasoning":"nothing to ground in","not_applicable":true}"#,
+        )
+        .unwrap();
+        assert!(na);
+    }
+
+    /// Absent / explicit-false / wrong-typed all read as "did not abstain" —
+    /// a malformed field must never silently delete a real datapoint from the
+    /// A/B comparison.
+    #[test]
+    fn parse_judgment_not_applicable_defaults_and_tolerates_junk() {
+        for raw in [
+            r#"{"score":0.5,"passed":true,"reasoning":"r"}"#,
+            r#"{"score":0.5,"passed":true,"reasoning":"r","not_applicable":false}"#,
+            r#"{"score":0.5,"passed":true,"reasoning":"r","not_applicable":"true"}"#,
+            r#"{"score":0.5,"passed":true,"reasoning":"r","not_applicable":null}"#,
+        ] {
+            let (_, _, _, na) = parse_judgment(raw).unwrap();
+            assert!(!na, "{raw}");
+        }
     }
 
     #[test]

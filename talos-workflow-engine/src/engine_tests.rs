@@ -585,6 +585,136 @@ fn inline_judge_rejects_when_score_below_threshold() {
     );
 }
 
+/// THE LEAK, as a regression fixture.
+///
+/// An inline judge that ABSTAINS while also reporting a low score and
+/// `passed: false`, under the DEFAULT `on_failure: "error"`. Before the fix,
+/// only the pass and passthrough branches propagated the abstention marker;
+/// the error branch dropped it, so this verdict recorded into `judge_scores`
+/// as a 0.2 quality FAILURE. An abstention — a run with nothing to judge —
+/// dragged the workflow's quality trend down.
+///
+/// The three assertions are the whole contract:
+///   1. the envelope carries the reserved abstention key,
+///   2. so the recorder yields an ABSTENTION, not a scored datapoint,
+///   3. and routing is untouched (`passed: false` still errors — D2: N/A
+///      affects recording, never routing).
+#[cfg(feature = "llm-primitives")]
+#[test]
+fn inline_judge_on_failure_error_propagates_not_applicable() {
+    use talos_workflow_engine_test_utils::noop::StubExpressionEvaluator;
+
+    let mut engine = ParallelWorkflowEngine::new();
+    engine.set_expression_evaluator(Arc::new(StubExpressionEvaluator::new().with_json(
+        serde_json::json!({
+            "score": 0.2,
+            "passed": false,
+            "not_applicable": true,
+            "reasoning": "nothing to classify",
+            "feedback": "",
+        }),
+    )));
+
+    let out = engine.dispatch_inline_judge(
+        serde_json::json!({ "answer": "x" }),
+        "verdict(answer)",
+        None,
+        "error",
+    );
+
+    // (3) Routing unchanged: `passed: false` still produces the error
+    // envelope. The abstention did NOT silently re-route the node.
+    assert_eq!(out.get("__error").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(
+        out.get("__judge_passed__").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+
+    // (1) The reserved key rides along on the error branch too.
+    assert_eq!(
+        out.get(talos_workflow_engine_core::reserved_keys::JUDGE_NOT_APPLICABLE)
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "on_failure=\"error\" must propagate the abstention marker — without it \
+         an abstention records as a low-score quality failure"
+    );
+
+    // (2) …so the recorder sees an ABSTENTION, not a scored 0.2 datapoint.
+    let (score, passed, not_applicable) = extract_judge_score(&out).expect("judge envelope");
+    assert!(
+        not_applicable,
+        "an abstaining verdict must never be recorded as a scored datapoint"
+    );
+    assert_eq!(score, 0.2);
+    assert!(!passed);
+}
+
+/// The marker must NOT appear on the error branch when the judge did not
+/// abstain — otherwise every rejected verdict would silently vanish from the
+/// quality trend, which is the same defect pointed the other way.
+#[cfg(feature = "llm-primitives")]
+#[test]
+fn inline_judge_on_failure_error_omits_marker_when_not_abstaining() {
+    use talos_workflow_engine_test_utils::noop::StubExpressionEvaluator;
+
+    let mut engine = ParallelWorkflowEngine::new();
+    engine.set_expression_evaluator(Arc::new(StubExpressionEvaluator::new().with_json(
+        serde_json::json!({
+            "score": 0.2, "passed": false, "reasoning": "bad", "feedback": "",
+        }),
+    )));
+
+    let out = engine.dispatch_inline_judge(serde_json::json!({}), "v()", None, "error");
+    assert!(out
+        .get(talos_workflow_engine_core::reserved_keys::JUDGE_NOT_APPLICABLE)
+        .is_none());
+    assert_eq!(extract_judge_score(&out), Some((0.2, false, false)));
+}
+
+/// Abstention on the PASS branch (the common author shape: `passed: true` so
+/// an empty run doesn't fail the workflow) still records as an abstention.
+#[cfg(feature = "llm-primitives")]
+#[test]
+fn inline_judge_pass_branch_propagates_not_applicable() {
+    use talos_workflow_engine_test_utils::noop::StubExpressionEvaluator;
+
+    let mut engine = ParallelWorkflowEngine::new();
+    engine.set_expression_evaluator(Arc::new(StubExpressionEvaluator::new().with_json(
+        serde_json::json!({
+            "score": 1.0, "passed": true, "not_applicable": true,
+            "reasoning": "quiet inbox", "feedback": "",
+        }),
+    )));
+
+    let out = engine.dispatch_inline_judge(serde_json::json!({}), "v()", None, "error");
+    assert_eq!(out.get("__error").and_then(|v| v.as_bool()), None);
+    let (_, _, not_applicable) = extract_judge_score(&out).expect("judge envelope");
+    assert!(not_applicable);
+}
+
+/// Abstention on the PASSTHROUGH branch.
+#[cfg(feature = "llm-primitives")]
+#[test]
+fn inline_judge_passthrough_branch_propagates_not_applicable() {
+    use talos_workflow_engine_test_utils::noop::StubExpressionEvaluator;
+
+    let mut engine = ParallelWorkflowEngine::new();
+    engine.set_expression_evaluator(Arc::new(StubExpressionEvaluator::new().with_json(
+        serde_json::json!({
+            "score": 0.1, "passed": false, "not_applicable": true,
+            "reasoning": "quiet inbox", "feedback": "",
+        }),
+    )));
+
+    let out = engine.dispatch_inline_judge(serde_json::json!({}), "v()", None, "passthrough");
+    assert_eq!(
+        out.get("__judge_rejected__").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    let (_, _, not_applicable) = extract_judge_score(&out).expect("judge envelope");
+    assert!(not_applicable);
+}
+
 #[cfg(feature = "llm-primitives")]
 #[test]
 fn inline_judge_emits_error_envelope_when_no_evaluator_wired() {
@@ -1166,6 +1296,422 @@ fn graph_node_max_fuel_override_survives_load() {
     );
 }
 
+// ── JudgeVerdict::from_collapsed — the optional 5th field ───────────────
+
+#[test]
+fn judge_verdict_not_applicable_absent_is_false_and_not_malformed() {
+    // The overwhelmingly common case: a judge that never heard of the
+    // field. It must parse clean — absent is NOT malformed, because the
+    // field is optional.
+    let v = JudgeVerdict::from_collapsed(&serde_json::json!({
+        "score": 0.8, "passed": true, "reasoning": "r", "feedback": "f",
+    }));
+    assert!(!v.not_applicable);
+    assert_eq!(v.malformed_field_count, 0);
+    // The four required fields are untouched by the new parse.
+    assert_eq!(v.score, 0.8);
+    assert!(v.passed);
+    assert_eq!(v.reasoning, "r");
+    assert_eq!(v.feedback, "f");
+}
+
+#[test]
+fn judge_verdict_not_applicable_true_parses() {
+    let v = JudgeVerdict::from_collapsed(&serde_json::json!({
+        "score": 1.0, "passed": true, "reasoning": "empty inbox", "feedback": "",
+        "not_applicable": true,
+    }));
+    assert!(v.not_applicable);
+    assert_eq!(v.malformed_field_count, 0);
+}
+
+#[test]
+fn judge_verdict_not_applicable_explicit_false_parses() {
+    let v = JudgeVerdict::from_collapsed(&serde_json::json!({
+        "score": 0.3, "passed": false, "reasoning": "r", "feedback": "f",
+        "not_applicable": false,
+    }));
+    assert!(!v.not_applicable);
+    assert_eq!(v.malformed_field_count, 0);
+}
+
+/// Present-but-wrong-typed must fail LOUD. Silently reading the string
+/// "true" as an abstention would erase real datapoints from the trend; the
+/// author clearly meant to say something and got the type wrong, which is
+/// exactly what `malformed_field_count` exists to surface.
+#[test]
+fn judge_verdict_not_applicable_non_bool_is_false_and_malformed() {
+    for bad in [
+        serde_json::json!("true"),
+        serde_json::json!(1),
+        serde_json::json!(null),
+        serde_json::json!({}),
+    ] {
+        let v = JudgeVerdict::from_collapsed(&serde_json::json!({
+            "score": 0.5, "passed": true, "reasoning": "r", "feedback": "f",
+            "not_applicable": bad,
+        }));
+        assert!(!v.not_applicable, "non-bool must not abstain: {bad}");
+        assert_eq!(
+            v.malformed_field_count, 1,
+            "non-bool must be reported malformed: {bad}"
+        );
+    }
+}
+
+/// The new field must not perturb the existing malformed accounting for the
+/// four required fields.
+#[test]
+fn judge_verdict_malformed_count_unchanged_for_required_fields() {
+    let v = JudgeVerdict::from_collapsed(&serde_json::json!({}));
+    assert_eq!(v.malformed_field_count, 4);
+    assert!(!v.not_applicable);
+}
+
+// ── Ensemble best_of_n: an abstaining judge must not crown a winner ─────
+
+/// An N/A verdict is ineligible — its score means "nothing to judge", not
+/// "this candidate is good", so it must never compete for best-of-n.
+#[test]
+fn ensemble_candidate_score_skips_abstaining_verdict() {
+    let abstained = serde_json::json!({
+        "score": 1.0, "passed": true, "reasoning": "empty", "feedback": "",
+        "not_applicable": true,
+    });
+    assert_eq!(ensemble_candidate_score(&abstained), None);
+
+    // A normal verdict still scores, including an explicit `false`.
+    let scored = serde_json::json!({
+        "score": 0.7, "passed": true, "reasoning": "", "feedback": "",
+        "not_applicable": false,
+    });
+    assert_eq!(ensemble_candidate_score(&scored), Some(0.7));
+    let no_field = serde_json::json!({
+        "score": 0.7, "passed": true, "reasoning": "", "feedback": "",
+    });
+    assert_eq!(ensemble_candidate_score(&no_field), Some(0.7));
+}
+
+/// An abstention must never WIN, even when its score is the highest number
+/// in the field — the whole point is that the number is not a quality
+/// measure.
+#[test]
+fn ensemble_abstaining_candidate_never_wins() {
+    let candidates = vec![
+        serde_json::json!({ "id": "a" }),
+        serde_json::json!({ "id": "b" }),
+    ];
+    // Candidate "a" abstained with a perfect 1.0; "b" was genuinely scored 0.3.
+    let scores = vec![
+        ensemble_candidate_score(&serde_json::json!({
+            "score": 1.0, "passed": true, "reasoning": "", "feedback": "",
+            "not_applicable": true,
+        })),
+        ensemble_candidate_score(&serde_json::json!({
+            "score": 0.3, "passed": true, "reasoning": "", "feedback": "",
+        })),
+    ];
+    let (best, best_score) = pick_best_candidate(&candidates, &scores);
+    assert_eq!(
+        best.as_ref().and_then(|v| v["id"].as_str()),
+        Some("b"),
+        "an abstaining judge's 1.0 must not beat a real 0.3"
+    );
+    assert_eq!(best_score, 0.3);
+}
+
+/// All-N/A behaves exactly like all-failed: no winner, sentinel score, so
+/// the caller takes the existing first-candidate fallback path.
+#[test]
+fn ensemble_all_abstaining_behaves_like_all_failed() {
+    let candidates = vec![
+        serde_json::json!({ "id": "a" }),
+        serde_json::json!({ "id": "b" }),
+    ];
+    let na = serde_json::json!({
+        "score": 1.0, "passed": true, "reasoning": "", "feedback": "",
+        "not_applicable": true,
+    });
+    let all_na = vec![ensemble_candidate_score(&na), ensemble_candidate_score(&na)];
+    let all_failed: Vec<Option<f64>> = vec![None, None];
+    assert_eq!(
+        pick_best_candidate(&candidates, &all_na),
+        pick_best_candidate(&candidates, &all_failed)
+    );
+    let (best, score) = pick_best_candidate(&candidates, &all_na);
+    assert!(best.is_none());
+    assert_eq!(score, f64::NEG_INFINITY);
+}
+
+/// Selection is otherwise unchanged: first candidate wins a tie (strict `>`).
+#[test]
+fn ensemble_pick_best_keeps_first_on_tie() {
+    let candidates = vec![
+        serde_json::json!({ "id": "a" }),
+        serde_json::json!({ "id": "b" }),
+    ];
+    let (best, _) = pick_best_candidate(&candidates, &[Some(0.5), Some(0.5)]);
+    assert_eq!(best.as_ref().and_then(|v| v["id"].as_str()), Some("a"));
+}
+
+// ── build_judge_envelope — the shared judge output envelope ─────────────
+//
+// This is the production function BOTH `dispatch_judge` (sub-workflow) and
+// `dispatch_inline_judge` (expression) build their output with, so these
+// tests cover the sub-workflow judge's envelope without a DB or registry.
+// Before the unification they were separate copies, and every one of the
+// sub-workflow judge's three branches dropped the abstention marker — a
+// sub-workflow judge simply could not abstain.
+
+/// PARITY: the sub-workflow judge emits the abstention key on all three
+/// branches, exactly as the inline judge does, and `extract_judge_score`
+/// reads it back.
+#[test]
+fn judge_envelope_propagates_not_applicable_on_every_branch() {
+    let parent = || serde_json::json!({ "answer": "x" });
+    for (label, passed, on_failure) in [
+        ("Judge", true, "error"),
+        ("Judge", false, "passthrough"),
+        ("Judge", false, "error"),
+        ("InlineJudge", true, "error"),
+        ("InlineJudge", false, "passthrough"),
+        ("InlineJudge", false, "error"),
+    ] {
+        let out = build_judge_envelope(label, parent(), 0.2, passed, "quiet", "", true, on_failure);
+        assert_eq!(
+            out.get(talos_workflow_engine_core::reserved_keys::JUDGE_NOT_APPLICABLE)
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "{label}/passed={passed}/on_failure={on_failure} dropped the abstention marker"
+        );
+        let (_, _, na) = extract_judge_score(&out).expect("judge envelope");
+        assert!(na, "{label}/passed={passed}/on_failure={on_failure}");
+    }
+}
+
+/// The key is ABSENT (not `false`) when the judge did not abstain, on every
+/// branch — a rejected verdict must keep counting against the trend.
+#[test]
+fn judge_envelope_omits_not_applicable_when_not_abstaining() {
+    for (passed, on_failure) in [(true, "error"), (false, "passthrough"), (false, "error")] {
+        let out = build_judge_envelope(
+            "Judge",
+            serde_json::json!({}),
+            0.2,
+            passed,
+            "r",
+            "f",
+            false,
+            on_failure,
+        );
+        assert!(
+            out.get(talos_workflow_engine_core::reserved_keys::JUDGE_NOT_APPLICABLE)
+                .is_none(),
+            "passed={passed}/on_failure={on_failure}"
+        );
+        assert_eq!(extract_judge_score(&out), Some((0.2, passed, false)));
+    }
+}
+
+/// D2: abstention changes RECORDING, never ROUTING. `passed` alone selects
+/// the branch — an abstaining verdict with `passed: false` still errors (or
+/// passes through), and one with `passed: true` still passes.
+#[test]
+fn judge_envelope_routing_is_unaffected_by_not_applicable() {
+    for na in [false, true] {
+        // passed: false + default on_failure → error envelope, regardless.
+        let err = build_judge_envelope(
+            "Judge",
+            serde_json::json!({}),
+            0.2,
+            false,
+            "r",
+            "f",
+            na,
+            "error",
+        );
+        assert_eq!(err.get("__error").and_then(|v| v.as_bool()), Some(true));
+
+        // passed: false + passthrough → rejected envelope, regardless.
+        let pt = build_judge_envelope(
+            "Judge",
+            serde_json::json!({}),
+            0.2,
+            false,
+            "r",
+            "f",
+            na,
+            "passthrough",
+        );
+        assert_eq!(pt.get("__error"), None);
+        assert_eq!(
+            pt.get("__judge_rejected__").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+
+        // passed: true → pass envelope carrying the parent output, regardless.
+        let ok = build_judge_envelope(
+            "Judge",
+            serde_json::json!({ "answer": "x" }),
+            1.0,
+            true,
+            "r",
+            "f",
+            na,
+            "error",
+        );
+        assert_eq!(ok.get("__error"), None);
+        assert_eq!(ok.get("__judge_rejected__"), None);
+        assert_eq!(ok.get("answer").and_then(|v| v.as_str()), Some("x"));
+    }
+}
+
+/// The operator-facing error text still names which judge kind rejected —
+/// the one thing the two paths legitimately differ on.
+#[test]
+fn judge_envelope_error_message_keeps_its_label() {
+    let j = build_judge_envelope(
+        "Judge",
+        serde_json::json!({}),
+        0.25,
+        false,
+        "weak",
+        "",
+        false,
+        "error",
+    );
+    assert_eq!(
+        j.get("error_message").and_then(|v| v.as_str()),
+        Some("Judge rejected output: weak (score: 0.25)")
+    );
+    let i = build_judge_envelope(
+        "InlineJudge",
+        serde_json::json!({}),
+        0.25,
+        false,
+        "weak",
+        "",
+        false,
+        "error",
+    );
+    assert_eq!(
+        i.get("error_message").and_then(|v| v.as_str()),
+        Some("InlineJudge rejected output: weak (score: 0.25)")
+    );
+}
+
+// ── The parent output must not be able to AUTHOR the verdict ───────────
+//
+// The pass / passthrough branches build the envelope on top of the parent
+// node's output map, which is caller data — an upstream WASM module's JSON,
+// a trigger payload, or (the non-adversarial case) the envelope of an
+// EARLIER judge in a chain. Any judge-owned key that is only conditionally
+// inserted is therefore INHERITED whenever its condition is false.
+
+/// FORGERY: an upstream node emitting `__judge_not_applicable__: true` must
+/// not turn a real, non-abstaining verdict into an abstention. That would
+/// suppress a genuine failure datapoint from the quality trend — the same
+/// defect as counting an abstention, pointed the other way.
+#[test]
+fn parent_output_cannot_forge_an_abstention() {
+    let forged = serde_json::json!({
+        "answer": "x",
+        "__judge_not_applicable__": true,
+    });
+    // The judge did NOT abstain (`not_applicable: false`) on every branch
+    // that inherits the parent map.
+    for (passed, on_failure) in [(true, "error"), (false, "passthrough")] {
+        let out = build_judge_envelope(
+            "Judge",
+            forged.clone(),
+            0.2,
+            passed,
+            "real verdict",
+            "",
+            false,
+            on_failure,
+        );
+        assert!(
+            out.get(talos_workflow_engine_core::reserved_keys::JUDGE_NOT_APPLICABLE)
+                .is_none(),
+            "parent-supplied abstention marker survived (passed={passed}, \
+             on_failure={on_failure}) — an upstream node can erase this \
+             judge's datapoint from the quality trend"
+        );
+        assert_eq!(
+            extract_judge_score(&out),
+            Some((0.2, passed, false)),
+            "the recorder must see the JUDGE's verdict, not the parent's claim"
+        );
+    }
+}
+
+/// The same map, when the judge GENUINELY abstains, still yields an
+/// abstention — the strip removes inherited authority, not the real flag.
+#[test]
+fn genuine_abstention_survives_the_parent_strip() {
+    let parent = serde_json::json!({
+        "answer": "x",
+        "__judge_not_applicable__": true,
+    });
+    let out = build_judge_envelope("Judge", parent, 1.0, true, "quiet inbox", "", true, "error");
+    assert_eq!(extract_judge_score(&out), Some((1.0, true, true)));
+}
+
+/// FORGERY, routing edition: a parent-supplied `__judge_rejected__` must not
+/// mark a PASSING verdict as rejected — every downstream edge that
+/// conditional-routes on that key would misroute.
+#[test]
+fn parent_output_cannot_forge_a_rejection() {
+    let forged = serde_json::json!({ "answer": "x", "__judge_rejected__": true });
+    let out = build_judge_envelope("Judge", forged, 0.95, true, "good", "", false, "error");
+    assert_eq!(
+        out.get("__judge_rejected__"),
+        None,
+        "a parent-supplied rejection marker survived a PASSING verdict"
+    );
+    assert_eq!(
+        out.get("__judge_passed__").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+}
+
+/// The chained-judge case, which is why this is not merely an adversarial
+/// concern: judge A abstains under `passthrough`, judge B reads A's envelope
+/// as its parent input and does NOT abstain. B's verdict must be recorded as
+/// B authored it.
+#[test]
+fn chained_judge_does_not_inherit_the_upstream_abstention() {
+    let a = build_judge_envelope(
+        "Judge",
+        serde_json::json!({ "answer": "x" }),
+        0.1,
+        false,
+        "nothing to judge",
+        "",
+        true,
+        "passthrough",
+    );
+    assert_eq!(extract_judge_score(&a), Some((0.1, false, true)));
+
+    let b = build_judge_envelope(
+        "Judge",
+        a,
+        0.35,
+        false,
+        "weak answer",
+        "",
+        false,
+        "passthrough",
+    );
+    assert_eq!(
+        extract_judge_score(&b),
+        Some((0.35, false, false)),
+        "judge B's real 0.35 failure must not be recorded as an abstention \
+         merely because judge A abstained upstream"
+    );
+}
+
 // ── extract_judge_score (observe-only judge verdict recording) ──────────
 
 #[test]
@@ -1176,7 +1722,7 @@ fn extract_judge_score_reads_score_and_passed() {
         "__judge_reasoning__": "looks good",
         "content": "…",
     });
-    assert_eq!(extract_judge_score(&out), Some((0.82, true)));
+    assert_eq!(extract_judge_score(&out), Some((0.82, true, false)));
 }
 
 #[test]
@@ -1184,27 +1730,32 @@ fn extract_judge_score_defaults_passed_false_when_absent() {
     // A rejected verdict envelope carries the score but the recorder must
     // still capture it; missing `__judge_passed__` reads as false.
     let out = serde_json::json!({ "__judge_score__": 0.10 });
-    assert_eq!(extract_judge_score(&out), Some((0.10, false)));
+    assert_eq!(extract_judge_score(&out), Some((0.10, false, false)));
 }
 
-/// A verdict that declared itself NOT APPLICABLE must contribute NO datapoint.
-/// Recording it as a pass is the mirror of the bug it replaced: scoring a run
-/// with nothing to judge as 1.0 stopped the false failures but inflated the
-/// average and saturated the signal (pa-inbox-organizer-work read 1.0 across 17
-/// runs, almost all empty inboxes).
+/// A verdict that declared itself NOT APPLICABLE must contribute no SCORED
+/// datapoint. Recording it as a pass is the mirror of the bug it replaced:
+/// scoring a run with nothing to judge as 1.0 stopped the false failures but
+/// inflated the average and saturated the signal (pa-inbox-organizer-work read
+/// 1.0 across 17 runs, almost all empty inboxes).
+///
+/// It is FLAGGED rather than dropped: the row is still written so the
+/// abstention RATE survives ("ran 17×, abstained 12×" must not look like "ran
+/// 5×"), and the exclusion happens structurally in the aggregates.
 #[test]
-fn extract_judge_score_skips_not_applicable_runs() {
+fn extract_judge_score_flags_not_applicable_runs() {
     let out = serde_json::json!({
         "__judge_score__": 1.0,
         "__judge_passed__": true,
         "__judge_not_applicable__": true,
         "__judge_reasoning__": "no messages to classify",
     });
-    assert_eq!(extract_judge_score(&out), None);
+    assert_eq!(extract_judge_score(&out), Some((1.0, true, true)));
 }
 
-/// The marker only suppresses when it is genuinely true — `false` or a
-/// non-boolean must not silently drop a real quality datapoint.
+/// The marker only abstains when it is genuinely true — `false` or a
+/// non-boolean must not silently convert a real quality datapoint into an
+/// abstention.
 #[test]
 fn extract_judge_score_records_when_not_applicable_is_false_or_malformed() {
     let explicit_false = serde_json::json!({
@@ -1212,13 +1763,16 @@ fn extract_judge_score_records_when_not_applicable_is_false_or_malformed() {
         "__judge_passed__": false,
         "__judge_not_applicable__": false,
     });
-    assert_eq!(extract_judge_score(&explicit_false), Some((0.4, false)));
+    assert_eq!(
+        extract_judge_score(&explicit_false),
+        Some((0.4, false, false))
+    );
     let malformed = serde_json::json!({
         "__judge_score__": 0.4,
         "__judge_passed__": true,
         "__judge_not_applicable__": "yes",
     });
-    assert_eq!(extract_judge_score(&malformed), Some((0.4, true)));
+    assert_eq!(extract_judge_score(&malformed), Some((0.4, true, false)));
 }
 
 #[test]
@@ -1239,7 +1793,143 @@ fn extract_judge_score_ignores_reasoning_text() {
         "__judge_passed__": false,
         "__judge_feedback__": "email said SECRET stuff",
     });
-    let (score, passed) = extract_judge_score(&out).expect("has score");
+    let (score, passed, not_applicable) = extract_judge_score(&out).expect("has score");
     assert_eq!(score, 0.5);
     assert!(!passed);
+    assert!(!not_applicable);
+}
+
+// ── quality_gate telemetry carries the abstention ───────────────────────
+//
+// The `target: "talos_workflow_engine"` quality-gate event is what operators
+// build judge pass-rate dashboards on. An abstention must be VISIBLE there
+// too — #590 removed the inflated pass signal from SQL, but the tracing
+// stream kept emitting an abstaining run as an ordinary pass. The event is
+// still emitted (the run DID occur); it just must not read as a pass signal.
+
+#[cfg(feature = "llm-primitives")]
+mod quality_gate_events {
+    use super::*;
+    use std::sync::{Arc as StdArc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+    use tracing_subscriber::Registry;
+
+    /// One captured quality-gate event, reduced to the fields under test.
+    #[derive(Debug, Default, Clone)]
+    struct Captured {
+        gate: Option<String>,
+        passed: Option<bool>,
+        not_applicable: Option<bool>,
+        score: Option<f64>,
+    }
+
+    impl Visit for Captured {
+        fn record_bool(&mut self, f: &Field, v: bool) {
+            match f.name() {
+                "passed" => self.passed = Some(v),
+                "not_applicable" => self.not_applicable = Some(v),
+                _ => {}
+            }
+        }
+        fn record_f64(&mut self, f: &Field, v: f64) {
+            if f.name() == "score" {
+                self.score = Some(v);
+            }
+        }
+        fn record_str(&mut self, f: &Field, v: &str) {
+            if f.name() == "gate" {
+                self.gate = Some(v.to_string());
+            }
+        }
+        fn record_debug(&mut self, _f: &Field, _v: &dyn std::fmt::Debug) {}
+    }
+
+    #[derive(Clone, Default)]
+    struct CaptureLayer(StdArc<Mutex<Vec<Captured>>>);
+
+    impl<S: tracing::Subscriber> Layer<S> for CaptureLayer {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            if event.metadata().target() != "talos_workflow_engine" {
+                return;
+            }
+            let mut c = Captured::default();
+            event.record(&mut c);
+            // Only quality-gate events name a `gate`.
+            if c.gate.is_some() {
+                self.0.lock().unwrap().push(c);
+            }
+        }
+    }
+
+    /// Run `f` with a capturing subscriber installed on this thread and
+    /// return the quality-gate events it emitted.
+    fn capture(f: impl FnOnce()) -> Vec<Captured> {
+        let sink = StdArc::new(Mutex::new(Vec::new()));
+        let subscriber = Registry::default().with(CaptureLayer(sink.clone()));
+        tracing::subscriber::with_default(subscriber, f);
+        let events = sink.lock().unwrap().clone();
+        events
+    }
+
+    fn engine_returning(verdict: serde_json::Value) -> ParallelWorkflowEngine {
+        use talos_workflow_engine_test_utils::noop::StubExpressionEvaluator;
+        let mut engine = ParallelWorkflowEngine::new();
+        engine
+            .set_expression_evaluator(Arc::new(StubExpressionEvaluator::new().with_json(verdict)));
+        engine
+    }
+
+    #[test]
+    fn abstaining_verdict_is_flagged_in_the_quality_gate_event() {
+        let engine = engine_returning(serde_json::json!({
+            "score": 1.0, "passed": true, "not_applicable": true,
+            "reasoning": "quiet inbox", "feedback": "",
+        }));
+        let events = capture(|| {
+            engine.dispatch_inline_judge(serde_json::json!({}), "v()", None, "error");
+        });
+        assert_eq!(events.len(), 1, "one quality-gate event per judge run");
+        let e = &events[0];
+        assert_eq!(e.gate.as_deref(), Some("inline_judge"));
+        assert_eq!(
+            e.not_applicable,
+            Some(true),
+            "an observer computing a pass rate off this stream must be able to \
+             see that this run abstained"
+        );
+        // The event is still EMITTED — the run occurred.
+        assert_eq!(e.passed, Some(true));
+        assert_eq!(e.score, Some(1.0));
+    }
+
+    /// The field is present-and-false for an ordinary run, so consumers can
+    /// filter on it unconditionally rather than treating absence as false.
+    #[test]
+    fn ordinary_verdict_reports_not_applicable_false() {
+        let engine = engine_returning(serde_json::json!({
+            "score": 0.4, "passed": false, "reasoning": "weak", "feedback": "",
+        }));
+        let events = capture(|| {
+            engine.dispatch_inline_judge(serde_json::json!({}), "v()", None, "error");
+        });
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].not_applicable, Some(false));
+        assert_eq!(events[0].passed, Some(false));
+    }
+
+    /// The abstention flag travels independently of `passed` — the leak case
+    /// (abstained AND failed) must show BOTH, not one masking the other.
+    #[test]
+    fn abstaining_and_failing_reports_both() {
+        let engine = engine_returning(serde_json::json!({
+            "score": 0.2, "passed": false, "not_applicable": true,
+            "reasoning": "nothing to classify", "feedback": "",
+        }));
+        let events = capture(|| {
+            engine.dispatch_inline_judge(serde_json::json!({}), "v()", None, "error");
+        });
+        assert_eq!(events[0].passed, Some(false));
+        assert_eq!(events[0].not_applicable, Some(true));
+    }
 }

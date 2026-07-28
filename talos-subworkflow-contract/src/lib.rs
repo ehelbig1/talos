@@ -134,6 +134,13 @@ impl ContractTestOutcome {
                 "passed": v.passed,
                 "reasoning": v.reasoning,
                 "feedback": v.feedback,
+                // Surfaced so an author writing an abstaining judge can SEE
+                // the field round-trip through the engine's parser. A judge
+                // that meant to abstain but mistyped the field (e.g. the
+                // string "true") reads back `false` here — and shows up in
+                // `malformed_fields` — instead of silently scoring every
+                // empty run for weeks.
+                "not_applicable": v.not_applicable,
                 "malformed_fields": v.malformed_field_count,
             });
         }
@@ -379,6 +386,64 @@ mod tests {
         let v = out.judge_verdict.unwrap();
         assert_eq!(v.malformed_field_count, 0);
         assert!((v.score - 0.9).abs() < 1e-9);
+    }
+
+    /// An author writing an abstaining judge must be able to SEE the field
+    /// round-trip through the engine's parser — the tool is where they find
+    /// out whether `not_applicable` reached the engine at all.
+    #[test]
+    fn interpret_judge_surfaces_not_applicable() {
+        let collapsed = json!({
+            "score": 1.0, "passed": true, "reasoning": "empty inbox", "feedback": "",
+            "not_applicable": true,
+        });
+        let out = interpret(&collapsed, ContractKind::Judge, wf());
+        assert!(out.passed, "an abstaining verdict is still well-shaped");
+        assert!(out.judge_verdict.as_ref().unwrap().not_applicable);
+        let body = out.to_tool_body();
+        assert_eq!(
+            body["judge_verdict"]["not_applicable"].as_bool(),
+            Some(true)
+        );
+    }
+
+    /// A judge that never mentions the field reports `false` — and the tool
+    /// body still carries the key, so its absence in an author's verdict is
+    /// visible rather than ambiguous.
+    #[test]
+    fn interpret_judge_not_applicable_defaults_false_in_tool_body() {
+        let collapsed = json!({
+            "score": 0.9, "passed": true, "reasoning": "ok", "feedback": "good",
+        });
+        let body = interpret(&collapsed, ContractKind::Judge, wf()).to_tool_body();
+        assert_eq!(
+            body["judge_verdict"]["not_applicable"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(body["judge_verdict"]["malformed_fields"].as_u64(), Some(0));
+    }
+
+    /// A MISTYPED abstention is the failure mode worth catching here: the
+    /// author meant to abstain, the engine reads `false`, and without this
+    /// surface they would only discover it weeks later via a saturated
+    /// trend. It must read false AND be reported malformed.
+    #[test]
+    fn interpret_judge_mistyped_not_applicable_is_visible() {
+        let collapsed = json!({
+            "score": 1.0, "passed": true, "reasoning": "empty", "feedback": "",
+            "not_applicable": "true",
+        });
+        let out = interpret(&collapsed, ContractKind::Judge, wf());
+        assert!(
+            !out.passed,
+            "a mistyped verdict field must fail the contract"
+        );
+        let body = out.to_tool_body();
+        assert_eq!(
+            body["judge_verdict"]["not_applicable"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(body["judge_verdict"]["malformed_fields"].as_u64(), Some(1));
     }
 
     #[test]

@@ -21,6 +21,7 @@ use futures::stream::StreamExt;
 use petgraph::graph::NodeIndex;
 use petgraph::Direction;
 use serde_json::Value as JsonValue;
+use talos_workflow_engine_core::reserved_keys;
 use uuid::Uuid;
 
 use crate::engine::{ParallelWorkflowEngine, MAX_CONCURRENT_NODE_DISPATCH};
@@ -142,8 +143,19 @@ pub struct JudgeVerdict {
     /// Suggested correction or improvement that downstream nodes
     /// (e.g. `ReflectiveRetry`) can feed back into the next attempt.
     pub feedback: String,
+    /// The judge declared this run had NOTHING TO JUDGE (a quiet inbox, an
+    /// empty batch). OPTIONAL fifth field — absent means `false`, which is
+    /// why it does NOT count toward `malformed_field_count` when missing.
+    ///
+    /// Semantics: an N/A verdict contributes no scored datapoint to the
+    /// quality trend (it is recorded as an abstention row instead — see
+    /// [`extract_judge_score`]). Routing is UNCHANGED: `passed` still
+    /// drives gates exactly as authored.
+    pub not_applicable: bool,
     /// Number of expected fields that were missing or wrong-typed in the
-    /// sub-workflow output (0..=4). Non-zero indicates a malformed judge workflow.
+    /// sub-workflow output (0..=5). Non-zero indicates a malformed judge
+    /// workflow. The four required fields count when missing OR mistyped;
+    /// the optional `not_applicable` counts only when PRESENT-but-not-bool.
     pub malformed_field_count: u8,
 }
 
@@ -182,11 +194,28 @@ impl JudgeVerdict {
                 String::new()
             }
         };
+        // OPTIONAL fifth field. Absent → `false` (the overwhelmingly common
+        // case: a judge that always has something to judge). Present but
+        // NOT a bool → `false` AND malformed++, because a caller who wrote
+        // the key clearly meant to say something and got the type wrong;
+        // silently reading `"true"` as an abstention would let a typo erase
+        // real datapoints from the trend.
+        let not_applicable = match verdict.get("not_applicable") {
+            None => false,
+            Some(v) => match v.as_bool() {
+                Some(b) => b,
+                None => {
+                    malformed += 1;
+                    false
+                }
+            },
+        };
         if malformed > 0 {
             tracing::warn!(
                 malformed_fields = malformed,
                 "Judge sub-workflow returned malformed verdict — missing or wrong-typed fields. \
-                 Expected {{score: f64, passed: bool, reasoning: string, feedback: string}}."
+                 Expected {{score: f64, passed: bool, reasoning: string, feedback: string}} \
+                 plus the optional {{not_applicable: bool}}."
             );
         }
         Self {
@@ -194,39 +223,208 @@ impl JudgeVerdict {
             passed,
             reasoning,
             feedback,
+            not_applicable,
             malformed_field_count: malformed,
         }
     }
 }
 
-/// Pull the observe-only `(score, passed)` pair out of a judge node's
-/// enriched output envelope, for the `JudgeScoreRecorder` hook. Returns
-/// `None` when the output carries no `__judge_score__` (not a judge
-/// verdict) — the score is the gate, `__judge_passed__` defaults to
-/// `false` when absent. Kept pure (no engine state) so it is unit-tested
-/// without a runtime. DLP: intentionally reads only the score + pass
-/// boolean, never the reasoning/feedback text.
-pub(crate) fn extract_judge_score(output: &JsonValue) -> Option<(f64, bool)> {
-    // A verdict that declared itself NOT APPLICABLE contributes no datapoint.
-    // Recording it as a pass is the mirror of the bug it replaced: scoring a
-    // run with nothing to judge as 1.0 stopped the false failures but inflated
-    // the average and saturated the signal — `pa-inbox-organizer-work` read
-    // 1.0 across 17 runs purely because most were empty inboxes. "Nothing to
-    // measure" is not evidence of quality, exactly as it is not evidence of
-    // failure; the honest record is no row at all.
-    if output
-        .get("__judge_not_applicable__")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
+/// Score one `best_of_n` ensemble candidate from its judge's collapsed
+/// output. `None` means "this candidate is not eligible to win".
+///
+/// An ABSTAINING judge produced no opinion about this candidate, so its
+/// score is not a comparable quality measure — letting it compete would
+/// crown a candidate on a number that means "nothing to judge". An
+/// abstention is therefore treated exactly like a judge dispatch failure:
+/// skipped. When EVERY candidate abstains the field is empty and selection
+/// falls through to the same first-candidate fallback as all-failed.
+pub(crate) fn ensemble_candidate_score(collapsed: &JsonValue) -> Option<f64> {
+    let verdict = JudgeVerdict::from_collapsed(collapsed);
+    if verdict.not_applicable {
         return None;
     }
+    Some(verdict.score)
+}
+
+/// Pick the highest-scoring `best_of_n` candidate. `scores[i]` is the judge's
+/// verdict on `candidates[i]`, or `None` where the candidate is ineligible
+/// (judge errored, or judge abstained — see [`ensemble_candidate_score`]).
+///
+/// Strict `>` keeps the FIRST candidate that attains the maximum on a tie,
+/// which is what makes selection deterministic under `buffered`'s
+/// order-preserving concurrency. Returns `(None, f64::NEG_INFINITY)` when no
+/// candidate was eligible; the caller reads the sentinel to distinguish
+/// "a winner was chosen" from "fell back".
+pub(crate) fn pick_best_candidate(
+    candidates: &[JsonValue],
+    scores: &[Option<f64>],
+) -> (Option<JsonValue>, f64) {
+    let mut best_result: Option<JsonValue> = None;
+    let mut best_score = f64::NEG_INFINITY;
+    for (candidate, score) in candidates.iter().zip(scores.iter()) {
+        if let Some(score) = score {
+            if *score > best_score {
+                best_score = *score;
+                best_result = Some(candidate.clone());
+            }
+        }
+    }
+    (best_result, best_score)
+}
+
+/// Build the output envelope a judge node forwards downstream — the SINGLE
+/// implementation shared by [`ParallelWorkflowEngine::dispatch_judge`] (the
+/// sub-workflow judge) and
+/// [`ParallelWorkflowEngine::dispatch_inline_judge`] (the expression judge).
+///
+/// The two paths previously carried byte-for-byte duplicate three-branch
+/// envelope builders, and that duplication is precisely how the abstention
+/// leak survived: the marker was added to the inline judge's pass and
+/// passthrough branches, missed on its `on_failure: "error"` branch, and was
+/// absent from all three of the sub-workflow judge's branches. A judge that
+/// abstained therefore recorded as a low-score quality FAILURE on the default
+/// failure mode. One implementation means the next verdict field cannot be
+/// wired to two branches out of six.
+///
+/// `label` distinguishes only the operator-facing error text ("Judge" vs
+/// "`InlineJudge`"); every key and every rule below is identical by
+/// construction.
+///
+/// Branches:
+/// - `passed` → parent output + `__judge_score__`/`__judge_passed__: true`
+/// - `!passed && on_failure == "passthrough"` → parent output + the same,
+///   with `__judge_passed__: false` and `__judge_rejected__: true`, so
+///   downstream edges can conditional-route without tripping the error path
+/// - otherwise (`on_failure: "error"`, the default) → an `__error` envelope
+///
+/// **`not_applicable` is stamped on ALL THREE branches** when set, and
+/// **changes no routing** — `passed` alone selects the branch (design
+/// decision D2). An abstention must not silently invert an author's
+/// `passed: false`; it only tells the recorder that this run contributed no
+/// scored datapoint.
+///
+/// # Every judge-owned key is written UNCONDITIONALLY
+///
+/// The pass / passthrough branches build their output *on top of the parent
+/// node's output map*, which is caller data: an upstream WASM module's JSON,
+/// a trigger payload, or — the non-adversarial case — the envelope of an
+/// EARLIER judge in a chain. So a `__judge_*` key that is only *conditionally*
+/// inserted is inherited from the parent whenever the condition is false, and
+/// the parent gets to author this judge's verdict metadata:
+///
+/// - `__judge_not_applicable__` would let any upstream node emit
+///   `{"__judge_not_applicable__": true}` and have the downstream judge's
+///   REAL verdict silently recorded as an abstention — suppressing a genuine
+///   failure datapoint from the quality trend, which is precisely the
+///   inflation this change exists to prevent, pointed the other way.
+/// - `__judge_rejected__` would let a parent (or a rejecting upstream judge)
+///   mark a PASSING verdict as rejected, misrouting every downstream edge
+///   that conditional-routes on it.
+///
+/// `__judge_score__` / `__judge_passed__` / `__judge_reasoning__` /
+/// `__judge_feedback__` were never exposed because they are always inserted.
+/// The two conditional keys are therefore explicitly REMOVED when they do not
+/// apply, so the envelope's judge metadata is a total function of THIS
+/// verdict. Removal (rather than writing `false`) keeps the emitted shape
+/// byte-identical to the pre-change envelope for every honest producer.
+///
+/// This is the judge-envelope analogue of the reserved-key strip
+/// `inject_actor_context_into_input` performs on inbound trigger payloads:
+/// engine-authored keys must never be caller-authorable.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_judge_envelope(
+    label: &str,
+    parent_inputs: JsonValue,
+    score: f64,
+    passed: bool,
+    reasoning: &str,
+    feedback: &str,
+    not_applicable: bool,
+    on_failure: &str,
+) -> JsonValue {
+    if passed || on_failure == "passthrough" {
+        let mut out = match parent_inputs {
+            JsonValue::Object(obj) => obj,
+            _ => serde_json::Map::new(),
+        };
+        out.insert("__judge_score__".to_string(), serde_json::json!(score));
+        out.insert("__judge_passed__".to_string(), serde_json::json!(passed));
+        // Insert-OR-REMOVE, never insert-or-inherit: `out` started life as the
+        // PARENT's output map, so leaving either key untouched hands its
+        // authorship to caller data. See the doc comment above.
+        if !passed {
+            out.insert("__judge_rejected__".to_string(), serde_json::json!(true));
+        } else {
+            out.remove("__judge_rejected__");
+        }
+        if not_applicable {
+            out.insert(
+                reserved_keys::JUDGE_NOT_APPLICABLE.to_string(),
+                serde_json::json!(true),
+            );
+        } else {
+            out.remove(reserved_keys::JUDGE_NOT_APPLICABLE);
+        }
+        out.insert(
+            "__judge_reasoning__".to_string(),
+            serde_json::json!(reasoning),
+        );
+        out.insert(
+            "__judge_feedback__".to_string(),
+            serde_json::json!(feedback),
+        );
+        return JsonValue::Object(out);
+    }
+    let mut out = serde_json::json!({
+        "__error": true,
+        "error_message": format!("{label} rejected output: {reasoning} (score: {score:.2})"),
+        "__judge_score__": score,
+        "__judge_passed__": false,
+        "__judge_feedback__": feedback,
+    });
+    if not_applicable {
+        out[reserved_keys::JUDGE_NOT_APPLICABLE] = serde_json::json!(true);
+    }
+    out
+}
+
+/// Pull the observe-only `(score, passed, not_applicable)` triple out of a
+/// judge node's enriched output envelope, for the `JudgeScoreRecorder` hook.
+/// Returns `None` when the output carries no `__judge_score__` (not a judge
+/// verdict) — the score is the gate, `__judge_passed__` defaults to
+/// `false` when absent. Kept pure (no engine state) so it is unit-tested
+/// without a runtime. DLP: intentionally reads only the score + the two
+/// booleans, never the reasoning/feedback text.
+///
+/// The envelope this reads is always produced by [`build_judge_envelope`],
+/// which writes every judge-owned key unconditionally — so the flag read here
+/// is THIS judge's verdict and never a value inherited from the parent output
+/// the envelope was built on top of.
+///
+/// A verdict that declared itself NOT APPLICABLE contributes no SCORED
+/// datapoint. Recording it as a pass is the mirror of the bug it replaced:
+/// scoring a run with nothing to judge as 1.0 stopped the false failures but
+/// inflated the average and saturated the signal — `pa-inbox-organizer-work`
+/// read 1.0 across 17 runs purely because most were empty inboxes. "Nothing
+/// to measure" is not evidence of quality, exactly as it is not evidence of
+/// failure.
+///
+/// It is still returned (flagged) rather than dropped: writing the row with
+/// `not_applicable = true` makes the exclusion STRUCTURAL at the DB layer
+/// (`FILTER (WHERE NOT not_applicable)`) *and* recovers the abstention rate,
+/// so "judge ran 17×, 12 abstained" stops being indistinguishable from
+/// "judge ran 5×".
+pub(crate) fn extract_judge_score(output: &JsonValue) -> Option<(f64, bool, bool)> {
     let score = output.get("__judge_score__").and_then(|v| v.as_f64())?;
     let passed = output
         .get("__judge_passed__")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    Some((score, passed))
+    let not_applicable = output
+        .get(reserved_keys::JUDGE_NOT_APPLICABLE)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Some((score, passed, not_applicable))
 }
 
 impl ParallelWorkflowEngine {
@@ -380,9 +578,7 @@ impl ParallelWorkflowEngine {
                                 )
                                 .await
                             {
-                                Ok(collapsed) => {
-                                    Some(JudgeVerdict::from_collapsed(&collapsed).score)
-                                }
+                                Ok(collapsed) => ensemble_candidate_score(&collapsed),
                                 // Judge dispatch failed — preserve the old loop's
                                 // behavior of skipping this candidate from scoring.
                                 Err(_) => None,
@@ -395,18 +591,8 @@ impl ParallelWorkflowEngine {
                     .collect()
                     .await;
 
-                let mut best_result: Option<JsonValue> = None;
-                let mut best_score = f64::NEG_INFINITY;
-                for (candidate, score) in scored_candidates.iter().zip(judge_scores.iter()) {
-                    if let Some(score) = score {
-                        if *score > best_score {
-                            best_score = *score;
-                            // `candidate: &JsonValue` (iter over owned
-                            // Vec<JsonValue>); clone the owned candidate value.
-                            best_result = Some(candidate.clone());
-                        }
-                    }
-                }
+                let (best_result, best_score) =
+                    pick_best_candidate(&scored_candidates, &judge_scores);
                 let chosen = best_result.unwrap_or_else(|| {
                     all_results.first().cloned().unwrap_or_else(|| {
                         serde_json::json!({
@@ -425,6 +611,12 @@ impl ParallelWorkflowEngine {
                     },
                     Some(run_count),
                     None,
+                    // The ensemble gate itself never abstains: an all-N/A
+                    // (or all-failed) field collapses to the first-candidate
+                    // fallback, which is a real selection outcome, not an
+                    // abstention. Per-candidate abstentions are already
+                    // reflected by `best_score` staying at NEG_INFINITY.
+                    false,
                 );
                 chosen
             }
@@ -713,7 +905,14 @@ impl ParallelWorkflowEngine {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false)
             {
-                Self::emit_quality_gate_event("reflective_retry", true, None, Some(attempt), None);
+                Self::emit_quality_gate_event(
+                    "reflective_retry",
+                    true,
+                    None,
+                    Some(attempt),
+                    None,
+                    false,
+                );
                 let mut out = if let Some(obj) = child_out.as_object() {
                     obj.clone()
                 } else {
@@ -772,6 +971,7 @@ impl ParallelWorkflowEngine {
             None,
             Some(max_retries),
             Some("exhausted"),
+            false,
         );
         serde_json::json!({
             "__error": true,
@@ -821,12 +1021,18 @@ impl ParallelWorkflowEngine {
     /// Structured telemetry for judge / reflective-retry / ensemble so operators
     /// can answer "what's our judge pass rate?" and "how often does reflection
     /// rescue a failing child?" without plumbing custom metrics per-workflow.
+    ///
+    /// `not_applicable` is explicit in the event (not merely omitted) so an
+    /// observer computing a pass rate off this stream sees the abstention for
+    /// what it is. The event is still EMITTED for an N/A run — the run did
+    /// occur — it just must not be counted as a pass signal.
     fn emit_quality_gate_event(
         kind: &'static str,
         passed: bool,
         score: Option<f64>,
         attempts: Option<u32>,
         extra: Option<&str>,
+        not_applicable: bool,
     ) {
         tracing::info!(
             target: "talos_workflow_engine",
@@ -836,13 +1042,14 @@ impl ParallelWorkflowEngine {
             score = score,
             attempts = attempts,
             extra = extra,
+            not_applicable = not_applicable,
             "quality gate completed"
         );
     }
 
     /// Best-effort record of an observe-only judge verdict for the weekly
-    /// `assistant_report` node. Extracts `(score, passed)` from the judge
-    /// node's enriched output and hands it to the injected
+    /// `assistant_report` node. Extracts `(score, passed, not_applicable)`
+    /// from the judge node's enriched output and hands it to the injected
     /// [`JudgeScoreRecorder`](talos_workflow_engine_core::JudgeScoreRecorder)
     /// off the hot path via `tokio::spawn`. No recorder wired, no workflow
     /// id, or no `__judge_score__` in the output → silent no-op. The
@@ -855,13 +1062,20 @@ impl ParallelWorkflowEngine {
         let Some(workflow_id) = self.workflow_id else {
             return;
         };
-        let Some((score, passed)) = extract_judge_score(output) else {
+        let Some((score, passed, not_applicable)) = extract_judge_score(output) else {
             return;
         };
         let recorder = Arc::clone(recorder);
         tokio::spawn(async move {
             recorder
-                .record(workflow_id, node_id, execution_id, score, passed)
+                .record(
+                    workflow_id,
+                    node_id,
+                    execution_id,
+                    score,
+                    passed,
+                    not_applicable,
+                )
                 .await;
         });
     }
@@ -926,6 +1140,7 @@ impl ParallelWorkflowEngine {
                     passed: passed_raw,
                     reasoning,
                     feedback,
+                    not_applicable,
                     malformed_field_count,
                 } = verdict;
                 let passed = if let Some(threshold) = pass_threshold {
@@ -943,56 +1158,18 @@ impl ParallelWorkflowEngine {
                     } else {
                         None
                     },
+                    not_applicable,
                 );
-                if passed {
-                    let mut out = if let Some(obj) = parent_inputs.as_object() {
-                        obj.clone()
-                    } else {
-                        serde_json::Map::new()
-                    };
-                    out.insert("__judge_score__".to_string(), serde_json::json!(score));
-                    out.insert("__judge_passed__".to_string(), serde_json::json!(true));
-                    out.insert(
-                        "__judge_reasoning__".to_string(),
-                        serde_json::json!(reasoning),
-                    );
-                    out.insert(
-                        "__judge_feedback__".to_string(),
-                        serde_json::json!(feedback),
-                    );
-                    serde_json::Value::Object(out)
-                } else if on_failure == "passthrough" {
-                    // Forward the parent output enriched with the rejection
-                    // envelope. Downstream edges can conditional-route on
-                    // `__judge_passed__ == false` without tripping the error
-                    // path — same semantics as `verify` with
-                    // `on_failure: passthrough`.
-                    let mut out = if let Some(obj) = parent_inputs.as_object() {
-                        obj.clone()
-                    } else {
-                        serde_json::Map::new()
-                    };
-                    out.insert("__judge_score__".to_string(), serde_json::json!(score));
-                    out.insert("__judge_passed__".to_string(), serde_json::json!(false));
-                    out.insert("__judge_rejected__".to_string(), serde_json::json!(true));
-                    out.insert(
-                        "__judge_reasoning__".to_string(),
-                        serde_json::json!(reasoning),
-                    );
-                    out.insert(
-                        "__judge_feedback__".to_string(),
-                        serde_json::json!(feedback),
-                    );
-                    serde_json::Value::Object(out)
-                } else {
-                    serde_json::json!({
-                        "__error": true,
-                        "error_message": format!("Judge rejected output: {} (score: {:.2})", reasoning, score),
-                        "__judge_score__": score,
-                        "__judge_passed__": false,
-                        "__judge_feedback__": feedback,
-                    })
-                }
+                build_judge_envelope(
+                    "Judge",
+                    parent_inputs,
+                    score,
+                    passed,
+                    &reasoning,
+                    &feedback,
+                    not_applicable,
+                    on_failure,
+                )
             }
             Err(e) => e.into_error_envelope("Judge"),
         }
@@ -1058,21 +1235,13 @@ impl ParallelWorkflowEngine {
                 });
             }
         };
-        // Optional 5th verdict field, read from the raw map because
-        // `JudgeVerdict` is a fixed four-field shape: a verdict may declare
-        // that this run had nothing to judge (a quiet inbox, an empty batch).
-        // Such a run is EXCLUDED from the quality trend rather than counted as
-        // a pass — see `extract_judge_score`.
-        let not_applicable = raw_verdict
-            .get("not_applicable")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
         let verdict = JudgeVerdict::from_collapsed(&raw_verdict);
         let JudgeVerdict {
             score,
             passed: passed_raw,
             reasoning,
             feedback,
+            not_applicable,
             malformed_field_count,
         } = verdict;
         let passed = if let Some(threshold) = pass_threshold {
@@ -1090,66 +1259,18 @@ impl ParallelWorkflowEngine {
             } else {
                 None
             },
+            not_applicable,
         );
-        if passed {
-            let mut out = if let Some(obj) = parent_inputs.as_object() {
-                obj.clone()
-            } else {
-                serde_json::Map::new()
-            };
-            out.insert("__judge_score__".to_string(), serde_json::json!(score));
-            out.insert("__judge_passed__".to_string(), serde_json::json!(true));
-            if not_applicable {
-                out.insert(
-                    "__judge_not_applicable__".to_string(),
-                    serde_json::json!(true),
-                );
-            }
-            out.insert(
-                "__judge_reasoning__".to_string(),
-                serde_json::json!(reasoning),
-            );
-            out.insert(
-                "__judge_feedback__".to_string(),
-                serde_json::json!(feedback),
-            );
-            serde_json::Value::Object(out)
-        } else if on_failure == "passthrough" {
-            let mut out = if let Some(obj) = parent_inputs.as_object() {
-                obj.clone()
-            } else {
-                serde_json::Map::new()
-            };
-            out.insert("__judge_score__".to_string(), serde_json::json!(score));
-            out.insert("__judge_passed__".to_string(), serde_json::json!(false));
-            out.insert("__judge_rejected__".to_string(), serde_json::json!(true));
-            if not_applicable {
-                out.insert(
-                    "__judge_not_applicable__".to_string(),
-                    serde_json::json!(true),
-                );
-            }
-            out.insert(
-                "__judge_reasoning__".to_string(),
-                serde_json::json!(reasoning),
-            );
-            out.insert(
-                "__judge_feedback__".to_string(),
-                serde_json::json!(feedback),
-            );
-            serde_json::Value::Object(out)
-        } else {
-            serde_json::json!({
-                "__error": true,
-                "error_message": format!(
-                    "InlineJudge rejected output: {} (score: {:.2})",
-                    reasoning, score
-                ),
-                "__judge_score__": score,
-                "__judge_passed__": false,
-                "__judge_feedback__": feedback,
-            })
-        }
+        build_judge_envelope(
+            "InlineJudge",
+            parent_inputs,
+            score,
+            passed,
+            &reasoning,
+            &feedback,
+            not_applicable,
+            on_failure,
+        )
     }
 
     /// Execute a sub-workflow by ID with the given trigger input, and return

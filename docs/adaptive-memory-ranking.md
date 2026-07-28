@@ -44,7 +44,7 @@ drift between what was ranked and what was recorded.
 returns the training data Phase 2 will consume: each provenance row's feature
 snapshot LEFT-JOINed to its execution's OUTCOME label —
 
-- the newest `judge_scores` verdict for that execution (`judge_score`,
+- the newest SCORED `judge_scores` verdict for that execution (`judge_score`,
   `judge_passed`), via a `LATERAL` "newest verdict" subquery; and
 - the `workflow_executions.status` (`execution_status`).
 
@@ -104,10 +104,13 @@ only fires on the flag-ON smart path.
   **scheduler** (primary actor-bound path) + the manual trigger path; the
   sub-workflow resolver is a noted follow-up (its `execution_id` isn't in scope
   at that call site yet).
-- **Outcome label = newest judge verdict.** `fetch_rank_training_examples` takes
-  the most-recent `judge_scores` row per execution (`ORDER BY created_at DESC
-  LIMIT 1`). A workflow with more than one judge node collapses to whichever
-  judge wrote last — an arbitrary label. Phase 2's learner should treat the
+- **Outcome label = newest SCORED judge verdict.** `fetch_rank_training_examples`
+  takes the most-recent `judge_scores` row per execution (`ORDER BY created_at
+  DESC LIMIT 1`), skipping rows the judge marked `not_applicable` — an
+  abstention says the run had nothing to judge, which is not an outcome label,
+  so the lateral falls through to the prior scored verdict (or `None`). A
+  workflow with more than one judge node collapses to whichever judge wrote
+  last — an arbitrary label. Phase 2's learner should treat the
   label as execution-level, not judge-node-scoped, and may want to aggregate
   (e.g. min/mean passed) if multi-judge workflows become common.
 

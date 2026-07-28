@@ -2378,7 +2378,7 @@ pub async fn record_execution_memory_context(
 
 /// A labeled training example for the Phase-2 learned ranker: one memory's
 /// pack-time feature snapshot joined to its execution's OUTCOME label
-/// (`judge_score` / `judge_passed` — the newest judge verdict for that
+/// (`judge_score` / `judge_passed` — the newest SCORED judge verdict for that
 /// execution — and `execution_status`). Outcome fields are `Option` because a
 /// provenance row may have no judge verdict and/or an orphaned execution.
 #[derive(Clone, Debug)]
@@ -2401,7 +2401,7 @@ pub struct RankTrainingExample {
 const RANK_TRAINING_EXAMPLE_MAX: i64 = 50_000;
 
 /// Fetch labeled training examples for one actor since `since`, newest first.
-/// Left-joins each provenance row to (a) the NEWEST judge verdict for its
+/// Left-joins each provenance row to (a) the newest SCORED judge verdict for its
 /// execution and (b) the execution status — the labeled-data source Phase 2
 /// consumes. Actor-scoped (`WHERE emc.actor_id = $1`). `limit` is clamped to
 /// `[0, RANK_TRAINING_EXAMPLE_MAX]`. Reads are fail-loud (`try_get`).
@@ -2424,6 +2424,7 @@ pub async fn fetch_rank_training_examples(
          LEFT JOIN LATERAL ( \
              SELECT score, passed FROM judge_scores j \
              WHERE j.execution_id = emc.execution_id \
+               AND NOT j.not_applicable \
              ORDER BY j.created_at DESC LIMIT 1 \
          ) js ON true \
          LEFT JOIN workflow_executions we ON we.id = emc.execution_id \
@@ -2483,14 +2484,17 @@ pub struct ExecutionMemoryOutcome {
     pub max_fused: f64,
     /// Number of memories injected.
     pub mem_count: i64,
-    /// Newest judge verdict for the execution, if any.
+    /// Newest SCORED judge verdict for the execution, if any. Verdicts where
+    /// the judge abstained (`not_applicable`) are skipped by the lateral —
+    /// an abstention is not an outcome label, so a run whose last verdict was
+    /// an abstention falls back to its prior scored verdict (or `None`).
     pub judge_score: Option<f64>,
     pub judge_passed: Option<bool>,
     pub execution_status: Option<String>,
 }
 
 /// Per-execution aggregate of `execution_memory_context` joined to each
-/// execution's NEWEST judge verdict and status. Actor-scoped
+/// execution's newest SCORED judge verdict and status. Actor-scoped
 /// (`WHERE emc.actor_id = $1`). `limit` is clamped to
 /// `[0, RANK_TRAINING_EXAMPLE_MAX]`. Reads are fail-loud. Only executions that
 /// actually carried memory context appear (memory-OFF runs write no provenance
@@ -2517,6 +2521,7 @@ pub async fn fetch_execution_memory_outcomes(
          LEFT JOIN LATERAL ( \
              SELECT score, passed FROM judge_scores j \
              WHERE j.execution_id = emc.execution_id \
+               AND NOT j.not_applicable \
              ORDER BY j.created_at DESC LIMIT 1 \
          ) js ON true \
          LEFT JOIN workflow_executions we ON we.id = emc.execution_id \

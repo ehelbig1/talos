@@ -461,7 +461,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "test_subworkflow_contract",
-            "description": "Simulate how a parent system-node (judge, reflection, llm-dispatch classifier, reflective-retry child, sub_workflow) will see the sub-workflow's output. Runs the workflow via the engine's execute_subworkflow_graph + collapse_subworkflow_output helpers — the same path the real parent node takes — so authors can verify contract shape BEFORE wiring it in. For contract='judge', additionally parses the collapsed output via JudgeVerdict and reports score/passed/reasoning/feedback plus a malformed_fields count (>0 means the judge workflow is not returning the expected shape).",
+            "description": "Simulate how a parent system-node (judge, reflection, llm-dispatch classifier, reflective-retry child, sub_workflow) will see the sub-workflow's output. Runs the workflow via the engine's execute_subworkflow_graph + collapse_subworkflow_output helpers — the same path the real parent node takes — so authors can verify contract shape BEFORE wiring it in. For contract='judge', additionally parses the collapsed output via JudgeVerdict and reports score/passed/reasoning/feedback/not_applicable plus a malformed_fields count (>0 means the judge workflow is not returning the expected shape). Use not_applicable in the reply to confirm an ABSTAINING judge round-trips: a verdict that meant to abstain but mistyped the field (e.g. the string \"true\") reads back not_applicable=false AND malformed_fields=1 here, instead of silently scoring every empty run for weeks.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

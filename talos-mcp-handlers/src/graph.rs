@@ -1286,13 +1286,13 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "add_judge_node",
-            "description": "Add an LLM-as-Judge node to a workflow. The judge node executes a dedicated judge workflow that evaluates the parent output against a natural-language rubric. The judge workflow receives {content, rubric} and must return {score: 0.0–1.0, passed: bool, reasoning: string, feedback: string}. The parent output is forwarded downstream enriched with __judge_score__, __judge_passed__, __judge_reasoning__, and __judge_feedback__ metadata fields. Use this for automated quality gates that cannot be expressed as boolean Rhai conditions.",
+            "description": "Add an LLM-as-Judge node to a workflow. The judge node executes a dedicated judge workflow that evaluates the parent output against a natural-language rubric. The judge workflow receives {content, rubric} and must return {score: 0.0–1.0, passed: bool, reasoning: string, feedback: string}, plus an OPTIONAL fifth field not_applicable: bool. The parent output is forwarded downstream enriched with __judge_score__, __judge_passed__, __judge_reasoning__, and __judge_feedback__ metadata fields. Use this for automated quality gates that cannot be expressed as boolean Rhai conditions. ABSTENTION: set not_applicable: true when the run had nothing to judge (a quiet inbox, an empty batch). The verdict is then recorded as an abstention and EXCLUDED from the workflow's quality trend instead of counted as a pass (which inflates the average) or a failure (which drags it down). N/A affects RECORDING ONLY, never routing — 'passed' still drives the gate exactly as authored, so an abstaining verdict must also set 'passed' to whatever you want downstream edges to do (usually true, so an empty run doesn't fail the workflow).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "workflow_id": { "type": "string", "description": "UUID of the workflow to add this node to" },
                     "node_id": { "type": "string", "description": "Unique node identifier within this workflow" },
-                    "judge_workflow_id": { "type": "string", "description": "UUID of the judge workflow (must return {score, passed, reasoning, feedback})" },
+                    "judge_workflow_id": { "type": "string", "description": "UUID of the judge workflow (must return {score, passed, reasoning, feedback}; may also return the optional not_applicable: bool to abstain on a run with nothing to judge)" },
                     "rubric": { "type": "string", "description": "Natural-language evaluation criteria passed to the judge workflow" },
                     "pass_threshold": { "type": "number", "description": "Minimum score (0.0–1.0) required to pass. If omitted, only the judge's passed field governs." },
                     "on_failure": {
@@ -1315,13 +1315,13 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "add_inline_judge_node",
-            "description": "Add an inline-judge node. Unlike add_judge_node (which spawns a judge sub-workflow), this evaluates a Rhai expression against the parent output inline — no LLM round-trip, no extra execution, just a fast boolean gate. The expression MUST return an object with {score: 0.0–1.0, passed: bool, reasoning: string, feedback: string}. Top-level fields of the parent output are available as bare scope variables (e.g. `score`, `status`). The parent output is forwarded downstream enriched with __judge_score__, __judge_passed__, __judge_reasoning__, __judge_feedback__ — identical shape to add_judge_node so downstream consumers don't have to distinguish. Use this when the quality gate is structural (length check, field presence, numeric threshold, etc.) and doesn't need an LLM's judgment.",
+            "description": "Add an inline-judge node. Unlike add_judge_node (which spawns a judge sub-workflow), this evaluates a Rhai expression against the parent output inline — no LLM round-trip, no extra execution, just a fast boolean gate. The expression MUST return an object with {score: 0.0–1.0, passed: bool, reasoning: string, feedback: string}, plus an OPTIONAL fifth field not_applicable: bool. Top-level fields of the parent output are available as bare scope variables (e.g. `score`, `status`). The parent output is forwarded downstream enriched with __judge_score__, __judge_passed__, __judge_reasoning__, __judge_feedback__ — identical shape to add_judge_node so downstream consumers don't have to distinguish. Use this when the quality gate is structural (length check, field presence, numeric threshold, etc.) and doesn't need an LLM's judgment. ABSTENTION: set not_applicable: true when the run had nothing to judge (a quiet inbox, an empty batch). The verdict is then recorded as an abstention and EXCLUDED from the workflow's quality trend instead of counted as a pass (which inflates the average) or a failure (which drags it down). N/A affects RECORDING ONLY, never routing — 'passed' still drives the gate exactly as authored, so an abstaining verdict must also set 'passed' to whatever you want downstream edges to do (usually true, so an empty run doesn't fail the workflow).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "workflow_id": { "type": "string", "description": "UUID of the workflow to add this node to" },
                     "node_id": { "type": "string", "description": "Unique node identifier within this workflow" },
-                    "verdict_expr": { "type": "string", "description": "Rhai expression returning {score, passed, reasoning, feedback}. Parent output fields are in scope as bare variables. Max 2000 chars. Example: `#{ score: if len > 20 { 1.0 } else { 0.2 }, passed: len > 20, reasoning: \"length check\", feedback: \"\" }`" },
+                    "verdict_expr": { "type": "string", "description": "Rhai expression returning {score, passed, reasoning, feedback} and optionally not_applicable. Parent output fields are in scope as bare variables. Max 2000 chars. Example: `#{ score: if len > 20 { 1.0 } else { 0.2 }, passed: len > 20, reasoning: \"length check\", feedback: \"\" }`. Abstaining example (an empty batch is neither good nor bad): `#{ score: 1.0, passed: true, not_applicable: count == 0, reasoning: \"nothing to classify\", feedback: \"\" }`" },
                     "pass_threshold": { "type": "number", "description": "Minimum score (0.0–1.0) required to pass. If omitted, only the expression's 'passed' field governs." },
                     "on_failure": {
                         "type": "string",
@@ -1342,7 +1342,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "add_ensemble_node",
-            "description": "Add an ensemble (self-consistency) node that runs the same child workflow N times concurrently and applies a consensus strategy. Use majority_vote for classification tasks where reliability matters. Use best_of_n with a judge_workflow_id to pick the highest-quality output. Use first_pass for simple parallel diversity checks. Output includes __ensemble_method__, __ensemble_size__, and __ensemble_votes__ metadata.",
+            "description": "Add an ensemble (self-consistency) node that runs the same child workflow N times concurrently and applies a consensus strategy. Use majority_vote for classification tasks where reliability matters. Use best_of_n with a judge_workflow_id to pick the highest-quality output. Use first_pass for simple parallel diversity checks. Output includes __ensemble_method__, __ensemble_size__, and __ensemble_votes__ metadata. best_of_n note: a judge that ABSTAINS on a candidate (not_applicable: true) makes that candidate INELIGIBLE to win — its score means 'nothing to judge', not 'this is good' — exactly as a judge dispatch failure does. If every candidate is abstained-on or errored, selection falls back to the first candidate, same as the all-failed path.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5143,7 +5143,10 @@ async fn handle_add_judge_node(
              Judge workflow: {}\n\
              Rubric: {}{}\n\
              Timeout: {}s\n\
-             Parent output is forwarded enriched with __judge_score__, __judge_passed__, __judge_reasoning__, and __judge_feedback__.{}{}",
+             Parent output is forwarded enriched with __judge_score__, __judge_passed__, __judge_reasoning__, and __judge_feedback__.\n\
+             Abstention: a verdict may also set not_applicable: true when the run had nothing to judge — it is then \
+             recorded as an abstention and excluded from the quality trend rather than scored. It does NOT change routing; \
+             'passed' still drives the gate, so set it to what you want downstream edges to do.{}{}",
             added.node_id, added.workflow_id, judge_workflow_id,
             rubric, threshold_str, timeout_secs,
             added.wiring_in, added.wiring_out
@@ -5255,7 +5258,10 @@ async fn handle_add_inline_judge_node(
         &format!(
             "Inline-judge node '{}' added to workflow {}.\n\
              Verdict expression: {}{}\n\
-             Parent output is forwarded enriched with __judge_score__, __judge_passed__, __judge_reasoning__, and __judge_feedback__.{}{}",
+             Parent output is forwarded enriched with __judge_score__, __judge_passed__, __judge_reasoning__, and __judge_feedback__.\n\
+             Abstention: a verdict may also set not_applicable: true when the run had nothing to judge — it is then \
+             recorded as an abstention and excluded from the quality trend rather than scored. It does NOT change routing; \
+             'passed' still drives the gate, so set it to what you want downstream edges to do.{}{}",
             added.node_id, added.workflow_id, verdict_expr, threshold_str, added.wiring_in, added.wiring_out
         ),
     )
