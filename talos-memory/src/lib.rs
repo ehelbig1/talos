@@ -4395,3 +4395,580 @@ mod batched_listing_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod wire_hop_signing_specs {
+    //! Executable specification for the memory-RPC **raw-bytes signing** fix.
+    //!
+    //! ## The defect these specs describe
+    //!
+    //! [`crate::rpc_auth::canonical_json_bytes`] re-derives a number's TEXT
+    //! from a *parsed* `serde_json::Value`
+    //! (`Value::Number(n) => n.to_string()`). serde_json's f64 round trip is
+    //! **not idempotent**: for a meaningful fraction of ordinary computed
+    //! values `parse(write(x))` lands one ULP away from `x`, and some values
+    //! have no fixed point at all (they cycle between two representations
+    //! forever — see #597). So the sender canonicalises the `Value` it holds
+    //! in memory, the receiver canonicalises its *re-parse* of the wire JSON,
+    //! the two byte strings differ, and the signature fails — for an entirely
+    //! honest sender, on payload content alone.
+    //!
+    //! `rpc_auth`'s own module doc states the assumption that makes this
+    //! safe: "our callers don't feed floating-point edge cases into signed
+    //! bodies". That assumption is false. `actor_memory` values are ARBITRARY
+    //! module output; LLM/agent nodes persist computed ratios routinely.
+    //!
+    //! The identical defect took down `pa-autonomy-digest` on the
+    //! job-protocol dispatch surface (#595 → #597 → #598). The fix there was
+    //! `talos_workflow_job_protocol::SignedJson`: sign the EXACT wire text,
+    //! never a form re-derived on each side. The specs below are the contract
+    //! for the equivalent fix here (`RawSigned<T>` wrapping the whole op).
+    //!
+    //! ## How to read this module
+    //!
+    //! * `#[ignore]`d tests are the **OPEN** specs. They fail today, by
+    //!   design. Phase 2 lands `RawSigned<T>` and un-ignores them.
+    //! * Everything else passes today: the confirmed-UNAFFECTED RPC families
+    //!   (they bind only strings/ints, never a `Value`), the
+    //!   anti-vacuousness guard on the generator, and one unit-level pin of
+    //!   the root-cause mechanism that is scheduled for deletion alongside
+    //!   the canonical machinery it documents.
+
+    use crate::integration_state_rpc::{
+        IndexedSlots, IntegrationOp, IntegrationStateRequest, SUBJECT_NAME as INTEGRATION_SUBJECT,
+    };
+    use crate::memory_rpc::{MemoryOp, MemoryRpcRequest};
+    use crate::rpc_auth;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    /// A float with **no round-trip fixed point** under serde_json: writing
+    /// it, re-parsing, and writing again yields text that differs from the
+    /// first write, forever. Reproduced by the #598 reviewer as
+    /// `…890906e-115` (sent) vs `…8909045e-115` (received).
+    ///
+    /// This is the value that makes "normalise to the fixed point" (the #595
+    /// first attempt) provably insufficient and forces raw-bytes signing.
+    const POISON_2CYCLE: f64 = 5.455171886890906e-115;
+
+    /// The exact bit pattern the #597 search surfaced as round-trip unstable;
+    /// kept as a second, independently-sourced sample so a single serde_json
+    /// version bump can't silently make this whole module vacuous.
+    const POISON_BITS: u64 = 0x2284_3773_1ab4_9c0f;
+
+    /// Register the process-global HMAC key. `register_hmac_key` wraps a
+    /// `OnceLock::set`, so this is idempotent and first-caller-wins — every
+    /// other test in the crate does exactly this, and because BOTH signing
+    /// and verification read the same slot, which key wins is irrelevant.
+    ///
+    /// No serialisation lock is needed here: these tests never touch the
+    /// nonce cache (`verify()` deliberately does not — the subscriber calls
+    /// `check_and_record_nonce` separately), which is the only process-global
+    /// state in `rpc_auth` that tests must serialise on
+    /// (`rpc_auth::nonce_test_lock`).
+    fn ensure_hmac_key() {
+        rpc_auth::register_hmac_key(std::sync::Arc::new(vec![0x9Cu8; 32]));
+    }
+
+    /// The wire hop the worker → NATS → controller path actually performs:
+    /// `to_vec` on the signed struct, `from_slice` on the received bytes.
+    /// Confirmed to be exactly this in production — the worker serialises
+    /// with `serde_json::to_vec` (talos-worker-runtime/src/host/memory.rs)
+    /// and the single admission chokepoint deserialises with
+    /// `serde_json::from_slice` on the raw NATS payload
+    /// (talos-rpc-subscribers/src/admission.rs). No intermediate `Value` hop
+    /// exists on either side, so this helper is faithful, not a simplification.
+    fn wire_hop<T: serde::Serialize + serde::de::DeserializeOwned>(req: &T) -> T {
+        let bytes = serde_json::to_vec(req).expect("serialise");
+        serde_json::from_slice(&bytes).expect("deserialise")
+    }
+
+    fn memory_set(value: serde_json::Value, metadata: Option<serde_json::Value>) -> MemoryOp {
+        MemoryOp::Set {
+            key: "digest/ratios".to_string(),
+            value,
+            memory_type: "episodic".to_string(),
+            ttl_hours: None,
+            metadata,
+        }
+    }
+
+    fn integration_set(value: serde_json::Value) -> IntegrationOp {
+        IntegrationOp::Set {
+            key: "watch_channel/abc".to_string(),
+            value,
+            ttl_seconds: None,
+            slots: IndexedSlots::default(),
+        }
+    }
+
+    // ── OPEN specs: these MUST fail until RawSigned lands ────────────────
+
+    /// **OPEN SPEC.** A `MemoryOp::Set` whose value carries a float with no
+    /// round-trip fixed point must survive the wire and verify.
+    ///
+    /// This is the production shape that breaks: an agent node computes a
+    /// ratio, writes it through `agent_memory::set`, the worker signs the
+    /// canonical form of the `Value` it built, the controller canonicalises
+    /// its re-parse — and rejects an honest request as `Unauthorized`.
+    ///
+    /// Un-ignore when `RawSigned<MemoryOp>` binds the exact wire text.
+    #[test]
+    #[ignore = "OPEN: signing re-derives floats from parsed Values — un-ignore when RawSigned lands (see memory-rpc-signing-plan)"]
+    fn memory_set_survives_the_wire_with_a_2cycle_float() {
+        ensure_hmac_key();
+        let actor = Uuid::new_v4();
+        let req =
+            MemoryRpcRequest::new_signed(actor, memory_set(json!({"ratio": POISON_2CYCLE}), None))
+                .expect("sign");
+        assert!(
+            req.verify(),
+            "sender-side self-verify must hold — if THIS fails the harness is wrong, not the protocol"
+        );
+        let received = wire_hop(&req);
+        assert!(
+            received.verify(),
+            "an honest Set carrying {POISON_2CYCLE:e} failed verification after the wire hop — \
+             the signed form was re-derived from the receiver's re-parse"
+        );
+    }
+
+    /// **OPEN SPEC.** Same defect through `metadata` alone.
+    ///
+    /// `metadata` is canonicalised by the same code path as `value`
+    /// (`memory_rpc::sign_body_bytes`), so it carries the identical hazard.
+    /// Covered separately because `metadata` is the field the
+    /// `__memory_write__` protocol stamps with synthesis provenance —
+    /// scores, confidences and agreement ratios land here, not in `value`.
+    ///
+    /// The value is deliberately stable (a plain string) so a failure can
+    /// only be attributed to the metadata field.
+    #[test]
+    #[ignore = "OPEN: signing re-derives floats from parsed Values — un-ignore when RawSigned lands (see memory-rpc-signing-plan)"]
+    fn memory_set_survives_the_wire_with_a_2cycle_float_in_metadata_only() {
+        ensure_hmac_key();
+        let actor = Uuid::new_v4();
+        let req = MemoryRpcRequest::new_signed(
+            actor,
+            memory_set(
+                json!({"note": "stable text payload"}),
+                Some(json!({"kind": "daily_brief", "confidence": POISON_2CYCLE})),
+            ),
+        )
+        .expect("sign");
+        assert!(req.verify(), "sender-side self-verify must hold");
+        let received = wire_hop(&req);
+        assert!(
+            received.verify(),
+            "an honest Set whose METADATA carries {POISON_2CYCLE:e} failed verification \
+             after the wire hop"
+        );
+    }
+
+    /// **OPEN SPEC (measured, see the un-ignored `ttl_hours_f64_field_drift_measurement`
+    /// below for the evidence).** `ttl_hours` is a struct `Option<f64>`, not a
+    /// `Value`, and is bound as `f64::to_le_bytes`. Its wire text is written by
+    /// serde's float formatter from the sender's bits and re-parsed into the
+    /// receiver's bits; if that parse is not bit-exact the LE bytes differ and
+    /// the signature fails exactly as the `Value` path does.
+    ///
+    /// Uses the #597 bit pattern plus a seeded search for a drifting value, so
+    /// the spec is pinned to a measured fact rather than an assumption.
+    #[test]
+    #[ignore = "OPEN: signing re-derives floats from parsed Values — un-ignore when RawSigned lands (see memory-rpc-signing-plan)"]
+    fn memory_set_ttl_survives_the_wire_with_drifting_f64() {
+        ensure_hmac_key();
+        let actor = Uuid::new_v4();
+        let ttl = drifting_ttl_f64().expect(
+            "no ttl_hours bit pattern drifts through the struct-field hop — \
+             see ttl_hours_f64_field_drift_measurement",
+        );
+        let op = MemoryOp::Set {
+            key: "digest/ratios".to_string(),
+            value: json!({"note": "stable text payload"}),
+            memory_type: "episodic".to_string(),
+            ttl_hours: Some(ttl),
+            metadata: None,
+        };
+        let req = MemoryRpcRequest::new_signed(actor, op).expect("sign");
+        assert!(req.verify(), "sender-side self-verify must hold");
+        let received = wire_hop(&req);
+        assert!(
+            received.verify(),
+            "an honest Set with ttl_hours = {ttl:e} (bits {:#018x}) failed verification \
+             after the wire hop",
+            ttl.to_bits()
+        );
+    }
+
+    /// **OPEN SPEC.** The integration-state twin of the memory `Set` case.
+    ///
+    /// `integration_state_rpc::sign_body_bytes` canonicalises
+    /// `IntegrationOp::Set.value` through the same
+    /// `rpc_auth::canonical_json_bytes`, so the identical fix applies. Push
+    /// integrations persist `Value`s that include API-supplied numerics
+    /// (expiry timestamps, history ids), so this is not a theoretical path.
+    #[test]
+    #[ignore = "OPEN: signing re-derives floats from parsed Values — un-ignore when RawSigned lands (see memory-rpc-signing-plan)"]
+    fn integration_set_survives_the_wire_with_a_2cycle_float() {
+        ensure_hmac_key();
+        let req = IntegrationStateRequest::new_signed(
+            "gmail".to_string(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            integration_set(json!({"drift_ratio": POISON_2CYCLE})),
+        )
+        .expect("sign");
+        assert!(req.verify(), "sender-side self-verify must hold");
+        let received = wire_hop(&req);
+        assert!(
+            received.verify(),
+            "an honest IntegrationOp::Set carrying {POISON_2CYCLE:e} failed verification \
+             after the wire hop"
+        );
+    }
+
+    /// **OPEN SPEC (property).** The defect is payload-DEPENDENT, so every
+    /// hand-written example is a lottery ticket. This asks the general
+    /// question the #597 harness asked — "does sign → wire → verify hold for
+    /// arbitrary JSON?" — which is how the original root cause was found in
+    /// seconds after six reasoned hypotheses had failed.
+    ///
+    /// Seeded (never `thread_rng`) so a failure is reproducible from the
+    /// printed iteration and seed.
+    #[test]
+    #[ignore = "OPEN: signing re-derives floats from parsed Values — un-ignore when RawSigned lands (see memory-rpc-signing-plan)"]
+    fn memory_set_survives_the_wire_for_arbitrary_json() {
+        ensure_hmac_key();
+        let actor = Uuid::new_v4();
+        let mut seed = 0x5eed_0dd0_0000_0001_u64;
+        for i in 0..2_000 {
+            let value = arbitrary_json(&mut seed, 4);
+            let req =
+                MemoryRpcRequest::new_signed(actor, memory_set(value.clone(), None)).expect("sign");
+            let received = wire_hop(&req);
+            assert!(
+                received.verify(),
+                "iter {i}: verify failed after the wire hop for value {value}"
+            );
+        }
+    }
+
+    /// **OPEN SPEC (property).** Integration-state twin of the above.
+    #[test]
+    #[ignore = "OPEN: signing re-derives floats from parsed Values — un-ignore when RawSigned lands (see memory-rpc-signing-plan)"]
+    fn integration_set_survives_the_wire_for_arbitrary_json() {
+        ensure_hmac_key();
+        let mut seed = 0x5eed_0dd0_0000_0002_u64;
+        let actor = Uuid::new_v4();
+        let user = Uuid::new_v4();
+        for i in 0..2_000 {
+            let value = arbitrary_json(&mut seed, 4);
+            let req = IntegrationStateRequest::new_signed(
+                "gmail".to_string(),
+                actor,
+                user,
+                integration_set(value.clone()),
+            )
+            .expect("sign");
+            let received = wire_hop(&req);
+            assert!(
+                received.verify(),
+                "iter {i}: verify failed after the wire hop for value {value}"
+            );
+        }
+    }
+
+    // ── Passing confirmations: the UNAFFECTED RPC families ───────────────
+    //
+    // The #598 review claimed only the two `Set` paths bind a `Value`. These
+    // four tests are the proof rather than the assertion: each runs the same
+    // sign → wire → verify hop with the most float-hostile content its typed
+    // fields can carry, and passes today. If a future change threads a
+    // `Value` into any of them, the family moves from this section to the
+    // OPEN section above.
+
+    /// `graph_rpc` binds `(query: &str, max_depth: u32, limit: u32)` only —
+    /// no `Value`, no f64. Floats can reach it only as TEXT inside `query`,
+    /// where they are signed as UTF-8 bytes and are therefore immune.
+    #[test]
+    fn graph_rpc_survives_the_wire_including_float_text() {
+        ensure_hmac_key();
+        let req = crate::graph_rpc::GraphSearchRequest::new_signed(
+            Uuid::new_v4(),
+            format!("ratio {POISON_2CYCLE} and {}", f64::from_bits(POISON_BITS)),
+            3,
+            10,
+        )
+        .expect("sign");
+        assert!(wire_hop(&req).verify(), "graph_rpc must be unaffected");
+    }
+
+    /// `database_rpc` binds `(sql: &str, params: &[String], is_fetch: bool)`.
+    /// Params are length-prefixed UTF-8 — a float-shaped param is text.
+    #[test]
+    fn database_rpc_survives_the_wire_including_float_text_params() {
+        ensure_hmac_key();
+        let req = crate::database_rpc::DatabaseRpcRequest::new_signed(
+            Uuid::new_v4(),
+            "SELECT * FROM t WHERE ratio = $1".to_string(),
+            vec![
+                POISON_2CYCLE.to_string(),
+                f64::from_bits(POISON_BITS).to_string(),
+            ],
+            true,
+        )
+        .expect("sign");
+        assert!(wire_hop(&req).verify(), "database_rpc must be unaffected");
+    }
+
+    /// `state_rpc` binds `(execution_id, key: &str, value: &str, is_delete)`.
+    /// Note `value` is a pre-serialised STRING, not a `Value` — that is
+    /// precisely why this family is safe, and why the choice must not be
+    /// "simplified" to a `Value` later.
+    #[test]
+    fn state_rpc_survives_the_wire_with_float_bearing_json_text() {
+        ensure_hmac_key();
+        let req = crate::state_rpc::StateWriteRequest::new_signed(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "session/ratios".to_string(),
+            json!({"ratio": POISON_2CYCLE}).to_string(),
+            false,
+        )
+        .expect("sign");
+        assert!(wire_hop(&req).verify(), "state_rpc must be unaffected");
+    }
+
+    /// `ml_rpc` binds `(user_id, model_name: &str, inputs: &[String])` for
+    /// predict and `(user_id, model_name, k: u32)` for few-shot. Strings and
+    /// ints only.
+    #[test]
+    fn ml_rpc_survives_the_wire_including_float_text_inputs() {
+        ensure_hmac_key();
+        let predict = crate::ml_rpc::MlPredictRequest::new_signed(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "inbox-classifier".to_string(),
+            vec![format!("score={POISON_2CYCLE}")],
+        )
+        .expect("sign predict");
+        assert!(wire_hop(&predict).verify(), "ml predict must be unaffected");
+
+        let fewshot = crate::ml_rpc::MlFewShotRequest::new_signed(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "inbox-classifier".to_string(),
+            4,
+        )
+        .expect("sign fewshot");
+        assert!(
+            wire_hop(&fewshot).verify(),
+            "ml few-shot must be unaffected"
+        );
+    }
+
+    /// The `integration_state_rpc` signing subject is distinct from the
+    /// memory one — pinned here so the OPEN specs above cannot be "fixed" by
+    /// accidentally collapsing the two subjects into one.
+    #[test]
+    fn integration_and_memory_signing_subjects_are_distinct() {
+        assert_ne!(INTEGRATION_SUBJECT, crate::memory_rpc::SUBJECT_NAME);
+    }
+
+    // ── Root-cause pins and the property generator ───────────────────────
+
+    /// **Scheduled for deletion with `canonical_json_bytes` /
+    /// `write_canonical` in Phase 2.** This is the mechanism, stated as an
+    /// executable fact instead of a comment: canonicalising a value and
+    /// canonicalising its own re-parse produce DIFFERENT bytes.
+    ///
+    /// That inequality is the whole bug — the sender hashes the left side,
+    /// the receiver hashes the right side. Once the signed form is the exact
+    /// wire text, nothing re-derives anything and this test has no subject
+    /// left to describe; delete it together with the canonical machinery.
+    #[test]
+    fn canonical_bytes_are_not_stable_across_a_json_reparse() {
+        for poison in [POISON_2CYCLE, f64::from_bits(POISON_BITS)] {
+            let sender = json!({"ratio": poison});
+            let wire = sender.to_string();
+            let receiver: serde_json::Value =
+                serde_json::from_str(&wire).expect("wire text must re-parse");
+            assert_ne!(
+                rpc_auth::canonical_json_bytes(&sender),
+                rpc_auth::canonical_json_bytes(&receiver),
+                "expected canonical(parse(write(v))) != canonical(v) for {poison:e} — \
+                 if serde_json ever fixes its f64 round trip this test documents why \
+                 raw-bytes signing was introduced rather than becoming dead weight"
+            );
+        }
+    }
+
+    /// Measurement, not an assumption: does `ttl_hours` — a struct
+    /// `Option<f64>`, whose wire text is written by serde's float formatter
+    /// from the sender's bits and re-parsed into the receiver's bits — drift
+    /// across the serde struct-field hop the way a `Value` number does?
+    ///
+    /// Answer recorded by this test: YES. `drifting_ttl_f64()` finds a
+    /// bit pattern within a seeded 20k-sample search, and this test asserts
+    /// the search succeeds so the OPEN `…ttl_survives_the_wire…` spec can
+    /// never silently degrade into a no-op that skips on "not found".
+    #[test]
+    fn ttl_hours_f64_field_drift_measurement() {
+        let found = drifting_ttl_f64();
+        assert!(
+            found.is_some(),
+            "no drifting ttl_hours bit pattern found in {TTL_SEARCH_SAMPLES} seeded samples — \
+             if this ever regresses to None, downgrade the ttl OPEN spec to a passing pin \
+             documenting that ttl is stable in practice rather than manufacturing a failure"
+        );
+    }
+
+    /// Number of seeded samples the ttl drift search draws. Fixed (not
+    /// time-bounded) so the search is deterministic across machines.
+    const TTL_SEARCH_SAMPLES: usize = 20_000;
+
+    /// Seeded search for an `Option<f64>` value that does NOT survive the
+    /// serde struct-field wire hop bit-exactly. Returns `None` if no sample
+    /// drifts, which the measurement test above turns into a loud failure.
+    ///
+    /// Deliberately probes the REAL hop — a `#[derive(Serialize,
+    /// Deserialize)]` struct with the same `Option<f64>` shape as
+    /// `MemoryOp::Set.ttl_hours` — rather than `Value`, because the question
+    /// is specifically whether the struct-field path differs from the
+    /// `Value` path.
+    fn drifting_ttl_f64() -> Option<f64> {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct TtlProbe {
+            ttl_hours: Option<f64>,
+        }
+        let mut seed = 0x7710_0000_0001_u64;
+        for _ in 0..TTL_SEARCH_SAMPLES {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let f = f64::from_bits(seed);
+            // `validate_finite` rejects NaN/Inf before signing, so a
+            // non-finite sample could never reach the wire anyway.
+            if !f.is_finite() {
+                continue;
+            }
+            let text =
+                serde_json::to_string(&TtlProbe { ttl_hours: Some(f) }).expect("probe serialises");
+            let back: TtlProbe = serde_json::from_str(&text).expect("probe re-parses");
+            let got = back.ttl_hours.expect("field present");
+            if got.to_bits() != f.to_bits() {
+                return Some(f);
+            }
+        }
+        None
+    }
+
+    /// Pseudo-random structured JSON. Ported from
+    /// `talos_workflow_job_protocol`'s `arbitrary_json` (#597) — the
+    /// generator that found the original root cause by search after six
+    /// reasoned hypotheses had failed. Copied rather than shared because
+    /// that one is `#[cfg(test)]`-private to its own crate, and this fix
+    /// must not grow a dependency to borrow it.
+    ///
+    /// Seeded (never `thread_rng`) so a property failure is REPRODUCIBLE
+    /// from the printed seed; an unreplayable flaky property test is worse
+    /// than none. Deliberately emits the shapes that broke us: floats built
+    /// from raw bit patterns, computed ratios, deep nesting, mixed arrays,
+    /// non-ASCII keys, and integers at JSON's typing boundaries.
+    fn arbitrary_json(seed: &mut u64, depth: u32) -> serde_json::Value {
+        // xorshift64* — tiny, deterministic, no dev-dependency.
+        let mut next = || {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed
+        };
+        let pick = next() % if depth == 0 { 6 } else { 8 };
+        match pick {
+            0 => serde_json::Value::Null,
+            1 => serde_json::Value::Bool(next() % 2 == 0),
+            // Floats from RAW BITS: the class that actually broke signing
+            // (parse(write(x)) landing one ULP away).
+            2 => {
+                let f = f64::from_bits(next());
+                serde_json::Number::from_f64(f)
+                    .map_or(serde_json::Value::Null, serde_json::Value::Number)
+            }
+            // Integers at the boundaries where JSON number typing is subtle.
+            3 => json!(next() as i64),
+            4 => json!(next()),
+            // Computed ratios — what agent/LLM nodes actually persist, ~10%
+            // of which are round-trip unstable.
+            5 => {
+                let (a, b) = (next() % 1000 + 1, next() % 1000 + 1);
+                json!(a as f64 / b as f64)
+            }
+            6 => {
+                let n = (next() % 4) as usize;
+                serde_json::Value::Array((0..n).map(|_| arbitrary_json(seed, depth - 1)).collect())
+            }
+            _ => {
+                let n = (next() % 4) as usize;
+                let mut m = serde_json::Map::new();
+                for i in 0..n {
+                    // Non-ASCII keys: escaping differences change byte length
+                    // without changing meaning.
+                    m.insert(
+                        format!("k{i}\u{2014}\u{1f600}"),
+                        arbitrary_json(seed, depth - 1),
+                    );
+                }
+                serde_json::Value::Object(m)
+            }
+        }
+    }
+
+    /// Anti-vacuousness guard (ported from #597). The generator must actually
+    /// produce round-trip-unstable values, or every property spec above
+    /// passes for the wrong reason and we would never know.
+    #[test]
+    fn generator_actually_produces_round_trip_unstable_values() {
+        let mut seed = 0x5eed_0dd0_0000_0003_u64;
+        let mut unstable = 0;
+        for _ in 0..20_000 {
+            let v = arbitrary_json(&mut seed, 3);
+            let once = v.to_string();
+            if let Ok(p) = serde_json::from_str::<serde_json::Value>(&once) {
+                let twice = p.to_string();
+                if twice != once {
+                    unstable += 1;
+                }
+            }
+        }
+        assert!(
+            unstable > 0,
+            "generator produced NO round-trip-unstable value — the wire specs \
+             above would be passing (or failing) for reasons unrelated to floats"
+        );
+    }
+
+    /// Second anti-vacuousness guard, one level closer to the protocol: the
+    /// generator must produce values whose CANONICAL bytes differ across a
+    /// re-parse, since that — not raw text instability — is what the memory
+    /// signature is computed over.
+    #[test]
+    fn generator_produces_values_whose_canonical_bytes_drift() {
+        let mut seed = 0x5eed_0dd0_0000_0004_u64;
+        let mut drifted = 0;
+        for _ in 0..20_000 {
+            let v = arbitrary_json(&mut seed, 3);
+            let once = v.to_string();
+            if let Ok(p) = serde_json::from_str::<serde_json::Value>(&once) {
+                if rpc_auth::canonical_json_bytes(&p) != rpc_auth::canonical_json_bytes(&v) {
+                    drifted += 1;
+                }
+            }
+        }
+        assert!(
+            drifted > 0,
+            "generator produced NO value whose canonical bytes drift across a re-parse — \
+             the OPEN property specs could not observe the defect they exist for"
+        );
+    }
+}
