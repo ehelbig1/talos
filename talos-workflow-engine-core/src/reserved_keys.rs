@@ -374,6 +374,16 @@ pub const JUDGE_REASONING: &str = "__judge_reasoning__";
 /// Free-form feedback the judge returned.
 pub const JUDGE_FEEDBACK: &str = "__judge_feedback__";
 
+/// The judge declared that this run had NOTHING TO JUDGE (a quiet inbox,
+/// an empty batch). Such a run is excluded from the quality trend rather
+/// than counted as a pass or a failure — "nothing to measure" is not
+/// evidence of quality, exactly as it is not evidence of failure.
+///
+/// This affects RECORDING only, never routing: `passed` continues to
+/// drive gates exactly as authored, so an abstaining judge should also
+/// set `passed` to whatever it wants downstream edges to do.
+pub const JUDGE_NOT_APPLICABLE: &str = "__judge_not_applicable__";
+
 // ── Confidence gate output ──────────────────────────────────────────
 
 /// Default path into a parent output where a confidence value is

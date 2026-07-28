@@ -33,6 +33,7 @@ impl talos_workflow_engine_core::JudgeScoreRecorder for PostgresJudgeScoreRecord
         execution_id: Uuid,
         score: f64,
         passed: bool,
+        not_applicable: bool,
     ) {
         // Acquire a pooled connection and hand it to the conn-taking repo
         // method. Every failure path (acquire OR insert) is swallowed with
@@ -55,6 +56,7 @@ impl talos_workflow_engine_core::JudgeScoreRecorder for PostgresJudgeScoreRecord
             execution_id,
             score,
             passed,
+            not_applicable,
         )
         .await
         {

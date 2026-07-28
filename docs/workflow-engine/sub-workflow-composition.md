@@ -52,20 +52,59 @@ SystemNodeKind::Judge {
 
 The engine runs the judge sub-workflow, collapses its outputs, and
 parses a [`JudgeVerdict`][jv]. The contract: **the collapsed output
-must be a JSON object with these four fields**:
+must be a JSON object with these four fields**, plus an optional fifth:
 
 ```json
 {
   "score":     0.0..=1.0,
   "passed":    true,
   "reasoning": "...",
-  "feedback":  "..."
+  "feedback":  "...",
+
+  "not_applicable": false
 }
 ```
 
 Missing or wrong-typed fields fall back to defaults (`0.0` / `false` /
 `""`) and the engine logs a `malformed_field_count` warning so you can
 spot a broken judge in production.
+
+### `not_applicable` — abstaining from a verdict
+
+A judge has three outcomes, not two: pass, fail, and **"there was
+nothing to judge"** — a quiet inbox, an empty batch, a day with no
+meetings. Set `not_applicable: true` for that third case.
+
+An abstaining verdict is **recorded as an abstention and excluded from
+the workflow's quality trend**: it is not averaged in, it does not
+count toward the pass rate, and it is not the minimum score. This
+matters because both alternatives are wrong. Scoring an empty run 1.0
+inflates the average and saturates the signal — `pa-inbox-organizer-work`
+read avg 1.0 across 17 runs purely because most were empty inboxes, a
+dashboard that could never report a problem. Scoring it 0.2 drags the
+trend down for a run that measured nothing. "Nothing to measure" is
+evidence of neither quality nor its absence.
+
+The abstention is still *counted*: reports carry `na_runs` alongside the
+scored `runs`, so "ran 17×, abstained 12×" stays distinguishable from
+"ran 5×".
+
+**`not_applicable` affects RECORDING ONLY — never routing.** `passed`
+continues to drive the gate exactly as authored, on every `on_failure`
+mode. So an abstaining verdict must **also set `passed`** to whatever
+you want downstream edges to do — normally `true`, so a run with nothing
+to judge doesn't fail the workflow:
+
+```json
+{ "score": 1.0, "passed": true, "not_applicable": true,
+  "reasoning": "no messages to classify", "feedback": "" }
+```
+
+The field is optional: absent means `false`, so a judge that never
+emits it behaves exactly as before. Present-but-not-a-boolean reads as
+`false` **and** increments `malformed_field_count` — a typo like
+`"not_applicable": "true"` surfaces as a broken judge instead of
+silently discarding every abstention.
 
 ### The minimal judge graph
 

@@ -380,6 +380,10 @@ pub(crate) use crate::chain_detect::detect_linear_chains;
 
 #[cfg(test)]
 pub(crate) use crate::engine_dispatch_subflow::extract_judge_score;
+#[cfg(test)]
+pub(crate) use crate::engine_dispatch_subflow::{
+    build_judge_envelope, ensemble_candidate_score, pick_best_candidate,
+};
 pub use crate::engine_dispatch_subflow::{JudgeVerdict, SubflowError};
 
 // Suppress dead‑code warnings to keep the CI passing.

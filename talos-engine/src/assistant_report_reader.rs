@@ -122,9 +122,20 @@ impl talos_workflow_engine_core::AssistantReportReader for PostgresAssistantRepo
             "teacher_audits": teacher_audits,
             "judge_scores": {
                 "trailing_days": days,
+                "population_note": "runs/avg_score/pass_rate/worst_score cover SCORED \
+                                    verdicts only; na_runs counts runs where the judge \
+                                    reported nothing to judge and which are excluded from \
+                                    every score above",
                 "workflows": judge_scores.iter().map(|s| json!({
                     "name": s.workflow_name,
+                    // Scored verdicts only — see `population_note`. Total
+                    // judge invocations is `runs + na_runs`, reported as
+                    // `total_verdicts` so no reader has to do that sum (and
+                    // get it wrong) themselves.
                     "runs": s.runs,
+                    "scored_runs": s.runs,
+                    "na_runs": s.na_runs,
+                    "total_verdicts": s.runs + s.na_runs,
                     "avg_score": s.avg_score,
                     "pass_rate": s.pass_rate,
                     "worst_score": s.worst_score,

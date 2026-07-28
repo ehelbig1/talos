@@ -21,8 +21,16 @@ use uuid::Uuid;
 /// `tokio::spawn`, so `record` may block on I/O without stalling dispatch.
 #[async_trait]
 pub trait JudgeScoreRecorder: Send + Sync {
-    /// Persist one `(workflow_id, node_id, execution_id, score, passed)`
-    /// verdict row. Impls MUST NOT return errors — swallow and log them.
+    /// Persist one `(workflow_id, node_id, execution_id, score, passed,
+    /// not_applicable)` verdict row. Impls MUST NOT return errors — swallow
+    /// and log them.
+    ///
+    /// `not_applicable = true` marks an ABSTENTION: the judge declared this
+    /// run had nothing to judge. The row IS written (so the abstention rate
+    /// is recoverable — "ran 17×, abstained 12×" must not look like "ran
+    /// 5×"), but every quality aggregate excludes it structurally via
+    /// `FILTER (WHERE NOT not_applicable)`. `score`/`passed` are stored
+    /// as-authored and are meaningless for such a row.
     async fn record(
         &self,
         workflow_id: Uuid,
@@ -30,5 +38,6 @@ pub trait JudgeScoreRecorder: Send + Sync {
         execution_id: Uuid,
         score: f64,
         passed: bool,
+        not_applicable: bool,
     );
 }

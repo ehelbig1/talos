@@ -201,7 +201,13 @@ pub struct ObservationalRow {
     pub mean_fused: f64,
     /// Count of memories injected.
     pub mem_count: i64,
-    /// Newest judge verdict for the execution, if any.
+    /// Newest SCORED judge verdict for the execution, if any.
+    ///
+    /// Abstentions (`judge_scores.not_applicable`) never reach here: the
+    /// source lateral in `talos_memory::fetch_execution_memory_outcomes`
+    /// filters them, so an execution whose only verdict was an abstention
+    /// arrives with `judge_passed = None` and is dropped from the analyzable
+    /// set below — an abstention is not an outcome label.
     pub judge_passed: Option<bool>,
     pub judge_score: Option<f64>,
 }
@@ -473,6 +479,31 @@ mod tests {
         let c = r.corr_relevance_pass.expect("corr computable");
         assert!(c > 0.8, "expected strong positive corr, got {c}");
         assert!(r.pass_rate_high_relevance.unwrap() > r.pass_rate_low_relevance.unwrap());
+    }
+
+    /// An execution whose only judge verdict was an ABSTENTION must not
+    /// enter the correlation. The exclusion is structural — the source
+    /// lateral in `talos_memory::fetch_execution_memory_outcomes` filters
+    /// `not_applicable` rows, so such an execution arrives here with
+    /// `judge_passed: None` and is dropped by the `is_some` filter.
+    ///
+    /// This test pins the CONSEQUENCE of that contract: were the DB filter
+    /// ever removed, an abstention would arrive as `Some(true)` with score
+    /// 1.0 and silently inflate `overall_pass_rate` and the correlation.
+    #[test]
+    fn observational_drops_executions_whose_verdict_was_an_abstention() {
+        // Two really-scored executions plus one whose newest verdict was an
+        // abstention (→ no scored verdict → arrives unlabeled).
+        let rows = vec![
+            obs(0.9, 5, Some(true), Some(0.9)),
+            obs(0.2, 1, Some(false), Some(0.2)),
+            obs(0.95, 9, None, None), // abstained → unlabeled
+        ];
+        let r = analyze_observational(&rows);
+        assert_eq!(r.n_labeled, 2, "the abstaining execution must not count");
+        assert!((r.overall_pass_rate - 0.5).abs() < 1e-9);
+        // Mean score is over the two scored rows only.
+        assert!((r.mean_judge_score.unwrap() - 0.55).abs() < 1e-9);
     }
 
     #[test]
