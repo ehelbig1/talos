@@ -3826,41 +3826,19 @@ mod tests {
         // fail verify. This is the critical property for cross-tenant
         // security.
         let mut tampered = req.clone();
-        tampered.op = MemoryOp::Delete {
+        // Re-mints raw for the new op but keeps the original signature
+        // (computed over the Set body) — verify must reject.
+        tampered.op = crate::rpc_auth::RawSigned::from(MemoryOp::Delete {
             key: "victim-key".to_string(),
-        };
+        });
         assert!(!tampered.verify());
     }
 
-    #[test]
-    fn canonical_json_sorts_object_keys() {
-        use crate::rpc_auth::canonical_json_bytes;
-        // Same logical JSON built in two different insertion orders
-        // — canonical form must be byte-identical.
-        let mut a = serde_json::Map::new();
-        a.insert("z".to_string(), serde_json::json!(1));
-        a.insert("a".to_string(), serde_json::json!(2));
-        let mut b = serde_json::Map::new();
-        b.insert("a".to_string(), serde_json::json!(2));
-        b.insert("z".to_string(), serde_json::json!(1));
-        let va = serde_json::Value::Object(a);
-        let vb = serde_json::Value::Object(b);
-        assert_eq!(canonical_json_bytes(&va), canonical_json_bytes(&vb));
-
-        // Nested: a's inner keys must also be sorted recursively.
-        let nested_a = serde_json::json!({
-            "outer": {"zz": 1, "aa": 2, "mm": 3},
-            "arr": [{"x": 1, "y": 2}, {"y": 2, "x": 1}],
-        });
-        let nested_b = serde_json::json!({
-            "arr": [{"y": 2, "x": 1}, {"x": 1, "y": 2}],
-            "outer": {"aa": 2, "mm": 3, "zz": 1},
-        });
-        assert_eq!(
-            canonical_json_bytes(&nested_a),
-            canonical_json_bytes(&nested_b)
-        );
-    }
+    // (`canonical_json_sorts_object_keys` deleted with the canonical
+    // machinery. The key-order invariance it asserted now holds by virtue
+    // of `serde_json::Value::Object` being a BTreeMap in this workspace —
+    // covered end-to-end by `memory_set_signature_is_key_order_invariant`
+    // below, which signs two orderings and checks both verify.)
 
     #[test]
     fn memory_set_signature_is_key_order_invariant() {
@@ -4126,23 +4104,10 @@ mod tests {
         .is_some());
     }
 
-    #[test]
-    fn canonical_json_respects_depth_limit() {
-        use crate::rpc_auth::{canonical_json_bytes, MAX_CANONICAL_DEPTH};
-        // Build an object nested MAX_CANONICAL_DEPTH + 10 deep.
-        let mut v = serde_json::Value::Null;
-        for _ in 0..(MAX_CANONICAL_DEPTH + 10) {
-            let mut wrapper = serde_json::Map::new();
-            wrapper.insert("n".to_string(), v);
-            v = serde_json::Value::Object(wrapper);
-        }
-        // Overflow must return empty bytes so downstream signing fails.
-        assert!(canonical_json_bytes(&v).is_empty());
-
-        // Shallow nesting is fine.
-        let shallow = serde_json::json!({ "a": { "b": { "c": 1 } } });
-        assert!(!canonical_json_bytes(&shallow).is_empty());
-    }
+    // (`canonical_json_respects_depth_limit` deleted with the canonical
+    // machinery — RawSigned binds the exact wire text and relies on
+    // serde_json's own 128-deep recursion cap, exercised via the
+    // wire_hop_signing_specs property tests, not a bespoke depth walk.)
 
     #[test]
     fn embedding_cache_key_isolates_by_model() {
@@ -4402,9 +4367,10 @@ mod wire_hop_signing_specs {
     //!
     //! ## The defect these specs describe
     //!
-    //! [`crate::rpc_auth::canonical_json_bytes`] re-derives a number's TEXT
-    //! from a *parsed* `serde_json::Value`
-    //! (`Value::Number(n) => n.to_string()`). serde_json's f64 round trip is
+    //! The pre-Phase-2 signing path (`rpc_auth::canonical_json_bytes`, since
+    //! deleted) re-derived a number's TEXT from a *parsed*
+    //! `serde_json::Value` (`Value::Number(n) => n.to_string()`).
+    //! serde_json's f64 round trip is
     //! **not idempotent**: for a meaningful fraction of ordinary computed
     //! values `parse(write(x))` lands one ULP away from `x`, and some values
     //! have no fixed point at all (they cycle between two representations
@@ -4426,13 +4392,16 @@ mod wire_hop_signing_specs {
     //!
     //! ## How to read this module
     //!
-    //! * `#[ignore]`d tests are the **OPEN** specs. They fail today, by
-    //!   design. Phase 2 lands `RawSigned<T>` and un-ignores them.
-    //! * Everything else passes today: the confirmed-UNAFFECTED RPC families
-    //!   (they bind only strings/ints, never a `Value`), the
-    //!   anti-vacuousness guard on the generator, and one unit-level pin of
-    //!   the root-cause mechanism that is scheduled for deletion alongside
-    //!   the canonical machinery it documents.
+    //! * The wire-hop specs (memory `Set` value / metadata / ttl,
+    //!   integration `Set`, and the two seeded property tests) were the
+    //!   **OPEN** contract: `#[ignore]`d and failing until Phase 2 landed
+    //!   [`rpc_auth::RawSigned`]. They are now active and MUST pass — a
+    //!   regression here means the raw-bytes binding was reintroduced-as-
+    //!   re-derivation somewhere.
+    //! * The rest pin the confirmed-UNAFFECTED RPC families (they bind only
+    //!   strings/ints, never a `Value`) and the generator's
+    //!   anti-vacuousness guard. The two unit-level pins that referenced the
+    //!   now-deleted `canonical_json_bytes` were removed with it.
 
     use crate::integration_state_rpc::{
         IndexedSlots, IntegrationOp, IntegrationStateRequest, SUBJECT_NAME as INTEGRATION_SUBJECT,
@@ -4514,7 +4483,6 @@ mod wire_hop_signing_specs {
     ///
     /// Un-ignore when `RawSigned<MemoryOp>` binds the exact wire text.
     #[test]
-    #[ignore = "OPEN: signing re-derives floats from parsed Values — un-ignore when RawSigned lands (see memory-rpc-signing-plan)"]
     fn memory_set_survives_the_wire_with_a_2cycle_float() {
         ensure_hmac_key();
         let actor = Uuid::new_v4();
@@ -4544,7 +4512,6 @@ mod wire_hop_signing_specs {
     /// The value is deliberately stable (a plain string) so a failure can
     /// only be attributed to the metadata field.
     #[test]
-    #[ignore = "OPEN: signing re-derives floats from parsed Values — un-ignore when RawSigned lands (see memory-rpc-signing-plan)"]
     fn memory_set_survives_the_wire_with_a_2cycle_float_in_metadata_only() {
         ensure_hmac_key();
         let actor = Uuid::new_v4();
@@ -4575,7 +4542,6 @@ mod wire_hop_signing_specs {
     /// Uses the #597 bit pattern plus a seeded search for a drifting value, so
     /// the spec is pinned to a measured fact rather than an assumption.
     #[test]
-    #[ignore = "OPEN: signing re-derives floats from parsed Values — un-ignore when RawSigned lands (see memory-rpc-signing-plan)"]
     fn memory_set_ttl_survives_the_wire_with_drifting_f64() {
         ensure_hmac_key();
         let actor = Uuid::new_v4();
@@ -4609,7 +4575,6 @@ mod wire_hop_signing_specs {
     /// integrations persist `Value`s that include API-supplied numerics
     /// (expiry timestamps, history ids), so this is not a theoretical path.
     #[test]
-    #[ignore = "OPEN: signing re-derives floats from parsed Values — un-ignore when RawSigned lands (see memory-rpc-signing-plan)"]
     fn integration_set_survives_the_wire_with_a_2cycle_float() {
         ensure_hmac_key();
         let req = IntegrationStateRequest::new_signed(
@@ -4637,7 +4602,6 @@ mod wire_hop_signing_specs {
     /// Seeded (never `thread_rng`) so a failure is reproducible from the
     /// printed iteration and seed.
     #[test]
-    #[ignore = "OPEN: signing re-derives floats from parsed Values — un-ignore when RawSigned lands (see memory-rpc-signing-plan)"]
     fn memory_set_survives_the_wire_for_arbitrary_json() {
         ensure_hmac_key();
         let actor = Uuid::new_v4();
@@ -4656,7 +4620,6 @@ mod wire_hop_signing_specs {
 
     /// **OPEN SPEC (property).** Integration-state twin of the above.
     #[test]
-    #[ignore = "OPEN: signing re-derives floats from parsed Values — un-ignore when RawSigned lands (see memory-rpc-signing-plan)"]
     fn integration_set_survives_the_wire_for_arbitrary_json() {
         ensure_hmac_key();
         let mut seed = 0x5eed_0dd0_0000_0002_u64;
@@ -4778,31 +4741,12 @@ mod wire_hop_signing_specs {
 
     // ── Root-cause pins and the property generator ───────────────────────
 
-    /// **Scheduled for deletion with `canonical_json_bytes` /
-    /// `write_canonical` in Phase 2.** This is the mechanism, stated as an
-    /// executable fact instead of a comment: canonicalising a value and
-    /// canonicalising its own re-parse produce DIFFERENT bytes.
-    ///
-    /// That inequality is the whole bug — the sender hashes the left side,
-    /// the receiver hashes the right side. Once the signed form is the exact
-    /// wire text, nothing re-derives anything and this test has no subject
-    /// left to describe; delete it together with the canonical machinery.
-    #[test]
-    fn canonical_bytes_are_not_stable_across_a_json_reparse() {
-        for poison in [POISON_2CYCLE, f64::from_bits(POISON_BITS)] {
-            let sender = json!({"ratio": poison});
-            let wire = sender.to_string();
-            let receiver: serde_json::Value =
-                serde_json::from_str(&wire).expect("wire text must re-parse");
-            assert_ne!(
-                rpc_auth::canonical_json_bytes(&sender),
-                rpc_auth::canonical_json_bytes(&receiver),
-                "expected canonical(parse(write(v))) != canonical(v) for {poison:e} — \
-                 if serde_json ever fixes its f64 round trip this test documents why \
-                 raw-bytes signing was introduced rather than becoming dead weight"
-            );
-        }
-    }
+    // `canonical_bytes_are_not_stable_across_a_json_reparse` was deleted
+    // in Phase 2 together with `canonical_json_bytes` / `write_canonical`.
+    // The mechanism it pinned (canonicalising a value vs. canonicalising
+    // its re-parse yields different bytes) no longer has a subject: nothing
+    // re-derives anything now that the signature covers the exact wire
+    // text. The wire-hop specs above are the surviving, higher-level proof.
 
     /// Measurement, not an assumption: does `ttl_hours` — a struct
     /// `Option<f64>`, whose wire text is written by serde's float formatter
@@ -4948,27 +4892,13 @@ mod wire_hop_signing_specs {
         );
     }
 
-    /// Second anti-vacuousness guard, one level closer to the protocol: the
-    /// generator must produce values whose CANONICAL bytes differ across a
-    /// re-parse, since that — not raw text instability — is what the memory
-    /// signature is computed over.
-    #[test]
-    fn generator_produces_values_whose_canonical_bytes_drift() {
-        let mut seed = 0x5eed_0dd0_0000_0004_u64;
-        let mut drifted = 0;
-        for _ in 0..20_000 {
-            let v = arbitrary_json(&mut seed, 3);
-            let once = v.to_string();
-            if let Ok(p) = serde_json::from_str::<serde_json::Value>(&once) {
-                if rpc_auth::canonical_json_bytes(&p) != rpc_auth::canonical_json_bytes(&v) {
-                    drifted += 1;
-                }
-            }
-        }
-        assert!(
-            drifted > 0,
-            "generator produced NO value whose canonical bytes drift across a re-parse — \
-             the OPEN property specs could not observe the defect they exist for"
-        );
-    }
+    // The second anti-vacuousness guard
+    // (`generator_produces_values_whose_canonical_bytes_drift`) was deleted
+    // with `canonical_json_bytes` in Phase 2. Its purpose — proving the
+    // generator produces values that expose the re-derivation defect — is
+    // now served, one level higher, by
+    // `generator_actually_produces_round_trip_unstable_values` above: raw
+    // text instability across a re-parse is exactly what RawSigned's wire
+    // hop must survive, and the memory signature is now computed over that
+    // raw text rather than a canonicalised form.
 }

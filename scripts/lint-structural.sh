@@ -4016,16 +4016,28 @@ echo
 # Normalising to a "fixed point" was the FIRST fix and it was insufficient:
 # some floats have NO fixed point at all (`5.455171886890906e-115` enters a
 # permanent 2-cycle under repeated round trips), so no number of normalisation
-# passes converges. The real fix is to stop re-deriving: every signed payload
-# field is a `SignedJson`, which keeps the exact wire text and hashes THAT via
-# `raw_bytes()`. This check keeps a NEW signed field from reintroducing the
-# re-derived form: inside the job-protocol crate, a Sha256 must not be taken
-# over a `.to_string()` (with or without an intervening `.value()`).
+# passes converges. The real fix is to stop re-deriving: bind the EXACT wire
+# text and hash THAT. Two crates implement the pattern:
+#   • job-protocol `SignedJson` (Value-typed) — dispatch/result payloads.
+#   • talos-memory `RawSigned<T>` (typed) — the memory / integration-state
+#     `Set` ops, which carry an arbitrary `serde_json::Value` (2026-07-27,
+#     the #598 memory-RPC twin). It REPLACED `canonical_json_bytes` /
+#     `write_canonical`, which re-derived a parsed `Value`'s text on each side
+#     (`Value::Number(n) => n.to_string()`) and so hit the identical defect.
+# This check guards BOTH surfaces from a regression:
+#   (a) inside job-protocol, a Sha256 must not be taken over a signed field's
+#       `.to_string()` (with or without an intervening `.value()`);
+#   (b) inside talos-memory, the deleted `canonical_json_bytes` /
+#       `write_canonical` identifiers must never reappear in code — their
+#       return was a re-derived byte form, so resurrecting either name is the
+#       same class of bug wearing the old name.
 #
-# Only `<expr>.to_string()` fed straight to a digest is flagged — hashing a
-# String field (`logs.join`, `module_uri.as_bytes()`) is unaffected, since a
-# String is already the exact bytes and has no re-derivation step.
-# Opt-out: `// allow-raw-json-hash: <reason>`.
+# For (a): only `<expr>.to_string()` fed straight to a digest is flagged —
+# hashing a String field (`logs.join`, `module_uri.as_bytes()`) is unaffected,
+# since a String is already the exact bytes and has no re-derivation step.
+# For (b): comment lines are skipped (the RawSigned docs and this script name
+# the identifiers deliberately); only live code counts.
+# Opt-out (both): `// allow-raw-json-hash: <reason>`.
 bold "▶ check 61: signed JSON must be hashed as its exact wire bytes"
 
 RAW_JSON_HASH=0
@@ -4045,10 +4057,33 @@ $(grep -nE "Sha256::digest\((self|s)\.[A-Za-z_]+(\.value\(\))?\.to_string\(\)" "
 EOF
 fi
 
+# (b) the deleted canonical machinery must not reappear as live code in
+# talos-memory. Skip comment lines (`//`, `///`, `//!`, block `*`) so the
+# RawSigned docs that explain WHY it was removed don't self-trip.
+for mf in talos-memory/src/*.rs; do
+    [ -f "$mf" ] || continue
+    while IFS=: read -r lineno line; do
+        [ -n "$lineno" ] || continue
+        trimmed="$(printf '%s' "$line" | sed 's/^[[:space:]]*//')"
+        case "$trimmed" in
+            //*|\**) continue ;;
+        esac
+        start=$((lineno > 3 ? lineno - 3 : 1))
+        if sed -n "${start},${lineno}p" "$mf" | grep -q '// allow-raw-json-hash:'; then
+            continue
+        fi
+        red "✗ ${mf}:${lineno}: canonical_json_bytes/write_canonical resurrected (re-derives signed bytes)"
+        yellow "    $(printf '%s' "$trimmed")"
+        RAW_JSON_HASH=$((RAW_JSON_HASH + 1))
+    done <<EOF
+$(grep -nE 'canonical_json_bytes|write_canonical' "$mf" || true)
+EOF
+done
+
 if [ "$RAW_JSON_HASH" -gt 0 ]; then
     red "✗ ${RAW_JSON_HASH} signed-JSON hash site(s) re-derive the payload text"
-    yellow "  → make the field a SignedJson and hash its wire bytes:"
-    yellow "      Sha256::digest(self.field.raw_bytes())"
+    yellow "  → make the field a SignedJson / RawSigned<T> and hash its wire bytes:"
+    yellow "      Sha256::digest(self.field.raw_bytes())   // or op.raw_bytes()"
     yellow "  → serde_json's f64 round-trip is not idempotent and has no fixed"
     yellow "    point for some values, so ANY re-serialised form can differ per side"
     EXIT_CODE=1

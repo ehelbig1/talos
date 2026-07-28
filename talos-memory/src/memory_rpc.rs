@@ -96,7 +96,15 @@ pub enum MemoryOp {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryRpcRequest {
     pub actor_id: Uuid,
-    pub op: MemoryOp,
+    /// The whole op, wrapped so its signature covers the EXACT wire text.
+    /// Wrapping the ENVELOPE (not per-`Value`-field like the pre-#598
+    /// canonical scheme) fixes `value`, `metadata`, `ttl_hours` AND
+    /// `min_score` in one move — every float-bearing field is bound as raw
+    /// text with no re-derivation — and closes a latent footgun: a new
+    /// field added to `MemoryOp::Set` is signed by construction, never
+    /// silently left out of a hand-built body. See
+    /// [`rpc_auth::RawSigned`].
+    pub op: rpc_auth::RawSigned<MemoryOp>,
     pub timestamp_ms: i64,
     pub nonce: String,
     pub signature: Vec<u8>,
@@ -135,16 +143,17 @@ impl MemoryRpcRequest {
         // this check still fails the gate.
         //
         // Cheap-gate-first per the MCP-1026 / MCP-1033 sweep: this is the
-        // same validator that runs in verify(), so the canonical-bytes
-        // build + HMAC compute below only fires for well-formed payloads.
+        // same validator that runs in verify(), so the raw-bytes build +
+        // HMAC compute below only fires for well-formed payloads.
         validate_structure(&op)?;
         let timestamp_ms = rpc_auth::now_ms();
         let nonce = rpc_auth::random_nonce();
+        // Mint the exact wire text ONCE, here, inside the worker — the
+        // guest only ever supplied `Value`-semantics (see host/memory.rs,
+        // which parses the guest string to a `Value` before building the
+        // op). Everything from here signs `op.raw_bytes()`.
+        let op = rpc_auth::RawSigned::from(op);
         let body = sign_body_bytes(&op, timestamp_ms);
-        if body.is_empty() {
-            // canonical_json_bytes returned empty (depth exceeded).
-            return None;
-        }
         let (signature, worker_id, crypto_scheme) =
             rpc_auth::sign_rpc(SUBJECT_NAME, actor_id, &nonce, &body)?;
         Some(Self {
@@ -164,20 +173,18 @@ impl MemoryRpcRequest {
         if !rpc_auth::verify_freshness(self.timestamp_ms) {
             return false;
         }
-        if validate_finite(&self.op).is_none() {
+        if validate_finite(self.op.get()).is_none() {
             return false;
         }
         // MCP-1026 (2026-05-15): structural caps inside verify(). Same
         // sibling pattern as state_rpc (MCP-1024), graph_rpc (MCP-1025),
         // and integration_state_rpc::validate_op. Cheap-gate-first so
-        // an oversized field short-circuits before the HMAC compute.
-        if validate_structure(&self.op).is_none() {
+        // an oversized field short-circuits before the HMAC compute —
+        // reads the already-parsed op, no re-serialisation.
+        if validate_structure(self.op.get()).is_none() {
             return false;
         }
         let body = sign_body_bytes(&self.op, self.timestamp_ms);
-        if body.is_empty() {
-            return false;
-        }
         rpc_auth::verify_rpc(
             SUBJECT_NAME,
             self.actor_id,
@@ -207,10 +214,10 @@ impl MemoryRpcRequest {
 ///   (`is_valid_memory_type`).
 ///
 /// What we do NOT check here:
-/// - `value` / `metadata` canonical-bytes size — those are bounded by
+/// - `value` / `metadata` byte size — those are bounded by
 ///   MAX_VALUE_BYTES / MAX_METADATA_BYTES at persist time (lib.rs:452 /
-///   :581). Verifying here would require re-serialising the JSON value,
-///   which is expensive. The persist-path check is the right boundary.
+///   :581). Verifying here would require walking the JSON value, which is
+///   expensive. The persist-path check is the right boundary.
 fn validate_structure(op: &MemoryOp) -> Option<()> {
     fn ok_key(k: &str) -> bool {
         let trimmed = k.trim();
@@ -445,144 +452,31 @@ fn validate_finite(op: &MemoryOp) -> Option<()> {
     }
 }
 
-/// Variant tags for [`sign_body_bytes`]. Defined as named constants
-/// so adding a new `MemoryOp` variant forces the author to also
-/// extend the match in `sign_body_bytes` (the match is exhaustive —
-/// the compiler fails — and then pick a *new* tag byte here. Collisions
-/// with existing tags are visible as const-value conflicts at compile
-/// time if you also update the `debug_assert` below. **Never change
-/// or reuse a tag byte after deployment — old signatures would become
-/// invalid.**
-const TAG_GET: u8 = b'G';
-const TAG_SET: u8 = b'S';
-const TAG_DELETE: u8 = b'D';
-const TAG_LIST_KEYS: u8 = b'L';
-const TAG_SEARCH: u8 = b'Q';
-// Compile-time uniqueness guard — if a future edit introduces a
-// collision here, the const array fails to build.
-const _TAG_UNIQUENESS_GUARD: [u8; 5] = {
-    let tags = [TAG_GET, TAG_SET, TAG_DELETE, TAG_LIST_KEYS, TAG_SEARCH];
-    // Constant-evaluable dedupe check (loop allowed in const fn).
-    let mut i = 0;
-    while i < tags.len() {
-        let mut j = i + 1;
-        while j < tags.len() {
-            // Assertion: tag bytes must differ. A violation panics the build.
-            assert!(tags[i] != tags[j], "MemoryOp tag byte collision");
-            j += 1;
-        }
-        i += 1;
-    }
-    tags
-};
-
-/// Hand-built canonical byte form of the signed body. Using explicit
-/// byte concatenation rather than `serde_json::to_vec(&struct)` means:
+/// The signed body: the request's freshness timestamp followed by the
+/// EXACT wire bytes of the op.
 ///
-/// - `MemoryOp::Set.value` (a `serde_json::Value`) is serialized via
-///   [`rpc_auth::canonical_json_bytes`] — sorted keys recursively —
-///   so the same logical JSON always produces the same bytes
-///   regardless of whether `serde_json/preserve_order` is enabled
-///   anywhere in the dep tree.
-/// - Variant discriminants are fixed single-byte tags (`G`, `S`, `D`,
-///   `L`, `Q`) — they can never be reordered by a serde upgrade.
-/// - Numeric and bool fields are encoded as little-endian bytes, not
-///   as their decimal text form, so there's no ambiguity about
-///   leading zeros or sign prefixes.
+/// Layout: `timestamp_ms (i64 LE) || op.raw_bytes()`.
 ///
-/// The layout is: `timestamp (i64 LE) || variant_tag (1B) || field1 || \0 ||
-/// field2 || \0 || …`. Only change this layout in a coordinated
-/// controller+worker deploy — any mismatch invalidates every signature.
-fn sign_body_bytes(op: &MemoryOp, timestamp_ms: i64) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(64);
+/// The timestamp is an envelope field (outside the op) so it stays a
+/// fixed 8-byte LE prefix. `op.raw_bytes()` is the JSON text of the op as
+/// it appears on the wire — minted once at construction, captured
+/// verbatim on deserialise, NEVER re-derived (see [`rpc_auth::RawSigned`]).
+/// That is the whole fix: the old hand-built body re-serialised
+/// `MemoryOp::Set.value` / `metadata` via `canonical_json_bytes` and
+/// re-encoded `ttl_hours` / `min_score` as `to_le_bytes` of a re-parsed
+/// f64, and serde_json's non-idempotent float round trip made an honest
+/// sender and receiver disagree. Binding the raw text removes every
+/// re-derivation, and — because the receiver hashes the sender's exact
+/// bytes — also removes any dependence on key ordering or serde enum-tag
+/// stability that the old fixed-tag concatenation existed to defend.
+///
+/// Only change this layout in a coordinated controller+worker deploy —
+/// any mismatch invalidates every signature.
+fn sign_body_bytes(op: &rpc_auth::RawSigned<MemoryOp>, timestamp_ms: i64) -> Vec<u8> {
+    let raw = op.raw_bytes();
+    let mut buf = Vec::with_capacity(8 + raw.len());
     buf.extend_from_slice(&timestamp_ms.to_le_bytes());
-    match op {
-        MemoryOp::Get { key } => {
-            buf.push(TAG_GET);
-            buf.extend_from_slice(key.as_bytes());
-        }
-        MemoryOp::Set {
-            key,
-            value,
-            memory_type,
-            ttl_hours,
-            metadata,
-        } => {
-            buf.push(TAG_SET);
-            buf.extend_from_slice(key.as_bytes());
-            buf.push(0);
-            let canon = rpc_auth::canonical_json_bytes(value);
-            if canon.is_empty() {
-                // canonical_json_bytes returns empty when depth
-                // exceeded — propagate by also returning empty so
-                // callers signal failure.
-                return Vec::new();
-            }
-            buf.extend_from_slice(&canon);
-            buf.push(0);
-            buf.extend_from_slice(memory_type.as_bytes());
-            buf.push(0);
-            // Option<f64>: sentinel byte + optional 8-byte LE repr.
-            // Non-finite values are rejected earlier via
-            // `validate_finite`; if one slips through we still use
-            // to_le_bytes (the byte form is at least deterministic
-            // for a given NaN bit pattern).
-            match ttl_hours {
-                Some(t) => {
-                    buf.push(0x01);
-                    buf.extend_from_slice(&t.to_le_bytes());
-                }
-                None => buf.push(0x00),
-            }
-            // Metadata is optional; include in the signed byte stream so an
-            // attacker can't swap or drop it without breaking the HMAC.
-            match metadata {
-                Some(m) => {
-                    buf.push(0x01);
-                    let meta_canon = rpc_auth::canonical_json_bytes(m);
-                    if meta_canon.is_empty() {
-                        return Vec::new();
-                    }
-                    buf.extend_from_slice(&meta_canon);
-                }
-                None => buf.push(0x00),
-            }
-        }
-        MemoryOp::Delete { key } => {
-            buf.push(TAG_DELETE);
-            buf.extend_from_slice(key.as_bytes());
-        }
-        MemoryOp::ListKeys { prefix } => {
-            buf.push(TAG_LIST_KEYS);
-            if let Some(p) = prefix {
-                buf.extend_from_slice(p.as_bytes());
-            }
-        }
-        MemoryOp::Search {
-            query,
-            limit,
-            min_score,
-            exclude_kinds,
-        } => {
-            buf.push(TAG_SEARCH);
-            buf.extend_from_slice(query.as_bytes());
-            buf.push(0);
-            buf.extend_from_slice(&limit.to_le_bytes());
-            buf.extend_from_slice(&min_score.to_le_bytes());
-            // Length-prefixed list encoding so the HMAC binds both the
-            // count and the ordered contents. Sort-insensitive: we sort a
-            // local copy before encoding so two payloads that differ only
-            // in input ordering produce the same signature (the controller
-            // side de-duplicates anyway — no semantic difference).
-            let mut sorted: Vec<&String> = exclude_kinds.iter().collect();
-            sorted.sort();
-            buf.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
-            for k in sorted {
-                buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
-                buf.extend_from_slice(k.as_bytes());
-            }
-        }
-    }
+    buf.extend_from_slice(raw);
     buf
 }
 

@@ -1610,7 +1610,9 @@ pub fn spawn_memory_rpc_subscriber(
             // indefinitely. Elapsed maps to the protocol's existing
             // `Timeout` variant / "timeout" outcome tag.
             let op_result =
-                match kernel::guard_op(execute_memory_op(&pool, req.actor_id, req.op)).await {
+                match kernel::guard_op(execute_memory_op(&pool, req.actor_id, req.op.into_inner()))
+                    .await
+                {
                     Ok(r) => r,
                     Err(_elapsed) => {
                         tracing::warn!(
@@ -2725,7 +2727,7 @@ pub fn spawn_integration_state_subscriber(
                 &pool,
                 &req.integration_name,
                 req.user_id,
-                req.op,
+                req.op.into_inner(),
             ))
             .await
             {

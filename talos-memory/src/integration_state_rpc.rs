@@ -143,7 +143,11 @@ pub struct IntegrationStateRequest {
     pub integration_name: String,
     pub actor_id: Uuid,
     pub user_id: Uuid,
-    pub op: IntegrationOp,
+    /// The whole op, wrapped so its signature covers the EXACT wire text
+    /// — `IntegrationOp::Set.value` (a `serde_json::Value`) is bound as
+    /// raw bytes with no re-derivation. See [`rpc_auth::RawSigned`] and
+    /// the memory-RPC twin `memory_rpc::MemoryRpcRequest::op`.
+    pub op: rpc_auth::RawSigned<IntegrationOp>,
     pub timestamp_ms: i64,
     pub nonce: String,
     pub signature: Vec<u8>,
@@ -170,10 +174,10 @@ impl IntegrationStateRequest {
         validate_op(&op)?;
         let timestamp_ms = rpc_auth::now_ms();
         let nonce = rpc_auth::random_nonce();
+        // Mint the exact wire text once (host/integration_state.rs already
+        // parsed the guest string to a `Value` before building the op).
+        let op = rpc_auth::RawSigned::from(op);
         let body = sign_body_bytes(&integration_name, user_id, &op, timestamp_ms);
-        if body.is_empty() {
-            return None;
-        }
         let (signature, worker_id, crypto_scheme) =
             rpc_auth::sign_rpc(SUBJECT_NAME, actor_id, &nonce, &body)?;
         Some(Self {
@@ -196,7 +200,7 @@ impl IntegrationStateRequest {
         if !validate_integration_name(&self.integration_name) {
             return false;
         }
-        if validate_op(&self.op).is_none() {
+        if validate_op(self.op.get()).is_none() {
             return false;
         }
         let body = sign_body_bytes(
@@ -205,9 +209,6 @@ impl IntegrationStateRequest {
             &self.op,
             self.timestamp_ms,
         );
-        if body.is_empty() {
-            return false;
-        }
         rpc_auth::verify_rpc(
             SUBJECT_NAME,
             self.actor_id,
@@ -341,156 +342,46 @@ fn validate_op(op: &IntegrationOp) -> Option<()> {
     Some(())
 }
 
-/// Named variant tag constants. Same rationale as memory_rpc: adding
-/// a new variant forces picking a new tag byte; a collision would fail
-/// the build via the uniqueness guard. Tag bytes NEVER change after
-/// deployment — old signatures become invalid.
-const TAG_GET: u8 = b'G';
-const TAG_SET: u8 = b'S';
-const TAG_DELETE: u8 = b'D';
-const TAG_LIST: u8 = b'L';
-
-#[allow(dead_code)]
-const _TAG_UNIQUENESS_GUARD: [u8; 4] = {
-    let tags = [TAG_GET, TAG_SET, TAG_DELETE, TAG_LIST];
-    let mut i = 0;
-    while i < tags.len() {
-        let mut j = i + 1;
-        while j < tags.len() {
-            assert!(tags[i] != tags[j], "IntegrationOp tag byte collision");
-            j += 1;
-        }
-        i += 1;
-    }
-    tags
-};
-
-/// Hand-built canonical byte form — mirrors memory_rpc's design so both
-/// RPCs share the same serde-upgrade-immune signing surface. Layout:
+/// The signed body: the envelope fields (`integration_name`, `user_id`,
+/// freshness timestamp) followed by the EXACT wire bytes of the op.
+///
+/// Layout:
 ///
 ///   integration_name_len (u32 LE) || integration_name_bytes ||
 ///   user_id (16 bytes) ||
 ///   timestamp_ms (i64 LE) ||
-///   variant_tag (1 byte) ||
-///   per-variant fields (see match below)
+///   op.raw_bytes()
 ///
-/// JSON values are canonicalized via
-/// [`rpc_auth::canonical_json_bytes`] (sorted keys, depth-bounded) so
-/// logical equivalence produces byte equivalence regardless of any
-/// serde_json feature flags in the dep tree.
+/// `integration_name` and `user_id` are envelope fields (NOT part of the
+/// op enum) so they keep their fixed length-prefixed / 16-byte encoding —
+/// binding them here is what makes a gcal signature unusable as a gmail
+/// one and blocks cross-user replay. `op.raw_bytes()` is the JSON text of
+/// the op as it appears on the wire: minted once at construction, captured
+/// verbatim on deserialise, never re-derived. That replaces the old
+/// hand-built body that re-serialised `IntegrationOp::Set.value` via
+/// `canonical_json_bytes`, where serde_json's non-idempotent float round
+/// trip made an honest sender and receiver disagree (#598). Because the
+/// receiver hashes the sender's exact bytes, this also removes the old
+/// dependence on key ordering and serde enum-tag stability.
+///
+/// WIRE-FORMAT STABILITY: the envelope prefix order is load-bearing and
+/// the op text is bound verbatim. Changing the prefix layout — or moving
+/// to/from raw-bytes op binding — invalidates every deployed signature and
+/// must be a coordinated controller+worker deploy.
 fn sign_body_bytes(
     integration_name: &str,
     user_id: Uuid,
-    op: &IntegrationOp,
+    op: &rpc_auth::RawSigned<IntegrationOp>,
     timestamp_ms: i64,
 ) -> Vec<u8> {
-    // IMPORTANT — WIRE-FORMAT STABILITY RULE ----------------------------
-    // The byte order emitted below is load-bearing: every deployed
-    // signature was computed with these fields in THIS order. Changing
-    // or reordering the existing emits invalidates every in-flight
-    // request + every pending nonce-cache entry AND will produce
-    // Unauthorized on every client still running the old code — a
-    // guaranteed outage during rolling deploys.
-    //
-    // Adding fields: always APPEND to the end of the relevant variant's
-    // emit list, never insert in the middle. Adding a new variant:
-    // allocate a fresh TAG_* byte (the compile-time uniqueness guard
-    // above will fail the build on a collision).
-    //
-    // Removing fields is a breaking change and must be coordinated
-    // with a wire-format version bump.
-    // --------------------------------------------------------------------
-    let mut buf = Vec::with_capacity(128);
+    let raw = op.raw_bytes();
+    let mut buf = Vec::with_capacity(4 + integration_name.len() + 16 + 8 + raw.len());
     buf.extend_from_slice(&(integration_name.len() as u32).to_le_bytes());
     buf.extend_from_slice(integration_name.as_bytes());
     buf.extend_from_slice(user_id.as_bytes());
     buf.extend_from_slice(&timestamp_ms.to_le_bytes());
-
-    match op {
-        IntegrationOp::Get { key } => {
-            buf.push(TAG_GET);
-            write_str(&mut buf, key);
-        }
-        IntegrationOp::Set {
-            key,
-            value,
-            ttl_seconds,
-            slots,
-        } => {
-            buf.push(TAG_SET);
-            write_str(&mut buf, key);
-            let canon = rpc_auth::canonical_json_bytes(value);
-            if canon.is_empty() {
-                return Vec::new();
-            }
-            write_bytes(&mut buf, &canon);
-            write_optional_u64(&mut buf, *ttl_seconds);
-            write_optional_str(&mut buf, slots.idx_str_1.as_deref());
-            write_optional_str(&mut buf, slots.idx_str_2.as_deref());
-            write_optional_i64(&mut buf, slots.idx_ts_1_ms);
-            write_optional_i64(&mut buf, slots.idx_int_1);
-        }
-        IntegrationOp::Delete { key } => {
-            buf.push(TAG_DELETE);
-            write_str(&mut buf, key);
-        }
-        IntegrationOp::List { filter, limit } => {
-            buf.push(TAG_LIST);
-            buf.extend_from_slice(&limit.to_le_bytes());
-            write_optional_str(&mut buf, filter.key_prefix.as_deref());
-            write_optional_str(&mut buf, filter.idx_str_1_eq.as_deref());
-            write_optional_str(&mut buf, filter.idx_str_2_eq.as_deref());
-            write_optional_i64(&mut buf, filter.idx_ts_1_gte_ms);
-            write_optional_i64(&mut buf, filter.idx_ts_1_lt_ms);
-            write_optional_i64(&mut buf, filter.idx_int_1_eq);
-        }
-    }
+    buf.extend_from_slice(raw);
     buf
-}
-
-#[inline]
-fn write_str(buf: &mut Vec<u8>, s: &str) {
-    buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
-    buf.extend_from_slice(s.as_bytes());
-}
-
-#[inline]
-fn write_bytes(buf: &mut Vec<u8>, b: &[u8]) {
-    buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
-    buf.extend_from_slice(b);
-}
-
-#[inline]
-fn write_optional_str(buf: &mut Vec<u8>, v: Option<&str>) {
-    match v {
-        Some(s) => {
-            buf.push(0x01);
-            write_str(buf, s);
-        }
-        None => buf.push(0x00),
-    }
-}
-
-#[inline]
-fn write_optional_i64(buf: &mut Vec<u8>, v: Option<i64>) {
-    match v {
-        Some(n) => {
-            buf.push(0x01);
-            buf.extend_from_slice(&n.to_le_bytes());
-        }
-        None => buf.push(0x00),
-    }
-}
-
-#[inline]
-fn write_optional_u64(buf: &mut Vec<u8>, v: Option<u64>) {
-    match v {
-        Some(n) => {
-            buf.push(0x01);
-            buf.extend_from_slice(&n.to_le_bytes());
-        }
-        None => buf.push(0x00),
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -667,8 +558,15 @@ mod tests {
     }
 
     #[test]
-    fn canonical_json_sorts_set_value_keys() {
-        // Build the same logical value two ways — signatures must match.
+    fn set_value_key_order_does_not_affect_signed_bytes() {
+        // Build the same logical value two ways. `serde_json::Value::Object`
+        // is a BTreeMap (no `preserve_order` in this workspace), so both
+        // orderings serialise to the SAME wire text — and RawSigned binds
+        // that exact text, so the signed bodies are byte-identical. (Unlike
+        // the old canonical scheme this is a property of serde_json's Map,
+        // not of a re-sorting pass; if `preserve_order` were ever enabled
+        // the two would legitimately diverge, which is correct — the
+        // signature covers the literal wire bytes.)
         setup_key();
         let actor = Uuid::new_v4();
         let user = Uuid::new_v4();
@@ -689,24 +587,8 @@ mod tests {
         // Timestamps will differ — compare only the signed bytes via
         // reusing the sign_body_bytes helper with a shared timestamp.
         let ts = 1_700_000_000_000i64;
-        let body_a = sign_body_bytes(
-            "gcal",
-            user,
-            &match a.op {
-                IntegrationOp::Set { .. } => a.op.clone(),
-                _ => unreachable!(),
-            },
-            ts,
-        );
-        let body_b = sign_body_bytes(
-            "gcal",
-            user,
-            &match b.op {
-                IntegrationOp::Set { .. } => b.op.clone(),
-                _ => unreachable!(),
-            },
-            ts,
-        );
+        let body_a = sign_body_bytes("gcal", user, &a.op, ts);
+        let body_b = sign_body_bytes("gcal", user, &b.op, ts);
         assert_eq!(body_a, body_b, "key order must not affect signed bytes");
     }
 }
