@@ -677,10 +677,19 @@ pub struct TwinScanGraphRow {
 pub const TWIN_SCAN_GRAPH_LIMIT: i64 = 100;
 
 /// Per-graph payload guard. Graphs above this are counted in
-/// `workflow_graphs_skipped_oversized` and their text is never
-/// transferred (the projection nulls it out server-side). Defensive: the
-/// largest graph observed is ~8KB.
+/// `workflow_graphs_skipped` and their text is never transferred (the
+/// projection nulls it out server-side). Defensive: the largest graph
+/// observed is ~8KB.
 pub const TWIN_SCAN_MAX_GRAPH_BYTES: i64 = 262_144;
+
+/// Aggregate payload guard across the whole scan. The per-graph cap alone
+/// admits 100 × 256 KB = 25 MB of JSON, all of which the analyzer parses
+/// into `serde_json::Value`s AT ONCE (they must coexist to be diffed) —
+/// several hundred MB of controller RSS for one on-demand report. Graphs
+/// past this budget are counted in `workflow_graphs_skipped` exactly like
+/// oversized ones, so the report's coverage disclosure covers both.
+/// 4 MB is ~65× the current whole-fleet total (62 KB).
+pub const TWIN_SCAN_TOTAL_BYTES: i64 = 4_194_304;
 
 #[derive(Debug)]
 pub struct HygieneReport {
@@ -718,9 +727,15 @@ pub struct HygieneReport {
     /// True when the graph scan hit [`TWIN_SCAN_GRAPH_LIMIT`] — some
     /// workflows were not examined, so absence of findings proves nothing.
     pub workflow_graphs_truncated: bool,
-    /// Graphs inside the scan window skipped for exceeding
-    /// [`TWIN_SCAN_MAX_GRAPH_BYTES`].
-    pub workflow_graphs_skipped_oversized: i64,
+    /// Graphs inside the scan window dropped before analysis: individually
+    /// over [`TWIN_SCAN_MAX_GRAPH_BYTES`], or past the scan's aggregate
+    /// [`TWIN_SCAN_TOTAL_BYTES`] budget.
+    pub workflow_graphs_skipped: i64,
+    /// True when the scan QUERY failed. Every other hygiene query treats a
+    /// failure as "no rows" (best-effort report), which for the twin scan
+    /// would render as a complete-looking, clean "0 pairs" section — so
+    /// this one flag travels to the report and the note owns the gap.
+    pub workflow_graphs_scan_failed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -4276,14 +4291,18 @@ impl AnalyticsRepository {
         // diff them, so this is the only hygiene query that pulls
         // `graph_json` bodies.
         //
-        // Bounded three ways: user-scoped, LIMIT $2 rows (cap-hit reported
-        // as `workflow_graphs_truncated`), and a server-side per-graph size
+        // Bounded four ways: user-scoped, LIMIT $2 rows (cap-hit reported
+        // as `workflow_graphs_truncated`), a server-side per-graph size
         // guard — the CASE nulls out any graph over $3 bytes so an
-        // oversized payload is COUNTED but never transferred or parsed.
+        // oversized payload is COUNTED but never transferred or parsed —
+        // and a client-side aggregate byte budget (the analyzer holds every
+        // graph parsed at once, so 100 × the per-graph cap is the number
+        // that matters for controller memory). Both drops land in the same
+        // `workflow_graphs_skipped` counter the report discloses.
         // `ORDER BY name, id` is a total order (id breaks name ties), so
         // the cap window is stable across runs.
         let workflow_graphs_fut = async {
-            let rows = sqlx::query(
+            let fetched = sqlx::query(
                 "SELECT id, name, \
                         CASE WHEN octet_length(graph_json) <= $3 THEN graph_json END AS graph_json \
                    FROM workflows \
@@ -4296,24 +4315,32 @@ impl AnalyticsRepository {
             .bind(TWIN_SCAN_GRAPH_LIMIT)
             .bind(TWIN_SCAN_MAX_GRAPH_BYTES)
             .fetch_all(&self.db_pool)
-            .await
-            .unwrap_or_default();
+            .await;
+            let scan_failed = fetched.is_err();
+            let rows = fetched.unwrap_or_default();
             let truncated = rows.len() as i64 >= TWIN_SCAN_GRAPH_LIMIT;
-            let mut skipped_oversized: i64 = 0;
+            let mut skipped: i64 = 0;
+            let mut budget_remaining: i64 = TWIN_SCAN_TOTAL_BYTES;
             let mut graphs: Vec<TwinScanGraphRow> = Vec::with_capacity(rows.len());
             for r in rows {
                 let graph_json: Option<String> = r.try_get::<Option<_>, _>("graph_json")?;
                 let Some(graph_json) = graph_json else {
-                    skipped_oversized += 1;
+                    skipped += 1;
                     continue;
                 };
+                let len = graph_json.len() as i64;
+                if len > budget_remaining {
+                    skipped += 1;
+                    continue;
+                }
+                budget_remaining -= len;
                 graphs.push(TwinScanGraphRow {
                     id: r.try_get("id")?,
                     name: r.try_get("name")?,
                     graph_json,
                 });
             }
-            Ok((graphs, truncated, skipped_oversized))
+            Ok((graphs, truncated, skipped, scan_failed))
         };
 
         // Batch C — #12 (orphaned_secrets, gated on has_wildcard_module from
@@ -4332,7 +4359,7 @@ impl AnalyticsRepository {
             anyhow::Result<Vec<ExpiringMemoryRow>>,
             anyhow::Result<Vec<NeedsSchemaRow>>,
             Vec<UntypedValueModuleRow>,
-            anyhow::Result<(Vec<TwinScanGraphRow>, bool, i64)>,
+            anyhow::Result<(Vec<TwinScanGraphRow>, bool, i64, bool)>,
         ) = tokio::join!(
             orphaned_secrets_fut,
             secrets_without_expiry_fut,
@@ -4349,8 +4376,12 @@ impl AnalyticsRepository {
         // is schema drift on `workflows.id/name/graph_json`, which every
         // other hygiene query reads too — surfacing it beats a silent
         // default (check 52).
-        let (workflow_graphs, workflow_graphs_truncated, workflow_graphs_skipped_oversized) =
-            workflow_graphs?;
+        let (
+            workflow_graphs,
+            workflow_graphs_truncated,
+            workflow_graphs_skipped,
+            workflow_graphs_scan_failed,
+        ) = workflow_graphs?;
 
         Ok(HygieneReport {
             undescribed,
@@ -4374,7 +4405,8 @@ impl AnalyticsRepository {
             untyped_value_modules,
             workflow_graphs,
             workflow_graphs_truncated,
-            workflow_graphs_skipped_oversized,
+            workflow_graphs_skipped,
+            workflow_graphs_scan_failed,
         })
     }
 

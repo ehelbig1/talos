@@ -345,8 +345,11 @@ impl HygieneService {
         let diverged_twin_pairs = twin_analysis.diverged_pairs().count();
         let workflow_twins = twin_divergence::twins_section(
             &twin_analysis,
-            h.workflow_graphs_truncated,
-            h.workflow_graphs_skipped_oversized,
+            twin_divergence::ScanCoverage {
+                truncated: h.workflow_graphs_truncated,
+                skipped_graphs: h.workflow_graphs_skipped,
+                scan_failed: h.workflow_graphs_scan_failed,
+            },
         );
 
         // --- Build summary and recommendations ---
