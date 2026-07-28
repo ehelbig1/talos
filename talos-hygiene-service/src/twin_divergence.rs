@@ -31,9 +31,13 @@
 //!   equality walk, because a twin's control-logic expressions necessarily
 //!   embed that twin's suffixed node ids. "Equal after normalization" means
 //!   *differs only by matched node-id references* — which is precisely the
-//!   binding, not drift. Only word-shaped (`[A-Za-z0-9_]`) ids are mapped;
-//!   anything else is counted (`unnormalizable_ids`) and compared raw, so
-//!   the failure mode is a redundant finding, never a silenced one.
+//!   binding, not drift. Only ids that are word-shaped (`[A-Za-z0-9_]`),
+//!   longer than one character, and not themselves a literal or keyword
+//!   (`true`, `0`, `return`) are mapped; anything else is counted
+//!   (`unnormalizable_ids`) and compared raw, so the failure mode is a
+//!   redundant finding, never a silenced one. That asymmetry is the whole
+//!   design rule here: a hidden true positive is worse than a duplicate
+//!   false one, because the lagging twin is the thing being hunted.
 //! * **No config values are ever emitted** — key names and encoded byte
 //!   lengths only. Node configs hold prompts, account identifiers and
 //!   `vault://` paths; the report is operator-facing and must stay tight
@@ -174,9 +178,18 @@ const MAX_RENDERED_NAME_RELATED: usize = 25;
 /// it after one edit.
 ///
 /// A demoted pair is NOT hidden — it is listed under `name_related_only`
-/// with its node counts, so the report never silently claims "no name-twins
-/// exist". It is simply never diffed, so it can produce no findings and no
-/// recommendation.
+/// with its node counts and a [`DemotionReason`], so the report never
+/// silently claims "no name-twins exist". It is simply never diffed, so it
+/// can produce no findings and no recommendation.
+///
+/// The gate's own blind spot, stated rather than papered over: a twin that
+/// has lost MOST of its nodes (6 v 2) fails the size ratio and demotes,
+/// even though that is the incident class amplified. Node counts cannot
+/// distinguish it from the live `pa-ask-grounded` A/B harness (7 v 1),
+/// which has the identical shape and is benign. Confirming that shape would
+/// reinstate the false positives this gate exists to remove, so it stays
+/// demoted — but as [`DemotionReason::SizeMismatchSubset`], counted and
+/// rendered first.
 ///
 /// Expected state on the live fleet after this gate ships: **1 confirmed
 /// pair** (the organizers, with `control_logic_actionable_total` 0 once
@@ -305,19 +318,107 @@ fn is_id_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// A node id this module is willing to rewrite: non-empty and composed
-/// only of [`is_id_word_byte`] bytes.
+/// Tokens that already MEAN something inside a config value, whatever a
+/// node happens to be called: JSON/Rhai literals and control keywords.
 ///
-/// Ids containing anything else (`my-node`) are deliberately NOT rewritten.
-/// Under the boundary rule they would still match — `-` is not a word byte
-/// — but a rewrite whose search key straddles separators is ambiguous
-/// against the surrounding text, and every node id on the observed fleet is
-/// word-shaped. Skipping them is the fail-SAFE direction: the pair's values
-/// compare raw, which is the pre-normalization behaviour (a divergence is
-/// reported), never a silenced finding. The count travels as
-/// `unnormalizable_ids` so the operator can see it happened.
+/// Rewriting one of these is the module's single worst failure mode — it
+/// silences a TRUE positive. Constructed counterexample, verified against
+/// the shipped code before this list existed: twin A holds a node `false`
+/// and the judge expression `passed == false`; twin B holds a node `true`
+/// (matched to A's by the signature pass) and `passed == true`. The rewrite
+/// turned B's expression into A's, the semantic inversion compared EQUAL,
+/// and the pair reported zero findings. The numeric twin of the same case
+/// (`count > 1` vs `count > 2` behind node ids `1`/`2`) behaved identically.
+///
+/// Matched case-insensitively: over-excluding costs a redundant finding,
+/// under-excluding costs a hidden one.
+const RESERVED_VALUE_TOKENS: &[&str] = &[
+    "true",
+    "false",
+    "null",
+    "none",
+    "nan",
+    "inf",
+    "infinity",
+    "undefined",
+    "if",
+    "else",
+    "while",
+    "for",
+    "loop",
+    "do",
+    "break",
+    "continue",
+    "return",
+    "let",
+    "const",
+    "fn",
+    "in",
+    "switch",
+    "throw",
+    "try",
+    "catch",
+    "import",
+    "export",
+    "private",
+    "this",
+    "and",
+    "or",
+    "not",
+    "is",
+    "new",
+    "typeof",
+];
+
+/// Shortest node id this module will SEARCH FOR. A one-character token is
+/// far more often an incidental variable in an expression (`i`, `x`, `n`)
+/// than a node reference, so rewriting every occurrence of it is more
+/// likely to change meaning than to reveal binding. Prudential, not
+/// evidence-driven — and, like every other exclusion here, it errs toward
+/// reporting.
+const MIN_REWRITABLE_ID_LEN: usize = 2;
+
+/// Composed only of [`is_id_word_byte`] bytes, and non-empty.
 fn is_word_id(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(is_id_word_byte)
+}
+
+/// True when `s` is a literal or keyword in the languages config values are
+/// written in (Rhai expressions, JSON) rather than a plausible reference.
+fn is_reserved_value_token(s: &str) -> bool {
+    s.bytes().all(|b| b.is_ascii_digit())
+        || RESERVED_VALUE_TOKENS
+            .iter()
+            .any(|t| s.eq_ignore_ascii_case(t))
+}
+
+/// A B-side id this module is willing to SEARCH FOR and replace.
+///
+/// Three exclusions, all failing in the SAFE direction (the value compares
+/// raw — the pre-normalization behaviour, which REPORTS a divergence —
+/// never silently equal), all counted as `unnormalizable_ids` so the
+/// operator can see a pair where suffix binding may still surface as a
+/// finding:
+///
+/// * not word-shaped (`my-node`): under the boundary rule it would still
+///   match, but a search key that straddles separators is ambiguous against
+///   the surrounding text and every id on the observed fleet is word-shaped;
+/// * [`RESERVED_VALUE_TOKENS`] or all-digits — a token that carries its own
+///   meaning inside the value (`true`, `0`, `return`);
+/// * shorter than [`MIN_REWRITABLE_ID_LEN`].
+fn is_rewritable_key(b_id: &str) -> bool {
+    is_word_id(b_id) && b_id.len() >= MIN_REWRITABLE_ID_LEN && !is_reserved_value_token(b_id)
+}
+
+/// An A-side id this module is willing to WRITE into the normalized text.
+///
+/// Only the literal/keyword rule applies here, and for the mirror-image
+/// reason: the target is inserted verbatim, so the hazard is not losing a
+/// meaning but MANUFACTURING one — mapping `flag_work` onto a node called
+/// `true` would turn B's node reference into A's boolean literal and equate
+/// them. Shape and length are irrelevant to an inserted string.
+fn is_rewritable_target(a_id: &str) -> bool {
+    !is_reserved_value_token(a_id)
 }
 
 /// Rewrite every whole-token occurrence of a matched B-side node id into
@@ -334,8 +435,11 @@ fn is_word_id(s: &str) -> bool {
 /// mapping's *result* can never be re-substituted.
 ///
 /// Cost is O(len) with one hash lookup per token — no regex engine, no
-/// per-candidate scan, so the whole-pair bound is simply the byte size of
-/// the side-B graph the repository scan already caps.
+/// per-candidate scan, so the bound is just bytes. Per pair that is the
+/// side-B graph (each differing leaf normalized at most once); per REPORT
+/// it is the whole scan, because every name has at most one ancestor and so
+/// every candidate is side B of at most one pair — i.e. bounded by
+/// `TWIN_SCAN_TOTAL_BYTES` (4 MB), not by pairs × graph size.
 fn normalize_ids(s: &str, ids: &std::collections::HashMap<&str, &str>) -> String {
     let mut out = String::with_capacity(s.len());
     let bytes = s.as_bytes();
@@ -367,11 +471,12 @@ fn normalize_ids(s: &str, ids: &std::collections::HashMap<&str, &str>) -> String
 
 /// The rewrite map for one confirmed pair, built from its node matching.
 struct SuffixIdMap<'a> {
-    /// b-node-id → a-node-id, restricted to word-shaped keys that actually
+    /// b-node-id → a-node-id, restricted to rewritable keys that actually
     /// change (an exact-id match rewrites to itself and is dropped).
     map: std::collections::HashMap<&'a str, &'a str>,
-    /// Matched, renamed ids that were not word-shaped and so could not be
-    /// rewritten. Reported per pair; see [`is_word_id`].
+    /// Matched, renamed ids the analyzer refused to rewrite (not
+    /// word-shaped, literal/keyword-shaped, or too short). Reported per
+    /// pair; see [`is_rewritable_key`] / [`is_rewritable_target`].
     unnormalizable: usize,
 }
 
@@ -390,7 +495,10 @@ fn build_suffix_id_map<'a>(matched: &BTreeMap<&'a str, &'a str>) -> SuffixIdMap<
         if b_id == a_id {
             continue;
         }
-        if !is_word_id(b_id) {
+        // BOTH sides must be rewritable: mapping `true` onto something else
+        // destroys a literal, and mapping something else onto `true`
+        // manufactures one.
+        if !is_rewritable_key(b_id) || !is_rewritable_target(a_id) {
             unnormalizable += 1;
             continue;
         }
@@ -591,12 +699,73 @@ impl TwinPair {
     }
 }
 
+/// WHY a name pair was demoted. The distinction is the honest part of the
+/// gate: "we could not confirm these are twins" covers two very different
+/// stories and the report must not present them as one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DemotionReason {
+    /// Comparable node counts, almost nothing matched — two unrelated
+    /// workflows sharing a name prefix. The live `pa-ask` ↔ `pa-ask-email`
+    /// case (7 v 7, 0 matched): there is no twin here to have diverged.
+    NoStructuralOverlap,
+    /// The smaller graph is largely CONTAINED in the larger one but is less
+    /// than half its size. Two stories fit this shape and node counts alone
+    /// cannot separate them:
+    ///
+    /// * a deliberately small variant — the live `pa-ask-grounded` A/B
+    ///   harness, 7 v 1 with its single node matched; or
+    /// * **a twin that has lost most of its nodes** — the incident class,
+    ///   amplified past the point where the matcher can confirm twinhood.
+    ///   A 6-node organizer whose twin kept 2 nodes lands here (0.33 size,
+    ///   1.0 match), and that is exactly the divergence this module exists
+    ///   to catch.
+    ///
+    /// So it is demoted (auto-alarming it would recreate the false
+    /// positives the gate was built to remove — the benign reading is the
+    /// one the live fleet actually produced) but it is rendered FIRST among
+    /// demoted pairs, counted separately, and called out in the note as the
+    /// one demotion worth eyeballing.
+    SizeMismatchSubset,
+    /// Neither ratio came close — different size AND different content.
+    Unrelated,
+}
+
+impl DemotionReason {
+    fn label(self) -> &'static str {
+        match self {
+            DemotionReason::NoStructuralOverlap => "no_structural_overlap",
+            DemotionReason::SizeMismatchSubset => "size_mismatch_subset",
+            DemotionReason::Unrelated => "unrelated",
+        }
+    }
+
+    /// The one demotion shape that can hide a real lagging twin, and so the
+    /// one that is surfaced first and counted on its own.
+    fn is_subset(self) -> bool {
+        matches!(self, DemotionReason::SizeMismatchSubset)
+    }
+}
+
+/// Classify a demotion from the two gate ratios. Only reached when at least
+/// one of them failed.
+fn demotion_reason(size_ratio: f64, match_ratio: f64) -> DemotionReason {
+    match (
+        size_ratio >= MIN_TWIN_SIZE_RATIO,
+        match_ratio >= MIN_TWIN_MATCH_RATIO,
+    ) {
+        (true, false) => DemotionReason::NoStructuralOverlap,
+        (false, true) => DemotionReason::SizeMismatchSubset,
+        _ => DemotionReason::Unrelated,
+    }
+}
+
 /// A name pair that did NOT clear the structural confirmation gate.
 ///
-/// Carries names and node counts ONLY — no findings are computed for it, so
-/// there is nothing else to carry. It exists so the report can say "these
-/// two share a name shape and were deliberately not compared" instead of
-/// omitting them, which would read as "no such names exist".
+/// Carries names, node counts and the demotion REASON only — no findings
+/// are computed for it, so there is nothing else to carry. It exists so the
+/// report can say "these two share a name shape and were deliberately not
+/// compared" instead of omitting them, which would read as "no such names
+/// exist".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NameRelatedOnly {
     /// Base workflow (id, name).
@@ -612,6 +781,9 @@ pub struct NameRelatedOnly {
     /// Nodes the matcher could pair across the two graphs — the number that
     /// (with the counts) shows WHY the gate demoted them.
     pub matched_nodes: usize,
+    /// Which demotion shape this is. See [`DemotionReason`] — the
+    /// `SizeMismatchSubset` case is the one that can be a real twin.
+    pub reason: DemotionReason,
 }
 
 /// Result of a whole-fleet twin scan.
@@ -1171,7 +1343,7 @@ pub fn analyze_twins(candidates: &[TwinCandidate]) -> TwinAnalysis {
         // Gate BEFORE diffing: an unconfirmed pair must produce no findings
         // at all, not findings that are later filtered out.
         let matched = match_nodes(a_graph, b_graph, &suffix);
-        let (_, _, confirmed) =
+        let (size_ratio, match_ratio, confirmed) =
             twin_confirmation(a_graph.nodes.len(), b_graph.nodes.len(), matched.len());
         if !confirmed {
             name_related_only.push(NameRelatedOnly {
@@ -1181,6 +1353,7 @@ pub fn analyze_twins(candidates: &[TwinCandidate]) -> TwinAnalysis {
                 nodes_a: a_graph.nodes.len(),
                 nodes_b: b_graph.nodes.len(),
                 matched_nodes: matched.len(),
+                reason: demotion_reason(size_ratio, match_ratio),
             });
             continue;
         }
@@ -1347,6 +1520,10 @@ fn name_related_json(x: &NameRelatedOnly) -> serde_json::Value {
         "nodes_a": x.nodes_a,
         "nodes_b": x.nodes_b,
         "matched_nodes": x.matched_nodes,
+        // WHY it was demoted. `size_mismatch_subset` is the shape that can
+        // also be a twin which lost most of its nodes — worth an eyeball,
+        // which is why it renders first.
+        "reason": x.reason.label(),
     })
 }
 
@@ -1401,13 +1578,21 @@ pub fn twins_section(analysis: &TwinAnalysis, coverage: ScanCoverage) -> serde_j
          (matched/min >= 0.6). Pairs that fail are listed under name_related_only with their node \
          counts and are never diffed — sharing a name prefix is not evidence of duplication, and \
          pairs_count / diverged_pairs_count therefore count CONFIRMED pairs only, while \
-         name_related_only_count counts the rejected ones. String values are compared after \
+         name_related_only_count counts the rejected ones. Each rejection carries a reason: \
+         'no_structural_overlap' and 'unrelated' are pairs with nothing in common, but \
+         'size_mismatch_subset' (counted by name_related_only_subset_count, rendered first) means \
+         the smaller graph is largely CONTAINED in the larger — which is what a deliberately small \
+         variant looks like AND what a twin that has lost most of its nodes looks like. Node counts \
+         cannot tell those apart, so such a pair is not alarmed on but IS worth an operator's eye. \
+         String values are compared after \
          rewriting the twin's matched node ids into the base's id space (whole-token, \
          [A-Za-z0-9_]-delimited), because a twin's control-logic expressions necessarily embed \
          that twin's suffixed node ids; a value that matches only after that rewrite differs \
          solely by node-id binding and is counted as suffix_bound_matches instead of being \
-         reported as drift. Ids that are not word-shaped cannot be rewritten and are counted as \
-         unnormalizable_ids — on such a pair, suffix binding may still surface as a finding. \
+         reported as drift. Ids that are not word-shaped, that are single characters, or that are \
+         themselves literals or keywords ('true', '0', 'return' — rewriting one of those would \
+         change what the value MEANS) are never rewritten; they are counted as unnormalizable_ids, \
+         and on such a pair suffix binding may still surface as a finding. \
          Instance keys (auth, prompts, account ids) are EXPECTED to differ between twins \
          and never raise a recommendation; neither does a module/kind mismatch, which real twins \
          have by design, nor control-logic keys on a node whose module differs (different module \
@@ -1444,12 +1629,28 @@ pub fn twins_section(analysis: &TwinAnalysis, coverage: ScanCoverage) -> serde_j
         .map(pair_json)
         .collect();
     let pairs_omitted = analysis.pairs.len().saturating_sub(rendered_pairs.len());
+    // Subset-shaped demotions first, for the same signal-preserving reason
+    // the diverged pairs render first: they are the only demotion that can
+    // be hiding a real lagging twin, and the cap must not be able to drop
+    // one while showing an obviously-unrelated pair.
     let rendered_name_related: Vec<serde_json::Value> = analysis
         .name_related_only
         .iter()
+        .filter(|x| x.reason.is_subset())
+        .chain(
+            analysis
+                .name_related_only
+                .iter()
+                .filter(|x| !x.reason.is_subset()),
+        )
         .take(MAX_RENDERED_NAME_RELATED)
         .map(name_related_json)
         .collect();
+    let name_related_subset_count = analysis
+        .name_related_only
+        .iter()
+        .filter(|x| x.reason.is_subset())
+        .count();
     let name_related_omitted = analysis
         .name_related_only
         .len()
@@ -1475,6 +1676,10 @@ pub fn twins_section(analysis: &TwinAnalysis, coverage: ScanCoverage) -> serde_j
         "name_related_only": rendered_name_related,
         "name_related_only_count": analysis.name_related_only.len(),
         "name_related_only_omitted": name_related_omitted,
+        // Of the demoted pairs, how many are the shape that could ALSO be a
+        // twin which diverged beyond the matcher's reach. Zero means every
+        // demotion was an obviously-unrelated pair.
+        "name_related_only_subset_count": name_related_subset_count,
         "unparsable_graphs": analysis.unparsable_graphs,
         "skipped_graphs": skipped_graphs,
         "truncated": truncated,
@@ -2567,7 +2772,11 @@ mod tests {
             .iter()
             .map(|e| e["b"]["name"].as_str().unwrap())
             .collect();
-        assert_eq!(listed, vec!["pa-ask-email", "pa-ask-grounded"]);
+        // Subset-shaped demotions render FIRST: `pa-ask-grounded` (7 v 1,
+        // its one node matched) is the shape that could also be a twin
+        // which lost nodes, so it must never be the entry a cap drops.
+        assert_eq!(listed, vec!["pa-ask-grounded", "pa-ask-email"]);
+        assert_eq!(s["name_related_only_subset_count"], 1);
         // …and the note states which population each count describes.
         let note = s["note"].as_str().unwrap();
         assert!(note.contains("name_related_only"));
@@ -3003,9 +3212,14 @@ mod tests {
             "NORMCANARYEQUAL",
             "NORMCANARYDRIFT",
             "extra",
-            // The normalized text itself — the ONLY string in this module
-            // that does not exist verbatim in either input graph.
-            "classify)",
+            // The normalized text built on the REPORTED path — B's
+            // `…(classify_work) && extra` rewritten into A's id space. This
+            // exact string exists in NEITHER input graph (A lacks the
+            // `&& extra`, B lacks the rewrite), so it can only appear in
+            // the report if the analyzer's own intermediate escaped. The
+            // absorbed path's normalized form is by definition equal to A's
+            // value, so it is covered by the canaries above instead.
+            "classify) && extra",
         ] {
             assert!(
                 !rendered.contains(leak),
@@ -3013,6 +3227,231 @@ mod tests {
             );
         }
         assert!(rendered.contains("data.skip_condition"), "key names travel");
+    }
+
+    // ---- phase-2 review: normalization must not HIDE drift --------------
+
+    /// THE worst failure mode this module has, pinned as a fixture: a node
+    /// id that is also a LITERAL. Verified against the pre-fix code — twin
+    /// A's `passed == false` and twin B's `passed == true` compared EQUAL
+    /// (B's node `true` was signature-matched to A's node `false`, so the
+    /// rewrite inverted the expression into A's) and the pair reported zero
+    /// findings. A silenced true positive is the one outcome worse than a
+    /// noisy false one here.
+    #[test]
+    fn literal_shaped_node_ids_are_never_rewritten() {
+        let a = serde_json::json!({"nodes": [
+            {"id": "false", "type": "gate", "data": {}},
+            {"id": "j", "kind": "inline_judge", "data": {"verdict_expr": "passed == false"}}
+        ], "edges": []});
+        let b = serde_json::json!({"nodes": [
+            {"id": "true", "type": "gate", "data": {}},
+            {"id": "j_work", "kind": "inline_judge", "data": {"verdict_expr": "passed == true"}}
+        ], "edges": []});
+        let analysis = analyze_twins(&candidates(vec![("wf", a), ("wf-work", b)]));
+        let p = &analysis.pairs[0];
+        assert_eq!(p.matched_nodes, 2);
+        assert_eq!(p.suffix_bound_matches, 0, "an inversion is NOT binding");
+        assert_eq!(p.control_logic_actionable_total, 1, "it must still alarm");
+        assert_eq!(p.unnormalizable_ids, 1, "and the refusal is disclosed");
+        assert!(twin_recommendation(&analysis).is_some());
+    }
+
+    /// Same class, numeric: node ids `1` / `2` behind `count > 1` vs
+    /// `count > 2`. React-Flow graphs really do carry integer-ish node ids.
+    #[test]
+    fn numeric_node_ids_are_never_rewritten() {
+        let a = serde_json::json!({"nodes": [
+            {"id": "2", "type": "gate", "data": {}},
+            {"id": "j", "kind": "inline_judge", "data": {"verdict_expr": "count > 2"}}
+        ], "edges": []});
+        let b = serde_json::json!({"nodes": [
+            {"id": "1", "type": "gate", "data": {}},
+            {"id": "j_work", "kind": "inline_judge", "data": {"verdict_expr": "count > 1"}}
+        ], "edges": []});
+        let analysis = analyze_twins(&candidates(vec![("wf", a), ("wf-work", b)]));
+        let p = &analysis.pairs[0];
+        assert_eq!(p.suffix_bound_matches, 0);
+        assert_eq!(p.control_logic_actionable_total, 1);
+        assert_eq!(p.unnormalizable_ids, 1);
+    }
+
+    /// The exclusions, spelled out: the SEARCH key is the tightly
+    /// restricted side (its every occurrence gets replaced), the inserted
+    /// TARGET only has to avoid manufacturing a literal.
+    #[test]
+    fn rewritable_id_rules_are_explicit() {
+        for good in ["classify_work", "n1", "coverage_judge", "Report"] {
+            assert!(is_rewritable_key(good), "{good} should be a valid key");
+            assert!(is_rewritable_target(good));
+        }
+        for bad in [
+            "true", "FALSE", "null", "0", "42", "if", "return", "and", // literals/keywords
+            "x",   // single character
+            "a.b", // not word-shaped
+            "my-node", "",
+        ] {
+            assert!(!is_rewritable_key(bad), "{bad} must not be a search key");
+        }
+        // A single-char or dotted TARGET is harmless — it is inserted, not
+        // searched for — but a literal one is not.
+        assert!(is_rewritable_target("j") && is_rewritable_target("a.b"));
+        for bad in ["true", "0", "return"] {
+            assert!(!is_rewritable_target(bad), "{bad} must not be a target");
+        }
+        // …and the map refuses a mapping whose TARGET is a literal, not
+        // just its key: rewriting `flag_work` into `true` manufactures a
+        // literal exactly the way rewriting `true` away destroys one.
+        let matched: BTreeMap<&str, &str> = [("flag_work", "true"), ("ok_work", "ok")]
+            .into_iter()
+            .collect();
+        let m = build_suffix_id_map(&matched);
+        assert_eq!(m.map.len(), 1);
+        assert_eq!(m.unnormalizable, 1);
+        assert_eq!(m.map.get("ok_work"), Some(&"ok"));
+    }
+
+    /// Drift located EXACTLY at a node reference — B's judge reads a
+    /// different matched node than A's — is real rewiring and must survive
+    /// normalization. No mapping can equate them: the map is injective, so
+    /// `feedback_work` can only ever become `feedback`, never `classify`.
+    #[test]
+    fn rewiring_to_a_different_matched_node_still_alarms() {
+        let a = judge_graph("results.classify.score >= 0.8", "");
+        let b = judge_graph("results.feedback_work.score >= 0.8", "_work");
+        let analysis = analyze_twins(&candidates(vec![("wf", a), ("wf-work", b)]));
+        let p = &analysis.pairs[0];
+        assert_eq!(p.matched_nodes, 3);
+        assert_eq!(p.suffix_bound_matches, 0, "different node = real drift");
+        assert_eq!(p.control_logic_actionable_total, 1);
+        assert!(twin_recommendation(&analysis).is_some());
+    }
+
+    /// Normalization runs B→A only. A's text is canonical, so a B-side id
+    /// appearing in A's value is NOT rewritten — the pair compares raw and
+    /// reports, which is the fail-safe direction. Pinned because the
+    /// asymmetry is a choice.
+    #[test]
+    fn normalization_is_one_directional_b_into_a() {
+        // A's expr already names the TWIN's node id (a stale copy-paste).
+        let a = judge_graph("results.classify_work.score >= 0.8", "");
+        let b = judge_graph("results.classify.score >= 0.8", "_work");
+        let analysis = analyze_twins(&candidates(vec![("wf", a), ("wf-work", b)]));
+        let p = &analysis.pairs[0];
+        assert_eq!(p.suffix_bound_matches, 0);
+        assert_eq!(p.control_logic_actionable_total, 1, "reported, not hidden");
+    }
+
+    // ---- phase-2 review: the gate's blind spot is disclosed --------------
+
+    /// THE gate's hardest case: a twin that lost FOUR of six nodes. The
+    /// size ratio (0.33) demotes it — node counts cannot distinguish it
+    /// from the live 7-v-1 A/B harness — but it must not be filed away as
+    /// just another unrelated prefix. It is classified `size_mismatch_subset`,
+    /// counted, and rendered first among demoted pairs.
+    #[test]
+    fn catastrophically_lagging_twin_is_demoted_but_flagged_for_review() {
+        let mut broken = variant_graph();
+        for n in [
+            "classify_work",
+            "route_work",
+            "label_work",
+            "coverage_judge_work",
+        ] {
+            broken = without_node(broken, n);
+        }
+        let analysis = analyze_twins(&organizers(base_graph(), broken));
+        assert!(analysis.pairs.is_empty(), "cannot be confirmed");
+        assert_eq!(analysis.name_related_only.len(), 1);
+        let d = &analysis.name_related_only[0];
+        assert_eq!((d.nodes_a, d.nodes_b, d.matched_nodes), (6, 2, 2));
+        assert_eq!(d.reason, DemotionReason::SizeMismatchSubset);
+        let s = twins_section(&analysis, ScanCoverage::default());
+        assert_eq!(s["name_related_only_subset_count"], 1);
+        assert_eq!(s["name_related_only"][0]["reason"], "size_mismatch_subset");
+        // Still no HIGH — the benign reading of this shape is the common
+        // one on the live fleet, and alarming on it recreates v1.0.
+        assert!(twin_recommendation(&analysis).is_none());
+        // …and the note tells the operator what the flag means.
+        let note = s["note"].as_str().unwrap();
+        assert!(note.contains("size_mismatch_subset"));
+        assert!(note.contains("lost most of its nodes"));
+    }
+
+    /// A twin missing THREE of six still confirms (0.5 size / 1.0 match) —
+    /// the boundary between "graded" and "flagged for review" sits exactly
+    /// where the constants say it does, and the graded side alarms.
+    #[test]
+    fn twin_missing_half_its_nodes_still_confirms_and_alarms() {
+        let mut broken = variant_graph();
+        for n in ["route_work", "label_work", "coverage_judge_work"] {
+            broken = without_node(broken, n);
+        }
+        let analysis = analyze_twins(&organizers(base_graph(), broken));
+        assert_eq!(analysis.pairs.len(), 1);
+        let p = &analysis.pairs[0];
+        assert_eq!((p.nodes_a, p.nodes_b, p.matched_nodes), (6, 3, 3));
+        assert_eq!(p.structural_total, 3, "three missing nodes");
+        assert!(twin_recommendation(&analysis).is_some());
+    }
+
+    /// The three demotion shapes are distinguished, and the live negatives
+    /// classify as the harmless ones.
+    #[test]
+    fn demotion_reasons_separate_the_shapes() {
+        assert_eq!(
+            demotion_reason(1.0, 0.0),
+            DemotionReason::NoStructuralOverlap
+        );
+        assert_eq!(
+            demotion_reason(0.14, 1.0),
+            DemotionReason::SizeMismatchSubset
+        );
+        assert_eq!(demotion_reason(0.2, 0.1), DemotionReason::Unrelated);
+        let analysis = analyze_twins(&candidates(vec![
+            ("pa-ask", pa_ask_graph()),
+            ("pa-ask-email", pa_ask_email_graph()),
+            ("pa-ask-grounded", pa_ask_grounded_graph()),
+        ]));
+        let reasons: Vec<DemotionReason> = analysis
+            .name_related_only
+            .iter()
+            .map(|d| d.reason)
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                DemotionReason::NoStructuralOverlap,
+                DemotionReason::SizeMismatchSubset,
+            ]
+        );
+    }
+
+    /// The demoted-list render cap is signal-preserving too: with more
+    /// demotions than fit, the subset-shaped one survives.
+    #[test]
+    fn name_related_render_cap_shows_subset_shapes_first() {
+        let mut rows: Vec<(String, serde_json::Value)> = vec![("wf".to_string(), pa_ask_graph())];
+        // 30 unrelated-prefix pairs (7 v 7, 0 matched) …
+        for i in 0..30 {
+            rows.push((format!("wf-{i:02}"), pa_ask_email_graph()));
+        }
+        // …and one subset-shaped demotion, ordered LAST.
+        rows.push(("wf-zz".to_string(), pa_ask_grounded_graph()));
+        let c = candidates(rows.iter().map(|(n, g)| (n.as_str(), g.clone())).collect());
+        let analysis = analyze_twins(&c);
+        assert_eq!(analysis.name_related_only.len(), 31);
+        let s = twins_section(&analysis, ScanCoverage::default());
+        assert_eq!(s["name_related_only_count"], 31);
+        assert_eq!(s["name_related_only_subset_count"], 1);
+        assert_eq!(
+            s["name_related_only"].as_array().unwrap().len(),
+            MAX_RENDERED_NAME_RELATED
+        );
+        assert_eq!(
+            s["name_related_only"][0]["b"]["name"], "wf-zz",
+            "the reviewable demotion must survive the cap"
+        );
     }
 
     #[test]
