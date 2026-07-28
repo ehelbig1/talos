@@ -15,12 +15,21 @@
 //!
 //! ## Design invariants
 //!
-//! - **Canonical bytes, not JSON.** RPC request types serialize their
-//!   bodies via `#[derive(Serialize)]` structs with fixed field
-//!   declaration order — never `serde_json::json!({...})`, because
-//!   that produces a `Value::Object` whose byte encoding depends on
-//!   whether the `preserve_order` feature is enabled in the dep
-//!   graph. Using structs pins the order at compile time.
+//! - **Exact-wire-bytes signing for `Value`-bearing ops.** The two ops
+//!   that carry a `serde_json::Value` (`MemoryOp::Set`,
+//!   `IntegrationOp::Set`) are wrapped in [`RawSigned`], whose signature
+//!   covers the EXACT JSON text on the wire — minted once on the send
+//!   side, captured verbatim on the receive side, never re-derived. This
+//!   replaced an earlier `canonical_json_bytes` scheme that re-serialised
+//!   a parsed `Value` on each side; serde_json's f64 round trip is not
+//!   idempotent, so an honest sender and receiver disagreed on the bytes
+//!   for ordinary computed floats and the signature failed (#598 → the
+//!   memory-RPC twin of the job-protocol `SignedJson` fix). See
+//!   [`RawSigned`] for the full rationale.
+//! - **Fixed-tag LE concat for scalar ops.** The remaining request types
+//!   bind only strings/ints/lengths via hand-built byte concatenation
+//!   with fixed single-byte variant tags — immune to serde enum-tag
+//!   reordering and independent of any `preserve_order` feature flag.
 //! - **Subject binding.** `subject` is a const `SUBJECT_NAME` per
 //!   RPC type (e.g. `"memory_rpc"`), included in the MAC input so a
 //!   valid memory signature cannot be replayed as a graph request.
@@ -498,92 +507,135 @@ pub(crate) fn nonce_test_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Serialize a JSON value to its canonical byte form: object keys
-/// sorted lexicographically, recursively. This makes signing bytes
-/// independent of `serde_json::Map`'s internal type (BTreeMap vs
-/// IndexMap with `preserve_order` enabled) and independent of the
-/// order in which the caller inserted keys. Without this, two
-/// processes serializing the same logical JSON could produce
-/// different bytes, and HMAC verification would fail for any RPC
-/// whose signed body contained a `Value::Object`.
+/// A signed payload whose SIGNED representation is the EXACT JSON text
+/// that travels on the wire.
 ///
-/// Matches [RFC 8785 JCS](https://www.rfc-editor.org/rfc/rfc8785) in
-/// the common case (ASCII keys, standard numbers); we don't need the
-/// full number-canonicalisation dance because our callers don't feed
-/// floating-point edge cases into signed bodies.
-/// Deepest JSON nesting we'll canonicalise. Matches `serde_json`'s
-/// default recursion limit so any payload serde was willing to parse,
-/// we're willing to sign. Exceeding this returns an empty byte buffer
-/// — `verify()` then fails, not the process. 128 is well within the
-/// stack budget (each frame is small).
-pub const MAX_CANONICAL_DEPTH: usize = 128;
-
-pub fn canonical_json_bytes(v: &serde_json::Value) -> Vec<u8> {
-    let mut out = Vec::new();
-    if !write_canonical(v, &mut out, 0) {
-        // Depth exceeded — return empty so HMAC verify fails closed.
-        tracing::warn!(
-            max_depth = MAX_CANONICAL_DEPTH,
-            "canonical_json_bytes: nesting exceeded — returning empty"
-        );
-        return Vec::new();
-    }
-    out
+/// ## Why this type exists
+///
+/// The predecessor signed a `serde_json::Value` by re-deriving its
+/// canonical text on each side (`canonical_json_bytes`, now deleted:
+/// `Value::Number(n) => n.to_string()`). serde_json's f64 round trip is
+/// **not idempotent** — for a meaningful fraction of ordinary computed
+/// values `parse(write(x))` lands one ULP away from `x`, and some values
+/// have NO fixed point at all: they cycle between two spellings forever.
+/// `5.455171886890906e-115` is one — written, re-parsed and written again
+/// it becomes `…8909045e-115`, and the #598 reviewer reproduced exactly
+/// that split. So the sender canonicalised the `Value` it held, the
+/// receiver canonicalised its RE-PARSE of the wire JSON, the two byte
+/// strings differed, and the signature failed for an entirely honest
+/// sender on payload content alone. Actor-memory values are ARBITRARY
+/// module output — LLM/agent nodes persist computed ratios routinely — so
+/// the class was live, not theoretical.
+///
+/// `RawSigned<T>` removes the re-derivation entirely: the wire text is
+/// minted ONCE (send side, [`From`]) or captured VERBATIM (receive side,
+/// [`Deserialize`]), and everything security-relevant hashes
+/// [`raw_bytes`](Self::raw_bytes). Neither side ever re-serialises, so
+/// serde_json's non-idempotent float formatting cannot make signer and
+/// verifier disagree. It is the typed sibling of
+/// `talos_workflow_job_protocol::SignedJson` (which is `Value`-typed).
+///
+/// ## Why there is no mutable accessor
+///
+/// `raw` and `parsed` are two views of ONE payload that MUST stay in
+/// lock-step — `raw` is what the signature covers, `parsed` is what
+/// handlers read. Handing out `&mut parsed` (or `&mut raw`) would let a
+/// caller desync them, so the signature would cover text that no longer
+/// matches what the handler acts on: the exact class of bug this type
+/// exists to make impossible. Mutate by constructing a fresh
+/// `RawSigned::from(new_value)`, which re-mints both views together.
+///
+/// ## Trust boundary
+///
+/// Both sides only ever MINT raw text through [`From`], i.e.
+/// `serde_json::value::to_raw_value(&T)`, which emits canonical JSON (no
+/// duplicate keys, no interior padding). The only other way raw text
+/// enters is deserialising a message that will be signature-checked
+/// against the exact bytes — an on-path attacker who rewrites the text
+/// (even into a semantically identical form) invalidates the signature. A
+/// keyless guest supplies only `Value`-semantics to the worker host,
+/// which re-mints via `From` before signing, so exotic text cannot be
+/// laundered across the signing boundary by a component that lacks the key.
+///
+/// ## Deploy ordering
+///
+/// Controllers and workers must roll TOGETHER. The wire BYTES for `op`
+/// are unchanged (RawValue serialises transparently), but the signed-body
+/// FORMULA moved, so a mixed fleet fails EVERY memory / integration-state
+/// RPC closed (a verification error, never an accept or a panic) until
+/// both sides run the new code. Compose (`make up`) rolls both together.
+#[derive(Debug, Clone)]
+pub struct RawSigned<T> {
+    /// The authoritative form: the exact JSON text that is (or was) on the
+    /// wire. Everything security-relevant hashes THIS via
+    /// [`raw_bytes`](Self::raw_bytes).
+    raw: Box<serde_json::value::RawValue>,
+    /// Parsed view for consumers. Derived ONCE, alongside `raw`, at the
+    /// single construction point per side — never re-serialised back into
+    /// `raw`, which is what would reopen the desync bug.
+    parsed: T,
 }
 
-/// Returns `false` if the input exceeds [`MAX_CANONICAL_DEPTH`];
-/// callers should treat that as a signing failure.
-fn write_canonical(v: &serde_json::Value, out: &mut Vec<u8>, depth: usize) -> bool {
-    if depth > MAX_CANONICAL_DEPTH {
-        return false;
+impl<T> RawSigned<T> {
+    /// The parsed payload — what handlers dispatch on. NOT what gets
+    /// signed; see [`raw_bytes`](Self::raw_bytes).
+    pub fn get(&self) -> &T {
+        &self.parsed
     }
-    use serde_json::Value;
-    match v {
-        Value::Null => out.extend_from_slice(b"null"),
-        Value::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
-        Value::Number(n) => out.extend_from_slice(n.to_string().as_bytes()),
-        Value::String(s) => {
-            // Reuse serde_json's string escaping so embedded quotes,
-            // unicode, and control chars are handled correctly.
-            if let Ok(bytes) = serde_json::to_vec(s) {
-                out.extend_from_slice(&bytes);
-            }
-        }
-        Value::Array(arr) => {
-            out.push(b'[');
-            for (i, item) in arr.iter().enumerate() {
-                if i > 0 {
-                    out.push(b',');
-                }
-                if !write_canonical(item, out, depth + 1) {
-                    return false;
-                }
-            }
-            out.push(b']');
-        }
-        Value::Object(map) => {
-            // Keys sorted lexicographically — this is the whole point.
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            out.push(b'{');
-            for (i, key) in keys.iter().enumerate() {
-                if i > 0 {
-                    out.push(b',');
-                }
-                if let Ok(key_bytes) = serde_json::to_vec(*key) {
-                    out.extend_from_slice(&key_bytes);
-                }
-                out.push(b':');
-                if let Some(val) = map.get(*key) {
-                    if !write_canonical(val, out, depth + 1) {
-                        return false;
-                    }
-                }
-            }
-            out.push(b'}');
-        }
+
+    /// Consume the wrapper and take the parsed payload (for handlers that
+    /// move the op into an executor).
+    pub fn into_inner(self) -> T {
+        self.parsed
     }
-    true
+
+    /// The bytes covered by the signature: the exact JSON text of the
+    /// payload as it appears on the wire. Every signing/verification site
+    /// MUST use this — re-serialising [`get`](Self::get) reintroduces the
+    /// non-idempotent round trip this type exists to defeat.
+    pub fn raw_bytes(&self) -> &[u8] {
+        self.raw.get().as_bytes()
+    }
+}
+
+impl<T: serde::Serialize> From<T> for RawSigned<T> {
+    /// The ONLY value constructor — the send-side point that fixes the
+    /// wire text once. `to_raw_value` is infallible for the payload types
+    /// this wraps (`MemoryOp` / `IntegrationOp`: enums over strings, ints,
+    /// and `serde_json::Value` fields, none of which can fail to
+    /// serialise — a `Value` cannot hold NaN/Inf, and the one bare `f64`
+    /// field, `ttl_hours`, is validated finite before signing and
+    /// otherwise serialises as `null` rather than erroring). The `expect`
+    /// is therefore unreachable for these types; it is documented rather
+    /// than silently `unwrap`'d.
+    fn from(parsed: T) -> Self {
+        let raw = serde_json::value::to_raw_value(&parsed)
+            .expect("RawSigned payload types always serialise to valid JSON");
+        Self { raw, parsed }
+    }
+}
+
+impl<T> serde::Serialize for RawSigned<T> {
+    /// Forwards to the raw text, which `serde_json` emits verbatim — so
+    /// the bytes that were signed are the bytes that go out.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.raw.serialize(serializer)
+    }
+}
+
+impl<'de, T: serde::de::DeserializeOwned> serde::Deserialize<'de> for RawSigned<T> {
+    /// Captures the received text VERBATIM, then derives the parsed view
+    /// from it. The verifier consequently hashes exactly what the sender
+    /// hashed, whatever the sender's float formatting happened to be. A
+    /// parse failure is a malformed message (surfaced as a deserialize
+    /// error), not a signing concern — `RawValue` already guaranteed
+    /// syntactic JSON, so this only trips on `T`'s shape or the recursion
+    /// cap (serde_json's default 128, matching the old canonical depth).
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+        let parsed = serde_json::from_str(raw.get()).map_err(serde::de::Error::custom)?;
+        Ok(Self { raw, parsed })
+    }
 }
 
 /// Process-wide HMAC key slot. The worker registers it at startup
