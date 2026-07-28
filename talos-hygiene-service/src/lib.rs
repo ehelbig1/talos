@@ -706,12 +706,23 @@ impl HygieneService {
                 "expiring_memories_count": expiring_actor_memories.len(),
                 "workflows_needing_schema_count": workflows_needing_schema.len(),
                 "promotable_modules_count": promotable_modules.len(),
-                // Twin pairs DETECTED vs pairs carrying recommendation-grade
-                // divergence. Both are reported: the first says how much the
-                // name heuristic could see, the second is the actual signal —
-                // reading either alone would misstate the check's coverage.
+                // Three DIFFERENT populations, all reported, because reading
+                // any one alone misstates the check:
+                //   twin_pairs_count        — name pairs that also passed the
+                //                             STRUCTURAL confirmation gate,
+                //                             i.e. the pairs actually diffed;
+                //   diverged_twin_pairs_count — of those, the ones carrying
+                //                             recommendation-grade divergence
+                //                             (the only ones counted as issues);
+                //   name_related_only_count — pairs that share a name shape but
+                //                             failed the gate. Never diffed, so
+                //                             they contribute NO findings and NO
+                //                             recommendation; listed with their
+                //                             node counts in `workflow_twins` so
+                //                             the omission is visible.
                 "twin_pairs_count": twin_analysis.pairs.len(),
                 "diverged_twin_pairs_count": diverged_twin_pairs,
+                "name_related_only_count": twin_analysis.name_related_only.len(),
                 "suppressed_internal_test_workflows": suppressed_count,
                 "suppressed_low_score_count": suppressed_low_score_count,
                 "auto_classified_test_like_workflows": auto_classified_count,
