@@ -4092,6 +4092,62 @@ else
 fi
 echo
 
+# ── 62: build.rs git-stamp drift across the three copies ─────────────
+bold "▶ check 62: build.rs GIT_SHA stamping must be identical across crates"
+
+# The controller↔worker build-identity handshake (2026-07-28) compares the
+# `+sha[-dirty]` suffix of two independently-composed version strings and WARNs
+# when they differ. Three crates carry a copy of the same build script that
+# derives that sha — talos-mcp-handlers/build.rs (the original),
+# controller/build.rs, worker/build.rs. They must stay identical BELOW the
+# module doc header (each header describes its own crate's use):
+#   * if worker/build.rs drifts from controller/build.rs — a different
+#     `--short=N`, a different override-env precedence, a different dirty rule —
+#     a same-tree controller and worker compose DIFFERENT strings, and the skew
+#     WARN fires on a perfectly healthy fleet. The diagnostic that exists to
+#     answer "are we on one build?" would start lying, loudly and constantly.
+#   * a shared build-dep crate is not worth it for ~80 lines with zero runtime
+#     surface, so this lint is the enforcement the duplication needs (same shape
+#     as check 16 for the duplicated WIT file).
+# Comparison strips the leading `//!` doc header from each file. Opt-out:
+# `# allow-build-rs-drift: <reason>` anywhere in any of the three files.
+BUILD_RS_FILES=("$ROOT/talos-mcp-handlers/build.rs" "$ROOT/controller/build.rs" "$ROOT/worker/build.rs")
+BUILD_RS_MISSING=0
+for f in "${BUILD_RS_FILES[@]}"; do
+    [ -f "$f" ] || { yellow "⚠ $f not found — skipping build.rs drift check"; BUILD_RS_MISSING=1; }
+done
+if [ "$BUILD_RS_MISSING" -eq 0 ]; then
+    if grep -lq 'allow-build-rs-drift' "${BUILD_RS_FILES[@]}" >/dev/null 2>&1; then
+        yellow "⊘ build.rs drift check bypassed by allow-build-rs-drift marker"
+    else
+        # Strip the `//!` header (and the blank lines inside it); compare the rest.
+        strip_build_rs_header() { grep -vE '^\s*//!' "$1" | sed '/./,$!d'; }
+        BUILD_RS_DRIFT=0
+        AUTHORITATIVE="${BUILD_RS_FILES[0]}"
+        for f in "${BUILD_RS_FILES[@]:1}"; do
+            if ! diff -q <(strip_build_rs_header "$AUTHORITATIVE") \
+                         <(strip_build_rs_header "$f") >/dev/null 2>&1; then
+                red "✗ ${f#"$ROOT/"} has drifted from ${AUTHORITATIVE#"$ROOT/"}"
+                diff <(strip_build_rs_header "$AUTHORITATIVE") \
+                     <(strip_build_rs_header "$f") 2>/dev/null | head -20 | sed 's/^/    /'
+                BUILD_RS_DRIFT=1
+            fi
+        done
+        if [ "$BUILD_RS_DRIFT" -eq 1 ]; then
+            yellow "  → all three build.rs copies must derive GIT_SHA/GIT_DIRTY identically."
+            yellow "    talos-mcp-handlers/build.rs is authoritative; copy its body (everything"
+            yellow "    below the //! header) into the others, keeping each header as-is."
+            yellow "  → drift makes a same-tree controller and worker compose different build"
+            yellow "    strings, so the registration build-skew WARN fires on a healthy fleet."
+            yellow "  → opt-out: '# allow-build-rs-drift: <reason>' in any of the three files."
+            EXIT_CODE=1
+        else
+            green "✓ the three build.rs copies stamp GIT_SHA identically"
+        fi
+    fi
+fi
+echo
+
 # ── 54. Lint self-consistency (meta-check) ────────────────────────────
 # The system whose purpose is catching drift drifted from its own docs:
 # by 2026-07-01 the script had 49 checks while CLAUDE.md said 43 and the

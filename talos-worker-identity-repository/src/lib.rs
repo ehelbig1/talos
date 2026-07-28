@@ -996,6 +996,101 @@ mod tests {
         assert!(builds.contains(&None));
     }
 
+    /// The security-relevant half of the same contract: a REFUSED registration
+    /// must leave the column exactly as it was. `build_version` rides the
+    /// registration write, so every rejection arm — TOFU identity conflict,
+    /// active-key cap, ineligible provisioning token — has to be a no-op on the
+    /// recorded build. Without that, a caller who can only reach a REJECTED
+    /// path (a token-holder tripping the TOFU rule, say) could still rewrite
+    /// what the fleet report claims a worker is running: an unauthenticated-ish
+    /// edit of an operator's diagnostic.
+    #[tokio::test]
+    async fn refused_registrations_never_write_build_version() {
+        let Some(pool) = pool_or_skip().await else {
+            return;
+        };
+        let repo = WorkerIdentityRepository::new(pool);
+
+        async fn builds_for(repo: &WorkerIdentityRepository, wid: &str) -> Vec<Option<String>> {
+            let mut v: Vec<Option<String>> = repo
+                .list_active_builds()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.worker_id == wid)
+                .map(|r| r.build_version)
+                .collect();
+            v.sort();
+            v
+        }
+
+        // --- TOFU conflict + ineligible token, on a worker with a recorded build.
+        let wid = "test-refused-buildver";
+        clean(&repo.db_pool, wid).await;
+        let th = hash("refusedbuild");
+        clean_token(&repo.db_pool, &th).await;
+
+        assert_eq!(
+            repo.register_tofu(wid, &key(1), false, Some("0.1.0+goodaaa"))
+                .await
+                .unwrap(),
+            TofuOutcome::Registered
+        );
+        let baseline = builds_for(&repo, wid).await;
+        assert_eq!(baseline, vec![Some("0.1.0+goodaaa".to_string())]);
+
+        // A DIFFERENT key for a TOFU-bound worker_id: 409, and the attacker's
+        // build string must not land anywhere.
+        assert_eq!(
+            repo.register_tofu(wid, &key(2), false, Some("9.9.9+evilbbb"))
+                .await
+                .unwrap(),
+            TofuOutcome::IdentityConflict
+        );
+        assert_eq!(builds_for(&repo, wid).await, baseline, "conflict wrote");
+
+        // An unknown provisioning token: 401, same requirement (the whole tx,
+        // build_version included, rolls back).
+        assert_eq!(
+            repo.register_with_provisioning_token(
+                &th,
+                wid,
+                &key(2),
+                false,
+                true,
+                Some("9.9.9+evilccc")
+            )
+            .await
+            .unwrap(),
+            TokenRegisterOutcome::InvalidToken
+        );
+        assert_eq!(builds_for(&repo, wid).await, baseline, "bad token wrote");
+
+        // --- Cap-reached, on its own worker so the assertions stay exact.
+        let capped = "test-refused-buildver-cap";
+        clean(&repo.db_pool, capped).await;
+        for i in 0..MAX_ACTIVE_KEYS_PER_WORKER as u8 {
+            assert_eq!(
+                repo.register(capped, &key(i), false, Some(&format!("0.1.0+ok{i:05}")))
+                    .await
+                    .unwrap(),
+                RegisterOutcome::Registered
+            );
+        }
+        let at_cap = builds_for(&repo, capped).await;
+        assert_eq!(
+            repo.register(capped, &key(200), false, Some("9.9.9+evilddd"))
+                .await
+                .unwrap(),
+            RegisterOutcome::CapReached
+        );
+        assert_eq!(builds_for(&repo, capped).await, at_cap, "cap arm wrote");
+        assert!(
+            !at_cap.contains(&Some("9.9.9+evilddd".to_string())),
+            "refused build string must appear nowhere"
+        );
+    }
+
     #[tokio::test]
     async fn tofu_first_use_then_idempotent_then_conflicts() {
         let Some(pool) = pool_or_skip().await else {

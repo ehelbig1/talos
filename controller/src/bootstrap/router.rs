@@ -169,12 +169,21 @@ const MAX_BUILD_VERSION_BYTES: usize = 128;
 /// unit-testable without a live server.
 ///
 /// Rules, in order:
-/// * trim surrounding whitespace, then
-/// * keep only ASCII graphic characters and the plain space — this DROPS
-///   control characters (`\n`, `\r`, `\0`, and the `\x1b` that starts an ANSI
-///   escape) and all non-ASCII. A newline is the log-injection primitive: a
-///   registrant that could embed one would be able to forge whole log lines in
-///   an operator's terminal (and in anything tailing structured logs as text).
+/// * keep only ASCII GRAPHIC characters — no whitespace of any kind, no
+///   control characters, no non-ASCII. Two separate injection primitives die
+///   here:
+///     - `\n` / `\r` would let a registrant forge whole log lines in an
+///       operator's terminal (and in anything tailing structured logs as text);
+///       `\x1b` would let it repaint one. Both are control characters.
+///     - the plain SPACE is the field separator in `tracing`'s default text
+///       formatter, which renders `%`-recorded values unquoted. A build string
+///       of `x controller_build=0.1.0+deadbee` would otherwise emit a SECOND,
+///       forged `controller_build=` field on the WARN line, right next to the
+///       real one — a registrant editing the operator's own diagnostic. A
+///       version string never legitimately contains a space (the composite is
+///       `{pkg}+{sha}[-dirty]`, and a `TALOS_VERSION` override is a version),
+///       so allowing it bought nothing. Whitespace-only input therefore also
+///       collapses to `None` without a separate trim step.
 ///   Dropping rather than rejecting keeps a merely-odd string usable.
 /// * cap at [`MAX_BUILD_VERSION_BYTES`] — after filtering, so the cap counts
 ///   what is actually stored. Every retained character is one ASCII byte, so
@@ -184,12 +193,10 @@ const MAX_BUILD_VERSION_BYTES: usize = 128;
 ///   diagnostic fact, and both must read as "unverifiable", never as a match.
 fn sanitize_build_version(raw: Option<String>) -> Option<String> {
     let cleaned: String = raw?
-        .trim()
         .chars()
-        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .filter(char::is_ascii_graphic)
         .take(MAX_BUILD_VERSION_BYTES)
         .collect();
-    let cleaned = cleaned.trim().to_string();
     (!cleaned.is_empty()).then_some(cleaned)
 }
 
@@ -198,10 +205,19 @@ fn sanitize_build_version(raw: Option<String>) -> Option<String> {
 // flag needs the SAME comparison, and two surfaces disagreeing about whether the
 // fleet is skewed would be worse than either being wrong alone.
 
-/// The controller's own build string — same composition as
+/// The controller's own build string — same COMPOSITION as
 /// `get_platform_info.build_version` and the worker's `worker_build_version()`.
 /// Composed locally (from this crate's own `build.rs` constants) rather than
 /// reaching into `talos-mcp-handlers` internals.
+///
+/// Note the package halves legitimately differ per surface: this crate is
+/// versioned `1.0.0-rN` while `talos-mcp-handlers` (which composes the string in
+/// `get_platform_info`) takes the workspace `0.1.0`. So ONE controller process
+/// describes itself two ways, and a worker (also `0.1.0`) matches the reported
+/// string but not this one. That is exactly why only the `+sha[-dirty]` SUFFIX
+/// is ever compared — and why [`log_build_identity`] also logs the compared
+/// commit explicitly, so an operator reading two visibly different strings on a
+/// "matches" line can see what the verdict was actually based on.
 fn controller_build_version() -> String {
     std::env::var("TALOS_VERSION").unwrap_or_else(|_| {
         format!(
@@ -484,6 +500,10 @@ pub(crate) async fn register_worker_key_handler(
 /// * both sides known and DIFFERENT → WARN "build skew". Signed wire formats
 ///   are version-coupled (job dispatch, memory RPC, envelope sealing), so this
 ///   is the shape that breaks jobs in ways that look like signature bugs.
+///   "Different" covers a `-dirty` suffix on only one side: same commit, but a
+///   dirty tree corresponds to no commit at all, so the two binaries were built
+///   from different bytes. The wording says "different builds", not "different
+///   commits", so that case is not misreported.
 /// * either side unknown / unreported → WARN "unverifiable". NOT "match" — a
 ///   pre-handshake worker and an `unknown` sha prove nothing, and reporting
 ///   absence of evidence as agreement is precisely the failure mode the
@@ -492,9 +512,14 @@ pub(crate) async fn register_worker_key_handler(
 /// Logs only; nothing here influences whether the registration succeeded — it
 /// already did.
 fn log_build_identity(worker_id: &str, worker_build: Option<&str>) {
-    use talos_worker_identity_repository::{build_is_verifiable, builds_match};
+    use talos_worker_identity_repository::{build_is_verifiable, build_suffix, builds_match};
 
     let controller_build = controller_build_version();
+    // The two halves the verdict is ACTUALLY based on, logged next to the full
+    // strings. The package halves differ per crate by design (see
+    // `controller_build_version`), so a "matches" line whose two version strings
+    // look nothing alike is normal — these fields say why.
+    let controller_commit = build_suffix(&controller_build).unwrap_or("none");
     match worker_build {
         Some(wb) if builds_match(&controller_build, wb) => tracing::info!(
             target: "worker_registry",
@@ -502,7 +527,9 @@ fn log_build_identity(worker_id: &str, worker_build: Option<&str>) {
             worker_id = %worker_id,
             controller_build = %controller_build,
             worker_build = %wb,
-            "worker build matches the controller"
+            commit = %controller_commit,
+            "worker build matches the controller (compared on the commit suffix; \
+             the package halves differ per crate by design)"
         ),
         Some(wb) if build_is_verifiable(wb) && build_is_verifiable(&controller_build) => {
             tracing::warn!(
@@ -511,7 +538,10 @@ fn log_build_identity(worker_id: &str, worker_build: Option<&str>) {
                 worker_id = %worker_id,
                 controller_build = %controller_build,
                 worker_build = %wb,
-                "BUILD SKEW: worker and controller are running different commits. \
+                controller_commit = %controller_commit,
+                worker_commit = %build_suffix(wb).unwrap_or("none"),
+                "BUILD SKEW: worker and controller are running different builds \
+                 (differing commit sha, or a -dirty working tree on one side only). \
                  Signed wire formats (job dispatch, memory RPC, envelope sealing) are \
                  version-coupled — verify both images were published from the same tree."
             )
@@ -2027,6 +2057,30 @@ mod worker_build_identity_tests {
         // JSON metacharacters are harmless (serde_json escapes them) and stay,
         // so a weird-but-real version is still legible.
         assert_eq!(san("a+b\"c").as_deref(), Some("a+b\"c"));
+    }
+
+    /// The SECOND injection primitive, and the subtler one: `tracing`'s default
+    /// text formatter renders `%`-recorded values UNQUOTED as `key=value`
+    /// pairs separated by spaces. A build string containing a space would
+    /// therefore emit a forged extra field on the WARN line — here, a second
+    /// `controller_build=` sitting next to the real one, letting a registrant
+    /// edit the operator's own build-skew diagnostic. No whitespace survives.
+    #[test]
+    fn strips_the_tracing_field_separator() {
+        let forged = san("x controller_build=0.1.0+deadbee worker_id=someone-else").unwrap();
+        assert!(
+            !forged.contains(char::is_whitespace),
+            "no whitespace may survive: {forged}"
+        );
+        assert_eq!(
+            forged,
+            "xcontroller_build=0.1.0+deadbeeworker_id=someone-else"
+        );
+        // Tabs and vertical whitespace go the same way (they are not graphic).
+        assert_eq!(san("a\tb\u{b}c\u{c}d").as_deref(), Some("abcd"));
+        // Unicode spaces are non-ASCII, so they never survive either — a NBSP
+        // rendering as a separator in a terminal would be the same attack.
+        assert_eq!(san("a\u{a0}b").as_deref(), Some("ab"));
     }
 
     #[test]

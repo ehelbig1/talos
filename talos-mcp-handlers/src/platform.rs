@@ -895,8 +895,10 @@ fn handle_get_public_url_status(req_id: Option<serde_json::Value>) -> JsonRpcRes
 ///
 /// THREE states per worker, deliberately kept apart:
 /// * `"match"`      — same commit sha; the fleet agrees here.
-/// * `"skew"`       — both sides report a real sha and they DIFFER. The
-///                    actionable one: version-coupled signed wire formats
+/// * `"skew"`       — both sides report a real sha and they DIFFER (including
+///                    a `-dirty` suffix on one side only: same commit, but a
+///                    dirty tree corresponds to no commit, so the bytes differ).
+///                    The actionable one: version-coupled signed wire formats
 ///                    (job dispatch, memory RPC, envelope sealing) break in
 ///                    ways that look like signature bugs.
 /// * `"unverifiable"` — one side reported nothing (a pre-handshake worker), or
