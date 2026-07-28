@@ -12,8 +12,10 @@
 //! the response shape is operator-facing API.
 
 pub mod graph_heuristics;
+pub mod twin_divergence;
 
 pub use graph_heuristics::{count_nodes_with_empty_data, is_substantive_workflow};
+pub use twin_divergence::{analyze_twins, TwinAnalysis, TwinCandidate};
 
 use std::sync::Arc;
 use thiserror::Error;
@@ -319,8 +321,43 @@ impl HygieneService {
             })
             .collect();
 
+        // --- Twinned-workflow divergence (advisory) ---
+        //
+        // A defect fixed on ONE instance of a duplicated workflow is not
+        // fixed — the twin keeps running the old behavior until someone
+        // notices. That happened twice in one week on the inbox organizers
+        // (a missing `coverage_judge` leaf, then judge verdict drift), so
+        // the hygiene report now diffs name-paired twins. Grading is
+        // deliberate: only structural + control-logic divergence earns a
+        // recommendation. Module/prompt/auth differences are how real twins
+        // are SUPPOSED to differ, and an entry that fires on those would
+        // train operators to ignore the one that matters.
+        let twin_candidates: Vec<twin_divergence::TwinCandidate> = h
+            .workflow_graphs
+            .iter()
+            .map(|g| twin_divergence::TwinCandidate {
+                id: g.id.to_string(),
+                name: g.name.clone(),
+                graph_json: g.graph_json.clone(),
+            })
+            .collect();
+        let twin_analysis = twin_divergence::analyze_twins(&twin_candidates);
+        let diverged_twin_pairs = twin_analysis.diverged_pairs().count();
+        let workflow_twins = twin_divergence::twins_section(
+            &twin_analysis,
+            twin_divergence::ScanCoverage {
+                truncated: h.workflow_graphs_truncated,
+                skipped_graphs: h.workflow_graphs_skipped,
+                scan_failed: h.workflow_graphs_scan_failed,
+            },
+        );
+
         // --- Build summary and recommendations ---
         let mut recommendations: Vec<serde_json::Value> = Vec::new();
+
+        if let Some(rec) = twin_divergence::twin_recommendation(&twin_analysis) {
+            recommendations.push(rec);
+        }
 
         if !undescribed.is_empty() {
             recommendations.push(serde_json::json!({
@@ -615,6 +652,7 @@ impl HygieneService {
             + secret_issues
             + expiring_actor_memories.len()
             + workflows_needing_schema.len()
+            + diverged_twin_pairs
             + if unembedded_count > 0 { 1 } else { 0 };
 
         let note = {
@@ -657,7 +695,7 @@ impl HygieneService {
             "summary": {
                 "total_issues": issues_found,
                 "critical": stale_executions.len(),
-                "high": undescribed.len() + uncapabilized.len() + expiring_actor_memories.len(),
+                "high": undescribed.len() + uncapabilized.len() + expiring_actor_memories.len() + diverged_twin_pairs,
                 "medium": (if unembedded_count > 0 { 1 } else { 0 }) + secret_issues + workflows_needing_schema.len(),
                 "low": orphaned_modules.len() + dormant_workflows.len() + stale_draft_workflows.len() + idle_actors.len(),
                 "total_workflows": total_workflow_count,
@@ -668,6 +706,12 @@ impl HygieneService {
                 "expiring_memories_count": expiring_actor_memories.len(),
                 "workflows_needing_schema_count": workflows_needing_schema.len(),
                 "promotable_modules_count": promotable_modules.len(),
+                // Twin pairs DETECTED vs pairs carrying recommendation-grade
+                // divergence. Both are reported: the first says how much the
+                // name heuristic could see, the second is the actual signal —
+                // reading either alone would misstate the check's coverage.
+                "twin_pairs_count": twin_analysis.pairs.len(),
+                "diverged_twin_pairs_count": diverged_twin_pairs,
                 "suppressed_internal_test_workflows": suppressed_count,
                 "suppressed_low_score_count": suppressed_low_score_count,
                 "auto_classified_test_like_workflows": auto_classified_count,
@@ -689,6 +733,7 @@ impl HygieneService {
             "secrets_without_expiry": secrets_without_expiry,
             "expiring_actor_memories": expiring_actor_memories,
             "workflows_needing_schema": workflows_needing_schema,
+            "workflow_twins": workflow_twins,
             "recommendations": recommendations,
         });
 
