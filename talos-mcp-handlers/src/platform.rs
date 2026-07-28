@@ -78,7 +78,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_platform_info",
-            "description": "Get Talos platform metadata: version, tool count, database status, uptime, feature capabilities, and a 'fleet' section — every ACTIVE registered worker with the build it reported at registration, plus a build_skew flag when a worker's commit provably differs from the controller's. Use it to answer 'are the controller and workers running the same build?' before chasing a signature-verification failure. build_version is worker-self-reported and diagnostic only (never an authorization input); null means a pre-handshake worker, and build_status 'unverifiable' is not the same as 'match'.",
+            "description": "Get Talos platform metadata: version, tool count, database status, uptime, feature capabilities, and a 'fleet' section — every ACTIVE registered worker with the build it reported at registration, PLUS every worker pinned in the controller's static TALOS_WORKER_PUBLIC_KEYS ring (source: 'static-env'), and a build_skew flag when a worker's commit provably differs from the controller's. Use it to answer 'are the controller and workers running the same build?' before chasing a signature-verification failure. build_version is worker-self-reported and diagnostic only (never an authorization input); null means a pre-handshake worker or a static-env worker that cannot report at all, and build_status 'unverifiable' is not the same as 'match'. The two sources are NEVER deduped, so one worker_id legitimately appears twice (once per source) — that is a disagreement to read, not a duplicate to collapse; read the 'note' field for what each count is defined over.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -910,13 +910,21 @@ fn handle_get_public_url_status(req_id: Option<serde_json::Value>) -> JsonRpcRes
 ///                    operator never reads a clean `build_skew: false` as
 ///                    "everything checked out".
 ///
+/// TWO SOURCES, deliberately not merged into one identity. `source` is a closed
+/// set:
+/// * `"registered"` — a `worker_identities` row: the worker proved possession of
+///   its key against the registration endpoint and reported a build.
+/// * `"static-env"` — an entry in the controller's operator-pinned
+///   `TALOS_WORKER_PUBLIC_KEYS` ring. Such a worker never contacts the
+///   registration endpoint, so it has NO row, reports NO build, and was
+///   structurally invisible here until this merge (the dev stack's only real
+///   worker was missing from the report for exactly this reason).
+///
 /// A DB failure degrades to an `error` field rather than failing the whole
 /// platform-info call — the rest of the response is still useful, and this
 /// section is diagnostic. The message is the generic one; details go to the log.
 async fn build_fleet_report(db_pool: &sqlx::PgPool, controller_build: &str) -> serde_json::Value {
-    use talos_worker_identity_repository::{
-        build_is_verifiable, builds_match, WorkerIdentityRepository, MAX_FLEET_BUILD_ROWS,
-    };
+    use talos_worker_identity_repository::WorkerIdentityRepository;
 
     let repo = WorkerIdentityRepository::new(db_pool.clone());
     let rows = match repo.list_active_builds().await {
@@ -930,10 +938,33 @@ async fn build_fleet_report(db_pool: &sqlx::PgPool, controller_build: &str) -> s
         }
     };
 
+    assemble_fleet_report(
+        controller_build,
+        &rows,
+        &talos_workflow_job_protocol::static_worker_ring(),
+    )
+}
+
+/// Pure assembly of the fleet report — split from the DB read so every
+/// classification, count and merge rule is unit-testable without a Postgres
+/// (the whole surface was untestable while it lived inside the async fetch).
+///
+/// `static_ring` is `(worker_id, key_count)` from
+/// [`talos_workflow_job_protocol::static_worker_ring`] — ids and counts only,
+/// never key bytes.
+fn assemble_fleet_report(
+    controller_build: &str,
+    rows: &[talos_worker_identity_repository::WorkerBuildRow],
+    static_ring: &[(String, usize)],
+) -> serde_json::Value {
+    use talos_worker_identity_repository::{
+        build_is_verifiable, builds_match, MAX_FLEET_BUILD_ROWS,
+    };
+
     let controller_verifiable = build_is_verifiable(controller_build);
     let mut skew = 0usize;
     let mut unverifiable = 0usize;
-    let workers: Vec<serde_json::Value> = rows
+    let mut workers: Vec<serde_json::Value> = rows
         .iter()
         .map(|r| {
             let status = match r.build_version.as_deref() {
@@ -949,6 +980,7 @@ async fn build_fleet_report(db_pool: &sqlx::PgPool, controller_build: &str) -> s
             };
             serde_json::json!({
                 "worker_id": r.worker_id,
+                "source": "registered",
                 // null = this worker registered before the build-identity
                 // handshake existed (or through the operator CLI, which has no
                 // build to report) — NOT "unknown build of a new worker".
@@ -960,21 +992,103 @@ async fn build_fleet_report(db_pool: &sqlx::PgPool, controller_build: &str) -> s
         })
         .collect();
 
+    // NO DEDUPE against the registered rows, on purpose. A worker_id present in
+    // BOTH sources appears TWICE — once per source — because the two rows are
+    // claims from different trust roots: one is what the worker proved and
+    // reported about itself, the other is what the operator pinned in this
+    // controller's env. Collapsing them would hide precisely the disagreement an
+    // operator needs to see (a stale env pin next to a live registration), the
+    // same reason `list_active_builds` refuses to collapse a worker's two
+    // rotation keys into one row.
+    //
+    // Capped by the SAME runaway guard the DB listing uses. `TALOS_WORKER_PUBLIC_KEYS`
+    // is operator-authored, so a huge ring is self-inflicted rather than
+    // adversarial — but this section rides inside `get_platform_info`, a
+    // general-purpose response every MCP client parses, and a 10k-entry env
+    // would blow that tool up for a reason unrelated to it. Same posture as
+    // MAX_FLEET_BUILD_ROWS on the DB side: a runaway guard, not pagination, with
+    // `truncated` saying so.
+    let static_cap = MAX_FLEET_BUILD_ROWS as usize;
+    let static_truncated = static_ring.len() > static_cap;
+    let static_shown = static_ring.len().min(static_cap);
+    for (worker_id, key_count) in static_ring.iter().take(static_shown) {
+        workers.push(serde_json::json!({
+            "worker_id": worker_id,
+            "source": "static-env",
+            // Nothing about a static-ring entry is self-reported: the env pins
+            // an id and its key(s), full stop. build_version/last_seen_at are
+            // null because there is no report, and supports_sealing is null
+            // rather than false because the ring format carries no sealing bit —
+            // `false` would read as "this worker said it cannot seal", a claim
+            // the ring cannot make.
+            "build_version": serde_json::Value::Null,
+            "build_status": "unverifiable",
+            "static_key_count": key_count,
+            "supports_sealing": serde_json::Value::Null,
+            "last_seen_at": serde_json::Value::Null,
+        }));
+        unverifiable += 1;
+    }
+
+    // "How many workers do I actually have?" — the one question `worker_count`
+    // does NOT answer. That is a ROW count: a worker mid key-rotation is two
+    // rows, and a worker in both sources is two more. Left as-is for
+    // back-compat and disambiguated by an ADDED field rather than a rename
+    // (misleading-report-field rule, #579/#580).
+    let distinct_ids: std::collections::HashSet<&str> = rows
+        .iter()
+        .map(|r| r.worker_id.as_str())
+        .chain(
+            static_ring
+                .iter()
+                .take(static_shown)
+                .map(|(w, _)| w.as_str()),
+        )
+        .collect();
+
     serde_json::json!({
         "controller_build": controller_build,
         "workers": workers,
+        // ROWS in `workers`, not distinct workers — see `distinct_worker_ids`.
         "worker_count": workers.len(),
-        // Only PROVEN disagreement. Read it together with unverifiable_workers.
+        "distinct_worker_ids": distinct_ids.len(),
+        "registered_workers": rows.len(),
+        // Rows IN THIS REPORT, not fleet totals — both sources are capped (see
+        // `truncated`). Keeping this equal to the emitted static rows is what
+        // makes the note's `unverifiable_workers - static_env_workers`
+        // arithmetic hold in the capped case too.
+        "static_env_workers": static_shown,
+        // Only PROVEN disagreement, and only among REGISTERED rows — a static
+        // entry reports no build at all, so it can never contribute skew. A
+        // static-only fleet therefore reads `build_skew: false` with every
+        // worker unverifiable, which is the honest answer.
         "build_skew": skew > 0,
         "skewed_workers": skew,
         "unverifiable_workers": unverifiable,
-        "truncated": workers.len() as i64 >= MAX_FLEET_BUILD_ROWS,
-        "note": "One entry per ACTIVE registered (worker_id, signing key) — a worker mid key-rotation \
-                 appears twice by design. build_version is worker-self-reported and NOT covered by the \
-                 registration proof-of-possession: it is diagnostic only and never gates authorization. \
-                 null build_version = a pre-handshake worker (or an operator-CLI registration) that never \
-                 reported one. build_status 'unverifiable' means one side has no usable commit sha — that \
-                 is not the same as 'match'.",
+        // PER SOURCE, never of the merged array length: static rows are appended
+        // after the DB LIMIT, so they must not make a short listing look
+        // truncated — and a capped ring must not be silently dropped just
+        // because the listing was short. True when EITHER source was cut.
+        "truncated": rows.len() as i64 >= MAX_FLEET_BUILD_ROWS || static_truncated,
+        "note": "TWO SOURCES, never deduped. source='registered': one entry per ACTIVE registered \
+                 (worker_id, signing key) — a worker mid key-rotation appears twice by design. \
+                 source='static-env': a worker_id pinned in this controller's TALOS_WORKER_PUBLIC_KEYS \
+                 ring; it authenticates without ever calling the registration endpoint, so it has no row, \
+                 no last_seen_at and CANNOT report a build — its 'unverifiable' means 'this deployment \
+                 has not enabled worker self-registration', not 'a registered worker went quiet'. The \
+                 same worker_id may legitimately appear under both sources (different trust roots: what \
+                 the worker proved vs. what the operator pinned); disagreement between them is signal. \
+                 unverifiable_workers counts BOTH, and every static_env_workers entry is in it by \
+                 construction, so registered-but-silent = unverifiable_workers - static_env_workers. \
+                 build_version is worker-self-reported and NOT covered by the registration \
+                 proof-of-possession: it is diagnostic only and never gates authorization. null \
+                 build_version on a registered row = a pre-handshake worker (or an operator-CLI \
+                 registration) that never reported one. build_status 'unverifiable' means one side has no \
+                 usable commit sha — that is not the same as 'match'. worker_count is the number of ROWS \
+                 in 'workers' (rotation keys and both-source workers each add one); distinct_worker_ids \
+                 is the answer to 'how many workers do I have'. Every count above describes the rows IN \
+                 THIS REPORT: each source is independently capped at 200 rows and 'truncated' is true \
+                 when either one was cut.",
     })
 }
 
@@ -2249,5 +2363,228 @@ async fn handle_get_secret_access_log(
                 mcp_error(req_id, -32000, "Failed to query secret access log")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fleet_report_tests {
+    use super::assemble_fleet_report;
+    use talos_worker_identity_repository::WorkerBuildRow;
+
+    fn row(worker_id: &str, build: Option<&str>) -> WorkerBuildRow {
+        WorkerBuildRow {
+            worker_id: worker_id.to_string(),
+            build_version: build.map(str::to_string),
+            supports_sealing: false,
+            last_seen_at: chrono::Utc::now(),
+        }
+    }
+
+    fn ring(entries: &[(&str, usize)]) -> Vec<(String, usize)> {
+        entries
+            .iter()
+            .map(|(w, n)| ((*w).to_string(), *n))
+            .collect()
+    }
+
+    fn workers(report: &serde_json::Value) -> Vec<serde_json::Value> {
+        report["workers"].as_array().cloned().unwrap_or_default()
+    }
+
+    /// No static ring configured → byte-identical classification to the
+    /// pre-merge report (plus the new `source` label), so a deployment that
+    /// self-registers everything sees no behaviour change.
+    #[test]
+    fn registered_only_classification_is_unchanged() {
+        let report = assemble_fleet_report(
+            "1.0.0+aaaaaaa",
+            &[
+                row("w-match", Some("0.1.0+aaaaaaa")),
+                row("w-skew", Some("0.1.0+bbbbbbb")),
+                row("w-silent", None),
+            ],
+            &[],
+        );
+        let ws = workers(&report);
+        assert_eq!(ws.len(), 3);
+        assert!(ws.iter().all(|w| w["source"] == "registered"));
+        assert_eq!(ws[0]["build_status"], "match");
+        assert_eq!(ws[1]["build_status"], "skew");
+        assert_eq!(ws[2]["build_status"], "unverifiable");
+        assert_eq!(report["build_skew"], true);
+        assert_eq!(report["skewed_workers"], 1);
+        assert_eq!(report["unverifiable_workers"], 1);
+        assert_eq!(report["registered_workers"], 3);
+        assert_eq!(report["static_env_workers"], 0);
+        assert_eq!(report["worker_count"], 3);
+        assert_eq!(report["distinct_worker_ids"], 3);
+    }
+
+    /// A worker mid key-rotation is two REGISTERED rows for one worker — the
+    /// pre-existing reason `worker_count` overcounts, now stated by a field
+    /// instead of only by prose.
+    #[test]
+    fn rotation_rows_inflate_worker_count_but_not_distinct_ids() {
+        let report = assemble_fleet_report(
+            "1.0.0+aaaaaaa",
+            &[
+                row("w-rotating", Some("0.1.0+aaaaaaa")),
+                row("w-rotating", Some("0.1.0+aaaaaaa")),
+            ],
+            &[],
+        );
+        assert_eq!(report["worker_count"], 2);
+        assert_eq!(report["distinct_worker_ids"], 1);
+        assert_eq!(report["build_skew"], false);
+    }
+
+    /// The defect this merge fixes: a fleet whose workers all authenticate off
+    /// the static env ring used to report ZERO workers — indistinguishable from
+    /// "no workers running".
+    #[test]
+    fn static_only_fleet_is_visible_and_never_counts_as_skew() {
+        let report = assemble_fleet_report("1.0.0+aaaaaaa", &[], &ring(&[("dev-worker-fleet", 1)]));
+        let ws = workers(&report);
+        assert_eq!(ws.len(), 1);
+        assert_eq!(ws[0]["worker_id"], "dev-worker-fleet");
+        assert_eq!(ws[0]["source"], "static-env");
+        assert_eq!(ws[0]["build_status"], "unverifiable");
+        assert_eq!(ws[0]["static_key_count"], 1);
+        // Nothing self-reported: all three are null, not defaulted.
+        assert!(ws[0]["build_version"].is_null());
+        assert!(ws[0]["supports_sealing"].is_null());
+        assert!(ws[0]["last_seen_at"].is_null());
+
+        assert_eq!(report["worker_count"], 1);
+        assert_eq!(report["registered_workers"], 0);
+        assert_eq!(report["static_env_workers"], 1);
+        assert_eq!(report["unverifiable_workers"], 1);
+        // Honest answer: nothing PROVEN to differ, and the report says why.
+        assert_eq!(report["build_skew"], false);
+        assert_eq!(report["skewed_workers"], 0);
+    }
+
+    /// Same worker_id in both sources = two rows. Deduping would hide the
+    /// disagreement between what the worker proved and what the operator pinned.
+    #[test]
+    fn same_worker_id_in_both_sources_yields_two_rows() {
+        let report = assemble_fleet_report(
+            "1.0.0+aaaaaaa",
+            &[row("dev-worker-fleet", Some("0.1.0+aaaaaaa"))],
+            &ring(&[("dev-worker-fleet", 2)]),
+        );
+        let ws = workers(&report);
+        assert_eq!(ws.len(), 2, "one row per SOURCE, never collapsed");
+        assert_eq!(ws[0]["source"], "registered");
+        assert_eq!(ws[0]["build_status"], "match");
+        assert_eq!(ws[1]["source"], "static-env");
+        assert_eq!(ws[1]["build_status"], "unverifiable");
+        assert_eq!(ws[1]["static_key_count"], 2, "rotation overlap is visible");
+
+        // Counts split by source; the static row is unverifiable but not skew.
+        assert_eq!(report["worker_count"], 2, "ROW count: one per source");
+        assert_eq!(
+            report["distinct_worker_ids"], 1,
+            "…but it is ONE worker; worker_count must not be read as a fleet size"
+        );
+        assert_eq!(report["registered_workers"], 1);
+        assert_eq!(report["static_env_workers"], 1);
+        assert_eq!(report["unverifiable_workers"], 1);
+        assert_eq!(report["build_skew"], false);
+    }
+
+    /// A static row must not drag a proven-skew verdict either way, and
+    /// "registered but silent" stays derivable from the two counts.
+    #[test]
+    fn static_rows_do_not_perturb_skew_and_counts_stay_derivable() {
+        let report = assemble_fleet_report(
+            "1.0.0+aaaaaaa",
+            &[
+                row("w-skew", Some("0.1.0+bbbbbbb")),
+                row("w-silent", None),
+                row("w-unknown-sha", Some("0.1.0+unknown")),
+            ],
+            &ring(&[("pinned-a", 1), ("pinned-b", 1)]),
+        );
+        assert_eq!(report["build_skew"], true);
+        assert_eq!(report["skewed_workers"], 1, "static rows never add skew");
+        assert_eq!(report["unverifiable_workers"], 4);
+        assert_eq!(report["static_env_workers"], 2);
+        // The note's arithmetic: registered-but-silent = 4 - 2 = 2.
+        let silent = report["unverifiable_workers"].as_u64().unwrap()
+            - report["static_env_workers"].as_u64().unwrap();
+        assert_eq!(silent, 2);
+    }
+
+    /// `truncated` describes the DB listing hitting its LIMIT. Static entries
+    /// are appended after that LIMIT, so they must never flip the flag.
+    ///
+    /// Sized to actually DISCRIMINATE: the merged array is deliberately pushed
+    /// PAST `MAX_FLEET_BUILD_ROWS` while the listing itself is one row short of
+    /// it, so a `workers.len() >= MAX` implementation reports a truncation that
+    /// did not happen and this test fails. A three-row toy fleet would pass
+    /// under both the right and the wrong rule — i.e. assert nothing.
+    #[test]
+    fn truncated_reflects_the_db_listing_not_the_merged_array() {
+        let cap = talos_worker_identity_repository::MAX_FLEET_BUILD_ROWS as usize;
+        let rows: Vec<_> = (0..cap - 1)
+            .map(|i| row(&format!("w{i:05}"), None))
+            .collect();
+        let ring = ring(&[("pinned-a", 1), ("pinned-b", 1), ("pinned-c", 1)]);
+        let report = assemble_fleet_report("1.0.0+aaaaaaa", &rows, &ring);
+
+        assert_eq!(
+            report["worker_count"],
+            (cap + 2) as u64,
+            "merged exceeds cap"
+        );
+        assert_eq!(
+            report["truncated"], false,
+            "neither source was cut; only the merged length exceeds the cap"
+        );
+    }
+
+    /// The other half of the same rule: the DB listing hitting its LIMIT DOES
+    /// set the flag, even with no static ring at all.
+    #[test]
+    fn truncated_is_set_when_the_db_listing_hits_its_limit() {
+        let cap = talos_worker_identity_repository::MAX_FLEET_BUILD_ROWS as usize;
+        let rows: Vec<_> = (0..cap).map(|i| row(&format!("w{i:05}"), None)).collect();
+        let report = assemble_fleet_report("1.0.0+aaaaaaa", &rows, &[]);
+        assert_eq!(report["truncated"], true);
+        assert_eq!(report["registered_workers"], cap as u64);
+    }
+
+    /// An operator-authored ring is unbounded input to an operator-facing JSON
+    /// blob: cap it with the same runaway guard the DB listing uses, say so via
+    /// `truncated`, and keep every count describing the rows actually emitted so
+    /// the note's arithmetic still holds when the cap bites.
+    #[test]
+    fn an_oversized_static_ring_is_capped_and_says_so() {
+        let cap = talos_worker_identity_repository::MAX_FLEET_BUILD_ROWS as usize;
+        let huge: Vec<(String, usize)> = (0..cap + 37).map(|i| (format!("w{i:05}"), 1)).collect();
+        let report = assemble_fleet_report("1.0.0+aaaaaaa", &[], &huge);
+
+        assert_eq!(workers(&report).len(), cap, "static rows are capped");
+        assert_eq!(report["static_env_workers"], cap as u64);
+        assert_eq!(report["worker_count"], cap as u64);
+        assert_eq!(report["truncated"], true, "a cut ring must announce itself");
+        // The counts stay internally consistent under the cap: every emitted
+        // static row is unverifiable, and registered-but-silent is still
+        // derivable as unverifiable_workers - static_env_workers (= 0 here).
+        assert_eq!(report["unverifiable_workers"], cap as u64);
+        assert_eq!(report["registered_workers"], 0);
+        assert_eq!(report["build_skew"], false);
+    }
+
+    /// A ring exactly AT the cap is complete, not truncated — off-by-one guard
+    /// so `truncated` never cries wolf on the largest honest fleet.
+    #[test]
+    fn a_static_ring_exactly_at_the_cap_is_not_truncated() {
+        let cap = talos_worker_identity_repository::MAX_FLEET_BUILD_ROWS as usize;
+        let exact: Vec<(String, usize)> = (0..cap).map(|i| (format!("w{i:05}"), 1)).collect();
+        let report = assemble_fleet_report("1.0.0+aaaaaaa", &[], &exact);
+        assert_eq!(workers(&report).len(), cap);
+        assert_eq!(report["truncated"], false);
     }
 }

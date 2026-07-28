@@ -28,6 +28,23 @@ else
 TALOS_MASTER_KEY=$(openssl rand -hex 32)
 WORKER_SHARED_KEY=$(openssl rand -hex 32)
 JWT_SECRET=$(openssl rand -hex 32)
+# Shared bearer for worker boot-time self-registration (RFC 0010 P2 inc.4d).
+# docker-compose.yml hands the SAME value to the controller and the worker.
+#
+# It is NOT sufficient on its own: a worker only registers when it also holds an
+# Ed25519 identity (TALOS_WORKER_SIGNING_KEY), which this file deliberately does
+# NOT generate — a fresh dev stack runs the legacy shared-HMAC result path, where
+# there is no per-worker key to register. So out of the box this token only means
+# the controller MOUNTS POST /internal/worker-key (bearer-gated, in-cluster);
+# nothing registers until you provision worker keys with
+# \`controller generate-worker-trust-keypair --role worker --worker-id ID\` and
+# set TALOS_WORKER_ID + TALOS_WORKER_SIGNING_KEY here.
+#
+# Once you do, workers report their identity + the build they are running and
+# get_platform_info.fleet can answer "is the fleet on my build?" — until then it
+# honestly shows those workers as source:"static-env"/unverifiable (if pinned in
+# TALOS_WORKER_PUBLIC_KEYS) or not at all.
+TALOS_WORKER_REGISTRATION_TOKEN=$(openssl rand -hex 32)
 
 # ─── Datastore credentials ──────────────────────────────────────────────────
 POSTGRES_PASSWORD=$(openssl rand -hex 16)
@@ -76,6 +93,11 @@ EOF
     # write to a temp file rather than relying on GNU/BSD -i differences).
     PGPW="$(grep '^POSTGRES_PASSWORD=' .env | cut -d= -f2)"
     sed "s|__PGPW__|${PGPW}|" .env > .env.tmp && mv .env.tmp .env
+
+    # This file holds the master DEK, the worker shared key, the JWT secret, the
+    # worker-registration bearer and every datastore password. The default umask
+    # would leave it world-readable; only the invoking user needs it.
+    chmod 600 .env
 
     echo "✅ Created .env"
 fi

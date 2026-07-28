@@ -796,6 +796,47 @@ pub fn worker_public_keys(worker_id: &str) -> Vec<DispatchVerifyingKey> {
         .unwrap_or_default()
 }
 
+/// Enumerate the STATIC operator-pinned worker ring (`TALOS_WORKER_PUBLIC_KEYS`)
+/// as `(worker_id, key_count)` pairs, sorted by `worker_id`.
+///
+/// Exists because a worker that authenticates off this env ring never calls the
+/// self-registration endpoint, so it owns NO `worker_identities` row and is
+/// structurally invisible to every DB-backed fleet view — the dev stack's only
+/// worker was missing from `get_platform_info.fleet` for exactly this reason.
+/// Reporting surfaces merge this list in so "no rows" can mean "no workers"
+/// rather than "no workers I happen to look at".
+///
+/// **Never returns key bytes.** A verifying key is public, but an operator API
+/// has no use for 64 hex chars per worker: the only diagnostic question the ring
+/// answers is *which ids does this controller trust, and is one of them carrying
+/// a rotation overlap* — `key_count` says that. Widening this to the key
+/// material would hand every reader a fingerprint of the trust root for zero
+/// added answer.
+///
+/// Reads the immutable ENV base registry ONLY, never the live snapshot: the
+/// dynamic overlay is the DB-registered set, which the caller already lists from
+/// the repository. Mixing them here would double-count a registered worker as
+/// static.
+#[must_use]
+pub fn static_worker_ring() -> Vec<(String, usize)> {
+    summarize_worker_ring(env_worker_public_key_registry())
+}
+
+/// Pure half of [`static_worker_ring`], split out so the summarisation (and its
+/// tolerance for whatever [`parse_worker_public_keys`] admits) is unit-testable
+/// without mutating process env — the env registry is a `OnceLock` and cannot be
+/// re-parsed per test.
+fn summarize_worker_ring(map: &WorkerKeyMap) -> Vec<(String, usize)> {
+    let mut out: Vec<(String, usize)> = map
+        .iter()
+        .map(|(worker_id, keys)| (worker_id.clone(), keys.len()))
+        .collect();
+    // HashMap iteration order is nondeterministic; the report must not reshuffle
+    // itself between two calls on identical input.
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 /// Whether the controller still accepts legacy-HMAC-signed job/pipeline results.
 /// Default `true` (accept — the rollout posture while workers migrate to
 /// per-worker Ed25519). `TALOS_RESULT_REQUIRE_ED25519` ∈ {`1`,`true`,`yes`,`on`}
@@ -6138,6 +6179,53 @@ mod tests {
     fn worker_public_keys_empty_input_is_empty() {
         assert!(parse_worker_public_keys("").is_empty());
         assert!(parse_worker_public_keys("   ,  , ").is_empty());
+    }
+
+    /// The fleet-report enumerator: worker ids + key COUNTS, sorted, and never
+    /// key bytes. Mirrors the parser's tolerance because it consumes the parser's
+    /// output verbatim — a ring the parser accepts must be enumerable.
+    #[test]
+    fn static_ring_summary_counts_keys_per_worker_in_sorted_order() {
+        let a_old = ed_keypair();
+        let a_new = ed_keypair();
+        let b = ed_keypair();
+        // Deliberately declared out of alphabetical order, with worker-a split
+        // across two non-adjacent entries (the rotation-overlap shape).
+        let raw = format!(
+            "worker-b={},worker-a={},worker-a={}",
+            hex::encode(b.verifying_key().to_bytes()),
+            hex::encode(a_old.verifying_key().to_bytes()),
+            hex::encode(a_new.verifying_key().to_bytes()),
+        );
+        let summary = summarize_worker_ring(&parse_worker_public_keys(&raw));
+        assert_eq!(
+            summary,
+            vec![("worker-a".to_string(), 2), ("worker-b".to_string(), 1)],
+            "sorted by worker_id, one entry per id, count = registered keys"
+        );
+    }
+
+    #[test]
+    fn static_ring_summary_skips_malformed_entries_like_the_parser() {
+        let good = ed_keypair();
+        let raw = format!(
+            "  , notanentry , =deadbeef , worker-x=zzzz , worker-ok={} ,,",
+            hex::encode(good.verifying_key().to_bytes()),
+        );
+        assert_eq!(
+            summarize_worker_ring(&parse_worker_public_keys(&raw)),
+            vec![("worker-ok".to_string(), 1)],
+            "a malformed entry must not surface as a phantom fleet member"
+        );
+    }
+
+    #[test]
+    fn static_ring_summary_of_empty_env_is_empty() {
+        // An unset / empty TALOS_WORKER_PUBLIC_KEYS must yield NO rows — the
+        // fleet report then shows only registered workers, exactly as before
+        // this accessor existed.
+        assert!(summarize_worker_ring(&parse_worker_public_keys("")).is_empty());
+        assert!(summarize_worker_ring(&parse_worker_public_keys("  ,, ")).is_empty());
     }
 
     // RFC 0010 P2 inc.4: the DB-backed dynamic overlay. Uses a worker_id no other
