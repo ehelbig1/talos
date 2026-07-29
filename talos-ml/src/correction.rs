@@ -197,16 +197,12 @@ pub async fn resolve_disagreement(
     // further correction appended. A sibling that lost its own CAS (handled
     // concurrently) is skipped rather than failing the batch — the operator's
     // decision on the group still stands.
-    let mut siblings_resolved = 0usize;
-    for sibling in siblings {
-        if lifecycle
-            .set_disagreement_status(&mut tx, sibling, user_id, status)
-            .await
-            .map_err(ResolveError::Internal)?
-        {
-            siblings_resolved += 1;
-        }
-    }
+    // ONE statement for the whole group: key-based closure is no longer
+    // window-bounded, so this list can legitimately reach the per-model cap.
+    let siblings_resolved = lifecycle
+        .set_disagreement_statuses(&mut tx, &siblings, user_id, status)
+        .await
+        .map_err(ResolveError::Internal)?;
     tx.commit()
         .await
         .map_err(|e| ResolveError::Internal(e.into()))?;

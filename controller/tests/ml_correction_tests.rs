@@ -465,3 +465,147 @@ async fn null_key_siblings_still_close_through_the_paged_text_path() {
         .unwrap();
     assert_eq!(c_status, "pending", "a different example is untouched");
 }
+
+/// Tenancy belt on the NEW window-free closure predicate. `model_id` is
+/// owner-scoped in practice, so the `user_id` bind in
+/// `pending_siblings_by_key` is defence in depth — and defence in depth that
+/// nothing exercises is defence that can be deleted by a refactor without a
+/// single test going red. Seeding a foreign-owned row under the same model
+/// (which only a bug or a future sharing feature could produce) pins it: one
+/// tenant's decision must never flip another tenant's row, by the key path OR
+/// the text path.
+#[tokio::test]
+async fn key_closure_never_crosses_the_tenant_boundary() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    set_master_key();
+    let user = Uuid::new_v4();
+    let other_user = Uuid::new_v4();
+    seed_user(&pool, user).await;
+    seed_user(&pool, other_user).await;
+    let ds = seed_dataset(&pool, user).await;
+    let model = seed_model(&pool, user, ds).await;
+    let (ls, dsvc) = services(&pool).await;
+
+    // Same model, same key, same labels, same text — everything a closure
+    // could join on. Only the owner differs.
+    let mine = seed_disagreement_full(
+        &ls,
+        &pool,
+        model,
+        user,
+        Some("shared-key"),
+        "Subject: quarterly report",
+        Some("to_read"),
+        "archive",
+    )
+    .await;
+    let theirs = seed_disagreement_full(
+        &ls,
+        &pool,
+        model,
+        other_user,
+        Some("shared-key"),
+        "Subject: quarterly report",
+        Some("to_read"),
+        "archive",
+    )
+    .await;
+
+    // The predicate itself, not just its net effect: the closure query must
+    // not even SELECT the foreign row. (The status write is owner-scoped too,
+    // so testing only the end state would keep passing with the tenancy bind
+    // deleted from this query — the layer under test has to be probed
+    // directly.)
+    let mut conn = pool.acquire().await.unwrap();
+    let by_key = ls
+        .pending_siblings_by_key(
+            &mut conn,
+            model,
+            user,
+            "shared-key",
+            Some("to_read"),
+            "archive",
+            mine,
+        )
+        .await
+        .expect("sibling lookup");
+    assert!(
+        by_key.is_empty(),
+        "the closure query must not return another tenant's row"
+    );
+    drop(conn);
+
+    let outcome = resolve_disagreement(&pool, &ls, &dsvc, mine, user, Some("archive"))
+        .await
+        .expect("resolve ok");
+    assert_eq!(
+        outcome.siblings_resolved, 0,
+        "another tenant's row is not a sibling"
+    );
+    let their_status: String =
+        sqlx::query_scalar("SELECT status FROM ml_disagreements WHERE id = $1")
+            .bind(theirs)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        their_status, "pending",
+        "a foreign-owned row must never be closed by this tenant's decision"
+    );
+}
+
+/// The abstention half of the label-pair predicate. A shadow row whose fast
+/// model ABSTAINED stores `fast_label = NULL`, and the queue view (which
+/// compares `Option<String>`) treats two abstentions as the same question. The
+/// SQL must agree — `IS NOT DISTINCT FROM`, not `=`, which would make every
+/// abstention row unclosable-by-key and quietly re-ask the human. The
+/// non-matching direction is covered by
+/// `key_closure_does_not_cross_the_label_pair`.
+#[tokio::test]
+async fn key_closure_matches_two_abstentions_null_fast_label() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    set_master_key();
+    let user = Uuid::new_v4();
+    seed_user(&pool, user).await;
+    let ds = seed_dataset(&pool, user).await;
+    let model = seed_model(&pool, user, ds).await;
+    let (ls, dsvc) = services(&pool).await;
+
+    // Different TEXT, so only the key path can join them.
+    let a = seed_disagreement_full(
+        &ls,
+        &pool,
+        model,
+        user,
+        Some("msg-abstain"),
+        "Subject: renewal notice (copy 1)",
+        None,
+        "archive",
+    )
+    .await;
+    let b = seed_disagreement_full(
+        &ls,
+        &pool,
+        model,
+        user,
+        Some("msg-abstain"),
+        "Subject: renewal notice (copy 2)",
+        None,
+        "archive",
+    )
+    .await;
+
+    let outcome = resolve_disagreement(&pool, &ls, &dsvc, a, user, Some("archive"))
+        .await
+        .expect("resolve ok");
+    assert_eq!(
+        outcome.siblings_resolved, 1,
+        "two abstentions on one example are one question"
+    );
+    let b_status: String = sqlx::query_scalar("SELECT status FROM ml_disagreements WHERE id = $1")
+        .bind(b)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(b_status, "resolved");
+}

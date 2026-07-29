@@ -244,13 +244,43 @@ fn finalize_items(model: &str, items: Vec<DistillItem>, mac_key: &[u8]) -> Vec<D
     // re-fingerprint it. The duplicate is collapsed by `dedupe_by_content`,
     // which keys on the EMBEDDING and is therefore era-independent — and it
     // already runs on every append.
+    //
+    // RESERVED NAMESPACE: a producer-supplied key that claims `ck1:` (or the
+    // retired `ch:`) is DROPPED here and replaced by the genuine fingerprint,
+    // exactly like an oversized key — the item is kept, and it still dedupes.
+    // `example_key` is a caller-controlled string that reaches the
+    // `(dataset_id, example_key)` upsert, the gray-band dedup probe and the
+    // sibling-closure predicate verbatim, so letting a caller write into the
+    // namespace the ENGINE derives would (a) let a legacy `ch:` key — unkeyed
+    // sha256, computable by anyone who knows the text — be aimed at a
+    // surviving pre-cutover row, and (b) make the prefix lie about a row's
+    // provenance. Same rule as the engine's reserved `__actor_context__` /
+    // `__judge_*` keys: engine-authored keys are never caller-authorable.
+    let mut reserved = 0usize;
     for i in cleaned.iter_mut() {
+        if i.example_key
+            .as_deref()
+            .is_some_and(crate::content_identity::is_reserved_content_key)
+        {
+            i.example_key = None;
+            reserved += 1;
+        }
         if i.example_key.is_none() {
             i.example_key = Some(crate::content_identity::content_key(
                 mac_key,
                 &i.features_text,
             ));
         }
+    }
+    if reserved > 0 {
+        // Count only — the rejected key is caller data and says nothing
+        // useful once it has been replaced.
+        tracing::warn!(
+            model,
+            reserved,
+            "__ml_distill__ item(s) supplied a reserved content-fingerprint \
+             example_key; replaced with the derived fingerprint"
+        );
     }
     // Intra-batch dedup, LAST occurrence wins. One envelope can
     // legitimately carry the same example_key twice — e.g. two alert
@@ -766,6 +796,44 @@ mod tests {
         assert!(k1.starts_with(crate::content_identity::CONTENT_KEY_PREFIX));
         assert_eq!(k1, k2, "identical content → identical key (dedupes)");
         assert_ne!(k1, kb, "different content → different key");
+    }
+
+    /// `example_key` is a caller-controlled string. A producer must not be able
+    /// to write into the ENGINE's content-fingerprint namespace: the key
+    /// reaches the `(dataset_id, example_key)` upsert, the gray-band dedup
+    /// probe and the sibling-closure predicate verbatim, and the retired `ch:`
+    /// form is an UNKEYED sha256 that anyone knowing a text can compute for a
+    /// surviving pre-cutover row. Both prefixes are therefore replaced with the
+    /// genuine fingerprint — the item is kept and still dedupes, exactly like
+    /// the oversized-key case.
+    #[test]
+    fn finalize_refuses_a_producer_key_in_the_reserved_namespace() {
+        let forged_ck1 = format!("ck1:{}", "de".repeat(32));
+        let env: DistillEnvelope = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "items": [
+                {"features_text": "Subject: a", "label": "archive", "example_key": forged_ck1},
+                {"features_text": "Subject: b", "label": "archive",
+                 "example_key": "ch:0123456789abcdef"},
+                {"features_text": "Subject: c", "label": "archive",
+                 "example_key": "18f2c0a9b7d3e1aa"},
+            ]
+        }))
+        .unwrap();
+        let (_, items) = normalize_and_finalize(env).unwrap();
+        assert_eq!(items.len(), 3, "every item is kept");
+        for (i, text) in [(0usize, "Subject: a"), (1, "Subject: b")] {
+            assert_eq!(
+                items[i].example_key.as_deref(),
+                Some(crate::content_identity::content_key(&TEST_MAC_KEY, text).as_str()),
+                "a reserved-namespace producer key is replaced by the derived one"
+            );
+        }
+        assert_eq!(
+            items[2].example_key.as_deref(),
+            Some("18f2c0a9b7d3e1aa"),
+            "an ordinary producer key is still kept verbatim"
+        );
     }
 
     /// The fingerprint is KEYED: the same envelope under a different MAC key

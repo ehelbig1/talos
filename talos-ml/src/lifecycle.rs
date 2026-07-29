@@ -1080,6 +1080,46 @@ impl LifecycleService {
         .context("set disagreement status")?;
         Ok(res.rows_affected() == 1)
     }
+
+    /// Batched sibling variant of [`Self::set_disagreement_status`]: flip every
+    /// still-pending row in `ids`, returning how many actually flipped.
+    ///
+    /// ONE statement, not one per id. Sibling closure used to be bounded by the
+    /// 100-row queue page; `pending_siblings_by_key` deliberately removed that
+    /// window, so a backlogged model can now legitimately hand this up to
+    /// `MAX_DISAGREEMENTS_PER_MODEL` ids — a per-id loop would be exactly the
+    /// N+1 the house rules forbid, inside an open write transaction holding row
+    /// locks the whole time.
+    ///
+    /// Identical semantics to calling the single-row version in a loop: the
+    /// `status = 'pending'` predicate silently skips a row another caller
+    /// already handled (the count reflects real transitions), and the
+    /// `user_id` predicate keeps it owner-scoped.
+    pub async fn set_disagreement_statuses(
+        &self,
+        conn: &mut PgConnection,
+        ids: &[Uuid],
+        user_id: Uuid,
+        status: &str,
+    ) -> Result<usize> {
+        if !matches!(status, "resolved" | "dismissed") {
+            anyhow::bail!("invalid disagreement status");
+        }
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let res = sqlx::query(
+            "UPDATE ml_disagreements SET status = $1 \
+             WHERE id = ANY($2) AND user_id = $3 AND status = 'pending'",
+        )
+        .bind(status)
+        .bind(ids)
+        .bind(user_id)
+        .execute(&mut *conn)
+        .await
+        .context("set disagreement statuses")?;
+        Ok(res.rows_affected() as usize)
+    }
 }
 
 #[cfg(test)]

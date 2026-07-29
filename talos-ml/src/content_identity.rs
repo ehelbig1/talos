@@ -50,10 +50,14 @@
 //!
 //! Producer-supplied `example_key`s (a Gmail message id, an ops-alert
 //! `dedup_key`) are IDENTITY keys, not content-derived, and are stored
-//! verbatim — unchanged by this module. They are already plaintext by design
-//! (the ops `dedup_key` is a plaintext column in `ops_alerts`), and they carry
-//! no information about the encrypted text beyond what the producer already
-//! published elsewhere.
+//! verbatim. They are already plaintext by design (the ops `dedup_key` is a
+//! plaintext column in `ops_alerts`), and they carry no information about the
+//! encrypted text beyond what the producer already published elsewhere.
+//!
+//! The ONE exception is the namespace itself: a producer key that claims the
+//! `ck1:` / `ch:` prefixes is replaced with the derived fingerprint
+//! ([`is_reserved_content_key`]), because those prefixes are an ENGINE
+//! assertion about a row's provenance and a caller must not be able to make it.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -63,10 +67,44 @@ use sha2::Sha256;
 /// database and can never be mistaken for one another.
 pub const CONTENT_KEY_PREFIX: &str = "ck1:";
 
+/// The RETIRED unkeyed prefix (`"ch:" + sha256(features_text)`). Still present
+/// on rows written before the cutover, and still reserved: it is trivially
+/// computable by anyone who knows the text, so a caller must not be able to
+/// mint one either (see [`is_reserved_content_key`]).
+pub const LEGACY_CONTENT_KEY_PREFIX: &str = "ch:";
+
 /// Exact length of a [`content_key`] output: `"ck1:"` + 64 hex chars.
 /// Comfortably under the 512-byte `example_key` cap and under Postgres's
 /// btree row limit for the `(dataset_id, example_key)` index.
 pub const CONTENT_KEY_LEN: usize = CONTENT_KEY_PREFIX.len() + 64;
+
+/// Whether `key` claims one of the ENGINE-authored content-fingerprint
+/// namespaces (`ck1:` or the retired `ch:`).
+///
+/// Producer-supplied `example_key`s are caller-controlled strings that reach
+/// `ml_examples` (an `ON CONFLICT DO UPDATE` upsert) and `ml_disagreements`
+/// (the gray-band dedup probe and the sibling-closure predicate) verbatim. A
+/// caller must therefore not be able to WRITE INTO the namespace the engine
+/// derives, for the same reason the engine's reserved `__actor_context__` /
+/// `__judge_*` keys are stripped from caller payloads: an engine-authored key
+/// is never caller-authorable.
+///
+/// Two concrete reasons, one theoretical and one live:
+/// * `ck1:` — forging a specific fingerprint means forging a 256-bit MAC under
+///   a key the caller cannot reach, so a targeted collision is infeasible; but
+///   an *observed* key (the disagreement queue exposes `example_key` to the
+///   owner) could be replayed with different text, and a fabricated one makes
+///   the prefix lie about a row's provenance.
+/// * `ch:` — unkeyed sha256. Anyone who knows a text can compute the exact key
+///   of any surviving pre-cutover row for it, so this one is forgeable outright.
+///
+/// Callers treat a reserved key like an oversized one: drop it and derive the
+/// real fingerprint, so the item is still stored and still deduped — never
+/// dropped, never fatal.
+#[must_use]
+pub fn is_reserved_content_key(key: &str) -> bool {
+    key.starts_with(CONTENT_KEY_PREFIX) || key.starts_with(LEGACY_CONTENT_KEY_PREFIX)
+}
 
 /// Keyed content fingerprint of `features_text` under `mac_key`.
 ///
@@ -127,6 +165,42 @@ mod tests {
             content_key(&TEST_KEY, "Subject: same email"),
             content_key(&other, "Subject: same email")
         );
+    }
+
+    /// The MAC must cover the WHOLE text. Truncating the input before hashing
+    /// (a plausible "bound the work" optimisation) silently WIDENS identity:
+    /// two long items sharing a prefix would collapse onto one row, discarding
+    /// a distinct training example and, on the review queue, closing a question
+    /// the operator never saw. `MAX_FEATURE_BYTES` is 16 KiB, so texts far past
+    /// any such bound are the normal case, not a corner.
+    #[test]
+    fn content_key_covers_the_whole_text_not_a_prefix() {
+        let prefix = "S".repeat(8 * 1024);
+        let a = content_key(&TEST_KEY, &format!("{prefix}...and then we ship"));
+        let b = content_key(&TEST_KEY, &format!("{prefix}...and then we revert"));
+        assert_ne!(a, b, "a shared prefix must not mean a shared identity");
+    }
+
+    /// Caller-supplied `example_key`s must not be able to claim the
+    /// engine-authored namespaces — see [`is_reserved_content_key`].
+    #[test]
+    fn reserved_prefixes_are_recognised_and_ordinary_keys_are_not() {
+        assert!(is_reserved_content_key(&content_key(&TEST_KEY, "x")));
+        assert!(is_reserved_content_key("ck1:deadbeef"));
+        assert!(is_reserved_content_key("ch:deadbeef"));
+        // Real producer keys: a Gmail message id, an ops dedup_key, a URL.
+        for ordinary in [
+            "18f2c0a9b7d3e1aa",
+            "gcpmon|proj|resource",
+            "checkout-service/health",
+            "CK1:uppercase-is-not-the-prefix",
+            "prefix-ch:not-at-the-start",
+        ] {
+            assert!(
+                !is_reserved_content_key(ordinary),
+                "{ordinary} is a legitimate producer key"
+            );
+        }
     }
 
     #[test]
