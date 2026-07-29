@@ -2389,21 +2389,43 @@ impl AnalyticsRepository {
         // denominator. The scalar sub-SELECT became a LATERAL so BOTH the
         // rate and the count come from ONE pass over the same rows — a second
         // scalar subquery would have re-scanned, and a per-row follow-up query
-        // would have been an N+1. The rate expression is unchanged, so
-        // `runs_30d` is exactly the denominator it divides by: executions with
-        // `started_at` inside the window, in every status.
+        // would have been an N+1. The rate expression is copied UNCHANGED, so
+        // `runs_30d` is exactly the denominator it divides by: rows of
+        // `workflow_executions` whose `started_at` is inside the window, in
+        // every status. (`started_at` is NOT NULL DEFAULT NOW(), i.e. stamped
+        // at row creation, so queued-and-never-run executions are in the
+        // denominator too — the population note on the handler says so.)
+        //
+        // Phase-2 review, same date, two structural fixes:
+        //   * the candidate set is picked and LIMITed in a derived table, so
+        //     the LATERAL is evaluated for at most the 20 rows that are
+        //     actually returned rather than for every capability match. The
+        //     old scalar subquery sat in the target list where the planner
+        //     could defer it past the Limit; a join cannot be deferred, so
+        //     without the derived table this would have been a per-candidate
+        //     index scan on `workflow_executions`.
+        //   * `readiness_score` ties (NULL is the common case) previously left
+        //     the top-20 cut to heap order, so two identical calls could
+        //     return DIFFERENT workflows on a surface that decides which
+        //     workflow gets picked. `id` is the unique tiebreaker, applied to
+        //     the LIMIT and to the final ordering (checks 28/60's principle).
         let rows = sqlx::query(
             "SELECT w.id, w.name, w.description, w.capabilities, w.readiness_score, \
                     e.success_rate, e.runs_30d \
-             FROM workflows w \
+             FROM ( \
+                 SELECT id, name, description, capabilities, readiness_score \
+                 FROM workflows \
+                 WHERE user_id = $1 AND capabilities @> $2 \
+                 ORDER BY readiness_score DESC NULLS LAST, id \
+                 LIMIT 20 \
+             ) w \
              LEFT JOIN LATERAL ( \
                  SELECT COUNT(*) FILTER (WHERE status = 'completed')::float / NULLIF(COUNT(*), 0) AS success_rate, \
                         COUNT(*)::bigint AS runs_30d \
                  FROM workflow_executions \
                  WHERE workflow_id = w.id AND started_at > NOW() - interval '30 days' \
              ) e ON TRUE \
-             WHERE w.user_id = $1 AND w.capabilities @> $2 \
-             ORDER BY w.readiness_score DESC NULLS LAST LIMIT 20",
+             ORDER BY w.readiness_score DESC NULLS LAST, w.id",
         )
         .bind(user_id)
         .bind(capabilities)
@@ -4650,5 +4672,75 @@ impl AnalyticsRepository {
         .fetch_all(&self.db_pool)
         .await?;
         Ok(rows)
+    }
+}
+
+/// Structural pin on the capability-routing query (Phase-2 review, 2026-07-28).
+///
+/// `get_workflows_by_capability` has no unit coverage — the only tests are on
+/// the pure JSON renderer in `talos-mcp-handlers`, which takes the row as a
+/// given. So the two properties that make `runs_30d` HONEST live only in the
+/// SQL text: it must be the SAME `COUNT(*)` the rate divides by, over the SAME
+/// predicate, in the SAME subquery. Silently changing either one (a status
+/// filter on the count, a different window on the rate) would leave every test
+/// green while the row started claiming a denominator it does not have.
+#[cfg(test)]
+mod capability_query_pins {
+    /// The rate expression and the count must come from one subquery with one
+    /// window predicate.
+    #[test]
+    fn runs_30d_is_the_denominator_of_success_rate() {
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("LEFT JOIN LATERAL")
+            .expect("the capability query still uses a LATERAL");
+        let end = src[start..].find(") e ON TRUE").expect("LATERAL is closed") + start;
+        let lateral = &src[start..end];
+        // Numerator: completed only. Denominator: NULLIF(COUNT(*), 0).
+        assert!(
+            lateral.contains(
+                "COUNT(*) FILTER (WHERE status = 'completed')::float / NULLIF(COUNT(*), 0) AS success_rate"
+            ),
+            "the rate expression changed; runs_30d may no longer be its denominator:\n{lateral}"
+        );
+        // The count is the same unfiltered COUNT(*) — NOT a second FILTER.
+        assert!(
+            lateral.contains("COUNT(*)::bigint AS runs_30d"),
+            "runs_30d must be the bare COUNT(*):\n{lateral}"
+        );
+        // Exactly one window predicate governs both.
+        assert_eq!(
+            lateral
+                .matches("started_at > NOW() - interval '30 days'")
+                .count(),
+            1,
+            "rate and count must share ONE 30-day predicate:\n{lateral}"
+        );
+        assert_eq!(
+            lateral.matches("FROM workflow_executions").count(),
+            1,
+            "one pass over workflow_executions, not two:\n{lateral}"
+        );
+    }
+
+    /// The top-20 cut of a routing surface must be deterministic: readiness
+    /// ties (NULL is the common case) would otherwise be broken by heap order.
+    #[test]
+    fn the_candidate_cut_has_a_unique_tiebreaker() {
+        // The needles are assembled with `concat!` so this test's own source
+        // text is not a match for them — an `include_str!` self-scan that
+        // matches itself is a test that can never fail (or never pass).
+        let src = include_str!("lib.rs");
+        assert!(
+            src.contains(concat!("ORDER BY readiness_score DESC", " NULLS LAST, id")),
+            "the LIMIT 20 must be ordered by a unique tiebreaker"
+        );
+        assert!(
+            !src.contains(concat!(
+                "ORDER BY w.readiness_score DESC",
+                " NULLS LAST LIMIT 20"
+            )),
+            "the untiebroken cut reappeared"
+        );
     }
 }

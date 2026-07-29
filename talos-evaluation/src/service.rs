@@ -427,16 +427,24 @@ impl EvaluationService {
 
     /// Observational report: within executions that carried memory, does higher
     /// mean relevance track a better judge outcome? Correlational only.
+    ///
+    /// `since_days` is CLAMPED by [`effective_since_days`] — any renderer that
+    /// echoes the caller's raw argument as the report's window would be
+    /// stating a window the query did not use.
     pub async fn observational_report(
         &self,
         actor_id: Uuid,
         since_days: i64,
     ) -> Result<crate::stats::ObservationalReport, EvaluationError> {
-        let since = Utc::now() - Duration::days(since_days.clamp(1, 365));
-        let rows =
-            talos_memory::fetch_execution_memory_outcomes(&self.pool, actor_id, since, 10_000)
-                .await
-                .map_err(EvaluationError::Internal)?;
+        let since = Utc::now() - Duration::days(effective_since_days(since_days));
+        let rows = talos_memory::fetch_execution_memory_outcomes(
+            &self.pool,
+            actor_id,
+            since,
+            OBSERVATIONAL_ROW_CAP,
+        )
+        .await
+        .map_err(EvaluationError::Internal)?;
         let obs: Vec<crate::stats::ObservationalRow> = rows
             .iter()
             .map(|r| crate::stats::ObservationalRow {
@@ -448,6 +456,27 @@ impl EvaluationService {
             .collect();
         Ok(analyze_observational(&obs))
     }
+}
+
+/// Hard cap on the number of execution-groups the observational report reads.
+///
+/// The report's population is truncated at this many MOST RECENT eligible
+/// executions in the window — an actor busier than this silently gets a
+/// partial window, so any renderer must disclose the cap rather than imply
+/// the report covers everything since `since_days`.
+pub const OBSERVATIONAL_ROW_CAP: i64 = 10_000;
+
+/// The lookback the observational query will ACTUALLY use for a requested
+/// `since_days`.
+///
+/// Single source of truth for the clamp (2026-07-28): the service clamps to
+/// `[1, 365]`, so a handler that echoed the raw caller argument as the
+/// report's `window` would render `"trailing 5000 days"` over a 365-day
+/// query — a fresh instance of the very defect the measurement envelope
+/// exists to remove. Both the query and the echo call this.
+#[must_use]
+pub fn effective_since_days(requested: i64) -> i64 {
+    requested.clamp(1, 365)
 }
 
 /// Build the judge's user prompt: task label + input + response, each byte-capped

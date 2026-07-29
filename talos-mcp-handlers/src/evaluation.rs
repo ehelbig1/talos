@@ -215,21 +215,50 @@ pub(crate) fn render_grounding_report(
 ) -> String {
     let mut body = serde_json::to_value(report).unwrap_or_default();
     if let Some(obj) = body.as_object_mut() {
-        obj.insert("since_days".into(), serde_json::json!(since_days));
+        // The EFFECTIVE window, not the requested one: the service clamps to
+        // [1, 365], so echoing the raw argument would render
+        // "trailing 5000 days" over a 365-day query — the defect this change
+        // exists to remove, reintroduced by the fix for it.
+        let effective = talos_evaluation::effective_since_days(since_days);
+        obj.insert("since_days".into(), serde_json::json!(effective));
         obj.insert(
             "window".into(),
-            serde_json::json!(format!("trailing {since_days} days")),
+            serde_json::json!(format!("trailing {effective} days")),
         );
+        if effective != since_days {
+            obj.insert("since_days_requested".into(), serde_json::json!(since_days));
+            obj.insert(
+                "since_days_note".into(),
+                serde_json::json!(format!(
+                    "requested since_days={since_days} was clamped to {effective} \
+                     (allowed range 1-365); every number below covers the clamped window"
+                )),
+            );
+        }
         obj.insert(
             "population_note".into(),
-            serde_json::json!(
-                "n_labeled counts executions carrying a judge verdict in the window; \
-                 abstentions are not verdicts and never reach here. mean_judge_score is over \
+            serde_json::json!(format!(
+                "POPULATION: only executions of this actor that had MEMORY CONTEXT INJECTED are \
+                 eligible at all (rows come from execution_memory_context, and the window is on \
+                 that provenance row's timestamp, not on the execution's own clock); an execution \
+                 that ran without memory is invisible here. At most the {cap} most recent eligible \
+                 executions in the window are read — a busier actor gets a silently partial \
+                 window. n_labeled counts those executions that ALSO carry a judge verdict; \
+                 abstentions are not verdicts and are excluded at the source \
+                 (judge_scores NOT not_applicable). Every statistic below is over n_labeled, \
+                 never over all executions, and overall_pass_rate is a bare 0.0 when \
+                 n_labeled = 0 — read n_labeled first. mean_judge_score is over \
                  n_scored (labeled executions that also carry a numeric score), NOT n_labeled. \
                  pass_rate_high/low_relevance are over n_high/n_low, the two halves of a median \
-                 split on mean relevance. Correlations are OBSERVATIONAL — memory-OFF runs leave \
-                 no provenance, so nothing here is causal."
-            ),
+                 split on mean relevance; ties land in the high half, so the halves can be \
+                 lopsided and n_high/n_low are the only way to see that. \
+                 corr_*_ci95 are Fisher-z intervals and APPROXIMATE here: the judge pass is a 0/1 \
+                 outcome, not a normal one, so coverage degrades as the pass rate approaches 0 or \
+                 1 — read an interval as \"could this be zero?\", never as an exact bound. \
+                 Correlations are OBSERVATIONAL — memory-OFF runs leave \
+                 no provenance, so nothing here is causal.",
+                cap = talos_evaluation::OBSERVATIONAL_ROW_CAP,
+            )),
         );
     }
     serde_json::to_string_pretty(&body).unwrap_or_default()
@@ -292,6 +321,55 @@ mod grounding_report_window_tests {
         }
         assert_eq!(v["n_labeled"], 10);
         assert_eq!(v["n_scored"], 10);
+    }
+
+    /// Phase-2 finding: the echo must be the window the QUERY used, not the
+    /// caller's raw argument — `observational_report` clamps to [1, 365], so
+    /// echoing 5000 would have reintroduced the exact defect being fixed.
+    #[test]
+    fn an_out_of_range_window_echoes_the_clamped_value_and_says_it_clamped() {
+        let r = report(10);
+        let v: serde_json::Value =
+            serde_json::from_str(&render_grounding_report(&r, 5000)).unwrap();
+        assert_eq!(v["since_days"], 365, "the echo must be the clamped window");
+        assert_eq!(v["window"], "trailing 365 days");
+        assert_eq!(v["since_days_requested"], 5000);
+        let note = v["since_days_note"].as_str().unwrap();
+        assert!(note.contains("clamped to 365"), "{note}");
+        // The low end clamps too (0 or negative → 1).
+        let z: serde_json::Value = serde_json::from_str(&render_grounding_report(&r, 0)).unwrap();
+        assert_eq!(z["since_days"], 1);
+        assert_eq!(z["window"], "trailing 1 days");
+        // An in-range window carries no clamp noise.
+        let ok: serde_json::Value = serde_json::from_str(&render_grounding_report(&r, 30)).unwrap();
+        let obj = ok.as_object().unwrap();
+        assert!(!obj.contains_key("since_days_requested"));
+        assert!(!obj.contains_key("since_days_note"));
+    }
+
+    /// Phase-2 finding: the note must disclose that the population is
+    /// memory-context rows (not all executions), that it is capped, and that
+    /// the correlation intervals are approximate for a 0/1 outcome.
+    #[test]
+    fn population_note_discloses_eligibility_the_cap_and_the_ci_caveat() {
+        let v: serde_json::Value =
+            serde_json::from_str(&render_grounding_report(&report(10), 30)).unwrap();
+        let note = v["population_note"].as_str().unwrap();
+        assert!(note.contains("MEMORY CONTEXT INJECTED"), "{note}");
+        assert!(note.contains("execution_memory_context"), "{note}");
+        assert!(
+            note.contains(&talos_evaluation::OBSERVATIONAL_ROW_CAP.to_string()),
+            "the row cap must be stated and must track the constant: {note}"
+        );
+        assert!(note.contains("APPROXIMATE"), "{note}");
+        assert!(
+            note.contains("never as an exact bound"),
+            "a Fisher-z interval on a 0/1 outcome must not read as exact: {note}"
+        );
+        assert!(
+            note.contains("overall_pass_rate is a bare 0.0 when"),
+            "a rate over a zero denominator must be disclosed: {note}"
+        );
     }
 
     #[test]

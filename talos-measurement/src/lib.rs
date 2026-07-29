@@ -589,4 +589,19 @@ mod tests {
         assert!(JUDGE_SCORE_POPULATION_NOTE.contains("na_runs"));
         assert!(JUDGE_SCORE_POPULATION_NOTE.contains("excluded from every score above"));
     }
+
+    /// D5 claims the consolidation is BYTE-IDENTICAL to the two hand-copies it
+    /// replaced — the operator digest is rendered into `pa-autonomy-digest`
+    /// (WASM), so the payload must not move. Pinned in full: a reworded note
+    /// is a payload change and has to be a deliberate edit here, not a drive-by
+    /// in either consumer.
+    #[test]
+    fn judge_population_note_is_byte_identical_to_the_pre_move_copies() {
+        assert_eq!(
+            JUDGE_SCORE_POPULATION_NOTE,
+            "runs/avg_score/pass_rate/worst_score cover SCORED verdicts only; na_runs counts \
+             runs where the judge reported nothing to judge and which are excluded from every \
+             score above"
+        );
+    }
 }

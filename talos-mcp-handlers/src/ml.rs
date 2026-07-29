@@ -817,37 +817,79 @@ async fn handle_list_models(
 /// What the CURRENT-EPOCH shadow agreement is actually wired to, stated on the
 /// card so an operator does not infer a promotion gate that does not exist.
 ///
-/// Grounded 2026-07-28 against `talos-ml/src/lifecycle_job.rs`:
-///   * `shadow_agreement` (current epoch, bands >= the ceil'd serving
-///     threshold) is read by the DRIFT GUARD, which auto-DEMOTES one step when
-///     `total >= min_shadow_total && agreement < demote_below_agreement`.
+/// Grounded 2026-07-28 against `talos-ml/src/lifecycle_job.rs` (re-grounded in
+/// the Phase-2 review, which caught the band mismatch below):
+///   * The DRIFT GUARD calls `shadow_agreement(model, min_band)` where
+///     `min_band = ceil(config_json.confidence_threshold * 10)` — the current
+///     epoch restricted to the bands production actually serves — and
+///     auto-DEMOTES one step when
+///     `total >= min_shadow_total && agreement < demote_below_agreement`, and
+///     only from `Hybrid` / `FastPrimary`.
+///   * THIS CARD calls the same function with `min_band = 0`, i.e. every
+///     confidence band including predictions below the serving threshold. Same
+///     epoch, DIFFERENT population — so the card's figure is not the guard's
+///     figure whenever a `confidence_threshold` is configured. The note must
+///     say so rather than let an operator read a demote out of it.
 ///   * The auto-ADVANCE path is gated on `decision.satisfied && policy.auto_advance`
 ///     — a policy check over the scheduled eval's holdout metrics. Agreement is
 ///     not an input to it.
 ///   * `shadow_agreement_lifetime` has NO consumer other than display (its own
 ///     doc-comment: "never feed this to the drift guard").
 const SHADOW_EPOCH_NOTE: &str =
-    "POPULATION: the CURRENT shadow epoch only — the epoch rotates on every \
-     transition/promotion/window reset, so this counts evidence about the serving \
-     version in its current state. This is the figure the automated drift guard \
-     reads to auto-DEMOTE (agreement < demote_below_agreement once observations \
-     reach min_shadow_total). It is NOT the promotion gate: auto-advance is decided \
-     by the policy check over the scheduled eval's holdout metrics, not by agreement.";
+    "POPULATION: the CURRENT shadow epoch, across the confidence bands named in the \
+     `population` field — the epoch \
+     rotates on every transition/promotion/window reset, so this counts evidence about \
+     the serving version in its current state. RELATED TO BUT NOT THE SAME NUMBER AS the \
+     automated drift guard's: the guard reads this same epoch restricted to bands at or \
+     above the ceil'd confidence_threshold (the predictions production actually serves), \
+     so with a threshold configured its agreement differs from this one — it auto-DEMOTES \
+     on ITS figure (agreement < demote_below_agreement once observations reach \
+     min_shadow_total, and only from hybrid/fast_primary), not on this one. It is NOT the \
+     promotion gate either: auto-advance is decided by the policy check over the scheduled \
+     eval's holdout metrics, not by agreement. agreement_ci95 is a Wilson binomial interval \
+     over these observations; it assumes independent observations, which correlated inputs \
+     violate, so read it as a width, not as a guarantee.";
 
 const SHADOW_LIFETIME_NOTE: &str =
-    "POPULATION: every retained epoch summed — a DIFFERENT population from `shadow` \
-     above (current epoch only), so the two `agreement` values are not comparable and \
-     must not be averaged or substituted for one another. Context/display only: no \
-     lifecycle transition, drift guard or promotion decision reads this number.";
+    "POPULATION: every retained epoch summed, across the confidence bands named in the \
+     `population` field — a DIFFERENT \
+     population from `shadow` above (current epoch only), so the two `agreement` values are \
+     not comparable and must not be averaged or substituted for one another. Context/display \
+     only: no lifecycle transition, drift guard or promotion decision reads this number. \
+     agreement_ci95 carries the same Wilson caveat as `shadow`, and is additionally \
+     mixing eras — a narrow interval here is not evidence about the version serving now.";
+
+/// Which confidence bands an agreement figure was summed over, in words.
+///
+/// Derived from the `min_band` actually passed to `shadow_agreement*` rather
+/// than asserted in prose, so a call site that starts filtering by band cannot
+/// leave the card claiming "all bands" (Phase-2 finding: the drift guard and
+/// the card call the same function with DIFFERENT band floors, and the note
+/// originally claimed they were the same number).
+fn band_scope(min_band: i16) -> String {
+    if min_band <= 0 {
+        "all confidence bands (no confidence floor)".to_string()
+    } else {
+        format!(
+            "confidence bands >= {min_band} (predicted confidence >= {:.1})",
+            f64::from(min_band) / 10.0
+        )
+    }
+}
 
 /// The current-epoch shadow block for the model card.
 ///
 /// Additive disambiguation (2026-07-28, S2): `agreement`/`observations`/`epoch`
-/// are unchanged for existing consumers; `window`, `note` and the Wilson
-/// interval are new. Pure so the two window strings are unit-pinned — swapping
-/// them with [`shadow_lifetime_block`]'s is exactly the #588 defect and must
-/// fail a test.
-pub(crate) fn shadow_epoch_block(agreement: f64, total: i64, epoch: Option<i32>) -> Value {
+/// are unchanged for existing consumers; `window`, `population`, `note` and the
+/// Wilson interval are new. Pure so the two window strings are unit-pinned —
+/// swapping them with [`shadow_lifetime_block`]'s is exactly the #588 defect
+/// and must fail a test.
+pub(crate) fn shadow_epoch_block(
+    agreement: f64,
+    total: i64,
+    epoch: Option<i32>,
+    min_band: i16,
+) -> Value {
     serde_json::json!({
         "agreement": agreement,
         "observations": total,
@@ -857,6 +899,7 @@ pub(crate) fn shadow_epoch_block(agreement: f64, total: i64, epoch: Option<i32>)
             // The epoch read failed; say so rather than implying "all time".
             None => "current epoch (number unavailable)".to_string(),
         },
+        "population": band_scope(min_band),
         "agreement_ci95": talos_measurement::Measurement::from_fraction(
             agreement,
             u64::try_from(total).unwrap_or(0),
@@ -868,11 +911,12 @@ pub(crate) fn shadow_epoch_block(agreement: f64, total: i64, epoch: Option<i32>)
 }
 
 /// The all-epochs shadow block for the model card. See [`shadow_epoch_block`].
-pub(crate) fn shadow_lifetime_block(agreement: f64, total: i64) -> Value {
+pub(crate) fn shadow_lifetime_block(agreement: f64, total: i64, min_band: i16) -> Value {
     serde_json::json!({
         "agreement": agreement,
         "observations": total,
         "window": "lifetime (all epochs)",
+        "population": band_scope(min_band),
         "agreement_ci95": talos_measurement::Measurement::from_fraction(
             agreement,
             u64::try_from(total).unwrap_or(0),
@@ -918,18 +962,24 @@ async fn handle_get_model_card(
     // context, clearly labeled so nobody feeds it back into a decision.
     let lsvc = lifecycle_service(state);
     let epoch = talos_ml::shadow_epoch(&mut tx, model.model_id).await.ok();
+    // Band floor for BOTH card figures. Deliberately 0 (every band) — the card
+    // is a description of all shadow traffic, not a reconstruction of the
+    // drift guard's decision, which restricts to the served bands. The value
+    // is threaded into the blocks so the rendered `population` string is
+    // derived from the query rather than asserted in prose.
+    const CARD_MIN_BAND: i16 = 0;
     let shadow = lsvc
-        .shadow_agreement(&mut tx, model.model_id, 0)
+        .shadow_agreement(&mut tx, model.model_id, CARD_MIN_BAND)
         .await
         .ok()
         .flatten()
-        .map(|(agreement, total)| shadow_epoch_block(agreement, total, epoch));
+        .map(|(agreement, total)| shadow_epoch_block(agreement, total, epoch, CARD_MIN_BAND));
     let shadow_lifetime = lsvc
-        .shadow_agreement_lifetime(&mut tx, model.model_id, 0)
+        .shadow_agreement_lifetime(&mut tx, model.model_id, CARD_MIN_BAND)
         .await
         .ok()
         .flatten()
-        .map(|(agreement, total)| shadow_lifetime_block(agreement, total));
+        .map(|(agreement, total)| shadow_lifetime_block(agreement, total, CARD_MIN_BAND));
     let pending_disagreements = lsvc
         .pending_disagreements(&mut tx, model.model_id, user_id, 1)
         .await
@@ -1713,8 +1763,8 @@ mod shadow_window_tests {
 
     #[test]
     fn the_two_blocks_state_distinct_windows() {
-        let epoch = shadow_epoch_block(0.91, 120, Some(3));
-        let lifetime = shadow_lifetime_block(0.84, 900);
+        let epoch = shadow_epoch_block(0.91, 120, Some(3), 0);
+        let lifetime = shadow_lifetime_block(0.84, 900, 0);
         assert_eq!(epoch["window"], "epoch 3");
         assert_eq!(lifetime["window"], "lifetime (all epochs)");
         assert_ne!(
@@ -1727,8 +1777,8 @@ mod shadow_window_tests {
     /// assertion is on CONTENT, not merely on inequality, so a swap is caught.
     #[test]
     fn window_strings_are_not_interchangeable() {
-        let epoch = shadow_epoch_block(0.5, 10, Some(7));
-        let lifetime = shadow_lifetime_block(0.5, 10);
+        let epoch = shadow_epoch_block(0.5, 10, Some(7), 0);
+        let lifetime = shadow_lifetime_block(0.5, 10, 0);
         let ew = epoch["window"].as_str().unwrap();
         let lw = lifetime["window"].as_str().unwrap();
         assert!(
@@ -1753,11 +1803,11 @@ mod shadow_window_tests {
     /// shape — this is additive disambiguation, not a rename.
     #[test]
     fn agreement_observations_and_epoch_are_unchanged() {
-        let epoch = shadow_epoch_block(0.9125, 400, Some(3));
+        let epoch = shadow_epoch_block(0.9125, 400, Some(3), 0);
         assert_eq!(epoch["agreement"], 0.9125);
         assert_eq!(epoch["observations"], 400);
         assert_eq!(epoch["epoch"], 3);
-        let lifetime = shadow_lifetime_block(0.8425, 1600);
+        let lifetime = shadow_lifetime_block(0.8425, 1600, 0);
         assert_eq!(lifetime["agreement"], 0.8425);
         assert_eq!(lifetime["observations"], 1600);
         // The lifetime block has no epoch — it spans all of them.
@@ -1770,7 +1820,7 @@ mod shadow_window_tests {
     /// over eval metrics; the lifetime aggregate gates nothing.
     #[test]
     fn notes_state_which_population_gates_what() {
-        let epoch = shadow_epoch_block(0.9, 100, Some(1));
+        let epoch = shadow_epoch_block(0.9, 100, Some(1), 0);
         let note = epoch["note"].as_str().unwrap();
         assert!(note.contains("CURRENT shadow epoch"));
         assert!(note.contains("drift guard") && note.contains("auto-DEMOTE"));
@@ -1778,7 +1828,7 @@ mod shadow_window_tests {
             note.contains("NOT the promotion gate"),
             "the card must not let a reader infer agreement gates advance"
         );
-        let lnote = shadow_lifetime_block(0.9, 100)["note"]
+        let lnote = shadow_lifetime_block(0.9, 100, 0)["note"]
             .as_str()
             .unwrap()
             .to_string();
@@ -1789,25 +1839,68 @@ mod shadow_window_tests {
         );
     }
 
+    /// Phase-2 finding: the card and the drift guard call the SAME function
+    /// with different band floors (card 0, guard `ceil(confidence_threshold*10)`),
+    /// so the card must NOT claim its number is the one the guard reads, and
+    /// the band scope must be derived from the floor actually queried.
+    #[test]
+    fn the_card_does_not_claim_to_be_the_drift_guards_number() {
+        let note = shadow_epoch_block(0.9, 100, Some(1), 0)["note"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            note.contains("NOT THE SAME NUMBER AS"),
+            "the band difference from the guard's population must be stated: {note}"
+        );
+        assert!(
+            note.contains("restricted to bands at or above the ceil'd confidence_threshold"),
+            "{note}"
+        );
+        assert!(
+            !note.contains("This is the figure the automated drift guard"),
+            "the pre-review claim of identity must not come back"
+        );
+    }
+
+    /// The `population` string is a function of the band floor passed to the
+    /// query — a call site that starts filtering cannot leave the card saying
+    /// "all bands".
+    #[test]
+    fn band_scope_tracks_the_floor_that_was_queried() {
+        assert_eq!(
+            shadow_epoch_block(0.9, 100, Some(1), 0)["population"],
+            "all confidence bands (no confidence floor)"
+        );
+        assert_eq!(
+            shadow_lifetime_block(0.9, 100, 0)["population"],
+            "all confidence bands (no confidence floor)"
+        );
+        let filtered = shadow_epoch_block(0.9, 100, Some(1), 8);
+        let p = filtered["population"].as_str().unwrap();
+        assert!(p.contains(">= 8") && p.contains("0.8"), "{p}");
+        assert!(!p.contains("all confidence bands"));
+    }
+
     /// Small observation counts must show as wide intervals, and a zero
     /// observation count must produce no interval at all.
     #[test]
     fn agreement_carries_an_interval_sized_to_its_observations() {
-        let thin = shadow_epoch_block(1.0, 3, Some(2));
-        let thick = shadow_epoch_block(1.0, 3000, Some(2));
+        let thin = shadow_epoch_block(1.0, 3, Some(2), 0);
+        let thick = shadow_epoch_block(1.0, 3000, Some(2), 0);
         let thin_lo = thin["agreement_ci95"][0].as_f64().unwrap();
         let thick_lo = thick["agreement_ci95"][0].as_f64().unwrap();
         assert!(thin_lo < 0.5, "3 observations must read as thin: {thin_lo}");
         assert!(thick_lo > 0.99, "3000 observations: {thick_lo}");
         // n = 0 → no interval (never a [0,0] that reads as certainty).
-        assert!(shadow_epoch_block(0.0, 0, Some(2))["agreement_ci95"].is_null());
-        assert!(shadow_lifetime_block(0.0, 0)["agreement_ci95"].is_null());
+        assert!(shadow_epoch_block(0.0, 0, Some(2), 0)["agreement_ci95"].is_null());
+        assert!(shadow_lifetime_block(0.0, 0, 0)["agreement_ci95"].is_null());
     }
 
     /// A failed epoch read must not silently render as "all time".
     #[test]
     fn missing_epoch_says_so_rather_than_implying_lifetime() {
-        let v = shadow_epoch_block(0.9, 50, None);
+        let v = shadow_epoch_block(0.9, 50, None, 0);
         let w = v["window"].as_str().unwrap();
         assert!(
             w.contains("current epoch") && w.contains("unavailable"),

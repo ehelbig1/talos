@@ -358,7 +358,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_workflows_by_capability",
-            "description": "Find workflows that have ALL of the specified capabilities. Returns workflows with success rates and readiness scores. POPULATION: success_rate_30d covers executions whose started_at falls in the trailing 30 days, in ANY status (a still-running or cancelled execution is in the denominator but not the numerator); runs_30d is that exact denominator and is on every row. A rate over fewer than 20 runs is labeled sample_size=\"insufficient\": below 20, one failure moves the rate by 5+ points, so ranking two candidates by it is noise — prefer readiness_score or gather more runs.",
+            "description": "Find workflows that have ALL of the specified capabilities. Returns workflows with success rates and readiness scores. POPULATION: success_rate_30d covers every execution ROW created in the trailing 30 days, in ANY status (a queued, still-running or cancelled execution is in the denominator but not the numerator); runs_30d is that exact denominator and is on every row. A rate over fewer than 20 runs is labeled sample_size=\"insufficient\": below 20, one failure moves the rate by 5+ points, so ranking two candidates by it is noise — prefer readiness_score or gather more runs.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4889,11 +4889,20 @@ async fn handle_set_workflow_capabilities(
 /// is `COUNT(*)` over `workflow_executions` with `started_at` inside the
 /// window — every status, not just completed+failed — and the numerator is
 /// `COUNT(*) FILTER (WHERE status = 'completed')`.
+///
+/// Phase-2 review: `started_at` is `NOT NULL DEFAULT NOW()` (migration
+/// `009_workflow_executions`), i.e. stamped when the ROW is created, not when
+/// execution begins — so queued executions that never ran are in the
+/// denominator too, and the note must not imply a "started" filter that the
+/// column does not express.
 pub(crate) const CAPABILITY_ROW_POPULATION_NOTE: &str =
-    "success_rate_30d = completed / all executions STARTED in the trailing 30 days \
-     (running, cancelled and failed executions are all in the denominator); \
-     runs_30d is that denominator. Rates below the sample-size floor are labeled \
-     sample_size=\"insufficient\" and must not be used to rank candidates.";
+    "success_rate_30d = completed / EVERY execution row of the workflow created in the \
+     trailing 30 days (started_at is stamped at row creation, so queued, running, \
+     cancelled and failed executions are all in the denominator); \
+     runs_30d is that denominator. success_rate_30d_ci95 is a Wilson binomial interval \
+     over runs_30d — it assumes independent runs, which bursty failures violate, so it is \
+     a width to compare candidates by, not a guarantee. Rates below the sample-size floor \
+     are labeled sample_size=\"insufficient\" and must not be used to rank candidates.";
 
 /// Sample-size floor below which a 30-day success rate is not usable for
 /// RANKING two candidate workflows against each other.
@@ -6220,12 +6229,21 @@ mod capability_row_measurement_tests {
     /// completed+failed.
     #[test]
     fn population_note_matches_the_actual_denominator() {
-        assert!(CAPABILITY_ROW_POPULATION_NOTE.contains("STARTED in the trailing 30 days"));
+        assert!(CAPABILITY_ROW_POPULATION_NOTE.contains("created in the trailing 30 days"));
         assert!(
-            CAPABILITY_ROW_POPULATION_NOTE.contains("running, cancelled and failed"),
-            "the denominator includes non-terminal statuses; say so"
+            CAPABILITY_ROW_POPULATION_NOTE.contains("queued, running, cancelled and failed"),
+            "the denominator includes queued and other non-terminal statuses; say so"
         );
         assert!(CAPABILITY_ROW_POPULATION_NOTE.contains("runs_30d is that denominator"));
+        // Phase-2: the interval must not read as an exact bound.
+        assert!(
+            CAPABILITY_ROW_POPULATION_NOTE.contains("Wilson binomial interval"),
+            "name the interval's model"
+        );
+        assert!(
+            CAPABILITY_ROW_POPULATION_NOTE.contains("not a guarantee"),
+            "a ci95 field is read as a bound unless told otherwise"
+        );
     }
 }
 
