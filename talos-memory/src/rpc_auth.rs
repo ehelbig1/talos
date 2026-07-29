@@ -529,9 +529,13 @@ pub(crate) fn nonce_test_lock() -> std::sync::MutexGuard<'static, ()> {
 ///   timestamp_ms || op.raw_bytes()`). Which envelope fields wrap the raw text
 ///   is caller-specific and is what binds a signature to one subject, actor,
 ///   and user.
-/// * `validate_finite` / `validate_op` / `validate_structure` — the sign-time
-///   gates, which are about each op's own shape, not about the raw-text
-///   binding.
+/// * `validate_finite` / `validate_op` / `validate_structure` — the shape
+///   gates, which are about each op's own content, not about the raw-text
+///   binding. They run on BOTH sides — inside `new_signed` before a signature
+///   is minted AND inside `verify()` before the MAC is checked — which is why
+///   `RawSigned`'s public `From` is not a hole: a caller that skips
+///   `new_signed` and hand-builds a request still faces the same gates at the
+///   receiving end, and cannot mint a valid MAC without the key regardless.
 ///
 /// `talos-memory` uses `RawSigned<MemoryOp>` and `RawSigned<IntegrationOp>`;
 /// the job protocol uses the `serde_json::Value` specialisation, aliased there
