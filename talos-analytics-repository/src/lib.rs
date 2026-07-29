@@ -3683,6 +3683,16 @@ impl AnalyticsRepository {
         // honored while everything else parallelizes.
 
         // 1. Undescribed workflows
+        //
+        // D6 (2026-07-29): the `, id` tiebreaker on this LIMIT 25 (and on the
+        // uncapabilized twin below) is load-bearing, not tidiness. An
+        // UNDESCRIBED workflow very often has a NULL readiness_score, so the
+        // sort key is tied across most of the candidate set and Postgres
+        // breaks the tie by heap order — two consecutive hygiene reports over
+        // an unchanged database can list a DIFFERENT 25 workflows, and a
+        // "fixed it" that only changed which rows made the cut is
+        // indistinguishable from one that did. Same check-28/60 principle as
+        // the readiness-routing cut at ~:2419.
         let undescribed_fut = async {
             let rows: Vec<HygieneWorkflowRow> = sqlx::query(
                 "SELECT id, name, readiness_score, NULL::text AS description, created_at \
@@ -3692,7 +3702,7 @@ impl AnalyticsRepository {
                AND workflow_type IN ('production', 'template') \
                AND (description IS NULL OR description = '') \
                AND (readiness_score IS NULL OR readiness_score >= 10) \
-             ORDER BY readiness_score DESC NULLS LAST LIMIT 25",
+             ORDER BY readiness_score DESC NULLS LAST, id LIMIT 25",
             )
             .bind(user_id)
             .fetch_all(&self.db_pool)
@@ -3712,7 +3722,7 @@ impl AnalyticsRepository {
             Ok(rows)
         };
 
-        // 2. Uncapabilized workflows
+        // 2. Uncapabilized workflows (same `, id` tiebreaker rationale as #1).
         let uncapabilized_fut = async {
             let rows: Vec<HygieneWorkflowRow> = sqlx::query(
                 "SELECT id, name, readiness_score, description, created_at \
@@ -3722,7 +3732,7 @@ impl AnalyticsRepository {
                AND workflow_type IN ('production', 'template') \
                AND (capabilities IS NULL OR array_length(capabilities, 1) IS NULL) \
                AND (readiness_score IS NULL OR readiness_score >= 10) \
-             ORDER BY readiness_score DESC NULLS LAST LIMIT 25",
+             ORDER BY readiness_score DESC NULLS LAST, id LIMIT 25",
             )
             .bind(user_id)
             .fetch_all(&self.db_pool)
@@ -4720,6 +4730,35 @@ mod capability_query_pins {
             lateral.matches("FROM workflow_executions").count(),
             1,
             "one pass over workflow_executions, not two:\n{lateral}"
+        );
+    }
+
+    /// D6 (2026-07-29): the two hygiene-report LIMIT 25 cuts must be
+    /// deterministic for the same reason the routing cut is — an undescribed
+    /// or uncapabilized workflow usually has a NULL readiness_score, so
+    /// almost the whole candidate set is tied and the survivors of the cut
+    /// were chosen by heap order.
+    #[test]
+    fn the_hygiene_cuts_have_a_unique_tiebreaker() {
+        // Needles are `concat!`-assembled so this test's own source text is
+        // not a match — a self-scanning `include_str!` that matches itself is
+        // a test that can never fail.
+        let src = include_str!("lib.rs");
+        assert_eq!(
+            src.matches(concat!(
+                "ORDER BY readiness_score DESC",
+                " NULLS LAST, id LIMIT 25"
+            ))
+            .count(),
+            2,
+            "both hygiene LIMIT 25 cuts must carry the `, id` tiebreaker"
+        );
+        assert!(
+            !src.contains(concat!(
+                "ORDER BY readiness_score DESC",
+                " NULLS LAST LIMIT 25"
+            )),
+            "an untiebroken hygiene cut reappeared"
         );
     }
 

@@ -224,8 +224,42 @@ impl OperatorDigestService {
                     "scored_runs": s.runs,
                     "na_runs": s.na_runs,
                     "total_verdicts": s.runs + s.na_runs,
+                    // D3 (2026-07-29): every row echoes the window it was
+                    // aggregated over. The snapshot carries a top-level
+                    // `window_days`, but these rows are lifted OUT of the
+                    // envelope by every consumer that renders them (the
+                    // pa-autonomy-digest template iterates the array), and a
+                    // "runs: 5" with no window is unreadable — 5 runs in a day
+                    // and 5 runs in a month are opposite findings. The engine
+                    // twin (`talos-engine::assistant_report_reader`) already
+                    // echoed `trailing_days` on its judge block; this closes
+                    // the asymmetry. Value is the CLAMPED window actually
+                    // queried (`snapshot` clamps to [1, 31] before this point,
+                    // matching `weekly_judge_scores`' own clamp), never the
+                    // caller's raw request.
+                    "window_days": days,
                     "avg_score": s.avg_score,
                     "pass_rate": s.pass_rate,
+                    // D5 (2026-07-29): the same pass rate with its
+                    // denominator and a Wilson 95% interval attached.
+                    // `pass_rate: 1.0` over 2 scored verdicts and over 200
+                    // rendered identically; the interval is what separates
+                    // "this judge passes everything" from "this judge has
+                    // barely fired". n is the SCORED population (`runs`) —
+                    // the same denominator `pass_rate` itself uses, NOT
+                    // `runs + na_runs`. An explicit `null` (serde_json's
+                    // `json!` nulls an Option, it does not drop the key) when
+                    // there is no pass rate to envelope — never a fabricated
+                    // [0, 0] interval, which would read as a measured
+                    // certainty about a judge that has scored nothing.
+                    "pass_rate_measurement": s.pass_rate.and_then(|p| {
+                        u64::try_from(s.runs).ok().and_then(|n| {
+                            talos_measurement::Measurement::from_fraction(p, n)
+                                .map(|m| m
+                                    .with_population(JUDGE_PASS_RATE_POPULATION)
+                                    .with_window(format!("trailing {days} days")))
+                        })
+                    }),
                     "worst_score": s.worst_score,
                     // D5 (2026-07-28): one constant, shared with
                     // `talos-engine::assistant_report_reader`, which carried a
@@ -402,6 +436,44 @@ impl OperatorDigestService {
 /// the wording through without re-deriving the threshold).
 const RELIABILITY_DEGRADED_THRESHOLD_PCT: f64 = 10.0;
 
+/// What `failure_rate_24h_measurement.n` counts (D5, 2026-07-29).
+///
+/// Spelled out because `completed_24h` sits beside it and is NOT the
+/// denominator on its own — the rate is over TERMINAL executions, i.e. the
+/// sum of both counts.
+pub const FAILURE_RATE_POPULATION: &str =
+    "TERMINAL workflow executions in the trailing 24h (failed_24h + completed_24h); executions \
+     still running, queued or suspended are in neither count";
+
+/// Envelope the 24h failure rate with the denominator it was divided by and a
+/// Wilson 95% interval.
+///
+/// Pure, so the compat rules pin without a database. `None` — rendered as an
+/// explicit JSON `null` by the `json!` call site — exactly when
+/// [`failure_rate_pct`] is `None`: an empty or nonsensical window has no rate
+/// to bound. A `null` here means NOT MEASURED and must never be read as a
+/// zero-width interval. Deliberately NOT
+/// gated on a sample-size floor: an interval is a WIDTH, not a verdict, and
+/// its whole job at n=3 is to be embarrassingly wide.
+#[must_use]
+fn failure_rate_measurement(
+    failed_24h: i64,
+    completed_24h: i64,
+) -> Option<talos_measurement::Measurement> {
+    let total = failed_24h.checked_add(completed_24h)?;
+    if total <= 0 || failed_24h < 0 || completed_24h < 0 {
+        return None;
+    }
+    Some(
+        talos_measurement::Measurement::rate(
+            u64::try_from(failed_24h).ok()?,
+            u64::try_from(total).ok()?,
+        )?
+        .with_population(FAILURE_RATE_POPULATION)
+        .with_window("trailing 24 hours"),
+    )
+}
+
 /// Pure builder for the reliability section — testable without a DB.
 ///
 /// `failure_rate_24h_pct` is `null` when the 24h window has no terminal
@@ -450,6 +522,22 @@ fn build_reliability_section(
         "failed_24h": failed_24h,
         "completed_24h": completed_24h,
         "failure_rate_24h_pct": rate,
+        // D5 (2026-07-29): the same rate with its denominator and a Wilson
+        // 95% interval. `failure_rate_24h_pct` alone reads identically for
+        // 1-failure-in-3 (33.3%, DEGRADED) and 400-in-1200 (33.3%, DEGRADED),
+        // and the first is noise while the second is an incident — the
+        // `degraded` flag fires on both. The interval is what makes the
+        // difference visible without changing the flag's behaviour.
+        //
+        // NOTE the unit change: `failure_rate_24h_pct` is a PERCENTAGE
+        // (0-100) and `.value` here is the FRACTION (0-1) it was rounded
+        // from, per the `Measurement` contract that percentage formatting is
+        // a rendering decision. `n` = failed_24h + completed_24h, the same
+        // denominator `failure_rate_pct` divides by. Explicit `null`
+        // (never a [0, 0] interval) when the window is empty — exactly
+        // where `failure_rate_24h_pct` itself is null, so the two fields
+        // never disagree about whether anything was measured.
+        "failure_rate_24h_measurement": failure_rate_measurement(failed_24h, completed_24h),
         "degraded": degraded,
         "status_line": status_line,
         "top_failing_workflows_24h": top,
@@ -487,6 +575,15 @@ const MIN_GOLD_FOR_BAND_VERDICT: i64 = 40;
 /// Minimum runs before a judge's score spread is worth interpreting. Below
 /// this, "every run scored 1.0" is small-sample noise, not saturation.
 const JUDGE_MIN_RUNS_FOR_SIGNAL: i64 = 5;
+
+/// What `pass_rate_measurement.n` counts (D5, 2026-07-29).
+///
+/// Names the denominator explicitly because the row prints TWO plausible ones
+/// right next to each other — `runs` (scored) and `total_verdicts`
+/// (`runs + na_runs`) — and only the first is `pass_rate`'s.
+pub const JUDGE_PASS_RATE_POPULATION: &str =
+    "SCORED judge verdicts for this workflow in the window (`runs`); abstentions (`na_runs`) are \
+     excluded from both the numerator and the denominator";
 
 /// Classify what a judge's score distribution actually tells the operator.
 ///
@@ -1127,5 +1224,204 @@ mod tests {
         // Error previews are bounded, not full payloads.
         assert!(top[0]["latest_error_preview"].as_str().unwrap().len() <= 220);
         assert!(top[2]["latest_error_preview"].is_null());
+    }
+}
+
+/// D3 + D5 (2026-07-29): the judge-panel window echo and the two Wilson
+/// intervals.
+#[cfg(test)]
+mod measurement_pr3_tests {
+    use super::*;
+
+    // ---- D5: failure-rate envelope ---------------------------------------
+
+    /// The motivating pair: the SAME 33.3% rate over two populations that
+    /// mean opposite things. The percentage alone cannot tell them apart and
+    /// `degraded` fires on both; the interval is what separates them.
+    #[test]
+    fn failure_rate_envelope_separates_noise_from_an_incident() {
+        let small = build_reliability_section(1, 2, &[]);
+        let large = build_reliability_section(400, 800, &[]);
+        assert_eq!(small["failure_rate_24h_pct"], 33.3);
+        assert_eq!(large["failure_rate_24h_pct"], 33.3);
+        assert_eq!(small["degraded"], true);
+        assert_eq!(large["degraded"], true);
+
+        let sm = &small["failure_rate_24h_measurement"];
+        let lg = &large["failure_rate_24h_measurement"];
+        // n is failed + completed — the TERMINAL count, not `completed_24h`.
+        assert_eq!(sm["n"], 3);
+        assert_eq!(lg["n"], 1200);
+        // `.value` is the FRACTION the percentage was rounded from.
+        assert!((sm["value"].as_f64().unwrap() - 1.0 / 3.0).abs() < 1e-12);
+        let (slo, shi) = (
+            sm["ci95"][0].as_f64().unwrap(),
+            sm["ci95"][1].as_f64().unwrap(),
+        );
+        let (llo, lhi) = (
+            lg["ci95"][0].as_f64().unwrap(),
+            lg["ci95"][1].as_f64().unwrap(),
+        );
+        assert!(
+            (shi - slo) > 10.0 * (lhi - llo),
+            "n=3 must be visibly wider than n=1200: [{slo},{shi}] vs [{llo},{lhi}]"
+        );
+        // At n=3 the interval still admits a perfectly healthy system; at
+        // n=1200 it does not. That is the whole point.
+        assert!(
+            slo < 0.10,
+            "n=3 lower bound {slo} should not exclude health"
+        );
+        assert!(llo > 0.10, "n=1200 lower bound {llo} should exclude health");
+    }
+
+    /// The population is STATED, and names the sum rather than leaving a
+    /// reader to pick between the two counts printed beside it.
+    #[test]
+    fn failure_rate_envelope_states_its_denominator_and_window() {
+        let s = build_reliability_section(23, 100, &[]);
+        let m = &s["failure_rate_24h_measurement"];
+        assert_eq!(m["n"], 123);
+        assert_eq!(m["population"], FAILURE_RATE_POPULATION);
+        assert_eq!(m["window"], "trailing 24 hours");
+        assert!(FAILURE_RATE_POPULATION.contains("failed_24h + completed_24h"));
+    }
+
+    /// `null`, not `[0, 0]`, and null in LOCKSTEP with the rate itself — an
+    /// interval for a window with no runs would be a fabricated bound, and a
+    /// null rate beside a present interval would be two fields disagreeing
+    /// about whether anything was measured.
+    #[test]
+    fn failure_rate_envelope_is_null_on_an_empty_window() {
+        let s = build_reliability_section(0, 0, &[]);
+        assert!(s["failure_rate_24h_pct"].is_null());
+        // The key IS present and IS null: `json!` nulls an `Option` rather
+        // than dropping it. Pinned as an equality so a future switch to an
+        // omitting shape is a deliberate, visible change.
+        assert!(
+            s.as_object()
+                .unwrap()
+                .contains_key("failure_rate_24h_measurement"),
+            "the key is present-and-null, not dropped: {s}"
+        );
+        assert!(
+            s["failure_rate_24h_measurement"].is_null(),
+            "empty window must not carry an interval: {s}"
+        );
+        // Nonsense inputs are refused the same way.
+        assert!(failure_rate_measurement(-1, 5).is_none());
+        assert!(failure_rate_measurement(5, -1).is_none());
+        assert!(failure_rate_measurement(i64::MAX, i64::MAX).is_none());
+    }
+
+    /// A real 0-failure and a real all-failed window DO get intervals — the
+    /// refusal is about an empty denominator, not about extreme rates.
+    #[test]
+    fn failure_rate_envelope_survives_both_extremes() {
+        let clean = failure_rate_measurement(0, 50).expect("0/50 is measurable");
+        assert_eq!(clean.value, 0.0);
+        assert_eq!(clean.n, 50);
+        // 0 failures out of 50 does NOT prove the rate is zero forever.
+        assert!(clean.ci95.unwrap()[1] > 0.0);
+        let broken = failure_rate_measurement(50, 0).expect("50/50 is measurable");
+        assert_eq!(broken.value, 1.0);
+        assert_eq!(broken.ci95.unwrap()[0] < 1.0, true);
+    }
+
+    /// The envelope is ADDITIVE: every pre-D5 key keeps its value and type.
+    #[test]
+    fn reliability_section_is_additive_over_the_pre_d5_shape() {
+        let s = build_reliability_section(125, 245, &[]);
+        assert_eq!(s["available"], true);
+        assert_eq!(s["failed_24h"], 125);
+        assert_eq!(s["completed_24h"], 245);
+        assert_eq!(s["failure_rate_24h_pct"], 33.8);
+        assert_eq!(s["degraded"], true);
+        assert!(s["status_line"].as_str().unwrap().contains("33.8%"));
+        assert!(s["top_failing_workflows_24h"].is_array());
+    }
+
+    // ---- D3 + D5: the judge row ------------------------------------------
+
+    /// The judge row is assembled inside an async DB method, so the two new
+    /// fields are pinned through the SAME expressions the panel uses rather
+    /// than a shadow copy. `runs` is the denominator; `total_verdicts` is
+    /// deliberately NOT.
+    fn judge_pass_rate_measurement(
+        pass_rate: Option<f64>,
+        runs: i64,
+        days: i32,
+    ) -> Option<talos_measurement::Measurement> {
+        pass_rate.and_then(|p| {
+            u64::try_from(runs).ok().and_then(|n| {
+                talos_measurement::Measurement::from_fraction(p, n).map(|m| {
+                    m.with_population(JUDGE_PASS_RATE_POPULATION)
+                        .with_window(format!("trailing {days} days"))
+                })
+            })
+        })
+    }
+
+    /// D5: a judge that has passed everything twice and one that has passed
+    /// everything two hundred times both print `pass_rate: 1.0`.
+    #[test]
+    fn judge_pass_rate_envelope_separates_two_from_two_hundred() {
+        let few = judge_pass_rate_measurement(Some(1.0), 2, 7).expect("2 scored runs");
+        let many = judge_pass_rate_measurement(Some(1.0), 200, 7).expect("200 scored runs");
+        assert_eq!(few.value, 1.0);
+        assert_eq!(many.value, 1.0);
+        assert_eq!(few.n, 2);
+        assert_eq!(many.n, 200);
+        let flo = few.ci95.unwrap()[0];
+        let mlo = many.ci95.unwrap()[0];
+        assert!(
+            flo < 0.4,
+            "2-for-2 must not read as near-certainty, got lo={flo}"
+        );
+        assert!(mlo > 0.97, "200-for-200 should be tight, got lo={mlo}");
+    }
+
+    /// The denominator is the SCORED count, and the population says so —
+    /// `total_verdicts` sits in the same JSON object and is the wrong one.
+    #[test]
+    fn judge_pass_rate_population_names_the_scored_denominator() {
+        let m = judge_pass_rate_measurement(Some(0.5), 8, 7).unwrap();
+        assert_eq!(m.n, 8);
+        assert_eq!(m.population.as_deref(), Some(JUDGE_PASS_RATE_POPULATION));
+        assert!(JUDGE_PASS_RATE_POPULATION.contains("SCORED"));
+        assert!(JUDGE_PASS_RATE_POPULATION.contains("na_runs"));
+        assert_eq!(m.window.as_deref(), Some("trailing 7 days"));
+    }
+
+    /// An abstention-only judge (`runs = 0` ⇒ `pass_rate` NULL from the
+    /// `NULLIF` in the query) gets no envelope — never a [0, 0].
+    #[test]
+    fn judge_pass_rate_envelope_absent_when_there_is_no_rate() {
+        assert!(judge_pass_rate_measurement(None, 0, 7).is_none());
+        assert!(judge_pass_rate_measurement(None, 12, 7).is_none());
+        // A rate with a zero denominator is impossible upstream, but if it
+        // arrived it would still be refused rather than enveloped.
+        assert!(judge_pass_rate_measurement(Some(1.0), 0, 7).is_none());
+        // …as would an out-of-range rate.
+        assert!(judge_pass_rate_measurement(Some(1.5), 10, 7).is_none());
+    }
+
+    /// D3: the window travels ON the row. These rows are iterated out of the
+    /// envelope by the pa-autonomy-digest template, where the snapshot's
+    /// top-level `window_days` is not in scope.
+    #[test]
+    fn judge_row_window_matches_the_clamped_snapshot_window() {
+        // `snapshot` clamps to [1, 31] before `learned_panel` sees it, and
+        // `weekly_judge_scores` clamps identically — so the echoed value is
+        // the window actually queried for every reachable input.
+        for requested in [0u32, 1, 7, 31, 90, u32::MAX] {
+            let clamped = requested.clamp(1, 31) as i32;
+            assert!((1..=31).contains(&clamped));
+            let m = judge_pass_rate_measurement(Some(1.0), 5, clamped).unwrap();
+            assert_eq!(
+                m.window.as_deref(),
+                Some(&*format!("trailing {clamped} days"))
+            );
+        }
     }
 }

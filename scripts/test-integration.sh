@@ -164,6 +164,13 @@ CTRL_TESTS=(
     "governance_tests"
     "scheduler_tests"
     "workflow_version_tests"
+    # #609's closing provenance test (measurement PR 3, D7). Gated here on
+    # arrival rather than later: it is the ONLY coverage of the promoted-vs-
+    # latest attribution in SQL, and an ungated integration binary is one that
+    # silently rots (the PR #181/#182 lesson). NOTE for a follow-up: its eight
+    # ml_* sibling binaries (ml_lifecycle_tests, ml_registry_tenancy_tests,
+    # ml_digest_tests, …) are NOT in this list and run nowhere in CI.
+    "ml_measurement_provenance_tests"
     "env_vars"
 )
 # 'talos_ctl' is now the migrated TEMPLATE: setup_test_context clones it into a
