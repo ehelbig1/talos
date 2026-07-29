@@ -372,46 +372,7 @@ impl WorkflowsQueries {
                 async_graphql::Error::new(format!("Invalid mock context JSON: {}", e))
             })?;
 
-        let mut engine = rhai::Engine::new();
-        engine.set_max_operations(1000);
-        engine.set_max_array_size(500);
-        engine.set_max_call_levels(16);
-        engine.set_max_string_size(65536);
-        engine.disable_symbol("eval");
-        engine.set_module_resolver(rhai::module_resolvers::DummyModuleResolver);
-
-        let mut scope = rhai::Scope::new();
-
-        // Map JSON fields into script scope
-        if let serde_json::Value::Object(map) = &mock_context {
-            for (key, val) in map {
-                if let Ok(dynamic) = rhai::serde::to_dynamic(val) {
-                    scope.push_dynamic(key, dynamic);
-                }
-            }
-        }
-
-        if let Ok(ctx_dynamic) = rhai::serde::to_dynamic(&mock_context) {
-            scope.push_dynamic("ctx", ctx_dynamic.clone());
-            scope.push_dynamic("inputs", ctx_dynamic);
-        }
-
-        match engine.eval_with_scope::<rhai::Dynamic>(&mut scope, &input.script) {
-            Ok(result) => {
-                let json_result: serde_json::Value =
-                    rhai::serde::from_dynamic(&result).unwrap_or(serde_json::Value::Null);
-                Ok(TestRhaiExpressionResult {
-                    success: true,
-                    output: Some(json_result.to_string()),
-                    error: None,
-                })
-            }
-            Err(e) => Ok(TestRhaiExpressionResult {
-                success: false,
-                output: None,
-                error: Some(e.to_string()),
-            }),
-        }
+        Ok(eval_rhai_preview(&input.script, &mock_context))
     }
 
     async fn workflow_versions(
@@ -1021,5 +982,179 @@ impl WorkflowsQueries {
                 reason: row.reason,
             })
             .collect())
+    }
+}
+
+/// The sandboxed-evaluation half of the `testRhaiExpression` query.
+///
+/// Extracted from the resolver (2026-07-29) so the part that matters — the
+/// sandbox and the result mapping — is reachable from unit tests without an
+/// `async_graphql::Context`. The resolver keeps the auth gate, the 100 KB /
+/// 1 MB size caps, and the mock-context JSON parse; everything below the
+/// parse is here, so the tests exercise the real production path rather than
+/// a copy of it.
+///
+/// The engine comes from `talos_rhai_sandbox::sandboxed_engine`, the ONE
+/// sandbox builder for the workspace, under the `Expression` profile — the
+/// same profile as the thread-local engine in `talos_engine::rhai_helpers`
+/// that will evaluate the expression at runtime. A preview under different
+/// limits than production is not a preview.
+///
+/// Versus the config this site used to hand-roll, two things change:
+///
+/// * `print` / `debug` are now **discarded**. `rhai::Engine::new()` wires
+///   both to `println!`, i.e. the controller's stdout and therefore its
+///   container logs — and this query takes a CALLER-AUTHORED script over a
+///   CALLER-AUTHORED mock context (up to 100 KB + 1 MB), so
+///   `print(inputs)` wrote that whole context to the logs past every DLP
+///   boundary. They stay callable no-ops, so a script containing one still
+///   returns the same value.
+/// * `max_map_size` (500) is now applied; this was the one site that
+///   omitted it. That is a **behaviour change for pathological input only**:
+///   a script building an object map with more than 500 properties now
+///   errors in the preview — as it already did at runtime under the shared
+///   engine. The old omission meant such a script could pass the preview
+///   and then fail in production, which is the opposite of what a preview
+///   is for.
+fn eval_rhai_preview(script: &str, mock_context: &serde_json::Value) -> TestRhaiExpressionResult {
+    let engine =
+        talos_rhai_sandbox::sandboxed_engine(talos_rhai_sandbox::SandboxProfile::Expression);
+
+    let mut scope = rhai::Scope::new();
+
+    // Map JSON fields into script scope
+    if let serde_json::Value::Object(map) = mock_context {
+        for (key, val) in map {
+            if let Ok(dynamic) = rhai::serde::to_dynamic(val) {
+                scope.push_dynamic(key, dynamic);
+            }
+        }
+    }
+
+    if let Ok(ctx_dynamic) = rhai::serde::to_dynamic(mock_context) {
+        scope.push_dynamic("ctx", ctx_dynamic.clone());
+        scope.push_dynamic("inputs", ctx_dynamic);
+    }
+
+    match engine.eval_with_scope::<rhai::Dynamic>(&mut scope, script) {
+        Ok(result) => {
+            let json_result: serde_json::Value =
+                rhai::serde::from_dynamic(&result).unwrap_or(serde_json::Value::Null);
+            TestRhaiExpressionResult {
+                success: true,
+                output: Some(json_result.to_string()),
+                error: None,
+            }
+        }
+        Err(e) => TestRhaiExpressionResult {
+            success: false,
+            output: None,
+            error: Some(e.to_string()),
+        },
+    }
+}
+
+#[cfg(test)]
+mod test_rhai_expression_tests {
+    use super::eval_rhai_preview;
+    use serde_json::json;
+
+    /// Ordinary expressions — the shapes an author actually previews —
+    /// behave exactly as before the sandbox-builder refactor.
+    #[test]
+    fn ordinary_expressions_are_unchanged() {
+        let ctx = json!({ "score": 82, "name": "alpha", "nested": { "k": 1 } });
+        for (script, want) in [
+            ("score > 50", "true"),
+            ("score", "82"),
+            (r#"name"#, r#""alpha""#),
+            ("ctx.score", "82"),
+            ("inputs.nested.k", "1"),
+            ("nested.k + 1", "2"),
+        ] {
+            let r = eval_rhai_preview(script, &ctx);
+            assert!(r.success, "`{script}` should succeed: {:?}", r.error);
+            assert_eq!(r.output.as_deref(), Some(want), "`{script}`");
+            assert!(r.error.is_none());
+        }
+    }
+
+    /// Failures are reported in the result, not raised as a GraphQL error —
+    /// the preview's whole job is to show the author the message.
+    #[test]
+    fn syntax_errors_are_reported_in_the_result() {
+        let r = eval_rhai_preview("this is not rhai (", &json!({}));
+        assert!(!r.success);
+        assert!(r.output.is_none());
+        assert!(r.error.is_some(), "the author needs the message");
+    }
+
+    /// SECURITY: `eval` and `import` stay blocked in the preview.
+    #[test]
+    fn dynamic_eval_and_import_are_blocked() {
+        assert!(!eval_rhai_preview(r#"eval("1 + 1")"#, &json!({})).success);
+        assert!(!eval_rhai_preview(r#"import "std" as s; 1"#, &json!({})).success);
+    }
+
+    /// DLP (the fix): `print` no longer reaches stdout, and — because it is
+    /// discarded rather than `disable_symbol`ed — a script containing one
+    /// still previews to the same value instead of becoming a syntax error.
+    #[test]
+    fn print_is_a_silenced_no_op_and_does_not_change_the_output() {
+        let ctx = json!({ "secret": "sk-not-a-real-key", "n": 3 });
+        let with_print = eval_rhai_preview("print(secret); n", &ctx);
+        let baseline = eval_rhai_preview("n", &ctx);
+        assert!(
+            with_print.success,
+            "print must stay callable: {:?}",
+            with_print.error
+        );
+        assert_eq!(with_print.output, baseline.output);
+        assert!(eval_rhai_preview("debug(ctx); n", &ctx).success);
+    }
+
+    /// The documented behaviour change: `max_map_size` now applies to the
+    /// preview, so a >500-property map errors here as it already did at
+    /// runtime. A map inside the limit is unaffected.
+    #[test]
+    fn max_map_size_now_applies_to_the_preview() {
+        let ctx = json!({});
+
+        let within = eval_rhai_preview(
+            "let m = #{}; for i in 0..100 { m[`k${i}`] = i; } m.len()",
+            &ctx,
+        );
+        assert!(
+            within.success,
+            "a 100-property map is within the 500 cap: {:?}",
+            within.error
+        );
+        assert_eq!(within.output.as_deref(), Some("100"));
+
+        let over = eval_rhai_preview(
+            "let m = #{}; for i in 0..600 { m[`k${i}`] = i; } m.len()",
+            &ctx,
+        );
+        assert!(
+            !over.success,
+            "a 600-property map must now be rejected (was silently allowed)"
+        );
+    }
+
+    /// The preview must run under the runtime's operation budget, so a
+    /// script that would be killed at runtime is killed here too.
+    #[test]
+    fn the_operation_cap_applies_to_the_preview() {
+        let r = eval_rhai_preview("let i = 0; loop { i += 1; }", &json!({}));
+        assert!(!r.success);
+        assert!(
+            r.error
+                .as_deref()
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains("operation"),
+            "expected an operations-exceeded error, got: {:?}",
+            r.error
+        );
     }
 }

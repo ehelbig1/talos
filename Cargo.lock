@@ -7260,6 +7260,7 @@ dependencies = [
  "talos-organizations",
  "talos-rate-limit",
  "talos-registry",
+ "talos-rhai-sandbox",
  "talos-scheduler",
  "talos-secrets-manager",
  "talos-system-repo",
@@ -7617,6 +7618,7 @@ dependencies = [
  "talos-public-url",
  "talos-registry",
  "talos-retry-intelligence",
+ "talos-rhai-sandbox",
  "talos-secrets-manager",
  "talos-text-util",
  "talos-worker-fleet",
@@ -8746,6 +8748,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-rhai-sandbox"
+version = "0.1.0"
+dependencies = [
+ "rhai",
+]
+
+[[package]]
 name = "talos-rpc-subscribers"
 version = "0.1.0"
 dependencies = [
@@ -9309,6 +9318,7 @@ dependencies = [
  "sha2 0.10.9",
  "talos-capability-world",
  "talos-config",
+ "talos-rhai-sandbox",
  "talos-workflow-engine-core",
  "talos-workflow-engine-test-utils",
  "talos-workflow-job-protocol",

@@ -24,6 +24,8 @@ talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol", version
 petgraph = "0.6"
 regex = "1.12"
 rhai = { version = "1.19", features = ["serde"] }
+# The ONE Rhai sandbox builder — `evaluate_dispatch_expression`.
+talos-rhai-sandbox = { path = "../talos-rhai-sandbox" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"

@@ -47,6 +47,8 @@ talos-module-payload-encryption = { path = "../talos-module-payload-encryption" 
 talos-oauth = { path = "../talos-oauth" }
 talos-registry = { path = "../talos-registry" }
 talos-retry-intelligence = { path = "../talos-retry-intelligence" }
+# The ONE Rhai sandbox builder — the thread-local engine in rhai_helpers.rs.
+talos-rhai-sandbox = { path = "../talos-rhai-sandbox" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-text-util = { path = "../talos-text-util" }
 talos-measurement = { path = "../talos-measurement" }
