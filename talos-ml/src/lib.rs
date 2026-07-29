@@ -15,6 +15,7 @@
 //! embedding pipeline only — dataset content never leaves the host.
 
 pub mod active_learning;
+pub mod content_identity;
 pub mod correction;
 pub mod dataset;
 pub mod delete;
@@ -34,6 +35,7 @@ pub mod teacher_audit;
 pub mod teacher_audit_job;
 pub mod teacher_ceilings;
 
+pub use content_identity::{content_key, CONTENT_KEY_LEN, CONTENT_KEY_PREFIX};
 pub use correction::{resolve_disagreement, ResolveError, ResolveOutcome};
 pub use dataset::{
     AppendExample, ContentDedupeOutcome, DatasetService, DatasetStats, DatasetTenancy,

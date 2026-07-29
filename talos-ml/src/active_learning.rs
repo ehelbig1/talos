@@ -30,7 +30,6 @@
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::distill::DISTILL_CONTEXT;
@@ -50,15 +49,6 @@ pub struct GrayBandItem {
     pub features_text: String,
     pub label: String,
     pub confidence: f32,
-}
-
-/// Content-hash review key — the SAME derivation the distill flow uses
-/// for keyless items, so a gray-band row and a later distill/correction
-/// row for identical text share one `example_key` (dedup + upsert
-/// converge on the same identity).
-fn content_hash_key(features_text: &str) -> String {
-    let digest = Sha256::digest(features_text.as_bytes());
-    format!("ch:{digest:x}")
 }
 
 /// Fire-and-forget entry point called by `serve_predict_batch` AFTER a
@@ -108,6 +98,24 @@ async fn record_gray_band_reviews(
     daily_cap: i64,
     items: Vec<GrayBandItem>,
 ) -> Result<usize> {
+    // Review key for these items — the SAME keyed content fingerprint the
+    // distill flow derives for keyless items, so a gray-band row and a later
+    // distill/correction row for identical text share one `example_key` (the
+    // dedup probe below and the ml_examples upsert converge on one identity).
+    // Derived ONCE per batch, before the transaction opens; wipe-on-drop and
+    // never logged.
+    //
+    // SEAM: a still-pending row written before this change carries
+    // `ch:<sha256>`, which a `ck1:` key will not match, so the EXISTS probe
+    // below can re-admit one already-queued item ONCE across the boundary.
+    // Bounded by the pending window and the daily cap, and deliberate — see
+    // `crate::content_identity` for why there is no migration.
+    let mac_key = ctx
+        .secrets
+        .ml_content_mac_key()
+        .await
+        .context("resolve ML content-fingerprint key")?;
+
     let mut tx = talos_db::begin_tenant_read_scoped(
         &ctx.db_pool,
         &talos_tenancy::TenantReadScope::new(user_id, Vec::new()),
@@ -140,7 +148,7 @@ async fn record_gray_band_reviews(
         }
         let features =
             talos_text_util::truncate_at_char_boundary(&item.features_text, MAX_FEATURE_BYTES);
-        let example_key = content_hash_key(features);
+        let example_key = crate::content_identity::content_key(mac_key.as_bytes(), features);
         // Dedup: any pending review row for this example (either kind)
         // means a human is already going to see it.
         let pending: bool = sqlx::query_scalar(
@@ -189,17 +197,23 @@ async fn record_gray_band_reviews(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::content_identity::{content_key, CONTENT_KEY_LEN, CONTENT_KEY_PREFIX};
+    use crate::distill::MAX_EXAMPLE_KEY_BYTES;
 
+    /// The review key this module writes is the shared primitive's output —
+    /// same prefix, same length, same value the distill flow derives for the
+    /// same text. The old byte-compatibility test guarded two INLINE copies of
+    /// one derivation; there is now a single implementation, so what remains
+    /// worth pinning is the row-level shape (it is indexed and compared as an
+    /// id, and must fit the `example_key` cap).
     #[test]
-    fn content_hash_key_is_deterministic_and_distill_compatible() {
-        let a = content_hash_key("Subject: same email");
-        let b = content_hash_key("Subject: same email");
-        let c = content_hash_key("Subject: different email");
-        assert_eq!(a, b, "identical text → identical key");
-        assert_ne!(a, c);
-        // Same "ch:" prefix + hex the distill normalizer emits, so both
-        // producers converge on one example identity.
-        assert!(a.starts_with("ch:") && a.len() == 3 + 64);
+    fn review_key_shape_matches_the_shared_primitive() {
+        const KEY: [u8; 32] = [0x2au8; 32];
+        let k = content_key(&KEY, "Subject: same email");
+        assert!(k.starts_with(CONTENT_KEY_PREFIX));
+        assert_eq!(k.len(), CONTENT_KEY_LEN);
+        assert!(k.len() <= MAX_EXAMPLE_KEY_BYTES);
+        assert_eq!(k, content_key(&KEY, "Subject: same email"));
+        assert_ne!(k, content_key(&KEY, "Subject: different email"));
     }
 }

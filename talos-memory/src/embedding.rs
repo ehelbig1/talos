@@ -275,6 +275,21 @@ fn cache_insert(key: [u8; 32], vector: Vec<f32>) {
     );
 }
 
+/// Drop every cached vector.
+///
+/// Exists for the embedding-DETERMINISM check (`talos-ml`'s
+/// `embedding_determinism` integration test): the whole `md5(embedding)`
+/// content identity in `DatasetService::dedupe_by_content` rests on the
+/// provider returning bit-identical vectors for identical text, and back-to-back
+/// calls would otherwise be answered from this cache — verifying the cache
+/// instead of the provider, which is exactly the assumption nobody was
+/// checking. Not part of any request path.
+pub fn clear_cache() {
+    if let Ok(mut guard) = EMBEDDING_CACHE.lock() {
+        guard.clear();
+    }
+}
+
 /// In-flight map: when a miss is outstanding, concurrent callers
 /// share the same `OnceCell` rather than each launching their own
 /// HTTP request. Prevents thundering herd on hot queries that arrive

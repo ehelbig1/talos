@@ -53,7 +53,7 @@ const MAX_LABEL_BYTES: usize = 256;
 /// partial-unique btree; a key over Postgres's ~2704-byte btree row limit
 /// errors the whole append chunk. Kept well under that — an oversized key
 /// is dropped (append still succeeds; it just won't dedup), never fatal.
-const MAX_EXAMPLE_KEY_BYTES: usize = 512;
+pub(crate) const MAX_EXAMPLE_KEY_BYTES: usize = 512;
 
 /// Services the spawned flow needs — installed once from `main()`
 /// (same OnceLock-injection shape as `GRAPH_SERVICE` /
@@ -63,6 +63,12 @@ pub struct DistillContext {
     pub db_pool: sqlx::PgPool,
     pub dataset_service: DatasetService,
     pub lifecycle_service: LifecycleService,
+    /// Source of the ML content-fingerprint MAC key. Held directly (rather
+    /// than reached through one of the services) because BOTH the distill
+    /// fallback key and the gray-band review key derive from it, and they must
+    /// derive from the same place or the two producers would disagree about an
+    /// example's identity.
+    pub secrets: std::sync::Arc<talos_secrets_manager::SecretsManager>,
 }
 
 pub static DISTILL_CONTEXT: OnceLock<DistillContext> = OnceLock::new();
@@ -136,7 +142,7 @@ struct DistillEnvelope {
     example_key: Option<String>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 struct DistillItem {
     features_text: String,
     label: String,
@@ -144,9 +150,16 @@ struct DistillItem {
     example_key: Option<String>,
 }
 
-/// Normalize + validate the envelope into a bounded item list. Items
-/// with blank/oversized fields are skipped with a count (partial
-/// batches still distill).
+/// Normalize + validate the envelope into an item list. Items with
+/// blank/oversized fields are skipped with a count (partial batches still
+/// distill).
+///
+/// Runs SYNCHRONOUSLY on the caller's thread (the node-completion hook), so it
+/// deliberately does NOT derive the content-fallback `example_key` — that
+/// needs the server-side MAC key, which is an async resolve. Keyless items
+/// leave here with `example_key: None` and are finished by
+/// [`finalize_items`] inside the spawned flow. Intra-batch dedup and the item
+/// cap live there too, because both operate on the final keys.
 fn normalize(envelope: DistillEnvelope) -> Option<(String, Vec<DistillItem>)> {
     let model = envelope.model.trim().to_string();
     if model.is_empty()
@@ -182,30 +195,92 @@ fn normalize(envelope: DistillEnvelope) -> Option<(String, Vec<DistillItem>)> {
         {
             continue;
         }
-        // Oversized dedup key → replace with the content hash below (a
-        // dropped key would bypass dedupe entirely, see next comment).
+        // Oversized dedup key → replace with the content fingerprint in
+        // `finalize_items` (a dropped key would bypass dedupe entirely, see
+        // the comment there).
         if i.example_key
             .as_ref()
             .is_some_and(|k| k.len() > MAX_EXAMPLE_KEY_BYTES)
         {
             i.example_key = None;
         }
-        // Content-hash fallback key. The ml_examples dedupe index is partial
-        // (`WHERE example_key IS NOT NULL`), so a keyless row is NEVER
-        // deduped — retries, replays, and poll loops re-seeing the same item
-        // would append duplicate rows forever, inflating min_examples and
-        // class balance toward the promotion gate with repeated data. Keying
-        // by the hash of the features text makes re-teaching identical
-        // content an UPDATE (newest teacher label wins; corrections stay
-        // protected by the upsert's source guard) instead of a new row.
-        // Done here, not per-emitter, so every __ml_distill__ producer
-        // inherits it.
-        if i.example_key.is_none() {
-            use sha2::{Digest, Sha256};
-            let digest = Sha256::digest(i.features_text.as_bytes());
-            i.example_key = Some(format!("ch:{digest:x}"));
-        }
         cleaned.push(i);
+    }
+    if cleaned.len() < before {
+        tracing::warn!(
+            model,
+            skipped = before - cleaned.len(),
+            "__ml_distill__ envelope had invalid items; skipped"
+        );
+    }
+    (!cleaned.is_empty()).then_some((model, cleaned))
+}
+
+/// Assign the content-fingerprint fallback key, collapse intra-batch
+/// duplicates, and apply the item cap. Pure over `(items, mac_key)` so the
+/// whole identity rule is testable with a fixed key and no services.
+fn finalize_items(model: &str, items: Vec<DistillItem>, mac_key: &[u8]) -> Vec<DistillItem> {
+    let mut cleaned = items;
+    // Content-fingerprint fallback key. The ml_examples dedupe index is
+    // partial (`WHERE example_key IS NOT NULL`), so a keyless row is NEVER
+    // deduped — retries, replays, and poll loops re-seeing the same item
+    // would append duplicate rows forever, inflating min_examples and class
+    // balance toward the promotion gate with repeated data. Keying by a
+    // fingerprint of the features text makes re-teaching identical content an
+    // UPDATE (newest teacher label wins; corrections stay protected by the
+    // upsert's source guard) instead of a new row. Done here, not
+    // per-emitter, so every __ml_distill__ producer inherits it.
+    //
+    // The fingerprint is a KEYED MAC, not a bare hash: it is persisted next
+    // to the AEAD ciphertext of this very text, where an unkeyed hash would
+    // be an offline confirmation oracle. See `crate::content_identity`, which
+    // is also the ONE derivation the gray-band router uses — the two
+    // producers must agree on an example's identity.
+    //
+    // SEAM: rows written before this change carry `ch:<sha256>` and will never
+    // match a `ck1:` key, so the upsert can mint ONE duplicate row per distinct
+    // content across the boundary. Deliberate: there is no migration, because
+    // re-keying an old row would mean decrypting every example just to
+    // re-fingerprint it. The duplicate is collapsed by `dedupe_by_content`,
+    // which keys on the EMBEDDING and is therefore era-independent — and it
+    // already runs on every append.
+    //
+    // RESERVED NAMESPACE: a producer-supplied key that claims `ck1:` (or the
+    // retired `ch:`) is DROPPED here and replaced by the genuine fingerprint,
+    // exactly like an oversized key — the item is kept, and it still dedupes.
+    // `example_key` is a caller-controlled string that reaches the
+    // `(dataset_id, example_key)` upsert, the gray-band dedup probe and the
+    // sibling-closure predicate verbatim, so letting a caller write into the
+    // namespace the ENGINE derives would (a) let a legacy `ch:` key — unkeyed
+    // sha256, computable by anyone who knows the text — be aimed at a
+    // surviving pre-cutover row, and (b) make the prefix lie about a row's
+    // provenance. Same rule as the engine's reserved `__actor_context__` /
+    // `__judge_*` keys: engine-authored keys are never caller-authorable.
+    let mut reserved = 0usize;
+    for i in cleaned.iter_mut() {
+        if i.example_key
+            .as_deref()
+            .is_some_and(crate::content_identity::is_reserved_content_key)
+        {
+            i.example_key = None;
+            reserved += 1;
+        }
+        if i.example_key.is_none() {
+            i.example_key = Some(crate::content_identity::content_key(
+                mac_key,
+                &i.features_text,
+            ));
+        }
+    }
+    if reserved > 0 {
+        // Count only — the rejected key is caller data and says nothing
+        // useful once it has been replaced.
+        tracing::warn!(
+            model,
+            reserved,
+            "__ml_distill__ item(s) supplied a reserved content-fingerprint \
+             example_key; replaced with the derived fingerprint"
+        );
     }
     // Intra-batch dedup, LAST occurrence wins. One envelope can
     // legitimately carry the same example_key twice — e.g. two alert
@@ -214,7 +289,7 @@ fn normalize(envelope: DistillEnvelope) -> Option<(String, Vec<DistillItem>)> {
     // `INSERT ... ON CONFLICT DO UPDATE` refuses to affect the same row
     // twice, failing the WHOLE batch. Done here, not per-emitter, so
     // every __ml_distill__ producer inherits it (same rationale as the
-    // content-hash fallback above). Every item has Some(key) by now.
+    // content-fingerprint fallback above). Every item has Some(key) by now.
     let mut last_idx: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for (idx, it) in cleaned.iter().enumerate() {
         if let Some(k) = &it.example_key {
@@ -239,14 +314,7 @@ fn normalize(envelope: DistillEnvelope) -> Option<(String, Vec<DistillItem>)> {
         );
         items.truncate(MAX_DISTILL_ITEMS);
     }
-    if items.len() < before {
-        tracing::warn!(
-            model,
-            skipped = before - items.len(),
-            "__ml_distill__ envelope had invalid items; skipped"
-        );
-    }
-    (!items.is_empty()).then_some((model, items))
+    items
 }
 
 /// Entry point for the controller node hook (node-completion AND
@@ -315,6 +383,21 @@ async fn process_distill(
     model_name: &str,
     items: Vec<DistillItem>,
 ) -> Result<()> {
+    // Content-fingerprint identity for keyless items. Derived ONCE per
+    // envelope (never per item) and before any DB work, so a key-resolution
+    // failure drops the envelope loudly instead of silently writing rows that
+    // can never be deduped. `mac_key` is wipe-on-drop and never logged.
+    let mac_key = ctx
+        .secrets
+        .ml_content_mac_key()
+        .await
+        .context("resolve ML content-fingerprint key")?;
+    let items = finalize_items(model_name, items, mac_key.as_bytes());
+    drop(mac_key);
+    if items.is_empty() {
+        return Ok(());
+    }
+
     // Tenancy from the engine-stamped actor binding.
     let user_id: Option<Uuid> = sqlx::query_scalar("SELECT user_id FROM actors WHERE id = $1")
         .bind(actor_id)
@@ -548,6 +631,16 @@ async fn run_shadow(
 mod tests {
     use super::*;
 
+    /// FIXED test key — never the real KEK-derived value.
+    const TEST_MAC_KEY: [u8; 32] = [0x2au8; 32];
+
+    /// `normalize` + `finalize_items` as the production flow runs them.
+    fn normalize_and_finalize(envelope: DistillEnvelope) -> Option<(String, Vec<DistillItem>)> {
+        let (model, items) = normalize(envelope)?;
+        let items = finalize_items(&model, items, &TEST_MAC_KEY);
+        Some((model, items))
+    }
+
     #[test]
     fn normalize_accepts_batch_and_single_forms() {
         let batch: DistillEnvelope = serde_json::from_value(serde_json::json!({
@@ -588,7 +681,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        let (_, items) = normalize(batch).unwrap();
+        let (_, items) = normalize_and_finalize(batch).unwrap();
         assert_eq!(items.len(), 2);
         let fargate: Vec<_> = items
             .iter()
@@ -619,7 +712,7 @@ mod tests {
             .collect();
         let env: DistillEnvelope =
             serde_json::from_value(serde_json::json!({"model": "m", "items": items})).unwrap();
-        let (_, items) = normalize(env).unwrap();
+        let (_, items) = normalize_and_finalize(env).unwrap();
         assert_eq!(items.len(), MAX_DISTILL_ITEMS);
     }
 
@@ -638,10 +731,11 @@ mod tests {
     }
 
     #[test]
-    fn normalize_replaces_oversized_example_key_keeps_item() {
+    fn finalize_replaces_oversized_example_key_keeps_item() {
         // Oversized key would blow the (dataset_id, example_key) btree row
         // limit and error the whole append — replace it with the content
-        // hash (a bare drop would bypass dedupe entirely), keep the item.
+        // fingerprint (a bare drop would bypass dedupe entirely), keep the
+        // item.
         let big_key = "k".repeat(MAX_EXAMPLE_KEY_BYTES + 1);
         let env: DistillEnvelope = serde_json::from_value(serde_json::json!({
             "model": "m",
@@ -651,10 +745,14 @@ mod tests {
             ]
         }))
         .unwrap();
-        let (_, items) = normalize(env).unwrap();
+        let (_, items) = normalize_and_finalize(env).unwrap();
         assert_eq!(items.len(), 2, "both items retained");
-        let replaced = items[0].example_key.as_deref().expect("hash key");
-        assert!(replaced.starts_with("ch:"), "oversized key → content hash");
+        let replaced = items[0].example_key.as_deref().expect("fingerprint key");
+        assert_eq!(
+            replaced,
+            crate::content_identity::content_key(&TEST_MAC_KEY, "Subject: a"),
+            "oversized key → the shared keyed content fingerprint"
+        );
         assert!(replaced.len() <= MAX_EXAMPLE_KEY_BYTES);
         assert_eq!(
             items[1].example_key.as_deref(),
@@ -664,13 +762,20 @@ mod tests {
     }
 
     #[test]
-    fn normalize_derives_content_hash_key_when_absent() {
+    fn finalize_derives_the_shared_content_key_when_absent() {
         // The ml_examples dedupe index is partial (WHERE example_key IS NOT
         // NULL): a keyless row is NEVER deduped, so retries/replays of the
         // same content would append duplicate rows forever and inflate the
-        // promotion gate. Absent keys therefore get a deterministic
-        // content-hash key — identical text twice yields the SAME key
+        // promotion gate. Absent keys therefore get a deterministic keyed
+        // content fingerprint — identical text twice yields the SAME key
         // (upsert → one row), different text yields different keys.
+        //
+        // The exact value must equal `content_identity::content_key`: the
+        // gray-band router derives its review key from the SAME primitive, so
+        // a gray-band row and a later distill row for identical text share one
+        // example identity. That agreement used to be defended by a
+        // byte-compatibility test across two inline copies; it is now
+        // structural.
         let env = |text: &str| -> DistillEnvelope {
             serde_json::from_value(serde_json::json!({
                 "model": "m",
@@ -678,14 +783,73 @@ mod tests {
             }))
             .unwrap()
         };
-        let (_, a1) = normalize(env("Subject: same email")).unwrap();
-        let (_, a2) = normalize(env("Subject: same email")).unwrap();
-        let (_, b) = normalize(env("Subject: different email")).unwrap();
+        let (_, a1) = normalize_and_finalize(env("Subject: same email")).unwrap();
+        let (_, a2) = normalize_and_finalize(env("Subject: same email")).unwrap();
+        let (_, b) = normalize_and_finalize(env("Subject: different email")).unwrap();
         let k1 = a1[0].example_key.as_deref().expect("derived key");
         let k2 = a2[0].example_key.as_deref().expect("derived key");
         let kb = b[0].example_key.as_deref().expect("derived key");
-        assert!(k1.starts_with("ch:"));
+        assert_eq!(
+            k1,
+            crate::content_identity::content_key(&TEST_MAC_KEY, "Subject: same email")
+        );
+        assert!(k1.starts_with(crate::content_identity::CONTENT_KEY_PREFIX));
         assert_eq!(k1, k2, "identical content → identical key (dedupes)");
         assert_ne!(k1, kb, "different content → different key");
+    }
+
+    /// `example_key` is a caller-controlled string. A producer must not be able
+    /// to write into the ENGINE's content-fingerprint namespace: the key
+    /// reaches the `(dataset_id, example_key)` upsert, the gray-band dedup
+    /// probe and the sibling-closure predicate verbatim, and the retired `ch:`
+    /// form is an UNKEYED sha256 that anyone knowing a text can compute for a
+    /// surviving pre-cutover row. Both prefixes are therefore replaced with the
+    /// genuine fingerprint — the item is kept and still dedupes, exactly like
+    /// the oversized-key case.
+    #[test]
+    fn finalize_refuses_a_producer_key_in_the_reserved_namespace() {
+        let forged_ck1 = format!("ck1:{}", "de".repeat(32));
+        let env: DistillEnvelope = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "items": [
+                {"features_text": "Subject: a", "label": "archive", "example_key": forged_ck1},
+                {"features_text": "Subject: b", "label": "archive",
+                 "example_key": "ch:0123456789abcdef"},
+                {"features_text": "Subject: c", "label": "archive",
+                 "example_key": "18f2c0a9b7d3e1aa"},
+            ]
+        }))
+        .unwrap();
+        let (_, items) = normalize_and_finalize(env).unwrap();
+        assert_eq!(items.len(), 3, "every item is kept");
+        for (i, text) in [(0usize, "Subject: a"), (1, "Subject: b")] {
+            assert_eq!(
+                items[i].example_key.as_deref(),
+                Some(crate::content_identity::content_key(&TEST_MAC_KEY, text).as_str()),
+                "a reserved-namespace producer key is replaced by the derived one"
+            );
+        }
+        assert_eq!(
+            items[2].example_key.as_deref(),
+            Some("18f2c0a9b7d3e1aa"),
+            "an ordinary producer key is still kept verbatim"
+        );
+    }
+
+    /// The fingerprint is KEYED: the same envelope under a different MAC key
+    /// must produce a different identity. This is what removes the offline
+    /// confirmation oracle — swapping the primitive back to a bare
+    /// `sha256(features_text)` makes these two equal.
+    #[test]
+    fn finalize_content_keys_depend_on_the_mac_key() {
+        let env: DistillEnvelope = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "items": [{"features_text": "Subject: same email", "label": "archive"}]
+        }))
+        .unwrap();
+        let (model, items) = normalize(env).unwrap();
+        let a = finalize_items(&model, items.clone(), &TEST_MAC_KEY);
+        let b = finalize_items(&model, items, &[0x99u8; 32]);
+        assert_ne!(a[0].example_key, b[0].example_key);
     }
 }

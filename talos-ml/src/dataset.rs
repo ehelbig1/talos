@@ -179,6 +179,16 @@ pub struct ContentDedupeOutcome {
     pub corrections_superseded: i64,
     /// Rows actually deleted (0 in dry-run).
     pub rows_removed: u64,
+    /// Rows in the dataset that content-dedupe CANNOT see: they have no stored
+    /// embedding, so they have no content key to group on.
+    ///
+    /// Reported because every other number here is scoped to the embedded
+    /// population, and a survey that silently hid rows reads as "I checked
+    /// everything" when it did not (the misleading-report-field class). A
+    /// non-zero value usually means the local embedder was down during an
+    /// append — those rows are also invisible to `knn_search` and to the
+    /// parametric fit until they are backfilled.
+    pub rows_without_embedding: i64,
 }
 
 pub struct DatasetService {
@@ -466,15 +476,42 @@ impl DatasetService {
     }
 
     /// Precedence-ranked duplicate groups within ONE dataset, keyed on
-    /// embedding identity.
+    /// embedding identity **within one embedding model**.
     ///
     /// Identical `features_text` deterministically yields an identical
     /// embedding, so the vector IS a usable content key — which lets this run
-    /// entirely in SQL with **no decryption** and, critically, **without
-    /// persisting any plaintext-derived fingerprint** next to the ciphertext
-    /// (the confidentiality trade-off rejected for the same reason in the
-    /// disagreement-queue dedup). `md5` here is a GROUPING key over a column
-    /// already stored in the row — not a security primitive.
+    /// entirely in SQL with **no decryption**. `md5` here is a GROUPING key
+    /// over a column already stored in the row, not a security primitive.
+    ///
+    /// This is also why the grouping is decoupled from `example_key`: that
+    /// column is now a KEYED fingerprint (`crate::content_identity`), so it
+    /// changes across a purpose-key rotation, whereas embedding identity does
+    /// not. The embedding-keyed collapse is therefore the era-independent
+    /// backstop behind the `ch:` → `ck1:` seam — it cleans up any duplicate
+    /// the upsert misses because the two eras' keys did not match.
+    ///
+    /// **Model scoping.** `md5(embedding::text)` is only a content key WITHIN
+    /// one embedding model: the same text under two models yields two
+    /// different vectors, and during a partial re-embed backfill a dataset
+    /// legitimately holds both. Both windows therefore partition by
+    /// `(embedding_model, content_key)`, which
+    /// * makes cross-model collapse structurally impossible, and
+    /// * keeps every embedded row in the population. A strict
+    ///   `embedding_model = <active>` FILTER would instead hide rows — the
+    ///   survey would report "0 duplicates" for a dataset full of them, and
+    ///   `active_embedding_model()` returning `None` (embeddings disabled)
+    ///   would silently turn both the operator tool and the on-append
+    ///   auto-dedupe into no-ops.
+    ///
+    /// Legacy rows with `embedding_model IS NULL` (pre-provenance-migration,
+    /// stamped by `grandfather_examples_embedding_model`) form their OWN
+    /// group-space: SQL `PARTITION BY` treats NULLs as equal to each other and
+    /// distinct from every value, which is exactly the wanted semantics — they
+    /// collapse among themselves and never mix with a stamped model.
+    ///
+    /// Rows with `embedding IS NULL` have no content key at all and are
+    /// excluded; [`ContentDedupeOutcome::rows_without_embedding`] reports how
+    /// many, so the survey never implies a coverage it does not have.
     ///
     /// Two windows are required, not one: attaching `ORDER BY` to a window
     /// changes its default frame to `RANGE UNBOUNDED PRECEDING AND CURRENT
@@ -487,7 +524,7 @@ impl DatasetService {
     const CONTENT_RANK_CTE: &'static str = "\
         WITH grouped AS ( \
             SELECT id, source, label_json->>'label' AS label, created_at, \
-                   md5(embedding::text) AS content_key \
+                   embedding_model, md5(embedding::text) AS content_key \
             FROM ml_examples \
             WHERE dataset_id = $1 AND embedding IS NOT NULL \
         ), ranked AS ( \
@@ -498,13 +535,13 @@ impl DatasetService {
                        AS has_conflict \
             FROM grouped \
             WINDOW wo AS ( \
-                       PARTITION BY content_key \
+                       PARTITION BY embedding_model, content_key \
                        ORDER BY CASE source \
                                   WHEN 'correction' THEN 0 \
                                   WHEN 'llm_production' THEN 1 \
                                   ELSE 2 END, \
                                 created_at DESC, id), \
-                   wp AS (PARTITION BY content_key) \
+                   wp AS (PARTITION BY embedding_model, content_key) \
         ) ";
 
     /// Collapse content-duplicate examples to one row per distinct content,
@@ -571,6 +608,17 @@ impl DatasetService {
             .await
             .context("survey content-duplicate examples")?;
 
+        // The population this survey could NOT consider. Counted separately
+        // from the CTE (which drops these rows before it can count anything)
+        // and reported unconditionally, in dry-run and executed mode alike.
+        let rows_without_embedding: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ml_examples WHERE dataset_id = $1 AND embedding IS NULL",
+        )
+        .bind(dataset_id)
+        .fetch_one(&mut *conn)
+        .await
+        .context("count examples without an embedding")?;
+
         let mut outcome = ContentDedupeOutcome {
             dry_run,
             duplicate_groups,
@@ -578,6 +626,7 @@ impl DatasetService {
             rows_removable,
             corrections_superseded,
             rows_removed: 0,
+            rows_without_embedding,
         };
         if dry_run || rows_removable == 0 {
             return Ok(outcome);
@@ -608,6 +657,7 @@ impl DatasetService {
             duplicate_groups,
             conflicting_groups,
             corrections_superseded,
+            rows_without_embedding,
             rows_removed = outcome.rows_removed,
             "ml dataset content-dedupe applied"
         );

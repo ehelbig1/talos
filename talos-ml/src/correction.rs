@@ -53,6 +53,12 @@ pub struct ResolveOutcome {
     /// Exact-duplicate siblings closed by this same decision — copies of the
     /// SAME message carrying the SAME disagreement. Always 0 for a unique row.
     ///
+    /// Population: rows sharing this one's `example_key` AND its
+    /// `(fast_label, llm_label)` verdict pair — anywhere in the model's pending
+    /// set, not just the visible page — plus text-identical copies within the
+    /// queue window (which may carry different producer keys). See
+    /// [`sibling_ids`].
+    ///
     /// Exactly ONE gold correction is appended for the whole group. Appending
     /// one per copy would silently multiply a single human judgement in
     /// training and mint the duplicate embeddings that made the kNN neighbour
@@ -102,14 +108,12 @@ pub async fn resolve_disagreement(
             return Err(ResolveError::NotFound);
         };
         // Exact-duplicate siblings of this row, so ONE decision closes the
-        // whole group and appends ONE correction. Read through the same
-        // deduped queue view the operator saw, which is why the grouping key
-        // cannot drift between what was displayed and what gets closed.
+        // whole group and appends ONE correction.
         // Best-effort: a read failure or a row outside the window simply
         // yields no siblings — degrading to the previous one-row behaviour is
         // always safe, whereas failing the resolve would lose the human's
         // decision.
-        let siblings = sibling_ids(lifecycle, &mut tx, model_id, user_id, id).await;
+        let siblings = sibling_ids(lifecycle, &mut tx, model_id, user_id, &pending).await;
         let correction = match label {
             Some(label) => {
                 let model = ModelRegistry::resolve_by_id(&mut tx, model_id, user_id)
@@ -193,16 +197,12 @@ pub async fn resolve_disagreement(
     // further correction appended. A sibling that lost its own CAS (handled
     // concurrently) is skipped rather than failing the batch — the operator's
     // decision on the group still stands.
-    let mut siblings_resolved = 0usize;
-    for sibling in siblings {
-        if lifecycle
-            .set_disagreement_status(&mut tx, sibling, user_id, status)
-            .await
-            .map_err(ResolveError::Internal)?
-        {
-            siblings_resolved += 1;
-        }
-    }
+    // ONE statement for the whole group: key-based closure is no longer
+    // window-bounded, so this list can legitimately reach the per-model cap.
+    let siblings_resolved = lifecycle
+        .set_disagreement_statuses(&mut tx, &siblings, user_id, status)
+        .await
+        .map_err(ResolveError::Internal)?;
     tx.commit()
         .await
         .map_err(|e| ResolveError::Internal(e.into()))?;
@@ -213,27 +213,67 @@ pub async fn resolve_disagreement(
     })
 }
 
-/// Ids of the exact-duplicate siblings of `id` within the model's pending
-/// queue — every other row in its deduped group, whether `id` is the group's
-/// survivor or one of the collapsed copies.
+/// Ids of the exact-duplicate siblings of `row` — every other PENDING row that
+/// is the same question about the same example.
 ///
-/// Returns empty on ANY read failure or when `id` falls outside the queue
-/// window: siblings are an optimisation of the operator's attention, never a
-/// correctness precondition, so this must not be able to fail a resolve.
+/// TWO sources, unioned, because neither alone is complete:
+///
+/// 1. **By `example_key`** ([`LifecycleService::pending_siblings_by_key`]) —
+///    an indexed equality lookup with NO window. This is the arm that fixes
+///    the completeness bug: the paged listing collapses duplicates AFTER its
+///    `LIMIT`, so on a model with a backlog every sibling past the first 100
+///    rows silently stayed pending and could be re-asked. Only available for
+///    rows that HAVE a key (which, post-`ck1:`, is every row the distill and
+///    gray-band producers write).
+/// 2. **By decrypted text within the queue window**
+///    ([`siblings_from_groups`] over the deduped view) — still required,
+///    because copies of one message that carry DIFFERENT producer keys (the
+///    same CI alert delivered as several Gmail message ids — the case
+///    duplicate-collapse was built for) share no `example_key` at all. Keeping
+///    this arm means the change can only ever close MORE rows than before,
+///    never fewer.
+///
+/// Returns empty on ANY read failure: siblings are an optimisation of the
+/// operator's attention, never a correctness precondition, so this must not be
+/// able to fail a resolve. Never contains `row.id` itself.
 async fn sibling_ids(
     lifecycle: &LifecycleService,
     conn: &mut sqlx::PgConnection,
     model_id: Uuid,
     user_id: Uuid,
-    id: Uuid,
+    row: &crate::lifecycle::PendingDisagreement,
 ) -> Vec<Uuid> {
-    let Ok(groups) = lifecycle
+    let mut out: Vec<Uuid> = Vec::new();
+    if let Some(key) = row.example_key.as_deref() {
+        if let Ok(ids) = lifecycle
+            .pending_siblings_by_key(
+                conn,
+                model_id,
+                user_id,
+                key,
+                row.fast_label.as_deref(),
+                &row.llm_label,
+                row.id,
+            )
+            .await
+        {
+            out.extend(ids);
+        }
+    }
+    if let Ok(groups) = lifecycle
         .pending_disagreements(conn, model_id, user_id, 100)
         .await
-    else {
-        return Vec::new();
-    };
-    siblings_from_groups(groups, id)
+    {
+        for id in siblings_from_groups(groups, row.id) {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    // Defence in depth: the row being resolved is flipped by its own CAS, and
+    // re-flipping it here would double-count it in `siblings_resolved`.
+    out.retain(|id| *id != row.id);
+    out
 }
 
 /// Pure selection half of [`sibling_ids`] — every other id in `id`'s deduped
