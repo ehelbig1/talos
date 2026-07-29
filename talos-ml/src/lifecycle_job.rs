@@ -360,29 +360,37 @@ async fn evaluate_one_model(
         },
     );
 
-    // Record the winning backend as a version (same shape as ml_eval_model)
-    // so the model card carries the evidence + the backend comparison.
-    let mut metrics = serde_json::json!({
-        "backend": winner.backend,
-        "holdout_fraction": EVAL_HOLDOUT_FRACTION,
-        "report": winner.report.clone(),
-        "policy_decision": {"satisfied": decision.satisfied, "unmet": decision.unmet},
-        "evaluator": "scheduled",
-        "selected_backend": winner.backend,
-        "backend_comparison": candidates
-            .iter()
-            .map(|c| serde_json::json!({
-                "backend": c.backend,
-                "macro_recall": c.macro_recall,
-                "macro_f1": c.macro_f1,
-            }))
-            .collect::<Vec<_>>(),
-    });
-    if let (Some(obj), Some(p)) = (metrics.as_object_mut(), winner.params.as_object()) {
-        for (kk, vv) in p {
-            obj.insert(kk.clone(), vv.clone());
-        }
-    }
+    // Record the winning backend as a version through the SHARED assembly
+    // point (`build_version_metrics`) so the scheduled payload and
+    // `ml_eval_model`'s cannot drift — they already had, `evaluator` existing
+    // on this side only. Provenance rides along: `dataset_rows` is the labeled
+    // population the holdout was drawn from (counted just above, inside this
+    // eval's tx), `embedding_model` is the one whose vectors were scored, and
+    // `measured_at` is CARRIED from the report the runner stamped.
+    let metrics = crate::version_metrics::build_version_metrics(
+        crate::version_metrics::VersionMetricsInput {
+            backend: winner.backend,
+            holdout_fraction: EVAL_HOLDOUT_FRACTION,
+            report: &winner.report,
+            params: &winner.params,
+            backend_comparison: candidates
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "backend": c.backend,
+                        "macro_recall": c.macro_recall,
+                        "macro_f1": c.macro_f1,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            evaluator: "scheduled",
+            policy_decision: Some(
+                serde_json::json!({"satisfied": decision.satisfied, "unmet": decision.unmet}),
+            ),
+            dataset_rows: Some(total_examples),
+            embedding_model: talos_memory::embedding::active_embedding_model(),
+        },
+    );
     let version = ModelRegistry::create_version(
         &mut tx,
         model_id,

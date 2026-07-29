@@ -699,21 +699,31 @@ async fn handle_eval_model(
         })
         .collect();
 
-    let mut metrics = serde_json::json!({
-        "backend": winner_backend,
-        "holdout_fraction": holdout_fraction,
-        "report": report,
-        "selected_backend": winner_backend,
-        "backend_comparison": comparison.clone(),
-    });
-    // Fold in the winner's backend-specific hyperparameters (voting/k for
+    // Labeled rows in the dataset AT EVAL TIME — the population this run's
+    // holdout was drawn from, counted inside the eval's own transaction (one
+    // indexed grouped count per eval, not per row). Best-effort: a failure
+    // omits the key rather than stamping a 0 the reader would believe.
+    let dataset_rows: Option<i64> = svc
+        .class_counts(&mut tx, dataset_id)
+        .await
+        .ok()
+        .map(|c| c.values().sum());
+    // ONE assembly point, shared with the scheduled evaluator, which also
+    // folds in the winner's backend-specific hyperparameters (voting/k for
     // knn, epochs/l2/balanced for linear) so the card records exactly what
-    // produced the artifact.
-    if let (Some(obj), Some(p)) = (metrics.as_object_mut(), params.as_object()) {
-        for (kk, vv) in p {
-            obj.insert(kk.clone(), vv.clone());
-        }
-    }
+    // produced the artifact — plus the provenance stamps (measured_at carried
+    // from the report, dataset_rows, embedding_model).
+    let metrics = talos_ml::build_version_metrics(talos_ml::VersionMetricsInput {
+        backend: winner_backend,
+        holdout_fraction,
+        report: &report,
+        params: &params,
+        backend_comparison: comparison.clone(),
+        evaluator: "manual",
+        policy_decision: None,
+        dataset_rows,
+        embedding_model: talos_memory::embedding::active_embedding_model(),
+    });
     let version = match ModelRegistry::create_version(
         &mut tx,
         model_id,
@@ -735,9 +745,19 @@ async fn handle_eval_model(
                 "model_id": model_id.to_string(),
                 "version_id": version.id.to_string(),
                 "version": version.version,
+                "trained_at": version.trained_at,
                 "selected_backend": winner_backend,
                 "backend_comparison": comparison,
                 "report": metrics.get("report"),
+                // Echoed from the payload that was just PERSISTED, so the
+                // response and the stored row can never disagree — and so a
+                // null here is visibly "not measured" rather than a silent
+                // substitution.
+                "measured_at": metrics.get("measured_at"),
+                "dataset_rows": metrics.get("dataset_rows"),
+                "embedding_model": metrics.get("embedding_model"),
+                "provenance_note": talos_ml::METRICS_PROVENANCE_NOTE,
+                "coverage_curve_note": talos_ml::COVERAGE_CURVE_POPULATION_NOTE,
                 "next_step": "the eval scored every backend on one holdout and picked the highest macro-recall (balanced accuracy, aligned with the policy's per-class recall floors); judge report.coverage_curve + report.gold, then ml_promote_model when the policy clears",
             }))
             .unwrap_or_default(),
@@ -1004,6 +1024,13 @@ async fn handle_get_model_card(
         "promoted_version": model.promoted_version,
         "versions": versions,
         "dataset_stats": dataset_stats,
+        // Every version block above carries `trained_at` and (for versions
+        // evaluated from 2026-07-28 on) `metrics_json.measured_at` /
+        // `dataset_rows` / `embedding_model`. These two notes say how to read
+        // them, and say explicitly that an ABSENT key on an older version
+        // means unknown — not fresh, not zero.
+        "provenance_note": talos_ml::METRICS_PROVENANCE_NOTE,
+        "coverage_curve_note": talos_ml::COVERAGE_CURVE_POPULATION_NOTE,
     });
     mcp_text(
         req_id,

@@ -246,8 +246,9 @@ pub(crate) fn render_grounding_report(
                  window. n_labeled counts those executions that ALSO carry a judge verdict; \
                  abstentions are not verdicts and are excluded at the source \
                  (judge_scores NOT not_applicable). Every statistic below is over n_labeled, \
-                 never over all executions, and overall_pass_rate is a bare 0.0 when \
-                 n_labeled = 0 — read n_labeled first. mean_judge_score is over \
+                 never over all executions, and overall_pass_rate is NULL when \
+                 n_labeled = 0 — a rate over a zero denominator has no value, so it is not \
+                 reported rather than reported as 0.0; read n_labeled first. mean_judge_score is over \
                  n_scored (labeled executions that also carry a numeric score), NOT n_labeled. \
                  pass_rate_high/low_relevance are over n_high/n_low, the two halves of a median \
                  split on mean relevance; ties land in the high half, so the halves can be \
@@ -367,9 +368,40 @@ mod grounding_report_window_tests {
             "a Fisher-z interval on a 0/1 outcome must not read as exact: {note}"
         );
         assert!(
-            note.contains("overall_pass_rate is a bare 0.0 when"),
-            "a rate over a zero denominator must be disclosed: {note}"
+            note.contains("overall_pass_rate is NULL when"),
+            "the null convention must be stated: {note}"
         );
+        assert!(
+            !note.contains("bare 0.0"),
+            "D6 removed the stopgap disclosure — the value is null now, not a \
+             disclosed lie: {note}"
+        );
+    }
+
+    /// D6 (2026-07-28): the retype itself, end to end through the renderer.
+    /// An actor with no judged executions must render `overall_pass_rate:
+    /// null` — a `0.0` there reads as "everything this actor did failed".
+    #[test]
+    fn an_empty_population_renders_a_null_pass_rate_not_a_zero() {
+        let empty = report(0);
+        assert_eq!(empty.n_labeled, 0);
+        assert_eq!(empty.overall_pass_rate, None);
+        let v: serde_json::Value =
+            serde_json::from_str(&render_grounding_report(&empty, 30)).unwrap();
+        assert!(
+            v.as_object().unwrap().contains_key("overall_pass_rate"),
+            "the key must still be present — consumers read it by name"
+        );
+        assert!(
+            v["overall_pass_rate"].is_null(),
+            "n_labeled = 0 must render null, got {}",
+            v["overall_pass_rate"]
+        );
+        assert_ne!(v["overall_pass_rate"], serde_json::json!(0.0));
+        // …and a real population still renders a real number.
+        let v: serde_json::Value =
+            serde_json::from_str(&render_grounding_report(&report(9), 30)).unwrap();
+        assert!(v["overall_pass_rate"].as_f64().unwrap() > 0.0);
     }
 
     #[test]
