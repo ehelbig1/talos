@@ -70,6 +70,7 @@ talos-search-service = { path = "../talos-search-service" }
 talos-failure-analysis-service = { path = "../talos-failure-analysis-service" }
 talos-hygiene-service = { path = "../talos-hygiene-service" }
 talos-session-brief-service = { path = "../talos-session-brief-service" }
+talos-judge-probe = { path = "../talos-judge-probe" }
 talos-actor-lifecycle-service = { path = "../talos-actor-lifecycle-service" }
 talos-schedule-repo = { path = "../talos-schedule-repo" }
 talos-ops-alerts-repository = { path = "../talos-ops-alerts-repository" }

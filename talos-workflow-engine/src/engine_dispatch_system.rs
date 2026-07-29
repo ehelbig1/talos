@@ -126,7 +126,35 @@ impl ParallelWorkflowEngine {
     /// - **Single parent**: passes the parent output directly (unwrapped)
     /// - **Multiple parents**: wraps outputs in an object keyed by user-defined
     ///   node label (from `node_labels`) or falling back to the internal UUID.
-    pub(crate) fn gather_inputs(
+    ///
+    /// # The arity rule is load-bearing, and it is a trap
+    ///
+    /// The two branches produce DIFFERENT SHAPES, and node authors routinely
+    /// write expressions against the shape they expect rather than the shape
+    /// their edges produce. A `verdict_expr` of
+    /// `classify.classifications.len() > 0` is correct while the judge has two
+    /// or more parents and becomes an UNBOUND VARIABLE the moment it has
+    /// exactly one — Rhai then aborts the expression (routing the node to its
+    /// error envelope) or, if the author guarded it, evaluates a vacuous
+    /// branch that can never fail. A judge that cannot fail still records a
+    /// perfect score every run, which is the `saturated_pass` signal the
+    /// operator digest flags.
+    ///
+    /// Note also that a parent with no entry in `results` is simply ABSENT
+    /// from the arity count — dropping a completed parent would silently move
+    /// a node from the multi-parent branch to the single-parent one. Callers
+    /// replaying this rule outside a real run (see below) must therefore
+    /// supply every parent, not a subset.
+    ///
+    /// # Why this is `pub`
+    ///
+    /// `talos-judge-probe` (the `probe_inline_judge` MCP tool) binds synthetic
+    /// cases through THIS function, against a graph loaded by the real parser,
+    /// so the probe's scope is the engine's scope by construction. Diagnosing
+    /// the arity trap above is most of the tool's value, so a re-implemented
+    /// binding rule would be self-defeating: it would reproduce the author's
+    /// assumption instead of the engine's behaviour.
+    pub fn gather_inputs(
         &self,
         node_idx: NodeIndex,
         results: &HashMap<Uuid, JsonValue>,

@@ -74,6 +74,10 @@ pub use engine::{
     DEFAULT_SANDBOX_DIR_NAME,
 };
 pub use engine_builder::ParallelWorkflowEngineBuilder;
+// Re-exported for `talos-judge-probe`, which replays a judge node's
+// pass / passthrough / error branch against synthetic inputs. Reuse, never
+// re-implementation — see the function's own "Why this is `pub`" section.
+pub use engine_dispatch_subflow::build_judge_envelope;
 pub use error::WorkflowEngineError;
 pub use event_spawn::emit_event_spawn;
 pub use graph_builder::{BuildError, WorkflowGraphBuilder, WorkflowGraphBuilderError};

@@ -8186,6 +8186,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-judge-probe"
+version = "0.1.0"
+dependencies = [
+ "petgraph",
+ "serde_json",
+ "talos-advanced-repository",
+ "talos-engine",
+ "talos-text-util",
+ "talos-workflow-engine",
+ "talos-workflow-engine-core",
+ "talos-workflow-types",
+ "thiserror 1.0.69",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "talos-llm"
 version = "0.1.0"
 dependencies = [
@@ -8268,6 +8285,7 @@ dependencies = [
  "talos-http-utils",
  "talos-hygiene-service",
  "talos-inline-compile-service",
+ "talos-judge-probe",
  "talos-llm",
  "talos-mcp",
  "talos-measurement",

@@ -95,11 +95,20 @@ pub const JUDGE_SCORE_MIN_WINDOW_DAYS: i32 = 1;
 /// together.
 pub const JUDGE_SCORE_MAX_WINDOW_DAYS: i32 = 31;
 
-/// Per-workflow aggregate of observe-only judge verdicts over a trailing
+/// Per-JUDGE aggregate of observe-only judge verdicts over a trailing
 /// window — the `judge_scores` section of the weekly assistant report.
 /// `avg_score` / `pass_rate` / `worst_score` are `Option` so a schema
 /// drift on the aggregate columns surfaces as an error (via `try_get?`)
 /// rather than a silent default.
+///
+/// **One row per `(workflow, judge node)`, not per workflow** (2026-07-29).
+/// The grain was previously the workflow NAME alone, which pooled every
+/// judge in a workflow into one trend: both inbox organizers carry a `judge`
+/// AND a `coverage_judge`, two different quality gates, and their scores
+/// were averaged together. A saturated shape-check therefore hid inside a
+/// discriminating rubric's spread (and vice versa) — the misleading-report
+/// class. Name-only grouping also merged two DISTINCT workflows that happen
+/// to share a name.
 ///
 /// **Populations differ between the fields — do not sum them mentally.**
 /// `runs`, `avg_score`, `pass_rate` and `worst_score` are computed over
@@ -109,6 +118,15 @@ pub const JUDGE_SCORE_MAX_WINDOW_DAYS: i32 = 31;
 /// these numbers must say which population it is showing.
 #[derive(Debug)]
 pub struct JudgeScoreStat {
+    /// The workflow this judge belongs to. Carried so a report row is
+    /// ACTIONABLE — `probe_inline_judge` needs the pair, and without it a
+    /// "this judge may be a shape check" note is something the operator
+    /// cannot follow up on.
+    pub workflow_id: Uuid,
+    /// The judge NODE, as the engine recorded it. This is the engine node
+    /// UUID (`gather_inputs`' key), which `probe_inline_judge` accepts
+    /// directly as its `node_id`.
+    pub node_id: Uuid,
     pub workflow_name: String,
     /// SCORED verdicts in the window (abstentions excluded).
     pub runs: i64,
@@ -1321,11 +1339,20 @@ impl ExecutionRepository {
         Ok(())
     }
 
-    /// Per-workflow judge-score aggregates over the trailing `days` for
-    /// one user — the report's `judge_scores` section. Run count, average
-    /// score, pass rate, and worst (min) score per judged workflow.
+    /// Per-JUDGE judge-score aggregates over the trailing `days` for one
+    /// user — the report's `judge_scores` section. Run count, average score,
+    /// pass rate, and worst (min) score per `(workflow, judge node)`.
     /// Tenancy via the workflows join (`w.user_id = $1`), which also drops
     /// rows whose workflow was deleted.
+    ///
+    /// **Grain is `(workflow_id, node_id)`** (2026-07-29). Grouping by
+    /// `w.name` alone pooled every judge in a workflow — the organizers run
+    /// a rubric `judge` and a structural `coverage_judge` side by side, and
+    /// one trend over both describes neither. It also merged two distinct
+    /// workflows sharing a name. Renderers therefore emit one row PER JUDGE
+    /// and must carry `node_id`, or two rows with the same `name` become
+    /// indistinguishable. The `LIMIT 50` is unchanged and now bounds judges
+    /// rather than workflows.
     ///
     /// **Abstentions are excluded structurally.** Every quality aggregate
     /// carries `FILTER (WHERE NOT js.not_applicable)`, so `runs` /
@@ -1343,7 +1370,9 @@ impl ExecutionRepository {
     ) -> Result<Vec<JudgeScoreStat>> {
         let days = days.clamp(JUDGE_SCORE_MIN_WINDOW_DAYS, JUDGE_SCORE_MAX_WINDOW_DAYS);
         let rows = sqlx::query(
-            "SELECT w.name AS workflow_name, \
+            "SELECT js.workflow_id AS workflow_id, \
+                    js.node_id AS node_id, \
+                    w.name AS workflow_name, \
                     (COUNT(*) FILTER (WHERE NOT js.not_applicable))::bigint AS runs, \
                     (COUNT(*) FILTER (WHERE js.not_applicable))::bigint AS na_runs, \
                     (AVG(js.score) FILTER (WHERE NOT js.not_applicable))::float8 \
@@ -1357,8 +1386,8 @@ impl ExecutionRepository {
              JOIN workflows w ON w.id = js.workflow_id \
              WHERE w.user_id = $1 \
                AND js.created_at > NOW() - make_interval(days => $2::int) \
-             GROUP BY w.name \
-             ORDER BY runs DESC, na_runs DESC, w.name LIMIT 50",
+             GROUP BY js.workflow_id, js.node_id, w.name \
+             ORDER BY runs DESC, na_runs DESC, w.name, js.node_id LIMIT 50",
         )
         .bind(user_id)
         .bind(days)
@@ -1368,6 +1397,12 @@ impl ExecutionRepository {
         rows.into_iter()
             .map(|r| {
                 Ok(JudgeScoreStat {
+                    // Both are `NOT NULL` group keys — read as the concrete
+                    // type so a schema drift errors instead of defaulting to
+                    // a nil UUID, which would render as a probe pointer that
+                    // silently resolves to nothing (check 52's rule).
+                    workflow_id: r.try_get::<Uuid, _>("workflow_id")?,
+                    node_id: r.try_get::<Uuid, _>("node_id")?,
                     workflow_name: r
                         .try_get::<Option<String>, _>("workflow_name")?
                         .unwrap_or_default(),

@@ -100,6 +100,7 @@ members = [
     "talos-actor-scaffold",
     "talos-engine",
     "talos-subworkflow-contract",
+    "talos-judge-probe",
     "talos-scheduler",
     "talos-actor-policies",
     "talos-templates",
