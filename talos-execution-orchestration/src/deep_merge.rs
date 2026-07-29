@@ -27,10 +27,15 @@ use serde_json::Value;
 /// users on every replay-with-input call that uses such an override.
 ///
 /// 128 matches `talos-workflow-validation::MAX_SCHEMA_DEPTH`
-/// (MCP-558), `talos-dlp-provider::MAX_DLP_REDACT_DEPTH` (MCP-559),
-/// and `talos-memory`'s `MAX_CANONICAL_DEPTH`. All four fail-closed
-/// depth limits on user-controlled JSON tree-walkers share one
-/// ceiling so a future change can't drift one site out of sync.
+/// (MCP-558) and `talos-dlp-provider::MAX_DLP_REDACT_DEPTH`
+/// (MCP-559) — the fail-closed depth limits on user-controlled JSON
+/// tree-walkers share one ceiling so a future change can't drift one
+/// site out of sync. It also matches serde_json's own built-in
+/// 128-deep recursion limit at `from_slice`/`from_str`, which is what
+/// bounds the signed-RPC payloads in `talos-memory` (its
+/// `MAX_CANONICAL_DEPTH` was deleted in #600 along with the canonical
+/// encoder that needed it — nothing walks a signed payload's tree any
+/// more; the signature covers the exact wire bytes).
 pub const MAX_MERGE_DEPTH: usize = 128;
 
 pub fn deep_merge(base: &mut Value, overrides: &Value) {

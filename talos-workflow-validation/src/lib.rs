@@ -774,9 +774,12 @@ fn json_kind(v: &serde_json::Value) -> &'static str {
 ///
 /// 128 is well above any legitimate schema (JSON Schema dialect
 /// authors recommend ≤ 10 levels) and well below the stack-overflow
-/// threshold. Picked to match the `MAX_CANONICAL_DEPTH` used by
-/// `talos-memory`'s signed-RPC canonical-bytes encoder so the two
-/// related fail-closed depth limits agree.
+/// threshold. Picked to match serde_json's own built-in 128-deep
+/// recursion limit at `from_slice`/`from_str` — the bound that already
+/// governs `talos-memory`'s signed-RPC payloads (its
+/// `MAX_CANONICAL_DEPTH` was deleted in #600 with the canonical-bytes
+/// encoder; signatures now cover the exact wire bytes, so nothing
+/// walks the tree) — so the related fail-closed depth limits agree.
 const MAX_SCHEMA_DEPTH: usize = 128;
 
 pub fn validate_schema_well_formed(schema: &serde_json::Value) -> Vec<String> {

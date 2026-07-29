@@ -45,6 +45,13 @@ zeroize = "1"
 
 [features]
 default = []
+# Exposes `test_support` — the seeded `arbitrary_json` generator, the
+# round-trip-unstable float counterexamples, and the wire/transcode hop
+# helpers — to downstream DEV-dependencies (`talos-memory`) so the two
+# signed-wire surfaces test against one shared adversary instead of two
+# copies that drift. Deliberately NOT in `default`: production builds must
+# never compile the harness. Adds no dependencies of its own.
+test-support = []
 
 [lints.rust]
 unsafe_code = "forbid"

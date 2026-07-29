@@ -4416,19 +4416,28 @@ mod wire_hop_signing_specs {
     use serde_json::json;
     use uuid::Uuid;
 
-    /// A float with **no round-trip fixed point** under serde_json: writing
-    /// it, re-parsing, and writing again yields text that differs from the
-    /// first write, forever. Reproduced by the #598 reviewer as
-    /// `…890906e-115` (sent) vs `…8909045e-115` (received).
-    ///
-    /// This is the value that makes "normalise to the fixed point" (the #595
-    /// first attempt) provably insufficient and forces raw-bytes signing.
-    const POISON_2CYCLE: f64 = 5.455171886890906e-115;
-
-    /// The exact bit pattern the #597 search surfaced as round-trip unstable;
-    /// kept as a second, independently-sourced sample so a single serde_json
-    /// version bump can't silently make this whole module vacuous.
-    const POISON_BITS: u64 = 0x2284_3773_1ab4_9c0f;
+    // The generator and the two float counterexamples come from the SHARED
+    // harness in `talos_workflow_job_protocol::test_support` (dev-dependency,
+    // non-default `test-support` feature). They used to be a local copy —
+    // taken because the original was `cfg(test)`-private to its crate — and
+    // the copy drifted immediately: this module never grew the
+    // size-independence, text-vs-meaning, or transcode assertions the
+    // dispatch suite had, so the second signed-wire surface was tested
+    // strictly more weakly while both suites stayed green. Those three
+    // classes are now present below, on the shared adversary.
+    //
+    // * `POISON_2CYCLE` — a float with NO round-trip fixed point (writing,
+    //   re-parsing and writing again differs from the first write, forever);
+    //   `…890906e-115` sent vs `…8909045e-115` received, as reproduced by the
+    //   #598 reviewer. It is what makes "normalise to the fixed point" (the
+    //   #595 first attempt) provably insufficient and forces raw-bytes
+    //   signing.
+    // * `POISON_BITS` — the bit pattern the #597 search surfaced, kept as a
+    //   second independently-sourced sample so one serde_json version bump
+    //   cannot silently make this module vacuous.
+    use talos_workflow_job_protocol::test_support::{
+        arbitrary_json, round_trip_unstable_count, value_transcode_hop, POISON_2CYCLE, POISON_BITS,
+    };
 
     /// Register the process-global HMAC key. `register_hmac_key` wraps a
     /// `OnceLock::set`, so this is idempotent and first-caller-wins — every
@@ -4444,18 +4453,15 @@ mod wire_hop_signing_specs {
         rpc_auth::register_hmac_key(std::sync::Arc::new(vec![0x9Cu8; 32]));
     }
 
-    /// The wire hop the worker → NATS → controller path actually performs:
-    /// `to_vec` on the signed struct, `from_slice` on the received bytes.
-    /// Confirmed to be exactly this in production — the worker serialises
-    /// with `serde_json::to_vec` (talos-worker-runtime/src/host/memory.rs)
-    /// and the single admission chokepoint deserialises with
-    /// `serde_json::from_slice` on the raw NATS payload
-    /// (talos-rpc-subscribers/src/admission.rs). No intermediate `Value` hop
-    /// exists on either side, so this helper is faithful, not a simplification.
-    fn wire_hop<T: serde::Serialize + serde::de::DeserializeOwned>(req: &T) -> T {
-        let bytes = serde_json::to_vec(req).expect("serialise");
-        serde_json::from_slice(&bytes).expect("deserialise")
-    }
+    // `wire_hop` (to_vec → from_slice) is the shared helper, imported above.
+    // It is faithful to production on this surface, not a simplification: the
+    // worker serialises with `serde_json::to_vec`
+    // (talos-worker-runtime/src/host/memory.rs) and the single admission
+    // chokepoint deserialises with `serde_json::from_slice` on the raw NATS
+    // payload (talos-rpc-subscribers/src/admission.rs). No intermediate
+    // `Value` hop exists on either side — and `value_transcode_hop` below
+    // pins what happens if one is ever introduced.
+    use talos_workflow_job_protocol::test_support::wire_hop;
 
     fn memory_set(value: serde_json::Value, metadata: Option<serde_json::Value>) -> MemoryOp {
         MemoryOp::Set {
@@ -4825,87 +4831,250 @@ mod wire_hop_signing_specs {
         None
     }
 
-    /// Pseudo-random structured JSON. Ported from
-    /// `talos_workflow_job_protocol`'s `arbitrary_json` (#597) — the
-    /// generator that found the original root cause by search after six
-    /// reasoned hypotheses had failed. Copied rather than shared because
-    /// that one is `#[cfg(test)]`-private to its own crate, and this fix
-    /// must not grow a dependency to borrow it.
-    ///
-    /// Seeded (never `thread_rng`) so a property failure is REPRODUCIBLE
-    /// from the printed seed; an unreplayable flaky property test is worse
-    /// than none. Deliberately emits the shapes that broke us: floats built
-    /// from raw bit patterns, computed ratios, deep nesting, mixed arrays,
-    /// non-ASCII keys, and integers at JSON's typing boundaries.
-    fn arbitrary_json(seed: &mut u64, depth: u32) -> serde_json::Value {
-        // xorshift64* — tiny, deterministic, no dev-dependency.
-        let mut next = || {
-            *seed ^= *seed << 13;
-            *seed ^= *seed >> 7;
-            *seed ^= *seed << 17;
-            *seed
-        };
-        let pick = next() % if depth == 0 { 6 } else { 8 };
-        match pick {
-            0 => serde_json::Value::Null,
-            1 => serde_json::Value::Bool(next() % 2 == 0),
-            // Floats from RAW BITS: the class that actually broke signing
-            // (parse(write(x)) landing one ULP away).
-            2 => {
-                let f = f64::from_bits(next());
-                serde_json::Number::from_f64(f)
-                    .map_or(serde_json::Value::Null, serde_json::Value::Number)
-            }
-            // Integers at the boundaries where JSON number typing is subtle.
-            3 => json!(next() as i64),
-            4 => json!(next()),
-            // Computed ratios — what agent/LLM nodes actually persist, ~10%
-            // of which are round-trip unstable.
-            5 => {
-                let (a, b) = (next() % 1000 + 1, next() % 1000 + 1);
-                json!(a as f64 / b as f64)
-            }
-            6 => {
-                let n = (next() % 4) as usize;
-                serde_json::Value::Array((0..n).map(|_| arbitrary_json(seed, depth - 1)).collect())
-            }
-            _ => {
-                let n = (next() % 4) as usize;
-                let mut m = serde_json::Map::new();
-                for i in 0..n {
-                    // Non-ASCII keys: escaping differences change byte length
-                    // without changing meaning.
-                    m.insert(
-                        format!("k{i}\u{2014}\u{1f600}"),
-                        arbitrary_json(seed, depth - 1),
-                    );
-                }
-                serde_json::Value::Object(m)
-            }
-        }
-    }
-
-    /// Anti-vacuousness guard (ported from #597). The generator must actually
-    /// produce round-trip-unstable values, or every property spec above
-    /// passes for the wrong reason and we would never know.
+    /// Anti-vacuousness guard (ported from #597, now measured by the shared
+    /// harness). The generator must actually produce round-trip-unstable
+    /// values, or every property spec above passes for the wrong reason and
+    /// we would never know.
     #[test]
     fn generator_actually_produces_round_trip_unstable_values() {
         let mut seed = 0x5eed_0dd0_0000_0003_u64;
-        let mut unstable = 0;
-        for _ in 0..20_000 {
-            let v = arbitrary_json(&mut seed, 3);
-            let once = v.to_string();
-            if let Ok(p) = serde_json::from_str::<serde_json::Value>(&once) {
-                let twice = p.to_string();
-                if twice != once {
-                    unstable += 1;
-                }
-            }
-        }
+        let unstable = round_trip_unstable_count(&mut seed, 20_000, 3);
         assert!(
             unstable > 0,
             "generator produced NO round-trip-unstable value — the wire specs \
              above would be passing (or failing) for reasons unrelated to floats"
+        );
+    }
+
+    // ── Assertion classes the copied harness never grew ──────────────────
+    //
+    // The three tests below existed only on the job-protocol side. Their
+    // absence here was invisible: both suites were green, and nothing
+    // compared their coverage. They are ported now that the generator is
+    // shared, because each pins a property specific to raw-text binding that
+    // "sign → wire → verify holds" does NOT imply.
+
+    /// CLASS 1 — SIZE INDEPENDENCE. The binding must hold at every payload
+    /// size, not just the ~50-byte ones every hand-written case uses.
+    ///
+    /// Worth its own sweep because the signed body is a CONCATENATION
+    /// (`timestamp_ms` as 8 LE bytes, then `op.raw_bytes()`), and the whole
+    /// class of defect this file exists for changed the payload's byte LENGTH
+    /// as well as its content. A length-prefix mistake, an off-by-one at the
+    /// prefix boundary, or any capacity-based truncation in `sign_body_bytes`
+    /// would be invisible at one fixed size and fatal at another. Each sample
+    /// also carries the 2-cycle float so size and content hazards are
+    /// exercised together.
+    ///
+    /// Asserts BOTH that verification survives and that the received raw
+    /// length equals the sent one — a silent truncation that happened to be
+    /// applied identically on both sides would still verify.
+    #[test]
+    fn memory_set_survives_the_wire_across_a_payload_size_sweep() {
+        ensure_hmac_key();
+        let actor = Uuid::new_v4();
+        // Spans the 8-byte prefix boundary, several power-of-two boundaries,
+        // and up to the 64 KiB `MAX_VALUE_BYTES` ceiling the persist path
+        // enforces — i.e. the whole range a real `agent_memory::set` can put
+        // on the wire.
+        for filler_len in [
+            0usize, 1, 2, 3, 7, 8, 9, 15, 16, 63, 127, 255, 1023, 4096, 16_384, 60_000,
+        ] {
+            let value = json!({
+                "ratio": POISON_2CYCLE,
+                "blob": "x".repeat(filler_len),
+            });
+            let req = MemoryRpcRequest::new_signed(actor, memory_set(value, None))
+                .expect("sign at every size");
+            let sent_len = req.op.raw_bytes().len();
+            let received = wire_hop(&req);
+            assert_eq!(
+                received.op.raw_bytes().len(),
+                sent_len,
+                "filler {filler_len}: signed op text changed LENGTH across the wire"
+            );
+            assert_eq!(
+                received.op.raw_bytes(),
+                req.op.raw_bytes(),
+                "filler {filler_len}: signed op text changed across the wire"
+            );
+            assert!(
+                received.verify().is_ok(),
+                "filler {filler_len}: verify failed after the wire hop — the \
+                 raw-text binding is size-dependent"
+            );
+        }
+    }
+
+    /// CLASS 2 — TEXT, NOT MEANING. The signature binds the op's exact TEXT,
+    /// which is the security consequence of raw-bytes signing and the half
+    /// that "honest sender verifies" can never demonstrate.
+    ///
+    /// `RawSigned` can hold text no `MemoryOp` would ever emit: duplicate
+    /// keys, interior padding, non-shortest number spellings, escaped key
+    /// characters. Handlers read the deduplicated parse, so the natural worry
+    /// is a signed/executed split. Both halves are pinned:
+    ///
+    /// 1. A KEYLESS on-path rewrite cannot exploit it. Every rewrite below is
+    ///    semantics-preserving — each parses to the very op the sender signed,
+    ///    so the pre-#598 `canonical_json_bytes` scheme would have ACCEPTED
+    ///    them — and every one is refused now, because the digest covers the
+    ///    bytes. This is a strict security GAIN of the raw-text binding, not
+    ///    a cost.
+    /// 2. A KEY HOLDER can of course sign exotic text, and when it does the
+    ///    two halves stay consistent: verification checks the exact bytes and
+    ///    the subscriber acts on the last-wins parse of those same bytes.
+    ///    There is no view of the message that disagrees with the signed one.
+    #[test]
+    fn memory_signature_binds_op_text_not_meaning() {
+        ensure_hmac_key();
+        let actor = Uuid::new_v4();
+        let req =
+            MemoryRpcRequest::new_signed(actor, memory_set(json!({"a": 1}), None)).expect("sign");
+        let wire = String::from_utf8(serde_json::to_vec(&req).expect("serialise")).expect("utf8");
+        let sent = r#""value":{"a":1}"#;
+        assert!(wire.contains(sent), "op value text not found on the wire");
+
+        // 1. Keyless rewrites: same meaning, different bytes → all refused.
+        for rewrite in [
+            r#""value":{"a" : 1}"#,     // interior padding
+            r#""value":{"a":0,"a":1}"#, // duplicate key, last-wins
+            r#""value":{"a":1.0}"#,     // different number spelling
+            r#""value":{"\u0061":1}"#,  // escaped key spelling
+        ] {
+            let tampered: MemoryRpcRequest = serde_json::from_str(&wire.replace(sent, rewrite))
+                .unwrap_or_else(|e| panic!("rewrite {rewrite} must still be valid JSON: {e}"));
+            let MemoryOp::Set { value, .. } = tampered.op.get() else {
+                panic!("rewrite {rewrite} must still parse as a Set");
+            };
+            assert_eq!(
+                value.get("a").and_then(serde_json::Value::as_f64),
+                Some(1.0),
+                "precondition: {rewrite} must be semantics-preserving, or the \
+                 test proves nothing about text-vs-meaning"
+            );
+            assert!(
+                tampered.verify().is_err(),
+                "rewriting the op text to {rewrite} must invalidate the \
+                 signature — duplicate-key smuggling requires the signing key"
+            );
+        }
+
+        // 2. Key holder signs duplicate-key text. `new_signed` cannot express
+        //    this (it always re-mints from a `MemoryOp`), so the exotic text
+        //    is injected by deserialising it and re-signing over the body the
+        //    production formula defines: `timestamp_ms` LE || op.raw_bytes().
+        //    Mirroring the formula here is deliberate — it fails loudly if
+        //    `memory_rpc::sign_body_bytes` ever changes shape.
+        let dup = r#""value":{"a":9,"a":1}"#;
+        let mut exotic: MemoryRpcRequest =
+            serde_json::from_str(&wire.replace(sent, dup)).expect("exotic text is valid JSON");
+        let mut body = exotic.timestamp_ms.to_le_bytes().to_vec();
+        body.extend_from_slice(exotic.op.raw_bytes());
+        exotic.signature = rpc_auth::sign(
+            crate::memory_rpc::SUBJECT_NAME,
+            exotic.actor_id,
+            &exotic.nonce,
+            &body,
+        )
+        .expect("key registered");
+        let received = wire_hop(&exotic);
+        assert!(
+            String::from_utf8_lossy(received.op.raw_bytes()).contains(r#""a":9,"a":1"#),
+            "the exotic text must survive the wire verbatim"
+        );
+        let MemoryOp::Set { value, .. } = received.op.get() else {
+            panic!("expected a Set");
+        };
+        assert_eq!(
+            value,
+            &json!({"a": 1}),
+            "the parsed view must be the last-wins reading of the SIGNED bytes"
+        );
+        received
+            .verify()
+            .expect("text the key holder actually signed must verify");
+    }
+
+    /// CLASS 3 — THE TRANSCODE TRAP. Moving a signed request through
+    /// `serde_json::Value` (`to_value` → `from_value`) SILENTLY BREAKS ITS
+    /// SIGNATURE.
+    ///
+    /// Worth an executable warning because it does not fail loudly anywhere
+    /// else: the transcode compiles, runs, and produces a structurally
+    /// identical request — but it re-parses and re-serialises the op, so a
+    /// round-trip-unstable float lands on different bytes than the ones the
+    /// sender signed. Serialising to BYTES (what NATS actually carries)
+    /// preserves them exactly, which is why the production path is safe and
+    /// the `Value` detour is not.
+    ///
+    /// Rule for callers: move `MemoryRpcRequest` / `IntegrationStateRequest`
+    /// over the wire as bytes or a string, never via `serde_json::Value`.
+    #[test]
+    fn value_transcoding_loses_signed_memory_bytes_but_text_round_trip_does_not() {
+        ensure_hmac_key();
+        let actor = Uuid::new_v4();
+        let req =
+            MemoryRpcRequest::new_signed(actor, memory_set(json!({"ratio": POISON_2CYCLE}), None))
+                .expect("sign");
+        let signed_bytes = req.op.raw_bytes().to_vec();
+
+        // Byte round trip: byte-preserving, so the signature still verifies.
+        let via_bytes = wire_hop(&req);
+        assert_eq!(
+            via_bytes.op.raw_bytes(),
+            signed_bytes.as_slice(),
+            "the production wire path MUST preserve the signed bytes"
+        );
+        via_bytes
+            .verify()
+            .expect("the production wire path must still verify");
+
+        // Value transcode: re-derives the text, and the float drifts.
+        let via_value: MemoryRpcRequest = value_transcode_hop(&req);
+        assert_ne!(
+            via_value.op.raw_bytes(),
+            signed_bytes.as_slice(),
+            "if this ever starts preserving bytes, serde_json changed — relax \
+             the rule deliberately rather than by accident"
+        );
+        assert!(
+            via_value.verify().is_err(),
+            "a Value-transcoded request must FAIL verification — that is the \
+             whole reason the rule exists"
+        );
+    }
+
+    /// The same trap on the integration-state twin — covered separately
+    /// because the two surfaces have independent signing formulas and a fix
+    /// applied to one has historically missed the other.
+    #[test]
+    fn value_transcoding_loses_signed_integration_bytes() {
+        ensure_hmac_key();
+        let req = IntegrationStateRequest::new_signed(
+            "gmail".to_string(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            integration_set(json!({"drift_ratio": POISON_2CYCLE})),
+        )
+        .expect("sign");
+        let signed_bytes = req.op.raw_bytes().to_vec();
+
+        let via_bytes = wire_hop(&req);
+        assert_eq!(via_bytes.op.raw_bytes(), signed_bytes.as_slice());
+        via_bytes
+            .verify()
+            .expect("the production wire path must still verify");
+
+        let via_value: IntegrationStateRequest = value_transcode_hop(&req);
+        assert_ne!(
+            via_value.op.raw_bytes(),
+            signed_bytes.as_slice(),
+            "if this ever starts preserving bytes, serde_json changed"
+        );
+        assert!(
+            via_value.verify().is_err(),
+            "a Value-transcoded integration request must FAIL verification"
         );
     }
 

@@ -4017,32 +4017,42 @@ echo
 # some floats have NO fixed point at all (`5.455171886890906e-115` enters a
 # permanent 2-cycle under repeated round trips), so no number of normalisation
 # passes converges. The real fix is to stop re-deriving: bind the EXACT wire
-# text and hash THAT. Two crates implement the pattern:
-#   • job-protocol `SignedJson` (Value-typed) — dispatch/result payloads.
-#   • talos-memory `RawSigned<T>` (typed) — the memory / integration-state
-#     `Set` ops, which carry an arbitrary `serde_json::Value` (2026-07-27,
-#     the #598 memory-RPC twin). It REPLACED `canonical_json_bytes` /
-#     `write_canonical`, which re-derived a parsed `Value`'s text on each side
-#     (`Value::Number(n) => n.to_string()`) and so hit the identical defect.
+# text and hash THAT. ONE generic type implements the pattern
+# (`talos_workflow_job_protocol::RawSigned<T>`, 2026-07-29) for both surfaces:
+#   • `SignedJson = RawSigned<serde_json::Value>` — dispatch/result payloads.
+#   • `RawSigned<MemoryOp>` / `RawSigned<IntegrationOp>` — the memory /
+#     integration-state `Set` ops, which carry an arbitrary
+#     `serde_json::Value` (2026-07-27, the #598 memory-RPC twin);
+#     `talos-memory` re-exports the type rather than reimplementing it. It
+#     REPLACED `canonical_json_bytes` / `write_canonical`, which re-derived a
+#     parsed `Value`'s text on each side (`Value::Number(n) => n.to_string()`)
+#     and so hit the identical defect.
 # This check guards BOTH surfaces from a regression:
 #   (a) inside job-protocol, a Sha256 must not be taken over a signed field's
-#       `.to_string()` (with or without an intervening `.value()`);
-#   (b) inside talos-memory, the deleted `canonical_json_bytes` /
-#       `write_canonical` identifiers must never reappear in code — their
-#       return was a re-derived byte form, so resurrecting either name is the
-#       same class of bug wearing the old name.
+#       `.to_string()` (with or without an intervening accessor);
+#   (b) the deleted `canonical_json_bytes` / `write_canonical` identifiers
+#       must never reappear in code in EITHER crate — their return was a
+#       re-derived byte form, so resurrecting either name is the same class of
+#       bug wearing the old name.
 #
 # For (a): only `<expr>.to_string()` fed straight to a digest is flagged —
 # hashing a String field (`logs.join`, `module_uri.as_bytes()`) is unaffected,
 # since a String is already the exact bytes and has no re-derivation step.
+# The accessor group is an ALTERNATION (`.value()` | `.get()`), not just
+# `.value()`: the shared generic exposes `get()` and the `Value` alias exposes
+# `value()`, so a value-only pattern would silently stop matching the moment a
+# hash site used the generic spelling — the check would go quiet without
+# anyone touching it. Both crate globs are `src/*.rs`, not `src/lib.rs`: the
+# type now has module neighbours (`test_support.rs`, `envelope_seal.rs`,
+# `subjects.rs`) and a hash site added in one of them was previously invisible.
 # For (b): comment lines are skipped (the RawSigned docs and this script name
 # the identifiers deliberately); only live code counts.
 # Opt-out (both): `// allow-raw-json-hash: <reason>`.
 bold "▶ check 61: signed JSON must be hashed as its exact wire bytes"
 
 RAW_JSON_HASH=0
-jp_file="talos-workflow-job-protocol/src/lib.rs"
-if [ -f "$jp_file" ]; then
+for jp_file in talos-workflow-job-protocol/src/*.rs; do
+    [ -f "$jp_file" ] || continue
     while IFS=: read -r lineno _; do
         [ -n "$lineno" ] || continue
         start=$((lineno > 3 ? lineno - 3 : 1))
@@ -4053,14 +4063,17 @@ if [ -f "$jp_file" ]; then
         yellow "    $(sed -n "${lineno}p" "$jp_file" | sed 's/^ *//')"
         RAW_JSON_HASH=$((RAW_JSON_HASH + 1))
     done <<EOF
-$(grep -nE "Sha256::digest\((self|s)\.[A-Za-z_]+(\.value\(\))?\.to_string\(\)" "$jp_file" || true)
+$(grep -nE "Sha256::digest\((self|s)\.[A-Za-z_]+(\.(value|get)\(\))?\.to_string\(\)" "$jp_file" || true)
 EOF
-fi
+done
 
 # (b) the deleted canonical machinery must not reappear as live code in
-# talos-memory. Skip comment lines (`//`, `///`, `//!`, block `*`) so the
-# RawSigned docs that explain WHY it was removed don't self-trip.
-for mf in talos-memory/src/*.rs; do
+# either signed-wire crate — talos-memory (where it was deleted) or
+# job-protocol (where the shared type now lives, so a "canonicalise it here
+# instead" regression would land). Skip comment lines (`//`, `///`, `//!`,
+# block `*`) so the RawSigned docs that explain WHY it was removed don't
+# self-trip.
+for mf in talos-memory/src/*.rs talos-workflow-job-protocol/src/*.rs; do
     [ -f "$mf" ] || continue
     while IFS=: read -r lineno line; do
         [ -n "$lineno" ] || continue

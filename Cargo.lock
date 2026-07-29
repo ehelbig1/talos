@@ -8344,6 +8344,7 @@ dependencies = [
  "chrono",
  "dashmap 6.2.1",
  "ed25519-dalek",
+ "hex",
  "hmac 0.12.1",
  "pgvector",
  "rand 0.8.6",

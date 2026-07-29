@@ -59,12 +59,20 @@ covers. Rules:
 - **Reject `NaN` / `Inf` in signed numeric fields** — they have
   non-deterministic bit representations and let a forger slip the
   same value through two different byte streams.
-- **Sorted-key recursive JSON for nested `serde_json::Value`** — the
-  signing function walks the value and emits in sorted-key order so
-  `{"a":1,"b":2}` and `{"b":2,"a":1}` sign identically.
-- **`MAX_CANONICAL_DEPTH` = 128** — matches serde_json's default.
-  Deeper payloads fail signing closed rather than recursing into a
-  stack overflow.
+- **Exact wire bytes for nested `serde_json::Value`** — signed JSON
+  payloads are carried by `RawSigned<T>` (aliased `SignedJson` for the
+  `Value` case), which mints the wire text ONCE on the send side and
+  captures it VERBATIM on the receive side; every digest covers
+  `raw_bytes()`. This REPLACED the sorted-key recursive canonicaliser,
+  which re-derived the text independently on each side and so diverged
+  for any round-trip-unstable float (#595/#597/#598). `talos-memory`
+  re-exports the same type — one home, no second implementation.
+- **No Talos-side canonical depth cap** — there is nothing left to walk,
+  so `MAX_CANONICAL_DEPTH` was deleted in #600. Depth is bounded by
+  **serde_json's built-in 128-deep recursion limit** at
+  `from_slice`/`from_str`: a deeper payload fails to deserialize, so it
+  never reaches a signature check and cannot recurse into a stack
+  overflow.
 
 ## Reserved vault paths
 

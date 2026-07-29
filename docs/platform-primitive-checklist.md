@@ -68,7 +68,7 @@ pass.
 - [ ] Field order in `sign_body_bytes` is APPEND-ONLY after the first deploy.
 - [ ] Field order in `JobRequest::signing_payload` / `PipelineJobRequest::signing_payload` is APPEND-ONLY for any new identity field. A rolling deploy across versions with different signing payloads fails verify on cross-version messages.
 - [ ] New `ListFilter` fields appended to the struct definition AND to the sign body in the same order.
-- [ ] `MAX_CANONICAL_DEPTH = 128` (matches serde_json default) enforced on any JSON that enters the sign body.
+- [ ] Nesting depth on any JSON that enters the sign body is bounded. Since #600 there is no Talos-side `MAX_CANONICAL_DEPTH` — nothing walks a signed payload's tree, because `RawSigned<T>` binds the exact wire bytes — so the bound is **serde_json's built-in 128-deep recursion limit** at `from_slice`/`from_str`: a deeper payload is a deserialize error and never reaches the signature check. Confirm your primitive deserialises with a stock serde_json entry point (do NOT call `disable_recursion_limit`).
 
 ## 6. Defense in depth — size + range caps
 

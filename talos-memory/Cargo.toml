@@ -42,6 +42,20 @@ uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = "1.8"
 
 [dev-dependencies]
+# The SHARED wire-invariant property harness (seeded `arbitrary_json`, the
+# round-trip-unstable float counterexamples, the wire/transcode hop helpers).
+# Same path dependency as above, re-declared here purely to turn on the
+# non-default `test-support` feature for TEST builds: `cargo build` of this
+# crate (and of everything that depends on it) still resolves job-protocol
+# with default features, so the harness never enters a production binary.
+# Sharing it is the point — the #598 fork of this generator drifted, leaving
+# the memory signed-wire surface tested strictly more weakly than the
+# dispatch one while both suites stayed green.
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol", features = [
+    "test-support",
+] }
+# Hex encoding for the literal MAC digests in tests/wire_format_snapshots.rs.
+hex = "0.4"
 # Real AES-256-GCM for the integration-test MemoryCryptoHook — lets the
 # live-Postgres suite exercise the genuine encrypt→store→read→decrypt round
 # trip AND the MCP-S2 AAD-binding property, instead of stubbing crypto out.

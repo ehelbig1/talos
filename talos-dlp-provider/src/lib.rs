@@ -35,10 +35,14 @@ use std::sync::{Arc, LazyLock};
 /// would crash the controller for ALL users.
 ///
 /// 128 matches `talos-workflow-validation::MAX_SCHEMA_DEPTH`
-/// (MCP-558) and `talos-memory`'s `MAX_CANONICAL_DEPTH` — all three
-/// fail-closed depth limits on user-controlled JSON tree-walkers
+/// (MCP-558) and `talos-execution-orchestration::MAX_MERGE_DEPTH` —
+/// the fail-closed depth limits on user-controlled JSON tree-walkers
 /// share the same ceiling so a future change doesn't drift one site
-/// out of sync.
+/// out of sync. It is also serde_json's own built-in recursion limit
+/// at `from_slice`/`from_str`, which is what bounds `talos-memory`'s
+/// signed-RPC payloads (its `MAX_CANONICAL_DEPTH` was deleted in #600
+/// with the canonical encoder — a signature now covers the exact wire
+/// bytes, so nothing walks the tree).
 pub const MAX_DLP_REDACT_DEPTH: usize = 128;
 
 // ============================================================================
