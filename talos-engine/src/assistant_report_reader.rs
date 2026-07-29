@@ -72,7 +72,9 @@ impl talos_workflow_engine_core::AssistantReportReader for PostgresAssistantRepo
         // model has been audited yet.
         let teacher_audits = talos_ml::teacher_ceilings(&self.pool, user_id).await?;
 
-        // Observe-only judge scores per workflow over the window, recorded
+        // Observe-only judge scores per (workflow, judge NODE) over the
+        // window — one entry per judge since 2026-07-29, so a workflow with
+        // two judges emits two — recorded
         // at evaluation time into the unencrypted `judge_scores` table
         // (the node outputs they come from are encrypted at rest). Empty
         // when no judged workflow ran in the window.
@@ -127,8 +129,16 @@ impl talos_workflow_engine_core::AssistantReportReader for PostgresAssistantRepo
                 // constant so the disclosure can't drift away from the
                 // `FILTER (WHERE NOT not_applicable)` it describes.
                 "population_note": talos_measurement::JUDGE_SCORE_POPULATION_NOTE,
+                // One entry per (workflow, judge NODE) since 2026-07-29 —
+                // NOT per workflow. A workflow running two judges (the
+                // organizers run a rubric judge beside a structural coverage
+                // judge) emits two entries with the same `name`, so a reader
+                // must key on `node_id`, and the ids are what
+                // `probe_inline_judge` takes to verify a saturated one.
                 "workflows": judge_scores.iter().map(|s| json!({
                     "name": s.workflow_name,
+                    "workflow_id": s.workflow_id.to_string(),
+                    "node_id": s.node_id.to_string(),
                     // Scored verdicts only — see `population_note`. Total
                     // judge invocations is `runs + na_runs`, reported as
                     // `total_verdicts` so no reader has to do that sum (and

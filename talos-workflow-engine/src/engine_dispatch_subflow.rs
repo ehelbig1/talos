@@ -331,8 +331,19 @@ pub(crate) fn pick_best_candidate(
 /// This is the judge-envelope analogue of the reserved-key strip
 /// `inject_actor_context_into_input` performs on inbound trigger payloads:
 /// engine-authored keys must never be caller-authorable.
+///
+/// # Why this is `pub`
+///
+/// `talos-judge-probe` (the `probe_inline_judge` MCP tool) replays a judge
+/// node's verdict against SYNTHETIC parent inputs and must report which of
+/// the three branches production would take. It calls THIS function rather
+/// than re-deriving the branch rule, for the same reason
+/// [`JudgeVerdict::from_collapsed`] is public: a second copy of the rule
+/// drifts, and a probe that disagrees with the engine is worse than no probe
+/// — it would certify a judge as "can fail" on branch logic the engine no
+/// longer uses. The probe's whole value is its fidelity.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_judge_envelope(
+pub fn build_judge_envelope(
     label: &str,
     parent_inputs: JsonValue,
     score: f64,
@@ -1188,10 +1199,28 @@ impl ParallelWorkflowEngine {
     /// separate sub-workflow isn't justified. Promote to a full
     /// `Judge` once the rubric grows its own model call or branching.
     ///
-    /// On evaluator failure (no evaluator wired, expression error,
-    /// non-object output) the function emits an error envelope rather
-    /// than panicking — the engine already treats `__error: true` as
-    /// a node-level failure routable through `ErrorHandler` edges.
+    /// On evaluator failure — no evaluator wired, or the expression
+    /// itself failing to evaluate (syntax error, unbound variable,
+    /// operation-limit abort) — the function emits an `__error: true`
+    /// envelope rather than panicking; the engine already treats that
+    /// as a node-level failure routable through `ErrorHandler` edges.
+    ///
+    /// A NON-OBJECT result is a different story, and the pre-2026-07-29
+    /// wording of this paragraph got it wrong by lumping the two
+    /// together. [`JudgeVerdict::from_collapsed`] never fails: an
+    /// expression returning `true`, `42`, or a string evaluates fine,
+    /// parses to `score = 0.0`, `passed = false`, `reasoning = ""`,
+    /// `feedback = ""` with `malformed_field_count = 4`, and is then
+    /// routed as an ordinary REJECTION — an `__error` envelope under
+    /// the default `on_failure: "error"`, or a passthrough carrying
+    /// `__judge_rejected__: true` under `"passthrough"`. So the node
+    /// does not fail *because the shape was wrong*; it fails because a
+    /// verdict with no `passed` field defaults to not-passing. The
+    /// only signal that the expression was malformed rather than
+    /// genuinely rejecting is the `malformed_verdict` tag on the
+    /// `quality_gate` event (and the WARN
+    /// `from_collapsed` logs) — which is exactly why
+    /// `probe_inline_judge` surfaces `malformed_field_count` per case.
     ///
     /// # When to call this directly
     ///

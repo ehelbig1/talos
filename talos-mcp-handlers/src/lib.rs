@@ -326,6 +326,16 @@ pub struct McpState {
     /// only protocol parsing, compile-time identity (env!-stamped
     /// version), and the auto-heal background spawns.
     pub session_brief_service: std::sync::Arc<talos_session_brief_service::SessionBriefService>,
+    /// Judge-probe service — backs `probe_inline_judge`. Replays an
+    /// inline-judge node's verdict against synthetic parent inputs through
+    /// the engine's own binding / evaluation / envelope helpers, so an
+    /// operator can answer the digest's "verify it in the FAILURE direction"
+    /// instruction without firing the real workflow. A pure composition of
+    /// one repository Arc, so it is constructed in-place here (same shape as
+    /// `hygiene_service`). Cross-protocol-ready: typed input + outcome,
+    /// `ProbeError` with stable `jsonrpc_code()` and a generic
+    /// `user_facing_message()` for internal errors.
+    pub judge_probe_service: std::sync::Arc<talos_judge_probe::JudgeProbeService>,
 }
 
 pub fn create_router(
@@ -387,6 +397,9 @@ pub fn create_router(
     let session_brief_service = std::sync::Arc::new(
         talos_session_brief_service::SessionBriefService::new(advanced_repo.clone()),
     );
+    let judge_probe_service = std::sync::Arc::new(talos_judge_probe::JudgeProbeService::new(
+        advanced_repo.clone(),
+    ));
 
     // The workflow-creation service is constructed in main.rs (so
     // GraphQL and MCP share one instance) and threaded in here.
@@ -421,6 +434,7 @@ pub fn create_router(
         actor_lifecycle_service,
         hygiene_service,
         session_brief_service,
+        judge_probe_service,
     };
 
     // Authenticated routes (Bearer token required)

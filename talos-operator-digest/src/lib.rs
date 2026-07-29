@@ -557,6 +557,14 @@ fn judge_score_row(s: &talos_execution_repository::JudgeScoreStat, days: i32) ->
     let signal = judge_signal(s.runs, s.avg_score, s.worst_score);
     json!({
         "name": s.workflow_name,
+        // 2026-07-29: the row's grain is now (workflow, judge NODE), so
+        // `name` alone no longer identifies it — a workflow with a rubric
+        // judge and a structural coverage judge emits TWO rows with the same
+        // name. The ids disambiguate them AND make the row actionable: they
+        // are exactly the pair `probe_inline_judge` takes, which is what
+        // `signal_note` tells a reader to run when the trend is saturated.
+        "workflow_id": s.workflow_id.to_string(),
+        "node_id": s.node_id.to_string(),
         // POPULATION: scored verdicts only. `runs + na_runs` is the number of
         // times the judge actually fired — the two are reported separately
         // (and named so) because every score below is over the scored
@@ -603,7 +611,7 @@ fn judge_score_row(s: &talos_execution_repository::JudgeScoreStat, days: i32) ->
         // A judge whose score never varies is not evidence of quality — it may
         // be a shape check that cannot fail.
         "signal": signal,
-        "signal_note": judge_signal_note(signal, s.runs, s.na_runs),
+        "signal_note": judge_signal_note(signal, s.runs, s.na_runs, Some((s.workflow_id, s.node_id))),
     })
 }
 
@@ -660,10 +668,24 @@ pub fn judge_signal(runs: i64, avg_score: Option<f64>, worst_score: Option<f64>)
 /// always has nothing to judge" — a completely different thing to go fix.
 /// Reporting the bare signal would let the second case read as the first,
 /// which is the defect this whole module exists to prevent.
-pub fn judge_signal_note(signal: &str, runs: i64, na_runs: i64) -> String {
+///
+/// `probe` is the row's `(workflow_id, node_id)` pair. When present, a
+/// `saturated_pass` note gains the copy-pasteable command that ANSWERS it:
+/// the base wording has told operators to "verify it in the FAILURE
+/// direction" since the signal shipped, but until `probe_inline_judge`
+/// existed there was no way to do that short of running the workflow against
+/// live data — so the instruction sat unactioned. An instruction with no
+/// mechanism is a misleading report field of its own.
+pub fn judge_signal_note(
+    signal: &str,
+    runs: i64,
+    na_runs: i64,
+    probe: Option<(Uuid, Uuid)>,
+) -> String {
     let base = judge_signal_note_base(signal);
+    let pointer = judge_probe_pointer(signal, probe);
     if na_runs <= 0 {
-        return base.to_string();
+        return format!("{base}{pointer}");
     }
     // State BOTH populations explicitly — `runs` counts scored verdicts only,
     // and a reader who assumes it counts invocations will misread every
@@ -671,7 +693,7 @@ pub fn judge_signal_note(signal: &str, runs: i64, na_runs: i64) -> String {
     format!(
         "{base} ({runs} scored {}, {na_runs} abstained — the judge reported \
          nothing to judge on {}; scores and pass rate are over the scored \
-         {} only)",
+         {} only){pointer}",
         if runs == 1 { "run" } else { "runs" },
         if na_runs == 1 {
             "that run"
@@ -679,6 +701,30 @@ pub fn judge_signal_note(signal: &str, runs: i64, na_runs: i64) -> String {
             "those runs"
         },
         if runs == 1 { "run" } else { "runs" },
+    )
+}
+
+/// The copy-pasteable follow-up for a saturated-pass judge, or `""`.
+///
+/// Only `saturated_pass` gets it: that is the signal whose base wording asks
+/// the operator to do something, and this is the something.
+///
+/// The command names BOTH tools because `judge_scores` does not record which
+/// KIND of judge wrote the row — an inline-expression judge and an
+/// LLM-as-judge sub-workflow land in the same table, and pointing an operator
+/// at `probe_inline_judge` for a sub-workflow judge would be a confidently
+/// wrong instruction. Naming the fork costs one clause and never misdirects.
+fn judge_probe_pointer(signal: &str, probe: Option<(Uuid, Uuid)>) -> String {
+    let Some((workflow_id, node_id)) = probe else {
+        return String::new();
+    };
+    if signal != "saturated_pass" {
+        return String::new();
+    }
+    format!(
+        " — to verify: run probe_inline_judge(workflow_id=\"{workflow_id}\", \
+         node_id=\"{node_id}\") with a case that SHOULD fail; if that node is a \
+         sub-workflow judge instead, use test_subworkflow_contract(contract=\"judge\")"
     )
 }
 
@@ -849,7 +895,7 @@ mod tests {
     fn judge_pinned_at_max_is_flagged_saturated_not_perfect() {
         assert_eq!(judge_signal(11, Some(1.0), Some(1.0)), "saturated_pass");
         assert_eq!(judge_signal(9, Some(1.0), Some(1.0)), "saturated_pass");
-        assert!(judge_signal_note("saturated_pass", 11, 0).contains("FAILURE direction"));
+        assert!(judge_signal_note("saturated_pass", 11, 0, None).contains("FAILURE direction"));
     }
 
     /// A judge that fires constantly but almost always has nothing to judge
@@ -860,7 +906,7 @@ mod tests {
     fn heavily_abstaining_judge_states_its_abstentions() {
         // 3 scored runs, 9 abstentions: 12 invocations, not 3.
         assert_eq!(judge_signal(3, Some(1.0), Some(1.0)), "insufficient_runs");
-        let note = judge_signal_note("insufficient_runs", 3, 9);
+        let note = judge_signal_note("insufficient_runs", 3, 9, None);
         assert!(note.contains("3 scored runs"), "{note}");
         assert!(note.contains("9 abstained"), "{note}");
         assert!(note.contains("nothing to judge"), "{note}");
@@ -881,7 +927,7 @@ mod tests {
             "bogus",
         ] {
             assert_eq!(
-                judge_signal_note(signal, 7, 0),
+                judge_signal_note(signal, 7, 0, None),
                 judge_signal_note_base(signal),
                 "{signal}"
             );
@@ -894,7 +940,7 @@ mod tests {
     #[test]
     fn abstentions_do_not_change_the_signal() {
         assert_eq!(judge_signal(9, Some(1.0), Some(1.0)), "saturated_pass");
-        let note = judge_signal_note("saturated_pass", 9, 40);
+        let note = judge_signal_note("saturated_pass", 9, 40, None);
         assert!(note.contains("FAILURE direction"), "{note}");
         assert!(note.contains("40 abstained"), "{note}");
     }
@@ -902,10 +948,10 @@ mod tests {
     /// Singular/plural, because these strings go into an operator email.
     #[test]
     fn note_counts_read_grammatically() {
-        let one = judge_signal_note("insufficient_runs", 1, 1);
+        let one = judge_signal_note("insufficient_runs", 1, 1, None);
         assert!(one.contains("1 scored run,"), "{one}");
         assert!(one.contains("nothing to judge on that run"), "{one}");
-        let many = judge_signal_note("insufficient_runs", 2, 3);
+        let many = judge_signal_note("insufficient_runs", 2, 3, None);
         assert!(many.contains("2 scored runs,"), "{many}");
         assert!(many.contains("nothing to judge on those runs"), "{many}");
     }
@@ -1365,6 +1411,102 @@ mod measurement_pr3_tests {
 
     // ---- D3 + D5: the judge row ------------------------------------------
 
+    /// Fixed ids so assertions can match the exact pointer text.
+    fn probe_wf() -> Uuid {
+        Uuid::parse_str("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa").unwrap()
+    }
+    fn probe_node() -> Uuid {
+        Uuid::parse_str("bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb").unwrap()
+    }
+
+    fn saturated_row(node: Uuid) -> JsonValue {
+        judge_score_row(
+            &talos_execution_repository::JudgeScoreStat {
+                workflow_id: probe_wf(),
+                node_id: node,
+                workflow_name: "pa-inbox-organizer-work".to_string(),
+                runs: 11,
+                na_runs: 0,
+                avg_score: Some(1.0),
+                pass_rate: Some(1.0),
+                worst_score: Some(1.0),
+            },
+            7,
+        )
+    }
+
+    /// D4: the row's grain is (workflow, judge NODE), so `name` alone no
+    /// longer identifies it — two judges in one workflow render as two rows
+    /// with the same name. The ids are what tell them apart.
+    #[test]
+    fn judge_rows_of_one_workflow_are_distinguishable_by_node_id() {
+        let a = saturated_row(probe_node());
+        let b = saturated_row(Uuid::parse_str("cccccccc-3333-4333-8333-cccccccccccc").unwrap());
+        assert_eq!(a["name"], b["name"], "same workflow, same name");
+        assert_eq!(a["workflow_id"], b["workflow_id"]);
+        assert_ne!(
+            a["node_id"], b["node_id"],
+            "two judges must not collapse into one identity"
+        );
+        assert_eq!(a["workflow_id"], json!(probe_wf().to_string()));
+        assert_eq!(a["node_id"], json!(probe_node().to_string()));
+    }
+
+    /// D4: the saturated-pass note has told operators to "verify it in the
+    /// FAILURE direction" since it shipped, with no mechanism to do so. It
+    /// now carries the command, with THIS row's real ids — an instruction
+    /// with no mechanism is a misleading report field of its own.
+    #[test]
+    fn saturated_pass_note_carries_a_copy_pasteable_probe_pointer() {
+        let v = saturated_row(probe_node());
+        assert_eq!(v["signal"], "saturated_pass");
+        let note = v["signal_note"].as_str().unwrap();
+        // The base instruction survives.
+        assert!(note.contains("FAILURE direction"), "{note}");
+        assert!(
+            note.contains(&format!(
+                "probe_inline_judge(workflow_id=\"{}\", node_id=\"{}\")",
+                probe_wf(),
+                probe_node()
+            )),
+            "the pointer must be copy-pasteable with the row's own ids: {note}"
+        );
+        assert!(note.contains("SHOULD fail"), "{note}");
+        // `judge_scores` records no judge KIND, so the note must not send a
+        // sub-workflow judge's operator to the inline-only tool.
+        assert!(note.contains("test_subworkflow_contract"), "{note}");
+    }
+
+    /// Only `saturated_pass` gets the pointer — it is the one signal whose
+    /// wording asks the operator to go do something.
+    #[test]
+    fn other_signals_do_not_gain_the_probe_pointer() {
+        for signal in [
+            "saturated_fail",
+            "saturated_constant",
+            "insufficient_runs",
+            "discriminating",
+            "unknown",
+        ] {
+            let note = judge_signal_note(signal, 7, 0, Some((probe_wf(), probe_node())));
+            assert!(
+                !note.contains("probe_inline_judge"),
+                "{signal} must not carry the pointer: {note}"
+            );
+            assert_eq!(note, judge_signal_note_base(signal), "{signal}");
+        }
+    }
+
+    /// The abstention clause and the pointer compose — a saturated judge that
+    /// also abstains must report both, not one or the other.
+    #[test]
+    fn probe_pointer_composes_with_the_abstention_clause() {
+        let note = judge_signal_note("saturated_pass", 9, 40, Some((probe_wf(), probe_node())));
+        assert!(note.contains("40 abstained"), "{note}");
+        assert!(note.contains("probe_inline_judge"), "{note}");
+        assert!(note.contains("FAILURE direction"), "{note}");
+    }
+
     /// Build the row through the PRODUCTION builder (`judge_score_row`, the
     /// one `learned_panel` calls), then read the envelope back out of it.
     ///
@@ -1381,6 +1523,8 @@ mod measurement_pr3_tests {
     ) -> (JsonValue, Option<talos_measurement::Measurement>) {
         let v = judge_score_row(
             &talos_execution_repository::JudgeScoreStat {
+                workflow_id: probe_wf(),
+                node_id: probe_node(),
                 workflow_name: "pa-inbox-triage".to_string(),
                 runs,
                 na_runs,

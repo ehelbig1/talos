@@ -1341,6 +1341,31 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "probe_inline_judge",
+            "description": "Calibrate an inline-judge node: prove it CAN reject something, WITHOUT running the workflow. Read-only — no execution row, no module runs, no writes. This is the tool the operator digest points at when it flags a judge as 'saturated_pass' (every run scored 1.0, so the judge may be a shape check that cannot fail). Give it synthetic parent inputs — one case that SHOULD fail, one that should pass, one empty/no-op case if the judge abstains — and it replays the engine's real pipeline: the same arity binding, the same Rhai sandbox (1000 operations, no eval), the same verdict parse, the same pass/passthrough/error branch. Per case you get score, passed_raw vs passed_effective (after pass_threshold), not_applicable, malformed_field_count, the branch, and the exact envelope the node would forward. The summary's can_fail answers the saturation question in one field. THE ARITY TRAP, which is the most common cause of a judge that cannot fail: a judge with exactly ONE parent receives that parent's output UNWRAPPED (its top-level fields are the bare scope variables), while a judge with TWO OR MORE receives an object KEYED BY NODE LABEL (the labels are the variables). An expression like `classify.classifications.len() > 0` is correct in the second case and an unbound variable in the first. Supply cases in the matching shape — 'input' for a single-parent judge, 'parents' for a multi-parent one — and the tool rejects a mismatch by naming the node's real parents. THE OTHER COMMON TRAP: the verdict_expr must RETURN a verdict map #{score, passed, reasoning, feedback} — writing the bare condition (`covered >= total`) as the whole expression evaluates fine but carries no verdict, so `passed` defaults to false and the node rejects EVERY run; those cases are reported as verdictless_rejections and deliberately do NOT count toward can_fail. HONESTY: this evaluates the expression against SYNTHETIC inputs. A rejecting case proves the expression CAN fail; it does not prove production inputs ever exercise that branch. For a sub-workflow judge (add_judge_node) use test_subworkflow_contract instead.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workflow_id": { "type": "string", "description": "UUID of the workflow containing the judge node" },
+                    "node_id": { "type": "string", "description": "The judge node's label (e.g. 'coverage_judge') OR the node UUID — the operator digest's saturated-judge note carries the UUID, so its pointer can be pasted straight in." },
+                    "cases": {
+                        "type": "array",
+                        "description": "1–20 synthetic scenarios. Each is an object with an optional 'name' and EXACTLY ONE of: 'input' (the sole parent's output, for a judge with one in-edge) or 'parents' (an object mapping each parent node label to that parent's output, for a judge with two or more). Make at least one case one the judge SHOULD reject — a probe where everything passes proves nothing.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string", "description": "Label for this case in the results (default: case_<index>)" },
+                                "input": { "description": "Single-parent judges: the parent's output, bound unwrapped exactly as the engine binds it." },
+                                "parents": { "type": "object", "description": "Multi-parent judges: {\"<parent node label>\": <that parent's output>, ...}. Every parent must be present — omitting one changes the arity and therefore the scope shape." }
+                            }
+                        }
+                    },
+                    "verdict_expr": { "type": "string", "description": "Optional REPLACEMENT expression to try without writing it to the graph — the iterate-on-a-fix loop. When set, the response flags used_expr_override: true so the verdicts are not mistaken for the persisted judge's. Same 8 KiB bound as the graph validator." }
+                },
+                "required": ["workflow_id", "node_id", "cases"]
+            }
+        }),
+        serde_json::json!({
             "name": "add_ensemble_node",
             "description": "Add an ensemble (self-consistency) node that runs the same child workflow N times concurrently and applies a consensus strategy. Use majority_vote for classification tasks where reliability matters. Use best_of_n with a judge_workflow_id to pick the highest-quality output. Use first_pass for simple parallel diversity checks. Output includes __ensemble_method__, __ensemble_size__, and __ensemble_votes__ metadata. best_of_n note: a judge that ABSTAINS on a candidate (not_applicable: true) makes that candidate INELIGIBLE to win — its score means 'nothing to judge', not 'this is good' — exactly as a judge dispatch failure does. If every candidate is abstained-on or errored, selection falls back to the first candidate, same as the all-failed path.",
             "inputSchema": {
@@ -1503,6 +1528,7 @@ pub async fn dispatch(
         "add_inline_judge_node" => {
             Some(handle_add_inline_judge_node(req_id, args, state, agent).await)
         }
+        "probe_inline_judge" => Some(handle_probe_inline_judge(req_id, args, state, agent).await),
         "add_ensemble_node" => Some(handle_add_ensemble_node(req_id, args, state, agent).await),
         "add_confidence_gate_node" => {
             Some(handle_add_confidence_gate_node(req_id, args, state, agent).await)
@@ -5265,6 +5291,139 @@ async fn handle_add_inline_judge_node(
             added.node_id, added.workflow_id, verdict_expr, threshold_str, added.wiring_in, added.wiring_out
         ),
     )
+}
+
+// ── probe_inline_judge ────────────────────────────────────────────────────────
+
+/// Thin wrapper over [`talos_judge_probe::JudgeProbeService::probe`].
+///
+/// DLP: this handler deliberately logs NOTHING about `cases`, the override
+/// expression, or the returned reasoning/feedback — the same `skip_all`
+/// discipline `dispatch_inline_judge` applies, for the same reason (parent
+/// inputs can carry post-interpolation secrets, and judge reasoning can quote
+/// email-derived content). Everything is echoed in the RESPONSE only.
+async fn handle_probe_inline_judge(
+    req_id: Option<serde_json::Value>,
+    args: &serde_json::Value,
+    state: &McpState,
+    agent: Arc<auth::AgentIdentity>,
+) -> JsonRpcResponse {
+    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let workflow_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let node_ref = match args.get("node_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => {
+            return mcp_error(
+                req_id,
+                -32602,
+                "node_id required — the judge node's label (e.g. 'coverage_judge') or the \
+                 node UUID the operator digest's probe pointer carries",
+            )
+        }
+    };
+    let Some(raw_cases) = args.get("cases").and_then(|v| v.as_array()) else {
+        return mcp_error(req_id, -32602, "cases must be an array of case objects");
+    };
+    // Bound the payload BEFORE parsing it — 1 MB total (the house precedent),
+    // plus the service's own <=20-case cap, checked here so an oversized
+    // request is rejected before the graph read.
+    if let Err(resp) = crate::utils::enforce_payload_size_limit(
+        &serde_json::Value::Array(raw_cases.clone()),
+        req_id.clone(),
+    ) {
+        return resp;
+    }
+    // Case-shape validation (including the <=20 cap) lives in the service so
+    // a future GraphQL resolver gets the same rules and the same wording.
+    let cases = match talos_judge_probe::parse_cases(raw_cases) {
+        Ok(c) => c,
+        Err(msg) => return mcp_error(req_id, -32602, &msg),
+    };
+
+    // Length is NOT re-capped here: the service holds the override to the
+    // same `MAX_RHAI_EXPRESSION_BYTES` bound the persisted graph validator
+    // uses, and the GRAPH's own expression is read as persisted (a 2000-char
+    // handler cap here would make legal 8 KiB judges unprobeable).
+    let verdict_expr_override = match args.get("verdict_expr") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => match v.as_str() {
+            Some(s) => Some(s.to_string()),
+            None => {
+                let kind = crate::utils::json_type_name(v);
+                return mcp_error(
+                    req_id,
+                    -32602,
+                    &format!("verdict_expr must be a string, got {kind}"),
+                );
+            }
+        },
+    };
+
+    let input = talos_judge_probe::ProbeInput {
+        workflow_id,
+        node_ref,
+        cases,
+        verdict_expr_override,
+    };
+    match state.judge_probe_service.probe(user_id, &input).await {
+        Ok(outcome) => {
+            let s = outcome.summary;
+            // Order matters: both "broken" verdicts are reported BEFORE
+            // `can_fail`, because each of them rejects every possible input.
+            // Leading with "this judge CAN reject" for an expression that
+            // rejects unconditionally would be the misleading-report class
+            // this tool exists to catch.
+            let headline = if s.eval_errors > 0 {
+                format!(
+                    "{}/{} cases could not be evaluated at all — the expression is failing, not \
+                     judging.",
+                    s.eval_errors, s.cases
+                )
+            } else if s.verdictless_rejections > 0 && !s.can_fail {
+                format!(
+                    "{}/{} cases were rejected on a value that is NOT a verdict — no usable \
+                     score/passed field, so `passed` defaulted to false. This node rejects EVERY \
+                     input, in production too. The expression must return \
+                     #{{score, passed, reasoning, feedback}}, not the bare condition.",
+                    s.verdictless_rejections, s.cases
+                )
+            } else if s.can_fail {
+                "This judge CAN reject — it is a real gate, not a shape check.".to_string()
+            } else {
+                "NO case was rejected. Either the cases were not adversarial, or this judge \
+                 cannot fail."
+                    .to_string()
+            };
+            mcp_text_with_json(
+                req_id,
+                &format!(
+                    "Probed '{}' in workflow {} against {} synthetic case(s).\n{}\n\
+                     Parents: {} (scope: {}).\n{}",
+                    outcome.node_label,
+                    outcome.workflow_id,
+                    s.cases,
+                    headline,
+                    outcome.parents.join(", "),
+                    outcome
+                        .cases
+                        .first()
+                        .map(|c| c.scope_source.as_str())
+                        .unwrap_or("n/a"),
+                    talos_judge_probe::SYNTHETIC_INPUT_NOTE,
+                ),
+                outcome.to_tool_body(),
+            )
+        }
+        Err(e) => {
+            if let talos_judge_probe::ProbeError::Internal(detail) = &e {
+                tracing::error!(%workflow_id, error = %detail, "probe_inline_judge internal error");
+            }
+            mcp_error(req_id, e.jsonrpc_code(), &e.user_facing_message())
+        }
+    }
 }
 
 // ── add_ensemble_node ─────────────────────────────────────────────────────────

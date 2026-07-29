@@ -4161,6 +4161,50 @@ if [ "$BUILD_RS_MISSING" -eq 0 ]; then
 fi
 echo
 
+# ── 63: the shared Rhai engine must silence print/debug ───────────────
+bold "▶ check 63: Rhai sandbox must discard print/debug (they println! to stdout)"
+
+# `rhai::Engine::new()` installs `print`/`debug` handlers that `println!`
+# straight to STDOUT — the same stream tracing's `fmt::layer()` writes to, so
+# whatever they emit lands in the controller's container logs. Every variable
+# in a workflow expression's scope is upstream-node output: post-interpolation
+# secrets, email bodies, whatever that workflow carries. A stored
+# `verdict_expr` / `skip_condition` / retry condition of `print(ctx); …`
+# therefore dumps the entire bound context past every DLP boundary the
+# persistence path applies (the condition-eval WARN in the same file scrubs
+# its context through `redact_json` precisely because this data is sensitive).
+#
+# Confirmed exploitable 2026-07-29 while reviewing `probe_inline_judge`, which
+# made it sharper still: that tool takes a CALLER-AUTHORED expression and
+# CALLER-AUTHORED data per request, and its crate docs assert outright that
+# nothing on the path is logged.
+#
+# A unit test cannot observe process stdout from inside the same process
+# without fd surgery, so this lint is the enforcement. Discard (`on_print`)
+# rather than `disable_symbol`: silencing keeps `print` a callable no-op, so an
+# expression that already contains one keeps evaluating to the same verdict,
+# where disabling turns it into a PARSE ERROR and breaks a working stored
+# expression on deploy. Opt-out: `// allow-rhai-stdout: <reason>`.
+RHAI_ENGINE_FILE="$ROOT/talos-engine/src/rhai_helpers.rs"
+if [ ! -f "$RHAI_ENGINE_FILE" ]; then
+    yellow "⚠ $RHAI_ENGINE_FILE not found — skipping Rhai stdout check"
+elif grep -q 'allow-rhai-stdout' "$RHAI_ENGINE_FILE"; then
+    yellow "⊘ Rhai stdout check bypassed by allow-rhai-stdout marker"
+elif grep -q 'engine.on_print(' "$RHAI_ENGINE_FILE" \
+        && grep -q 'engine.on_debug(' "$RHAI_ENGINE_FILE"; then
+    green "✓ the shared Rhai engine discards print/debug output"
+else
+    red "✗ talos-engine/src/rhai_helpers.rs does not install on_print + on_debug handlers"
+    yellow "  → Engine::new()'s defaults println! to stdout, so a workflow expression"
+    yellow "    containing print(ctx) writes the whole node input to the container log."
+    yellow "  → add 'engine.on_print(|_| {});' and 'engine.on_debug(|_, _, _| {});'"
+    yellow "    to the thread-local engine builder (NOT disable_symbol — that turns an"
+    yellow "    existing stored expression into a parse error)."
+    yellow "  → opt-out: '// allow-rhai-stdout: <reason>'."
+    EXIT_CODE=1
+fi
+echo
+
 # ── 54. Lint self-consistency (meta-check) ────────────────────────────
 # The system whose purpose is catching drift drifted from its own docs:
 # by 2026-07-01 the script had 49 checks while CLAUDE.md said 43 and the

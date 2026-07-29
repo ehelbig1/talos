@@ -3,7 +3,7 @@
 //!
 //! Covers the two new repository queries added for the `assistant_report`
 //! node: `ExecutionRepository::{record_judge_score, weekly_judge_scores}`
-//! (the judge-score insert + per-workflow aggregate) and
+//! (the judge-score insert + per-(workflow, judge node) aggregate) and
 //! `talos_ml::teacher_ceilings` (per-model teacher-audit ceiling read).
 //! Each runs against an isolated `CREATE DATABASE … TEMPLATE` clone so
 //! the binaries parallelise without shared-state cleanup.
@@ -159,12 +159,16 @@ async fn weekly_judge_scores_all_abstentions_reports_zero_scored_runs() {
     seed_user(&pool, user, "allna@quality.test").await;
     seed_workflow(&pool, wf, user, "pa-quiet-inbox").await;
 
+    // ONE judge, abstaining four times. The node id is now a grouping key
+    // (2026-07-29), so it must be held fixed — a fresh uuid per insert would
+    // describe four different judges that abstained once each.
+    let node = Uuid::new_v4();
     for _ in 0..4 {
         let mut conn = pool.acquire().await.expect("acquire");
         ExecutionRepository::record_judge_score(
             &mut conn,
             wf,
-            Uuid::new_v4(),
+            node,
             Uuid::new_v4(),
             1.0,
             true,
@@ -248,6 +252,134 @@ async fn weekly_judge_scores_is_tenant_scoped() {
     );
     let b_stats = repo.weekly_judge_scores(user_b, 7).await.expect("b stats");
     assert_eq!(b_stats.len(), 1);
+}
+
+/// D4 (2026-07-29): the aggregate's grain is `(workflow, judge NODE)`.
+///
+/// Both inbox organizers run TWO judges — a rubric `judge` and a structural
+/// `coverage_judge`. Grouping by workflow name alone pooled them into one
+/// trend, so a saturated shape-check that never fails hid inside a
+/// discriminating rubric's spread and the digest's `saturated_pass` flag
+/// could never fire for it. Dropping `node_id` from the GROUP BY collapses
+/// these two rows back into one and fails here.
+#[tokio::test]
+async fn weekly_judge_scores_are_per_judge_not_per_workflow() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let repo = ExecutionRepository::new(pool.clone());
+
+    let user = Uuid::new_v4();
+    let wf = Uuid::new_v4();
+    let rubric_judge = Uuid::new_v4();
+    let coverage_judge = Uuid::new_v4();
+    seed_user(&pool, user, "twojudges@quality.test").await;
+    seed_workflow(&pool, wf, user, "pa-inbox-organizer-work").await;
+
+    // The rubric judge discriminates: 0.9 pass, 0.3 fail, plus an abstention.
+    // The coverage judge is saturated: 1.0 pass, twice.
+    let rows: [(Uuid, f64, bool, bool); 5] = [
+        (rubric_judge, 0.9, true, false),
+        (rubric_judge, 0.3, false, false),
+        (rubric_judge, 1.0, true, true),
+        (coverage_judge, 1.0, true, false),
+        (coverage_judge, 1.0, true, false),
+    ];
+    for (node, score, passed, na) in rows {
+        let mut conn = pool.acquire().await.expect("acquire");
+        ExecutionRepository::record_judge_score(
+            &mut conn,
+            wf,
+            node,
+            Uuid::new_v4(),
+            score,
+            passed,
+            na,
+        )
+        .await
+        .expect("insert judge score");
+    }
+
+    let stats = repo.weekly_judge_scores(user, 7).await.expect("stats");
+    assert_eq!(stats.len(), 2, "one row PER JUDGE, not per workflow");
+    for s in &stats {
+        assert_eq!(s.workflow_name, "pa-inbox-organizer-work");
+        assert_eq!(s.workflow_id, wf, "the row must carry its workflow id");
+    }
+
+    let rubric = stats
+        .iter()
+        .find(|s| s.node_id == rubric_judge)
+        .expect("rubric judge row");
+    let coverage = stats
+        .iter()
+        .find(|s| s.node_id == coverage_judge)
+        .expect("coverage judge row");
+
+    // FILTER semantics hold PER ROW: the abstention is excluded from the
+    // rubric judge's aggregates and counted only in its own `na_runs`.
+    assert_eq!(rubric.runs, 2, "scored verdicts only");
+    assert_eq!(rubric.na_runs, 1, "abstention counted on ITS judge");
+    assert_eq!(rubric.worst_score, Some(0.3));
+    assert!((rubric.avg_score.expect("avg") - 0.6).abs() < 1e-9);
+    assert!((rubric.pass_rate.expect("rate") - 0.5).abs() < 1e-9);
+
+    // The saturated judge is now visible AS saturated — pooled with the
+    // rubric judge its spread would have been 0.3..1.0 and read as healthy.
+    assert_eq!(coverage.runs, 2);
+    assert_eq!(
+        coverage.na_runs, 0,
+        "abstentions do not bleed across judges"
+    );
+    assert_eq!(coverage.avg_score, Some(1.0));
+    assert_eq!(coverage.worst_score, Some(1.0));
+    // Zero spread — `avg == worst` is the exact test `judge_signal` applies.
+    // Pooled with the rubric judge the spread would have been 0.3..1.0 and
+    // read as healthy, so this row could never have been flagged.
+    assert_eq!(
+        coverage.avg_score, coverage.worst_score,
+        "the saturated judge's spread is only visible on its OWN row"
+    );
+    assert_ne!(
+        rubric.avg_score, rubric.worst_score,
+        "the rubric judge genuinely varies"
+    );
+}
+
+/// Two DIFFERENT workflows that share a name are also no longer pooled —
+/// the old `GROUP BY w.name` merged them into one trend.
+#[tokio::test]
+async fn weekly_judge_scores_do_not_pool_same_named_workflows() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let repo = ExecutionRepository::new(pool.clone());
+
+    let user = Uuid::new_v4();
+    let wf_a = Uuid::new_v4();
+    let wf_b = Uuid::new_v4();
+    seed_user(&pool, user, "samename@quality.test").await;
+    seed_workflow(&pool, wf_a, user, "pa-recall").await;
+    seed_workflow(&pool, wf_b, user, "pa-recall").await;
+
+    for wf in [wf_a, wf_b] {
+        let mut conn = pool.acquire().await.expect("acquire");
+        ExecutionRepository::record_judge_score(
+            &mut conn,
+            wf,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            0.5,
+            true,
+            false,
+        )
+        .await
+        .expect("insert");
+    }
+
+    let stats = repo.weekly_judge_scores(user, 7).await.expect("stats");
+    assert_eq!(stats.len(), 2, "same name, different workflows, two rows");
+    let mut ids: Vec<Uuid> = stats.iter().map(|s| s.workflow_id).collect();
+    ids.sort();
+    let mut expected = vec![wf_a, wf_b];
+    expected.sort();
+    assert_eq!(ids, expected);
 }
 
 #[tokio::test]
