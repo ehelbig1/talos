@@ -45,6 +45,24 @@
 //! like the synthetic ones — see [`SYNTHETIC_INPUT_NOTE`], which every
 //! outcome carries.
 //!
+//! Two more ways a probe could be confidently wrong, both closed explicitly
+//! rather than left to the reader:
+//!
+//! * A rejection is only counted toward [`ProbeSummary::can_fail`] when the
+//!   RUBRIC produced it. An expression that fails to evaluate, or that returns
+//!   something which is not a verdict at all (the commonest authoring mistake:
+//!   writing the bare condition `covered >= total` as the whole
+//!   `verdict_expr`), rejects EVERY input — reporting that as "this judge can
+//!   fail" would certify a node that fails 100% of production runs. Those land
+//!   in [`ProbeSummary::eval_errors`] and
+//!   [`ProbeSummary::verdictless_rejections`] instead.
+//! * A parent whose node label is `ctx` or `inputs` is bound and then
+//!   OVERWRITTEN by the evaluator's own bindings, so it is unreachable from
+//!   the expression. Such keys are reported as `shadowed_scope_keys` — see
+//!   [`RESERVED_SCOPE_NAMES`] — because listing a variable as available when
+//!   the engine has overwritten it is precisely the class of trap this tool
+//!   exists to diagnose.
+//!
 //! # DLP
 //!
 //! Case inputs, the expression text, and verdict reasoning/feedback are
@@ -71,6 +89,17 @@ use talos_workflow_engine_core::SystemNodeKind;
 /// cap exists to bound the RESPONSE, which echoes every case's bound scope
 /// and envelope back to the caller.
 pub const MAX_CASES: usize = 20;
+
+/// Scope names the evaluator binds ITSELF, after the parent keys.
+///
+/// `talos_engine::rhai_helpers::evaluate_expression` pushes every top-level
+/// key of the bound input, then pushes `ctx` and `inputs` (both the whole
+/// context). Rhai resolves a name to the LAST binding, so a parent whose node
+/// label is one of these is unreachable from the expression — reading `ctx`
+/// yields the context object, not that parent's output. Reported per case as
+/// `shadowed_scope_keys` so the probe never lists a variable as available
+/// when the engine has overwritten it.
+pub const RESERVED_SCOPE_NAMES: [&str; 2] = ["ctx", "inputs"];
 
 /// The honesty disclosure attached to every outcome.
 ///
@@ -262,6 +291,10 @@ pub struct CaseOutcome {
     /// expression can actually reference. The single highest-signal field
     /// when an expression silently reads an unbound variable.
     pub scope_keys: Vec<String>,
+    /// Keys from [`Self::scope_keys`] that the evaluator OVERWRITES with its
+    /// own bindings, so reading them does not yield the parent's output. See
+    /// [`RESERVED_SCOPE_NAMES`].
+    pub shadowed_scope_keys: Vec<String>,
     /// Raw value the expression returned, before verdict parsing. `None`
     /// when evaluation failed.
     pub raw_verdict: Option<JsonValue>,
@@ -281,6 +314,13 @@ pub struct CaseOutcome {
     /// expression returning a non-object (e.g. a bare `true`) scores 4 here
     /// and routes as a REJECTION — it does not error.
     pub malformed_field_count: u8,
+    /// The returned value carried a usable `score` OR `passed` field — i.e.
+    /// the rejection/pass below is the RUBRIC's opinion rather than the
+    /// engine's default. `false` means the expression returned something that
+    /// is not a verdict at all (a bare `true`, a number, `()`), which the
+    /// engine rejects unconditionally on every input. See
+    /// [`ProbeSummary::can_fail`].
+    pub verdict_present: bool,
     /// The branch production would take.
     pub branch: Branch,
     /// Set when the expression itself failed (syntax error, unbound
@@ -299,6 +339,7 @@ impl CaseOutcome {
             "name": self.name,
             "bound_scope_source": self.scope_source.as_str(),
             "bound_scope_keys": self.scope_keys,
+            "shadowed_scope_keys": self.shadowed_scope_keys,
             "raw_verdict": self.raw_verdict,
             "score": self.score,
             "passed_raw": self.passed_raw,
@@ -306,6 +347,7 @@ impl CaseOutcome {
             "passed_effective": self.passed_effective,
             "not_applicable": self.not_applicable,
             "malformed_field_count": self.malformed_field_count,
+            "verdict_present": self.verdict_present,
             "branch": self.branch.as_str(),
             "eval_error": self.eval_error,
             "envelope": self.envelope,
@@ -319,8 +361,26 @@ pub struct ProbeSummary {
     /// Cases run.
     pub cases: usize,
     /// At least one case produced a REJECTING verdict — the judge is a gate,
-    /// not a shape check. Expression failures do NOT count: a broken
-    /// expression rejects everything and proves nothing about the rubric.
+    /// not a shape check.
+    ///
+    /// Two kinds of rejection are excluded, because both reject EVERY input
+    /// and so demonstrate nothing about the rubric:
+    /// * expression failures ([`Self::eval_errors`]) — the expression never
+    ///   produced a verdict;
+    /// * verdict-less results ([`Self::verdictless_rejections`]) — the
+    ///   expression evaluated fine but returned something that is not a
+    ///   verdict, so `passed` DEFAULTED to false.
+    ///
+    /// The second exclusion matters most for the commonest authoring mistake
+    /// there is: writing the condition itself (`covered >= total`) as the
+    /// whole `verdict_expr`. That returns a bare bool, which
+    /// [`JudgeVerdict::from_collapsed`] scores 0.0 / not-passed with four
+    /// malformed fields — so every case "rejects" and a naive `can_fail`
+    /// would certify a judge that fails 100% of production runs as "a real
+    /// gate". Being confidently wrong in the operator's favour is worse here
+    /// than saying nothing.
+    ///
+    /// [`JudgeVerdict::from_collapsed`]: talos_workflow_engine::JudgeVerdict::from_collapsed
     pub can_fail: bool,
     /// At least one case abstained (`not_applicable: true`).
     pub can_abstain: bool,
@@ -330,6 +390,12 @@ pub struct ProbeSummary {
     /// Cases where the expression failed to evaluate. Non-zero means the
     /// node is erroring in production too, for any input of that shape.
     pub eval_errors: usize,
+    /// Cases the engine rejected on a value that carried NO verdict — no
+    /// usable `score`, no usable `passed`. Non-zero means the expression is
+    /// not returning a verdict map at all, so the node rejects every run
+    /// regardless of input. Excluded from [`Self::can_fail`]; reported
+    /// separately because it is a DIFFERENT repair from a weak rubric.
+    pub verdictless_rejections: usize,
 }
 
 impl ProbeSummary {
@@ -342,6 +408,7 @@ impl ProbeSummary {
             "can_abstain": self.can_abstain,
             "all_pass": self.all_pass,
             "eval_errors": self.eval_errors,
+            "verdictless_rejections": self.verdictless_rejections,
         })
     }
 }
@@ -822,13 +889,22 @@ fn evaluate_case(
     pass_threshold: Option<f64>,
     on_failure: &str,
 ) -> CaseOutcome {
-    // Exactly the variable names `evaluate_expression` will push into scope
-    // (it also pushes `ctx` / `inputs`, which are always present and so carry
-    // no diagnostic signal).
+    // Exactly the variable names `evaluate_expression` will push into scope.
     let scope_keys: Vec<String> = parent_inputs
         .as_object()
         .map(|m| m.keys().cloned().collect())
         .unwrap_or_default();
+    // ...except that the evaluator pushes `ctx` / `inputs` AFTER the parent
+    // keys, and Rhai resolves a name to the LAST binding. A parent labelled
+    // `ctx` is therefore invisible: `ctx.field` reads the whole context, not
+    // that parent. Reporting such a key as available without qualification
+    // would be a diagnostic lie in the one tool whose job is diagnosing
+    // scope-binding traps.
+    let shadowed_scope_keys: Vec<String> = scope_keys
+        .iter()
+        .filter(|k| RESERVED_SCOPE_NAMES.contains(&k.as_str()))
+        .cloned()
+        .collect();
 
     // Production limits BY REUSE — 1000 operations, 16 call levels, no
     // `eval`, no module resolver, and the same HTML-entity decode the
@@ -847,6 +923,7 @@ fn evaluate_case(
                 name: name.to_string(),
                 scope_source,
                 scope_keys,
+                shadowed_scope_keys,
                 raw_verdict: None,
                 score: 0.0,
                 passed_raw: false,
@@ -854,6 +931,7 @@ fn evaluate_case(
                 passed_effective: false,
                 not_applicable: false,
                 malformed_field_count: 0,
+                verdict_present: false,
                 branch: Branch::Error,
                 eval_error: Some(e),
                 envelope,
@@ -896,6 +974,8 @@ fn evaluate_case(
         name: name.to_string(),
         scope_source,
         scope_keys,
+        shadowed_scope_keys,
+        verdict_present: carries_a_verdict(&raw_verdict),
         raw_verdict: Some(raw_verdict),
         score,
         passed_raw,
@@ -909,18 +989,39 @@ fn evaluate_case(
     }
 }
 
+/// Did the expression's result actually CARRY a verdict, or did
+/// [`JudgeVerdict::from_collapsed`] have to default the whole thing?
+///
+/// The two accessor chains are the same ones `from_collapsed` applies to
+/// `score` and `passed` — the one place this crate reads a verdict directly
+/// rather than through the engine. It is confined to these two lines, and
+/// `verdict_presence_matches_from_collapsed` cross-checks it against the real
+/// parse so a change to either accessor fails a test rather than silently
+/// re-arming the false `can_fail`.
+///
+/// [`JudgeVerdict::from_collapsed`]: talos_workflow_engine::JudgeVerdict::from_collapsed
+fn carries_a_verdict(raw: &JsonValue) -> bool {
+    raw.get("score").and_then(JsonValue::as_f64).is_some()
+        || raw.get("passed").and_then(JsonValue::as_bool).is_some()
+}
+
 fn summarize(cases: &[CaseOutcome]) -> ProbeSummary {
+    // A rejection counts as evidence only when the RUBRIC produced it: the
+    // expression evaluated (no `eval_error`) AND returned something with a
+    // usable `score`/`passed`. Both exclusions describe expressions that
+    // reject every possible input, which is the opposite of a working gate.
+    let rejected_by_rubric =
+        |c: &&CaseOutcome| c.eval_error.is_none() && c.verdict_present && !c.passed_effective;
     ProbeSummary {
         cases: cases.len(),
-        // A rejecting VERDICT only. An expression that blew up rejects
-        // everything for the wrong reason; counting it would let a broken
-        // judge certify itself as a working gate.
-        can_fail: cases
-            .iter()
-            .any(|c| c.eval_error.is_none() && !c.passed_effective),
+        can_fail: cases.iter().any(|c| rejected_by_rubric(&c)),
         can_abstain: cases.iter().any(|c| c.not_applicable),
         all_pass: cases.iter().all(|c| c.passed_effective),
         eval_errors: cases.iter().filter(|c| c.eval_error.is_some()).count(),
+        verdictless_rejections: cases
+            .iter()
+            .filter(|c| c.eval_error.is_none() && !c.verdict_present && !c.passed_effective)
+            .count(),
     }
 }
 

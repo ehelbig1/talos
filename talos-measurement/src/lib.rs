@@ -47,7 +47,7 @@ use std::fmt;
 /// Population disclosure for every judge-score aggregate we render.
 ///
 /// Consolidates two byte-identical hand-copies (D5): the operator digest's
-/// per-workflow judge block and the assistant report reader's `judge_scores`
+/// per-judge judge block and the assistant report reader's `judge_scores`
 /// block. Both now re-import this constant, so the sentence can never drift
 /// away from the `FILTER (WHERE NOT not_applicable)` it describes.
 ///

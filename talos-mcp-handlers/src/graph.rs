@@ -1342,7 +1342,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "probe_inline_judge",
-            "description": "Calibrate an inline-judge node: prove it CAN reject something, WITHOUT running the workflow. Read-only — no execution row, no module runs, no writes. This is the tool the operator digest points at when it flags a judge as 'saturated_pass' (every run scored 1.0, so the judge may be a shape check that cannot fail). Give it synthetic parent inputs — one case that SHOULD fail, one that should pass, one empty/no-op case if the judge abstains — and it replays the engine's real pipeline: the same arity binding, the same Rhai sandbox (1000 operations, no eval), the same verdict parse, the same pass/passthrough/error branch. Per case you get score, passed_raw vs passed_effective (after pass_threshold), not_applicable, malformed_field_count, the branch, and the exact envelope the node would forward. The summary's can_fail answers the saturation question in one field. THE ARITY TRAP, which is the most common cause of a judge that cannot fail: a judge with exactly ONE parent receives that parent's output UNWRAPPED (its top-level fields are the bare scope variables), while a judge with TWO OR MORE receives an object KEYED BY NODE LABEL (the labels are the variables). An expression like `classify.classifications.len() > 0` is correct in the second case and an unbound variable in the first. Supply cases in the matching shape — 'input' for a single-parent judge, 'parents' for a multi-parent one — and the tool rejects a mismatch by naming the node's real parents. HONESTY: this evaluates the expression against SYNTHETIC inputs. A rejecting case proves the expression CAN fail; it does not prove production inputs ever exercise that branch. For a sub-workflow judge (add_judge_node) use test_subworkflow_contract instead.",
+            "description": "Calibrate an inline-judge node: prove it CAN reject something, WITHOUT running the workflow. Read-only — no execution row, no module runs, no writes. This is the tool the operator digest points at when it flags a judge as 'saturated_pass' (every run scored 1.0, so the judge may be a shape check that cannot fail). Give it synthetic parent inputs — one case that SHOULD fail, one that should pass, one empty/no-op case if the judge abstains — and it replays the engine's real pipeline: the same arity binding, the same Rhai sandbox (1000 operations, no eval), the same verdict parse, the same pass/passthrough/error branch. Per case you get score, passed_raw vs passed_effective (after pass_threshold), not_applicable, malformed_field_count, the branch, and the exact envelope the node would forward. The summary's can_fail answers the saturation question in one field. THE ARITY TRAP, which is the most common cause of a judge that cannot fail: a judge with exactly ONE parent receives that parent's output UNWRAPPED (its top-level fields are the bare scope variables), while a judge with TWO OR MORE receives an object KEYED BY NODE LABEL (the labels are the variables). An expression like `classify.classifications.len() > 0` is correct in the second case and an unbound variable in the first. Supply cases in the matching shape — 'input' for a single-parent judge, 'parents' for a multi-parent one — and the tool rejects a mismatch by naming the node's real parents. THE OTHER COMMON TRAP: the verdict_expr must RETURN a verdict map #{score, passed, reasoning, feedback} — writing the bare condition (`covered >= total`) as the whole expression evaluates fine but carries no verdict, so `passed` defaults to false and the node rejects EVERY run; those cases are reported as verdictless_rejections and deliberately do NOT count toward can_fail. HONESTY: this evaluates the expression against SYNTHETIC inputs. A rejecting case proves the expression CAN fail; it does not prove production inputs ever exercise that branch. For a sub-workflow judge (add_judge_node) use test_subworkflow_contract instead.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5371,11 +5371,24 @@ async fn handle_probe_inline_judge(
     match state.judge_probe_service.probe(user_id, &input).await {
         Ok(outcome) => {
             let s = outcome.summary;
+            // Order matters: both "broken" verdicts are reported BEFORE
+            // `can_fail`, because each of them rejects every possible input.
+            // Leading with "this judge CAN reject" for an expression that
+            // rejects unconditionally would be the misleading-report class
+            // this tool exists to catch.
             let headline = if s.eval_errors > 0 {
                 format!(
                     "{}/{} cases could not be evaluated at all — the expression is failing, not \
                      judging.",
                     s.eval_errors, s.cases
+                )
+            } else if s.verdictless_rejections > 0 && !s.can_fail {
+                format!(
+                    "{}/{} cases were rejected on a value that is NOT a verdict — no usable \
+                     score/passed field, so `passed` defaulted to false. This node rejects EVERY \
+                     input, in production too. The expression must return \
+                     #{{score, passed, reasoning, feedback}}, not the bare condition.",
+                    s.verdictless_rejections, s.cases
                 )
             } else if s.can_fail {
                 "This judge CAN reject — it is a real gate, not a shape check.".to_string()

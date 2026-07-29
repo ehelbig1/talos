@@ -308,6 +308,139 @@ fn non_object_verdict_is_malformed_four_and_routes_as_rejection() {
     assert!(!c.passed_effective);
     assert_eq!(c.branch, Branch::Error);
     assert_eq!(c.envelope["__error"], json!(true));
+    assert!(!c.verdict_present, "a bare bool carries no verdict");
+}
+
+/// The commonest authoring mistake: writing the CONDITION as the whole
+/// `verdict_expr`. It evaluates fine, rejects every input, and would be
+/// certified as "a real gate" by a `can_fail` that only looked at
+/// `passed_effective` — the exact misleading-report class this tool exists to
+/// catch, pointed at the tool itself.
+#[test]
+fn a_bare_condition_expression_rejects_everything_and_is_not_can_fail() {
+    let g = single_parent_graph("covered >= total", None, "error");
+    let out = probe_graph(
+        &g,
+        &input(
+            "coverage_judge",
+            vec![
+                case("full", json!({ "covered": 5, "total": 5 })),
+                case("under", json!({ "covered": 1, "total": 5 })),
+            ],
+        ),
+    )
+    .expect("probe runs");
+
+    // BOTH cases reject — including the one that should obviously pass.
+    assert_eq!(out.cases[0].raw_verdict, Some(json!(true)));
+    assert!(!out.cases[0].passed_effective, "even `true` rejects");
+    assert!(!out.cases[1].passed_effective);
+    for c in &out.cases {
+        assert_eq!(c.eval_error, None, "the expression itself is fine");
+        assert!(!c.verdict_present);
+    }
+
+    assert!(
+        !out.summary.can_fail,
+        "rejecting EVERY input is not evidence the rubric discriminates"
+    );
+    assert_eq!(out.summary.verdictless_rejections, 2, "counted separately");
+    assert_eq!(out.summary.eval_errors, 0, "not an evaluation failure");
+    assert!(!out.summary.all_pass);
+}
+
+/// A rejection with SOME malformed fields is still a real rubric rejection —
+/// the exclusion must key on "carried no verdict", not on "malformed at all".
+#[test]
+fn a_partially_malformed_but_real_rejection_still_counts_as_can_fail() {
+    // No `reasoning`, no `feedback` → malformed 2, but `passed` is genuine.
+    let g = single_parent_graph("#{ score: 0.2, passed: false }", None, "error");
+    let out =
+        probe_graph(&g, &input("coverage_judge", vec![case("x", json!({}))])).expect("probe runs");
+    assert_eq!(out.cases[0].malformed_field_count, 2);
+    assert!(out.cases[0].verdict_present);
+    assert!(out.summary.can_fail, "the rubric really did reject");
+    assert_eq!(out.summary.verdictless_rejections, 0);
+}
+
+/// `carries_a_verdict` reads the verdict directly — the one spot in this
+/// crate that does. Cross-check it against the real parse so a change to
+/// `from_collapsed`'s accessors fails here instead of silently re-arming the
+/// false `can_fail`.
+#[test]
+fn verdict_presence_matches_from_collapsed() {
+    // Carries nothing usable → `from_collapsed` defaults BOTH gate fields.
+    for v in [
+        json!(true),
+        json!(42),
+        json!("verdict"),
+        json!([1, 2]),
+        json!({}),
+        json!(null),
+        json!({ "reasoning": "why", "feedback": "fix" }),
+        json!({ "score": "0.5", "passed": "true" }), // present but wrong-typed
+    ] {
+        assert!(!carries_a_verdict(&v), "{v}");
+        let parsed = JudgeVerdict::from_collapsed(&v);
+        assert_eq!(parsed.score, 0.0, "{v}");
+        assert!(!parsed.passed, "{v}");
+        assert!(parsed.malformed_field_count >= 2, "{v}");
+    }
+    // Carries at least one → the parse reflects the input, not a default.
+    assert!(carries_a_verdict(&json!({ "score": 0.75 })));
+    assert!((JudgeVerdict::from_collapsed(&json!({ "score": 0.75 })).score - 0.75).abs() < 1e-9);
+    assert!(carries_a_verdict(&json!({ "passed": true })));
+    assert!(JudgeVerdict::from_collapsed(&json!({ "passed": true })).passed);
+}
+
+/// The evaluator pushes `ctx` / `inputs` AFTER the parent keys, so a parent
+/// LABELLED `ctx` is shadowed — `ctx.field` reads the whole context, not that
+/// parent. Production does the same thing (the envelope assert pins it); what
+/// must not happen is the probe listing `ctx` as a usable variable, since
+/// diagnosing exactly this class of trap is the tool's job.
+#[test]
+fn a_parent_labelled_ctx_is_reported_as_shadowed() {
+    let expr =
+        r#"#{ score: 1.0, passed: ctx.marker == "from_parent", reasoning: "", feedback: "" }"#;
+    let g = json!({
+        "nodes": [
+            { "id": "ctx", "type": MODULE, "data": {} },
+            { "id": "other", "type": MODULE, "data": {} },
+            { "id": "j", "type": "system:inline_judge", "kind": "inline_judge",
+              "data": { "verdict_expr": expr, "on_failure": "error" } },
+        ],
+        "edges": [ { "source": "ctx", "target": "j" }, { "source": "other", "target": "j" } ],
+    })
+    .to_string();
+    let bound = json!({ "ctx": { "marker": "from_parent" }, "other": { "x": 1 } });
+    let out =
+        probe_graph(&g, &input("j", vec![parents_case("c", bound.clone())])).expect("probe runs");
+    let c = &out.cases[0];
+
+    assert!(c.scope_keys.contains(&"ctx".to_string()));
+    assert_eq!(
+        c.shadowed_scope_keys,
+        vec!["ctx".to_string()],
+        "the key is bound but unreachable — say so"
+    );
+    assert!(
+        !c.passed_effective,
+        "`ctx.marker` reads the context object, not the parent"
+    );
+    // ...and the engine agrees, which is why the probe reports rather than
+    // "fixes" the collision.
+    let mut engine = ParallelWorkflowEngine::new();
+    engine.set_expression_evaluator(Arc::new(
+        talos_engine::expression_evaluator::RhaiEvaluator::new(),
+    ));
+    assert_eq!(
+        c.envelope,
+        engine.dispatch_inline_judge(bound, expr, None, "error")
+    );
+    assert!(
+        RESERVED_SCOPE_NAMES.contains(&"inputs"),
+        "the sibling reserved name is covered by the same rule"
+    );
 }
 
 #[test]

@@ -126,6 +126,12 @@ pub struct JudgeScoreStat {
     /// The judge NODE, as the engine recorded it. This is the engine node
     /// UUID (`gather_inputs`' key), which `probe_inline_judge` accepts
     /// directly as its `node_id`.
+    ///
+    /// **Not globally unique.** The engine derives it from the graph's
+    /// React-Flow node id (`Uuid::parse_str(rf_id)` or `sha256(rf_id)[..16]`),
+    /// so every workflow whose judge node is labelled `judge` carries the
+    /// SAME value — observed live across five workflows. Always key a row on
+    /// `(workflow_id, node_id)`; `node_id` alone identifies nothing.
     pub node_id: Uuid,
     pub workflow_name: String,
     /// SCORED verdicts in the window (abstentions excluded).
@@ -1352,7 +1358,19 @@ impl ExecutionRepository {
     /// workflows sharing a name. Renderers therefore emit one row PER JUDGE
     /// and must carry `node_id`, or two rows with the same `name` become
     /// indistinguishable. The `LIMIT 50` is unchanged and now bounds judges
-    /// rather than workflows.
+    /// rather than workflows — a user running more than 50 judges in the
+    /// window loses the lowest-volume ones from the report, silently. That is
+    /// the pre-existing behaviour of the cap, just reached sooner; revisit it
+    /// with a `truncated` marker if a real deployment approaches 50.
+    ///
+    /// **`node_id` is NOT globally unique** — it is derived from the graph's
+    /// React-Flow node id, so every workflow with a node labelled `judge`
+    /// shares one (observed live: a single `node_id` across five workflows).
+    /// The identity of a row is therefore the PAIR, which is why both ids are
+    /// returned and why the ORDER BY carries `js.workflow_id` before
+    /// `js.node_id` — without it the sort key is not unique and the row that
+    /// falls off the `LIMIT` could differ between two runs over identical
+    /// data (check 28 / check 60's rule, in the GROUP BY path).
     ///
     /// **Abstentions are excluded structurally.** Every quality aggregate
     /// carries `FILTER (WHERE NOT js.not_applicable)`, so `runs` /
@@ -1387,7 +1405,8 @@ impl ExecutionRepository {
              WHERE w.user_id = $1 \
                AND js.created_at > NOW() - make_interval(days => $2::int) \
              GROUP BY js.workflow_id, js.node_id, w.name \
-             ORDER BY runs DESC, na_runs DESC, w.name, js.node_id LIMIT 50",
+             ORDER BY runs DESC, na_runs DESC, w.name, js.workflow_id, js.node_id \
+             LIMIT 50",
         )
         .bind(user_id)
         .bind(days)

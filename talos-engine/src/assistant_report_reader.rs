@@ -72,7 +72,9 @@ impl talos_workflow_engine_core::AssistantReportReader for PostgresAssistantRepo
         // model has been audited yet.
         let teacher_audits = talos_ml::teacher_ceilings(&self.pool, user_id).await?;
 
-        // Observe-only judge scores per workflow over the window, recorded
+        // Observe-only judge scores per (workflow, judge NODE) over the
+        // window — one entry per judge since 2026-07-29, so a workflow with
+        // two judges emits two — recorded
         // at evaluation time into the unencrypted `judge_scores` table
         // (the node outputs they come from are encrypted at rest). Empty
         // when no judged workflow ran in the window.

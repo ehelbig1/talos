@@ -3,7 +3,7 @@
 //!
 //! Covers the two new repository queries added for the `assistant_report`
 //! node: `ExecutionRepository::{record_judge_score, weekly_judge_scores}`
-//! (the judge-score insert + per-workflow aggregate) and
+//! (the judge-score insert + per-(workflow, judge node) aggregate) and
 //! `talos_ml::teacher_ceilings` (per-model teacher-audit ceiling read).
 //! Each runs against an isolated `CREATE DATABASE … TEMPLATE` clone so
 //! the binaries parallelise without shared-state cleanup.

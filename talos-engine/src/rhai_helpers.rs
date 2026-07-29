@@ -64,6 +64,24 @@ thread_local! {
         // time. Engine::new() sets no resolver by default; this makes the intent
         // explicit and guards against future Engine::new() behaviour changes.
         engine.set_module_resolver(rhai::module_resolvers::DummyModuleResolver);
+        // DLP: `Engine::new()` installs `print`/`debug` handlers that
+        // `println!` to STDOUT — the same stream `tracing`'s `fmt::layer()`
+        // writes to, so anything they emit lands in the controller's container
+        // logs. Every scope variable here is upstream-node output: post-
+        // interpolation secrets, email bodies, whatever the workflow carries.
+        // A stored `verdict_expr` / `skip_condition` of
+        // `print(ctx); #{...}` therefore dumps the whole bound context to the
+        // log, defeating the DLP redaction every other persistence boundary
+        // applies (the one condition-eval WARN below scrubs its context
+        // through `redact_json` precisely because this data is sensitive).
+        //
+        // Discarded rather than `disable_symbol`ed: silencing keeps `print`
+        // a no-op unit call, so an expression that already contains one keeps
+        // evaluating to the same verdict. Disabling the symbol would turn it
+        // into a PARSE ERROR and change a working stored expression into a
+        // node failure on deploy.
+        engine.on_print(|_| {});
+        engine.on_debug(|_, _, _| {});
         engine
     };
 }
@@ -576,6 +594,40 @@ mod html_entity_decode_tests {
         let ctx = json!({ "error": { "code": 500, "msg": "fail" } });
         assert!(evaluate_condition("is_error", &ctx));
         assert_eq!(evaluate_condition_with_error("is_error", &ctx), Ok(true),);
+    }
+}
+
+/// The `print` / `debug` discard (2026-07-29).
+///
+/// `Engine::new()` wires both builtins to `println!`, i.e. straight to the
+/// controller's stdout and therefore its container logs. Every variable in
+/// scope here is upstream-node output, so a single `print(ctx)` in a stored
+/// expression exfiltrates the whole node input past every DLP boundary. The
+/// discard is installed in the thread-local engine above.
+///
+/// A unit test cannot observe process stdout from inside the same process
+/// without fd surgery, so what is pinned here is the OTHER half of the fix:
+/// silencing must not change evaluation semantics. `print`/`debug` remain
+/// callable and still return unit, so an expression that already contains
+/// one keeps producing the same verdict — which is exactly why the fix
+/// discards the output instead of `disable_symbol`ing the call into a parse
+/// error.
+#[cfg(test)]
+mod print_discard_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn print_and_debug_stay_callable_and_do_not_change_the_result() {
+        let ctx = json!({ "secret": "sk-not-a-real-key", "n": 3 });
+        // The value of the expression is the map, exactly as without the call.
+        let with_print = evaluate_expression(r#"print(secret); #{ n: n }"#, &ctx)
+            .expect("print must remain a callable no-op, not a parse error");
+        let without = evaluate_expression(r#"#{ n: n }"#, &ctx).expect("baseline");
+        assert_eq!(with_print, without);
+        assert!(evaluate_expression(r#"debug(ctx); #{ n: n }"#, &ctx).is_ok());
+        // And a condition carrying one still routes.
+        assert!(evaluate_condition(r#"print(secret); n > 2"#, &ctx));
     }
 }
 
