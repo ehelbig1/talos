@@ -30,10 +30,12 @@ pub const METRICS_PROVENANCE_NOTE: &str =
     "PROVENANCE: measured_at is when the eval finished scoring (carried from the run, not the \
      time you are reading this); dataset_rows is the number of LABELED rows in the dataset at \
      that moment — the population the holdout was drawn from, NOT the eval denominator, which is \
-     report.total; embedding_model is the embedding model whose vectors this eval scored (rows \
-     embedded by any other model were not loaded at all, so they are outside every number here). \
-     A key that is absent was NOT MEASURED — versions recorded before 2026-07-28 carry none of \
-     these three, and absence must never be rendered as 0 or as now().";
+     report.total; embedding_model is the embedding model that was active when this eval ran — \
+     the TRAIN side loaded ONLY rows embedded under it, so rows carrying another model's vector \
+     contributed no neighbours and no fit rows, while a holdout row with no usable vector \
+     abstains and counts as an error in report.total. A key that is absent was NOT MEASURED — \
+     versions recorded before 2026-07-28 carry none of these three, and absence must never be \
+     rendered as 0 or as now().";
 
 /// Everything one eval run contributes to its version row.
 ///
@@ -63,9 +65,13 @@ pub struct VersionMetricsInput<'a> {
     /// was drawn from). `None` when the caller could not count them — the key
     /// is then omitted rather than zeroed.
     pub dataset_rows: Option<i64>,
-    /// The embedding model whose vectors this eval scored — i.e.
-    /// `talos_memory::embedding::active_embedding_model()` read inside the
-    /// eval transaction, which is also the value the loaders filtered on.
+    /// The embedding model that was active when this eval ran — i.e.
+    /// `talos_memory::embedding::active_embedding_model()`, which is the value
+    /// the TRAIN-side loaders (`load_train_embeddings_with_source`,
+    /// `knn_search`) filtered on. It is process-cached (`OnceLock`), so it
+    /// cannot change under a running eval. Holdout rows are NOT filtered by it:
+    /// one carrying another model's vector is still scored, and one with no
+    /// vector abstains — either way it is inside `report.total`.
     /// `None` when embeddings are disabled.
     pub embedding_model: Option<String>,
 }

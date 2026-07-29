@@ -15,8 +15,16 @@ pub struct ModelVersionRow {
     pub backend: String,
     pub metrics_json: serde_json::Value,
     pub status: String,
-    /// When the row was written — i.e. when the eval that produced
-    /// `metrics_json` completed (RFC 3339).
+    /// When the eval that produced `metrics_json` was RECORDED (RFC 3339).
+    ///
+    /// Precisely: the recording transaction's timestamp — the column defaults
+    /// to `NOW()`, which in Postgres is the transaction START — and both eval
+    /// paths open that transaction before scoring. So it brackets the run from
+    /// below and can precede the scoring instant by the eval's duration. When
+    /// the exact instant matters, read `metrics_json.measured_at`, which the
+    /// runner stamps at completion (absent on versions written before
+    /// 2026-07-28 — which is why this column, present on every row since the
+    /// RFC-0011 migration, is the one the envelope carries).
     ///
     /// Added 2026-07-28 (measurement envelope, D1): the column has existed
     /// since the RFC-0011 migration, but every reader stripped it, so a model
@@ -226,9 +234,11 @@ impl ModelRegistry {
         .await
         .context("insert ml_model_version")?;
         let version: i32 = row.try_get("version")?;
-        // The DB's own write instant, returned by the INSERT — the same value
-        // every later reader of this row will see, so the card and the row
-        // can never disagree about when the eval landed.
+        // The recording transaction's timestamp, returned by the INSERT — the
+        // same value every later reader of this row will see, so the card and
+        // the row can never disagree about when the eval landed. (Not a clock
+        // read here: the DB stamped it, and it is read back rather than
+        // guessed.)
         let trained_at: chrono::DateTime<chrono::Utc> = row.try_get("trained_at")?;
         Ok(ModelVersionRow {
             id,
