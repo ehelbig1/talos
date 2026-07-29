@@ -21,6 +21,73 @@ use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
+/// How to read `summary.embedding_coverage_percent`, including its null.
+pub const EMBEDDING_COVERAGE_NOTE: &str =
+    "share of this user's counted workflows (denominator = summary.total_workflows) that have a \
+     semantic-search embedding, rounded to one decimal; null when there are no counted workflows \
+     — an empty platform has no coverage to report, and 100 would read as 'fully indexed'. \
+     Exactly 100 means EVERY counted workflow is embedded and exactly 0 means none are: a \
+     near-miss that would round onto an endpoint is held at 99.9 / 0.1 instead, so the number \
+     never contradicts unembedded_workflow_count";
+
+/// A share of a whole as a percentage, rounded to ONE decimal
+/// (half-away-from-zero), or `None` when there is no whole.
+///
+/// D4 (2026-07-29). Every percent in this crate was `part * 100 / whole` on
+/// `i64` — INTEGER division, which truncates toward zero. Two ways that
+/// misleads, both observed in this file:
+///   * `249 * 100 / 250` = `99`, not `99.6`. On a coverage metric an operator
+///     drives to 100, the truncation is systematically pessimistic and hides
+///     the last percent of progress.
+///   * `1 * 100 / 250` = `0`. A real, actionable gap renders as literally
+///     nothing, in a sentence that says "1 of 250" two words earlier.
+///
+/// `None` rather than `0` or `100` on a zero denominator: a share of an empty
+/// population is not a share, and both of the plausible defaults read as a
+/// verdict (`0` = "none of it", `100` = "all of it"). Same doctrine as
+/// [`talos_measurement::Measurement::rate`] and the digest's
+/// `failure_rate_24h_pct`.
+///
+/// Nonsense inputs (negative counts, `part > whole`) return `None` too —
+/// refused rather than clamped into a plausible-looking number.
+///
+/// **The endpoints are reserved for the exact cases.** Rounding to one decimal
+/// re-creates D4's own bug at the other end of the scale: `1999/2000` is
+/// 99.95%, which `format_percent` rounds to `100.0` — "fully indexed" printed
+/// beside `unembedded_workflow_count: 1`, the same self-contradicting sentence
+/// the `1 * 100 / 250 == 0` truncation produced. So a non-exact share that
+/// would land on an endpoint is held one step short (99.9 / 0.1). `100.0`
+/// therefore means EXACTLY all and `0.0` EXACTLY none, and the reader never
+/// has to reconcile the percent against the count beside it.
+#[must_use]
+pub fn share_pct(part: i64, whole: i64) -> Option<f64> {
+    if whole <= 0 || part < 0 || part > whole {
+        return None;
+    }
+    // `format_percent` is the platform's one percent-rounding contract (1
+    // decimal, JSON number) — reused rather than re-implemented so hygiene
+    // percents round exactly like every other percent surface.
+    let pct = talos_analytics_repository::format_percent((part as f64 / whole as f64) * 100.0);
+    Some(match pct {
+        p if p >= 100.0 && part < whole => 99.9,
+        p if p <= 0.0 && part > 0 => 0.1,
+        p => p,
+    })
+}
+
+/// Render a [`share_pct`] result for interpolation into operator prose.
+///
+/// An unmeasurable share renders as `"share unknown"`, never as `"0%"` — the
+/// string form has to carry the same refusal the number does, or the null is
+/// undone the moment it reaches a sentence.
+#[must_use]
+pub fn render_share_pct(pct: Option<f64>) -> String {
+    match pct {
+        Some(p) => format!("{p}%"),
+        None => "share unknown".to_string(),
+    }
+}
+
 /// Service-level errors. The `jsonrpc_code()` helper maps each variant
 /// to the stable JSON-RPC code the protocol wrapper emits.
 #[derive(Debug, Error)]
@@ -378,16 +445,21 @@ impl HygieneService {
         }
 
         if unembedded_count > 0 {
-            let pct = if total_workflow_count > 0 {
-                unembedded_count * 100 / total_workflow_count
-            } else {
-                0
-            };
+            // D4 (2026-07-29): honest rounding. `unembedded * 100 / total`
+            // is INTEGER division — 1 unembedded workflow out of 250 rendered
+            // "(0%) lack embeddings" directly beside "1 of 250", i.e. the
+            // sentence contradicted itself and the actionable number rounded
+            // away to nothing. `share_pct` rounds half-away-from-zero to one
+            // decimal, so that case reads 0.4%.
+            let pct = share_pct(unembedded_count, total_workflow_count);
             recommendations.push(serde_json::json!({
                 "priority": "medium",
                 "category": "semantic_search",
-                "action": format!("{} of {} workflows ({pct}%) lack embeddings — semantic search falls back to keyword matching for these. Run generate_workflow_embeddings to index them for true vector search.", unembedded_count, total_workflow_count),
+                "action": format!("{} of {} workflows ({}) lack embeddings — semantic search falls back to keyword matching for these. Run generate_workflow_embeddings to index them for true vector search.", unembedded_count, total_workflow_count, render_share_pct(pct)),
                 "affected_count": unembedded_count,
+                // The rendered share as a number, for a consumer that would
+                // otherwise re-parse it out of `action`.
+                "affected_share_pct": pct,
             }));
         }
 
@@ -726,9 +798,23 @@ impl HygieneService {
                 "suppressed_internal_test_workflows": suppressed_count,
                 "suppressed_low_score_count": suppressed_low_score_count,
                 "auto_classified_test_like_workflows": auto_classified_count,
-                "embedding_coverage_percent": if total_workflow_count > 0 {
-                    (total_workflow_count - unembedded_count) * 100 / total_workflow_count
-                } else { 100 },
+                // D4 (2026-07-29): two fixes on one line.
+                //   1. Integer division truncated TOWARD ZERO, so 249 of 250
+                //      embedded rendered 99 — and, worse, the truncation is
+                //      systematically pessimistic on a metric an operator
+                //      chases to 100. `share_pct` rounds to one decimal
+                //      (99.6), so the last workflow is visibly the last one.
+                //   2. The zero-workflow case claimed `100` — a coverage
+                //      verdict from an empty population, the exact
+                //      "0.0 reads as healthy" defect inverted. It is now
+                //      `null`: nothing to embed is not full coverage.
+                // Denominator is `total_workflow_count`, the same population
+                // `unembedded_workflow_count` is counted out of.
+                "embedding_coverage_percent": share_pct(
+                    total_workflow_count - unembedded_count,
+                    total_workflow_count,
+                ),
+                "embedding_coverage_note": EMBEDDING_COVERAGE_NOTE,
                 "note": note,
             },
             "stale_executions": stale_executions,
@@ -893,5 +979,96 @@ mod error_mapping_tests {
         ));
         assert_eq!(e.user_facing_message(), "Failed to generate hygiene report");
         assert!(!e.user_facing_message().contains("relation"));
+    }
+}
+
+#[cfg(test)]
+mod share_pct_tests {
+    use super::{render_share_pct, share_pct, EMBEDDING_COVERAGE_NOTE};
+
+    /// The two cases integer division got wrong, both from a 250-workflow
+    /// platform — the exact shape this crate reports on.
+    #[test]
+    fn integer_division_truncation_is_gone() {
+        // 249/250 embedded: was `99` (the pessimistic truncation an operator
+        // chasing 100% sees stall), now 99.6.
+        assert_eq!(share_pct(249, 250), Some(99.6));
+        // 1/250 unembedded: was `0` — a real gap rendering as nothing, in a
+        // sentence that says "1 of 250".
+        assert_eq!(share_pct(1, 250), Some(0.4));
+    }
+
+    /// Rounding is half-away-from-zero to ONE decimal, matching
+    /// `format_percent` — the platform's single percent contract.
+    #[test]
+    fn rounds_to_one_decimal_not_toward_zero() {
+        // 2/3 = 66.666…  → 66.7 (rounds UP; truncation gave 66).
+        assert_eq!(share_pct(2, 3), Some(66.7));
+        // 1/3 = 33.333…  → 33.3.
+        assert_eq!(share_pct(1, 3), Some(33.3));
+        // 1/8 = 12.5 exactly — no rounding to do.
+        assert_eq!(share_pct(1, 8), Some(12.5));
+    }
+
+    /// The endpoints stay exact: a full or empty share must not drift off
+    /// 100.0 / 0.0 through float noise.
+    #[test]
+    fn endpoints_are_exact() {
+        assert_eq!(share_pct(250, 250), Some(100.0));
+        assert_eq!(share_pct(0, 250), Some(0.0));
+    }
+
+    /// …and the endpoints are RESERVED for those exact cases. Rounding to one
+    /// decimal otherwise re-creates D4's own bug at the top of the scale:
+    /// 1999/2000 is 99.95%, which rounds to 100.0 — "fully indexed" printed
+    /// beside a nonzero `unembedded_workflow_count`, exactly the sentence that
+    /// contradicts itself.
+    #[test]
+    fn a_nonzero_gap_never_renders_as_a_hundred() {
+        assert_eq!(share_pct(1999, 2000), Some(99.9));
+        assert_eq!(share_pct(19_999, 20_000), Some(99.9));
+        // Symmetrically at the bottom: a real, single unembedded workflow out
+        // of 20 000 is not "none of them".
+        assert_eq!(share_pct(1, 20_000), Some(0.1));
+        // The step below each endpoint is untouched — the guard only fires on
+        // a value that ROUNDED onto the endpoint.
+        assert_eq!(share_pct(999, 1000), Some(99.9));
+        assert_eq!(share_pct(1, 1000), Some(0.1));
+    }
+
+    /// A share of an empty population is refused, in BOTH directions — the
+    /// pre-fix code answered `0` at one site and `100` at the other, and both
+    /// are verdicts drawn from nothing.
+    #[test]
+    fn zero_denominator_is_null_never_zero_and_never_a_hundred() {
+        assert_eq!(share_pct(0, 0), None);
+        assert_eq!(share_pct(5, 0), None);
+        assert_eq!(share_pct(0, -3), None);
+    }
+
+    /// Impossible inputs are refused rather than clamped into something
+    /// plausible.
+    #[test]
+    fn impossible_shares_are_refused() {
+        assert_eq!(share_pct(5, 4), None);
+        assert_eq!(share_pct(-1, 4), None);
+    }
+
+    /// The prose renderer must carry the refusal too — a null that becomes
+    /// "0%" the moment it reaches a sentence is not a null.
+    #[test]
+    fn rendered_prose_never_turns_an_unknown_share_into_zero_percent() {
+        assert_eq!(render_share_pct(Some(0.4)), "0.4%");
+        assert_eq!(render_share_pct(Some(100.0)), "100%");
+        assert_eq!(render_share_pct(None), "share unknown");
+        assert!(!render_share_pct(None).contains('%'));
+    }
+
+    #[test]
+    fn the_coverage_note_states_its_denominator_and_its_null() {
+        let n = EMBEDDING_COVERAGE_NOTE;
+        assert!(n.contains("summary.total_workflows"), "{n}");
+        assert!(n.contains("null when"), "{n}");
+        assert!(n.contains("one decimal"), "{n}");
     }
 }

@@ -48,6 +48,11 @@ up: ## Build + start the full dev stack, wait for health
 	    printf '\033[1;31m✗ no .env found.\033[0m Run `make setup` to generate one (or see QUICKSTART.md).\n'; \
 	    exit 1; \
 	}
+	@# Refuse to build onto a full Docker VM disk: Postgres PANICs on ENOSPC
+	@# mid-checkpoint and crash-loops (2026-07-29). Advisory unless >=95% —
+	@# skips silently when docker is unavailable. TALOS_UP_SKIP_DISK_CHECK=1
+	@# to override.
+	@bash scripts/preflight-disk.sh
 	@dirty="$$(git status --porcelain 2>/dev/null | head -5)"; \
 	 if [ -n "$$dirty" ]; then \
 	    printf '\033[1;33m⚠ working tree is DIRTY — images will be stamped `-dirty` and correspond to NO commit.\033[0m\n'; \

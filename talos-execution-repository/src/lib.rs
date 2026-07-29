@@ -80,6 +80,21 @@ pub struct ExecutionEvent {
     pub error_class: Option<String>,
 }
 
+/// Narrowest trailing window [`ExecutionRepository::weekly_judge_scores`]
+/// will query, whatever the caller asks for.
+pub const JUDGE_SCORE_MIN_WINDOW_DAYS: i32 = 1;
+
+/// Widest trailing window [`ExecutionRepository::weekly_judge_scores`] will
+/// query, whatever the caller asks for.
+///
+/// Named (rather than an inline literal) because the operator digest ECHOES
+/// its own clamped window onto every judge row it renders, so a row is only
+/// truthful while the digest's clamp is no wider than this one. See
+/// `talos_operator_digest::DIGEST_MAX_WINDOW_DAYS` and the
+/// `digest_window_never_exceeds_the_judge_query_window` test that pins the two
+/// together.
+pub const JUDGE_SCORE_MAX_WINDOW_DAYS: i32 = 31;
+
 /// Per-workflow aggregate of observe-only judge verdicts over a trailing
 /// window — the `judge_scores` section of the weekly assistant report.
 /// `avg_score` / `pass_rate` / `worst_score` are `Option` so a schema
@@ -1326,7 +1341,7 @@ impl ExecutionRepository {
         user_id: Uuid,
         days: i32,
     ) -> Result<Vec<JudgeScoreStat>> {
-        let days = days.clamp(1, 31);
+        let days = days.clamp(JUDGE_SCORE_MIN_WINDOW_DAYS, JUDGE_SCORE_MAX_WINDOW_DAYS);
         let rows = sqlx::query(
             "SELECT w.name AS workflow_name, \
                     (COUNT(*) FILTER (WHERE NOT js.not_applicable))::bigint AS runs, \

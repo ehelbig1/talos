@@ -5,6 +5,49 @@ use serde_json::Value;
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// How to read `stats_24h.rolling_success_rate_pct`, including what its
+/// absence means.
+///
+/// Shipped beside the number (D1, 2026-07-29) because the null it can now be
+/// is a DIFFERENT statement from the `0.0` it used to be, and a reader with no
+/// note reasonably assumes the old one.
+pub(crate) const ROLLING_SUCCESS_RATE_NOTE: &str =
+    "percentage of SCHEDULER-TRIGGERED terminal executions of this workflow in the last 24h that \
+     completed (denominator = stats_24h.total); null when that window has no terminal scheduled \
+     executions — a rate over zero runs has no value, and 0.0 would read as 'everything failed'. \
+     A null alongside a data_warnings entry that starts 'stats_24h unavailable' means the stats \
+     query FAILED and the zeros beside it are not authoritative; a null with no such entry (or \
+     with only the 'streak unavailable' one) means the schedule genuinely did not run. Exactly \
+     100 means EVERY run in the window succeeded and exactly 0 means none did: a near-miss that \
+     would round onto an endpoint is held at 99.9 / 0.1 so the rate never contradicts \
+     stats_24h.failed";
+
+/// The 24h scheduled-run success rate, or `None` when the window is empty.
+///
+/// Pure, so the null convention is pinned without a database. `total` is the
+/// count of terminal scheduled executions in the window; `succeeded` is the
+/// completed subset of exactly that population. Nonsense inputs (negative
+/// counts, `succeeded > total`) are refused rather than clamped — the same
+/// posture as [`talos_measurement::Measurement::rate`].
+///
+/// The endpoints are reserved for the exact cases: `format_percent` rounds to
+/// one decimal, so 1999-of-2000 successes would print `100.0` right beside
+/// `failed: 1`. A non-exact rate that would land on an endpoint is held one
+/// step short (99.9 / 0.1), so `100` means EVERY run succeeded and `0` means
+/// none did — the same guard `talos_hygiene_service::share_pct` applies.
+#[must_use]
+pub(crate) fn rolling_success_rate_pct(succeeded: i64, total: i64) -> Option<f64> {
+    if total <= 0 || succeeded < 0 || succeeded > total {
+        return None;
+    }
+    let pct = talos_analytics_repository::format_percent((succeeded as f64 / total as f64) * 100.0);
+    Some(match pct {
+        p if p >= 100.0 && succeeded < total => 99.9,
+        p if p <= 0.0 && succeeded > 0 => 0.1,
+        p => p,
+    })
+}
+
 /// Best-effort human description of a 5-field cron expression. Doesn't attempt
 /// to handle every conceivable expression — just calls out the common shapes
 /// so the response is self-evident for typical schedules. Falls back to the
@@ -609,11 +652,25 @@ async fn handle_get_schedule_health(
         })
     };
 
-    let rolling_success_rate_24h = if total > 0 {
-        (succeeded as f64 / total as f64) * 100.0
-    } else {
-        0.0
-    };
+    // D1 (2026-07-29): `null`, NOT `0.0`, when the 24h window has no
+    // scheduled terminal executions.
+    //
+    // The pre-fix `else { 0.0 }` rendered "this schedule has not run yet"
+    // (or "the stats query failed", which lands in the same branch via the
+    // zeroed fallback above) as a 0% success rate — the single most alarming
+    // number this surface can print, emitted for the least alarming state.
+    // It also directly contradicted the sibling contract the operator digest
+    // already documents for `failure_rate_24h_pct` ("a rate over zero runs is
+    // meaningless; `0.0` would falsely read healthy" → null). Two surfaces of
+    // one platform disagreeing about what an empty window means is how a
+    // reader learns to distrust both, so they converge here on null.
+    //
+    // Shape: `rolling_success_rate_pct` becomes NULLABLE (it was always a
+    // JSON number). The only consumer is this MCP response; there is no
+    // frontend or digest reader (grounded 2026-07-29). `stats_24h.total` is
+    // right beside it and is the denominator, so a consumer that must have a
+    // number can branch on `total > 0` rather than guess.
+    let rolling_success_rate_24h = rolling_success_rate_pct(succeeded, total);
 
     let mut result = serde_json::json!({
         "schedule": {
@@ -632,7 +689,8 @@ async fn handle_get_schedule_health(
             "total": total,
             "succeeded": succeeded,
             "failed": failed,
-            "rolling_success_rate_pct": talos_analytics_repository::format_percent(rolling_success_rate_24h),
+            "rolling_success_rate_pct": rolling_success_rate_24h,
+            "rolling_success_rate_note": ROLLING_SUCCESS_RATE_NOTE,
             "last_success_at": last_success_at.map(|t| t.to_rfc3339()),
             "last_failure_at": last_failure_at.map(|t| t.to_rfc3339()),
         },
@@ -684,5 +742,72 @@ mod tests {
         // mistakenly matched against a 5-field pattern.
         let out = describe_cron("0 9 * *");
         assert_eq!(out, "Cron: 0 9 * *");
+    }
+
+    // ---- D1: the zero-denominator null convention -----------------------
+
+    /// The whole point of D1. A schedule that has not fired in the window
+    /// must NOT render a 0% success rate — that is the most alarming number
+    /// this surface prints, and "never ran" is the least alarming state.
+    #[test]
+    fn empty_window_is_null_not_a_zero_percent_success_rate() {
+        // `(0, 0)` is BOTH reachable states: a schedule that has not fired in
+        // the window, and the DB-error fallback, which zeroes the stats
+        // struct. They are told apart by `data_warnings`, not by this number —
+        // see ROLLING_SUCCESS_RATE_NOTE.
+        assert_eq!(super::rolling_success_rate_pct(0, 0), None);
+        // A negative total can't come from a COUNT, but it is refused rather
+        // than trusted into a division.
+        assert_eq!(super::rolling_success_rate_pct(0, -1), None);
+    }
+
+    /// A REAL zero — the schedule fired and everything failed — is still a
+    /// reportable 0.0. The null is about an empty denominator, not about
+    /// suppressing bad news.
+    #[test]
+    fn a_real_all_failed_window_still_reports_zero() {
+        assert_eq!(super::rolling_success_rate_pct(0, 12), Some(0.0));
+    }
+
+    /// The non-empty path is byte-identical to the pre-D1 values: same
+    /// `format_percent` 1-decimal rounding, same arithmetic.
+    #[test]
+    fn nonzero_path_values_are_unchanged() {
+        assert_eq!(super::rolling_success_rate_pct(24, 24), Some(100.0));
+        assert_eq!(super::rolling_success_rate_pct(12, 24), Some(50.0));
+        // 2/3 = 66.666…% → 66.7 (format_percent's 1-decimal contract).
+        assert_eq!(super::rolling_success_rate_pct(2, 3), Some(66.7));
+        assert_eq!(super::rolling_success_rate_pct(1, 3), Some(33.3));
+    }
+
+    /// Nonsense counts are refused, not clamped to a plausible 100%.
+    #[test]
+    fn impossible_counts_are_refused() {
+        assert_eq!(super::rolling_success_rate_pct(5, 4), None);
+        assert_eq!(super::rolling_success_rate_pct(-1, 4), None);
+    }
+
+    /// The note must actually say what the null means — otherwise a reader
+    /// who remembers the old `0.0` shape has no way to learn the new one.
+    #[test]
+    fn the_note_states_the_denominator_and_the_null() {
+        let n = super::ROLLING_SUCCESS_RATE_NOTE;
+        assert!(n.contains("stats_24h.total"), "{n}");
+        assert!(n.contains("null when"), "{n}");
+        assert!(n.contains("data_warnings"), "{n}");
+        // The note must quote the warning that actually distinguishes the two
+        // nulls. `data_warnings` is ALSO populated by a streak-query failure
+        // alone, so "a null with data_warnings present means the stats query
+        // failed" would be a claim the handler does not support.
+        assert!(n.contains("stats_24h unavailable"), "{n}");
+        assert!(n.contains("streak unavailable"), "{n}");
+    }
+
+    /// The endpoints are reserved for the exact cases — 100 must not appear
+    /// beside a nonzero `stats_24h.failed`.
+    #[test]
+    fn a_single_failure_never_renders_as_a_hundred_percent() {
+        assert_eq!(super::rolling_success_rate_pct(1999, 2000), Some(99.9));
+        assert_eq!(super::rolling_success_rate_pct(1, 2000), Some(0.1));
     }
 }

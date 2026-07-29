@@ -3790,6 +3790,60 @@ async fn handle_get_workflow_dependency_map(
     )
 }
 
+/// `source` value for a node-timing row averaged from the engine's
+/// `output_data.__node_timings__` stamp.
+pub(crate) const NODE_TIMING_SOURCE_OUTPUT: &str = "execution_output.__node_timings__";
+
+/// `source` value for a node-timing row averaged from `execution_cost_rollup`.
+pub(crate) const NODE_TIMING_SOURCE_ROLLUP: &str = "execution_cost_rollup";
+
+/// How to read `node_timing_breakdown` — stated ONCE beside the list rather
+/// than implied per row.
+pub(crate) const NODE_TIMING_BREAKDOWN_NOTE: &str =
+    "avg_duration_ms is a mean over sample_count observations from ONE source, and every row in \
+     this list shares that source. source=execution_output.__node_timings__ means the mean is \
+     over per-node timings stamped on the last 50 completed executions in the window (one \
+     observation per node per execution); source=execution_cost_rollup means the engine did not \
+     stamp those timings and the mean is over execution_cost_rollup rows for the whole window. \
+     The two populations are NOT interchangeable — compare rows within one report, not across \
+     reports with different sources. An empty list means the stamped timings were absent AND the \
+     rollup fallback produced nothing — either it had no rows or its query failed, which this \
+     surface does not distinguish; treat an empty list as NO DATA, never as zero time spent.";
+
+/// Build one `node_timing_breakdown` row.
+///
+/// D2 (2026-07-29): ONE builder for BOTH sources. Pre-fix the primary
+/// (`__node_timings__`) path emitted `{node_id, avg_duration_ms}` and the
+/// rollup fallback emitted `{node_id, avg_duration_ms, sample_count, source}`,
+/// so a reader could not tell a mean over ONE observation from a mean over
+/// fifty, and could not tell which of the two populations they were looking
+/// at — the shape itself was the only clue, and only if you had seen both.
+/// A shared builder makes the asymmetry unrepresentable.
+///
+/// `avg_ms` is rounded to 2 decimals and emitted as a JSON number (MCP-49:
+/// matches `latency.*` and `get_execution_cost.total_node_time_ms`); a
+/// non-finite mean renders as `0.0`, preserving the pre-D2 behavior of both
+/// paths.
+#[must_use]
+pub(crate) fn node_timing_entry(
+    node_id: &str,
+    avg_ms: f64,
+    sample_count: i64,
+    source: &str,
+) -> serde_json::Value {
+    let rounded = if avg_ms.is_finite() {
+        (avg_ms * 100.0).round() / 100.0
+    } else {
+        0.0
+    };
+    serde_json::json!({
+        "node_id": node_id,
+        "avg_duration_ms": rounded,
+        "sample_count": sample_count,
+        "source": source,
+    })
+}
+
 async fn handle_get_workflow_performance_report(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
@@ -3900,26 +3954,15 @@ async fn handle_get_workflow_performance_report(
     }
 
     let mut node_breakdown: Vec<serde_json::Value> = {
-        let mut items: Vec<(String, f64)> = node_timing_sums
+        let mut items: Vec<(String, f64, usize)> = node_timing_sums
             .iter()
-            .map(|(node_id, (sum, count))| (node_id.clone(), sum / *count as f64))
+            .map(|(node_id, (sum, count))| (node_id.clone(), sum / *count as f64, *count))
             .collect();
         items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         items
             .into_iter()
-            .map(|(node_id, avg_ms)| {
-                // MCP-49: avg_duration_ms emits a JSON number, not
-                // a quoted string (matches latency.* and
-                // total_node_time_ms in get_execution_cost).
-                let rounded = if avg_ms.is_finite() {
-                    (avg_ms * 100.0).round() / 100.0
-                } else {
-                    0.0
-                };
-                serde_json::json!({
-                    "node_id": node_id,
-                    "avg_duration_ms": rounded,
-                })
+            .map(|(node_id, avg_ms, count)| {
+                node_timing_entry(&node_id, avg_ms, count as i64, NODE_TIMING_SOURCE_OUTPUT)
             })
             .collect()
     };
@@ -3940,17 +3983,7 @@ async fn handle_get_workflow_performance_report(
             node_breakdown = rollup_rows
                 .into_iter()
                 .map(|(node_label, avg_ms, sample_count)| {
-                    let rounded = if avg_ms.is_finite() {
-                        (avg_ms * 100.0).round() / 100.0
-                    } else {
-                        0.0
-                    };
-                    serde_json::json!({
-                        "node_id": node_label,
-                        "avg_duration_ms": rounded,
-                        "sample_count": sample_count,
-                        "source": "execution_cost_rollup",
-                    })
+                    node_timing_entry(&node_label, avg_ms, sample_count, NODE_TIMING_SOURCE_ROLLUP)
                 })
                 .collect();
         }
@@ -4021,6 +4054,7 @@ async fn handle_get_workflow_performance_report(
             "avg_ms": avg_ms,
         },
         "node_timing_breakdown": node_breakdown,
+        "node_timing_breakdown_note": NODE_TIMING_BREAKDOWN_NOTE,
         "slowest_execution": slowest,
         "fastest_execution": fastest,
         "performance_trend": trend,
@@ -6462,5 +6496,69 @@ mod dependency_view_tests {
         let err = parse_dependency_view(&json!({"view": 3})).unwrap_err();
         assert!(err.contains("'view' must be a string"), "{err}");
         assert!(err.contains("number"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod node_timing_shape_tests {
+    use super::{
+        node_timing_entry, NODE_TIMING_BREAKDOWN_NOTE, NODE_TIMING_SOURCE_OUTPUT,
+        NODE_TIMING_SOURCE_ROLLUP,
+    };
+
+    /// D2's whole point: a reader must be able to tell "n=1" from "n=50",
+    /// and must be able to tell WHICH population a row came from. Both keys
+    /// are mandatory on BOTH sources.
+    #[test]
+    fn both_sources_emit_sample_count_and_source() {
+        for source in [NODE_TIMING_SOURCE_OUTPUT, NODE_TIMING_SOURCE_ROLLUP] {
+            let v = node_timing_entry("compose", 1234.5678, 7, source);
+            let obj = v.as_object().expect("object row");
+            for key in ["node_id", "avg_duration_ms", "sample_count", "source"] {
+                assert!(obj.contains_key(key), "{source} row is missing {key}: {v}");
+            }
+            assert_eq!(obj.len(), 4, "unexpected extra keys: {v}");
+            assert_eq!(v["node_id"], "compose");
+            assert_eq!(v["sample_count"], 7);
+            assert_eq!(v["source"], source);
+        }
+    }
+
+    /// The two sources are distinguishable — a single shared `source` string
+    /// would make the field decorative.
+    #[test]
+    fn the_two_source_labels_differ_and_name_their_origin() {
+        assert_ne!(NODE_TIMING_SOURCE_OUTPUT, NODE_TIMING_SOURCE_ROLLUP);
+        assert!(NODE_TIMING_SOURCE_OUTPUT.contains("__node_timings__"));
+        assert!(NODE_TIMING_SOURCE_ROLLUP.contains("execution_cost_rollup"));
+    }
+
+    /// Rounding + the non-finite fallback are unchanged from the pre-D2
+    /// per-path copies (MCP-49's 2-decimal JSON-number contract).
+    #[test]
+    fn rounding_matches_the_pre_unification_behaviour() {
+        let v = node_timing_entry("n", 22_205.164_099_999_998, 3, NODE_TIMING_SOURCE_OUTPUT);
+        assert_eq!(v["avg_duration_ms"], 22_205.16);
+        assert!(v["avg_duration_ms"].is_number(), "must not be a string");
+        // A non-finite mean (empty divisor upstream) renders 0.0, not null
+        // and not NaN — serde_json cannot encode NaN at all.
+        let v = node_timing_entry("n", f64::NAN, 0, NODE_TIMING_SOURCE_ROLLUP);
+        assert_eq!(v["avg_duration_ms"], 0.0);
+        let v = node_timing_entry("n", f64::INFINITY, 0, NODE_TIMING_SOURCE_ROLLUP);
+        assert_eq!(v["avg_duration_ms"], 0.0);
+    }
+
+    /// The population is stated ONCE, and states both sources plus what an
+    /// empty list means.
+    #[test]
+    fn the_note_states_both_populations_once() {
+        let n = NODE_TIMING_BREAKDOWN_NOTE;
+        assert!(n.contains(NODE_TIMING_SOURCE_OUTPUT), "{n}");
+        assert!(n.contains(NODE_TIMING_SOURCE_ROLLUP), "{n}");
+        assert!(n.contains("sample_count"), "{n}");
+        assert!(n.contains("empty list"), "{n}");
+        // The fallback's error is swallowed (`if let Ok(..)`), so the note
+        // must not promise that an empty list proves both sources were empty.
+        assert!(n.contains("its query failed"), "{n}");
     }
 }
