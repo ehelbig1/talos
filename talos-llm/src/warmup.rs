@@ -67,7 +67,26 @@ pub const MAX_WARMUP_MODELS: usize = 3;
 /// Per-model wall-clock budget. A model that has not answered a
 /// one-token prompt in two minutes is not going to help the next
 /// scheduled run either; move on to the next one.
+///
+/// Enforced TWICE, deliberately: as a per-request `reqwest` timeout
+/// inside [`OllamaClient::warm_model`](crate::OllamaClient::warm_model)
+/// — which is what actually bounds a socket that accepts the connection
+/// and then never answers — and again by the task-level
+/// [`tokio::time::timeout`] in [`run_boot_warmup`], which covers
+/// anything outside the HTTP call. The request-level override is load
+/// bearing: without it the client-wide 60 s Ollama timeout would cap
+/// every warmup at HALF this budget, giving up on a cold load right in
+/// the window this module exists to absorb.
 pub const WARMUP_MODEL_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Slack between the request-level deadline and the task-level backstop.
+///
+/// Two timers set to the identical instant make it a coin flip which one
+/// fires, so the log line for a stuck model would alternate between
+/// `..._model_failed` and `..._model_deadline` for one condition. The
+/// grace makes the request timeout the expected reporter (it names the
+/// transport error) and leaves the task timeout a true backstop.
+const WARMUP_DEADLINE_GRACE: Duration = Duration::from_secs(5);
 
 /// Residency hint used when a node references a model without naming
 /// its own `keep_alive` — matches the value the live LLM/classifier
@@ -287,7 +306,7 @@ pub async fn run_boot_warmup(client: Arc<OllamaClient>, targets: Vec<WarmupTarge
     for target in targets {
         let started = std::time::Instant::now();
         let result = tokio::time::timeout(
-            WARMUP_MODEL_DEADLINE,
+            WARMUP_MODEL_DEADLINE + WARMUP_DEADLINE_GRACE,
             client.warm_model(&target.model, &target.keep_alive),
         )
         .await;
@@ -317,7 +336,7 @@ pub async fn run_boot_warmup(client: Arc<OllamaClient>, targets: Vec<WarmupTarge
                 model = %target.model,
                 references = target.references,
                 duration_ms,
-                deadline_secs = WARMUP_MODEL_DEADLINE.as_secs(),
+                deadline_secs = (WARMUP_MODEL_DEADLINE + WARMUP_DEADLINE_GRACE).as_secs(),
                 "LLM boot warmup exceeded its per-model deadline — moving on"
             ),
         }
@@ -577,5 +596,25 @@ mod tests {
     async fn empty_target_list_is_a_no_op() {
         let client = Arc::new(OllamaClient::new("http://127.0.0.1:1".to_string()));
         run_boot_warmup(client, vec![]).await;
+    }
+
+    #[test]
+    fn the_per_model_budget_exceeds_the_client_wide_ollama_timeout() {
+        // This inequality is the entire reason `warm_model` carries an
+        // explicit per-request `.timeout(WARMUP_MODEL_DEADLINE)`: the
+        // client-wide Ollama timeout is SHORTER than the budget this
+        // module documents, so without the override a cold load gets half
+        // the time it was promised — and a >60 s cold load is exactly the
+        // case the warmup exists to absorb. If this constant is ever
+        // lowered below the client timeout the override becomes dead code,
+        // and this assertion is the note explaining why it was there.
+        assert!(
+            WARMUP_MODEL_DEADLINE > crate::OLLAMA_HTTP_TIMEOUT,
+            "the per-request timeout override in warm_model is only \
+             meaningful while the warmup budget exceeds the client-wide one"
+        );
+        // The task-level backstop must sit strictly after the request-level
+        // deadline, or the two race and the failure log line is a coin flip.
+        assert!(WARMUP_DEADLINE_GRACE > Duration::ZERO);
     }
 }

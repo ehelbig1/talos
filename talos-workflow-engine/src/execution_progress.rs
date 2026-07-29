@@ -33,13 +33,18 @@
 //!   is actually about.
 //! * **Completed count** — *every* node kind, counted at the two commit
 //!   chokepoints (`commit_result!` and `route_system_node_output`) plus
-//!   the dispatch-pool completion branch.
+//!   the dispatch-pool completion branch. One caveat worth knowing when
+//!   reading the number: a pipeline CHAIN completes as a single unit
+//!   (one future, one commit), so an `a→b→c` chain contributes 1, not 3.
+//!   The count is "dispatch units completed"; on chain-bearing graphs it
+//!   reads low against the node total.
 //!
 //! System nodes that are `.await`ed inline in the reactor body (judge,
 //! ensemble, `sub_workflow`, …) are therefore counted when they finish
 //! but do not appear in the in-flight set while running — a timeout
-//! parked on one renders `in flight: none`, which is itself a usable
-//! signal ("no dispatched node was outstanding"). Widening this would
+//! parked on one renders `in flight: none tracked`, whose wording names
+//! that gap explicitly rather than implying the engine was idle (see
+//! [`render_attribution`]). Widening this would
 //! mean pairing a start/finish marker across ~20 handler sites, each
 //! with its own error/pause branch; a missed pairing would leave a
 //! phantom node named in the error forever, which is worse than the
@@ -171,28 +176,38 @@ pub(crate) fn render_attribution(mut in_flight: Vec<(String, u64)>, completed: u
 
     in_flight.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-    let rendered = if in_flight.is_empty() {
-        // Every dispatched node came back, yet the reactor still ran out
-        // of wall clock — a real signal (the graph is too big for its
-        // budget, or a locally-computed node kind is spinning), so say
-        // so explicitly rather than omitting the clause.
-        "none".to_string()
-    } else {
-        let overflow = in_flight.len().saturating_sub(MAX_RENDERED_IN_FLIGHT);
-        let mut parts: Vec<String> = in_flight
-            .iter()
-            .take(MAX_RENDERED_IN_FLIGHT)
-            .map(|(label, elapsed_ms)| {
-                format!("{} {}", truncate_label(label), render_elapsed(*elapsed_ms))
-            })
-            .collect();
-        if overflow > 0 {
-            parts.push(format!("+{overflow} more"));
-        }
-        parts.join(", ")
-    };
-
     let noun = if completed == 1 { "node" } else { "nodes" };
+
+    if in_flight.is_empty() {
+        // Every DISPATCHED node came back, yet the reactor still ran out
+        // of wall clock. A bare "in flight: none" would read as "the
+        // engine sat idle" — which is exactly the misleading-error class
+        // this attribution exists to kill, and it is wrong: the tracked
+        // set covers worker-dispatched nodes and pipeline chains only, so
+        // an inline-awaited system node (judge / loop / sub-workflow /
+        // ensemble / agent-loop) holding the clock lands here. Name the
+        // gap instead of implying its absence. See the module header for
+        // why the tracked set is scoped the way it is.
+        return format!(
+            " (in flight: none tracked — an inline system node \
+             (judge/loop/sub-workflow) or graph overhead held the clock; \
+             {completed} {noun} completed)"
+        );
+    }
+
+    let overflow = in_flight.len().saturating_sub(MAX_RENDERED_IN_FLIGHT);
+    let mut parts: Vec<String> = in_flight
+        .iter()
+        .take(MAX_RENDERED_IN_FLIGHT)
+        .map(|(label, elapsed_ms)| {
+            format!("{} {}", truncate_label(label), render_elapsed(*elapsed_ms))
+        })
+        .collect();
+    if overflow > 0 {
+        parts.push(format!("+{overflow} more"));
+    }
+    let rendered = parts.join(", ");
+
     format!(" (in flight: {rendered}; {completed} {noun} completed)")
 }
 
@@ -270,10 +285,35 @@ mod tests {
     }
 
     #[test]
-    fn nothing_in_flight_but_work_done_says_none() {
+    fn nothing_in_flight_names_the_tracking_gap_instead_of_implying_idleness() {
+        // The tracked set is worker-dispatched nodes + pipeline chains
+        // only, so an inline-awaited system node holding the clock lands
+        // in this branch. "in flight: none" alone would tell an operator
+        // the engine hung with nothing running — a fresh instance of the
+        // misleading-error class this whole feature exists to close.
+        let out = render_attribution(vec![], 7);
         assert_eq!(
-            render_attribution(vec![], 7),
-            " (in flight: none; 7 nodes completed)"
+            out,
+            " (in flight: none tracked — an inline system node \
+             (judge/loop/sub-workflow) or graph overhead held the clock; \
+             7 nodes completed)"
+        );
+        assert!(out.contains("none tracked"), "{out}");
+        assert!(out.contains("7 nodes completed"), "{out}");
+    }
+
+    #[test]
+    fn the_no_tracked_node_clause_fits_the_digest_preview() {
+        // `latest_error_preview` in the operator digest caps at 200 BYTES.
+        // This branch's clause is the longest fixed text the attribution
+        // can emit, so it must leave room for the base message or the
+        // completed-count gets truncated away behind an ellipsis.
+        let base = "workflow execution timed out after 420 seconds";
+        let full = format!("{base}{}", render_attribution(vec![], 12));
+        assert!(
+            full.len() <= 200,
+            "clause + base is {} bytes, over the 200-byte digest preview: {full}",
+            full.len()
         );
     }
 
@@ -335,6 +375,8 @@ mod tests {
         // the in-flight pool but do complete.
         let p = ExecutionProgress::default();
         p.mark_finished(Uuid::new_v4());
-        assert_eq!(p.describe(), " (in flight: none; 1 node completed)");
+        let out = p.describe();
+        assert!(out.contains("none tracked"), "{out}");
+        assert!(out.ends_with("1 node completed)"), "{out}");
     }
 }

@@ -68,11 +68,23 @@ impl ExecStats {
 /// concrete IDs/timestamps/numbers/embedded payloads into placeholder
 /// tokens.
 ///
-/// Four substitutions:
+/// Six substitutions:
 ///   * UUIDs → `<UUID>`
 ///   * ISO-8601 timestamps → `<TIMESTAMP>`
 ///   * `(after|attempt|retry|timeout|took|elapsed) <N>` → `$1 N`
+///   * Bare durations (`173s`, `250ms`) → `Ns` / `Nms`
+///   * Per-run tallies (`4 nodes completed`, `+7 more`) → `N …`
 ///   * Long double-quoted strings (≥16 chars between the quotes) → `"<QUOTED>"`
+///
+/// The bare-duration and tally collapses exist for the engine's timeout
+/// ATTRIBUTION clause — `"… timed out after 420 seconds (in flight:
+/// synthesize 411s; 4 nodes completed)"`. Every one of those numbers
+/// moves run to run, so without them each occurrence of the *same*
+/// recurring timeout hashes to its own fingerprint and top-K aggregation
+/// degrades to a list of singletons — the opposite of what an operator
+/// staring at a repeatedly-failing workflow needs. Node LABELS stay
+/// verbatim on purpose: "which node held the clock" is the signal worth
+/// grouping BY, not grouping away.
 ///
 /// The quoted-string collapse handles error patterns that embed
 /// variable user-data inside quotes — e.g. OUTPUT_SCHEMA enforcement
@@ -103,9 +115,26 @@ pub fn fingerprint_error_message(msg: &str) -> String {
     static RE_LONG_QUOTE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r#""[^"]{16,}""#).expect("valid long-quoted-string regex")
     });
+    // Bare durations, as emitted by the timeout attribution's per-node
+    // elapsed rendering. Anchored on both sides so it can't eat the tail
+    // of an identifier (`v2s`, `qwen3.6:q4s`).
+    static RE_BARE_DURATION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\b\d+(ms|s)\b").expect("valid bare-duration regex")
+    });
+    // Per-run tallies: `4 nodes completed` / `1 node completed` and the
+    // in-flight overflow marker `+7 more`.
+    static RE_TALLY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\b\d+ nodes? completed").expect("valid node-tally regex")
+    });
+    static RE_OVERFLOW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\+\d+ more").expect("valid overflow-marker regex")
+    });
     let result = RE_UUID.replace_all(msg, "<UUID>");
     let result = RE_TS.replace_all(&result, "<TIMESTAMP>");
     let result = RE_NUM.replace_all(&result, "$1 N");
+    let result = RE_BARE_DURATION.replace_all(&result, "N$1");
+    let result = RE_TALLY.replace_all(&result, "N nodes completed");
+    let result = RE_OVERFLOW.replace_all(&result, "+N more");
     RE_LONG_QUOTE
         .replace_all(&result, r#""<QUOTED>""#)
         .to_string()
@@ -1115,6 +1144,54 @@ mod fingerprint_tests {
         let out = fingerprint_error_message(msg);
         assert!(out.contains(r#""id""#));
         assert!(!out.contains("<QUOTED>"));
+    }
+
+    #[test]
+    fn groups_repeated_attributed_timeouts_of_the_same_node() {
+        // The engine's wall-clock timeout now appends a node-attribution
+        // clause whose numbers all move between runs. Two occurrences of
+        // the SAME recurring failure must still land in one top-K bucket.
+        let a = fingerprint_error_message(
+            "workflow execution timed out after 420 seconds \
+             (in flight: synthesize 411s; 4 nodes completed)",
+        );
+        let b = fingerprint_error_message(
+            "workflow execution timed out after 420 seconds \
+             (in flight: synthesize 409s; 5 nodes completed)",
+        );
+        assert_eq!(a, b, "same node, same failure — must share a fingerprint");
+        // The node label is the diagnostic payload and must SURVIVE.
+        assert!(a.contains("synthesize"), "{a}");
+    }
+
+    #[test]
+    fn keeps_timeouts_on_different_nodes_in_different_buckets() {
+        // The collapse must not over-group: "synthesize is slow" and
+        // "fetch is slow" are different problems with different fixes.
+        let a = fingerprint_error_message(
+            "workflow execution timed out after 420 seconds \
+             (in flight: synthesize 411s; 4 nodes completed)",
+        );
+        let b = fingerprint_error_message(
+            "workflow execution timed out after 420 seconds \
+             (in flight: fetch 411s; 4 nodes completed)",
+        );
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn collapses_the_in_flight_overflow_marker() {
+        let a = fingerprint_error_message("(in flight: a 9s, +7 more; 3 nodes completed)");
+        let b = fingerprint_error_message("(in flight: a 8s, +9 more; 4 nodes completed)");
+        assert_eq!(a, b);
+        assert!(a.contains("+N more"), "{a}");
+    }
+
+    #[test]
+    fn bare_duration_collapse_does_not_eat_identifier_tails() {
+        // `\b\d+(ms|s)\b` must not chew the end of a model/module name.
+        let out = fingerprint_error_message("node 'qwen3.6-q4s' failed: boom");
+        assert!(out.contains("qwen3.6-q4s"), "{out}");
     }
 
     #[test]

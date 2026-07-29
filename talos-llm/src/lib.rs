@@ -855,6 +855,15 @@ impl OllamaClient {
     /// The endpoint is always `self.base_url`, i.e. the process's
     /// configured `OLLAMA_URL`. Nothing from a workflow graph
     /// contributes to the URL.
+    ///
+    /// The request carries an explicit
+    /// [`warmup::WARMUP_MODEL_DEADLINE`](crate::warmup::WARMUP_MODEL_DEADLINE)
+    /// override (same idiom as `pull_model`'s [`OLLAMA_PULL_TIMEOUT`]).
+    /// Without it the client-wide [`OLLAMA_HTTP_TIMEOUT`] (60 s) would
+    /// cap the call at HALF the documented warmup budget — and a cold
+    /// load that takes 60–120 s is precisely the case this whole module
+    /// exists to move off the first user-visible run, so the warmup
+    /// would give up exactly when it was needed.
     pub async fn warm_model(&self, model: &str, keep_alive: &str) -> Result<()> {
         let body = json!({
             "model": model,
@@ -868,6 +877,7 @@ impl OllamaClient {
             .client
             .post(format!("{}/api/chat", self.base_url))
             .json(&body)
+            .timeout(crate::warmup::WARMUP_MODEL_DEADLINE)
             .send()
             .await?;
         let status = resp.status();
