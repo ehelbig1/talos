@@ -47,6 +47,19 @@ fn is_autonomous(trigger_type: &str) -> bool {
     AUTONOMOUS_TRIGGERS.contains(&trigger_type)
 }
 
+/// Narrowest window [`OperatorDigestService::snapshot`] will query.
+pub const DIGEST_MIN_WINDOW_DAYS: u32 = 1;
+
+/// Widest window [`OperatorDigestService::snapshot`] will query.
+///
+/// D3 (2026-07-29) makes every judge row ECHO this window, so the echo is only
+/// truthful while this clamp is no wider than the clamp the judge query itself
+/// applies ([`talos_execution_repository::JUDGE_SCORE_MAX_WINDOW_DAYS`]). A
+/// silent widening here would make each row advertise a window the SQL never
+/// used. `digest_window_never_exceeds_the_judge_query_window` pins the
+/// relationship so the drift breaks a test instead of a report.
+pub const DIGEST_MAX_WINDOW_DAYS: u32 = 31;
+
 /// Composes the domain repositories into the operator digest. Cheap to
 /// construct (each repo just wraps the shared pool via `Arc` clone).
 pub struct OperatorDigestService {
@@ -77,7 +90,7 @@ impl OperatorDigestService {
     /// the outer result only errors on a catastrophic failure that leaves
     /// nothing to report.
     pub async fn snapshot(&self, user_id: Uuid, days: u32) -> anyhow::Result<JsonValue> {
-        let days = days.clamp(1, 31) as i32;
+        let days = days.clamp(DIGEST_MIN_WINDOW_DAYS, DIGEST_MAX_WINDOW_DAYS) as i32;
 
         Ok(json!({
             "window_days": days,
@@ -211,68 +224,8 @@ impl OperatorDigestService {
             .weekly_judge_scores(user_id, days)
             .await
             .unwrap_or_default()
-            .into_iter()
-            .map(|s| {
-                let signal = judge_signal(s.runs, s.avg_score, s.worst_score);
-                json!({
-                    "name": s.workflow_name,
-                    // POPULATION: scored verdicts only. `runs + na_runs` is
-                    // the number of times the judge actually fired — the two
-                    // are reported separately (and named so) because every
-                    // score below is over the scored population alone.
-                    "runs": s.runs,
-                    "scored_runs": s.runs,
-                    "na_runs": s.na_runs,
-                    "total_verdicts": s.runs + s.na_runs,
-                    // D3 (2026-07-29): every row echoes the window it was
-                    // aggregated over. The snapshot carries a top-level
-                    // `window_days`, but these rows are lifted OUT of the
-                    // envelope by every consumer that renders them (the
-                    // pa-autonomy-digest template iterates the array), and a
-                    // "runs: 5" with no window is unreadable — 5 runs in a day
-                    // and 5 runs in a month are opposite findings. The engine
-                    // twin (`talos-engine::assistant_report_reader`) already
-                    // echoed `trailing_days` on its judge block; this closes
-                    // the asymmetry. Value is the CLAMPED window actually
-                    // queried (`snapshot` clamps to [1, 31] before this point,
-                    // matching `weekly_judge_scores`' own clamp), never the
-                    // caller's raw request.
-                    "window_days": days,
-                    "avg_score": s.avg_score,
-                    "pass_rate": s.pass_rate,
-                    // D5 (2026-07-29): the same pass rate with its
-                    // denominator and a Wilson 95% interval attached.
-                    // `pass_rate: 1.0` over 2 scored verdicts and over 200
-                    // rendered identically; the interval is what separates
-                    // "this judge passes everything" from "this judge has
-                    // barely fired". n is the SCORED population (`runs`) —
-                    // the same denominator `pass_rate` itself uses, NOT
-                    // `runs + na_runs`. An explicit `null` (serde_json's
-                    // `json!` nulls an Option, it does not drop the key) when
-                    // there is no pass rate to envelope — never a fabricated
-                    // [0, 0] interval, which would read as a measured
-                    // certainty about a judge that has scored nothing.
-                    "pass_rate_measurement": s.pass_rate.and_then(|p| {
-                        u64::try_from(s.runs).ok().and_then(|n| {
-                            talos_measurement::Measurement::from_fraction(p, n)
-                                .map(|m| m
-                                    .with_population(JUDGE_PASS_RATE_POPULATION)
-                                    .with_window(format!("trailing {days} days")))
-                        })
-                    }),
-                    "worst_score": s.worst_score,
-                    // D5 (2026-07-28): one constant, shared with
-                    // `talos-engine::assistant_report_reader`, which carried a
-                    // byte-identical hand-copy. Two copies of a population
-                    // disclosure is two chances for it to stop describing the
-                    // query it annotates.
-                    "population_note": talos_measurement::JUDGE_SCORE_POPULATION_NOTE,
-                    // A judge whose score never varies is not evidence of
-                    // quality — it may be a shape check that cannot fail.
-                    "signal": signal,
-                    "signal_note": judge_signal_note(signal, s.runs, s.na_runs),
-                })
-            })
+            .iter()
+            .map(|s| judge_score_row(s, days))
             .collect::<Vec<_>>();
 
         json!({
@@ -584,6 +537,75 @@ const JUDGE_MIN_RUNS_FOR_SIGNAL: i64 = 5;
 pub const JUDGE_PASS_RATE_POPULATION: &str =
     "SCORED judge verdicts for this workflow in the window (`runs`); abstentions (`na_runs`) are \
      excluded from both the numerator and the denominator";
+
+/// Build ONE `learned.judge_scores` row.
+///
+/// Extracted from `learned_panel`'s closure (2026-07-29 review) because the
+/// two fields D3/D5 added — `window_days` and `pass_rate_measurement` — were
+/// pinned only by a test-local RE-IMPLEMENTATION of this expression. Both
+/// mutations that matter survived it: swapping the envelope's denominator from
+/// the SCORED `runs` to `runs + na_runs` (the exact #606 FILTER semantics the
+/// population string swears are honored), and deleting `window_days`
+/// outright, each left the whole suite green. Per the house testing rule, the
+/// logic now lives in one place and the tests call THIS.
+///
+/// `days` is the CLAMPED window actually queried (`snapshot` narrows to
+/// `[DIGEST_MIN_WINDOW_DAYS, DIGEST_MAX_WINDOW_DAYS]` before this point, and
+/// `weekly_judge_scores` clamps no narrower), never the caller's raw request.
+#[must_use]
+fn judge_score_row(s: &talos_execution_repository::JudgeScoreStat, days: i32) -> JsonValue {
+    let signal = judge_signal(s.runs, s.avg_score, s.worst_score);
+    json!({
+        "name": s.workflow_name,
+        // POPULATION: scored verdicts only. `runs + na_runs` is the number of
+        // times the judge actually fired — the two are reported separately
+        // (and named so) because every score below is over the scored
+        // population alone.
+        "runs": s.runs,
+        "scored_runs": s.runs,
+        "na_runs": s.na_runs,
+        "total_verdicts": s.runs + s.na_runs,
+        // D3 (2026-07-29): every row echoes the window it was aggregated
+        // over. The snapshot carries a top-level `window_days`, but these rows
+        // are lifted OUT of the envelope by every consumer that renders them
+        // (the pa-autonomy-digest template iterates the array), and a
+        // "runs: 5" with no window is unreadable — 5 runs in a day and 5 runs
+        // in a month are opposite findings. The engine twin
+        // (`talos-engine::assistant_report_reader`) already echoed
+        // `trailing_days` on its judge block; this closes the asymmetry.
+        "window_days": days,
+        "avg_score": s.avg_score,
+        "pass_rate": s.pass_rate,
+        // D5 (2026-07-29): the same pass rate with its denominator and a
+        // Wilson 95% interval attached. `pass_rate: 1.0` over 2 scored
+        // verdicts and over 200 rendered identically; the interval is what
+        // separates "this judge passes everything" from "this judge has barely
+        // fired". n is the SCORED population (`runs`) — the same denominator
+        // `pass_rate` itself uses, NOT `runs + na_runs`. An explicit `null`
+        // (serde_json's `json!` nulls an Option, it does not drop the key)
+        // when there is no pass rate to envelope — never a fabricated [0, 0]
+        // interval, which would read as a measured certainty about a judge
+        // that has scored nothing.
+        "pass_rate_measurement": s.pass_rate.and_then(|p| {
+            u64::try_from(s.runs).ok().and_then(|n| {
+                talos_measurement::Measurement::from_fraction(p, n).map(|m| {
+                    m.with_population(JUDGE_PASS_RATE_POPULATION)
+                        .with_window(format!("trailing {days} days"))
+                })
+            })
+        }),
+        "worst_score": s.worst_score,
+        // D5 (2026-07-28): one constant, shared with
+        // `talos-engine::assistant_report_reader`, which carried a
+        // byte-identical hand-copy. Two copies of a population disclosure is
+        // two chances for it to stop describing the query it annotates.
+        "population_note": talos_measurement::JUDGE_SCORE_POPULATION_NOTE,
+        // A judge whose score never varies is not evidence of quality — it may
+        // be a shape check that cannot fail.
+        "signal": signal,
+        "signal_note": judge_signal_note(signal, s.runs, s.na_runs),
+    })
+}
 
 /// Classify what a judge's score distribution actually tells the operator.
 ///
@@ -1343,23 +1365,43 @@ mod measurement_pr3_tests {
 
     // ---- D3 + D5: the judge row ------------------------------------------
 
-    /// The judge row is assembled inside an async DB method, so the two new
-    /// fields are pinned through the SAME expressions the panel uses rather
-    /// than a shadow copy. `runs` is the denominator; `total_verdicts` is
-    /// deliberately NOT.
+    /// Build the row through the PRODUCTION builder (`judge_score_row`, the
+    /// one `learned_panel` calls), then read the envelope back out of it.
+    ///
+    /// The pre-review version of this helper RE-IMPLEMENTED the envelope
+    /// expression, which meant the tests below passed against a copy: swapping
+    /// production's denominator to `runs + na_runs` and deleting `window_days`
+    /// entirely both left the suite green. Going through the real builder is
+    /// what makes those mutations fail.
+    fn row(
+        pass_rate: Option<f64>,
+        runs: i64,
+        na_runs: i64,
+        days: i32,
+    ) -> (JsonValue, Option<talos_measurement::Measurement>) {
+        let v = judge_score_row(
+            &talos_execution_repository::JudgeScoreStat {
+                workflow_name: "pa-inbox-triage".to_string(),
+                runs,
+                na_runs,
+                avg_score: Some(0.8),
+                pass_rate,
+                worst_score: Some(0.5),
+            },
+            days,
+        );
+        let m: Option<talos_measurement::Measurement> =
+            serde_json::from_value(v["pass_rate_measurement"].clone())
+                .expect("pass_rate_measurement is a Measurement or null");
+        (v, m)
+    }
+
     fn judge_pass_rate_measurement(
         pass_rate: Option<f64>,
         runs: i64,
         days: i32,
     ) -> Option<talos_measurement::Measurement> {
-        pass_rate.and_then(|p| {
-            u64::try_from(runs).ok().and_then(|n| {
-                talos_measurement::Measurement::from_fraction(p, n).map(|m| {
-                    m.with_population(JUDGE_PASS_RATE_POPULATION)
-                        .with_window(format!("trailing {days} days"))
-                })
-            })
-        })
+        row(pass_rate, runs, 0, days).1
     }
 
     /// D5: a judge that has passed everything twice and one that has passed
@@ -1383,10 +1425,19 @@ mod measurement_pr3_tests {
 
     /// The denominator is the SCORED count, and the population says so —
     /// `total_verdicts` sits in the same JSON object and is the wrong one.
+    ///
+    /// The abstentions here are what make this bite: with `runs = 8` and
+    /// `na_runs = 5` the two candidate denominators are 8 and 13, so an
+    /// envelope built over `runs + na_runs` fails on `n` instead of quietly
+    /// agreeing (the #606 `FILTER (WHERE NOT not_applicable)` semantics).
     #[test]
     fn judge_pass_rate_population_names_the_scored_denominator() {
-        let m = judge_pass_rate_measurement(Some(0.5), 8, 7).unwrap();
-        assert_eq!(m.n, 8);
+        let (v, m) = row(Some(0.5), 8, 5, 7);
+        let m = m.expect("8 scored runs");
+        assert_eq!(v["runs"], 8);
+        assert_eq!(v["na_runs"], 5);
+        assert_eq!(v["total_verdicts"], 13);
+        assert_eq!(m.n, 8, "n must be `runs`, never `total_verdicts`: {v}");
         assert_eq!(m.population.as_deref(), Some(JUDGE_PASS_RATE_POPULATION));
         assert!(JUDGE_PASS_RATE_POPULATION.contains("SCORED"));
         assert!(JUDGE_PASS_RATE_POPULATION.contains("na_runs"));
@@ -1406,22 +1457,43 @@ mod measurement_pr3_tests {
         assert!(judge_pass_rate_measurement(Some(1.5), 10, 7).is_none());
     }
 
-    /// D3: the window travels ON the row. These rows are iterated out of the
-    /// envelope by the pa-autonomy-digest template, where the snapshot's
-    /// top-level `window_days` is not in scope.
+    /// D3: the window travels ON the row, as a top-level `window_days` key.
+    /// These rows are iterated out of the envelope by the pa-autonomy-digest
+    /// template, where the snapshot's top-level `window_days` is not in scope.
     #[test]
     fn judge_row_window_matches_the_clamped_snapshot_window() {
-        // `snapshot` clamps to [1, 31] before `learned_panel` sees it, and
-        // `weekly_judge_scores` clamps identically — so the echoed value is
-        // the window actually queried for every reachable input.
         for requested in [0u32, 1, 7, 31, 90, u32::MAX] {
-            let clamped = requested.clamp(1, 31) as i32;
-            assert!((1..=31).contains(&clamped));
-            let m = judge_pass_rate_measurement(Some(1.0), 5, clamped).unwrap();
+            let clamped = requested.clamp(DIGEST_MIN_WINDOW_DAYS, DIGEST_MAX_WINDOW_DAYS) as i32;
+            let (v, m) = row(Some(1.0), 5, 0, clamped);
             assert_eq!(
-                m.window.as_deref(),
+                v["window_days"], clamped,
+                "the row must echo the window it was aggregated over: {v}"
+            );
+            assert_eq!(
+                m.unwrap().window.as_deref(),
                 Some(&*format!("trailing {clamped} days"))
             );
         }
+    }
+
+    /// The echoed `window_days` is only truthful while the digest's own clamp
+    /// is no WIDER than the clamp the judge query applies — otherwise a row
+    /// would advertise a 31-day window that the SQL narrowed behind its back.
+    /// Both bounds are now named constants so a drift in either fails here
+    /// instead of shipping a mislabelled report.
+    #[test]
+    fn digest_window_never_exceeds_the_judge_query_window() {
+        assert!(
+            DIGEST_MAX_WINDOW_DAYS as i64
+                <= talos_execution_repository::JUDGE_SCORE_MAX_WINDOW_DAYS as i64,
+            "digest clamps to {DIGEST_MAX_WINDOW_DAYS}d but weekly_judge_scores narrows to {}d",
+            talos_execution_repository::JUDGE_SCORE_MAX_WINDOW_DAYS
+        );
+        assert!(
+            DIGEST_MIN_WINDOW_DAYS as i64
+                >= talos_execution_repository::JUDGE_SCORE_MIN_WINDOW_DAYS as i64,
+            "digest allows {DIGEST_MIN_WINDOW_DAYS}d but weekly_judge_scores widens to {}d",
+            talos_execution_repository::JUDGE_SCORE_MIN_WINDOW_DAYS
+        );
     }
 }

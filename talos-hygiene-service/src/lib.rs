@@ -25,7 +25,10 @@ use uuid::Uuid;
 pub const EMBEDDING_COVERAGE_NOTE: &str =
     "share of this user's counted workflows (denominator = summary.total_workflows) that have a \
      semantic-search embedding, rounded to one decimal; null when there are no counted workflows \
-     — an empty platform has no coverage to report, and 100 would read as 'fully indexed'";
+     — an empty platform has no coverage to report, and 100 would read as 'fully indexed'. \
+     Exactly 100 means EVERY counted workflow is embedded and exactly 0 means none are: a \
+     near-miss that would round onto an endpoint is held at 99.9 / 0.1 instead, so the number \
+     never contradicts unembedded_workflow_count";
 
 /// A share of a whole as a percentage, rounded to ONE decimal
 /// (half-away-from-zero), or `None` when there is no whole.
@@ -47,6 +50,15 @@ pub const EMBEDDING_COVERAGE_NOTE: &str =
 ///
 /// Nonsense inputs (negative counts, `part > whole`) return `None` too —
 /// refused rather than clamped into a plausible-looking number.
+///
+/// **The endpoints are reserved for the exact cases.** Rounding to one decimal
+/// re-creates D4's own bug at the other end of the scale: `1999/2000` is
+/// 99.95%, which `format_percent` rounds to `100.0` — "fully indexed" printed
+/// beside `unembedded_workflow_count: 1`, the same self-contradicting sentence
+/// the `1 * 100 / 250 == 0` truncation produced. So a non-exact share that
+/// would land on an endpoint is held one step short (99.9 / 0.1). `100.0`
+/// therefore means EXACTLY all and `0.0` EXACTLY none, and the reader never
+/// has to reconcile the percent against the count beside it.
 #[must_use]
 pub fn share_pct(part: i64, whole: i64) -> Option<f64> {
     if whole <= 0 || part < 0 || part > whole {
@@ -55,9 +67,12 @@ pub fn share_pct(part: i64, whole: i64) -> Option<f64> {
     // `format_percent` is the platform's one percent-rounding contract (1
     // decimal, JSON number) — reused rather than re-implemented so hygiene
     // percents round exactly like every other percent surface.
-    Some(talos_analytics_repository::format_percent(
-        (part as f64 / whole as f64) * 100.0,
-    ))
+    let pct = talos_analytics_repository::format_percent((part as f64 / whole as f64) * 100.0);
+    Some(match pct {
+        p if p >= 100.0 && part < whole => 99.9,
+        p if p <= 0.0 && part > 0 => 0.1,
+        p => p,
+    })
 }
 
 /// Render a [`share_pct`] result for interpolation into operator prose.
@@ -1001,6 +1016,24 @@ mod share_pct_tests {
     fn endpoints_are_exact() {
         assert_eq!(share_pct(250, 250), Some(100.0));
         assert_eq!(share_pct(0, 250), Some(0.0));
+    }
+
+    /// …and the endpoints are RESERVED for those exact cases. Rounding to one
+    /// decimal otherwise re-creates D4's own bug at the top of the scale:
+    /// 1999/2000 is 99.95%, which rounds to 100.0 — "fully indexed" printed
+    /// beside a nonzero `unembedded_workflow_count`, exactly the sentence that
+    /// contradicts itself.
+    #[test]
+    fn a_nonzero_gap_never_renders_as_a_hundred() {
+        assert_eq!(share_pct(1999, 2000), Some(99.9));
+        assert_eq!(share_pct(19_999, 20_000), Some(99.9));
+        // Symmetrically at the bottom: a real, single unembedded workflow out
+        // of 20 000 is not "none of them".
+        assert_eq!(share_pct(1, 20_000), Some(0.1));
+        // The step below each endpoint is untouched — the guard only fires on
+        // a value that ROUNDED onto the endpoint.
+        assert_eq!(share_pct(999, 1000), Some(99.9));
+        assert_eq!(share_pct(1, 1000), Some(0.1));
     }
 
     /// A share of an empty population is refused, in BOTH directions — the

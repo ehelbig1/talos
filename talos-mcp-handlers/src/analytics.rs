@@ -3806,7 +3806,9 @@ pub(crate) const NODE_TIMING_BREAKDOWN_NOTE: &str =
      observation per node per execution); source=execution_cost_rollup means the engine did not \
      stamp those timings and the mean is over execution_cost_rollup rows for the whole window. \
      The two populations are NOT interchangeable — compare rows within one report, not across \
-     reports with different sources. An empty list means neither source had rows.";
+     reports with different sources. An empty list means the stamped timings were absent AND the \
+     rollup fallback produced nothing — either it had no rows or its query failed, which this \
+     surface does not distinguish; treat an empty list as NO DATA, never as zero time spent.";
 
 /// Build one `node_timing_breakdown` row.
 ///
@@ -6555,5 +6557,8 @@ mod node_timing_shape_tests {
         assert!(n.contains(NODE_TIMING_SOURCE_ROLLUP), "{n}");
         assert!(n.contains("sample_count"), "{n}");
         assert!(n.contains("empty list"), "{n}");
+        // The fallback's error is swallowed (`if let Ok(..)`), so the note
+        // must not promise that an empty list proves both sources were empty.
+        assert!(n.contains("its query failed"), "{n}");
     }
 }

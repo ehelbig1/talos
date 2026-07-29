@@ -18,13 +18,17 @@
 #
 # CONTRACT (all four matter — see the tests in the `make up` report):
 #   * ADVISORY BY DEFAULT. Anything unexpected — docker not installed, daemon
-#     unreachable, probe image absent, probe times out, df output we cannot
-#     parse — SKIPS SILENTLY with exit 0. A preflight that breaks `make up` on
-#     a machine with a slightly different docker is worse than no preflight.
+#     unreachable, daemon WEDGED (accepts the connection, never answers — the
+#     state a full disk actually produces), probe image absent, probe times
+#     out, df output we cannot parse — SKIPS SILENTLY with exit 0. A preflight
+#     that breaks `make up` on a machine with a slightly different docker is
+#     worse than no preflight, and one that HANGS `make up` is worse still.
 #   * >=80% used: warn, name the exact reclaim commands, exit 0.
 #   * >=95% used: FAIL (exit 1), same commands, and print the override.
 #   * Override: TALOS_UP_SKIP_DISK_CHECK=1 skips the whole check.
-#   * Budget: under ~2s. The probe runs behind a hard deadline.
+#   * Budget: ~0.3s in the healthy case. EVERY docker call runs behind the same
+#     hard deadline, so the pathological case is bounded at 2 × DEADLINE_TENTHS
+#     (~2s) rather than unbounded.
 #
 # Deliberately NOT suggested as a remedy: `docker volume prune` / `system
 # prune --volumes`. Those delete the Postgres data volume — the exact data the
@@ -42,45 +46,62 @@ FAIL_PCT="${TALOS_UP_DISK_FAIL_PCT:-95}"
 # The probe image. Any image with a `df` will do; alpine is already present on
 # every machine that has built this stack.
 PROBE_IMAGE="${TALOS_UP_DISK_PROBE_IMAGE:-alpine}"
-# Hard deadline for the probe, in tenths of a second.
-DEADLINE_TENTHS="${TALOS_UP_DISK_DEADLINE_TENTHS:-15}"
+# Hard deadline for EACH docker call, in tenths of a second. There are two
+# (inspect, then run), so the pathological worst case is twice this.
+DEADLINE_TENTHS="${TALOS_UP_DISK_DEADLINE_TENTHS:-10}"
 
 YEL=$'\033[1;33m'; RED=$'\033[1;31m'; DIM=$'\033[2m'; RST=$'\033[0m'
 
 # Everything below is best-effort. Any failure path returns 0.
 command -v docker >/dev/null 2>&1 || exit 0
 
+# `mktemp` portably: BSD (macOS) accepts `-t PREFIX` and appends its own X's,
+# but GNU coreutils REJECTS a template with no X's ("too few X's in template"),
+# which would have made this whole preflight a permanent silent no-op on every
+# Linux dev machine. An explicit `.XXXXXX` template is the one form both
+# implementations accept.
+probe_out="$(mktemp "${TMPDIR:-/tmp}/talos-disk-preflight.XXXXXX" 2>/dev/null)" || exit 0
+# shellcheck disable=SC2064  # expand $probe_out now, not at trap time
+trap "rm -f '$probe_out'" EXIT
+
+# Run a docker command behind a hard deadline, writing stdout to $probe_out.
+#
+# EVERY docker call needs this, not just the probe: a WEDGED daemon accepts the
+# connection and never answers, so `docker image inspect` hangs as readily as
+# `docker run` does — and a wedged daemon is precisely the state a full disk
+# produces (the 2026-07-24 incident). An unguarded call there would hang
+# `make up` forever, which is a far worse outcome than the corrupted checkpoint
+# this script exists to prevent.
+run_with_deadline() { # $@ = docker args
+  : >"$probe_out"
+  docker "$@" >"$probe_out" 2>/dev/null &
+  local pid=$! waited=0
+  while [ "$waited" -lt "$DEADLINE_TENTHS" ]; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    # Wedged daemon or a very cold image layer. Not our problem to diagnose —
+    # kill the call and get out of the way.
+    kill -9 "$pid" >/dev/null 2>&1
+    wait "$pid" 2>/dev/null
+    return 1
+  fi
+  wait "$pid"
+}
+
 # Daemon reachable? `docker image inspect` talks to the daemon, so this doubles
 # as the daemon check and the image-present check in one round trip. A missing
 # image (fresh machine, pruned cache) is a SKIP, never a pull: pulling would
 # blow the time budget and would be a surprising side effect of `make up`.
-docker image inspect "$PROBE_IMAGE" >/dev/null 2>&1 || exit 0
-
-probe_out="$(mktemp -t talos-disk-preflight 2>/dev/null)" || exit 0
-# shellcheck disable=SC2064  # expand $probe_out now, not at trap time
-trap "rm -f '$probe_out'" EXIT
+run_with_deadline image inspect "$PROBE_IMAGE" || exit 0
 
 # `--pull=never` is belt to the inspect check's suspenders: even if the image
 # vanished between the two calls, we fail rather than silently pulling.
 # The container's `/` is the Docker VM's data disk, which is the thing that
 # fills — NOT the host filesystem `df /` would report on a Mac.
-docker run --rm --pull=never "$PROBE_IMAGE" df -P / >"$probe_out" 2>/dev/null &
-probe_pid=$!
-
-waited=0
-while [ "$waited" -lt "$DEADLINE_TENTHS" ]; do
-  kill -0 "$probe_pid" 2>/dev/null || break
-  sleep 0.1
-  waited=$((waited + 1))
-done
-if kill -0 "$probe_pid" 2>/dev/null; then
-  # Wedged daemon or a very cold image layer. Not our problem to diagnose —
-  # kill the probe and get out of the way.
-  kill -9 "$probe_pid" >/dev/null 2>&1
-  wait "$probe_pid" 2>/dev/null
-  exit 0
-fi
-wait "$probe_pid" || exit 0
+run_with_deadline run --rm --pull=never "$PROBE_IMAGE" df -P / || exit 0
 
 # Defensive parse. `df -P` promises one unwrapped line per filesystem with the
 # mount point last, but we never trust that: find the line whose LAST field is
