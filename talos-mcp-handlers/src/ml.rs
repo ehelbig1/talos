@@ -814,6 +814,75 @@ async fn handle_list_models(
     }
 }
 
+/// What the CURRENT-EPOCH shadow agreement is actually wired to, stated on the
+/// card so an operator does not infer a promotion gate that does not exist.
+///
+/// Grounded 2026-07-28 against `talos-ml/src/lifecycle_job.rs`:
+///   * `shadow_agreement` (current epoch, bands >= the ceil'd serving
+///     threshold) is read by the DRIFT GUARD, which auto-DEMOTES one step when
+///     `total >= min_shadow_total && agreement < demote_below_agreement`.
+///   * The auto-ADVANCE path is gated on `decision.satisfied && policy.auto_advance`
+///     — a policy check over the scheduled eval's holdout metrics. Agreement is
+///     not an input to it.
+///   * `shadow_agreement_lifetime` has NO consumer other than display (its own
+///     doc-comment: "never feed this to the drift guard").
+const SHADOW_EPOCH_NOTE: &str =
+    "POPULATION: the CURRENT shadow epoch only — the epoch rotates on every \
+     transition/promotion/window reset, so this counts evidence about the serving \
+     version in its current state. This is the figure the automated drift guard \
+     reads to auto-DEMOTE (agreement < demote_below_agreement once observations \
+     reach min_shadow_total). It is NOT the promotion gate: auto-advance is decided \
+     by the policy check over the scheduled eval's holdout metrics, not by agreement.";
+
+const SHADOW_LIFETIME_NOTE: &str =
+    "POPULATION: every retained epoch summed — a DIFFERENT population from `shadow` \
+     above (current epoch only), so the two `agreement` values are not comparable and \
+     must not be averaged or substituted for one another. Context/display only: no \
+     lifecycle transition, drift guard or promotion decision reads this number.";
+
+/// The current-epoch shadow block for the model card.
+///
+/// Additive disambiguation (2026-07-28, S2): `agreement`/`observations`/`epoch`
+/// are unchanged for existing consumers; `window`, `note` and the Wilson
+/// interval are new. Pure so the two window strings are unit-pinned — swapping
+/// them with [`shadow_lifetime_block`]'s is exactly the #588 defect and must
+/// fail a test.
+pub(crate) fn shadow_epoch_block(agreement: f64, total: i64, epoch: Option<i32>) -> Value {
+    serde_json::json!({
+        "agreement": agreement,
+        "observations": total,
+        "epoch": epoch,
+        "window": match epoch {
+            Some(e) => format!("epoch {e}"),
+            // The epoch read failed; say so rather than implying "all time".
+            None => "current epoch (number unavailable)".to_string(),
+        },
+        "agreement_ci95": talos_measurement::Measurement::from_fraction(
+            agreement,
+            u64::try_from(total).unwrap_or(0),
+        )
+        .and_then(|m| m.ci95)
+        .map_or(Value::Null, |ci| serde_json::json!(ci)),
+        "note": SHADOW_EPOCH_NOTE,
+    })
+}
+
+/// The all-epochs shadow block for the model card. See [`shadow_epoch_block`].
+pub(crate) fn shadow_lifetime_block(agreement: f64, total: i64) -> Value {
+    serde_json::json!({
+        "agreement": agreement,
+        "observations": total,
+        "window": "lifetime (all epochs)",
+        "agreement_ci95": talos_measurement::Measurement::from_fraction(
+            agreement,
+            u64::try_from(total).unwrap_or(0),
+        )
+        .and_then(|m| m.ci95)
+        .map_or(Value::Null, |ci| serde_json::json!(ci)),
+        "note": SHADOW_LIFETIME_NOTE,
+    })
+}
+
 async fn handle_get_model_card(
     req_id: Option<Value>,
     args: &Value,
@@ -854,17 +923,13 @@ async fn handle_get_model_card(
         .await
         .ok()
         .flatten()
-        .map(|(agreement, total)| {
-            serde_json::json!({"agreement": agreement, "observations": total, "epoch": epoch})
-        });
+        .map(|(agreement, total)| shadow_epoch_block(agreement, total, epoch));
     let shadow_lifetime = lsvc
         .shadow_agreement_lifetime(&mut tx, model.model_id, 0)
         .await
         .ok()
         .flatten()
-        .map(
-            |(agreement, total)| serde_json::json!({"agreement": agreement, "observations": total}),
-        );
+        .map(|(agreement, total)| shadow_lifetime_block(agreement, total));
     let pending_disagreements = lsvc
         .pending_disagreements(&mut tx, model.model_id, user_id, 1)
         .await
@@ -1636,5 +1701,118 @@ mod policy_schema_tests {
             "ml_set_policy description omits settable policy key(s): {missing:?} — \
              deny_unknown_fields makes an undocumented key undiscoverable"
         );
+    }
+}
+
+/// S2 (measurement envelope, 2026-07-28): `shadow` and `shadow_lifetime`
+/// render DIFFERENT populations under the SAME field name `agreement`. This
+/// is structurally the #588 defect; these tests pin the disambiguation.
+#[cfg(test)]
+mod shadow_window_tests {
+    use super::{shadow_epoch_block, shadow_lifetime_block};
+
+    #[test]
+    fn the_two_blocks_state_distinct_windows() {
+        let epoch = shadow_epoch_block(0.91, 120, Some(3));
+        let lifetime = shadow_lifetime_block(0.84, 900);
+        assert_eq!(epoch["window"], "epoch 3");
+        assert_eq!(lifetime["window"], "lifetime (all epochs)");
+        assert_ne!(
+            epoch["window"], lifetime["window"],
+            "the two populations must never share a window string"
+        );
+    }
+
+    /// Mutation guard (8c): swapping the two window strings must fail. The
+    /// assertion is on CONTENT, not merely on inequality, so a swap is caught.
+    #[test]
+    fn window_strings_are_not_interchangeable() {
+        let epoch = shadow_epoch_block(0.5, 10, Some(7));
+        let lifetime = shadow_lifetime_block(0.5, 10);
+        let ew = epoch["window"].as_str().unwrap();
+        let lw = lifetime["window"].as_str().unwrap();
+        assert!(
+            ew.starts_with("epoch ") && ew.contains('7'),
+            "the current-epoch block must name its epoch, got {ew}"
+        );
+        assert!(
+            lw.contains("lifetime") && lw.contains("all epochs"),
+            "the lifetime block must say it spans all epochs, got {lw}"
+        );
+        assert!(
+            !ew.contains("lifetime"),
+            "epoch window must not claim lifetime coverage"
+        );
+        assert!(
+            !lw.starts_with("epoch "),
+            "lifetime window must not claim a single epoch"
+        );
+    }
+
+    /// The existing consumer fields are byte-identical to the pre-change
+    /// shape — this is additive disambiguation, not a rename.
+    #[test]
+    fn agreement_observations_and_epoch_are_unchanged() {
+        let epoch = shadow_epoch_block(0.9125, 400, Some(3));
+        assert_eq!(epoch["agreement"], 0.9125);
+        assert_eq!(epoch["observations"], 400);
+        assert_eq!(epoch["epoch"], 3);
+        let lifetime = shadow_lifetime_block(0.8425, 1600);
+        assert_eq!(lifetime["agreement"], 0.8425);
+        assert_eq!(lifetime["observations"], 1600);
+        // The lifetime block has no epoch — it spans all of them.
+        assert!(lifetime.get("epoch").is_none());
+    }
+
+    /// The note must be accurate about what the number gates. Grounded in
+    /// `talos-ml/src/lifecycle_job.rs`: current-epoch agreement drives the
+    /// auto-DEMOTE drift guard; auto-advance is gated on the policy check
+    /// over eval metrics; the lifetime aggregate gates nothing.
+    #[test]
+    fn notes_state_which_population_gates_what() {
+        let epoch = shadow_epoch_block(0.9, 100, Some(1));
+        let note = epoch["note"].as_str().unwrap();
+        assert!(note.contains("CURRENT shadow epoch"));
+        assert!(note.contains("drift guard") && note.contains("auto-DEMOTE"));
+        assert!(
+            note.contains("NOT the promotion gate"),
+            "the card must not let a reader infer agreement gates advance"
+        );
+        let lnote = shadow_lifetime_block(0.9, 100)["note"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(lnote.contains("DIFFERENT population"));
+        assert!(
+            lnote.contains("Context/display only"),
+            "the lifetime aggregate feeds no decision; say so"
+        );
+    }
+
+    /// Small observation counts must show as wide intervals, and a zero
+    /// observation count must produce no interval at all.
+    #[test]
+    fn agreement_carries_an_interval_sized_to_its_observations() {
+        let thin = shadow_epoch_block(1.0, 3, Some(2));
+        let thick = shadow_epoch_block(1.0, 3000, Some(2));
+        let thin_lo = thin["agreement_ci95"][0].as_f64().unwrap();
+        let thick_lo = thick["agreement_ci95"][0].as_f64().unwrap();
+        assert!(thin_lo < 0.5, "3 observations must read as thin: {thin_lo}");
+        assert!(thick_lo > 0.99, "3000 observations: {thick_lo}");
+        // n = 0 → no interval (never a [0,0] that reads as certainty).
+        assert!(shadow_epoch_block(0.0, 0, Some(2))["agreement_ci95"].is_null());
+        assert!(shadow_lifetime_block(0.0, 0)["agreement_ci95"].is_null());
+    }
+
+    /// A failed epoch read must not silently render as "all time".
+    #[test]
+    fn missing_epoch_says_so_rather_than_implying_lifetime() {
+        let v = shadow_epoch_block(0.9, 50, None);
+        let w = v["window"].as_str().unwrap();
+        assert!(
+            w.contains("current epoch") && w.contains("unavailable"),
+            "{w}"
+        );
+        assert!(!w.contains("lifetime"));
     }
 }

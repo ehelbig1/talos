@@ -122,10 +122,11 @@ impl talos_workflow_engine_core::AssistantReportReader for PostgresAssistantRepo
             "teacher_audits": teacher_audits,
             "judge_scores": {
                 "trailing_days": days,
-                "population_note": "runs/avg_score/pass_rate/worst_score cover SCORED \
-                                    verdicts only; na_runs counts runs where the judge \
-                                    reported nothing to judge and which are excluded from \
-                                    every score above",
+                // D5 (2026-07-28): shared with the operator digest, which
+                // carried a byte-identical hand-copy of this sentence. One
+                // constant so the disclosure can't drift away from the
+                // `FILTER (WHERE NOT not_applicable)` it describes.
+                "population_note": talos_measurement::JUDGE_SCORE_POPULATION_NOTE,
                 "workflows": judge_scores.iter().map(|s| json!({
                     "name": s.workflow_name,
                     // Scored verdicts only — see `population_note`. Total

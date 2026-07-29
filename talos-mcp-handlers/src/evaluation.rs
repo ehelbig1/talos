@@ -198,10 +198,113 @@ async fn handle_grounding_report(
 
     let svc = eval_service(state);
     match svc.observational_report(actor_id, since_days).await {
-        Ok(report) => mcp_text(
-            req_id,
-            &serde_json::to_string_pretty(&report).unwrap_or_default(),
-        ),
+        Ok(report) => mcp_text(req_id, &render_grounding_report(&report, since_days)),
         Err(e) => eval_err(req_id, &e),
+    }
+}
+
+/// The window disclosure the report itself cannot carry: `since_days` is a
+/// caller argument that the pure stats kernel never sees, so before this the
+/// handler silently DROPPED it and a 7-day report rendered identically to a
+/// 365-day one (S3, 2026-07-28). Additive: every existing field is untouched.
+///
+/// Pure + `pub(crate)` so the echo is unit-tested against real production code.
+pub(crate) fn render_grounding_report(
+    report: &talos_evaluation::stats::ObservationalReport,
+    since_days: i64,
+) -> String {
+    let mut body = serde_json::to_value(report).unwrap_or_default();
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("since_days".into(), serde_json::json!(since_days));
+        obj.insert(
+            "window".into(),
+            serde_json::json!(format!("trailing {since_days} days")),
+        );
+        obj.insert(
+            "population_note".into(),
+            serde_json::json!(
+                "n_labeled counts executions carrying a judge verdict in the window; \
+                 abstentions are not verdicts and never reach here. mean_judge_score is over \
+                 n_scored (labeled executions that also carry a numeric score), NOT n_labeled. \
+                 pass_rate_high/low_relevance are over n_high/n_low, the two halves of a median \
+                 split on mean relevance. Correlations are OBSERVATIONAL — memory-OFF runs leave \
+                 no provenance, so nothing here is causal."
+            ),
+        );
+    }
+    serde_json::to_string_pretty(&body).unwrap_or_default()
+}
+
+/// S3 (measurement envelope, 2026-07-28): the handler owns `since_days` and
+/// used to drop it, so a 7-day report rendered identically to a 365-day one.
+#[cfg(test)]
+mod grounding_report_window_tests {
+    use super::render_grounding_report;
+    use talos_evaluation::stats::{analyze_observational, ObservationalRow};
+
+    fn report(n: usize) -> talos_evaluation::stats::ObservationalReport {
+        let rows: Vec<ObservationalRow> = (0..n)
+            .map(|i| ObservationalRow {
+                mean_fused: if i % 2 == 0 { 0.8 } else { 0.2 },
+                mem_count: i as i64,
+                judge_passed: Some(i % 3 != 0),
+                judge_score: Some(0.5),
+            })
+            .collect();
+        analyze_observational(&rows)
+    }
+
+    #[test]
+    fn since_days_is_echoed_and_the_window_is_named() {
+        let r = report(10);
+        let v: serde_json::Value = serde_json::from_str(&render_grounding_report(&r, 7)).unwrap();
+        assert_eq!(v["since_days"], 7);
+        assert_eq!(v["window"], "trailing 7 days");
+        // Two different windows must not produce identical output.
+        let other: serde_json::Value =
+            serde_json::from_str(&render_grounding_report(&r, 365)).unwrap();
+        assert_ne!(v, other, "the window must be visible in the output");
+        assert_eq!(other["since_days"], 365);
+    }
+
+    #[test]
+    fn every_report_field_survives_the_wrapping() {
+        let r = report(10);
+        let v: serde_json::Value = serde_json::from_str(&render_grounding_report(&r, 30)).unwrap();
+        for k in [
+            "n_labeled",
+            "overall_pass_rate",
+            "corr_relevance_pass",
+            "corr_relevance_pass_ci95",
+            "corr_count_pass",
+            "corr_count_pass_ci95",
+            "pass_rate_high_relevance",
+            "pass_rate_low_relevance",
+            "n_high",
+            "n_low",
+            "mean_judge_score",
+            "n_scored",
+        ] {
+            assert!(
+                v.as_object().unwrap().contains_key(k),
+                "{k} missing from the rendered report"
+            );
+        }
+        assert_eq!(v["n_labeled"], 10);
+        assert_eq!(v["n_scored"], 10);
+    }
+
+    #[test]
+    fn population_note_names_each_denominator() {
+        let v: serde_json::Value =
+            serde_json::from_str(&render_grounding_report(&report(10), 30)).unwrap();
+        let note = v["population_note"].as_str().unwrap();
+        assert!(note.contains("n_scored"), "{note}");
+        assert!(note.contains("NOT n_labeled"), "{note}");
+        assert!(note.contains("n_high/n_low"), "{note}");
+        assert!(
+            note.contains("nothing here is causal"),
+            "an observational correlation must say so: {note}"
+        );
     }
 }

@@ -49,6 +49,7 @@ talos-registry = { path = "../talos-registry" }
 talos-retry-intelligence = { path = "../talos-retry-intelligence" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-text-util = { path = "../talos-text-util" }
+talos-measurement = { path = "../talos-measurement" }
 # Phase C: load_worker_shared_key() to key the per-node checkpoint AEAD,
 # matching the scheduler's completion-time checkpoint.
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }

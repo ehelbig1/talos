@@ -477,6 +477,14 @@ pub struct WorkflowCapabilityRow {
     pub capabilities: Option<Vec<String>>,
     pub readiness_score: Option<i32>,
     pub success_rate: Option<f64>,
+    /// The DENOMINATOR of `success_rate` — executions whose `started_at`
+    /// falls in the trailing 30 days, in ANY status.
+    ///
+    /// Added 2026-07-28 (measurement envelope, S1). `success_rate` alone
+    /// renders 1-for-1 identically to 400-for-400, and this row feeds
+    /// capability ROUTING — which workflow gets picked. Never emit the rate
+    /// without this count beside it.
+    pub runs_30d: i64,
 }
 
 #[derive(Debug)]
@@ -2377,11 +2385,23 @@ impl AnalyticsRepository {
         user_id: Uuid,
         capabilities: &[String],
     ) -> Result<Vec<WorkflowCapabilityRow>> {
+        // 2026-07-28 (measurement envelope, S1): the rate now ships with its
+        // denominator. The scalar sub-SELECT became a LATERAL so BOTH the
+        // rate and the count come from ONE pass over the same rows — a second
+        // scalar subquery would have re-scanned, and a per-row follow-up query
+        // would have been an N+1. The rate expression is unchanged, so
+        // `runs_30d` is exactly the denominator it divides by: executions with
+        // `started_at` inside the window, in every status.
         let rows = sqlx::query(
             "SELECT w.id, w.name, w.description, w.capabilities, w.readiness_score, \
-                    (SELECT COUNT(*) FILTER (WHERE status = 'completed')::float / NULLIF(COUNT(*), 0) \
-                     FROM workflow_executions WHERE workflow_id = w.id AND started_at > NOW() - interval '30 days') AS success_rate \
+                    e.success_rate, e.runs_30d \
              FROM workflows w \
+             LEFT JOIN LATERAL ( \
+                 SELECT COUNT(*) FILTER (WHERE status = 'completed')::float / NULLIF(COUNT(*), 0) AS success_rate, \
+                        COUNT(*)::bigint AS runs_30d \
+                 FROM workflow_executions \
+                 WHERE workflow_id = w.id AND started_at > NOW() - interval '30 days' \
+             ) e ON TRUE \
              WHERE w.user_id = $1 AND w.capabilities @> $2 \
              ORDER BY w.readiness_score DESC NULLS LAST LIMIT 20",
         )
@@ -2398,6 +2418,11 @@ impl AnalyticsRepository {
                     capabilities: r.try_get::<Option<_>, _>("capabilities")?,
                     readiness_score: r.try_get::<Option<_>, _>("readiness_score")?,
                     success_rate: r.try_get::<Option<_>, _>("success_rate")?,
+                    // A workflow with no executions in the window still gets
+                    // a row from the LEFT JOIN LATERAL; COUNT(*) is 0 there,
+                    // never NULL. Read as Option anyway so a schema drift
+                    // surfaces as an error rather than a silent 0 (check 52).
+                    runs_30d: r.try_get::<Option<i64>, _>("runs_30d")?.unwrap_or(0),
                 })
             })
             .collect::<Result<Vec<_>>>()
