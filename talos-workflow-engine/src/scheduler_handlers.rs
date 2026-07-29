@@ -2660,6 +2660,31 @@ impl DispatchedOrigin {
 /// that the 10× is inherited from the workspace fold rather than derived,
 /// and why narrowing it is a separate decision). The scope-push semantics
 /// below are untouched.
+///
+/// # The added size caps ARE an observable change
+///
+/// "Adds the caps this site never had" is not the same as "changes nothing".
+/// Dispatch scope carries whole gathered node outputs, and rhai applies
+/// `max_string_size` / `max_array_size` / `max_map_size` to the `&mut`
+/// receiver of every method call — using an AGGREGATE, RECURSIVE size for
+/// that value. So under the caps:
+///
+/// * reads and property navigation of an oversized payload still work
+///   (`route`, `inputs.route`, `nested.body`, `arr[0]`, `big == "z"`);
+/// * a method call on one now fails — `inputs.body.contains("urgent")` on a
+///   100 KB body, `items.len()` on a 600-element array, or even
+///   `inputs.len()` when the total string content under `inputs` exceeds
+///   64 KiB — with `Dispatch expression evaluation failed: Length of string
+///   too large`.
+///
+/// Pinned below by `dispatch_size_cap_semantics`, and accepted rather than
+/// deferred because the live deployment stores zero dispatch expressions
+/// (checked 2026-07-29) while an uncapped engine could grow a 16 MiB string
+/// inside the 10 000-operation budget. Both halves of that reasoning, and
+/// the re-measure instruction for other deployments, are recorded on
+/// `SandboxProfile::Dispatch`. If a deployment DOES have big-payload
+/// dispatch expressions, the fix is a per-profile size cap in the builder —
+/// not a hand-rolled engine here.
 fn evaluate_dispatch_expression(expression: &str, inputs: &JsonValue) -> Result<String, String> {
     let rhai_engine =
         talos_rhai_sandbox::sandboxed_engine(talos_rhai_sandbox::SandboxProfile::Dispatch);
@@ -2822,6 +2847,90 @@ mod dispatch_expression_tests {
         assert!(
             err.to_string().to_lowercase().contains("operation"),
             "expected an operations-exceeded error, got: {err}"
+        );
+    }
+    /// The OTHER half of the profile decision, and the sharpest behaviour
+    /// risk in the sandbox-builder change: this site previously set NO
+    /// `max_string_size` / `max_array_size` / `max_map_size`, so the caps are
+    /// newly live here. Pins exactly which expression shapes that changes, so
+    /// a future reader debugging a `Length of string too large` from a
+    /// dispatch node finds the semantics written down instead of rediscovering
+    /// them.
+    ///
+    /// The rule (rhai 1.24 `src/eval/data_check.rs`): the caps are not
+    /// applied when the host pushes a value into scope, but they ARE applied
+    /// to the result of every call and to the `&mut` receiver of every method
+    /// call — against an AGGREGATE, RECURSIVE size of that value.
+    #[test]
+    fn dispatch_size_cap_semantics() {
+        let inputs = json!({
+            "route": "workflow-a",
+            "big": "x".repeat(200_000),
+            "arr": (0..600).collect::<Vec<i64>>(),
+            "nested": { "target": "workflow-b", "body": "y".repeat(100_000) },
+        });
+
+        // (1) Reads and property navigation of oversized values are FINE —
+        // the caps do not apply at scope-push time. Every real dispatch
+        // expression observed in the wild is one of these shapes.
+        for (expr, want) in [
+            ("route", "workflow-a"),
+            ("inputs.route", "workflow-a"),
+            ("nested.target", "workflow-b"),
+            (
+                r#"if big == "z" { "hit" } else { "workflow-a" }"#,
+                "workflow-a",
+            ),
+            (
+                r#"if arr[0] == 0 { "workflow-a" } else { "hit" }"#,
+                "workflow-a",
+            ),
+        ] {
+            assert_eq!(
+                evaluate_dispatch_expression(expr, &inputs).as_deref(),
+                Ok(want),
+                "reading an oversized payload must still route: `{expr}`"
+            );
+        }
+
+        // (2) A METHOD CALL whose receiver is oversized now fails. Each of
+        // these routed before 2026-07-29 and errors after.
+        for (expr, marker) in [
+            (r#"if big.len() > 3 { "a" } else { "b" }"#, "string"),
+            (r#"if big.contains("x") { "a" } else { "b" }"#, "string"),
+            (
+                r#"if nested.body.starts_with("y") { "a" } else { "b" }"#,
+                "string",
+            ),
+            (r#"if arr.len() > 3 { "a" } else { "b" }"#, "array"),
+            (
+                r#"if arr.filter(|x| x > 500).len() > 3 { "a" } else { "b" }"#,
+                "array",
+            ),
+            // Aggregate + recursive: `inputs` has four keys, but the total
+            // string content beneath it is 300 KB.
+            (r#"if inputs.len() > 3 { "a" } else { "b" }"#, "string"),
+        ] {
+            let err = evaluate_dispatch_expression(expr, &inputs)
+                .expect_err(&format!("`{expr}` must be refused by the size caps"));
+            assert!(
+                err.starts_with("Dispatch expression evaluation failed:")
+                    && err.to_lowercase().contains("too large")
+                    && err.to_lowercase().contains(marker),
+                "`{expr}`: expected a {marker}-too-large error, got: {err}"
+            );
+        }
+
+        // (3) The same shapes on a NORMAL-sized payload are unaffected —
+        // the caps bite on size, not on method calls as such.
+        let small = json!({ "arr": [1, 2, 3], "body": "short", "route": "workflow-a" });
+        assert_eq!(
+            evaluate_dispatch_expression(
+                r#"if arr.len() == 3 && body.contains("sho") { route } else { "other" }"#,
+                &small
+            )
+            .as_deref(),
+            Ok("workflow-a")
         );
     }
 }

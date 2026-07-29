@@ -4209,12 +4209,36 @@ bold "▶ check 63: one Rhai sandbox (discard print/debug + no raw rhai::Engine:
 #     `if let Some(ref print) = self.print`), so it cannot reach stdout even
 #     in principle. The compile-only sites in talos-mcp-handlers use it and
 #     only ever call `Engine::compile`, which never dispatches a function.
-#   * Comments are stripped before matching so the prose in these files
+#   * `//`-comments are stripped before matching so the prose in these files
 #     (which necessarily names `Engine::new()`) does not self-trip.
+#   * `*/.claude/*` is excluded along with `target/` and `.git/`. Agent
+#     worktrees live under `.claude/worktrees/`, so without this the check run
+#     from the main checkout scans every stale sibling branch and reports its
+#     files (measured: 20+ hits from pre-#614 checkouts) — a failure the
+#     developer in the main tree cannot fix, which is how a check gets
+#     bypassed. Same exclusion the other find-based checks above use.
+#   * The walk MUST be `find .` (relative to the `cd "$ROOT"` at the top of
+#     this script), never `find "$ROOT"`. When the script runs from inside an
+#     agent worktree, `$ROOT` ITSELF contains `/.claude/`, so an absolute walk
+#     plus the exclusion above matches every file and the check silently
+#     scans nothing. The zero-scan guard below exists because that failure is
+#     invisible — it reports success.
+#
+# Known matcher limits (this is a DRIFT check, not an adversary check — the
+# shapes below need deliberate effort, and a reviewer sees them):
+#   * an aliased import (`use rhai::Engine as E; E::new()`), a trait-qualified
+#     `let e: rhai::Engine = Default::default();`, and a construction split
+#     across two lines all evade the grep. `cargo fmt` re-joins the split form,
+#     and the other two are not shapes anyone reaches for by accident.
+#   * a `/* … */` BLOCK comment naming `Engine::new()` is a false positive
+#     (only `//` is stripped); use the file-level opt-out if that ever happens.
 #
 # Opt-outs: `// allow-rhai-stdout: <reason>` (part A),
-#           `// allow-raw-rhai-engine: <reason>` (part B, per file).
-RHAI_SANDBOX_FILE="$ROOT/talos-rhai-sandbox/src/lib.rs"
+#           `// allow-raw-rhai-engine: <reason>` (part B, per file — note it is
+#           file-WIDE, not line-scoped, so a file that legitimately carries one
+#           is no longer covered for any FUTURE engine added to it).
+RHAI_SANDBOX_REL="talos-rhai-sandbox/src/lib.rs"
+RHAI_SANDBOX_FILE="$ROOT/$RHAI_SANDBOX_REL"
 RHAI_FAIL=0
 
 # Part A — the builder must silence both handlers.
@@ -4240,23 +4264,41 @@ fi
 # Part B — nobody else constructs a rhai Engine.
 if [ "$RHAI_FAIL" != "2" ]; then
     RAW_RHAI_HITS=""
+    RHAI_SCANNED=0
     while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        RHAI_SCANNED=$((RHAI_SCANNED + 1))
         # Skip the builder's own file, and any file with the opt-out marker.
-        case "$f" in "$RHAI_SANDBOX_FILE") continue ;; esac
+        case "$f" in "./$RHAI_SANDBOX_REL") continue ;; esac
         grep -q 'allow-raw-rhai-engine' "$f" && continue
         # Strip //-comments so prose naming Engine::new() doesn't self-trip.
+        # The `if hit=…; then` wrapper is load-bearing under `set -euo
+        # pipefail`: the inner greps legitimately exit 1 on "no match", and a
+        # BARE assignment from a failing pipeline aborts the whole script
+        # (measured: the lint died silently after part A). Keep the wrapper.
         if hit="$(sed 's|//.*||' "$f" \
                 | grep -nE '(^|[^A-Za-z0-9_:])(rhai::)?Engine::(new|default)[[:space:]]*\([[:space:]]*\)' \
                 | grep -v 'wasmtime::' | head -3)"; then
             if [ -n "$hit" ]; then
-                RAW_RHAI_HITS="${RAW_RHAI_HITS}${f#$ROOT/}:
+                RAW_RHAI_HITS="${RAW_RHAI_HITS}${f#./}:
 $(echo "$hit" | sed 's/^/    /')
 "
             fi
         fi
-    done <<< "$(find "$ROOT" -name '*.rs' -type f -not -path '*/target/*' -not -path '*/.git/*')"
+    done <<< "$(find . -name '*.rs' -type f \
+                    -not -path '*/target/*' -not -path '*/.git/*' \
+                    -not -path '*/.claude/*')"
 
-    if [ -n "$RAW_RHAI_HITS" ]; then
+    # A check that scans nothing reports success. Fail loud instead — this is
+    # what an absolute-path walk from inside a `.claude/worktrees/…` checkout
+    # did before it was caught in review.
+    if [ "$RHAI_SCANNED" -lt 100 ]; then
+        red "✗ check 63 part B scanned only $RHAI_SCANNED .rs files — the walk is broken"
+        yellow "  → expected the whole workspace; a near-empty scan means the find"
+        yellow "    exclusions swallowed everything (e.g. an absolute walk whose root"
+        yellow "    is itself under an excluded path). Fix the find, do not lower this."
+        RHAI_FAIL=1
+    elif [ -n "$RAW_RHAI_HITS" ]; then
         red "✗ raw rhai Engine construction outside the sandbox builder:"
         echo "$RAW_RHAI_HITS" | sed 's/^/  /'
         yellow "  → every engine that EVALUATES an expression must come from"

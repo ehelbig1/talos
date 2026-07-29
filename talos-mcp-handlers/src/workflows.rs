@@ -8641,7 +8641,9 @@ async fn handle_add_edge_to_workflow(
         // handlers, no StandardPackage) and the only call is `compile`,
         // which never dispatches a function. Deliberately not the
         // `talos_rhai_sandbox` builder — that is for engines that EVALUATE.
-        // See the comment on `RHAI_VALIDATION_ENGINE` in graph.rs.
+        // Never add an eval/run/call_fn here: `new_raw()` also has NO
+        // operation cap, and check 63 exempts it so the lint cannot catch
+        // it. See the comment on `RHAI_VALIDATION_ENGINE` in graph.rs.
         let mut check_engine = rhai::Engine::new_raw();
         check_engine.disable_symbol("eval");
         if let Err(e) = check_engine.compile(cond) {
@@ -10056,7 +10058,8 @@ async fn handle_plan_and_execute_workflow(
             )
         }
         Some(expr) => {
-            // COMPILE-ONLY: see the sibling comment above / graph.rs.
+            // COMPILE-ONLY, no eval ever: see the sibling comment above /
+            // graph.rs.
             let mut check_engine = rhai::Engine::new_raw();
             check_engine.disable_symbol("eval");
             if let Err(e) = check_engine.compile(expr) {
