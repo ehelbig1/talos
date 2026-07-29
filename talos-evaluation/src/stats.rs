@@ -219,7 +219,15 @@ pub struct ObservationalReport {
     /// Executions with a judge label (the analyzable set).
     pub n_labeled: usize,
     /// Overall judge pass rate across labeled executions.
-    pub overall_pass_rate: f64,
+    ///
+    /// `None` when `n_labeled == 0`: a rate over a zero denominator has no
+    /// value, and the bare `0.0` this used to emit read as "everything failed"
+    /// on an actor that simply had no judged runs. Retyped 2026-07-28
+    /// (measurement envelope, D6) — the MCP renderer previously DISCLOSED the
+    /// lie in prose instead of not telling it. Same convention as every other
+    /// optional statistic in this struct: serialized as JSON `null`, never
+    /// omitted, so a consumer that reads the key still finds it.
+    pub overall_pass_rate: Option<f64>,
     /// Point-biserial (Pearson) correlation between mean fused relevance and
     /// judge pass (0/1). Positive → relevance tracks passing. `None` when
     /// there is too little data or no variance to compute it.
@@ -274,7 +282,8 @@ pub fn analyze_observational(rows: &[ObservationalRow]) -> ObservationalReport {
     if n == 0 {
         return ObservationalReport {
             n_labeled: 0,
-            overall_pass_rate: 0.0,
+            // NOT 0.0 — see the field doc. Nothing was measured here.
+            overall_pass_rate: None,
             corr_relevance_pass: None,
             corr_relevance_pass_ci95: None,
             corr_count_pass: None,
@@ -298,7 +307,8 @@ pub fn analyze_observational(rows: &[ObservationalRow]) -> ObservationalReport {
             }
         })
         .collect();
-    let overall_pass_rate = passed.iter().sum::<f64>() / nf;
+    // `n > 0` here (the zero case returned above), so this is a real rate.
+    let overall_pass_rate = Some(passed.iter().sum::<f64>() / nf);
 
     let relevance: Vec<f64> = labeled.iter().map(|r| r.mean_fused).collect();
     let counts: Vec<f64> = labeled.iter().map(|r| r.mem_count as f64).collect();
@@ -523,7 +533,9 @@ mod tests {
         ];
         let r = analyze_observational(&rows);
         assert_eq!(r.n_labeled, 2);
-        assert!((r.overall_pass_rate - 0.5).abs() < 1e-9);
+        // D6: a real rate over a real sample is Some — only the empty
+        // population yields None (see `observational_empty_has_no_pass_rate`).
+        assert!((r.overall_pass_rate.expect("n_labeled > 0") - 0.5).abs() < 1e-9);
     }
 
     #[test]
@@ -564,7 +576,7 @@ mod tests {
         ];
         let r = analyze_observational(&rows);
         assert_eq!(r.n_labeled, 2, "the abstaining execution must not count");
-        assert!((r.overall_pass_rate - 0.5).abs() < 1e-9);
+        assert!((r.overall_pass_rate.expect("n_labeled > 0") - 0.5).abs() < 1e-9);
         // Mean score is over the two scored rows only.
         assert!((r.mean_judge_score.unwrap() - 0.55).abs() < 1e-9);
     }

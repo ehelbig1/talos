@@ -652,6 +652,11 @@ pub fn annotate_correction_loop(ml: &mut JsonValue) {
             .get("gold")
             .and_then(|g| g.get("total"))
             .and_then(JsonValue::as_i64);
+        let gold_measured_at = m
+            .get("gold")
+            .and_then(|g| g.get("measured_at"))
+            .and_then(JsonValue::as_str)
+            .map(str::to_string);
         let Some(state) = correction_loop_state(banked, gold_acc, gold_total) else {
             continue;
         };
@@ -666,6 +671,16 @@ pub fn annotate_correction_loop(ml: &mut JsonValue) {
             "correction_loop_note".into(),
             json!(correction_loop_note(state)),
         );
+        // WHEN the gold slice this verdict is drawn from was measured, lifted
+        // to the model level next to the interval so a flat renderer (the
+        // digest email) shows the age beside the band label. COPIED from the
+        // payload — a `correction_loop: converged` from an eval that last ran
+        // in April is a different fact from the same label measured today, and
+        // the annotator has no business inventing the difference. Absent when
+        // the version predates provenance capture; absent stays absent.
+        if let Some(at) = gold_measured_at {
+            obj.insert("gold_measured_at".into(), json!(at));
+        }
         // Ship the interval next to the point estimate so nobody (including a
         // future me) reads a 35-row gold accuracy as a precise figure.
         if let Some((lo, hi)) = ci {
@@ -966,6 +981,37 @@ mod tests {
             models[1].get("correction_loop").is_none(),
             "a model with no gold slice must get NO verdict, not a default one"
         );
+        // The 2026-07-26 payload had no `measured_at` (the field did not
+        // exist), and the annotator must not invent one.
+        assert!(
+            models[0].get("gold_measured_at").is_none(),
+            "an unstamped gold slice must not acquire a timestamp here"
+        );
+    }
+
+    /// D5 (2026-07-28): when `loop_health` carries the gold slice's
+    /// measurement time, the digest lifts it to the model level beside the
+    /// interval — a `converged` verdict from an eval that last ran in April is
+    /// a different fact from the same verdict measured today, and the flat
+    /// email renderer reads model-level keys.
+    #[test]
+    fn the_annotation_carries_the_gold_measurement_time_when_the_payload_has_one() {
+        let mut ml = json!({"models": [
+            {"name": "inbox-classifier-personal", "corrections_banked": 143,
+             "gold": {"accuracy": 0.9, "total": 60, "source_version": 43,
+                      "measured_at": "2026-07-27T09:30:00.000Z"}},
+        ]});
+        annotate_correction_loop(&mut ml);
+        let m = &ml["models"][0];
+        assert_eq!(m["correction_loop"], "converged");
+        assert_eq!(
+            m["gold_measured_at"], "2026-07-27T09:30:00.000Z",
+            "the stamp must be COPIED from the payload, not derived"
+        );
+        // Idempotent + clock-free: re-annotating cannot move the timestamp.
+        let before = ml.clone();
+        annotate_correction_loop(&mut ml);
+        assert_eq!(ml, before);
     }
 
     /// The annotation is decoration on a best-effort panel — every malformed

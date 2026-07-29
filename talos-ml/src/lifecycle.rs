@@ -1316,9 +1316,16 @@ mod tests {
                     threshold: *t,
                     coverage: *cov,
                     accuracy: *acc,
+                    // Fixture: 100-row holdout, so n is coverage x total.
+                    // Filled rather than defaulted — a test fixture that
+                    // carries no denominator is how the production shape
+                    // loses one.
+                    n: Some((*cov * 100.0).round() as u64),
                 })
                 .collect(),
             gold: None,
+            // This fixture is not a measurement; it must not claim to be one.
+            measured_at: None,
         }
     }
 

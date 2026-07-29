@@ -34,6 +34,7 @@ pub mod serve;
 pub mod teacher_audit;
 pub mod teacher_audit_job;
 pub mod teacher_ceilings;
+pub mod version_metrics;
 
 pub use content_identity::{content_key, CONTENT_KEY_LEN, CONTENT_KEY_PREFIX};
 pub use correction::{resolve_disagreement, ResolveError, ResolveOutcome};
@@ -47,7 +48,8 @@ pub use distill::{spawn_distill_from_output, DistillContext, DISTILL_CONTEXT};
 pub use eval::{
     correction_aware_holdout, coverage_curve, evaluate_predictions, macro_f1, macro_recall,
     run_backend_selection_eval, run_knn_eval, stratified_holdout, BackendCandidate, ClassMetrics,
-    CorrectionsCfg, CoveragePoint, EvalReport, MIN_CLASS_FOR_HOLDOUT,
+    CorrectionsCfg, CoveragePoint, EvalReport, COVERAGE_CURVE_POPULATION_NOTE,
+    MIN_CLASS_FOR_HOLDOUT,
 };
 pub use knn::{knn_vote, knn_vote_balanced, knn_vote_balanced_weighted, KnnPrediction, Neighbor};
 pub use lifecycle::{
@@ -71,3 +73,4 @@ pub use teacher_audit::{
 };
 pub use teacher_audit_job::{run_teacher_audit_tick, spawn_teacher_audit_scheduler};
 pub use teacher_ceilings::teacher_ceilings;
+pub use version_metrics::{build_version_metrics, VersionMetricsInput, METRICS_PROVENANCE_NOTE};

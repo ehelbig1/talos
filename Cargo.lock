@@ -8436,6 +8436,7 @@ dependencies = [
  "sqlx",
  "talos-db",
  "talos-llm",
+ "talos-measurement",
  "talos-memory",
  "talos-secrets-manager",
  "talos-tenancy",

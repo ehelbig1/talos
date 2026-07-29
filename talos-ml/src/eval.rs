@@ -5,10 +5,25 @@
 //! the async orchestration (split assignment, running backends over the
 //! holdout) lives in the service layer so this stays unit-testable.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+/// Population disclosure for the accuracy@coverage curve.
+///
+/// Every renderer of `report.coverage_curve` states this ONCE (D2,
+/// 2026-07-28): `accuracy` at a band is over `n` rows, not over the holdout,
+/// and `n` shrinks as the threshold rises — 1.0 at n=6 is not 1.0 at n=600.
+/// Kept as a constant so the two surfaces that render the curve (the
+/// `ml_eval_model` response and the model card) cannot drift apart.
+pub const COVERAGE_CURVE_POPULATION_NOTE: &str =
+    "coverage_curve: each point is over its OWN population — `n` is the number of holdout rows \
+     predicted at-or-above that confidence threshold, and `accuracy` is the fraction of those n \
+     that were right (NOT of the whole holdout). `coverage` is n / holdout total. n falls as the \
+     threshold rises, so a high-threshold accuracy is the least-supported number on the curve; \
+     read n before the accuracy. `accuracy` is null when n = 0 (nothing covered), never 0.0. \
+     Points written before 2026-07-28 carry no `n` — absent means not recorded, not zero.";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ClassMetrics {
     pub precision: f64,
     pub recall: f64,
@@ -21,7 +36,7 @@ pub struct ClassMetrics {
 /// and how accurate is the covered fast path. Production falls back to
 /// the LLM below the threshold, so THIS — not overall accuracy — is
 /// the deploy-decision number.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoveragePoint {
     pub threshold: f64,
     pub coverage: f64,
@@ -30,9 +45,21 @@ pub struct CoveragePoint {
     /// (a policy evaluator reading 0.0 would treat absence of data as
     /// catastrophic quality).
     pub accuracy: Option<f64>,
+    /// The DENOMINATOR of `accuracy`: holdout rows predicted at-or-above
+    /// `threshold`. Added 2026-07-28 (measurement envelope, D2) — its own
+    /// doc called this "the deploy-decision number" while shipping without a
+    /// sample size, so `accuracy = 1.0` over 6 rows rendered identically to
+    /// 1.0 over 600.
+    ///
+    /// `Option` ONLY so payloads stored before the field existed deserialize
+    /// as absent rather than as a fabricated `0`. Every producer in this
+    /// crate fills it — [`coverage_curve`] is the sole one, and
+    /// `coverage_points_carry_their_denominator` pins that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalReport {
     pub accuracy: f64,
     pub total: usize,
@@ -45,14 +72,40 @@ pub struct EvalReport {
     pub per_class: BTreeMap<String, ClassMetrics>,
     /// accuracy@coverage at the standard thresholds (empty when the
     /// caller supplied no confidences).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub coverage_curve: Vec<CoveragePoint>,
     /// GOLD subset (source='correction' — human truth) scored
     /// separately: teacher labels grade agreement, gold grades
     /// correctness, and a distilled model can legitimately beat its
     /// teacher here. None until corrections exist in the holdout.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gold: Option<Box<EvalReport>>,
+    /// When this report was PRODUCED (RFC 3339), stamped once by the eval
+    /// runner at completion — see [`stamp_measured_at`].
+    ///
+    /// Carried, never re-derived: a reader that fills this in at render time
+    /// would be inventing a freshness the numbers do not have. Absent on the
+    /// pure kernel ([`evaluate_predictions`], which has no clock) and on every
+    /// report stored before 2026-07-28 — absent means "not recorded", and a
+    /// reader must render it as such rather than substituting `now()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_at: Option<String>,
+}
+
+impl EvalReport {
+    /// Stamp `measured_at` on this report AND its gold sub-report with ONE
+    /// instant — the moment the eval finished scoring.
+    ///
+    /// The parent and the gold slice are the same measurement event (gold is a
+    /// re-score of a subset of the same holdout run), so they must not carry
+    /// two different clocks.
+    pub fn stamp_measured_at(&mut self, at: impl Into<String>) {
+        let at = at.into();
+        if let Some(g) = self.gold.as_mut() {
+            g.measured_at = Some(at.clone());
+        }
+        self.measured_at = Some(at);
+    }
 }
 
 /// Compute the report from parallel truth/prediction slices.
@@ -133,6 +186,10 @@ pub fn evaluate_predictions(
         per_class,
         coverage_curve: Vec::new(),
         gold: None,
+        // The pure kernel has no clock and no eval context: the RUNNER
+        // stamps this at completion (`report_from_scored`). Fabricating a
+        // timestamp here would put one on every unit-test report too.
+        measured_at: None,
     })
 }
 
@@ -166,6 +223,10 @@ pub fn coverage_curve(
                 threshold: t,
                 coverage: covered as f64 / total as f64,
                 accuracy: (covered > 0).then(|| correct as f64 / covered as f64),
+                // The accuracy denominator, always recorded: `coverage` is a
+                // fraction of the holdout and cannot be inverted into a count
+                // by a reader who does not also have the holdout total.
+                n: Some(covered as u64),
             }
         })
         .collect()
@@ -359,9 +420,25 @@ pub fn macro_recall(report: &EvalReport) -> f64 {
     scored.iter().sum::<f64>() / scored.len() as f64
 }
 
+/// The single clock read of the eval path: the instant a backend finished
+/// scoring the holdout, in RFC 3339.
+///
+/// Every `measured_at` downstream (the report's own, the version's
+/// `metrics_json`, the model card's) is a COPY of this value, propagated by
+/// value. No reader ever calls `now()` — a render-time timestamp claims a
+/// freshness the numbers do not have, which is the misleading-report-field
+/// class this whole change exists to close.
+fn measurement_instant() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
 /// Build the full report (overall + coverage curve + gold subset) from a
 /// backend's scored holdout. Shared by every backend so the eval shape is
 /// identical no matter which one produced the predictions.
+///
+/// This is where `measured_at` is stamped: it is the completion point of one
+/// backend's scoring pass, and it is shared by the parent report and its gold
+/// sub-report (one measurement event, one clock).
 fn report_from_scored(
     truths: &[String],
     sources: &[String],
@@ -391,6 +468,7 @@ fn report_from_scored(
         gold.coverage_curve = coverage_curve(&gt, &gs);
         report.gold = Some(Box::new(gold));
     }
+    report.stamp_measured_at(measurement_instant());
     Ok(report)
 }
 
@@ -729,6 +807,136 @@ mod tests {
         assert_eq!(r.per_class["a"].precision, 0.0);
         assert_eq!(r.per_class["b"].recall, 0.0);
         assert_eq!(r.per_class["b"].support, 1);
+    }
+
+    /// D2: every coverage point carries the DENOMINATOR its accuracy is over.
+    ///
+    /// Mutation guard — deleting `n` from [`CoveragePoint`], or filling it
+    /// with anything other than the covered count, fails here. Before this
+    /// field, `accuracy = 1.0` at `coverage = 0.03` (2 rows) rendered
+    /// identically to 1.0 over 600, and the doc-comment on this very struct
+    /// called it "the deploy-decision number".
+    #[test]
+    fn coverage_points_carry_their_denominator() {
+        let truths = vec![s("a"), s("a"), s("b"), s("b")];
+        let preds = vec![
+            Some((s("a"), 0.95f32)),
+            Some((s("a"), 0.85)),
+            Some((s("a"), 0.55)), // wrong, low confidence
+            None,                 // abstention: covers nothing at any threshold
+        ];
+        let curve = coverage_curve(&truths, &preds);
+        // n IS the accuracy denominator, exactly: at 0.5 three rows are
+        // covered and two are right (2/3); at 0.9 one row is covered.
+        assert_eq!(curve[0].n, Some(3));
+        assert_eq!(curve[4].n, Some(1));
+        // …and it is consistent with `coverage` (n / holdout total) at every
+        // point, so the two fields can never tell different stories.
+        for p in &curve {
+            let n = p.n.expect("every produced point carries n");
+            assert!(
+                (p.coverage - n as f64 / truths.len() as f64).abs() < 1e-12,
+                "coverage {} disagrees with n {n} at threshold {}",
+                p.coverage,
+                p.threshold
+            );
+            // A band with nothing in it reports no accuracy — not 0.0.
+            assert_eq!(p.accuracy.is_none(), n == 0, "n/accuracy disagree at {p:?}");
+        }
+        // MONOTONIC: raising the confidence floor can only shed rows. A curve
+        // whose n rises with the threshold would mean the bands are not nested
+        // and none of the accuracies mean what they claim.
+        for w in curve.windows(2) {
+            assert!(w[0].threshold < w[1].threshold);
+            assert!(
+                w[0].n.unwrap() >= w[1].n.unwrap(),
+                "n rose from {:?} to {:?} as the threshold rose",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    /// D2's other half: the per-band population is stated ONCE, in the shared
+    /// constant both renderers (`ml_eval_model`, the model card) emit.
+    #[test]
+    fn the_coverage_note_states_the_denominator_and_what_absence_means() {
+        assert!(COVERAGE_CURVE_POPULATION_NOTE.contains("its OWN population"));
+        assert!(COVERAGE_CURVE_POPULATION_NOTE.contains("NOT of the whole holdout"));
+        assert!(COVERAGE_CURVE_POPULATION_NOTE.contains("read n before the accuracy"));
+        assert!(
+            COVERAGE_CURVE_POPULATION_NOTE.contains("absent means not recorded, not zero"),
+            "old points carry no n and the note must say what that means"
+        );
+    }
+
+    /// D4: the eval RUNNER stamps `measured_at`; the pure kernel does not.
+    ///
+    /// One instant covers the report and its gold sub-report — they are one
+    /// measurement event (gold re-scores a subset of the same holdout run), so
+    /// two different clocks there would be two different claims about when.
+    #[test]
+    fn the_runner_stamps_one_instant_and_the_kernel_stamps_none() {
+        let truths = vec![s("a"), s("b"), s("a")];
+        let scored = vec![
+            Some((s("a"), 0.9f32)),
+            Some((s("b"), 0.8)),
+            Some((s("a"), 0.7)),
+        ];
+        // Only the middle row is a human correction → a gold slice exists.
+        let sources = vec![s("llm"), s("correction"), s("llm")];
+        let report = report_from_scored(&truths, &sources, &scored).unwrap();
+        let stamp = report.measured_at.clone().expect("runner must stamp");
+        // RFC 3339, UTC.
+        chrono::DateTime::parse_from_rfc3339(&stamp).expect("measured_at must be RFC 3339");
+        assert!(stamp.ends_with('Z'), "{stamp}");
+        assert_eq!(
+            report.gold.as_ref().unwrap().measured_at.as_deref(),
+            Some(stamp.as_str()),
+            "gold is the same measurement event and must carry the same instant"
+        );
+        // The REAL eval path (not just `coverage_curve` in isolation) fills
+        // the per-band denominator, on the parent AND on the gold slice.
+        assert_eq!(report.coverage_curve[0].n, Some(3));
+        assert_eq!(report.gold.as_ref().unwrap().coverage_curve[0].n, Some(1));
+        // The PURE kernel has no clock — a unit-test report must not look like
+        // it was measured against production data.
+        let bare = evaluate_predictions(&truths, &[Some(s("a")), None, None]).unwrap();
+        assert_eq!(bare.measured_at, None);
+    }
+
+    /// D3/D4 compat: a report stored BEFORE the provenance fields existed
+    /// deserializes with them ABSENT — never defaulted to `0` or to a
+    /// fabricated timestamp — and round-trips back out without inventing them.
+    #[test]
+    fn a_legacy_stored_report_deserializes_with_its_provenance_absent() {
+        let legacy = serde_json::json!({
+            "accuracy": 0.8,
+            "total": 35,
+            "abstained": 2,
+            "per_class": {
+                "archive": { "precision": 0.9, "recall": 0.8, "f1": 0.85, "support": 20 }
+            },
+            "coverage_curve": [
+                { "threshold": 0.5, "coverage": 0.6, "accuracy": 1.0 }
+            ],
+            "gold": {
+                "accuracy": 0.4857, "total": 35, "abstained": 0, "per_class": {}
+            }
+        });
+        let r: EvalReport = serde_json::from_value(legacy).expect("old shape must still parse");
+        assert_eq!(r.total, 35);
+        assert_eq!(r.measured_at, None, "absent means NOT MEASURED");
+        assert_eq!(r.coverage_curve[0].n, None, "absent means NOT RECORDED");
+        assert_eq!(r.gold.as_ref().unwrap().measured_at, None);
+        // Re-serializing must not materialize the missing keys as zeros.
+        let back = serde_json::to_value(&r).unwrap();
+        let point = back["coverage_curve"][0].as_object().unwrap();
+        assert!(!point.contains_key("n"), "n must stay absent: {back}");
+        assert!(!back.as_object().unwrap().contains_key("measured_at"));
+        // A 1.0 accuracy with no n is exactly the number a reader must not
+        // over-read; it survives as-is so the renderer can say "unknown n".
+        assert_eq!(point["accuracy"], 1.0);
     }
 
     #[test]

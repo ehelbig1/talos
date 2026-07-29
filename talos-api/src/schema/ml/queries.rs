@@ -17,7 +17,26 @@ pub struct MlModelSummary {
     pub lifecycle_state: String,
     pub promoted_version: Option<i32>,
     /// Holdout accuracy of the promoted version (0–1), if promoted.
+    ///
+    /// A BARE rate: no denominator, no date. Kept unchanged because the model
+    /// review page already renders it; read it alongside the four
+    /// `promotedAccuracy*` / `promotedBackend` fields below, which say over how
+    /// many rows, by which backend, and when it was measured.
     pub promoted_accuracy: Option<f64>,
+    /// The DENOMINATOR of `promotedAccuracy`: holdout rows the promoted
+    /// version was scored on. `null` for versions whose stored report carries
+    /// no total (pre-RFC-0011-era rows) — absent, not zero.
+    pub promoted_accuracy_n: Option<i32>,
+    /// Wilson 95% interval `[lo, hi]` for `promotedAccuracy`, so a 1-of-1
+    /// "100%" is visibly not a 400-of-400 one. `null` when `promotedAccuracyN`
+    /// is.
+    pub promoted_accuracy_ci95: Option<Vec<f64>>,
+    /// When the promoted version's eval was recorded (RFC 3339), carried from
+    /// the version row's `trained_at`. `null` on rows written before
+    /// provenance capture — which means UNKNOWN age, not recent.
+    pub promoted_accuracy_measured_at: Option<String>,
+    /// The promoted version's backend (`knn-pgvector`, `linear-logreg`, …).
+    pub promoted_backend: Option<String>,
     /// Count of `pending` disagreements awaiting human review.
     pub pending_disagreements: i32,
 }
@@ -108,6 +127,24 @@ impl MlQueries {
                 lifecycle_state: m.lifecycle_state,
                 promoted_version: m.promoted_version,
                 promoted_accuracy: m.promoted_accuracy,
+                // The envelope beside the bare float. Every field is READ off
+                // the measurement the registry built from the version row —
+                // nothing is recomputed or defaulted here, so an absent
+                // denominator stays absent instead of becoming 0.
+                promoted_accuracy_n: m
+                    .promoted_accuracy_measurement
+                    .as_ref()
+                    .map(|meas| i32::try_from(meas.n).unwrap_or(i32::MAX)),
+                promoted_accuracy_ci95: m
+                    .promoted_accuracy_measurement
+                    .as_ref()
+                    .and_then(|meas| meas.ci95)
+                    .map(|ci| ci.to_vec()),
+                promoted_accuracy_measured_at: m
+                    .promoted_accuracy_measurement
+                    .as_ref()
+                    .and_then(|meas| meas.measured_at.clone()),
+                promoted_backend: m.promoted_backend,
                 // Clamp to i32 for the wire; counts never realistically
                 // exceed i32::MAX (per-model cap is a few hundred).
                 pending_disagreements: m.pending_disagreements.min(i64::from(i32::MAX)) as i32,
