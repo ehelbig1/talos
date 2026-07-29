@@ -2639,14 +2639,55 @@ impl DispatchedOrigin {
 /// gathered input and return the result as a string (typically a
 /// workflow UUID or name).
 ///
-/// The Rhai engine is configured with a 10,000-operation cap, `eval`
-/// disabled, and a dummy module resolver to bound runtime and
-/// dependency surface.
+/// The engine comes from `talos_rhai_sandbox::sandboxed_engine`, the ONE
+/// sandbox builder for the workspace, under the `Dispatch` profile.
+///
+/// Before 2026-07-29 this function hand-rolled its own engine and was the
+/// worst of the four such copies: it set a 10 000-operation cap, disabled
+/// `eval`, and installed the dummy module resolver — but had **no**
+/// `print`/`debug` discard and **no** call-depth or string/array/map caps.
+/// The missing discard was a live DLP hole: `rhai::Engine::new()` wires
+/// both builtins to `println!`, so a stored dispatch expression of
+/// `print(inputs); "some-workflow"` dumped every gathered node input —
+/// post-interpolation secrets, email bodies — to the controller's stdout
+/// and therefore its container logs, past every DLP boundary the
+/// persistence path applies. Dispatch expressions are the highest-risk of
+/// the four: caller-authored expressions over caller-adjacent node output.
+///
+/// Routing through the builder therefore *adds* the discard plus the
+/// depth/size caps this site never had, and keeps the 10 000-operation
+/// budget as a NAMED profile (see `SandboxProfile::Dispatch`, which records
+/// that the 10× is inherited from the workspace fold rather than derived,
+/// and why narrowing it is a separate decision). The scope-push semantics
+/// below are untouched.
+///
+/// # The added size caps ARE an observable change
+///
+/// "Adds the caps this site never had" is not the same as "changes nothing".
+/// Dispatch scope carries whole gathered node outputs, and rhai applies
+/// `max_string_size` / `max_array_size` / `max_map_size` to the `&mut`
+/// receiver of every method call — using an AGGREGATE, RECURSIVE size for
+/// that value. So under the caps:
+///
+/// * reads and property navigation of an oversized payload still work
+///   (`route`, `inputs.route`, `nested.body`, `arr[0]`, `big == "z"`);
+/// * a method call on one now fails — `inputs.body.contains("urgent")` on a
+///   100 KB body, `items.len()` on a 600-element array, or even
+///   `inputs.len()` when the total string content under `inputs` exceeds
+///   64 KiB — with `Dispatch expression evaluation failed: Length of string
+///   too large`.
+///
+/// Pinned below by `dispatch_size_cap_semantics`, and accepted rather than
+/// deferred because the live deployment stores zero dispatch expressions
+/// (checked 2026-07-29) while an uncapped engine could grow a 16 MiB string
+/// inside the 10 000-operation budget. Both halves of that reasoning, and
+/// the re-measure instruction for other deployments, are recorded on
+/// `SandboxProfile::Dispatch`. If a deployment DOES have big-payload
+/// dispatch expressions, the fix is a per-profile size cap in the builder —
+/// not a hand-rolled engine here.
 fn evaluate_dispatch_expression(expression: &str, inputs: &JsonValue) -> Result<String, String> {
-    let mut rhai_engine = rhai::Engine::new();
-    rhai_engine.set_max_operations(10_000);
-    rhai_engine.disable_symbol("eval");
-    rhai_engine.set_module_resolver(rhai::module_resolvers::DummyModuleResolver);
+    let rhai_engine =
+        talos_rhai_sandbox::sandboxed_engine(talos_rhai_sandbox::SandboxProfile::Dispatch);
     let mut scope = rhai::Scope::new();
     // Push top-level input keys as bare scope variables (so `route == "A"` works),
     // using serde conversion so nested objects/arrays stay structured rather than
@@ -2677,5 +2718,219 @@ fn evaluate_dispatch_expression(expression: &str, inputs: &JsonValue) -> Result<
             }
         }
         Err(e) => Err(format!("Dispatch expression evaluation failed: {e}")),
+    }
+}
+
+/// `evaluate_dispatch_expression` had ZERO test coverage before 2026-07-29,
+/// which is how its engine config drifted 10× from every other Rhai site and
+/// lost the `print`/`debug` discard without anything noticing. These pin the
+/// behaviour the sandbox-builder refactor must preserve, plus the two things
+/// it deliberately changes.
+#[cfg(test)]
+mod dispatch_expression_tests {
+    use super::evaluate_dispatch_expression;
+    use serde_json::json;
+
+    /// The documented access patterns: bare top-level keys, and the whole
+    /// payload as `input` / `ctx` / `inputs`. Unchanged by the refactor.
+    #[test]
+    fn resolves_every_documented_access_pattern() {
+        let inputs = json!({ "route": "workflow-a", "nested": { "target": "workflow-b" } });
+        for expr in [
+            "route",
+            "input.route",
+            "ctx.route",
+            "inputs.route",
+            "nested.target",
+        ] {
+            let got = evaluate_dispatch_expression(expr, &inputs)
+                .unwrap_or_else(|e| panic!("`{expr}` should evaluate: {e}"));
+            let want = if expr == "nested.target" {
+                "workflow-b"
+            } else {
+                "workflow-a"
+            };
+            assert_eq!(got, want, "`{expr}`");
+        }
+    }
+
+    /// Conditional routing — the shape a real `DynamicDispatch` node stores.
+    #[test]
+    fn evaluates_a_conditional_route() {
+        let inputs = json!({ "score": 82 });
+        assert_eq!(
+            evaluate_dispatch_expression(
+                r#"if score > 50 { "high-wf" } else { "low-wf" }"#,
+                &inputs
+            ),
+            Ok("high-wf".to_string())
+        );
+        let inputs = json!({ "score": 12 });
+        assert_eq!(
+            evaluate_dispatch_expression(
+                r#"if score > 50 { "high-wf" } else { "low-wf" }"#,
+                &inputs
+            ),
+            Ok("low-wf".to_string())
+        );
+    }
+
+    /// An empty result is an error, not a dispatch to "" — and an eval
+    /// failure keeps its operator-recognised message prefix.
+    #[test]
+    fn empty_and_failing_expressions_stay_errors() {
+        let inputs = json!({ "route": "" });
+        assert_eq!(
+            evaluate_dispatch_expression("route", &inputs),
+            Err("Dispatch expression returned empty string".to_string())
+        );
+        let err = evaluate_dispatch_expression("this is not rhai (", &inputs)
+            .expect_err("a syntax error must not route");
+        assert!(
+            err.starts_with("Dispatch expression evaluation failed:"),
+            "error prefix changed: {err}"
+        );
+    }
+
+    /// SECURITY: dynamic code execution stays blocked at this site.
+    #[test]
+    fn dynamic_eval_is_blocked() {
+        let inputs = json!({});
+        assert!(evaluate_dispatch_expression(r#"eval("\"wf\"")"#, &inputs).is_err());
+    }
+
+    /// DLP (the fix): a dispatch expression containing `print(inputs)` used
+    /// to write every gathered node input to the controller's stdout. It is
+    /// now discarded — but `print` stays a CALLABLE no-op, so the expression
+    /// still routes to exactly the same workflow instead of becoming a parse
+    /// error and failing the node on deploy.
+    #[test]
+    fn print_is_a_no_op_and_does_not_change_the_route() {
+        let inputs = json!({ "route": "workflow-a", "secret": "sk-not-a-real-key" });
+        assert_eq!(
+            evaluate_dispatch_expression("print(inputs); route", &inputs),
+            Ok("workflow-a".to_string()),
+            "print must remain callable and route-neutral"
+        );
+        assert_eq!(
+            evaluate_dispatch_expression("debug(secret); route", &inputs),
+            Ok("workflow-a".to_string()),
+        );
+    }
+
+    /// Pins the `SandboxProfile::Dispatch` decision: this site keeps a
+    /// 10 000-operation budget, so an expression that costs more than the
+    /// 1 000-op `Expression` budget still routes here. The second half is
+    /// the point — the same expression FAILS under the Expression profile,
+    /// which is the evidence that "just normalise dispatch to 1 000" would
+    /// have been an observable behaviour change to stored graphs, not a
+    /// cleanup. See `SandboxProfile::Dispatch`'s docs for why that decision
+    /// was deferred rather than taken here.
+    #[test]
+    fn the_dispatch_operation_budget_is_load_bearing_versus_expression() {
+        // ~900 loop iterations: comfortably over 1 000 operations, well
+        // under 10 000.
+        let expr = r#"let n = 0; for i in 0..900 { n += 1; } "wf-" + n"#;
+        let inputs = serde_json::json!({});
+
+        assert_eq!(
+            evaluate_dispatch_expression(expr, &inputs),
+            Ok("wf-900".to_string()),
+            "the Dispatch profile's 10 000-op budget must still cover this"
+        );
+
+        let expression_profile =
+            talos_rhai_sandbox::sandboxed_engine(talos_rhai_sandbox::SandboxProfile::Expression);
+        let err = expression_profile
+            .eval::<rhai::Dynamic>(expr)
+            .expect_err("the 1 000-op Expression budget must NOT cover this");
+        assert!(
+            err.to_string().to_lowercase().contains("operation"),
+            "expected an operations-exceeded error, got: {err}"
+        );
+    }
+    /// The OTHER half of the profile decision, and the sharpest behaviour
+    /// risk in the sandbox-builder change: this site previously set NO
+    /// `max_string_size` / `max_array_size` / `max_map_size`, so the caps are
+    /// newly live here. Pins exactly which expression shapes that changes, so
+    /// a future reader debugging a `Length of string too large` from a
+    /// dispatch node finds the semantics written down instead of rediscovering
+    /// them.
+    ///
+    /// The rule (rhai 1.24 `src/eval/data_check.rs`): the caps are not
+    /// applied when the host pushes a value into scope, but they ARE applied
+    /// to the result of every call and to the `&mut` receiver of every method
+    /// call — against an AGGREGATE, RECURSIVE size of that value.
+    #[test]
+    fn dispatch_size_cap_semantics() {
+        let inputs = json!({
+            "route": "workflow-a",
+            "big": "x".repeat(200_000),
+            "arr": (0..600).collect::<Vec<i64>>(),
+            "nested": { "target": "workflow-b", "body": "y".repeat(100_000) },
+        });
+
+        // (1) Reads and property navigation of oversized values are FINE —
+        // the caps do not apply at scope-push time. Every real dispatch
+        // expression observed in the wild is one of these shapes.
+        for (expr, want) in [
+            ("route", "workflow-a"),
+            ("inputs.route", "workflow-a"),
+            ("nested.target", "workflow-b"),
+            (
+                r#"if big == "z" { "hit" } else { "workflow-a" }"#,
+                "workflow-a",
+            ),
+            (
+                r#"if arr[0] == 0 { "workflow-a" } else { "hit" }"#,
+                "workflow-a",
+            ),
+        ] {
+            assert_eq!(
+                evaluate_dispatch_expression(expr, &inputs).as_deref(),
+                Ok(want),
+                "reading an oversized payload must still route: `{expr}`"
+            );
+        }
+
+        // (2) A METHOD CALL whose receiver is oversized now fails. Each of
+        // these routed before 2026-07-29 and errors after.
+        for (expr, marker) in [
+            (r#"if big.len() > 3 { "a" } else { "b" }"#, "string"),
+            (r#"if big.contains("x") { "a" } else { "b" }"#, "string"),
+            (
+                r#"if nested.body.starts_with("y") { "a" } else { "b" }"#,
+                "string",
+            ),
+            (r#"if arr.len() > 3 { "a" } else { "b" }"#, "array"),
+            (
+                r#"if arr.filter(|x| x > 500).len() > 3 { "a" } else { "b" }"#,
+                "array",
+            ),
+            // Aggregate + recursive: `inputs` has four keys, but the total
+            // string content beneath it is 300 KB.
+            (r#"if inputs.len() > 3 { "a" } else { "b" }"#, "string"),
+        ] {
+            let err = evaluate_dispatch_expression(expr, &inputs)
+                .expect_err(&format!("`{expr}` must be refused by the size caps"));
+            assert!(
+                err.starts_with("Dispatch expression evaluation failed:")
+                    && err.to_lowercase().contains("too large")
+                    && err.to_lowercase().contains(marker),
+                "`{expr}`: expected a {marker}-too-large error, got: {err}"
+            );
+        }
+
+        // (3) The same shapes on a NORMAL-sized payload are unaffected —
+        // the caps bite on size, not on method calls as such.
+        let small = json!({ "arr": [1, 2, 3], "body": "short", "route": "workflow-a" });
+        assert_eq!(
+            evaluate_dispatch_expression(
+                r#"if arr.len() == 3 && body.contains("sho") { route } else { "other" }"#,
+                &small
+            )
+            .as_deref(),
+            Ok("workflow-a")
+        );
     }
 }

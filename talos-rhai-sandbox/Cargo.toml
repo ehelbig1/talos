@@ -1,0 +1,18 @@
+[package]
+name = "talos-rhai-sandbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The ONLY dependency. This crate is a deliberate leaf so that every
+# rhai-using crate in the workspace can depend on it without a cycle —
+# see the module docs in src/lib.rs for why it is not folded into
+# `talos-workflow-engine-core` (which `worker/` depends on, and which
+# therefore must not grow a scripting-engine dependency).
+rhai = { version = "1.19", features = ["serde"] }
+
+[lints]
+workspace = true

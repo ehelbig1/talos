@@ -46,44 +46,22 @@ fn looks_like_error_string(s: &str) -> bool {
 
 // Thread-local Rhai engine, created once per thread and reused.
 // Rhai's Engine is not Send+Sync, so we use thread_local instead of a static.
+//
+// The configuration — operation / depth / size caps, no dynamic `eval`, no
+// module resolver, and the `print`/`debug` discard that keeps stored
+// expressions from writing upstream-node output to the controller's stdout —
+// lives in ONE place for the whole workspace: `talos_rhai_sandbox`. It used
+// to be spelled out inline here and re-typed (differently, and with the
+// discard missing) at three other call sites; see that crate's docs for the
+// drift table and the reason it is a leaf crate.
+//
+// `SandboxProfile::Expression` is byte-equivalent to the config this block
+// applied inline: 1 000 operations, 16 call levels, 64 KiB strings, 500-element
+// arrays, 500-property maps.
 thread_local! {
-    static RHAI_ENGINE: Engine = {
-        let mut engine = Engine::new();
-        // Safety limits to prevent runaway scripts
-        engine.set_max_operations(1000);
-        engine.set_max_call_levels(16);
-        engine.set_max_string_size(65536);
-        engine.set_max_array_size(500);
-        engine.set_max_map_size(500);
-        // SECURITY: disable dynamic code execution inside approval conditions.
-        // eval() allows arbitrary Rhai code from a string — blocked here so a
-        // stored condition like eval("some_dynamic_expr") cannot be used to
-        // bypass the save-time syntax check.
-        engine.disable_symbol("eval");
-        // SECURITY: no module resolver — `import` statements fail at evaluation
-        // time. Engine::new() sets no resolver by default; this makes the intent
-        // explicit and guards against future Engine::new() behaviour changes.
-        engine.set_module_resolver(rhai::module_resolvers::DummyModuleResolver);
-        // DLP: `Engine::new()` installs `print`/`debug` handlers that
-        // `println!` to STDOUT — the same stream `tracing`'s `fmt::layer()`
-        // writes to, so anything they emit lands in the controller's container
-        // logs. Every scope variable here is upstream-node output: post-
-        // interpolation secrets, email bodies, whatever the workflow carries.
-        // A stored `verdict_expr` / `skip_condition` of
-        // `print(ctx); #{...}` therefore dumps the whole bound context to the
-        // log, defeating the DLP redaction every other persistence boundary
-        // applies (the one condition-eval WARN below scrubs its context
-        // through `redact_json` precisely because this data is sensitive).
-        //
-        // Discarded rather than `disable_symbol`ed: silencing keeps `print`
-        // a no-op unit call, so an expression that already contains one keeps
-        // evaluating to the same verdict. Disabling the symbol would turn it
-        // into a PARSE ERROR and change a working stored expression into a
-        // node failure on deploy.
-        engine.on_print(|_| {});
-        engine.on_debug(|_, _, _| {});
-        engine
-    };
+    static RHAI_ENGINE: Engine = talos_rhai_sandbox::sandboxed_engine(
+        talos_rhai_sandbox::SandboxProfile::Expression,
+    );
 }
 
 /// Helper function to evaluate Rhai conditions using JSON context.
@@ -603,7 +581,8 @@ mod html_entity_decode_tests {
 /// controller's stdout and therefore its container logs. Every variable in
 /// scope here is upstream-node output, so a single `print(ctx)` in a stored
 /// expression exfiltrates the whole node input past every DLP boundary. The
-/// discard is installed in the thread-local engine above.
+/// discard is installed by `talos_rhai_sandbox::sandboxed_engine`, which
+/// builds the thread-local engine above.
 ///
 /// A unit test cannot observe process stdout from inside the same process
 /// without fd surgery, so what is pinned here is the OTHER half of the fix:
@@ -612,10 +591,29 @@ mod html_entity_decode_tests {
 /// one keeps producing the same verdict — which is exactly why the fix
 /// discards the output instead of `disable_symbol`ing the call into a parse
 /// error.
+///
+/// These tests exercise the discard through the real `evaluate_*` helpers,
+/// i.e. through the same thread-local engine production uses; the builder's
+/// own per-profile tests live in `talos-rhai-sandbox`.
 #[cfg(test)]
 mod print_discard_tests {
     use super::*;
     use serde_json::json;
+
+    /// The shared engine must be built from the `Expression` profile, and
+    /// that profile's limits must be the ones this file used to hardcode.
+    /// This is what makes "the refactor changed no behaviour" checkable
+    /// rather than asserted.
+    #[test]
+    fn shared_engine_uses_the_expression_profile_limits() {
+        RHAI_ENGINE.with(|engine| {
+            assert_eq!(engine.max_operations(), 1000);
+            assert_eq!(engine.max_call_levels(), 16);
+            assert_eq!(engine.max_string_size(), 65536);
+            assert_eq!(engine.max_array_size(), 500);
+            assert_eq!(engine.max_map_size(), 500);
+        });
+    }
 
     #[test]
     fn print_and_debug_stay_callable_and_do_not_change_the_result() {

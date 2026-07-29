@@ -22,9 +22,24 @@
 //!   bypass validation by constructing code at runtime.
 //! * **No module / import resolver** — expressions cannot pull in
 //!   external source or host-provided libraries.
+//! * **`print` / `debug` output discarded** — the host language's
+//!   console builtins must not reach the process's stdout. Expression
+//!   scopes are full of upstream-node output (post-interpolation
+//!   secrets, email bodies), and stdout is the container log, i.e.
+//!   past every DLP boundary the persistence path applies. Discard the
+//!   output rather than disabling the call, so an expression that
+//!   already contains one keeps evaluating to the same result.
 //!
-//! A reference `rhai`-backed adapter implementing all four lives in
-//! the sibling `talos-workflow-engine` crate.
+//! **The enforcement of this contract lives in `talos-rhai-sandbox`**
+//! (`sandboxed_engine(SandboxProfile::…)`), which is the ONLY sanctioned
+//! way to construct an engine that will evaluate an expression. Do NOT
+//! hand-roll a config from this list: it was documented here and
+//! re-typed at four call sites, which had already drifted apart by
+//! 2026-07-29 (two of them missing the print/debug discard entirely, one
+//! missing every depth/size cap). Structural lint check 63 now fails on
+//! any `rhai::Engine::new()` outside that crate. A reference `rhai`-backed
+//! adapter implementing all four evaluation shapes lives in the sibling
+//! `talos-workflow-engine` crate.
 
 use serde_json::Value as JsonValue;
 

@@ -42,6 +42,9 @@ members = [
     "talos-graph-rag",
     "talos-security-headers",
     "talos-retry-intelligence",
+    # The ONE Rhai sandbox builder (leaf crate, only dep is `rhai`) — every
+    # engine that EVALUATES a stored/caller-authored expression is built here.
+    "talos-rhai-sandbox",
     "talos-capability-world",
     "talos-jobs",
     "talos-replay-diff",

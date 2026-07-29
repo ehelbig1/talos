@@ -7,7 +7,31 @@ use uuid::Uuid;
 
 // Thread-local Rhai validation engine — created once per thread, reused for syntax checks.
 // `rhai::Engine` contains `Rc` and is not `Send`; `thread_local!` avoids that constraint.
-// We only use `compile` for syntax validation; no scripts are executed.
+//
+// COMPILE-ONLY, and deliberately NOT built by `talos_rhai_sandbox::sandboxed_engine`
+// (the builder every EVALUATING engine must come from — lint check 63). Two
+// independent reasons this engine cannot leak to stdout, either of which
+// would be sufficient:
+//   1. `new_raw()`, not `new()`. `Engine::new()` is what installs the
+//      `println!`-backed `print`/`debug` handlers; `new_raw()` leaves both
+//      as `None`, and rhai's dispatch site is `if let Some(ref print) =
+//      self.print` — a `None` handler emits nothing and still yields unit.
+//      `new_raw()` also registers no StandardPackage at all.
+//   2. Nothing here evaluates. The only method called on this engine is
+//      `Engine::compile` (see `validate_rhai_expression` below), which
+//      parses to AST and never dispatches a function call, so `print`
+//      cannot fire regardless of the handler.
+// A dry-run that DOES evaluate (`dry_run_retry_condition`) deliberately
+// routes to `talos_engine::rhai_helpers::evaluate_condition_with_error`,
+// i.e. the production sandbox, rather than evaluating on this engine.
+//
+// DO NOT add an `eval` / `run` / `call_fn` / `eval_ast` call on this engine.
+// Reason 2 above is what makes the exemption sound, and check 63 exempts
+// `new_raw()` by construction, so it CANNOT catch such an addition. Nor is
+// stdout the only exposure: `Engine::RAW` starts from `Limits::new()`, whose
+// `num_operations` is `None` — no operation cap at all — so an eval here
+// would let one authoring request spin a controller thread forever.
+// Evaluating anything means `talos_rhai_sandbox::sandboxed_engine`.
 std::thread_local! {
     static RHAI_VALIDATION_ENGINE: rhai::Engine = {
         let mut e = rhai::Engine::new_raw();
