@@ -625,6 +625,50 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+    // Tier-1 GENERATION-model boot warmup — the sibling of the embedding
+    // provider's warmup (`talos_memory::embedding::warmup`, spawned in
+    // bootstrap/services). Ollama's `keep_alive` residency dies with the
+    // container, so the FIRST scheduled workflow after every deploy paid
+    // the cold model load on top of its own inference. That surcharge
+    // failed the flagship `pa-chief-of-staff` briefing on two consecutive
+    // days, both minutes after a stack restart. Warming here moves the
+    // cost to boot, where nobody is waiting.
+    //
+    // Gated on the probe above: `memory_loop_ollama` is `Some` only when
+    // Ollama actually answered, so an ollama-less deploy does no work and
+    // logs no noise. Fire-and-forget — boot neither waits for it nor
+    // fails on it; every outcome inside is a log line. See
+    // `talos_llm::warmup` for the local-provider-only / static-prompt /
+    // bounded-list security posture.
+    if talos_config::llm_boot_warmup_enabled() {
+        if let Some(warm_client) = memory_loop_ollama.clone() {
+            let warm_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
+            tokio::spawn(async move {
+                // Bounded scan; the selector caps the result at
+                // `MAX_WARMUP_MODELS` regardless of how many rows come back.
+                const WARMUP_GRAPH_SCAN_LIMIT: i64 = 500;
+                match warm_repo
+                    .list_enabled_graph_json_for_boot_warmup(WARMUP_GRAPH_SCAN_LIMIT)
+                    .await
+                {
+                    Ok(graphs) => {
+                        let targets = talos_llm::warmup::select_warmup_targets(&graphs);
+                        talos_llm::warmup::run_boot_warmup(warm_client, targets).await;
+                    }
+                    // Generic message only — the query is ours, but the
+                    // rule is uniform: no DB error detail into logs that
+                    // ship off-host.
+                    Err(e) => tracing::warn!(
+                        target: "talos_llm",
+                        event_kind = "llm_boot_warmup_scan_failed",
+                        error = %e,
+                        "Could not read enabled workflows for LLM boot warmup — skipping"
+                    ),
+                }
+            });
+        }
+    }
+
     talos_ml::spawn_policy_evaluator(
         db_pool.clone(),
         talos_ml::DatasetService::new(core.secrets_manager.clone()),

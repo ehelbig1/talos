@@ -166,7 +166,7 @@ async fn run_with_transport_enforces_workflow_timeout() {
     // catch-all `Execution(String)` form rather than only relying on
     // a substring match.
     assert!(
-        matches!(err, WorkflowEngineError::Timeout { secs: 1 }),
+        matches!(err, WorkflowEngineError::Timeout { secs: 1, .. }),
         "expected Timeout {{ secs: 1 }}, got: {err:?}"
     );
     // Elapsed should be close to the 1-second cap — give generous
@@ -207,7 +207,7 @@ async fn run_with_seed_with_transport_enforces_workflow_timeout() {
         .expect_err("workflow must time out");
     let elapsed = started.elapsed();
     assert!(
-        matches!(err, WorkflowEngineError::Timeout { secs: 1 }),
+        matches!(err, WorkflowEngineError::Timeout { secs: 1, .. }),
         "expected Timeout {{ secs: 1 }}, got: {err:?}"
     );
     assert!(
@@ -264,6 +264,280 @@ async fn execution_timeout_secs_zero_disables_the_cap() {
         .await
         .expect("no timeout when execution_timeout_secs = 0");
     assert_eq!(ctx.results.len(), 3, "all three nodes should complete");
+}
+
+// ============================================================================
+// Timeout attribution — the error must name the node holding the clock.
+//
+// Motivation: `pa-chief-of-staff` timed out twice in production with
+// "workflow execution timed out after 180 seconds" and nothing else. The
+// culprit (`synthesize`, an LLM node whose cold-start pushed it past the
+// cap) had to be reconstructed from node-timing archaeology across prior
+// runs. These tests lock in that the attribution is present, correct, and
+// carries node identity + timings ONLY.
+// ============================================================================
+
+/// Canary planted in node `b`'s CONFIG. It must never appear in a
+/// timeout message — the string flows into
+/// `workflow_executions.error_message`, the operator digest preview, and
+/// the failure webhook. Node config is exactly the kind of content
+/// (API hosts, prompts, header templates) that must not leak there.
+const CONFIG_CANARY: &str = "CONFIG_CANARY_do_not_leak_9f3a";
+
+/// Canary returned as node `a`'s OUTPUT — the other half of the DLP
+/// contract. `a` completes before the timeout fires, so its output is
+/// live in the engine's results map at the moment the message is built.
+const OUTPUT_CANARY: &str = "OUTPUT_CANARY_do_not_leak_51bd";
+
+/// Dispatcher that answers instantly for every module except one, which
+/// it parks on. Lets a test pin exactly which node is in flight when the
+/// wall-clock cap trips.
+struct SelectiveSleepingDispatcher {
+    slow_module: Uuid,
+    delay: Duration,
+    slow_output_for: Uuid,
+}
+
+#[async_trait]
+impl NodeDispatcher for SelectiveSleepingDispatcher {
+    async fn dispatch(&self, job: DispatchJob) -> Result<DispatchResult, BoxError> {
+        if job.module_id == self.slow_module {
+            tokio::time::sleep(self.delay).await;
+        }
+        let output = if job.module_id == self.slow_output_for {
+            json!({"output": OUTPUT_CANARY})
+        } else {
+            json!({"output": "fast"})
+        };
+        Ok(DispatchResult { output })
+    }
+
+    async fn dispatch_chain(
+        &self,
+        _request: ChainDispatchRequest,
+    ) -> Result<ChainDispatchResult, BoxError> {
+        unreachable!("fan-out graph keeps every node on the single-node path")
+    }
+}
+
+/// Same fan-out topology as `build_slow_graph`, but node `b` carries a
+/// config canary so the DLP assertion has something real to look for.
+fn build_attribution_graph() -> (serde_json::Value, Uuid, Uuid, Uuid) {
+    let root_mod = Uuid::new_v4();
+    let a_mod = Uuid::new_v4();
+    let b_mod = Uuid::new_v4();
+    let graph = WorkflowGraphBuilder::new()
+        .add_module("root", root_mod, None)
+        .add_module("a", a_mod, None)
+        .add_module(
+            "b",
+            b_mod,
+            Some(json!({ "API_ENDPOINT": CONFIG_CANARY, "MODEL": "qwen3.6:latest" })),
+        )
+        .edge("root", "a")
+        .edge("root", "b")
+        .build()
+        .expect("builder inputs well-formed");
+    (graph, root_mod, a_mod, b_mod)
+}
+
+#[tokio::test]
+async fn timeout_message_names_the_in_flight_node_and_completed_count() {
+    let (graph_json, root_mod, a_mod, b_mod) = build_attribution_graph();
+    let mut engine = engine_with_timeout(2, root_mod, a_mod, b_mod);
+    engine
+        .load_graph_from_json(&serde_json::to_string(&graph_json).unwrap())
+        .await
+        .expect("graph loads");
+
+    // `root` and `a` return instantly; `b` parks well past the 2s cap.
+    let dispatcher = Arc::new(SelectiveSleepingDispatcher {
+        slow_module: b_mod,
+        delay: Duration::from_secs(30),
+        slow_output_for: a_mod,
+    });
+    let err = engine
+        .run_with_transport(dispatcher, None, Uuid::new_v4())
+        .await
+        .expect_err("workflow must time out");
+    let msg = err.to_string();
+
+    // The base contract is unchanged...
+    assert!(
+        msg.starts_with("workflow execution timed out after 2 seconds"),
+        "base message changed: {msg}"
+    );
+    // ...and the attribution names the node that was actually holding
+    // the clock. This is the assertion that fails if a refactor drops
+    // the progress snapshot on the floor.
+    assert!(
+        msg.contains("in flight: b "),
+        "expected the stalled node named, got: {msg}"
+    );
+    // `root` and `a` both completed before the cap tripped.
+    assert!(
+        msg.contains("2 nodes completed"),
+        "expected completed count of 2, got: {msg}"
+    );
+    // Elapsed is rendered for the in-flight node. At a 2s cap it has
+    // been running ~2s (root's round trip is sub-millisecond), so the
+    // seconds form must be present rather than a bare label.
+    assert!(
+        msg.contains("in flight: b 1s") || msg.contains("in flight: b 2s"),
+        "expected ~1-2s elapsed for the stalled node, got: {msg}"
+    );
+    // Nodes that finished must NOT be reported as in flight.
+    assert!(
+        !msg.contains("in flight: a") && !msg.contains(", a "),
+        "completed nodes must not be listed as in flight: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn timeout_message_carries_no_node_config_or_output_content() {
+    // DLP: node IDS and timings only. Node config values and node output
+    // must never reach `error_message` / the digest preview / the
+    // failure webhook through this path.
+    let (graph_json, root_mod, a_mod, b_mod) = build_attribution_graph();
+    let mut engine = engine_with_timeout(2, root_mod, a_mod, b_mod);
+    engine
+        .load_graph_from_json(&serde_json::to_string(&graph_json).unwrap())
+        .await
+        .expect("graph loads");
+
+    let dispatcher = Arc::new(SelectiveSleepingDispatcher {
+        slow_module: b_mod,
+        delay: Duration::from_secs(30),
+        slow_output_for: a_mod,
+    });
+    let err = engine
+        .run_with_transport(dispatcher, None, Uuid::new_v4())
+        .await
+        .expect_err("workflow must time out");
+    let msg = err.to_string();
+
+    assert!(
+        !msg.contains(CONFIG_CANARY),
+        "node CONFIG leaked into the timeout message: {msg}"
+    );
+    assert!(
+        !msg.contains(OUTPUT_CANARY),
+        "node OUTPUT leaked into the timeout message: {msg}"
+    );
+    assert!(
+        !msg.contains("qwen3.6"),
+        "node config value leaked into the timeout message: {msg}"
+    );
+    // Sanity: the canaries really were wired in, so the assertions above
+    // are not passing vacuously.
+    let graph_text = serde_json::to_string(&graph_json).unwrap();
+    assert!(graph_text.contains(CONFIG_CANARY));
+}
+
+#[tokio::test]
+async fn timeout_before_any_dispatch_completes_reports_all_nodes_in_flight() {
+    // Elapsed/count correctness at the other extreme: when the cap trips
+    // before ANY node returns, the count is 0 and every dispatched node
+    // is named.
+    let (graph_json, root_mod, a_mod, b_mod) = build_slow_graph();
+    let mut engine = engine_with_timeout(1, root_mod, a_mod, b_mod);
+    engine
+        .load_graph_from_json(&serde_json::to_string(&graph_json).unwrap())
+        .await
+        .expect("graph loads");
+
+    let dispatcher = Arc::new(SleepingDispatcher {
+        delay: Duration::from_secs(30),
+    });
+    let err = engine
+        .run_with_transport(dispatcher, None, Uuid::new_v4())
+        .await
+        .expect_err("workflow must time out");
+    let msg = err.to_string();
+
+    // Only `root` is dispatchable before its successors unblock.
+    assert!(
+        msg.contains("in flight: root "),
+        "expected root named, got: {msg}"
+    );
+    assert!(
+        msg.contains("0 nodes completed"),
+        "nothing completed, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn seeded_resume_path_also_attributes_the_timeout() {
+    // The seeded path boxes the reactor future through a separate
+    // wrapper; a regression there would silently drop attribution on
+    // exactly the resume/crash-recovery runs where it is most useful.
+    let (graph_json, root_mod, a_mod, b_mod) = build_attribution_graph();
+    let mut engine = engine_with_timeout(2, root_mod, a_mod, b_mod);
+    engine
+        .load_graph_from_json(&serde_json::to_string(&graph_json).unwrap())
+        .await
+        .expect("graph loads");
+
+    let dispatcher = Arc::new(SelectiveSleepingDispatcher {
+        slow_module: b_mod,
+        delay: Duration::from_secs(30),
+        slow_output_for: a_mod,
+    });
+    let err = engine
+        .run_with_seed_with_transport(
+            dispatcher,
+            None,
+            std::collections::HashMap::new(),
+            Uuid::new_v4(),
+        )
+        .await
+        .expect_err("workflow must time out");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("in flight: b "),
+        "seeded path lost attribution: {msg}"
+    );
+    assert!(msg.contains("2 nodes completed"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn a_reused_engine_does_not_report_the_previous_run_in_flight() {
+    // The progress snapshot lives on the engine, so it must be reset per
+    // run — otherwise a second run's timeout blames a node that belonged
+    // to the first.
+    let (graph_json, root_mod, a_mod, b_mod) = build_attribution_graph();
+    let mut engine = engine_with_timeout(2, root_mod, a_mod, b_mod);
+    engine
+        .load_graph_from_json(&serde_json::to_string(&graph_json).unwrap())
+        .await
+        .expect("graph loads");
+
+    let dispatcher = Arc::new(SelectiveSleepingDispatcher {
+        slow_module: b_mod,
+        delay: Duration::from_secs(30),
+        slow_output_for: a_mod,
+    });
+    let first = engine
+        .run_with_transport(dispatcher.clone(), None, Uuid::new_v4())
+        .await
+        .expect_err("first run times out");
+    assert!(first.to_string().contains("2 nodes completed"));
+
+    let second = engine
+        .run_with_transport(dispatcher, None, Uuid::new_v4())
+        .await
+        .expect_err("second run times out");
+    let msg = second.to_string();
+    // Without a reset the counter would have carried over to 4.
+    assert!(
+        msg.contains("2 nodes completed"),
+        "progress snapshot leaked across runs: {msg}"
+    );
+    assert_eq!(
+        msg.matches("in flight: b ").count(),
+        1,
+        "node b must be listed once, not once per run: {msg}"
+    );
 }
 
 #[tokio::test]

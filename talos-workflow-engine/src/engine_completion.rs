@@ -88,6 +88,12 @@ impl ParallelWorkflowEngine {
         pending: &mut HashMap<NodeIndex, usize>,
         ready: &mut VecDeque<NodeIndex>,
     ) -> Result<(), String> {
+        // Timeout attribution: the commit chokepoint for system nodes
+        // that route their output here instead of through the
+        // `commit_result!` macro. Counted once for both branches; the
+        // `executing.next()` completion path marks its own nodes and
+        // never reaches this function, so there is no double count.
+        self.progress.mark_finished(self.graph[node_idx]);
         let is_error = output
             .get("__error")
             .and_then(|v| v.as_bool())

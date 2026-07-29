@@ -53,6 +53,7 @@ mod engine_dispatch_system;
 mod engine_graph_load;
 pub mod error;
 mod event_spawn;
+mod execution_progress;
 pub mod graph_builder;
 pub mod graph_json;
 mod graph_parser;

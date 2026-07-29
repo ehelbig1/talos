@@ -382,6 +382,36 @@ impl WorkflowRepository {
         Ok(row.map(|(gj,)| gj))
     }
 
+    /// Fleet-wide scan of enabled, non-archived workflows' `graph_json`
+    /// for BOOT-TIME PLATFORM WARMUP only.
+    ///
+    /// Deliberately unscoped by user/org, like
+    /// `talos_registry::reconcile`'s module-usage scan: this runs once
+    /// during controller startup, before any request context exists, and
+    /// its only consumer extracts LOCAL LLM model names
+    /// (`talos_llm::warmup::select_warmup_targets`). No row, field, or
+    /// derived value reaches a user-facing surface — the output is a
+    /// capped list of ollama model strings used to pre-load VRAM.
+    ///
+    /// **Do not repurpose this for a request path.** Anything serving a
+    /// user must go through the `user_id`- / org-scoped readers above so
+    /// RLS and tenancy hold.
+    ///
+    /// `limit` bounds the scan; graphs are returned newest-first so a
+    /// fleet larger than the limit still reflects current authoring.
+    pub async fn list_enabled_graph_json_for_boot_warmup(&self, limit: i64) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT graph_json::text FROM workflows \
+             WHERE is_enabled = true AND status <> 'archived' \
+             ORDER BY updated_at DESC NULLS LAST, id \
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.db_pool)
+        .await?;
+        Ok(rows.into_iter().map(|(gj,)| gj).collect())
+    }
+
     /// Fetch the actor_id for a workflow — used at authoring time to enforce capability ceilings.
     /// Returns `Ok(None)` when the workflow has no actor_id or the workflow does not belong
     /// to `user_id`. Returns `Err` only on a real database failure.
