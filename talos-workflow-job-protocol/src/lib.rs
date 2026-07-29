@@ -24,6 +24,13 @@ pub mod subjects;
 
 /// RFC 0010 P3 (D3b) — per-execution ephemeral secret-envelope sealing.
 pub mod envelope_seal;
+
+/// Shared wire-invariant property harness (generator + counterexamples).
+/// Compiled only for this crate's own tests, or for downstream dev-builds
+/// that opt in via the non-default `test-support` feature — never in a
+/// production build.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub use envelope_seal::{
     seal_secrets, ClaimResponse, SealOutput, SealedSecrets, SecretClaim, WorkerEphemeral,
 };
@@ -2355,11 +2362,21 @@ impl EncryptedSecrets {
 // Signed JSON payloads
 // ============================================================================
 
-/// A JSON payload whose SIGNED representation is the exact text that travels on
-/// the wire: produced ONCE on the sending side (in [`From<serde_json::Value>`])
-/// and captured VERBATIM from the received bytes on the verifying side (in
-/// `Deserialize`). It is never re-derived, so signer and verifier hash the same
-/// bytes by construction.
+/// A payload whose SIGNED representation is the exact text that travels on the
+/// wire: produced ONCE on the sending side (in [`From`]) and captured VERBATIM
+/// from the received bytes on the verifying side (in `Deserialize`). It is
+/// never re-derived, so signer and verifier hash the same bytes by
+/// construction.
+///
+/// `T` is the parsed view handlers read. Two specialisations exist today:
+/// [`SignedJson`] (`T = serde_json::Value`) for the dispatch/result payloads
+/// in this crate, and `RawSigned<MemoryOp>` / `RawSigned<IntegrationOp>` in
+/// `talos-memory`, which wrap a whole typed RPC op. This is the SINGLE home
+/// for the mechanism — `talos_memory::rpc_auth::RawSigned` re-exports this
+/// type rather than reimplementing it, so the two signed-wire surfaces cannot
+/// drift apart. The per-caller signing FORMULAS (which envelope fields are
+/// concatenated around `raw_bytes()`) deliberately stay in their own crates;
+/// only the raw-text binding is shared.
 ///
 /// # Why this type exists
 ///
@@ -2374,8 +2391,8 @@ impl EncryptedSecrets {
 ///     -> 5.455171886890905e-115   <- back to the 2nd form: a permanent 2-cycle
 /// ```
 ///
-/// Any signature derived by RE-SERIALISING a parsed `Value` therefore depends
-/// on how many round trips that particular `Value` happened to have made. The
+/// Any signature derived by RE-SERIALISING a parsed value therefore depends
+/// on how many round trips that particular value happened to have made. The
 /// controller hashed `write(x)`; the worker parsed the wire bytes into the
 /// drifted f64 and hashed `write(parse(write(x)))`; the two digests differed
 /// and the job failed dispatch verification. It presented as a LOTTERY — a job
@@ -2383,44 +2400,62 @@ impl EncryptedSecrets {
 /// why `pa-autonomy-digest` (≈30 computed ratios) failed every run while
 /// text-only payloads verified fine for weeks (2026-07-27 incident, #595/#597).
 ///
+/// The memory-RPC twin (#598) had the identical defect one layer down: its
+/// predecessor signed a `serde_json::Value` by re-deriving canonical text on
+/// each side (`canonical_json_bytes`, now deleted:
+/// `Value::Number(n) => n.to_string()`). The sender canonicalised the value it
+/// held, the receiver canonicalised its RE-PARSE of the wire JSON, the two
+/// byte strings differed, and the signature failed for an entirely honest
+/// sender on payload content alone. Actor-memory values are ARBITRARY module
+/// output — LLM/agent nodes persist computed ratios routinely — so the class
+/// was live, not theoretical.
+///
 /// Hashing the raw text removes the re-derivation entirely: there is exactly
 /// one byte string per payload per direction, and it is the one on the wire.
+/// Because the receiver hashes the sender's exact bytes, this ALSO removes any
+/// dependence on key ordering or serde enum-tag stability that a fixed-tag
+/// canonical concatenation existed to defend.
 ///
-/// # Invariant: `raw` and `value` are never supplied independently
+/// # Invariant: `raw` and `parsed` are never supplied independently
 ///
 /// There is deliberately NO constructor that accepts both halves, and NO
-/// mutable accessor (`&mut Value`, `raw_mut`, …). A caller who could set — or
-/// mutate — `raw` and `value` independently could desync them, signing one
-/// payload while the module executes another, which is precisely the bug class
-/// this type exists to make unrepresentable. Do not add one: mutate the
-/// `Value` you own and build a fresh `SignedJson` from it. Construct from a
-/// [`serde_json::Value`] (send side) or by deserialising (receive side).
+/// mutable accessor (`&mut T`, `raw_mut`, …). `raw` is what the signature
+/// covers and `parsed` is what handlers act on; a caller who could set — or
+/// mutate — them independently could desync them, signing one payload while
+/// the module executes another, which is precisely the bug class this type
+/// exists to make unrepresentable. Do not add one: mutate the value you own
+/// and build a fresh `RawSigned` from it, which re-mints both views together.
+/// Construct from a `T` (send side) or by deserialising (receive side).
 ///
 /// Note the two halves are semantically equal but need not be bit-equal: on the
-/// send side `value` is the caller's original `Value`, and re-parsing `raw`
+/// send side `parsed` is the caller's original value, and re-parsing `raw`
 /// could land one ULP away for an unstable float. That is harmless *because*
-/// nothing security-relevant is ever derived from `value` — see
+/// nothing security-relevant is ever derived from `parsed` — see
 /// [`Self::raw_bytes`].
 ///
 /// # Why exotic JSON text is not an attack surface
 ///
-/// `raw` can hold text a `Value` can never round-trip back to: duplicate keys
-/// (`{"a":1,"a":2}`, which parses last-wins), interior padding, non-shortest
-/// float spellings, redundant `\u` escapes. The signature covers that text
-/// while every consumer reads the deduplicated `value` — so it is worth being
-/// explicit about who can put such text there:
+/// `raw` can hold text a round-trip through `T` can never reproduce: duplicate
+/// keys (`{"a":1,"a":2}`, which parses last-wins), interior padding,
+/// non-shortest float spellings, redundant `\u` escapes. The signature covers
+/// that text while every consumer reads the deduplicated parse — so it is
+/// worth being explicit about who can put such text there:
 ///
-/// * Both sides only ever MINT raw text through `From<Value>`, i.e.
-///   `Value::to_string()`, which cannot emit duplicate keys or padding.
+/// * Both sides only ever MINT raw text through [`From`], i.e.
+///   `serde_json::value::to_raw_value(&T)` (for `T = Value` this is exactly
+///   `Value::to_string()` — the same compact serializer), which cannot emit
+///   duplicate keys or padding.
 /// * The only other way raw text enters is deserialisation of a message that
 ///   ALREADY VERIFIES under a signing key — the digest covers the exact bytes,
 ///   so an on-path attacker who rewrites the payload text (even into a
 ///   semantically identical form) invalidates the signature and the message is
-///   refused before anything reads `value`.
+///   refused before anything reads `parsed`.
 /// * Worker output never becomes controller-signed request text verbatim: the
-///   engine takes `into_value()`/`value().clone()` and a fresh `From<Value>`
-///   re-mints the bytes, so exotic text cannot be laundered across a signing
-///   boundary by a keyless component.
+///   engine takes `into_value()`/`value().clone()` and a fresh `From` re-mints
+///   the bytes, so exotic text cannot be laundered across a signing boundary
+///   by a keyless component. The same holds for the memory RPCs: a keyless
+///   guest supplies only `Value`-semantics to the worker host, which re-mints
+///   via [`From`] before signing.
 ///
 /// Consequently duplicate-key smuggling requires the signing key, and a key
 /// holder can already send whatever it likes. Pinned by
@@ -2445,34 +2480,43 @@ impl EncryptedSecrets {
 /// once-normalised form, so a mixed pair diverges for EVERY payload whose float
 /// spelling is unstable at all (39_495 + 19_721 of 199_902 sampled f64),
 /// whereas the pre-fix pair only diverged for those still unstable after one
-/// pass (19_721) — roughly 3× the failure surface. Expect elevated dispatch
-/// failures for the duration of a staggered rollout, and keep the window short.
+/// pass (19_721) — roughly 3× the failure surface. On the memory-RPC side the
+/// mixed fleet fails EVERY memory / integration-state RPC until both halves
+/// run the new code. Expect elevated dispatch failures for the duration of a
+/// staggered rollout, and keep the window short; compose (`make up`) rolls both
+/// together.
 #[derive(Debug, Clone)]
-pub struct SignedJson {
-    /// The authoritative form: the exact JSON text that is (or was) on the wire.
-    /// Everything security-relevant hashes THIS.
+pub struct RawSigned<T> {
+    /// The authoritative form: the exact JSON text that is (or was) on the
+    /// wire. Everything security-relevant hashes THIS via
+    /// [`raw_bytes`](Self::raw_bytes).
     raw: Box<serde_json::value::RawValue>,
-    /// Parsed view for consumers, who overwhelmingly want a `Value`. Derived
-    /// once, alongside `raw`, at the single construction point per side.
-    value: serde_json::Value,
+    /// Parsed view for consumers, who overwhelmingly want a typed payload.
+    /// Derived ONCE, alongside `raw`, at the single construction point per
+    /// side — never re-serialised back into `raw`, which is what would reopen
+    /// the desync bug.
+    parsed: T,
 }
 
-impl SignedJson {
-    /// The parsed payload — what module dispatch, judges, and every other
-    /// consumer read. NOT what gets signed; see [`Self::raw_bytes`].
-    pub fn value(&self) -> &serde_json::Value {
-        &self.value
+impl<T> RawSigned<T> {
+    /// The parsed payload — what module dispatch, judges, RPC handlers, and
+    /// every other consumer read. NOT what gets signed; see
+    /// [`Self::raw_bytes`].
+    pub fn get(&self) -> &T {
+        &self.parsed
     }
 
-    /// Consume the wrapper and take the parsed payload.
-    pub fn into_value(self) -> serde_json::Value {
-        self.value
+    /// Consume the wrapper and take the parsed payload (for handlers that
+    /// move the payload into an executor).
+    pub fn into_inner(self) -> T {
+        self.parsed
     }
 
     /// The bytes covered by the signature: the exact JSON text of this payload
-    /// as it appears on the wire. Every `Sha256::digest` over a signed payload
-    /// MUST use this — hashing `value().to_string()` re-introduces the
-    /// non-idempotent round trip documented on the type.
+    /// as it appears on the wire. Every `Sha256::digest` / signing /
+    /// verification site over a signed payload MUST use this — hashing a
+    /// re-serialised form of [`Self::get`] re-introduces the non-idempotent
+    /// round trip documented on the type.
     pub fn raw_bytes(&self) -> &[u8] {
         self.raw.get().as_bytes()
     }
@@ -2484,36 +2528,26 @@ impl SignedJson {
     }
 }
 
-impl From<serde_json::Value> for SignedJson {
-    /// The ONLY way to build a `SignedJson` from a `Value` — the send-side
-    /// construction point that fixes the wire text once and for all.
-    fn from(value: serde_json::Value) -> Self {
-        // `expect` is unreachable: `Value::to_string` always emits valid JSON
-        // (NaN/Inf cannot exist inside a `Value` — `Number::from_f64` rejects
-        // them), and `RawValue::from_string` only rejects invalid JSON.
-        let raw = serde_json::value::RawValue::from_string(value.to_string())
-            .expect("serde_json::Value always serialises to valid JSON");
-        Self { raw, value }
+impl<T: Serialize> From<T> for RawSigned<T> {
+    /// The ONLY value constructor — the send-side construction point that
+    /// fixes the wire text once and for all.
+    ///
+    /// `to_raw_value` is infallible for the payload types this wraps.
+    /// `serde_json::Value` always serialises (NaN/Inf cannot exist inside one
+    /// — `Number::from_f64` rejects them). `MemoryOp` / `IntegrationOp` are
+    /// enums over strings, ints, and `Value` fields; the one bare `f64` field,
+    /// `ttl_hours`, is validated finite before signing and otherwise
+    /// serialises as `null` rather than erroring. The `expect` is therefore
+    /// unreachable for these types; it is documented rather than silently
+    /// `unwrap`'d.
+    fn from(parsed: T) -> Self {
+        let raw = serde_json::value::to_raw_value(&parsed)
+            .expect("RawSigned payload types always serialise to valid JSON");
+        Self { raw, parsed }
     }
 }
 
-impl Default for SignedJson {
-    fn default() -> Self {
-        Self::from(serde_json::Value::Null)
-    }
-}
-
-/// Semantic equality: compares the PARSED values, so two payloads that differ
-/// only in whitespace or key order compare equal. Signing does NOT use this —
-/// signatures cover [`SignedJson::raw_bytes`], which is byte-exact. A test
-/// asserting `a == b` therefore proves nothing about their signatures.
-impl PartialEq for SignedJson {
-    fn eq(&self, other: &Self) -> bool {
-        self.value == other.value
-    }
-}
-
-impl Serialize for SignedJson {
+impl<T> Serialize for RawSigned<T> {
     /// Forwards to the raw text, which `serde_json` emits verbatim — so the
     /// bytes that were signed are the bytes that go out.
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -2521,18 +2555,45 @@ impl Serialize for SignedJson {
     }
 }
 
-impl<'de> Deserialize<'de> for SignedJson {
+impl<'de, T: serde::de::DeserializeOwned> Deserialize<'de> for RawSigned<T> {
     /// Captures the received text VERBATIM, then derives the parsed view from
     /// it. The verifier consequently hashes exactly what the sender hashed,
     /// whatever the sender's float formatting happened to be.
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
         // A parse failure here is a malformed message, not a signing concern:
-        // `RawValue` guarantees syntactic JSON, so this only trips on limits
-        // (e.g. the 128-deep recursion cap) — surface it as a deserialize error
-        // rather than panicking on untrusted input.
-        let value = serde_json::from_str(raw.get()).map_err(serde::de::Error::custom)?;
-        Ok(Self { raw, value })
+        // `RawValue` guarantees syntactic JSON, so this only trips on `T`'s
+        // shape or on serde_json's built-in 128-deep recursion limit —
+        // surface it as a deserialize error rather than panicking on
+        // untrusted input.
+        let parsed = serde_json::from_str(raw.get()).map_err(serde::de::Error::custom)?;
+        Ok(Self { raw, parsed })
+    }
+}
+
+/// The `serde_json::Value` specialisation of [`RawSigned`] — the dispatch and
+/// result payloads carried by [`JobRequest`], [`JobResult`], [`PipelineStep`],
+/// and the pipeline results.
+///
+/// A type alias, not a distinct type: everything in [`RawSigned`]'s docs
+/// applies verbatim, and `value()` / `into_value()` below are the
+/// `Value`-flavoured spellings of [`RawSigned::get`] / [`RawSigned::into_inner`].
+pub type SignedJson = RawSigned<serde_json::Value>;
+
+impl RawSigned<serde_json::Value> {
+    /// The parsed payload — what module dispatch, judges, and every other
+    /// consumer read. NOT what gets signed; see [`Self::raw_bytes`].
+    ///
+    /// Value-typed alias of [`RawSigned::get`]; both are kept because the
+    /// dispatch surface reads far better as `input_payload.value()`.
+    pub fn value(&self) -> &serde_json::Value {
+        &self.parsed
+    }
+
+    /// Consume the wrapper and take the parsed payload. Value-typed alias of
+    /// [`RawSigned::into_inner`].
+    pub fn into_value(self) -> serde_json::Value {
+        self.parsed
     }
 }
 
@@ -5677,59 +5738,68 @@ mod tests {
     //
     // Every existing hand-written sign/verify test uses `json!({})` payloads,
     // which is structurally incapable of catching a payload-DEPENDENT fault.
-    // The generator below deliberately produces the shapes that broke us:
-    // floats from raw bit patterns (the actual failure), deep nesting, mixed
-    // arrays, unicode, and integers at type boundaries.
+    // The generator deliberately produces the shapes that broke us: floats
+    // from raw bit patterns (the actual failure), deep nesting, mixed arrays,
+    // unicode, and integers at type boundaries.
+    //
+    // The generator itself lives in `crate::test_support` — also published to
+    // downstream dev-builds behind the non-default `test-support` feature —
+    // so the talos-memory signed-wire suite tests against the SAME adversary
+    // rather than a copy. The #598 fork of this generator drifted within one
+    // release: it never grew the size-independence, text-vs-meaning, or
+    // transcode assertions this suite has.
+    use crate::test_support::{arbitrary_json, round_trip_unstable_count};
 
-    /// Pseudo-random structured JSON. Seeded (not `thread_rng`) so a failure
-    /// is REPRODUCIBLE from the printed seed — a flaky property test that
-    /// cannot be replayed is worse than none.
-    fn arbitrary_json(seed: &mut u64, depth: u32) -> serde_json::Value {
-        // xorshift64* — tiny, deterministic, no dev-dependency.
-        let mut next = || {
-            *seed ^= *seed << 13;
-            *seed ^= *seed >> 7;
-            *seed ^= *seed << 17;
-            *seed
-        };
-        let pick = next() % if depth == 0 { 6 } else { 8 };
-        match pick {
-            0 => serde_json::Value::Null,
-            1 => serde_json::Value::Bool(next() % 2 == 0),
-            // Floats from RAW BITS: this is the class that actually broke
-            // signing (parse(write(x)) landing one ULP away).
-            2 => {
-                let f = f64::from_bits(next());
-                serde_json::Number::from_f64(f)
-                    .map_or(serde_json::Value::Null, serde_json::Value::Number)
-            }
-            // Integers at the boundaries where JSON number typing is subtle.
-            3 => serde_json::json!(next() as i64),
-            4 => serde_json::json!(next()),
-            // Computed ratios — the digest's actual content, ~10% of which
-            // are round-trip unstable.
-            5 => {
-                let (a, b) = (next() % 1000 + 1, next() % 1000 + 1);
-                serde_json::json!(a as f64 / b as f64)
-            }
-            6 => {
-                let n = (next() % 4) as usize;
-                serde_json::Value::Array((0..n).map(|_| arbitrary_json(seed, depth - 1)).collect())
-            }
-            _ => {
-                let n = (next() % 4) as usize;
-                let mut m = serde_json::Map::new();
-                for i in 0..n {
-                    // Non-ASCII keys and values: escaping differences would
-                    // change byte length without changing meaning.
-                    m.insert(
-                        format!("k{i}\u{2014}\u{1f600}"),
-                        arbitrary_json(seed, depth - 1),
-                    );
-                }
-                serde_json::Value::Object(m)
-            }
+    /// The public surface of the SHARED generic and its `Value` alias.
+    ///
+    /// `SignedJson` is a `pub type` alias of `RawSigned<serde_json::Value>`,
+    /// so the two accessor spellings must BOTH resolve on it: the generic
+    /// `get()`/`into_inner()` (what `talos-memory` calls on
+    /// `RawSigned<MemoryOp>`) and the Value-flavoured `value()`/`into_value()`
+    /// (what ~70 dispatch call sites call). Pinned as an executable fact
+    /// because the whole point of the alias was ZERO call-site churn across
+    /// the unification — drop either spelling and one of the two crates stops
+    /// compiling, which this catches in the crate that owns the type rather
+    /// than downstream.
+    ///
+    /// Also pins `raw_len()` on the GENERIC (not the specialisation): the
+    /// signature diagnostics report it via `diag_hashes`, so a length that
+    /// described anything other than the signed bytes would make an outage
+    /// harder to read, not easier.
+    #[test]
+    fn raw_signed_exposes_both_accessor_spellings_and_raw_len() {
+        let payload: SignedJson = serde_json::json!({"a": 1}).into();
+
+        // Generic spelling.
+        assert_eq!(payload.get(), &serde_json::json!({"a": 1}));
+        // Value-flavoured spelling — same object, different name.
+        assert_eq!(payload.value(), &serde_json::json!({"a": 1}));
+
+        // The signed bytes and their length describe the SAME text.
+        assert_eq!(payload.raw_bytes(), br#"{"a":1}"#);
+        assert_eq!(payload.raw_len(), payload.raw_bytes().len());
+        assert_eq!(payload.raw_len(), 7);
+
+        // Both consuming accessors yield the parsed payload.
+        assert_eq!(payload.clone().into_inner(), serde_json::json!({"a": 1}));
+        assert_eq!(payload.into_value(), serde_json::json!({"a": 1}));
+
+        // The generic instantiates over a typed payload too, and `From`
+        // mints the same compact text `Value::to_string` would.
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct Op {
+            key: String,
+            n: u32,
         }
+        let typed: RawSigned<Op> = Op {
+            key: "k".to_string(),
+            n: 1,
+        }
+        .into();
+        assert_eq!(typed.raw_bytes(), br#"{"key":"k","n":1}"#);
+        assert_eq!(typed.raw_len(), 17);
+        assert_eq!(typed.get().n, 1);
+        assert_eq!(typed.into_inner().key, "k");
     }
 
     /// INVARIANT 1: the SIGNED BYTES survive the wire unchanged.
@@ -5855,16 +5925,7 @@ mod tests {
     #[test]
     fn generator_actually_produces_round_trip_unstable_floats() {
         let mut seed = 0x5eed_1234_abcd_0004_u64;
-        let mut unstable = 0;
-        for _ in 0..20_000 {
-            let v = arbitrary_json(&mut seed, 3);
-            let once = v.to_string();
-            if let Ok(p) = serde_json::from_str::<serde_json::Value>(&once) {
-                if p.to_string() != once {
-                    unstable += 1;
-                }
-            }
-        }
+        let unstable = round_trip_unstable_count(&mut seed, 20_000, 3);
         assert!(
             unstable > 0,
             "generator produced NO round-trip-unstable value — the wire tests \
