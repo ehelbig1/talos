@@ -21,8 +21,8 @@ pub mod stats;
 
 pub use error::EvaluationError;
 pub use service::{
-    ArmResult, EvalRunInput, EvalRunOutcome, EvalTask, EvalTaskResult, EvaluationService,
-    SkippedTask,
+    effective_since_days, ArmResult, EvalRunInput, EvalRunOutcome, EvalTask, EvalTaskResult,
+    EvaluationService, SkippedTask, OBSERVATIONAL_ROW_CAP,
 };
 pub use stats::{
     aggregate_paired, analyze_observational, EvalSummary, LiftVerdict, ObservationalReport,

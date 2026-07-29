@@ -7605,6 +7605,7 @@ dependencies = [
  "talos-envelope-seal",
  "talos-execution-repository",
  "talos-http-utils",
+ "talos-measurement",
  "talos-memory",
  "talos-metrics",
  "talos-ml",
@@ -7688,6 +7689,7 @@ dependencies = [
  "talos-execution-orchestration",
  "talos-execution-repository",
  "talos-llm",
+ "talos-measurement",
  "talos-memory",
  "talos-secrets-manager",
  "thiserror 1.0.69",
@@ -8268,6 +8270,7 @@ dependencies = [
  "talos-inline-compile-service",
  "talos-llm",
  "talos-mcp",
+ "talos-measurement",
  "talos-memory",
  "talos-memory-ranking",
  "talos-ml",
@@ -8321,6 +8324,14 @@ dependencies = [
  "serde",
  "serde_json",
  "talos-capability-world",
+]
+
+[[package]]
+name = "talos-measurement"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -8556,6 +8567,7 @@ dependencies = [
  "talos-actor-repository",
  "talos-analytics-repository",
  "talos-execution-repository",
+ "talos-measurement",
  "talos-memory",
  "talos-ml",
  "talos-ops-alerts-repository",

@@ -17,6 +17,7 @@ talos-execution-orchestration = { path = "../talos-execution-orchestration" }
 talos-execution-repository = { path = "../talos-execution-repository" }
 talos-actor-repository = { path = "../talos-actor-repository" }
 talos-llm = { path = "../talos-llm" }
+talos-measurement = { path = "../talos-measurement" }
 talos-memory = { path = "../talos-memory" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 tokio = { version = "1", features = ["rt", "sync", "time"] }

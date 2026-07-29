@@ -358,7 +358,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_workflows_by_capability",
-            "description": "Find workflows that have ALL of the specified capabilities. Returns workflows with success rates and readiness scores.",
+            "description": "Find workflows that have ALL of the specified capabilities. Returns workflows with success rates and readiness scores. POPULATION: success_rate_30d covers every execution ROW created in the trailing 30 days, in ANY status (a queued, still-running or cancelled execution is in the denominator but not the numerator); runs_30d is that exact denominator and is on every row. A rate over fewer than 20 runs is labeled sample_size=\"insufficient\": below 20, one failure moves the rate by 5+ points, so ranking two candidates by it is noise — prefer readiness_score or gather more runs.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1981,11 +1981,14 @@ async fn handle_get_workflow_sla_report(
     //   target=99 → need N ≥ 100
     //   target=95 → need N ≥ 20
     //   target=99.9 → need N ≥ 1000
-    let min_n_for_target = if target_success_rate < 100.0 && target_success_rate > 0.0 {
-        (1.0 / (1.0 - target_success_rate / 100.0)).ceil() as i64
-    } else {
-        0
-    };
+    //
+    // 2026-07-28: lifted verbatim into `talos_measurement::min_n_for_rate_target`
+    // (which takes a FRACTION, not a percentage) so the model card and the
+    // capability router judge sample size by the same rule. The old inline
+    // version returned a 0 sentinel where there is no threshold; the shared
+    // one returns None, which is the same branch below.
+    let min_n_for_target: Option<u64> =
+        talos_measurement::min_n_for_rate_target(target_success_rate / 100.0);
     // MCP-92 (2026-05-07): round percentile millis to 1 decimal so the
     // f64-conversion artifacts (e.g. 22205.164099999998 → 22205.2) don't
     // leak. Operates on Option<f64> (the percentile lookup returns None
@@ -2016,7 +2019,11 @@ async fn handle_get_workflow_sla_report(
         "period_days": days,
         "total_executions": total,
     });
-    if min_n_for_target > 0 && total < min_n_for_target {
+    // `total` is a row count (>= 0); the saturating conversion keeps a
+    // hypothetical negative from wrapping into a huge u64 and suppressing the
+    // warning (check 21).
+    let total_u = u64::try_from(total).unwrap_or(0);
+    if let Some(min_n_for_target) = min_n_for_target.filter(|m| total_u < *m) {
         result["sample_size_warning"] = serde_json::json!(format!(
             "Sample size ({total}) is below the threshold ({min_n_for_target}) needed for a {target_success_rate}% target to be statistically meaningful. A single failure is {failure_pct:.1}% of {total} runs — verdict may not be actionable. Consider lowering target_success_rate, extending the days window, or accepting the verdict as advisory.",
             total = total,
@@ -4875,6 +4882,96 @@ async fn handle_set_workflow_capabilities(
     }
 }
 
+/// Population disclosure for `get_workflows_by_capability` rows.
+///
+/// Grounded against the actual SQL in
+/// `talos_analytics_repository::get_workflows_by_capability`: the denominator
+/// is `COUNT(*)` over `workflow_executions` with `started_at` inside the
+/// window — every status, not just completed+failed — and the numerator is
+/// `COUNT(*) FILTER (WHERE status = 'completed')`.
+///
+/// Phase-2 review: `started_at` is `NOT NULL DEFAULT NOW()` (migration
+/// `009_workflow_executions`), i.e. stamped when the ROW is created, not when
+/// execution begins — so queued executions that never ran are in the
+/// denominator too, and the note must not imply a "started" filter that the
+/// column does not express.
+pub(crate) const CAPABILITY_ROW_POPULATION_NOTE: &str =
+    "success_rate_30d = completed / EVERY execution row of the workflow created in the \
+     trailing 30 days (started_at is stamped at row creation, so queued, running, \
+     cancelled and failed executions are all in the denominator); \
+     runs_30d is that denominator. success_rate_30d_ci95 is a Wilson binomial interval \
+     over runs_30d — it assumes independent runs, which bursty failures violate, so it is \
+     a width to compare candidates by, not a guarantee. Rates below the sample-size floor \
+     are labeled sample_size=\"insufficient\" and must not be used to rank candidates.";
+
+/// Sample-size floor below which a 30-day success rate is not usable for
+/// RANKING two candidate workflows against each other.
+///
+/// Grounded in the same convention as the SLA report's MCP-4 warning
+/// (`talos_measurement::min_n_for_rate_target`): the smallest observable
+/// failure rate in `n` runs is `1/n`, so distinguishing a 95%-class workflow
+/// from a lucky one needs `n >= 1/(1 - 0.95) = 20`. Below that a single
+/// failure swings the rate by five points or more and the ordering between
+/// two candidates is noise.
+const CAPABILITY_RANKING_TARGET_RATE: f64 = 0.95;
+
+/// Render one capability row: the legacy fields byte-for-byte as before, plus
+/// the sample size, the Wilson interval and the sufficiency label.
+///
+/// Extracted as a pure function (2026-07-28) so the shape is unit-testable
+/// against real production code rather than a test-local re-implementation —
+/// and so dropping `runs_30d` fails a test instead of silently shipping.
+pub(crate) fn capability_row_json(
+    row: &talos_analytics_repository::WorkflowCapabilityRow,
+) -> serde_json::Value {
+    // success_rate is Option<f64>: None when total = 0.
+    // Emit the legacy fraction rounded to 4dp; the new
+    // _percent field is only meaningful when the fraction
+    // exists. None → null on both fields so callers can
+    // distinguish "no executions yet" from "ran and 0%".
+    let frac_opt: Option<f64> = row.success_rate;
+    let frac_4dp: Option<f64> = frac_opt.and_then(|f| {
+        if f.is_finite() {
+            Some((f * 10000.0).round() / 10000.0)
+        } else {
+            None
+        }
+    });
+    let percent_value: serde_json::Value = match frac_opt {
+        Some(f) if f.is_finite() => {
+            serde_json::json!(talos_analytics_repository::format_percent(f * 100.0))
+        }
+        _ => serde_json::Value::Null,
+    };
+    let runs = u64::try_from(row.runs_30d).unwrap_or(0);
+    // `Measurement::from_fraction` refuses n = 0 and non-finite fractions, so
+    // "never ran" can never render as a healthy-looking 0.0 with a [0,0]
+    // interval — it renders as no interval at all.
+    let ci95: serde_json::Value = frac_opt
+        .and_then(|f| talos_measurement::Measurement::from_fraction(f, runs))
+        .and_then(|m| m.ci95)
+        .map_or(serde_json::Value::Null, |ci| serde_json::json!(ci));
+    let floor = talos_measurement::min_n_for_rate_target(CAPABILITY_RANKING_TARGET_RATE)
+        .unwrap_or(u64::MAX);
+    let sufficiency = talos_measurement::Sufficiency::judge(runs, floor);
+    serde_json::json!({
+        "id": row.id,
+        "workflow_id": row.id,
+        "name": row.name,
+        "description": row.description,
+        "capabilities": row.capabilities,
+        "readiness_score": row.readiness_score,
+        "success_rate_30d": frac_4dp,
+        "success_rate_30d_percent": percent_value,
+        // The n. Its absence is the whole S1 defect: without it, 1-for-1 and
+        // 400-for-400 both render "100.0%" and routing picks either.
+        "runs_30d": row.runs_30d,
+        "success_rate_30d_ci95": ci95,
+        "sample_size": sufficiency.label(),
+        "sample_size_note": sufficiency.to_string(),
+    })
+}
+
 async fn handle_get_workflows_by_capability(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
@@ -4925,43 +5022,11 @@ async fn handle_get_workflows_by_capability(
             //     leak is gone either way).
             //   * wrap in `{count, capabilities_filter, workflows}`
             //     envelope so the surface matches MCP-45 sweep.
-            let results: Vec<serde_json::Value> = rows
-                .iter()
-                .map(|row| {
-                    // success_rate is Option<f64>: None when total = 0.
-                    // Emit the legacy fraction rounded to 4dp; the new
-                    // _percent field is only meaningful when the fraction
-                    // exists. None → null on both fields so callers can
-                    // distinguish "no executions yet" from "ran and 0%".
-                    let frac_opt: Option<f64> = row.success_rate;
-                    let frac_4dp: Option<f64> = frac_opt.and_then(|f| {
-                        if f.is_finite() {
-                            Some((f * 10000.0).round() / 10000.0)
-                        } else {
-                            None
-                        }
-                    });
-                    let percent_value: serde_json::Value = match frac_opt {
-                        Some(f) if f.is_finite() => {
-                            serde_json::json!(talos_analytics_repository::format_percent(f * 100.0))
-                        }
-                        _ => serde_json::Value::Null,
-                    };
-                    serde_json::json!({
-                        "id": row.id,
-                        "workflow_id": row.id,
-                        "name": row.name,
-                        "description": row.description,
-                        "capabilities": row.capabilities,
-                        "readiness_score": row.readiness_score,
-                        "success_rate_30d": frac_4dp,
-                        "success_rate_30d_percent": percent_value,
-                    })
-                })
-                .collect();
+            let results: Vec<serde_json::Value> = rows.iter().map(capability_row_json).collect();
             let envelope = serde_json::json!({
                 "count": results.len(),
                 "capabilities_filter": capabilities,
+                "population_note": CAPABILITY_ROW_POPULATION_NOTE,
                 "workflows": results,
             });
             mcp_text(
@@ -6053,6 +6118,133 @@ async fn handle_get_platform_hygiene_report(
         req_id,
         &serde_json::to_string_pretty(&report).unwrap_or_default(),
     )
+}
+
+/// S1 (measurement envelope, 2026-07-28): the capability-routing row must
+/// carry the denominator of its own success rate.
+#[cfg(test)]
+mod capability_row_measurement_tests {
+    use super::{capability_row_json, CAPABILITY_ROW_POPULATION_NOTE};
+    use talos_analytics_repository::WorkflowCapabilityRow;
+    use uuid::Uuid;
+
+    fn row(rate: Option<f64>, runs: i64) -> WorkflowCapabilityRow {
+        WorkflowCapabilityRow {
+            id: Uuid::nil(),
+            name: "wf".to_string(),
+            description: None,
+            capabilities: Some(vec!["http-fetch".to_string()]),
+            readiness_score: Some(70),
+            success_rate: rate,
+            runs_30d: runs,
+        }
+    }
+
+    /// The defect verbatim: 1-for-1 and 400-for-400 are both "100.0%".
+    /// The rendered rows must be distinguishable.
+    #[test]
+    fn identical_rates_over_different_samples_are_distinguishable() {
+        let lucky = capability_row_json(&row(Some(1.0), 1));
+        let proven = capability_row_json(&row(Some(1.0), 400));
+        // The legacy fields are, by design, identical — that IS the bug.
+        assert_eq!(lucky["success_rate_30d"], proven["success_rate_30d"]);
+        assert_eq!(
+            lucky["success_rate_30d_percent"],
+            proven["success_rate_30d_percent"]
+        );
+        // …so the row must differ somewhere a reader will see.
+        assert_ne!(lucky, proven, "rows over 1 and 400 runs render identically");
+        assert_eq!(lucky["runs_30d"], 1);
+        assert_eq!(proven["runs_30d"], 400);
+        assert_eq!(lucky["sample_size"], "insufficient");
+        assert_eq!(proven["sample_size"], "sufficient");
+        // The interval is what makes the difference legible: 1/1 spans most
+        // of the range, 400/400 barely moves off 1.0.
+        let lucky_lo = lucky["success_rate_30d_ci95"][0].as_f64().unwrap();
+        let proven_lo = proven["success_rate_30d_ci95"][0].as_f64().unwrap();
+        assert!(lucky_lo < 0.3, "1-for-1 lower bound was {lucky_lo}");
+        assert!(proven_lo > 0.98, "400-for-400 lower bound was {proven_lo}");
+    }
+
+    /// Mutation guard (8b): dropping `runs_30d` from the row must fail here.
+    #[test]
+    fn every_row_carries_its_sample_size() {
+        for (rate, runs) in [
+            (Some(1.0), 1i64),
+            (Some(0.0), 5),
+            (Some(0.75), 40),
+            (None, 0),
+        ] {
+            let v = capability_row_json(&row(rate, runs));
+            let obj = v.as_object().expect("row is an object");
+            assert!(
+                obj.contains_key("runs_30d"),
+                "runs_30d missing for ({rate:?}, {runs})"
+            );
+            assert_eq!(v["runs_30d"], runs);
+            assert!(obj.contains_key("sample_size"));
+        }
+    }
+
+    /// The floor is 20, grounded in `min_n_for_rate_target(0.95)`. Pin the
+    /// boundary so a silent change to the routing floor is visible.
+    #[test]
+    fn insufficient_label_flips_exactly_at_the_floor() {
+        assert_eq!(
+            talos_measurement::min_n_for_rate_target(super::CAPABILITY_RANKING_TARGET_RATE),
+            Some(20)
+        );
+        assert_eq!(
+            capability_row_json(&row(Some(0.9), 19))["sample_size"],
+            "insufficient"
+        );
+        assert_eq!(
+            capability_row_json(&row(Some(0.9), 20))["sample_size"],
+            "sufficient"
+        );
+        // The note names the n and the floor, so "insufficient" is actionable.
+        let note = capability_row_json(&row(Some(0.9), 19))["sample_size_note"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(note.contains("n=19") && note.contains("20"), "{note}");
+    }
+
+    /// n = 0 must never render as a healthy 0.0 with a [0,0] interval.
+    #[test]
+    fn a_workflow_that_never_ran_reports_no_rate_and_no_interval() {
+        let v = capability_row_json(&row(None, 0));
+        assert!(v["success_rate_30d"].is_null());
+        assert!(v["success_rate_30d_percent"].is_null());
+        assert!(
+            v["success_rate_30d_ci95"].is_null(),
+            "n=0 must not produce an interval"
+        );
+        assert_eq!(v["runs_30d"], 0);
+        assert_eq!(v["sample_size"], "insufficient");
+    }
+
+    /// The population string must describe the SQL that produced the number:
+    /// the denominator is every execution started in the window, not just
+    /// completed+failed.
+    #[test]
+    fn population_note_matches_the_actual_denominator() {
+        assert!(CAPABILITY_ROW_POPULATION_NOTE.contains("created in the trailing 30 days"));
+        assert!(
+            CAPABILITY_ROW_POPULATION_NOTE.contains("queued, running, cancelled and failed"),
+            "the denominator includes queued and other non-terminal statuses; say so"
+        );
+        assert!(CAPABILITY_ROW_POPULATION_NOTE.contains("runs_30d is that denominator"));
+        // Phase-2: the interval must not read as an exact bound.
+        assert!(
+            CAPABILITY_ROW_POPULATION_NOTE.contains("Wilson binomial interval"),
+            "name the interval's model"
+        );
+        assert!(
+            CAPABILITY_ROW_POPULATION_NOTE.contains("not a guarantee"),
+            "a ci95 field is read as a bound unless told otherwise"
+        );
+    }
 }
 
 #[cfg(test)]

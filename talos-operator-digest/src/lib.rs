@@ -227,10 +227,12 @@ impl OperatorDigestService {
                     "avg_score": s.avg_score,
                     "pass_rate": s.pass_rate,
                     "worst_score": s.worst_score,
-                    "population_note": "runs/avg_score/pass_rate/worst_score cover SCORED \
-                                        verdicts only; na_runs counts runs where the judge \
-                                        reported nothing to judge and which are excluded \
-                                        from every score above",
+                    // D5 (2026-07-28): one constant, shared with
+                    // `talos-engine::assistant_report_reader`, which carried a
+                    // byte-identical hand-copy. Two copies of a population
+                    // disclosure is two chances for it to stop describing the
+                    // query it annotates.
+                    "population_note": talos_measurement::JUDGE_SCORE_POPULATION_NOTE,
                     // A judge whose score never varies is not evidence of
                     // quality — it may be a shape check that cannot fail.
                     "signal": signal,
@@ -618,24 +620,15 @@ pub fn correction_loop_state(
     }
 }
 
-/// Wilson score interval (95%) for a proportion — the standard small-sample
-/// interval, and correct where the normal approximation is not: it never leaves
-/// [0, 1] and stays sane at 0 or 1 successes, both of which occur here (gold
-/// `archive` recall was a literal 0/16 for weeks).
-pub fn wilson_interval_95(accuracy: f64, n: i64) -> Option<(f64, f64)> {
-    if n <= 0 || !accuracy.is_finite() || !(0.0..=1.0).contains(&accuracy) {
-        return None;
-    }
-    const Z: f64 = 1.959_963_984_540_054;
-    let n = n as f64;
-    let denom = 1.0 + Z * Z / n;
-    let centre = accuracy + Z * Z / (2.0 * n);
-    let margin = Z * ((accuracy * (1.0 - accuracy) / n) + (Z * Z / (4.0 * n * n))).sqrt();
-    Some((
-        ((centre - margin) / denom).clamp(0.0, 1.0),
-        ((centre + margin) / denom).clamp(0.0, 1.0),
-    ))
-}
+/// Wilson score interval (95%) for a proportion.
+///
+/// MOVED to `talos-measurement` (2026-07-28) and re-exported here so the
+/// digest's callers and tests keep one import path. Do NOT re-inline a local
+/// copy: the digest, the model card and any future rate annotation must all
+/// produce the same interval for the same counts, and a second copy is exactly
+/// how the six piecemeal conventions this envelope replaces came about.
+/// `wilson_is_not_reinlined_in_this_crate` below fails if a copy reappears.
+pub use talos_measurement::wilson_interval_95;
 
 /// Stamp `correction_loop` + `correction_loop_note` onto every model in a
 /// `loop_health` payload, in place. Best-effort by design: an unexpected shape
@@ -896,6 +889,54 @@ mod tests {
         let (wlo, whi) = wilson_interval_95(0.5, 35).unwrap();
         let (nlo, nhi) = wilson_interval_95(0.5, 350).unwrap();
         assert!((nhi - nlo) < (whi - wlo));
+    }
+
+    /// Mutation guard (2026-07-28): the Wilson interval MOVED to
+    /// `talos-measurement`; this crate re-exports it. If someone re-inlines a
+    /// local definition of it here — the exact way the six piecemeal
+    /// conventions accumulated in the first place — the two copies can drift
+    /// silently, because both compile and both look right. Assert
+    /// structurally that no definition lives in this file.
+    #[test]
+    fn wilson_is_not_reinlined_in_this_crate() {
+        // The needles are assembled with `concat!` so this test's own source
+        // text is not a match for them — an `include_str!` self-scan that
+        // matches itself is a test that can never pass.
+        let src = include_str!("lib.rs");
+        assert!(
+            !src.contains(concat!("fn wilson", "_interval_95")),
+            "wilson_interval_95 must stay a re-export of talos_measurement, \
+             not a local definition — a second copy is a drift vector"
+        );
+        assert!(
+            src.contains(concat!("pub use talos_measurement::", "wilson_interval_95")),
+            "the re-export must remain so existing import paths resolve"
+        );
+        // And the re-exported function is the one that is pinned there.
+        let (lo, hi) = wilson_interval_95(0.4857, 35).unwrap();
+        assert_eq!(lo.to_bits(), 0.329_929_602_948_868_2_f64.to_bits());
+        assert_eq!(hi.to_bits(), 0.644_298_965_431_609_8_f64.to_bits());
+    }
+
+    /// Mutation guard: the judge population note is one shared constant. A
+    /// re-inlined literal here would let the digest's disclosure drift away
+    /// from the assistant report's while both keep compiling.
+    #[test]
+    fn judge_population_note_is_the_shared_constant() {
+        let src = include_str!("lib.rs");
+        assert!(
+            src.contains(concat!(
+                "talos_measurement::",
+                "JUDGE_SCORE_POPULATION_NOTE"
+            )),
+            "the digest must read the shared population note, not a copy"
+        );
+        assert!(
+            !src.contains(concat!("reported nothing to ju", "dge and which are")),
+            "a re-inlined copy of the population-note literal reappeared"
+        );
+        // …and the shared constant still says what the note claims.
+        assert!(talos_measurement::JUDGE_SCORE_POPULATION_NOTE.contains("SCORED verdicts only"));
     }
 
     #[test]
