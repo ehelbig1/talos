@@ -20,9 +20,18 @@ use std::sync::{LazyLock, OnceLock};
 /// `secs == 0` opts out of the wall-clock cap entirely (per-node
 /// timeouts remain the only safety net). Non-zero wraps with
 /// [`tokio::time::timeout`].
+///
+/// `progress` is the engine's shared [`ExecutionProgress`] handle. The
+/// inner reactor future is dropped the instant the deadline fires, so
+/// its local view of which nodes were still outstanding dies with it —
+/// the handle is the only surviving witness, and it is read here to
+/// attribute the timeout to the node(s) that were actually holding the
+/// clock. See `crate::execution_progress` for the DLP contract on what
+/// may appear in that string.
 async fn run_with_workflow_timeout(
     secs: u64,
     cancel: Option<tokio_util::sync::CancellationToken>,
+    progress: ExecutionProgress,
     fut: impl std::future::Future<Output = Result<talos_workflow_engine_core::WorkflowContext, String>>,
 ) -> Result<talos_workflow_engine_core::WorkflowContext, crate::WorkflowEngineError> {
     // Race the inner scheduler against:
@@ -45,7 +54,10 @@ async fn run_with_workflow_timeout(
             () = token.cancelled() => return Err(crate::WorkflowEngineError::Cancelled),
             r = tokio::time::timeout(dur, &mut fut) => match r {
                 Ok(inner) => Ok(inner),
-                Err(_) => return Err(crate::WorkflowEngineError::Timeout { secs }),
+                Err(_) => return Err(crate::WorkflowEngineError::Timeout {
+                    secs,
+                    attribution: progress.describe(),
+                }),
             },
         },
         (Some(token), None) => tokio::select! {
@@ -55,7 +67,12 @@ async fn run_with_workflow_timeout(
         },
         (None, Some(dur)) => match tokio::time::timeout(dur, fut).await {
             Ok(inner) => Ok(inner),
-            Err(_) => return Err(crate::WorkflowEngineError::Timeout { secs }),
+            Err(_) => {
+                return Err(crate::WorkflowEngineError::Timeout {
+                    secs,
+                    attribution: progress.describe(),
+                })
+            }
         },
         (None, None) => Ok(fut.await),
     };
@@ -320,6 +337,7 @@ pub const DEFAULT_AGENT_LOOP_MAX_HISTORY: usize = 20;
 pub const DEFAULT_MAX_SUBFLOW_DEPTH: usize = 16;
 
 use crate::emit_event_spawn;
+use crate::execution_progress::ExecutionProgress;
 use talos_workflow_engine_core::{
     CheckpointStore, EdgeLogic, EventSink, ModuleFetcher, NodeEventWrite, NodeLifecycleHook,
     SecretsResolver, SystemNodeKind, WorkflowContext, WorkflowGraphStore,
@@ -686,6 +704,19 @@ pub struct ParallelWorkflowEngine {
     /// [`AdapterSet::into_engine_with_graph`] when hydrating a
     /// sub-engine from the parent's adapter set.
     pub(crate) current_subflow_depth: usize,
+    /// Shared in-flight/completed snapshot for THIS engine's run.
+    ///
+    /// Interior mutability by design: the whole reactor runs under
+    /// `&self` (same reason `module_prefetch_cache` and the checkpoint
+    /// dirty counter are shared handles), and the wall-clock timeout
+    /// site needs to read the reactor's progress *after* the reactor
+    /// future has been dropped. Reset at the top of every run, so a
+    /// reused engine handle never reports a prior run's nodes.
+    ///
+    /// Deliberately NOT propagated through [`AdapterSet`] — each
+    /// sub-engine gets a fresh handle so a sub-workflow's timeout
+    /// attributes its OWN nodes, not the parent's.
+    pub(crate) progress: ExecutionProgress,
 }
 
 impl Default for ParallelWorkflowEngine {
@@ -910,6 +941,7 @@ impl ParallelWorkflowEngine {
             cancellation_token: None,
             max_subflow_depth: DEFAULT_MAX_SUBFLOW_DEPTH,
             current_subflow_depth: 0,
+            progress: ExecutionProgress::default(),
         }
     }
 
@@ -989,6 +1021,41 @@ impl ParallelWorkflowEngine {
     // In production every constructor (`with_registry`, `with_services*`)
     // wires these via `wire_default_policy_adapters`, so the fallbacks
     // never fire on real traffic; they're only for bare `new()` test engines.
+
+    /// Operator-facing name for a node in timeout attribution — the
+    /// graph label when present, else the raw UUID.
+    ///
+    /// Mirrors the `node '{label}' failed: …` idiom in
+    /// `engine_completion` so both error surfaces name a node the same
+    /// way. Labels and UUIDs only — never node config or output (see
+    /// the DLP contract in `crate::execution_progress`).
+    pub(crate) fn progress_label(&self, node_id: Uuid) -> String {
+        self.node_labels
+            .get(&node_id)
+            .cloned()
+            .unwrap_or_else(|| node_id.to_string())
+    }
+
+    /// Attribution label for a pipeline chain, which dispatches as a
+    /// single future under its head index.
+    ///
+    /// Rendered as `head+N` (e.g. `fetch+2`) so the operator can tell a
+    /// stalled 3-node chain from a stalled single node — the head's
+    /// bare label would imply the head itself is the slow step when the
+    /// hang could be in any interior member.
+    pub(crate) fn chain_progress_label(&self, chain: &[NodeIndex]) -> String {
+        // `chain` is never empty in practice (the detector only emits
+        // chains of length >= 2), but index-free access keeps a future
+        // detector change from panicking inside an error-reporting path.
+        let Some(&head_idx) = chain.first() else {
+            return "<empty chain>".to_string();
+        };
+        let head = self.progress_label(self.graph[head_idx]);
+        match chain.len() {
+            0 | 1 => head,
+            n => format!("{head}+{}", n - 1),
+        }
+    }
 
     pub(crate) fn eval_bool(&self, expression: &str, context: &JsonValue) -> bool {
         self.expression_evaluator
@@ -1184,6 +1251,7 @@ impl ParallelWorkflowEngine {
         run_with_workflow_timeout(
             self.execution_timeout_secs,
             self.cancellation_token.clone(),
+            self.progress.clone(),
             self.run_inner(dispatcher, worker_shared_key, HashMap::new(), execution_id),
         )
         .await
@@ -1222,6 +1290,7 @@ impl ParallelWorkflowEngine {
         run_with_workflow_timeout(
             self.execution_timeout_secs,
             Some(cancel),
+            self.progress.clone(),
             self.run_inner(dispatcher, worker_shared_key, HashMap::new(), execution_id),
         )
         .await
@@ -1276,8 +1345,11 @@ impl ParallelWorkflowEngine {
         let timeout_secs = self.execution_timeout_secs;
         // Engine-level cancel propagation; see set_cancellation_token.
         let cancel = self.cancellation_token.clone();
+        let progress = self.progress.clone();
         let inner = self.run_inner(dispatcher, worker_shared_key, initial_results, execution_id);
-        Box::pin(async move { run_with_workflow_timeout(timeout_secs, cancel, inner).await })
+        Box::pin(
+            async move { run_with_workflow_timeout(timeout_secs, cancel, progress, inner).await },
+        )
     }
 
     /// Cancellable variant of
@@ -1299,8 +1371,11 @@ impl ParallelWorkflowEngine {
             return Box::pin(async move { Err(e) });
         }
         let timeout_secs = self.execution_timeout_secs;
+        let progress = self.progress.clone();
         let inner = self.run_inner(dispatcher, worker_shared_key, initial_results, execution_id);
-        Box::pin(async move { run_with_workflow_timeout(timeout_secs, Some(cancel), inner).await })
+        Box::pin(async move {
+            run_with_workflow_timeout(timeout_secs, Some(cancel), progress, inner).await
+        })
     }
 
     /// Execute the graph with a caller-supplied **trigger input** —
@@ -1550,6 +1625,13 @@ impl ParallelWorkflowEngine {
             return Err("Workflow contains a cycle".into());
         }
 
+        // Timeout attribution: start this run's progress snapshot from
+        // zero. An engine handle can legitimately be run more than once
+        // (seeded resume after a pause, agent-loop iterations), and a
+        // stale in-flight entry would make the next timeout blame the
+        // previous run's node.
+        self.progress.reset();
+
         let is_fresh_run = initial_results.is_empty();
 
         // Pipeline chain detection runs ONLY on fresh runs. On seeded
@@ -1655,6 +1737,13 @@ impl ParallelWorkflowEngine {
         let mut accumulated_memo: Option<(u64, Option<Arc<JsonValue>>)> = None;
         macro_rules! commit_result {
             ($id:expr, $value:expr) => {{
+                // Timeout attribution: this macro is the chokepoint for
+                // every locally-computed / inline-awaited node commit, so
+                // counting here keeps `nodes completed` honest across all
+                // node kinds rather than only worker-dispatched ones. The
+                // in-flight removal is a no-op for kinds that never
+                // entered the pool.
+                self.progress.mark_finished($id);
                 results.insert($id, $value);
             }};
         }
@@ -1700,6 +1789,16 @@ impl ParallelWorkflowEngine {
                         results_version,
                         &mut accumulated_memo,
                     );
+                    // Timeout attribution: a chain is dispatched as ONE
+                    // future keyed on its head index and never touches
+                    // `node_start_times`, so without this the whole chain
+                    // is invisible to the in-flight snapshot. Label it
+                    // with the head's label + the chain length so the
+                    // operator sees which chain stalled, not a bare head
+                    // node that has long since finished its own step.
+                    let chain_head_id = self.graph[node_idx];
+                    self.progress
+                        .mark_started(chain_head_id, self.chain_progress_label(&chain));
                     let fut = self.run_pipeline_chain_dispatch(
                         chain,
                         chain_input,
@@ -2423,6 +2522,11 @@ impl ParallelWorkflowEngine {
                 // so callers using WorkflowContext.node_timings get
                 // data regardless of entry point.
                 node_start_times.insert(node_idx, std::time::Instant::now());
+                // Timeout attribution: mirror the in-flight transition
+                // into the shared snapshot so the wall-clock timeout can
+                // name this node after the reactor future is dropped.
+                self.progress
+                    .mark_started(node_id, self.progress_label(node_id));
                 emit_event_spawn(
                     &self.event_sink,
                     NodeEventWrite {
@@ -2448,6 +2552,11 @@ impl ParallelWorkflowEngine {
             // passed only when chain detection actually ran
             // (fresh-run path); seeded runs supply `None`.
             if let Some((finished_idx, exec_result)) = executing.next().await {
+                // Timeout attribution: clear the in-flight marker
+                // unconditionally (keyed on the graph id, so it covers
+                // the chain-head entry too, which never appears in
+                // `node_start_times`).
+                self.progress.mark_finished(self.graph[finished_idx]);
                 let wall_time_ms = if let Some(start) = node_start_times.remove(&finished_idx) {
                     let elapsed_ms = start.elapsed().as_millis() as u64;
                     let label = self

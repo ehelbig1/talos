@@ -219,6 +219,7 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `ANTHROPIC_API_KEY` | none (vault-first; env is fallback) | both | Anthropic key fallback for LLM + graph-RAG | 🔒 |
 | `OPENAI_API_KEY` | none (optional) | controller | OpenAI key for embeddings fallback | 🔒 |
 | `OLLAMA_URL` | `http://ollama:11434` | both | Local Ollama endpoint (Tier-1 local LLM) | |
+| `TALOS_LLM_BOOT_WARMUP` | `true` | controller | Warm the ≤3 most-referenced local (ollama) generation models at boot, after the reachability probe, so the first scheduled run doesn't pay the cold model load. Fail-soft, spawned, never delays boot. Local provider only. | |
 | `EMBEDDING_API_URL` | none (optional) | both | Embedding service URL | |
 | `EMBEDDING_API_KEY` | none (optional) | both | Embedding API key | 🔒 |
 | `EMBEDDING_MODEL` | built-in default | both | Embedding model name | |

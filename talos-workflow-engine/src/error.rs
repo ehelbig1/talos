@@ -116,11 +116,30 @@ pub enum WorkflowEngineError {
     ///
     /// Per-node timeouts surface differently — those land as
     /// individual node failures, propagated through
-    /// [`Execution`](Self::Execution).
-    #[error("workflow execution timed out after {secs} seconds")]
+    /// [`Execution`](Self::Execution). Those already name their node:
+    /// the dispatcher's `"Job execution timed out"` is wrapped by the
+    /// completion handler into `node '<label>' failed: …`. The
+    /// workflow-level cap is the one that historically named nothing,
+    /// which is what `attribution` fixes.
+    #[error("workflow execution timed out after {secs} seconds{attribution}")]
     Timeout {
         /// The wall-clock budget the workflow exceeded, in seconds.
         secs: u64,
+        /// Pre-rendered, bounded node attribution — either empty, or a
+        /// leading-space clause naming the still-in-flight nodes with
+        /// their elapsed times and the completed-node count, e.g.
+        /// `" (in flight: synthesize 173s; 4 nodes completed)"`.
+        ///
+        /// **Node labels and timings only.** Node config values and node
+        /// output must never be rendered into this field — it flows into
+        /// `workflow_executions.error_message`, the operator digest
+        /// preview, and the failure webhook. See
+        /// `crate::execution_progress` for the full contract.
+        ///
+        /// Empty when the engine observed no node transitions at all, so
+        /// the `Display` output is byte-identical to the pre-attribution
+        /// format on those paths.
+        attribution: String,
     },
 
     /// A sub-workflow dispatch chain exceeded

@@ -262,6 +262,23 @@ pub fn actor_context_injection_enabled() -> bool {
     bool_env_or_default("ENABLE_ACTOR_CONTEXT_INJECTION", true)
 }
 
+/// Kill-switch for the boot-time warmup of LOCAL (Ollama) generation
+/// models. **Default ON.** Set `TALOS_LLM_BOOT_WARMUP=false|0|no|off` to
+/// skip it.
+///
+/// The sibling of the embedding provider's boot warmup: after the Ollama
+/// reachability probe succeeds, a spawned task issues one minimal
+/// generation per referenced local model so the first scheduled workflow
+/// after a deploy does not pay the cold model load. The warmup is
+/// fail-soft and never delays boot, so the switch exists for hosts where
+/// the residency cost is unwanted (a shared GPU, a model set too large
+/// to hold, a deliberately cold node) rather than as a safety valve.
+///
+/// Accepted truthy tokens: `true | 1 | yes | on` — see [`bool_env_or_default`].
+pub fn llm_boot_warmup_enabled() -> bool {
+    bool_env_or_default("TALOS_LLM_BOOT_WARMUP", true)
+}
+
 /// Route the EXPLICIT semantic-recall path (the worker `agent_memory::search`
 /// RPC + the MCP `actor_recall_semantic` / `actor_recall_hyde` handlers)
 /// through the smart-context fused ranker instead of raw pgvector-cosine order.

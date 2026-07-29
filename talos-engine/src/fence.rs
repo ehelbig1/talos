@@ -274,6 +274,9 @@ mod tests {
     #[test]
     fn was_fenced_only_matches_cancellation() {
         assert!(was_fenced(&WorkflowEngineError::Cancelled));
-        assert!(!was_fenced(&WorkflowEngineError::Timeout { secs: 30 }));
+        assert!(!was_fenced(&WorkflowEngineError::Timeout {
+            secs: 30,
+            attribution: String::new()
+        }));
     }
 }

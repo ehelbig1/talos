@@ -5,6 +5,19 @@
 use crate::*;
 use anyhow::Context as _;
 
+/// Per-graph payload guard for
+/// [`WorkflowRepository::list_enabled_graph_json_for_boot_warmup`].
+/// Graphs above this are dropped by the projection SERVER-side, so their
+/// text never crosses the wire. Defensive: real LLM-bearing graphs are
+/// single-digit KB. Mirrors `TWIN_SCAN_MAX_GRAPH_BYTES`.
+pub const BOOT_WARMUP_MAX_GRAPH_BYTES: i64 = 262_144;
+
+/// Aggregate payload guard for the same scan. The per-graph cap alone
+/// admits `limit` × 256 KB of JSON held in one `Vec<String>` — at BOOT,
+/// on the pool the request path is about to want. 4 MB is far past the
+/// whole-fleet total and matches `TWIN_SCAN_TOTAL_BYTES`.
+pub const BOOT_WARMUP_TOTAL_BYTES: i64 = 4_194_304;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Row DTOs
 // ─────────────────────────────────────────────────────────────────────────────
@@ -380,6 +393,59 @@ impl WorkflowRepository {
                 .fetch_optional(&self.db_pool)
                 .await?;
         Ok(row.map(|(gj,)| gj))
+    }
+
+    /// Fleet-wide scan of enabled, non-archived workflows' `graph_json`
+    /// for BOOT-TIME PLATFORM WARMUP only.
+    ///
+    /// Deliberately unscoped by user/org, like
+    /// `talos_registry::reconcile`'s module-usage scan: this runs once
+    /// during controller startup, before any request context exists, and
+    /// its only consumer extracts LOCAL LLM model names
+    /// (`talos_llm::warmup::select_warmup_targets`). No row, field, or
+    /// derived value reaches a user-facing surface — the output is a
+    /// capped list of ollama model strings used to pre-load VRAM.
+    ///
+    /// **Do not repurpose this for a request path.** Anything serving a
+    /// user must go through the `user_id`- / org-scoped readers above so
+    /// RLS and tenancy hold.
+    ///
+    /// `limit` bounds the scan by ROWS; graphs are returned newest-first
+    /// so a fleet larger than the limit still reflects current authoring.
+    /// Both BYTE dimensions are bounded too — see
+    /// [`BOOT_WARMUP_MAX_GRAPH_BYTES`] / [`BOOT_WARMUP_TOTAL_BYTES`].
+    pub async fn list_enabled_graph_json_for_boot_warmup(&self, limit: i64) -> Result<Vec<String>> {
+        // Row cap alone leaves the payload unbounded (`limit` × whatever a
+        // graph happens to weigh), and this runs at BOOT with the pool the
+        // request path is about to need. Same two-dimensional guard the
+        // hygiene twin-scan uses: an oversized graph is dropped
+        // SERVER-side (never transferred), and the aggregate budget stops
+        // the transfer once the scan has seen enough. A graph too big for
+        // the per-graph cap is not where warmup targets come from — the
+        // flagship LLM graphs are single-digit KB.
+        let rows: Vec<(Option<String>,)> = sqlx::query_as(
+            "SELECT CASE WHEN octet_length(graph_json) <= $2 THEN graph_json::text END \
+               FROM workflows \
+              WHERE is_enabled = true AND status <> 'archived' \
+              ORDER BY updated_at DESC NULLS LAST, id \
+              LIMIT $1",
+        )
+        .bind(limit)
+        .bind(BOOT_WARMUP_MAX_GRAPH_BYTES)
+        .fetch_all(&self.db_pool)
+        .await?;
+        let mut budget = BOOT_WARMUP_TOTAL_BYTES;
+        let mut graphs = Vec::with_capacity(rows.len());
+        for (gj,) in rows {
+            let Some(gj) = gj else { continue };
+            let len = gj.len() as i64;
+            if len > budget {
+                continue;
+            }
+            budget -= len;
+            graphs.push(gj);
+        }
+        Ok(graphs)
     }
 
     /// Fetch the actor_id for a workflow — used at authoring time to enforce capability ceilings.
