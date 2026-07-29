@@ -96,6 +96,35 @@ async fn seed_disagreement(
     .expect("record disagreement")
 }
 
+/// Full-control variant for the sibling-closure tests: chooses the key (or
+/// none), the feature text, and both labels.
+#[allow(clippy::too_many_arguments)]
+async fn seed_disagreement_full(
+    ls: &LifecycleService,
+    pool: &sqlx::Pool<sqlx::Postgres>,
+    model: Uuid,
+    user: Uuid,
+    example_key: Option<&str>,
+    features_text: &str,
+    fast_label: Option<&str>,
+    llm_label: &str,
+) -> Uuid {
+    let mut conn = pool.acquire().await.unwrap();
+    ls.record_disagreement(
+        &mut conn,
+        model,
+        user,
+        None,
+        example_key,
+        features_text,
+        fast_label.map(|l| (l, 0.9f32)),
+        llm_label,
+        "divergence",
+    )
+    .await
+    .expect("record disagreement")
+}
+
 #[tokio::test]
 async fn resolve_appends_correction_and_flips_status() {
     let (pool, _db) = common::isolated_db_pool().await;
@@ -224,4 +253,215 @@ async fn resolve_refuses_another_tenants_disagreement() {
     .await
     .unwrap();
     assert_eq!(corrections, 0);
+}
+
+/// The completeness bug this closes: the queue listing collapses duplicates
+/// AFTER its `LIMIT 100`, so a correction driven by that listing could only
+/// ever close siblings that happened to be on the visible page. With 150
+/// same-example rows pending, every one of them must close under ONE decision
+/// — including the ones far outside the window.
+///
+/// The rows deliberately carry DIFFERENT `features_text`, so the text-based
+/// page grouping cannot join them: only the `example_key` predicate can, which
+/// is precisely the path under test.
+#[tokio::test]
+async fn one_correction_closes_same_key_siblings_beyond_the_queue_window() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    set_master_key();
+    let user = Uuid::new_v4();
+    seed_user(&pool, user).await;
+    let ds = seed_dataset(&pool, user).await;
+    let model = seed_model(&pool, user, ds).await;
+    let (ls, dsvc) = services(&pool).await;
+
+    const ROWS: usize = 150;
+    let mut ids = Vec::with_capacity(ROWS);
+    for i in 0..ROWS {
+        ids.push(
+            seed_disagreement_full(
+                &ls,
+                &pool,
+                model,
+                user,
+                Some("shared-example-key"),
+                &format!("Subject: delivery copy {i}"),
+                Some("to_read"),
+                "archive",
+            )
+            .await,
+        );
+    }
+
+    // Resolve the OLDEST row — the queue sorts `created_at DESC`, so this one
+    // is well past the 100-row window a paged closure could see.
+    let target = ids[0];
+    let outcome = resolve_disagreement(&pool, &ls, &dsvc, target, user, Some("archive"))
+        .await
+        .expect("resolve ok");
+    assert_eq!(outcome.status, "resolved");
+    assert_eq!(
+        outcome.siblings_resolved,
+        ROWS - 1,
+        "every same-example sibling must close, not just the visible page"
+    );
+
+    let still_pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ml_disagreements WHERE model_id = $1 AND status = 'pending'",
+    )
+    .bind(model)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(still_pending, 0, "no sibling may be re-asked later");
+
+    // ONE human judgement → ONE gold example, however many copies it closed.
+    let corrections: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ml_examples WHERE dataset_id = $1 AND source = 'correction'",
+    )
+    .bind(ds)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(corrections, 1);
+}
+
+/// The over-reach guard. The queue's identity deliberately includes the
+/// `(fast_label, llm_label)` pair — a different verdict on the same item is a
+/// DIFFERENT question and gets its own row. Key-based closure must respect
+/// that, or one answer would silently dispose of a question the operator never
+/// saw.
+#[tokio::test]
+async fn key_closure_does_not_cross_the_label_pair() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    set_master_key();
+    let user = Uuid::new_v4();
+    seed_user(&pool, user).await;
+    let ds = seed_dataset(&pool, user).await;
+    let model = seed_model(&pool, user, ds).await;
+    let (ls, dsvc) = services(&pool).await;
+
+    let same_question = seed_disagreement_full(
+        &ls,
+        &pool,
+        model,
+        user,
+        Some("msg-1"),
+        "Subject: quarterly report",
+        Some("to_read"),
+        "archive",
+    )
+    .await;
+    // Same example, DIFFERENT teacher verdict.
+    let other_llm = seed_disagreement_full(
+        &ls,
+        &pool,
+        model,
+        user,
+        Some("msg-1"),
+        "Subject: quarterly report",
+        Some("to_read"),
+        "follow_up",
+    )
+    .await;
+    // Same example, DIFFERENT fast verdict (and the abstention case: NULL).
+    let other_fast = seed_disagreement_full(
+        &ls,
+        &pool,
+        model,
+        user,
+        Some("msg-1"),
+        "Subject: quarterly report",
+        None,
+        "archive",
+    )
+    .await;
+
+    let outcome = resolve_disagreement(&pool, &ls, &dsvc, same_question, user, Some("archive"))
+        .await
+        .expect("resolve ok");
+    assert_eq!(
+        outcome.siblings_resolved, 0,
+        "rows the queue keeps as separate questions must stay pending"
+    );
+    for other in [other_llm, other_fast] {
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM ml_disagreements WHERE id = $1")
+                .bind(other)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "pending", "a different question must not be closed");
+    }
+}
+
+/// Keyless rows keep the previous behaviour exactly: they are not addressable
+/// by the key predicate, so they close via the decrypted-text comparison
+/// within the queue window — and a keyed row's closure never reaches them
+/// through the key path.
+#[tokio::test]
+async fn null_key_siblings_still_close_through_the_paged_text_path() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    set_master_key();
+    let user = Uuid::new_v4();
+    seed_user(&pool, user).await;
+    let ds = seed_dataset(&pool, user).await;
+    let model = seed_model(&pool, user, ds).await;
+    let (ls, dsvc) = services(&pool).await;
+
+    let text = "Subject: [CI] Run failed: build #4211";
+    let a = seed_disagreement_full(
+        &ls,
+        &pool,
+        model,
+        user,
+        None,
+        text,
+        Some("to_read"),
+        "archive",
+    )
+    .await;
+    let b = seed_disagreement_full(
+        &ls,
+        &pool,
+        model,
+        user,
+        None,
+        text,
+        Some("to_read"),
+        "archive",
+    )
+    .await;
+    // Unrelated keyless row: different text, must be untouched.
+    let c = seed_disagreement_full(
+        &ls,
+        &pool,
+        model,
+        user,
+        None,
+        "Subject: lunch tomorrow?",
+        Some("to_read"),
+        "archive",
+    )
+    .await;
+
+    let outcome = resolve_disagreement(&pool, &ls, &dsvc, a, user, Some("archive"))
+        .await
+        .expect("resolve ok");
+    assert_eq!(
+        outcome.siblings_resolved, 1,
+        "the text-identical copy closes"
+    );
+
+    let b_status: String = sqlx::query_scalar("SELECT status FROM ml_disagreements WHERE id = $1")
+        .bind(b)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(b_status, "resolved");
+    let c_status: String = sqlx::query_scalar("SELECT status FROM ml_disagreements WHERE id = $1")
+        .bind(c)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(c_status, "pending", "a different example is untouched");
 }

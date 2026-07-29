@@ -407,6 +407,34 @@ pub struct DataEncryptionKey {
     pub key: Zeroizing<Vec<u8>>,
 }
 
+/// The ML content-fingerprint MAC key (see
+/// [`SecretsManager::ml_content_mac_key`]).
+///
+/// A newtype rather than a bare `Zeroizing<[u8; 32]>` for two reasons:
+/// * `Zeroizing<[u8; 32]>` implements `Debug` and would print the key bytes
+///   through any `{:?}` on a struct that holds one — the exact leak structural
+///   lint check 37 exists to prevent. The manual `Debug` below redacts.
+/// * it makes the key's single legitimate use nameable at call sites.
+///
+/// Deliberately NOT `Clone`, NOT `Serialize`, NOT `Display`: this value never
+/// crosses a process boundary, never reaches a log line, never reaches NATS,
+/// MCP or WASM.
+pub struct MlContentMacKey(Zeroizing<[u8; 32]>);
+
+impl MlContentMacKey {
+    /// The raw key bytes, for handing to an HMAC construction.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+impl std::fmt::Debug for MlContentMacKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MlContentMacKey([REDACTED])")
+    }
+}
+
 impl SecretsManager {
     /// Access the underlying database pool (used by OAuthCredentialService for
     /// proactive token refresh when the engine detects expiring OAuth tokens).
@@ -1752,6 +1780,63 @@ impl SecretsManager {
             // 255*HashLen; 32 bytes is always valid, so this is unreachable.
             .map_err(|_| anyhow!("HKDF expand for per-context subkey failed"))?;
         Ok(subkey)
+    }
+
+    /// HKDF salt / domain-separation label for the ML content-fingerprint
+    /// MAC key. Versioned: bumping the `/vN` suffix mints an entirely new
+    /// key space (and therefore a new fingerprint era).
+    const ML_CONTENT_KEY_LABEL: &[u8] = b"talos-ml-content-key/v1";
+    /// HKDF `info` for the same derivation — states the single legitimate use.
+    const ML_CONTENT_KEY_INFO: &[u8] = b"ml-example-content-fingerprint";
+
+    /// The server-side MAC key for ML content fingerprints
+    /// (`talos_ml::content_identity::content_key`).
+    ///
+    /// WHY A KEY AT ALL: the fingerprint is persisted in
+    /// `ml_examples.example_key` / `ml_disagreements.example_key`, right next
+    /// to the AEAD ciphertext of the very text it fingerprints. An UNKEYED
+    /// `sha256(features_text)` there is a confirmation oracle — anyone holding
+    /// a database backup can hash guessed plaintexts and learn which ones the
+    /// tenant holds, without touching the encryption at all. Keying it under a
+    /// server-side purpose key removes the offline capability: the fingerprint
+    /// can only be recomputed by a party that can also unwrap the DEKs.
+    ///
+    /// KEY SOURCE (two rooted paths, both requiring the KEK):
+    /// 1. `KekProvider::derive_purpose_key` — a LOCAL-material KEK
+    ///    (`EnvKekProvider`) derives HKDF-SHA256 from the master key. This is
+    ///    the canonical path: stable across worker fleets, across
+    ///    `WORKER_SHARED_KEY` rotation, and across DEK rotation.
+    /// 2. Fallback for KMS-backed KEKs (Vault transit, future AWS/GCP KMS),
+    ///    which never export key material and whose encrypt endpoints are
+    ///    non-deterministic: HKDF-SHA256 over the GLOBAL active DEK, which is
+    ///    itself only readable by unwrapping through the KEK. Same
+    ///    confidentiality property; it additionally moves if an operator runs
+    ///    `rotate_dek` (a bounded fingerprint-era change — see the `ck1:` seam
+    ///    note in `talos_ml::content_identity`).
+    ///
+    /// Rotating the KEK (`rotate_master_key`) likewise starts a new fingerprint
+    /// era on path 1. Both are the SAME bounded, self-healing seam the
+    /// `ch:` → `ck1:` cutover documents: identity keys stop matching across the
+    /// boundary, duplicate rows may be minted once, and the embedding-keyed
+    /// content dedupe (which never looks at `example_key`) collapses them.
+    ///
+    /// Derived per call — path 1 is a few microseconds of HKDF, path 2 adds a
+    /// TTL-cached DEK read. Callers still derive ONCE per batch, never per item.
+    /// The result is never logged, never serialised, never leaves the process.
+    pub async fn ml_content_mac_key(&self) -> Result<MlContentMacKey> {
+        if let Some(key) = self
+            .current_kek()?
+            .derive_purpose_key(Self::ML_CONTENT_KEY_LABEL, Self::ML_CONTENT_KEY_INFO)?
+        {
+            return Ok(MlContentMacKey(key));
+        }
+        let dek = self.get_active_dek().await?;
+        let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(Self::ML_CONTENT_KEY_LABEL), &dek.key);
+        let mut out = Zeroizing::new([0u8; 32]);
+        hk.expand(Self::ML_CONTENT_KEY_INFO, out.as_mut())
+            // Unreachable: 32 bytes is always a valid HKDF-Expand length.
+            .map_err(|_| anyhow!("HKDF expand for ML content MAC key failed"))?;
+        Ok(MlContentMacKey(out))
     }
 
     /// Decrypt a `secrets.encrypted_value` blob, dispatching on the
@@ -5785,6 +5870,58 @@ mod aad_binding_tests {
         let e = SecretsError::MissingDek { key_id };
         assert!(e.to_string().contains(&key_id.to_string()));
         assert!(!e.user_facing_message().contains(&key_id.to_string()));
+    }
+}
+
+#[cfg(test)]
+mod ml_content_mac_key_tests {
+    //! The ML content-fingerprint purpose key: stable per deployment,
+    //! domain-separated from every other derivation, and never printable.
+    //! The stub's KEK is local-material, so this exercises the canonical
+    //! (KEK-derived) path with no database.
+    use super::SecretsManager;
+
+    #[tokio::test]
+    async fn purpose_key_is_stable_within_a_deployment() {
+        let sm = SecretsManager::test_stub_for_cache();
+        let a = sm.ml_content_mac_key().await.expect("derive");
+        let b = sm.ml_content_mac_key().await.expect("derive again");
+        assert_eq!(a.as_bytes(), b.as_bytes(), "derivation must be stable");
+        assert_eq!(a.as_bytes().len(), 32);
+    }
+
+    /// A `{:?}` anywhere near this key must not print key material —
+    /// structural lint check 37's property, enforced by the manual Debug.
+    #[tokio::test]
+    async fn debug_never_reveals_key_material() {
+        let sm = SecretsManager::test_stub_for_cache();
+        let key = sm.ml_content_mac_key().await.expect("derive");
+        let rendered = format!("{key:?}");
+        assert_eq!(rendered, "MlContentMacKey([REDACTED])");
+        assert!(!rendered.contains(&hex::encode(key.as_bytes())));
+        // Also covers the "wrapped in another struct" case.
+        #[derive(Debug)]
+        struct Holder {
+            #[allow(dead_code)]
+            key: super::MlContentMacKey,
+        }
+        let holder = Holder { key };
+        assert!(!format!("{holder:?}").contains("00"));
+    }
+
+    /// The purpose key must not be the DEK-subkey derivation under a
+    /// different label — a shared output would let one primitive's compromise
+    /// forge the other's.
+    #[tokio::test]
+    async fn purpose_key_is_domain_separated_from_the_per_context_subkey() {
+        let sm = SecretsManager::test_stub_for_cache();
+        let mac = sm.ml_content_mac_key().await.expect("derive");
+        let subkey = SecretsManager::derive_per_context_subkey(
+            &[0u8; 32],
+            SecretsManager::ML_CONTENT_KEY_INFO,
+        )
+        .unwrap();
+        assert_ne!(mac.as_bytes(), subkey.as_slice());
     }
 }
 

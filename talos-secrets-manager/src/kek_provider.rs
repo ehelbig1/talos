@@ -66,6 +66,29 @@ pub trait KekProvider: Send + Sync + 'static {
     /// `vault://transit/keys/talos-kek`, etc.). Must NOT include the
     /// key material itself.
     fn name(&self) -> &str;
+
+    /// Deterministically derive a 32-byte PURPOSE key from the KEK, for
+    /// server-side keyed primitives that are not envelope encryption (today:
+    /// the ML content-fingerprint MAC key). `salt` is the versioned
+    /// domain-separation label, `info` the per-use context.
+    ///
+    /// Returns `Ok(None)` when the provider CANNOT derive — a KMS-backed KEK
+    /// (Vault transit, AWS KMS) never exposes key material, and its
+    /// encrypt endpoints are non-deterministic, so there is no local HKDF to
+    /// run. `None` is not an error: the caller falls back to a different
+    /// server-side root (see `SecretsManager::ml_content_mac_key`). Default
+    /// impl is `Ok(None)` so a new provider is non-derivable until it
+    /// deliberately opts in.
+    ///
+    /// Sync + local by contract: callers derive on hot-ish paths and must not
+    /// pay a network round trip per derivation.
+    fn derive_purpose_key(
+        &self,
+        _salt: &[u8],
+        _info: &[u8],
+    ) -> Result<Option<Zeroizing<[u8; 32]>>> {
+        Ok(None)
+    }
 }
 
 /// Local-AES KEK provider — backwards-compatible path matching the
@@ -205,6 +228,19 @@ impl KekProvider for EnvKekProvider {
     fn name(&self) -> &str {
         "env"
     }
+
+    /// HKDF-SHA256 over the master key. The master key never leaves this
+    /// struct — only the derived, domain-separated output does, and the
+    /// output is `Zeroizing` so it is wiped on drop.
+    fn derive_purpose_key(&self, salt: &[u8], info: &[u8]) -> Result<Option<Zeroizing<[u8; 32]>>> {
+        let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(salt), &self.master_key);
+        let mut out = Zeroizing::new([0u8; 32]);
+        hk.expand(info, out.as_mut())
+            // HKDF-Expand only fails when the requested length exceeds
+            // 255*HashLen; 32 bytes is always valid, so this is unreachable.
+            .map_err(|_| anyhow!("HKDF expand for KEK purpose key failed"))?;
+        Ok(Some(out))
+    }
 }
 
 /// Convenience constructor that reads the env var (or
@@ -283,6 +319,44 @@ mod tests {
         // A real key is accepted.
         let real = "11".repeat(32); // 32 bytes, not all-zero
         assert!(EnvKekProvider::from_hex(&real).is_ok());
+    }
+
+    #[test]
+    fn purpose_key_is_deterministic_domain_separated_and_not_the_master_key() {
+        let kek = EnvKekProvider::from_raw_bytes(vec![13u8; 32]);
+        let a = kek
+            .derive_purpose_key(b"label/v1", b"ctx")
+            .unwrap()
+            .expect("env provider derives locally");
+        let b = kek
+            .derive_purpose_key(b"label/v1", b"ctx")
+            .unwrap()
+            .expect("deterministic");
+        assert_eq!(a.as_slice(), b.as_slice(), "same inputs → same key");
+        // Domain separation on BOTH salt and info.
+        let other_salt = kek
+            .derive_purpose_key(b"label/v2", b"ctx")
+            .unwrap()
+            .unwrap();
+        let other_info = kek
+            .derive_purpose_key(b"label/v1", b"other")
+            .unwrap()
+            .unwrap();
+        assert_ne!(a.as_slice(), other_salt.as_slice());
+        assert_ne!(a.as_slice(), other_info.as_slice());
+        // The derived key must never BE the master key (a pass-through would
+        // hand a downstream MAC the root of the whole encryption tree).
+        assert_ne!(a.as_slice(), &[13u8; 32]);
+        // A different master key yields a different purpose key.
+        let other_kek = EnvKekProvider::from_raw_bytes(vec![14u8; 32]);
+        assert_ne!(
+            a.as_slice(),
+            other_kek
+                .derive_purpose_key(b"label/v1", b"ctx")
+                .unwrap()
+                .unwrap()
+                .as_slice()
+        );
     }
 
     #[test]

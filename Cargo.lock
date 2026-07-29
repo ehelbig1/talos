@@ -8416,6 +8416,8 @@ dependencies = [
  "anyhow",
  "chrono",
  "futures",
+ "hex",
+ "hmac 0.12.1",
  "pgvector",
  "serde",
  "serde_json",

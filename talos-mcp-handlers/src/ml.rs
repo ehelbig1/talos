@@ -507,6 +507,20 @@ async fn handle_dedupe_dataset(
                          and gold slice are all recomputed from the surviving rows."
                     }),
                 );
+                // Population disclosure (additive field; existing consumers
+                // are unaffected). Every count above is over rows that HAVE a
+                // stored embedding, grouped within one embedding model — a
+                // survey that quietly dropped rows would read as full
+                // coverage.
+                o.insert(
+                    "population_note".into(),
+                    serde_json::json!(format!(
+                        "counts cover rows WITH a stored embedding, grouped per embedding_model; \
+                         {} row(s) have no embedding and were not considered (backfill them — \
+                         they are invisible to knn serving and to eval too)",
+                        outcome.rows_without_embedding
+                    )),
+                );
             }
             mcp_text(
                 req_id,

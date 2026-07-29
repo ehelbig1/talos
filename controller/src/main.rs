@@ -493,6 +493,7 @@ async fn main() -> anyhow::Result<()> {
         db_pool: db_pool.clone(),
         dataset_service: talos_ml::DatasetService::new(core.secrets_manager.clone()),
         lifecycle_service: talos_ml::LifecycleService::new(core.secrets_manager.clone()),
+        secrets: core.secrets_manager.clone(),
     });
 
     // R2 token ledger: install the two process-wide LLM usage recorders

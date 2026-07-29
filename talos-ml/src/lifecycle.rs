@@ -903,8 +903,22 @@ impl LifecycleService {
         }
         // Collapse re-deliveries of the same message AFTER decryption — the
         // per-row AEAD nonce makes identical plaintext produce distinct
-        // ciphertext, so this cannot be a SQL DISTINCT or a unique index
-        // without persisting a plaintext-derived fingerprint at rest.
+        // ciphertext, so this cannot be a SQL DISTINCT or a unique index over
+        // the stored features.
+        //
+        // `example_key` does NOT replace this, even though it now carries a
+        // KEYED content fingerprint for rows the distill / gray-band producers
+        // wrote (`crate::content_identity`; the fingerprint is a MAC under a
+        // server-side purpose key, so persisting it beside the ciphertext is
+        // not an offline confirmation oracle the way the old unkeyed sha256
+        // was). Two reasons it cannot be the grouping key HERE: copies of one
+        // message can arrive under DIFFERENT producer-supplied keys (several
+        // Gmail message ids for one alert — the case this collapse was built
+        // for), and this view's identity deliberately includes the
+        // `(fast_label, llm_label)` verdict pair, which `example_key` knows
+        // nothing about. The key-based path is used where it IS exact: closing
+        // the siblings of an already-identified row
+        // (`Self::pending_siblings_by_key`).
         Ok(dedupe_pending_disagreements(out))
     }
 
@@ -975,6 +989,71 @@ impl LifecycleService {
                 duplicate_ids: Vec::new(),
             },
         )))
+    }
+
+    /// Ids of every OTHER pending row that is the SAME question about the
+    /// SAME example, resolved by indexed SQL rather than by re-scanning the
+    /// paged queue view.
+    ///
+    /// WHY THIS EXISTS: [`Self::pending_disagreements`] collapses duplicates
+    /// AFTER `LIMIT`, so a closure driven by that listing can only reach
+    /// siblings that happened to fall inside one 100-row window. A model with
+    /// a backlog therefore left same-example rows pending — and re-asked the
+    /// human a question they had already answered. This query is window-free:
+    /// it uses `idx_ml_disagreements_model_key_pending` directly.
+    ///
+    /// POPULATION — deliberately narrower than "same example_key":
+    /// * `fast_label` and `llm_label` must MATCH. The queue view's grouping key
+    ///   is `(features_text, fast_label, llm_label)`: a genuinely different
+    ///   verdict on the same item is a DIFFERENT question and stays its own
+    ///   row. Closing across label pairs would silently answer a question the
+    ///   operator never saw. `fast_label` compares with `IS NOT DISTINCT FROM`
+    ///   so two abstentions (NULL) match each other, matching the view's
+    ///   `Option<String>` equality.
+    /// * it differs from the view in ONE direction: two rows sharing a
+    ///   PRODUCER-supplied `example_key` (a Gmail message id) whose
+    ///   `features_text` later drifted — same id, re-fetched with a different
+    ///   snippet — are closed together here and kept apart by the view. That is
+    ///   correct: the `(dataset_id, example_key)` upsert means both rows
+    ///   resolve to ONE dataset row anyway, so leaving the second pending only
+    ///   re-asks about a row the first correction already overwrote.
+    /// * rows with `example_key IS NULL` are NOT addressable here at all (the
+    ///   caller falls back to the paged text comparison for those — see
+    ///   `correction::sibling_ids`).
+    ///
+    /// Owner-scoped like every other read on this table. Capped at
+    /// `MAX_DISAGREEMENTS_PER_MODEL` — the table's own per-model ceiling, so
+    /// the cap can never truncate a real group — and ordered for determinism.
+    pub async fn pending_siblings_by_key(
+        &self,
+        conn: &mut PgConnection,
+        model_id: Uuid,
+        user_id: Uuid,
+        example_key: &str,
+        fast_label: Option<&str>,
+        llm_label: &str,
+        exclude: Uuid,
+    ) -> Result<Vec<Uuid>> {
+        let rows: Vec<(Uuid,)> = sqlx::query_as(
+            "SELECT id FROM ml_disagreements \
+             WHERE model_id = $1 AND user_id = $2 AND example_key = $3 \
+               AND status = 'pending' \
+               AND fast_label IS NOT DISTINCT FROM $4 \
+               AND llm_label = $5 \
+               AND id <> $6 \
+             ORDER BY created_at DESC, id LIMIT $7",
+        )
+        .bind(model_id)
+        .bind(user_id)
+        .bind(example_key)
+        .bind(fast_label)
+        .bind(llm_label)
+        .bind(exclude)
+        .bind(MAX_DISAGREEMENTS_PER_MODEL)
+        .fetch_all(&mut *conn)
+        .await
+        .context("list pending siblings by example_key")?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
     /// One-tap digest verdict: mark resolved (a correction was
