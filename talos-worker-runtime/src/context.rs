@@ -339,6 +339,26 @@ pub struct TalosContext {
     /// host denials can't consume the guest's log budget.
     pub(crate) host_diag_count: AtomicU64,
 
+    /// The [`crate::reason_class`] token of the most recent host-side HTTP
+    /// OUTCOME in this execution, or `None` if the most recent outcome was a
+    /// success (or there has been none).
+    ///
+    /// This is what makes the opaque `networkerror` cause visible to the retry
+    /// gates: [`crate::runtime`] reads it after the guest returns and appends
+    /// `[reason_class=<token>]` to the node-failure message.
+    ///
+    /// **Set on failure, CLEARED on success** — deliberately. A "last failure
+    /// seen anywhere in this execution" latch would attribute a stale DNS blip
+    /// to a module that later failed on, say, a 401, and both classifiers
+    /// would then wrongly retry a permanent error. Clearing on success narrows
+    /// the claim to exactly what the code knows: *the last HTTP call this
+    /// module made failed host-side, with this class*.
+    ///
+    /// `Arc<Mutex<…>>` because `runtime` must keep a handle after the
+    /// `TalosContext` is moved into the wasmtime `Store` (same shape as
+    /// `stderr_capture`). `&'static str` because the token set is closed.
+    pub(crate) last_network_reason: Arc<std::sync::Mutex<Option<&'static str>>>,
+
     /// Per-execution event emission counter for the events interface.
     pub(crate) event_emit_count: AtomicU64,
 
@@ -1126,6 +1146,7 @@ impl TalosContext {
             fs_bytes_written: AtomicU64::new(0),
             log_message_count: AtomicU64::new(0),
             host_diag_count: AtomicU64::new(0),
+            last_network_reason: Arc::new(std::sync::Mutex::new(None)),
             event_emit_count: AtomicU64::new(0),
             streams: StreamRegistry::new(),
             sse_connects_per_host: dashmap::DashMap::new(),
@@ -1459,6 +1480,43 @@ impl TalosContext {
             let topic = format!("wasm.log.{execution_id}");
             let _ = nats.publish(topic, payload.into()).await;
         }
+    }
+
+    /// Record a host-side HTTP FAILURE and publish its diagnostic in one step.
+    ///
+    /// The single chokepoint for [`crate::reason_class`] tokens: the same
+    /// `class` becomes BOTH the `[host:<reason>]` diagnostic tag AND the
+    /// `[reason_class=…]` marker the retry gates read, so the two can never
+    /// drift into disagreeing about why a call failed.
+    ///
+    /// `class` must be one of the `reason_class` consts — never a
+    /// request-derived string. `message` is bound by the same sanitization
+    /// contract as [`Self::emit_host_diagnostic`].
+    pub(crate) async fn emit_network_failure(&mut self, class: &'static str, message: &str) {
+        self.record_network_outcome(Some(class));
+        self.emit_host_diagnostic(class, message).await;
+    }
+
+    /// Record the class of the latest host-side HTTP outcome — `Some(class)`
+    /// for a failure, `None` to CLEAR after a success. See
+    /// [`Self::last_network_reason`] for why success must clear.
+    ///
+    /// Takes `&self` (not `&mut`) so the success path can call it without
+    /// disturbing borrow shapes in the middle of a request pipeline. A
+    /// poisoned mutex is recovered rather than propagated: losing a
+    /// diagnostic breadcrumb must never change a call's outcome.
+    pub(crate) fn record_network_outcome(&self, class: Option<&'static str>) {
+        let mut guard = self
+            .last_network_reason
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = class;
+    }
+
+    /// Handle onto [`Self::last_network_reason`] for the runtime to keep after
+    /// this context is moved into the wasmtime `Store`.
+    pub(crate) fn network_reason_handle(&self) -> Arc<std::sync::Mutex<Option<&'static str>>> {
+        self.last_network_reason.clone()
     }
 
     /// Every policy-driven refusal in the worker — HTTP host allowlist,

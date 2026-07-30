@@ -107,8 +107,43 @@ pub fn classify_error(error_msg: &str) -> String {
     // "circuit open" marker makes the controller-side dispatcher skip its
     // re-dispatch retries, the cross-process complement of the worker's
     // in-process retry gate.
-    if lower.contains("circuit open") || lower.contains("circuit breaker open") {
+    if lower.contains("circuit open")
+        || lower.contains("circuit breaker open")
+        || lower.contains("reason_class=circuit-open")
+    {
         return "circuit_open".to_string();
+    }
+
+    // ── Host-side WIT deny / cap classes ─────────────────────────────────
+    //
+    // The worker's `wit_http` error enum is a payload-less C-style
+    // discriminant, so a Tier-1 data-egress deny, an execution cancellation
+    // and a response-size refusal all reach the controller as the same bare
+    // `networkerror` token that the `network_transient` bucket below now
+    // matches. Each of these is DETERMINISTIC — the actor's egress ceiling,
+    // the cancellation, and the oversized response are identical on the next
+    // attempt — so they must be carved out BEFORE the generic token, exactly
+    // like the circuit-open hoist above.
+    //
+    // `[reason_class=…]` is stamped by the worker at the emitting host site
+    // (`talos_worker_runtime::reason_class`); `forbiddenhost` is the other
+    // WIT deny variant (host allowlist / method allowlist / request caps).
+    if lower.contains("reason_class=tier1-egress")
+        || lower.contains("forbiddenhost")
+        || lower.contains("reason_class=header-cap")
+        || lower.contains("reason_class=response-too-large")
+    {
+        return "capability_denied".to_string();
+    }
+    if lower.contains("reason_class=cancelled") {
+        return "cancelled".to_string();
+    }
+    // A missing / ungranted vault slot is a configuration error, not a
+    // network blip — even though the host had to report it as `networkerror`.
+    // Hoisted above the `missing_secret` bucket's own position for the same
+    // precedence reason as the classes above.
+    if lower.contains("reason_class=secret-lookup") {
+        return "missing_secret".to_string();
     }
 
     if lower.contains("fuel exhausted") || lower.contains("out of fuel") {
@@ -176,6 +211,28 @@ pub fn classify_error(error_msg: &str) -> String {
         || lower.contains("pool timed out")
         || lower.contains("pool exhausted")
         || lower.contains("no available connection")
+        // 2026-07-30: the bare WIT transport token. A read-only Gmail GET
+        // module is correctly granted 2 transient retries by
+        // `default_max_retries_for_module`, but the dispatcher's classifier
+        // gate vetoed them because the literal failure string —
+        // `Component returned error: list fetch: Error { code: 2, name:
+        // "networkerror", message: "" }` — matched NOTHING here, classified
+        // `unknown`, and the job ran exactly once (13-15 failures/hour across
+        // four workflows on 2026-07-23). Transient BY DEFAULT even though the
+        // enum spans non-transient causes: those are carved out above by their
+        // `reason_class`, and when the cause is genuinely unknown the
+        // read-only default (retry a possible blip) is the safer error. The
+        // per-host circuit breaker backstops a genuinely-down host.
+        || lower.contains("networkerror")
+        // The precise transport classes the worker now stamps. Listed
+        // explicitly rather than relying on the bare token above so that
+        // dropping the `networkerror` arm alone cannot silently un-retry them.
+        || lower.contains("reason_class=dns")
+        || lower.contains("reason_class=tls")
+        || lower.contains("reason_class=connect-refused")
+        || lower.contains("reason_class=connect-failed")
+        || lower.contains("reason_class=send-failed")
+        || lower.contains("reason_class=response-stream")
     {
         return "network_transient".to_string();
     }
@@ -580,6 +637,113 @@ mod tests {
         huge.push_str(" HTTP 504");
         let c = classify_error(&huge);
         assert_eq!(c, "unknown");
+    }
+
+    /// The 2026-07-30 buried lede. `default_max_retries_for_module` correctly
+    /// grants a read-only Gmail GET module 2 transient retries, but the
+    /// dispatcher's classifier gate vetoed them: the literal failure string
+    /// matched NO token here, classified `unknown`, and the job ran exactly
+    /// ONCE. 13-15 failures/hour across four workflows on 2026-07-23.
+    #[test]
+    fn bare_networkerror_is_network_transient() {
+        let live = r#"Component returned error: list fetch: Error { code: 2, name: "networkerror", message: "" }"#;
+        let c = classify_error(live);
+        assert_eq!(c, "network_transient");
+        assert!(
+            is_transient_error_type(&c),
+            "the granted retry budget must not be vetoed"
+        );
+        // Mutation guard: no other token in this string can carry the result.
+        assert_eq!(classify_error("networkerror"), "network_transient");
+    }
+
+    /// The other WIT deny variant. `forbiddenhost` is a capability denial —
+    /// host allowlist, method allowlist, or a request cap — and is
+    /// deterministic. It must classify NON-transient, and it must do so
+    /// BEFORE the broadened network bucket can see the `networkerror` token
+    /// that a mixed message may also carry.
+    #[test]
+    fn forbiddenhost_is_non_transient() {
+        let c = classify_error(
+            r#"Component returned error: fetch: Error { code: 3, name: "forbiddenhost", message: "" }"#,
+        );
+        assert_eq!(c, "capability_denied");
+        assert!(!is_transient_error_type(&c));
+    }
+
+    /// Circuit-open reaches the controller as a bare `networkerror` (the WIT
+    /// enum is payload-less), so broadening the bucket would have started
+    /// retrying against a host the breaker already declared down. The
+    /// `reason_class` marker plus the hoisted bucket is what prevents it.
+    #[test]
+    fn circuit_open_reason_class_beats_the_networkerror_token() {
+        let msg = r#"Component returned error: fetch: Error { code: 2, name: "networkerror", message: "" } [reason_class=circuit-open]"#;
+        assert!(msg.contains("networkerror"), "test premise");
+        let c = classify_error(msg);
+        assert_eq!(c, "circuit_open");
+        assert!(!is_transient_error_type(&c));
+    }
+
+    /// Every `reason_class` token the worker can stamp, and the class each
+    /// must land in. The token list is hand-mirrored from
+    /// `talos_worker_runtime::reason_class::ALL` (this crate must not depend
+    /// on the worker runtime); that module's `closed_set_snapshot` test fails
+    /// if a token is added or renamed without updating this table.
+    #[test]
+    fn every_reason_class_token_maps_to_the_right_bucket() {
+        let cases: &[(&str, &str, bool)] = &[
+            // token, expected class, expected transient
+            ("dns", "network_transient", true),
+            ("tls", "network_transient", true),
+            ("connect-refused", "network_transient", true),
+            ("connect-failed", "network_transient", true),
+            ("send-failed", "network_transient", true),
+            ("response-stream", "network_transient", true),
+            ("circuit-open", "circuit_open", false),
+            ("tier1-egress", "capability_denied", false),
+            ("cancelled", "cancelled", false),
+            ("response-too-large", "capability_denied", false),
+            ("header-cap", "capability_denied", false),
+            ("secret-lookup", "missing_secret", false),
+            ("timeout", "timeout", true),
+        ];
+        for (token, expected, transient) in cases {
+            // `timeout` is the one token paired with `wit_http::Error::Timeout`
+            // rather than `networkerror`, so the guest renders a different
+            // enum name. Building the realistic pairing keeps the case honest
+            // (an artificial `networkerror` + `reason_class=timeout` message
+            // would classify network_transient — same transience, wrong class).
+            let wit_name = if *token == "timeout" {
+                "timeout"
+            } else {
+                "networkerror"
+            };
+            let msg = format!(
+                r#"Component returned error: fetch: Error {{ code: 2, name: "{wit_name}", message: "" }} [reason_class={token}]"#
+            );
+            let c = classify_error(&msg);
+            assert_eq!(&c, expected, "token {token:?} classified {c:?}");
+            assert_eq!(
+                is_transient_error_type(&c),
+                *transient,
+                "token {token:?} transience"
+            );
+        }
+    }
+
+    /// The pre-existing suffixed forms must keep classifying exactly as
+    /// before — the broadening adds a token, it must not reroute anything.
+    #[test]
+    fn broadening_does_not_disturb_existing_classifications() {
+        assert_eq!(classify_error("connection refused"), "network_transient");
+        assert_eq!(classify_error("401 Unauthorized"), "auth_failure");
+        assert_eq!(classify_error("HTTP 429 Too Many Requests"), "rate_limit");
+        assert_eq!(classify_error("Job execution timed out"), "timeout");
+        assert_eq!(
+            classify_error("WASM fuel exhausted after 10000000"),
+            "fuel_exhaustion"
+        );
+        assert_eq!(classify_error("something random"), "unknown");
     }
 
     #[test]
