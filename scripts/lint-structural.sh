@@ -4331,12 +4331,14 @@ echo
 # (RLS does not cover it on a superuser pool), and four per-org-DEK
 # encryption-at-rest binaries whose own headers ASSERTED they ran in CI.
 #
-# A cargo integration binary is any `<crate>/tests/<name>.rs` at depth 1
-# (files under `tests/<subdir>/` — `common/mod.rs`, `test_helpers/mod.rs`
-# — are shared modules, not binaries; that is cargo's own rule, so the
-# exclusion needs no hand-maintained list). Every one must be named by
-# `.github/workflows/quality.yml` or `scripts/test-integration.sh`, or
-# carry a `// ci-ungated: <reason>` marker.
+# Cargo auto-discovers integration binaries at BOTH `<crate>/tests/<name>.rs`
+# (target `<name>`) AND `<crate>/tests/<dir>/main.rs` (target `<dir>`) — the
+# second form is easy to forget and was a hole in this check's first cut
+# (verified against `cargo metadata`, not from memory). Everything else under
+# `tests/<subdir>/` — `common/mod.rs`, `test_helpers/mod.rs` — is a shared
+# module, not a binary, so the exclusion needs no hand-maintained list. Every
+# discovered target must be named by `.github/workflows/quality.yml` or
+# `scripts/test-integration.sh`, or carry a `// ci-ungated: <reason>` marker.
 #
 # Matching is CRATE-QUALIFIED, not by bare name: `wire_format_snapshots`
 # exists in BOTH talos-workflow-job-protocol and talos-memory, and a
@@ -4345,6 +4347,21 @@ echo
 # Comments are stripped from both runner files first, so a binary
 # mentioned only in prose ("its eight ml_* siblings are NOT in this
 # list") does not count as gated.
+#
+# Three directions are checked, because "named by a runner" is only as good
+# as the runner being real and being run:
+#   (i)   file with no runner entry      → ungated, the original defect;
+#   (ii)  runner entry with no file      → a stale entry. Cargo fails the job
+#         with `no test target named X` (the #567 lesson), so this is loud
+#         rather than silent — but it fails 20 minutes into the integration
+#         job instead of at pre-push, and a stale entry also silently
+#         "covers" nothing while looking like coverage;
+#   (iii) `scripts/test-integration.sh` must actually be WIRED into CI. This
+#         check reads that file directly, so if `quality.yml` stopped invoking
+#         `make test-integration` (or the Makefile target stopped invoking the
+#         script) every CTRL_TESTS/TC_TESTS entry would still read as "gated"
+#         while running nowhere — the exact shape of the defect this check
+#         exists to end, one level up.
 bold "▶ check 64: every tests/*.rs binary is named by a CI runner"
 
 CI_GATE_FAIL=0
@@ -4392,15 +4409,22 @@ else
     }
 
     # --- (a) quality.yml + (b) test-integration.sh cargo invocations.
-    GATED="$(cargo_gates "$QUALITY_YML")
-$(cargo_gates "$INTEGRATION_SH")"
+    # Every parser below is `|| true`-terminated. Under `set -euo pipefail` a
+    # grep that matches nothing makes the whole command-substitution
+    # assignment non-zero, which aborts the ENTIRE lint script silently at
+    # this line — the emptiest possible input (a runner file that stopped
+    # naming any test) would kill the run instead of failing this check with a
+    # message. An empty parse is a legitimate input here; let the reporting
+    # below be what fails.
+    GATED="$(cargo_gates "$QUALITY_YML" || true)
+$(cargo_gates "$INTEGRATION_SH" || true)"
     # TESTS=( "crate:binary:store" … )
     GATED="$GATED
 $(
         strip_comments "$INTEGRATION_SH" \
             | sed -n '/^TESTS=(/,/^)/p' \
             | grep -oE '"[A-Za-z0-9_-]+:[A-Za-z0-9_]+:[a-z]+"' \
-            | tr -d '"' | sed -E 's#:[a-z]+$##'
+            | tr -d '"' | sed -E 's#:[a-z]+$##' || true
 )"
     # CTRL_TESTS / TC_TESTS =( "binary" … ) — all controller binaries.
     GATED="$GATED
@@ -4408,22 +4432,33 @@ $(
         strip_comments "$INTEGRATION_SH" \
             | sed -n -e '/^CTRL_TESTS=(/,/^)/p' -e '/^TC_TESTS=(/,/^)/p' \
             | grep -oE '"[A-Za-z0-9_]+"' \
-            | tr -d '"' | sed 's#^#controller:#'
+            | tr -d '"' | sed 's#^#controller:#' || true
 )"
-    GATED="$(printf '%s\n' "$GATED" | grep -v '^$' | sort -u)"
+    GATED="$(printf '%s\n' "$GATED" | grep -v '^$' | sort -u || true)"
 
-    # --- (c) walk every crate's tests/ dir for depth-1 .rs binaries.
+    # --- (c) walk every crate's tests/ dir for cargo-discovered targets:
+    #         `tests/<name>.rs` AND `tests/<dir>/main.rs`.
     UNGATED_HITS=""
     STALE_MARKERS=""
+    EXISTING_TARGETS=""
     CI_GATE_SCANNED=0
     while IFS= read -r tf; do
         [ -n "$tf" ] || continue
         CI_GATE_SCANNED=$((CI_GATE_SCANNED + 1))
-        bin="$(basename "$tf" .rs)"
-        crate_dir="$(dirname "$(dirname "$tf")")"
+        if [ "$(basename "$tf")" = "main.rs" ]; then
+            # tests/<dir>/main.rs → target named <dir>; crate is two levels up
+            # from the tests/ dir rather than one.
+            bin="$(basename "$(dirname "$tf")")"
+            crate_dir="$(dirname "$(dirname "$(dirname "$tf")")")"
+        else
+            bin="$(basename "$tf" .rs)"
+            crate_dir="$(dirname "$(dirname "$tf")")"
+        fi
         crate="$(grep -m1 -E '^name[[:space:]]*=' "$crate_dir/Cargo.toml" 2>/dev/null \
                     | sed -E 's/^name[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
         [ -n "$crate" ] || crate="$(basename "$crate_dir")"
+        EXISTING_TARGETS="${EXISTING_TARGETS}${crate}:${bin}
+"
         marked=0
         grep -qE '^[[:space:]]*(//|#)[[:space:]]*ci-ungated:' "$tf" && marked=1
         if printf '%s\n' "$GATED" | grep -qxF -e "${crate}:${bin}" -e "${crate}:*"; then
@@ -4439,7 +4474,19 @@ $(
                     -not -path './target/*' -not -path './vendor/*' \
                     -not -path './frontend/*' -not -path '*/node_modules/*' \
                     -not -path './.git/*' -not -path './.claude/*' \
-                    -exec sh -c 'ls -1 "$1"/*.rs 2>/dev/null' _ {} \; | sort)"
+                    -exec sh -c 'ls -1 "$1"/*.rs "$1"/*/main.rs 2>/dev/null' _ {} \; | sort)"
+
+    # --- (d) the reverse direction: a runner entry naming a target that does
+    # not exist. `crate:*` whole-crate entries are skipped (they name no
+    # specific target).
+    STALE_ENTRIES=""
+    while IFS= read -r g; do
+        [ -n "$g" ] || continue
+        case "$g" in *:\*) continue ;; esac
+        printf '%s\n' "$EXISTING_TARGETS" | grep -qxF "$g" \
+            || STALE_ENTRIES="${STALE_ENTRIES}  ${g}
+"
+    done <<< "$GATED"
 
     # A walk that scans nothing reports success. Fail loud instead (the
     # check-63 lesson — an absolute walk rooted under an excluded path).
@@ -4472,8 +4519,36 @@ $(
         yellow "    misleading-comment class this check exists to end."
         CI_GATE_FAIL=1
     fi
+    if [ -n "$STALE_ENTRIES" ]; then
+        red "✗ CI runner names a test target that does not exist:"
+        printf '%s' "$STALE_ENTRIES"
+        yellow "  → cargo fails the whole job with 'no test target named <name>'"
+        yellow "    (the PR #567 lesson — a deleted test file broke the Rust check"
+        yellow "    while the code was fine). Delete the runner entry too, or"
+        yellow "    restore the file. Grep .github/ + Makefile before deleting a test."
+        CI_GATE_FAIL=1
+    fi
+
+    # --- (e) the runner file this check trusts must actually be invoked by CI.
+    # Without this, dropping the `make test-integration` step from quality.yml
+    # would leave every CTRL_TESTS/TC_TESTS entry reading as "gated" while
+    # running nowhere — the original defect, one level up.
+    if ! grep -qE '^[[:space:]]*run:[[:space:]]*make test-integration[[:space:]]*$' "$QUALITY_YML"; then
+        red "✗ $QUALITY_YML no longer runs 'make test-integration'"
+        yellow "  → check 64 counts every CTRL_TESTS / TC_TESTS / TESTS entry in"
+        yellow "    $INTEGRATION_SH as gated. That is only true while CI invokes"
+        yellow "    the script. Restore the step, or teach this check the new path."
+        CI_GATE_FAIL=1
+    fi
+    if ! grep -qE 'bash[[:space:]]+scripts/test-integration\.sh' Makefile 2>/dev/null; then
+        red "✗ the Makefile 'test-integration' target no longer runs $INTEGRATION_SH"
+        yellow "  → same reason as above: the entries in that script are only"
+        yellow "    coverage while something actually executes it."
+        CI_GATE_FAIL=1
+    fi
+
     if [ "$CI_GATE_FAIL" -eq 0 ]; then
-        green "✓ all $CI_GATE_SCANNED tests/*.rs binaries are gated or explicitly marked ci-ungated"
+        green "✓ all $CI_GATE_SCANNED cargo test targets are gated or explicitly marked ci-ungated (runners wired, no stale entries)"
     fi
 fi
 

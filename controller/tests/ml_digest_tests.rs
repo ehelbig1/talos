@@ -78,13 +78,37 @@ async fn seed_dataset(pool: &sqlx::Pool<sqlx::Postgres>, user_id: Uuid) -> Uuid 
     id
 }
 
-/// Initialized SecretsManager + the real memory-crypto hook installed
-/// (idempotent OnceLock — first test wins), so both the disagreement
-/// encryption and the actor_memory write path work.
-async fn service(pool: &sqlx::Pool<sqlx::Postgres>) -> LifecycleService {
+/// Initialized SecretsManager, per-test. Disagreement encryption goes through
+/// THIS handle, so every test can have its own — no global involved.
+async fn secrets(pool: &sqlx::Pool<sqlx::Postgres>) -> Arc<controller::secrets::SecretsManager> {
     set_master_key();
     let sm = Arc::new(controller::secrets::SecretsManager::new(pool.clone()).unwrap());
     sm.initialize().await.unwrap();
+    sm
+}
+
+async fn service(pool: &sqlx::Pool<sqlx::Postgres>) -> LifecycleService {
+    LifecycleService::new(secrets(pool).await)
+}
+
+/// Same, plus the REAL memory-crypto hook, needed only by the test that
+/// actually writes the digest into `actor_memory`.
+///
+/// **AT MOST ONE test per binary may call this.** `register_memory_crypto_hook`
+/// is a process-wide `OnceLock` (`let _ = HOOK.set(..)` — first writer wins,
+/// later writers silently discarded) that CAPTURES the `SecretsManager` it is
+/// given, and under the isolated-DB harness that manager is bound to one test's
+/// private, `DROP DATABASE`-on-scope-exit clone. Before 2026-07-30 BOTH tests
+/// here called the registering helper: when `digest_refuses_…` won the race,
+/// `digest_delivers_…`'s `persist_memory` ran through the loser's pool,
+/// `deliver_one` returned Err, `run_digest_tick` swallowed it to a WARN, and
+/// the `delivered == 1` assertion failed. Measured 3 failures in 35 runs
+/// multi-threaded, 0 in 15 single-threaded (single-threaded runs
+/// `digest_delivers_…` first, so it wins by name order) — i.e. a ~10% flaky
+/// gate the moment this binary entered CI. Same trap
+/// `memory_get_entry_tests.rs` and `actor_memory_sweep_dek_tests.rs` document.
+async fn service_with_memory_hook(pool: &sqlx::Pool<sqlx::Postgres>) -> LifecycleService {
+    let sm = secrets(pool).await;
     talos_memory::register_memory_crypto_hook(Arc::new(
         talos_memory_crypto::SecretsManagerMemoryCrypto::new(sm.clone()),
     ));
@@ -102,7 +126,9 @@ async fn digest_delivers_pending_disagreements_to_the_configured_owner_actor() {
     let ds = seed_dataset(&pool, user).await;
     let model = seed_model_with_digest(&pool, user, ds, digest_actor).await;
 
-    let svc = service(&pool).await;
+    // The ONE test in this binary that reaches an `actor_memory` write, so the
+    // ONE that may claim the process-wide crypto-hook OnceLock.
+    let svc = service_with_memory_hook(&pool).await;
 
     // A real (encrypted) divergence + a low-confidence sample.
     let mut conn = pool.acquire().await.unwrap();
@@ -181,6 +207,11 @@ async fn digest_refuses_an_actor_owned_by_another_user() {
     let ds = seed_dataset(&pool, owner).await;
     let model = seed_model_with_digest(&pool, owner, ds, foreign_actor).await;
 
+    // Deliberately does NOT register the memory-crypto hook — see
+    // `service_with_memory_hook`. The tenancy gate in `deliver_one` refuses
+    // BEFORE any `persist_memory`, so there is nothing here for the hook to do,
+    // and claiming the process-wide OnceLock from this test would bind it to a
+    // database that disappears when this test ends.
     let svc = service(&pool).await;
     let mut conn = pool.acquire().await.unwrap();
     svc.record_disagreement(

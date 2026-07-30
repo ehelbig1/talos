@@ -62,13 +62,29 @@ async fn seed_model(pool: &sqlx::Pool<sqlx::Postgres>, user_id: Uuid, dataset_id
     id
 }
 
+/// Per-test SecretsManager — every crypto path these tests exercise
+/// (disagreement ciphertext, dataset example encryption) goes through THIS
+/// handle, so nothing here needs a process-wide registration.
+///
+/// This helper used to also call `talos_memory::register_memory_crypto_hook`,
+/// and all 9 tests reach it. That hook is a process-wide `OnceLock` that
+/// CAPTURES the `SecretsManager` it is handed — under the isolated-DB harness
+/// that manager is bound to one test's private, `DROP DATABASE`-on-scope-exit
+/// clone, so first-writer-wins leaves the other 8 tests pointing at a database
+/// that is about to vanish. It was harmless only by accident: no test in this
+/// binary touches `actor_memory` (proven — 20/20 green multi-threaded AND 5/5
+/// green with `--test-threads=1`, which is the ordering that makes a live
+/// captured pool impossible). The sibling `ml_digest_tests` had the same shape
+/// and a test that DOES write memory, and flaked ~10% the moment it entered CI.
+/// Registration removed rather than left as a trap.
+///
+/// If a test here ever needs `actor_memory`: register the hook from THAT test
+/// and that test only (the one-registrar-per-binary rule documented in
+/// `memory_get_entry_tests.rs` and `ml_digest_tests.rs`).
 async fn services(pool: &sqlx::Pool<sqlx::Postgres>) -> (LifecycleService, DatasetService) {
     set_master_key();
     let sm = Arc::new(controller::secrets::SecretsManager::new(pool.clone()).unwrap());
     sm.initialize().await.unwrap();
-    talos_memory::register_memory_crypto_hook(Arc::new(
-        talos_memory_crypto::SecretsManagerMemoryCrypto::new(sm.clone()),
-    ));
     (LifecycleService::new(sm.clone()), DatasetService::new(sm))
 }
 
