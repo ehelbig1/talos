@@ -3,6 +3,7 @@
 
 use super::*;
 
+use crate::reason_class;
 use talos_idempotency::{DedupCheck, DedupResponse, InMemoryIdempotencyStore};
 
 /// Process-global worker-side idempotency dedup store. Belt-and-suspenders ON
@@ -287,6 +288,11 @@ impl wit_http::Host for TalosContext {
             if let Some(ref m) = self.metrics {
                 m.record_execution_cancelled();
             }
+            self.emit_network_failure(
+                reason_class::CANCELLED,
+                "the execution was cancelled before the request was sent",
+            )
+            .await;
             return Err(wit_http::Error::Networkerror);
         }
 
@@ -395,8 +401,8 @@ impl wit_http::Host for TalosContext {
                     // Fixed-text reason (no resolver error string — it can
                     // embed infra detail); distinguishes the DNS-outage
                     // class from every policy deny that shares this enum.
-                    self.emit_host_diagnostic(
-                        "dns-resolution-failed",
+                    self.emit_network_failure(
+                        reason_class::DNS,
                         &format!(
                             "hostname resolution failed for '{host}' — DNS unavailable \
                              or name does not exist; the request was not sent"
@@ -446,8 +452,8 @@ impl wit_http::Host for TalosContext {
         let host_str = host.to_string();
         if !get_global_circuit_breaker().allow_request(&host_str) {
             tracing::warn!(host = %host, "Circuit breaker open - rejecting HTTP request");
-            self.emit_host_diagnostic(
-                "circuit-breaker-open",
+            self.emit_network_failure(
+                reason_class::CIRCUIT_OPEN,
                 &format!(
                     "circuit breaker open for '{host}' after recent failures — \
                      request rejected without being sent; it closes automatically"
@@ -584,53 +590,103 @@ impl wit_http::Host for TalosContext {
         let response = match builder.send().await {
             Ok(resp) => {
                 get_global_circuit_breaker().record_success(&host_str);
+                // Clear the reason latch: the module's most recent HTTP
+                // outcome is a success, so a class recorded by an earlier,
+                // recovered failure must not be attributed to whatever this
+                // module fails on later.
+                self.record_network_outcome(None);
                 resp
             }
             Err(e) => {
                 get_global_circuit_breaker().record_failure(&host_str);
+                // D3 — the ONE place the real transport error is surfaced.
+                // Worker log only (never host→guest, never a stored payload):
+                // URL erased, DLP-redacted, then IP/path-sanitized. Before
+                // this, `e` was consumed for two booleans and dropped, so the
+                // connect/TLS/reset path logged NOTHING AT ALL and the true
+                // cause of a `networkerror` was unrecoverable after the fact.
+                // Bounded: one line per failed HTTP call, and gated on the
+                // SAME per-execution `HOST_DIAG_CAP` (100) the diagnostic
+                // channel spends — otherwise this would be a second, uncapped
+                // stream bounded only by MAX_HTTP_CALLS_PER_EXECUTION (1000)
+                // × the sanitizer's 2000-char truncation.
+                if self.host_diag_budget_remaining() {
+                    tracing::warn!(
+                        module_id = ?self.module_id,
+                        host = %host_str,
+                        detail = %reason_class::sanitized_transport_detail(&e),
+                        "outbound HTTP request failed (sanitized transport detail)"
+                    );
+                }
                 if e.is_timeout() {
-                    self.emit_host_diagnostic(
-                        "request-timeout",
+                    self.emit_network_failure(
+                        reason_class::TIMEOUT,
                         &format!("request to '{host_str}' timed out"),
                     )
                     .await;
                     return Err(wit_http::Error::Timeout);
                 }
-                if e.is_connect()
-                    && self.max_llm_tier == talos_workflow_job_protocol::LlmTier::Tier1
-                {
-                    // A Tier-1 (local-egress-only) actor's SsrfFilteringResolver
-                    // drops every public IP, so a connect failure to a
-                    // non-loopback host is almost always the data-egress gate
-                    // — NOT the host being down. Say so with the fix, since the
-                    // resolver itself (a reqwest dns::Resolve impl) has no
-                    // TalosContext to emit from. Loopback/private targets still
-                    // connect under Tier-1 (local Ollama), so those failures
+                // Classify FIRST, then decide whether the Tier-1 explanation
+                // applies. Pre-fix this branch keyed on the bare
+                // `is_connect()`, which is also true for TLS handshake
+                // failures — so a genuine certificate problem under a Tier-1
+                // actor was reported as an egress-policy deny, sending the
+                // operator to change the actor's tier over a broken cert.
+                let class = reason_class::classify_reqwest_send_error(&e);
+                // The gate keys on `local_egress_only` — the value the
+                // resolver in THIS context's `http_client` was actually built
+                // with — never on `max_llm_tier == Tier1`. Since the
+                // 2026-07-23 `egress_scope` split the two disagree in both
+                // directions, and both mistakes are load-bearing now that the
+                // class drives retry classification:
+                //   * `Tier1 + egress_scope=Public` (the house pattern for a
+                //     Gmail-reading privacy actor) permits public egress, so a
+                //     connect failure there is an ORDINARY transport failure.
+                //     Tagging it `tier1-egress` makes it `capability_denied`
+                //     and vetoes exactly the retries D1 restores — the whole
+                //     defect, re-introduced for the flagship actor shape.
+                //   * `Tier2 + egress_scope=Local` denies public egress, so
+                //     its connect failures ARE the gate and must not retry;
+                //     keying on the tier left them classed `connect-failed`
+                //     (transient) and retried against a deny that cannot
+                //     change between attempts.
+                if reason_class::is_local_egress_attributable(class, self.local_egress_only) {
+                    // A local-egress-only actor's SsrfFilteringResolver drops
+                    // every public IP, leaving hyper an EMPTY address list —
+                    // which surfaces as `tcp connect error: Network
+                    // unreachable`, i.e. exactly this class. So a connect
+                    // failure to a non-loopback host is almost always the
+                    // data-egress gate, NOT the host being down. Say so with
+                    // the fix, since the resolver itself (a reqwest
+                    // dns::Resolve impl) has no TalosContext to emit from.
+                    // Loopback/private targets still connect under
+                    // local-egress-only (local Ollama), so those failures
                     // produce the generic reason below.
-                    self.emit_host_diagnostic(
-                        "tier1-egress-blocked",
+                    self.emit_network_failure(
+                        reason_class::TIER1_EGRESS,
                         &format!(
-                            "'{host_str}' was blocked by this workflow's Tier-1 actor \
+                            "'{host_str}' was blocked by this workflow's actor \
                              (local-egress-only — data must not leave the host). To reach \
-                             an external API, bind the workflow to a Tier-2 actor."
+                             an external API, set the actor's egress_scope to 'public' \
+                             (set_actor_egress_scope) or bind a Tier-2 actor."
                         ),
                     )
                     .await;
                     return Err(wit_http::Error::Networkerror);
                 }
-                // Class only — reqwest's Display can embed proxy /
-                // internal-infra detail, and the connect-vs-reset
-                // distinction is all the module author needs.
-                let class = if e.is_connect() {
-                    "connection failed (refused/unreachable)"
-                } else {
-                    "request failed after connecting (reset/protocol)"
+                // Fixed prose per class — never the reqwest string, which
+                // embeds the full URL (query params included) and can carry
+                // proxy / internal-infra detail.
+                let prose = match class {
+                    reason_class::TLS => "the TLS handshake failed (certificate or protocol)",
+                    reason_class::CONNECT_REFUSED => "the peer refused the connection",
+                    reason_class::CONNECT_FAILED => {
+                        "the connection could not be established (unreachable or no route)"
+                    }
+                    _ => "the request failed after connecting (reset or protocol error)",
                 };
-                self.emit_host_diagnostic(
-                    "connection-failed",
-                    &format!("request to '{host_str}': {class}"),
-                )
-                .await;
+                self.emit_network_failure(class, &format!("request to '{host_str}': {prose}"))
+                    .await;
                 return Err(wit_http::Error::Networkerror);
             }
         };
@@ -653,8 +709,21 @@ impl wit_http::Host for TalosContext {
                 limit = MAX_INBOUND_HEADERS,
                 "wit_http::fetch response rejected: header count exceeds cap"
             );
+            self.emit_network_failure(
+                reason_class::HEADER_CAP,
+                &format!(
+                    "the response from '{host_str}' carried more headers than the \
+                     inbound cap ({MAX_INBOUND_HEADERS}) allows"
+                ),
+            )
+            .await;
             return Err(wit_http::Error::Networkerror);
         }
+        // Two-pass so the oversize-header diagnostic can be emitted after the
+        // borrow of `response.headers()` ends — `emit_network_failure` takes
+        // `&mut self` and the loop below holds no `self` borrow, but keeping
+        // the await out of the iteration also bounds it to one emit per call.
+        let mut oversize_header: Option<String> = None;
         let resp_headers: Vec<(String, String)> = {
             let mut out: Vec<(String, String)> = Vec::with_capacity(response.headers().len());
             for (k, v) in response.headers().iter() {
@@ -666,7 +735,10 @@ impl wit_http::Host for TalosContext {
                         limit = MAX_INBOUND_HEADER_VALUE_BYTES,
                         "wit_http::fetch response rejected: header value exceeds cap"
                     );
-                    return Err(wit_http::Error::Networkerror);
+                    // Header NAME only — the oversized VALUE is upstream
+                    // content and may be a token; it never leaves the host.
+                    oversize_header = Some(k.to_string());
+                    break;
                 }
                 out.push((
                     k.to_string(),
@@ -675,6 +747,17 @@ impl wit_http::Host for TalosContext {
             }
             out
         };
+        if let Some(name) = oversize_header {
+            self.emit_network_failure(
+                reason_class::HEADER_CAP,
+                &format!(
+                    "the response from '{host_str}' carried a '{name}' header larger \
+                     than the inbound cap ({MAX_INBOUND_HEADER_VALUE_BYTES} bytes)"
+                ),
+            )
+            .await;
+            return Err(wit_http::Error::Networkerror);
+        }
         // Enforce configurable response size limit to prevent OOM.
         // MCP-670 (2026-05-13): route through `positive_env_or_default`
         // so `WASM_HTTP_MAX_RESPONSE_BYTES=0` (a real Helm placeholder
@@ -699,12 +782,45 @@ impl wit_http::Host for TalosContext {
         let mut stream = response.bytes_stream();
         use futures_util::StreamExt;
         while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result.map_err(|_| wit_http::Error::Networkerror)?;
+            let chunk = match chunk_result {
+                Ok(c) => c,
+                Err(e) => {
+                    // Same D3 treatment as the send path: the raw error is
+                    // logged sanitized host-side and never crosses to the
+                    // guest. One line per failed body read, under the same
+                    // per-execution HOST_DIAG_CAP budget.
+                    if self.host_diag_budget_remaining() {
+                        tracing::warn!(
+                            module_id = ?self.module_id,
+                            host = %host_str,
+                            detail = %reason_class::sanitized_transport_detail(&e),
+                            "HTTP response body stream failed (sanitized transport detail)"
+                        );
+                    }
+                    self.emit_network_failure(
+                        reason_class::RESPONSE_STREAM,
+                        &format!(
+                            "the response body from '{host_str}' failed mid-transfer \
+                             (transport reset or decode error)"
+                        ),
+                    )
+                    .await;
+                    return Err(wit_http::Error::Networkerror);
+                }
+            };
             if resp_body_bytes.len() + chunk.len() > max_resp {
                 tracing::warn!(
                     limit = max_resp,
                     "HTTP response exceeds size limit during streaming"
                 );
+                self.emit_network_failure(
+                    reason_class::RESPONSE_TOO_LARGE,
+                    &format!(
+                        "the response body from '{host_str}' exceeded the {max_resp}-byte \
+                         limit (WASM_HTTP_MAX_RESPONSE_BYTES) and was not delivered"
+                    ),
+                )
+                .await;
                 return Err(wit_http::Error::Networkerror);
             }
             resp_body_bytes.extend_from_slice(&chunk);
@@ -1313,21 +1429,34 @@ impl wit_http::Host for TalosContext {
         // Per-failure diagnostics for DISPATCH failures. Validation
         // failures (request_hosts[i] == None) were already diagnosed at
         // validation time; capped globally by HOST_DIAG_CAP.
-        let tier1 = self.max_llm_tier == talos_workflow_job_protocol::LlmTier::Tier1;
+        // Same predicate as the single-fetch path: the posture the resolver
+        // was actually built with, NOT `max_llm_tier == Tier1`. See
+        // `TalosContext::local_egress_only`.
+        let egress_gated = self.local_egress_only;
         for (idx, r) in &indexed {
             if let Err(e) = r {
                 if let Some(Some(host)) = request_hosts.get(*idx) {
-                    // A Networkerror under a Tier-1 actor is almost always the
-                    // local-egress-only gate (same reasoning as the single-fetch
+                    // A Networkerror under a local-egress-only actor is almost
+                    // always that gate (same reasoning as the single-fetch
                     // path); surface the actionable reason instead of the
                     // ambiguous connection/reset class.
-                    if tier1 && matches!(e, wit_http::Error::Networkerror) {
-                        self.emit_host_diagnostic(
-                            "tier1-egress-blocked",
+                    //
+                    // `emit_network_failure` (not the bare diagnostic) so the
+                    // class also reaches the retry gates. `fetch_all` does not
+                    // otherwise participate in the reason latch — its send
+                    // path runs inside a moved future with no `self` — but the
+                    // egress deny is the one class where getting it wrong is a
+                    // CORRECTNESS bug rather than a diagnostic one: without
+                    // the marker the batch's bare `networkerror` is now
+                    // transient by default and a deny that cannot change
+                    // between attempts would burn the retry budget.
+                    if egress_gated && matches!(e, wit_http::Error::Networkerror) {
+                        self.emit_network_failure(
+                            reason_class::TIER1_EGRESS,
                             &format!(
-                                "fetch_all[{idx}]: '{host}' blocked by this workflow's Tier-1 \
-                                 actor (local-egress-only). Bind a Tier-2 actor to reach \
-                                 external APIs."
+                                "fetch_all[{idx}]: '{host}' blocked by this workflow's actor \
+                                 (local-egress-only). Set the actor's egress_scope to \
+                                 'public' or bind a Tier-2 actor to reach external APIs."
                             ),
                         )
                         .await;
@@ -1360,13 +1489,25 @@ impl wit_http::Host for TalosContext {
         mut req: wit_http::Request,
     ) -> Result<wit_http::Response, wit_http::Error> {
         // Resolve the slot to its plaintext value on the host side only.
-        let auth_value = self
+        let auth_value = match self
             .provider
             .into_auth_header(talos_secrets::SlotHandle(slot), "Authorization")
-            .map_err(|e| {
+        {
+            Ok(v) => v,
+            Err(e) => {
                 tracing::warn!(slot, error = %e, "fetch-with-bearer: slot lookup failed");
-                wit_http::Error::Networkerror
-            })?;
+                // Slot number only — never the vault path or the value.
+                self.emit_network_failure(
+                    reason_class::SECRET_LOOKUP,
+                    &format!(
+                        "secret slot {slot} could not be resolved for the Authorization \
+                         header; the request was not sent"
+                    ),
+                )
+                .await;
+                return Err(wit_http::Error::Networkerror);
+            }
+        };
         // `into_auth_header` ALREADY applies the case-insensitive "Bearer " scheme
         // prefix when the header name is "Authorization" (and is idempotent — it
         // won't double up if the secret already carries a Bearer/Basic scheme). Use
@@ -1395,13 +1536,25 @@ impl wit_http::Host for TalosContext {
         header_name: String,
         mut req: wit_http::Request,
     ) -> Result<wit_http::Response, wit_http::Error> {
-        let header_value = self
+        let header_value = match self
             .provider
             .into_auth_header(talos_secrets::SlotHandle(slot), &header_name)
-            .map_err(|e| {
+        {
+            Ok(v) => v,
+            Err(e) => {
                 tracing::warn!(slot, header_name, error = %e, "fetch-with-header: slot lookup failed");
-                wit_http::Error::Networkerror
-            })?;
+                // Slot number + the caller's own header name only.
+                self.emit_network_failure(
+                    reason_class::SECRET_LOOKUP,
+                    &format!(
+                        "secret slot {slot} could not be resolved for the '{header_name}' \
+                         header; the request was not sent"
+                    ),
+                )
+                .await;
+                return Err(wit_http::Error::Networkerror);
+            }
+        };
         // L-4: Zeroizing<String> → owned String at point of use; the
         // wrapper wipes when its scope ends.
         let owned_value = (*header_value).clone();

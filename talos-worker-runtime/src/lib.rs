@@ -20,6 +20,7 @@ pub mod job_idempotency;
 pub mod job_span;
 pub mod metrics;
 pub mod module_fetcher;
+pub mod reason_class;
 pub mod runtime;
 pub mod s3_signer;
 pub mod sql_validator;

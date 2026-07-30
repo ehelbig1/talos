@@ -234,6 +234,25 @@ pub struct TalosContext {
     /// or from pre-tier workers.
     pub max_llm_tier: talos_workflow_job_protocol::LlmTier,
 
+    /// The blanket public-egress SSRF posture this context's HTTP client was
+    /// actually built with — `resolve_local_egress_only(egress_scope,
+    /// max_llm_tier)`, stamped at construction so it can never disagree with
+    /// the [`crate::ssrf_resolver::SsrfFilteringResolver`] inside
+    /// `http_client`.
+    ///
+    /// Read it — never `max_llm_tier == Tier1` — when attributing a connect
+    /// failure to the egress gate. The two diverge in BOTH directions since
+    /// the 2026-07-23 `egress_scope` split:
+    ///
+    /// * `Tier1 + egress_scope=Public` (the house pattern for a Gmail-reading
+    ///   privacy actor) has `local_egress_only = false`: its connect failures
+    ///   are ordinary transport failures and must stay retryable. Attributing
+    ///   them to the egress gate marks them `capability_denied` and vetoes the
+    ///   very retries this change exists to restore.
+    /// * `Tier2 + egress_scope=Local` has `local_egress_only = true`: its
+    ///   connect failures ARE the egress gate and must not be retried.
+    pub(crate) local_egress_only: bool,
+
     /// Per-actor write ceiling — the mutation-permission gate. `ReadOnly`
     /// refuses every data-mutating host op (agent-memory writes, non-GET
     /// HTTP, DB execute, webhook/email/messaging sends, object-storage
@@ -338,6 +357,26 @@ pub struct TalosContext {
     /// can't starve host diagnostics out of the quota, and a burst of
     /// host denials can't consume the guest's log budget.
     pub(crate) host_diag_count: AtomicU64,
+
+    /// The [`crate::reason_class`] token of the most recent host-side HTTP
+    /// OUTCOME in this execution, or `None` if the most recent outcome was a
+    /// success (or there has been none).
+    ///
+    /// This is what makes the opaque `networkerror` cause visible to the retry
+    /// gates: [`crate::runtime`] reads it after the guest returns and appends
+    /// `[reason_class=<token>]` to the node-failure message.
+    ///
+    /// **Set on failure, CLEARED on success** — deliberately. A "last failure
+    /// seen anywhere in this execution" latch would attribute a stale DNS blip
+    /// to a module that later failed on, say, a 401, and both classifiers
+    /// would then wrongly retry a permanent error. Clearing on success narrows
+    /// the claim to exactly what the code knows: *the last HTTP call this
+    /// module made failed host-side, with this class*.
+    ///
+    /// `Arc<Mutex<…>>` because `runtime` must keep a handle after the
+    /// `TalosContext` is moved into the wasmtime `Store` (same shape as
+    /// `stderr_capture`). `&'static str` because the token set is closed.
+    pub(crate) last_network_reason: Arc<std::sync::Mutex<Option<&'static str>>>,
 
     /// Per-execution event emission counter for the events interface.
     pub(crate) event_emit_count: AtomicU64,
@@ -1126,6 +1165,7 @@ impl TalosContext {
             fs_bytes_written: AtomicU64::new(0),
             log_message_count: AtomicU64::new(0),
             host_diag_count: AtomicU64::new(0),
+            last_network_reason: Arc::new(std::sync::Mutex::new(None)),
             event_emit_count: AtomicU64::new(0),
             streams: StreamRegistry::new(),
             sse_connects_per_host: dashmap::DashMap::new(),
@@ -1197,6 +1237,13 @@ impl TalosContext {
             // `new()` (a no-op since they pass the same value); legacy /
             // test paths that pass `LlmTier::default()` keep Tier-2.
             max_llm_tier,
+            // Stamped from the SAME expression that built `http_client`'s
+            // resolver a few lines above, so the egress-attribution branch in
+            // `wit_http::fetch` can never disagree with the resolver that
+            // actually dropped the address. Live paths re-assign
+            // `max_llm_tier` after `new()` with the identical value, so this
+            // stays in agreement.
+            local_egress_only,
             // Default `Write` (permissive) at construction; live dispatch
             // paths re-stamp this from the signed `JobRequest.max_write_ceiling`
             // right after `new()`, mirroring `max_llm_tier`. Tests / legacy
@@ -1459,6 +1506,58 @@ impl TalosContext {
             let topic = format!("wasm.log.{execution_id}");
             let _ = nats.publish(topic, payload.into()).await;
         }
+    }
+
+    /// Record a host-side HTTP FAILURE and publish its diagnostic in one step.
+    ///
+    /// The single chokepoint for [`crate::reason_class`] tokens: the same
+    /// `class` becomes BOTH the `[host:<reason>]` diagnostic tag AND the
+    /// `[reason_class=…]` marker the retry gates read, so the two can never
+    /// drift into disagreeing about why a call failed.
+    ///
+    /// `class` must be one of the `reason_class` consts — never a
+    /// request-derived string. `message` is bound by the same sanitization
+    /// contract as [`Self::emit_host_diagnostic`].
+    pub(crate) async fn emit_network_failure(&mut self, class: &'static str, message: &str) {
+        self.record_network_outcome(Some(class));
+        self.emit_host_diagnostic(class, message).await;
+    }
+
+    /// Record the class of the latest host-side HTTP outcome — `Some(class)`
+    /// for a failure, `None` to CLEAR after a success. See
+    /// [`Self::last_network_reason`] for why success must clear.
+    ///
+    /// Takes `&self` (not `&mut`) so the success path can call it without
+    /// disturbing borrow shapes in the middle of a request pipeline. A
+    /// poisoned mutex is recovered rather than propagated: losing a
+    /// diagnostic breadcrumb must never change a call's outcome.
+    pub(crate) fn record_network_outcome(&self, class: Option<&'static str>) {
+        let mut guard = self
+            .last_network_reason
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = class;
+    }
+
+    /// Is there host-diagnostic budget left this execution?
+    ///
+    /// Read-only peek at the same counter [`Self::emit_host_diagnostic`]
+    /// spends, so the WORKER-LOG line carrying the sanitized transport detail
+    /// shares the diagnostic channel's `HOST_DIAG_CAP` bound instead of being
+    /// a second, uncapped stream. Without it the per-execution ceiling on that
+    /// line is `MAX_HTTP_CALLS_PER_EXECUTION` (1000) × the sanitizer's 2000-char
+    /// truncation — megabytes from one runaway module. Failures are rare and
+    /// the first 100 carry all the diagnostic value.
+    pub(crate) fn host_diag_budget_remaining(&self) -> bool {
+        self.host_diag_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+            < Self::HOST_DIAG_CAP
+    }
+
+    /// Handle onto [`Self::last_network_reason`] for the runtime to keep after
+    /// this context is moved into the wasmtime `Store`.
+    pub(crate) fn network_reason_handle(&self) -> Arc<std::sync::Mutex<Option<&'static str>>> {
+        self.last_network_reason.clone()
     }
 
     /// Every policy-driven refusal in the worker — HTTP host allowlist,
@@ -2000,6 +2099,38 @@ mod egress_scope_gate_tests {
             Some(EgressScope::Local),
             LlmTier::Tier1
         ));
+    }
+
+    /// The tie-in that the failure-attribution branch in `wit_http::fetch`
+    /// depends on: it MUST key on the resolver's posture, never on
+    /// `max_llm_tier == Tier1`. Keying on the tier is wrong in BOTH
+    /// directions, and since a connect failure's class now drives retry
+    /// classification, each mistake is a correctness bug:
+    ///
+    /// * `Tier1 + Public` — the house pattern for a Gmail-reading privacy
+    ///   actor — permits public egress. Calling its connect failures
+    ///   `tier1-egress` makes them `capability_denied` (non-transient) and
+    ///   vetoes exactly the retries this change restores.
+    /// * `Tier2 + Local` denies public egress. NOT calling its connect
+    ///   failures `tier1-egress` leaves them `connect-failed` (transient), so
+    ///   a deny that cannot change between attempts burns the retry budget.
+    #[test]
+    fn egress_attribution_follows_the_resolver_not_the_llm_tier() {
+        use crate::reason_class::{is_local_egress_attributable, CONNECT_FAILED};
+        let attributable = |scope, tier| {
+            is_local_egress_attributable(CONNECT_FAILED, resolve_local_egress_only(scope, tier))
+        };
+        assert!(
+            !attributable(Some(EgressScope::Public), LlmTier::Tier1),
+            "Tier1+Public connect failures are ordinary transport failures — must stay retryable"
+        );
+        assert!(
+            attributable(Some(EgressScope::Local), LlmTier::Tier2),
+            "Tier2+Local connect failures ARE the egress gate — must not be retried"
+        );
+        // The two unchanged, pre-split defaults still behave as before.
+        assert!(attributable(None, LlmTier::Tier1));
+        assert!(!attributable(None, LlmTier::Tier2));
     }
 }
 
