@@ -127,9 +127,17 @@ fn model_serves(mode: ServingMode, lifecycle_state: &str) -> bool {
 /// MCP sanity-check tool) is deliberately not reachable through this function:
 /// those callers are not production.
 ///
-/// True here still does NOT mean every prediction is served: a Gated vote
-/// below the model's `confidence_threshold` abstains to the LLM
-/// ([`keep_vote`]). It means the model is consulted at all.
+/// True here still does NOT mean every prediction is served. Two further
+/// conditions live outside this predicate, and a caller reporting "this runs in
+/// production" must check both:
+///
+/// * the model must have a promoted version — [`serve_predict_batch`] fails
+///   `NotPromoted` otherwise, and nothing prevents a never-promoted model from
+///   being advanced to `hybrid` by hand;
+/// * an individual Gated vote below the model's `confidence_threshold` still
+///   abstains to the LLM ([`keep_vote`]).
+///
+/// So: true means the LIFECYCLE STATE permits serving, nothing more.
 #[must_use]
 pub fn state_serves_production(lifecycle_state: &str) -> bool {
     model_serves(ServingMode::Gated, lifecycle_state)

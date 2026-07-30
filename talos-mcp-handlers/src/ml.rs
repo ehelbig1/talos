@@ -614,25 +614,44 @@ async fn handle_create_model(
     }
 }
 
-/// Judge the model's configured lifecycle policy against THIS eval, or return
-/// `None` when there is no policy to judge.
+/// What `ml_eval_model` was able to say about the model's lifecycle gate.
 ///
-/// `None` is returned — and the caller then stores no `policy_decision` at all
-/// — in exactly three cases, all of them "there is no verdict", never "the
-/// verdict is negative":
-///
-/// 1. `policy_json` is absent or `{}` — no gate is configured.
-/// 2. `policy_json` does not parse as a [`talos_ml::PolicyJson`] (the typed
-///    policy is `deny_unknown_fields`, so a hand-edited key lands here). The
-///    scheduled evaluator skips such a model entirely for the same reason.
-/// 3. The class counts could not be read, so `min_examples` /
-///    `min_corrections_per_class` have no inputs. `evaluate_policy` is
-///    fail-safe and would report those gates UNMET on missing data, which is
-///    the right call when deciding whether to promote — but writing that into
-///    the version row would record a data-plane hiccup as a policy failure.
-///
-/// Everything else is `evaluate_policy`, byte-identical to the scheduled
-/// path's call: same typed policy, same [`talos_ml::PolicyInputs`] fields.
+/// Three outcomes, because "there is no gate", "there is a gate nobody can
+/// read" and "here is the verdict" are three different facts and only the
+/// third may ever be stored as a `policy_decision`. Collapsing the first two
+/// into one `None` is what made the pre-phase-2 wording tell an operator with
+/// a BROKEN policy that they had none — while `PolicyJson` is
+/// `deny_unknown_fields`, so removing a field in a future release turns every
+/// stored policy using it unreadable at once, silently disabling governance
+/// (the same state `lifecycle_job` WARNs about and skips).
+enum PolicyJudgement {
+    /// No gate is configured: `policy_json` absent or `{}`.
+    NoPolicy,
+    /// A policy IS configured and could not be used — it does not parse as a
+    /// [`talos_ml::PolicyJson`], or the class counts needed by `min_examples`
+    /// / `min_corrections_per_class` could not be read. `evaluate_policy` is
+    /// fail-safe and would call those gates UNMET on missing data, which is
+    /// right when deciding whether to promote but would record a data-plane
+    /// hiccup as a policy failure if written to the version row.
+    Unreadable(&'static str),
+    /// `evaluate_policy`'s answer, byte-identical to the scheduled path's
+    /// call: same typed policy, same [`talos_ml::PolicyInputs`] fields.
+    Judged(talos_ml::PolicyDecision),
+}
+
+impl PolicyJudgement {
+    /// The value stored on the version row. Only a real verdict is ever
+    /// persisted — the other two arms leave the key absent, which every reader
+    /// renders as "not evaluated".
+    fn decision(&self) -> Option<&talos_ml::PolicyDecision> {
+        match self {
+            Self::Judged(d) => Some(d),
+            _ => None,
+        }
+    }
+}
+
+/// Judge the model's configured lifecycle policy against THIS eval.
 async fn judge_configured_policy(
     svc: &DatasetService,
     tx: &mut sqlx::PgConnection,
@@ -640,17 +659,38 @@ async fn judge_configured_policy(
     policy_json: Option<&Value>,
     report: &talos_ml::EvalReport,
     class_counts: Option<&std::collections::HashMap<String, i64>>,
-) -> Option<talos_ml::PolicyDecision> {
-    let raw = policy_json?;
+) -> PolicyJudgement {
+    let Some(raw) = policy_json else {
+        return PolicyJudgement::NoPolicy;
+    };
     if raw.as_object().is_some_and(serde_json::Map::is_empty) {
-        return None;
+        return PolicyJudgement::NoPolicy;
     }
-    let policy = talos_ml::PolicyJson::parse(raw).ok()?;
-    let counts = class_counts?;
+    let Ok(policy) = talos_ml::PolicyJson::parse(raw) else {
+        return PolicyJudgement::Unreadable(
+            "its stored policy_json DOES NOT PARSE as a lifecycle policy (an unknown or \
+             mistyped key), so no gate could be evaluated. The scheduled evaluator skips this \
+             model for the same reason — its governance is currently OFF. Re-write it with \
+             ml_set_policy, which validates before storing",
+        );
+    };
+    let Some(counts) = class_counts else {
+        return PolicyJudgement::Unreadable(
+            "its dataset class counts could not be read, so the example-count gates had no \
+             inputs and no verdict was computed. This is a data-plane failure, not a policy \
+             failure, and is deliberately NOT recorded as one — re-run ml_eval_model",
+        );
+    };
     let total_examples: i64 = counts.values().sum();
     let dataset_classes: Vec<String> = counts.keys().cloned().collect();
-    let corrections = svc.corrections_per_class(tx, dataset_id).await.ok()?;
-    Some(talos_ml::evaluate_policy(
+    let Ok(corrections) = svc.corrections_per_class(tx, dataset_id).await else {
+        return PolicyJudgement::Unreadable(
+            "its per-class correction counts could not be read, so min_corrections_per_class \
+             had no inputs and no verdict was computed. This is a data-plane failure, not a \
+             policy failure, and is deliberately NOT recorded as one — re-run ml_eval_model",
+        );
+    };
+    PolicyJudgement::Judged(talos_ml::evaluate_policy(
         &policy,
         &talos_ml::PolicyInputs {
             report,
@@ -664,28 +704,35 @@ async fn judge_configured_policy(
 /// `next_step` for `ml_eval_model`, stating the verdict this run actually
 /// computed rather than pointing at a gate it declined to evaluate.
 ///
-/// The three arms say three different things, and none of them recommends a
+/// The four arms say four different things, and none of them recommends a
 /// promotion: a satisfied policy means the gate is clear, not that the newer
 /// version is better than the serving one (that is a separate comparison the
 /// operator makes).
-fn eval_next_step(decision: Option<&talos_ml::PolicyDecision>) -> String {
+fn eval_next_step(judgement: &PolicyJudgement) -> String {
     let base = "the eval scored every backend on one holdout and picked the highest macro-recall \
                 (balanced accuracy, aligned with the policy's per-class recall floors); judge \
                 report.coverage_curve + report.gold";
-    match decision {
-        None => format!(
+    match judgement {
+        PolicyJudgement::NoPolicy => format!(
             "{base}. NO LIFECYCLE POLICY IS CONFIGURED on this model, so no gate was evaluated \
              and this version carries no policy_decision — 'not evaluated', not 'passed'. Set \
              one with ml_set_policy if promotion should be gated."
         ),
-        Some(d) if d.satisfied => format!(
+        // A configured-but-unusable policy is NOT "no policy": telling the
+        // operator to set one they already have is how a broken gate stays
+        // broken. Name the reason instead.
+        PolicyJudgement::Unreadable(why) => format!(
+            "{base}. THE POLICY GATE COULD NOT BE EVALUATED on this version: {why}. This \
+             version carries no policy_decision — 'not evaluated', not 'passed'."
+        ),
+        PolicyJudgement::Judged(d) if d.satisfied => format!(
             "{base}. THE POLICY GATE IS SATISFIED on this version (stored as \
              policy_decision.satisfied). That clears the gate; it does not establish that this \
              version beats the one production serves — compare report.gold and the confidence \
              intervals before ml_promote_model, and remember that promoting a version does not \
              advance the lifecycle state (a model in shadow still serves nothing)."
         ),
-        Some(d) => format!(
+        PolicyJudgement::Judged(d) => format!(
             "{base}. THE POLICY GATE IS NOT SATISFIED on this version; the blocking gates are \
              stored verbatim in policy_decision.unmet: {}. Clearing those is what a promotion \
              is waiting on.",
@@ -821,7 +868,7 @@ async fn handle_eval_model(
         backend_comparison: comparison.clone(),
         evaluator: "manual",
         policy_decision: policy_eval
-            .as_ref()
+            .decision()
             .map(|d| serde_json::json!({ "satisfied": d.satisfied, "unmet": d.unmet })),
         dataset_rows,
         embedding_model: talos_memory::embedding::active_embedding_model(),
@@ -864,7 +911,7 @@ async fn handle_eval_model(
                 "policy_decision": metrics.get("policy_decision"),
                 "provenance_note": talos_ml::METRICS_PROVENANCE_NOTE,
                 "coverage_curve_note": talos_ml::COVERAGE_CURVE_POPULATION_NOTE,
-                "next_step": eval_next_step(policy_eval.as_ref()),
+                "next_step": eval_next_step(&policy_eval),
             }))
             .unwrap_or_default(),
         ),
@@ -2049,7 +2096,7 @@ mod shadow_window_tests {
 /// of the replacement actually claim.
 #[cfg(test)]
 mod eval_next_step_tests {
-    use super::eval_next_step;
+    use super::{eval_next_step, PolicyJudgement};
     use talos_ml::PolicyDecision;
 
     #[test]
@@ -2062,7 +2109,7 @@ mod eval_next_step_tests {
                 "accuracy_at_coverage: no threshold reaches 0.95".into(),
             ],
         };
-        let s = eval_next_step(Some(&d));
+        let s = eval_next_step(&PolicyJudgement::Judged(d));
         assert!(s.contains("NOT SATISFIED"), "{s}");
         assert!(s.contains(unmet), "reasons must survive verbatim: {s}");
         assert!(s.contains("no threshold reaches 0.95"), "{s}");
@@ -2077,7 +2124,7 @@ mod eval_next_step_tests {
             satisfied: true,
             unmet: vec![],
         };
-        let s = eval_next_step(Some(&d));
+        let s = eval_next_step(&PolicyJudgement::Judged(d));
         assert!(s.contains("THE POLICY GATE IS SATISFIED"), "{s}");
         assert!(
             s.contains("does not establish that this version beats"),
@@ -2093,7 +2140,7 @@ mod eval_next_step_tests {
     /// there was one to clear.
     #[test]
     fn no_configured_policy_says_not_evaluated_never_passed() {
-        let s = eval_next_step(None);
+        let s = eval_next_step(&PolicyJudgement::NoPolicy);
         assert!(s.contains("NO LIFECYCLE POLICY IS CONFIGURED"), "{s}");
         assert!(s.contains("'not evaluated', not 'passed'"), "{s}");
         // The pre-fix sentence pointed at a gate this path never judged.
@@ -2101,5 +2148,39 @@ mod eval_next_step_tests {
             !s.contains("ml_promote_model when the policy clears"),
             "{s}"
         );
+    }
+
+    /// Phase 2. A policy that IS configured but cannot be read is not the same
+    /// as no policy — and it is the more dangerous state, because governance
+    /// is silently off. `PolicyJson` is `deny_unknown_fields`, so dropping a
+    /// field in a future release makes every stored policy using it unreadable
+    /// at once. Telling that operator "no lifecycle policy is configured, set
+    /// one" describes a model they do not have.
+    #[test]
+    fn an_unreadable_policy_is_not_reported_as_an_absent_one() {
+        let s = eval_next_step(&PolicyJudgement::Unreadable(
+            "its stored policy_json DOES NOT PARSE as a lifecycle policy",
+        ));
+        assert!(s.contains("COULD NOT BE EVALUATED"), "{s}");
+        assert!(s.contains("DOES NOT PARSE"), "the reason must survive: {s}");
+        assert!(s.contains("'not evaluated', not 'passed'"), "{s}");
+        assert!(
+            !s.contains("NO LIFECYCLE POLICY IS CONFIGURED"),
+            "a broken gate is not a missing one: {s}"
+        );
+    }
+
+    /// Only a real verdict is ever persisted. Both non-verdict arms must leave
+    /// `policy_decision` absent, which every reader renders "not evaluated".
+    #[test]
+    fn only_a_real_verdict_is_stored_on_the_version_row() {
+        assert!(PolicyJudgement::NoPolicy.decision().is_none());
+        assert!(PolicyJudgement::Unreadable("x").decision().is_none());
+        assert!(PolicyJudgement::Judged(PolicyDecision {
+            satisfied: false,
+            unmet: vec!["min_examples: 3 < 50".into()],
+        })
+        .decision()
+        .is_some());
     }
 }

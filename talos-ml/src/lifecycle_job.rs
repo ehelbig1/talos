@@ -146,10 +146,13 @@ pub async fn run_policy_tick(
     // LEAST-recently-VISITED first (review 2026-07-11: ordering by
     // dataset heat let 25 hot DISTILL datasets permanently starve every
     // other model from its drift check). `last_policy_eval_at` is
-    // stamped on EVERY completed visit — including drift-only and
-    // skip-unchanged visits — so the LIMIT window rotates fairly. That is
-    // ALL it is: the eval decision below reads the SEPARATE
-    // `last_policy_eval_attempt_at` clock (see the module docs).
+    // stamped on EVERY visit this tick actually reaches — drift-only,
+    // skip-unchanged AND unparseable-policy alike — so the LIMIT window
+    // rotates fairly. The ONE case that deliberately does not stamp is a
+    // model whose advisory lock another replica holds: that replica is
+    // visiting it and will stamp it. That is ALL this column is: the eval
+    // decision below reads the SEPARATE `last_policy_eval_attempt_at`
+    // clock (see the module docs).
     let rows = sqlx::query(
         "SELECT m.id, m.user_id, m.org_id, m.name, m.dataset_id, m.lifecycle_state, \
                 m.policy_json, m.config_json, m.last_policy_eval_attempt_at, \
@@ -206,6 +209,18 @@ async fn evaluate_one_model(
             // governance otherwise) but not retried into log spam every
             // tick — WARN once per tick is acceptable at 25/tick.
             tracing::warn!(%model_id, error = %e, "unparseable policy_json; model skipped");
+            // Rotate anyway (2026-07-30, phase 2). This return used to
+            // precede the cursor stamp, so an unparseable model kept a NULL
+            // cursor forever and — with `ORDER BY last_policy_eval_at ASC
+            // NULLS FIRST` — re-occupied a slot of the LIMIT window on EVERY
+            // tick. Measured: 26 such models plus one healthy one, five
+            // ticks; the healthy model was visited exactly once and never
+            // again, so the drift guard AND the policy evaluator stopped for
+            // the whole tenant. Skipping the model is right; skipping the
+            // ROTATION is what starves its neighbours. No lock is taken
+            // first because there is no work to serialise — the stamp is an
+            // idempotent NOW() write and two replicas racing it is a no-op.
+            stamp_pool(pool, model_id, "last_policy_eval_at").await;
             return Ok(false);
         }
     };
@@ -528,14 +543,35 @@ async fn stamp_pool(pool: &PgPool, model_id: Uuid, column: &'static str) {
     }
 }
 
-/// `ML_POLICY_EVAL_MIN_INTERVAL_SECS`, clamped to non-negative.
+/// Upper clamp on `ML_POLICY_EVAL_MIN_INTERVAL_SECS`: ten years, which is
+/// "never re-evaluate" for every practical purpose and is far inside
+/// `chrono::Duration::seconds`'s panic bound (`i64::MAX / 1000`). Without a
+/// clamp an operator typo of a very large number PANICS the construction — and
+/// the panic unwinds out of the evaluator's `tokio::spawn`ed loop, killing the
+/// background task for the life of the process rather than misconfiguring one
+/// interval.
+const MAX_MIN_EVAL_INTERVAL_SECS: i64 = 10 * 365 * 24 * 3600;
+
+/// `ML_POLICY_EVAL_MIN_INTERVAL_SECS`, clamped into a representable
+/// non-negative range. An unparseable or negative value falls back to the
+/// default rather than disabling the bound.
 fn min_eval_interval_from_env() -> chrono::Duration {
-    chrono::Duration::seconds(
+    parse_min_eval_interval(
         std::env::var("ML_POLICY_EVAL_MIN_INTERVAL_SECS")
             .ok()
-            .and_then(|v| v.parse::<i64>().ok())
+            .as_deref(),
+    )
+}
+
+/// The parsing half of [`min_eval_interval_from_env`], split out so it can be
+/// tested over every value an operator might set WITHOUT mutating a
+/// process-wide variable that peer tests run beside.
+fn parse_min_eval_interval(raw: Option<&str>) -> chrono::Duration {
+    chrono::Duration::seconds(
+        raw.and_then(|v| v.parse::<i64>().ok())
             .filter(|v| *v >= 0)
-            .unwrap_or(DEFAULT_MIN_EVAL_INTERVAL_SECS),
+            .unwrap_or(DEFAULT_MIN_EVAL_INTERVAL_SECS)
+            .min(MAX_MIN_EVAL_INTERVAL_SECS),
     )
 }
 
@@ -685,6 +721,33 @@ mod tests {
             t(59),
             Duration::zero()
         ));
+    }
+
+    /// Every `ML_POLICY_EVAL_MIN_INTERVAL_SECS` an operator can type must
+    /// produce a Duration, not a panic — the construction runs inside the
+    /// evaluator's spawned loop, so a panic there stops policy evaluation for
+    /// the whole process until restart. Bad values fall back to the default;
+    /// absurd ones clamp.
+    #[test]
+    fn every_env_value_yields_a_duration_rather_than_a_panic() {
+        let hour = Duration::seconds(DEFAULT_MIN_EVAL_INTERVAL_SECS);
+        assert_eq!(parse_min_eval_interval(None), hour, "unset");
+        assert_eq!(parse_min_eval_interval(Some("0")), Duration::zero());
+        assert_eq!(parse_min_eval_interval(Some("900")), Duration::seconds(900));
+        // Negative, empty and unparseable all mean "use the default", never
+        // "no bound".
+        for bad in ["-1", "", "not-a-number", "3600.0"] {
+            assert_eq!(parse_min_eval_interval(Some(bad)), hour, "{bad}");
+        }
+        // Past chrono's representable range (`Duration::seconds` PANICS above
+        // i64::MAX/1000) — must clamp.
+        for huge in ["9223372036854775807", "999999999999999999"] {
+            assert_eq!(
+                parse_min_eval_interval(Some(huge)),
+                Duration::seconds(MAX_MIN_EVAL_INTERVAL_SECS),
+                "{huge}"
+            );
+        }
     }
 
     /// A zero min-interval (`ML_POLICY_EVAL_MIN_INTERVAL_SECS=0`) disables the

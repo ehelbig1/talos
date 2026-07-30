@@ -60,6 +60,24 @@ pub const DIGEST_MIN_WINDOW_DAYS: u32 = 1;
 /// relationship so the drift breaks a test instead of a report.
 pub const DIGEST_MAX_WINDOW_DAYS: u32 = 31;
 
+/// What `needs_me.total` counts — because its summands are not all the same
+/// KIND of thing, and the number is what the digest subject line says.
+///
+/// Three of the four are counts of the items listed beside it (one approval,
+/// one correction, one parked ML decision = one unit each). The fourth,
+/// `autonomous_failures`, is a count of failed EXECUTIONS, so a single
+/// workflow failing thirty times in the window moves `total` by thirty while
+/// exactly one thing needs looking at. That predates the ML entry and is
+/// deliberately not re-defined here — every alert and subject line built on
+/// `total` would shift under it — but a reader is owed the denominator.
+pub const NEEDS_ME_TOTAL_NOTE: &str =
+    "total = pending_approvals + ops_alert_corrections + ml_decisions + autonomous_failures. The \
+     first three are COUNTS OF THE ITEMS LISTED HERE (one unit each, and each list is capped). \
+     autonomous_failures is a count of failed EXECUTIONS, not of listed items, so one workflow \
+     failing repeatedly inflates total well past the number of distinct things to look at — read \
+     it beside the per-workflow breakdown in the `ran` panel. ops_backlog is NOT in the total (it \
+     is a standing backlog, not new work).";
+
 /// Composes the domain repositories into the operator digest. Cheap to
 /// construct (each repo just wraps the shared pool via `Arc` clone).
 pub struct OperatorDigestService {
@@ -353,9 +371,15 @@ impl OperatorDigestService {
         .collect::<Vec<_>>();
 
         // Every summand is a COUNT OF LISTED ITEMS except autonomous_failures,
-        // which is a count of failed executions (the list itself lives in the
+        // which is a count of failed EXECUTIONS (the list itself lives in the
         // "Ran" panel). Adding the ML items keeps that shape: one parked
-        // decision, one unit of "needs me".
+        // decision, one unit of "needs me". The mixed denominator predates
+        // this change and is NOT silently corrected here — one retry storm of
+        // a single workflow can move `total` by dozens while three things
+        // actually await a decision, and re-defining a published number would
+        // move every subject line and threshold built on it. It is instead
+        // STATED, in the payload, beside the number (see NEEDS_ME_TOTAL_NOTE):
+        // this change is about numbers saying what they are.
         let total = approvals.len() as i64
             + corrections.len() as i64
             + ml_decisions.len() as i64
@@ -363,6 +387,7 @@ impl OperatorDigestService {
 
         json!({
             "total": total,
+            "total_note": NEEDS_ME_TOTAL_NOTE,
             "pending_approvals": approvals,
             "ops_alert_corrections": corrections,
             "ml_decisions": ml_decisions,
@@ -898,6 +923,17 @@ pub fn annotate_correction_loop(ml: &mut JsonValue) {
             .as_ref()
             .and_then(|v| v.get("source_version"))
             .and_then(JsonValue::as_i64);
+        // WHEN the verdict was recorded. Without this the blocking reasons
+        // render with a version but no age, and `versions_since_verdict` is 0
+        // whenever the newest evaluation is the judged one — which is the
+        // NORMAL shape now that every eval stores a verdict. A five-day-old
+        // "follow_up has 1 < 3" would then read as current, which is the
+        // defect this whole change exists to retire (phase 2, 2026-07-30).
+        let verdict_measured_at = verdict
+            .as_ref()
+            .and_then(|v| v.get("measured_at"))
+            .and_then(JsonValue::as_str)
+            .map(str::to_string);
         let versions_since = verdict
             .as_ref()
             .and_then(|v| v.get("versions_since_verdict"))
@@ -914,6 +950,7 @@ pub fn annotate_correction_loop(ml: &mut JsonValue) {
             subject_version,
             &unmet,
             verdict_version,
+            verdict_measured_at.as_deref(),
             versions_since,
         );
         let Some(obj) = m.as_object_mut() else {
@@ -954,10 +991,18 @@ pub fn annotate_correction_loop(ml: &mut JsonValue) {
 /// 2. **The stored verdict, verbatim.** When `policy_verdict.unmet` is
 ///    present, those strings ARE the answer to "what is blocking this" and
 ///    they displace the generic prescription. They are also stamped with the
-///    version they judged and how many evaluations have happened since, so a
-///    reader can see when they describe older evidence than the numbers beside
-///    them — the platform naming a cleared blocker is exactly how the
-///    2026-07-30 situation stayed invisible.
+///    version they judged, WHEN it was judged, and how many evaluations have
+///    happened since, so a reader can see when they describe older evidence
+///    than the numbers beside them — the platform naming a cleared blocker is
+///    exactly how the 2026-07-30 situation stayed invisible.
+///
+///    The DATE is load-bearing and not redundant with the version delta
+///    (phase 2): `versions_since_verdict` is 0 whenever the newest evaluation
+///    is the judged one, which is the normal shape now that `ml_eval_model`
+///    stores a verdict too. Age in versions would then be silent while the
+///    reasons could still be days old and measured over evidence that has
+///    since grown. An absent date is stated as absent — never dropped, since
+///    "no date shown" and "recorded just now" must not render alike.
 /// 3. **The reading guide** ([`correction_loop_note`]), which explains what
 ///    the gold slice measures. That part is not a prescription and is kept.
 #[must_use]
@@ -966,6 +1011,7 @@ pub fn correction_loop_note_for(
     subject_version: Option<i64>,
     unmet: &[String],
     verdict_version: Option<i64>,
+    verdict_measured_at: Option<&str>,
     versions_since_verdict: Option<i64>,
 ) -> String {
     let subject = match subject_version {
@@ -982,16 +1028,29 @@ pub fn correction_loop_note_for(
             || "an earlier version".to_string(),
             |v| format!("version {v}"),
         );
+        // The verdict's own age, always stated. `recorded <date>` is a fact
+        // copied off the version row; "at an unknown date" is what an absent
+        // one says, because a missing date must not read as a fresh one.
+        let when = verdict_measured_at.map_or_else(
+            || " (recorded at an unknown date)".to_string(),
+            |t| format!(" (recorded {t})"),
+        );
         let staleness = match versions_since_verdict {
             Some(n) if n > 0 => format!(
                 " That verdict is {n} evaluation(s) old — nothing has re-judged those gates \
                  since, so whether they are STILL unmet is unknown."
             ),
-            _ => String::new(),
+            // Judged on the newest evaluation there is — so no VERSION has
+            // been recorded since. That is not the same as current: examples
+            // bank continuously and the evaluator re-judges at most once per
+            // ML_POLICY_EVAL_MIN_INTERVAL_SECS, so read the date above.
+            _ => " No evaluation has been recorded since that verdict; whether those gates are \
+                   STILL unmet is only as current as its date."
+                .to_string(),
         };
         format!(
-            "THE PLATFORM'S STORED POLICY VERDICT on {judged} names the blocking gates: {}.\
-             {staleness} Those named gates are what a lifecycle advance is waiting on — move \
+            "THE PLATFORM'S STORED POLICY VERDICT on {judged}{when} names the blocking gates: \
+             {}.{staleness} Those named gates are what a lifecycle advance is waiting on — move \
              them, rather than the generic advice below. ",
             unmet.join("; ")
         )
@@ -1244,6 +1303,41 @@ mod tests {
         assert_eq!(hi.to_bits(), 0.644_298_965_431_609_8_f64.to_bits());
     }
 
+    /// `needs_me.total` sums two different KINDS of thing — three item counts
+    /// plus a failed-EXECUTION count — and the digest subject line is built
+    /// from it. The mix predates the ML entry and is not silently re-defined,
+    /// so the denominator has to be stated. This pins that the note names
+    /// every summand actually in the expression, and only those.
+    #[test]
+    fn the_needs_me_total_note_names_its_actual_summands() {
+        let src = include_str!("lib.rs");
+        // The expression itself, as written in `needs_me_panel`.
+        for summand in [
+            "approvals.len() as i64",
+            "corrections.len() as i64",
+            "ml_decisions.len() as i64",
+            "+ autonomous_failures",
+        ] {
+            assert!(
+                src.contains(summand),
+                "the note describes a total that no longer exists: missing {summand}"
+            );
+        }
+        for named in [
+            "pending_approvals",
+            "ops_alert_corrections",
+            "ml_decisions",
+            "autonomous_failures",
+        ] {
+            assert!(NEEDS_ME_TOTAL_NOTE.contains(named), "{named}");
+        }
+        // The distinction that makes the number readable at all.
+        assert!(NEEDS_ME_TOTAL_NOTE.contains("COUNTS OF THE ITEMS LISTED HERE"));
+        assert!(NEEDS_ME_TOTAL_NOTE.contains("failed EXECUTIONS, not of listed items"));
+        // And the one panel member that is deliberately NOT summed.
+        assert!(NEEDS_ME_TOTAL_NOTE.contains("ops_backlog is NOT in the total"));
+    }
+
     /// Mutation guard: the judge population note is one shared constant. A
     /// re-inlined literal here would let the digest's disclosure drift away
     /// from the assistant report's while both keep compiling.
@@ -1378,6 +1472,10 @@ mod tests {
             "the verdict's age in versions must be stated: {note}"
         );
         assert!(
+            note.contains("recorded 2026-07-25T09:30:00.000Z"),
+            "the verdict's age in TIME must be stated too: {note}"
+        );
+        assert!(
             note.contains("STILL unmet is unknown"),
             "a stale verdict must not be presented as current: {note}"
         );
@@ -1385,6 +1483,53 @@ mod tests {
             note.contains("rather than the generic advice below"),
             "{note}"
         );
+    }
+
+    /// Phase 2. `versions_since_verdict` is 0 whenever the newest evaluation
+    /// IS the judged one — the normal shape now that `ml_eval_model` stores a
+    /// verdict too. The version delta is then silent, so without the date a
+    /// days-old "follow_up has 1 < 3" reads as current: precisely the defect
+    /// this change exists to retire, reintroduced one level down.
+    #[test]
+    fn a_verdict_on_the_newest_version_still_carries_its_date() {
+        let unmet = "min_corrections_per_class: 'follow_up' has 1 < 3";
+        let mut ml = json!({"models": [
+            {"name": "inbox-classifier-personal", "corrections_banked": 143,
+             "gold": {"accuracy": 0.55, "total": 120, "source_version": 44},
+             "policy_verdict": {
+                 "source_version": 44,
+                 "measured_at": "2026-07-25T09:30:00.000Z",
+                 "satisfied": false,
+                 "unmet": [unmet],
+                 "versions_since_verdict": 0,
+             }},
+        ]});
+        annotate_correction_loop(&mut ml);
+        let note = ml["models"][0]["correction_loop_note"].as_str().unwrap();
+        assert!(
+            note.contains("recorded 2026-07-25T09:30:00.000Z"),
+            "no version delta means the DATE is the only age the reader gets: {note}"
+        );
+        assert!(
+            note.contains("only as current as its date"),
+            "the note must not imply the verdict is current: {note}"
+        );
+        assert!(!note.contains("evaluation(s) old"), "{note}");
+    }
+
+    /// An absent date must be STATED as absent — "no date shown" and
+    /// "recorded just now" must not render alike.
+    #[test]
+    fn a_verdict_with_no_date_says_the_date_is_unknown() {
+        let note = correction_loop_note_for(
+            "partially_learned",
+            Some(44),
+            &["min_examples: 3 < 50".to_string()],
+            Some(31),
+            None,
+            Some(13),
+        );
+        assert!(note.contains("recorded at an unknown date"), "{note}");
     }
 
     /// The no-verdict case — the common one (30 of 44 versions on the live
@@ -1404,7 +1549,7 @@ mod tests {
         assert!(!note.to_ascii_lowercase().contains("unmet"), "{note}");
         assert_eq!(
             note,
-            correction_loop_note_for("partially_learned", Some(44), &[], None, None)
+            correction_loop_note_for("partially_learned", Some(44), &[], None, None, None)
         );
     }
 
@@ -1412,7 +1557,14 @@ mod tests {
     /// not render as "the blocking gates are: ".
     #[test]
     fn an_empty_unmet_list_produces_no_blocker_sentence() {
-        let note = correction_loop_note_for("converged", Some(9), &[], Some(9), Some(0));
+        let note = correction_loop_note_for(
+            "converged",
+            Some(9),
+            &[],
+            Some(9),
+            Some("2026-07-29T09:30:00.000Z"),
+            Some(0),
+        );
         assert!(!note.contains("blocking gates"), "{note}");
         assert!(note.contains("VERSION 9"), "{note}");
     }

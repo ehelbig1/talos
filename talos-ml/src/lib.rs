@@ -59,7 +59,10 @@ pub use lifecycle::{
     validate_llm_locality, LifecycleService, LifecycleState, PolicyDecision, PolicyInputs,
     PolicyJson,
 };
-pub use lifecycle_job::{run_policy_tick, should_evaluate, spawn_policy_evaluator};
+pub use lifecycle_job::{
+    run_policy_tick, should_evaluate, spawn_policy_evaluator, DEFAULT_MIN_EVAL_INTERVAL_SECS,
+    MODELS_PER_TICK,
+};
 pub use linear::{FitOpts, LinearModel, LinearPrediction};
 pub use loop_health::{gold_promoted_serving_note, loop_health};
 pub use ops_bridge::spawn_ops_correction_bridge;

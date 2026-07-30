@@ -24,29 +24,45 @@ pub const GOLD_PROVENANCE_NOTE: &str =
      is visible as an old timestamp rather than as a plausible-looking number. `gold` is the \
      LATEST version's slice (falling back to the promoted one when there is no newer version, in \
      which case both blocks carry the same source_version); `gold_promoted` is the PROMOTED \
-     version's slice. PROMOTED IS NOT THE SAME AS SERVING: production only consults the model in \
-     lifecycle_state hybrid/fast_primary, so read `serves_production` (and \
-     `gold_promoted_serving_note`, both derived from the serving gate) before treating \
-     gold_promoted as a measurement of what runs today. A null measured_at means the version \
-     predates provenance capture — unknown age, not recent.";
+     version's slice. PROMOTED IS NOT THE SAME AS SERVING: production consults the model only in \
+     lifecycle_state hybrid/fast_primary AND only when a version is actually promoted, so read \
+     `serves_production` (and `gold_promoted_serving_note`, both derived from the serving path's \
+     own conditions) before treating gold_promoted as a measurement of what runs today. A null \
+     measured_at means the version predates provenance capture — unknown age, not recent.";
 
 /// What `gold_promoted` describes for THIS model, derived from the serving
 /// gate ([`crate::serve::state_serves_production`]) rather than asserted.
 ///
-/// The two arms make different claims because the platform knows two different
-/// facts; neither wording may be reused for the other state.
+/// The three arms make different claims because the platform knows three
+/// different facts; no wording may be reused for another state.
+///
+/// `has_promoted_version` is the SECOND condition serving depends on, and it is
+/// a separate axis from the lifecycle state (phase 2, 2026-07-30):
+/// `serve_predict_batch` fails `NotPromoted` when `production_version_id` is
+/// NULL, and nothing stops `ml_set_lifecycle` from advancing a never-promoted
+/// model to `hybrid`. Such a model passes the gate and still serves nothing, so
+/// reporting the gate alone would assert exactly the kind of unchecked claim
+/// this surface exists to retire.
 #[must_use]
-pub fn gold_promoted_serving_note(lifecycle_state: &str) -> &'static str {
-    if crate::serve::state_serves_production(lifecycle_state) {
-        "the promoted version IS consulted by production: this lifecycle_state passes the serving \
-         gate (hybrid/fast_primary). Individual predictions below the model's \
-         confidence_threshold still abstain to the LLM, so this is what the fast path scores when \
-         it answers — not the share of traffic it answers."
-    } else {
+pub fn gold_promoted_serving_note(
+    lifecycle_state: &str,
+    has_promoted_version: bool,
+) -> &'static str {
+    if !crate::serve::state_serves_production(lifecycle_state) {
         "the promoted version SERVES NOTHING: this lifecycle_state does not pass the serving gate \
          (only hybrid/fast_primary do), so every production prediction falls back to the LLM and \
          these numbers describe a candidate, not what runs today. Advancing the lifecycle is what \
          changes that — promoting a version alone does not."
+    } else if !has_promoted_version {
+        "this model SERVES NOTHING despite passing the lifecycle gate: it has NO promoted version, \
+         so serve_predict_batch resolves nothing (NotPromoted) and every production prediction \
+         falls back to the LLM. There are no gold_promoted numbers to read for the same reason. \
+         Promoting a version is what changes this — the lifecycle state already allows it."
+    } else {
+        "the promoted version IS consulted by production: this lifecycle_state passes the serving \
+         gate (hybrid/fast_primary) and a version is promoted. Individual predictions below the \
+         model's confidence_threshold still abstain to the LLM, so this is what the fast path \
+         scores when it answers — not the share of traffic it answers."
     }
 }
 
@@ -221,13 +237,20 @@ pub async fn loop_health(pool: &PgPool, user_id: Uuid) -> Result<JsonValue> {
         // `gold` tracks the LATEST evaluation — it answers "are corrections
         // being learned RIGHT NOW", which is the question this panel exists
         // for. Falls back to the promoted report when a model has no newer
-        // version. `gold_promoted` keeps the serving-version figure visible,
-        // since that is the one describing what actually runs today.
+        // version. `gold_promoted` keeps the PROMOTED version's figure
+        // visible; whether that is a description of production is
+        // `serves_production` below, never an assumption made here.
         //
         // Each arm is annotated with ITS OWN version + trained_at, so a
         // fallback can never present the promoted row's numbers under the
         // latest row's identity (the #588 mis-attribution, one level down).
-        let serves_production = crate::serve::state_serves_production(&lifecycle_state);
+        //
+        // Serving needs BOTH conditions the serving path checks: the
+        // lifecycle gate AND a resolvable promoted version
+        // (`serve_predict_batch` → `NotPromoted`). A never-promoted model
+        // advanced to `hybrid` by hand passes the first and fails the second.
+        let serves_production =
+            crate::serve::state_serves_production(&lifecycle_state) && promoted_version.is_some();
         let gold_latest = gold_of(latest_metrics.as_ref(), latest_version, latest_trained_at);
         let gold_promoted = gold_of(metrics.as_ref(), promoted_version, promoted_trained_at);
         let gold = gold_latest.or_else(|| gold_promoted.clone());
@@ -294,7 +317,8 @@ pub async fn loop_health(pool: &PgPool, user_id: Uuid) -> Result<JsonValue> {
             // promoted version's eval either way; this is what says whether
             // that version is a description of production or of a candidate.
             "serves_production": serves_production,
-            "gold_promoted_serving_note": gold_promoted_serving_note(&lifecycle_state),
+            "gold_promoted_serving_note":
+                gold_promoted_serving_note(&lifecycle_state, promoted_version.is_some()),
             // The newest STORED policy judgment, verbatim, with the version it
             // judged. null = never evaluated (NOT "unsatisfied").
             "policy_verdict": policy_verdict,
@@ -427,20 +451,49 @@ mod tests {
     #[test]
     fn the_serving_note_follows_the_gate_in_both_directions() {
         for parked in ["shadow", "llm_only"] {
-            let n = gold_promoted_serving_note(parked);
+            let n = gold_promoted_serving_note(parked, true);
             assert!(n.contains("SERVES NOTHING"), "{parked}: {n}");
             assert!(n.contains("falls back to the LLM"), "{parked}: {n}");
         }
         for live in ["hybrid", "fast_primary"] {
-            let n = gold_promoted_serving_note(live);
+            let n = gold_promoted_serving_note(live, true);
             assert!(n.contains("IS consulted by production"), "{live}: {n}");
             // …but not "serves every prediction".
             assert!(n.contains("abstain to the LLM"), "{live}: {n}");
         }
         // Same predicate the serving path uses — no second state list here.
         assert_ne!(
-            gold_promoted_serving_note("shadow"),
-            gold_promoted_serving_note("hybrid")
+            gold_promoted_serving_note("shadow", true),
+            gold_promoted_serving_note("hybrid", true)
+        );
+    }
+
+    /// Phase 2. Passing the lifecycle gate is only ONE of the two conditions
+    /// `serve_predict_batch` checks: with no promoted version it returns
+    /// `NotPromoted` and the model serves nothing. `ml_set_lifecycle` will
+    /// happily advance a never-promoted model to `hybrid`, so the note must
+    /// not read the gate as the whole answer.
+    #[test]
+    fn a_gate_passing_model_with_no_promoted_version_still_serves_nothing() {
+        for live in ["hybrid", "fast_primary"] {
+            let n = gold_promoted_serving_note(live, false);
+            assert!(n.contains("SERVES NOTHING"), "{live}: {n}");
+            assert!(n.contains("NO promoted version"), "{live}: {n}");
+            assert!(n.contains("NotPromoted"), "{live}: {n}");
+            // It must NOT be the parked-lifecycle wording: the lifecycle is
+            // fine here, the missing version is the problem, and telling the
+            // operator to advance would be the wrong instruction.
+            assert_ne!(n, gold_promoted_serving_note("shadow", false), "{live}");
+            assert!(
+                n.contains("the lifecycle state already allows it"),
+                "{live}: {n}"
+            );
+        }
+        // A parked model says the same thing either way — its lifecycle is
+        // the blocker, promoted version or not.
+        assert_eq!(
+            gold_promoted_serving_note("shadow", false),
+            gold_promoted_serving_note("shadow", true)
         );
     }
 

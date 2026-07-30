@@ -128,13 +128,32 @@ impl PendingMlDecision {
                     .verdict_version
                     .map_or_else(|| "?".to_string(), |v| v.to_string());
                 let next = self.next_state.as_deref().unwrap_or("the next state");
+                // What advancing ONE step actually does, asked of the serving
+                // gate rather than assumed. `llm_only -> shadow` is the
+                // counter-example this guards: it is a legitimate parked
+                // decision, and shadow serves NOTHING, so the flat sentence
+                // "advancing is what changes what production serves" would be
+                // false exactly where an operator is most likely to act on it.
+                let effect = if crate::serve::state_serves_production(next) {
+                    format!(
+                        "Advancing {} -> {next} is the step that lets production consult this \
+                         model at all — it serves only with BOTH that state and a promoted \
+                         version, so neither act alone changes what runs.",
+                        self.lifecycle_state
+                    )
+                } else {
+                    format!(
+                        "Advancing {} -> {next} does NOT change what production serves: {next} \
+                         does not pass the serving gate either (hybrid is the first state that \
+                         does), so this is one rung of the ladder and nothing more.",
+                        self.lifecycle_state
+                    )
+                };
                 format!(
                     "'{model}''s lifecycle policy is SATISFIED on version {v} and auto_advance is \
-                     off, so the platform stopped here on purpose. Advancing {} -> {next} is what \
-                     changes what production serves; promoting a version alone does not. A \
-                     cleared gate is not evidence that version {v} beats the version serving \
-                     today — compare the gold intervals first. The decision is yours.",
-                    self.lifecycle_state
+                     off, so the platform stopped here on purpose. {effect} A cleared gate is not \
+                     evidence that version {v} beats the version serving today — compare the gold \
+                     intervals first. The decision is yours."
                 )
             }
         }
@@ -168,6 +187,17 @@ impl PendingMlDecision {
 /// path. `fast_primary` models are excluded: the scheduled evaluator governs
 /// them by drift alone and never re-judges the policy, so a stale verdict
 /// there is by design, not a parked decision.
+///
+/// The example count is written as `created_at > COALESCE(pv.trained_at,
+/// '-infinity')` rather than `pv.trained_at IS NULL OR created_at >
+/// pv.trained_at` (phase 2, 2026-07-30): the two are semantically identical
+/// over a NOT NULL `created_at`, but the OR-form tests a LATERAL parameter for
+/// NULL, which Postgres cannot resolve at plan time, so it degrades to a full
+/// scan of the dataset's examples — measured 6 ms over 50 k rows to return a
+/// count of 0, and a distilling dataset grows without bound. The COALESCE form
+/// is a range scan on `idx_ml_examples_dataset (dataset_id, created_at)`, i.e.
+/// proportional to the rows banked SINCE the verdict, which is the number
+/// being reported.
 pub async fn pending_ml_decisions(
     pool: &PgPool,
     user_id: Uuid,
@@ -193,7 +223,7 @@ pub async fn pending_ml_decisions(
          LEFT JOIN LATERAL ( \
              SELECT COUNT(*)::bigint AS n FROM ml_examples e \
              WHERE e.dataset_id = m.dataset_id \
-               AND (pv.trained_at IS NULL OR e.created_at > pv.trained_at) \
+               AND e.created_at > COALESCE(pv.trained_at, '-infinity'::timestamptz) \
          ) ex ON TRUE \
          WHERE m.user_id = $1 AND m.policy_json <> '{}'::jsonb \
            AND m.lifecycle_state <> 'fast_primary' \
@@ -372,8 +402,8 @@ mod tests {
         let action = item.next_action();
         assert!(action.contains("shadow -> hybrid"), "{action}");
         assert!(
-            action.contains("promoting a version alone does not"),
-            "{action}"
+            action.contains("neither act alone changes what runs"),
+            "advancing and promoting are both required: {action}"
         );
         assert!(
             action.contains("not evidence that version 31 beats"),
@@ -417,6 +447,38 @@ mod tests {
         let action = item.next_action();
         assert!(action.contains("has ever had its lifecycle policy evaluated"));
         assert!(action.contains("161 labeled examples"));
+    }
+
+    /// Phase 2. `llm_only -> shadow` is a real parked decision, and shadow
+    /// SERVES NOTHING — so the item must not tell the operator that advancing
+    /// changes what production serves. The sentence is asked of the serving
+    /// gate, not assumed from "advancing is progress".
+    #[test]
+    fn advancing_into_a_non_serving_state_does_not_claim_to_change_production() {
+        let item = classify(
+            "llm_only",
+            false,
+            Some(json!({ "satisfied": true, "unmet": [] })),
+            0,
+        )
+        .expect("listed");
+        assert_eq!(item.kind, PendingKind::PolicySatisfiedAwaitingHuman);
+        assert_eq!(item.next_state.as_deref(), Some("shadow"));
+        let action = item.next_action();
+        assert!(action.contains("llm_only -> shadow"), "{action}");
+        assert!(
+            action.contains("does NOT change what production serves"),
+            "shadow serves nothing: {action}"
+        );
+        assert!(
+            action.contains("hybrid is the first state that does"),
+            "{action}"
+        );
+        // The serving-state wording must not leak into this arm.
+        assert!(
+            !action.contains("lets production consult this model"),
+            "{action}"
+        );
     }
 
     /// A satisfied policy at the end of the ladder has nowhere to advance, so

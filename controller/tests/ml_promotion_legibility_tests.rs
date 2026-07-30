@@ -204,6 +204,39 @@ async fn backdate_attempt(pool: &Pool, model_id: Uuid, interval: &str) {
     .expect("backdate attempt clock");
 }
 
+/// Drive one tick and require that it VISITED a specific model.
+///
+/// Back-to-back ticks are a test-only cadence — production runs them
+/// `ML_POLICY_EVAL_INTERVAL_SECS` (600 s) apart — and they race a detail of
+/// the evaluator's clean-up: the eval-not-runnable path ends in `drop(tx)`,
+/// which schedules the ROLLBACK on the connection rather than awaiting it, so
+/// the per-model `pg_try_advisory_xact_lock` can still be held microseconds
+/// later. The next tick then takes the "another replica is evaluating this,
+/// skip cleanly" branch — CORRECT behaviour that simply is not the branch
+/// these tests mean to exercise.
+///
+/// So: retry until the model's rotation cursor moves, bounded. The retry can
+/// never mask a missing stamp (that would exhaust the budget and fail); it
+/// only absorbs a visit the tick legitimately declined.
+async fn tick_visiting(pool: &Pool, ds: &DatasetService, ls: &LifecycleService, model_id: Uuid) {
+    let (before, _) = clocks(pool, model_id).await;
+    for attempt in 1..=20 {
+        talos_ml::run_policy_tick(pool, ds, ls)
+            .await
+            .expect("policy tick");
+        let (after, _) = clocks(pool, model_id).await;
+        if after > before {
+            return;
+        }
+        assert!(
+            attempt < 20,
+            "the evaluator never visited {model_id} in 20 ticks — the rotation cursor is \
+             not being stamped"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 async fn touch_dataset(pool: &Pool, dataset_id: Uuid, interval: &str) {
     sqlx::query(&format!(
         "UPDATE ml_datasets SET updated_at = NOW() - INTERVAL '{interval}' WHERE id = $1"
@@ -251,12 +284,8 @@ async fn repeated_ticks_advance_the_cursor_every_time_and_attempt_once() {
     let c1 = c1.expect("the visit stamped the rotation cursor");
     let a1 = a1.expect("a never-attempted model must be evaluated on its first visit");
 
-    talos_ml::run_policy_tick(&pool, &ds, &ls)
-        .await
-        .expect("tick 2");
-    talos_ml::run_policy_tick(&pool, &ds, &ls)
-        .await
-        .expect("tick 3");
+    tick_visiting(&pool, &ds, &ls, model_id).await;
+    tick_visiting(&pool, &ds, &ls, model_id).await;
     let (c3, a3) = clocks(&pool, model_id).await;
 
     assert!(
@@ -305,9 +334,7 @@ async fn a_stale_attempt_with_a_changed_dataset_is_re_judged() {
     backdate_attempt(&pool, model_id, "2 hours").await;
     touch_dataset(&pool, dataset_id, "1 hour").await;
 
-    talos_ml::run_policy_tick(&pool, &ds, &ls)
-        .await
-        .expect("tick 2");
+    tick_visiting(&pool, &ds, &ls, model_id).await;
     let (cursor_2, attempt_2) = clocks(&pool, model_id).await;
     let attempt_2 = attempt_2.expect("attempt clock");
     assert!(
@@ -324,9 +351,7 @@ async fn a_stale_attempt_with_a_changed_dataset_is_re_judged() {
     backdate_attempt(&pool, model_id, "2 hours").await;
     touch_dataset(&pool, dataset_id, "3 hours").await;
     let (_, before) = clocks(&pool, model_id).await;
-    talos_ml::run_policy_tick(&pool, &ds, &ls)
-        .await
-        .expect("tick 3");
+    tick_visiting(&pool, &ds, &ls, model_id).await;
     let (_, after) = clocks(&pool, model_id).await;
     assert_eq!(
         after, before,
@@ -363,6 +388,127 @@ async fn the_drift_only_path_does_not_spend_an_eval_attempt() {
     assert!(
         attempt.is_none(),
         "fast_primary is the drift guard's alone — it must never spend an eval"
+    );
+}
+
+/// FAIRNESS, proved past the per-tick cap (phase 2). Two ticks must reach
+/// every one of 30 policy-bearing models: the rotation cursor is what makes
+/// `ORDER BY last_policy_eval_at ASC NULLS FIRST` cycle, and a model that is
+/// visited without being stamped re-occupies a slot forever.
+///
+/// This also measures the DEPLOY TRANSIENT the two-clock split creates: every
+/// pre-existing row has a NULL attempt clock, so each policy-bearing model
+/// gets exactly ONE eval attempt, at most `MODELS_PER_TICK` per tick and then
+/// one per `ML_POLICY_EVAL_MIN_INTERVAL_SECS` per model thereafter.
+#[tokio::test]
+async fn every_model_past_the_per_tick_cap_is_reached_within_two_ticks() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let (ls, ds) = services(&pool).await;
+    let user_id = Uuid::new_v4();
+    seed_user(&pool, user_id).await;
+    let cap = talos_ml::MODELS_PER_TICK;
+    for i in 0..(cap + 5) {
+        let dataset_id = seed_dataset(&pool, user_id).await;
+        seed_model(
+            &pool,
+            user_id,
+            &format!("m{i:03}"),
+            Some(dataset_id),
+            "shadow",
+            serde_json::json!({ "min_examples": 50 }),
+        )
+        .await;
+    }
+
+    async fn stamped(pool: &Pool, column: &str) -> i64 {
+        sqlx::query_scalar(&format!(
+            "SELECT COUNT(*)::bigint FROM ml_models WHERE {column} IS NOT NULL"
+        ))
+        .fetch_one(pool)
+        .await
+        .expect("count stamped rows")
+    }
+
+    talos_ml::run_policy_tick(&pool, &ds, &ls)
+        .await
+        .expect("tick 1");
+    assert_eq!(
+        stamped(&pool, "last_policy_eval_at").await,
+        cap,
+        "one tick visits exactly MODELS_PER_TICK models"
+    );
+    talos_ml::run_policy_tick(&pool, &ds, &ls)
+        .await
+        .expect("tick 2");
+    assert_eq!(
+        stamped(&pool, "last_policy_eval_at").await,
+        cap + 5,
+        "the tail must be reached on the next tick — that is what the cursor is for"
+    );
+    assert_eq!(
+        stamped(&pool, "last_policy_eval_attempt_at").await,
+        cap + 5,
+        "the deploy transient is exactly one attempt per model, spread over ceil(n/cap) ticks"
+    );
+}
+
+/// A model whose `policy_json` does not PARSE must still rotate. It used not
+/// to: the skip returned before the cursor stamp, so such a model kept a NULL
+/// cursor and — sorting `NULLS FIRST` — re-took a slot of the LIMIT window on
+/// every tick. Measured at 26 unparseable models plus one healthy one: the
+/// healthy model was visited once and then never again across four further
+/// ticks, so the drift guard AND the policy evaluator stopped for the whole
+/// tenant. Skipping the MODEL is right; skipping the ROTATION starves its
+/// neighbours.
+#[tokio::test]
+async fn an_unparseable_policy_cannot_starve_its_neighbours() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let (ls, ds) = services(&pool).await;
+    let user_id = Uuid::new_v4();
+    seed_user(&pool, user_id).await;
+    for i in 0..(talos_ml::MODELS_PER_TICK + 1) {
+        let dataset_id = seed_dataset(&pool, user_id).await;
+        seed_model(
+            &pool,
+            user_id,
+            &format!("bad{i:03}"),
+            Some(dataset_id),
+            "shadow",
+            // Non-empty (so the evaluator picks it up) and unparseable
+            // (`PolicyJson` is deny_unknown_fields).
+            serde_json::json!({ "totally_bogus_key": i }),
+        )
+        .await;
+    }
+    let healthy_ds = seed_dataset(&pool, user_id).await;
+    let healthy = seed_model(
+        &pool,
+        user_id,
+        "zz-healthy",
+        Some(healthy_ds),
+        "shadow",
+        serde_json::json!({ "min_examples": 50 }),
+    )
+    .await;
+
+    // Enough ticks to visit everything at least once, then more.
+    for _ in 0..3 {
+        talos_ml::run_policy_tick(&pool, &ds, &ls)
+            .await
+            .expect("tick");
+    }
+    let (first, _) = clocks(&pool, healthy).await;
+    let first = first.expect("the healthy model is reached at all");
+    for _ in 0..3 {
+        talos_ml::run_policy_tick(&pool, &ds, &ls)
+            .await
+            .expect("tick");
+    }
+    let (last, _) = clocks(&pool, healthy).await;
+    assert!(
+        last.expect("cursor") > first,
+        "a model that cannot be evaluated must still rotate, or it starves every \
+         model behind it in the cursor order"
     );
 }
 
@@ -444,6 +590,53 @@ async fn loop_health_surfaces_the_newest_stored_verdict_with_its_own_identity() 
         .as_str()
         .expect("shadow note")
         .contains("PROMOTED version"));
+}
+
+/// Phase 2: `serves_production` must answer with BOTH conditions the serving
+/// path checks. `ml_set_lifecycle` will advance a never-promoted model all the
+/// way to `hybrid`, where it passes the lifecycle gate and still serves
+/// nothing — `serve_predict_batch` fails `NotPromoted`. Reporting the gate
+/// alone would assert a serving claim the code does not check, which is the
+/// exact class this change exists to retire.
+#[tokio::test]
+async fn a_hybrid_model_with_no_promoted_version_is_not_reported_as_serving() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let user_id = Uuid::new_v4();
+    seed_user(&pool, user_id).await;
+    let dataset_id = seed_dataset(&pool, user_id).await;
+    let model_id = seed_model(
+        &pool,
+        user_id,
+        "advanced-but-never-promoted",
+        Some(dataset_id),
+        "hybrid",
+        serde_json::json!({ "min_examples": 50 }),
+    )
+    .await;
+    // A version EXISTS — it was simply never promoted, so
+    // production_version_id stays NULL.
+    seed_version(
+        &pool,
+        model_id,
+        user_id,
+        &metrics_with(None),
+        "2026-07-29T09:30:00Z",
+    )
+    .await;
+
+    let health = talos_ml::loop_health(&pool, user_id)
+        .await
+        .expect("loop health");
+    let m = &health["models"].as_array().expect("models")[0];
+    assert_eq!(m["lifecycle_state"], "hybrid");
+    assert!(m["promoted_version"].is_null());
+    assert_eq!(
+        m["serves_production"], false,
+        "the lifecycle gate passes, but there is nothing to serve: {m}"
+    );
+    let note = m["gold_promoted_serving_note"].as_str().expect("note");
+    assert!(note.contains("SERVES NOTHING"), "{note}");
+    assert!(note.contains("NO promoted version"), "{note}");
 }
 
 /// A model no version of which has ever been judged must render "not
