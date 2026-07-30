@@ -2,7 +2,9 @@
 // Proves a module payload encrypts as format v4 under the WORKFLOW's org root DEK
 // (the execution tenant, resolved via workflow_execution_id) and decrypts back,
 // and that an org-less (no workflow execution) payload stays v3 global.
-// Env-gated (runs in quality.yml).
+// Runs in CI via `scripts/test-integration.sh` (TC_TESTS) — testcontainers, not
+// DATABASE_URL. (The previous "Env-gated (runs in quality.yml)" claim was false:
+// no runner named this binary until 2026-07-30.)
 
 mod test_helpers;
 

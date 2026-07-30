@@ -86,6 +86,30 @@ impl Drop for TestDb {
 /// `DATABASE_URL` points at) and return a pool bound to it plus a guard that
 /// drops it on scope-exit. Used by `setup_test_context` and by other CTL test
 /// binaries that need an isolated DB without the shared-state cleanup.
+///
+/// ## Running these locally: mind the repo `.env`
+///
+/// `dotenvy::dotenv()` walks UP from the crate directory, so in a normal
+/// checkout it finds the repo's `.env` — whose `DATABASE_URL` is the LIVE dev
+/// database. An explicitly-exported `DATABASE_URL` wins (dotenvy never
+/// overrides a set var), which is how `scripts/test-integration.sh` points
+/// this at the disposable `talos_ctl`. But a bare `cargo test -p controller
+/// --test <binary>` with nothing exported will try to `CREATE DATABASE …
+/// TEMPLATE talos` against the dev DB.
+///
+/// That is not silently destructive — Postgres refuses to use a template that
+/// has live connections, so a running dev stack makes it fail loudly with
+/// "source database is being accessed by other users" after the retry loop —
+/// but the failure is confusing, and against an IDLE dev DB it would clone
+/// (read-only) real data into throwaway databases. Always run these binaries
+/// with an explicit `DATABASE_URL` naming a disposable migrated template:
+///
+/// ```bash
+/// DATABASE_URL=postgres://…/talos_ctl TALOS_MASTER_KEY=<64 hex> \
+///   cargo test -p controller --test ml_registry_tenancy_tests
+/// ```
+///
+/// (`make test-integration` does this for you.)
 #[allow(dead_code)]
 pub async fn isolated_db_pool() -> (Pool<Postgres>, TestDb) {
     let _ = dotenvy::dotenv();

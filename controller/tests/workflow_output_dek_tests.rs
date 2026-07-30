@@ -1,6 +1,9 @@
 // Per-org root DEKs — workflow_executions.output_data_enc cutover (end-to-end).
 // Proves execution output lands as format v4 under the WORKFLOW's org root DEK
-// (the execution tenant) and reads back decrypted. Env-gated (runs in quality.yml).
+// (the execution tenant) and reads back decrypted.
+// Runs in CI via `scripts/test-integration.sh` (TC_TESTS) — testcontainers, not
+// DATABASE_URL. (The previous "Env-gated (runs in quality.yml)" claim was false:
+// no runner named this binary until 2026-07-30.)
 
 mod test_helpers;
 

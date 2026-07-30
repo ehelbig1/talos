@@ -226,9 +226,60 @@ workspace now runs in CI:
   against a dead server. Fixed by making it `#[tokio::test]` + a lazy NATS client
   (`retry_on_initial_connect`, the analogue of the existing `connect_lazy` pool).
   Now DB/NATS-free and gated in the `test` job security group. **100% of
-  `tests/`-dir binaries now run in CI — no exclusions.**
+  `tests/`-dir binaries ran in CI as of this date — no exclusions.**
 
-**100% COMPLETE (2026-06-08).** The doctest gate is back (`cargo test --workspace
+**DECAYED, THEN ENFORCED (2026-07-30).** The sentence above was true on
+2026-06-08 and false seven weeks later. A sweep is a SNAPSHOT, not a gate:
+nothing required a new `tests/*.rs` to appear in a runner, so **28 binaries
+accumulated that no runner named** — every one of the 20 ungated controller
+binaries was added AFTER this sweep (earliest 06-25). They compiled at
+authoring time and then ran nowhere, behind a docs claim of "100%, no
+exclusions" that made the gap invisible. The worst of it:
+- `ml_registry_tenancy_tests` — the ONLY guard on the app-layer
+  `AND user_id = $2` predicate in `ModelRegistry::{resolve_by_name,
+  resolve_by_id,list_models}`. RLS does not cover that path on a superuser
+  pool (the common in-cluster deploy), so dropping the predicate would be a
+  cross-tenant model-resolution leak on the `talos.ml.predict` serving path,
+  invisible to every other test.
+- Four per-org-DEK (v4) encryption-at-rest binaries whose OWN header comments
+  asserted "Env-gated (runs in quality.yml)". An auditor reading those files
+  concluded the coverage was gated when it wasn't. Comments corrected.
+- Three consecutive PRs (#607, #609, #613) shipped their own hardening tests
+  into that directory.
+
+All 28 are now resolved: 20 gated into `scripts/test-integration.sh`
+(16 controller `CTRL_TESTS` + 4 DEK `TC_TESTS`), 3 gated elsewhere
+(`talos-memory:wire_format_snapshots` and `worker:kill_switch_tests` in
+quality.yml's `test` job; `talos-actor-repository:write_ceiling_guard_integration`
+in the `TESTS` array), and 5 explicitly marked `// ci-ungated: <reason>` in the
+file itself (they need a builder image, live Ollama+Neo4j, a real TLS
+nats-server, or a configured embedding provider). Gating the last of those
+would buy a green check over zero executed assertions — strictly worse than an
+honest exclusion.
+
+The invariant is no longer maintained by sweeping: **structural lint check 64**
+fails the build if any `*/tests/*.rs` is named by neither `quality.yml` nor
+`scripts/test-integration.sh` and carries no `ci-ungated` marker. Matching is
+crate-qualified (the `wire_format_snapshots` name collision between
+`talos-workflow-job-protocol` and `talos-memory` is exactly what hid one of
+them) and comment-stripped (a binary named only in prose does not count as
+gated — `test-integration.sh` literally carried a comment listing three of the
+ungated `ml_*` binaries).
+
+**Cost, measured (local, warm cache).** The 20 new `test-integration.sh`
+entries add **~210 s** to the integration job (full-script wall clock 12 m 19 s;
+247 tests, 0 failures). Only **17 s of that is test execution** — the other
+193 s is per-invocation cargo overhead: the script runs one
+`cargo test -p controller --test <name>` per binary, and each pays ~8.5 s of
+freshness-check + link before running for well under a second. NOT ACTED ON
+here (the per-binary loop is what gives per-binary pass/fail attribution and
+the `rc=1`-and-continue semantics). If the job ever needs to get shorter, the
+first lever is batching the `CTRL_TESTS` loop into a single multi-`--test`
+invocation (est. ~2 min back, at the cost of that attribution), ahead of
+sharding across runners.
+
+**COMPLETE AS OF 2026-06-08** (see the decay note above — the enduring fix is
+check 64, not this sweep). The doctest gate is back (`cargo test --workspace
 --doc`, ~218 doctests, re-confirmed green). The probing found 1 real latent bug
 (CARGO_MANIFEST_DIR discovery, #190), 1 real harness flake (cross-runtime pool,
 #198), 2 more latent test-harness defects (webhooks_hmac runtime+NATS), and ~16

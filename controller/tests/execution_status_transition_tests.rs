@@ -35,21 +35,32 @@ async fn queued_execution_requires_running_promotion_before_completion() {
     let user_id = common::create_test_user(&ctx.auth_service, "exec-status@example.com").await;
     let workflow_id = common::create_test_workflow(&ctx.db_pool, user_id, "exec-status-test").await;
 
+    // `workflow_executions.actor_id` is NOT NULL post-universalization
+    // (#307–#317) — every execution carries an actor, DB-enforced. Bind the
+    // user's default the way the real trigger path does.
+    let actor_id = talos_actor_repository::ActorRepository::new(ctx.db_pool.clone())
+        .get_or_create_default_actor(user_id)
+        .await
+        .expect("default actor");
+
     let repo = WorkflowRepository::new(ctx.db_pool.clone());
     let exec_id = Uuid::new_v4();
 
     // GraphQL trigger_workflow creates the row as `queued`.
+    // Arguments are labelled: `version_id` and `actor_id` are BOTH
+    // `Option<Uuid>` and two apart, so a swap type-checks silently (it did —
+    // see the sibling test below).
     let admission = repo
         .create_execution_under_concurrency_limit(
             exec_id,
             workflow_id,
             user_id,
-            None,
-            Some("normal"),
-            None,
-            None,
-            None,
-            None,
+            None,           // version_id
+            Some("normal"), // priority
+            Some(actor_id), // actor_id
+            None,           // provenance
+            None,           // parent_execution_id
+            None,           // root_execution_id
             InitialExecutionStatus::Queued,
         )
         .await
@@ -123,16 +134,22 @@ async fn get_execution_decodes_text_priority_column() {
 
     let repo = WorkflowRepository::new(ctx.db_pool.clone());
     let exec_id = Uuid::new_v4();
+    // `Some(actor_id)` used to sit in the FOURTH slot — which is
+    // `version_id`, not `actor_id`. Both are `Option<Uuid>`, so the swap
+    // type-checked; the row failed at INSERT with
+    // `workflow_executions_workflow_version_id_fkey`, and this test never
+    // ran the decode it exists to guard because the binary was never gated
+    // in CI. Arguments are labelled now.
     repo.create_execution_under_concurrency_limit(
         exec_id,
         workflow_id,
         user_id,
-        Some(actor_id),
-        Some("high"), // priority: TEXT enum, not an integer
-        None,
-        None,
-        None,
-        None,
+        None,           // version_id
+        Some("high"),   // priority: TEXT enum, not an integer
+        Some(actor_id), // actor_id (NOT NULL post-universalization)
+        None,           // provenance
+        None,           // parent_execution_id
+        None,           // root_execution_id
         InitialExecutionStatus::Queued,
     )
     .await

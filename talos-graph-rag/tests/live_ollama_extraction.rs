@@ -17,6 +17,10 @@
 //! runs (this test asserts the OLLAMA BACKEND works; the tier gate is
 //! covered by `tier_gate_tests` in the crate).
 
+// ci-ungated: `#[ignore]`d and needs a live Neo4j AND a reachable Ollama with
+// the extraction model pulled. Neither CI job provisions either, so gating it
+// would add a green check over a skipped test.
+
 use std::sync::Arc;
 use uuid::Uuid;
 

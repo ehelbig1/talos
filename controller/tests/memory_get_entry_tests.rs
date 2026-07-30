@@ -2,9 +2,12 @@
 //! the additive `agent-memory::get-entry` WIT function. Proves that a memory
 //! written through the canonical `persist_memory` fn reads back through
 //! `recall_entry` with its value AND `created_at` metadata, and that an
-//! absent key returns `Ok(None)` (never an error). Env-gated like the rest
-//! of the controller suite (runs in quality.yml); uses the isolated-DB
-//! harness (`common::isolated_db_pool`).
+//! absent key returns `Ok(None)` (never an error). Uses the isolated-DB
+//! harness (`common::isolated_db_pool`) and runs in CI via
+//! `scripts/test-integration.sh` (CTRL_TESTS), which quality.yml's
+//! `integration` job invokes as `make test-integration`. (The previous
+//! "runs in quality.yml" claim was false — no runner named this binary
+//! until 2026-07-30.)
 
 mod common;
 
@@ -54,10 +57,20 @@ async fn seed_actor_with_org(pool: &sqlx::Pool<sqlx::Postgres>) -> Uuid {
 
 /// Register the REAL memory crypto hook so `persist_memory` encrypts and
 /// `recall_entry` decrypts through the same versioned path as production.
+///
+/// **AT MOST ONE test per binary may call this.** `register_memory_crypto_hook`
+/// is a process-wide `OnceLock` that CAPTURES the pool handed to it, and under
+/// the isolated-DB harness that pool is bound to one test's private,
+/// `DROP DATABASE`-on-scope-exit clone. A second test that then encrypts or
+/// decrypts goes through the FIRST test's pool and hits
+/// `database "test_<uuid>" does not exist` — which is precisely how this
+/// binary failed the first time it was ever executed (it had never been named
+/// by a CI runner). Same trap `actor_memory_sweep_dek_tests` documents; the
+/// rule there and here is one hook-registering test per binary, and it must be
+/// the test that owns the pool.
 async fn register_crypto(pool: &sqlx::Pool<sqlx::Postgres>) {
     let sm = Arc::new(controller::secrets::SecretsManager::new(pool.clone()).unwrap());
     sm.initialize().await.unwrap();
-    // Idempotent OnceLock — first registration wins; safe across tests.
     talos_memory::register_memory_crypto_hook(Arc::new(
         talos_memory_crypto::SecretsManagerMemoryCrypto::new(sm),
     ));
@@ -114,8 +127,11 @@ async fn recall_entry_returns_value_and_created_at() {
 async fn recall_entry_absent_key_is_none_not_error() {
     set_master_key();
     let (pool, _db) = common::isolated_db_pool().await;
-    register_crypto(&pool).await;
-
+    // Deliberately does NOT register the crypto hook — see `register_crypto`.
+    // The absent-key path returns `Ok(None)` from `fetch_optional` before any
+    // decrypt, so there is nothing here for the hook to do, and claiming the
+    // process-wide OnceLock from this test would bind it to a database that
+    // disappears when this test ends.
     let actor = seed_actor_with_org(&pool).await;
 
     let missing = format!("daily_brief/never-written-{}", Uuid::new_v4());

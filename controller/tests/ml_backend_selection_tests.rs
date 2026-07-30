@@ -6,6 +6,22 @@
 //! parametric algorithm's minority-class advantage is proven separately in
 //! the `talos-ml` unit tests; this proves the DB-wired selection +
 //! persistence path.
+//!
+//! ## Embedding-model provenance (#527) and the crafted fixture
+//!
+//! Both loaders the selector uses —
+//! `DatasetService::load_train_embeddings_with_source` and
+//! `DatasetService::knn_search` — filter `embedding_model =
+//! active_embedding_model()`, so a vector whose provenance does not match
+//! the model in force is (correctly) refused as training/voting signal. A
+//! crafted vector written straight into `ml_examples.embedding` therefore
+//! has to declare its provenance too, and the process has to HAVE an active
+//! model — with no embedding provider configured `active_embedding_model()`
+//! is `None`, the bind is NULL, `embedding_model = NULL` is never true, and
+//! both backends see an empty dataset. So this test declares a provider
+//! (pointed at a closed port, so the real embedder call fails fast to a NULL
+//! embedding that we then overwrite by hand) and stamps every crafted row
+//! with that model's name.
 
 mod common;
 
@@ -19,6 +35,26 @@ fn set_master_key() {
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     );
 }
+
+/// Declare an embedding provider so `active_embedding_model()` — which both
+/// selector loaders bind into their `embedding_model = $n` provenance filter
+/// (#527) — resolves to a real name instead of NULL. The URL points at a
+/// closed port on purpose: `prepare_examples` must fail fast to a NULL
+/// embedding (this test supplies its own crafted vectors); it must not reach
+/// a real embedder, and it must not sit in a timeout.
+///
+/// `EmbeddingConfig::cached()` is a process-wide `OnceLock`, so this has to
+/// run before the first `prepare_examples`.
+fn declare_crafted_embedding_provider() -> String {
+    std::env::set_var("EMBEDDING_API_URL", "http://127.0.0.1:1/v1/embeddings");
+    std::env::set_var("EMBEDDING_MODEL", CRAFTED_MODEL);
+    std::env::set_var("EMBEDDING_DIMENSIONS", "1024");
+    talos_memory::embedding::active_embedding_model()
+        .expect("an explicit EMBEDDING_API_URL makes the config resolvable")
+}
+
+/// The provenance name stamped onto every crafted vector below.
+const CRAFTED_MODEL: &str = "talos-test-crafted-onehot-1024";
 
 async fn seed_user(pool: &sqlx::Pool<sqlx::Postgres>, id: Uuid) {
     sqlx::query(
@@ -70,6 +106,7 @@ fn embedding_literal(hot: usize) -> String {
 async fn selector_evaluates_both_backends_and_tags_linear_artifact() {
     let (pool, _db) = common::isolated_db_pool().await;
     set_master_key();
+    let active_model = declare_crafted_embedding_provider();
     let user = Uuid::new_v4();
     seed_user(&pool, user).await;
     let ds = seed_dataset(&pool, user).await;
@@ -95,13 +132,17 @@ async fn selector_evaluates_both_backends_and_tags_linear_artifact() {
                 .await
                 .unwrap();
         }
+        // `embedding_model` is stamped alongside the vector: without it the
+        // #527 provenance filter refuses these rows as training/voting
+        // signal and both backends evaluate an empty dataset.
         sqlx::query(
-            "UPDATE ml_examples SET embedding = $1::vector \
+            "UPDATE ml_examples SET embedding = $1::vector, embedding_model = $4 \
              WHERE dataset_id = $2 AND label_json->>'label' = $3",
         )
         .bind(embedding_literal(hot))
         .bind(ds)
         .bind(label)
+        .bind(&active_model)
         .execute(&pool)
         .await
         .unwrap();

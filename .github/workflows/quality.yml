@@ -77,9 +77,11 @@ jobs:
   # never-in-CI bugs were fixed: `module_template_tests` (disk template
   # discovery) and `sandbox_security_tests` (WASM sandbox boundaries). The
   # remaining `tests/`-dir binaries need a full-app DB harness and run in the
-  # `integration` job below (`make test-integration`) — bringing those in is
-  # tracked in docs/backlog.md. `--lib` keeps the default run from re-executing
-  # (and failing on) the DB-requiring binaries.
+  # `integration` job below (`make test-integration`). `--lib` keeps the
+  # default run from re-executing (and failing on) the DB-requiring binaries.
+  # Which binary belongs where is no longer a matter of memory: structural
+  # lint check 64 fails if any `*/tests/*.rs` is named by neither this
+  # workflow nor `scripts/test-integration.sh`.
   test:
     name: Rust tests (unit / lib)
     runs-on: ubuntu-latest
@@ -183,12 +185,25 @@ jobs:
         # behaviour (cancellation, checkpointing, fan-in, subflow recursion,
         # wait/pause/resume, timeouts, rate-limit, precheck, trigger input),
         # signed job-protocol serialization + wire-format snapshots, worker
-        # runtime/trap, and controller circuit-breaker / execution-event /
-        # JS-compilation / NATS-topic / rhai / worker-manager. All verified
-        # green and need no DB or container. Completes the DB-free never-in-CI
-        # gate; the only remaining ungated binaries need a real DB
-        # (env_vars / scheduler_tests / workflow_version_tests — tracked) or NATS
-        # (webhooks_hmac_test, already #[ignore]'d).
+        # runtime/trap/kill-switch, and controller circuit-breaker /
+        # execution-event / JS-compilation / NATS-topic / rhai / worker-manager.
+        # All verified green and need no DB or container.
+        #
+        # `kill_switch_tests` joined 2026-07-30. It is DB-free and its WASM
+        # fixtures are built IN-PROCESS from WAT (`wat` + `wit_component`
+        # dev-deps reading `wit/talos.wit` out of the checkout) — no
+        # talos-builder image, no cargo-component, no network — so it belongs
+        # here beside its six already-gated worker siblings rather than in the
+        # `integration` job. Same rationale as `sandbox_security_tests`: these
+        # are the fuel/epoch/cancellation guards the entire sandbox design
+        # leans on, exactly the class that must not silently rot.
+        #
+        # Every `tests/`-dir binary in the workspace is now named by either
+        # this workflow or `scripts/test-integration.sh`, EXCEPT the handful
+        # carrying an explicit `// ci-ungated: <reason>` marker (they need a
+        # builder image, a live Ollama/Neo4j, a real TLS nats-server, or a
+        # configured embedding provider). Structural lint check 64 fails the
+        # build if a new binary appears in neither place.
         run: |
           cargo nextest run -p talos-workflow-engine \
             --test cancellation \
@@ -203,10 +218,17 @@ jobs:
           cargo nextest run -p talos-workflow-job-protocol \
             --test serialization \
             --test wire_format_snapshots
+          # talos-memory has a SAME-NAMED `wire_format_snapshots` binary (the
+          # memory/integration-state signed-wire surface, #612). It needs its
+          # own `-p` invocation: the name collision with the job-protocol one
+          # above is precisely what hid the fact that it ran nowhere. DB-free
+          # — literal JSON + literal MAC hex, no Postgres.
+          cargo nextest run -p talos-memory --test wire_format_snapshots
           cargo nextest run -p worker \
             --test runtime_test \
             --test runtime_integration_test \
-            --test trap_test
+            --test trap_test \
+            --test kill_switch_tests
           cargo nextest run -p controller \
             --test execution_event_tests \
             --test js_compilation_tests \

@@ -1,7 +1,12 @@
 // Per-org root DEKs — actor_memory cutover (real crypto hook, end-to-end).
 // Proves a memory write lands as format v4 under the ACTOR's org root DEK, is
 // stamped with that org_id, and reads back through the versioned decrypt path.
-// Env-gated like the rest of the controller suite (runs in quality.yml).
+// Runs in CI via `scripts/test-integration.sh` (TC_TESTS), which quality.yml's
+// `integration` job invokes as `make test-integration`. Self-provisions its own
+// Postgres through testcontainers (`mod test_helpers`) — it does NOT read
+// DATABASE_URL. Correcting a false claim: this header previously said "Env-gated
+// (runs in quality.yml)" while NO runner named the binary, so an auditor reading
+// it concluded per-org-DEK encryption-at-rest was covered when it ran nowhere.
 
 mod test_helpers;
 

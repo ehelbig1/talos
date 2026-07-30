@@ -4320,6 +4320,168 @@ if [ "$RHAI_FAIL" = "1" ]; then
 fi
 echo
 
+# ── 64. Every tests/ binary must be named by a CI runner ──────────────
+# docs/backlog.md claimed "100% of tests/-dir binaries now run in CI — no
+# exclusions" after the June-2026 sweep. It was true on 06-08 and false
+# seven weeks later: 28 binaries had accumulated that no runner named,
+# because NOTHING enforced the invariant — a sweep is a snapshot, not a
+# gate. Among the decayed set was `ml_registry_tenancy_tests`, the ONLY
+# guard on the app-layer `AND user_id = $2` predicate that stops
+# cross-tenant model resolution on the `talos.ml.predict` serving path
+# (RLS does not cover it on a superuser pool), and four per-org-DEK
+# encryption-at-rest binaries whose own headers ASSERTED they ran in CI.
+#
+# A cargo integration binary is any `<crate>/tests/<name>.rs` at depth 1
+# (files under `tests/<subdir>/` — `common/mod.rs`, `test_helpers/mod.rs`
+# — are shared modules, not binaries; that is cargo's own rule, so the
+# exclusion needs no hand-maintained list). Every one must be named by
+# `.github/workflows/quality.yml` or `scripts/test-integration.sh`, or
+# carry a `// ci-ungated: <reason>` marker.
+#
+# Matching is CRATE-QUALIFIED, not by bare name: `wire_format_snapshots`
+# exists in BOTH talos-workflow-job-protocol and talos-memory, and a
+# name-only match would have reported the (ungated) talos-memory one as
+# covered by the job-protocol entry. That collision is what hid it.
+# Comments are stripped from both runner files first, so a binary
+# mentioned only in prose ("its eight ml_* siblings are NOT in this
+# list") does not count as gated.
+bold "▶ check 64: every tests/*.rs binary is named by a CI runner"
+
+CI_GATE_FAIL=0
+QUALITY_YML=".github/workflows/quality.yml"
+INTEGRATION_SH="scripts/test-integration.sh"
+
+if [ ! -f "$QUALITY_YML" ] || [ ! -f "$INTEGRATION_SH" ]; then
+    red "✗ check 64 cannot find its runner files ($QUALITY_YML / $INTEGRATION_SH)"
+    CI_GATE_FAIL=1
+else
+    # Strip full-line and trailing comments, then join backslash
+    # continuations so a multi-line `cargo nextest run -p X \ --test a \
+    # --test b` reads as one logical command.
+    strip_comments() {
+        sed -e 's/[[:space:]]#.*$//' -e 's/^[[:space:]]*#.*$//' "$1"
+    }
+
+    # Emit `crate:binary` (or `crate:*` for a whole-crate run) for every
+    # literal `cargo (test|nextest run)` invocation in a file. Lines whose
+    # package or test name is a SHELL VARIABLE (the `for ctest in …; do
+    # cargo test -p controller --test "$ctest"` loop bodies) are skipped —
+    # matching them would mark EVERY controller binary as gated, which is
+    # the exact false negative this check exists to prevent. Those loops'
+    # real contents come from the array parsers below.
+    cargo_gates() {
+        strip_comments "$1" \
+            | awk '{ l=$0; while (l ~ /\\$/) { sub(/\\$/,"",l); if ((getline n) > 0) l = l " " n; else break } print l }' \
+            | grep -E 'cargo (nextest run|test)' \
+            | while IFS= read -r line; do
+                crate="$(printf '%s\n' "$line" | grep -oE '(-p|--package) [A-Za-z0-9_-]+' | head -1 | awk '{print $2}')"
+                # No literal package (e.g. `--workspace`, or `-p "$crate"`).
+                [ -n "$crate" ] || continue
+                tests="$(printf '%s\n' "$line" | grep -oE '\--test [A-Za-z0-9_]+' | awk '{print $2}')"
+                if [ -n "$tests" ]; then
+                    printf '%s\n' "$tests" | sed "s#^#${crate}:#"
+                elif printf '%s\n' "$line" | grep -qE '\--test([[:space:]]|$)'; then
+                    # `--test "$var"` — variable-driven, contributes nothing.
+                    continue
+                elif ! printf '%s\n' "$line" | grep -qE '\--(lib|doc|bins?|examples?)([[:space:]]|$)'; then
+                    # Whole-crate invocation (e.g. `cargo test -p
+                    # talos-envelope-seal`) — covers every binary in it.
+                    printf '%s:*\n' "$crate"
+                fi
+            done
+    }
+
+    # --- (a) quality.yml + (b) test-integration.sh cargo invocations.
+    GATED="$(cargo_gates "$QUALITY_YML")
+$(cargo_gates "$INTEGRATION_SH")"
+    # TESTS=( "crate:binary:store" … )
+    GATED="$GATED
+$(
+        strip_comments "$INTEGRATION_SH" \
+            | sed -n '/^TESTS=(/,/^)/p' \
+            | grep -oE '"[A-Za-z0-9_-]+:[A-Za-z0-9_]+:[a-z]+"' \
+            | tr -d '"' | sed -E 's#:[a-z]+$##'
+)"
+    # CTRL_TESTS / TC_TESTS =( "binary" … ) — all controller binaries.
+    GATED="$GATED
+$(
+        strip_comments "$INTEGRATION_SH" \
+            | sed -n -e '/^CTRL_TESTS=(/,/^)/p' -e '/^TC_TESTS=(/,/^)/p' \
+            | grep -oE '"[A-Za-z0-9_]+"' \
+            | tr -d '"' | sed 's#^#controller:#'
+)"
+    GATED="$(printf '%s\n' "$GATED" | grep -v '^$' | sort -u)"
+
+    # --- (c) walk every crate's tests/ dir for depth-1 .rs binaries.
+    UNGATED_HITS=""
+    STALE_MARKERS=""
+    CI_GATE_SCANNED=0
+    while IFS= read -r tf; do
+        [ -n "$tf" ] || continue
+        CI_GATE_SCANNED=$((CI_GATE_SCANNED + 1))
+        bin="$(basename "$tf" .rs)"
+        crate_dir="$(dirname "$(dirname "$tf")")"
+        crate="$(grep -m1 -E '^name[[:space:]]*=' "$crate_dir/Cargo.toml" 2>/dev/null \
+                    | sed -E 's/^name[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
+        [ -n "$crate" ] || crate="$(basename "$crate_dir")"
+        marked=0
+        grep -qE '^[[:space:]]*(//|#)[[:space:]]*ci-ungated:' "$tf" && marked=1
+        if printf '%s\n' "$GATED" | grep -qxF -e "${crate}:${bin}" -e "${crate}:*"; then
+            if [ "$marked" = "1" ]; then
+                STALE_MARKERS="${STALE_MARKERS}  ${tf#./}  (crate ${crate})
+"
+            fi
+        elif [ "$marked" = "0" ]; then
+            UNGATED_HITS="${UNGATED_HITS}  ${tf#./}  → would need '${crate}:${bin}'
+"
+        fi
+    done <<< "$(find . -type d -name tests \
+                    -not -path './target/*' -not -path './vendor/*' \
+                    -not -path './frontend/*' -not -path '*/node_modules/*' \
+                    -not -path './.git/*' -not -path './.claude/*' \
+                    -exec sh -c 'ls -1 "$1"/*.rs 2>/dev/null' _ {} \; | sort)"
+
+    # A walk that scans nothing reports success. Fail loud instead (the
+    # check-63 lesson — an absolute walk rooted under an excluded path).
+    if [ "$CI_GATE_SCANNED" -lt 50 ]; then
+        red "✗ check 64 found only $CI_GATE_SCANNED tests/*.rs binaries — the walk is broken"
+        yellow "  → expected the whole workspace (~90). Fix the find, do not lower this."
+        CI_GATE_FAIL=1
+    fi
+    if [ -n "$UNGATED_HITS" ]; then
+        red "✗ integration-test binaries that NO CI runner names:"
+        printf '%s' "$UNGATED_HITS"
+        yellow "  → a tests/*.rs that no runner enumerates compiles at authoring time"
+        yellow "    and then runs NOWHERE. That is how 28 binaries — including the"
+        yellow "    only cross-tenant guard on the ml serving path — silently rotted"
+        yellow "    for seven weeks behind a docs claim of '100%, no exclusions'."
+        yellow "  → add it to CTRL_TESTS / TC_TESTS / TESTS in scripts/test-integration.sh"
+        yellow "    (needs a DB or a container) or to a 'cargo nextest run -p <crate>"
+        yellow "    --test <name>' step in .github/workflows/quality.yml (DB-free)."
+        yellow "  → if it genuinely cannot run in CI, say why in the file itself:"
+        yellow "    '// ci-ungated: <reason>'. Do NOT gate a test that early-returns"
+        yellow "    without a provider — a green check over zero assertions is worse"
+        yellow "    than an honest exclusion."
+        CI_GATE_FAIL=1
+    fi
+    if [ -n "$STALE_MARKERS" ]; then
+        red "✗ '// ci-ungated:' marker on a binary that IS gated (stale claim):"
+        printf '%s' "$STALE_MARKERS"
+        yellow "  → the marker says CI cannot run this; a runner says it does. Delete"
+        yellow "    the marker, or remove the runner entry — leaving both is the same"
+        yellow "    misleading-comment class this check exists to end."
+        CI_GATE_FAIL=1
+    fi
+    if [ "$CI_GATE_FAIL" -eq 0 ]; then
+        green "✓ all $CI_GATE_SCANNED tests/*.rs binaries are gated or explicitly marked ci-ungated"
+    fi
+fi
+
+if [ "$CI_GATE_FAIL" = "1" ]; then
+    EXIT_CODE=1
+fi
+echo
+
 # ── 54. Lint self-consistency (meta-check) ────────────────────────────
 # The system whose purpose is catching drift drifted from its own docs:
 # by 2026-07-01 the script had 49 checks while CLAUDE.md said 43 and the

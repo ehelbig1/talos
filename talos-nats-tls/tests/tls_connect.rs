@@ -14,6 +14,10 @@
 //! `NATS_CA_FILE` → adds the root cert + `require_tls`), connect over the
 //! `tls://` URL, and round-trip a message.
 
+// ci-ungated: `#[ignore]`d and needs a REAL TLS-terminating nats-server plus a
+// CA file on disk (NATS_TEST_URL / NATS_CA_FILE). `make test-integration`'s
+// disposable NATS is plaintext, so there is nothing here for CI to connect to.
+
 use async_nats::ConnectOptions;
 use futures::StreamExt;
 

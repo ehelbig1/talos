@@ -4,7 +4,9 @@
 // SecretsManager pool must stay bound to a live tokio runtime — so the single
 // hook-registering test here keeps that pool alive for the whole test (the
 // cross-runtime-pool trap that bites a second hook test in the same binary).
-// Env-gated (runs in quality.yml).
+// Runs in CI via `scripts/test-integration.sh` (TC_TESTS) — testcontainers, not
+// DATABASE_URL. (The previous "Env-gated (runs in quality.yml)" claim was false:
+// no runner named this binary until 2026-07-30.)
 
 mod test_helpers;
 
