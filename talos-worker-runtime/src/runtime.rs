@@ -1202,20 +1202,45 @@ pub(crate) fn first_open_circuit_host_in<'a>(
 }
 
 /// Render the ` [reason_class=…]` suffix for a node-failure message, or the
-/// empty string when the module's most recent host-side HTTP outcome was not
-/// a failure.
+/// empty string when there is nothing for the marker to explain.
 ///
-/// Free function (not a closure) so the "empty unless a failure is latched"
-/// rule is unit-testable — a mutation that always emits a suffix would
-/// silently start attributing a stale class to unrelated failures.
+/// TWO conditions, both required — the second is the bound on the latch:
+///
+/// 1. A host-side HTTP failure is latched (`TalosContext::last_network_reason`
+///    is `Some`; a later successful `fetch` clears it).
+/// 2. **`guest_error` actually carries the opaque `networkerror` token.** The
+///    marker exists for exactly one job: to say WHICH of the eight causes hid
+///    behind the payload-less WIT discriminant. Any other failure text needs
+///    no explanation and must not receive one.
+///
+/// Condition 2 closes a real mis-attribution: the latch is set on failure and
+/// cleared on `fetch` SUCCESS, but nothing else clears it — not `fetch_all`,
+/// not `graphql`, not `webhook`, not the `llm::*` client, none of which touch
+/// it. So a module that swallowed a failed fetch and then failed for an
+/// unrelated reason would inherit the stale class, and the controller's
+/// `classify_error` checks its `network_transient` bucket BEFORE
+/// `auth_failure` — meaning `"401 Unauthorized [reason_class=dns]"` would
+/// classify transient and retry a permanent auth error forever. Gating on the
+/// token means a message with no `networkerror` in it classifies exactly as it
+/// did before this change.
+///
+/// Free function (not a closure) so both rules are unit-testable — a mutation
+/// that always emits a suffix must fail a test, not ship.
 pub(crate) fn last_network_reason_suffix(
     latch: &std::sync::Arc<std::sync::Mutex<Option<&'static str>>>,
+    guest_error: &str,
 ) -> String {
     let guard = latch.lock().unwrap_or_else(|e| e.into_inner());
-    match *guard {
-        Some(class) => format!(" {}", crate::reason_class::marker(class)),
-        None => String::new(),
+    let Some(class) = *guard else {
+        return String::new();
+    };
+    // Cheap containment check on the WIT enum's rendered name. The generated
+    // bindings render `Error { code: 2, name: "networkerror", message: "" }`;
+    // a `{:?}` of the enum renders `Networkerror`. Lowercase covers both.
+    if !guest_error.to_lowercase().contains("networkerror") {
+        return String::new();
     }
+    format!(" {}", crate::reason_class::marker(class))
 }
 
 /// The `execution_id` a pipeline step stamps on its `wasm.log.*` entries.
@@ -3406,10 +3431,13 @@ impl TalosRuntime {
                 // hand-written `retry_condition`, something to key on.
                 //
                 // Only present when the module's MOST RECENT host-side HTTP
-                // outcome was a failure (a later success clears the latch),
-                // so the marker never attributes a recovered blip to an
-                // unrelated failure.
-                let reason_suffix = last_network_reason_suffix(&net_reason_arc);
+                // outcome was a failure (a later success clears the latch)
+                // AND the guest error actually carries the opaque
+                // `networkerror` token the class exists to explain — see
+                // `last_network_reason_suffix` for why the second condition
+                // is what bounds a stale latch.
+                let err_text = e.to_string();
+                let reason_suffix = last_network_reason_suffix(&net_reason_arc, &err_text);
                 return Err(anyhow::anyhow!(
                     "Component returned error: {}{}",
                     e,
@@ -4098,11 +4126,12 @@ impl TalosRuntime {
             let output_str = match output_result {
                 Ok(s) => s,
                 Err(e) => {
+                    let err_text = e.to_string();
                     anyhow::bail!(
                         "Pipeline step '{}' returned error: {}{}",
                         step.module_id,
-                        e,
-                        last_network_reason_suffix(&step_net_reason)
+                        err_text,
+                        last_network_reason_suffix(&step_net_reason, &err_text)
                     );
                 }
             };
@@ -4885,13 +4914,15 @@ mod pipeline_step_retry_tests {
         }
     }
 
+    const WIT_NETWORKERROR: &str = r#"Component returned error: list fetch: Error { code: 2, name: "networkerror", message: "" }"#;
+
     #[test]
     fn suffix_is_empty_when_no_failure_is_latched() {
         use std::sync::{Arc, Mutex};
         // Mutation guard: a version that always emits a marker would start
         // attributing a stale class to unrelated failures.
         let latch: Arc<Mutex<Option<&'static str>>> = Arc::new(Mutex::new(None));
-        assert_eq!(last_network_reason_suffix(&latch), "");
+        assert_eq!(last_network_reason_suffix(&latch, WIT_NETWORKERROR), "");
     }
 
     #[test]
@@ -4899,9 +4930,113 @@ mod pipeline_step_retry_tests {
         use crate::reason_class;
         use std::sync::{Arc, Mutex};
         let latch: Arc<Mutex<Option<&'static str>>> = Arc::new(Mutex::new(Some(reason_class::DNS)));
-        assert_eq!(last_network_reason_suffix(&latch), " [reason_class=dns]");
+        assert_eq!(
+            last_network_reason_suffix(&latch, WIT_NETWORKERROR),
+            " [reason_class=dns]"
+        );
         // A hand-written `retry_condition` must be able to grep the token.
-        assert!(last_network_reason_suffix(&latch).contains("dns"));
+        assert!(last_network_reason_suffix(&latch, WIT_NETWORKERROR).contains("dns"));
+    }
+
+    /// THE STALE-LATCH BOUND. The latch is set on failure and cleared on
+    /// `fetch` success — but NOTHING else clears it (`fetch_all`, `graphql`,
+    /// `webhook` and the `llm::*` client never touch it). So a module that
+    /// swallowed a failed fetch and then failed for an unrelated reason would
+    /// inherit the stale class. That matters because the controller's
+    /// `classify_error` checks its `network_transient` bucket BEFORE
+    /// `auth_failure`: `"401 Unauthorized [reason_class=dns]"` classifies
+    /// TRANSIENT and retries a permanent auth error to exhaustion.
+    ///
+    /// The marker is therefore emitted only when the guest error carries the
+    /// opaque token the class exists to explain. Any other failure text
+    /// classifies exactly as it did before this change.
+    #[test]
+    fn stale_latch_cannot_retag_an_unrelated_failure() {
+        use crate::reason_class;
+        use std::sync::{Arc, Mutex};
+        let latch: Arc<Mutex<Option<&'static str>>> = Arc::new(Mutex::new(Some(reason_class::DNS)));
+        for unrelated in [
+            "Component returned error: 401 Unauthorized",
+            "Component returned error: invalid JSON at line 3",
+            "Component returned error: 404 Not Found",
+            "Pipeline step 'x' returned error: business rule violated",
+        ] {
+            assert_eq!(
+                last_network_reason_suffix(&latch, unrelated),
+                "",
+                "a stale class must not be attached to: {unrelated}"
+            );
+        }
+        // …and the latched class still reaches the message it DOES explain.
+        assert_eq!(
+            last_network_reason_suffix(&latch, WIT_NETWORKERROR),
+            " [reason_class=dns]"
+        );
+    }
+
+    /// THE 2026-07-23 REGRESSION CASE, end to end through the production
+    /// functions — no hand-written failure strings standing in for the ones
+    /// the code actually produces.
+    ///
+    /// That day 126 outbound calls were refused by an actor's local-egress-only
+    /// gate. Making the bare `networkerror` token transient (D1) would re-run
+    /// every one of them against a policy decision that is identical on the
+    /// next attempt. This chains the four production steps that prevent it:
+    ///
+    /// 1. The gate denies by handing hyper an EMPTY address list, which
+    ///    hyper-util reports as `ConnectError("tcp connect error", io::Error
+    ///    { kind: NotConnected, "Network unreachable" })` — see
+    ///    `hyper-util/src/client/legacy/connect/http.rs`. That shape
+    ///    classifies `connect-failed` (NOT `connect-refused`: the errno is
+    ///    NotConnected, and NOT `tls`: no TLS frame in the chain).
+    /// 2. Under `local_egress_only` a connect-class failure is attributable to
+    ///    the gate, so the host site emits `tier1-egress`.
+    /// 3. The class reaches the node-failure message as `[reason_class=…]`.
+    /// 4. Both transient gates read it as NON-transient — this one directly,
+    ///    and `talos_retry_intelligence::classify_error` via its
+    ///    `capability_denied` bucket (pinned in that crate's
+    ///    `every_reason_class_token_maps_to_the_right_bucket`).
+    #[test]
+    fn local_egress_denials_are_never_retried_end_to_end() {
+        use crate::reason_class as rc;
+        use std::sync::{Arc, Mutex};
+
+        // 1. The real hyper-util shape for "resolver returned no addresses".
+        let class = rc::classify_transport_detail_with_kind(
+            "client error (connect) tcp connect error network unreachable",
+            true,
+            Some(std::io::ErrorKind::NotConnected),
+        );
+        assert_eq!(
+            class,
+            rc::CONNECT_FAILED,
+            "empty-address-list connect shape"
+        );
+
+        // 2. Attributable to the gate — and NOT attributable when the same
+        //    failure happens under an actor that permits public egress
+        //    (Tier1 + egress_scope=Public), which must stay retryable.
+        assert!(rc::is_local_egress_attributable(class, true));
+        assert!(!rc::is_local_egress_attributable(class, false));
+
+        // 3. The host site emits TIER1_EGRESS; the guest still sees only the
+        //    payload-less discriminant, so the marker is what carries it.
+        let latch: Arc<Mutex<Option<&'static str>>> = Arc::new(Mutex::new(Some(rc::TIER1_EGRESS)));
+        let guest = r#"Component returned error: list fetch: Error { code: 2, name: "networkerror", message: "" }"#;
+        let suffix = last_network_reason_suffix(&latch, guest);
+        assert_eq!(suffix, " [reason_class=tier1-egress]");
+
+        // 4. NOT retried, even though the message contains "networkerror".
+        let full = format!("{guest}{suffix}");
+        assert!(full.contains("networkerror"), "test premise");
+        assert!(
+            !is_transient_error_text(&full),
+            "a local-egress deny must never be retried: {full}"
+        );
+        // Control: the SAME transport failure without the gate keeps the
+        // retries D1 restores.
+        let retryable = format!("{guest} {}", rc::marker(rc::CONNECT_FAILED));
+        assert!(is_transient_error_text(&retryable));
     }
 
     /// The controller's `wasm.log.*` subscriber parses this field with

@@ -731,6 +731,31 @@ mod tests {
         }
     }
 
+    /// WHY THE WORKER GATES THE MARKER, pinned here because the hazard lives
+    /// in THIS function's bucket ORDER, not in the worker.
+    ///
+    /// `network_transient` is checked before `auth_failure` (and before
+    /// `rate_limit`), so ANY message carrying a `reason_class` transport token
+    /// classifies transient regardless of what else it says. A `401` that
+    /// picked up a stale `[reason_class=dns]` would therefore be retried to
+    /// exhaustion — a permanent error treated as a blip.
+    ///
+    /// The producer side is what prevents it: the worker attaches the marker
+    /// ONLY when the guest error carries the opaque `networkerror` token the
+    /// class exists to explain (`last_network_reason_suffix`). This test
+    /// documents the sharp edge so nobody "simplifies" that gate away, and
+    /// fails loudly if the bucket order is ever changed underneath it.
+    #[test]
+    fn transport_marker_outranks_auth_so_the_producer_must_gate_it() {
+        assert_eq!(classify_error("HTTP 401 Unauthorized"), "auth_failure");
+        assert_eq!(
+            classify_error("HTTP 401 Unauthorized [reason_class=dns]"),
+            "network_transient",
+            "bucket order makes a stray transport marker outrank auth — the \
+             worker MUST NOT attach one to a non-networkerror message"
+        );
+    }
+
     /// The pre-existing suffixed forms must keep classifying exactly as
     /// before — the broadening adds a token, it must not reroute anything.
     #[test]

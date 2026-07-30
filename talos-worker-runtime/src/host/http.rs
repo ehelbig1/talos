@@ -605,15 +605,19 @@ impl wit_http::Host for TalosContext {
                 // this, `e` was consumed for two booleans and dropped, so the
                 // connect/TLS/reset path logged NOTHING AT ALL and the true
                 // cause of a `networkerror` was unrecoverable after the fact.
-                // Bounded by construction: at most one line per failed HTTP
-                // call, and HTTP calls are already capped per execution
-                // (MAX_HTTP_CALLS_PER_EXECUTION) and per host (M-6).
-                tracing::warn!(
-                    module_id = ?self.module_id,
-                    host = %host_str,
-                    detail = %reason_class::sanitized_transport_detail(&e),
-                    "outbound HTTP request failed (sanitized transport detail)"
-                );
+                // Bounded: one line per failed HTTP call, and gated on the
+                // SAME per-execution `HOST_DIAG_CAP` (100) the diagnostic
+                // channel spends — otherwise this would be a second, uncapped
+                // stream bounded only by MAX_HTTP_CALLS_PER_EXECUTION (1000)
+                // × the sanitizer's 2000-char truncation.
+                if self.host_diag_budget_remaining() {
+                    tracing::warn!(
+                        module_id = ?self.module_id,
+                        host = %host_str,
+                        detail = %reason_class::sanitized_transport_detail(&e),
+                        "outbound HTTP request failed (sanitized transport detail)"
+                    );
+                }
                 if e.is_timeout() {
                     self.emit_network_failure(
                         reason_class::TIMEOUT,
@@ -629,25 +633,42 @@ impl wit_http::Host for TalosContext {
                 // actor was reported as an egress-policy deny, sending the
                 // operator to change the actor's tier over a broken cert.
                 let class = reason_class::classify_reqwest_send_error(&e);
-                if matches!(
-                    class,
-                    reason_class::CONNECT_REFUSED | reason_class::CONNECT_FAILED
-                ) && self.max_llm_tier == talos_workflow_job_protocol::LlmTier::Tier1
-                {
-                    // A Tier-1 (local-egress-only) actor's SsrfFilteringResolver
-                    // drops every public IP, so a connect failure to a
-                    // non-loopback host is almost always the data-egress gate
-                    // — NOT the host being down. Say so with the fix, since the
-                    // resolver itself (a reqwest dns::Resolve impl) has no
-                    // TalosContext to emit from. Loopback/private targets still
-                    // connect under Tier-1 (local Ollama), so those failures
+                // The gate keys on `local_egress_only` — the value the
+                // resolver in THIS context's `http_client` was actually built
+                // with — never on `max_llm_tier == Tier1`. Since the
+                // 2026-07-23 `egress_scope` split the two disagree in both
+                // directions, and both mistakes are load-bearing now that the
+                // class drives retry classification:
+                //   * `Tier1 + egress_scope=Public` (the house pattern for a
+                //     Gmail-reading privacy actor) permits public egress, so a
+                //     connect failure there is an ORDINARY transport failure.
+                //     Tagging it `tier1-egress` makes it `capability_denied`
+                //     and vetoes exactly the retries D1 restores — the whole
+                //     defect, re-introduced for the flagship actor shape.
+                //   * `Tier2 + egress_scope=Local` denies public egress, so
+                //     its connect failures ARE the gate and must not retry;
+                //     keying on the tier left them classed `connect-failed`
+                //     (transient) and retried against a deny that cannot
+                //     change between attempts.
+                if reason_class::is_local_egress_attributable(class, self.local_egress_only) {
+                    // A local-egress-only actor's SsrfFilteringResolver drops
+                    // every public IP, leaving hyper an EMPTY address list —
+                    // which surfaces as `tcp connect error: Network
+                    // unreachable`, i.e. exactly this class. So a connect
+                    // failure to a non-loopback host is almost always the
+                    // data-egress gate, NOT the host being down. Say so with
+                    // the fix, since the resolver itself (a reqwest
+                    // dns::Resolve impl) has no TalosContext to emit from.
+                    // Loopback/private targets still connect under
+                    // local-egress-only (local Ollama), so those failures
                     // produce the generic reason below.
                     self.emit_network_failure(
                         reason_class::TIER1_EGRESS,
                         &format!(
-                            "'{host_str}' was blocked by this workflow's Tier-1 actor \
+                            "'{host_str}' was blocked by this workflow's actor \
                              (local-egress-only — data must not leave the host). To reach \
-                             an external API, bind the workflow to a Tier-2 actor."
+                             an external API, set the actor's egress_scope to 'public' \
+                             (set_actor_egress_scope) or bind a Tier-2 actor."
                         ),
                     )
                     .await;
@@ -766,13 +787,16 @@ impl wit_http::Host for TalosContext {
                 Err(e) => {
                     // Same D3 treatment as the send path: the raw error is
                     // logged sanitized host-side and never crosses to the
-                    // guest. One line per failed body read.
-                    tracing::warn!(
-                        module_id = ?self.module_id,
-                        host = %host_str,
-                        detail = %reason_class::sanitized_transport_detail(&e),
-                        "HTTP response body stream failed (sanitized transport detail)"
-                    );
+                    // guest. One line per failed body read, under the same
+                    // per-execution HOST_DIAG_CAP budget.
+                    if self.host_diag_budget_remaining() {
+                        tracing::warn!(
+                            module_id = ?self.module_id,
+                            host = %host_str,
+                            detail = %reason_class::sanitized_transport_detail(&e),
+                            "HTTP response body stream failed (sanitized transport detail)"
+                        );
+                    }
                     self.emit_network_failure(
                         reason_class::RESPONSE_STREAM,
                         &format!(
@@ -1405,21 +1429,34 @@ impl wit_http::Host for TalosContext {
         // Per-failure diagnostics for DISPATCH failures. Validation
         // failures (request_hosts[i] == None) were already diagnosed at
         // validation time; capped globally by HOST_DIAG_CAP.
-        let tier1 = self.max_llm_tier == talos_workflow_job_protocol::LlmTier::Tier1;
+        // Same predicate as the single-fetch path: the posture the resolver
+        // was actually built with, NOT `max_llm_tier == Tier1`. See
+        // `TalosContext::local_egress_only`.
+        let egress_gated = self.local_egress_only;
         for (idx, r) in &indexed {
             if let Err(e) = r {
                 if let Some(Some(host)) = request_hosts.get(*idx) {
-                    // A Networkerror under a Tier-1 actor is almost always the
-                    // local-egress-only gate (same reasoning as the single-fetch
+                    // A Networkerror under a local-egress-only actor is almost
+                    // always that gate (same reasoning as the single-fetch
                     // path); surface the actionable reason instead of the
                     // ambiguous connection/reset class.
-                    if tier1 && matches!(e, wit_http::Error::Networkerror) {
-                        self.emit_host_diagnostic(
-                            "tier1-egress-blocked",
+                    //
+                    // `emit_network_failure` (not the bare diagnostic) so the
+                    // class also reaches the retry gates. `fetch_all` does not
+                    // otherwise participate in the reason latch — its send
+                    // path runs inside a moved future with no `self` — but the
+                    // egress deny is the one class where getting it wrong is a
+                    // CORRECTNESS bug rather than a diagnostic one: without
+                    // the marker the batch's bare `networkerror` is now
+                    // transient by default and a deny that cannot change
+                    // between attempts would burn the retry budget.
+                    if egress_gated && matches!(e, wit_http::Error::Networkerror) {
+                        self.emit_network_failure(
+                            reason_class::TIER1_EGRESS,
                             &format!(
-                                "fetch_all[{idx}]: '{host}' blocked by this workflow's Tier-1 \
-                                 actor (local-egress-only). Bind a Tier-2 actor to reach \
-                                 external APIs."
+                                "fetch_all[{idx}]: '{host}' blocked by this workflow's actor \
+                                 (local-egress-only). Set the actor's egress_scope to \
+                                 'public' or bind a Tier-2 actor to reach external APIs."
                             ),
                         )
                         .await;

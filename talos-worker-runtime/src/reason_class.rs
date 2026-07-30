@@ -128,6 +128,22 @@ pub fn marker(class: &str) -> String {
     format!("[reason_class={class}]")
 }
 
+/// Should a connect-phase failure be attributed to the blanket
+/// local-egress-only SSRF gate rather than to the network?
+///
+/// `local_egress_only` MUST be the posture the context's own HTTP client was
+/// built with (`TalosContext::local_egress_only`) — never `max_llm_tier ==
+/// Tier1`, which disagrees with it in both directions since the `egress_scope`
+/// split. Pure so the matrix is testable without building a context.
+///
+/// Only the two CONNECT classes qualify: under local-egress-only the resolver
+/// hands hyper an EMPTY address list, which surfaces as a connect-phase
+/// failure. A TLS alert or a post-connect reset means the connection was
+/// permitted and actually reached a peer, so it is not the gate.
+pub(crate) fn is_local_egress_attributable(class: &str, local_egress_only: bool) -> bool {
+    local_egress_only && matches!(class, CONNECT_REFUSED | CONNECT_FAILED)
+}
+
 /// Lowercased markers found in a `reqwest` error's **source chain** that
 /// indicate a TLS-layer failure rather than a transport-layer one.
 const TLS_MARKERS: &[&str] = &[
@@ -161,7 +177,38 @@ const REFUSED_MARKERS: &[&str] = &["connection refused", "econnrefused"];
 /// `is_connect() == true` — the misreport this function exists to fix.
 pub fn classify_reqwest_send_error(e: &reqwest::Error) -> &'static str {
     let detail = source_chain_detail(e);
-    classify_transport_detail(&detail, e.is_connect())
+    classify_transport_detail_with_kind(&detail, e.is_connect(), source_chain_io_kind(e))
+}
+
+/// The `std::io::ErrorKind` of the first `std::io::Error` in the source chain,
+/// if any.
+///
+/// This is the AUTHORITATIVE refusal signal. `hyper_util`'s `ConnectError`
+/// wraps the raw `std::io::Error` from `connect(2)`, and `ErrorKind` is
+/// derived from the errno — unlike the error's `Display`, which comes from
+/// `strerror_r` and is therefore locale-dependent (a non-C `LC_MESSAGES` in
+/// the worker image renders `ECONNREFUSED` in the operator's language, and the
+/// `"connection refused"` substring silently stops matching). The substring
+/// pass stays as a fallback for chains that stringify the io error instead of
+/// nesting it.
+fn source_chain_io_kind(e: &reqwest::Error) -> Option<std::io::ErrorKind> {
+    let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    for _ in 0..16 {
+        let cur = src?;
+        if let Some(io) = cur.downcast_ref::<std::io::Error>() {
+            return Some(io.kind());
+        }
+        src = cur.source();
+    }
+    None
+}
+
+/// Test shorthand for [`classify_transport_detail_with_kind`] with no
+/// downcastable `io::Error` in the chain — i.e. the substring fallback path.
+/// Production always has the real error object and so always passes a kind.
+#[cfg(test)]
+pub(crate) fn classify_transport_detail(detail: &str, is_connect: bool) -> &'static str {
+    classify_transport_detail_with_kind(detail, is_connect, None)
 }
 
 /// Pure core of [`classify_reqwest_send_error`], split out so the mapping is
@@ -170,12 +217,24 @@ pub fn classify_reqwest_send_error(e: &reqwest::Error) -> &'static str {
 ///
 /// `detail` must already be lowercased and must contain ONLY source-chain
 /// text — see the caller's doc-comment for why request-derived text is barred.
-pub(crate) fn classify_transport_detail(detail: &str, is_connect: bool) -> &'static str {
+///
+/// `io_kind` is the authoritative refusal signal (errno-derived, therefore
+/// locale-independent); the `REFUSED_MARKERS` substring pass is only consulted
+/// when no `io::Error` was found to downcast.
+pub(crate) fn classify_transport_detail_with_kind(
+    detail: &str,
+    is_connect: bool,
+    io_kind: Option<std::io::ErrorKind>,
+) -> &'static str {
     if TLS_MARKERS.iter().any(|m| detail.contains(m)) {
         return TLS;
     }
     if is_connect {
-        if REFUSED_MARKERS.iter().any(|m| detail.contains(m)) {
+        let refused = match io_kind {
+            Some(k) => k == std::io::ErrorKind::ConnectionRefused,
+            None => REFUSED_MARKERS.iter().any(|m| detail.contains(m)),
+        };
+        if refused {
             return CONNECT_REFUSED;
         }
         return CONNECT_FAILED;
@@ -277,6 +336,64 @@ mod tests {
                 CONNECT_FAILED,
                 "detail: {detail}"
             );
+        }
+    }
+
+    /// The refusal signal must come from the errno, not from `strerror`'s
+    /// locale-dependent prose. A worker image with a non-C `LC_MESSAGES`
+    /// renders `ECONNREFUSED` in the operator's language, and a substring-only
+    /// detector silently degrades every refusal to `connect-failed` — the
+    /// token claiming a precision the code no longer has.
+    #[test]
+    fn io_error_kind_beats_locale_dependent_error_text() {
+        use std::io::ErrorKind;
+        // Localized text, no English marker — the errno still decides.
+        assert_eq!(
+            classify_transport_detail_with_kind(
+                "tcp connect error: verbindungsaufbau abgelehnt",
+                true,
+                Some(ErrorKind::ConnectionRefused),
+            ),
+            CONNECT_REFUSED
+        );
+        // And the converse: hyper's EMPTY-address-list error (what a
+        // local-egress-only resolver produces) is NotConnected, so it must
+        // NOT be called a refusal even if some other frame said "refused".
+        assert_eq!(
+            classify_transport_detail_with_kind(
+                "tcp connect error: connection refused",
+                true,
+                Some(ErrorKind::NotConnected),
+            ),
+            CONNECT_FAILED
+        );
+        // No io error to downcast → substring fallback still works.
+        assert_eq!(
+            classify_transport_detail_with_kind(
+                "tcp connect error: connection refused",
+                true,
+                None
+            ),
+            CONNECT_REFUSED
+        );
+    }
+
+    /// The egress-attribution predicate. Keyed on the resolver's OWN posture,
+    /// not on the LLM tier — the two disagree in both directions.
+    #[test]
+    fn egress_attribution_keys_on_the_resolver_posture_only() {
+        // Tier1 + egress_scope=Public (the house pattern) → public egress is
+        // PERMITTED, so a connect failure is an ordinary transport failure and
+        // must stay retryable.
+        assert!(!is_local_egress_attributable(CONNECT_FAILED, false));
+        assert!(!is_local_egress_attributable(CONNECT_REFUSED, false));
+        // Tier2 + egress_scope=Local → the gate IS the cause.
+        assert!(is_local_egress_attributable(CONNECT_FAILED, true));
+        assert!(is_local_egress_attributable(CONNECT_REFUSED, true));
+        // A TLS alert or a post-connect reset means a peer was reached, so the
+        // blanket gate cannot be the explanation even under local-egress-only.
+        for c in [TLS, SEND_FAILED, RESPONSE_STREAM, TIMEOUT] {
+            assert!(!is_local_egress_attributable(c, true), "class {c}");
         }
     }
 
@@ -392,6 +509,68 @@ mod tests {
         assert!(out.contains("[INTERNAL_IP]"));
         // The useful part survives.
         assert!(out.contains("tcp connect error"));
+    }
+
+    /// END-TO-END against a REAL `reqwest::Error`, not a hand-built string.
+    ///
+    /// The two claims this PR makes about the send path are only worth as much
+    /// as the real error object supports, and `reqwest::Error`'s inner `Kind`
+    /// is private so no unit test can forge one. Here we produce a genuine one
+    /// — connect to a loopback port nothing is listening on, with a canary
+    /// access token in the query string — and assert both claims at once:
+    ///
+    /// 1. **No leak.** The full URL (reqwest's `Display` appends
+    ///    ` for url (…)` verbatim, query string included) is erased BEFORE
+    ///    truncation, so neither the token, the query parameter name, the
+    ///    path, nor the loopback IP survives into the worker log.
+    /// 2. **Honest class.** The real source chain classifies `connect-refused`
+    ///    via the errno, exercising the `io::ErrorKind` downcast rather than
+    ///    the locale-dependent substring fallback.
+    ///
+    /// Hermetic: loopback only, no external network, no listener.
+    #[tokio::test]
+    async fn real_reqwest_error_is_classified_and_never_leaks_its_url() {
+        // Bind then drop to obtain a port that is (almost certainly) free, so
+        // connect() gets a prompt ECONNREFUSED instead of hanging.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            l.local_addr().expect("addr").port()
+        };
+        let url =
+            format!("http://127.0.0.1:{port}/v1/messages?access_token=sk-canary-000111222333");
+        let err = reqwest::Client::builder()
+            // Explicit per lint check 32 — the connect never succeeds here, but
+            // the rule is "no client without a stated redirect posture".
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("client")
+            .get(&url)
+            .send()
+            .await
+            .expect_err("connect to a closed loopback port must fail");
+
+        // Premise: the raw error really does carry the secret-bearing URL —
+        // if reqwest ever stops doing this the test still holds, but the
+        // assertion below would be vacuous, so state it.
+        let raw = err.to_string();
+        assert!(
+            raw.contains("sk-canary-000111222333") || !raw.contains("127.0.0.1"),
+            "premise check: raw reqwest Display was {raw:?}"
+        );
+
+        let out = sanitized_transport_detail(&err);
+        assert!(
+            !out.contains("sk-canary-000111222333"),
+            "secret leaked: {out}"
+        );
+        assert!(!out.contains("access_token"), "query param leaked: {out}");
+        assert!(!out.contains("/v1/messages"), "url path leaked: {out}");
+        assert!(!out.contains("127.0.0.1"), "loopback IP leaked: {out}");
+        assert!(!out.contains(&port.to_string()), "port leaked: {out}");
+
+        // And the class is the honest one, derived from the errno.
+        assert_eq!(classify_reqwest_send_error(&err), CONNECT_REFUSED);
     }
 
     #[test]
