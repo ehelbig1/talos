@@ -14,9 +14,9 @@
 //!      ones, plus schedule health.
 //!   2. **Learned** — counts of what the loops PRODUCED (memory writes by
 //!      `metadata.kind`, per-actor rank-weight fits) alongside ML loop health.
-//!   3. **Needs me** — a UNIFIED decision inbox merging the four silos: pending
-//!      approvals, ops-alert corrections, autonomous failures, and the active
-//!      ops-alert backlog.
+//!   3. **Needs me** — a UNIFIED decision inbox merging the previously-siloed
+//!      sources: pending approvals, ops-alert corrections, parked ML lifecycle
+//!      decisions, autonomous failures, and the active ops-alert backlog.
 //!
 //! ## Tenancy
 //! Every query is scoped by the `user_id` the caller passes in (the execution's
@@ -236,7 +236,7 @@ impl OperatorDigestService {
         })
     }
 
-    /// Panel 3 — the UNIFIED operator-decision inbox: the four previously-siloed
+    /// Panel 3 — the UNIFIED operator-decision inbox: the previously-siloed
     /// "needs a human" sources in one place, with a single `total` so the email
     /// subject can say "3 things need you."
     async fn needs_me_panel(&self, user_id: Uuid, days: i32) -> JsonValue {
@@ -312,12 +312,60 @@ impl OperatorDigestService {
             .map(|(_, _, _, failed)| failed)
             .sum();
 
-        let total = approvals.len() as i64 + corrections.len() as i64 + autonomous_failures;
+        // ML lifecycle decisions the platform has parked (2026-07-30). Until
+        // now this panel had NO ML entry while the evaluator's
+        // `ml_lifecycle_policy_satisfied` event had zero consumers repo-wide —
+        // a model could clear its gate, or drift five days past its last
+        // verdict, and nothing said so. One statement, capped at
+        // `MAX_PENDING_ML_DECISIONS`, at most one item per model.
+        let ml_decisions = talos_ml::pending_ml_decisions(
+            &self.pool,
+            user_id,
+            talos_ml::MAX_PENDING_ML_DECISIONS,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(%user_id, error = %e, "operator_digest: ml pending decisions failed");
+            Vec::new()
+        })
+        .into_iter()
+        .map(|d| {
+            json!({
+                "model": d.model,
+                "lifecycle_state": d.lifecycle_state,
+                "kind": d.kind.as_str(),
+                // WHICH version the stored verdict judged, and when — the
+                // numbers beside it in the `learned` panel are usually a
+                // DIFFERENT version's.
+                "verdict_version": d.verdict_version,
+                "verdict_measured_at": d.verdict_measured_at,
+                // null = no readable verdict; never coerced to false.
+                "verdict_satisfied": d.verdict_satisfied,
+                // evaluate_policy's own strings, unedited.
+                "unmet": d.unmet,
+                "latest_version": d.latest_version,
+                "examples_since_verdict": d.examples_since_verdict,
+                "auto_advance": d.auto_advance,
+                "next_action": d.next_action(),
+                "why_listed": d.why_listed(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+        // Every summand is a COUNT OF LISTED ITEMS except autonomous_failures,
+        // which is a count of failed executions (the list itself lives in the
+        // "Ran" panel). Adding the ML items keeps that shape: one parked
+        // decision, one unit of "needs me".
+        let total = approvals.len() as i64
+            + corrections.len() as i64
+            + ml_decisions.len() as i64
+            + autonomous_failures;
 
         json!({
             "total": total,
             "pending_approvals": approvals,
             "ops_alert_corrections": corrections,
+            "ml_decisions": ml_decisions,
             "autonomous_failures": autonomous_failures,
             "ops_backlog": ops_backlog,
         })
@@ -822,20 +870,60 @@ pub fn annotate_correction_loop(ml: &mut JsonValue) {
             .and_then(|g| g.get("measured_at"))
             .and_then(JsonValue::as_str)
             .map(str::to_string);
+        // WHICH version this verdict judges. `gold` is the LATEST evaluated
+        // version's slice, which is routinely NOT `promoted_version` — the
+        // label rendered unqualified beside `promoted_version: 19` while being
+        // computed from v44.
+        let subject_version = m
+            .get("gold")
+            .and_then(|g| g.get("source_version"))
+            .and_then(JsonValue::as_i64);
+        // The platform's OWN stored blocking reasons, if any version of this
+        // model has ever been judged. `loop_health` copies these verbatim out
+        // of `metrics_json.policy_decision`; they are `evaluate_policy`'s
+        // strings ("min_corrections_per_class: 'follow_up' has 1 < 3"), which
+        // is a strictly more actionable sentence than "keep correcting".
+        let verdict = m.get("policy_verdict").cloned();
+        let unmet: Vec<String> = verdict
+            .as_ref()
+            .and_then(|v| v.get("unmet"))
+            .and_then(JsonValue::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let verdict_version = verdict
+            .as_ref()
+            .and_then(|v| v.get("source_version"))
+            .and_then(JsonValue::as_i64);
+        let versions_since = verdict
+            .as_ref()
+            .and_then(|v| v.get("versions_since_verdict"))
+            .and_then(JsonValue::as_i64);
+
         let Some(state) = correction_loop_state(banked, gold_acc, gold_total) else {
             continue;
         };
         let ci = gold_acc
             .zip(gold_total)
             .and_then(|(a, n)| wilson_interval_95(a, n));
+        let composed = correction_loop_note_for(
+            state,
+            subject_version,
+            &unmet,
+            verdict_version,
+            versions_since,
+        );
         let Some(obj) = m.as_object_mut() else {
             continue;
         };
         obj.insert("correction_loop".into(), json!(state));
-        obj.insert(
-            "correction_loop_note".into(),
-            json!(correction_loop_note(state)),
-        );
+        // The version the LABEL is about. Named separately from the note so a
+        // flat renderer that shows only the label still has it.
+        obj.insert("correction_loop_version".into(), json!(subject_version));
+        obj.insert("correction_loop_note".into(), json!(composed));
         // WHEN the gold slice this verdict is drawn from was measured, lifted
         // to the model level next to the interval so a flat renderer (the
         // digest email) shows the age beside the band label. COPIED from the
@@ -854,7 +942,65 @@ pub fn annotate_correction_loop(ml: &mut JsonValue) {
     }
 }
 
-/// Reading guide for [`correction_loop_state`].
+/// The rendered `correction_loop_note`: which version the label judges, the
+/// platform's own stored blocking reasons when it has any, then the reading
+/// guide.
+///
+/// Three parts, in the order a reader needs them:
+///
+/// 1. **Subject.** `correction_loop` is computed from `gold`, which is the
+///    LATEST evaluated version — routinely not `promoted_version`, and the
+///    label used to render unqualified beside it.
+/// 2. **The stored verdict, verbatim.** When `policy_verdict.unmet` is
+///    present, those strings ARE the answer to "what is blocking this" and
+///    they displace the generic prescription. They are also stamped with the
+///    version they judged and how many evaluations have happened since, so a
+///    reader can see when they describe older evidence than the numbers beside
+///    them — the platform naming a cleared blocker is exactly how the
+///    2026-07-30 situation stayed invisible.
+/// 3. **The reading guide** ([`correction_loop_note`]), which explains what
+///    the gold slice measures. That part is not a prescription and is kept.
+#[must_use]
+pub fn correction_loop_note_for(
+    state: &str,
+    subject_version: Option<i64>,
+    unmet: &[String],
+    verdict_version: Option<i64>,
+    versions_since_verdict: Option<i64>,
+) -> String {
+    let subject = match subject_version {
+        Some(v) => format!(
+            "THIS VERDICT DESCRIBES VERSION {v} (the eval `gold` was taken from), which is not \
+             necessarily the version production serves — see gold_promoted / serves_production. "
+        ),
+        None => "This verdict describes the version named in gold.source_version. ".to_string(),
+    };
+    let blockers = if unmet.is_empty() {
+        String::new()
+    } else {
+        let judged = verdict_version.map_or_else(
+            || "an earlier version".to_string(),
+            |v| format!("version {v}"),
+        );
+        let staleness = match versions_since_verdict {
+            Some(n) if n > 0 => format!(
+                " That verdict is {n} evaluation(s) old — nothing has re-judged those gates \
+                 since, so whether they are STILL unmet is unknown."
+            ),
+            _ => String::new(),
+        };
+        format!(
+            "THE PLATFORM'S STORED POLICY VERDICT on {judged} names the blocking gates: {}.\
+             {staleness} Those named gates are what a lifecycle advance is waiting on — move \
+             them, rather than the generic advice below. ",
+            unmet.join("; ")
+        )
+    };
+    format!("{subject}{blockers}{}", correction_loop_note(state))
+}
+
+/// Reading guide for [`correction_loop_state`]: what the gold slice measures
+/// and what the band label does (and does not) mean.
 pub fn correction_loop_note(state: &str) -> &'static str {
     match state {
         "not_converging" => {
@@ -1177,6 +1323,98 @@ mod tests {
         let before = ml.clone();
         annotate_correction_loop(&mut ml);
         assert_eq!(ml, before);
+    }
+
+    /// D3b (2026-07-30). `correction_loop` is computed from `gold`, i.e. the
+    /// LATEST evaluated version — and it rendered unqualified beside
+    /// `promoted_version: 19`. The label must name its own subject.
+    #[test]
+    fn the_correction_loop_verdict_names_the_version_it_judges() {
+        let mut ml = json!({"models": [
+            {"name": "inbox-classifier-personal", "corrections_banked": 143,
+             "promoted_version": 19,
+             "gold": {"accuracy": 0.55, "total": 120, "source_version": 44}},
+        ]});
+        annotate_correction_loop(&mut ml);
+        let m = &ml["models"][0];
+        assert_eq!(m["correction_loop"], "partially_learned");
+        assert_eq!(
+            m["correction_loop_version"], 44,
+            "the label is about v44, not the promoted v19"
+        );
+        let note = m["correction_loop_note"].as_str().unwrap();
+        assert!(note.contains("VERSION 44"), "{note}");
+        assert!(
+            note.contains("not necessarily the version production serves"),
+            "{note}"
+        );
+        // The reading guide is still attached.
+        assert!(note.contains(correction_loop_note("partially_learned")));
+    }
+
+    /// D3b. When the platform HAS a stored verdict naming the blocking gates,
+    /// those strings must reach the reader verbatim — "keep correcting" is
+    /// strictly less useful than "follow_up has 1 < 3".
+    #[test]
+    fn stored_unmet_reasons_displace_the_generic_prescription() {
+        let unmet = "min_corrections_per_class: 'follow_up' has 1 < 3";
+        let mut ml = json!({"models": [
+            {"name": "inbox-classifier-personal", "corrections_banked": 143,
+             "gold": {"accuracy": 0.55, "total": 120, "source_version": 44},
+             "policy_verdict": {
+                 "source_version": 31,
+                 "measured_at": "2026-07-25T09:30:00.000Z",
+                 "satisfied": false,
+                 "unmet": [unmet, "accuracy_at_coverage: no threshold reaches 0.95"],
+                 "versions_since_verdict": 13,
+             }},
+        ]});
+        annotate_correction_loop(&mut ml);
+        let note = ml["models"][0]["correction_loop_note"].as_str().unwrap();
+        assert!(note.contains(unmet), "verbatim, unedited: {note}");
+        assert!(note.contains("version 31"), "{note}");
+        assert!(
+            note.contains("13 evaluation(s) old"),
+            "the verdict's age in versions must be stated: {note}"
+        );
+        assert!(
+            note.contains("STILL unmet is unknown"),
+            "a stale verdict must not be presented as current: {note}"
+        );
+        assert!(
+            note.contains("rather than the generic advice below"),
+            "{note}"
+        );
+    }
+
+    /// The no-verdict case — the common one (30 of 44 versions on the live
+    /// model). The note must be byte-identical to the pre-verdict wording
+    /// apart from the version subject: no blocker sentence, and above all no
+    /// implication that the gate failed.
+    #[test]
+    fn a_model_with_no_stored_verdict_gains_no_blocker_sentence() {
+        let mut ml = json!({"models": [
+            {"name": "unjudged", "corrections_banked": 143,
+             "gold": {"accuracy": 0.55, "total": 120, "source_version": 44},
+             "policy_verdict": null},
+        ]});
+        annotate_correction_loop(&mut ml);
+        let note = ml["models"][0]["correction_loop_note"].as_str().unwrap();
+        assert!(!note.contains("blocking gates"), "{note}");
+        assert!(!note.to_ascii_lowercase().contains("unmet"), "{note}");
+        assert_eq!(
+            note,
+            correction_loop_note_for("partially_learned", Some(44), &[], None, None)
+        );
+    }
+
+    /// A satisfied verdict carries an empty `unmet`, and an empty list must
+    /// not render as "the blocking gates are: ".
+    #[test]
+    fn an_empty_unmet_list_produces_no_blocker_sentence() {
+        let note = correction_loop_note_for("converged", Some(9), &[], Some(9), Some(0));
+        assert!(!note.contains("blocking gates"), "{note}");
+        assert!(note.contains("VERSION 9"), "{note}");
     }
 
     /// The annotation is decoration on a best-effort panel — every malformed

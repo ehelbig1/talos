@@ -118,6 +118,23 @@ fn model_serves(mode: ServingMode, lifecycle_state: &str) -> bool {
     }
 }
 
+/// Does a model in this lifecycle state serve PRODUCTION consumers?
+///
+/// The reporting surfaces' single source of truth for the claim "this is what
+/// runs today". It is [`model_serves`] under [`ServingMode::Gated`] — the mode
+/// every production consumer uses — so a report cannot assert serving
+/// independently of the gate that decides it. `Raw` (shadow accounting, the
+/// MCP sanity-check tool) is deliberately not reachable through this function:
+/// those callers are not production.
+///
+/// True here still does NOT mean every prediction is served: a Gated vote
+/// below the model's `confidence_threshold` abstains to the LLM
+/// ([`keep_vote`]). It means the model is consulted at all.
+#[must_use]
+pub fn state_serves_production(lifecycle_state: &str) -> bool {
+    model_serves(ServingMode::Gated, lifecycle_state)
+}
+
 /// Whether one slot's vote is returned to the consumer. Gated abstains
 /// below the confidence threshold (→ LLM fallback), serves at/above.
 /// Raw keeps every vote for agreement accounting.
@@ -579,6 +596,30 @@ mod tests {
         assert!(!model_serves(ServingMode::Gated, "shadow"));
         assert!(model_serves(ServingMode::Gated, "hybrid"));
         assert!(model_serves(ServingMode::Gated, "fast_primary"));
+    }
+
+    /// The reporting surfaces' predicate IS the gate — not a second copy of
+    /// its state list that could drift into claiming a shadow model serves.
+    #[test]
+    fn the_reporting_predicate_tracks_the_gated_mode_exactly() {
+        for s in [
+            "llm_only",
+            "shadow",
+            "hybrid",
+            "fast_primary",
+            "not_a_state",
+        ] {
+            assert_eq!(
+                state_serves_production(s),
+                model_serves(ServingMode::Gated, s),
+                "state_serves_production must not diverge from the gate for {s}"
+            );
+        }
+        // Named explicitly so a widened gate is a deliberate, visible edit.
+        assert!(!state_serves_production("shadow"));
+        assert!(!state_serves_production("llm_only"));
+        assert!(state_serves_production("hybrid"));
+        assert!(state_serves_production("fast_primary"));
     }
 
     #[test]

@@ -28,6 +28,7 @@ pub mod lifecycle_job;
 pub mod linear;
 pub mod loop_health;
 pub mod ops_bridge;
+pub mod pending_decisions;
 pub mod provision;
 pub mod registry;
 pub mod serve;
@@ -58,10 +59,14 @@ pub use lifecycle::{
     validate_llm_locality, LifecycleService, LifecycleState, PolicyDecision, PolicyInputs,
     PolicyJson,
 };
-pub use lifecycle_job::{run_policy_tick, spawn_policy_evaluator};
+pub use lifecycle_job::{run_policy_tick, should_evaluate, spawn_policy_evaluator};
 pub use linear::{FitOpts, LinearModel, LinearPrediction};
-pub use loop_health::loop_health;
+pub use loop_health::{gold_promoted_serving_note, loop_health};
 pub use ops_bridge::spawn_ops_correction_bridge;
+pub use pending_decisions::{
+    classify_pending, pending_ml_decisions, PendingKind, PendingMlDecision,
+    MAX_PENDING_ML_DECISIONS,
+};
 pub use provision::{provision_classifier, ProvisionError, ProvisionInput, ProvisionOutcome};
 pub use registry::{ModelRegistry, ModelReviewSummary, ModelVersionRow, ResolvedModel};
 pub use serve::{

@@ -824,7 +824,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "add_operator_digest_node",
-            "description": "Add an operator_digest system node — the autonomy-cockpit feed (ran/learned/needs_me over a trailing window) for a digest compose node. Controller-side system node: emits what the autonomous machinery ran (executions by trigger_type + schedules), learned (memory writes by kind, rank-weight fits, ML loop health), and needs the operator to decide (unified approvals + ops-alert corrections + autonomous failures) as node output for downstream compose nodes. No worker dispatch, no secrets, tenancy from the execution's resolved identity; degrades to {available: false} instead of failing.",
+            "description": "Add an operator_digest system node — the autonomy-cockpit feed (ran/learned/needs_me over a trailing window) for a digest compose node. Controller-side system node: emits what the autonomous machinery ran (executions by trigger_type + schedules), learned (memory writes by kind, rank-weight fits, ML loop health), and needs the operator to decide (unified approvals + ops-alert corrections + parked ML lifecycle decisions + autonomous failures) as node output for downstream compose nodes. No worker dispatch, no secrets, tenancy from the execution's resolved identity; degrades to {available: false} instead of failing.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

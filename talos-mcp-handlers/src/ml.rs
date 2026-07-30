@@ -97,7 +97,7 @@ pub fn tool_schemas() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "ml_promote_model",
-            "description": "Promote a version to production: predict() serves it from now on; the previously promoted version is retired.",
+            "description": "Promote a version: it becomes the model's production_version_id and the previously promoted version is retired. This is which version resolves — NOT whether the model serves. Production consumers use the GATED serving mode, which only answers in lifecycle_state hybrid/fast_primary; in llm_only/shadow the promoted version still serves nothing and every prediction falls back to the LLM. Only ml_predict's raw sanity-check path serves it unconditionally. Advancing the lifecycle is a separate act (ml_set_lifecycle / the policy evaluator's auto_advance).",
             "inputSchema": { "type": "object", "properties": {
                 "model_id": { "type": "string" },
                 "version_id": { "type": "string" }
@@ -614,6 +614,86 @@ async fn handle_create_model(
     }
 }
 
+/// Judge the model's configured lifecycle policy against THIS eval, or return
+/// `None` when there is no policy to judge.
+///
+/// `None` is returned — and the caller then stores no `policy_decision` at all
+/// — in exactly three cases, all of them "there is no verdict", never "the
+/// verdict is negative":
+///
+/// 1. `policy_json` is absent or `{}` — no gate is configured.
+/// 2. `policy_json` does not parse as a [`talos_ml::PolicyJson`] (the typed
+///    policy is `deny_unknown_fields`, so a hand-edited key lands here). The
+///    scheduled evaluator skips such a model entirely for the same reason.
+/// 3. The class counts could not be read, so `min_examples` /
+///    `min_corrections_per_class` have no inputs. `evaluate_policy` is
+///    fail-safe and would report those gates UNMET on missing data, which is
+///    the right call when deciding whether to promote — but writing that into
+///    the version row would record a data-plane hiccup as a policy failure.
+///
+/// Everything else is `evaluate_policy`, byte-identical to the scheduled
+/// path's call: same typed policy, same [`talos_ml::PolicyInputs`] fields.
+async fn judge_configured_policy(
+    svc: &DatasetService,
+    tx: &mut sqlx::PgConnection,
+    dataset_id: Uuid,
+    policy_json: Option<&Value>,
+    report: &talos_ml::EvalReport,
+    class_counts: Option<&std::collections::HashMap<String, i64>>,
+) -> Option<talos_ml::PolicyDecision> {
+    let raw = policy_json?;
+    if raw.as_object().is_some_and(serde_json::Map::is_empty) {
+        return None;
+    }
+    let policy = talos_ml::PolicyJson::parse(raw).ok()?;
+    let counts = class_counts?;
+    let total_examples: i64 = counts.values().sum();
+    let dataset_classes: Vec<String> = counts.keys().cloned().collect();
+    let corrections = svc.corrections_per_class(tx, dataset_id).await.ok()?;
+    Some(talos_ml::evaluate_policy(
+        &policy,
+        &talos_ml::PolicyInputs {
+            report,
+            total_examples,
+            corrections_per_class: &corrections,
+            dataset_classes: &dataset_classes,
+        },
+    ))
+}
+
+/// `next_step` for `ml_eval_model`, stating the verdict this run actually
+/// computed rather than pointing at a gate it declined to evaluate.
+///
+/// The three arms say three different things, and none of them recommends a
+/// promotion: a satisfied policy means the gate is clear, not that the newer
+/// version is better than the serving one (that is a separate comparison the
+/// operator makes).
+fn eval_next_step(decision: Option<&talos_ml::PolicyDecision>) -> String {
+    let base = "the eval scored every backend on one holdout and picked the highest macro-recall \
+                (balanced accuracy, aligned with the policy's per-class recall floors); judge \
+                report.coverage_curve + report.gold";
+    match decision {
+        None => format!(
+            "{base}. NO LIFECYCLE POLICY IS CONFIGURED on this model, so no gate was evaluated \
+             and this version carries no policy_decision — 'not evaluated', not 'passed'. Set \
+             one with ml_set_policy if promotion should be gated."
+        ),
+        Some(d) if d.satisfied => format!(
+            "{base}. THE POLICY GATE IS SATISFIED on this version (stored as \
+             policy_decision.satisfied). That clears the gate; it does not establish that this \
+             version beats the one production serves — compare report.gold and the confidence \
+             intervals before ml_promote_model, and remember that promoting a version does not \
+             advance the lifecycle state (a model in shadow still serves nothing)."
+        ),
+        Some(d) => format!(
+            "{base}. THE POLICY GATE IS NOT SATISFIED on this version; the blocking gates are \
+             stored verbatim in policy_decision.unmet: {}. Clearing those is what a promotion \
+             is waiting on.",
+            d.unmet.join("; ")
+        ),
+    }
+}
+
 async fn handle_eval_model(
     req_id: Option<Value>,
     args: &Value,
@@ -703,11 +783,31 @@ async fn handle_eval_model(
     // holdout was drawn from, counted inside the eval's own transaction (one
     // indexed grouped count per eval, not per row). Best-effort: a failure
     // omits the key rather than stamping a 0 the reader would believe.
-    let dataset_rows: Option<i64> = svc
-        .class_counts(&mut tx, dataset_id)
-        .await
-        .ok()
-        .map(|c| c.values().sum());
+    let class_counts = svc.class_counts(&mut tx, dataset_id).await.ok();
+    let dataset_rows: Option<i64> = class_counts.as_ref().map(|c| c.values().sum());
+
+    // ── The policy gate, judged HERE (2026-07-30) ───────────────────────
+    // This path used to pass `policy_decision: None` while the scheduled
+    // evaluator supplied one, so 30 of `inbox-classifier-personal`'s 44
+    // versions carried no verdict at all — including the version every
+    // surface features — and this tool's own next_step told the reader to
+    // "ml_promote_model when the policy clears" about a gate it had just
+    // declined to evaluate. Same policy, same inputs, same
+    // `evaluate_policy` as `lifecycle_job`; the ONLY difference is that
+    // nothing here promotes or advances (see the `judged` note below).
+    //
+    // A model with no policy configured gets `None` — the honest value.
+    // There is no gate, so there is no verdict, and the stored row must
+    // not carry one that a reader could take for a pass.
+    let policy_eval = judge_configured_policy(
+        &svc,
+        &mut tx,
+        dataset_id,
+        models.policy_json.as_ref(),
+        &report,
+        class_counts.as_ref(),
+    )
+    .await;
     // ONE assembly point, shared with the scheduled evaluator, which also
     // folds in the winner's backend-specific hyperparameters (voting/k for
     // knn, epochs/l2/balanced for linear) so the card records exactly what
@@ -720,7 +820,9 @@ async fn handle_eval_model(
         params: &params,
         backend_comparison: comparison.clone(),
         evaluator: "manual",
-        policy_decision: None,
+        policy_decision: policy_eval
+            .as_ref()
+            .map(|d| serde_json::json!({ "satisfied": d.satisfied, "unmet": d.unmet })),
         dataset_rows,
         embedding_model: talos_memory::embedding::active_embedding_model(),
     });
@@ -756,9 +858,13 @@ async fn handle_eval_model(
                 "measured_at": metrics.get("measured_at"),
                 "dataset_rows": metrics.get("dataset_rows"),
                 "embedding_model": metrics.get("embedding_model"),
+                // Echoed from the payload that was just PERSISTED (same rule
+                // as measured_at above): absent here means the model has no
+                // policy configured, so no gate was judged.
+                "policy_decision": metrics.get("policy_decision"),
                 "provenance_note": talos_ml::METRICS_PROVENANCE_NOTE,
                 "coverage_curve_note": talos_ml::COVERAGE_CURVE_POPULATION_NOTE,
-                "next_step": "the eval scored every backend on one holdout and picked the highest macro-recall (balanced accuracy, aligned with the policy's per-class recall floors); judge report.coverage_curve + report.gold, then ml_promote_model when the policy clears",
+                "next_step": eval_next_step(policy_eval.as_ref()),
             }))
             .unwrap_or_default(),
         ),
@@ -1934,5 +2040,66 @@ mod shadow_window_tests {
             "{w}"
         );
         assert!(!w.contains("lifetime"));
+    }
+}
+
+/// D2 (2026-07-30): `ml_eval_model` used to store `policy_decision: None` and
+/// then tell the reader to "ml_promote_model when the policy clears" — pointing
+/// at a gate it had just declined to evaluate. These pin what the three arms
+/// of the replacement actually claim.
+#[cfg(test)]
+mod eval_next_step_tests {
+    use super::eval_next_step;
+    use talos_ml::PolicyDecision;
+
+    #[test]
+    fn an_unsatisfied_gate_names_its_blocking_reasons_verbatim() {
+        let unmet = "min_corrections_per_class: 'follow_up' has 1 < 3";
+        let d = PolicyDecision {
+            satisfied: false,
+            unmet: vec![
+                unmet.to_string(),
+                "accuracy_at_coverage: no threshold reaches 0.95".into(),
+            ],
+        };
+        let s = eval_next_step(Some(&d));
+        assert!(s.contains("NOT SATISFIED"), "{s}");
+        assert!(s.contains(unmet), "reasons must survive verbatim: {s}");
+        assert!(s.contains("no threshold reaches 0.95"), "{s}");
+    }
+
+    /// A cleared gate is not a recommendation. The wording must say what the
+    /// verdict IS and stop — the version comparison is the operator's, and
+    /// promoting does not advance the lifecycle.
+    #[test]
+    fn a_satisfied_gate_states_the_verdict_without_recommending_a_promotion() {
+        let d = PolicyDecision {
+            satisfied: true,
+            unmet: vec![],
+        };
+        let s = eval_next_step(Some(&d));
+        assert!(s.contains("THE POLICY GATE IS SATISFIED"), "{s}");
+        assert!(
+            s.contains("does not establish that this version beats"),
+            "{s}"
+        );
+        assert!(
+            s.contains("a model in shadow still serves nothing"),
+            "promoting is not advancing: {s}"
+        );
+    }
+
+    /// No policy configured → no gate → no verdict. The old wording implied
+    /// there was one to clear.
+    #[test]
+    fn no_configured_policy_says_not_evaluated_never_passed() {
+        let s = eval_next_step(None);
+        assert!(s.contains("NO LIFECYCLE POLICY IS CONFIGURED"), "{s}");
+        assert!(s.contains("'not evaluated', not 'passed'"), "{s}");
+        // The pre-fix sentence pointed at a gate this path never judged.
+        assert!(
+            !s.contains("ml_promote_model when the policy clears"),
+            "{s}"
+        );
     }
 }

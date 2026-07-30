@@ -12,7 +12,7 @@ use uuid::Uuid;
 /// what the autonomous machinery RAN (executions by `trigger_type` + schedules),
 /// LEARNED (memory writes by kind, rank-weight fits, ML loop health), and
 /// NEEDS the operator to decide (unified approvals + ops-alert corrections +
-/// autonomous failures).
+/// parked ML lifecycle decisions + autonomous failures).
 #[async_trait]
 pub trait OperatorDigestReader: Send + Sync {
     /// `user_id` is the TENANT scope — impls MUST filter every query by it
