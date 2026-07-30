@@ -2515,6 +2515,7 @@ impl TalosRuntime {
             talos_workflow_job_protocol::WriteCeiling::default(), // write (permissive) for legacy helper
             None, // egress_scope — legacy helper: tier-derived default
             None, // llm_usage_out — legacy helper doesn't collect usage
+            None, // host_diag_out — legacy helper has a real execution id (NATS route)
         )
         .await
     }
@@ -2576,6 +2577,15 @@ impl TalosRuntime {
         // still spent). `None` = caller doesn't collect usage (legacy
         // wrappers, controller-embedded sandbox runs).
         llm_usage_out: Option<crate::context::LlmUsageAcc>,
+        // In-process `[host:*]` diagnostic collector. `Some(sink)` mirrors every
+        // host diagnostic this job emits into the caller's Vec IN ADDITION to
+        // the normal `wasm.log.{execution_id}` publish. For callers with NO
+        // execution row — `run_sandbox` / `test_module`, which pass
+        // `execution_context: None` — the NATS route is a no-op, so the sink is
+        // the only way their diagnostics reach a human. Shared across retry
+        // attempts (each attempt builds a fresh context) and bounded inside
+        // `emit_host_diagnostic`. `None` = unchanged behaviour.
+        host_diag_out: Option<crate::context::HostDiagSink>,
     ) -> Result<JsonValue> {
         // Per-job fuel override: use the controller-supplied value when non-zero,
         // otherwise fall back to the runtime's global fuel_limit.
@@ -2761,6 +2771,7 @@ impl TalosRuntime {
                     max_write_ceiling,
                     egress_scope,
                     llm_usage_out.clone(),
+                    host_diag_out.clone(),
                 )
                 .await
             {
@@ -2944,6 +2955,9 @@ impl TalosRuntime {
         // R2 token ledger: caller-shared LLM usage accumulator (see
         // `execute_job_with_full_features`).
         llm_usage_out: Option<crate::context::LlmUsageAcc>,
+        // In-process host-diagnostic collector (see
+        // `execute_job_with_full_features`).
+        host_diag_out: Option<crate::context::HostDiagSink>,
     ) -> Result<JsonValue> {
         // DISTRIBUTED TRACING: Create execution span
         let execution_id = execution_context
@@ -3040,6 +3054,12 @@ impl TalosRuntime {
         // readable after execution (drained into the signed JobResult).
         if let Some(ref acc) = llm_usage_out {
             context.llm_usage = acc.clone();
+        }
+        // In-process host-diagnostic mirror for callers with no execution row
+        // (`run_sandbox` / `test_module`). Attached before the module runs so
+        // diagnostics from the very first host call are collected.
+        if let Some(ref sink) = host_diag_out {
+            context.host_diag_sink = Some(sink.clone());
         }
         // Wire LLM tier ceiling. `get_llm_api_key` refuses to resolve
         // external-provider keys when this is Tier1.

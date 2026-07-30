@@ -474,3 +474,94 @@ async fn local_llm_client_reaches_private_loopback() {
     // Drain the server task so it doesn't leak.
     let _ = server.await;
 }
+
+/// A denied fetch must leave a `[host:*]` line in the caller's sink.
+///
+/// This is the probe that produced NOTHING before: `run_sandbox` with a
+/// deliberately-failing fetch returned only the module's opaque error,
+/// because the diagnostic route required an execution id the handler
+/// doesn't have. Exercises the REAL deny path (`wit_http::fetch` →
+/// `record_capability_denied` → `emit_host_diagnostic`), not a stub.
+#[tokio::test]
+async fn denied_fetch_lands_in_the_in_process_diagnostic_sink() {
+    let sink: crate::context::HostDiagSink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut ctx = TalosContext::new(
+        CapabilityWorld::Http,
+        // Empty allowlist ⇒ deny-all, the "no host allowlist configured" arm.
+        vec![],
+        vec![],
+        128,
+        HashMap::new(),
+        None, // redis
+        None, // NATS — exactly the run_sandbox / test_module shape
+        false,
+        None,
+        std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+        LlmTier::default(),
+        None,
+    )
+    .unwrap();
+    ctx.host_diag_sink = Some(sink.clone());
+
+    let req = wit_http::Request {
+        method: wit_http::Method::Get,
+        url: "https://blocked.example.com/thing".to_string(),
+        headers: vec![],
+        body: vec![],
+        timeout_ms: None,
+    };
+    let result = ctx.fetch(req).await;
+    assert!(matches!(result, Err(wit_http::Error::Forbiddenhost)));
+
+    let lines = sink.lock().unwrap().clone();
+    assert_eq!(
+        lines.len(),
+        1,
+        "the deny must be explained exactly once, got: {lines:?}"
+    );
+    assert!(
+        lines[0].starts_with("[host:"),
+        "diagnostic lines carry the [host:<reason>] tag: {}",
+        lines[0]
+    );
+    assert!(
+        lines[0].contains("no-allowlist-configured"),
+        "the line must name the policy that fired, not just say 'denied': {}",
+        lines[0]
+    );
+    // Sanitization contract: fixed policy tokens plus caller-supplied values
+    // only. The host is the caller's own; nothing else leaks.
+    assert!(lines[0].contains("blocked.example.com"));
+}
+
+/// The `http://127.0.0.1:9` probe from the #617 write-up returns
+/// `Invalidurl` via the HTTPS-only SCHEME gate — it never reaches the
+/// private-IP SSRF guard (which returns `Forbiddenhost`). Pinned because
+/// the two were conflated in a prior diagnosis: the SSRF guard sits BELOW
+/// the scheme gate in `wit_http::fetch`, so a plaintext loopback URL is
+/// refused for its scheme and its IP is never classified at all. Asserted
+/// at the classifier rather than through `fetch` deliberately —
+/// `WASM_ALLOW_INSECURE_HTTP` is process-global and a sibling test in this
+/// binary sets it, so a fetch-level assertion here would be order-dependent
+/// under plain `cargo test` (CI's nextest isolates by process; contributors'
+/// `cargo test` does not).
+#[test]
+fn loopback_http_probe_is_refused_by_the_scheme_gate_not_the_ssrf_guard() {
+    use crate::host::egress::{classify_url_scheme, UrlSchemeVerdict};
+
+    let url: url::Url = "http://127.0.0.1:9".parse().expect("valid url");
+    // Without the operator opt-in — the production default — the scheme
+    // alone decides, and the verdict maps to `Invalidurl`, NOT
+    // `Forbiddenhost`.
+    assert!(matches!(
+        classify_url_scheme(url.scheme(), false),
+        UrlSchemeVerdict::InsecureRefused { .. }
+    ));
+    // The private-IP guard WOULD have fired on this host — which is exactly
+    // why the distinction matters: identical URL, two different reasons, and
+    // only the diagnostic line says which one ran.
+    assert!(
+        crate::host::egress::denied_ip_literal(&url).is_some(),
+        "127.0.0.1 is a denied IP literal — but the scheme gate refuses it first"
+    );
+}

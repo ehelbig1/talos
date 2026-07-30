@@ -308,7 +308,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "replay_module_regression",
-            "description": "Sanity-check a module's semantics by replaying completed executions against the current code and diffing each new output against the stored one. Complements hot_update_module: run this after a typed rewrite to verify the new implementation produces the same results on real production inputs.\n\nTwo modes:\n1. **Workflow mode** (preferred): pass `workflow_id` + `node_label`. Sources per-node input/output from `workflow_executions.output_data`, which stores every completed node's output keyed by label. The predecessor node's output becomes the replay input (the tool walks the graph edges to find it). V1 supports linear pipelines — fan-in nodes (multiple predecessors) are rejected with a clear error.\n2. **Module mode** (fallback): pass `module_id`. Sources from `module_executions` (only populated for test_module runs — much sparser).\n\nFraming: this is a sanity check, NOT a proof. Replayed executions may diverge for legitimate reasons (upstream APIs returned different data, non-deterministic LLM output, time-varying fields), so the tool ignores engine metadata by default and lets callers extend the ignore list.\n\nSecurity: scoped to caller user_id. Limited to 20 replays. Governance-world modules rejected.",
+            "description": "Sanity-check a module's semantics by replaying completed executions against the current code and diffing each new output against the stored one. Complements hot_update_module: run this after a typed rewrite to verify the new implementation produces the same results on real production inputs.\n\nTwo modes:\n1. **Workflow mode** (preferred): pass `workflow_id` + `node_label`. Sources per-node input/output from `workflow_executions.output_data`, which stores every completed node's output keyed by label. The predecessor node's output becomes the replay input (the tool walks the graph edges to find it). V1 supports linear pipelines — fan-in nodes (multiple predecessors) are rejected with a clear error.\n2. **Module mode** (fallback): pass `module_id`. Sources from `module_executions`, which holds one row per node dispatch (single-node, pipeline step, and loop-body iteration) — NOT `test_module` runs, which record no row at all. A module used as a loop body will therefore return many rows from one workflow run.\n\nFraming: this is a sanity check, NOT a proof. Replayed executions may diverge for legitimate reasons (upstream APIs returned different data, non-deterministic LLM output, time-varying fields), so the tool ignores engine metadata by default and lets callers extend the ignore list.\n\nSecurity: scoped to caller user_id. Limited to 20 replays. Governance-world modules rejected.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1842,6 +1842,17 @@ async fn handle_run_sandbox(
         None => talos_workflow_job_protocol::LlmTier::Tier1,
     };
 
+    // In-process host-diagnostic sink. `run_sandbox` passes
+    // `execution_context: None` (below) — it has no `workflow_executions` or
+    // `module_executions` row — so `emit_host_diagnostic`'s NATS route is a
+    // no-op here and every `[host:*]` line this run produces would otherwise
+    // be lost. That is the exact opposite of what this tool is for: the
+    // caller is a developer whose fetch just failed with a bare
+    // `networkerror` and who has nowhere else to look. Collected here and
+    // appended to the response below.
+    let host_diags: talos_worker_runtime::context::HostDiagSink =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
     let execution_result = state
         .runtime
         .execute_job_with_full_features(
@@ -1869,18 +1880,74 @@ async fn handle_run_sandbox(
             // run permissively. The ceiling gates live actor dispatch,
             // which the actor binding stamps at engine dispatch.
             talos_workflow_job_protocol::WriteCeiling::Write,
-            None, // egress_scope — internal path: tier-derived default
-            None, // llm_usage_out — internal sandbox path doesn't collect usage
+            None,                     // egress_scope — internal path: tier-derived default
+            None,                     // llm_usage_out — internal sandbox path doesn't collect usage
+            Some(host_diags.clone()), // host_diag_out — no execution row, so this is the ONLY route
         )
         .await;
 
     match execution_result {
         Ok(val) => {
             let output = talos_workflow_engine::ParallelWorkflowEngine::unwrap_output(&val);
-            mcp_text(req_id, &output.to_string())
+            mcp_text(
+                req_id,
+                &append_host_diagnostics(output.to_string(), &host_diags),
+            )
         }
-        Err(e) => mcp_text(req_id, &format!("Execution error: {}", e)),
+        Err(e) => mcp_text(
+            req_id,
+            &append_host_diagnostics(format!("Execution error: {}", e), &host_diags),
+        ),
     }
+}
+
+/// Append this run's collected `[host:*]` diagnostic lines to an MCP text
+/// response.
+///
+/// Both in-process execution surfaces (`run_sandbox`, `test_module`) call
+/// this on BOTH the success and error arms. The error arm matters most — a
+/// module that failed with an opaque `networkerror` is exactly the case the
+/// diagnostics exist to explain — but the success arm matters too: a run can
+/// succeed while a denied host call was silently swallowed by the module's
+/// own error handling.
+///
+/// No-op when nothing was emitted, so a clean run's response is unchanged
+/// byte-for-byte. The lines carry only fixed policy tokens plus values the
+/// caller already supplied (their own host, method, key path) — the same
+/// sanitization contract `emit_host_diagnostic` enforces for the NATS route,
+/// which is why they are safe to hand straight back to that caller.
+fn append_host_diagnostics(
+    body: String,
+    sink: &talos_worker_runtime::context::HostDiagSink,
+) -> String {
+    let lines = match sink.lock() {
+        Ok(guard) => guard.clone(),
+        // A poisoned mutex means a panic elsewhere; losing diagnostics must
+        // never change what the caller gets back.
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    if lines.is_empty() {
+        return body;
+    }
+    format!("{body}\n\nHost diagnostics:\n{}", lines.join("\n"))
+}
+
+/// The same collected lines, as a JSON field value for handlers whose
+/// response is structured (`test_module`) rather than raw text.
+///
+/// `None` when nothing was emitted, so `skip_serializing_if`-style omission
+/// keeps a clean run's response shape unchanged. Deliberately NOT an empty
+/// array on the quiet path: an empty `host_diagnostics: []` invites the
+/// reading that the host had nothing to say, when on most historical runs the
+/// truth was that nobody was listening.
+fn collected_host_diagnostics(
+    sink: &talos_worker_runtime::context::HostDiagSink,
+) -> Option<Vec<String>> {
+    let lines = match sink.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    (!lines.is_empty()).then_some(lines)
 }
 
 async fn handle_compile_template(
@@ -3206,6 +3273,12 @@ async fn handle_test_module(
         integration_name: module.integration_name.clone(),
         ..Default::default()
     };
+    // Same rationale as run_sandbox: `test_module` passes
+    // `execution_context: None` and writes no `module_executions` row, so the
+    // NATS diagnostic route is a no-op and its `[host:*]` lines have nowhere
+    // to go. Collect them in-process and return them in the response.
+    let host_diags: talos_worker_runtime::context::HostDiagSink =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let start = std::time::Instant::now();
     let execution_result = state
         .runtime
@@ -3244,8 +3317,9 @@ async fn handle_test_module(
             // run permissively. The ceiling gates live actor dispatch,
             // which the actor binding stamps at engine dispatch.
             talos_workflow_job_protocol::WriteCeiling::Write,
-            None, // egress_scope — internal path: tier-derived default
-            None, // llm_usage_out — internal sandbox path doesn't collect usage
+            None,                     // egress_scope — internal path: tier-derived default
+            None,                     // llm_usage_out — internal sandbox path doesn't collect usage
+            Some(host_diags.clone()), // host_diag_out — no execution row, so this is the ONLY route
         )
         .await;
     let duration_ms = start.elapsed().as_millis();
@@ -3289,6 +3363,10 @@ async fn handle_test_module(
                     "output": output,
                     "duration_ms": duration_ms,
                     "memory_write": memory_write_note,
+                    // Denied/failed host calls this run. Present on the
+                    // SUCCESS arm too: a module can swallow a failed fetch in
+                    // its own error handling and still return ok.
+                    "host_diagnostics": collected_host_diagnostics(&host_diags),
                 })
                 .to_string(),
             ))
@@ -3299,6 +3377,9 @@ async fn handle_test_module(
                 "success": false,
                 "error": format!("{}", e),
                 "duration_ms": duration_ms,
+                // The whole point: an opaque `networkerror` here is now
+                // accompanied by the host's reason for it.
+                "host_diagnostics": collected_host_diagnostics(&host_diags),
             })
             .to_string(),
         )),

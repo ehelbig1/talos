@@ -1130,6 +1130,10 @@ async fn execute_job(
             req.max_write_ceiling,
             req.egress_scope,
             Some(llm_usage_acc.clone()),
+            // host_diag_out: the worker has a real execution id, so host
+            // diagnostics take the NATS route to the log tables. The
+            // in-process sink exists only for the id-less MCP surfaces.
+            None,
         ),
     )
     .await

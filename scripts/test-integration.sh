@@ -221,6 +221,12 @@ CTRL_TESTS=(
     "memory_get_entry_tests"
     "module_execution_status_tests"
     "execution_status_transition_tests"
+    # Where a wasm.log line lands, and what the writer reports when it lands
+    # nowhere (2026-07-30). Needs a real Postgres because the thing under test
+    # IS the `WHERE EXISTS` guard on the log INSERT — the predicate that
+    # silently discarded every Loop-body iteration's logs while `add_log`
+    # returned Ok. A mock cannot fail the way the real statement failed.
+    "wasm_log_routing_tests"
     "env_vars"
 )
 # 'talos_ctl' is now the migrated TEMPLATE: setup_test_context clones it into a

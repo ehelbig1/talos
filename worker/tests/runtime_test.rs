@@ -38,6 +38,7 @@ async fn test_runtime_no_nested_block_on() {
             talos_workflow_job_protocol::WriteCeiling::Write, // max_write_ceiling
             None,                                             // egress_scope: tier default
             None,                                             // llm_usage_out — not collected
+            None,                                             // host_diag_out — not collected
         )
         .await;
 

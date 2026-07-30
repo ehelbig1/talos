@@ -8,6 +8,56 @@ use uuid::Uuid;
 #[path = "module_executions_tests.rs"]
 mod tests;
 
+/// What actually happened to a log line handed to
+/// [`ModuleExecutionService::add_log`].
+///
+/// WHY this exists (2026-07-30): `add_log` used to return `Result<()>` and
+/// matched the INSERT's `Ok(_)` while IGNORING `rows_affected`. Its INSERT is
+/// `... SELECT $1,$2,$3,$4 WHERE EXISTS (SELECT 1 FROM module_executions
+/// WHERE id = $1)`, so a line addressed to an id with no `module_executions`
+/// row affects ZERO rows and returns `Ok`. Caller and operator alike saw
+/// success. Every iteration of every Loop node was losing its logs that way
+/// for months, and nothing in the system said so — the one signal that could
+/// have reported it (a `trace!` on the FK-violation `Err` arm) was made
+/// unreachable by the very `WHERE EXISTS` guard that stopped the FK errors.
+///
+/// A `bool` would collapse the two DIFFERENT ways a line fails to land:
+/// "there is no such execution" (a routing/attribution bug — someone's logs
+/// are being discarded) and "this execution hit its log cap" (working as
+/// designed). Calling the second one "orphaned" in an operator warning would
+/// reproduce the misleading-report-field class this type exists to close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogWriteOutcome {
+    /// A row was inserted into `module_execution_logs`.
+    Inserted,
+    /// No `module_executions` row matched the id — the `WHERE EXISTS` guard
+    /// selected nothing and the line was **discarded**. The line is gone;
+    /// nothing else in the system records it.
+    NoExecutionRow,
+    /// The per-execution log-cap trigger rejected the insert. Deliberate
+    /// back-pressure, not a routing bug.
+    RateLimited,
+    /// The write itself failed (DB outage, etc.). Only produced by
+    /// [`ModuleExecutionService::add_log_best_effort`], which swallows the
+    /// error after logging it; `add_log` propagates it instead.
+    WriteFailed,
+}
+
+impl LogWriteOutcome {
+    /// Did the line actually land in `module_execution_logs`?
+    pub fn is_inserted(self) -> bool {
+        matches!(self, Self::Inserted)
+    }
+
+    /// Was the line dropped because no execution row owns it?
+    ///
+    /// This is the ONLY variant that means "someone's logs are being
+    /// silently thrown away" — the caller should say so loudly.
+    pub fn is_orphaned(self) -> bool {
+        matches!(self, Self::NoExecutionRow)
+    }
+}
+
 /// Module execution status
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
 #[sqlx(type_name = "text")]
@@ -776,14 +826,18 @@ impl ModuleExecutionService {
     /// - Validates metadata size (max 1MB)
     /// - Rate limiting is enforced by database trigger (migration 013/015)
     ///
-    /// Returns Ok(()) even if rate limit is exceeded (fails silently to not block execution)
+    /// Returns `Ok(outcome)` — including for a rate-limited or orphaned line,
+    /// which are non-fatal by design (a log write must never fail an
+    /// execution). **Callers must inspect the [`LogWriteOutcome`]**: `Ok` does
+    /// NOT mean the line was stored. See that type for why a `bool` isn't
+    /// enough and why the distinction is load-bearing.
     pub async fn add_log(
         &self,
         execution_id: Uuid,
         level: LogLevel,
         message: String,
         metadata: Option<JsonValue>,
-    ) -> Result<()> {
+    ) -> Result<LogWriteOutcome> {
         // Sanitize message (strip control chars, truncate if too long)
         let mut sanitized_message: String = message
             .chars()
@@ -844,7 +898,13 @@ impl ModuleExecutionService {
 
         // Handle rate limit exception gracefully
         match result {
-            Ok(_) => Ok(()),
+            // `rows_affected() == 0` is the ONLY signal that the `WHERE
+            // EXISTS` guard above selected nothing, i.e. the line was
+            // addressed to an id with no `module_executions` row and has been
+            // discarded. Swallowing it (the pre-2026-07-30 `Ok(_) => Ok(())`)
+            // is what made the loop-body log drop invisible.
+            Ok(r) if r.rows_affected() > 0 => Ok(LogWriteOutcome::Inserted),
+            Ok(_) => Ok(LogWriteOutcome::NoExecutionRow),
             Err(e) => {
                 let error_msg = e.to_string();
 
@@ -859,17 +919,21 @@ impl ModuleExecutionService {
                         sanitized_message.chars().take(50).collect::<String>()
                     );
                     // Return Ok to not fail the execution - just drop the log
-                    Ok(())
+                    Ok(LogWriteOutcome::RateLimited)
                 } else if error_msg.contains("violates foreign key constraint")
                     || error_msg.contains("is not present in table")
                 {
-                    // This happens for workflow/canvas node executions which don't have
-                    // an entry in the module_executions table. We can safely ignore these logs in the DB.
-                    tracing::trace!(
-                        "Dropped log for canvas execution {} (no module_execution row)",
-                        execution_id
-                    );
-                    Ok(())
+                    // Belt-and-braces fallback, NOT the live path: the
+                    // `WHERE EXISTS` guard on the INSERT means a missing
+                    // parent row yields zero affected rows (handled above),
+                    // never an FK violation. This arm survives only so that
+                    // removing the guard degrades to the same OUTCOME value
+                    // instead of an error. It deliberately emits no log line
+                    // of its own — the previous `trace!` here claimed to
+                    // report dropped logs while being unreachable, which is
+                    // the same "absence reads as a negative result" class
+                    // this whole change exists to close. The caller warns.
+                    Ok(LogWriteOutcome::NoExecutionRow)
                 } else {
                     // Real database error - propagate it
                     Err(e).context("Failed to add execution log")
@@ -1189,38 +1253,49 @@ impl ModuleExecutionService {
         }
     }
 
-    /// Add log entry (best effort - logs error on failure)
+    /// Add log entry (best effort - logs error on failure).
+    ///
+    /// Returns the [`LogWriteOutcome`] so a caller that can distinguish
+    /// "stored" from "silently discarded" is able to say so. Callers with
+    /// nothing useful to do with the answer may ignore it (it is not
+    /// `#[must_use]`), but a caller that is the LAST routing hop for a log
+    /// line — the WASM-log subscriber — must check
+    /// [`LogWriteOutcome::is_orphaned`] and warn.
     pub async fn add_log_best_effort(
         &self,
         execution_id: Uuid,
         level: LogLevel,
         message: String,
         metadata: Option<JsonValue>,
-    ) {
-        if let Err(e) = self
+    ) -> LogWriteOutcome {
+        match self
             .add_log(execution_id, level, message.clone(), metadata)
             .await
         {
-            // MCP-989 (2026-05-15): DLP-redact the message preview that
-            // lands in the WARN log. `add_log` redacts before INSERT
-            // (MCP-481), but this wrapper kept a copy of the ORIGINAL
-            // unredacted `message` and previewed its first 50 chars when
-            // the DB write failed. A WASM module emitting a log message
-            // like "sk-ant-XXXXX rejected by API" would land the secret
-            // prefix in operator logs — secret-shaped content needs the
-            // same DLP discipline on the operator-log boundary as on
-            // the persistence boundary (sibling class to MCP-852/853/
-            // 854/921 — `info!`/`warn!` of WASM-supplied content).
-            let preview: String = talos_dlp_provider::redact_str(&message)
-                .chars()
-                .take(50)
-                .collect();
-            tracing::warn!(
-                "Failed to add log to execution {}: {} (message: {})",
-                execution_id,
-                e,
-                preview
-            );
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // MCP-989 (2026-05-15): DLP-redact the message preview that
+                // lands in the WARN log. `add_log` redacts before INSERT
+                // (MCP-481), but this wrapper kept a copy of the ORIGINAL
+                // unredacted `message` and previewed its first 50 chars when
+                // the DB write failed. A WASM module emitting a log message
+                // like "sk-ant-XXXXX rejected by API" would land the secret
+                // prefix in operator logs — secret-shaped content needs the
+                // same DLP discipline on the operator-log boundary as on
+                // the persistence boundary (sibling class to MCP-852/853/
+                // 854/921 — `info!`/`warn!` of WASM-supplied content).
+                let preview: String = talos_dlp_provider::redact_str(&message)
+                    .chars()
+                    .take(50)
+                    .collect();
+                tracing::warn!(
+                    "Failed to add log to execution {}: {} (message: {})",
+                    execution_id,
+                    e,
+                    preview
+                );
+                LogWriteOutcome::WriteFailed
+            }
         }
     }
 

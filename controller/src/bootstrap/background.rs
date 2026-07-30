@@ -2228,9 +2228,57 @@ pub(crate) fn spawn_nats_log_subscribers(
                                     Ok(true) => {} // landed in workflow_execution_logs
                                     Ok(false) => {
                                         // Not a workflow execution → standalone module run.
-                                        exec_service_for_logs
+                                        let outcome = exec_service_for_logs
                                             .add_log_best_effort(exec_id, level, message, metadata)
                                             .await;
+                                        // BOTH routes missed: `exec_id` names
+                                        // neither a `workflow_executions` row nor a
+                                        // `module_executions` row, so this line has
+                                        // been DISCARDED. This is the terminal hop —
+                                        // if we don't say it here, nobody does, and
+                                        // `get_execution_logs` will return `[]`,
+                                        // byte-identical to an execution that
+                                        // genuinely logged nothing. That silence is
+                                        // how every Loop-node iteration lost all of
+                                        // its logs (host diagnostics AND guest
+                                        // `logging::log`) unnoticed until 2026-07-30.
+                                        //
+                                        // Only `NoExecutionRow` warns: a `RateLimited`
+                                        // drop is deliberate back-pressure and a
+                                        // `WriteFailed` already warned inside
+                                        // `add_log_best_effort` — calling either
+                                        // "orphaned" would be the misleading-signal
+                                        // bug in the fix for a misleading signal.
+                                        //
+                                        // CONTENT: execution id + level ONLY. The
+                                        // message body is guest-authored and may carry
+                                        // anything the module printed; it must not be
+                                        // copied into the controller's operator log by
+                                        // a diagnostic about routing.
+                                        //
+                                        // VOLUME: one warn per orphaned line is
+                                        // bounded, not unbounded — a producer's
+                                        // per-execution log budget is capped in the
+                                        // worker (MAX_LOG_MESSAGES_PER_EXECUTION for
+                                        // guest lines, HOST_DIAG_CAP for host
+                                        // diagnostics), so a single pathological module
+                                        // cannot emit more warns than it can emit logs,
+                                        // and every legitimate dispatch path now
+                                        // pre-INSERTs a row (loop bodies included), so
+                                        // the steady state is zero.
+                                        if outcome.is_orphaned() {
+                                            tracing::warn!(
+                                                target: "talos_controller",
+                                                event_kind = "wasm_log_orphaned",
+                                                %exec_id,
+                                                level = level_upper,
+                                                "WASM log line discarded: execution id matches \
+                                                 neither workflow_executions nor module_executions. \
+                                                 The dispatching path minted an id without \
+                                                 recording an execution row — its logs are being \
+                                                 lost and will not appear in get_execution_logs."
+                                            );
+                                        }
                                     }
                                     Err(e) => {
                                         // exec_id IS a workflow execution but the insert failed
@@ -2244,7 +2292,18 @@ pub(crate) fn spawn_nats_log_subscribers(
                                     }
                                 }
                             } else {
-                                tracing::debug!("Received WASM log without valid execution_id");
+                                // Same class as `wasm_log_orphaned` one branch up:
+                                // the line is discarded here and nothing downstream
+                                // will ever mention it. A `debug!` (off in every
+                                // real deployment) meant an entire producer could
+                                // publish malformed ids forever and read as silence.
+                                // No message body — see the content rule above.
+                                tracing::warn!(
+                                    target: "talos_controller",
+                                    event_kind = "wasm_log_unparseable_execution_id",
+                                    subject = %msg.subject,
+                                    "WASM log line discarded: missing or unparseable execution_id"
+                                );
                             }
                         }
                         Err(e) => {

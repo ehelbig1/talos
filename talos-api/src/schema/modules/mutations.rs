@@ -628,6 +628,7 @@ impl ModulesMutations {
                 talos_workflow_job_protocol::WriteCeiling::Write, // permissive: internal test path
                 None,              // egress_scope — internal path: tier-derived default
                 None,              // llm_usage_out — internal test path doesn't collect usage
+                None,              // host_diag_out — no in-process diagnostic sink on this path
             )
             .await;
 

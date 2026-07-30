@@ -46,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
             talos_workflow_job_protocol::WriteCeiling::Write, // max_write_ceiling
             None,                                             // egress_scope: tier default
             None,                                             // llm_usage_out — not collected
+            None,                                             // host_diag_out — not collected
         )
         .await
     {
