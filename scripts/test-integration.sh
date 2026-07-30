@@ -99,6 +99,11 @@ TESTS=(
     "talos-idempotency:middleware_integration:redis"
     "talos-tenancy:rls_integration:selfcontained"
     "talos-actor-repository:budget_guard_integration:selfcontained"
+    # Sibling of budget_guard_integration, same self-contained schema shape.
+    # It was written after the June-2026 "every binary runs in CI" sweep and
+    # never got an entry, so the write-ceiling GRANT guard (the trigger that
+    # refuses a bulk `readonly -> write` escalation) had zero live coverage.
+    "talos-actor-repository:write_ceiling_guard_integration:selfcontained"
     "talos-db:rls_helper_enforcement:migrated"
     "talos-db:rls_org_isolation:migrated"
     "talos-organizations:personal_org_resolution:migrated"
@@ -167,10 +172,49 @@ CTRL_TESTS=(
     # #609's closing provenance test (measurement PR 3, D7). Gated here on
     # arrival rather than later: it is the ONLY coverage of the promoted-vs-
     # latest attribution in SQL, and an ungated integration binary is one that
-    # silently rots (the PR #181/#182 lesson). NOTE for a follow-up: its eight
-    # ml_* sibling binaries (ml_lifecycle_tests, ml_registry_tenancy_tests,
-    # ml_digest_tests, …) are NOT in this list and run nowhere in CI.
+    # silently rots (the PR #181/#182 lesson).
     "ml_measurement_provenance_tests"
+    # ── The ml_* / report-quality siblings (gated 2026-07-30) ───────────────
+    # Every one of these was written AFTER the June-2026 "100% of tests/-dir
+    # binaries run in CI" sweep and landed in a directory that no runner
+    # enumerated, so they compiled at authoring time and then ran NOWHERE.
+    # Most of them were last EDITED before #520/#527/#607/#609 reworked
+    # talos-ml, and three of the four defects found when they were finally
+    # executed had been sitting latent for weeks.
+    # `ml_registry_tenancy_tests` is the load-bearing one: it is the ONLY
+    # guard on the app-layer
+    # `AND user_id = $2` predicate in ModelRegistry::{resolve_by_name,
+    # resolve_by_id,list_models} — cross-tenant model resolution on the
+    # talos.ml.predict serving path is invisible to RLS on a superuser pool.
+    # Check 64 (scripts/lint-structural.sh) now fails the lint if a new
+    # tests/*.rs binary appears without a runner entry, so this class of
+    # decay can't silently re-open.
+    "ml_registry_tenancy_tests"
+    "ml_correction_tests"
+    "ml_dedupe_tests"
+    "ml_lifecycle_tests"
+    "ml_backend_selection_tests"
+    "report_quality_signals_tests"
+    "ml_digest_tests"
+    "ml_delete_tests"
+    "ml_fewshot_tests"
+    "ml_provision_tests"
+    # ── Tenancy / crypto / status-drift siblings (gated 2026-07-30) ─────────
+    # Same story: isolated-DB-harness binaries that never had a runner entry.
+    # Three guard a security boundary directly — github_app_tenancy_tests
+    # (cross-user GitHub App installation-token minting), oauth_flow_tests
+    # (state-token single-use + provider scoping, i.e. the OAuth CSRF gate),
+    # integration_state_crypto_tests (per-slot AAD threading). The other
+    # three are correctness/drift guards: memory_get_entry_tests (the
+    # agent-memory get-entry read path), module_execution_status_tests and
+    # execution_status_transition_tests (both exist precisely to fail when a
+    # schema/enum or status-guard pair diverges).
+    "github_app_tenancy_tests"
+    "oauth_flow_tests"
+    "integration_state_crypto_tests"
+    "memory_get_entry_tests"
+    "module_execution_status_tests"
+    "execution_status_transition_tests"
     "env_vars"
 )
 # 'talos_ctl' is now the migrated TEMPLATE: setup_test_context clones it into a
@@ -209,6 +253,18 @@ TC_TESTS=(
     "registry_access_tests"
     "registry_tests"
     "secrets_tests"
+    # ── Per-org root-DEK (v4) cutover binaries (gated 2026-07-30) ───────────
+    # These four are the ONLY end-to-end coverage that encryption-at-rest
+    # actually writes format v4 under the right org's root DEK (actor_memory
+    # write + re-encrypt sweep, module_executions payloads, workflow output).
+    # Their own header comments asserted "Env-gated (runs in quality.yml)" —
+    # which was FALSE: no runner named them. The comments now say what is
+    # true. They use the testcontainers harness (test_helpers), not the
+    # DATABASE_URL harness, so they belong in this block.
+    "actor_memory_dek_tests"
+    "actor_memory_sweep_dek_tests"
+    "module_payload_dek_tests"
+    "workflow_output_dek_tests"
 )
 for tctest in "${TC_TESTS[@]}"; do
     echo

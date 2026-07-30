@@ -15,6 +15,11 @@
 //! assertion is deliberately loose (warm < 60% of cold) — the point is
 //! "deps were reused", not a benchmark number.
 
+// ci-ungated: needs the HOST cargo-component toolchain + the wasm32-wasip2
+// target and runs two real WASM compiles back to back (minutes); it is also a
+// timing comparison, which is exactly the shape that flakes on shared CI
+// runners. Requires TALOS_TEST_COMPILE_CACHE=1.
+
 use std::path::PathBuf;
 
 const SOURCE_A: &str = r#"

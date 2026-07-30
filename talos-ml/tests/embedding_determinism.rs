@@ -25,6 +25,14 @@
 //! cargo test -p talos-ml --test embedding_determinism -- --nocapture
 //! ```
 
+// ci-ungated: needs a configured + reachable embedding provider
+// (EMBEDDING_API_URL / EMBEDDING_MODEL / EMBEDDING_DIMENSIONS). Every test
+// here early-returns without one, and `scripts/test-integration.sh`
+// provisions Postgres / Redis / NATS but no embedder — so a runner entry
+// would buy a green check over ZERO executed assertions, which is strictly
+// worse than an honest exclusion. Gate it the day the harness grows an
+// embedding provider, not before.
+
 use talos_memory::embedding;
 
 fn provider_configured() -> bool {

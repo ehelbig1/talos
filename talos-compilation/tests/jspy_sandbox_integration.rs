@@ -15,6 +15,10 @@
 //! * the Python SDK shim (module-level `run` → `WitWorld`) compiles;
 //! * `--network=none` holds — the tools need no fetch at componentize time.
 
+// ci-ungated: needs a locally-built `talos-builder:latest` image (`make
+// builder-image`) plus TALOS_TEST_JSPY_SANDBOX=1; neither CI job builds that
+// image, so a runner entry would only ever execute the env-gated no-op.
+
 const PY_SDK_SHAPED: &str = r#"
 import json
 
