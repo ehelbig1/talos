@@ -11,12 +11,32 @@
 //!   observations exist. Fail-safe direction: missing data can never
 //!   promote; only PRESENT bad data demotes.
 //! - **Policy re-eval (only on dataset change)**: when the dataset's
-//!   `updated_at` has passed `last_policy_eval_at`, run the eval
-//!   harness (records a version, same as `ml_eval_model`), judge the
-//!   typed policy, and — only when `auto_advance: true` — promote the
-//!   fresh version and advance ONE lifecycle step. `auto_advance:
+//!   `updated_at` has passed `last_policy_eval_attempt_at`, run the
+//!   eval harness (records a version, same as `ml_eval_model`), judge
+//!   the typed policy, and — only when `auto_advance: true` — promote
+//!   the fresh version and advance ONE lifecycle step. `auto_advance:
 //!   false` records the satisfied policy in the audit log and leaves
 //!   the promote button to a human.
+//!
+//! # Two clocks, deliberately separate (2026-07-30)
+//!
+//! `last_policy_eval_at` is the fair-rotation CURSOR: stamped on every
+//! completed visit so the LIMIT window cycles. `last_policy_eval_attempt_at`
+//! is the eval DEBOUNCE: stamped only when an evaluation is actually
+//! attempted. They were one column, and because the cursor is stamped once
+//! per tick (default 600 s) while the debounce window is an hour, the debounce
+//! test `now - stamp < ML_POLICY_EVAL_MIN_INTERVAL_SECS` was permanently true
+//! — the re-eval branch was unreachable in the default configuration. Live
+//! symptom (measured 2026-07-30): a model whose last STORED verdict was five
+//! days and 161 examples behind, revisited every ten minutes the whole time.
+//! See [`should_evaluate`] for the predicate and migration
+//! `20260730120000_ml_models_last_policy_eval_attempt_at.sql` for the split.
+//!
+//! **Re-eval bound**: at most one eval ATTEMPT per model per
+//! `ML_POLICY_EVAL_MIN_INTERVAL_SECS` (default 3600 s), and at most
+//! [`MODELS_PER_TICK`] models touched per tick. The attempt stamp lands
+//! BEFORE the eval runs, so an eval that fails (or is not runnable yet) still
+//! consumes the window and cannot hot-loop.
 //!
 //! Bounds: per-tick model scan is LIMIT-capped; each model's work runs
 //! under a `pg_try_advisory_xact_lock` (skip-if-held, so two replicas
@@ -37,7 +57,12 @@ use crate::serve::{invalidate_serving_cache, DEFAULT_KNN_K};
 
 const DEFAULT_INTERVAL_SECS: u64 = 600;
 /// Per-tick model cap — backlog catches up over subsequent ticks.
-const MODELS_PER_TICK: i64 = 25;
+pub const MODELS_PER_TICK: i64 = 25;
+/// Default floor on how often ONE model may be re-judged
+/// (`ML_POLICY_EVAL_MIN_INTERVAL_SECS`). This is the eval-storm bound: with
+/// the attempt clock split out of the rotation cursor, a hot dataset now
+/// reaches the evaluator, and this is what keeps it to once an hour.
+pub const DEFAULT_MIN_EVAL_INTERVAL_SECS: i64 = 3600;
 const DEFAULT_MIN_SHADOW_TOTAL: i64 = 50;
 const EVAL_HOLDOUT_FRACTION: f64 = 0.2;
 
@@ -121,11 +146,16 @@ pub async fn run_policy_tick(
     // LEAST-recently-VISITED first (review 2026-07-11: ordering by
     // dataset heat let 25 hot DISTILL datasets permanently starve every
     // other model from its drift check). `last_policy_eval_at` is
-    // stamped on EVERY completed visit — including drift-only and
-    // skip-unchanged visits — so the LIMIT window rotates fairly.
+    // stamped on EVERY visit this tick actually reaches — drift-only,
+    // skip-unchanged AND unparseable-policy alike — so the LIMIT window
+    // rotates fairly. The ONE case that deliberately does not stamp is a
+    // model whose advisory lock another replica holds: that replica is
+    // visiting it and will stamp it. That is ALL this column is: the eval
+    // decision below reads the SEPARATE `last_policy_eval_attempt_at`
+    // clock (see the module docs).
     let rows = sqlx::query(
         "SELECT m.id, m.user_id, m.org_id, m.name, m.dataset_id, m.lifecycle_state, \
-                m.policy_json, m.config_json, m.last_policy_eval_at, \
+                m.policy_json, m.config_json, m.last_policy_eval_attempt_at, \
                 d.updated_at AS dataset_updated_at \
          FROM ml_models m JOIN ml_datasets d ON d.id = m.dataset_id \
          WHERE m.policy_json <> '{}'::jsonb \
@@ -168,7 +198,8 @@ async fn evaluate_one_model(
         .unwrap_or(LifecycleState::LlmOnly);
     let policy_raw: serde_json::Value = row.try_get("policy_json")?;
     let config_json: serde_json::Value = row.try_get("config_json")?;
-    let last_eval: Option<chrono::DateTime<chrono::Utc>> = row.try_get("last_policy_eval_at")?;
+    let last_attempt: Option<chrono::DateTime<chrono::Utc>> =
+        row.try_get("last_policy_eval_attempt_at")?;
     let dataset_updated: chrono::DateTime<chrono::Utc> = row.try_get("dataset_updated_at")?;
 
     let policy = match PolicyJson::parse(&policy_raw) {
@@ -178,6 +209,18 @@ async fn evaluate_one_model(
             // governance otherwise) but not retried into log spam every
             // tick — WARN once per tick is acceptable at 25/tick.
             tracing::warn!(%model_id, error = %e, "unparseable policy_json; model skipped");
+            // Rotate anyway (2026-07-30, phase 2). This return used to
+            // precede the cursor stamp, so an unparseable model kept a NULL
+            // cursor forever and — with `ORDER BY last_policy_eval_at ASC
+            // NULLS FIRST` — re-occupied a slot of the LIMIT window on EVERY
+            // tick. Measured: 26 such models plus one healthy one, five
+            // ticks; the healthy model was visited exactly once and never
+            // again, so the drift guard AND the policy evaluator stopped for
+            // the whole tenant. Skipping the model is right; skipping the
+            // ROTATION is what starves its neighbours. No lock is taken
+            // first because there is no work to serialise — the stamp is an
+            // idempotent NOW() write and two replicas racing it is a no-op.
+            stamp_pool(pool, model_id, "last_policy_eval_at").await;
             return Ok(false);
         }
     };
@@ -200,13 +243,14 @@ async fn evaluate_one_model(
     if !locked {
         return Ok(false);
     }
-    // Visit stamp FIRST, on the POOL (autocommit, not this tx): it must
-    // survive an eval that aborts the tx (review 2026-07-11: stamping
-    // on the same tx after a SQL-level eval failure hits "current
-    // transaction is aborted", losing the stamp and hot-looping the
-    // full eval every tick). The stamp doubles as the rotation cursor;
-    // the eval-decision below uses the PRE-visit value from the scan.
-    stamp_last_eval_pool(pool, model_id).await;
+    // Rotation-cursor stamp FIRST, on the POOL (autocommit, not this tx):
+    // it must survive an eval that aborts the tx (review 2026-07-11:
+    // stamping on the same tx after a SQL-level eval failure hits
+    // "current transaction is aborted", losing the stamp and hot-looping
+    // the full eval every tick). This stamp is ONLY the fair-rotation
+    // cursor — it says "visited", never "judged". The eval decision below
+    // reads `last_policy_eval_attempt_at`, which this does not touch.
+    stamp_pool(pool, model_id, "last_policy_eval_at").await;
 
     // ── Drift guard (fail-safe demote) ──────────────────────────────
     // `shadow_agreement` is scoped to the model's CURRENT shadow epoch
@@ -282,29 +326,22 @@ async fn evaluate_one_model(
     }
 
     // ── Policy re-eval — only on dataset change, debounced ──────────
-    // fast_primary is governed by the drift guard alone (RFC: LLM only
-    // runs on fallback there; re-eval resumes if it demotes). The
-    // debounce bounds eval churn for actively-distilling models: the
-    // DISTILL hook touches ml_datasets.updated_at on every production
-    // call, and each eval rewrites every row's split + scans the whole
-    // holdout — once per ML_POLICY_EVAL_MIN_INTERVAL_SECS (default 1 h)
-    // is governance-fresh without the per-tick full-dataset churn.
     let now = chrono::Utc::now();
-    let min_eval_interval = chrono::Duration::seconds(
-        std::env::var("ML_POLICY_EVAL_MIN_INTERVAL_SECS")
-            .ok()
-            .and_then(|v| v.parse::<i64>().ok())
-            .filter(|v| *v >= 0)
-            .unwrap_or(3600),
-    );
-    let unchanged = last_eval.map(|t| dataset_updated <= t).unwrap_or(false);
-    let debounced = last_eval
-        .map(|t| now - t < min_eval_interval)
-        .unwrap_or(false);
-    if state == LifecycleState::FastPrimary || unchanged || debounced {
+    if !should_evaluate(
+        state,
+        last_attempt,
+        dataset_updated,
+        now,
+        min_eval_interval_from_env(),
+    ) {
         tx.commit().await.ok();
         return Ok(true);
     }
+    // Attempt stamp BEFORE the eval, on the POOL: an eval that fails, is
+    // not runnable yet, or aborts its tx must still consume the debounce
+    // window. This is the eval-storm bound in code — a model that cannot
+    // be evaluated is retried once per min_eval_interval, not every tick.
+    stamp_pool(pool, model_id, "last_policy_eval_attempt_at").await;
 
     let k = config_json
         .get("k")
@@ -453,8 +490,10 @@ async fn evaluate_one_model(
     tx.commit().await?;
     if decision.satisfied {
         // auto_advance: false — human keeps the promote button; say so
-        // once per dataset change (the last_policy_eval_at stamp gates
-        // repeats).
+        // once per dataset change (the last_policy_eval_attempt_at stamp
+        // gates repeats). `talos_operator_digest` turns the same state
+        // into a `needs_me` item, reading the STORED verdict on the
+        // version row rather than this log line.
         audit_transition(
             pool,
             user_id,
@@ -481,15 +520,254 @@ async fn evaluate_one_model(
     Ok(true)
 }
 
-/// Visit stamp on the pool (autocommit): rotation cursor + hot-loop
-/// guard. Failure is non-fatal (WARN) — worst case the model is
-/// revisited next tick.
-async fn stamp_last_eval_pool(pool: &PgPool, model_id: Uuid) {
-    if let Err(e) = sqlx::query("UPDATE ml_models SET last_policy_eval_at = NOW() WHERE id = $1")
-        .bind(model_id)
-        .execute(pool)
-        .await
-    {
-        tracing::warn!(%model_id, error = %e, "failed to stamp last_policy_eval_at");
+/// Stamp one of the evaluator's two `ml_models` clocks on the pool
+/// (autocommit, so it survives an aborted eval tx).
+///
+/// `column` is a compile-time literal from THIS module — never caller data —
+/// because Postgres has no bind parameter for an identifier. The two call
+/// sites pass `"last_policy_eval_at"` (rotation cursor, every visit) and
+/// `"last_policy_eval_attempt_at"` (eval debounce, only on an attempt).
+/// Failure is non-fatal (WARN): worst case for the cursor is a re-visit next
+/// tick, worst case for the attempt clock is one extra eval attempt.
+async fn stamp_pool(pool: &PgPool, model_id: Uuid, column: &'static str) {
+    debug_assert!(
+        matches!(
+            column,
+            "last_policy_eval_at" | "last_policy_eval_attempt_at"
+        ),
+        "stamp_pool takes a fixed column literal, never caller data"
+    );
+    let sql = format!("UPDATE ml_models SET {column} = NOW() WHERE id = $1");
+    if let Err(e) = sqlx::query(&sql).bind(model_id).execute(pool).await {
+        tracing::warn!(%model_id, column, error = %e, "failed to stamp evaluator clock");
+    }
+}
+
+/// Upper clamp on `ML_POLICY_EVAL_MIN_INTERVAL_SECS`: ten years, which is
+/// "never re-evaluate" for every practical purpose and is far inside
+/// `chrono::Duration::seconds`'s panic bound (`i64::MAX / 1000`). Without a
+/// clamp an operator typo of a very large number PANICS the construction — and
+/// the panic unwinds out of the evaluator's `tokio::spawn`ed loop, killing the
+/// background task for the life of the process rather than misconfiguring one
+/// interval.
+const MAX_MIN_EVAL_INTERVAL_SECS: i64 = 10 * 365 * 24 * 3600;
+
+/// `ML_POLICY_EVAL_MIN_INTERVAL_SECS`, clamped into a representable
+/// non-negative range. An unparseable or negative value falls back to the
+/// default rather than disabling the bound.
+fn min_eval_interval_from_env() -> chrono::Duration {
+    parse_min_eval_interval(
+        std::env::var("ML_POLICY_EVAL_MIN_INTERVAL_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The parsing half of [`min_eval_interval_from_env`], split out so it can be
+/// tested over every value an operator might set WITHOUT mutating a
+/// process-wide variable that peer tests run beside.
+fn parse_min_eval_interval(raw: Option<&str>) -> chrono::Duration {
+    chrono::Duration::seconds(
+        raw.and_then(|v| v.parse::<i64>().ok())
+            .filter(|v| *v >= 0)
+            .unwrap_or(DEFAULT_MIN_EVAL_INTERVAL_SECS)
+            .min(MAX_MIN_EVAL_INTERVAL_SECS),
+    )
+}
+
+/// Should this visit ATTEMPT a policy evaluation?
+///
+/// Pure so the defect that motivated the two-clock split is testable without a
+/// database or a background loop. Three reasons to decline, all of them
+/// stated over `last_attempt` — the clock that advances only when an eval is
+/// actually attempted, NEVER the rotation cursor:
+///
+/// * `fast_primary` is governed by the drift guard alone (RFC: the LLM only
+///   runs on fallback there; re-eval resumes if it demotes).
+/// * **unchanged** — the dataset has not been written since the last attempt,
+///   so a re-eval would score the same rows against the same policy.
+/// * **debounced** — the last attempt is inside `min_eval_interval`. This
+///   bounds eval churn for actively-distilling models: the DISTILL hook
+///   touches `ml_datasets.updated_at` on every production call, and each eval
+///   rewrites every row's split and scans the whole holdout.
+///
+/// A `None` `last_attempt` (never attempted, including every row at the time
+/// migration `20260730120000` added the column) declines nothing: the model is
+/// evaluated on its next visit.
+pub fn should_evaluate(
+    state: LifecycleState,
+    last_attempt: Option<chrono::DateTime<chrono::Utc>>,
+    dataset_updated: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+    min_eval_interval: chrono::Duration,
+) -> bool {
+    if state == LifecycleState::FastPrimary {
+        return false;
+    }
+    let Some(last) = last_attempt else {
+        return true;
+    };
+    let unchanged = dataset_updated <= last;
+    let debounced = now - last < min_eval_interval;
+    !unchanged && !debounced
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, TimeZone, Utc};
+
+    fn t(min: u32) -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 7, 30, 12, min, 0).unwrap()
+    }
+
+    /// THE defect (2026-07-30). Before the two-clock split the debounce read
+    /// the rotation cursor, which is re-stamped on every visit — so with the
+    /// default cadence (visit every 600 s, debounce 3600 s) `now - stamp` was
+    /// permanently under the window and this predicate could never say yes.
+    ///
+    /// Here the model has been VISITED nine minutes ago but never ATTEMPTED,
+    /// and the dataset is hot. It must evaluate. Feeding the visit time in as
+    /// `last_attempt` (the pre-split behaviour) is the mutation this pins.
+    #[test]
+    fn a_never_attempted_model_with_a_hot_dataset_evaluates() {
+        let hour = Duration::seconds(DEFAULT_MIN_EVAL_INTERVAL_SECS);
+        assert!(should_evaluate(
+            LifecycleState::Shadow,
+            None,
+            t(55),
+            t(59),
+            hour
+        ));
+        // The mutation: pass the once-per-tick visit stamp instead. Nine
+        // minutes < one hour, so the pre-split code declined — forever.
+        assert!(!should_evaluate(
+            LifecycleState::Shadow,
+            Some(t(50)),
+            t(55),
+            t(59),
+            hour
+        ));
+    }
+
+    /// D1 case 1 — a model visited N times inside the min-interval attempts
+    /// ONE evaluation. Simulated exactly as the tick does it: the attempt
+    /// clock advances only on the visit that evaluates.
+    #[test]
+    fn repeated_visits_inside_the_window_yield_one_attempt() {
+        let hour = Duration::seconds(3600);
+        let mut last_attempt: Option<chrono::DateTime<Utc>> = None;
+        let dataset_updated = t(0);
+        let mut attempts = 0;
+        // Six visits ten minutes apart — one full hour of ticks.
+        for i in 0..6 {
+            let now = t(i * 10);
+            if should_evaluate(
+                LifecycleState::Shadow,
+                last_attempt,
+                dataset_updated,
+                now,
+                hour,
+            ) {
+                attempts += 1;
+                last_attempt = Some(now);
+            }
+        }
+        assert_eq!(
+            attempts, 1,
+            "the debounce must admit exactly one attempt per window"
+        );
+    }
+
+    /// D1 case 2 — once the dataset grows past the last attempt AND the
+    /// window has elapsed, the model is re-judged. Both conditions are
+    /// required, and each is pinned separately so neither can be dropped.
+    #[test]
+    fn a_grown_dataset_re_evaluates_once_the_window_elapses() {
+        let ten_min = Duration::seconds(600);
+        // Window elapsed, dataset untouched since the attempt → no.
+        assert!(!should_evaluate(
+            LifecycleState::Shadow,
+            Some(t(0)),
+            t(0),
+            t(30),
+            ten_min
+        ));
+        // Dataset grew, window NOT elapsed → no (this is the storm bound).
+        assert!(!should_evaluate(
+            LifecycleState::Shadow,
+            Some(t(0)),
+            t(5),
+            t(9),
+            ten_min
+        ));
+        // Both → yes.
+        assert!(should_evaluate(
+            LifecycleState::Shadow,
+            Some(t(0)),
+            t(5),
+            t(30),
+            ten_min
+        ));
+    }
+
+    /// `fast_primary` is the drift guard's alone — it never spends an eval.
+    #[test]
+    fn fast_primary_never_evaluates_however_hot_the_dataset() {
+        assert!(!should_evaluate(
+            LifecycleState::FastPrimary,
+            None,
+            t(59),
+            t(59),
+            Duration::zero()
+        ));
+    }
+
+    /// Every `ML_POLICY_EVAL_MIN_INTERVAL_SECS` an operator can type must
+    /// produce a Duration, not a panic — the construction runs inside the
+    /// evaluator's spawned loop, so a panic there stops policy evaluation for
+    /// the whole process until restart. Bad values fall back to the default;
+    /// absurd ones clamp.
+    #[test]
+    fn every_env_value_yields_a_duration_rather_than_a_panic() {
+        let hour = Duration::seconds(DEFAULT_MIN_EVAL_INTERVAL_SECS);
+        assert_eq!(parse_min_eval_interval(None), hour, "unset");
+        assert_eq!(parse_min_eval_interval(Some("0")), Duration::zero());
+        assert_eq!(parse_min_eval_interval(Some("900")), Duration::seconds(900));
+        // Negative, empty and unparseable all mean "use the default", never
+        // "no bound".
+        for bad in ["-1", "", "not-a-number", "3600.0"] {
+            assert_eq!(parse_min_eval_interval(Some(bad)), hour, "{bad}");
+        }
+        // Past chrono's representable range (`Duration::seconds` PANICS above
+        // i64::MAX/1000) — must clamp.
+        for huge in ["9223372036854775807", "999999999999999999"] {
+            assert_eq!(
+                parse_min_eval_interval(Some(huge)),
+                Duration::seconds(MAX_MIN_EVAL_INTERVAL_SECS),
+                "{huge}"
+            );
+        }
+    }
+
+    /// A zero min-interval (`ML_POLICY_EVAL_MIN_INTERVAL_SECS=0`) disables the
+    /// debounce but NOT the dataset-change test — an operator turning the
+    /// bound off still does not get a re-eval of unchanged data.
+    #[test]
+    fn a_zero_window_still_requires_the_dataset_to_have_changed() {
+        assert!(!should_evaluate(
+            LifecycleState::Shadow,
+            Some(t(10)),
+            t(10),
+            t(10),
+            Duration::zero()
+        ));
+        assert!(should_evaluate(
+            LifecycleState::Shadow,
+            Some(t(10)),
+            t(11),
+            t(11),
+            Duration::zero()
+        ));
     }
 }

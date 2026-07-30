@@ -199,6 +199,12 @@ CTRL_TESTS=(
     "ml_delete_tests"
     "ml_fewshot_tests"
     "ml_provision_tests"
+    # The 2026-07-30 promotion-legibility binary: drives run_policy_tick for
+    # real so the ROTATION cursor and the EVAL-ATTEMPT clock are read back as
+    # two separate columns. Pure tests of `should_evaluate` cannot catch a
+    # caller that feeds it the wrong column — which is exactly the defect that
+    # left one model five days and 161 examples past its last policy verdict.
+    "ml_promotion_legibility_tests"
     # ── Tenancy / crypto / status-drift siblings (gated 2026-07-30) ─────────
     # Same story: isolated-DB-harness binaries that never had a runner entry.
     # Three guard a security boundary directly — github_app_tenancy_tests

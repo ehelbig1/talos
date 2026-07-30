@@ -1,0 +1,41 @@
+-- Split the policy evaluator's EVAL-DEBOUNCE clock out of its ROTATION CURSOR.
+--
+-- `ml_models.last_policy_eval_at` was doing two incompatible jobs at once:
+--
+--   1. the fair-rotation cursor — stamped on EVERY completed visit of the
+--      policy evaluator (drift-only visits, skipped visits, everything), so a
+--      fleet with more policy-bearing models than one tick's scan cap still
+--      cycles through all of them (`ORDER BY last_policy_eval_at ASC`);
+--   2. the input to the re-eval debounce
+--      (`now - last_policy_eval_at < ML_POLICY_EVAL_MIN_INTERVAL_SECS`, default
+--      3600 s) and to the dataset-change test
+--      (`ml_datasets.updated_at <= last_policy_eval_at`).
+--
+-- Job 1 stamps the column once per tick (`ML_POLICY_EVAL_INTERVAL_SECS`,
+-- default 600 s). Job 2 then reads a value that is at most one tick old, so
+-- `now - last_policy_eval_at` was permanently under the hour-long debounce
+-- window and the re-eval branch was UNREACHABLE whenever the revisit cadence
+-- is shorter than the debounce — which is the default configuration.
+--
+-- Measured on the live database 2026-07-30: `inbox-classifier-personal` had
+-- `last_policy_eval_at` stamped minutes earlier and a last STORED policy
+-- verdict from 2026-07-25 — five days and 161 examples behind, with 30 of its
+-- 44 versions carrying no verdict at all.
+--
+-- This column is stamped ONLY when the evaluator actually ATTEMPTS an
+-- evaluation, so the two clocks stop overwriting each other. It is named for
+-- the attempt, not for a verdict: it is stamped before the eval runs (so a
+-- failing eval cannot hot-loop the model every tick) and therefore does NOT
+-- assert that a verdict was produced. The question "when was this model last
+-- JUDGED" is answered by the newest `ml_model_versions` row whose
+-- `metrics_json` carries a `policy_decision` — a stored fact, not a clock.
+--
+-- No backfill: NULL means "no attempt has been recorded under this clock",
+-- which is exactly true on every existing row. The evaluator reads NULL as
+-- "evaluate on the next visit", so each policy-bearing model gets one eval
+-- attempt after deploy, bounded by the per-tick model cap (25) and then by
+-- ML_POLICY_EVAL_MIN_INTERVAL_SECS per model thereafter. Copying
+-- `last_policy_eval_at` into this column would re-assert the very claim the
+-- split exists to retire.
+ALTER TABLE ml_models
+    ADD COLUMN IF NOT EXISTS last_policy_eval_attempt_at TIMESTAMPTZ;
