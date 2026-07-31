@@ -68,7 +68,7 @@ bytes = "1.11.1"
 [dev-dependencies]
 # Integration tests (tests/) compile guest fixtures and poke the runtime
 # directly; the runtime itself comes through talos-worker-runtime.
-wasmtime = { version = "45.0.3", features = ["async", "component-model", "parallel-compilation", "memory-protection-keys"] }
+wasmtime = { version = "47.0.3", features = ["async", "component-model", "parallel-compilation", "memory-protection-keys"] }
 wat = "1"  # Convert WAT text to a minimal component for AOT tests
 wit-component = "0.224"
 wit-parser = "0.224"  # Resolve the minimal-node world for kill-switch integration fixtures
