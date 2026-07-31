@@ -17,6 +17,29 @@ use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, W
 /// [`drain_llm_usage_entries`].
 pub type LlmUsageAcc = Arc<std::sync::Mutex<HashMap<(String, String), (u64, u64, u32)>>>;
 
+/// In-process collector for the `[host:*]` diagnostic lines an execution
+/// emits — the SAME lines [`TalosContext::emit_host_diagnostic`] publishes to
+/// `wasm.log.{execution_id}`.
+///
+/// WHY it exists: the NATS route requires an `execution_id` that names a real
+/// `workflow_executions` / `module_executions` row. The in-process diagnostic
+/// surfaces — `run_sandbox` and `test_module` — deliberately have neither
+/// (they pass `execution_context: None`), so `emit_host_diagnostic`
+/// short-circuits and their host diagnostics go nowhere at all. That is
+/// precisely the surface the diagnostics exist for: a developer iterating on
+/// a module, whose fetch just failed with a bare `networkerror`.
+///
+/// This is a SIDE CHANNEL, not a second log store: nothing persists it, it is
+/// bounded by the same per-execution `HOST_DIAG_CAP`, and it carries the same
+/// already-sanitized strings the NATS entry does — never more. A caller that
+/// supplies no sink gets byte-identical behaviour to before.
+///
+/// Same share-outside-the-Store shape as `stderr_capture`: a plain std
+/// `Mutex` (never held across an await) the caller owns and reads after the
+/// call returns, including on failure — a diagnostic about why a job failed
+/// is worth most when the job failed.
+pub type HostDiagSink = Arc<std::sync::Mutex<Vec<String>>>;
+
 /// Fold one LLM call's provider-reported usage into the accumulator.
 /// Saturating arithmetic — a hostile provider reporting `u64::MAX` tokens
 /// shows up as a visible spike, never a wrap. Poisoned-lock is impossible in
@@ -442,6 +465,11 @@ pub struct TalosContext {
     /// paths in `main.rs` pass their own Arc in so usage survives job
     /// timeout/failure (tokens spent before a trap are still spent).
     pub llm_usage: LlmUsageAcc,
+
+    /// Optional in-process mirror of this execution's `[host:*]` diagnostic
+    /// lines. See [`HostDiagSink`]. `None` (the default) for every dispatch
+    /// path that has a real execution id and therefore a working NATS route.
+    pub host_diag_sink: Option<HostDiagSink>,
 
     /// When true, non-GET HTTP requests, webhook sends, and messaging publishes
     /// are mocked with success responses instead of executing real network calls.
@@ -1228,6 +1256,10 @@ impl TalosContext {
             // read usage after execution overwrite this with their own Arc
             // (same pattern as `state_store` sharing across pipeline steps).
             llm_usage: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            // Off unless a caller explicitly asks to collect diagnostics
+            // in-process (`run_sandbox` / `test_module`). Every NATS-backed
+            // dispatch path leaves this None and is unchanged.
+            host_diag_sink: None,
             dry_run: false,
             actor_id: None,
             // Stamped from the constructor arg so the SSRF resolver's
@@ -1471,8 +1503,15 @@ impl TalosContext {
     /// embed proxy or internal-infra detail) and NEVER secret-derived
     /// values (same rule as `record_capability_denied`'s `target`).
     ///
-    /// Best-effort and fire-and-forget: no NATS / no execution_id → no-op;
-    /// a publish failure never changes the call's outcome.
+    /// Best-effort and fire-and-forget: no NATS / no execution_id → nothing
+    /// is published; a publish failure never changes the call's outcome.
+    ///
+    /// When a [`HostDiagSink`] is attached, the SAME formatted line is also
+    /// appended in-process BEFORE those two early-returns — that is the whole
+    /// point of the sink, since `run_sandbox` / `test_module` have no
+    /// execution id and would otherwise emit nothing anywhere. Both routes
+    /// spend the one shared `HOST_DIAG_CAP` budget, so attaching a sink
+    /// cannot increase how much a module can emit.
     // `&mut self` (not `&self`): TalosContext is Send but not Sync (the
     // WASI stdio streams), so async methods must hold an exclusive ref
     // to keep their futures Send — same reason record_capability_denied
@@ -1489,6 +1528,22 @@ impl TalosContext {
                 );
             }
             return;
+        }
+        // In-process mirror first: it is the ONLY route for a caller with no
+        // execution id, so it must not sit behind the NATS/id guards below.
+        // Same text as the published entry (`build_host_diagnostic_entry`'s
+        // `message` field) so the two surfaces can't describe the same event
+        // differently.
+        if let Some(ref sink) = self.host_diag_sink {
+            if let Ok(mut lines) = sink.lock() {
+                // Bound independently of the per-context counter: a retrying
+                // execution builds a fresh TalosContext (and a fresh counter)
+                // per attempt while the caller's sink is shared across all of
+                // them, so the counter alone would not cap the Vec.
+                if (lines.len() as u64) < Self::HOST_DIAG_CAP {
+                    lines.push(format_host_diagnostic_line(reason, message));
+                }
+            }
         }
         let Some(nats) = &self.nats_client else {
             return;
@@ -2216,6 +2271,16 @@ mod per_host_rate_limit_tests {
 /// constructing a `TalosContext` (no test constructor exists — the
 /// context owns WASI streams). `source: "host"` distinguishes these
 /// entries from guest `logging::log` output (`source: "wasm"`).
+/// The one place the `[host:<reason>] <message>` line is spelled.
+///
+/// Both delivery routes format through this — the NATS entry below and the
+/// in-process [`HostDiagSink`] — so an operator reading a persisted log line
+/// and a developer reading `run_sandbox` output see the same text for the
+/// same event.
+pub(crate) fn format_host_diagnostic_line(reason: &str, message: &str) -> String {
+    format!("[host:{reason}] {message}")
+}
+
 pub(crate) fn build_host_diagnostic_entry(
     execution_id: &str,
     request_id: &str,
@@ -2226,12 +2291,145 @@ pub(crate) fn build_host_diagnostic_entry(
         "execution_id": execution_id,
         "request_id": request_id,
         "level": "WARN",
-        "message": format!("[host:{reason}] {message}"),
+        "message": format_host_diagnostic_line(reason, message),
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "source": "host",
         "trace_id": null,
         "span_id": null,
     })
+}
+
+#[cfg(test)]
+mod host_diagnostic_sink_tests {
+    //! The in-process `[host:*]` sink — the ONLY diagnostic route for a
+    //! caller with no execution row (`run_sandbox`, `test_module`).
+    //!
+    //! Regression cover for the surface #617 built diagnostics for but could
+    //! not reach: both handlers pass `execution_context: None`, so
+    //! `emit_host_diagnostic`'s `execution_id` guard short-circuited and a
+    //! developer probing a failing fetch got a bare `networkerror` and an
+    //! empty response. The ORDER of the guards is the whole fix, so these
+    //! tests pin it: the sink must be fed BEFORE the NATS/id early-returns.
+
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use talos_workflow_job_protocol::LlmTier;
+
+    use super::{build_host_diagnostic_entry, HostDiagSink, TalosContext};
+    use crate::wit_inspector::CapabilityWorld;
+
+    /// A context in exactly the `run_sandbox` shape: no NATS client, no
+    /// execution id.
+    fn sandbox_shaped_context() -> TalosContext {
+        TalosContext::new(
+            CapabilityWorld::Minimal,
+            vec![],
+            vec![],
+            128,
+            HashMap::new(),
+            None, // redis
+            None, // NATS — the published route is dead
+            false,
+            None,
+            Arc::new(crate::expose_fallback::ExposeFallback::new()),
+            LlmTier::default(),
+            None,
+        )
+        .expect("context builds")
+    }
+
+    fn sink() -> HostDiagSink {
+        Arc::new(std::sync::Mutex::new(Vec::new()))
+    }
+
+    #[tokio::test]
+    async fn sink_collects_when_there_is_no_nats_and_no_execution_id() {
+        let mut ctx = sandbox_shaped_context();
+        assert!(ctx.execution_id.is_none() && ctx.nats_client.is_none());
+        let s = sink();
+        ctx.host_diag_sink = Some(s.clone());
+
+        ctx.emit_host_diagnostic(
+            "allowed-hosts",
+            "http-fetch denied by policy 'allowed-hosts'",
+        )
+        .await;
+
+        let lines = s.lock().unwrap().clone();
+        assert_eq!(
+            lines,
+            vec!["[host:allowed-hosts] http-fetch denied by policy 'allowed-hosts'".to_string()],
+            "with no execution id the sink is the only route — if it is fed AFTER the id guard, \
+             this is empty and the developer sees nothing at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_sink_nothing_is_collected_and_nothing_breaks() {
+        let mut ctx = sandbox_shaped_context();
+        assert!(ctx.host_diag_sink.is_none());
+        // The pre-existing behaviour for every NATS-backed dispatch path.
+        ctx.emit_host_diagnostic("dns-resolution-failed", "hostname resolution failed")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn sink_line_is_textually_identical_to_the_published_entry() {
+        let mut ctx = sandbox_shaped_context();
+        let s = sink();
+        ctx.host_diag_sink = Some(s.clone());
+        ctx.emit_host_diagnostic(
+            "tls-handshake-failed",
+            "TLS handshake failed for 'api.x.test'",
+        )
+        .await;
+
+        let published = build_host_diagnostic_entry(
+            "exec-1",
+            "req-1",
+            "tls-handshake-failed",
+            "TLS handshake failed for 'api.x.test'",
+        );
+        assert_eq!(
+            s.lock().unwrap()[0],
+            published["message"].as_str().unwrap(),
+            "the two surfaces must never describe the same event differently"
+        );
+    }
+
+    #[tokio::test]
+    async fn sink_is_bounded_by_the_diagnostic_cap() {
+        let mut ctx = sandbox_shaped_context();
+        let s = sink();
+        ctx.host_diag_sink = Some(s.clone());
+        for i in 0..(TalosContext::HOST_DIAG_CAP + 50) {
+            ctx.emit_host_diagnostic("allowed-hosts", &format!("denial {i}"))
+                .await;
+        }
+        assert_eq!(
+            s.lock().unwrap().len() as u64,
+            TalosContext::HOST_DIAG_CAP,
+            "a module hammering a denied host must not grow the sink without bound"
+        );
+    }
+
+    /// The sink is shared across retry attempts (each attempt builds a fresh
+    /// context with a fresh counter), so the Vec's own length check — not the
+    /// per-context counter — is what actually bounds it.
+    #[tokio::test]
+    async fn shared_sink_stays_bounded_across_multiple_contexts() {
+        let s = sink();
+        for _ in 0..3 {
+            let mut ctx = sandbox_shaped_context();
+            ctx.host_diag_sink = Some(s.clone());
+            for i in 0..TalosContext::HOST_DIAG_CAP {
+                ctx.emit_host_diagnostic("allowed-hosts", &format!("denial {i}"))
+                    .await;
+            }
+        }
+        assert_eq!(s.lock().unwrap().len() as u64, TalosContext::HOST_DIAG_CAP);
+    }
 }
 
 #[cfg(test)]

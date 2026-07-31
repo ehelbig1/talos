@@ -830,6 +830,7 @@ async fn run_replays(
                 // LLM hosts.)
                 None,
                 None, // llm_usage_out — replay diagnostics don't collect usage
+                None, // host_diag_out — no in-process diagnostic sink on this path
             )
             .await;
         let duration_ms = start.elapsed().as_millis() as i64;

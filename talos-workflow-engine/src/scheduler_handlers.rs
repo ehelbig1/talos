@@ -20,7 +20,8 @@ use petgraph::graph::NodeIndex;
 use petgraph::Direction;
 use serde_json::{json, Value as JsonValue};
 use talos_workflow_engine_core::{
-    DispatchJob, EdgeLogic, NodeDispatcher, SystemNodeKind, WorkerSharedKey,
+    DispatchJob, EdgeLogic, ExecutionStartedContext, NodeDispatcher, SystemNodeKind,
+    WorkerSharedKey,
 };
 
 // AGENT_LOOP_MAX_HISTORY is now an engine field — see
@@ -2006,6 +2007,48 @@ impl ParallelWorkflowEngine {
         Some(loop_result)
     }
 
+    /// Close out one loop iteration's `module_executions` row.
+    ///
+    /// Every exit path from a dispatched iteration calls this — success,
+    /// `__error` envelope, and dispatch error alike — so a per-iteration row
+    /// can never linger in `'running'` after the loop ends. A stuck-running
+    /// row is not a cosmetic defect: the crash-recovery and stale-execution
+    /// sweeps read that status, and "running" rows that nothing will ever
+    /// complete are exactly the phantom the race-safe INSERT exists to avoid.
+    ///
+    /// Payload/error redaction mirrors the pipeline-step path
+    /// (`engine_dispatch_pipeline.rs`); the store redacts again at the bind
+    /// boundary, which is the intended defense in depth, not a duplication.
+    async fn complete_loop_iteration_row(
+        &self,
+        iter_exec_id: Uuid,
+        status: &str,
+        output: &JsonValue,
+        duration_ms: i32,
+        error_message: Option<&str>,
+    ) {
+        let Some(ref store) = self.module_execution_store else {
+            return;
+        };
+        let redacted_error = error_message.map(|e| self.redact_str(e));
+        if let Err(db_err) = store
+            .record_completed(
+                iter_exec_id,
+                status,
+                &self.redact_json(output),
+                duration_ms,
+                redacted_error.as_deref(),
+            )
+            .await
+        {
+            tracing::error!(
+                %iter_exec_id,
+                "module_execution_store.record_completed failed for loop iteration: {}",
+                db_err
+            );
+        }
+    }
+
     /// Body of the [`SystemNodeKind::Loop`] iteration loop. Kept on
     /// its own method so the happy path in
     /// [`try_dispatch_loop`](Self::try_dispatch_loop) stays readable —
@@ -2103,6 +2146,15 @@ impl ParallelWorkflowEngine {
         let cached_dispatch_secrets = self
             .build_dispatch_secrets(body_module_id, execution_id, worker_shared_key)
             .await;
+
+        // Canonical `modules.id` for the per-iteration `module_executions`
+        // rows below. Hoisted out of the loop for the same reason the module
+        // bytes and secrets are (MCP-H6): a store impl is free to make this a
+        // DB round-trip, and the answer is invariant across iterations.
+        let iter_module_id = match self.module_execution_store {
+            Some(ref store) => store.resolve_module_id(body_module_id).await,
+            None => body_module_id,
+        };
 
         while iteration < max_iters {
             // Evaluate condition against current output + loop metadata.
@@ -2210,14 +2262,70 @@ impl ParallelWorkflowEngine {
             // iteration is wasted work. Clone is cheap (a small Vec<u8> +
             // nonce, or the resolved plaintext map under claim-based sealing).
             let dispatch_secrets = cached_dispatch_secrets.clone();
+
+            // Pre-INSERT a `module_executions` row for THIS iteration, then
+            // dispatch under its id — the same contract the single-node
+            // (`engine_dispatch_single.rs`) and pipeline-step
+            // (`engine_dispatch_pipeline.rs`) paths already honour.
+            //
+            // WHY (2026-07-30): this used to pass `job_id: None`, and
+            // `NatsDispatcher::dispatch` minted a fresh UUID for the wire.
+            // The worker stamps that UUID as the execution id on every log
+            // line it publishes to `wasm.log.{id}` — but the id existed in
+            // NEITHER `workflow_executions` NOR `module_executions`, so both
+            // of the subscriber's `WHERE EXISTS`-guarded inserts selected
+            // zero rows. Every iteration of every Loop node lost ALL of its
+            // logs: host diagnostics (the `[host:*]` reason classes) AND the
+            // guest's own `talos::core::logging::log`. `get_execution_logs`
+            // then returned `[]`, which reads as "the module printed
+            // nothing" rather than "we threw its output away". Minting the
+            // id HERE and recording the row is what makes the id real.
+            //
+            // The row is also the per-iteration status/output record the
+            // loop path never had; it is completed below on every exit path
+            // so it can't linger in 'running'.
+            let iter_exec_id = Uuid::new_v4();
+            if let Some(ref store) = self.module_execution_store {
+                if let Err(db_err) = store
+                    .record_started(ExecutionStartedContext {
+                        id: iter_exec_id,
+                        module_id: iter_module_id,
+                        user_id: loop_user_id,
+                        workflow_execution_id: execution_id,
+                        input: &job_input,
+                        trigger_type: "webhook",
+                        // Race-safe, matching single-node dispatch: a loop
+                        // node runs concurrently with sibling nodes in the
+                        // parallel scheduler, so a sibling's failure UPDATE
+                        // can land between this INSERT and the dispatch.
+                        // (Pipeline steps set this false because they are
+                        // dispatched atomically as one chain.)
+                        race_safe_status: true,
+                        actor_id: self.actor_id(),
+                    })
+                    .await
+                {
+                    // Non-fatal: losing the audit row must not fail the
+                    // iteration. It does mean this iteration's logs will be
+                    // dropped downstream — which the subscriber now reports
+                    // as `wasm_log_orphaned` instead of swallowing.
+                    tracing::error!(
+                        %iter_exec_id,
+                        "module_execution_store.record_started failed for loop iteration: {}",
+                        db_err
+                    );
+                }
+            }
+            let iter_started = std::time::Instant::now();
+
             let body_job = DispatchJob {
                 execution_id,
                 node_id: body_uuid,
                 module_id: body_module_id,
-                // Loop-body iterations don't pre-INSERT
-                // `module_executions` rows; let the adapter mint a
-                // fresh `job_id`.
-                job_id: None,
+                // Keyed to the `module_executions` row INSERTed just above,
+                // so the worker's `wasm.log.{job_id}` lines have somewhere
+                // to land. Never `None` here — see the block above.
+                job_id: Some(iter_exec_id),
                 user_id: self.user_id(),
                 actor_id: self.actor_id(),
                 // User-scoped redis URI (L-27): `wasm:{user_id}:{module_id}`,
@@ -2313,7 +2421,11 @@ impl ParallelWorkflowEngine {
                 emit_retry_events: false,
             };
 
-            match dispatcher.dispatch(body_job).await {
+            let dispatch_outcome = dispatcher.dispatch(body_job).await;
+            let iter_duration_ms =
+                i32::try_from(iter_started.elapsed().as_millis()).unwrap_or(i32::MAX);
+
+            match dispatch_outcome {
                 Ok(result) => {
                     // Unwrap the engine envelope so the next iteration
                     // receives clean output, not double-wrapped input.
@@ -2332,16 +2444,45 @@ impl ParallelWorkflowEngine {
                             .and_then(|v| v.as_str())
                             .unwrap_or("loop body returned an error envelope")
                             .to_string();
+                        // The dispatch succeeded but the BODY reported an
+                        // error — record 'failed', not 'completed'. Same
+                        // reasoning as the `__error` check itself: a row
+                        // that says "completed" for a failed iteration is
+                        // the misleading-field class in the audit log.
+                        self.complete_loop_iteration_row(
+                            iter_exec_id,
+                            "failed",
+                            &clean,
+                            iter_duration_ms,
+                            Some(&msg),
+                        )
+                        .await;
                         last_output = clean;
                         termination_reason = "body_error";
                         terminating_error = Some(msg);
                         break;
                     }
+                    self.complete_loop_iteration_row(
+                        iter_exec_id,
+                        "completed",
+                        &clean,
+                        iter_duration_ms,
+                        None,
+                    )
+                    .await;
                     last_output = clean.clone();
                     current_input = clean;
                 }
                 Err(e) => {
                     let msg = e.to_string();
+                    self.complete_loop_iteration_row(
+                        iter_exec_id,
+                        "failed",
+                        &serde_json::Value::Null,
+                        iter_duration_ms,
+                        Some(&msg),
+                    )
+                    .await;
                     last_output = serde_json::json!({
                         "__error": true,
                         "error_message": msg.clone(),
@@ -2932,5 +3073,412 @@ mod dispatch_expression_tests {
             .as_deref(),
             Ok("workflow-a")
         );
+    }
+}
+
+#[cfg(test)]
+mod loop_iteration_execution_row_tests {
+    //! Loop bodies must dispatch under a REAL execution-row id.
+    //!
+    //! Regression cover for the 2026-07-30 finding: `run_loop_iterations`
+    //! passed `job_id: None`, the NATS dispatcher minted a fresh UUID for the
+    //! wire, and the worker stamped that UUID onto every `wasm.log.{id}` line
+    //! it published. The id named no row in `workflow_executions` OR
+    //! `module_executions`, so both of the log subscriber's `WHERE EXISTS`
+    //! inserts matched nothing and every iteration of every Loop node lost
+    //! ALL of its logs — host diagnostics and the guest's own
+    //! `talos::core::logging::log` alike.
+    //!
+    //! These tests drive the REAL `run_loop_iterations` (not a re-implementation
+    //! of its logic) through the in-memory adapters, and assert on the recorded
+    //! store calls — i.e. that the row EXISTS, not merely that the field is
+    //! `Some`. `Some(<uuid nobody recorded>)` would be the same bug wearing a
+    //! different mask.
+
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use talos_workflow_engine_core::{NodeDispatcher, SystemNodeKind, WasmModuleArtifact};
+    use talos_workflow_engine_test_utils::capture::{
+        CaptureModuleExecutionStore, ExecutionStoreCall,
+    };
+    use talos_workflow_engine_test_utils::dispatch::ScriptedDispatcher;
+    use talos_workflow_engine_test_utils::memory::InMemoryModuleFetcher;
+    use talos_workflow_engine_test_utils::noop::StubExpressionEvaluator;
+    use uuid::Uuid;
+
+    use crate::engine::ParallelWorkflowEngine;
+
+    fn stub_artifact(module_id: Uuid) -> WasmModuleArtifact {
+        WasmModuleArtifact {
+            module_id,
+            content_hash: "stub".into(),
+            wasm_bytes: vec![1, 2, 3],
+            oci_url: None,
+            max_fuel: 1_000_000,
+            capability_world: "stub".into(),
+            allowed_hosts: vec![],
+            allowed_methods: vec![],
+            allowed_secrets: vec![],
+            requires_approval_for: vec![],
+            integration_name: None,
+            config: None,
+        }
+    }
+
+    /// Engine wired with the in-memory adapters a loop dispatch needs:
+    /// a module fetcher, a user, an actor, and a recording execution store.
+    fn engine_with_loop(
+        loop_node: Uuid,
+        body_node: Uuid,
+        body_module: Uuid,
+        store: Arc<CaptureModuleExecutionStore>,
+    ) -> ParallelWorkflowEngine {
+        let mut engine = ParallelWorkflowEngine::new();
+        engine.set_user_id(Uuid::new_v4());
+        // Bare `set_actor_id` needs no opt-out here: lint check 29 excludes
+        // `talos-workflow-engine/**` wholesale, and check 3 (whose
+        // `allow-agent-context-key` marker an earlier draft pasted onto this
+        // line) only greps `__agent_context__`, in other crates. An inert
+        // opt-out reads as "this tripped a lint and was excused" — a claim
+        // neither check would ever make.
+        engine.set_actor_id(Uuid::new_v4());
+        // A bare engine has no evaluator, and `eval_bool` fail-closes to
+        // false — which would silently stop every loop after one iteration
+        // and make these tests pass for the wrong reason.
+        engine.set_expression_evaluator(Arc::new(StubExpressionEvaluator::new().with_bool(true)));
+        engine.set_module_execution_store(store);
+        engine.set_module_fetcher(Arc::new(
+            InMemoryModuleFetcher::new().with_module(body_module, stub_artifact(body_module)),
+        ));
+        engine.add_node(
+            loop_node,
+            None,
+            None,
+            Some(SystemNodeKind::Loop {
+                max_iterations: 3,
+                condition: "true".into(),
+            }),
+        );
+        engine.add_node(body_node, Some(body_module), None, None);
+        engine
+    }
+
+    fn started_calls(store: &CaptureModuleExecutionStore) -> Vec<ExecutionStoreCall> {
+        store
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, ExecutionStoreCall::Started { .. }))
+            .collect()
+    }
+
+    /// THE regression: every dispatched iteration carries a `job_id` that a
+    /// `record_started` call actually created a row for.
+    #[tokio::test]
+    async fn every_loop_iteration_dispatches_under_a_recorded_execution_row() {
+        let store = Arc::new(CaptureModuleExecutionStore::new());
+        let loop_node = Uuid::new_v4();
+        let body_node = Uuid::new_v4();
+        let body_module = Uuid::new_v4();
+        let engine = engine_with_loop(loop_node, body_node, body_module, store.clone());
+
+        let dispatcher = Arc::new(
+            ScriptedDispatcher::new().with_response(body_module, json!({ "keep_going": true })),
+        );
+        let dyn_dispatcher: Arc<dyn NodeDispatcher> = dispatcher.clone();
+
+        let out = engine
+            .run_loop_iterations(
+                loop_node,
+                Uuid::new_v4(),
+                body_node,
+                body_module,
+                json!({ "seed": 1 }),
+                "true", // condition: keep looping until max_iters
+                3,
+                &dyn_dispatcher,
+                &None,
+                &std::collections::HashMap::new(),
+            )
+            .await;
+
+        assert_eq!(out["iterations"], json!(3), "loop ran to its cap");
+        let jobs = dispatcher.jobs();
+        assert_eq!(jobs.len(), 3, "one dispatch per iteration");
+
+        // The ids the store was told about — i.e. the rows that exist.
+        let recorded: Vec<Uuid> = started_calls(&store)
+            .into_iter()
+            .map(|c| match c {
+                ExecutionStoreCall::Started { id, .. } => id,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(recorded.len(), 3, "one execution row per iteration");
+
+        for (i, job) in jobs.iter().enumerate() {
+            let job_id = job.job_id.unwrap_or_else(|| {
+                panic!(
+                    "iteration {i} dispatched with job_id: None — the worker would mint its own \
+                     id and every log line for this iteration would be discarded"
+                )
+            });
+            assert!(
+                recorded.contains(&job_id),
+                "iteration {i} dispatched under {job_id}, which no record_started call created a \
+                 row for — the log-persist predicate would miss it just the same"
+            );
+        }
+        // Distinct per iteration: sharing one row across iterations would
+        // collapse their logs and their status into one another.
+        let mut unique = recorded.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 3, "each iteration gets its OWN row");
+    }
+
+    /// The row's parentage and attribution must match the dispatch, or the
+    /// `module_execution_logs → module_executions → workflow_execution_id`
+    /// join that `tail_worker_logs` walks won't find the lines.
+    #[tokio::test]
+    async fn loop_iteration_row_is_bound_to_the_parent_execution_and_module() {
+        let store = Arc::new(CaptureModuleExecutionStore::new());
+        let loop_node = Uuid::new_v4();
+        let body_node = Uuid::new_v4();
+        let body_module = Uuid::new_v4();
+        let engine = engine_with_loop(loop_node, body_node, body_module, store.clone());
+        let execution_id = Uuid::new_v4();
+
+        let dispatcher: Arc<dyn NodeDispatcher> =
+            Arc::new(ScriptedDispatcher::new().with_response(body_module, json!({ "ok": true })));
+
+        engine
+            .run_loop_iterations(
+                loop_node,
+                execution_id,
+                body_node,
+                body_module,
+                json!({}),
+                "true",
+                1,
+                &dispatcher,
+                &None,
+                &std::collections::HashMap::new(),
+            )
+            .await;
+
+        let started = started_calls(&store);
+        assert_eq!(started.len(), 1);
+        match &started[0] {
+            ExecutionStoreCall::Started {
+                module_id,
+                workflow_execution_id,
+                trigger_type,
+                race_safe_status,
+                actor_id,
+                ..
+            } => {
+                assert_eq!(*module_id, body_module, "row must name the BODY module");
+                assert_eq!(
+                    *workflow_execution_id, execution_id,
+                    "row must hang off the parent workflow execution"
+                );
+                // Must be a value the module_executions trigger_type CHECK
+                // accepts; matches the single-node dispatch path.
+                assert_eq!(trigger_type, "webhook");
+                assert!(
+                    *race_safe_status,
+                    "loop nodes run concurrently with sibling nodes — a sibling failure between \
+                     INSERT and dispatch must land the row as cancelled, not phantom-running"
+                );
+                assert!(actor_id.is_some(), "row inherits the engine's actor");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Rows must never be left in `running`. The stuck-execution sweeper and
+    /// the sibling-cancel trigger both read that status; a loop that leaks
+    /// N phantom running rows per run poisons both.
+    #[tokio::test]
+    async fn every_started_row_is_completed_on_success_and_on_failure() {
+        // Success path.
+        let store = Arc::new(CaptureModuleExecutionStore::new());
+        let (l, b, m) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let engine = engine_with_loop(l, b, m, store.clone());
+        let dispatcher: Arc<dyn NodeDispatcher> =
+            Arc::new(ScriptedDispatcher::new().with_response(m, json!({ "ok": true })));
+        engine
+            .run_loop_iterations(
+                l,
+                Uuid::new_v4(),
+                b,
+                m,
+                json!({}),
+                "true",
+                2,
+                &dispatcher,
+                &None,
+                &std::collections::HashMap::new(),
+            )
+            .await;
+        let calls = store.calls();
+        let started: Vec<Uuid> = calls
+            .iter()
+            .filter_map(|c| match c {
+                ExecutionStoreCall::Started { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        let completed: Vec<(Uuid, String)> = calls
+            .iter()
+            .filter_map(|c| match c {
+                ExecutionStoreCall::Completed { id, status, .. } => Some((*id, status.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started.len(), 2);
+        assert_eq!(completed.len(), 2, "no row left in 'running'");
+        for id in &started {
+            let done = completed.iter().find(|(cid, _)| cid == id);
+            assert_eq!(
+                done.map(|(_, s)| s.as_str()),
+                Some("completed"),
+                "row {id} must be completed"
+            );
+        }
+
+        // Dispatch-failure path: the row still has to be closed out, and as
+        // 'failed' — a 'completed' row for a failed iteration is the
+        // misleading-field class in the audit log.
+        let store = Arc::new(CaptureModuleExecutionStore::new());
+        let (l, b, m) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let engine = engine_with_loop(l, b, m, store.clone());
+        let dispatcher: Arc<dyn NodeDispatcher> =
+            Arc::new(ScriptedDispatcher::new().with_error(m, "transport exploded"));
+        engine
+            .run_loop_iterations(
+                l,
+                Uuid::new_v4(),
+                b,
+                m,
+                json!({}),
+                "true",
+                2,
+                &dispatcher,
+                &None,
+                &std::collections::HashMap::new(),
+            )
+            .await;
+        let calls = store.calls();
+        let completed: Vec<(Uuid, String, Option<String>)> = calls
+            .iter()
+            .filter_map(|c| match c {
+                ExecutionStoreCall::Completed {
+                    id,
+                    status,
+                    error_message,
+                    ..
+                } => Some((*id, status.clone(), error_message.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completed.len(), 1, "the failing iteration's row is closed");
+        assert_eq!(completed[0].1, "failed");
+        assert!(
+            completed[0]
+                .2
+                .as_deref()
+                .is_some_and(|e| e.contains("transport exploded")),
+            "the failure reason is recorded on the row"
+        );
+    }
+
+    /// A body that returns an `__error` envelope succeeded at the transport
+    /// layer but FAILED as work. The row must say so.
+    #[tokio::test]
+    async fn error_envelope_records_the_row_as_failed() {
+        let store = Arc::new(CaptureModuleExecutionStore::new());
+        let (l, b, m) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let engine = engine_with_loop(l, b, m, store.clone());
+        let dispatcher: Arc<dyn NodeDispatcher> =
+            Arc::new(ScriptedDispatcher::new().with_response(
+                m,
+                json!({ "__error": true, "error_message": "body blew up" }),
+            ));
+        engine
+            .run_loop_iterations(
+                l,
+                Uuid::new_v4(),
+                b,
+                m,
+                json!({}),
+                "true",
+                3,
+                &dispatcher,
+                &None,
+                &std::collections::HashMap::new(),
+            )
+            .await;
+        let completed: Vec<(String, Option<String>)> = store
+            .calls()
+            .iter()
+            .filter_map(|c| match c {
+                ExecutionStoreCall::Completed {
+                    status,
+                    error_message,
+                    ..
+                } => Some((status.clone(), error_message.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].0, "failed");
+        assert!(completed[0]
+            .1
+            .as_deref()
+            .is_some_and(|e| e.contains("body blew up")));
+    }
+
+    /// An engine with no store still dispatches under a stable minted id
+    /// (test/embedded configurations must not regress into a panic or an
+    /// unset job_id).
+    #[tokio::test]
+    async fn storeless_engine_still_stamps_a_job_id() {
+        let mut engine = ParallelWorkflowEngine::new();
+        engine.set_user_id(Uuid::new_v4());
+        engine.set_expression_evaluator(Arc::new(StubExpressionEvaluator::new().with_bool(true)));
+        let (l, b, m) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        engine.set_module_fetcher(Arc::new(
+            InMemoryModuleFetcher::new().with_module(m, stub_artifact(m)),
+        ));
+        engine.add_node(
+            l,
+            None,
+            None,
+            Some(SystemNodeKind::Loop {
+                max_iterations: 1,
+                condition: "true".into(),
+            }),
+        );
+        engine.add_node(b, Some(m), None, None);
+
+        let dispatcher = Arc::new(ScriptedDispatcher::new().with_response(m, json!({ "ok": 1 })));
+        let dyn_dispatcher: Arc<dyn NodeDispatcher> = dispatcher.clone();
+        engine
+            .run_loop_iterations(
+                l,
+                Uuid::new_v4(),
+                b,
+                m,
+                json!({}),
+                "true",
+                1,
+                &dyn_dispatcher,
+                &None,
+                &std::collections::HashMap::new(),
+            )
+            .await;
+        assert!(dispatcher.jobs()[0].job_id.is_some());
     }
 }

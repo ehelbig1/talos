@@ -318,6 +318,26 @@ pub async fn diagnose_failures(
         0.0
     };
 
+    // DEAD AND BROKEN — read this before "fixing" it (audited 2026-07-30).
+    //
+    // `module_executions` has NO `node_label` and NO `node_id` column (it
+    // carries `module_id` + `workflow_execution_id` and nothing node-shaped),
+    // so this statement fails to prepare on EVERY call. The `unwrap_or_else`
+    // below turns that into an empty breakdown plus a warn, and
+    // `diagnose_failures` has zero callers workspace-wide — which is the only
+    // reason nobody has noticed.
+    //
+    // THE TRAP: adding a `node_label` column would make this compile and start
+    // reporting — with the wrong denominator. `module_executions` holds one row
+    // per DISPATCH, not one per workflow run, and as of 2026-07-30 that
+    // includes one row per loop-body ITERATION (a `loop` node is capped at 100
+    // iterations, so a single workflow execution can contribute up to 100 rows
+    // for one node). `COUNT(*)` here is therefore "dispatches", never "runs",
+    // and rendering it as the latter beside `total`/`failed` — which ARE
+    // per-workflow-execution, counted off `workflow_executions` above — would
+    // put two different populations in one report under one label. If this is
+    // ever revived: label the column `dispatches`, or aggregate
+    // `COUNT(DISTINCT workflow_execution_id)` instead, and say which you chose.
     let node_failures: Vec<(String, i64, i64)> = sqlx::query_as(
         "SELECT COALESCE(node_label, node_id::text), COUNT(*), \
          COUNT(*) FILTER (WHERE status = 'failed') \

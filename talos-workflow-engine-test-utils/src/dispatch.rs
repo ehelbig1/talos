@@ -34,6 +34,7 @@ enum ScriptedResponse {
 pub struct ScriptedDispatcher {
     responses: Arc<DashMap<Uuid, ScriptedResponse>>,
     dispatch_count: Arc<DashMap<Uuid, usize>>,
+    jobs: Arc<std::sync::Mutex<Vec<DispatchJob>>>,
 }
 
 impl ScriptedDispatcher {
@@ -70,6 +71,20 @@ impl ScriptedDispatcher {
     pub fn total_dispatches(&self) -> usize {
         self.dispatch_count.iter().map(|e| *e.value()).sum()
     }
+
+    /// Every [`DispatchJob`] this dispatcher has received, in order.
+    ///
+    /// Counts alone can't answer questions about what was ON the job. The
+    /// loop-body log drop was exactly such a question: the dispatch happened
+    /// (count 1 per iteration) but carried `job_id: None`, so the worker's
+    /// logs were addressed to a minted id that named no execution row and
+    /// were discarded. Assert against the job, not just the tally.
+    pub fn jobs(&self) -> Vec<DispatchJob> {
+        self.jobs
+            .lock()
+            .expect("ScriptedDispatcher jobs mutex poisoned")
+            .clone()
+    }
 }
 
 impl std::fmt::Debug for ScriptedDispatcher {
@@ -87,6 +102,10 @@ impl NodeDispatcher for ScriptedDispatcher {
         // Record the attempt BEFORE looking up the response, so the
         // count reflects tries even on misses.
         *self.dispatch_count.entry(job.module_id).or_insert(0) += 1;
+        self.jobs
+            .lock()
+            .expect("ScriptedDispatcher jobs mutex poisoned")
+            .push(job.clone());
 
         let Some(entry) = self.responses.get(&job.module_id) else {
             let e: BoxError = format!(
