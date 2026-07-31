@@ -3769,30 +3769,60 @@ fi
 # field.clone()))`) and the pre-seed loops (`field.with_label_values(…)
 # .inc_by(0.0)` on the BARE local) don't match — real increments go
 # through `self.field`/`m.field` (leading dot); registration/seed use the
-# bare local. `#[cfg(test)]` regions are dropped so a metric incremented
-# only by a test still counts as dead. Opt out for a genuinely
-# externally-set/scrape-only metric with `// allow-unincremented-metric:
-# <reason>` on the field's struct-declaration line.
+# bare local.
+#
+# TEST CODE IS NOT PRODUCTION CODE. A metric whose only mutation lives in
+# a `#[cfg(test)] mod …` (or in a test-only source file) is still DEAD in
+# production, and the alert built on it still never fires. Until 2026-07-31
+# the check did NOT drop those regions — `talos_dek_cache_size` and
+# `talos_module_payload_encryption_failures_total` read as LIVE solely
+# because `talos-metrics`' own `crypto_invariant_metrics_render` unit test
+# touches them, and that test exists specifically to prove the alerts on
+# them would not silently stop firing. The lint written for this class was
+# blind in this class. The haystack now drops each file's trailing
+# `#[cfg(test)] mod` region and skips test-only source files (see the perl
+# below for the exact, deliberately conservative rule). Opt out for a
+# genuinely externally-set/scrape-only metric with
+# `// allow-unincremented-metric: <reason>` on the field's
+# struct-declaration line.
 bold "▶ check 58: registered Prometheus metric never incremented (dead metric)"
 METRICS_LIB="talos-metrics/src/lib.rs"
 if [ -f "$METRICS_LIB" ]; then
     DEAD_METRICS="$(
         find talos-* worker controller -name '*.rs' -not -path '*/target/*' 2>/dev/null \
-            | grep -vE '/tests/|_tests?\.rs' \
+            | grep -vE '/tests/|_tests?\.rs|/tests\.rs$|/test_support\.rs$' \
             | perl -e '
                 # NB: NOT perl -0777 — that would put STDIN (the piped file
                 # list) into slurp mode too; each `local $/;` slurp below is
                 # scoped to its own block so the line-based STDIN read works.
                 #
-                # We do NOT strip #[cfg(test)] regions: brace-matching them
-                # without a real tokenizer desyncs on `{`/`}` in string/char
-                # literals (manager.rs crypto code triggered exactly this),
-                # producing FALSE POSITIVES that block correct PRs — the
-                # cardinal sin for a structural lint. Instead a test-only
-                # increment counts as "live" (an accepted false-NEGATIVE:
-                # rare, and low-harm). The register-and-forget bug this check
-                # targets has ZERO increments anywhere — prod OR test — so it
-                # is still caught.
+                # Dropping #[cfg(test)] mod regions, WITHOUT brace matching.
+                # Counting braces without a real tokenizer desyncs on `{`/`}`
+                # inside string/char literals (manager.rs crypto code
+                # triggered exactly this), producing FALSE POSITIVES that
+                # block correct PRs — the cardinal sin for a structural lint.
+                # And truncating to EOF at the first `#[cfg(test)] mod` is
+                # WRONG too: crash_recovery.rs keeps ~90 lines of production
+                # code (incl. its crash_recovery_total increment) AFTER its
+                # test module, so truncation invents a dead metric.
+                #
+                # Instead: a COLUMN-0 `#[cfg(test)]` attached to a COLUMN-0
+                # `mod` opens a region that ends at the next line beginning
+                # with `}` in column 0. rustfmt guarantees a top-level items
+                # closing brace sits in column 0, and nothing nested inside
+                # the module can — except a line inside a multi-line raw
+                # string. That single failure mode ENDS THE REGION EARLY,
+                # i.e. leaves test code in the haystack (a false NEGATIVE,
+                # the safe direction). It can never swallow production code.
+                #
+                # Deliberately conservative elsewhere too, all in the same
+                # safe direction (test code may remain in the haystack, prod
+                # code is never removed from it):
+                #  * an INDENTED `#[cfg(test)]` (a test mod nested inside
+                #    another mod) is not matched at all.
+                #  * a `#[cfg(test)]` on a fn/const/use (a test-only HELPER
+                #    mid-file, ~14 sites workspace-wide) opens no region —
+                #    only `mod` does.
                 my $lib = shift @ARGV;
                 my $src;
                 { open(my $fh, "<", $lib) or die "open $lib: $!"; local $/; $src = <$fh>; close $fh; }
@@ -3808,9 +3838,9 @@ if [ -f "$METRICS_LIB" ]; then
                         $optout{$f} = 1 if $line =~ m{//\s*allow-unincremented-metric};
                     }
                 }
-                # Haystack: every workspace .rs (test files already excluded by
-                # the caller), with each file truncated at its first
-                # #[cfg(test)] so test-only increments do not mask a dead
+                # Haystack: every workspace .rs (test-only files already
+                # excluded by the caller), with each `#[cfg(test)] mod`
+                # region removed so a test-only increment cannot mask a dead
                 # metric. Newlines collapsed so a multi-line
                 # `.field .with_label_values(..) .inc()` matches as one stmt.
                 my $hay = "";
@@ -3818,9 +3848,57 @@ if [ -f "$METRICS_LIB" ]; then
                     chomp $f;
                     open(my $g, "<", $f) or next;
                     my $c; { local $/; $c = <$g>; } close $g;
-                    $hay .= " " . ($c // "");
-
+                    $c = "" unless defined $c;
+                    my @lines = split /\n/, $c, -1;
+                    my @keep;
+                    my $in_test = 0;
+                    for (my $i = 0; $i < scalar(@lines); $i++) {
+                        my $l = $lines[$i];
+                        if ($in_test) {
+                            # Column-0 `}` closes the top-level test module.
+                            $in_test = 0 if $l =~ /^\}/;
+                            next;
+                        }
+                        if ($l =~ /^\#\[cfg\(test\)\]/) {
+                            # What does this attribute apply to? Skip any
+                            # further column-0 attribute lines in between
+                            # (e.g. #[path = "..._tests.rs"]).
+                            my $tail = $l;
+                            $tail =~ s/^\#\[cfg\(test\)\]\s*//;
+                            my $j = $i;
+                            while ($tail eq "" && $j + 1 < scalar(@lines)) {
+                                $j++;
+                                next if $lines[$j] =~ /^\#\[/;
+                                $tail = $lines[$j];
+                                last;
+                            }
+                            if ($tail =~ /^(?:pub(?:\([^)]*\))?\s+)?mod\s/) {
+                                # `mod tests;` file mount: no inline body, and
+                                # the mounted file is already excluded by the
+                                # caller path filter. Drop just these lines.
+                                $in_test = 1 unless $tail =~ /;\s*$/;
+                                $i = $j;
+                                next;
+                            }
+                        }
+                        push @keep, $l;
+                    }
+                    $hay .= " " . join("\n", @keep);
                 }
+                # Tripwire on the strip itself. The blind spot this check
+                # shipped with was invisible precisely because a BROKEN
+                # haystack still produces a plausible-looking answer — it
+                # just quietly calls dead metrics live. So assert both
+                # directions against two known landmarks in
+                # talos-metrics/src/lib.rs: a name that exists ONLY inside its
+                # `#[cfg(test)] mod tests` (must be gone) and one that exists
+                # only in its production region (must remain). Rename either
+                # and this fires — which is the point; re-point it at a
+                # current landmark rather than deleting the assert.
+                my $strip_broken = ($hay =~ /crypto_invariant_metrics_render/) ? 1 : 0;
+                my $overstripped = ($hay =~ /pub fn record_workflow_outcome/) ? 0 : 1;
+                print "__CFG_TEST_STRIP_BROKEN__\n" if $strip_broken;
+                print "__CFG_TEST_OVERSTRIPPED__\n" if $overstripped;
                 $hay =~ s/\s+/ /g;
                 for my $field (@fields) {
                     next if $optout{$field};
@@ -3841,19 +3919,43 @@ if [ -f "$METRICS_LIB" ]; then
                 }
             ' "$METRICS_LIB"
     )"
+    DEAD58_SELFTEST=0
+    if printf '%s\n' "$DEAD_METRICS" | grep -qx '__CFG_TEST_STRIP_BROKEN__'; then
+        red "✗ check 58 is not stripping #[cfg(test)] mod regions — every result below is untrustworthy"
+        yellow "  → a metric mutated only by a unit test would read as LIVE, which is the"
+        yellow "    exact defect this check was blind to until 2026-07-31 (talos_dek_cache_size"
+        yellow "    and talos_module_payload_encryption_failures_total both shipped alerts that"
+        yellow "    could never fire). Fix the strip in the perl above; do not delete this assert."
+        DEAD58_SELFTEST=1
+    fi
+    if printf '%s\n' "$DEAD_METRICS" | grep -qx '__CFG_TEST_OVERSTRIPPED__'; then
+        red "✗ check 58 stripped PRODUCTION code out of its haystack (over-truncation)"
+        yellow "  → every metric flagged below may be a false positive. The strip must only"
+        yellow "    remove #[cfg(test)] mod regions — never truncate a file to EOF, which"
+        yellow "    would swallow the ~90 lines of production code after crash_recovery.rs's"
+        yellow "    test module."
+        DEAD58_SELFTEST=1
+    fi
+    DEAD_METRICS="$(printf '%s\n' "$DEAD_METRICS" | grep -vxE '__CFG_TEST_(STRIP_BROKEN|OVERSTRIPPED)__' || true)"
     # Burn-down baseline (introduced 2026-07-24 with this check, like checks
     # 52/55): metrics that were already declared + registered but never
     # instrumented when the check landed. The check FAILS only on a NEW dead
-    # metric — these 14 are pre-existing observability debt to wire down over
+    # metric — these are pre-existing observability debt to wire down over
     # time. To burn one down: add a real increment site AND delete it from
     # this list (a now-live baseline entry is itself a failure below, so the
     # list can't rot). Do NOT add to this list to silence the check — a new
     # dead metric means the alert/dashboard you're building is inert; wire it.
+    #
+    # 2026-07-31: 14 → 12. `auth_attempts_total` + `auth_failures_total` were
+    # burned down because an alert (TalosControllerHighErrorRate) was already
+    # shipping against them and therefore could never fire. That is the
+    # priority order for the rest of this list: a dead metric with NO alert is
+    # debt; a dead metric WITH an alert is a false assurance. Every remaining
+    # entry below has been checked against deploy/helm/talos/files/alerts.yaml
+    # and deploy/observability/*.json — none is referenced by an alert.
     BASELINE_DEAD="$(printf '%s\n' \
         webhook_requests_total \
         webhook_request_duration_seconds \
-        auth_attempts_total \
-        auth_failures_total \
         auth_2fa_attempts_total \
         api_key_validations_total \
         module_executions_total \
@@ -3870,7 +3972,7 @@ if [ -f "$METRICS_LIB" ]; then
     NEW_DEAD="$(comm -23 <(printf '%s\n' "$DEAD_SORTED" | grep -vE '^$') <(printf '%s\n' "$BASELINE_DEAD") || true)"
     # STALE baseline = listed but no longer dead (someone wired it) → remove it.
     STALE_BASELINE="$(comm -13 <(printf '%s\n' "$DEAD_SORTED" | grep -vE '^$') <(printf '%s\n' "$BASELINE_DEAD") || true)"
-    DEAD58_FAIL=0
+    DEAD58_FAIL="$DEAD58_SELFTEST"
     if [ -n "$NEW_DEAD" ]; then
         red "✗ NEW dead metric(s) — registered but never incremented (alerts on them never fire):"
         echo "$NEW_DEAD" | sed 's/^/    /'

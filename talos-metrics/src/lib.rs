@@ -61,7 +61,18 @@ pub struct TalosMetrics {
     pub webhook_request_duration_seconds: HistogramVec,
     pub webhook_dlq_drops_total: Counter,
 
-    // Authentication metrics
+    // Authentication metrics.
+    //
+    // `auth_attempts_total` / `auth_failures_total` are the denominator and
+    // numerator of the `TalosControllerHighErrorRate` alert. Emitted for
+    // INTERACTIVE logins only — `method=password` (`talos_auth::AuthService::
+    // login`) and `method=oauth` (the controller's `oauth_callback_handler`).
+    // API-key validation is deliberately excluded: it runs on every GraphQL
+    // request, so folding it into the same `sum(rate(...))` would swamp the
+    // interactive population and leave a credential-stuffing burst unable to
+    // move the ratio — an alert that is technically live but still cannot
+    // fire. `api_key_validations_total` below is that surface's own series
+    // (currently unwired; no alert references it).
     pub auth_attempts_total: CounterVec,
     pub auth_failures_total: CounterVec,
     pub auth_2fa_attempts_total: CounterVec,
@@ -172,7 +183,9 @@ impl TalosMetrics {
                 "talos_auth_attempts_total",
                 "Total number of authentication attempts",
             ),
-            &["method"], // password, oauth, api_key
+            // Emitted values: password | oauth. See the struct-field comment
+            // for why api_key is deliberately not in this population.
+            &["method"],
         )?;
         registry.register(Box::new(auth_attempts_total.clone()))?;
 
@@ -181,7 +194,11 @@ impl TalosMetrics {
                 "talos_auth_failures_total",
                 "Total number of authentication failures",
             ),
-            &["method", "reason"], // invalid_password, rate_limited, locked, etc.
+            // Emitted reasons are a closed literal set owned by the emitting
+            // crate — see the `AUTH_REASON_*` constants in `talos-auth`.
+            // Never a username, IP, or key id: this endpoint is scrapeable
+            // and the label set must stay bounded.
+            &["method", "reason"],
         )?;
         registry.register(Box::new(auth_failures_total.clone()))?;
 

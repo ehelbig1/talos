@@ -175,6 +175,33 @@ fn inc_secret_decrypt_failure(reason: &'static str) {
     }
 }
 
+/// Republish `talos_dek_cache_size` from the CURRENT `dek_cache` length.
+///
+/// Always an absolute `set(len())`, never `inc`/`dec`. Delta accounting
+/// cannot survive this cache's mutation shapes: `retain` and `clear` remove
+/// an unknown number of entries at once, and `get_dek`'s expired-remove →
+/// insert sequence can race a concurrent repopulate, so the same key can be
+/// inserted twice. A gauge that drifts is strictly worse than one pinned at
+/// 0 — `TalosDEKCacheOverflow` (`talos_dek_cache_size > 10000`, 15m) would
+/// then fire on accounting error rather than on a real leak.
+///
+/// Called from EVERY `dek_cache` mutation site: the read-path expiry evict
+/// and the insert in [`SecretsManager::get_dek`], the periodic
+/// [`SecretsManager::sweep_expired_deks`], the bulk
+/// [`SecretsManager::cleanup_expired_cache_entries`], and both invalidating
+/// clears ([`SecretsManager::invalidate_dek_cache`], `rotate_master_key`).
+/// Adding a seventh mutation site without calling this reintroduces drift.
+///
+/// Scope is the by-id decrypt cache ONLY — deliberately not the single-slot
+/// `active_dek_cache` or the per-org `active_org_dek_cache`, both of which
+/// are O(1)/O(orgs) and cannot produce the unbounded growth the alert
+/// watches for.
+fn publish_dek_cache_size(len: usize) {
+    if let Some(m) = talos_metrics::global() {
+        m.dek_cache_size.set(len as i64);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Secret {
     pub id: Uuid,
@@ -725,6 +752,7 @@ impl SecretsManager {
         for k in expired {
             self.dek_cache.remove(&k);
         }
+        publish_dek_cache_size(self.dek_cache.len());
         evicted
     }
 
@@ -901,6 +929,7 @@ impl SecretsManager {
         // don't deadlock the shard. Mirrors `try_llm_keys_cache_hit`.
         if expired {
             self.dek_cache.remove(&key_id);
+            publish_dek_cache_size(self.dek_cache.len());
         }
 
         // 2️⃣ Cache miss - fetch from database and decrypt
@@ -928,6 +957,7 @@ impl SecretsManager {
                 cached_at: now,
             },
         );
+        publish_dek_cache_size(self.dek_cache.len());
 
         tracing::debug!(
             dek_id = %key_id,
@@ -4079,6 +4109,7 @@ impl SecretsManager {
         ip_address: Option<&str>,
     ) -> anyhow::Result<()> {
         self.dek_cache.clear();
+        publish_dek_cache_size(self.dek_cache.len());
         {
             let mut active_cache = self.active_dek_cache.write().await;
             *active_cache = None;
@@ -4146,6 +4177,7 @@ impl SecretsManager {
 
         self.dek_cache
             .retain(|_, cached| now.duration_since(cached.cached_at) < ttl);
+        publish_dek_cache_size(self.dek_cache.len());
         {
             let mut active_cache = self.active_dek_cache.write().await;
             if let Some(cached) = active_cache.as_ref() {
@@ -5068,6 +5100,7 @@ impl SecretsManager {
 
             // Invalidate the DEK cache so cached entries are re-decrypted with the new provider
             self.dek_cache.clear();
+            publish_dek_cache_size(self.dek_cache.len());
             {
                 let mut active_cache = self.active_dek_cache.write().await;
                 *active_cache = None;
@@ -6614,6 +6647,7 @@ mod dek_cache_sweep_tests {
 
     #[tokio::test]
     async fn sweep_drops_only_expired_deks() {
+        let _g = gauge_guard();
         let sm = SecretsManager::test_stub_for_cache();
         let fresh = Uuid::new_v4();
         let stale = Uuid::new_v4();
@@ -6634,6 +6668,7 @@ mod dek_cache_sweep_tests {
 
     #[tokio::test]
     async fn sweep_is_idempotent_on_clean_cache() {
+        let _g = gauge_guard();
         let sm = SecretsManager::test_stub_for_cache();
         seed_fresh(&sm, Uuid::new_v4());
         assert_eq!(sm.sweep_expired_deks(), 0);
@@ -6649,9 +6684,95 @@ mod dek_cache_sweep_tests {
         for _ in 0..2 {
             seed_expired(&sm, Uuid::new_v4());
         }
+        let _g = gauge_guard();
         assert_eq!(sm.dek_cache.len(), 5);
         let evicted = sm.sweep_expired_deks();
         assert_eq!(evicted, 2);
         assert_eq!(sm.dek_cache.len(), 3);
+    }
+
+    /// `talos_dek_cache_size` is process-global while these tests run
+    /// concurrently in one binary and every `sweep_expired_deks` call now
+    /// republishes it. Any test that asserts an absolute gauge value — or
+    /// that calls a production fn which republishes it — holds this.
+    static GAUGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn gauge_guard() -> std::sync::MutexGuard<'static, ()> {
+        GAUGE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// D3 pin for `talos_dek_cache_size`, and the anti-drift proof for the
+    /// gauge specifically: it is asserted on the way UP *and* on the way back
+    /// DOWN to zero. A gauge that is published on insert but not on eviction
+    /// is a LYING gauge — worse than the dead one this replaces, because
+    /// `TalosDEKCacheOverflow` (`> 10000`, 15m) would then fire on accounting
+    /// error rather than on a real leak, and an operator watching the Grafana
+    /// panel would read a monotonically climbing line as a cache leak.
+    ///
+    /// Every step drives a REAL production mutation path — the periodic
+    /// sweep, the bulk expiry cleanup — never a bare `dek_cache` poke, and
+    /// never `render_prometheus`.
+    ///
+    /// The `GAUGE_LOCK` guard is deliberately held across the `.await`s:
+    /// every `#[tokio::test]` gets its own current-thread runtime on its own
+    /// thread, so a sibling blocking on `lock()` blocks only its own (idle)
+    /// runtime — there is no task on THIS runtime that could be starved.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn dek_cache_size_gauge_tracks_fill_and_drain() {
+        let _g = gauge_guard();
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        let gauge = &talos_metrics::global()
+            .expect("global installed")
+            .dek_cache_size;
+
+        let sm = SecretsManager::test_stub_for_cache();
+        // Start from a known floor: the stub's cache is empty, and a sweep is
+        // a production republish path.
+        assert_eq!(sm.sweep_expired_deks(), 0);
+        assert_eq!(gauge.get(), 0, "empty cache must publish 0");
+
+        // Fill, then sweep: 3 fresh survive, 2 expired evicted.
+        for _ in 0..3 {
+            seed_fresh(&sm, Uuid::new_v4());
+        }
+        for _ in 0..2 {
+            seed_expired(&sm, Uuid::new_v4());
+        }
+        assert_eq!(sm.sweep_expired_deks(), 2);
+        assert_eq!(
+            gauge.get(),
+            3,
+            "gauge must equal live cache size after a partial sweep"
+        );
+
+        // Drain the rest through the OTHER production eviction path
+        // (`cleanup_expired_cache_entries`, the 10-min maintenance tick).
+        // A gauge wired only into the sweep would stick at 3 here.
+        for _ in 0..3 {
+            seed_expired(&sm, Uuid::new_v4());
+        }
+        sm.cleanup_expired_cache_entries().await;
+        assert_eq!(
+            gauge.get(),
+            3,
+            "retain-based cleanup must republish: 3 fresh survive, 3 expired dropped"
+        );
+
+        // ...and back to zero once nothing is fresh. Collect the keys BEFORE
+        // re-seeding: `DashMap::iter` holds a shard read guard, so inserting
+        // from inside the loop deadlocks against it.
+        let survivors: Vec<Uuid> = sm.dek_cache.iter().map(|r| *r.key()).collect();
+        assert_eq!(survivors.len(), 3);
+        for k in survivors {
+            seed_expired(&sm, k);
+        }
+        sm.cleanup_expired_cache_entries().await;
+        assert_eq!(
+            gauge.get(),
+            0,
+            "gauge must return to 0 when the cache drains — a gauge that only \
+             counts up is a leak alert that fires on itself"
+        );
     }
 }

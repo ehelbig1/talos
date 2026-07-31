@@ -252,6 +252,17 @@ groups:
             All N controller replicas have failed scrapes for 2m. Platform
             is down. Check: `kubectl -n talos get pods -l app.kubernetes.io/component=controller`.
 
+      # Interactive-login failure rate. Population is method="password"
+      # (talos_auth::AuthService::login) + method="oauth" (the controller's
+      # oauth_callback_handler) — every attempt counted once, on success and
+      # failure alike, so the ratio is well-defined. API-key validation is
+      # deliberately NOT in these series: it runs on every GraphQL request
+      # and would swamp the denominator, leaving a credential-stuffing burst
+      # unable to move the ratio past the threshold.
+      #
+      # Both series were registered but never incremented until 2026-07-31,
+      # so this alert could not fire at all — which is why its description
+      # used to send the operator to `grep auth_failure` in the logs.
       - alert: TalosControllerHighErrorRate
         expr: |
           sum(rate(talos_auth_failures_total[5m]))
@@ -264,7 +275,13 @@ groups:
           summary: "Auth failure rate > 20% for 10m"
           description: |
             Either credential stuffing in progress, or an auth bug.
-            Check: `kubectl -n talos logs -l app.kubernetes.io/component=controller | grep auth_failure`.
+            Break down by cause first:
+            `sum by (method, reason) (rate(talos_auth_failures_total[5m]))`.
+            reason=invalid_password/lockout_triggered concentrated on one
+            method is abuse; reason=error is the platform failing (DB down,
+            token minting broken) and pairs with the DB-pool alerts.
+            Per-account detail (email, IP) is in `auth_audit_log` and the
+            controller logs — deliberately not in the metric labels.
 
       # DEK cache unbounded growth (leak).
       - alert: TalosDEKCacheOverflow

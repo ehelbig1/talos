@@ -19,6 +19,87 @@ pub use bootstrap::promote_first_user_if_needed;
 // initial extraction so the crate could land standalone).
 use talos_config::{get_env, read_env_or_file};
 
+// ── `talos_auth_attempts_total` / `talos_auth_failures_total` label sets ──
+//
+// These two series are the denominator and numerator of the
+// `TalosControllerHighErrorRate` alert
+// (`deploy/helm/talos/files/alerts.yaml`: `sum(rate(failures[5m])) /
+// sum(rate(attempts[5m])) > 0.2` for 10m). Until 2026-07-31 nothing in the
+// workspace incremented either one, so the alert could not fire and its own
+// description told the operator to go `grep auth_failure` in the logs
+// instead — the log was the real signal all along.
+//
+// SCOPE — INTERACTIVE LOGIN ONLY. The emitted `method` values are
+// `password` (here) and `oauth` (the callback handler in
+// `controller/src/bootstrap/router.rs`). API-key validation is
+// deliberately NOT counted here even though the metric's original comment
+// listed `api_key`: it runs on every GraphQL request, so folding it into
+// the same `sum()` would swamp the interactive population and a
+// credential-stuffing burst could never move the ratio past 0.2 — a
+// technically-live alert that still cannot fire in practice. The API-key
+// surface has its own dedicated `talos_api_key_validations_total{status}`
+// series (still unwired; no alert references it).
+
+/// `method` label value for the interactive password-login path.
+pub const AUTH_METHOD_PASSWORD: &str = "password";
+/// `method` label value for the OAuth callback login path (emitted by the
+/// controller's `oauth_callback_handler`, the only other interactive login).
+pub const AUTH_METHOD_OAUTH: &str = "oauth";
+
+// `reason` label values for `talos_auth_failures_total`. A CLOSED set of
+// `&'static str`s: nothing derived from the request (no email, no IP, no
+// user id, no user agent) may become a Prometheus label — it would both
+// leak PII into the metrics endpoint and make cardinality unbounded, and
+// the whole point of the counter is that the log already carries that
+// detail (`log_auth_event_best_effort` writes it to `auth_audit_log`).
+pub const AUTH_REASON_UNKNOWN_USER: &str = "unknown_user";
+pub const AUTH_REASON_LOCKED: &str = "locked";
+pub const AUTH_REASON_LOCKOUT_TRIGGERED: &str = "lockout_triggered";
+pub const AUTH_REASON_INVALID_PASSWORD: &str = "invalid_password";
+/// OAuth: the provider redirected back without a `code` (user denied, or
+/// the provider reported an error).
+pub const AUTH_REASON_PROVIDER_ERROR: &str = "provider_error";
+/// OAuth: `handle_callback` rejected the exchange — bad/absent/consumed
+/// state token, session-binding mismatch, PKCE or token-exchange failure.
+pub const AUTH_REASON_CSRF_STATE: &str = "csrf_state";
+/// OAuth: the handshake verified but the identity could not be linked to a
+/// local user.
+pub const AUTH_REASON_LINK_FAILED: &str = "link_failed";
+/// Catch-all for an unclassified propagation (DB down, bcrypt task panic,
+/// token minting failure). Deliberately counted: an auth path that fails
+/// 100% of the time for an infrastructure reason is exactly what
+/// `TalosControllerHighErrorRate` means by "or an auth bug", and leaving it
+/// out would show a 0% failure rate during a total outage.
+pub const AUTH_REASON_ERROR: &str = "error";
+
+/// Count one authentication attempt on `talos_auth_attempts_total{method}`
+/// — the DENOMINATOR of `TalosControllerHighErrorRate`
+/// (`sum(rate(failures)) / sum(rate(attempts)) > 0.2`, 10m).
+///
+/// Must be called exactly once per attempt, on every outcome including
+/// success, or the ratio is meaningless. Inert (never unwraps) before
+/// `talos_metrics::set_global` has run, per the `talos_metrics::global`
+/// contract; that is a `OnceLock` read, so this adds no lock and no await
+/// to the auth hot path.
+pub fn inc_auth_attempt(method: &'static str) {
+    if let Some(m) = talos_metrics::global() {
+        m.auth_attempts_total.with_label_values(&[method]).inc();
+    }
+}
+
+/// Count one authentication failure on
+/// `talos_auth_failures_total{method,reason}` — the NUMERATOR of
+/// `TalosControllerHighErrorRate`. At most once per attempt, and only for
+/// attempts already counted by [`inc_auth_attempt`], so the ratio stays in
+/// `[0, 1]`. Both labels are `&'static str` from a closed set.
+pub fn inc_auth_failure(method: &'static str, reason: &'static str) {
+    if let Some(m) = talos_metrics::global() {
+        m.auth_failures_total
+            .with_label_values(&[method, reason])
+            .inc();
+    }
+}
+
 static REFRESH_RATE_LIMITER: OnceLock<Mutex<HashMap<Uuid, (usize, Instant)>>> = OnceLock::new();
 
 /// MCP-1147 (2026-05-16): defense-in-depth max-entries cap.
@@ -689,6 +770,20 @@ impl AuthService {
     }
 
     /// Authenticate user and return access token, refresh token, and user (login)
+    ///
+    /// Counts exactly one `talos_auth_attempts_total{method="password"}` per
+    /// call and at most one `talos_auth_failures_total{method="password"}` —
+    /// the two series behind the `TalosControllerHighErrorRate` alert. Both
+    /// live here rather than in the GraphQL mutation because this is the only
+    /// production password-verify path in the workspace.
+    ///
+    /// The classification is done by the inner fn (which knows WHY it is
+    /// failing — every caller-visible error is the same deliberately opaque
+    /// `"Invalid email or password"`) and reported through `reason`. A `?`
+    /// propagation that never sets `reason` is an infrastructure error, not a
+    /// credential outcome; it is still counted, as `reason="error"`, so a DB
+    /// outage that fails every login shows up as a 100% failure rate instead
+    /// of a suspiciously quiet 0%.
     #[must_use = "auth result must be handled"]
     pub async fn login(
         &self,
@@ -696,6 +791,27 @@ impl AuthService {
         password: &str,
         ip_address: Option<&str>,
         user_agent: Option<&str>,
+    ) -> Result<(String, String, User)> {
+        inc_auth_attempt(AUTH_METHOD_PASSWORD);
+        let mut reason: Option<&'static str> = None;
+        let outcome = self
+            .login_classified(email, password, ip_address, user_agent, &mut reason)
+            .await;
+        if outcome.is_err() {
+            inc_auth_failure(AUTH_METHOD_PASSWORD, reason.unwrap_or(AUTH_REASON_ERROR));
+        }
+        outcome
+    }
+
+    /// Body of [`Self::login`]. Sets `*reason` to a bounded `&'static str`
+    /// immediately before each classified `return Err`; see the caller.
+    async fn login_classified(
+        &self,
+        email: &str,
+        password: &str,
+        ip_address: Option<&str>,
+        user_agent: Option<&str>,
+        reason: &mut Option<&'static str>,
     ) -> Result<(String, String, User)> {
         // MCP-659: normalize email to trim+lowercase and match
         // case-insensitively via `LOWER(email) = $1`. Pre-fix the WHERE
@@ -758,6 +874,7 @@ impl AuthService {
                     Some("User not found or inactive"),
                 )
                 .await;
+                *reason = Some(AUTH_REASON_UNKNOWN_USER);
                 return Err(anyhow!("Invalid email or password"));
             }
         };
@@ -795,6 +912,7 @@ impl AuthService {
                     Some(&format!("Account locked for {} more seconds", remaining)),
                 )
                 .await;
+                *reason = Some(AUTH_REASON_LOCKED);
                 return Err(anyhow!("Invalid email or password"));
             } else {
                 // Lock period expired, reset failed attempts
@@ -871,6 +989,7 @@ impl AuthService {
                 )
                 .await;
 
+                *reason = Some(AUTH_REASON_LOCKOUT_TRIGGERED);
                 return Err(anyhow!("Invalid email or password"));
             } else {
                 // Log failed login attempt (wrong password)
@@ -888,6 +1007,7 @@ impl AuthService {
                 )
                 .await;
 
+                *reason = Some(AUTH_REASON_INVALID_PASSWORD);
                 return Err(anyhow!("Invalid email or password"));
             }
         }

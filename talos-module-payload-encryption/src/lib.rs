@@ -65,6 +65,48 @@ impl PayloadSlot {
             PayloadSlot::Trigger => b"trigger",
         }
     }
+
+    /// Prometheus `stage` label for
+    /// `talos_module_payload_encryption_failures_total`. Deliberately NOT
+    /// derived from [`Self::aad_tag`]: the AAD tag is `trigger` (a wire
+    /// constant that can never change without breaking existing rows) while
+    /// the metric label — and the `TalosModulePayloadEncryptionFailures`
+    /// alert annotation, and the crypto Grafana panel's `sum by (op, stage)`
+    /// — say `trigger_metadata`, after the DB column. Two different
+    /// contracts; keep them separate.
+    #[must_use]
+    pub const fn metric_stage(self) -> &'static str {
+        match self {
+            PayloadSlot::Input => "input",
+            PayloadSlot::Output => "output",
+            PayloadSlot::Trigger => "trigger_metadata",
+        }
+    }
+}
+
+/// Count one `module_executions` payload crypto failure on
+/// `talos_module_payload_encryption_failures_total{op,stage}`.
+///
+/// This crate is the single chokepoint both directions pass through
+/// ([`encrypt_payload_bundle`] has 5 caller sites across 3 crates,
+/// [`decrypt_payload_slot`] has 9 across 3 more), and it is the only place
+/// with the failing SLOT in scope — `ModuleExecutionService` encrypts input
+/// and trigger_metadata in ONE call, so a caller-side handler could not
+/// attribute `stage` at all.
+///
+/// Both labels are `&'static str` from the closed sets `{encrypt, decrypt}`
+/// × [`PayloadSlot::metric_stage`], so cardinality is fixed at 6 series. No
+/// identifier, ciphertext, key id, or error text reaches a label — the error
+/// keeps carrying that detail to the logs via `with_context`.
+///
+/// Inert (never unwraps) when `talos_metrics::set_global` has not run, per
+/// the `talos_metrics::global` contract.
+fn inc_payload_crypto_failure(op: &'static str, stage: &'static str) {
+    if let Some(m) = talos_metrics::global() {
+        m.module_payload_encryption_failures_total
+            .with_label_values(&[op, stage])
+            .inc();
+    }
 }
 
 /// Canonical AAD builder for a module-payload slot at a given format version.
@@ -108,6 +150,7 @@ pub async fn decrypt_payload_slot(
     secrets_manager
         .decrypt_versioned(key_id, encrypted, &aad, format_version)
         .await
+        .inspect_err(|_| inc_payload_crypto_failure("decrypt", slot.metric_stage()))
         .with_context(|| format!("payload_encryption: decrypt {slot:?}"))
 }
 
@@ -202,12 +245,15 @@ pub async fn encrypt_payload_bundle(
         (PayloadSlot::Trigger, trigger),
     ] {
         let Some(v) = value else { continue };
+        let stage = slot.metric_stage();
         let plain = serde_json::to_string(v)
+            .inspect_err(|_| inc_payload_crypto_failure("encrypt", stage))
             .with_context(|| format!("payload_encryption: serialize {slot:?}"))?;
         let aad = payload_slot_aad(module_execution_id, slot, format_version);
         let (kid, ciphertext, _version) = sm
             .encrypt_value_aad_v4_or_global(&plain, org_id, &aad)
             .await
+            .inspect_err(|_| inc_payload_crypto_failure("encrypt", stage))
             .with_context(|| format!("payload_encryption: encrypt {slot:?}"))?;
         if let Some(prev) = bundle.key_id {
             // M-3: a single bundle write must reuse the same DEK across
@@ -222,6 +268,7 @@ pub async fn encrypt_payload_bundle(
             // — the next attempt will see a stable active DEK across all
             // bundle slots.
             if prev != kid {
+                inc_payload_crypto_failure("encrypt", stage);
                 anyhow::bail!(
                     "payload_encryption: DEK rotated mid-bundle write (prev={prev}, current={kid}); \
                      retry the write so all slots reference one DEK"
@@ -375,6 +422,19 @@ mod stub_sm_tests {
     use super::*;
     use serde_json::json;
 
+    /// `talos_module_payload_encryption_failures_total` is process-global
+    /// while these tests run concurrently in one binary, so any test that
+    /// drives a crypto FAILURE (i.e. bumps the counter) must hold this while
+    /// it does, or the delta-assert below sees sibling traffic. Held by every
+    /// counter-moving test in this module — add new ones to the list.
+    /// `into_inner` on poison: a sibling panic must not cascade into an
+    /// unrelated failure here.
+    static METRIC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn metric_guard() -> std::sync::MutexGuard<'static, ()> {
+        METRIC_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Real SecretsManager over a never-connected lazy pool + a real (non-zero)
     /// env KEK. Any code path that touches the pool errors on connect — which
     /// is exactly what these tests rely on NOT happening.
@@ -435,6 +495,7 @@ mod stub_sm_tests {
     /// version columns.
     #[tokio::test]
     async fn decrypt_unknown_format_fails_closed_without_db_access() {
+        let _g = metric_guard();
         let sm = stub_sm();
         let row = Uuid::new_v4();
         // Plausible ciphertext length (nonce + tag + payload) so the failure
@@ -465,6 +526,7 @@ mod stub_sm_tests {
     /// malformed rows, no DB dependency).
     #[tokio::test]
     async fn decrypt_derived_format_rejects_truncated_ciphertext() {
+        let _g = metric_guard();
         let sm = stub_sm();
         let row = Uuid::new_v4();
         for version in [
@@ -488,5 +550,120 @@ mod stub_sm_tests {
                 );
             }
         }
+    }
+
+    /// D3 pin for `talos_module_payload_encryption_failures_total`.
+    ///
+    /// Drives the REAL production `decrypt_payload_slot` /
+    /// `encrypt_payload_bundle` into their real failure edges and asserts the
+    /// counter moved — deliberately NOT a `render_prometheus` shape test.
+    /// A metrics-render test is exactly what made this metric look alive for
+    /// months while every one of its production paths was silent, and what
+    /// made check 58 report it as instrumented.
+    ///
+    /// Deltas, never absolutes: `set_global` is a process-wide one-shot
+    /// `OnceLock`, so sibling tests in this binary share the registry and may
+    /// run concurrently. Read back through `talos_metrics::global()` rather
+    /// than the local `Arc` for the same reason — another test may have won
+    /// the `set_global` race.
+    #[tokio::test]
+    async fn payload_crypto_failures_are_counted_on_the_production_path() {
+        let _g = metric_guard();
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        let m = talos_metrics::global().expect("global installed");
+        let read = |op: &str, stage: &str| {
+            m.module_payload_encryption_failures_total
+                .with_label_values(&[op, stage])
+                .get()
+        };
+
+        // ── decrypt: unknown format version, fails closed with no DB touch.
+        let before = read("decrypt", "output");
+        decrypt_payload_slot(
+            &stub_sm(),
+            Uuid::new_v4(),
+            &vec![0u8; 12 + 16 + 32],
+            Uuid::new_v4(),
+            PayloadSlot::Output,
+            99,
+        )
+        .await
+        .expect_err("unknown format must fail closed");
+        assert_eq!(
+            read("decrypt", "output") - before,
+            1.0,
+            "decrypt failure must bump {{op=decrypt,stage=output}}"
+        );
+
+        // ── decrypt: the Trigger slot reports stage `trigger_metadata` (the
+        // DB column / alert-annotation spelling), NOT the `trigger` AAD wire
+        // tag. An alert or Grafana panel selecting on the wrong spelling is
+        // the same false assurance as a dead counter.
+        let before = read("decrypt", "trigger_metadata");
+        decrypt_payload_slot(
+            &stub_sm(),
+            Uuid::new_v4(),
+            &vec![0u8; 60],
+            Uuid::new_v4(),
+            PayloadSlot::Trigger,
+            99,
+        )
+        .await
+        .expect_err("unknown format must fail closed");
+        assert_eq!(read("decrypt", "trigger_metadata") - before, 1.0);
+        assert_eq!(
+            m.module_payload_encryption_failures_total
+                .with_label_values(&["decrypt", "trigger"])
+                .get(),
+            0.0,
+            "stage label must be trigger_metadata, not the AAD tag"
+        );
+
+        // ── encrypt: a real bundle write whose DEK lookup cannot reach
+        // Postgres. Own pool (not stub_sm) so the refused connection fails in
+        // ~250ms instead of on sqlx's 30s default acquire timeout.
+        let fast_fail_sm = {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(std::time::Duration::from_millis(250))
+                .connect_lazy("postgres://127.0.0.1:1/talos_never_connects")
+                .expect("lazy pool build");
+            let kek = Arc::new(
+                talos_secrets_manager::kek_provider::EnvKekProvider::from_hex(&"cd".repeat(32))
+                    .expect("stub KEK"),
+            );
+            Arc::new(
+                talos_secrets_manager::SecretsManager::with_kek_provider(pool, kek)
+                    .expect("stub SecretsManager"),
+            )
+        };
+        let before = read("encrypt", "input");
+        encrypt_payload_bundle(
+            Some(&fast_fail_sm),
+            Uuid::new_v4(),
+            None,
+            Some(&json!({"in": 1})),
+            None,
+            None,
+        )
+        .await
+        .expect_err("DEK resolution must fail against a dead pool");
+        assert_eq!(
+            read("encrypt", "input") - before,
+            1.0,
+            "encrypt failure must bump {{op=encrypt,stage=input}}"
+        );
+    }
+
+    /// The `stage` label set is fixed at three values and is NOT derived from
+    /// the AAD wire tag — two contracts that must not be collapsed (the AAD
+    /// tag can never change without breaking existing rows; the label follows
+    /// the DB column name the alert annotation prints).
+    #[test]
+    fn metric_stage_labels_are_the_documented_closed_set() {
+        assert_eq!(PayloadSlot::Input.metric_stage(), "input");
+        assert_eq!(PayloadSlot::Output.metric_stage(), "output");
+        assert_eq!(PayloadSlot::Trigger.metric_stage(), "trigger_metadata");
+        assert_eq!(PayloadSlot::Trigger.aad_tag(), b"trigger");
     }
 }
