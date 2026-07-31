@@ -79,7 +79,16 @@ groups:
             unrecoverable.
 
       # ── KEK decrypt failures — rate > 0 means current write path is
-      # broken. "both" label (active+legacy both failed) is hard-fail.
+      # broken. "both" means EVERY CONFIGURED provider failed, so the read
+      # is terminally broken; it is emitted when active+legacy both fail AND
+      # (since 2026-07-31) when the active provider fails with no legacy
+      # wired at all. That second arm is the difference between this alert
+      # being fireable and being decorative on the two supported no-legacy
+      # postures — KEK_PROVIDER=env (legacy hardcoded None) and
+      # KEK_PROVIDER=vault + KEK_DISABLE_LEGACY=true, the documented Phase-5
+      # end state. Before it, a total KEK outage on those postures surfaced
+      # ONLY on the warning-level Active alert below, whose own summary
+      # claims a legacy fallback is carrying the load that does not exist.
       - alert: TalosKEKDecryptFailuresBoth
         expr: rate(talos_kek_decrypt_failures_total{provider="both"}[5m]) > 0
         for: 2m
@@ -87,13 +96,15 @@ groups:
           severity: critical
           category: crypto-broken
         annotations:
-          summary: "KEK decrypt failing on BOTH active and legacy providers"
+          summary: "KEK decrypt failing on EVERY configured provider"
           description: |
-            Neither the active KEK provider (Vault transit or env) nor
-            the legacy fallback could unwrap a DEK. Encrypted-at-rest
-            reads are currently failing. Most common cause: Vault's
-            transit key was rotated/deleted without rewrapping DEKs,
-            and the env KEK master key doesn't match either.
+            No configured KEK provider could unwrap a DEK — the active one
+            (Vault transit or env) failed and either the legacy fallback
+            failed too or no legacy is wired. Encrypted-at-rest reads are
+            currently failing. Most common cause: Vault's transit key was
+            rotated/deleted without rewrapping DEKs, and the env KEK master
+            key doesn't match either (or there is no env KEK to fall back
+            to, because KEK_DISABLE_LEGACY=true).
           action: |
             1. Check Vault transit key version: `vault read transit/keys/talos-kek`
             2. Check controller KEK_PROVIDER env: matches Vault or env?
@@ -109,11 +120,14 @@ groups:
           severity: warning
           category: crypto-degraded
         annotations:
-          summary: "KEK active-provider decrypt failing (legacy fallback active)"
+          summary: "KEK active-provider decrypt failing"
           description: |
-            active provider ({{ $labels.provider }}) is failing decryption;
-            legacy fallback is carrying the load. This is survivable in the
-            short term but will become critical if legacy becomes unavailable.
+            The active KEK provider is failing decryption. If a legacy
+            provider is wired it is carrying the load — survivable short
+            term, critical once legacy goes too. If no legacy is wired
+            (KEK_PROVIDER=env, or vault with KEK_DISABLE_LEGACY=true) then
+            reads are ALREADY failing and TalosKEKDecryptFailuresBoth is
+            firing alongside this one; treat that pair as the critical case.
             Often means a misconfigured Vault token or network partition.
 
       # ── memory-write failures — node outputs are being lost.
@@ -252,6 +266,32 @@ groups:
             All N controller replicas have failed scrapes for 2m. Platform
             is down. Check: `kubectl -n talos get pods -l app.kubernetes.io/component=controller`.
 
+      # Interactive-login failure rate. Population is method="password"
+      # (talos_auth::AuthService::login) + method="oauth" (the controller's
+      # oauth_callback_handler) — every attempt counted once, on success and
+      # failure alike, so the ratio is well-defined. API-key validation is
+      # deliberately NOT in these series: it runs on every GraphQL request
+      # and would swamp the denominator, leaving a credential-stuffing burst
+      # unable to move the ratio past the threshold.
+      #
+      # Both series were registered but never incremented until 2026-07-31,
+      # so this alert could not fire at all — which is why its description
+      # used to send the operator to `grep auth_failure` in the logs.
+      #
+      # KNOWN, DELIBERATE ASYMMETRY between the two methods, because an
+      # operator reading a firing instance needs it. method="password" runs
+      # behind CSRF + the distributed per-IP auth limiter, so its population
+      # is hard to author from outside. method="oauth" is a plain
+      # unauthenticated GET on `/auth/oauth/{provider}/callback`, proxied
+      # publicly by the chart nginx with no per-IP limit — so anyone on the
+      # internet can hold this ratio at 1.0 with ~1 req/min of
+      # `?error=access_denied`, on a deployment whose real interactive login
+      # volume is well under one per day. The drive direction is toward
+      # FIRING, never toward suppressing (each such request counts as both an
+      # attempt and a failure), so it is noise, not a blind spot — but the
+      # first time this alert ever fires here, check `method`/`reason` before
+      # concluding "credential stuffing". The break-down below is the first
+      # step for exactly that reason.
       - alert: TalosControllerHighErrorRate
         expr: |
           sum(rate(talos_auth_failures_total[5m]))
@@ -264,7 +304,16 @@ groups:
           summary: "Auth failure rate > 20% for 10m"
           description: |
             Either credential stuffing in progress, or an auth bug.
-            Check: `kubectl -n talos logs -l app.kubernetes.io/component=controller | grep auth_failure`.
+            Break down by cause first:
+            `sum by (method, reason) (rate(talos_auth_failures_total[5m]))`.
+            reason=invalid_password/lockout_triggered concentrated on one
+            method is abuse; reason=error is the platform failing (DB down,
+            token minting broken) and pairs with the DB-pool alerts.
+            method=oauth,reason=provider_error alone — with password traffic
+            quiet — is almost always an internet scanner hitting the public
+            /auth/oauth/{provider}/callback redirect, not a login problem.
+            Per-account detail (email, IP) is in `auth_audit_log` and the
+            controller logs — deliberately not in the metric labels.
 
       # DEK cache unbounded growth (leak).
       - alert: TalosDEKCacheOverflow

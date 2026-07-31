@@ -546,3 +546,102 @@ mod refresh_rate_limiter_cap_tests {
         lim.lock().unwrap().clear();
     }
 }
+
+// ── talos_auth_attempts_total / talos_auth_failures_total ────────────────
+//
+// These two series are the denominator and numerator of the
+// `TalosControllerHighErrorRate` alert. Until 2026-07-31 nothing in the
+// workspace incremented either, so the alert shipped un-fireable — and the
+// structural lint that exists to catch exactly that (check 58) had them
+// parked in its burn-down baseline. The tests below pin the wiring to the
+// REAL `AuthService::login`, not to a metrics-render assertion: a render
+// test is what let the sibling crypto metrics look alive while every
+// production path stayed silent.
+mod auth_metric_tests {
+    use super::*;
+
+    /// Build the real `AuthService` over a pool that cannot connect, with a
+    /// fast acquire timeout so the refused connection surfaces in ~250 ms
+    /// rather than on sqlx's 30 s default. Low bcrypt cost keeps the
+    /// constructor's dummy-hash computation cheap.
+    fn unreachable_db_service() -> AuthService {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(250))
+            .connect_lazy("postgres://127.0.0.1:1/talos_never_connects")
+            .expect("lazy pool build");
+        AuthService::new(
+            pool,
+            "this-is-a-test-secret-that-is-32bytes".into(),
+            // Minimum the constructor accepts; the dummy-hash computation it
+            // does up front is O(2^cost), so anything higher makes this test
+            // seconds-long for no added coverage.
+            10,
+            None,
+        )
+        .expect("auth service")
+    }
+
+    /// One attempt and one failure per `login()` call, counted by the real
+    /// production function. The failure here is an infrastructure
+    /// propagation (`reason="error"`), which is deliberately still counted:
+    /// if an outage made every login throw, an uncounted `?` path would show
+    /// a 0% failure rate and `TalosControllerHighErrorRate` would stay quiet
+    /// through a total auth outage — the same false assurance as a dead
+    /// counter, one level in.
+    #[tokio::test]
+    async fn login_counts_one_attempt_and_one_failure_per_call() {
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        let m = talos_metrics::global().expect("global installed");
+        let attempts = || m.auth_attempts_total.with_label_values(&["password"]).get();
+        let failures = || {
+            m.auth_failures_total
+                .with_label_values(&["password", "error"])
+                .get()
+        };
+
+        let svc = unreachable_db_service();
+        let (a0, f0) = (attempts(), failures());
+
+        svc.login("nobody@example.com", "hunter2", None, None)
+            .await
+            .expect_err("login against a dead pool must fail");
+
+        assert_eq!(attempts() - a0, 1.0, "exactly one attempt per login() call");
+        assert_eq!(failures() - f0, 1.0, "exactly one failure per failed login");
+
+        // A second call moves both by exactly one again — the ratio the alert
+        // divides is only meaningful if neither side double-counts.
+        svc.login("nobody@example.com", "hunter2", None, None)
+            .await
+            .expect_err("login against a dead pool must fail");
+        assert_eq!(attempts() - a0, 2.0);
+        assert_eq!(failures() - f0, 2.0);
+    }
+
+    /// The `method` and `reason` label values are a closed set of literals.
+    /// A runtime-built label here (an email, an IP, a user id) would leak PII
+    /// onto the public `/metrics` endpoint AND blow up cardinality; the
+    /// alert's `sum(rate(...))` also silently changes meaning if the `method`
+    /// population changes, so the emitted set is asserted rather than assumed.
+    #[test]
+    fn auth_metric_labels_are_a_closed_literal_set() {
+        assert_eq!(AUTH_METHOD_PASSWORD, "password");
+        assert_eq!(AUTH_METHOD_OAUTH, "oauth");
+        for reason in [
+            AUTH_REASON_UNKNOWN_USER,
+            AUTH_REASON_LOCKED,
+            AUTH_REASON_LOCKOUT_TRIGGERED,
+            AUTH_REASON_INVALID_PASSWORD,
+            AUTH_REASON_PROVIDER_ERROR,
+            AUTH_REASON_CSRF_STATE,
+            AUTH_REASON_LINK_FAILED,
+            AUTH_REASON_ERROR,
+        ] {
+            assert!(
+                reason.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "reason label {reason:?} must be a fixed lowercase literal"
+            );
+        }
+    }
+}

@@ -1679,6 +1679,19 @@ pub(crate) async fn oauth_login_handler(
     Ok(Redirect::temporary(&auth_url))
 }
 
+/// `map_err` target for the OAuth callback's post-handshake internal
+/// failures (user lookup, access/refresh token minting). Counts one
+/// `talos_auth_failures_total{method="oauth",reason="error"}` so a login
+/// path that is 100% broken for an infrastructure reason still shows up as
+/// a 100% failure rate on `TalosControllerHighErrorRate` rather than as a
+/// suspiciously quiet 0%. Generic over the error type so the same site
+/// works for every `map_err` in the handler; the error VALUE is discarded
+/// and never reaches a label.
+fn oauth_login_internal_error<E>(_e: E) -> axum::http::StatusCode {
+    talos_auth::inc_auth_failure(talos_auth::AUTH_METHOD_OAUTH, talos_auth::AUTH_REASON_ERROR);
+    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+}
+
 /// Handle OAuth callback
 pub(crate) async fn oauth_callback_handler(
     axum::extract::Path(provider): axum::extract::Path<String>,
@@ -1696,6 +1709,15 @@ pub(crate) async fn oauth_callback_handler(
 
     let provider_enum =
         OAuthProvider::from_str(&provider).map_err(|_e| axum::http::StatusCode::BAD_REQUEST)?;
+
+    // One `talos_auth_attempts_total{method="oauth"}` per callback that names
+    // a real provider — the second half (with `AuthService::login`) of the
+    // interactive-login population behind TalosControllerHighErrorRate.
+    // Counted AFTER the provider parse on purpose: a request for a provider
+    // that does not exist is a scanner, not a login attempt, and letting it
+    // into the denominator would only DILUTE the failure ratio and suppress
+    // the alert.
+    talos_auth::inc_auth_attempt(talos_auth::AUTH_METHOD_OAUTH);
 
     // Extract authorization code and state parameter
     //
@@ -1720,6 +1742,14 @@ pub(crate) async fn oauth_callback_handler(
                 .map(|s| s.as_str())
                 .unwrap_or("missing_code");
             tracing::warn!("OAuth callback missing code. Error: {}", error_msg);
+            // NB: the provider-supplied `error` string is NOT the metric
+            // label — it is attacker-influenced and unbounded. The label is
+            // the fixed `provider_error`; the detail stays in the log line
+            // above and in the sanitised redirect.
+            talos_auth::inc_auth_failure(
+                talos_auth::AUTH_METHOD_OAUTH,
+                talos_auth::AUTH_REASON_PROVIDER_ERROR,
+            );
             // MCP-1094: sanitise provider-supplied error before
             // reflecting into the dashboard redirect URL.
             let safe_error = talos_config::sanitize_oauth_error_code(error_msg);
@@ -1758,6 +1788,10 @@ pub(crate) async fn oauth_callback_handler(
         Ok(info) => info,
         Err(e) => {
             tracing::error!("❌ OAuth callback error: {}", e);
+            talos_auth::inc_auth_failure(
+                talos_auth::AUTH_METHOD_OAUTH,
+                talos_auth::AUTH_REASON_CSRF_STATE,
+            );
             oauth_service
                 .log_oauth_event(
                     None,
@@ -1783,7 +1817,13 @@ pub(crate) async fn oauth_callback_handler(
     let (user_id, is_new_user) = oauth_service
         .link_or_create_user(provider_enum.clone(), user_info, None)
         .await
-        .map_err(|_e| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_e| {
+            talos_auth::inc_auth_failure(
+                talos_auth::AUTH_METHOD_OAUTH,
+                talos_auth::AUTH_REASON_LINK_FAILED,
+            );
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // RFC 0004: give brand-new OAuth users a personal organization (their
     // org-as-tenant home), mirroring the GraphQL signup path. Best-effort
@@ -1916,7 +1956,7 @@ pub(crate) async fn oauth_callback_handler(
     let user = auth_service
         .get_user(user_id)
         .await
-        .map_err(|_e| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(oauth_login_internal_error)?;
 
     // Generate tokens.
     //
@@ -1930,12 +1970,12 @@ pub(crate) async fn oauth_callback_handler(
     let is_2fa_verified = !user.totp_enabled.unwrap_or(false);
     let access_token = auth_service
         .generate_access_token(&user, is_2fa_verified)
-        .map_err(|_e| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(oauth_login_internal_error)?;
 
     let refresh_token = auth_service
         .generate_refresh_token(user_id, is_2fa_verified)
         .await
-        .map_err(|_e| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(oauth_login_internal_error)?;
 
     // Set httpOnly cookies.
     // MCP-1040 (2026-05-15): canonical session-cookie installer.
@@ -3435,4 +3475,41 @@ pub(crate) fn build_router(
         .layer(from_fn(cors_middleware));
 
     Ok(app)
+}
+
+/// The OAuth login leg of `talos_auth_failures_total`. The three
+/// error-redirect branches inside `oauth_callback_handler` need the full
+/// axum Extension set to drive, so what is pinned here is narrower than the
+/// handler: `oauth_login_internal_error` is a free function, and this test
+/// proves that CALLING IT counts a failure and returns 500. It does NOT
+/// prove the handler still calls it, and nothing else does either —
+/// deleting a `.map_err(oauth_login_internal_error)` (or the
+/// `inc_auth_attempt` at the top of the callback) leaves both this test and
+/// structural check 58 green. Say so rather than implying coverage that is
+/// not here; the honest guard for the OAuth leg is the post-merge live
+/// check (hit the callback, watch `talos_auth_attempts_total{method="oauth"}`
+/// on `/metrics/prometheus`).
+#[cfg(test)]
+mod oauth_auth_metric_tests {
+    use super::oauth_login_internal_error;
+
+    #[test]
+    fn internal_error_counts_an_oauth_auth_failure_and_returns_500() {
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        let m = talos_metrics::global().expect("global installed");
+        let read = || {
+            m.auth_failures_total
+                .with_label_values(&[talos_auth::AUTH_METHOD_OAUTH, talos_auth::AUTH_REASON_ERROR])
+                .get()
+        };
+
+        let before = read();
+        let status = oauth_login_internal_error(anyhow::anyhow!("token minting blew up"));
+        assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            read() - before,
+            1.0,
+            "an internal OAuth login failure must reach talos_auth_failures_total"
+        );
+    }
 }

@@ -13,6 +13,9 @@ talos-config = { path = "../talos-config" }
 # MCP-1012: DLP-redact user_agent before persisting to auth_audit_log,
 # matching the sibling parity with oauth_audit_log + admin_event_log.
 talos-dlp-provider = { path = "../talos-dlp-provider" }
+# Feeds talos_auth_attempts_total / talos_auth_failures_total, the two
+# series behind the TalosControllerHighErrorRate alert.
+talos-metrics = { path = "../talos-metrics" }
 anyhow.workspace = true
 chrono.workspace = true
 serde.workspace = true
