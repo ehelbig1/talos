@@ -3136,10 +3136,16 @@ mod loop_iteration_execution_row_tests {
     ) -> ParallelWorkflowEngine {
         let mut engine = ParallelWorkflowEngine::new();
         engine.set_user_id(Uuid::new_v4());
-        engine.set_actor_id(Uuid::new_v4()); // allow-agent-context-key: not a context key
-                                             // A bare engine has no evaluator, and `eval_bool` fail-closes to
-                                             // false — which would silently stop every loop after one iteration
-                                             // and make these tests pass for the wrong reason.
+        // Bare `set_actor_id` needs no opt-out here: lint check 29 excludes
+        // `talos-workflow-engine/**` wholesale, and check 3 (whose
+        // `allow-agent-context-key` marker an earlier draft pasted onto this
+        // line) only greps `__agent_context__`, in other crates. An inert
+        // opt-out reads as "this tripped a lint and was excused" — a claim
+        // neither check would ever make.
+        engine.set_actor_id(Uuid::new_v4());
+        // A bare engine has no evaluator, and `eval_bool` fail-closes to
+        // false — which would silently stop every loop after one iteration
+        // and make these tests pass for the wrong reason.
         engine.set_expression_evaluator(Arc::new(StubExpressionEvaluator::new().with_bool(true)));
         engine.set_module_execution_store(store);
         engine.set_module_fetcher(Arc::new(

@@ -1912,41 +1912,70 @@ async fn handle_run_sandbox(
 /// own error handling.
 ///
 /// No-op when nothing was emitted, so a clean run's response is unchanged
-/// byte-for-byte. The lines carry only fixed policy tokens plus values the
-/// caller already supplied (their own host, method, key path) — the same
-/// sanitization contract `emit_host_diagnostic` enforces for the NATS route,
-/// which is why they are safe to hand straight back to that caller.
+/// byte-for-byte.
+///
+/// SANITIZATION. `emit_host_diagnostic`'s CONSTRUCTION contract already binds
+/// these lines to fixed policy tokens plus values the caller supplied (their
+/// own host, method, key path). But the NATS route gets a SECOND pass the sink
+/// does not: it lands via `add_log`, which DLP-redacts before the INSERT, so
+/// the line an operator later reads out of `get_execution_logs` is scrubbed.
+/// Returning the sink's copy raw would mean the same host event renders
+/// scrubbed on one surface and unscrubbed on the other — the two-surfaces-
+/// disagree class this change exists to close, and the exact reason
+/// `add_log_best_effort` redacts its own operator-log preview (MCP-989).
+/// `redact_lines` restores parity; on a correctly-constructed line it is a
+/// no-op.
 fn append_host_diagnostics(
     body: String,
     sink: &talos_worker_runtime::context::HostDiagSink,
 ) -> String {
-    let lines = match sink.lock() {
-        Ok(guard) => guard.clone(),
-        // A poisoned mutex means a panic elsewhere; losing diagnostics must
-        // never change what the caller gets back.
-        Err(poisoned) => poisoned.into_inner().clone(),
-    };
+    let lines = redact_lines(read_host_diagnostics(sink));
     if lines.is_empty() {
         return body;
     }
     format!("{body}\n\nHost diagnostics:\n{}", lines.join("\n"))
 }
 
+/// Snapshot the sink. A poisoned mutex means a panic elsewhere; losing
+/// diagnostics must never change what the caller gets back.
+fn read_host_diagnostics(sink: &talos_worker_runtime::context::HostDiagSink) -> Vec<String> {
+    match sink.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// DLP pass over the collected lines — see `append_host_diagnostics` for why
+/// the sink route needs the one the NATS route gets for free at persist time.
+fn redact_lines(lines: Vec<String>) -> Vec<String> {
+    lines
+        .into_iter()
+        .map(|l| talos_dlp_provider::redact_str(&l))
+        .collect()
+}
+
 /// The same collected lines, as a JSON field value for handlers whose
 /// response is structured (`test_module`) rather than raw text.
 ///
-/// `None` when nothing was emitted, so `skip_serializing_if`-style omission
-/// keeps a clean run's response shape unchanged. Deliberately NOT an empty
-/// array on the quiet path: an empty `host_diagnostics: []` invites the
-/// reading that the host had nothing to say, when on most historical runs the
-/// truth was that nobody was listening.
+/// `None` when nothing was emitted. NOTE THE ACTUAL WIRE SHAPE: the call site
+/// interpolates this into a `json!` literal, and `json!` renders `None` as
+/// `null` — it does NOT omit the key. So a quiet run answers
+/// `"host_diagnostics": null`, not a missing field. (An earlier draft of this
+/// comment claimed `skip_serializing_if`-style omission; it never did that,
+/// and describing a shape the code doesn't produce is the same unearned-claim
+/// class this change exists to close. `test_module_quiet_run_reports_null_not_empty_array`
+/// pins the real shape.)
+///
+/// `null` rather than `[]` is the deliberate part, and it is now honest either
+/// way: `test_module` always attaches a sink, so "nothing emitted" really does
+/// mean the host had nothing to say — which was NOT true before this change,
+/// when the truth was that nobody was listening.
+///
+/// Same DLP pass as the text sibling — see `append_host_diagnostics`.
 fn collected_host_diagnostics(
     sink: &talos_worker_runtime::context::HostDiagSink,
 ) -> Option<Vec<String>> {
-    let lines = match sink.lock() {
-        Ok(guard) => guard.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    };
+    let lines = redact_lines(read_host_diagnostics(sink));
     (!lines.is_empty()).then_some(lines)
 }
 
@@ -4296,5 +4325,103 @@ mod expensive_op_limiter_cap_tests {
         assert_eq!(EXPENSIVE_OP_LIMITER.len(), EXPENSIVE_OP_LIMITER_MAX_ENTRIES);
 
         EXPENSIVE_OP_LIMITER.clear();
+    }
+}
+
+#[cfg(test)]
+mod host_diagnostic_response_tests {
+    //! The in-process `[host:*]` sink is the ONLY diagnostic route for
+    //! `run_sandbox` / `test_module` (no execution row ⇒ no NATS route). These
+    //! pin the two properties that make handing it back to the caller safe and
+    //! honest: it is DLP-scrubbed the same way the persisted NATS copy is, and
+    //! a run that emitted nothing is unchanged byte-for-byte rather than
+    //! decorated with an empty section.
+
+    use super::{append_host_diagnostics, collected_host_diagnostics};
+
+    fn sink_with(lines: &[&str]) -> talos_worker_runtime::context::HostDiagSink {
+        std::sync::Arc::new(std::sync::Mutex::new(
+            lines.iter().map(|s| s.to_string()).collect(),
+        ))
+    }
+
+    #[test]
+    fn a_run_with_no_diagnostics_is_unchanged() {
+        let empty = sink_with(&[]);
+        assert_eq!(
+            append_host_diagnostics("{\"ok\":true}".into(), &empty),
+            "{\"ok\":true}",
+            "a clean run's response must be byte-identical to pre-feature"
+        );
+        assert_eq!(
+            collected_host_diagnostics(&empty),
+            None,
+            "`None`, not `Some(vec![])`"
+        );
+    }
+
+    /// Pin the SERIALIZED shape `test_module` actually emits, not the Rust
+    /// `Option`. `json!` renders `None` as `null`; it does not drop the key.
+    /// A comment once claimed omission here — this test is why that can't
+    /// silently be believed again.
+    #[test]
+    fn test_module_quiet_run_reports_null_not_empty_array() {
+        let quiet = collected_host_diagnostics(&sink_with(&[]));
+        let body = serde_json::json!({ "success": true, "host_diagnostics": quiet });
+
+        assert!(
+            body.get("host_diagnostics").is_some(),
+            "the key IS present on a quiet run — do not document this as omitted"
+        );
+        assert!(body["host_diagnostics"].is_null());
+        assert!(
+            !body["host_diagnostics"].is_array(),
+            "never `[]`: an empty array asserts the host had nothing to say, which is a \
+             stronger claim than `null`"
+        );
+
+        // …and a noisy run carries the lines themselves.
+        let noisy = collected_host_diagnostics(&sink_with(&["[host:tls] handshake failed"]));
+        let body = serde_json::json!({ "success": false, "host_diagnostics": noisy });
+        assert_eq!(body["host_diagnostics"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn diagnostics_are_appended_and_returned() {
+        let s = sink_with(&["[host:dns] resolution failed for 'api.x.test'"]);
+        let body = append_host_diagnostics("Execution error: networkerror".into(), &s);
+        assert!(body.starts_with("Execution error: networkerror"));
+        assert!(body.contains("[host:dns] resolution failed for 'api.x.test'"));
+        assert_eq!(
+            collected_host_diagnostics(&s).expect("present").len(),
+            1,
+            "both surfaces report the same run"
+        );
+    }
+
+    /// PARITY: the NATS route is DLP-redacted at `add_log`'s INSERT, so the
+    /// sink route must be too — otherwise the same host event renders scrubbed
+    /// in `get_execution_logs` and unscrubbed in the sandbox response, which is
+    /// the two-surfaces-disagree class this change exists to close.
+    #[test]
+    fn secret_shaped_content_is_redacted_on_both_surfaces() {
+        let s = sink_with(&["[host:allowed-hosts] denied (target: sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA)"]);
+
+        let text = append_host_diagnostics("boom".into(), &s);
+        assert!(
+            !text.contains("sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            "the raw secret-shaped token must not survive into the text response: {text}"
+        );
+        assert!(
+            text.contains("[host:allowed-hosts]"),
+            "redaction must not destroy the reason tag the line exists to carry: {text}"
+        );
+
+        let json = collected_host_diagnostics(&s).expect("present");
+        assert!(
+            !json[0].contains("sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            "…and not into the structured response either: {}",
+            json[0]
+        );
     }
 }

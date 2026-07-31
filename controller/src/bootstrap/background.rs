@@ -2262,10 +2262,40 @@ pub(crate) fn spawn_nats_log_subscribers(
                                         // worker (MAX_LOG_MESSAGES_PER_EXECUTION for
                                         // guest lines, HOST_DIAG_CAP for host
                                         // diagnostics), so a single pathological module
-                                        // cannot emit more warns than it can emit logs,
-                                        // and every legitimate dispatch path now
-                                        // pre-INSERTs a row (loop bodies included), so
-                                        // the steady state is zero.
+                                        // cannot emit more warns than it can emit logs.
+                                        //
+                                        // EXPECTED RATE: zero on ordinary
+                                        // trigger / schedule / webhook / push traffic
+                                        // — every routine dispatch path pre-INSERTs its
+                                        // row before publishing (single-node
+                                        // `engine_dispatch_single.rs`, pipeline steps via
+                                        // the parent `workflow_executions.id`, loop bodies
+                                        // as of 2026-07-30, and the live webhook path at
+                                        // `talos-webhooks/src/router.rs`). It is NOT
+                                        // zero everywhere, and the earlier draft of this
+                                        // comment claiming otherwise was the same
+                                        // unearned-certainty class the warn exists to
+                                        // close. Three paths audited 2026-07-30 can still
+                                        // orphan, none on the routine path:
+                                        //   1. Webhook DLQ replay
+                                        //      (`talos-webhooks/src/router.rs`
+                                        //      `dispatch_replay`) mints a `job_id` and
+                                        //      inserts NO row — unlike the live webhook
+                                        //      path it mirrors. Orphans EVERY line of a
+                                        //      replayed run. Operator-initiated, so not
+                                        //      steady state, but unconditional when used.
+                                        //   2. Google Calendar push
+                                        //      (`talos-google-calendar` `handlers.rs`)
+                                        //      falls back to a random `job_id` when
+                                        //      `create_execution` errors — it fails OPEN
+                                        //      where Gmail and Google Cloud fail closed.
+                                        //   3. Either engine `record_started` failing
+                                        //      (deliberately non-fatal; always paired
+                                        //      with a nearby `tracing::error!`).
+                                        // A burst of these named by `exec_id` is the
+                                        // signal that one of the three fired — which is
+                                        // what this warn is FOR. Fix the producer; do
+                                        // not silence the warn.
                                         if outcome.is_orphaned() {
                                             tracing::warn!(
                                                 target: "talos_controller",
