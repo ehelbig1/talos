@@ -195,7 +195,7 @@ pub struct SecurityPolicy {
 ///             reads 45.0.3, changing the HMAC for every blob; bumping the
 ///             header to V7 rejects V6 blobs cleanly on the fleet rather
 ///             than surfacing an HMAC failure on stale precompiled bytes.
-pub const AOT_VERSION_HDR: &[u8] = b"TALOSV7";
+pub const AOT_VERSION_HDR: &[u8] = b"TALOSV8";
 /// Number of bytes occupied by the HMAC-SHA256 integrity tag that immediately
 /// follows the version header in every AOT blob.
 const AOT_HMAC_LEN: usize = 32;
@@ -297,7 +297,7 @@ fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> String {
 // wasmtime's own deserialize version check was the only thing still catching
 // stale blobs).
 const ENGINE_CONFIG_FINGERPRINT: &[u8] = b"talos-engine-config-v1\n\
-    wasmtime=45.0.3\n\
+    wasmtime=47.0.3\n\
     concurrency_support=true\n\
     consume_fuel=true\n\
     op_cost.memory_grow=255\n\
@@ -601,7 +601,7 @@ mod aot_hmac_input_tests {
         // Pinned SHA-256 of the canonical fingerprint constant.
         // If this fails, ENGINE_CONFIG_FINGERPRINT was edited (config knob
         // or the wasmtime= line). See test doc for the update procedure.
-        const EXPECTED: &str = "d3032116fc2bfe18650320141743d0f6ec6cec635191f873ee78d7947a2d7ca9";
+        const EXPECTED: &str = "06d85079d47486223ec41495d8ab6e992c20d30ddbcc11bb4f29519c1ba8c6dd";
         let actual = hex::encode(super::engine_config_fingerprint_hash());
         assert_eq!(
             actual, EXPECTED,
