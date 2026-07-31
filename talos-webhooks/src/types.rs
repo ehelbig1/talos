@@ -314,6 +314,54 @@ pub(crate) fn inject_webhook_meta(target: &mut serde_json::Value, meta: serde_js
     }
 }
 
+/// Parse an inbound webhook body into the trigger payload every downstream
+/// consumer sees, with the RFC 0007 D5 `__webhook__` metadata already injected.
+///
+/// Shared by the LIVE delivery path and the DLQ replay path so the two cannot
+/// drift. Before this existed they had: replay parsed the body and stopped
+/// there, so a replayed delivery carried NO `__webhook__` key at all while the
+/// live one did — a module branching on `__webhook__.event` took a different
+/// path on replay than on the original delivery, which is precisely the moment
+/// (an operator debugging that delivery) when the two must agree.
+///
+/// A non-object body (bare string / array) has no field-access surface, so
+/// `inject_webhook_meta` leaves it alone — same as the live path.
+pub(crate) fn build_webhook_trigger_payload(
+    body_str: &str,
+    headers: &HeaderMap,
+    event_filter: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut payload_value = serde_json::from_str::<serde_json::Value>(body_str)
+        .unwrap_or_else(|_| serde_json::Value::String(body_str.to_string()));
+    // Built BEFORE injection so `action` reads the original body.
+    let meta = build_webhook_meta(headers, event_filter, &payload_value);
+    inject_webhook_meta(&mut payload_value, meta);
+    payload_value
+}
+
+/// Wrap a webhook trigger payload into the module dispatch envelope.
+///
+/// `__trigger_input__` honors the scaffold contract that original trigger
+/// fields are ALWAYS reachable via `data["__trigger_input__"]` — webhooks
+/// deliver at `data["input"]` for the primary path, but modules that follow the
+/// standard "trigger-input escape hatch" pattern also resolve here. Cheap
+/// duplication; prevents the "works from trigger_workflow but not from webhook"
+/// DX trap (pain point #13, 2026-04-23).
+///
+/// Shared by the live and DLQ-replay dispatch sites. Replay used to build only
+/// `{config, input}`, so a replayed delivery was structurally different from the
+/// original and any module reading the documented escape hatch saw `null`.
+pub(crate) fn build_module_dispatch_payload(
+    module_config: &serde_json::Value,
+    payload_value: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "config": module_config,
+        "input": payload_value,
+        "__trigger_input__": payload_value,
+    })
+}
+
 /// Absolute difference in seconds between `now_secs` and a caller-supplied
 /// `ts_secs` (a webhook timestamp header), using overflow-free `i64::abs_diff`.
 ///
@@ -679,5 +727,120 @@ mod event_filter_tests {
         let mut arr = json!([1, 2, 3]);
         inject_webhook_meta(&mut arr, json!({ "event": "x" }));
         assert_eq!(arr, json!([1, 2, 3]));
+    }
+}
+
+/// The live delivery path and the DLQ replay path must produce the SAME payload
+/// shape. They did not: replay built `{config, input}` — no `__trigger_input__`
+/// and no `__webhook__` — so a module read `null` from the documented escape
+/// hatch on the one run an operator was watching. These tests pin the shape of
+/// the two shared builders that now serve both paths.
+#[cfg(test)]
+mod dispatch_payload_tests {
+    use super::{build_module_dispatch_payload, build_webhook_trigger_payload};
+    use http::{HeaderMap, HeaderValue};
+    use serde_json::json;
+
+    fn gh_headers() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("X-GitHub-Event", HeaderValue::from_static("pull_request"));
+        h.insert("X-GitHub-Delivery", HeaderValue::from_static("d-42"));
+        h
+    }
+
+    const BODY: &str = r#"{"action":"opened","number":7}"#;
+
+    /// The live envelope: three keys, and the body reachable through BOTH
+    /// `input` and `__trigger_input__`.
+    #[test]
+    fn module_envelope_carries_config_input_and_trigger_input() {
+        let payload = build_webhook_trigger_payload(BODY, &gh_headers(), None);
+        let env = build_module_dispatch_payload(&json!({ "URL": "https://x" }), &payload);
+
+        let obj = env.as_object().expect("envelope is an object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["__trigger_input__", "config", "input"],
+            "the envelope is exactly {{config, input, __trigger_input__}} — dropping \
+             __trigger_input__ is the replay divergence this builder exists to prevent"
+        );
+        assert_eq!(env["config"], json!({ "URL": "https://x" }));
+        assert_eq!(env["input"], payload);
+        assert_eq!(env["__trigger_input__"], payload);
+        assert_eq!(env["__trigger_input__"]["number"], json!(7));
+    }
+
+    /// THE regression: live vs replay for the same body. Only the two
+    /// header-derived fields may differ — everything else must be byte-equal.
+    #[test]
+    fn replay_payload_matches_live_except_header_derived_fields() {
+        let live = build_webhook_trigger_payload(BODY, &gh_headers(), None);
+        // Replay has no request headers (the DLQ row hands `dispatch_replay`
+        // only the body), so it passes an empty map.
+        let replay = build_webhook_trigger_payload(BODY, &HeaderMap::new(), None);
+
+        assert_eq!(
+            live["__webhook__"],
+            json!({ "event": "pull_request", "delivery": "d-42", "action": "opened" })
+        );
+        assert_eq!(
+            replay["__webhook__"],
+            json!({ "event": null, "delivery": null, "action": "opened" }),
+            "replay cannot recover the header-derived fields, but the KEY and its shape \
+             must still be there — pre-fix `__webhook__` was absent entirely on replay"
+        );
+
+        // Structural equality everywhere else, including the reserved key set.
+        let mut live_keys: Vec<&str> = live
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut replay_keys: Vec<&str> = replay
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        live_keys.sort_unstable();
+        replay_keys.sort_unstable();
+        assert_eq!(live_keys, replay_keys);
+        assert_eq!(live["action"], replay["action"]);
+        assert_eq!(live["number"], replay["number"]);
+
+        // And the envelopes agree once the header-derived fields are equalised.
+        let cfg = json!({ "k": "v" });
+        let mut live_env = build_module_dispatch_payload(&cfg, &live);
+        let replay_env = build_module_dispatch_payload(&cfg, &replay);
+        for slot in ["input", "__trigger_input__"] {
+            live_env[slot]["__webhook__"]["event"] = json!(null);
+            live_env[slot]["__webhook__"]["delivery"] = json!(null);
+        }
+        assert_eq!(live_env, replay_env);
+    }
+
+    /// A non-JSON body is preserved as a string on both paths, and a
+    /// non-object has no surface to attach `__webhook__` to — same as before.
+    #[test]
+    fn non_json_body_is_preserved_verbatim_without_meta() {
+        let p = build_webhook_trigger_payload("not json", &gh_headers(), None);
+        assert_eq!(p, json!("not json"));
+        let env = build_module_dispatch_payload(&json!({}), &p);
+        assert_eq!(env["input"], json!("not json"));
+        assert_eq!(env["__trigger_input__"], json!("not json"));
+    }
+
+    /// The event header name follows the trigger's own `event_filter.header`,
+    /// so a non-GitHub provider resolves through the same one source of truth.
+    #[test]
+    fn event_header_follows_the_trigger_filter() {
+        let mut h = HeaderMap::new();
+        h.insert("X-Gitlab-Event", HeaderValue::from_static("Push Hook"));
+        let filter = json!({ "header": "X-Gitlab-Event", "values": ["Push Hook"] });
+        let p = build_webhook_trigger_payload("{}", &h, Some(&filter));
+        assert_eq!(p["__webhook__"]["event"], json!("Push Hook"));
     }
 }

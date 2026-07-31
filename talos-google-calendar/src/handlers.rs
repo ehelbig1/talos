@@ -1265,6 +1265,26 @@ pub async fn process_webhook_events(
         }
     };
 
+    // 7.1. The execution recorder is a HARD requirement, not a nice-to-have.
+    // Every `wasm.log.{job_id}` line the worker publishes is routed into
+    // `module_execution_logs` behind a `WHERE EXISTS` guard on
+    // `module_executions`, so a job dispatched under an id with no row there
+    // runs invisibly: no logs, no status, nothing for an operator to find.
+    // Pre-fix an absent service (and, below, a failed INSERT) fell through to
+    // `Uuid::new_v4()` and dispatched anyway. Same shape as the NATS check
+    // above — refuse the batch rather than dispatch untrackable work.
+    let exec_service = match execution_service.as_ref() {
+        Some(svc) => svc,
+        None => {
+            tracing::error!(
+                channel = %channel_uuid,
+                events = filtered_events.len(),
+                "❌ ModuleExecutionService not available - refusing to dispatch untrackable jobs"
+            );
+            anyhow::bail!("ModuleExecutionService not configured");
+        }
+    };
+
     // 7.5. Resolve oauth_account_id + token presence in a single query.
     // The caller already passed in integration_uuid (from the outer
     // handler's WatchChannel lookup), saving us one round-trip.
@@ -1325,57 +1345,74 @@ pub async fn process_webhook_events(
             .and_then(|v| v.as_str())
             .unwrap_or("(no title)");
 
-        // Create execution record
-        let execution_id = if let Some(exec_service) = execution_service.as_ref() {
-            let trigger_metadata = serde_json::json!({
-                "channel_id": channel_uuid.to_string(),
-                "event_id": event_id,
-                "event_summary": event_summary,
-                "calendar_event_index": index + 1,
-                "total_events": filtered_events.len(),
-            });
+        // Create execution record. FAIL CLOSED: the job id IS the execution
+        // id, so without this row the dispatched job is untrackable (see 7.1).
+        //
+        // The honest tradeoff, stated because it is NOT universally right:
+        // skipping DROPS this notification. `sync_channel_events` above has
+        // ALREADY committed the new sync token, so Google will not re-deliver
+        // this delta — the event returns only if it is modified again. What we
+        // trade for it is a job that runs with no logs, no status and no
+        // operator-visible record at all, on a path where a DB failure is
+        // exactly the moment someone will go looking. A loud skip beats an
+        // invisible run HERE, where the payload is a calendar delta that will
+        // be re-derivable from the calendar itself; it would be the wrong call
+        // on a path whose payload exists nowhere else (an incident push, say).
+        // The event is deliberately NOT marked processed in Redis, so a
+        // subsequent delivery carrying it is still eligible to run.
+        let trigger_metadata = serde_json::json!({
+            "channel_id": channel_uuid.to_string(),
+            "event_id": event_id,
+            "event_summary": event_summary,
+            "calendar_event_index": index + 1,
+            "total_events": filtered_events.len(),
+        });
 
-            match exec_service
-                .create_execution(
-                    module_uuid,
-                    user_id,
-                    Uuid::new_v4(),
-                    TriggerType::Webhook,
-                    Some(event.clone()),
-                    Some(trigger_metadata),
-                    None,
-                    resolved_actor,
-                )
-                .await
-            {
-                Ok(id) => {
-                    // Mark as queued (will be picked up by worker)
-                    exec_service
-                        .add_log_best_effort(
-                            id,
-                            LogLevel::Info,
-                            format!("Job queued for calendar event: {}", event_summary),
-                            Some(serde_json::json!({
-                                "event_id": event_id,
-                                "index": index + 1,
-                                "total": filtered_events.len(),
-                                "execution_location": "worker"
-                            })),
-                        )
-                        .await;
+        let execution_id = match exec_service
+            .create_execution(
+                module_uuid,
+                user_id,
+                Uuid::new_v4(),
+                TriggerType::Webhook,
+                Some(event.clone()),
+                Some(trigger_metadata),
+                None,
+                resolved_actor,
+            )
+            .await
+        {
+            Ok(id) => {
+                // Mark as queued (will be picked up by worker)
+                exec_service
+                    .add_log_best_effort(
+                        id,
+                        LogLevel::Info,
+                        format!("Job queued for calendar event: {}", event_summary),
+                        Some(serde_json::json!({
+                            "event_id": event_id,
+                            "index": index + 1,
+                            "total": filtered_events.len(),
+                            "execution_location": "worker"
+                        })),
+                    )
+                    .await;
 
-                    Some(id)
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to create execution record: {}", e);
-                    None
-                }
+                id
             }
-        } else {
-            None
+            Err(e) => {
+                tracing::warn!(
+                    channel = %channel_uuid,
+                    event_id,
+                    error = %e,
+                    "Failed to create execution record — skipping this event rather than \
+                     dispatching an untrackable job (the notification is dropped; the sync \
+                     token has already advanced)"
+                );
+                continue;
+            }
         };
 
-        let job_id = execution_id.unwrap_or_else(Uuid::new_v4);
+        let job_id = execution_id;
 
         tracing::debug!(
             "📤 Publishing job to worker for event {}/{}: {} ({})",
@@ -1548,18 +1585,16 @@ pub async fn process_webhook_events(
             }
             tracing::error!("❌ {sign_err}. Skipping event.");
             // Mark the execution record as failed so it doesn't stay orphaned.
-            if let (Some(svc), Some(eid)) = (execution_service.as_ref(), execution_id) {
-                if let Err(e) = svc
-                    .fail_execution(
-                        eid,
-                        user_id,
-                        sign_err.clone(),
-                        Some("signing_error".to_string()),
-                    )
-                    .await
-                {
-                    tracing::warn!("Failed to mark execution {} as failed: {}", eid, e);
-                }
+            if let Err(e) = exec_service
+                .fail_execution(
+                    execution_id,
+                    user_id,
+                    sign_err.clone(),
+                    Some("signing_error".to_string()),
+                )
+                .await
+            {
+                tracing::warn!("Failed to mark execution {} as failed: {}", execution_id, e);
             }
             if let (Some(_rt), Some(sm), Some(nats_clone)) = (
                 runtime.clone(),
@@ -1585,7 +1620,7 @@ pub async fn process_webhook_events(
                         user_id,
                         event_data,
                         channel_uuid,
-                        execution_id.unwrap_or(Uuid::new_v4()),
+                        execution_id,
                         Some(sign_err),
                     )
                     .await
@@ -1679,7 +1714,7 @@ pub async fn process_webhook_events(
                             user_id,
                             event_data,
                             channel_uuid,
-                            execution_id.unwrap_or(Uuid::new_v4()),
+                            execution_id,
                             None, // Google calendar only runs chains on success
                         )
                         .await
@@ -1703,18 +1738,14 @@ pub async fn process_webhook_events(
                 let err_str = format!("Failed to publish job to worker: {}", e);
 
                 // Mark execution as failed
-                if let (Some(exec_service), Some(exec_id)) =
-                    (execution_service.as_ref(), execution_id)
-                {
-                    exec_service
-                        .fail_execution_best_effort(
-                            exec_id,
-                            user_id,
-                            err_str.clone(),
-                            Some("nats_publish".to_string()),
-                        )
-                        .await;
-                }
+                exec_service
+                    .fail_execution_best_effort(
+                        execution_id,
+                        user_id,
+                        err_str.clone(),
+                        Some("nats_publish".to_string()),
+                    )
+                    .await;
 
                 if let (Some(_rt), Some(sm), Some(nats_clone)) = (
                     runtime.clone(),
@@ -1740,7 +1771,7 @@ pub async fn process_webhook_events(
                             user_id,
                             event_data,
                             channel_uuid,
-                            execution_id.unwrap_or(Uuid::new_v4()),
+                            execution_id,
                             Some(err_str),
                         )
                         .await

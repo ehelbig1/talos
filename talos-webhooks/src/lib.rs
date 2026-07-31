@@ -59,6 +59,6 @@ pub use approval::{
 pub use approval_actions::{approval_action_apply, approval_action_preview};
 pub use correction::{correction_apply, correction_preview};
 pub use dlq::{DlqMetrics, DlqService};
-pub use router::{webhook_handler, WebhookRouter};
+pub use router::{insert_webhook_module_execution, webhook_handler, WebhookRouter};
 pub use suspension::suspension_callback_handler;
 pub use types::{validate_event_filter, WebhookTrigger};

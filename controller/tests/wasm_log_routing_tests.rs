@@ -310,3 +310,267 @@ async fn a_row_recorded_by_the_execution_store_makes_loop_logs_persist() {
          not the iteration"
     );
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// The webhook half of the same family.
+//
+// A webhook-dispatched module job carries `job_id` as BOTH the job id and the
+// execution id, so the `module_executions` row must exist before the job is
+// published or every `wasm.log.{job_id}` line hits the same `WHERE EXISTS`
+// guard and is discarded. Two paths dispatch such jobs:
+//   * the LIVE delivery path — it inserted the row but only `tracing::error!`d
+//     on failure and dispatched anyway, so any DB blip produced an invisible
+//     execution;
+//   * the DLQ REPLAY path — it never inserted a row at all, so 100% of
+//     replayed module deliveries were orphaned, on the one path an operator
+//     reaches for *because* they are debugging.
+// Both now go through `talos_webhooks::insert_webhook_module_execution`, and
+// these tests drive that exact function against a real Postgres.
+// ───────────────────────────────────────────────────────────────────────────
+
+fn secrets_manager(pool: &sqlx::Pool<sqlx::Postgres>) -> Arc<controller::secrets::SecretsManager> {
+    Arc::new(controller::secrets::SecretsManager::new(pool.clone()).expect("SecretsManager"))
+}
+
+/// The fix, end to end: the row the webhook helper writes is the one the log
+/// router needs. Mutation-resistant — the same assertion is pointed at an
+/// UNRECORDED uuid to prove it is not merely asserting `is_ok()`.
+#[tokio::test]
+async fn webhook_dispatch_row_makes_its_logs_land() {
+    let f = fixture().await;
+    let sm = secrets_manager(&f.pool);
+    let job_id = Uuid::new_v4();
+
+    talos_webhooks::insert_webhook_module_execution(
+        &f.pool,
+        &sm,
+        job_id,
+        f.module,
+        f.user,
+        &serde_json::json!({ "action": "opened", "number": 7 }),
+        Some(f.actor),
+    )
+    .await
+    .expect("the webhook tracking row must insert");
+
+    let outcome = f
+        .service
+        .add_log(
+            job_id,
+            LogLevel::Info,
+            "webhook module says hello".to_string(),
+            None,
+        )
+        .await
+        .expect("add_log");
+    assert_eq!(
+        outcome,
+        LogWriteOutcome::Inserted,
+        "a job dispatched under this id can be tailed — the DLQ replay path had no row at all, \
+         so this was NoExecutionRow for every replayed delivery"
+    );
+
+    // The control: an id no INSERT ever created — same call, same table, and
+    // it must NOT report Inserted. Without this, the assertion above would
+    // still pass if `add_log` had been weakened to always report success.
+    let never_recorded = Uuid::new_v4();
+    assert_eq!(
+        f.service
+            .add_log(never_recorded, LogLevel::Info, "orphan".to_string(), None)
+            .await
+            .expect("add_log"),
+        LogWriteOutcome::NoExecutionRow,
+        "the positive assertion above is only meaningful if an unrecorded id still fails"
+    );
+
+    assert_eq!(f.log_row_count(job_id).await, 1);
+    assert_eq!(f.log_row_count(never_recorded).await, 0);
+}
+
+/// Data-at-rest, ENCRYPTING branch: with a DEK provisioned (the production
+/// state), the webhook body must land as ciphertext only. Webhook bodies
+/// routinely carry secret-shaped values — provider callbacks echo bearer
+/// tokens — so a refactor that always bound `input_data` would be a silent
+/// regression no shape test catches.
+#[tokio::test]
+async fn webhook_row_stores_ciphertext_when_encryption_is_available() {
+    let f = fixture().await;
+    let sm = secrets_manager(&f.pool);
+    sm.initialize().await.expect("provision the global DEK");
+    let job_id = Uuid::new_v4();
+
+    talos_webhooks::insert_webhook_module_execution(
+        &f.pool,
+        &sm,
+        job_id,
+        f.module,
+        f.user,
+        &serde_json::json!({ "token": "sk-live-should-never-be-queryable" }),
+        Some(f.actor),
+    )
+    .await
+    .expect("insert");
+
+    let (pt, ct, fmt): (Option<serde_json::Value>, Option<Vec<u8>>, Option<i16>) = sqlx::query_as(
+        "SELECT input_data, input_data_enc, payload_format FROM module_executions WHERE id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(&f.pool)
+    .await
+    .expect("read back the row");
+
+    assert!(
+        pt.is_none(),
+        "input_data must stay NULL while encryption succeeds — operators querying this column \
+         must not be able to read the webhook body"
+    );
+    let ct = ct.expect("ciphertext must be present");
+    assert!(!ct.is_empty());
+    assert!(
+        !String::from_utf8_lossy(&ct).contains("sk-live-should-never-be-queryable"),
+        "the stored bytes must not contain the plaintext"
+    );
+    assert!(
+        fmt.unwrap_or(0) > 0,
+        "an encrypted row must record its AEAD format version"
+    );
+}
+
+/// Data-at-rest, FALLBACK branch: when encryption is unavailable (KMS outage,
+/// DEK rotation race, an un-initialized manager — the state of this fixture
+/// before `initialize()`), the helper falls back to plaintext in `input_data`
+/// — but DLP-REDACTED first (MCP-987). Preserving BOTH branches through the
+/// extraction is the security invariant; a helper that dropped the redaction
+/// would look fine in the happy-path test above and quietly land raw tokens in
+/// a queryable column exactly when things are already going wrong.
+#[tokio::test]
+async fn webhook_row_redacts_the_plaintext_fallback() {
+    let f = fixture().await;
+    // Deliberately NOT initialized: no active DEK → encrypt_payload_bundle errs.
+    let sm = secrets_manager(&f.pool);
+    let job_id = Uuid::new_v4();
+
+    talos_webhooks::insert_webhook_module_execution(
+        &f.pool,
+        &sm,
+        job_id,
+        f.module,
+        f.user,
+        &serde_json::json!({
+            "api_key": "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "note": "keep me"
+        }),
+        Some(f.actor),
+    )
+    .await
+    .expect("an encryption failure must NOT fail the insert — only the INSERT failing is fatal");
+
+    let (pt, ct): (Option<serde_json::Value>, Option<Vec<u8>>) =
+        sqlx::query_as("SELECT input_data, input_data_enc FROM module_executions WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&f.pool)
+            .await
+            .expect("read back");
+
+    assert!(ct.is_none(), "nothing was encrypted on this branch");
+    let pt = pt.expect("the fallback stores the payload as plaintext");
+    let rendered = pt.to_string();
+    assert!(
+        !rendered.contains("sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        "the secret-shaped value must be DLP-redacted before it reaches a queryable column; \
+         got: {rendered}"
+    );
+    assert!(
+        rendered.contains("keep me"),
+        "redaction must not gut the payload — the non-secret field survives"
+    );
+}
+
+/// `ON CONFLICT DO NOTHING` is load-bearing: an operator may replay the same
+/// DLQ entry twice, and a second insert under a colliding id must not turn a
+/// dispatch into an error.
+#[tokio::test]
+async fn webhook_row_insert_is_idempotent() {
+    let f = fixture().await;
+    let sm = secrets_manager(&f.pool);
+    let job_id = Uuid::new_v4();
+    let payload = serde_json::json!({ "action": "reopened" });
+
+    for attempt in 1..=2 {
+        talos_webhooks::insert_webhook_module_execution(
+            &f.pool,
+            &sm,
+            job_id,
+            f.module,
+            f.user,
+            &payload,
+            Some(f.actor),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("insert attempt {attempt} must succeed: {e}"));
+    }
+
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM module_executions WHERE id = $1")
+        .bind(job_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("count");
+    assert_eq!(
+        rows, 1,
+        "the second insert must be a no-op, not a duplicate"
+    );
+}
+
+/// Tenancy: the row is bound to the user the trigger names. A helper that
+/// defaulted the user (the class the engine's `unwrap_or_else(Uuid::new_v4)`
+/// was misread as) would produce a row that violates the `users` FK — or worse,
+/// attributes the execution to nobody.
+#[tokio::test]
+async fn webhook_row_is_bound_to_the_trigger_user_and_actor() {
+    let f = fixture().await;
+    let sm = secrets_manager(&f.pool);
+    let job_id = Uuid::new_v4();
+
+    talos_webhooks::insert_webhook_module_execution(
+        &f.pool,
+        &sm,
+        job_id,
+        f.module,
+        f.user,
+        &serde_json::json!({}),
+        Some(f.actor),
+    )
+    .await
+    .expect("insert");
+
+    let (uid, aid, status, trigger_type): (Uuid, Option<Uuid>, String, Option<String>) =
+        sqlx::query_as(
+            "SELECT user_id, actor_id, status, trigger_type FROM module_executions WHERE id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("read back");
+
+    assert_eq!(uid, f.user);
+    assert_eq!(aid, Some(f.actor));
+    assert_eq!(status, "running");
+    assert_eq!(trigger_type.as_deref(), Some("webhook"));
+
+    // And an unknown user must be refused by the FK rather than silently
+    // landing an unattributable row.
+    let err = talos_webhooks::insert_webhook_module_execution(
+        &f.pool,
+        &sm,
+        Uuid::new_v4(),
+        f.module,
+        Uuid::new_v4(),
+        &serde_json::json!({}),
+        Some(f.actor),
+    )
+    .await;
+    assert!(
+        err.is_err(),
+        "a row for a non-existent user must fail loudly — the caller now stops the dispatch on it"
+    );
+}

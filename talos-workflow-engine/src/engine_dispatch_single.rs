@@ -325,7 +325,18 @@ impl ParallelWorkflowEngine {
                 .record_started(ExecutionStartedContext {
                     id: job_id,
                     module_id: actual_module_id,
-                    user_id: self.user_id.unwrap_or_else(Uuid::new_v4),
+                    // The `user_id` bound at the top of this function, NOT a
+                    // minted fallback. `self.user_id.unwrap_or_else(Uuid::
+                    // new_v4)` stood here and was read (twice, in two separate
+                    // reviews) as a guaranteed FK violation against `users`.
+                    // It was not: the `None` arm is unreachable — the match at
+                    // the top of this function early-returns on `None`, the
+                    // receiver is `&self`, and `user_id` is a plain
+                    // `Option<Uuid>` field with no interior mutability, so it
+                    // cannot become `None` in between. Using the bound local
+                    // makes that structural rather than something the next
+                    // reader has to re-derive.
+                    user_id,
                     workflow_execution_id: execution_id,
                     input: &inputs,
                     trigger_type: "webhook",

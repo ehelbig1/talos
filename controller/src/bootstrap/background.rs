@@ -2275,25 +2275,32 @@ pub(crate) fn spawn_nats_log_subscribers(
                                         // zero everywhere, and the earlier draft of this
                                         // comment claiming otherwise was the same
                                         // unearned-certainty class the warn exists to
-                                        // close. Three paths audited 2026-07-30 can still
-                                        // orphan, none on the routine path:
-                                        //   1. Webhook DLQ replay
-                                        //      (`talos-webhooks/src/router.rs`
-                                        //      `dispatch_replay`) mints a `job_id` and
-                                        //      inserts NO row — unlike the live webhook
-                                        //      path it mirrors. Orphans EVERY line of a
-                                        //      replayed run. Operator-initiated, so not
-                                        //      steady state, but unconditional when used.
-                                        //   2. Google Calendar push
-                                        //      (`talos-google-calendar` `handlers.rs`)
-                                        //      falls back to a random `job_id` when
-                                        //      `create_execution` errors — it fails OPEN
-                                        //      where Gmail and Google Cloud fail closed.
-                                        //   3. Either engine `record_started` failing
-                                        //      (deliberately non-fatal; always paired
-                                        //      with a nearby `tracing::error!`).
-                                        // A burst of these named by `exec_id` is the
-                                        // signal that one of the three fired — which is
+                                        // close.
+                                        //
+                                        // The 2026-07-30 audit listed three residual
+                                        // producers here. Two of them — webhook DLQ
+                                        // replay (no row at all) and Google Calendar
+                                        // push (random `job_id` when `create_execution`
+                                        // errored) — were closed on 2026-07-31, along
+                                        // with a fourth the audit itself had missed: the
+                                        // LIVE webhook INSERT, which on error logged and
+                                        // dispatched anyway. All three webhook/GCal paths
+                                        // now fail closed. Do not re-derive that list
+                                        // from this comment: it is a snapshot, and this
+                                        // is the second time it has gone stale. The warn
+                                        // below is the live detector — trust it over the
+                                        // prose.
+                                        //
+                                        // ONE deliberate producer remains, and it is not
+                                        // a bug: either engine `record_started` failing
+                                        // is non-fatal by design (always paired with a
+                                        // nearby `tracing::error!`), so a DB blip during
+                                        // a node dispatch still orphans that node's
+                                        // lines.
+                                        //
+                                        // A burst of these named by `exec_id` therefore
+                                        // means either that, or a NEW dispatch path that
+                                        // mints an id without recording a row — which is
                                         // what this warn is FOR. Fix the producer; do
                                         // not silence the warn.
                                         if outcome.is_orphaned() {
