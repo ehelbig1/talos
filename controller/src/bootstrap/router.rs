@@ -3479,9 +3479,16 @@ pub(crate) fn build_router(
 
 /// The OAuth login leg of `talos_auth_failures_total`. The three
 /// error-redirect branches inside `oauth_callback_handler` need the full
-/// axum Extension set to drive, but `oauth_login_internal_error` — the
-/// `map_err` target that covers every post-handshake internal failure — is a
-/// free function and pins the wiring on the real production path.
+/// axum Extension set to drive, so what is pinned here is narrower than the
+/// handler: `oauth_login_internal_error` is a free function, and this test
+/// proves that CALLING IT counts a failure and returns 500. It does NOT
+/// prove the handler still calls it, and nothing else does either —
+/// deleting a `.map_err(oauth_login_internal_error)` (or the
+/// `inc_auth_attempt` at the top of the callback) leaves both this test and
+/// structural check 58 green. Say so rather than implying coverage that is
+/// not here; the honest guard for the OAuth leg is the post-merge live
+/// check (hit the callback, watch `talos_auth_attempts_total{method="oauth"}`
+/// on `/metrics/prometheus`).
 #[cfg(test)]
 mod oauth_auth_metric_tests {
     use super::oauth_login_internal_error;

@@ -3785,6 +3785,20 @@ fi
 # genuinely externally-set/scrape-only metric with
 # `// allow-unincremented-metric: <reason>` on the field's
 # struct-declaration line.
+#
+# WHAT THIS CHECK STILL CANNOT SEE (state it, do not imply otherwise —
+# overstating a lint is the same defect one level up). The haystack is
+# TEXTUAL, so an increment wrapped in a helper reads as live even when
+# NOTHING CALLS THE HELPER: `record_outcome` (crash_recovery_total),
+# `publish_dek_cache_size`, `inc_auth_attempt` / `inc_auth_failure`,
+# `inc_payload_crypto_failure` and `inc_secret_decrypt_failure` are all
+# one-site wrappers, so deleting every CALL SITE leaves this check green.
+# Verified by mutation 2026-07-31: gutting a wrapper BODY is caught;
+# deleting all its call sites is not. Closing that needs a call-graph, not
+# a grep — so the guard for call sites is the per-metric production-path
+# unit test (talos-auth auth_metric_tests, the dek_cache_size fill/drain
+# test, payload_crypto_failures_are_counted_on_the_production_path). When
+# you wire a metric through a wrapper, ship that test with it.
 bold "▶ check 58: registered Prometheus metric never incremented (dead metric)"
 METRICS_LIB="talos-metrics/src/lib.rs"
 if [ -f "$METRICS_LIB" ]; then
@@ -3889,14 +3903,37 @@ if [ -f "$METRICS_LIB" ]; then
                 # shipped with was invisible precisely because a BROKEN
                 # haystack still produces a plausible-looking answer — it
                 # just quietly calls dead metrics live. So assert both
-                # directions against two known landmarks in
-                # talos-metrics/src/lib.rs: a name that exists ONLY inside its
-                # `#[cfg(test)] mod tests` (must be gone) and one that exists
-                # only in its production region (must remain). Rename either
-                # and this fires — which is the point; re-point it at a
-                # current landmark rather than deleting the assert.
+                # directions against two known landmarks. Rename either and
+                # this fires — which is the point; re-point it at a current
+                # landmark rather than deleting the assert.
+                #
+                # NB: no apostrophes anywhere in this perl block — it is
+                # single-quoted in the surrounding shell, so one ends the
+                # program mid-comment.
+                #
+                # UNDER-strip landmark: a name that exists ONLY inside the
+                # `#[cfg(test)] mod tests` of talos-metrics/src/lib.rs — and
+                # it is the very test whose touch made talos_dek_cache_size
+                # and talos_module_payload_encryption_failures_total read
+                # live for months. It must be gone from the haystack.
+                #
+                # OVER-strip landmark: MUST be production code that sits
+                # AFTER a `#[cfg(test)] mod` IN THE SAME FILE, or the assert
+                # is vacuous. The first version of this tripwire used
+                # `pub fn record_workflow_outcome`, which lives near the TOP
+                # of talos-metrics/src/lib.rs, ABOVE the test module in that
+                # file — so the exact regression the assert names (truncate
+                # each file to EOF at its first `#[cfg(test)]`) left the
+                # landmark untouched, the tripwire stayed silent, and the
+                # check falsely reported crash_recovery_total dead.
+                # `record_outcome` is the crash_recovery_total increment in
+                # talos-execution-orchestration/src/crash_recovery.rs, ~50
+                # lines BELOW the test module in that same file: exactly the
+                # production code truncation would swallow. Verified by
+                # mutation 2026-07-31 — neutering the region-close makes
+                # this fire.
                 my $strip_broken = ($hay =~ /crypto_invariant_metrics_render/) ? 1 : 0;
-                my $overstripped = ($hay =~ /pub fn record_workflow_outcome/) ? 0 : 1;
+                my $overstripped = ($hay =~ /fn record_outcome\(outcome: &str, n: u64\)/) ? 0 : 1;
                 print "__CFG_TEST_STRIP_BROKEN__\n" if $strip_broken;
                 print "__CFG_TEST_OVERSTRIPPED__\n" if $overstripped;
                 $hay =~ s/\s+/ /g;

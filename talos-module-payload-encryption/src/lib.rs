@@ -88,8 +88,10 @@ impl PayloadSlot {
 /// `talos_module_payload_encryption_failures_total{op,stage}`.
 ///
 /// This crate is the single chokepoint both directions pass through
-/// ([`encrypt_payload_bundle`] has 5 caller sites across 3 crates,
-/// [`decrypt_payload_slot`] has 9 across 3 more), and it is the only place
+/// ([`encrypt_payload_bundle`] has 5 production caller sites across 3 crates
+/// — talos-webhooks, talos-engine, talos-module-executions;
+/// [`decrypt_payload_slot`] has 3 across 3 more — talos-module-repository,
+/// talos-execution-repository, talos-module-executions), and it is the only place
 /// with the failing SLOT in scope — `ModuleExecutionService` encrypts input
 /// and trigger_metadata in ONE call, so a caller-side handler could not
 /// attribute `stage` at all.

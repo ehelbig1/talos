@@ -1150,6 +1150,32 @@ impl SecretsManager {
                         key: bytes,
                     })
                 } else {
+                    // No legacy provider configured, and the active one just
+                    // failed — so EVERY configured provider is exhausted and
+                    // this read is terminally broken, exactly the condition
+                    // `TalosKEKDecryptFailuresBoth` (critical, `rate(...{
+                    // provider="both"}[5m]) > 0` for 2m) exists to page on.
+                    //
+                    // Before 2026-07-31 only the active+legacy-both-failed
+                    // arm emitted `provider="both"`, so on the two SUPPORTED
+                    // postures that wire no legacy at all — `KEK_PROVIDER=env`
+                    // (the homelab path behind TALOS_ALLOW_ENV_KEK, which
+                    // hardcodes legacy=None) and `KEK_PROVIDER=vault` with
+                    // `KEK_DISABLE_LEGACY=true` (the documented Phase-5 end
+                    // state) — that label value could never be emitted and the
+                    // CRITICAL alert could never fire. A total KEK outage
+                    // surfaced only on the WARNING alert, whose own summary
+                    // says "legacy fallback is carrying the load" when there is
+                    // no legacy to carry it. Same defect class as the three
+                    // dead alerts fixed in #620: a selector that matches no
+                    // emittable series is a false assurance, and a live metric
+                    // with an unreachable label VALUE hides it from check 58,
+                    // which only sees the field.
+                    if let Some(m) = talos_metrics::global() {
+                        m.kek_decrypt_failures_total
+                            .with_label_values(&["both"])
+                            .inc();
+                    }
                     Err(active_err
                         .context(format!("decrypt_dek: active provider failed for {key_id}")))
                 }
@@ -6773,6 +6799,58 @@ mod dek_cache_sweep_tests {
             0,
             "gauge must return to 0 when the cache drains — a gauge that only \
              counts up is a leak alert that fires on itself"
+        );
+    }
+}
+
+// =============================================================================
+// `talos_kek_decrypt_failures_total{provider}` label-value reachability
+// =============================================================================
+#[cfg(test)]
+mod kek_failure_label_tests {
+    use super::SecretsManager;
+    use uuid::Uuid;
+
+    /// `TalosKEKDecryptFailuresBoth` (critical, `provider="both"`) must be
+    /// able to fire on a deployment that wires NO legacy KEK — which is the
+    /// SUPPORTED posture for `KEK_PROVIDER=env` (legacy hardcoded `None` in
+    /// `bootstrap::services`) and for `KEK_PROVIDER=vault` +
+    /// `KEK_DISABLE_LEGACY=true`. Before 2026-07-31 only the
+    /// active-AND-legacy-both-failed arm emitted `both`, so on those postures
+    /// a total KEK outage produced only `provider="active"` and the critical
+    /// alert could never fire — the same "selector matches no emittable
+    /// series" defect as the three dead alerts, invisible to structural check
+    /// 58 because the FIELD is live and only a label VALUE was unreachable.
+    ///
+    /// Drives the real private `decrypt_dek` (it takes the ciphertext as an
+    /// argument and touches no DB) with a ciphertext the stub KEK cannot
+    /// unwrap, and asserts BOTH label values move by exactly one.
+    #[tokio::test]
+    async fn no_legacy_kek_still_emits_provider_both_on_total_failure() {
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        let m = talos_metrics::global().expect("global installed");
+        let read = |p: &str| m.kek_decrypt_failures_total.with_label_values(&[p]).get();
+
+        let sm = SecretsManager::test_stub_for_cache();
+        assert!(
+            sm.current_legacy_kek().is_none(),
+            "this test is only meaningful with no legacy provider wired"
+        );
+
+        let (a0, b0) = (read("active"), read("both"));
+        assert!(
+            sm.decrypt_dek(Uuid::new_v4(), b"not a valid wrapped DEK")
+                .await
+                .is_err(),
+            "garbage ciphertext must not unwrap"
+        );
+
+        assert_eq!(read("active") - a0, 1.0, "active-provider failure counted");
+        assert_eq!(
+            read("both") - b0,
+            1.0,
+            "with no legacy configured, an active-provider failure IS a total \
+             failure and must reach the series TalosKEKDecryptFailuresBoth selects"
         );
     }
 }

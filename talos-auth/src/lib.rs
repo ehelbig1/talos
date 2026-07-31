@@ -775,7 +775,11 @@ impl AuthService {
     /// call and at most one `talos_auth_failures_total{method="password"}` —
     /// the two series behind the `TalosControllerHighErrorRate` alert. Both
     /// live here rather than in the GraphQL mutation because this is the only
-    /// production password-verify path in the workspace.
+    /// production password-LOGIN path in the workspace. (It is not the only
+    /// `bcrypt::verify` — `change_password` re-checks the old password, and
+    /// the MCP/refresh paths verify tokens the same way. Those are
+    /// deliberately outside this population: none of them is a login, and
+    /// folding them in would change what the alert ratio means.)
     ///
     /// The classification is done by the inner fn (which knows WHY it is
     /// failing — every caller-visible error is the same deliberately opaque
