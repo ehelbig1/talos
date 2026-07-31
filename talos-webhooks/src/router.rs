@@ -24,7 +24,7 @@ use crate::dlq::{DlqEntry, DlqService};
 use crate::rate_limiter;
 use crate::rate_limiter::RateLimiter;
 use crate::types::{
-    build_webhook_meta, event_filter_matches, inject_webhook_meta,
+    build_module_dispatch_payload, build_webhook_trigger_payload, event_filter_matches,
     webhook_must_fail_closed_on_hmac, webhook_timestamp_skew_secs, WebhookTrigger,
 };
 use crate::{CircuitBreaker, CircuitBreakerFailureType};
@@ -33,6 +33,94 @@ use crate::{CircuitBreaker, CircuitBreakerFailureType};
 
 /// Maximum webhook payload size (1 MB) to prevent memory exhaustion attacks.
 const MAX_WEBHOOK_PAYLOAD_SIZE: usize = 1024 * 1024;
+
+/// Insert the `module_executions` tracking row for a bare-module webhook
+/// dispatch — the ONE implementation shared by the live delivery path and the
+/// DLQ replay path.
+///
+/// Why it must run before every such dispatch: `wasm.log.{job_id}` routing is
+/// `WHERE EXISTS`-guarded on this table, so a job dispatched under an id with
+/// no row here has its logs discarded, never reaches a terminal status, and is
+/// invisible to `get_execution_logs`. The DLQ replay path had no INSERT at all
+/// — 100% of replayed webhook module deliveries were orphaned that way, which
+/// is the worst possible moment to lose the logs (an operator replays a DLQ
+/// entry *because* they are debugging it).
+///
+/// Both encrypt branches are preserved deliberately:
+/// * `encrypt_payload_bundle` OK → `pt_payload` stays `None` and only the
+///   ciphertext lands in `input_data_enc` (MCP-S2: AAD = `job_id`, binding the
+///   ciphertext to this row). No org context on a standalone webhook dispatch →
+///   global DEK (v3).
+/// * encryption FAILS (KMS outage, DEK rotation race, wiring gap) → fall back
+///   to plaintext in `input_data`, but DLP-redacted first (MCP-987). Webhook
+///   bodies routinely carry secrets — provider callbacks echo bearer tokens,
+///   signing signatures land in the JSON itself — so an unredacted fallback
+///   would land secret-shaped values in a queryable column. An encryption
+///   failure is NOT fatal to the dispatch; only the INSERT failing is.
+///
+/// `ON CONFLICT DO NOTHING` is load-bearing: replay may re-run against a
+/// `job_id` that already has a row.
+///
+/// `org_id` / `actor_id` NOT-NULLs are filled by `trg_set_default_actor`.
+///
+/// Free function (rather than a `&self` method) so the family harness in
+/// `controller/tests/wasm_log_routing_tests.rs` can drive the REAL statement
+/// against a real Postgres — the `WHERE EXISTS` interaction is the thing under
+/// test and a mock cannot fail the way the real statement failed.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_webhook_module_execution(
+    db_pool: &Pool<Postgres>,
+    secrets_manager: &Arc<SecretsManager>,
+    job_id: Uuid,
+    module_id: Uuid,
+    user_id: Uuid,
+    payload: &serde_json::Value,
+    actor_id: Option<Uuid>,
+) -> Result<(), sqlx::Error> {
+    let payload_bundle = match talos_module_payload_encryption::encrypt_payload_bundle(
+        Some(secrets_manager),
+        job_id,
+        // Standalone webhook module dispatch — no parent workflow
+        // execution, so no org to scope to → global DEK (v3).
+        None,
+        Some(payload),
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!("Failed to encrypt webhook payload: {}", e);
+            talos_module_payload_encryption::EncryptedPayloadBundle::default()
+        }
+    };
+    let redacted_pt_payload = if payload_bundle.encrypting() {
+        None
+    } else {
+        Some(talos_dlp_provider::redact_json(payload))
+    };
+
+    sqlx::query(
+        "INSERT INTO module_executions (id, module_id, user_id, status, \
+          input_data, input_data_enc, payload_enc_key_id, payload_format, \
+          workflow_execution_id, actor_id, trigger_type, started_at)
+         VALUES ($1, $2, $3, 'running', $4, $5, $6, $7, $8, $9, 'webhook', NOW())
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(job_id)
+    .bind(module_id)
+    .bind(user_id)
+    .bind(redacted_pt_payload.as_ref())
+    .bind(payload_bundle.input_enc.as_deref())
+    .bind(payload_bundle.key_id)
+    .bind(payload_bundle.format_version)
+    .bind(None::<Uuid>)
+    .bind(actor_id)
+    .execute(db_pool)
+    .await
+    .map(|_| ())
+}
 
 /// Webhook router manages incoming webhook requests
 #[derive(Clone)]
@@ -942,81 +1030,21 @@ impl WebhookRouter {
                     );
                 }
             };
-            let mut payload_value = serde_json::from_str::<serde_json::Value>(&body_str)
-                .unwrap_or(serde_json::Value::String(body_str.clone()));
-
             // RFC 0007 D5: surface inbound event metadata (event type + delivery
             // id from headers, body `action`) as a reserved `__webhook__` key so
-            // both `input` and `__trigger_input__` below carry it. Built BEFORE
-            // injection so `action` reads the original body.
-            let webhook_meta =
-                build_webhook_meta(headers, trigger.event_filter.as_ref(), &payload_value);
-            inject_webhook_meta(&mut payload_value, webhook_meta);
+            // both `input` and `__trigger_input__` below carry it. Shared with
+            // the DLQ replay path so the two payload shapes cannot drift.
+            let payload_value =
+                build_webhook_trigger_payload(&body_str, headers, trigger.event_filter.as_ref());
 
-            // Wrap webhook payload with config. `__trigger_input__` honors the
-            // scaffold contract that original trigger fields are ALWAYS reachable
-            // via `data["__trigger_input__"]` — webhooks deliver at data["input"]
-            // for the primary path, but modules that follow the standard
-            // "trigger-input escape hatch" pattern also resolve here. Cheap
-            // duplication; prevents the "works from trigger_workflow but not
-            // from webhook" DX trap (pain point #13, 2026-04-23).
-            let wrapped_input = serde_json::json!({
-                "config": module_config,
-                "input": payload_value.clone(),
-                "__trigger_input__": payload_value,
-            });
+            // Wrap webhook payload with config (shared builder — see
+            // `build_module_dispatch_payload` for the `__trigger_input__`
+            // contract).
+            let wrapped_input = build_module_dispatch_payload(&module_config, &payload_value);
 
             // 8. Execute WASM module
             let wasm_start = Instant::now();
             let job_id = Uuid::new_v4();
-
-            // Phase A: encrypt the webhook payload at rest before insert.
-            // self.secrets_manager is always present at WebhookRouter
-            // construction (constructor takes Arc<SecretsManager>), so the
-            // bundle's `encrypting()` flag should always be true here —
-            // the conditional write keeps the codepath robust to future
-            // configurations where SecretsManager might be optional.
-            // MCP-S2: AAD = job_id binds the webhook payload ciphertext
-            // to its module_executions row.
-            let payload_bundle = match talos_module_payload_encryption::encrypt_payload_bundle(
-                Some(&self.secrets_manager),
-                job_id,
-                // Standalone webhook module dispatch — no parent workflow
-                // execution, so no org to scope to → global DEK (v3).
-                None,
-                Some(&payload_value),
-                None,
-                None,
-            )
-            .await
-            {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::error!("Failed to encrypt webhook payload: {}", e);
-                    talos_module_payload_encryption::EncryptedPayloadBundle::default()
-                }
-            };
-            // MCP-987 (2026-05-15): DLP-redact the plaintext-fallback
-            // path. When `encrypt_payload_bundle` succeeds (the
-            // production-default branch), `pt_payload` is None and the
-            // ciphertext lands in `input_data_enc` — operators querying
-            // `module_executions.input_data` see NULL and can't read
-            // anything sensitive. When encryption fails (KMS outage,
-            // DEK rotation race, SecretsManager wiring gap), we fall
-            // back to binding plaintext to `input_data`. Webhook
-            // bodies routinely carry secrets — provider callbacks
-            // echo bearer tokens for diagnostic purposes, signing
-            // signatures land in the JSON payload itself. Without
-            // redaction the failure path silently lands raw user
-            // input + secret-shaped values in a queryable column.
-            // Same defense-in-depth shape as MCP-971/972/975 on
-            // workflow_executions; sibling fix at
-            // talos-engine/src/module_execution_store.rs.
-            let redacted_pt_payload = if payload_bundle.encrypting() {
-                None
-            } else {
-                Some(talos_dlp_provider::redact_json(&payload_value))
-            };
 
             // Phase C of "every execution gets an actor": resolve an owning
             // actor for this bare-module webhook dispatch. Webhook triggers
@@ -1055,26 +1083,70 @@ impl WebhookRouter {
                 }
             };
 
-            if let Err(e) = sqlx::query(
-                "INSERT INTO module_executions (id, module_id, user_id, status, \
-                  input_data, input_data_enc, payload_enc_key_id, payload_format, \
-                  workflow_execution_id, actor_id, trigger_type, started_at)
-                 VALUES ($1, $2, $3, 'running', $4, $5, $6, $7, $8, $9, 'webhook', NOW())
-                 ON CONFLICT DO NOTHING",
+            // The tracking row MUST exist before the job is dispatched under
+            // `job_id`: every `wasm.log.{job_id}` line the worker publishes is
+            // routed by a `WHERE EXISTS` guard on this table, so a dispatch
+            // whose row is missing produces an execution with no logs, no
+            // status, and no way for an operator to find it. Pre-fix this was
+            // `tracing::error!` only and the dispatch proceeded anyway — a
+            // single DB blip silently produced an invisible execution.
+            // Fail CLOSED instead: the module has not run yet, so this is a
+            // transient pre-execution failure of exactly the same class as the
+            // module-load / module-config failures above — abandon the dedup
+            // claim and let the sender retry.
+            //
+            // Two honest costs, both accepted:
+            //  * At-least-once. If the INSERT commits but the call still
+            //    reports an error (connection reset after commit), the released
+            //    claim lets the sender's retry run the module a second time
+            //    under a NEW `job_id`. Pre-fix that delivery would have
+            //    dispatched once and returned 200. Webhook delivery is
+            //    at-least-once by contract and both pre-existing 500 branches
+            //    above have the same shape.
+            //  * Not every failure here is transient. `module_executions
+            //    .actor_id` is NOT NULL and `trg_set_default_actor` can only
+            //    stamp it for a user who HAS a default actor, so a user with
+            //    none makes this INSERT fail permanently and the sender retries
+            //    into a wall. Every user has had one since the Phase-B backfill
+            //    (`20260626180000`), and a permanently-refused delivery is
+            //    still better than a permanently-invisible one.
+            if let Err(e) = insert_webhook_module_execution(
+                &self.db_pool,
+                &self.secrets_manager,
+                job_id,
+                module_id,
+                trigger.user_id,
+                &payload_value,
+                resolved_actor,
             )
-            .bind(job_id)
-            .bind(module_id)
-            .bind(trigger.user_id)
-            .bind(redacted_pt_payload.as_ref())
-            .bind(payload_bundle.input_enc.as_deref())
-            .bind(payload_bundle.key_id)
-            .bind(payload_bundle.format_version)
-            .bind(None::<Uuid>)
-            .bind(resolved_actor)
-            .execute(&self.db_pool)
             .await
             {
-                tracing::error!("Failed to insert module_execution for webhook: {}", e);
+                tracing::error!(
+                    trigger_id = %trigger_id,
+                    job_id = %job_id,
+                    error = %e,
+                    "Failed to insert module_execution for webhook; refusing to dispatch an \
+                     untrackable job"
+                );
+                self.log_request(
+                    trigger_id,
+                    headers,
+                    &body,
+                    source_ip,
+                    StatusCode::INTERNAL_SERVER_ERROR.as_u16() as i32,
+                    None,
+                    0,
+                    0,
+                    false,
+                    Some("Failed to record module execution"),
+                )
+                .await;
+                // R2-4: transient pre-execution failure — the module never
+                // ran, so abandon the dedup claim and let the sender retry.
+                self.release_dedup_claim(trigger_id, &dedup_claim).await;
+                return Ok(
+                    (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
+                );
             }
 
             let registry = self.registry.clone();
@@ -1515,16 +1587,13 @@ impl WebhookRouter {
             // 5xx/504 AFTER the engine ran — so the decision lives inside the
             // method where pre- vs post-dispatch is unambiguous.
             let body_str = std::str::from_utf8(&body).unwrap_or("");
-            let mut input_payload = serde_json::from_str::<serde_json::Value>(body_str)
-                .unwrap_or(serde_json::Value::String(body_str.to_string()));
 
             // RFC 0007 D5: surface inbound event metadata to the workflow as a
             // reserved `__webhook__` key inside the trigger seed (the workflow
-            // reads `{{__trigger_input__.__webhook__.event}}`). Built before
-            // injection so `action` reads the original body.
-            let webhook_meta =
-                build_webhook_meta(headers, trigger.event_filter.as_ref(), &input_payload);
-            inject_webhook_meta(&mut input_payload, webhook_meta);
+            // reads `{{__trigger_input__.__webhook__.event}}`). Same shared
+            // builder as the module path and the DLQ replay path.
+            let input_payload =
+                build_webhook_trigger_payload(body_str, headers, trigger.event_filter.as_ref());
 
             self.trigger_workflow_execution(
                 workflow_id,
@@ -2618,8 +2687,29 @@ impl WebhookRouter {
         let trigger = self.get_trigger(trigger_id).await?;
 
         let body_str = std::str::from_utf8(&body).unwrap_or("");
-        let input_payload = serde_json::from_str::<serde_json::Value>(body_str)
-            .unwrap_or(serde_json::Value::String(body_str.to_string()));
+
+        // Build the payload through the SAME helper the live path uses, so a
+        // replayed delivery is structurally identical to the original. Pre-fix
+        // BOTH replay branches skipped the `__webhook__` injection entirely, so
+        // a replayed delivery carried no `__webhook__` key at all while the
+        // original did — and the module branch additionally omitted
+        // `__trigger_input__` (below), so every module using the documented
+        // `data["__trigger_input__"]` escape hatch read `null` on replay.
+        //
+        // ONE deliberate difference remains, and it is a data limitation rather
+        // than a choice: replay has no request headers. The DLQ row does store a
+        // redacted header map, but `dispatch_replay` is handed only the body
+        // (`WebhookRepository::get_dlq_entry_for_replay` selects `trigger_id,
+        // payload, replayed_at`), so the two header-derived fields come back
+        // `null`: `__webhook__.event` and `__webhook__.delivery`. `action` is
+        // read from the body and IS faithful. Null-but-present is the documented
+        // shape of an absent field here — strictly closer to the original than
+        // omitting the key — but a module that ROUTES on `__webhook__.event`
+        // still takes its no-event branch on replay. Plumbing the stored headers
+        // through is the follow-up if that ever bites.
+        let replay_headers = HeaderMap::new();
+        let payload_value =
+            build_webhook_trigger_payload(body_str, &replay_headers, trigger.event_filter.as_ref());
 
         if let Some(workflow_id) = trigger.workflow_id {
             // Replay path is fire-and-forget — never returns the result inline.
@@ -2628,7 +2718,7 @@ impl WebhookRouter {
             self.trigger_workflow_execution(
                 workflow_id,
                 trigger.user_id,
-                input_payload,
+                payload_value,
                 trigger_id,
                 false, // auto_respond: replay never waits inline
                 trigger.sync_timeout_secs,
@@ -2643,10 +2733,9 @@ impl WebhookRouter {
                 .await?
                 .unwrap_or(serde_json::json!({}));
 
-            let wrapped_input = serde_json::json!({
-                "config": module_config,
-                "input": input_payload,
-            });
+            // Same envelope builder as the live module path — `{config, input,
+            // __trigger_input__}`, not the `{config, input}` this used to build.
+            let wrapped_input = build_module_dispatch_payload(&module_config, &payload_value);
 
             let job_id = Uuid::new_v4();
             let registry = self.registry.clone();
@@ -2656,6 +2745,22 @@ impl WebhookRouter {
             let sealing_handle = self.sealing_handle.clone();
             let worker_shared_key_clone = self.worker_shared_key.clone();
             let user_id = trigger.user_id;
+            // Now that the replay records a tracking row, the dispatch task's
+            // own bail-outs (module load / sign / serialize / publish) must
+            // finalize it — a row stuck at 'running' forever is its own
+            // misleading state.
+            //
+            // The SUCCESS path needs nothing here: this dispatch sets
+            // `reply_topic: None` and publishes with no wire reply, so the
+            // worker sends its `JobResult` to `talos.results.{job_id}`, where
+            // the controller's audit subscriber
+            // (`bootstrap/background.rs`, `RESULTS_WILDCARD`) calls
+            // `complete_execution_from_worker` / `fail_execution_from_worker`
+            // on that same id. What it does NOT cover is the four bail-outs
+            // below — those happen before the worker ever sees the job, so no
+            // result is ever published and nothing else would move the row off
+            // 'running'.
+            let exec_service = self.module_execution_service.clone();
 
             // Phase C: resolve an owning actor for the DLQ replay (same shape as
             // the live webhook path above). Webhook triggers carry no actor →
@@ -2687,7 +2792,47 @@ impl WebhookRouter {
                 }
             };
 
+            // Record the tracking row BEFORE dispatching, exactly as the live
+            // path does and through the same helper. Without it every
+            // `wasm.log.{job_id}` line from the replayed run is discarded by
+            // the log router's `WHERE EXISTS` guard and the run never reaches a
+            // terminal status — a 100%-deterministic orphan on the one path an
+            // operator reaches for *because* they are debugging. Fail closed:
+            // an untrackable replay is worse than a refused one, and the caller
+            // (`replayWebhookDeadLetterEntry`) surfaces the error and leaves
+            // `replayed_at` unset so the entry can be replayed again.
+            insert_webhook_module_execution(
+                &self.db_pool,
+                &self.secrets_manager,
+                job_id,
+                module_id,
+                user_id,
+                &payload_value,
+                resolved_actor,
+            )
+            .await
+            .with_context(|| {
+                format!("DLQ replay: failed to record module_execution row for job {job_id}")
+            })?;
+
             tokio::spawn(async move {
+                // Finalize the tracking row inserted above when this task bails
+                // out before the worker ever sees the job.
+                let fail_row = |reason: String| {
+                    let svc = exec_service.clone();
+                    async move {
+                        if let Some(svc) = svc {
+                            svc.fail_execution_best_effort(
+                                job_id,
+                                user_id,
+                                reason,
+                                Some("dlq_replay_dispatch".to_string()),
+                            )
+                            .await;
+                        }
+                    }
+                };
+
                 let exec_info = match registry.get_execution_info(module_id, user_id).await {
                     Ok(info) => info,
                     Err(e) => {
@@ -2696,6 +2841,7 @@ impl WebhookRouter {
                             "DLQ replay: failed to load execution info: {}",
                             e
                         );
+                        fail_row("DLQ replay: failed to load execution info".to_string()).await;
                         return;
                     }
                 };
@@ -2770,6 +2916,7 @@ impl WebhookRouter {
                         h.in_flight.discard(job_id);
                     }
                     tracing::error!(trigger_id = %trigger_id, "DLQ replay: sign failed: {}", e);
+                    fail_row("DLQ replay: job signing failed".to_string()).await;
                     return;
                 }
 
@@ -2780,6 +2927,7 @@ impl WebhookRouter {
                             h.in_flight.discard(job_id);
                         }
                         tracing::error!(trigger_id = %trigger_id, "DLQ replay: serialize failed: {}", e);
+                        fail_row("DLQ replay: job serialization failed".to_string()).await;
                         return;
                     }
                 };
@@ -2799,6 +2947,7 @@ impl WebhookRouter {
                         h.in_flight.discard(job_id);
                     }
                     tracing::error!(trigger_id = %trigger_id, "DLQ replay: NATS publish failed: {}", e);
+                    fail_row("DLQ replay: NATS publish failed".to_string()).await;
                 } else {
                     tracing::info!(trigger_id = %trigger_id, job_id = %job_id, "DLQ replay dispatched");
                 }

@@ -875,6 +875,15 @@ pub trait NodeDispatcher: Send + Sync {
 ///
 /// Note: this does not provide sandbox sharing. If `share_sandbox` is
 /// load-bearing for a consumer, they MUST implement batch dispatch.
+///
+/// LATENT HAZARD for any future non-batch transport: each step's
+/// [`DispatchJob`] carries `job_id: None`, so a `dispatch` impl that mints
+/// its own UUID per step produces log ids that no `module_executions` row
+/// backs — and `wasm.log.{id}` routing is `WHERE EXISTS`-guarded, so every
+/// line from every step is silently discarded (the loop-body regression,
+/// #618). `NatsDispatcher` overrides `dispatch_chain`, so no production path
+/// reaches this today. A new impl that DOES must record a row per step (or
+/// stamp a recorded id) before dispatching it.
 pub async fn dispatch_chain_sequential<D: NodeDispatcher + ?Sized>(
     dispatcher: &D,
     request: ChainDispatchRequest,

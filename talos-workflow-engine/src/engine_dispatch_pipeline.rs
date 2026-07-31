@@ -516,7 +516,23 @@ impl ParallelWorkflowEngine {
         // format doesn't carry them. The post-dispatch UPDATE below
         // targets the right row by id.
         let mut step_exec_ids = Vec::new();
-        if let Some(ref store) = self.module_execution_store {
+        // `uid_for_chain` is destructured here rather than
+        // `unwrap_or_else(Uuid::new_v4)`'d at the `user_id` binding below —
+        // the exact twin of the `engine_dispatch_single` site fixed alongside
+        // this one, and left standing when that one was cleaned up. The minted
+        // fallback reads as a guaranteed `users`-FK violation; it is not (the
+        // `None` arm is unreachable: `uid_for_chain` is only `None` when
+        // `module_fetcher` is `None`, and in that case the step loop above
+        // returns `Err` on its first iteration — the chain is never empty,
+        // `chain_node_ids[0]` is indexed unconditionally at the top of this
+        // function). Binding it makes the guarantee structural instead of
+        // something the next reader has to re-derive, and in the impossible
+        // `None` case the pre-INSERT loop is skipped (leaving `step_exec_ids`
+        // empty, which every consumer below already handles via `.get(i)`)
+        // rather than writing rows the FK would reject anyway.
+        if let (Some(ref store), Some(chain_user_id)) =
+            (&self.module_execution_store, uid_for_chain)
+        {
             for (i, &actual_mid) in chain_module_ids.iter().enumerate() {
                 let step_exec_id = Uuid::new_v4();
                 step_exec_ids.push(step_exec_id);
@@ -539,7 +555,7 @@ impl ParallelWorkflowEngine {
                     .record_started(ExecutionStartedContext {
                         id: step_exec_id,
                         module_id: actual_mid,
-                        user_id: uid_for_chain.unwrap_or_else(Uuid::new_v4),
+                        user_id: chain_user_id,
                         workflow_execution_id: execution_id,
                         input: &input_for_db,
                         trigger_type: "webhook",
@@ -576,6 +592,18 @@ impl ParallelWorkflowEngine {
         let chain_request = talos_workflow_engine_core::ChainDispatchRequest {
             workflow_execution_id: execution_id,
             user_id: uid_for_chain,
+            // `None` ⇒ the dispatcher mints the wire id
+            // (`NatsNodeDispatcher::dispatch_chain`). No `module_executions`
+            // row is ever created under that minted id, so it would be an
+            // orphan-log id if anything routed logs by it. Nothing does: the
+            // worker stamps `wasm.log.{workflow_execution_id}` for pipeline
+            // steps, NOT the chain `job_id`
+            // (`talos_worker_runtime::pipeline_log_execution_id`), and
+            // `workflow_execution_id` above names a real `workflow_executions`
+            // row. That coupling is the ONLY thing keeping this path out of
+            // the #618 orphan family — a future change to which id the worker
+            // stamps for a pipeline must either keep it the parent execution
+            // id or start supplying a RECORDED `job_id` here.
             job_id: None,
             steps: step_jobs,
             share_sandbox: true,

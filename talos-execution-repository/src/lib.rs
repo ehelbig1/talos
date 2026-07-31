@@ -371,10 +371,22 @@ impl ExecutionRepository {
         //   1. workflow_execution_logs — direct workflow-scoped lines (engine
         //      events, future native workflow logging).
         //   2. module_execution_logs scoped to child module_executions of this
-        //      workflow_execution. The worker publishes wasm.log.{exec_id} where
-        //      exec_id is the per-NODE module_executions.id, so today every
-        //      `talos::core::logging::log` call from inside a workflow node lands
-        //      here. The JOIN routes them back to the parent workflow_execution.
+        //      workflow_execution. The JOIN routes them back to the parent
+        //      workflow_execution.
+        //
+        // Which of the two a given node's lines land in depends on how it was
+        // dispatched, and the UNION is load-bearing for exactly that reason —
+        // an earlier version of this comment claimed branch 2 catches
+        // everything, which is only true of single-node dispatch:
+        //   * SINGLE-NODE dispatch stamps `wasm.log.{JobRequest.job_id}`, and
+        //     `job_id` IS the per-node `module_executions.id` → branch 2.
+        //   * PIPELINE (chained) steps stamp
+        //     `wasm.log.{PipelineJobRequest.workflow_execution_id}` — the
+        //     PARENT id, not the per-step row (see
+        //     `talos_worker_runtime::pipeline_log_execution_id`) → branch 1.
+        //     So the per-step `module_executions` rows a chain pre-INSERTs
+        //     carry no log lines at all; reading one in isolation returns `[]`
+        //     even though the step logged.
         let rows = sqlx::query(
             "WITH unified AS ( \
                 SELECT id, execution_id, node_id, level, message, metadata, created_at \
