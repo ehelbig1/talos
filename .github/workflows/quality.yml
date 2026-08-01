@@ -131,8 +131,15 @@ jobs:
         with:
           tool: cargo-nextest
 
-      - name: Run library unit tests
-        run: cargo nextest run --workspace --lib --no-fail-fast
+      - name: Run library + binary unit tests
+        # `--bins` added 2026-08. `--lib` alone selects LIBRARY targets only, so
+        # every `#[cfg(test)]` inside a bin-private module ran NOWHERE in CI —
+        # `controller/src/bootstrap/*` is bin-private by design (`mod bootstrap;`
+        # is declared in main.rs, not lib.rs), which silently excluded #620's own
+        # `oauth_auth_metric_tests` and would have excluded the detector-metric
+        # pins added alongside this line. Exactly the class those PRs are about:
+        # a guard that exists and is never consulted.
+        run: cargo nextest run --workspace --lib --bins --no-fail-fast
 
       - name: Run module-template catalog tests
         # An integration binary (so NOT covered by --lib above), but DB-free: it

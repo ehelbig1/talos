@@ -89,6 +89,55 @@ pub struct TalosMetrics {
     // restart-resume sweep that silently does nothing or whose resumes fail.
     pub crash_recovery_total: CounterVec,
 
+    // ---- Detector metrics (2026-08) ----
+    //
+    // Each of the five below existed as a WARN/ERROR log line ONLY. Every
+    // alert this platform ships is metric-based, so a log-only detector is a
+    // signal nothing can consume — the same defect as a signal never emitted.
+    // Adding the counter is what makes the detector page-able.
+    //
+    // DO NOT collapse these into a shared `warn_and_count!` macro. A macro
+    // body would contain the literal `.field….inc()` for every metric it can
+    // touch, so all of them would read as LIVE to structural check 58 from one
+    // definition site — re-blinding the lint in exactly the way #620 just
+    // fixed. If a future author does build such a helper, check 58 must first
+    // be taught to require an INVOCATION naming the field rather than a
+    // textual match.
+    /// WASM log lines discarded because they could not be routed to any
+    /// execution row. Labels: `kind=no_execution_row|unparseable_id`, a
+    /// closed set of `&'static str` — never the guest-authored message body,
+    /// never the execution id (an orphaned line may carry module output, and
+    /// a per-execution label would be unbounded cardinality).
+    pub wasm_log_orphaned_total: CounterVec,
+    /// `module_executions` start-row INSERT failures at the single
+    /// `PostgresModuleExecutionStore::record_started` chokepoint. The upstream
+    /// CAUSE of `wasm_log_orphaned_total{kind="no_execution_row"}`, and
+    /// independently it means `get_execution_logs` / `get_node_io` / cost
+    /// attribution are quietly missing rows.
+    pub module_execution_record_started_failures_total: Counter,
+    /// WORM audit-ledger verification failures. Labels:
+    /// `stage=event|chain` — `event` is the inline per-message
+    /// authenticity/integrity check at ingest (the message is quarantined,
+    /// never persisted); `chain` is the offline hash-chain sweep over a
+    /// completed execution's full ordered record set. Either means the
+    /// compliance artifact is void for that execution.
+    pub audit_verification_failures_total: CounterVec,
+    /// Worker-key trust-on-first-use conflicts at the self-registration
+    /// endpoint: a `worker_id` presented a key that is not its bound
+    /// identity. In-fleet impersonation, or an operator rotating off the
+    /// managed path. UNLABELLED on purpose — `worker_id` and the submitted
+    /// key are both caller-supplied at a network endpoint, so neither may
+    /// become a label (unbounded cardinality, attacker-driven).
+    pub worker_key_tofu_conflicts_total: Counter,
+    /// Number of ACTIVE registered workers whose build provably differs from
+    /// this controller's. A GAUGE, recomputed from a query each sweep (always
+    /// `set`, never `inc`/`dec`) so a worker leaving the fleet or catching up
+    /// lowers it. A counter would be wrong at both ends: it would fire on
+    /// every rolling deploy AND go quiet while a fleet stayed skewed.
+    /// "Unverifiable" workers are NOT counted here (absence of evidence is
+    /// not evidence of skew — #578).
+    pub worker_build_skew_workers: IntGauge,
+
     // Rate limiting metrics
     pub rate_limit_hits_total: CounterVec,
 
@@ -291,6 +340,80 @@ impl TalosMetrics {
                 .inc_by(0.0);
         }
 
+        // ---- Detector metrics (2026-08) ----
+        let wasm_log_orphaned_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_wasm_log_orphaned_total",
+                "WASM log lines discarded because they could not be routed to \
+                 any execution row. Labels: kind=no_execution_row|unparseable_id. \
+                 Non-zero means a dispatch path is minting execution ids without \
+                 recording a row — those executions' logs are lost.",
+            ),
+            &["kind"],
+        )?;
+        registry.register(Box::new(wasm_log_orphaned_total.clone()))?;
+        // Pre-seed both kinds at 0, same reasoning as crash_recovery_total: the
+        // expected steady state is zero, so without seeding the series would be
+        // ABSENT and `increase(...[15m]) > 0` would have nothing to reference
+        // until the first incident. Seeding at 0 also lets a dashboard show
+        // "detector present and quiet" rather than "detector missing".
+        for kind in ["no_execution_row", "unparseable_id"] {
+            wasm_log_orphaned_total
+                .with_label_values(&[kind])
+                .inc_by(0.0);
+        }
+
+        let module_execution_record_started_failures_total = Counter::new(
+            "talos_module_execution_record_started_failures_total",
+            "Failures writing the module_executions start row at the \
+             PostgresModuleExecutionStore::record_started chokepoint. Non-fatal \
+             by design, so the execution proceeds — but its row is missing, its \
+             WASM logs orphan, and get_execution_logs / get_node_io / cost \
+             attribution silently under-report.",
+        )?;
+        registry.register(Box::new(
+            module_execution_record_started_failures_total.clone(),
+        ))?;
+
+        let audit_verification_failures_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_audit_verification_failures_total",
+                "WORM audit-ledger verification failures. Labels: \
+                 stage=event|chain. stage=event is the inline per-message check \
+                 at ingest (message quarantined, not persisted); stage=chain is \
+                 the offline hash-chain sweep over a completed execution. Either \
+                 is positive tamper/corruption evidence.",
+            ),
+            &["stage"],
+        )?;
+        registry.register(Box::new(audit_verification_failures_total.clone()))?;
+        // Seeded for the same reason as the orphan counter above — the CRITICAL
+        // alert on this series must have something to reference in steady state.
+        for stage in ["event", "chain"] {
+            audit_verification_failures_total
+                .with_label_values(&[stage])
+                .inc_by(0.0);
+        }
+
+        let worker_key_tofu_conflicts_total = Counter::new(
+            "talos_worker_key_tofu_conflicts_total",
+            "Worker self-registration refusals where the presented key is not \
+             the worker_id's bound trust-on-first-use identity. Possible \
+             in-fleet impersonation; legitimate rotation goes through the \
+             operator CLI or a worker_id-bound provisioning token.",
+        )?;
+        registry.register(Box::new(worker_key_tofu_conflicts_total.clone()))?;
+
+        let worker_build_skew_workers = IntGauge::new(
+            "talos_worker_build_skew_workers",
+            "ACTIVE registered workers whose build PROVABLY differs from this \
+             controller's (different commit sha, or -dirty on one side only). \
+             Recomputed each sweep, so it falls back to 0 once the fleet \
+             converges. Workers that report no usable sha are 'unverifiable' \
+             and are NOT counted here.",
+        )?;
+        registry.register(Box::new(worker_build_skew_workers.clone()))?;
+
         // Rate limiting metrics
         let rate_limit_hits_total = CounterVec::new(
             prometheus::Opts::new(
@@ -476,6 +599,11 @@ impl TalosMetrics {
             workflow_executions_total,
             workflow_execution_duration_seconds,
             crash_recovery_total,
+            wasm_log_orphaned_total,
+            module_execution_record_started_failures_total,
+            audit_verification_failures_total,
+            worker_key_tofu_conflicts_total,
+            worker_build_skew_workers,
             rate_limit_hits_total,
             cache_hits_total,
             cache_misses_total,

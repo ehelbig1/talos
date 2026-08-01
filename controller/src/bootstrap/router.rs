@@ -478,26 +478,7 @@ pub(crate) async fn register_worker_key_handler(
             worker_reg_error(StatusCode::UNAUTHORIZED, "invalid registration token")
         }
         Ok(talos_worker_identity_repository::TokenRegisterOutcome::IdentityConflict) => {
-            // The single loudest signal this endpoint can emit: a token-holder
-            // tried to bind a key that is NOT this worker_id's trusted key —
-            // either in-fleet impersonation or an unmanaged rotation. Public
-            // key material only (never the bearer token).
-            tracing::warn!(
-                target: "talos_security",
-                event_kind = "worker_key_tofu_conflict",
-                worker_id = %req.worker_id,
-                submitted_public_key = %hex::encode(public_key),
-                auth_path = ?path,
-                "worker-key registration REFUSED: worker_id already has a bound \
-                 identity and the submitted key does not match its active key. \
-                 Possible in-fleet impersonation attempt; legitimate rotation \
-                 goes through the register-worker-identity operator CLI or a \
-                 worker_id-bound provisioning token."
-            );
-            worker_reg_error(
-                StatusCode::CONFLICT,
-                "worker_id already has a registered identity; rotation requires operator action",
-            )
+            worker_key_tofu_conflict_refusal(&req.worker_id, &public_key, path)
         }
         Ok(talos_worker_identity_repository::TokenRegisterOutcome::CapReached) => worker_reg_error(
             StatusCode::TOO_MANY_REQUESTS,
@@ -517,6 +498,52 @@ pub(crate) async fn register_worker_key_handler(
             )
         }
     }
+}
+
+/// Refuse a worker-key registration that lost the trust-on-first-use rule:
+/// counts `talos_worker_key_tofu_conflicts_total`, emits the security WARN, and
+/// returns the 409.
+///
+/// The single loudest signal this endpoint can emit — a token-holder tried to
+/// bind a key that is NOT this `worker_id`'s trusted key, i.e. in-fleet
+/// impersonation or an unmanaged rotation. It was a WARN with no metric, and
+/// every alert this platform ships is metric-based, so nothing could page on it.
+///
+/// THE COUNTER CARRIES NO LABELS, and must not grow any. Both `worker_id` and
+/// the submitted public key are caller-supplied at an unauthenticated-until-
+/// proof network endpoint: labelling by either hands an attacker unbounded
+/// control over Prometheus series cardinality. The WARN below keeps that detail
+/// for triage (public key material only — never the bearer token).
+///
+/// Split out of the handler's match arm purely so the wiring is unit-testable;
+/// the handler itself needs the full axum `Extension` set plus a live Postgres
+/// to drive. What the test proves is that CALLING this counts and returns 409 —
+/// it does not prove the handler still calls it. Same honest scope as
+/// `oauth_login_internal_error`'s pin below.
+fn worker_key_tofu_conflict_refusal(
+    worker_id: &str,
+    submitted_public_key: &[u8; 32],
+    path: RegBearerPath,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    if let Some(m) = metrics::global() {
+        m.worker_key_tofu_conflicts_total.inc();
+    }
+    tracing::warn!(
+        target: "talos_security",
+        event_kind = "worker_key_tofu_conflict",
+        worker_id = %worker_id,
+        submitted_public_key = %hex::encode(submitted_public_key),
+        auth_path = ?path,
+        "worker-key registration REFUSED: worker_id already has a bound \
+         identity and the submitted key does not match its active key. \
+         Possible in-fleet impersonation attempt; legitimate rotation \
+         goes through the register-worker-identity operator CLI or a \
+         worker_id-bound provisioning token."
+    );
+    worker_reg_error(
+        axum::http::StatusCode::CONFLICT,
+        "worker_id already has a registered identity; rotation requires operator action",
+    )
 }
 
 /// Emit the build-identity handshake result for one successful registration.
@@ -3511,5 +3538,51 @@ mod oauth_auth_metric_tests {
             1.0,
             "an internal OAuth login failure must reach talos_auth_failures_total"
         );
+    }
+}
+
+/// D4 pin for `talos_worker_key_tofu_conflicts_total`.
+///
+/// Drives the production refusal function the registration handler calls and
+/// asserts the counter moved — not a `render_prometheus` shape test.
+///
+/// Scope, stated rather than implied (same limit as the OAuth pin above):
+/// `register_worker_key_handler` needs the full axum `Extension` set and a live
+/// Postgres to reach the `IdentityConflict` arm, so what is pinned is that
+/// calling `worker_key_tofu_conflict_refusal` counts and returns 409. Deleting
+/// the handler's call to it leaves this test AND structural check 58 green.
+/// The honest guard for the call site is the post-merge live check.
+///
+/// NOTE: these tests live in the controller BIN target. `quality.yml`'s unit
+/// step runs `cargo nextest run --workspace --lib`, which selects lib targets
+/// only — so `--bins` was added there in the same change; without it neither
+/// this pin nor the OAuth pin above executes in CI.
+#[cfg(test)]
+mod worker_tofu_metric_tests {
+    use super::{worker_key_tofu_conflict_refusal, RegBearerPath};
+
+    #[test]
+    fn tofu_conflict_counts_and_refuses_with_409() {
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        let m = talos_metrics::global().expect("global installed");
+        let read = || m.worker_key_tofu_conflicts_total.get();
+
+        let before = read();
+        let (status, _body) =
+            worker_key_tofu_conflict_refusal("worker-a", &[7u8; 32], RegBearerPath::LegacyShared);
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(
+            read() - before,
+            1.0,
+            "a TOFU identity conflict must reach talos_worker_key_tofu_conflicts_total"
+        );
+
+        // Counted per refusal, not once per process — a burst is the signal.
+        let before = read();
+        let _ =
+            worker_key_tofu_conflict_refusal("worker-b", &[9u8; 32], RegBearerPath::Provisioning);
+        let _ =
+            worker_key_tofu_conflict_refusal("worker-b", &[9u8; 32], RegBearerPath::Provisioning);
+        assert_eq!(read() - before, 2.0);
     }
 }

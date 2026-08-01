@@ -46,19 +46,17 @@ impl PostgresModuleExecutionStore {
         self.secrets_manager = Some(sm);
         self
     }
-}
 
-impl std::fmt::Debug for PostgresModuleExecutionStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PostgresModuleExecutionStore")
-            .field("pool", &self.pool)
-            .finish()
-    }
-}
-
-#[async_trait]
-impl ModuleExecutionStore for PostgresModuleExecutionStore {
-    async fn record_started(&self, ctx: ExecutionStartedContext<'_>) -> Result<(), BoxError> {
+    /// The real `record_started` body. Split out of the trait method purely so
+    /// the failure counter below has ONE exit point covering BOTH failure edges
+    /// (payload-encryption/DEK resolution, and the INSERT itself) instead of a
+    /// count bolted onto each `?`.
+    ///
+    /// This is the only non-test `ModuleExecutionStore` impl in the workspace,
+    /// and all three engine callers of `record_started` route through it — so
+    /// instrumenting here covers every production start-row write without
+    /// touching `talos-workflow-engine` (which owns the trait, not the DB).
+    async fn record_started_inner(&self, ctx: ExecutionStartedContext<'_>) -> Result<(), BoxError> {
         let ExecutionStartedContext {
             id,
             module_id,
@@ -191,6 +189,44 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
         };
         result.map(|_| ()).map_err(|e| -> BoxError { e.into() })
     }
+}
+
+impl std::fmt::Debug for PostgresModuleExecutionStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresModuleExecutionStore")
+            .field("pool", &self.pool)
+            .finish()
+    }
+}
+
+#[async_trait]
+impl ModuleExecutionStore for PostgresModuleExecutionStore {
+    async fn record_started(&self, ctx: ExecutionStartedContext<'_>) -> Result<(), BoxError> {
+        let result = self.record_started_inner(ctx).await;
+        // The SINGLE production chokepoint for `module_executions` start-row
+        // writes. `record_started`'s Err is NON-FATAL at every caller by design
+        // (the engine logs it and dispatches anyway), which is precisely why it
+        // needs a metric: the execution still runs, but its row never exists, so
+        // its WASM logs orphan (`talos_wasm_log_orphaned_total{kind=
+        // "no_execution_row"}`) and get_execution_logs / get_node_io / cost
+        // attribution quietly under-report. Before this counter the only trace
+        // was a `tracing::error!` at each caller.
+        //
+        // Unlabelled on purpose: the failure edges are "DEK/encryption" and
+        // "INSERT", and neither an execution id, a module id, a user id nor the
+        // sqlx error text may become a label. The error itself keeps carrying
+        // that detail to the caller's log.
+        //
+        // Deliberately NOT routed through a shared warn-and-count helper — see
+        // the detector-metrics block in `talos_metrics::TalosMetrics` for why
+        // one would re-blind structural check 58.
+        if result.is_err() {
+            if let Some(m) = talos_metrics::global() {
+                m.module_execution_record_started_failures_total.inc();
+            }
+        }
+        result
+    }
 
     async fn record_completed(
         &self,
@@ -301,5 +337,68 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
         // `talos_workflow_engine_core::ModuleExecutionStore`, so we keep
         // the impl but skip the DB round-trip.
         id_or_template
+    }
+}
+
+/// D2 pin for `talos_module_execution_record_started_failures_total`.
+///
+/// Drives the REAL production `record_started` (the trait method the engine
+/// calls) into its real INSERT failure edge and asserts the counter moved —
+/// deliberately NOT a `render_prometheus` shape test. A metrics-render test is
+/// exactly what let `talos_dek_cache_size` and
+/// `talos_module_payload_encryption_failures_total` read as instrumented for
+/// months while every production path was silent (#620).
+#[cfg(test)]
+mod record_started_metric_tests {
+    use super::PostgresModuleExecutionStore;
+    use serde_json::json;
+    use talos_workflow_engine_core::{ExecutionStartedContext, ModuleExecutionStore};
+    use uuid::Uuid;
+
+    /// `set_global` is a process-wide one-shot `OnceLock` and sibling tests in
+    /// this binary share the registry, so read DELTAS through
+    /// `talos_metrics::global()` rather than absolutes off a local `Arc`.
+    #[tokio::test]
+    async fn record_started_failure_is_counted_on_the_production_path() {
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        let m = talos_metrics::global().expect("global installed");
+        let read = || m.module_execution_record_started_failures_total.get();
+
+        // A pool that can never connect: the INSERT fails at acquire time.
+        // Short acquire timeout so the failure lands in ~250ms rather than on
+        // sqlx's 30s default.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(250))
+            .connect_lazy("postgres://127.0.0.1:1/talos_never_connects")
+            .expect("lazy pool build");
+        // No SecretsManager wired → `encrypt_payload_bundle` returns an empty
+        // bundle without erroring, so the ONLY failure edge exercised here is
+        // the INSERT itself.
+        let store = PostgresModuleExecutionStore::new(pool);
+
+        let input = json!({"k": "v"});
+        for race_safe_status in [true, false] {
+            let before = read();
+            store
+                .record_started(ExecutionStartedContext {
+                    id: Uuid::new_v4(),
+                    module_id: Uuid::new_v4(),
+                    user_id: Uuid::new_v4(),
+                    workflow_execution_id: Uuid::new_v4(),
+                    input: &input,
+                    trigger_type: "manual",
+                    race_safe_status,
+                    actor_id: None,
+                })
+                .await
+                .expect_err("INSERT against a dead pool must fail");
+            assert_eq!(
+                read() - before,
+                1.0,
+                "record_started failure (race_safe_status={race_safe_status}) must reach \
+                 talos_module_execution_record_started_failures_total"
+            );
+        }
     }
 }

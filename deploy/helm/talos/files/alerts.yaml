@@ -215,6 +215,224 @@ groups:
             tail_worker_logs on a recent failed execution for the node-level
             cause.
 
+      # ── WASM log lines that reached no execution row.
+      # Reachability: this series is produced by the controller's `wasm.log.*`
+      # NATS subscriber, which is only spawned when a NATS client exists. NATS
+      # is mandatory for job dispatch, so on any functioning deployment it is
+      # live; on a NATS-less one there are no WASM executions to log either.
+      # #618 added the `wasm_log_orphaned` WARN as the detector for a whole bug
+      # family (a dispatch path minting an execution id without recording a
+      # row, so every log line it publishes is silently discarded and
+      # get_execution_logs returns [] — byte-identical to an execution that
+      # genuinely logged nothing). #619 closed the family's live instances. But
+      # the detector was a LOG LINE, and every alert in this file is
+      # metric-based, so nothing could page on it. This is that alert.
+      #
+      # `kind` is a closed set of two values, both emitted by
+      # controller/src/bootstrap/background.rs::handle_wasm_log_message:
+      #   no_execution_row — the id parsed but names neither a
+      #                      workflow_executions nor a module_executions row.
+      #   unparseable_id   — the published line carried no usable execution id.
+      # Deliberately unfiltered here so a NEW kind (should one ever be added)
+      # cannot slip past the alert by not matching a selector.
+      #
+      # WARNING, not critical, and `for: 0m`. Expected rate is zero on routine
+      # traffic (#619 verified zero over a live deploy window), so any hit is
+      # worth a look immediately — but ONE deliberate residual producer remains:
+      # `record_started` failing is non-fatal by design, so a DB blip during a
+      # node dispatch legitimately orphans that node's lines. Volume is bounded
+      # by the worker's per-execution log budget
+      # (MAX_LOG_MESSAGES_PER_EXECUTION / HOST_DIAG_CAP), not unbounded.
+      - alert: TalosWasmLogsOrphaned
+        expr: increase(talos_wasm_log_orphaned_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          category: observability-loss
+        annotations:
+          summary: "WASM log lines discarded (kind={{ $labels.kind }})"
+          description: |
+            {{ $value }} WASM log line(s) in the last 15m could not be routed to
+            any execution row and were DISCARDED — get_execution_logs will
+            return [] for those executions, indistinguishable from an execution
+            that logged nothing.
+            kind=no_execution_row: a dispatch path published under an id with no
+            execution row. First check whether
+            talos_module_execution_record_started_failures_total moved in the
+            same window — that is the one legitimate cause (a DB blip on a
+            non-fatal start-row write). If it did not, a NEW dispatch path is
+            minting ids without recording rows: grep the controller log for
+            event_kind="wasm_log_orphaned" and fix the producer.
+            kind=unparseable_id: a publisher is emitting malformed
+            execution_ids; grep event_kind="wasm_log_unparseable_execution_id".
+
+      # ── module_executions start rows that never landed.
+      # The upstream CAUSE of the orphan alert above, and independently a
+      # correctness problem of its own: record_started's Err is non-fatal at
+      # every caller (the engine logs and dispatches anyway), so the execution
+      # runs while its row is missing and get_execution_logs / get_node_io /
+      # cost attribution all quietly under-report.
+      #
+      # `for: 5m` rather than 0m: a single transient acquire timeout is not
+      # worth a page, a sustained one is — this is the failing-DB shape, not
+      # the tamper shape.
+      - alert: TalosModuleExecutionStartRowFailures
+        expr: increase(talos_module_execution_record_started_failures_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          category: observability-loss
+        annotations:
+          summary: "module_executions start rows failing to persist"
+          description: |
+            {{ $value }} module_executions start-row write(s) failed in the last
+            15m at PostgresModuleExecutionStore::record_started. The affected
+            executions still RAN — they just have no row, so their WASM logs
+            orphan (expect TalosWasmLogsOrphaned alongside this) and their
+            input payloads, timings and cost attribution are missing.
+            Two failure edges: DEK/payload encryption (check the KEK alerts and
+            Vault) and the INSERT itself (check the DB-pool saturation alerts).
+            The per-failure detail is in the controller log at the calling site.
+
+  # ────────────────────────────────────────────────────────────────────
+  # WORM audit-ledger integrity. Two independent verification layers, one
+  # series: `stage=event` is the inline per-message check at ingest (the
+  # message is quarantined and never persisted); `stage=chain` is the offline
+  # hash-chain sweep over a completed execution's full ordered record set.
+  # Both were ERROR logs with no metric.
+  - name: talos.audit
+    interval: 30s
+    rules:
+      # CRITICAL with `for: 0m` because the tolerable background is ZERO by
+      # construction: the ledger REJECTS a failing event rather than persisting
+      # it, so a non-zero value is positive tamper/corruption evidence, not a
+      # threshold judgement. A week unnoticed means the compliance artifact is
+      # void for the affected executions AND the correlation window (who had
+      # access, what else happened) has closed.
+      #
+      # Unfiltered on `stage` on purpose — both values are emitted
+      # (talos-audit-ledger: verify_audit_message → stage="event",
+      # record_chain_verification_outcome → stage="chain") and a future third
+      # layer must not be able to hide behind a selector.
+      #
+      # NOTE what this does NOT cover: an execution whose chain cannot be READ
+      # (S3/IO error) counts as `errored`, not a verification failure —
+      # unreadable is not the same as tampered (#578). That population surfaces
+      # in the audit_chain_sweep_summary log line, not here. The chain sweep
+      # also self-disables when no S3/WORM endpoint is configured, so
+      # stage="chain" is structurally silent on a deployment with no WORM store.
+      - alert: TalosAuditVerificationFailures
+        expr: increase(talos_audit_verification_failures_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          category: audit-integrity
+        annotations:
+          summary: "Audit ledger verification FAILED (stage={{ $labels.stage }})"
+          description: |
+            {{ $value }} audit verification failure(s) in the last 15m. This is
+            tamper/corruption evidence against the WORM audit ledger.
+            stage=event: an inbound audit event failed its hash or HMAC check at
+            ingest and was QUARANTINED (not persisted). Grep the controller log
+            for event_kind="audit_event_verification_failed" — the `reason`
+            field distinguishes hash_mismatch / bad_signature /
+            event_deserialize_failed.
+            stage=chain: a completed execution's full chain failed offline
+            verification — a sequence gap (deleted or never-persisted events),
+            broken previous_hash linkage (reorder/substitution), or a per-event
+            HMAC failure. Grep event_kind="audit_chain_verification_failed" for
+            the execution_id and the structured `breaks` list.
+          action: |
+            1. Treat the affected execution's audit record as UNTRUSTED; do not
+               delete anything (the quarantined bytes are the evidence).
+            2. Check whether the audit signing keys were rotated without a
+               matching verify-key roll — that presents as bad_signature across
+               many executions at once, which is misconfiguration, not tampering.
+            3. Check S3/MinIO Object Lock is still enforced on the audit bucket.
+
+  # ────────────────────────────────────────────────────────────────────
+  # Worker fleet identity + build agreement. Both series existed only as
+  # controller log lines before 2026-08.
+  #
+  # POSTURE CAVEAT, stated because a flat 0 here is otherwise easy to misread
+  # as "checked and clean": BOTH series are about REGISTERED workers, i.e. the
+  # `worker_identities` table. A deployment that pins its fleet purely through
+  # the controller's static `TALOS_WORKER_PUBLIC_KEYS` ring has no registration
+  # endpoint at all (it is only mounted when TALOS_WORKER_REGISTRATION_TOKEN or
+  # TALOS_WORKER_REG_REQUIRE_BOUND_TOKEN is set) and no rows, so both series sit
+  # at 0 permanently — quiet because there is nothing to observe, not because
+  # the fleet was verified. `get_platform_info.fleet` is the surface that shows
+  # static-env workers; it does not merge them with registered ones, and neither
+  # does this.
+  - name: talos.fleet
+    interval: 30s
+    rules:
+      # A worker_id presented a key that is NOT its bound trust-on-first-use
+      # identity. Legitimate rotation goes through the register-worker-identity
+      # operator CLI or a worker_id-bound provisioning token — neither of which
+      # reaches this path — so a non-zero value is either in-fleet
+      # impersonation or an operator working off the managed path. Both want a
+      # human, hence `> 0` over a 1h window with no `for`.
+      #
+      # The counter is UNLABELLED and must stay that way: worker_id and the
+      # submitted key are caller-supplied at a network endpoint, so labelling
+      # by either would hand an attacker control of series cardinality. The
+      # identifying detail is in the controller's talos_security log.
+      - alert: TalosWorkerKeyTofuConflicts
+        expr: increase(talos_worker_key_tofu_conflicts_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          category: fleet-identity
+        annotations:
+          summary: "Worker key registration refused — TOFU identity conflict"
+          description: |
+            {{ $value }} worker-key registration(s) in the last hour were
+            refused because the presented key is not that worker_id's bound
+            identity. The registration was REFUSED (409), so nothing was
+            granted — but someone with a valid registration bearer token tried
+            to bind a key they should not have.
+            Grep the controller log for event_kind="worker_key_tofu_conflict"
+            to get worker_id, the submitted public key, and the auth path. If
+            it is a legitimate rotation, do it via the operator CLI. If it is
+            not, the registration bearer token is compromised: rotate it and
+            revoke outstanding provisioning tokens.
+
+      # Controller↔worker build skew. A GAUGE, not a counter: the underlying
+      # `worker_build_skew` WARN fires exactly once per worker at registration,
+      # so `increase()` over it would page on EVERY rolling deploy and then go
+      # SILENT while a fleet sat skewed — wrong at both ends. The gauge is
+      # recomputed from a query each sweep, so it falls back to 0 on its own
+      # once the fleet converges.
+      #
+      # `for: 30m` outlasts any rolling deploy (workers re-register within
+      # seconds of their pod starting) and catches the case the WARN cannot
+      # express: a worker that is STILL skewed long after the deploy settled.
+      #
+      # Counts PROVEN skew only. A worker that reports no usable commit sha is
+      # "unverifiable" and is NOT counted — absence of evidence is not evidence
+      # of skew (#578) — so a clean 0 here is not "everything checked out". Use
+      # get_platform_info.fleet for the unverifiable population.
+      - alert: TalosWorkerBuildSkew
+        expr: talos_worker_build_skew_workers > 0
+        for: 30m
+        labels:
+          severity: warning
+          category: fleet-identity
+        annotations:
+          summary: "{{ $value }} worker(s) running a different build than the controller"
+          description: |
+            At least one ACTIVE registered worker has been on a provably
+            different build than this controller for 30m — longer than any
+            rolling deploy should take. Signed wire formats (job dispatch,
+            memory RPC, envelope sealing) are version-coupled, so this breaks
+            jobs in ways that look like signature bugs; it cost several turns of
+            misdiagnosis during the 2026-07-27 signing outage.
+            Run get_platform_info and read the `fleet` section for the
+            per-worker build_status, or grep the controller log for
+            event_kind="worker_build_skew". Then verify the controller and
+            worker images were published from the same tree.
+
   # ────────────────────────────────────────────────────────────────────
   - name: talos.vault
     interval: 30s
