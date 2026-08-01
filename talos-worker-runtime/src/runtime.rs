@@ -273,11 +273,17 @@ fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> String {
 ///     a `const`: `concat!` expands macros in its arguments but cannot read
 ///     a `const`.
 ///
-/// A macro also means the two cannot disagree *by construction* — there is
-/// no second copy to forget. `fingerprint_wasmtime_version_matches_cargo_toml`
-/// closes the remaining gap by tying this literal to the DECLARED dependency
-/// in the manifests at test time, and by scanning the crate source for any
-/// stray wasmtime version literal that bypassed this macro.
+/// A macro also means those two cannot disagree *by construction* — there is
+/// no second copy of the number between them to forget. What a macro cannot
+/// prevent is a THIRD site typing the number out again, so
+/// `fingerprint_wasmtime_version_matches_cargo_toml` covers that separately:
+/// it ties this literal to the DECLARED dependency in the manifests at test
+/// time, and scans `talos-worker-runtime/src/` + `worker/src/` for a stray
+/// version literal on any wasmtime-mentioning line — flagging a bare
+/// `"X.Y.Z"` string immediately (whether or not it agrees today) and any
+/// other version-shaped token once it disagrees. Read that test's doc for
+/// the exact boundary; it is stated there rather than summarised here,
+/// because a summary of a guard is how this bug shipped in the first place.
 ///
 /// Why the boot log matters as much as the AOT fingerprint: #621 bumped
 /// 45.0.3 → 47.0.3 for RUSTSEC-2026-0222, and the boot log kept reporting
@@ -655,45 +661,73 @@ mod aot_hmac_input_tests {
         );
     }
 
-    /// Extract the declared `wasmtime = { version = "X.Y.Z", ... }` pin from
-    /// a Cargo manifest's text. Matches the BASE crate only — `wasmtime-wasi`
-    /// / `wasmtime-wasi-http` have no space between the crate name and `=`
-    /// here, and the `starts_with('=')` guard rejects them regardless.
-    fn declared_wasmtime_version(manifest: &str, what: &str) -> String {
-        manifest
-            .lines()
-            .find_map(|line| {
-                let line = line.trim_start();
-                let rest = line.strip_prefix("wasmtime ")?.trim_start();
-                if !rest.starts_with('=') {
-                    return None;
-                }
-                let vstart = rest.find("version = \"")? + "version = \"".len();
-                let vend = rest[vstart..].find('"')? + vstart;
-                Some(rest[vstart..vend].to_string())
-            })
-            .unwrap_or_else(|| {
-                panic!("could not find `wasmtime = {{ version = \"...\" }}` in {what}")
-            })
+    /// Extract the pin `manifest` declares for EXACTLY `crate_name`, in
+    /// either spelling cargo allows: `foo = "X.Y.Z"` or
+    /// `foo = { version = "X.Y.Z", … }`.
+    ///
+    /// The match is exact because the prefix is consumed and the next
+    /// non-space character must be `=`: looking up `wasmtime` will not match
+    /// the `wasmtime-wasi` line (`-wasi = …` has no leading `=` left), and
+    /// looking up `wasmtime-wasi` will not match `wasmtime-wasi-http`. That
+    /// exactness is what lets the doc-table check resolve each family
+    /// member against its OWN pin instead of assuming they are equal.
+    fn declared_crate_version(manifest: &str, crate_name: &str) -> Option<String> {
+        manifest.lines().find_map(|line| {
+            let rest = line.trim_start().strip_prefix(crate_name)?.trim_start();
+            let rest = rest.strip_prefix('=')?.trim_start();
+            // Bare-string form: `wasmtime-wasi = "47.0.3"`.
+            if let Some(after_quote) = rest.strip_prefix('"') {
+                let end = after_quote.find('"')?;
+                return Some(after_quote[..end].to_string());
+            }
+            // Inline-table form: `wasmtime = { version = "47.0.3", … }`.
+            let vstart = rest.find("version = \"")? + "version = \"".len();
+            let vend = rest[vstart..].find('"')? + vstart;
+            Some(rest[vstart..vend].to_string())
+        })
     }
 
-    /// Tie EVERY hardcoded wasmtime version in this crate to the DECLARED
-    /// dependency in the manifests. Three checks, in widening order:
+    /// [`declared_crate_version`] for the base `wasmtime` crate, which every
+    /// caller here treats as mandatory.
+    fn declared_wasmtime_version(manifest: &str, what: &str) -> String {
+        declared_crate_version(manifest, "wasmtime").unwrap_or_else(|| {
+            panic!("could not find a `wasmtime = ...` dependency line in {what}")
+        })
+    }
+
+    /// Tie every hardcoded wasmtime version in the two crates that link
+    /// wasmtime to the DECLARED dependency in the manifests. Five
+    /// assertions, in widening order — numbered here to match the `// 1.`
+    /// … `// 5.` markers in the body:
     ///
     ///   1. `wasmtime_version!` (the single source) == the version declared
     ///      in `talos-worker-runtime/Cargo.toml`, which is the manifest that
     ///      actually determines which wasmtime this runtime links.
-    ///   2. `worker/Cargo.toml` declares the same version — the deployable
-    ///      binary re-declares the dep, and a disagreement between the two
-    ///      manifests is a bump that landed in only one of them.
-    ///   3. No OTHER wasmtime version literal anywhere in
-    ///      `talos-worker-runtime/src/` or `worker/src/` disagrees with it —
-    ///      i.e. nobody re-typed the number at a use site instead of
-    ///      deriving it. Plus `docs/wasmtime-version-tracking.md`'s
-    ///      "Current pin" table, which is the CVE-response reference
-    ///      `THREAT_MODEL.md` sends an operator to.
+    ///   2. `worker/Cargo.toml` declares the same version. Note what that
+    ///      manifest's wasmtime entry actually is: a DEV-dependency, so
+    ///      `worker/tests/` can build guest fixtures and poke the engine
+    ///      directly — production wasmtime reaches the binary through
+    ///      `talos-worker-runtime`. It still has to agree, and for a sharper
+    ///      reason than "a bump landed in one file": across a major, cargo
+    ///      does NOT unify the two, it resolves BOTH (verified — a
+    ///      deliberate 47/46 split pulls a whole second wasmtime + cranelift
+    ///      family into `Cargo.lock`). The worker's integration tests would
+    ///      then be exercising a different runtime than the fleet ships,
+    ///      while everything still compiles.
+    ///   3. `ENGINE_CONFIG_FINGERPRINT` carries the declared version. True
+    ///      by construction now that the line is `concat!`-composed, but a
+    ///      refactor could reintroduce a literal there.
+    ///   4. No OTHER wasmtime version literal anywhere in
+    ///      `talos-worker-runtime/src/` or `worker/src/` — see
+    ///      [`stray_wasmtime_version_literals`] for what exactly counts as
+    ///      one, since "no other literal" is a claim with an edge and the
+    ///      edge is where this class of bug lives.
+    ///   5. `docs/wasmtime-version-tracking.md`'s "Current pin" table, which
+    ///      is the CVE-response reference `THREAT_MODEL.md` sends an
+    ///      operator to. Each row is checked against the pin for THAT crate,
+    ///      and every wasmtime crate the runtime links must have a row.
     ///
-    /// Check 3 is the one this test was missing. Its original form asserted
+    /// Check 4 is the one this test was missing. Its original form asserted
     /// only that `ENGINE_CONFIG_FINGERPRINT` carried the declared version —
     /// while the `Engine created` boot log a few thousand lines away carried
     /// its OWN literal, which sat at `45.0.3` for a release after #621
@@ -701,8 +735,8 @@ mod aot_hmac_input_tests {
     /// AOT-cache key) was guarded; the boot log (the thing an operator
     /// actually greps during a CVE response) was not, and the comment above
     /// the log literal claimed this test covered it. The fingerprint line is
-    /// now composed from the same macro, so check 3 is what does the real
-    /// work — it catches the next copy before it can be believed.
+    /// now composed from the same macro, so check 4 is what does the real
+    /// work — it is the one that would have failed #621.
     ///
     /// What this test does NOT cover, stated precisely so the next reader
     /// does not have to infer it — an over-claiming coverage comment is what
@@ -715,6 +749,15 @@ mod aot_hmac_input_tests {
     ///     and must stay free to say `41.0.3`. A stale *comment* is
     ///     therefore still possible; only live code and the pin table are
     ///     mechanically held.
+    ///   * A same-version copy written in a shape the scan does not
+    ///     recognise as a bare literal — `"v47.0.3"`, a `format!` that
+    ///     assembles the digits, a version split across two source lines so
+    ///     that neither line has both the word and the number. Those are
+    ///     caught only once they DISAGREE, i.e. at the next bump, which is
+    ///     before an operator can read a wrong number but is detection
+    ///     rather than prevention. The two shapes that actually occurred —
+    ///     a bare `"X.Y.Z"` on a wasmtime line, and the `Engine created`
+    ///     field itself — are both held at write time.
     ///   * Docs other than `docs/wasmtime-version-tracking.md`, and even
     ///     there only its `Current pin` rows — not its CVE history table.
     ///   * The lock-resolved patch: this pins to the Cargo.toml pin, so a
@@ -748,8 +791,10 @@ mod aot_hmac_input_tests {
             worker_version, version,
             "worker/Cargo.toml declares wasmtime {worker_version} but \
              talos-worker-runtime/Cargo.toml declares {version} — a bump landed in only \
-             one manifest. Cargo will unify them in the lock, so the disagreement is \
-             silent at build time and only shows up as a surprising resolved version."
+             one manifest. Across a major, cargo does not unify these: it resolves \
+             BOTH, so Cargo.lock grows a second wasmtime + cranelift family and \
+             worker's integration tests link a different engine than the one the fleet \
+             actually runs. Everything still compiles, which is why this is asserted."
         );
 
         // 3. The fingerprint carries it (now by construction, still asserted:
@@ -768,61 +813,122 @@ mod aot_hmac_input_tests {
         let strays = stray_wasmtime_version_literals(&version);
         assert!(
             strays.is_empty(),
-            "hardcoded wasmtime version literal(s) disagree with the declared dep \
-             ({version}):\n{}\n\nThese sites carry their own copy of the version \
-             instead of deriving it from `wasmtime_version!` / `WASMTIME_VERSION`. \
-             That is exactly how the `Engine created` boot log came to report 45.0.3 \
-             on a fleet running 47.0.3 after #621. Replace the literal with \
+            "hardcoded wasmtime version literal(s) found outside the single source \
+             (declared dep is {version}):\n{}\n\nThese sites carry their own copy of \
+             the version instead of deriving it from `wasmtime_version!` / \
+             `WASMTIME_VERSION`. Note that a copy is flagged even when it currently \
+             AGREES: the `Engine created` boot log's literal agreed on the day it was \
+             written too, and still went on to report 45.0.3 on a fleet running \
+             47.0.3 after #621. So the fix is to replace the literal with \
              `WASMTIME_VERSION` (or `wasmtime_version!()` in a const/`concat!` \
-             position) rather than updating it.",
+             position) — NOT to update it to the current number.",
             strays.join("\n")
         );
 
         // 5. The CVE-response doc's "Current pin" table. THREAT_MODEL.md
         //    names docs/wasmtime-version-tracking.md as the reference an
         //    operator consults during a wasmtime advisory, and it said
-        //    43.0.2 across four bumps — the same defect as the boot log,
+        //    43.0.2 across four wasmtime-family bumps (44.0.2, 44.0.3,
+        //    45.0.3, 47.0.3) — the same defect as the boot log,
         //    one layer out and read by exactly the same person under
         //    exactly the same time pressure. Only the `| \`wasmtime...\` |`
         //    rows are checked; the "Why this version" table below them is a
         //    history of past versions and must stay free to name them.
+        //
+        //    Each row is resolved against the pin for THAT crate, not against
+        //    the base `wasmtime` version. The family has always moved in
+        //    lockstep, but nothing guarantees it will: an advisory that
+        //    patches only `wasmtime-wasi` is exactly the kind of event this
+        //    document exists for, and a check that demanded every row equal
+        //    the base version would force the operator to write a false row
+        //    in a CVE reference in order to get a green build.
         let tracking_doc = include_str!("../../docs/wasmtime-version-tracking.md");
-        let mut checked_rows = 0usize;
+        let mut documented: Vec<&str> = Vec::new();
         for (idx, line) in tracking_doc.lines().enumerate() {
-            if !line.trim_start().starts_with("| `wasmtime") {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with("| `wasmtime") {
                 continue;
             }
-            for token in version_shaped_tokens(line) {
-                checked_rows += 1;
-                assert_eq!(
-                    token,
-                    version,
-                    "docs/wasmtime-version-tracking.md:{} pins wasmtime {token} but the \
-                     manifests declare {version}. That file is the CVE-response reference \
-                     named by THREAT_MODEL.md — a stale pin there tells an operator the \
-                     bump did not land. Update its `Current pin` table and append a row to \
-                     `Why this version`.",
-                    idx + 1
-                );
-            }
+            let mut cells = trimmed.split('|').skip(1);
+            let crate_name = cells.next().unwrap_or("").trim().trim_matches('`');
+            let version_cell = cells.next().unwrap_or("").trim();
+            // Rows are resolved against the runtime manifest first (the three
+            // production entries) and the worker manifest second (its
+            // test-fixture dev-dep, which check 2 already holds equal).
+            let declared = declared_crate_version(own_manifest, crate_name)
+                .or_else(|| declared_crate_version(worker_manifest, crate_name))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "docs/wasmtime-version-tracking.md:{} documents a `Current pin` \
+                         for `{crate_name}`, but no manifest declares that crate. Either \
+                         the dependency was dropped and the row is now fiction, or the \
+                         crate was renamed — a pin table naming a crate nobody depends on \
+                         is worse than no table.",
+                        idx + 1
+                    )
+                });
+            assert_eq!(
+                version_cell,
+                declared,
+                "docs/wasmtime-version-tracking.md:{} pins `{crate_name}` at \
+                 {version_cell} but the manifests declare {declared}. That file is the \
+                 CVE-response reference named by THREAT_MODEL.md — a stale pin there \
+                 tells an operator the bump did not land. Update its `Current pin` table \
+                 and append a row to `Why this version`.",
+                idx + 1
+            );
+            documented.push(crate_name);
         }
+        // Non-vacuity, stated as a completeness requirement rather than a
+        // row count: every wasmtime crate the RUNTIME links must appear, so
+        // reshaping the table cannot quietly drop one out of coverage.
+        //
+        // The required set is DERIVED from the manifest rather than listed
+        // here. A hand-written `["wasmtime", "wasmtime-wasi", …]` would be
+        // one more copy that has to be remembered — the same shape as the
+        // literal this whole change exists to delete — and adding a fourth
+        // wasmtime crate would silently leave it out of the doc's coverage.
+        let linked: Vec<&str> = own_manifest
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim_start();
+                if !l.starts_with("wasmtime") {
+                    return None;
+                }
+                let name = l.split('=').next()?.trim();
+                name.starts_with("wasmtime").then_some(name)
+            })
+            .collect();
         assert!(
-            checked_rows >= 2,
-            "found {checked_rows} `Current pin` rows in \
-             docs/wasmtime-version-tracking.md — expected at least the `wasmtime` and \
-             `wasmtime-wasi` rows. The table was reshaped and this guard is now scanning \
-             (almost) nothing, which would pass vacuously."
+            linked.len() >= 2,
+            "found only {} wasmtime dependency line(s) in \
+             talos-worker-runtime/Cargo.toml ({linked:?}) — the manifest parse is \
+             broken, so the `Current pin` completeness check below would demand \
+             nothing and pass vacuously.",
+            linked.len()
         );
+        for required in linked {
+            assert!(
+                documented.contains(&required),
+                "docs/wasmtime-version-tracking.md's `Current pin` table has no row for \
+                 `{required}`, which talos-worker-runtime/Cargo.toml declares. Rows \
+                 found: {documented:?}. An operator reading that table during an \
+                 advisory would conclude Talos does not ship the crate."
+            );
+        }
     }
 
     /// The `Engine created` boot log must report the version FROM the single
     /// source, not from a copy that happens to be correct today.
     ///
-    /// `fingerprint_wasmtime_version_matches_cargo_toml` catches a copy that
-    /// has already drifted; this catches the copy while it still agrees —
-    /// i.e. the moment it is written, rather than at the next bump. That
-    /// distinction is the whole incident: the boot log's literal was correct
-    /// when it was written and became a lie one bump later.
+    /// This is the POSITIVE half of the contract, and the two halves are not
+    /// the same assertion. `fingerprint_wasmtime_version_matches_cargo_toml`
+    /// says what must NOT be here (no version literal); this says what MUST
+    /// be — that the field exists at all, and that it binds
+    /// `WASMTIME_VERSION`. Deleting the field, or rebuilding the string some
+    /// other way (`format!`, a `&str` copied through a local), leaves the
+    /// negative check perfectly happy and still costs the operator the one
+    /// line they grep during a CVE response.
     ///
     /// Asserted structurally (on the source line) rather than by capturing
     /// tracing output, because capturing it would require standing up a real
@@ -859,15 +965,32 @@ mod aot_hmac_input_tests {
     }
 
     /// Scan the two crates that link wasmtime — `talos-worker-runtime/src/`
-    /// and `worker/src/` — for wasmtime version literals that disagree with
-    /// `expected`, returning `file:line: <text>` for each.
+    /// and `worker/src/` — for wasmtime version literals that bypassed
+    /// [`wasmtime_version!`], returning `file:line: <text>` for each.
     ///
-    /// A "wasmtime version literal" is a `X.Y.Z`-shaped token on a line that
-    /// also mentions `wasmtime` (case-insensitively — this catches the
-    /// `wasmtime_version = "..."` tracing field as well as a `wasmtime=`
-    /// string), in NON-comment source. Comment lines are skipped on purpose:
-    /// `AOT_VERSION_HDR`'s History section documents every past version and
-    /// must stay free to say `41.0.3`.
+    /// Only NON-comment lines that mention `wasmtime` (case-insensitively,
+    /// so the `wasmtime_version = ...` tracing field counts as well as a
+    /// `wasmtime=` string) are considered. Comment lines are skipped on
+    /// purpose: `AOT_VERSION_HDR`'s History section documents every past
+    /// version and must stay free to say `41.0.3`.
+    ///
+    /// Such a line is flagged on either of two independent triggers, because
+    /// a re-typed copy is dangerous in two different ways:
+    ///
+    ///   * **A bare version string** — a quoted literal whose entire content
+    ///     is `X.Y.Z` — is flagged WHETHER OR NOT it agrees with `expected`.
+    ///     This is the shape the `Engine created` field had, and the reason
+    ///     for the equality-free trigger is that the field was *correct* on
+    ///     the day it was written and became a lie one bump later: a guard
+    ///     that only compares cannot see a copy during the window in which
+    ///     it still looks fine. The single source itself is exempt by name
+    ///     (`macro_rules! wasmtime_version`), and prose in an assertion
+    ///     message is not a bare literal, so neither trips this.
+    ///   * **Any version-shaped token that disagrees** with `expected` — the
+    ///     looser net, for interpolated or decorated forms (`"v47.0.3"`, a
+    ///     `format!`) that the first trigger cannot recognise. It catches
+    ///     them at the next bump, when they turn wrong, which is still
+    ///     before any operator can read the wrong number.
     ///
     /// The source trees are WALKED at test time rather than `include_str!`-ed
     /// so the check automatically covers files added later — a new module
@@ -918,11 +1041,18 @@ mod aot_hmac_input_tests {
                 if !line.to_ascii_lowercase().contains("wasmtime") {
                     continue;
                 }
-                for token in version_shaped_tokens(line) {
-                    if token != expected {
-                        strays.push(format!("  {rel}:{}: {}", idx + 1, line.trim()));
-                        break;
-                    }
+                // The single source is allowed to spell the number out —
+                // that is its entire job. Matched on the `macro_rules!` line
+                // so the exemption survives the body being reflowed onto it.
+                if line.contains("macro_rules! wasmtime_version") {
+                    continue;
+                }
+                let bare = !bare_version_strings(line).is_empty();
+                let drifted = version_shaped_tokens(line)
+                    .iter()
+                    .any(|t| t.as_str() != expected);
+                if bare || drifted {
+                    strays.push(format!("  {rel}:{}: {}", idx + 1, line.trim()));
                 }
             }
         }
@@ -941,6 +1071,30 @@ mod aot_hmac_input_tests {
                 out.push(path);
             }
         }
+    }
+
+    /// Every quoted string in `line` whose ENTIRE content is `X.Y.Z`.
+    ///
+    /// This is the discriminator that lets the scan flag a re-typed copy
+    /// while it still agrees with the manifest without also flagging the
+    /// surrounding prose: `wasmtime_version = "47.0.3"` has a bare version
+    /// string, an assertion message that happens to narrate "47.0.3" inside
+    /// a sentence does not. Quote-splitting is approximate around escaped
+    /// quotes, which is fine — it only ever has to be right about short,
+    /// digits-and-dots-only literals.
+    fn bare_version_strings(line: &str) -> Vec<String> {
+        line.split('"')
+            .skip(1)
+            .step_by(2)
+            .filter(|chunk| {
+                let parts: Vec<&str> = chunk.split('.').collect();
+                parts.len() == 3
+                    && parts
+                        .iter()
+                        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+            })
+            .map(|c| c.to_string())
+            .collect()
     }
 
     /// Every `MAJOR.MINOR.PATCH` token in `line`. Deliberately dumb: it only

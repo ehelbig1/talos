@@ -13,13 +13,21 @@ why, and when the operator should bump.
 | `wasmtime`           | 47.0.3   | `talos-worker-runtime/Cargo.toml`  |
 | `wasmtime-wasi`      | 47.0.3   | `talos-worker-runtime/Cargo.toml`  |
 | `wasmtime-wasi-http` | 47.0.3   | `talos-worker-runtime/Cargo.toml`  |
-| `wasmtime`           | 47.0.3   | `worker/Cargo.toml`                |
+| `wasmtime`           | 47.0.3   | `worker/Cargo.toml` (dev-dep)      |
 
 The runtime library (`TalosRuntime`, the engine config, the AOT cache) was
 extracted from `worker/` to `talos-worker-runtime/` in July 2026, so that
-crate's manifest is the one that governs which wasmtime is linked. The
-deployable `worker` binary re-declares the base crate; **both must move
-together** — `fingerprint_wasmtime_version_matches_cargo_toml` fails if they
+crate's manifest is the one that governs which wasmtime the fleet actually
+runs — all three production entries live there. The deployable `worker`
+binary's own wasmtime entry is a **dev-dependency**: `worker/tests/` builds
+guest fixtures and pokes the engine directly, and nothing else in that crate
+links wasmtime.
+
+It still has to move in lockstep. Across a major, cargo does not unify the
+two specs — it resolves BOTH, so the lockfile grows a second wasmtime +
+cranelift family and the worker's integration tests end up validating an
+engine the fleet does not ship, with no compile error anywhere.
+`fingerprint_wasmtime_version_matches_cargo_toml` fails if the two manifests
 disagree, and it reads THIS table too, so a bump that forgets this file
 fails the same test rather than leaving a stale CVE-response reference.
 
@@ -36,7 +44,8 @@ column is the version bumped *to*.
 |----------|------------------------|------------------------------------------|
 | 47.0.3   | RUSTSEC-2026-0222      | Stores mix up type indices between engines (GHSA-hgjw-h833-99q9) |
 | 45.0.3   | RUSTSEC-2026-0188      | WASI hard-link/rename `FilePerms` bypass |
-| 44.0.3   | RUSTSEC-2026-0182      | (44.0.3 fix)                             |
+| 44.0.3   | RUSTSEC-2026-0182      | WASIp1 `fd_renumber` memory leak (lockfile-only bump — the manifests stayed `44.0.2`) |
+| 44.0.2   | RUSTSEC-2026-0149      | WASI `path_open(TRUNCATE)` bypasses host `FilePerms::WRITE` (HIGH, CVSS 7.5) |
 | 43.0.2   | CVE-2026-34971         | Sandbox escape                           |
 | 43.0.2   | CVE-2026-27572         | HTTP headers DoS                         |
 | 43.0.2   | CVE-2026-27195         | `call_async` DoS                         |
@@ -67,20 +76,27 @@ column is the version bumped *to*.
 
 ## What gets pinned
 
-The `Cargo.toml` line is an **exact** pin (a literal `X.Y.Z`, not `"43"` or
-`"^43"`). This is deliberate:
+The `Cargo.toml` line names the full three-part version (a literal `X.Y.Z`, not
+`"43"` or `"^43"`). Note what that is and is not: cargo reads `"47.0.3"` as
+`^47.0.3`, so it pins the MAJOR and floors the patch — it does not forbid
+`cargo update` from resolving 47.0.4 within the 47.x line. `Cargo.lock` is
+what makes any given build exact. Both properties are deliberate:
 
 1. Reproducible builds — `cargo audit` runs against `Cargo.lock`, and
    the lockfile records the exact transitive set. An unpinned major
-   would let `cargo update` silently shift the version.
+   would let `cargo update` silently shift the version. A patch that
+   moves within the line (as RUSTSEC-2026-0182 did, 44.0.2 → 44.0.3) is
+   a lockfile change with no manifest change, so it will NOT trip
+   `fingerprint_wasmtime_version_matches_cargo_toml` — wasmtime's own
+   `Component::deserialize` version check is the backstop there.
 
 2. Auditability — the `THREAT_MODEL.md` references this file by name.
    If wasmtime updates without us noticing, the threat model goes
    stale and we wouldn't know.
 
 3. Forces reviewer attention — bumping wasmtime is a security event,
-   not a maintenance task. The exact pin makes the bump a deliberate
-   PR action with a diff a reviewer can see.
+   not a maintenance task. Naming the full `X.Y.Z` makes the bump a
+   deliberate PR action with a diff a reviewer can see.
 
 ## What to check at upgrade time
 
@@ -129,10 +145,10 @@ The three edits a wasmtime bump requires, all named by
    mismatch instead of an HMAC failure;
 3. the **Current pin** table at the top of this file.
 
-Item 3 is in the list because it was NOT for the first four bumps: this
-file still said 43.0.2 on a fleet running 47.0.3, while being the document
-`THREAT_MODEL.md` names as the CVE-response reference. It is now read by
-that same test.
+Item 3 is in the list because it was NOT for the first four wasmtime-family
+bumps (44.0.2, 44.0.3, 45.0.3, 47.0.3): this file still said 43.0.2 on a
+fleet running 47.0.3, while being the document `THREAT_MODEL.md` names as
+the CVE-response reference. It is now read by that same test.
 
 ## Reference
 
