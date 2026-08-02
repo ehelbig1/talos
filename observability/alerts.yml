@@ -112,18 +112,23 @@ groups:
   - name: service_health
     interval: 30s
     rules:
-      # Worker down
-      - alert: TalosWorkerDown
-        expr: up{job="talos-worker"} == 0
-        for: 1m
-        labels:
-          severity: critical
-          component: worker
-        annotations:
-          summary: "Talos worker is down"
-          description: "Worker instance {{ $labels.instance }} has been down for > 1 minute"
+      # TalosWorkerDown deliberately does NOT live here. It is defined once, in
+      # the canonical deploy/helm/talos/files/alerts.yaml (group
+      # talos.infra.availability, for: 2m) — the same file the chart's
+      # PrometheusRule embeds. This file used to carry a second copy with
+      # for: 1m and a different label set; that was invisible while
+      # docker-compose.yml mounted no rules at all, and the moment both files
+      # were mounted (2026-08-02) the dev stack loaded BOTH and fired BOTH on
+      # one worker outage — observed live, two `firing` alerts for one event.
+      # Alertmanager cannot dedup them: the label sets differ
+      # (component: worker vs category: availability), so it is two pages, two
+      # `for` windows, and two contradictory runbook pointers for one incident.
+      # Enforced by structural lint check 65(d): no alert name may be defined
+      # in more than one mounted rule file.
 
-      # Prometheus scrape failures
+      # Prometheus scrape failures. Broader than TalosWorkerDown by design —
+      # this fires for ANY down target, including the controller and
+      # Prometheus's own self-scrape. Not a duplicate of a named per-job alert.
       - alert: PrometheusScrapeFailure
         expr: up == 0
         for: 5m

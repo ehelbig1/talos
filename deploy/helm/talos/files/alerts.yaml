@@ -625,6 +625,13 @@ groups:
     rules:
       # Scraped from the drill script's metric output (see
       # deploy/observability/drill-textfile-exporter.md).
+      #
+      # allow-unobserved-metric: talos_backup_drill_* is a node_exporter
+      # TEXTFILE series written by scripts/drills/backup-restore.sh, not a
+      # metric registered in Rust — so structural check 65(c), which
+      # requires every alerted talos_* series to be registered in a .rs
+      # file, cannot see its producer. The producer is real; only its
+      # language is different.
       - alert: TalosBackupRestoreDrillFailed
         expr: talos_backup_drill_last_success_timestamp_seconds < (time() - 14*86400)
         labels:

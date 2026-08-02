@@ -18,9 +18,31 @@ global:
 #         - targets:
 #           - alertmanager:9093
 
-# Load alerting rules
+# Load alerting rules.
+#
+# 2026-08-02: these were absolute-pathed into /etc/prometheus/rules/ and the
+# compose files taught to mount both rule files there. The previous entry was
+# a bare 'alerts.yml', which docker-compose.yml never mounted — and Prometheus
+# treats every rule_files entry as a GLOB, so a literal path matching nothing
+# expands to zero files WITHOUT an error. `/api/v1/rules` reported 0 groups
+# while the config looked alert-capable. Structural lint check 65 now resolves
+# each entry through the compose mounts and fails if it names no real file.
+#
+# This file is SHARED by both compose stacks, so check 65(b) requires EACH of
+# them to mount every entry listed below — not merely one of them. That is the
+# shape of the bug above (docker-compose.observability.yml mounted the rules,
+# docker-compose.yml did not); a first-match check would have passed that tree,
+# so it was changed to per-stack during review. LIMIT: 65(b) only inspects the
+# two compose files it is told about, and only recognises the short
+# `- ./host:/container[:ro]` bind syntax.
+#
+# talos-alerts.yaml is bind-mounted straight from
+# deploy/helm/talos/files/alerts.yaml — the SAME file the chart's PrometheusRule
+# embeds via `.Files.Get`. It is deliberately NOT copied into observability/:
+# a second copy is exactly the drift this change exists to prevent.
 rule_files:
-  - 'alerts.yml'
+  - '/etc/prometheus/rules/wasm-alerts.yml'
+  - '/etc/prometheus/rules/talos-alerts.yaml'
 
 # Scrape configurations
 scrape_configs:
@@ -34,29 +56,81 @@ scrape_configs:
           service: 'prometheus'
 
   # ========================================================================
+  # Talos Controller Metrics
+  # ========================================================================
+  # Every `talos_*` series lives in the CONTROLLER process, and until
+  # 2026-08-02 this file did not scrape it at all — so the dev stack could not
+  # exercise a single one of the alerts in talos-alerts.yaml.
+  #
+  # The path is `/metrics/prometheus`, NOT `/metrics`: the latter is a
+  # different, authenticated dashboard route served through the GraphQL proxy.
+  #
+  # No `bearer_token` here is CORRECT and is not a weakening of the production
+  # gate. `prometheus_metrics_handler` (controller/src/bootstrap/router.rs)
+  # treats an unset/empty PROMETHEUS_SCRAPE_TOKEN as "no token configured" and
+  # serves the scrape OUTSIDE production; the SAME handler fail-closes with
+  # 403 ("PROMETHEUS_SCRAPE_TOKEN must be set in production") when
+  # `is_production()` and no token is configured. Note this is a REQUEST-time
+  # gate, not a boot gate: the startup validator in bootstrap/services.rs
+  # passes `required=false`, so it only checks token STRENGTH when one is set
+  # and a prod controller with no token still boots (and then 403s every
+  # scrape). Dev-unauthenticated is the deliberate documented posture; the
+  # in-cluster path authenticates via the ServiceMonitor's bearer Secret.
+  - job_name: 'talos-controller'
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    metrics_path: '/metrics/prometheus'
+    static_configs:
+      - targets: ['controller:8000']
+        labels:
+          service: 'talos-controller'
+          component: 'controller'
+
+  # ========================================================================
   # Talos Worker Metrics
   # ========================================================================
+  # 2026-08-02: this job was broken THREE independent ways at once, each of
+  # which alone was enough to hold `up` at 0 — and because a down target is
+  # indistinguishable from a job that was never wired, none of them surfaced:
+  #   1. host   — `talos-worker` does not resolve on the compose network. The
+  #               compose SERVICE is `worker`; `talos-worker-1` is a container
+  #               name that renumbers under `--scale`, so the service name is
+  #               the only stable handle.
+  #   2. port   — the worker's metrics server binds METRICS_PORT, which
+  #               DEFAULTS TO 9090 (worker/src/main.rs) and is unset in both
+  #               .env and docker-compose.yml. 9091 is the metrics_demo binary.
+  #   3. token  — the worker reads METRICS_AUTH_TOKENS, which defaults to
+  #               `dev-token` in docker-compose.yml. `dev-metrics-token` was a
+  #               literal that matched nothing and returned 401.
+  # Both literals below are dev-only fixtures and must stay that way: nothing
+  # derived from .env may be written into observability/.
+  #
+  # dns_sd_configs (not static_configs) because `worker` runs with
+  # `replicas: ${WORKER_REPLICAS:-2}`. An A-record lookup returns EVERY replica
+  # address, whereas a static `worker:9090` target resolves to a single
+  # arbitrary replica and would silently under-report a scaled fleet.
+  #
+  # The former `host.docker.internal:9091` target is deleted rather than
+  # re-pointed: a host-run worker also defaults to 9090, and on this stack the
+  # host's 9090 is Prometheus's own published port — so "fixing" the port would
+  # have made Prometheus scrape ITSELF under the worker job's labels. A
+  # permanently-down target that nothing owns is the same misleading-signal
+  # family as the rest of this change.
   - job_name: 'talos-worker'
     scrape_interval: 10s     # Scrape more frequently for worker metrics
     scrape_timeout: 5s
     metrics_path: '/metrics'
-    bearer_token: 'dev-metrics-token'
-
-    # Static configuration (for docker-compose and local development)
-    static_configs:
-      # Production worker (containerized)
-      - targets: ['talos-worker:9091']
-        labels:
-          service: 'talos-worker'
-          component: 'wasm-runtime'
-          environment: 'production'
-
-      # Local development worker (host machine)
-      - targets: ['host.docker.internal:9091']
-        labels:
-          service: 'talos-worker'
-          component: 'wasm-runtime'
-          environment: 'development'
+    bearer_token: 'dev-token'
+    dns_sd_configs:
+      - names: ['worker']
+        type: 'A'
+        port: 9090
+        refresh_interval: 30s
+    relabel_configs:
+      - target_label: service
+        replacement: 'talos-worker'
+      - target_label: component
+        replacement: 'wasm-runtime'
 
     # Alternative: Kubernetes service discovery
     # kubernetes_sd_configs:
