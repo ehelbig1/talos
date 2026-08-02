@@ -238,10 +238,13 @@ groups:
       #
       # WARNING, not critical, and `for: 0m`. Expected rate is zero on routine
       # traffic (#619 verified zero over a live deploy window), so any hit is
-      # worth a look immediately — but ONE deliberate residual producer remains:
-      # `record_started` failing is non-fatal by design, so a DB blip during a
-      # node dispatch legitimately orphans that node's lines. Volume is bounded
-      # by the worker's per-execution log budget
+      # worth a look immediately. At least one deliberate residual producer is
+      # KNOWN — `record_started` failing is non-fatal by design, so a DB blip
+      # during a node dispatch legitimately orphans that node's lines — and that
+      # is a known-causes list, not a proof of completeness: the same list in the
+      # code has gone stale twice already, which is why the alert stays `> 0`
+      # rather than being tuned around an assumed floor. Volume is bounded by the
+      # worker's per-execution log budget
       # (MAX_LOG_MESSAGES_PER_EXECUTION / HOST_DIAG_CAP), not unbounded.
       - alert: TalosWasmLogsOrphaned
         expr: increase(talos_wasm_log_orphaned_total[15m]) > 0
@@ -259,10 +262,15 @@ groups:
             kind=no_execution_row: a dispatch path published under an id with no
             execution row. First check whether
             talos_module_execution_record_started_failures_total moved in the
-            same window — that is the one legitimate cause (a DB blip on a
-            non-fatal start-row write). If it did not, a NEW dispatch path is
-            minting ids without recording rows: grep the controller log for
-            event_kind="wasm_log_orphaned" and fix the producer.
+            same window — that is the one KNOWN benign cause (a DB blip on a
+            non-fatal start-row write). If it did not, assume a NEW dispatch path
+            is minting ids without recording rows: grep the controller log for
+            event_kind="wasm_log_orphaned" and fix the producer. Treat "the one
+            known cause" as a SNAPSHOT, not an inventory — the equivalent list in
+            the code has already gone stale twice; the live enumeration is the
+            comment at the warn site in
+            controller/src/bootstrap/background.rs, and the warn itself outranks
+            both.
             kind=unparseable_id: a publisher is emitting malformed
             execution_ids; grep event_kind="wasm_log_unparseable_execution_id".
 
@@ -273,9 +281,20 @@ groups:
       # runs while its row is missing and get_execution_logs / get_node_io /
       # cost attribution all quietly under-report.
       #
-      # `for: 5m` rather than 0m: a single transient acquire timeout is not
-      # worth a page, a sustained one is — this is the failing-DB shape, not
-      # the tamper shape.
+      # WHAT `for: 5m` ACTUALLY DOES HERE — say it precisely, because the
+      # obvious reading is wrong. It does NOT mean "one transient failure will
+      # not page". `increase(...[15m])` stays positive for the whole 15m window
+      # after a SINGLE increment, which trivially outlasts a 5m `for`, so one
+      # transient acquire timeout still fires — just 5 minutes later. A `for`
+      # shorter than the range window can only delay a page, never suppress a
+      # one-off; suppressing one-offs needs a THRESHOLD on the value (compare
+      # TalosMemoryWriteFailuresDB's `rate(...) > 0.1` in this file), not a
+      # `for`. That is deliberate here: one lost start row is silent data loss
+      # worth knowing about, and its downstream twin TalosWasmLogsOrphaned pages
+      # at `for: 0m` on the same event anyway — a threshold here would only make
+      # the pair disagree. The 5m buys exactly one thing: the series must stay
+      # positive across ~10 evaluations, which rides out a counter reset or a
+      # single-scrape gap that briefly lifts increase() off zero.
       - alert: TalosModuleExecutionStartRowFailures
         expr: increase(talos_module_execution_record_started_failures_total[15m]) > 0
         for: 5m
@@ -303,12 +322,21 @@ groups:
   - name: talos.audit
     interval: 30s
     rules:
-      # CRITICAL with `for: 0m` because the tolerable background is ZERO by
-      # construction: the ledger REJECTS a failing event rather than persisting
-      # it, so a non-zero value is positive tamper/corruption evidence, not a
-      # threshold judgement. A week unnoticed means the compliance artifact is
-      # void for the affected executions AND the correlation window (who had
-      # access, what else happened) has closed.
+      # CRITICAL with `for: 0m` because the expected steady-state background is
+      # ZERO: the ledger REJECTS a failing event rather than persisting it, so a
+      # non-zero value is evidence of a real integrity break, not a threshold
+      # judgement. A week unnoticed means the compliance artifact is void for the
+      # affected executions AND the correlation window (who had access, what else
+      # happened) has closed.
+      #
+      # "Expected zero" is NOT the same as "can only mean tampering", and the
+      # runbook below must be read before anyone declares an incident. The event
+      # hash is recomputed from the deserialized AuditEvent, so a controller and
+      # worker on DIFFERENT BUILDS whose AuditEvent shape or hash input changed
+      # produce stage="event" hash_mismatch (or event_deserialize_failed) on
+      # EVERY event for the duration of the skew — a deploy-ordering fault
+      # presenting as a fleet-wide tamper alarm. Check TalosWorkerBuildSkew and
+      # the controller/worker image shas FIRST.
       #
       # Unfiltered on `stage` on purpose — both values are emitted
       # (talos-audit-ledger: verify_audit_message → stage="event",
@@ -318,9 +346,15 @@ groups:
       # NOTE what this does NOT cover: an execution whose chain cannot be READ
       # (S3/IO error) counts as `errored`, not a verification failure —
       # unreadable is not the same as tampered (#578). That population surfaces
-      # in the audit_chain_sweep_summary log line, not here. The chain sweep
-      # also self-disables when no S3/WORM endpoint is configured, so
-      # stage="chain" is structurally silent on a deployment with no WORM store.
+      # in the audit_chain_sweep_summary log line, not here. Nor does the
+      # operator's on-demand `verify_execution_chain_from_env` path count, so
+      # re-checking a known-broken chain cannot re-page.
+      #
+      # stage="chain" is structurally silent on two postures — no S3/WORM
+      # endpoint configured (the sweep self-disables) and
+      # AUDIT_CHAIN_SWEEP_INTERVAL_SECS=0 (explicitly disabled). A flat 0 on
+      # either means "never looked", not "verified clean". stage="event" has no
+      # such gate: the ingest subscriber runs wherever NATS does.
       - alert: TalosAuditVerificationFailures
         expr: increase(talos_audit_verification_failures_total[15m]) > 0
         for: 0m
@@ -330,8 +364,11 @@ groups:
         annotations:
           summary: "Audit ledger verification FAILED (stage={{ $labels.stage }})"
           description: |
-            {{ $value }} audit verification failure(s) in the last 15m. This is
-            tamper/corruption evidence against the WORM audit ledger.
+            {{ $value }} audit verification failure(s) in the last 15m against
+            the WORM audit ledger. Expected steady state is 0. Read the runbook
+            below BEFORE calling it tampering — a fleet-wide burst is far more
+            often a key-rotation or controller/worker build-skew fault, and both
+            look identical to tampering from this number alone.
             stage=event: an inbound audit event failed its hash or HMAC check at
             ingest and was QUARANTINED (not persisted). Grep the controller log
             for event_kind="audit_event_verification_failed" — the `reason`
@@ -345,9 +382,16 @@ groups:
           action: |
             1. Treat the affected execution's audit record as UNTRUSTED; do not
                delete anything (the quarantined bytes are the evidence).
-            2. Check whether the audit signing keys were rotated without a
-               matching verify-key roll — that presents as bad_signature across
-               many executions at once, which is misconfiguration, not tampering.
+            2. Rule out the two MISCONFIGURATION shapes before treating this as
+               tampering — both present as a broad, simultaneous burst rather
+               than an isolated event:
+               a. audit signing keys rotated without a matching verify-key roll
+                  → bad_signature across many executions at once;
+               b. controller and workers on different builds → hash_mismatch or
+                  event_deserialize_failed on essentially every event. Check
+                  TalosWorkerBuildSkew / get_platform_info.fleet.
+               Tampering is the residual after both are excluded; a scattered
+               handful of failures against a same-build fleet is the real shape.
             3. Check S3/MinIO Object Lock is still enforced on the audit bucket.
 
   # ────────────────────────────────────────────────────────────────────
@@ -402,14 +446,29 @@ groups:
       # `worker_build_skew` WARN fires exactly once per worker at registration,
       # so `increase()` over it would page on EVERY rolling deploy and then go
       # SILENT while a fleet sat skewed — wrong at both ends. The gauge is
-      # recomputed from a query each sweep, so it falls back to 0 on its own
-      # once the fleet converges.
+      # recomputed from a query each sweep, so it falls to 0 once the counted
+      # population converges.
+      #
+      # READ "ACTIVE" NARROWLY — this is the one thing about this alert that is
+      # easy to get wrong. The population is rows in `worker_identities` that
+      # have not been explicitly deactivated. It is NOT "processes currently
+      # running". Nothing reaps the row of a pod that is gone, and
+      # `last_seen_at` is written only at boot registration (there is no
+      # periodic re-register and the NATS fleet heartbeat does not touch this
+      # table), so no age filter can distinguish a departed pod from a healthy
+      # long-lived one and none is applied. With the chart's default worker
+      # `Deployment` + HPA, `worker_id` is the pod name, so every roll and
+      # scale-down leaves rows behind: after the FIRST controller upgrade that
+      # follows, this gauge counts those ghosts and STAYS above zero until an
+      # operator deactivates their keys. It does not self-drain on that posture.
+      # Give workers stable ids (TALOS_WORKER_ID per replica) if you want it to.
       #
       # `for: 30m` outlasts any rolling deploy (workers re-register within
       # seconds of their pod starting) and catches the case the WARN cannot
       # express: a worker that is STILL skewed long after the deploy settled.
       #
-      # Counts PROVEN skew only. A worker that reports no usable commit sha is
+      # Counts PROVEN skew only, per distinct worker_id (a worker mid-rotation
+      # holds two rows). A worker that reports no usable commit sha is
       # "unverifiable" and is NOT counted — absence of evidence is not evidence
       # of skew (#578) — so a clean 0 here is not "everything checked out". Use
       # get_platform_info.fleet for the unverifiable population.
@@ -420,18 +479,31 @@ groups:
           severity: warning
           category: fleet-identity
         annotations:
-          summary: "{{ $value }} worker(s) running a different build than the controller"
+          summary: "{{ $value }} registered worker id(s) on a different build than the controller"
           description: |
-            At least one ACTIVE registered worker has been on a provably
-            different build than this controller for 30m — longer than any
-            rolling deploy should take. Signed wire formats (job dispatch,
-            memory RPC, envelope sealing) are version-coupled, so this breaks
-            jobs in ways that look like signature bugs; it cost several turns of
-            misdiagnosis during the 2026-07-27 signing outage.
+            At least one worker_id with an ACTIVE worker_identities row has
+            reported a provably different build than this controller for 30m —
+            longer than any rolling deploy should take. Signed wire formats (job
+            dispatch, memory RPC, envelope sealing) are version-coupled, so this
+            breaks jobs in ways that look like signature bugs; it cost several
+            turns of misdiagnosis during the 2026-07-27 signing outage.
             Run get_platform_info and read the `fleet` section for the
-            per-worker build_status, or grep the controller log for
-            event_kind="worker_build_skew". Then verify the controller and
+            per-worker build_status and last_seen_at, or grep the controller log
+            for event_kind="worker_build_skew". Then verify the controller and
             worker images were published from the same tree.
+          action: |
+            1. get_platform_info → `fleet`. Cross-check last_seen_at against
+               the pods that actually exist.
+            2. If the offending worker_id has no running pod, this is a GHOST
+               ROW, not a live skew: the registry has no reaper, so a retired
+               pod's identity stays ACTIVE forever. Find it with the controller
+               CLI `list-worker-identities` and clear it with
+               `deactivate-worker-identity --worker-id <id> --public-key <hex>`;
+               the gauge drops on the next 60s sweep.
+            3. If the pod IS running, it is genuinely on another image — roll it
+               onto the controller's build. Do NOT silence this one: a skewed
+               live worker fails signature verification in ways that read as
+               crypto bugs.
 
   # ────────────────────────────────────────────────────────────────────
   - name: talos.vault

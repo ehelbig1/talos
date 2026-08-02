@@ -51,9 +51,34 @@ fn scrub_wasm_log_for_broadcast(message: &str) -> String {
 /// the ACTIVE `worker_identities` rows.
 ///
 /// ALWAYS `set`, never `inc`/`dec` — the gauge is derived fresh from the query
-/// each sweep, so a worker that catches up, is retired, or is deactivated
-/// lowers it without any bookkeeping. A rise-only wiring would pin the alert
-/// firing forever after one rolling deploy.
+/// each sweep, so a worker that catches up, or whose key is deactivated, lowers
+/// it without any bookkeeping. A rise-only wiring would pin the alert firing
+/// forever after one rolling deploy.
+///
+/// WHAT "ACTIVE" MEANS HERE, stated because the word is easy to over-read:
+/// `worker_identities.active`, i.e. a row that was registered and has not been
+/// explicitly deactivated. It is NOT "currently running". Nothing reaps rows for
+/// pods that no longer exist — `last_seen_at` is written only at boot
+/// registration (there is no periodic re-register, and the NATS fleet heartbeat
+/// does not touch this table), so an age filter cannot separate a departed pod
+/// from a long-lived healthy one and none is applied. In the chart's default
+/// posture the worker is a `Deployment` with an HPA and `worker_id` defaults to
+/// the pod name, so EVERY rolling deploy and scale-down leaves behind rows
+/// carrying the build those pods reported. Once the controller moves on, those
+/// rows are provably skewed forever and this gauge stays above zero until an
+/// operator runs `deactivate-worker-identity` for each. Pin `TALOS_WORKER_ID`
+/// per replica (stable ids re-register onto the same rows) or expect to drain
+/// the alert by hand. Do NOT "fix" this by decaying on `last_seen_at`: that
+/// would blind the gauge to a genuinely stale worker that has been up for days,
+/// which is the case it exists to catch.
+///
+/// Counted per distinct `worker_id`, not per row: `list_active_builds` returns
+/// one row per (worker_id, key) and a worker mid-rotation legitimately holds
+/// two, so a row count would render a single skewed worker as two and make the
+/// number in the alert summary wrong — the metric is named `..._workers`.
+/// `get_platform_info.fleet`'s `skewed_workers` counts ROWS, so the two numbers
+/// can differ by the rotation overlap; the BOOLEAN they imply cannot, which is
+/// the invariant that matters (`>0` here iff `build_skew: true` there).
 ///
 /// Counts only PROVEN skew, using the same `builds_match` /
 /// `build_is_verifiable` pair as the registration WARN and
@@ -67,6 +92,13 @@ fn scrub_wasm_log_for_broadcast(message: &str) -> String {
 /// Written by hand rather than through a shared warn-and-count helper; see the
 /// detector-metrics block in `talos_metrics::TalosMetrics` for why a macro
 /// would re-blind structural check 58.
+///
+/// TEST SCOPE, stated rather than implied (same residual as the D3/D4 pins):
+/// the unit tests drive THIS function. They do not prove the 60s sweep still
+/// calls it, and structural check 58 cannot either — it matches the increment
+/// textually, so deleting the call in `spawn_metrics_gauge_tasks` leaves both
+/// green. The honest guard for the call site is the post-merge live check that
+/// `talos_worker_build_skew_workers` is present on `/metrics`.
 pub(crate) fn publish_worker_build_skew(
     controller_build: &str,
     rows: &[talos_worker_identity_repository::WorkerBuildRow],
@@ -83,7 +115,9 @@ pub(crate) fn publish_worker_build_skew(
                     && !builds_match(controller_build, wb)
             })
         })
-        .count();
+        .map(|r| r.worker_id.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
     if let Some(m) = metrics::global() {
         m.worker_build_skew_workers
             .set(i64::try_from(skewed).unwrap_or(i64::MAX));
@@ -177,7 +211,11 @@ pub(crate) fn spawn_metrics_gauge_tasks(db_pool: sqlx::Pool<sqlx::Postgres>) {
     // ahead of or behind the controller) and would then go SILENT while a
     // fleet sat skewed for days — wrong at both ends. A recomputed gauge is
     // level-triggered: it stays up while the condition holds and falls back to
-    // 0 on its own once the fleet converges or the skewed worker is retired.
+    // 0 once the fleet converges or the stale rows are deactivated. "Retiring"
+    // a worker POD is not enough — see the population caveat on
+    // `publish_worker_build_skew` above; nothing reaps rows for pods that are
+    // gone, so on a pod-name-keyed fleet this gauge needs an operator to drain
+    // it after the first controller upgrade.
     //
     // Unconditional: no config gate, no feature flag. The query is one bounded
     // SELECT over a fleet-sized table (MAX_FLEET_BUILD_ROWS = 200).
@@ -3358,5 +3396,48 @@ mod detector_metric_tests {
         // A -dirty tree on ONE side only IS skew: same commit, different bytes.
         publish_worker_build_skew(controller, &[row("w1", Some("0.1.0+aaaaaaa-dirty"))]);
         assert_eq!(m.worker_build_skew_workers.get(), 1);
+    }
+
+    /// The metric is named `..._workers`, and `list_active_builds` returns one
+    /// row per (worker_id, key) — a worker mid-rotation legitimately holds two
+    /// ACTIVE keys. Counting ROWS would render one skewed worker as two and put
+    /// a wrong number in the alert summary, so the count is per distinct
+    /// `worker_id`.
+    #[test]
+    fn build_skew_gauge_counts_workers_not_rows() {
+        let _g = gauge_guard();
+        let m = install_metrics();
+        let controller = "1.0.0-r400+aaaaaaa";
+
+        // One worker, two active keys, both reporting the same skewed build.
+        publish_worker_build_skew(
+            controller,
+            &[
+                row("w1", Some("0.1.0+bbbbbbb")),
+                row("w1", Some("0.1.0+bbbbbbb")),
+            ],
+        );
+        assert_eq!(m.worker_build_skew_workers.get(), 1);
+
+        // Mid-rotation disagreement: one key already on the controller's build,
+        // the other still stale. The worker is still (partly) skewed — once.
+        publish_worker_build_skew(
+            controller,
+            &[
+                row("w1", Some("0.1.0+aaaaaaa")),
+                row("w1", Some("0.1.0+bbbbbbb")),
+            ],
+        );
+        assert_eq!(m.worker_build_skew_workers.get(), 1);
+
+        // Distinct workers still add up.
+        publish_worker_build_skew(
+            controller,
+            &[
+                row("w1", Some("0.1.0+bbbbbbb")),
+                row("w2", Some("0.1.0+bbbbbbb")),
+            ],
+        );
+        assert_eq!(m.worker_build_skew_workers.get(), 2);
     }
 }

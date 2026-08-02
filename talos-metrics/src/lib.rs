@@ -129,11 +129,20 @@ pub struct TalosMetrics {
     /// key are both caller-supplied at a network endpoint, so neither may
     /// become a label (unbounded cardinality, attacker-driven).
     pub worker_key_tofu_conflicts_total: Counter,
-    /// Number of ACTIVE registered workers whose build provably differs from
-    /// this controller's. A GAUGE, recomputed from a query each sweep (always
-    /// `set`, never `inc`/`dec`) so a worker leaving the fleet or catching up
-    /// lowers it. A counter would be wrong at both ends: it would fire on
-    /// every rolling deploy AND go quiet while a fleet stayed skewed.
+    /// Number of distinct `worker_id`s with an ACTIVE `worker_identities` row
+    /// whose reported build provably differs from this controller's. A GAUGE,
+    /// recomputed from a query each sweep (always `set`, never `inc`/`dec`) so a
+    /// worker catching up, or having its key deactivated, lowers it. A counter
+    /// would be wrong at both ends: it would fire on every rolling deploy AND go
+    /// quiet while a fleet stayed skewed.
+    ///
+    /// ACTIVE means "row not deactivated", NOT "process running": nothing reaps
+    /// the row of a pod that is gone, and `last_seen_at` is boot-only so no age
+    /// filter can tell the two apart. On a fleet whose `worker_id` is the pod
+    /// name (the chart default), retired pods keep this above zero after a
+    /// controller upgrade until an operator deactivates their keys. See
+    /// `controller::bootstrap::background::publish_worker_build_skew`.
+    ///
     /// "Unverifiable" workers are NOT counted here (absence of evidence is
     /// not evidence of skew — #578).
     pub worker_build_skew_workers: IntGauge,
@@ -406,11 +415,13 @@ impl TalosMetrics {
 
         let worker_build_skew_workers = IntGauge::new(
             "talos_worker_build_skew_workers",
-            "ACTIVE registered workers whose build PROVABLY differs from this \
-             controller's (different commit sha, or -dirty on one side only). \
-             Recomputed each sweep, so it falls back to 0 once the fleet \
-             converges. Workers that report no usable sha are 'unverifiable' \
-             and are NOT counted here.",
+            "Distinct worker_ids with an ACTIVE worker_identities row whose \
+             build PROVABLY differs from this controller's (different commit \
+             sha, or -dirty on one side only). Recomputed each sweep, so it \
+             falls back to 0 once the fleet converges OR the stale rows are \
+             deactivated — ACTIVE means 'row not deactivated', not 'process \
+             running', and nothing reaps the row of a departed pod. Workers \
+             that report no usable sha are 'unverifiable' and are NOT counted.",
         )?;
         registry.register(Box::new(worker_build_skew_workers.clone()))?;
 
