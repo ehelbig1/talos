@@ -12,8 +12,9 @@ This directory contains all configuration files for the Talos observability stac
 ```
 observability/
 ├── README.md                           # This file
-├── prometheus.yml                      # Prometheus configuration
-├── alerts.yml                          # Alert rules
+├── prometheus/
+│   └── prometheus.yml                  # Prometheus configuration
+├── alerts.yml                          # WASM/worker alert rules (dev stack)
 └── grafana/
     ├── provisioning/
     │   ├── datasources/
@@ -28,29 +29,115 @@ observability/
 
 ## Files
 
-### prometheus.yml
+### prometheus/prometheus.yml
 
 Prometheus scraping configuration:
-- Scrapes Talos worker every 10 seconds at `/metrics`
+- Scrapes the Talos **controller** every 15 seconds at `/metrics/prometheus`
+- Scrapes every Talos **worker** replica every 10 seconds at `/metrics`
 - Self-monitoring for Prometheus, Grafana, Jaeger
-- Support for Docker Compose and Kubernetes service discovery
 - Global labels for cluster/environment
 
 **Key sections**:
 ```yaml
-global:
-  scrape_interval: 15s
-
 scrape_configs:
-  - job_name: 'talos-worker'
-    scrape_interval: 10s
+  # Every talos_* series lives in the CONTROLLER process.
+  # `/metrics/prometheus` is the scrape route; `/metrics` is a
+  # different, authenticated dashboard route — not this one.
+  - job_name: 'talos-controller'
+    metrics_path: '/metrics/prometheus'
     static_configs:
-      - targets: ['talos-worker:9090']
+      - targets: ['controller:8000']
+
+  # `worker` is the compose SERVICE name. dns_sd (not static) because the
+  # service runs with replicas — an A lookup returns every replica, while a
+  # static target resolves to one arbitrary replica.
+  - job_name: 'talos-worker'
+    bearer_token: 'dev-token'      # matches METRICS_AUTH_TOKENS default
+    dns_sd_configs:
+      - names: ['worker']
+        type: 'A'
+        port: 9090                 # METRICS_PORT default
 ```
+
+> **Before 2026-08-02 this file scraped nothing of Talos.** There was no
+> controller job at all, and the worker job was wrong three ways at once
+> (host `talos-worker` does not resolve, port 9091 vs the real 9090 default,
+> bearer `dev-metrics-token` vs the real `dev-token`). Structural lint
+> **check 65** now fails the build if a job an alert selects on via
+> `up{job="…"}` is missing, if a `rule_files` entry no compose file mounts,
+> or if an alert references a `talos_*` metric no Rust source registers.
+> There is a fourth direction, 65(d): no alert name may be defined in more
+> than one mounted rule file. Read check 65's header in
+> `scripts/lint-structural.sh` for its six stated limits before relying on it. 65(b) is now enforced **per compose file**, so
+> dropping this stack's rule mounts fails the lint; the remaining documented
+> holes are a glob `rule_files` entry (rejected though Prometheus allows it),
+> extra scrape jobs no alert selects on, mount mode (`:rw` passes), and
+> `wasm_*` metrics (65(c) only inspects `talos_*`).
+
+**Note on the two stacks.** Only `docker-compose.yml` can exercise these
+alerts: its Prometheus shares `talos-network` with the controller and worker.
+`docker-compose.observability.yml`, run standalone as its header documents,
+has only the `observability` bridge and no Talos service (the worker entry is
+commented out), so `controller:8000` and the `worker` A-record do not resolve
+and no `talos_*` series is collected there. Both stacks also bind host `:9090`
+and the container name `talos-prometheus`, so they cannot run at once.
+
+### Alert rules
+
+Two rule files are mounted into the container at `/etc/prometheus/rules/`:
+
+| Mounted as | Source | Covers |
+|---|---|---|
+| `wasm-alerts.yml` | `observability/alerts.yml` | WASM runtime / worker (11 rules) |
+| `talos-alerts.yaml` | `deploy/helm/talos/files/alerts.yaml` | Controller `talos_*` invariants (26 rules) |
+
+`talos-alerts.yaml` is **bind-mounted, never copied** — it is the same file the
+chart's `PrometheusRule` embeds via `.Files.Get`, so the dev rules and the
+production CRD cannot drift. (`deploy/observability/alerts.yaml` is a symlink to
+it for the same reason.)
+
+**Five `talos_*` series named by these alerts are absent from a healthy
+controller's `/metrics/prometheus`** (verified 2026-08-02 against the live
+endpoint): `talos_auth_attempts_total`, `talos_auth_failures_total`,
+`talos_kek_decrypt_failures_total`, `talos_memory_write_failures_total`,
+`talos_module_payload_encryption_failures_total`. All five are registered in
+`talos-metrics`, so structural check 65(c) passes — but they are labelled
+`CounterVec`s with no pre-seeded label combination, and a prometheus `*Vec`
+exports nothing until some label set is first touched. That is NOT the same as
+"the alert can never fire" (an `increase(...) > 0` rule fires once the series
+appears and has two samples), but it does mean "detector absent" and "detector
+present and quiet" are indistinguishable on a healthy stack. Deliberately not
+pre-seeded here: `talos_auth_failures_total{method,reason}` has an open reason
+set, and #623's own rule is that seeding a label combination nothing writes
+"would imply a wired signal that doesn't exist". Filed as follow-up, not fixed
+in this change. (The five #623 detectors added in that PR — `talos_wasm_log_
+orphaned_total` etc. — ARE seeded and do appear.)
+
+`TalosWorkerDown` is defined **once**, in `talos-alerts.yaml`. Until 2026-08-02
+`observability/alerts.yml` carried a second copy (`for: 1m`, `component=worker`
+vs the canonical `for: 2m`, `category=availability`). That was invisible while
+`docker-compose.yml` mounted no rules at all; mounting both files loaded both
+copies and fired both on one worker outage — observed live. Alertmanager cannot
+dedup them because the label sets differ, so it is two pages and two
+contradictory runbook pointers for one incident. The dev copy was deleted and
+structural lint **check 65(d)** now fails on any alert name defined in more than
+one mounted rule file.
 
 ### alerts.yml
 
-Production-ready alert rules (12 total):
+WASM/worker alert rules (11 total).
+
+> **These are not currently exercisable, even though `up{job="talos-worker"}`
+> is now 1.** Verified 2026-08-02 by scraping the live worker: its
+> `/metrics` returns `target_info` and nothing else. The instruments behind
+> these alerts are real (`talos-worker-runtime/src/metrics.rs` declares
+> `wasm.executions.total`, `wasm.errors.total`, …), but the OTEL Prometheus
+> exporter emits an instrument only after its first recorded measurement, so
+> on an idle worker every `wasm_*` series is ABSENT rather than zero. A green
+> target here means "reachable", not "producing the series the rules need" —
+> and structural check 65 cannot see the difference, because 65(c) only
+> inspects `talos_*` names.
+
 
 **Performance Alerts** (5):
 - HighWASMErrorRate (> 0.1 errors/sec)
@@ -64,9 +151,12 @@ Production-ready alert rules (12 total):
 - TooManyActiveInstances (> 500)
 - HighRetryRate (> 0.5 retries/sec)
 
-**Service Health Alerts** (3):
-- TalosWorkerDown
-- PrometheusScrapeFailure
+**Service Health Alerts** (1):
+- PrometheusScrapeFailure (any target down > 5m — broader than the per-job
+  `TalosWorkerDown`/`TalosControllerDown`, which live in `talos-alerts.yaml`)
+
+**Throughput Alerts** (2):
+- LowWASMThroughput (< 10 executions/sec)
 - NoWASMExecutions (30 min idle)
 
 ### grafana/provisioning/datasources/datasources.yml
@@ -137,7 +227,7 @@ docker exec talos-prometheus kill -HUP 1
 
 ### Modify Scrape Interval
 
-Edit `prometheus.yml`:
+Edit `prometheus/prometheus.yml`:
 
 ```yaml
 scrape_configs:
@@ -253,14 +343,18 @@ docker-compose -f docker-compose.observability.yml restart grafana
 
 If target is DOWN:
 ```bash
-# Check if worker is running and exposing metrics
-curl http://localhost:9090/metrics
+# Check the worker is running and exposing metrics. The worker's metrics port
+# is NOT published to the host (host :9090 is Prometheus itself), so probe it
+# from inside the network — and send the bearer token or you get a 401.
+docker compose exec worker \
+  wget -qO- --header 'Authorization: Bearer dev-token' http://localhost:9090/metrics | head
 
 # Check Prometheus logs
 docker logs talos-prometheus | tail -50
 
-# Verify network
-docker network inspect observability_observability
+# Verify network (docker-compose.yml stack; the observability stack's net
+# is <project>_observability instead)
+docker network inspect talos_talos-network
 ```
 
 ### Grafana Dashboard Shows No Data
@@ -300,5 +394,5 @@ docker logs talos-prometheus | grep -i alert
 
 ---
 
-**Last Updated**: 2026-02-17
+**Last Updated**: 2026-08-02
 **Maintained By**: Talos Team

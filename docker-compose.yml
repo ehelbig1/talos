@@ -913,6 +913,24 @@ services:
       - "127.0.0.1:9090:9090"
     volumes:
       - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # Rule files. Until 2026-08-02 this service mounted NO rules at all while
+      # prometheus.yml still named `alerts.yml` — Prometheus globs rule_files,
+      # so the missing file loaded zero groups silently and the stack looked
+      # alert-capable while `/api/v1/rules` returned `{"groups":[]}`.
+      #
+      # talos-alerts.yaml is the canonical chart file, bind-mounted (NOT copied)
+      # so the dev rules and the PrometheusRule CRD can never drift apart —
+      # deploy/observability/alerts.yaml symlinks the same file for the same
+      # reason.
+      #
+      # Structural lint check 65(b) resolves every rule_files entry through a
+      # compose bind mount to a file on disk, SEPARATELY FOR EACH compose file
+      # that mounts this shared prometheus.yml. Deleting the two lines below
+      # fails the lint even though docker-compose.observability.yml still has
+      # them — that per-stack gap is exactly the pre-2026-08-02 shape, and a
+      # first-match check would have passed it.
+      - ./observability/alerts.yml:/etc/prometheus/rules/wasm-alerts.yml:ro
+      - ./deploy/helm/talos/files/alerts.yaml:/etc/prometheus/rules/talos-alerts.yaml:ro
       - prometheus_data:/prometheus
     networks:
       - talos-network

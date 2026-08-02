@@ -1,5 +1,29 @@
-# Talos Observability Stack
-# Includes: Prometheus, Grafana, Jaeger for full observability
+# Talos Observability Stack — STANDALONE, and SUPERSEDED for Talos work.
+# Includes: Prometheus, Grafana, Jaeger.
+#
+# READ THIS BEFORE USING IT (2026-08-02).
+# `docker-compose.yml` already runs the same three services, on the same
+# `talos-network` as the controller and worker. This file duplicates them with
+# the SAME container names (talos-prometheus / talos-grafana / talos-jaeger) and
+# the SAME host ports, so the two stacks are mutually exclusive — you cannot run
+# both — and this one is an ALTERNATIVE, not a companion.
+#
+# It cannot observe Talos. Its only network is the `observability` bridge and
+# its only Talos service (the worker) is commented out at the bottom, so the
+# `talos-controller` job in the shared observability/prometheus/prometheus.yml
+# is RED BY CONSTRUCTION here and the `worker` A-record resolves to nothing.
+# That is pre-existing — before 2026-08-02 this stack had TWO permanently-red
+# Talos targets (talos-worker:9091 and host.docker.internal:9091); it now has
+# one. It was deliberately NOT "fixed" by forking prometheus.yml: a second copy
+# of the scrape config is exactly the drift the 2026-08-02 change exists to
+# prevent, and no network wiring makes `controller:8000` resolve here without
+# breaking the standalone usage this header documents.
+#
+# ⇒ For anything that needs to see `talos_*` metrics or exercise an alert, use
+#   `docker-compose.yml`. Use this file only for a Talos-free Prometheus /
+#   Grafana / Jaeger sandbox, and expect the Talos scrape job to be red.
+#   Retiring it (it is referenced by nothing but this README) is filed as a
+#   separate change; deleting a stack file was out of scope for that review.
 #
 # Usage:
 #   docker-compose -f docker-compose.observability.yml up -d
@@ -23,7 +47,25 @@ services:
     volumes:
       # The correct Prometheus config resides in ./observability/prometheus/prometheus.yml
       - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+      # Both compose files share the SAME prometheus.yml, so both must mount the
+      # rule files at the paths its rule_files entries name — enforced per-stack
+      # by structural lint check 65(b) since the 2026-08-02 review (it used to
+      # pass if EITHER file provided the mount, which is the pre-fix shape).
+      # This stack already mounted the WASM rules (at the old
+      # /etc/prometheus/alerts.yml path), so it loaded 12 groups where
+      # docker-compose.yml loaded zero; the canonical controller rules were
+      # missing here too, and are added below so the paths stay in step.
+      #
+      # Being honest about what that does and does not buy: mounting the rules
+      # here does NOT make any `talos_*` alert exercisable on THIS stack. Used
+      # as this file's header documents (standalone), its only network is the
+      # `observability` bridge — the controller and worker live on
+      # docker-compose.yml's `talos-network`, and the sole Talos service here is
+      # commented out — so `controller:8000` and the `worker` A-record do not
+      # resolve and no `talos_*` series is ever collected. The stack that can
+      # actually exercise these alerts is docker-compose.yml.
+      - ./observability/alerts.yml:/etc/prometheus/rules/wasm-alerts.yml:ro
+      - ./deploy/helm/talos/files/alerts.yaml:/etc/prometheus/rules/talos-alerts.yaml:ro
       - prometheus-data:/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'

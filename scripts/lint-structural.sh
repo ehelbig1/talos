@@ -4696,6 +4696,394 @@ if [ "$CI_GATE_FAIL" = "1" ]; then
 fi
 echo
 
+# ── 65: the dev Prometheus must actually observe Talos ────────────────
+bold "▶ check 65: dev Prometheus scrapes Talos and its rule files resolve"
+
+# 2026-08-02: the local observability stack observed NOTHING of Talos and
+# loaded ZERO alert rules, while looking fully configured from the outside.
+# Three independent defects, none of which any existing gate could see:
+#
+#   * `observability/prometheus/prometheus.yml` had no controller job at
+#     all — and EVERY `talos_*` series lives in the controller process. So
+#     the 26 alerts in the chart's canonical rules could not be exercised
+#     locally before shipping, which is how #618/#620/#623 each landed
+#     detectors nobody could test.
+#   * `rule_files: ['alerts.yml']` named a file docker-compose.yml never
+#     mounted. Prometheus treats every rule_files entry as a GLOB, so a
+#     literal path matching nothing expands to zero files and loads zero
+#     groups WITHOUT an error or a warning. `/api/v1/rules` returned
+#     `{"groups":[]}` on a stack whose config listed a rules file.
+#   * the worker job was broken three ways at once (host `talos-worker`
+#     does not resolve, port 9091 vs the real 9090 default, bearer
+#     `dev-metrics-token` vs the real `dev-token`) and held `up` at 0.
+#
+# The fixes are a snapshot; this check is the gate — a sweep is not a gate
+# (check 64's lesson). Four directions:
+#
+#  (a) SELECTOR AGREEMENT. Every `up{job="X"}` an alert selects on must be
+#      declared as a `job_name: X` in prometheus.yml. Derived from the
+#      ALERTS (the consumer) rather than a hardcoded job list, so adding an
+#      alert that selects `up{job="…"}` for a job nothing scrapes fails
+#      here. The controller job must also scrape `/metrics/prometheus`, NOT
+#      `/metrics` — the latter is a different, authenticated dashboard
+#      route behind the GraphQL proxy.
+#  (b) RULE FILES RESOLVE, IN EVERY STACK. Every rule_files entry is
+#      resolved through the compose bind mounts to a real file in this repo
+#      (config entry → mount → file on disk), separately for EACH compose
+#      file that mounts this shared prometheus.yml. Per-file, not
+#      first-match: the motivating bug was a per-stack gap
+#      (docker-compose.observability.yml mounted `alerts.yml`,
+#      docker-compose.yml did not), so a check satisfied by any one stack
+#      would have passed the tree it exists to reject.
+#  (c) ALERTED-BUT-NEVER-REGISTERED. Every `talos_*` metric named in an
+#      alert EXPRESSION must appear as a quoted string in some .rs file.
+#      The natural extension of check 58: 58 finds registered-but-never-
+#      incremented, this finds alerted-but-never-registered. Only `expr:`
+#      blocks are scanned — comments and annotation prose mention names
+#      like `talos_auth`/`talos_metrics` that are crate paths, not series.
+#  (d) ONE DEFINITION PER ALERT NAME across the mounted rule files.
+#      Prometheus does not dedup by name; two definitions fire twice on one
+#      event and Alertmanager cannot merge them when the label sets differ.
+#      Added during the 2026-08-02 review after mounting both files exposed
+#      a long-latent duplicate `TalosWorkerDown` (1m vs 2m) firing twice.
+#
+# LIMITS, stated rather than implied — overstating a lint is the same
+# defect one level up (check 58 learned this the expensive way):
+#   * (b) knows only about compose files it is TOLD to look at — the two
+#     named in PROM_COMPOSE below. A third STACK mounting this same
+#     prometheus.yml would not be checked until it is added to that list.
+#     (A third RULE FILE needs no such edit: the scanned rule-file set is
+#     derived from rule_files + the mounts, so (a)/(c)/(d) pick it up.)
+#     (Until 2026-08-02 review, (b) also stopped at the FIRST compose file
+#     providing a mount, which meant it PASSED the pre-fix tree that
+#     motivated it; it now requires every listed stack to provide every
+#     entry, and the battery mutation "delete only docker-compose.yml's two
+#     mount lines" fails the check.)
+#   * (b) is a static text match on the compose bind-mount syntax
+#     `- ./host:/container[:ro]`. A mount expressed in long form
+#     (`type: bind` / `source:` / `target:`), through `extends`, or via an
+#     env-var-interpolated path is invisible to it and reads as missing —
+#     the safe direction (it fails loudly), but worth knowing before
+#     rewriting a compose file.
+#   * (b) rejects a GLOB rule_files entry (`- '/etc/prometheus/rules/*.yml'`)
+#     even though Prometheus supports it, because a glob names no single
+#     mount to resolve. Verified 2026-08-02: the glob form fails the check.
+#     That is a false POSITIVE (loud), not a hole — but if the config ever
+#     needs a glob, (b) has to learn to expand it against the mount set
+#     rather than the entry being "worked around" with an opt-out.
+#   * (a) matches the literal single-line, double-quoted `up{…job="X"…}`
+#     form only. A job selector on a non-`up` series, a single-quoted
+#     `job='X'`, or a selector split across lines of a block-scalar `expr:`
+#     is invisible to it.
+#   * (a) checks that every job an ALERT NEEDS exists. It says nothing about
+#     jobs no alert selects: a redundant/incorrect extra scrape job (e.g. a
+#     second controller job under a different name hitting the wrong path)
+#     passes, because the `metrics_path` probe is keyed to the literal
+#     `talos-controller` job name. Verified 2026-08-02.
+#   * NOTHING here checks the mount MODE. A rule file bind-mounted `:rw`
+#     instead of `:ro` passes (verified 2026-08-02). Prometheus only reads
+#     them, so this is hygiene rather than function — but it means the `:ro`
+#     on the canonical chart file is convention, not an enforced invariant.
+#   * (a) reads job declarations and the controller `metrics_path` out of
+#     prometheus.yml textually. The metrics_path probe is scoped to the
+#     controller job's OWN block (its `job_name` line up to the next
+#     `job_name`); it was a fixed `grep -A12` window until the 2026-08-02
+#     review, which was exploitable in the UNSAFE direction — proven by
+#     mutation: controller on '/metrics' plus a NEIGHBOUR job on
+#     '/metrics/prometheus' passed. It still never checks that a declared
+#     target actually RESOLVES — `up == 1` is the live stack's job, not the
+#     lint's.
+#   * (c)'s "registered" evidence is any quoted `"talos_x"` string anywhere
+#     in any .rs file — INCLUDING test files and test modules, which check
+#     58 deliberately strips and this one does not. A metric named only by
+#     a test therefore reads as registered. PROVEN, not inferred: on
+#     2026-08-02 an alert on `talos_only_named_by_a_test_total` failed the
+#     check, and adding that literal inside a `#[cfg(test)] mod` — and
+#     nowhere else — made it pass. Conversely a name assembled at runtime
+#     (`format!`/`concat!`) reads as unregistered; that direction is safe
+#     (it fails loudly), and it also means an OTEL-style instrument
+#     declared with dots (`talos.foo.total`) would read as unregistered
+#     even though the Prometheus exporter renders it `talos_foo_total`.
+#   * (c) only inspects `talos_*` names. The 11 dev-stack alerts in
+#     observability/alerts.yml are built entirely on `wasm_*` series
+#     (exported by the worker's OTEL instruments, which are spelled
+#     `wasm.executions.total` etc. in Rust), so they get NO coverage from
+#     any direction of this check.
+#
+# Opt-out (c) only: `# allow-unobserved-metric: <reason naming the series>`
+# anywhere in ANY scanned rule file, for a series produced outside Rust (e.g. a
+# node_exporter textfile written by a shell drill). PLACEMENT IS IRRELEVANT
+# and the marker is file-global — deliberately not a proximity heuristic
+# (see the longer note at the match site). The reason text MUST contain the
+# metric name, optionally with a trailing `*` prefix wildcard; a marker
+# that names no `talos_*` series excuses nothing and the check still fails.
+# There is no opt-out for (a), (b) or (d): a job an alert needs but nothing
+# scrapes, a rules file that resolves to nothing, and one alert name defined
+# twice are each the defect itself and have no legitimate form.
+PROM_CFG="$ROOT/observability/prometheus/prometheus.yml"
+# NOTE: observability/alerts.yml is deliberately NOT named here. The scanned
+# rule-file set is DERIVED from rule_files + the compose mounts (see below), so
+# that file is picked up because it is mounted, and a third rule file added the
+# same way is picked up too. Only the canonical chart file is named explicitly:
+# it ships to clusters via the PrometheusRule whether or not dev mounts it.
+PROM_RULES_CANON="$ROOT/deploy/helm/talos/files/alerts.yaml"
+PROM_FAIL=0
+
+if [ ! -f "$PROM_CFG" ]; then
+    yellow "⚠ $PROM_CFG not found — skipping dev-Prometheus check"
+else
+    # ── (b) runs FIRST because it also DISCOVERS the file set ──────────
+    # (a), (c) and (d) all scan "the mounted rule files". Naming those files
+    # in a hardcoded list would make the scan a SNAPSHOT of today's two —
+    # add a third rule file, mount it in both stacks and name it in
+    # rule_files, and every one of those directions would silently skip it
+    # while (b) happily reported the entry as resolved. That is check 64's
+    # lesson inside check 65, so the set is DERIVED: whatever the config
+    # names and the compose files mount is what gets scanned. The canonical
+    # chart file is always added, mounted or not — it ships to clusters via
+    # the PrometheusRule regardless of what the dev stack does with it.
+    PROM_RESOLVED=""
+    # Collect container→host bind mounts from every compose file that
+    # mounts this prometheus.yml, so each entry is validated end to end.
+    PROM_COMPOSE=()
+    for c in "$ROOT/docker-compose.yml" "$ROOT/docker-compose.observability.yml"; do
+        [ -f "$c" ] && grep -q 'observability/prometheus/prometheus.yml' "$c" && PROM_COMPOSE+=("$c")
+    done
+    if [ "${#PROM_COMPOSE[@]}" -eq 0 ]; then
+        yellow "⚠ no compose file mounts prometheus.yml — skipping rule_files resolution"
+    else
+        # rule_files entries: the indented list items under `rule_files:`.
+        RULE_ENTRIES="$(awk '
+            /^rule_files:/ { inrf=1; next }
+            inrf && /^[^[:space:]#]/ { inrf=0 }
+            inrf && /^[[:space:]]*-[[:space:]]*/ {
+                line=$0
+                sub(/^[[:space:]]*-[[:space:]]*/,"",line)
+                gsub(/^['"'"'"]|['"'"'"][[:space:]]*$/,"",line)
+                sub(/[[:space:]]*#.*$/,"",line)
+                if (line != "") print line
+            }
+        ' "$PROM_CFG")"
+        if [ -z "$RULE_ENTRIES" ]; then
+            red "✗ prometheus.yml declares no rule_files entries — no alerts would load"
+            yellow "  → the canonical rules are deploy/helm/talos/files/alerts.yaml; mount and name them."
+            PROM_FAIL=1
+        fi
+        while IFS= read -r entry; do
+            [ -n "$entry" ] || continue
+            # Prometheus resolves a relative entry against the config's directory.
+            case "$entry" in
+                /*) cpath="$entry" ;;
+                *)  cpath="/etc/prometheus/$entry" ;;
+            esac
+            # EVERY compose file that mounts this shared prometheus.yml must
+            # provide the mount — not merely one of them. A first-match
+            # `break` here would have PASSED the very tree that motivated
+            # this check: docker-compose.observability.yml mounted
+            # `alerts.yml` while docker-compose.yml (the only stack that can
+            # reach Talos) did not, so the entry resolved "somewhere" and the
+            # dev stack still loaded zero groups. The config is shared; the
+            # mounts that satisfy it must be too, or the two stacks disagree
+            # about what the same file means.
+            missing_in=""
+            for c in "${PROM_COMPOSE[@]}"; do
+                # Match `- ./host/path:/container/path[:ro]` on the container path.
+                m="$(grep -oE "\.[^:[:space:]]*:${cpath}(:[a-z,]+)?[[:space:]]*$" "$c" | head -1 || true)"
+                if [ -z "$m" ]; then
+                    missing_in="$missing_in $(basename "$c")"
+                    continue
+                fi
+                # Validate each stack's own host path independently: two
+                # compose files may name different sources for one entry.
+                hp="${m%%:*}"
+                if [ ! -f "$ROOT/${hp#./}" ]; then
+                    red "✗ rule_files entry '$entry': $(basename "$c") mounts it from '$hp', which does not exist"
+                    yellow "  → the mount points at a missing file; Prometheus would load zero groups."
+                    PROM_FAIL=1
+                else
+                    PROM_RESOLVED="$PROM_RESOLVED
+$ROOT/${hp#./}"
+                fi
+            done
+            if [ -n "$missing_in" ]; then
+                red "✗ rule_files entry '$entry' is not mounted by:$missing_in"
+                yellow "  → no bind mount there provides '$cpath'. Prometheus GLOBS rule_files,"
+                yellow "    so this silently loads ZERO rule groups instead of failing — the exact"
+                yellow "    defect this check exists for. Every compose file that mounts"
+                yellow "    observability/prometheus/prometheus.yml shares its rule_files list and"
+                yellow "    must satisfy all of it. Add the mount, or drop the entry."
+                PROM_FAIL=1
+            fi
+        done <<< "$RULE_ENTRIES"
+    fi
+
+    # Scan set = every rule file actually reachable through a mount, plus the
+    # canonical chart file (which ships whether or not dev mounts it).
+    PROM_RULE_FILES=()
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        [ -f "$f" ] || continue
+        case "
+${PROM_RULE_FILES[*]:-}" in *"$f"*) continue ;; esac
+        PROM_RULE_FILES+=("$f")
+    done <<< "$PROM_RESOLVED
+$PROM_RULES_CANON"
+    if [ "${#PROM_RULE_FILES[@]}" -eq 0 ]; then
+        yellow "⚠ no Prometheus rule files found — skipping dev-Prometheus check"
+    else
+        # ── (d) no alert name defined in more than one mounted file ────
+        # Prometheus loads every rule_files match independently and does NOT
+        # dedup by alert name, so a name defined in two mounted files becomes
+        # TWO alerting rules. They fire together on one event and Alertmanager
+        # cannot merge them when their label sets differ — two pages, two `for`
+        # windows, two contradictory runbooks for one incident.
+        # Found live 2026-08-02: `TalosWorkerDown` existed in BOTH
+        # observability/alerts.yml (for: 1m, component=worker) and the canonical
+        # deploy/helm/talos/files/alerts.yaml (for: 2m, category=availability).
+        # It was harmless only while docker-compose.yml mounted NO rules at all;
+        # mounting both surfaced it immediately, with both copies observed
+        # `firing` on a single worker outage. Fixing the mounts without gating
+        # this would just re-arm it. Duplicates WITHIN one file are Prometheus's
+        # own problem and are not checked here.
+        if [ "${#PROM_RULE_FILES[@]}" -gt 1 ]; then
+            DUP_ALERTS="$(for f in "${PROM_RULE_FILES[@]}"; do
+                    grep -oE '^[[:space:]]*-[[:space:]]*alert:[[:space:]]*[A-Za-z0-9_]+' "$f" \
+                        | sed -E 's/.*alert:[[:space:]]*//' | sort -u
+                done | sort | uniq -d)"
+            for a in $DUP_ALERTS; do
+                red "✗ alert '$a' is defined in more than one mounted rule file"
+                yellow "  → Prometheus loads each rule file independently and does not dedup by"
+                yellow "    name, so both copies fire on one event; Alertmanager cannot merge them"
+                yellow "    when their labels differ. Define it once — the canonical home is"
+                yellow "    deploy/helm/talos/files/alerts.yaml (the file the chart's PrometheusRule"
+                yellow "    embeds); observability/alerts.yml is dev-only WASM/worker rules."
+                PROM_FAIL=1
+            done
+        fi
+
+        # ── (a) every job an alert selects on must be scraped ──────────
+        DECLARED_JOBS="$(grep -oE "job_name:[[:space:]]*'[^']+'|job_name:[[:space:]]*\"[^\"]+\"" "$PROM_CFG" \
+            | sed -E "s/job_name:[[:space:]]*['\"]//; s/['\"]$//" | sort -u)"
+        SELECTED_JOBS="$(grep -ohE 'up\{[^}]*job="[^"]+"' "${PROM_RULE_FILES[@]}" \
+            | grep -oE 'job="[^"]+"' | sed 's/job="//; s/"$//' | sort -u)"
+        for j in $SELECTED_JOBS; do
+            if ! echo "$DECLARED_JOBS" | grep -qx "$j"; then
+                red "✗ alerts select up{job=\"$j\"} but prometheus.yml declares no such job_name"
+                yellow "  → the alert can never fire: \`up\` is only produced for jobs that exist."
+                yellow "    Add a scrape_config with job_name: '$j' to observability/prometheus/prometheus.yml"
+                PROM_FAIL=1
+            fi
+        done
+        # The controller job must use the scrape route, not the dashboard route.
+        # Scoped to the job's OWN block (job_name line → the next job_name line),
+        # NOT a fixed `grep -A12` window. The window version was exploitable in
+        # the UNSAFE direction, proven by mutation 2026-08-02: point the
+        # controller job at '/metrics' and give the NEXT job
+        # '/metrics/prometheus', and the probe passes on the neighbour's line
+        # while the controller scrapes the authenticated dashboard route.
+        if echo "$DECLARED_JOBS" | grep -qx 'talos-controller'; then
+            CTRL_JOB_BLOCK="$(awk "
+                /^[[:space:]]*-[[:space:]]*job_name:[[:space:]]*['\\\"]talos-controller['\\\"]/ { inblk=1; next }
+                inblk && /^[[:space:]]*-[[:space:]]*job_name:/ { inblk=0 }
+                inblk { print }
+            " "$PROM_CFG")"
+            if ! echo "$CTRL_JOB_BLOCK" \
+                 | grep -qE "^[[:space:]]*metrics_path:[[:space:]]*['\"]/metrics/prometheus['\"]"; then
+                red "✗ the talos-controller job does not scrape metrics_path '/metrics/prometheus'"
+                yellow "  → '/metrics' is a DIFFERENT, authenticated dashboard route served through"
+                yellow "    the GraphQL proxy; only '/metrics/prometheus' emits the talos_* series."
+                PROM_FAIL=1
+            fi
+        fi
+
+
+        # ── (c) alerted-but-never-registered talos_* metrics ───────────
+        # Scan `expr:` blocks only (block scalars included), stopping at the
+        # next sibling key, so annotation prose and comments are excluded.
+        ALERT_METRICS="$(awk '
+            /^[[:space:]]*expr:[[:space:]]*/ {
+                inexpr=1
+                line=$0
+                sub(/^[[:space:]]*expr:[[:space:]]*/,"",line)
+                if (line != "|" && line != "|-" && line != ">" && line != ">-") print line
+                next
+            }
+            inexpr && /^[[:space:]]*(for|labels|annotations|record|alert):[[:space:]]*/ { inexpr=0 }
+            inexpr && /^[[:space:]]*-[[:space:]]*alert:/ { inexpr=0 }
+            inexpr { print }
+        ' "${PROM_RULE_FILES[@]}" | grep -oE '\btalos_[a-z0-9_]+' | sort -u || true)"
+        # ONE pass over the Rust sources collecting every quoted `talos_*`
+        # string literal, rather than a workspace grep per alert metric.
+        # `target/` MUST be excluded: it is ~96 GB of build output on a warm
+        # tree, and a name matched inside a vendored or generated source there
+        # would also count as "registered" when nothing in this repo registers
+        # it. (Learned the slow way while writing this check — the first draft
+        # ran 18 unscoped `grep -r` passes and had not finished after 10min.)
+        # Metrics explicitly excused from (c) because their producer is not
+        # Rust. Parsed from `allow-unobserved-metric:` markers, which must
+        # name the series (trailing `*` = prefix wildcard).
+        METRIC_EXEMPTIONS="$(grep -h 'allow-unobserved-metric' "${PROM_RULE_FILES[@]}" 2>/dev/null \
+            | grep -oE 'talos_[a-z0-9_]*\*?' | sort -u || true)"
+        REGISTERED_METRICS="$(grep -rhoE '"talos_[a-z0-9_]+"' \
+            --include='*.rs' \
+            --exclude-dir=target \
+            --exclude-dir=.git \
+            "$ROOT" 2>/dev/null | tr -d '"' | sort -u || true)"
+        for m in $ALERT_METRICS; do
+            # Histograms/summaries expose _bucket/_sum/_count suffixes that are
+            # generated by the client library, not registered under that name.
+            base="$m"
+            case "$m" in
+                *_bucket) base="${m%_bucket}" ;;
+                *_sum)    base="${m%_sum}" ;;
+                *_count)  base="${m%_count}" ;;
+            esac
+            if echo "$REGISTERED_METRICS" | grep -qx "$base"; then
+                continue
+            fi
+            # Opt-out for series produced outside Rust (textfile collectors
+            # etc.). The marker must NAME the metric it excuses — a trailing
+            # `*` is a prefix wildcard, e.g.
+            #   # allow-unobserved-metric: talos_backup_drill_* is written by …
+            # Deliberately NOT a proximity heuristic ("marker within N lines
+            # of the alert"): proximity silently excuses whatever metric a
+            # LATER edit happens to add nearby, which is the same
+            # blast-radius-by-accident this whole check exists to prevent.
+            # (The first draft of this opt-out was proximity-based and did not
+            # match at all — it failed loudly, which is the correct direction.)
+            if [ -n "$METRIC_EXEMPTIONS" ]; then
+                exempt=0
+                while IFS= read -r ex; do
+                    [ -n "$ex" ] || continue
+                    case "$ex" in
+                        *\*) [ "${m#"${ex%\*}"}" != "$m" ] && exempt=1 ;;
+                        *)   [ "$m" = "$ex" ] && exempt=1 ;;
+                    esac
+                    [ "$exempt" -eq 1 ] && break
+                done <<< "$METRIC_EXEMPTIONS"
+                [ "$exempt" -eq 1 ] && continue
+            fi
+            red "✗ alert expression references '$m', which no Rust source registers"
+            yellow "  → an alert on an unregistered series NEVER fires — the read-side twin of"
+            yellow "    check 58 (registered but never incremented). Either register the metric,"
+            yellow "    fix the name, or — if it is produced outside Rust (e.g. a node_exporter"
+            yellow "    textfile) — add a comment in the rule file reading"
+            yellow "    '# allow-unobserved-metric: $m is …'. The marker must NAME the series"
+            yellow "    (trailing '*' = prefix wildcard); placement does not matter, it is"
+            yellow "    matched file-globally, and a marker naming no talos_* series excuses"
+            yellow "    nothing."
+            PROM_FAIL=1
+        done
+    fi
+fi
+
+if [ "$PROM_FAIL" -eq 1 ]; then
+    EXIT_CODE=1
+else
+    green "✓ dev Prometheus scrapes every alerted job, rule files resolve, alert metrics are registered"
+fi
+echo
+
 # ── 54. Lint self-consistency (meta-check) ────────────────────────────
 # The system whose purpose is catching drift drifted from its own docs:
 # by 2026-07-01 the script had 49 checks while CLAUDE.md said 43 and the
