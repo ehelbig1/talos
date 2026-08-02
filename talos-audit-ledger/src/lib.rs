@@ -45,7 +45,50 @@ enum VerifyOutcome {
 /// The STATEFUL completeness check (sequence contiguity, chain linkage) is
 /// deliberately NOT here — it needs the full ordered record set and runs
 /// offline via [`talos_audit_event::verify_chain`].
+///
+/// Counts `talos_audit_verification_failures_total{stage="event"}` on every
+/// `Reject`. The count lives HERE rather than at the quarantine site below
+/// because this is the whole classification, it has exactly one production
+/// caller (the ingest batch loop), and it is directly unit-testable — the
+/// quarantine site sits inside a NATS+Postgres batch handler that no test can
+/// drive. A future second caller MUST be a real verification decision, not a
+/// dry run, or it will inflate a CRITICAL alert.
 fn verify_audit_message(
+    event_value: &Value,
+    published_hash: Option<&str>,
+    keys: &[Vec<u8>],
+) -> VerifyOutcome {
+    let outcome = classify_audit_message(event_value, published_hash, keys);
+    if matches!(outcome, VerifyOutcome::Reject(_)) {
+        inc_audit_verification_failure(AUDIT_STAGE_EVENT);
+    }
+    outcome
+}
+
+/// Stage label values for `talos_audit_verification_failures_total`. A closed
+/// set of `&'static str`: `event` is the inline per-message check at ingest,
+/// `chain` the offline hash-chain sweep. No execution id, workflow id, reject
+/// reason or event content is ever a label — `reason` in particular is bounded
+/// today but lives next to caller-shaped data, and the alert routes on stage.
+pub(crate) const AUDIT_STAGE_EVENT: &str = "event";
+pub(crate) const AUDIT_STAGE_CHAIN: &str = "chain";
+
+/// Count one audit-verification failure. Inert (never unwraps) when
+/// `talos_metrics::set_global` has not run, per the `talos_metrics::global`
+/// contract. Written by hand at both stages rather than through a shared
+/// warn-and-count macro — see the detector-metrics block in
+/// `talos_metrics::TalosMetrics` for why a macro would re-blind check 58.
+fn inc_audit_verification_failure(stage: &'static str) {
+    if let Some(m) = talos_metrics::global() {
+        m.audit_verification_failures_total
+            .with_label_values(&[stage])
+            .inc();
+    }
+}
+
+/// The verification decision itself, split from [`verify_audit_message`] so the
+/// counter has one exit point instead of one per `Reject` return.
+fn classify_audit_message(
     event_value: &Value,
     published_hash: Option<&str>,
     keys: &[Vec<u8>],
@@ -641,40 +684,67 @@ pub async fn run_chain_verification_sweep(
 
     stats.scanned = rows.len();
     for (exec_id, wf_id) in rows {
-        match verify_execution_chain(s3_client, bucket, &wf_id.to_string(), &exec_id.to_string())
-            .await
-        {
-            Ok(report) if report.ok => stats.verified_ok += 1,
-            Ok(report) => {
-                stats.failed += 1;
-                // The security signal — one ERROR per broken chain so SIEM
-                // can alert per execution. `breaks` is a structured list.
-                tracing::error!(
-                    target: "talos_audit",
-                    event_kind = "audit_chain_verification_failed",
-                    execution_id = %exec_id,
-                    workflow_id = %wf_id,
-                    total_events = report.total_events,
-                    signatures_checked = report.signatures_checked,
-                    breaks = ?report.breaks,
-                    "audit chain verification FAILED for a completed execution — \
-                     possible tampering, deletion, reorder, or corruption"
-                );
-            }
-            Err(e) => {
-                stats.errored += 1;
-                tracing::warn!(
-                    target: "talos_audit",
-                    event_kind = "audit_chain_verification_errored",
-                    execution_id = %exec_id,
-                    workflow_id = %wf_id,
-                    error = %e,
-                    "could not verify an execution's audit chain (S3/IO) — left unverified"
-                );
-            }
-        }
+        let outcome =
+            verify_execution_chain(s3_client, bucket, &wf_id.to_string(), &exec_id.to_string())
+                .await;
+        record_chain_verification_outcome(&mut stats, outcome, exec_id, wf_id);
     }
     stats
+}
+
+/// Fold ONE chain-verification result into the sweep stats, the operator log,
+/// and `talos_audit_verification_failures_total{stage="chain"}`.
+///
+/// Split out of [`run_chain_verification_sweep`]'s loop so the classification
+/// (and therefore the counter wiring) is unit-testable — the loop itself needs
+/// both Postgres and an S3/WORM endpoint, so nothing could drive it. What this
+/// does NOT prove is that the sweep still CALLS it; that residual is one line
+/// above, and the honest guard for it is the post-merge live check.
+///
+/// Only a chain WITH BREAKS counts. An S3/IO error is `errored`, not `failed`:
+/// "could not read the chain" is not evidence of tampering, and counting it
+/// would make an object-store blip page as a compliance incident (#578 —
+/// unverifiable is not the same as verified-bad). The counter is deliberately
+/// NOT incremented by the on-demand
+/// [`verify_execution_chain_from_env`] operator path either, so repeatedly
+/// re-checking one known-broken chain cannot re-page.
+fn record_chain_verification_outcome(
+    stats: &mut ChainSweepStats,
+    outcome: Result<ChainVerificationReport>,
+    exec_id: Uuid,
+    wf_id: Uuid,
+) {
+    match outcome {
+        Ok(report) if report.ok => stats.verified_ok += 1,
+        Ok(report) => {
+            stats.failed += 1;
+            inc_audit_verification_failure(AUDIT_STAGE_CHAIN);
+            // The security signal — one ERROR per broken chain so SIEM
+            // can alert per execution. `breaks` is a structured list.
+            tracing::error!(
+                target: "talos_audit",
+                event_kind = "audit_chain_verification_failed",
+                execution_id = %exec_id,
+                workflow_id = %wf_id,
+                total_events = report.total_events,
+                signatures_checked = report.signatures_checked,
+                breaks = ?report.breaks,
+                "audit chain verification FAILED for a completed execution — \
+                 possible tampering, deletion, reorder, or corruption"
+            );
+        }
+        Err(e) => {
+            stats.errored += 1;
+            tracing::warn!(
+                target: "talos_audit",
+                event_kind = "audit_chain_verification_errored",
+                execution_id = %exec_id,
+                workflow_id = %wf_id,
+                error = %e,
+                "could not verify an execution's audit chain (S3/IO) — left unverified"
+            );
+        }
+    }
 }
 
 /// Convenience wrapper: build the S3 client + bucket from env and run
@@ -1686,5 +1756,131 @@ mod inline_verify_tests {
             verify_audit_message(&v, Some("x"), &[]),
             VerifyOutcome::Reject("event_deserialize_failed")
         ));
+    }
+}
+
+/// D3 pin for `talos_audit_verification_failures_total`.
+///
+/// Both stages are driven through the REAL production functions the ingest
+/// loop and the sweep call (`verify_audit_message`,
+/// `record_chain_verification_outcome`), and the counter is read back — NOT a
+/// `render_prometheus` shape test, which is the exact thing that let dead
+/// metrics look alive until #620.
+///
+/// Also pins the label VALUES the alert selects on. An alert filtering
+/// `stage="events"` or `stage="chains"` against code that emits `event` /
+/// `chain` is the `provider="both"` defect repeated: a live counter, an alert
+/// that can never fire.
+#[cfg(test)]
+mod audit_verification_metric_tests {
+    use super::*;
+
+    /// `set_global` is a process-wide one-shot `OnceLock` shared with sibling
+    /// tests in this binary, so assert DELTAS read back through
+    /// `talos_metrics::global()`, never absolutes.
+    fn stage_count(stage: &str) -> f64 {
+        talos_metrics::global()
+            .expect("global installed")
+            .audit_verification_failures_total
+            .with_label_values(&[stage])
+            .get()
+    }
+
+    fn ev() -> AuditEvent {
+        AuditEvent {
+            workflow_id: "wf".into(),
+            execution_id: "ex".into(),
+            sequence_num: 1,
+            timestamp: 1,
+            actor: "a".into(),
+            action: "act".into(),
+            payload: "p".into(),
+            previous_hash: "g".into(),
+            hmac_signature: None,
+        }
+    }
+
+    fn report(ok: bool) -> ChainVerificationReport {
+        ChainVerificationReport {
+            execution_id: "ex".into(),
+            workflow_id: "wf".into(),
+            total_events: 3,
+            ok,
+            signatures_checked: true,
+            breaks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn event_stage_counts_on_the_real_ingest_verification_path() {
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+
+        // A rejected message — the ingest loop quarantines this and never
+        // persists it. Nothing but a log recorded it before this counter.
+        let v = serde_json::to_value(ev()).expect("serialize");
+        let before = stage_count(AUDIT_STAGE_EVENT);
+        assert!(matches!(
+            verify_audit_message(&v, Some("deadbeef"), &[]),
+            VerifyOutcome::Reject("hash_mismatch")
+        ));
+        assert_eq!(
+            stage_count(AUDIT_STAGE_EVENT) - before,
+            1.0,
+            "a rejected audit event must reach stage=\"event\""
+        );
+
+        // An ACCEPTED message must not move it — a counter that also counts
+        // the healthy path turns a `> 0` critical alert into a pager loop.
+        let good = ev();
+        let h = good.calculate_hash();
+        let gv = serde_json::to_value(&good).expect("serialize");
+        let before = stage_count(AUDIT_STAGE_EVENT);
+        assert!(matches!(
+            verify_audit_message(&gv, Some(&h), &[]),
+            VerifyOutcome::Accept { .. }
+        ));
+        assert_eq!(stage_count(AUDIT_STAGE_EVENT) - before, 0.0);
+    }
+
+    #[test]
+    fn chain_stage_counts_only_broken_chains_not_unreadable_ones() {
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        let mut stats = ChainSweepStats::default();
+
+        // ok chain → no count.
+        let before = stage_count(AUDIT_STAGE_CHAIN);
+        record_chain_verification_outcome(&mut stats, Ok(report(true)), Uuid::nil(), Uuid::nil());
+        assert_eq!(stage_count(AUDIT_STAGE_CHAIN) - before, 0.0);
+        assert_eq!(stats.verified_ok, 1);
+
+        // broken chain → exactly one count.
+        let before = stage_count(AUDIT_STAGE_CHAIN);
+        record_chain_verification_outcome(&mut stats, Ok(report(false)), Uuid::nil(), Uuid::nil());
+        assert_eq!(
+            stage_count(AUDIT_STAGE_CHAIN) - before,
+            1.0,
+            "a chain WITH breaks must reach stage=\"chain\""
+        );
+        assert_eq!(stats.failed, 1);
+
+        // S3/IO error → `errored`, NOT a verification failure. Counting it
+        // would make an object-store blip page as a compliance incident.
+        let before = stage_count(AUDIT_STAGE_CHAIN);
+        record_chain_verification_outcome(
+            &mut stats,
+            Err(anyhow::anyhow!("s3 unreachable")),
+            Uuid::nil(),
+            Uuid::nil(),
+        );
+        assert_eq!(stage_count(AUDIT_STAGE_CHAIN) - before, 0.0);
+        assert_eq!(stats.errored, 1);
+    }
+
+    /// The two stage labels are exactly what
+    /// `deploy/helm/talos/files/alerts.yaml` selects on.
+    #[test]
+    fn stage_label_values_are_the_ones_the_alerts_select() {
+        assert_eq!(AUDIT_STAGE_EVENT, "event");
+        assert_eq!(AUDIT_STAGE_CHAIN, "chain");
     }
 }

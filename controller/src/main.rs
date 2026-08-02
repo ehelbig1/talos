@@ -406,7 +406,8 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    // Embedding re-probe + crypto-invariant orphan gauges + DB-pool gauges.
+    // Embedding re-probe + crypto-invariant orphan gauges + worker build-skew
+    // gauge + DB-pool gauges.
     spawn_metrics_gauge_tasks(db_pool.clone());
 
     // Seed templates on first run

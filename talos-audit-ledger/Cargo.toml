@@ -35,6 +35,11 @@ serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-config = { path = "../talos-config" }
 talos-audit-event = { path = "../talos-audit-event" }
+# Prometheus counter for the two verification-failure detectors (event-level at
+# ingest, chain-level in the sweep). Both were ERROR logs only, and every alert
+# this platform ships is metric-based. `talos-metrics` is a true leaf (anyhow +
+# prometheus), so this edge cannot introduce a cycle.
+talos-metrics = { path = "../talos-metrics" }
 # For the canonical NATS subject registry (talos.audit.ledger) shared with the
 # worker producer — the ledger is the consumer of this subject.
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }

@@ -7402,6 +7402,7 @@ dependencies = [
  "talos-config",
  "talos-dlp-provider",
  "talos-http-utils",
+ "talos-metrics",
  "talos-secrets-manager",
  "talos-text-util",
  "talos-workflow-job-protocol",
