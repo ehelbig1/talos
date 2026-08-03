@@ -206,4 +206,125 @@ mod tests {
         assert_eq!(normalize_host_function_name("custom::function"), "other");
         assert_eq!(normalize_host_function_name(""), "other");
     }
+
+    // ========================================================================
+    // Exported Prometheus name pinning + idle-seed
+    // ========================================================================
+
+    /// The dot→underscore + `_total` mapping is a PROPERTY OF THE EXPORTER,
+    /// not of anything in this repo, and until 2026-08-02 nothing checked it.
+    /// `opentelemetry-prometheus` appends `_total` to every monotonic counter
+    /// unconditionally, so the three instruments that used to be named
+    /// `wasm.*.total` were exported as `wasm_*_total_total` — and nine of the
+    /// eleven alert rules in `observability/alerts.yml` selected on names the
+    /// worker could not emit under any workload. A behavioural test that only
+    /// asserted "the counter went up" would not have caught it; only the
+    /// rendered exposition text can.
+    ///
+    /// This test is the ground truth structural lint check 65(c) trusts when
+    /// it derives an exported `wasm_*` name from an OTEL declaration. If the
+    /// exporter's suffix rule ever changes under a dependency bump, this
+    /// fails here rather than silently unfiring every WASM alert in
+    /// production.
+    ///
+    /// It also asserts the idle seed: on a cold process that has executed
+    /// NOTHING, the seeded series must be PRESENT and 0. Absent and zero are
+    /// different, and the whole point of `seed_zero_series` is to make the
+    /// idle case the second one.
+    #[test]
+    fn exported_prometheus_names_are_stable_and_idle_seeds_at_zero() {
+        // Installs the global meter provider over `prometheus::default_registry()`.
+        // Safe to do once per test binary; no other test in this module touches it.
+        init_telemetry().expect("telemetry init");
+
+        // Cold process: construct the metrics and record NOTHING.
+        let _m = RuntimeMetrics::new();
+        let cold = get_prometheus_metrics();
+
+        // ── the idle seed ────────────────────────────────────────────────
+        for expected in [
+            r#"wasm_executions_total{status="success""#,
+            r#"wasm_executions_total{status="error""#,
+            r#"wasm_executions_total{status="retry_exhausted""#,
+            "wasm_cache_hits_total{",
+            "wasm_cache_misses_total{",
+        ] {
+            assert!(
+                cold.contains(expected),
+                "idle worker must EXPORT {expected} (at 0), not omit it — \
+                 an absent series silences `rate(...) == 0` alerts.\n{cold}"
+            );
+        }
+        for line in cold.lines() {
+            if line.starts_with("wasm_executions_total{") || line.starts_with("wasm_cache_") {
+                assert!(
+                    line.ends_with(" 0"),
+                    "seeded series must read 0 on a cold process, got: {line}"
+                );
+            }
+        }
+        // Nothing has run, so the started-side counter must NOT have been
+        // seeded into existence: it would claim a dispatch that never happened.
+        assert!(
+            !cold.contains("wasm_executions_started_total"),
+            "wasm.executions.started is deliberately unseeded; a 0 there would \
+             imply a dispatch path was observed when none has run yet:\n{cold}"
+        );
+
+        // ── the exported-name mapping ────────────────────────────────────
+        let m = RuntimeMetrics::new();
+        m.record_execution(1.0, "success");
+        m.record_compilation(1.0, true);
+        m.record_compilation(2.0, false);
+        m.increment_active();
+        m.record_retry("transient_error");
+        m.record_error("timeout");
+        // Written directly on the pub field rather than through a helper,
+        // because that is exactly how the dispatch entry point does it
+        // (`runtime.rs`: `metrics.total_executions.add(1, &[])`). Without
+        // this the started-side counter is never touched, so the name
+        // assertion below has nothing to observe and fails — which is not a
+        // naming bug but a gap in what this block exercises.
+        m.total_executions.add(1, &[]);
+        let out = get_prometheus_metrics();
+
+        // Exactly the spellings observability/alerts.yml and the Grafana
+        // dashboards select on. A counter declared `wasm.x` exports
+        // `wasm_x_total`; a histogram declared `wasm.x` exports
+        // `wasm_x_bucket`/`_sum`/`_count`; an up/down counter and a gauge
+        // export their name unchanged.
+        for expected in [
+            "wasm_executions_total{",             // u64_counter  wasm.executions
+            "wasm_executions_started_total{",     // u64_counter  wasm.executions.started
+            "wasm_errors_total{",                 // u64_counter  wasm.errors
+            "wasm_retries_total{",                // u64_counter  wasm.retries
+            "wasm_cache_hits_total{",             // u64_counter  wasm.cache.hits
+            "wasm_cache_misses_total{",           // u64_counter  wasm.cache.misses
+            "wasm_execution_duration_ms_bucket{", // f64_histogram wasm.execution.duration_ms
+            "wasm_execution_duration_ms_sum{",
+            "wasm_execution_duration_ms_count{",
+            "wasm_instances_active{", // i64_up_down_counter wasm.instances.active
+            "wasm_cache_hit_ratio{",  // f64_gauge    wasm.cache.hit_ratio
+        ] {
+            assert!(
+                out.contains(expected),
+                "expected exported series {expected} — alerts and dashboards \
+                 select on this exact spelling.\n{out}"
+            );
+        }
+
+        // The regression that motivated the rename: NO double suffix.
+        for forbidden in [
+            "wasm_executions_total_total",
+            "wasm_errors_total_total",
+            "wasm_retries_total_total",
+        ] {
+            assert!(
+                !out.contains(forbidden),
+                "instrument name still carries a redundant `total` component; \
+                 the exporter appends its own, producing {forbidden}, which no \
+                 alert rule selects on.\n{out}"
+            );
+        }
+    }
 }

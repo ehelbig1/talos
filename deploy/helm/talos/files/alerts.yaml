@@ -14,6 +14,49 @@
 # or (kube-prometheus-stack):
 #   kubectl -n monitoring create configmap talos-alerts --from-file=alerts.yaml
 #   then reference it from a PrometheusRule CRD.
+#
+# ===========================================================================
+# ABSENCE AUDIT, 2026-08-02 — every rule in this file was re-examined
+# ===========================================================================
+#
+# In PromQL an ABSENT series and a series reading 0 are different, and every
+# idiom used here (`== 0`, `< N`, `> N`, `rate(...) == 0`, `a / b`) treats
+# absence as "no match". A detector can therefore be silenced by exactly the
+# condition it detects. ONE rule in this file had that shape and is fixed:
+# `TalosBackupRestoreDrillFailed`, where a drill that had NEVER run made "no
+# successful drill in 14+ days" unfireable. Its sibling in the dev rules is
+# `NoWASMExecutions` (observability/alerts.yml); read that file's header for
+# the full statement of the class.
+#
+# Every other rule here was left alone deliberately. Three categorical
+# reasons, so they are not restated per rule:
+#
+#   1. THE SERIES CANNOT BE ABSENT. A non-`Vec` prometheus `Counter` or
+#      `IntGauge` is exported from the moment it is registered, so the
+#      orphan gauges, pool gauges, DEK-cache gauge, build-skew gauge and the
+#      plain start-row/TOFU counters always have a sample. `up` is
+#      synthesised for every configured target.
+#   2. THE SERIES CAN BE ABSENT AND THAT IS THE HEALTHY STATE. The alerted
+#      `CounterVec`s (`talos_kek_decrypt_failures_total`,
+#      `talos_memory_write_failures_total`,
+#      `talos_module_payload_encryption_failures_total`,
+#      `talos_auth_*`) are all `> threshold` shapes: no failures, no series,
+#      no alert — correct. These are additionally pre-seeded at 0 in
+#      talos-metrics as of this change, so a dashboard can now distinguish
+#      "detector present and quiet" from "detector deleted" — but note that
+#      the seed proves REGISTRATION, not that the incrementing call site
+#      still exists. Check 58 and the per-metric unit tests are what guard
+#      the call site.
+#   3. THE SERIES ISN'T OURS. `vault_*` and `kube_*` come from Vault and
+#      kube-state-metrics; their absence means "not deployed / not
+#      installed", a topology fact rather than an outage. An `absent()` arm
+#      on those would page `critical` forever on every cluster that
+#      legitimately does not run them. Marked at each site.
+#
+# The rule of thumb this leaves: add an `absent()` arm when the missing
+# series is one TALOS ITSELF is supposed to produce, and never when its
+# absence is a legitimate deployment choice. Keep the severity the arm
+# stands in for.
 groups:
   # ────────────────────────────────────────────────────────────────────
   - name: talos.crypto.invariants
@@ -511,6 +554,17 @@ groups:
     rules:
 
       # Vault's own metric: 1 = sealed, 0 = unsealed. Paging on sealed.
+      #
+      # DELIBERATELY NO `absent()` ARM (2026-08-02 absence audit). Every
+      # other `== 0` in this file was re-examined for the self-silencing
+      # shape; this one is a genuine "absence means not applicable":
+      # `vault_core_unsealed` is Vault's OWN series, and a Talos cluster
+      # running `KEK_PROVIDER=env` (or any posture without Vault) neither
+      # deploys Vault nor scrapes it. An absent arm here would page
+      # `critical` forever on every such cluster for a component it does
+      # not run. "Vault is missing when it should be present" is a
+      # deployment-topology assertion, not a metric one — it belongs to the
+      # chart, not to an alert expression.
       - alert: VaultSealed
         expr: vault_core_unsealed == 0
         for: 2m
@@ -544,6 +598,22 @@ groups:
   - name: talos.controller.health
     interval: 30s
     rules:
+      # DELIBERATELY NO `absent()` ARM — and this is the one `== 0` in the
+      # file where absence is structurally impossible rather than merely
+      # inapplicable. Prometheus synthesises an `up` sample for every
+      # CONFIGURED target on every scrape, so `up{job="talos-controller"}`
+      # cannot be absent while the job exists; it can only be absent if
+      # nothing scrapes the controller at all, which is a CONFIG defect,
+      # not a runtime one. That defect has its own gate: structural lint
+      # check 65(a) fails the build when an alert selects `up` for a job
+      # name prometheus.yml does not declare. Same reasoning applies to
+      # TalosWorkerDown below.
+      #
+      # (Do not write that selector out literally in a comment here: 65(a)
+      # scans the whole rule file, not just `expr:` blocks, so a job name
+      # mentioned in prose reads as selected. Discovered by tripping over
+      # it while writing this very comment. Loud/false-positive direction,
+      # so it is documented in the check rather than "fixed".)
       - alert: TalosControllerDown
         expr: up{job="talos-controller"} == 0
         for: 2m
@@ -582,6 +652,28 @@ groups:
       # first time this alert ever fires here, check `method`/`reason` before
       # concluding "credential stuffing". The break-down below is the first
       # step for exactly that reason.
+      #
+      # DELIBERATELY NO `absent()` ARM (2026-08-02 absence audit). Both legs
+      # can be absent, and in both directions absence is the correct
+      # non-alerting answer:
+      #   - denominator absent  ⇒ no interactive logins were attempted. A
+      #     ratio over an empty population is undefined, not high.
+      #   - numerator absent    ⇒ zero failures. `sum(rate(...))` over an
+      #     absent series yields an empty vector, the division yields empty,
+      #     and nothing fires — which is exactly right.
+      # What absence DOES hide here is a broken numerator: if
+      # `inc_auth_failure` were deleted, this alert would fall silent and
+      # look identical to a healthy stack. That is not fixable from the
+      # expression side (an `absent(failures)` arm would fire on every
+      # healthy deployment), so it is covered from the metric side instead:
+      # `talos_auth_attempts_total{method}` is pre-seeded at 0 for both
+      # emitted methods in talos-metrics, so the DENOMINATOR is always
+      # present and an operator can tell "instrumented and quiet" from
+      # "instrumentation gone". Note precisely what that does and does not
+      # prove: a present denominator shows the auth counters were registered
+      # in this process, NOT that the failure leg is still wired. The guard
+      # for the failure leg is the unit test in talos-auth that drives the
+      # production path and asserts the counter moved.
       - alert: TalosControllerHighErrorRate
         expr: |
           sum(rate(talos_auth_failures_total[5m]))
@@ -632,8 +724,40 @@ groups:
       # requires every alerted talos_* series to be registered in a .rs
       # file, cannot see its producer. The producer is real; only its
       # language is different.
+      # ABSENCE IS NOT ZERO — and here absence is the WORST case.
+      #
+      # Pre-2026-08-02 this was the bare `< (time() - 14*86400)` comparison.
+      # A comparison against an ABSENT series matches nothing, so the alert
+      # whose own description says the drill "has either not run or is
+      # failing" was silenced by the drill never having run: the textfile
+      # never written, the series never created, the selector matching
+      # nothing, no alert. It could only fire for a drill that had once
+      # succeeded and then went stale — never for a cluster where backup
+      # verification was never wired up at all, which is the case an
+      # operator most needs told. Same shape as `NoWASMExecutions` in
+      # observability/alerts.yml; see that file's header.
+      #
+      # The `absent()` arm does NOT change the severity semantics: both arms
+      # are the same warning / ops-hygiene pair, and both mean exactly what
+      # the summary says — there is no evidence of a successful drill in the
+      # last 14 days. `for: 1h` (new; there was no `for` at all) keeps a
+      # cluster that is mid-bring-up from paging before its textfile
+      # collector has published once. An hour is immaterial against a
+      # 14-day threshold and it is not a grace period for the stale arm in
+      # any meaningful sense.
+      #
+      # This WILL fire, permanently, on a cluster that has never run the
+      # drill. That is not a false positive — it is the alert's literal
+      # subject, and it is a `warning` in the ops-hygiene category, not a
+      # page. Silence it by running the drill (or by removing this rule if
+      # the deployment's backups are verified some other way), not by
+      # reverting to an expression that cannot see its own condition.
       - alert: TalosBackupRestoreDrillFailed
-        expr: talos_backup_drill_last_success_timestamp_seconds < (time() - 14*86400)
+        expr: |
+          absent(talos_backup_drill_last_success_timestamp_seconds)
+          or
+          talos_backup_drill_last_success_timestamp_seconds < (time() - 14*86400)
+        for: 1h
         labels:
           severity: warning
           category: ops-hygiene
@@ -642,7 +766,10 @@ groups:
           description: |
             scripts/drills/backup-restore.sh has either not run or is
             failing. A backup you have not restored is a hypothesis —
-            run the drill now.
+            run the drill now. If this fired via the absent() arm the
+            series has NEVER been published: check that the drill script
+            is scheduled at all and that its node_exporter textfile
+            directory is being collected.
 
   # ────────────────────────────────────────────────────────────────────
   # Capacity / saturation. Series come from talos-controller
@@ -690,6 +817,16 @@ groups:
             acquire timeout and requests are failing. See the runbook's
             pool-exhaustion section.
 
+      # DELIBERATELY NO `absent()` ARM — see TalosControllerDown above for
+      # the full reasoning. `up` exists for every configured target, so it
+      # cannot go absent while the job is declared, and "no worker job is
+      # configured" is caught at build time by structural lint check 65(a).
+      #
+      # What this alert does NOT cover, and what this cycle added a separate
+      # detector for: a worker whose scrape SUCCEEDS but whose metrics
+      # pipeline produces nothing. `up == 1` certifies reachability, not
+      # production. That is `WASMMetricsPipelineDead` in
+      # observability/alerts.yml.
       - alert: TalosWorkerDown
         expr: up{job="talos-worker"} == 0
         for: 2m
@@ -708,6 +845,17 @@ groups:
   # ServiceMonitors assume). If you don't run kube-state-metrics, these
   # alerts simply never fire; they are not a hard dependency. Tune the
   # `namespace` / `statefulset` matchers to your release name.
+  #
+  # RE-CONFIRMED in the 2026-08-02 absence audit and DELIBERATELY left
+  # without `absent()` arms: all three expressions below (`== 0`, `< 2`,
+  # `increase(...) > 5`) are silenced by an absent series, and here that is
+  # correct. These series belong to kube-state-metrics, not to Talos, and
+  # their absence means "this cluster does not run kube-state-metrics" or
+  # "this component is not deployed in-cluster" (managed Postgres, no
+  # Vault, no MinIO) — a deployment-topology fact, not an outage. An
+  # absent() arm would page `critical` forever on every such cluster.
+  # Contrast `NoWASMExecutions` / `TalosBackupRestoreDrillFailed`, where the
+  # absent series is one Talos itself is supposed to produce.
   - name: talos.infra.availability
     interval: 30s
     rules:

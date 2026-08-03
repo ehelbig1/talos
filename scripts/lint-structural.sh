@@ -4771,7 +4771,14 @@ bold "▶ check 65: dev Prometheus scrapes Talos and its rule files resolve"
 #     That is a false POSITIVE (loud), not a hole — but if the config ever
 #     needs a glob, (b) has to learn to expand it against the mount set
 #     rather than the entry being "worked around" with an opt-out.
-#   * (a) matches the literal single-line, double-quoted `up{…job="X"…}`
+#   * (a) scans the WHOLE rule file, not just `expr:` blocks (unlike (c)), so
+#     a job name written out in a comment or an annotation counts as
+#     "selected" and must then be declared as a scrape job. Tripped over live
+#     2026-08-02 by a comment in the canonical file that spelled the selector
+#     out while explaining this very check. False-POSITIVE direction (it fails
+#     loudly), so it is documented rather than narrowed — but do not write the
+#     selector form out in prose.
+#   * (a) matches the literal single-line, double-quoted `up{…job=…}`
 #     form only. A job selector on a non-`up` series, a single-quoted
 #     `job='X'`, or a selector split across lines of a block-scalar `expr:`
 #     is invisible to it.
@@ -4997,9 +5004,58 @@ $PROM_RULES_CANON"
         fi
 
 
-        # ── (c) alerted-but-never-registered talos_* metrics ───────────
+        # ── (c) alerted-but-never-registered talos_* / wasm_* metrics ──
         # Scan `expr:` blocks only (block scalars included), stopping at the
         # next sibling key, so annotation prose and comments are excluded.
+        #
+        # `wasm_*` was added 2026-08-02. Until then (c) inspected only
+        # `talos_*`, so the eleven WASM rules in observability/alerts.yml had
+        # ZERO coverage from any direction of this check — and NINE of them
+        # named a series the worker cannot emit under any workload. They had
+        # been written against worker/src/bin/metrics_demo.rs, a demo binary
+        # that fabricates `wasm_*` data into its OWN private registry on the
+        # port this stack's Prometheus used to scrape.
+        #
+        # THE DOT/UNDERSCORE PROBLEM AND HOW IT IS SOLVED. The worker declares
+        # its instruments through OpenTelemetry with DOTS
+        # (`meter.u64_counter("wasm.executions")`), and the Prometheus
+        # exporter renders them with underscores — so the literal-string
+        # evidence that works for `talos_*` finds nothing for `wasm_*`. The
+        # derivation below reproduces the exporter's mapping instead:
+        #
+        #     .  →  _                                          (all kinds)
+        #     monotonic counter: append `_total` UNCONDITIONALLY
+        #
+        # That last word is the whole point and is empirically verified, not
+        # assumed: `opentelemetry-prometheus` 0.32 does NOT check whether the
+        # name already ends in `total`, so `wasm.executions.total` exported as
+        # `wasm_executions_total_TOTAL`. Encoding the rule as "append unless
+        # already present" would have made the pre-fix tree PASS this check —
+        # i.e. the gate would not catch the bug it exists for. The mapping is
+        # pinned from the other side by
+        # `exported_prometheus_names_are_stable_and_idle_seeds_at_zero` in
+        # talos-worker-runtime, so a dependency bump that changes the
+        # exporter's suffix rule breaks a test rather than silently unfiring
+        # every WASM alert.
+        #
+        # LIMITS specific to the wasm_* half, stated rather than implied:
+        #   * Evidence for a `wasm_*` name comes ONLY from an OTEL instrument
+        #     declaration — never from a quoted literal, unlike `talos_*`.
+        #     That is deliberate and is what excludes metrics_demo.rs without
+        #     naming it: that file builds raw `prometheus::Counter`s into a
+        #     private `Registry::new()` that no scrape endpoint serves, so its
+        #     names are evidence of nothing. The cost is that a future
+        #     `wasm_*` series registered directly into the default prometheus
+        #     registry would read as unregistered — a false positive, which is
+        #     the safe direction, and the opt-out below covers it.
+        #   * The constructor and the name must be on ONE line
+        #     (`.u64_counter("wasm.x")`). A declaration split across lines by
+        #     rustfmt reads as no declaration — again the safe direction.
+        #   * `.with_unit(...)` is NOT modelled. The exporter appends a unit
+        #     suffix when a unit is set; nothing in this workspace sets one,
+        #     and if that changes this derivation goes stale in the UNSAFE
+        #     direction (it would keep vouching for the unsuffixed name). The
+        #     pinning test is the tripwire for that, not this grep.
         ALERT_METRICS="$(awk '
             /^[[:space:]]*expr:[[:space:]]*/ {
                 inexpr=1
@@ -5011,7 +5067,7 @@ $PROM_RULES_CANON"
             inexpr && /^[[:space:]]*(for|labels|annotations|record|alert):[[:space:]]*/ { inexpr=0 }
             inexpr && /^[[:space:]]*-[[:space:]]*alert:/ { inexpr=0 }
             inexpr { print }
-        ' "${PROM_RULE_FILES[@]}" | grep -oE '\btalos_[a-z0-9_]+' | sort -u || true)"
+        ' "${PROM_RULE_FILES[@]}" | grep -oE '\b(talos|wasm)_[a-z0-9_]+' | sort -u || true)"
         # ONE pass over the Rust sources collecting every quoted `talos_*`
         # string literal, rather than a workspace grep per alert metric.
         # `target/` MUST be excluded: it is ~96 GB of build output on a warm
@@ -5023,12 +5079,32 @@ $PROM_RULES_CANON"
         # Rust. Parsed from `allow-unobserved-metric:` markers, which must
         # name the series (trailing `*` = prefix wildcard).
         METRIC_EXEMPTIONS="$(grep -h 'allow-unobserved-metric' "${PROM_RULE_FILES[@]}" 2>/dev/null \
-            | grep -oE 'talos_[a-z0-9_]*\*?' | sort -u || true)"
+            | grep -oE '(talos|wasm)_[a-z0-9_]*\*?' | sort -u || true)"
         REGISTERED_METRICS="$(grep -rhoE '"talos_[a-z0-9_]+"' \
             --include='*.rs' \
             --exclude-dir=target \
             --exclude-dir=.git \
             "$ROOT" 2>/dev/null | tr -d '"' | sort -u || true)"
+        # OTEL instrument declarations → the names the Prometheus exporter
+        # actually renders. See the long note above for the mapping and its
+        # limits. Applies to every prefix, but in practice only the worker's
+        # `wasm_*` instruments are declared this way.
+        OTEL_REGISTERED_METRICS="$(grep -rhoE \
+            '\.(u64_counter|f64_counter|u64_up_down_counter|i64_up_down_counter|f64_up_down_counter|u64_gauge|i64_gauge|f64_gauge|u64_histogram|f64_histogram|u64_observable_counter|f64_observable_counter|i64_observable_gauge|f64_observable_gauge)\("[a-z0-9_.]+"' \
+            --include='*.rs' \
+            --exclude-dir=target \
+            --exclude-dir=.git \
+            "$ROOT" 2>/dev/null \
+            | perl -ne '
+                next unless /\.(\w+)\("([a-z0-9_.]+)"/;
+                my ($ctor, $name) = ($1, $2);
+                $name =~ s/\./_/g;
+                # Monotonic counters (NOT up/down counters, which render as
+                # gauges) get `_total` appended by the exporter — always,
+                # even when the name already ends in `total`.
+                $name .= "_total" if $ctor =~ /counter$/ && $ctor !~ /up_down/;
+                print "$name\n";
+            ' | sort -u || true)"
         for m in $ALERT_METRICS; do
             # Histograms/summaries expose _bucket/_sum/_count suffixes that are
             # generated by the client library, not registered under that name.
@@ -5038,9 +5114,21 @@ $PROM_RULES_CANON"
                 *_sum)    base="${m%_sum}" ;;
                 *_count)  base="${m%_count}" ;;
             esac
-            if echo "$REGISTERED_METRICS" | grep -qx "$base"; then
-                continue
-            fi
+            # `wasm_*` is satisfied ONLY by an OTEL declaration (see above);
+            # every other prefix accepts a quoted literal too.
+            case "$base" in
+                wasm_*)
+                    if echo "$OTEL_REGISTERED_METRICS" | grep -qx "$base"; then
+                        continue
+                    fi
+                    ;;
+                *)
+                    if echo "$REGISTERED_METRICS" | grep -qx "$base" \
+                       || echo "$OTEL_REGISTERED_METRICS" | grep -qx "$base"; then
+                        continue
+                    fi
+                    ;;
+            esac
             # Opt-out for series produced outside Rust (textfile collectors
             # etc.). The marker must NAME the metric it excuses — a trailing
             # `*` is a prefix wildcard, e.g.
@@ -5070,8 +5158,18 @@ $PROM_RULES_CANON"
             yellow "    textfile) — add a comment in the rule file reading"
             yellow "    '# allow-unobserved-metric: $m is …'. The marker must NAME the series"
             yellow "    (trailing '*' = prefix wildcard); placement does not matter, it is"
-            yellow "    matched file-globally, and a marker naming no talos_* series excuses"
-            yellow "    nothing."
+            yellow "    matched file-globally, and a marker naming no talos_*/wasm_* series"
+            yellow "    excuses nothing."
+            case "$m" in
+                wasm_*)
+                    yellow "    NOTE for wasm_*: evidence must be an OTEL instrument declaration"
+                    yellow "    in talos-worker-runtime (e.g. .u64_counter(\"wasm.executions\")), NOT a"
+                    yellow "    quoted \"wasm_...\" literal. The exporter renders '.'→'_' and appends"
+                    yellow "    '_total' to every counter UNCONDITIONALLY, so an instrument named"
+                    yellow "    'wasm.x.total' becomes 'wasm_x_total_total'. Do not put 'total' in an"
+                    yellow "    instrument name."
+                    ;;
+            esac
             PROM_FAIL=1
         done
     fi

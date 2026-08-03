@@ -1,0 +1,194 @@
+# `promtool test rules` unit tests for observability/alerts.yml.
+#
+# Run:
+#   docker run --rm -v "$PWD/observability:/o:ro" --entrypoint promtool \
+#     prom/prometheus:v2.48.0 test rules /o/alerts_test.yml
+#
+# WHY THESE EXIST. Every alert here was, until 2026-08-02, silenced by
+# exactly the condition it was written to detect: `rate(x[30m]) == 0` over an
+# ABSENT series yields an empty vector, and `empty == 0` matches nothing. A
+# live stack cannot demonstrate the FIRING transition inside a review (the
+# flagship has `for: 30m`) and cannot demonstrate the negative cases at all
+# without generating real traffic. These tests drive synthetic series through
+# the real rule file and assert the transitions directly.
+#
+# NOT WIRED INTO CI. `promtool` is not available on the CI runners and this
+# repo has no Prometheus toolchain step; naming that plainly is better than
+# implying a gate that does not exist (a sweep is not a gate — see structural
+# lint check 64). What IS gated at build time is the complementary half:
+# structural check 65(c) fails if a rule here names a series nothing
+# registers, and 65(a)/(b)/(d) cover the scrape jobs, rule-file resolution and
+# duplicate names.
+
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ══════════════════════════════════════════════════════════════════════
+  # THE FLAGSHIP: a worker that has NEVER executed anything.
+  # No wasm_* series is fed at all — this is the exact state of an idle dev
+  # stack, and the state in which the pre-fix expression matched nothing.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: cold-dead worker; wasm_executions_total never existed
+    input_series:
+      - series: 'up{job="talos-worker", instance="worker:9090"}'
+        values: "1+0x60"
+    alert_rule_test:
+      # Before `for: 30m` elapses it is pending, not firing.
+      - eval_time: 20m
+        alertname: NoWASMExecutions
+        exp_alerts: []
+      - eval_time: 31m
+        alertname: NoWASMExecutions
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: wasm-runtime
+            exp_annotations:
+              summary: "No WASM executions detected"
+              description: >-
+                No executions in the last 30 minutes — the worker is idle, or
+                its execution pipeline is broken. If WASMMetricsPipelineDead
+                is also firing, the worker is reachable but exporting nothing
+                and this is NOT mere idleness.
+      # The meta-detector fires too, and its `for: 15m` makes it fire FIRST —
+      # which is the point: it tells the operator that the flagship's "idle or
+      # broken" is the broken one.
+      - eval_time: 16m
+        alertname: WASMMetricsPipelineDead
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: monitoring
+            exp_annotations:
+              summary: "Worker target is UP but exports no WASM metrics"
+              description: >-
+                Prometheus is scraping a worker successfully and receiving no
+                wasm_executions_total series. Every wasm_* alert is blind
+                while this is true. Check, in order: OTEL_METRICS_ENABLED is
+                set for the worker (it defaults to FALSE, and the runtime
+                skips building RuntimeMetrics entirely when unset); the
+                worker's /metrics body is non-empty; and the instrument name
+                has not drifted from the one these rules select on
+                (talos-worker-runtime's exported-name pinning test is the
+                arbiter).
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Idle BUT SEEDED: the producer-side fix. The series exists and is flat at
+  # 0, which is what a worker built from this tree exports before its first
+  # execution.
+  #   - NoWASMExecutions must still fire (no work is happening).
+  #   - WASMMetricsPipelineDead must NOT — the pipeline is alive. This is the
+  #     case that keeps the meta-detector off a permanently-red state on an
+  #     idle-but-healthy stack.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: idle but instrumented; seeded series flat at zero
+    input_series:
+      - series: 'up{job="talos-worker", instance="worker:9090"}'
+        values: "1+0x60"
+      - series: 'wasm_executions_total{job="talos-worker", instance="worker:9090", status="success"}'
+        values: "0+0x60"
+    alert_rule_test:
+      # NOTE the label difference from the cold-dead case above: the
+      # `absent()` arm yields a bare `{}` series, while the `rate(...) == 0`
+      # arm carries the source series' labels. Same alert, and an operator can
+      # tell which arm fired from whether `instance` is present.
+      - eval_time: 31m
+        alertname: NoWASMExecutions
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: wasm-runtime
+              job: talos-worker
+              instance: worker:9090
+              status: success
+            exp_annotations:
+              summary: "No WASM executions detected"
+              description: >-
+                No executions in the last 30 minutes — the worker is idle, or
+                its execution pipeline is broken. If WASMMetricsPipelineDead
+                is also firing, the worker is reachable but exporting nothing
+                and this is NOT mere idleness.
+      - eval_time: 31m
+        alertname: WASMMetricsPipelineDead
+        exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Work flowing: neither detector may fire. Guards against the absent() arm
+  # being written in a way that is unconditionally true.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: executions flowing; nothing fires
+    input_series:
+      - series: 'up{job="talos-worker", instance="worker:9090"}'
+        values: "1+0x60"
+      - series: 'wasm_executions_total{job="talos-worker", instance="worker:9090", status="success"}'
+        values: "0+60x60"
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: NoWASMExecutions
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: WASMMetricsPipelineDead
+        exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # No worker target at all (controller-only stack). The meta-detector is
+  # gated on `up{job="talos-worker"}`, so it must be inert rather than
+  # permanently red.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: no worker scraped; meta-detector is inert
+    input_series:
+      - series: 'up{job="talos-controller", instance="controller:8000"}'
+        values: "1+0x60"
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: WASMMetricsPipelineDead
+        exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Worker down: the meta-detector must stay quiet and leave the outage to
+  # TalosWorkerDown. "Unreachable" and "reachable but silent" are different
+  # incidents with different first steps.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: worker down; meta-detector defers to TalosWorkerDown
+    input_series:
+      - series: 'up{job="talos-worker", instance="worker:9090"}'
+        values: "0+0x60"
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: WASMMetricsPipelineDead
+        exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # LowCacheHitRate one-sided absence, closed on the producer side.
+  # hits seeded at 0 while misses flow = a genuine 0% hit rate. Pre-fix the
+  # hits series did not exist (nothing had touched the counter), the binary
+  # operator found no match, and the worst case this alert exists for was the
+  # one case it could not see.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: zero percent cache hit rate is visible once both legs are seeded
+    input_series:
+      - series: 'wasm_cache_hits_total{job="talos-worker", instance="worker:9090"}'
+        values: "0+0x60"
+      - series: 'wasm_cache_misses_total{job="talos-worker", instance="worker:9090"}'
+        values: "0+60x60"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: LowCacheHitRate
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: wasm-runtime
+              job: talos-worker
+              instance: worker:9090
+            exp_annotations:
+              summary: "Low WASM cache hit rate"
+              description: "Cache hit rate is 0% (threshold: 70%)"

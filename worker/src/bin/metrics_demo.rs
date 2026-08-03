@@ -1,11 +1,31 @@
 /// Simple Metrics Demo for Observability Testing
 /// Generates sample metrics and traces without requiring full WASM runtime
 ///
+/// ⚠️  THE METRIC NAMES BELOW ARE NOT THE WORKER'S. Everything here is
+/// registered as a raw `prometheus` collector into a PRIVATE
+/// `Registry::new()` served by this binary's own listener on 9091. The real
+/// worker exports through OpenTelemetry on `METRICS_PORT` (default 9090),
+/// where the exporter renders `wasm.executions` as `wasm_executions_total`
+/// — and `wasm_memory_used_bytes` does not exist at all outside this file.
+///
+/// This mattered: the eleven alert rules in `observability/alerts.yml` were
+/// written against THIS binary (the dev Prometheus scraped 9091 until
+/// 2026-08-02), so seven of them selected on a series the production worker
+/// could not emit under any workload. Structural lint check 65(c) now
+/// derives the alertable `wasm_*` names from the OTEL declarations in
+/// talos-worker-runtime and deliberately does NOT accept a quoted literal as
+/// evidence — which is exactly what excludes this file. Do not "fix" that by
+/// aligning these names with the real ones: a demo that is indistinguishable
+/// from production is the misleading signal, not the cure.
+///
 /// Usage:
 ///   cargo run --bin metrics_demo
 ///
 /// This will:
-/// - Start metrics server on port 9090
+/// - Start metrics server on port 9091 (the code binds 9091; this line said
+///   9090 until 2026-08-02, which is the REAL worker's default METRICS_PORT
+///   — a one-digit doc error pointing at the exact port confusion that made
+///   the dev Prometheus scrape this demo instead of the worker)
 /// - Generate sample metric data
 /// - Send traces to Jaeger (if available)
 use std::time::Duration;

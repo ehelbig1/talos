@@ -9,6 +9,30 @@
 /// - Compilation performance
 ///
 /// Metrics are exposed in Prometheus format at /metrics endpoint
+///
+/// ## Instrument naming — do NOT put `total` in a counter's name
+///
+/// `opentelemetry-prometheus` renders an OTEL instrument by replacing `.`
+/// with `_` and then, for every monotonic counter, APPENDING `_total`
+/// unconditionally. It does not check whether the name already ends in
+/// `total`. So an instrument named `wasm.executions.total` is exported as
+/// `wasm_executions_total_total` — verified empirically against
+/// opentelemetry-prometheus 0.32 and pinned by
+/// `exported_prometheus_names_are_stable_and_idle_seeds_at_zero` in
+/// `metrics_tests.rs`.
+///
+/// Until 2026-08-02 three instruments here carried the redundant suffix
+/// (`wasm.executions.total`, `wasm.errors.total`, `wasm.retries.total`) and
+/// the alert rules in `observability/alerts.yml` selected on the SINGLE-
+/// suffixed names the exporter never produces. That is the read side of the
+/// same defect as an unregistered metric: every one of those alerts was
+/// permanently unfireable, and the Grafana dashboard had already been
+/// hand-patched to the double-suffixed spelling — two files disagreeing
+/// about the name of one series, with the alerts on the losing side.
+///
+/// The names below therefore carry NO `total` component; the exporter adds
+/// exactly one. Sibling rule to the same class in `talos-metrics`
+/// (structural lint checks 58 and 65(c)).
 use opentelemetry::{global, metrics::*, KeyValue};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -210,14 +234,19 @@ pub struct RuntimeMetrics {
 
 #[allow(dead_code)]
 impl RuntimeMetrics {
-    /// Initialize OpenTelemetry metrics
+    /// Initialize OpenTelemetry metrics.
+    ///
+    /// The returned value has already had [`Self::seed_zero_series`] applied,
+    /// so an idle worker exports the execution/cache series at 0 rather than
+    /// not at all. See that method for why that distinction is load-bearing.
     pub fn new() -> Self {
         let meter = global::meter("talos-wasm-runtime");
 
-        Self {
+        let this = Self {
+            // → `wasm_executions_total` (the exporter appends `_total`).
             executions_total: meter
-                .u64_counter("wasm.executions.total")
-                .with_description("Total WASM executions")
+                .u64_counter("wasm.executions")
+                .with_description("WASM executions COMPLETED, by terminal status")
                 .build(),
 
             execution_duration: meter
@@ -239,9 +268,20 @@ impl RuntimeMetrics {
                 .i64_up_down_counter("wasm.instances.active")
                 .with_description("Currently active WASM instances")
                 .build(),
+            // → `wasm_executions_started_total`.
+            //
+            // Until 2026-08-02 this instrument was declared with the SAME
+            // OTEL name as `executions_total` above. Both were incremented
+            // per execution — this one at dispatch (no attributes), the
+            // other at completion (with `status`) — so the single exported
+            // series counted roughly TWICE per execution and mixed a
+            // started population with a completed one. Anything computing a
+            // throughput or a per-status share off it was wrong by a factor
+            // that varied with the in-flight count. Distinct name, distinct
+            // meaning: `started - sum(completed)` is the in-flight count.
             total_executions: meter
-                .u64_counter("wasm.executions.total")
-                .with_description("Total WASM executions (cumulative)")
+                .u64_counter("wasm.executions.started")
+                .with_description("WASM executions STARTED (incremented at dispatch)")
                 .build(),
             cache_hit_ratio: meter
                 .f64_gauge("wasm.cache.hit_ratio")
@@ -253,13 +293,15 @@ impl RuntimeMetrics {
                 .with_description("Module compilation duration in milliseconds")
                 .build(),
 
+            // → `wasm_retries_total`.
             retry_attempts: meter
-                .u64_counter("wasm.retries.total")
+                .u64_counter("wasm.retries")
                 .with_description("Total retry attempts")
                 .build(),
 
+            // → `wasm_errors_total`.
             errors_total: meter
-                .u64_counter("wasm.errors.total")
+                .u64_counter("wasm.errors")
                 .with_description("Total errors by type")
                 .build(),
             // Individual error counters for low-cardinality series
@@ -345,7 +387,80 @@ impl RuntimeMetrics {
             // Initialize atomic counters
             cache_hits_count: AtomicU64::new(0),
             cache_misses_count: AtomicU64::new(0),
+        };
+
+        this.seed_zero_series();
+        this
+    }
+
+    /// Record a zero-valued measurement on every series whose label set is
+    /// CLOSED and whose emitting call site is live, so the series exists on
+    /// an idle process.
+    ///
+    /// ## Why
+    ///
+    /// An OTEL instrument produces no Prometheus series until its first
+    /// recorded measurement. On an idle worker every `wasm_*` series is
+    /// therefore ABSENT, not zero — and in PromQL those are different in a
+    /// way that silences detectors: `rate(wasm_executions_total[30m]) == 0`
+    /// over an absent series yields an EMPTY vector, and `empty == 0` matches
+    /// nothing. The alert built to notice "nothing is executing" could only
+    /// fire on a worker that HAD executed and then stopped, never on the
+    /// cold-dead case. Seeding at 0 is the honest fix on the producer side;
+    /// the `absent()` arm added to `NoWASMExecutions` is the belt to this
+    /// braces (it still covers a worker too old to seed, or an exporter that
+    /// died before first scrape).
+    ///
+    /// It is also what keeps the `WASMMetricsPipelineDead` meta-detector from
+    /// being permanently red: with seeding, "target up and exporting nothing"
+    /// means the pipeline is genuinely broken rather than merely quiet.
+    ///
+    /// ## What is deliberately NOT seeded
+    ///
+    /// Only combinations a live code path actually writes. Seeding a label
+    /// combination nothing increments implies a wired signal that does not
+    /// exist — a flat-zero series an operator reads as "checked, healthy"
+    /// when it is really "never checked".
+    ///
+    /// * `executions` — seeded for the three statuses `record_execution` is
+    ///   actually called with (`success`, `error`, `retry_exhausted` in
+    ///   runtime.rs). The other five values `normalize_status` can produce
+    ///   are reachable only as a normalisation of a caller string no caller
+    ///   passes today, so they stay unseeded.
+    /// * `executions.started` — deliberately NOT seeded, even though its
+    ///   label set is empty and therefore maximally closed. It is written at
+    ///   dispatch ENTRY (`runtime.rs`, `total_executions.add(1, &[])`) while
+    ///   `executions` is written at completion, so a seeded 0 on the started
+    ///   side would assert a dispatch path had been observed before any
+    ///   execution reached it. The asymmetry with the seeded completion-side
+    ///   counter is intentional; `exported_prometheus_names_are_stable_and_
+    ///   idle_seeds_at_zero` pins both halves — absent on a cold process,
+    ///   present once a dispatch has actually occurred.
+    /// * `cache.hits` / `cache.misses` — no labels at all, and
+    ///   `record_compilation` writes one or the other on every compile. Both
+    ///   seeded, which also makes `LowCacheHitRate`'s
+    ///   `hits / (hits + misses)` well-defined instead of dropping to an
+    ///   empty vector whenever one leg had never been touched.
+    /// * `errors` / `retries` / `llm.*` / `approval.*` / `quota.*` /
+    ///   `host_function.*` — NOT seeded. Their label populations are driven
+    ///   by which failure or which host call actually happened, so a seeded
+    ///   combination would assert a class of event is being watched for when
+    ///   nothing distinguishes "zero timeouts" from "the timeout path was
+    ///   deleted". Their alerts are `> threshold` shapes, which behave
+    ///   correctly over an absent series (no data, no alert).
+    ///
+    /// SECURITY: every label value below is a compile-time `&'static str`
+    /// from a closed set. No worker id, execution id, module name, user id,
+    /// guest content, or error text may ever be seeded (or emitted) as a
+    /// label — unbounded label cardinality is a memory-exhaustion surface on
+    /// both the worker and the Prometheus server.
+    fn seed_zero_series(&self) {
+        for status in ["success", "error", "retry_exhausted"] {
+            self.executions_total
+                .add(0, &[KeyValue::new("status", status)]);
         }
+        self.cache_hits.add(0, &[]);
+        self.cache_misses.add(0, &[]);
     }
 
     /// Record execution completion
