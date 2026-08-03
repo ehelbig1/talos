@@ -175,6 +175,35 @@ scrape_configs:
     #     target_label: app
 
   # ========================================================================
+  # node-exporter — TEXTFILE COLLECTOR ONLY
+  # ========================================================================
+  # The scrape path for metrics produced by SCRIPTS rather than by a Rust
+  # process. Today that is exactly one producer:
+  # `scripts/drills/backup-restore.sh` writes `talos_backup_drill_*` into a
+  # textfile directory that the exporter mounts read-only.
+  #
+  # Before 2026-08-03 no node_exporter and no textfile collector existed
+  # anywhere in this repo, so `talos_backup_drill_last_success_timestamp_seconds`
+  # had NO path to Prometheus and `TalosBackupRestoreDrillFailed` could not be
+  # cleared by any drill run, however green. This job is that path.
+  #
+  # The exporter runs with `--collector.disable-defaults`, so this job pulls
+  # the textfile series and nothing else — no host CPU/disk/process inventory.
+  # See docker-compose.yml's node-exporter service for the full rationale.
+  #
+  # docker-compose.observability.yml does not define this service, so the job
+  # is red on that stack — the same pre-existing, documented condition as the
+  # `talos-controller` job there (see that file's header).
+  - job_name: 'node-exporter'
+    scrape_interval: 30s
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['node-exporter:9100']
+        labels:
+          service: 'node-exporter'
+          component: 'textfile-collector'
+
+  # ========================================================================
   # Grafana self-monitoring (optional)
   # ========================================================================
   - job_name: 'grafana'

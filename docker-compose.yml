@@ -921,6 +921,71 @@ services:
   # Observability Stack
   # ========================================================================
 
+  # node-exporter, TEXTFILE COLLECTOR ONLY — the scrape path for metrics
+  # produced by scripts, not by a Rust process.
+  #
+  # WHY IT EXISTS. `scripts/drills/backup-restore.sh` has always written
+  # `talos_backup_drill_*` to a node_exporter textfile directory, and until
+  # 2026-08-03 no node_exporter and no textfile collector existed anywhere in
+  # this repo — zero matches in this file or in prometheus.yml. The script even
+  # degraded SILENTLY when the directory was missing ("skipping metric
+  # emission"), so the series had no path to Prometheus at all and
+  # `TalosBackupRestoreDrillFailed` was PERMANENTLY RED BY CONSTRUCTION: a
+  # perfect drill run could not clear it. A permanently-firing alert trains
+  # operators to ignore red, which is the defect class this arc keeps closing.
+  #
+  # `--collector.disable-defaults` is deliberate and is the whole security
+  # argument. A default node-exporter publishes host CPU/mem/disk/network/
+  # filesystem/process inventory; in this container that would be the Docker
+  # Desktop VM's, which is noise here and attack surface everywhere.
+  #
+  # AUDITED, not assumed — the full exposed set with these flags is:
+  #   * talos_backup_drill_{last_run,last_success}_timestamp_seconds and
+  #     talos_backup_drill_last_status — the three gauges the drill writes
+  #     (two unix timestamps and a 1/0). No secret, no path, no hostname.
+  #   * node_textfile_mtime_seconds / node_textfile_scrape_error — the
+  #     collector's own health, which usefully catches a malformed .prom.
+  #   * the exporter's Go/process/promhttp self-metrics and
+  #     node_exporter_build_info.
+  # There is no node_cpu_*, node_filesystem_*, node_network_* — nothing about
+  # the host at all.
+  #
+  # The directory is mounted READ-ONLY: the exporter can never write there,
+  # and a compromised exporter cannot forge a green drill on disk.
+  #
+  # No `ports:` — Prometheus reaches it over the compose network as
+  # `node-exporter:9100`. Publishing it would put an unauthenticated metrics
+  # endpoint on the host for no benefit.
+  #
+  # The host directory is a DIRECTORY mount (check 66) and lives under
+  # ${HOME}/.talos/ next to the backups, deliberately NOT in the repo: these
+  # are generated files whose whole purpose is to survive `make clean` and to
+  # never be committed.
+  #
+  # `make up` creates it (as the invoking user) before starting anything.
+  # Docker would create a missing bind source on its own, but as ROOT — and
+  # the drill then cannot write its metric and refuses to run, which is a
+  # confusing way to discover a mount detail. If you start this service
+  # without `make up`, `mkdir -p` it yourself first.
+  node-exporter:
+    image: prom/node-exporter:v1.8.2@sha256:4032c6d5bfd752342c3e631c2f1de93ba6b86c41db6b167b9a35372c139e7706
+    container_name: talos-node-exporter
+    command:
+      - '--collector.disable-defaults'
+      - '--collector.textfile'
+      - '--collector.textfile.directory=/textfile'
+      - '--web.listen-address=:9100'
+    volumes:
+      - ${TALOS_TEXTFILE_DIR:-${HOME}/.talos/metrics/textfile_collector}:/textfile:ro
+    networks:
+      - talos-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+          cpus: '0.1'
+
   # Prometheus - Metrics Collection
   prometheus:
     image: prom/prometheus:v2.48.0@sha256:b440bc0e8aa5bab44a782952c09516b6a50f9d7b2325c1ffafac7bc833298e2e

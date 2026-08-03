@@ -715,8 +715,31 @@ groups:
   - name: talos.backups
     interval: 1m
     rules:
-      # Scraped from the drill script's metric output (see
-      # deploy/observability/drill-textfile-exporter.md).
+      # Scraped from the drill script's metric output. The producer is
+      # scripts/drills/backup-restore.sh; the collection path and the
+      # per-deployment "can this alert ever clear here?" analysis are in
+      # scripts/drills/README.md § Wiring the metric into Prometheus.
+      # (This used to point at deploy/observability/drill-textfile-exporter.md,
+      # which has never existed — a dangling reference on the one line an
+      # operator reads when the alert fires.)
+      #
+      # WHERE THIS CAN BE SATISFIED, stated because "run the drill" was not
+      # true everywhere until 2026-08-03:
+      #   * docker-compose dev stack — YES. A textfile-only node-exporter
+      #     (docker-compose.yml) mounts the drill's output directory and the
+      #     `node-exporter` scrape job in observability/prometheus/prometheus.yml
+      #     collects it. `make drill` clears this alert.
+      #   * a VM / bare-metal host running the stack — YES, with a system
+      #     node_exporter: point TALOS_DRILL_TEXTFILE_DIR at its textfile
+      #     directory and schedule the drill (systemd timer in the README).
+      #   * Kubernetes / the Helm chart — NOT YET. The drill drives the docker
+      #     socket directly, which a pod does not have, so nothing publishes
+      #     this series in-cluster and the alert fires permanently. That is
+      #     ACCURATE (nobody has verified those backups) but it is not
+      #     actionable in-cluster today. Operators who accept the risk should
+      #     drop this rule from their PrometheusRule rather than let a
+      #     permanently-red alert train them to ignore red; porting the drill
+      #     to a CronJob is tracked in scripts/drills/README.md.
       #
       # allow-unobserved-metric: talos_backup_drill_* is a node_exporter
       # TEXTFILE series written by scripts/drills/backup-restore.sh, not a

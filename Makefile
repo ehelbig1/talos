@@ -25,7 +25,8 @@ export GIT_DIRTY_OVERRIDE := $(shell test -n "$$(git status --porcelain 2>/dev/n
 
 .PHONY: help setup up down rebuild restart logs ps shell doctor quickstart \
         check build lint lint-frontend hooks test test-changed test-integration coverage-html audit check-catalog ci \
-        drill clean nuke smoke rls-preflight sqlx-prepare sqlx-check _wait-healthy \
+        drill drill-schedule drill-unschedule drill-schedule-status \
+        clean nuke smoke rls-preflight sqlx-prepare sqlx-check _wait-healthy \
         observability-reload observability-verify
 
 ## ──── Dev ──────────────────────────────────────────────────────────
@@ -54,6 +55,11 @@ up: ## Build + start the full dev stack, wait for health
 	@# skips silently when docker is unavailable. TALOS_UP_SKIP_DISK_CHECK=1
 	@# to override.
 	@bash scripts/preflight-disk.sh
+	@# The node-exporter service bind-mounts the drill's textfile directory.
+	@# Docker WILL create a missing bind source, but as root — after which the
+	@# drill (running as you) cannot write its metric and refuses to run. Make
+	@# the directory here, owned by the invoking user, so that never happens.
+	@mkdir -p "$${TALOS_TEXTFILE_DIR:-$$HOME/.talos/metrics/textfile_collector}"
 	@dirty="$$(git status --porcelain 2>/dev/null | head -5)"; \
 	 if [ -n "$$dirty" ]; then \
 	    printf '\033[1;33m⚠ working tree is DIRTY — images will be stamped `-dirty` and correspond to NO commit.\033[0m\n'; \
@@ -300,8 +306,17 @@ ci: lint lint-frontend audit test check-catalog ## Full local gate matching GitH
 
 ## ──── Ops ──────────────────────────────────────────────────────────
 
-drill: ## Run the backup→restore drill (pg_dump + vault snapshot → scratch stack → verify_phase_b)
-	@bash scripts/drills/backup-restore.sh
+drill: ## Restore the newest backup artifacts into a scratch stack and verify them (ARGS=--source live)
+	@bash scripts/drills/backup-restore.sh $(ARGS)
+
+drill-schedule: ## Install the weekly drill LaunchAgent (macOS). Prints the plist and asks before loading.
+	@bash scripts/drills/schedule.sh install
+
+drill-unschedule: ## Remove the weekly drill LaunchAgent (macOS)
+	@bash scripts/drills/schedule.sh uninstall
+
+drill-schedule-status: ## Show whether the weekly drill is scheduled and when it last ran
+	@bash scripts/drills/schedule.sh status
 
 deploy-prod: ## One-command production deploy: publish (gated+signed) -> pin digests -> install.sh on the VM -> external smoke. ARGS passthrough (--yes, --no-sign, ...)
 	bash scripts/deploy-prod.sh $(ARGS)
