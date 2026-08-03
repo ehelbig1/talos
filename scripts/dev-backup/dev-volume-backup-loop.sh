@@ -1,7 +1,7 @@
 #!/bin/bash
 # Local-dev volume backup loop — the non-Postgres half of the dev-stack
 # backup story. Runs inside the `vault-backup` and `neo4j-backup` compose
-# sidecars (see docker-compose.yml). Sibling of scripts/dev-backup-loop.sh
+# sidecars (see docker-compose.yml). Sibling of scripts/dev-backup/dev-backup-loop.sh
 # (Postgres); this script covers the two stateful stores whose data is NOT
 # reproducible from git and NOT reachable with a clean logical dump tool:
 #
@@ -75,7 +75,7 @@
 # root for backward compatibility with existing dumps.)
 #
 # Wake-aware cadence, .partial atomicity, loud ERROR logs, and retention
-# pruning all mirror scripts/dev-backup-loop.sh.
+# pruning all mirror scripts/dev-backup/dev-backup-loop.sh.
 set -euo pipefail
 
 BACKUP_TARGET="${BACKUP_TARGET:?BACKUP_TARGET required (vault|neo4j)}"

@@ -23,7 +23,7 @@
 ///
 /// Until 2026-08-02 three instruments here carried the redundant suffix
 /// (`wasm.executions.total`, `wasm.errors.total`, `wasm.retries.total`) and
-/// the alert rules in `observability/alerts.yml` selected on the SINGLE-
+/// the alert rules in `observability/rules/alerts.yml` selected on the SINGLE-
 /// suffixed names the exporter never produces. That is the read side of the
 /// same defect as an unregistered metric: every one of those alerts was
 /// permanently unfireable, and the Grafana dashboard had already been

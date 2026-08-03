@@ -809,7 +809,7 @@
       ],
       "title": "Memory Usage \u2014 NO PRODUCER (always empty)",
       "type": "timeseries",
-      "description": "wasm_memory_used_bytes has no producer. It is registered only in worker/src/bin/metrics_demo.rs, which serves its own private registry on port 9091 that nothing scrapes; the real worker exports no memory instrument of any name. This panel is therefore permanently empty, and is kept (renamed) rather than deleted so the gap stays visible instead of reading as 'memory is fine'. The matching alert HighWASMMemoryUsage was deleted from observability/alerts.yml for the same reason. To fix: add a gauge in talos-worker-runtime/src/metrics.rs, extend the exported-name pinning test, then point this panel at the name that test asserts."
+      "description": "wasm_memory_used_bytes has no producer. It is registered only in worker/src/bin/metrics_demo.rs, which serves its own private registry on port 9091 that nothing scrapes; the real worker exports no memory instrument of any name. This panel is therefore permanently empty, and is kept (renamed) rather than deleted so the gap stays visible instead of reading as 'memory is fine'. The matching alert HighWASMMemoryUsage was deleted from observability/rules/alerts.yml for the same reason. To fix: add a gauge in talos-worker-runtime/src/metrics.rs, extend the exported-name pinning test, then point this panel at the name that test asserts."
     }
   ],
   "refresh": "10s",

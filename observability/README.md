@@ -14,7 +14,11 @@ observability/
 ├── README.md                           # This file
 ├── prometheus/
 │   └── prometheus.yml                  # Prometheus configuration
-├── alerts.yml                          # WASM/worker alert rules (dev stack)
+├── rules/
+│   └── alerts.yml                      # WASM/worker alert rules (dev stack)
+├── alerts_test.yml                     # promtool fixture — deliberately NOT
+│                                       #   in rules/ (Prometheus would fail
+│                                       #   to parse it as a rule file)
 └── grafana/
     ├── provisioning/
     │   ├── datasources/
@@ -73,10 +77,12 @@ scrape_configs:
 > dropping this stack's rule mounts fails the lint; **65(c) covers `wasm_*` as
 > of 2026-08-02** — it derives the exported name from the OTEL declaration
 > rather than looking for a literal, and run against the pre-fix tree it fails
-> on six real defects. The remaining documented holes are a glob `rule_files`
-> entry (rejected though Prometheus allows it), extra scrape jobs no alert
-> selects on, mount mode (`:rw` passes), and 65(a) scanning whole rule files
-> rather than `expr:` blocks.
+> on six real defects. Mount mode was a documented hole
+> until 2026-08-03; 65(b) now requires `:ro` on every resolved rule-file mount,
+> and `make observability-verify` fails any read-write bind on the Prometheus
+> container. The remaining documented holes are a glob `rule_files` entry
+> (rejected though Prometheus allows it), extra scrape jobs no alert selects
+> on, and 65(a) scanning whole rule files rather than `expr:` blocks.
 
 **Note on the two stacks.** Only `docker-compose.yml` can exercise these
 alerts: its Prometheus shares `talos-network` with the controller and worker.
@@ -88,12 +94,54 @@ and the container name `talos-prometheus`, so they cannot run at once.
 
 ### Alert rules
 
-Two rule files are mounted into the container at `/etc/prometheus/rules/`:
+Two rule files are mounted into the container, each via a **directory** mount:
 
-| Mounted as | Source | Covers |
+| Mounted as | Source directory | Covers |
 |---|---|---|
-| `wasm-alerts.yml` | `observability/alerts.yml` | WASM runtime / worker (10 rules) |
-| `talos-alerts.yaml` | `deploy/helm/talos/files/alerts.yaml` | Controller `talos_*` invariants (26 rules) |
+| `/etc/prometheus/rules/alerts.yml` | `observability/rules/` | WASM runtime / worker (10 rules) |
+| `/etc/prometheus/rules-chart/alerts.yaml` | `deploy/helm/talos/files/` | Controller `talos_*` invariants (26 rules) |
+
+**Why directories and not the individual files.** A single-file bind mount can
+leave the container serving *corrupted* content once the host file is replaced,
+and git replaces rather than rewrites files in place.
+
+*Measured* here 2026-08-03: the host rules file was 21953 bytes and the
+container served a byte-exact 6464-byte prefix **of that same current file**,
+cut mid-word. It parsed, loaded 13 groups / 37 rules, and `/api/v1/rules` looked
+perfectly healthy while #625's `WASMMetricsPipelineDead` was simply absent.
+
+*Mechanism*, reproduced deterministically on 2026-08-03 (Docker Desktop 29.6.2,
+VirtioFS) after two earlier attempts failed: the trigger is the host file
+acquiring a **new inode**, which every `git checkout` of a changed file does.
+While a file is edited *in place* the mount tracks it correctly and
+indefinitely; the first replacement freezes the container's cached **size** at
+its last-known value permanently (observed frozen for 26 h), while the **data**
+path keeps resolving by name and returning the current bytes. Net: current
+content clamped to the superseded length — 6464 here is exactly the previous
+committed version's byte length. "The mount pins the inode" is the one
+explanation ruled out; the data came from the *new* file. A same-length or
+in-place edit cannot exhibit the bug and will "prove" a single-file mount is
+fine, which is how the first two attempts came back negative.
+
+Directory mounts were correct in every equivalent test, including on a
+four-day-old container — but one directory-mounted container was observed frozen
+and could not be made to repeat it. So the mount change removes a
+**deterministic, every-time** failure and leaves a rare one. The real protection
+is `make observability-verify`, which compares live content and fires on the
+symptom whatever caused it.
+
+Each mounted directory therefore contains **only** files Prometheus should read
+— a directory mount exposes everything in it, now and in future. That is why
+`observability/` itself is not mountable (`grafana/provisioning/datasources/`
+lives under it) and why `alerts_test.yml` deliberately stays in `observability/`
+rather than moving into `rules/`: it is a `promtool` fixture, and Prometheus
+would fail to parse it as a rule file.
+
+Prometheus still needs a *signal* to re-read rules after an edit. The dev stack
+runs with `--web.enable-lifecycle`, so `make observability-reload` applies a
+change via `POST /-/reload` without recreating the container (and so without
+dropping the in-memory TSDB head). `make observability-verify` then proves the
+running process and the repo agree.
 
 `talos-alerts.yaml` is **bind-mounted, never copied** — it is the same file the
 chart's `PrometheusRule` embeds via `.Files.Get`, so the dev rules and the
@@ -130,7 +178,7 @@ way. Asserted in both directions by
 `talos-metrics`.
 
 `TalosWorkerDown` is defined **once**, in `talos-alerts.yaml`. Until 2026-08-02
-`observability/alerts.yml` carried a second copy (`for: 1m`, `component=worker`
+`observability/rules/alerts.yml` carried a second copy (`for: 1m`, `component=worker`
 vs the canonical `for: 2m`, `category=availability`). That was invisible while
 `docker-compose.yml` mounted no rules at all; mounting both files loaded both
 copies and fired both on one worker outage — observed live. Alertmanager cannot
@@ -139,7 +187,7 @@ contradictory runbook pointers for one incident. The dev copy was deleted and
 structural lint **check 65(d)** now fails on any alert name defined in more than
 one mounted rule file.
 
-### alerts.yml
+### rules/alerts.yml
 
 WASM/worker alert rules (10 total).
 
@@ -256,7 +304,7 @@ Pre-built production dashboard with 10 panels:
 
 ### Add a New Alert
 
-Edit `alerts.yml`:
+Edit `rules/alerts.yml`:
 
 ```yaml
 groups:
@@ -273,10 +321,13 @@ groups:
           description: "Alert description"
 ```
 
-Reload Prometheus:
+Reload Prometheus — and then prove the reload actually took effect:
 ```bash
-docker exec talos-prometheus kill -HUP 1
+make observability-reload   # POST /-/reload, then runs observability-verify
 ```
+
+(`docker exec talos-prometheus kill -HUP 1` also reloads, but tells you
+nothing about whether the running process now matches the repo.)
 
 ### Modify Scrape Interval
 

@@ -216,11 +216,11 @@ mod tests {
     /// `opentelemetry-prometheus` appends `_total` to every monotonic counter
     /// unconditionally, so the three instruments that used to be named
     /// `wasm.*.total` were exported as `wasm_*_total_total` — which made FIVE
-    /// of the eleven alert rules in `observability/alerts.yml` select on a
+    /// of the eleven alert rules in `observability/rules/alerts.yml` select on a
     /// name the worker could not emit under any workload (two more were
     /// unfireable for unrelated reasons — the cache rule was missing the
     /// exporter's `_total`, and `wasm_memory_used_bytes` had no instrument at
-    /// all — for seven total; `observability/alerts.yml`'s header carries the
+    /// all — for seven total; `observability/rules/alerts.yml`'s header carries the
     /// full breakdown). A behavioural test that only asserted "the counter
     /// went up" would not have caught it; only the rendered exposition text
     /// can.
@@ -292,7 +292,7 @@ mod tests {
         m.total_executions.add(1, &[]);
         let out = get_prometheus_metrics();
 
-        // Exactly the spellings observability/alerts.yml and the Grafana
+        // Exactly the spellings observability/rules/alerts.yml and the Grafana
         // dashboards select on. A counter declared `wasm.x` exports
         // `wasm_x_total`; a histogram declared `wasm.x` exports
         // `wasm_x_bucket`/`_sum`/`_count`; an up/down counter and a gauge

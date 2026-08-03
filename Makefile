@@ -25,7 +25,8 @@ export GIT_DIRTY_OVERRIDE := $(shell test -n "$$(git status --porcelain 2>/dev/n
 
 .PHONY: help setup up down rebuild restart logs ps shell doctor quickstart \
         check build lint lint-frontend hooks test test-changed test-integration coverage-html audit check-catalog ci \
-        drill clean nuke smoke rls-preflight sqlx-prepare sqlx-check _wait-healthy
+        drill clean nuke smoke rls-preflight sqlx-prepare sqlx-check _wait-healthy \
+        observability-reload observability-verify
 
 ## ──── Dev ──────────────────────────────────────────────────────────
 
@@ -85,6 +86,17 @@ up: ## Build + start the full dev stack, wait for health
 	fi
 	@$(MAKE) _wait-healthy
 	@printf '\033[1;32m✓ stack healthy — http://localhost:8000/health\033[0m\n'
+	@# Prove the observability config the stack just came up with is the config
+	@# in this checkout. `docker compose up -d` does NOT recreate a container
+	@# whose spec is unchanged, so a rules/scrape edit can be merged, on disk,
+	@# and still not in effect — that is exactly how #625's alert stayed absent
+	@# from /api/v1/rules for a day while everything looked healthy. Advisory
+	@# here (a stale Prometheus must not block a dev stack); `make
+	@# observability-verify` is the same check as a hard gate.
+	@bash scripts/verify-observability.sh >/dev/null 2>&1 || { \
+	    printf '\033[1;33m⚠ Prometheus is NOT reading this checkout — merged config changes are not in effect.\033[0m\n'; \
+	    printf '\033[1;33m  Details: make observability-verify   Fix: make observability-reload\033[0m\n'; \
+	}
 	@if grep -Eq '^NGROK_AUTHTOKEN=.+' .env 2>/dev/null; then \
 	    sleep 2; \
 	    url="$$(curl -sf http://127.0.0.1:4040/api/tunnels 2>/dev/null | grep -o '"public_url":"https:[^"]*"' | head -1 | cut -d'"' -f4)"; \
@@ -105,6 +117,30 @@ rebuild: ## Hot-rebuild one service (SERVICE=controller|worker|frontend|...)
 
 restart: ## Restart one service without rebuilding (SERVICE=...)
 	@docker compose restart -- "$(SERVICE)"
+
+observability-reload: ## Apply edited Prometheus rules/config to the running stack (no recreate)
+	@# POST /-/reload, not a restart: it keeps the in-memory TSDB head, so the
+	@# user's local metric history survives. Enabled by --web.enable-lifecycle
+	@# on the dev stack only (port is bound to 127.0.0.1; prod ships no
+	@# prometheus service and the chart uses a PrometheusRule CRD).
+	@# The 403 case is the one that actually happens and it must not be
+	@# reported as "is the stack up?": Prometheus answers /-/reload with 403
+	@# when it was started WITHOUT --web.enable-lifecycle, i.e. the container
+	@# predates this flag being added. Recreating it is the fix, and a wrong
+	@# remedy in an error message costs more than no message at all.
+	@code="$$(curl -s -o /dev/null -w '%{http_code}' -XPOST http://127.0.0.1:9090/-/reload 2>/dev/null)"; \
+	case "$$code" in \
+	  200) printf 'reloaded — verifying it actually took effect\n' ;; \
+	  403) printf 'reload refused (403): this container was started without --web.enable-lifecycle.\n'; \
+	       printf '  → it predates the flag. Recreate it (the prometheus_data volume is untouched):\n'; \
+	       printf '      docker compose up -d --force-recreate prometheus\n'; exit 1 ;; \
+	  000) printf 'no response from http://127.0.0.1:9090 — is the stack up? (make up)\n'; exit 1 ;; \
+	  *)   printf 'reload failed with HTTP %s\n' "$$code"; exit 1 ;; \
+	esac
+	@$(MAKE) --no-print-directory observability-verify
+
+observability-verify: ## Prove the running Prometheus reads THIS repo (rules + config parity)
+	@bash scripts/verify-observability.sh
 
 logs: ## Tail logs for one service (SERVICE=..., empty for all: `make logs SERVICE=`)
 	@docker compose logs -f $(SERVICE)

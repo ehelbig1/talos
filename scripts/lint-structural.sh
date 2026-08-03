@@ -4811,7 +4811,7 @@ bold "▶ check 65: dev Prometheus scrapes Talos and its rule files resolve"
 #     (it fails loudly).
 #   * (c) covers BOTH `talos_*` and `wasm_*` as of 2026-08-02. It previously
 #     inspected only `talos_*`, which is why the dev-stack rules in
-#     observability/alerts.yml — built entirely on `wasm_*` series the
+#     observability/rules/alerts.yml — built entirely on `wasm_*` series the
 #     worker declares through OTEL with dots — shipped with SEVEN rules
 #     naming a series no producer could emit. `wasm_*` evidence is derived
 #     from the OTEL declaration (see the long note at the match site);
@@ -4846,7 +4846,7 @@ bold "▶ check 65: dev Prometheus scrapes Talos and its rule files resolve"
 # scrapes, a rules file that resolves to nothing, and one alert name defined
 # twice are each the defect itself and have no legitimate form.
 PROM_CFG="$ROOT/observability/prometheus/prometheus.yml"
-# NOTE: observability/alerts.yml is deliberately NOT named here. The scanned
+# NOTE: observability/rules/alerts.yml is deliberately NOT named here. The scanned
 # rule-file set is DERIVED from rule_files + the compose mounts (see below), so
 # that file is picked up because it is mounted, and a third rule file added the
 # same way is picked up too. Only the canonical chart file is named explicitly:
@@ -4855,7 +4855,26 @@ PROM_RULES_CANON="$ROOT/deploy/helm/talos/files/alerts.yaml"
 PROM_FAIL=0
 
 if [ ! -f "$PROM_CFG" ]; then
-    yellow "⚠ $PROM_CFG not found — skipping dev-Prometheus check"
+    # SKIP-BLINDING GUARD (added 2026-08-03 after mutation testing). $PROM_CFG is
+    # a hardcoded path, so ANY future move of observability/prometheus/ silently
+    # turns this entire check into a ⚠ and exit 0 — mutation-proved: renaming the
+    # directory to observability/prom-conf/ and updating BOTH compose files
+    # consistently (a legitimate refactor) disabled every leg of check 65. That
+    # is the defect this check's own header lectures about, one level up. A skip
+    # is only honest when the dev stack genuinely has no Prometheus, so: if any
+    # compose file still declares a prometheus service, a missing config is a
+    # FAILURE, not a skip. (Deriving $PROM_CFG from the compose mount would be
+    # better still and is left as the real fix; this closes the silent-pass.)
+    if grep -qE '^[[:space:]]{2}prometheus:[[:space:]]*$' \
+            "$ROOT/docker-compose.yml" "$ROOT/docker-compose.observability.yml" 2>/dev/null; then
+        red "✗ $PROM_CFG not found, but a compose file still declares a prometheus service"
+        yellow "  → the dev Prometheus config moved without updating this check, which would"
+        yellow "    otherwise skip silently and take checks 65(a)-(d) with it. Point PROM_CFG"
+        yellow "    at the new path."
+        PROM_FAIL=1
+    else
+        yellow "⚠ $PROM_CFG not found and no compose prometheus service — skipping dev-Prometheus check"
+    fi
 else
     # ── (b) runs FIRST because it also DISCOVERS the file set ──────────
     # (a), (c) and (d) all scan "the mounted rule files". Naming those files
@@ -4870,9 +4889,24 @@ else
     PROM_RESOLVED=""
     # Collect container→host bind mounts from every compose file that
     # mounts this prometheus.yml, so each entry is validated end to end.
+    #
+    # The detector must match BOTH the single-file mount
+    # (`./observability/prometheus/prometheus.yml:/etc/…`) and the directory
+    # mount (`./observability/prometheus:/etc/prometheus/conf`) that replaced
+    # it on 2026-08-03. This is not hypothetical tidiness: the directory-mount
+    # change removed the literal string `observability/prometheus/prometheus.yml`
+    # from docker-compose.yml, so a detector keyed to that literal silently
+    # dropped docker-compose.yml out of PROM_COMPOSE — quietly undoing the
+    # per-stack coverage the 2026-08-02 review had just added, and letting a
+    # deleted rule mount and a `:rw` downgrade both PASS. Caught only by
+    # mutation-testing the new checks against a deliberately broken tree;
+    # the fix that motivates a gate is exactly what is most likely to blind it.
+    # The trailing `:` is load-bearing — it matches a MOUNT, not a prose
+    # mention of the path in a comment.
     PROM_COMPOSE=()
     for c in "$ROOT/docker-compose.yml" "$ROOT/docker-compose.observability.yml"; do
-        [ -f "$c" ] && grep -q 'observability/prometheus/prometheus.yml' "$c" && PROM_COMPOSE+=("$c")
+        [ -f "$c" ] && grep -qE 'observability/prometheus(/prometheus\.yml)?:' "$c" \
+            && PROM_COMPOSE+=("$c")
     done
     if [ "${#PROM_COMPOSE[@]}" -eq 0 ]; then
         yellow "⚠ no compose file mounts prometheus.yml — skipping rule_files resolution"
@@ -4912,22 +4946,56 @@ else
             # about what the same file means.
             missing_in=""
             for c in "${PROM_COMPOSE[@]}"; do
-                # Match `- ./host/path:/container/path[:ro]` on the container path.
+                # An entry may be satisfied by a mount of the FILE itself or of
+                # any ANCESTOR DIRECTORY. Directory mounts became the house
+                # style on 2026-08-03: once the host file is REPLACED (a new
+                # inode, which every git checkout produces), a single-file bind
+                # mount freezes the container's cached SIZE while still reading
+                # the current bytes, so the running Prometheus served the new
+                # rules TRUNCATED to the superseded file's length — silently,
+                # and with /api/v1/rules looking healthy.
+                # Resolving only exact file mounts here would have failed the
+                # very fix for that bug, so walk the ancestors too.
+                m=""; hostfile=""; mode=""
+                # 1. exact file mount: `- ./host/file:/container/file[:ro]`
                 m="$(grep -oE "\.[^:[:space:]]*:${cpath}(:[a-z,]+)?[[:space:]]*$" "$c" | head -1 || true)"
+                if [ -n "$m" ]; then
+                    hostfile="$ROOT/$(echo "${m%%:*}" | sed 's|^\./||')"
+                    mode="$(echo "$m" | awk -F: 'NF>2{print $NF}')"
+                else
+                    # 2. ancestor-directory mount. Walk /a/b/c.yml → /a/b → /a.
+                    probe="${cpath%/*}"; rest="${cpath##*/}"
+                    while [ -n "$probe" ] && [ "$probe" != "/" ]; do
+                        m="$(grep -oE "\.[^:[:space:]]*:${probe}(:[a-z,]+)?[[:space:]]*$" "$c" | head -1 || true)"
+                        if [ -n "$m" ]; then
+                            hostfile="$ROOT/$(echo "${m%%:*}" | sed 's|^\./||')/$rest"
+                            mode="$(echo "$m" | awk -F: 'NF>2{print $NF}')"
+                            break
+                        fi
+                        rest="${probe##*/}/$rest"; probe="${probe%/*}"
+                    done
+                fi
                 if [ -z "$m" ]; then
                     missing_in="$missing_in $(basename "$c")"
                     continue
                 fi
                 # Validate each stack's own host path independently: two
                 # compose files may name different sources for one entry.
-                hp="${m%%:*}"
-                if [ ! -f "$ROOT/${hp#./}" ]; then
-                    red "✗ rule_files entry '$entry': $(basename "$c") mounts it from '$hp', which does not exist"
-                    yellow "  → the mount points at a missing file; Prometheus would load zero groups."
+                if [ ! -f "$hostfile" ]; then
+                    red "✗ rule_files entry '$entry': $(basename "$c") mounts it from '${m%%:*}', which yields no file"
+                    yellow "  → resolved to '$hostfile', which does not exist; Prometheus would load zero groups."
                     PROM_FAIL=1
                 else
+                    # Mode was an explicitly documented gap until 2026-08-03: a
+                    # silent `:rw` downgrade would have passed. Prometheus never
+                    # writes its rules, so anything but read-only is a mistake.
+                    if [ "$mode" != "ro" ]; then
+                        red "✗ rule_files entry '$entry': $(basename "$c") mounts it '${mode:-rw}', not ':ro'"
+                        yellow "  → rule files must be mounted read-only; Prometheus never writes them."
+                        PROM_FAIL=1
+                    fi
                     PROM_RESOLVED="$PROM_RESOLVED
-$ROOT/${hp#./}"
+$hostfile"
                 fi
             done
             if [ -n "$missing_in" ]; then
@@ -4963,7 +5031,7 @@ $PROM_RULES_CANON"
         # cannot merge them when their label sets differ — two pages, two `for`
         # windows, two contradictory runbooks for one incident.
         # Found live 2026-08-02: `TalosWorkerDown` existed in BOTH
-        # observability/alerts.yml (for: 1m, component=worker) and the canonical
+        # observability/rules/alerts.yml (for: 1m, component=worker) and the canonical
         # deploy/helm/talos/files/alerts.yaml (for: 2m, category=availability).
         # It was harmless only while docker-compose.yml mounted NO rules at all;
         # mounting both surfaced it immediately, with both copies observed
@@ -4981,7 +5049,7 @@ $PROM_RULES_CANON"
                 yellow "    name, so both copies fire on one event; Alertmanager cannot merge them"
                 yellow "    when their labels differ. Define it once — the canonical home is"
                 yellow "    deploy/helm/talos/files/alerts.yaml (the file the chart's PrometheusRule"
-                yellow "    embeds); observability/alerts.yml is dev-only WASM/worker rules."
+                yellow "    embeds); observability/rules/alerts.yml is dev-only WASM/worker rules."
                 PROM_FAIL=1
             done
         fi
@@ -5027,7 +5095,7 @@ $PROM_RULES_CANON"
         # next sibling key, so annotation prose and comments are excluded.
         #
         # `wasm_*` was added 2026-08-02. Until then (c) inspected only
-        # `talos_*`, so the eleven WASM rules in observability/alerts.yml had
+        # `talos_*`, so the eleven WASM rules in observability/rules/alerts.yml had
         # ZERO coverage from any direction of this check — and SEVEN of them
         # named a series the worker cannot emit under any workload (six
         # distinct metric names; `wasm_errors_total` and
@@ -5201,6 +5269,114 @@ if [ "$PROM_FAIL" -eq 1 ]; then
     EXIT_CODE=1
 else
     green "✓ dev Prometheus scrapes every alerted job, rule files resolve, alert metrics are registered"
+fi
+echo
+
+# ── 66: no single-FILE bind mount of a git-tracked config file ────────
+bold "▶ check 66: compose bind mounts of tracked files must mount the DIRECTORY"
+# A single-file bind mount can leave the container serving CORRUPTED content
+# after the host file is replaced — silently: no error, no log line, no
+# unhealthy container. Git replaces rather than rewrites in place (verified:
+# every `git checkout` of a changed file yields a new inode); atomic-saving
+# editors do the same.
+#
+# OBSERVED live 2026-08-03, after it had already cost a whole cycle. #625
+# merged, deployed, its alert on disk; `/api/v1/rules` still reported the
+# pre-merge 13 groups / 37 rules with `WASMMetricsPipelineDead` absent. The
+# host rules file was 21953 bytes; `docker exec stat` said 6464, and the
+# bytes served were a byte-exact 6464-byte PREFIX of the CURRENT host file,
+# cut mid-word inside a comment. Two independent confirmations it was a
+# prefix of the NEW file and not the old file intact: `cmp` against
+# `head -c 6464` matched, and that prefix names WASMMetricsPipelineDead
+# exactly once (the live count) where the previous committed version names it
+# zero times. 6464 is exactly the previous committed version's byte length.
+# It parsed only because the cut landed inside a comment block — mid-value
+# the stack would have failed loudly and the bug would have been found in
+# minutes rather than surviving three merges. The same shape would truncate a
+# scrape config, silently dropping jobs off the tail of prometheus.yml.
+#
+# MECHANISM, reproduced deterministically 2026-08-03 (Docker Desktop 29.6.2,
+# VirtioFS) after two earlier attempts failed. The trigger is the host file
+# acquiring a NEW INODE — which every `git checkout` of a changed file does:
+#   * edited IN PLACE (inode kept), a single-file mount tracks size and
+#     content correctly and indefinitely (measured 100→301→701→1201 bytes);
+#   * the FIRST replacement freezes the container's cached SIZE at its
+#     last-known value, permanently (observed frozen for 26 h, and not
+#     refreshed by later writes, replacements, re-reads, or elapsed time);
+#   * the DATA path still resolves by NAME — reads return the CURRENT file's
+#     bytes and `open()` gives ENOENT once the host path is gone. So do NOT
+#     restate this as "a single-file mount pins the inode": the data
+#     demonstrably comes from the NEW file. Only the attributes are stale;
+#   * net: current bytes clamped to the frozen size (longer file → the
+#     byte-exact prefix above; shorter → `stat` lies, reads are complete);
+#   * `docker restart` re-binds and clears it.
+# A same-length replacement cannot exhibit the bug at all and will "prove"
+# the mount is fine — which is how the first two attempts came back negative.
+#
+# The rule is a large reduction, not a proof. A DIRECTORY mount resolves the
+# name at access time and was correct in every equivalent test, including on
+# a four-day-old container and across kill+start — but one directory-mounted
+# container was seen frozen across two replacements and could not be made to
+# do it again. The live half (scripts/verify-observability.sh) is what
+# actually catches the symptom regardless of cause.
+#
+# SCOPE: git-TRACKED sources only. An untracked/generated file is not
+# replaced by git operations and is a different (weaker) story, so flagging
+# it would be noise. Long-syntax (`type: bind`) mounts are not recognised —
+# the repo uses short syntax exclusively; that is the safe direction (a
+# missed mount is a false negative, never a false positive). Only host paths
+# written `./relative` are considered (an absolute or `${VAR}` source is not
+# a repo file).
+#
+# LIMITS worth stating rather than implying:
+#  * this is a STATIC check. It proves the mounts are shaped correctly; it
+#    cannot prove the running container is reading the current bytes — a
+#    container started before the fix still serves stale content through a
+#    now-correct compose file. That half needs a live stack and lives in
+#    scripts/verify-observability.sh (`make observability-verify`),
+#    deliberately NOT here, because a CI lint with no stack could only skip,
+#    and a check that skips is not a gate.
+#  * only the three compose files enumerated below are scanned.
+#    docker-compose.override.yml is deliberately excluded because it is
+#    gitignored and per-developer — but that does mean a single-file mount
+#    added there is invisible to this check (same shape as check 65's
+#    PROM_COMPOSE limit).
+#
+# Opt-out: `# allow-single-file-mount: <reason>` on the mount line or the
+# line above it.
+MOUNT_FAIL=0
+for cf in docker-compose.yml docker-compose.observability.yml docker-compose.prod.yml; do
+    [ -f "$ROOT/$cf" ] || continue
+    while IFS= read -r ln; do
+        num="${ln%%:*}"
+        body="${ln#*:}"
+        # `- ./host/path:/container/path[:mode]` — relative host paths only
+        # (an absolute or ${VAR} source is not a repo file).
+        hp="$(printf '%s' "$body" | sed -nE 's|^[[:space:]]*-[[:space:]]*(\./[^:[:space:]]+):/[^:[:space:]]+(:[a-z,]+)?[[:space:]]*$|\1|p')"
+        [ -n "$hp" ] || continue
+        rel="${hp#./}"
+        # Directory sources are the desired shape.
+        [ -f "$ROOT/$rel" ] || continue
+        # Untracked sources are out of scope (git does not replace them).
+        git -C "$ROOT" ls-files --error-unmatch "$rel" >/dev/null 2>&1 || continue
+        # Opt-out on this line or the one above it.
+        if printf '%s' "$body" | grep -q 'allow-single-file-mount:'; then continue; fi
+        prev="$(sed -n "$((num - 1))p" "$ROOT/$cf")"
+        if printf '%s' "$prev" | grep -q 'allow-single-file-mount:'; then continue; fi
+        red "✗ $cf:$num bind-mounts the tracked FILE '$rel'"
+        yellow "  → a single-file bind mount pins the container to that file's"
+        yellow "    cached size once the file is REPLACED; a git checkout then serves"
+        yellow "    the new bytes TRUNCATED to the old length, silently. Mount its parent"
+        yellow "    DIRECTORY instead — and make sure that directory contains ONLY"
+        yellow "    files this container should read, since a directory mount exposes"
+        yellow "    all of them. Opt out with '# allow-single-file-mount: <reason>'."
+        MOUNT_FAIL=1
+    done < <(grep -nE '^[[:space:]]*-[[:space:]]*\./[^:[:space:]]+:/' "$ROOT/$cf" || true)
+done
+if [ "$MOUNT_FAIL" -eq 1 ]; then
+    EXIT_CODE=1
+else
+    green "✓ no compose service bind-mounts a tracked config file singly"
 fi
 echo
 
