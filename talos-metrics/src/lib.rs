@@ -246,6 +246,25 @@ impl TalosMetrics {
             &["method"],
         )?;
         registry.register(Box::new(auth_attempts_total.clone()))?;
+        // Pre-seed the two `method` values that are actually emitted
+        // (`talos_auth::AUTH_METHOD_PASSWORD` / `_OAUTH`), so a controller
+        // that has served no interactive login still EXPORTS the series at 0
+        // instead of omitting it. A `CounterVec` emits nothing at all until a
+        // label set is first touched, which makes "detector present and
+        // quiet" indistinguishable from "detector deleted" on a healthy
+        // stack — the exact ambiguity that let five alerted CounterVecs here
+        // sit unexercised. `api_key` is deliberately NOT seeded: it is not in
+        // this population (see the talos-auth header for why folding it in
+        // would make TalosControllerHighErrorRate unfireable in practice).
+        //
+        // Note precisely what this proves and what it does not: a present
+        // denominator shows the auth counters were registered in THIS
+        // process. It does not show the failure leg is still wired — that is
+        // what the talos-auth unit tests driving the production login path
+        // are for.
+        for method in ["password", "oauth"] {
+            auth_attempts_total.with_label_values(&[method]).inc_by(0.0);
+        }
 
         let auth_failures_total = CounterVec::new(
             prometheus::Opts::new(
@@ -259,6 +278,19 @@ impl TalosMetrics {
             &["method", "reason"],
         )?;
         registry.register(Box::new(auth_failures_total.clone()))?;
+        // DELIBERATELY NOT PRE-SEEDED, unlike its denominator above. The
+        // `reason` values are a closed set of `&'static str` constants, but
+        // the (method, reason) PRODUCT is not a valid population: only 9 of
+        // the 16 pairs have an emitting call site (`unknown_user`, `locked`,
+        // `lockout_triggered`, `invalid_password` are password-only;
+        // `provider_error`, `csrf_state`, `link_failed` are oauth-only), and
+        // seeding a pair nothing writes would imply a wired signal that does
+        // not exist. Encoding the real pairing here would also mean copying
+        // talos-auth's constants across a dependency edge that only points
+        // the other way (talos-auth depends on this crate), so the two could
+        // drift silently. Absence of a failure series is the correct
+        // non-alerting answer anyway — see the TalosControllerHighErrorRate
+        // comment in deploy/helm/talos/files/alerts.yaml.
 
         let auth_2fa_attempts_total = CounterVec::new(
             prometheus::Opts::new(
@@ -491,6 +523,18 @@ impl TalosMetrics {
             &["provider"],
         )?;
         registry.register(Box::new(kek_decrypt_failures_total.clone()))?;
+        // Seed only the two `provider` values with a live emitting site:
+        // `active` and `both`, both in `SecretsManager::decrypt_dek`. The
+        // description's third value, `legacy`, has NO emitter anywhere in the
+        // workspace — a total legacy-provider failure is reported as `both`.
+        // Seeding `legacy` would put a permanent flat 0 on a dashboard for a
+        // condition nothing can ever report, which reads as "watched and
+        // healthy" rather than "not watched".
+        for provider in ["active", "both"] {
+            kek_decrypt_failures_total
+                .with_label_values(&[provider])
+                .inc_by(0.0);
+        }
 
         let memory_write_failures_total = CounterVec::new(
             prometheus::Opts::new(
@@ -502,6 +546,17 @@ impl TalosMetrics {
             &["reason"],
         )?;
         registry.register(Box::new(memory_write_failures_total.clone()))?;
+        // Closed set, and every value has a live emitter: the label comes
+        // from `MemoryWriteError::metric_label()`, whose four variants are
+        // exhaustively matched at the two `__memory_write__` hook sites in
+        // talos-engine. Note the description above lists only three — the
+        // catch-all `other` was added to the type without updating it; the
+        // seed follows the CODE, which is what actually emits.
+        for reason in ["crypto", "db", "validation", "other"] {
+            memory_write_failures_total
+                .with_label_values(&[reason])
+                .inc_by(0.0);
+        }
 
         let ops_alert_ingest_failures_total = CounterVec::new(
             prometheus::Opts::new(
@@ -531,6 +586,19 @@ impl TalosMetrics {
             &["op", "stage"],
         )?;
         registry.register(Box::new(module_payload_encryption_failures_total.clone()))?;
+        // All six combinations are reachable, so all six are seeded:
+        // `encrypt_payload_bundle` loops over all three `PayloadSlot`s and
+        // `decrypt_payload_slot` is called for each of them, and both wrap
+        // their failures through `inc_payload_crypto_failure`. Cardinality is
+        // fixed at 6 by construction (both labels are `&'static str` from
+        // closed sets) — the same bound that crate's own doc comment states.
+        for op in ["encrypt", "decrypt"] {
+            for stage in ["input", "output", "trigger_metadata"] {
+                module_payload_encryption_failures_total
+                    .with_label_values(&[op, stage])
+                    .inc_by(0.0);
+            }
+        }
 
         let secret_decrypt_failures_total = CounterVec::new(
             prometheus::Opts::new(
@@ -728,6 +796,65 @@ mod tests {
         assert!(rendered.contains(r#"talos_kek_decrypt_failures_total{provider="both"} 2"#));
         assert!(rendered.contains("talos_actor_memory_orphaned_rows 3"));
         assert!(rendered.contains("talos_dek_cache_size 42"));
+    }
+
+    /// Absence is not zero. A `CounterVec` emits NOTHING until some label set
+    /// is first touched, so on a healthy controller that has had no auth
+    /// traffic and no crypto failure, ALL FIVE alerted CounterVecs were
+    /// simply missing from `/metrics/prometheus` (verified 2026-08-02 against
+    /// the live endpoint) — indistinguishable from the wiring having been
+    /// deleted. Pre-seeding the combinations that have a live emitter makes
+    /// idle read `0` instead; that fixes FOUR of the five, and
+    /// `talos_auth_failures_total` deliberately stays absent (asserted
+    /// below), because only 9 of its 16 (method, reason) pairs have an
+    /// emitting call site.
+    ///
+    /// This test asserts the seeds on a FRESH registry with nothing recorded,
+    /// which is the state that matters (`crypto_invariant_metrics_render`
+    /// above increments first, so it cannot see this).
+    #[test]
+    fn alerted_counter_vecs_are_seeded_at_zero_on_a_cold_registry() {
+        let m = TalosMetrics::new().unwrap();
+        let rendered = m.render_prometheus().expect("render");
+
+        for expected in [
+            r#"talos_auth_attempts_total{method="password"} 0"#,
+            r#"talos_auth_attempts_total{method="oauth"} 0"#,
+            r#"talos_kek_decrypt_failures_total{provider="active"} 0"#,
+            r#"talos_kek_decrypt_failures_total{provider="both"} 0"#,
+            r#"talos_memory_write_failures_total{reason="crypto"} 0"#,
+            r#"talos_memory_write_failures_total{reason="db"} 0"#,
+            r#"talos_memory_write_failures_total{reason="validation"} 0"#,
+            r#"talos_memory_write_failures_total{reason="other"} 0"#,
+            r#"talos_module_payload_encryption_failures_total{op="encrypt",stage="input"} 0"#,
+            r#"talos_module_payload_encryption_failures_total{op="encrypt",stage="output"} 0"#,
+            r#"talos_module_payload_encryption_failures_total{op="encrypt",stage="trigger_metadata"} 0"#,
+            r#"talos_module_payload_encryption_failures_total{op="decrypt",stage="input"} 0"#,
+            r#"talos_module_payload_encryption_failures_total{op="decrypt",stage="output"} 0"#,
+            r#"talos_module_payload_encryption_failures_total{op="decrypt",stage="trigger_metadata"} 0"#,
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "cold registry must EXPORT `{expected}` — an absent series is \
+                 not a zero one, and every alert built on these reads absence \
+                 as 'no match'\n--- output ---\n{rendered}"
+            );
+        }
+
+        // The two deliberate non-seeds, asserted so a later "tidy-up" that
+        // seeds them has to argue with a test rather than slip through.
+        assert!(
+            !rendered.contains("talos_auth_failures_total{"),
+            "talos_auth_failures_total is deliberately unseeded: only 9 of its \
+             16 (method, reason) pairs have an emitter, and seeding a pair \
+             nothing writes implies a signal that does not exist\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(r#"provider="legacy""#),
+            "provider=\"legacy\" has no emitting site anywhere in the \
+             workspace; a flat 0 there would read as 'watched' when it is \
+             not\n{rendered}"
+        );
     }
 
     // Crash-recovery outcome counter (durable execution, RFC 0003) must be

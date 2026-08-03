@@ -65,14 +65,18 @@ scrape_configs:
 > bearer `dev-metrics-token` vs the real `dev-token`). Structural lint
 > **check 65** now fails the build if a job an alert selects on via
 > `up{job="…"}` is missing, if a `rule_files` entry no compose file mounts,
-> or if an alert references a `talos_*` metric no Rust source registers.
+> or if an alert references a `talos_*` **or `wasm_*`** metric no Rust source
+> registers.
 > There is a fourth direction, 65(d): no alert name may be defined in more
 > than one mounted rule file. Read check 65's header in
-> `scripts/lint-structural.sh` for its six stated limits before relying on it. 65(b) is now enforced **per compose file**, so
-> dropping this stack's rule mounts fails the lint; the remaining documented
-> holes are a glob `rule_files` entry (rejected though Prometheus allows it),
-> extra scrape jobs no alert selects on, mount mode (`:rw` passes), and
-> `wasm_*` metrics (65(c) only inspects `talos_*`).
+> `scripts/lint-structural.sh` for its seven stated limits before relying on it. 65(b) is now enforced **per compose file**, so
+> dropping this stack's rule mounts fails the lint; **65(c) covers `wasm_*` as
+> of 2026-08-02** — it derives the exported name from the OTEL declaration
+> rather than looking for a literal, and run against the pre-fix tree it fails
+> on six real defects. The remaining documented holes are a glob `rule_files`
+> entry (rejected though Prometheus allows it), extra scrape jobs no alert
+> selects on, mount mode (`:rw` passes), and 65(a) scanning whole rule files
+> rather than `expr:` blocks.
 
 **Note on the two stacks.** Only `docker-compose.yml` can exercise these
 alerts: its Prometheus shares `talos-network` with the controller and worker.
@@ -88,7 +92,7 @@ Two rule files are mounted into the container at `/etc/prometheus/rules/`:
 
 | Mounted as | Source | Covers |
 |---|---|---|
-| `wasm-alerts.yml` | `observability/alerts.yml` | WASM runtime / worker (11 rules) |
+| `wasm-alerts.yml` | `observability/alerts.yml` | WASM runtime / worker (10 rules) |
 | `talos-alerts.yaml` | `deploy/helm/talos/files/alerts.yaml` | Controller `talos_*` invariants (26 rules) |
 
 `talos-alerts.yaml` is **bind-mounted, never copied** — it is the same file the
@@ -96,22 +100,34 @@ chart's `PrometheusRule` embeds via `.Files.Get`, so the dev rules and the
 production CRD cannot drift. (`deploy/observability/alerts.yaml` is a symlink to
 it for the same reason.)
 
-**Five `talos_*` series named by these alerts are absent from a healthy
-controller's `/metrics/prometheus`** (verified 2026-08-02 against the live
-endpoint): `talos_auth_attempts_total`, `talos_auth_failures_total`,
-`talos_kek_decrypt_failures_total`, `talos_memory_write_failures_total`,
-`talos_module_payload_encryption_failures_total`. All five are registered in
-`talos-metrics`, so structural check 65(c) passes — but they are labelled
-`CounterVec`s with no pre-seeded label combination, and a prometheus `*Vec`
-exports nothing until some label set is first touched. That is NOT the same as
-"the alert can never fire" (an `increase(...) > 0` rule fires once the series
-appears and has two samples), but it does mean "detector absent" and "detector
-present and quiet" are indistinguishable on a healthy stack. Deliberately not
-pre-seeded here: `talos_auth_failures_total{method,reason}` has an open reason
-set, and #623's own rule is that seeding a label combination nothing writes
-"would imply a wired signal that doesn't exist". Filed as follow-up, not fixed
-in this change. (The five #623 detectors added in that PR — `talos_wasm_log_
-orphaned_total` etc. — ARE seeded and do appear.)
+**Four of the five alerted `talos_*` `CounterVec`s are now pre-seeded at 0**
+(2026-08-02). A prometheus `*Vec` exports nothing until some label set is
+first touched, so on a healthy controller `talos_auth_attempts_total`,
+`talos_kek_decrypt_failures_total`, `talos_memory_write_failures_total` and
+`talos_module_payload_encryption_failures_total` were simply missing from
+`/metrics/prometheus` — "detector absent" and "detector present and quiet"
+were indistinguishable. Each now records `0` at registration for exactly the
+label combinations a live call site writes:
+
+| Series | Seeded values | Why that set |
+|---|---|---|
+| `talos_auth_attempts_total{method}` | `password`, `oauth` | the only two interactive-login emitters; `api_key` is deliberately not in this population |
+| `talos_kek_decrypt_failures_total{provider}` | `active`, `both` | `legacy` has no emitting site anywhere — a flat 0 there would read as "watched" |
+| `talos_memory_write_failures_total{reason}` | `crypto`, `db`, `validation`, `other` | the exhaustive `MemoryWriteError::metric_label()` match |
+| `talos_module_payload_encryption_failures_total{op,stage}` | all 6 | both directions cover all three `PayloadSlot`s |
+
+Note this makes the series PRESENT; it does not prove the incrementing call
+site still exists. That is what check 58 and the per-metric unit tests are
+for.
+
+`talos_auth_failures_total{method,reason}` is the deliberate exception and
+stays unseeded: only 9 of its 16 pairs have an emitting call site, and seeding
+a pair nothing writes "would imply a wired signal that doesn't exist"
+(#623's rule). Encoding the real pairing here would also mean duplicating
+talos-auth's constants across a dependency edge that only points the other
+way. Asserted in both directions by
+`alerted_counter_vecs_are_seeded_at_zero_on_a_cold_registry` in
+`talos-metrics`.
 
 `TalosWorkerDown` is defined **once**, in `talos-alerts.yaml`. Until 2026-08-02
 `observability/alerts.yml` carried a second copy (`for: 1m`, `component=worker`
@@ -125,18 +141,41 @@ one mounted rule file.
 
 ### alerts.yml
 
-WASM/worker alert rules (11 total).
+WASM/worker alert rules (10 total).
 
-> **These are not currently exercisable, even though `up{job="talos-worker"}`
-> is now 1.** Verified 2026-08-02 by scraping the live worker: its
-> `/metrics` returns `target_info` and nothing else. The instruments behind
-> these alerts are real (`talos-worker-runtime/src/metrics.rs` declares
-> `wasm.executions.total`, `wasm.errors.total`, …), but the OTEL Prometheus
-> exporter emits an instrument only after its first recorded measurement, so
-> on an idle worker every `wasm_*` series is ABSENT rather than zero. A green
-> target here means "reachable", not "producing the series the rules need" —
-> and structural check 65 cannot see the difference, because 65(c) only
-> inspects `talos_*` names.
+> **Seven of the eleven rules that used to live here named a series the
+> worker cannot emit under any workload** (found 2026-08-02). Two independent causes, both fixed:
+>
+> 1. **Wrong names.** These rules had been written against
+>    `worker/src/bin/metrics_demo.rs` — a demo binary that fabricates
+>    `wasm_*` data into its own private registry on port 9091, which is
+>    exactly what this stack used to scrape. The real worker exports through
+>    OpenTelemetry, and the exporter appends `_total` to every counter
+>    UNCONDITIONALLY, so `wasm.executions.total` was rendered
+>    `wasm_executions_total_total`. The instruments were renamed to drop the
+>    redundant component; `wasm_cache_hits`/`_misses` were corrected to their
+>    `_total` spellings; and `HighWASMMemoryUsage` was DELETED because
+>    `wasm_memory_used_bytes` has no producer outside the demo binary.
+>    `LowWASMThroughput` was deleted too — its 10 exec/sec floor came from
+>    the demo's synthetic workload, and once the producer seeds at 0 it would
+>    have sat permanently firing at `info` on every stack.
+> 2. **Absence is not zero.** An OTEL instrument emits nothing until its
+>    first measurement, so on an idle worker every `wasm_*` series was ABSENT
+>    — and `rate(x[30m]) == 0` over an absent series matches NOTHING. The
+>    alert built to detect "nothing is executing" was silenced by exactly the
+>    condition it detects. `RuntimeMetrics::seed_zero_series` now records a 0
+>    on the closed-label-set instruments at startup, and `NoWASMExecutions`
+>    carries an `absent()` arm for the cases seeding cannot reach (a worker
+>    too old to seed, a dead exporter, a renamed instrument).
+>
+> `OTEL_METRICS_ENABLED` is also now set for the worker in
+> `docker-compose.yml`. It defaults to FALSE and the runtime skips building
+> `RuntimeMetrics` entirely when unset, so before this the worker's
+> `/metrics` was empty regardless of workload.
+>
+> `observability/alerts_test.yml` drives these transitions through
+> `promtool test rules` (NOT CI-wired — there is no Prometheus toolchain on
+> the runners; see its header).
 
 
 **Performance Alerts** (5):
@@ -146,18 +185,32 @@ WASM/worker alert rules (11 total).
 - VerySlowWASMExecution (P95 > 2000ms)
 - LowCacheHitRate (< 70%)
 
-**Resource Alerts** (3):
-- HighWASMMemoryUsage (> 1GB)
+**Resource Alerts** (2):
 - TooManyActiveInstances (> 500)
 - HighRetryRate (> 0.5 retries/sec)
+- ~~HighWASMMemoryUsage~~ — deleted; `wasm_memory_used_bytes` has no producer
 
 **Service Health Alerts** (1):
 - PrometheusScrapeFailure (any target down > 5m — broader than the per-job
   `TalosWorkerDown`/`TalosControllerDown`, which live in `talos-alerts.yaml`)
 
-**Throughput Alerts** (2):
-- LowWASMThroughput (< 10 executions/sec)
-- NoWASMExecutions (30 min idle)
+**Throughput Alerts** (1):
+- NoWASMExecutions (`absent(...)` OR 30 min at a zero **summed** rate).
+  The `sum()` is not cosmetic: `seed_zero_series` writes three `status`
+  values, and a label-preserving `rate(...) == 0` turned one idle worker
+  into THREE simultaneous alerts differing only by a label that means
+  nothing here. Consequence for routing: **this alert carries no
+  `job`/`instance`/`status` labels on either arm** — both yield the bare
+  `{severity, component}` pair. An Alertmanager route or silence keyed on
+  `instance` will not match it.
+- ~~LowWASMThroughput~~ — deleted; a demo-derived SLO that would sit
+  permanently firing once the producer seeds at 0
+
+**Pipeline Liveness** (1):
+- WASMMetricsPipelineDead — the worker target is UP but exports no
+  `wasm_executions_total`. `up == 1` certifies reachability, NOT production.
+  Gated on the target existing AND on the producer-side seeding, so it does
+  not sit permanently red on a stack that is merely idle.
 
 ### grafana/provisioning/datasources/datasources.yml
 
@@ -269,17 +322,14 @@ histogram_quantile(0.95, rate(wasm_execution_duration_ms_bucket[5m]))
 # P99 latency
 histogram_quantile(0.99, rate(wasm_execution_duration_ms_bucket[5m]))
 
-# Cache hit rate (%)
-100 * rate(wasm_cache_hits[5m]) / (rate(wasm_cache_hits[5m]) + rate(wasm_cache_misses[5m]))
+# Cache hit rate (%) — note the `_total` suffix the OTEL exporter appends
+100 * rate(wasm_cache_hits_total[5m]) / (rate(wasm_cache_hits_total[5m]) + rate(wasm_cache_misses_total[5m]))
 
 # Error rate by type
 sum by (type) (rate(wasm_errors_total[5m]))
 
 # Active instances
 wasm_instances_active
-
-# Memory usage (MB)
-wasm_memory_used_bytes / (1024 * 1024)
 
 # Retry rate
 rate(wasm_retries_total[5m])

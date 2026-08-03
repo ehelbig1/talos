@@ -74,7 +74,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(rate(wasm_executions_total_total[5m]))",
+          "expr": "sum(rate(wasm_executions_total[5m]))",
           "refId": "A"
         }
       ],
@@ -277,7 +277,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(rate(wasm_errors_total_total[5m]))",
+          "expr": "sum(rate(wasm_errors_total[5m]))",
           "refId": "A"
         }
       ],
@@ -414,7 +414,10 @@
       "id": 6,
       "options": {
         "legend": {
-          "calcs": ["mean", "max"],
+          "calcs": [
+            "mean",
+            "max"
+          ],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -431,7 +434,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(rate(wasm_executions_total_total{status=\"success\"}[5m]))",
+          "expr": "sum(rate(wasm_executions_total{status=\"success\"}[5m]))",
           "legendFormat": "Success",
           "refId": "A"
         },
@@ -440,7 +443,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(rate(wasm_executions_total_total{status=\"error\"}[5m]))",
+          "expr": "sum(rate(wasm_executions_total{status=\"error\"}[5m]))",
           "legendFormat": "Error",
           "refId": "B"
         }
@@ -511,7 +514,10 @@
       "id": 7,
       "options": {
         "legend": {
-          "calcs": ["mean", "max"],
+          "calcs": [
+            "mean",
+            "max"
+          ],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -588,7 +594,9 @@
           "displayMode": "table",
           "placement": "right",
           "showLegend": true,
-          "values": ["value"]
+          "values": [
+            "value"
+          ]
         },
         "pieType": "donut",
         "tooltip": {
@@ -603,7 +611,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (type) (rate(wasm_errors_total_total[5m]))",
+          "expr": "sum by (type) (rate(wasm_errors_total[5m]))",
           "legendFormat": "{{type}}",
           "refId": "A"
         }
@@ -674,7 +682,10 @@
       "id": 9,
       "options": {
         "legend": {
-          "calcs": ["mean", "max"],
+          "calcs": [
+            "mean",
+            "max"
+          ],
           "displayMode": "table",
           "placement": "right",
           "showLegend": true
@@ -771,7 +782,10 @@
       "id": 10,
       "options": {
         "legend": {
-          "calcs": ["mean", "max"],
+          "calcs": [
+            "mean",
+            "max"
+          ],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -793,14 +807,19 @@
           "refId": "A"
         }
       ],
-      "title": "Memory Usage",
-      "type": "timeseries"
+      "title": "Memory Usage \u2014 NO PRODUCER (always empty)",
+      "type": "timeseries",
+      "description": "wasm_memory_used_bytes has no producer. It is registered only in worker/src/bin/metrics_demo.rs, which serves its own private registry on port 9091 that nothing scrapes; the real worker exports no memory instrument of any name. This panel is therefore permanently empty, and is kept (renamed) rather than deleted so the gap stays visible instead of reading as 'memory is fine'. The matching alert HighWASMMemoryUsage was deleted from observability/alerts.yml for the same reason. To fix: add a gauge in talos-worker-runtime/src/metrics.rs, extend the exported-name pinning test, then point this panel at the name that test asserts."
     }
   ],
   "refresh": "10s",
   "schemaVersion": 38,
   "style": "dark",
-  "tags": ["talos", "wasm", "runtime"],
+  "tags": [
+    "talos",
+    "wasm",
+    "runtime"
+  ],
   "templating": {
     "list": []
   },

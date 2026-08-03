@@ -1,5 +1,71 @@
-# Prometheus Alert Rules for Talos WASM Runtime
-# These alerts trigger when metrics exceed thresholds
+# Prometheus alert rules for the Talos WASM runtime (DEV STACK ONLY).
+#
+# Loaded by both compose stacks via the `/etc/prometheus/rules/wasm-alerts.yml`
+# bind mount. The canonical, chart-shipped rules live in
+# deploy/helm/talos/files/alerts.yaml and cover `talos_*` (controller) and
+# infrastructure series; this file covers `wasm_*` (worker) series. No alert
+# name may appear in both files — structural lint check 65(d).
+#
+# ===========================================================================
+# ABSENCE IS NOT ZERO  (2026-08-02)
+# ===========================================================================
+#
+# In PromQL an ABSENT series and a series reading 0 are different things, and
+# almost every alert idiom below (`== 0`, `< N`, `rate(...) == 0`) treats
+# absence as "no match". The sharpest consequence was in this very file:
+#
+#     - alert: NoWASMExecutions
+#       expr: rate(wasm_executions_total[30m]) == 0
+#       for: 30m
+#
+# `rate()` over an absent series returns an EMPTY vector, and `empty == 0`
+# matches nothing. The alert built to detect "nothing is executing" was
+# silenced by exactly the condition it detects: it could only fire once the
+# worker HAD executed something and then stopped — never on the cold-dead
+# case, which is the one that matters.
+#
+# Two things had to change for it to work at all, on two different sides:
+#
+#   PRODUCER: an OTEL instrument emits no series until its first recorded
+#   measurement, so on an idle worker every `wasm_*` series is absent rather
+#   than 0. `RuntimeMetrics::seed_zero_series` now records a zero on the
+#   closed-label-set instruments at startup. (An idle worker with the metrics
+#   subsystem enabled therefore reports `wasm_executions_total 0`, which is
+#   both true and alertable.)
+#
+#   CONSUMER: the `absent()` arm below, which still covers the cases seeding
+#   cannot — a worker too old to seed, `OTEL_METRICS_ENABLED` unset, or an
+#   exporter that died before the first scrape.
+#
+# ===========================================================================
+# METRIC NAMES: seven of the eleven rules here selected on a series the
+# worker cannot emit
+# ===========================================================================
+#
+# These rules were originally written against `worker/src/bin/metrics_demo.rs`
+# — a demo binary that fabricates plausible `wasm_*` data on port 9091, which
+# is exactly what this stack's Prometheus used to scrape. The REAL worker
+# exports through OpenTelemetry on port 9090, and `opentelemetry-prometheus`
+# renders instrument names by replacing `.` with `_` and appending `_total` to
+# every counter. Two consequences, both fixed 2026-08-02:
+#
+#   * `wasm.executions.total` was exported as `wasm_executions_total_TOTAL`.
+#     The instruments were renamed to drop the redundant component, so the
+#     exporter now produces the single-suffixed names these rules use. Pinned
+#     by `exported_prometheus_names_are_stable_and_idle_seeds_at_zero` in
+#     talos-worker-runtime. (observability/grafana/dashboards/
+#     talos-wasm-runtime.json had already been hand-patched to the
+#     double-suffixed spelling — two files disagreeing about the name of one
+#     series, with the alerts on the losing side. It is corrected here too.)
+#   * `wasm_cache_hits` / `wasm_cache_misses` never existed; the counters are
+#     `wasm_cache_hits_total` / `wasm_cache_misses_total`. Corrected below.
+#   * `wasm_memory_used_bytes` has NO instrument in the worker at all — only
+#     in the demo binary. Its alert is deleted rather than left pointing at
+#     nothing; see the note where it used to be.
+#
+# Structural lint check 65(c) now derives the exported name from the OTEL
+# declaration and fails the build when a rule here names a series nothing
+# registers.
 
 groups:
   # ========================================================================
@@ -8,7 +74,13 @@ groups:
   - name: wasm_performance
     interval: 30s
     rules:
-      # High error rate
+      # ABSENCE AUDIT: no `absent()` arm, deliberately. A `> threshold` shape
+      # over an absent series correctly yields no match, and here absence
+      # means "no errors have been recorded", which is the healthy state and
+      # must not page. The failure mode absence WOULD hide — the error
+      # counter's call sites being deleted — is not detectable from this
+      # expression at all; `WASMMetricsPipelineDead` below is the detector for
+      # a silent producer. Same reasoning for the next three rules.
       - alert: HighWASMErrorRate
         expr: rate(wasm_errors_total[5m]) > 0.1
         for: 2m
@@ -19,7 +91,6 @@ groups:
           summary: "High WASM execution error rate"
           description: "WASM error rate is {{ $value | humanize }} errors/sec (threshold: 0.1/sec)"
 
-      # Critical error rate
       - alert: CriticalWASMErrorRate
         expr: rate(wasm_errors_total[5m]) > 1.0
         for: 1m
@@ -30,7 +101,10 @@ groups:
           summary: "Critical WASM execution error rate"
           description: "WASM error rate is {{ $value | humanize }} errors/sec (threshold: 1.0/sec)"
 
-      # Slow execution time (P95 > 500ms)
+      # Slow execution time (P95 > 500ms). No absent() arm: absence means no
+      # executions were observed in the window, and a latency quantile over an
+      # empty population is undefined, not slow. "No executions" has its own
+      # alert (NoWASMExecutions).
       - alert: SlowWASMExecution
         expr: histogram_quantile(0.95, rate(wasm_execution_duration_ms_bucket[5m])) > 500
         for: 5m
@@ -41,7 +115,6 @@ groups:
           summary: "Slow WASM execution detected"
           description: "P95 execution time is {{ $value | humanize }}ms (threshold: 500ms)"
 
-      # Very slow execution time (P95 > 2000ms)
       - alert: VerySlowWASMExecution
         expr: histogram_quantile(0.95, rate(wasm_execution_duration_ms_bucket[5m])) > 2000
         for: 2m
@@ -52,12 +125,36 @@ groups:
           summary: "Very slow WASM execution detected"
           description: "P95 execution time is {{ $value | humanize }}ms (threshold: 2000ms)"
 
-      # Low cache hit rate (< 70%)
+      # Low cache hit rate (< 70%).
+      #
+      # NAME FIX: was `wasm_cache_hits` / `wasm_cache_misses`; the exporter
+      # emits `_total` on both.
+      #
+      # ONE-SIDED ABSENCE was a real hole here and is closed on the producer
+      # side rather than in PromQL. Binary operators match on label sets, so
+      # if `wasm_cache_hits_total` had never been touched while misses were
+      # flowing — a genuine 0% hit rate, the worst case this alert exists for
+      # — the division dropped to an empty vector and nothing fired. Both
+      # counters are now seeded at 0 at worker startup, so both series always
+      # exist and the ratio is well-formed. No `absent()` arm: when BOTH are
+      # absent nothing has been compiled at all, and a hit rate over zero
+      # compilations is undefined, not bad.
+      #
+      # AND WITH SEEDING, THE IDLE CASE IS NOW A NaN, NOT AN EMPTY VECTOR —
+      # which is the property this rule actually rests on post-2026-08-02 and
+      # is worth naming. On an idle worker both legs are present and flat, so
+      # `rate(hits)` and `rate(misses)` are both 0 and the expression is
+      # 0/(0+0) = NaN. Every PromQL comparison against NaN is false, so the
+      # element is dropped and nothing fires — the same (correct) silence as
+      # before, reached by a different mechanism. Do NOT "fix" the division
+      # with a `clamp_min(denominator, 1)`-style guard: that would turn the
+      # undefined idle ratio into a hard 0 and make this alert fire
+      # permanently on every idle stack.
       - alert: LowCacheHitRate
         expr: |
           (
-            rate(wasm_cache_hits[5m]) /
-            (rate(wasm_cache_hits[5m]) + rate(wasm_cache_misses[5m]))
+            rate(wasm_cache_hits_total[5m]) /
+            (rate(wasm_cache_hits_total[5m]) + rate(wasm_cache_misses_total[5m]))
           ) < 0.7
         for: 10m
         labels:
@@ -73,18 +170,25 @@ groups:
   - name: wasm_resources
     interval: 30s
     rules:
-      # High memory usage
-      - alert: HighWASMMemoryUsage
-        expr: wasm_memory_used_bytes > 1073741824  # 1GB
-        for: 5m
-        labels:
-          severity: warning
-          component: wasm-runtime
-        annotations:
-          summary: "High WASM memory usage"
-          description: "Memory usage is {{ $value | humanize1024 }}B (threshold: 1GB)"
+      # `HighWASMMemoryUsage` (wasm_memory_used_bytes > 1GiB) WAS HERE and is
+      # deleted, not repaired. The worker registers no memory instrument of
+      # any name — `wasm_memory_used_bytes` exists only in
+      # worker/src/bin/metrics_demo.rs, which serves its own private registry
+      # that no scrape endpoint exposes. The alert had therefore never been
+      # capable of firing, in any deployment, since it was written. A rule
+      # that cannot fire is worse than no rule: it occupies the slot where a
+      # working memory alert would be and reads, on review, as coverage.
+      #
+      # To bring it back: add an instrument to
+      # talos-worker-runtime/src/metrics.rs (an `f64_gauge`/`u64_gauge`
+      # sampled from the wasmtime store's memory accounting), extend the
+      # exported-name pinning test, and re-add the rule against the name that
+      # test asserts.
 
-      # Too many active instances
+      # No absent() arm: absence means no instances have ever been created,
+      # which cannot be "too many". Note this gauge has no reaper — see the
+      # gauge-population caveat in the worker runtime — so it is a
+      # process-local UpDownCounter, not a fleet total.
       - alert: TooManyActiveInstances
         expr: wasm_instances_active > 500
         for: 5m
@@ -95,7 +199,11 @@ groups:
           summary: "Too many active WASM instances"
           description: "{{ $value }} active instances (threshold: 500)"
 
-      # High retry rate
+      # No absent() arm: absence means nothing has been retried. Deliberately
+      # NOT seeded on the producer side either — a flat 0 per retry `reason`
+      # would assert that each reason is being watched for when the only thing
+      # distinguishing "zero timeouts" from "the timeout path was deleted" is
+      # a call site nothing checks.
       - alert: HighRetryRate
         expr: rate(wasm_retries_total[5m]) > 0.5
         for: 5m
@@ -129,6 +237,12 @@ groups:
       # Prometheus scrape failures. Broader than TalosWorkerDown by design —
       # this fires for ANY down target, including the controller and
       # Prometheus's own self-scrape. Not a duplicate of a named per-job alert.
+      #
+      # No absent() arm: Prometheus synthesises an `up` sample for every
+      # configured target on every scrape, so `up` cannot be absent while any
+      # target is configured. "A job an alert needs is not scraped at all" is
+      # a config defect and is gated at build time by structural lint check
+      # 65(a), not at runtime by an alert.
       - alert: PrometheusScrapeFailure
         expr: up == 0
         for: 5m
@@ -140,29 +254,159 @@ groups:
           description: "Failed to scrape {{ $labels.job }} for > 5 minutes"
 
   # ========================================================================
-  # Throughput Alerts
+  # Throughput
   # ========================================================================
   - name: throughput
     interval: 30s
     rules:
-      # Low throughput (< 10 req/sec)
-      - alert: LowWASMThroughput
-        expr: rate(wasm_executions_total[5m]) < 10
-        for: 10m
-        labels:
-          severity: info
-          component: wasm-runtime
-        annotations:
-          summary: "Low WASM execution throughput"
-          description: "Throughput is {{ $value | humanize }} executions/sec (threshold: 10/sec)"
+      # `LowWASMThroughput` (rate(wasm_executions_total[5m]) < 10) WAS HERE
+      # and is deleted. Its 10 executions/second floor came from the demo
+      # binary's synthetic 10-per-second workload, not from any Talos SLO; no
+      # real deployment sustains it, so once the producer seeds at 0 the rule
+      # would have sat permanently firing at `info` on every stack. A
+      # permanently-red signal trains operators to ignore red, which is the
+      # same defect this file exists to close. `NoWASMExecutions` below is the
+      # honest form of the question. If a throughput floor is ever wanted
+      # again it needs a real SLO number and a business-hours gate, not a
+      # threshold inherited from a demo.
 
-      # No executions for 30 minutes
+      # ── THE FLAGSHIP ────────────────────────────────────────────────────
+      # `absent()` FIRST, then the zero-rate comparison. The two arms cover
+      # different failures and the alert is only complete with both:
+      #
+      #   absent(...)          the series does not exist: the worker never
+      #                        started its metrics subsystem
+      #                        (OTEL_METRICS_ENABLED unset), the exporter
+      #                        failed, the instrument was renamed, or the
+      #                        worker predates the startup seeding. This arm
+      #                        is the one that was missing, and it is the only
+      #                        arm that can fire on a cold-dead worker.
+      #   sum(rate(...)) == 0  the series exists and is flat: a worker that is
+      #                        up, instrumented, and simply not being given
+      #                        work.
+      #
+      # THE `sum()` IS LOAD-BEARING AND WAS ADDED IN REVIEW. Without it this
+      # arm keeps the source series' labels, and the producer-side seeding
+      # this same change introduced creates THREE of them —
+      # `seed_zero_series` writes status=success, status=error and
+      # status=retry_exhausted. An idle worker therefore raised THREE
+      # simultaneous NoWASMExecutions alerts differing only by a `status`
+      # label that means nothing on this alert (`status="error"` does not say
+      # errors occurred; it says the error-status counter is flat). One
+      # condition, three pages — our own fix manufacturing the alert-fatigue
+      # this file exists to reduce. `sum()` collapses them to one AND
+      # aggregates correctly: any status with traffic makes the sum positive,
+      # so the alert stays silent. Both arms now yield the same bare `{}`
+      # label set, so the alert looks identical whichever one fired.
+      # Reproduced and pinned in alerts_test.yml ("seeded worker exports
+      # THREE status series; exactly ONE alert").
+      #
+      # Note the label fan-out is only a defect where the label is MEANINGLESS
+      # to the alert. `HighWASMErrorRate`/`HighRetryRate` deliberately keep
+      # their `type`/`reason` labels — one alert per failing error type is the
+      # useful shape there, and neither counter is seeded, so neither fans out
+      # while idle.
+      #
+      # SEVERITY IS UNCHANGED (warning) across both arms — an absent detector
+      # must not page harder than the condition it stands in for.
+      #
+      # BE HONEST ABOUT WHAT THIS CANNOT DISTINGUISH: firing means "idle OR
+      # broken", and on a dev stack that is idle by nature it will fire and
+      # stay firing. That is the alert's literal subject and always was; the
+      # bug was that it could not say so. To tell the two apart, look at
+      # `WASMMetricsPipelineDead` below — if that is also firing, the worker
+      # is reachable but producing nothing, which is a defect. If only this
+      # one is firing, the worker is instrumented and genuinely idle.
+      #
+      # NEITHER ARM IS PER-INSTANCE. `absent()` yields nothing as soon as
+      # ANY instance exports the series, and the `sum()` above aggregates
+      # across the whole fleet for the same reason it drops `status`. So a
+      # single silent replica in a scaled worker fleet is invisible to BOTH
+      # arms — and the compose stack does scale the worker
+      # (`WORKER_REPLICAS:-2`), so this is not hypothetical here.
+      # The meta-detector below does NOT close that gap either — it uses the
+      # same global `absent()`.
+      # Per-replica silence would need a right-join from `up` onto the metric
+      # (`up{job="talos-worker"} == 1 unless on(instance) <metric>`), which is
+      # deliberately not attempted here: the bare `{}` result set both arms
+      # now share is what makes these two rules simple and reviewable, and
+      # one silent replica out of two still leaves the fleet doing work.
+      # Say it rather than imply coverage that is not there.
       - alert: NoWASMExecutions
-        expr: rate(wasm_executions_total[30m]) == 0
+        expr: |
+          absent(wasm_executions_total)
+          or
+          sum(rate(wasm_executions_total[30m])) == 0
         for: 30m
         labels:
           severity: warning
           component: wasm-runtime
         annotations:
           summary: "No WASM executions detected"
-          description: "No executions in the last 30 minutes - worker may be idle or broken"
+          description: >-
+            No executions in the last 30 minutes — the worker is idle, or its
+            execution pipeline is broken. If WASMMetricsPipelineDead is also
+            firing, the worker is reachable but exporting nothing and this is
+            NOT mere idleness.
+
+  # ========================================================================
+  # Meta-detection: is the signal itself alive?
+  # ========================================================================
+  - name: wasm_pipeline_liveness
+    interval: 30s
+    rules:
+      # `up == 1` certifies REACHABILITY, not PRODUCTION. The 2026-08-02
+      # grounding found `up{job="talos-worker"} == 1` green while the entire
+      # TSDB held zero `wasm_*` series of any kind — a target answering
+      # scrapes with nothing in them. Every per-metric alert above is silent
+      # in that state, because each one's own series is missing. This rule is
+      # the generalisation: it watches the pipeline rather than a metric, and
+      # it is what would have caught this class without a human noticing.
+      #
+      # WHY IT CANNOT SIT PERMANENTLY RED, which was the explicit design
+      # constraint (a permanently-firing alert trains operators to ignore red,
+      # the same defect this change closes):
+      #
+      #   * It is gated on the target being UP. On any deployment that does
+      #     not scrape a worker, `up{job="talos-worker"}` is empty, the `and`
+      #     has no left-hand side, and the rule is inert. It cannot fire on a
+      #     controller-only or non-Talos stack.
+      #   * It is gated on `wasm_executions_total` being ABSENT, and a worker
+      #     built from this tree with metrics enabled SEEDS that series at 0
+      #     during startup, before its first execution. So an idle-but-healthy
+      #     worker does not trip it — idleness is `NoWASMExecutions`'s
+      #     subject, brokenness is this one's.
+      #   * It lives ONLY in this dev-stack file, which is loaded only by the
+      #     compose stacks — the deployments that explicitly run this
+      #     Prometheus AND set OTEL_METRICS_ENABLED=true for the worker. It is
+      #     not in the chart's PrometheusRule.
+      #
+      # It DOES fire, correctly and until fixed, when a worker is scraped with
+      # its metrics subsystem disabled or broken. That is not a false
+      # positive: in that state every WASM alert in this file is blind, and an
+      # operator should know that before trusting any of them.
+      #
+      # The `on()` is load-bearing: `max()` collapses the left side to the
+      # empty label set while `absent()` returns `{}` too, but written without
+      # it a future edit that keeps a label on either side would silently stop
+      # matching and the rule would go quiet rather than loud.
+      - alert: WASMMetricsPipelineDead
+        expr: |
+          (max(up{job="talos-worker"}) == 1)
+          and on()
+          absent(wasm_executions_total)
+        for: 15m
+        labels:
+          severity: warning
+          component: monitoring
+        annotations:
+          summary: "Worker target is UP but exports no WASM metrics"
+          description: >-
+            Prometheus is scraping a worker successfully and receiving no
+            wasm_executions_total series. Every wasm_* alert is blind while
+            this is true. Check, in order: OTEL_METRICS_ENABLED is set for the
+            worker (it defaults to FALSE, and the runtime skips building
+            RuntimeMetrics entirely when unset); the worker's /metrics body is
+            non-empty; and the instrument name has not drifted from the one
+            these rules select on (talos-worker-runtime's exported-name
+            pinning test is the arbiter).
