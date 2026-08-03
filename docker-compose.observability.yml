@@ -43,10 +43,31 @@ services:
     container_name: talos-prometheus
     restart: unless-stopped
     ports:
-      - "9090:9090"
+      # LOOPBACK-ONLY, matching docker-compose.yml. `--web.enable-lifecycle`
+      # below enables `/-/quit` as well as `/-/reload`, so a `"9090:9090"`
+      # binding — which is what this line was until 2026-08-03 — let any host
+      # on the LAN shut this Prometheus down unauthenticated. The flag and the
+      # wide binding both predate this change; the pairing is what makes it
+      # reachable, so the binding is narrowed here rather than documented.
+      # (Grafana on 3001 and the Jaeger ports below are still LAN-wide. That is
+      # pre-existing debt in a compose file this header already calls a
+      # standalone duplicate that cannot reach Talos — listed, not silently
+      # fixed.)
+      - "127.0.0.1:9090:9090"
     volumes:
+      # DIRECTORY mounts, not single-file — see the long note in
+      # docker-compose.yml's prometheus service. Short version: once the host
+      # file is REPLACED (a new inode — every git checkout/merge of a changed
+      # file produces one), a single-file bind mount freezes the container's
+      # cached SIZE while still reading the current bytes, so it serves the new
+      # rules truncated to the superseded length, silently. In-place edits are
+      # unaffected, which is what makes it so easy to "disprove". Each
+      # directory mounted here contains only files Prometheus should read;
+      # observability/ itself is not mountable because
+      # grafana/provisioning/datasources/datasources.yml lives under it.
+      #
       # The correct Prometheus config resides in ./observability/prometheus/prometheus.yml
-      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus:/etc/prometheus/conf:ro
       # Both compose files share the SAME prometheus.yml, so both must mount the
       # rule files at the paths its rule_files entries name — enforced per-stack
       # by structural lint check 65(b) since the 2026-08-02 review (it used to
@@ -64,11 +85,11 @@ services:
       # commented out — so `controller:8000` and the `worker` A-record do not
       # resolve and no `talos_*` series is ever collected. The stack that can
       # actually exercise these alerts is docker-compose.yml.
-      - ./observability/alerts.yml:/etc/prometheus/rules/wasm-alerts.yml:ro
-      - ./deploy/helm/talos/files/alerts.yaml:/etc/prometheus/rules/talos-alerts.yaml:ro
+      - ./observability/rules:/etc/prometheus/rules:ro
+      - ./deploy/helm/talos/files:/etc/prometheus/rules-chart:ro
       - prometheus-data:/prometheus
     command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--config.file=/etc/prometheus/conf/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
       - '--web.console.libraries=/usr/share/prometheus/console_libraries'
       - '--web.console.templates=/usr/share/prometheus/consoles'

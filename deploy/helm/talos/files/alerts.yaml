@@ -25,7 +25,7 @@
 # condition it detects. ONE rule in this file had that shape and is fixed:
 # `TalosBackupRestoreDrillFailed`, where a drill that had NEVER run made "no
 # successful drill in 14+ days" unfireable. Its sibling in the dev rules is
-# `NoWASMExecutions` (observability/alerts.yml); read that file's header for
+# `NoWASMExecutions` (observability/rules/alerts.yml); read that file's header for
 # the full statement of the class.
 #
 # Every other rule here was left alone deliberately. Three categorical
@@ -735,7 +735,7 @@ groups:
       # succeeded and then went stale — never for a cluster where backup
       # verification was never wired up at all, which is the case an
       # operator most needs told. Same shape as `NoWASMExecutions` in
-      # observability/alerts.yml; see that file's header.
+      # observability/rules/alerts.yml; see that file's header.
       #
       # The `absent()` arm does NOT change the severity semantics: both arms
       # are the same warning / ops-hygiene pair, and both mean exactly what
@@ -826,7 +826,7 @@ groups:
       # detector for: a worker whose scrape SUCCEEDS but whose metrics
       # pipeline produces nothing. `up == 1` certifies reachability, not
       # production. That is `WASMMetricsPipelineDead` in
-      # observability/alerts.yml.
+      # observability/rules/alerts.yml.
       - alert: TalosWorkerDown
         expr: up{job="talos-worker"} == 0
         for: 2m

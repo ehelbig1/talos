@@ -1,4 +1,4 @@
-# `promtool test rules` unit tests for observability/alerts.yml.
+# `promtool test rules` unit tests for observability/rules/alerts.yml.
 #
 # Run:
 #   docker run --rm -v "$PWD/observability:/o:ro" --entrypoint promtool \
@@ -21,7 +21,7 @@
 # duplicate names.
 
 rule_files:
-  - alerts.yml
+  - rules/alerts.yml
 
 evaluation_interval: 1m
 

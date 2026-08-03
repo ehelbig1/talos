@@ -20,8 +20,8 @@ in per-target subdirs:
     └── neo4j-<stamp>.tar.gz.manifest
 ```
 
-Shared behavior across all three (see `scripts/dev-backup-loop.sh` and
-`scripts/dev-volume-backup-loop.sh`): **wake-aware cadence** (each hourly
+Shared behavior across all three (see `scripts/dev-backup/dev-backup-loop.sh` and
+`scripts/dev-backup/dev-volume-backup-loop.sh`): **wake-aware cadence** (each hourly
 tick backs up only when the newest artifact is older than
 `BACKUP_INTERVAL_HOURS`, default 24 — a laptop opened after a week backs up
 immediately instead of missing a fixed nightly hour), **`.partial`

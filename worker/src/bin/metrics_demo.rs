@@ -8,7 +8,7 @@
 /// where the exporter renders `wasm.executions` as `wasm_executions_total`
 /// — and `wasm_memory_used_bytes` does not exist at all outside this file.
 ///
-/// This mattered: the eleven alert rules in `observability/alerts.yml` were
+/// This mattered: the eleven alert rules in `observability/rules/alerts.yml` were
 /// written against THIS binary (the dev Prometheus scraped 9091 until
 /// 2026-08-02), so seven of them selected on a series the production worker
 /// could not emit under any workload. Structural lint check 65(c) now

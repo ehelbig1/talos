@@ -38,7 +38,7 @@ services:
   # `make clean`; rides Time Machine off-box). The dev DB holds the only
   # copy of human corrections + the ML gold slice; code is in git,
   # labels aren't. Wake-aware + restore-verified — see
-  # scripts/dev-backup-loop.sh. Override dir with TALOS_BACKUP_DIR.
+  # scripts/dev-backup/dev-backup-loop.sh. Override dir with TALOS_BACKUP_DIR.
   postgres-backup:
     restart: unless-stopped
     image: pgvector/pgvector:pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
@@ -50,8 +50,8 @@ services:
       PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required in .env}
     volumes:
       - ${TALOS_BACKUP_DIR:-${HOME}/.talos/backups}:/backups
-      - ./scripts/dev-backup-loop.sh:/usr/local/bin/dev-backup-loop.sh:ro
-    entrypoint: ["/bin/bash", "/usr/local/bin/dev-backup-loop.sh"]
+      - ./scripts/dev-backup:/usr/local/bin/dev-backup:ro
+    entrypoint: ["/bin/bash", "/usr/local/bin/dev-backup/dev-backup-loop.sh"]
     deploy:
       resources:
         limits:
@@ -64,7 +64,7 @@ services:
   # DEKs + every OAuth token; losing it makes ALL encrypted rows permanently
   # unreadable (the single worst dev-stack failure mode). The file backend
   # has no consistent-snapshot API, so we tar /vault/file opaquely with a
-  # read-stability retry (see scripts/dev-volume-backup-loop.sh). The volume
+  # read-stability retry (see scripts/dev-backup/dev-volume-backup-loop.sh). The volume
   # is mounted READ-ONLY — a volume-level copy needs no Vault token, so none
   # is granted (least privilege). Verification is INTEGRITY-ONLY (tar -tzf +
   # expected paths + manifest), NOT a restore-verify — the real proof of DEK
@@ -91,8 +91,8 @@ services:
       # READ-ONLY: the sidecar only reads the file backend to copy it. No RW,
       # no Vault token, no unseal key — a torn opaque tar is the worst case.
       - vault_data:/vault-data:ro
-      - ./scripts/dev-volume-backup-loop.sh:/usr/local/bin/dev-volume-backup-loop.sh:ro
-    entrypoint: ["/bin/bash", "/usr/local/bin/dev-volume-backup-loop.sh"]
+      - ./scripts/dev-backup:/usr/local/bin/dev-backup:ro
+    entrypoint: ["/bin/bash", "/usr/local/bin/dev-backup/dev-volume-backup-loop.sh"]
     deploy:
       resources:
         limits:
@@ -130,8 +130,8 @@ services:
     volumes:
       - ${TALOS_BACKUP_DIR:-${HOME}/.talos/backups}:/backups
       - neo4j_data:/neo4j-data:ro
-      - ./scripts/dev-volume-backup-loop.sh:/usr/local/bin/dev-volume-backup-loop.sh:ro
-    entrypoint: ["/bin/bash", "/usr/local/bin/dev-volume-backup-loop.sh"]
+      - ./scripts/dev-backup:/usr/local/bin/dev-backup:ro
+    entrypoint: ["/bin/bash", "/usr/local/bin/dev-backup/dev-volume-backup-loop.sh"]
     deploy:
       resources:
         limits:
@@ -259,7 +259,12 @@ services:
       # File storage for transit keys. Survives restarts.
       - vault_data:/vault/file
       # Vault server config (file storage backend, disable_mlock, etc.).
-      - ./docker/vault/vault.hcl:/vault/config/vault.hcl:ro
+      # DIRECTORY mount (docker/vault/ holds only vault.hcl) for the same reason
+      # as prometheus: a single-file bind mount serves a replaced file truncated
+      # to its old length. vault.hcl changes rarely, but "rarely" is what makes
+      # it worse — the one time it does change, the container silently runs a
+      # half-config. Structural lint check 66 enforces the rule generally.
+      - ./docker/vault:/vault/config:ro
     networks:
       - talos-network
     healthcheck:
@@ -763,7 +768,7 @@ services:
       # on names the worker cannot emit.
       #
       # It is ALSO what keeps the `WASMMetricsPipelineDead` meta-detector in
-      # observability/alerts.yml honest: that rule fires when a scraped
+      # observability/rules/alerts.yml honest: that rule fires when a scraped
       # worker exports no execution series, and this stack is one of the
       # deployments that genuinely expects them. Do not remove it here
       # without removing that rule.
@@ -921,32 +926,112 @@ services:
     image: prom/prometheus:v2.48.0@sha256:b440bc0e8aa5bab44a782952c09516b6a50f9d7b2325c1ffafac7bc833298e2e
     container_name: talos-prometheus
     command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--config.file=/etc/prometheus/conf/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
       - '--web.console.libraries=/usr/share/prometheus/console_libraries'
       - '--web.console.templates=/usr/share/prometheus/consoles'
+      # Lifecycle API enables `POST /-/reload`, which `make observability-reload`
+      # uses to apply a rule/scrape edit without recreating the container (and so
+      # without dropping the in-memory TSDB head). Safe HERE because the port
+      # below is bound to 127.0.0.1 and this is the dev stack.
+      # docker-compose.prod.yml ships no prometheus service at all, and the chart
+      # delivers rules as a PrometheusRule CRD — neither inherits this flag.
+      # NOT unique to this file, and the safety argument does NOT carry over:
+      # docker-compose.observability.yml has carried this flag since before
+      # 2026-08-03 while publishing "9090:9090" on ALL interfaces, so on that
+      # stack any host on the LAN can POST /-/reload and /-/quit (the flag
+      # enables both). Pre-existing and out of scope for this change, but do
+      # not read this comment as saying it isn't there.
+      - '--web.enable-lifecycle'
     ports:
       - "127.0.0.1:9090:9090"
     volumes:
-      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      # Rule files. Until 2026-08-02 this service mounted NO rules at all while
-      # prometheus.yml still named `alerts.yml` — Prometheus globs rule_files,
-      # so the missing file loaded zero groups silently and the stack looked
-      # alert-capable while `/api/v1/rules` returned `{"groups":[]}`.
+      # ── DIRECTORY mounts, deliberately, not single-file ──────────────────
+      # A single-file bind mount can leave the container serving CORRUPTED
+      # content after the host file is replaced. `git checkout`/`merge`/`pull`
+      # replace rather than rewrite in place (verified: every checkout of a
+      # changed file yields a new inode); atomic-saving editors do the same.
       #
+      # OBSERVED on this stack 2026-08-03 — this part is measurement, not
+      # theory. Host observability/rules/alerts.yml was 21953 bytes;
+      # `docker exec talos-prometheus stat` reported 6464; and the bytes the
+      # container served were a byte-exact 6464-byte PREFIX of the CURRENT
+      # host file, cut mid-word inside a comment block. Two independent
+      # confirmations that it was a prefix of the NEW file rather than the old
+      # file intact: `cmp` against `head -c 6464` matched, and that prefix
+      # contains `WASMMetricsPipelineDead` exactly once — the live count — while
+      # the previous committed version contains it zero times. 6464 is exactly
+      # the byte length of that previous committed version, so the truncation
+      # length came from the superseded file.
+      #
+      # Consequence: Prometheus parsed the fragment and loaded 13 groups /
+      # 37 rules — exactly the pre-merge count — so #625's
+      # WASMMetricsPipelineDead was simply absent from /api/v1/rules while the
+      # stack looked entirely healthy. Had the cut landed mid-value it would
+      # have been a parse error; that it loaded cleanly is luck, not design.
+      # A truncated prometheus.yml would silently drop scrape jobs off its tail.
+      #
+      # MECHANISM — reproduced deterministically 2026-08-03 (Docker Desktop
+      # 29.6.2, VirtioFS), across five independent rigs plus a 26-hour-old
+      # container, after two earlier attempts had failed. The trigger is the
+      # host file being REPLACED, i.e. acquiring a NEW INODE:
+      #
+      #   * While the host file is edited IN PLACE (inode preserved), a
+      #     single-file mount tracks size and content correctly, indefinitely.
+      #     Measured: 100 → 301 → 701 → 1201 bytes, all correct.
+      #   * The FIRST replacement freezes the container's cached SIZE at its
+      #     last-known value — permanently. Not refreshed by later replacements,
+      #     by later in-place writes, by re-reading, or by time (observed frozen
+      #     for 26 h).
+      #   * The DATA path still resolves by NAME at access time: reads return
+      #     the CURRENT host file's bytes, and `open()` returns ENOENT if the
+      #     host path is removed. So the inode is NOT pinned for data — only
+      #     the attributes are stale. Do not write "the mount pins the inode".
+      #   * Net: current bytes clamped to the frozen size. Longer file → a
+      #     byte-exact PREFIX (the signature above). Shorter file → `stat` lies
+      #     but reads return the real, complete content.
+      #   * `docker restart` re-binds and clears it.
+      #
+      # A same-length replacement cannot exhibit the bug and will "prove" a
+      # single-file mount is fine — which is how the first two reproduction
+      # attempts came back negative.
+      #
+      # THE FIX IS A LARGE REDUCTION, NOT A PROOF. A DIRECTORY mount resolves
+      # each child by name and was correct in every equivalent test, including
+      # on a container that had been up four days and across kill+start. But
+      # ONE directory-mounted container was observed frozen across two
+      # replacements in the same session; a `docker restart` cleared it and it
+      # could not be reproduced. So this mount style removes a deterministic,
+      # every-time failure and leaves a rare one. The real protection is the
+      # LIVE check — `make observability-verify` / scripts/verify-observability.sh
+      # — which compares content and fires on the symptom whatever caused it.
+      #
+      # Each mounted directory must contain ONLY what Prometheus should read —
+      # a directory mount exposes every file in it, now and in the future.
+      #   observability/prometheus/  → only prometheus.yml
+      #   observability/rules/       → only alerts.yml   (alerts_test.yml stays
+      #                                in observability/ ON PURPOSE: it is a
+      #                                promtool fixture, and Prometheus would
+      #                                fail to parse it as a rule file)
+      #   deploy/helm/talos/files/   → only alerts.yaml
+      # observability/ itself is NOT mountable: it holds grafana/provisioning,
+      # whose datasources.yml carries a POSTGRES_PASSWORD reference.
+      - ./observability/prometheus:/etc/prometheus/conf:ro
       # talos-alerts.yaml is the canonical chart file, bind-mounted (NOT copied)
       # so the dev rules and the PrometheusRule CRD can never drift apart —
       # deploy/observability/alerts.yaml symlinks the same file for the same
-      # reason.
+      # reason. It gets its own container directory because its host directory
+      # is separate; two sources cannot share one mount point.
       #
       # Structural lint check 65(b) resolves every rule_files entry through a
-      # compose bind mount to a file on disk, SEPARATELY FOR EACH compose file
-      # that mounts this shared prometheus.yml. Deleting the two lines below
-      # fails the lint even though docker-compose.observability.yml still has
-      # them — that per-stack gap is exactly the pre-2026-08-02 shape, and a
-      # first-match check would have passed it.
-      - ./observability/alerts.yml:/etc/prometheus/rules/wasm-alerts.yml:ro
-      - ./deploy/helm/talos/files/alerts.yaml:/etc/prometheus/rules/talos-alerts.yaml:ro
+      # compose bind mount — a file mount, or a mount of an ANCESTOR directory —
+      # SEPARATELY FOR EACH compose file that mounts this shared prometheus.yml.
+      # Deleting either line below fails the lint even though
+      # docker-compose.observability.yml still has them; that per-stack gap is
+      # exactly the pre-2026-08-02 shape, and a first-match check would have
+      # passed it.
+      - ./observability/rules:/etc/prometheus/rules:ro
+      - ./deploy/helm/talos/files:/etc/prometheus/rules-chart:ro
       - prometheus_data:/prometheus
     networks:
       - talos-network

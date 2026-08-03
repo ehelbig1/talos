@@ -40,9 +40,18 @@ global:
 # deploy/helm/talos/files/alerts.yaml — the SAME file the chart's PrometheusRule
 # embeds via `.Files.Get`. It is deliberately NOT copied into observability/:
 # a second copy is exactly the drift this change exists to prevent.
+#
+# 2026-08-03: the two entries below live in SEPARATE container directories
+# because each is now satisfied by a DIRECTORY bind mount rather than a
+# single-file one, and their host directories differ
+# (observability/rules/ and deploy/helm/talos/files/). Single-file mounts pin
+# the container's view to the file's start-of-container attributes, so a git
+# checkout silently served this config's rules TRUNCATED to their old length —
+# see the note in docker-compose.yml. Two sources cannot share one mount point,
+# hence rules/ and rules-chart/.
 rule_files:
-  - '/etc/prometheus/rules/wasm-alerts.yml'
-  - '/etc/prometheus/rules/talos-alerts.yaml'
+  - '/etc/prometheus/rules/alerts.yml'
+  - '/etc/prometheus/rules-chart/alerts.yaml'
 
 # Scrape configurations
 scrape_configs:
