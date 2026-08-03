@@ -195,7 +195,14 @@ WASM/worker alert rules (10 total).
   `TalosWorkerDown`/`TalosControllerDown`, which live in `talos-alerts.yaml`)
 
 **Throughput Alerts** (1):
-- NoWASMExecutions (`absent(...)` OR 30 min at a zero rate)
+- NoWASMExecutions (`absent(...)` OR 30 min at a zero **summed** rate).
+  The `sum()` is not cosmetic: `seed_zero_series` writes three `status`
+  values, and a label-preserving `rate(...) == 0` turned one idle worker
+  into THREE simultaneous alerts differing only by a label that means
+  nothing here. Consequence for routing: **this alert carries no
+  `job`/`instance`/`status` labels on either arm** — both yield the bare
+  `{severity, component}` pair. An Alertmanager route or silence keyed on
+  `instance` will not match it.
 - ~~LowWASMThroughput~~ — deleted; a demo-derived SLO that would sit
   permanently firing once the producer seeds at 0
 

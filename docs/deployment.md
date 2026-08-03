@@ -272,17 +272,34 @@ backend-agnostic — works identically with `env` and `vault` providers.
 
 ## Prometheus Metrics
 
-The worker exposes Prometheus-compatible metrics on port `9090` at the `/metrics` endpoint. Access requires a bearer token set via the `METRICS_BEARER_TOKEN` environment variable.
+The worker exposes Prometheus-compatible metrics on `METRICS_PORT` (default
+`9090`) at `/metrics`. Access requires a bearer token listed in
+`METRICS_AUTH_TOKENS` (comma-separated). The worker also needs
+`OTEL_METRICS_ENABLED=true` — it defaults to FALSE and the runtime skips
+building the metrics subsystem entirely when unset, so `/metrics` answers with
+an essentially empty body and every `wasm_*` alert is blind.
 
-Available metrics include:
+Every table below was WRONG until 2026-08-02: it named five `talos_*`-prefixed
+series (`talos_job_duration_seconds`, `talos_jobs_total`,
+`talos_wasm_cache_{hits,misses}_total`, `talos_active_jobs`) that no producer
+in this workspace has ever registered, and the wrong env var
+(`METRICS_BEARER_TOKEN`). The worker's series are `wasm_*`, exported through
+OpenTelemetry — the exporter replaces `.` with `_` and appends `_total` to
+every counter, so do NOT put `total` in an instrument name. The authoritative
+list is the assertion set in `exported_prometheus_names_are_stable_and_idle_
+seeds_at_zero` (`talos-worker-runtime/src/metrics_tests.rs`); structural lint
+check 65(c) fails the build if an alert names a series no instrument exports.
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `talos_job_duration_seconds` | Histogram | WASM job execution duration |
-| `talos_jobs_total` | Counter | Total jobs processed (by status) |
-| `talos_wasm_cache_hits_total` | Counter | WASM module cache hits |
-| `talos_wasm_cache_misses_total` | Counter | WASM module cache misses |
-| `talos_active_jobs` | Gauge | Currently executing jobs |
+| `wasm_executions_total{status}` | Counter | Executions COMPLETED, by terminal status. Seeded at 0 for `success`/`error`/`retry_exhausted` at startup |
+| `wasm_executions_started_total` | Counter | Executions STARTED (incremented at dispatch); deliberately not seeded |
+| `wasm_execution_duration_ms_{bucket,sum,count}` | Histogram | Execution duration |
+| `wasm_errors_total{type}` | Counter | Errors by normalized type |
+| `wasm_retries_total{reason}` | Counter | Retry attempts by reason |
+| `wasm_cache_hits_total` / `wasm_cache_misses_total` | Counter | Module compilation cache; both seeded at 0 |
+| `wasm_cache_hit_ratio` | Gauge | Cache hit ratio, 0.0–1.0 |
+| `wasm_instances_active` | Gauge (UpDownCounter) | Currently active instances, process-local |
 
 The **controller** exposes metrics on its main port at `/metrics/prometheus`
 (bearer `PROMETHEUS_SCRAPE_TOKEN`). Beyond the crypto-invariant gauges, it

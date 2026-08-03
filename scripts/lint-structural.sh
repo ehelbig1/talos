@@ -4808,14 +4808,32 @@ bold "▶ check 65: dev Prometheus scrapes Talos and its rule files resolve"
 #     check, and adding that literal inside a `#[cfg(test)] mod` — and
 #     nowhere else — made it pass. Conversely a name assembled at runtime
 #     (`format!`/`concat!`) reads as unregistered; that direction is safe
-#     (it fails loudly), and it also means an OTEL-style instrument
-#     declared with dots (`talos.foo.total`) would read as unregistered
-#     even though the Prometheus exporter renders it `talos_foo_total`.
-#   * (c) only inspects `talos_*` names. The 11 dev-stack alerts in
-#     observability/alerts.yml are built entirely on `wasm_*` series
-#     (exported by the worker's OTEL instruments, which are spelled
-#     `wasm.executions.total` etc. in Rust), so they get NO coverage from
-#     any direction of this check.
+#     (it fails loudly).
+#   * (c) covers BOTH `talos_*` and `wasm_*` as of 2026-08-02. It previously
+#     inspected only `talos_*`, which is why the dev-stack rules in
+#     observability/alerts.yml — built entirely on `wasm_*` series the
+#     worker declares through OTEL with dots — shipped with SEVEN rules
+#     naming a series no producer could emit. `wasm_*` evidence is derived
+#     from the OTEL declaration (see the long note at the match site);
+#     `talos_*` accepts EITHER a quoted literal or an OTEL declaration, so
+#     a `talos.foo` counter declared through OTEL now correctly vouches for
+#     the exported `talos_foo_total`.
+#   * The OTEL-declaration evidence has the SAME test-file hole as the
+#     quoted-literal evidence one bullet up, and it is not narrowed by
+#     living in a particular crate: a `.u64_counter("wasm.ghost")` inside a
+#     `#[cfg(test)] mod` in ANY workspace crate vouches for an alert on
+#     `wasm_ghost_total`. PROVEN by mutation 2026-08-02, not inferred. So
+#     "evidence must be an OTEL declaration" means the CONSTRUCTOR FORM, not
+#     "declared in talos-worker-runtime" and not "in production code" — it
+#     is what excludes metrics_demo.rs's raw `prometheus::Counter`s, nothing
+#     more. Closing it needs the same call-graph check that check 58's
+#     wrapper limit needs; a per-metric test that drives the production path
+#     is the real guard.
+#   * The `_bucket`/`_sum`/`_count` strip happens BEFORE the prefix split and
+#     does not check the instrument KIND, so an alert on
+#     `wasm_executions_total_sum` — a `_sum` a counter never exposes —
+#     passes by stripping to a registered counter name. Also proven by
+#     mutation; false-NEGATIVE direction, and it applies to `talos_*` too.
 #
 # Opt-out (c) only: `# allow-unobserved-metric: <reason naming the series>`
 # anywhere in ANY scanned rule file, for a series produced outside Rust (e.g. a
@@ -5010,11 +5028,15 @@ $PROM_RULES_CANON"
         #
         # `wasm_*` was added 2026-08-02. Until then (c) inspected only
         # `talos_*`, so the eleven WASM rules in observability/alerts.yml had
-        # ZERO coverage from any direction of this check — and NINE of them
-        # named a series the worker cannot emit under any workload. They had
-        # been written against worker/src/bin/metrics_demo.rs, a demo binary
-        # that fabricates `wasm_*` data into its OWN private registry on the
-        # port this stack's Prometheus used to scrape.
+        # ZERO coverage from any direction of this check — and SEVEN of them
+        # named a series the worker cannot emit under any workload (six
+        # distinct metric names; `wasm_errors_total` and
+        # `wasm_executions_total` were each selected on by two rules). Most
+        # had been written against worker/src/bin/metrics_demo.rs, a demo
+        # binary that fabricates `wasm_*` data into its OWN private registry
+        # on the port this stack's Prometheus used to scrape — though
+        # `wasm_retries_total` was never in the demo either, so that one
+        # named a series no producer in the tree had ever exported.
         #
         # THE DOT/UNDERSCORE PROBLEM AND HOW IT IS SOLVED. The worker declares
         # its instruments through OpenTelemetry with DOTS

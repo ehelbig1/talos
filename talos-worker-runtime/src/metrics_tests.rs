@@ -215,11 +215,15 @@ mod tests {
     /// not of anything in this repo, and until 2026-08-02 nothing checked it.
     /// `opentelemetry-prometheus` appends `_total` to every monotonic counter
     /// unconditionally, so the three instruments that used to be named
-    /// `wasm.*.total` were exported as `wasm_*_total_total` — and nine of the
-    /// eleven alert rules in `observability/alerts.yml` selected on names the
-    /// worker could not emit under any workload. A behavioural test that only
-    /// asserted "the counter went up" would not have caught it; only the
-    /// rendered exposition text can.
+    /// `wasm.*.total` were exported as `wasm_*_total_total` — which made FIVE
+    /// of the eleven alert rules in `observability/alerts.yml` select on a
+    /// name the worker could not emit under any workload (two more were
+    /// unfireable for unrelated reasons — the cache rule was missing the
+    /// exporter's `_total`, and `wasm_memory_used_bytes` had no instrument at
+    /// all — for seven total; `observability/alerts.yml`'s header carries the
+    /// full breakdown). A behavioural test that only asserted "the counter
+    /// went up" would not have caught it; only the rendered exposition text
+    /// can.
     ///
     /// This test is the ground truth structural lint check 65(c) trusts when
     /// it derives an exported `wasm_*` name from an OTEL declaration. If the
@@ -312,6 +316,20 @@ mod tests {
                  select on this exact spelling.\n{out}"
             );
         }
+
+        // Every exported series also carries `otel_scope_name` = the meter
+        // name. Confirmed 2026-08-02 by scraping a real running process over
+        // authenticated HTTP, not inferred from the exporter's source. It is
+        // pinned here because it is a LABEL the alert rules and
+        // `observability/alerts_test.yml` have to model: `LowCacheHitRate`'s
+        // `a / (a + b)` matches on identical label sets, so both cache legs
+        // sharing one meter is load-bearing — split them across two meters and
+        // the division silently yields an empty vector.
+        assert!(
+            out.contains(r#"otel_scope_name="talos-wasm-runtime""#),
+            "exported series must carry the meter's otel_scope_name label; the \
+             alert-rule tests model it\n{out}"
+        );
 
         // The regression that motivated the rename: NO double suffix.
         for forbidden in [

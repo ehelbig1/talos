@@ -800,10 +800,14 @@ mod tests {
 
     /// Absence is not zero. A `CounterVec` emits NOTHING until some label set
     /// is first touched, so on a healthy controller that has had no auth
-    /// traffic and no crypto failure, four of the five alerted CounterVecs
-    /// were simply missing from `/metrics/prometheus` — indistinguishable
-    /// from the wiring having been deleted. Pre-seeding the combinations that
-    /// have a live emitter makes idle read `0` instead.
+    /// traffic and no crypto failure, ALL FIVE alerted CounterVecs were
+    /// simply missing from `/metrics/prometheus` (verified 2026-08-02 against
+    /// the live endpoint) — indistinguishable from the wiring having been
+    /// deleted. Pre-seeding the combinations that have a live emitter makes
+    /// idle read `0` instead; that fixes FOUR of the five, and
+    /// `talos_auth_failures_total` deliberately stays absent (asserted
+    /// below), because only 9 of its 16 (method, reason) pairs have an
+    /// emitting call site.
     ///
     /// This test asserts the seeds on a FRESH registry with nothing recorded,
     /// which is the state that matters (`crypto_invariant_metrics_render`

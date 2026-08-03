@@ -78,12 +78,17 @@ tests:
 
   # ══════════════════════════════════════════════════════════════════════
   # Idle BUT SEEDED: the producer-side fix. The series exists and is flat at
-  # 0, which is what a worker built from this tree exports before its first
-  # execution.
+  # 0, which is the state a worker built from this tree is in before its
+  # first execution.
   #   - NoWASMExecutions must still fire (no work is happening).
   #   - WASMMetricsPipelineDead must NOT — the pipeline is alive. This is the
   #     case that keeps the meta-detector off a permanently-red state on an
   #     idle-but-healthy stack.
+  #
+  # THIS CASE FEEDS ONE STATUS. A real seeded worker exports THREE — see the
+  # dedicated fan-out case immediately below, which is what actually pins the
+  # `sum()`. Both are kept: this one is the minimal idle-but-alive shape, that
+  # one is the shape the producer really emits.
   # ══════════════════════════════════════════════════════════════════════
   - interval: 1m
     name: idle but instrumented; seeded series flat at zero
@@ -93,19 +98,18 @@ tests:
       - series: 'wasm_executions_total{job="talos-worker", instance="worker:9090", status="success"}'
         values: "0+0x60"
     alert_rule_test:
-      # NOTE the label difference from the cold-dead case above: the
-      # `absent()` arm yields a bare `{}` series, while the `rate(...) == 0`
-      # arm carries the source series' labels. Same alert, and an operator can
-      # tell which arm fired from whether `instance` is present.
+      # Both arms now yield the same bare `{}` label set — the `sum()` in the
+      # rate arm drops `job`/`instance`/`status` exactly as `absent()` does.
+      # So this expectation is label-identical to the cold-dead case above,
+      # and an operator cannot (and no longer needs to) tell the arms apart
+      # from the label set: `WASMMetricsPipelineDead` is what distinguishes
+      # "idle" from "broken".
       - eval_time: 31m
         alertname: NoWASMExecutions
         exp_alerts:
           - exp_labels:
               severity: warning
               component: wasm-runtime
-              job: talos-worker
-              instance: worker:9090
-              status: success
             exp_annotations:
               summary: "No WASM executions detected"
               description: >-
@@ -115,6 +119,69 @@ tests:
                 and this is NOT mere idleness.
       - eval_time: 31m
         alertname: WASMMetricsPipelineDead
+        exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # THE PRODUCER'S REAL IDLE SHAPE: `seed_zero_series` writes THREE status
+  # values, so an idle worker exports three `wasm_executions_total` series.
+  #
+  # This case exists because the producer-side fix in this same change made
+  # the consumer side WRONG for a while: `rate(...) == 0` preserves the
+  # source series' labels, so three seeded series became three simultaneous
+  # NoWASMExecutions alerts differing only by a `status` label that means
+  # nothing on this alert (`status="error"` does not say errors occurred, it
+  # says the error-status counter is flat). One condition, three pages —
+  # measured with promtool, not reasoned about. The `sum()` in the rule is
+  # what collapses them, and this case is what stops it being removed.
+  #
+  # Exactly ONE alert, and its label set must be the bare `{}` pair.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: seeded worker exports THREE status series; exactly ONE alert
+    input_series:
+      - series: 'up{job="talos-worker", instance="worker:9090"}'
+        values: "1+0x60"
+      - series: 'wasm_executions_total{job="talos-worker", instance="worker:9090", status="success"}'
+        values: "0+0x60"
+      - series: 'wasm_executions_total{job="talos-worker", instance="worker:9090", status="error"}'
+        values: "0+0x60"
+      - series: 'wasm_executions_total{job="talos-worker", instance="worker:9090", status="retry_exhausted"}'
+        values: "0+0x60"
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: NoWASMExecutions
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: wasm-runtime
+            exp_annotations:
+              summary: "No WASM executions detected"
+              description: >-
+                No executions in the last 30 minutes — the worker is idle, or
+                its execution pipeline is broken. If WASMMetricsPipelineDead
+                is also firing, the worker is reachable but exporting nothing
+                and this is NOT mere idleness.
+
+  # ══════════════════════════════════════════════════════════════════════
+  # The `sum()` must AGGREGATE, not merely deduplicate: traffic on ONE status
+  # while the other seeded statuses stay flat has to silence the alert. A
+  # `sum without(status)` variant would pass this too; a per-series arm would
+  # keep firing for `status="error"` on a perfectly healthy worker.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: one status flowing while the other seeds stay flat; silent
+    input_series:
+      - series: 'up{job="talos-worker", instance="worker:9090"}'
+        values: "1+0x60"
+      - series: 'wasm_executions_total{job="talos-worker", instance="worker:9090", status="success"}'
+        values: "0+60x60"
+      - series: 'wasm_executions_total{job="talos-worker", instance="worker:9090", status="error"}'
+        values: "0+0x60"
+      - series: 'wasm_executions_total{job="talos-worker", instance="worker:9090", status="retry_exhausted"}'
+        values: "0+0x60"
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: NoWASMExecutions
         exp_alerts: []
 
   # ══════════════════════════════════════════════════════════════════════
@@ -155,6 +222,13 @@ tests:
   # Worker down: the meta-detector must stay quiet and leave the outage to
   # TalosWorkerDown. "Unreachable" and "reachable but silent" are different
   # incidents with different first steps.
+  #
+  # NOTE WHAT IS AND IS NOT ASSERTED: only the meta-detector's silence.
+  # TalosWorkerDown lives in deploy/helm/talos/files/alerts.yaml, which
+  # `rule_files:` above does NOT load (check 65(d) forbids a second copy
+  # here), so this case cannot and does not verify that the outage is still
+  # caught by something. It verifies only that this rule is not the thing
+  # that catches it.
   # ══════════════════════════════════════════════════════════════════════
   - interval: 1m
     name: worker down; meta-detector defers to TalosWorkerDown
@@ -172,13 +246,25 @@ tests:
   # hits series did not exist (nothing had touched the counter), the binary
   # operator found no match, and the worst case this alert exists for was the
   # one case it could not see.
+  #
+  # `otel_scope_name` is NOT decoration. Scraped from a real worker (verified
+  # 2026-08-02 over authenticated HTTP against a running process), every
+  # series the OTEL exporter emits carries
+  # `otel_scope_name="talos-wasm-runtime"` — the meter name. This is the only
+  # remaining case whose `exp_labels` inherit the source series' labels, so it
+  # is the only one where feeding a synthetic series without that label would
+  # assert a label set production never produces. It also matters to the rule
+  # itself: `a / (a + b)` matches on IDENTICAL label sets, so both cache legs
+  # having the SAME scope is load-bearing — if one leg were ever moved to a
+  # different meter the division would silently drop to an empty vector, which
+  # is the one-sided-absence bug this case exists for, wearing a new hat.
   # ══════════════════════════════════════════════════════════════════════
   - interval: 1m
     name: zero percent cache hit rate is visible once both legs are seeded
     input_series:
-      - series: 'wasm_cache_hits_total{job="talos-worker", instance="worker:9090"}'
+      - series: 'wasm_cache_hits_total{job="talos-worker", instance="worker:9090", otel_scope_name="talos-wasm-runtime"}'
         values: "0+0x60"
-      - series: 'wasm_cache_misses_total{job="talos-worker", instance="worker:9090"}'
+      - series: 'wasm_cache_misses_total{job="talos-worker", instance="worker:9090", otel_scope_name="talos-wasm-runtime"}'
         values: "0+60x60"
     alert_rule_test:
       - eval_time: 20m
@@ -189,6 +275,34 @@ tests:
               component: wasm-runtime
               job: talos-worker
               instance: worker:9090
+              otel_scope_name: talos-wasm-runtime
             exp_annotations:
               summary: "Low WASM cache hit rate"
               description: "Cache hit rate is 0% (threshold: 70%)"
+
+  # ══════════════════════════════════════════════════════════════════════
+  # …and the other half of that seeding change: an IDLE worker must stay
+  # SILENT here. Seeding altered the MECHANISM of that silence without
+  # altering the outcome, and the new mechanism was untested. Pre-seeding,
+  # both legs were absent and the division produced an empty vector.
+  # Post-seeding both legs exist and are flat, so the expression is
+  # 0 / (0 + 0) = NaN — and every PromQL comparison against NaN is false, so
+  # the element is dropped. Same silence, different reason.
+  #
+  # This case exists so a future "fix" for the NaN cannot land quietly: a
+  # `clamp_min(denominator, 1)`-style guard turns the undefined idle ratio
+  # into a hard 0 and makes this alert fire permanently on every idle stack —
+  # the exact permanently-red failure this change exists to remove. If you
+  # are here because you changed the denominator, this test is the objection.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: idle worker with both cache legs seeded; LowCacheHitRate silent
+    input_series:
+      - series: 'wasm_cache_hits_total{job="talos-worker", instance="worker:9090", otel_scope_name="talos-wasm-runtime"}'
+        values: "0+0x60"
+      - series: 'wasm_cache_misses_total{job="talos-worker", instance="worker:9090", otel_scope_name="talos-wasm-runtime"}'
+        values: "0+0x60"
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: LowCacheHitRate
+        exp_alerts: []

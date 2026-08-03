@@ -273,12 +273,26 @@ impl RuntimeMetrics {
             // Until 2026-08-02 this instrument was declared with the SAME
             // OTEL name as `executions_total` above. Both were incremented
             // per execution — this one at dispatch (no attributes), the
-            // other at completion (with `status`) — so the single exported
-            // series counted roughly TWICE per execution and mixed a
-            // started population with a completed one. Anything computing a
-            // throughput or a per-status share off it was wrong by a factor
-            // that varied with the in-flight count. Distinct name, distinct
-            // meaning: `started - sum(completed)` is the in-flight count.
+            // other at completion (with `status`).
+            //
+            // Precisely what that produced, since "two counters, one name"
+            // has a non-obvious resolution: the SDK's `InstrumentId`
+            // includes the DESCRIPTION, and the two descriptions differed,
+            // so the two instruments resolved to two SEPARATE aggregators
+            // rather than summing. The Prometheus exporter then emitted both
+            // under one metric family (`validate_metrics` logs a
+            // description conflict and reuses the first-seen help rather
+            // than dropping), and `prometheus::Registry::gather` merges
+            // same-named families by appending metrics. Net: ONE metric
+            // NAME carrying TWO series, told apart only by whether `status`
+            // is present. So it was not one series double-counting — but
+            // any `sum()` over the name DID count roughly twice per
+            // execution, and any `sum by (status)` grew a meaningless
+            // empty-status bucket, both off by an amount that varied with
+            // the in-flight count. (Moot in practice: the name it collided
+            // under was `wasm_executions_total_total`, which no alert or
+            // dashboard selected on.) Distinct name, distinct meaning:
+            // `started - sum(completed)` is the in-flight count.
             total_executions: meter
                 .u64_counter("wasm.executions.started")
                 .with_description("WASM executions STARTED (incremented at dispatch)")
