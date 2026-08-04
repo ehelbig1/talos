@@ -36,6 +36,189 @@
 use opentelemetry::{global, metrics::*, KeyValue};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Explicit bucket boundaries (milliseconds) for `wasm.execution.duration_ms`.
+///
+/// ## Why these are not the defaults
+///
+/// Until 2026-08-04 this histogram used the OTEL Rust SDK's DEFAULT explicit
+/// boundaries — `0, 5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500, 5000,
+/// 7500, 10000` — because no `with_boundaries` call and no View existed
+/// anywhere in the workspace. Its top finite bound was therefore 10 000 ms,
+/// and **the thing it exists to measure lives above that**: execution duration
+/// includes nested Ollama `llm::complete` time.
+///
+/// The consequence is specific and was measured, not inferred.
+/// `histogram_quantile` cannot interpolate inside the `+Inf` bucket, so it
+/// returns the highest FINITE bound whenever the quantile lands there. Over a
+/// 13.75 h window the dashboard's p95 was pinned at exactly 10000.0 for 19 % of
+/// evaluated points; re-measured independently over 15 d at a 60 s step, 128 of
+/// 810 non-NaN points (15.8 %) read exactly 10000.0, the second most common
+/// value the panel reported after 450 ms. Every "p95 is 10 seconds" this arc
+/// reported was a FLOOR reported as a value — the same misleading-report class
+/// as a metric whose name implies a verdict the number does not carry.
+///
+/// The p99 is worse and is the sharper argument for the change: at 97.13 %
+/// cumulative by 10 000 ms, the 99th percentile lands in the overflow bucket
+/// even over the FULL 15 d population, so `histogram_quantile(0.99, …)`
+/// returns a flat 10000 no matter how much data it is given. The p95 at least
+/// resolves over a long window (5556.6 ms measured); the p99 was simply not a
+/// number this histogram could produce.
+///
+/// ## What the live distribution actually is (15 d, ~1114 executions)
+///
+/// Cumulative, from `sum by (le) (increase(wasm_execution_duration_ms_bucket[15d]))`
+/// on the dev stack, 2026-08-04:
+///
+/// | ≤ ms   |    10 |    25 |    50 |    75 |   100 |   250 |   500 |  1000 |  2500 |  5000 |  7500 | 10000 |  +Inf |
+/// |--------|-------|-------|-------|-------|-------|-------|-------|-------|-------|-------|-------|-------|-------|
+/// | cum %  | 45.3  | 57.4  | 57.9  | 59.3  | 61.1  | 62.2  | 81.7  | 85.7  | 89.7  | 94.5  | 96.3  | 97.1  | 100.0 |
+///
+/// `_sum/_count` mean = 1283.8 ms (unaffected by saturation).
+///
+/// The tail above 10 s cannot be read from that table at all — it is one
+/// undifferentiated 2.87 % overflow. Its actual values were recovered by
+/// diffing RAW counter samples: over-sample `_count`/`_sum` below the 10 s
+/// scrape interval, compress runs of identical state, and keep only intervals
+/// where `_count` advanced by exactly 1 — then `Δ_sum` IS that one execution's
+/// duration, exactly. 39 executions were isolated this way; 16 exceeded 10 s:
+///
+/// ```text
+/// 10.3  10.3  10.4  11.2  12.8  13.6  13.9  14.7
+/// 15.2  15.6  18.4  19.5  24.8  26.0  50.5  81.9   (seconds)
+/// ```
+///
+/// **The slowest single execution observed was 81.9 s — 8.2× the old top
+/// bound.** That sample is deliberately NOT used for percentiles: isolated
+/// executions are over-represented among slow ones (41 % of the sample is
+/// above 10 s versus 2.87 % of the population, a ~14× enrichment), so it is
+/// evidence about the SHAPE of the tail and nothing else. The body percentages
+/// above come from all 1114 executions and are unbiased.
+///
+/// ## Region-by-region justification
+///
+/// * **`5, 10`** — 45.3 % of all executions finish inside 10 ms (cache-hit
+///   trivial modules). This is the modal population and needs to stay visible,
+///   but distinguishing 3 ms from 8 ms drives no decision, so two boundaries.
+///   The default's `0` is DROPPED: `le=0` counted exactly 0 executions across
+///   the whole 15 d window — `duration_ms` is an `as_millis()` truncation and
+///   nothing completes in under one whole millisecond. A boundary no
+///   measurement can ever fall under is a series that is always equal to its
+///   neighbour.
+/// * **`25, 100`** — the 25 → 250 ms span holds only 4.8 % of executions, and
+///   the default spent FOUR boundaries (25/50/75/100) on it. `(25,50]` alone
+///   held 0.45 %. Two boundaries here, not four; `50` and `75` are dropped.
+/// * **`250, 400, 500`** — `(250,500]` is the single largest bucket in the
+///   whole histogram: 19.5 % of ALL executions, and the healthy p95 (~450 ms)
+///   sits inside it. The default gave it ZERO interior resolution, so "the
+///   healthy p95" was only ever knowable to ±250 ms. `400` splits it. Exactly
+///   one split, not two: the exact-recovery sample contains no observations in
+///   this range (it is biased to the tail), so a second interior boundary
+///   would be placed from intuition, which is the thing this cycle exists to
+///   stop doing.
+/// * **`1000, 2500, 5000, 7500, 10000`** — 11.4 % of executions span 1–10 s.
+///   `2500` and `10000` are load-bearing: `SlowWASMExecution` and
+///   `VerySlowWASMExecution` select on them by `le=`, and their thresholds
+///   were calibrated in #628. They are KEPT AT THEIR EXACT VALUES so this
+///   change does not silently re-calibrate an alert while re-bucketing a
+///   histogram — two changes that must not ride in one commit. `750` is
+///   dropped (1.8 %).
+///
+///   `7500` was ALSO dropped in the first draft of this set, on the same
+///   occupancy argument (its bucket holds 0.8 %), and that was a reasoning
+///   error worth naming because it is easy to repeat: **a boundary's value is
+///   not its own bucket's mass, it is the WIDTH it gives to whichever bucket a
+///   quantile of interest lands in.** The 15 d p95 sits at ~5.6 s, i.e. in the
+///   bucket immediately above 5000. Removing 7500 widens that bucket from
+///   2500 ms to 5000 ms and moves the interpolated p95 from 5666.7 ms to
+///   5919.5 ms — a 4.5 % shift, and double the uncertainty band, on the single
+///   number this whole cycle exists to report correctly. It costs one series.
+///   Kept. (`p90` is unaffected — it lands lower down — which is why the
+///   occupancy argument looked fine until the p95 was actually computed both
+///   ways.)
+/// * **`15000, 20000, 30000, 60000, 120000`** — the region that did not exist
+///   before, and the entire point of the change. Placed on the recovered
+///   values: 8 of the 16 over-10 s observations fall in 10–15 s, 4 in 15–20 s,
+///   2 in 20–30 s, then 50.5 s and 81.9 s. `120000` is not a data point but a
+///   STRUCTURAL bound — it is the worker's default per-node wall-clock timeout
+///   (`WASM_EXECUTION_TIMEOUT_SECS`, default 120, resolved in
+///   `worker/src/main.rs` and `DEFAULT_NODE_TIMEOUT_SECS`), so a single
+///   successful attempt cannot exceed it. Overflow past `120000` therefore
+///   means retries/backoff accumulated in `overall_start.elapsed()`, which is
+///   genuinely exceptional and informative rather than a measurement failure.
+///   Five boundaries for 2.87 % of the mass is disproportionate BY MASS on
+///   purpose: mass is the wrong metric for a tail, and the operational
+///   question this whole arc has been unable to answer — "how slow is slow?" —
+///   lives entirely here.
+///
+/// ## Cardinality
+///
+/// Bucket series = (finite boundaries + 1 for `+Inf`) × label sets ×
+/// instances; `_sum` and `_count` add 2 more per label set per instance.
+///
+/// **17 finite boundaries here versus 15 in the SDK default — 18 bucket series
+/// per (status, instance) instead of 16, i.e. +2 (+12.5 %).** Six boundaries
+/// were added (`400`, `15000`, `20000`, `30000`, `60000`, `120000`) and four
+/// removed (`0`, `50`, `75`, `750`). The reallocation, not the growth, is the
+/// change: five of the six additions cover a decade of latency the histogram
+/// previously could not express at all.
+///
+/// Counting whole series including `_sum`/`_count`:
+///
+/// * live today (`status="success"` only, one replica): **20 vs 18**.
+/// * realistic ceiling — the three statuses `record_execution` is actually
+///   called with (`success`, `error`, `retry_exhausted`) × the compose default
+///   of 2 replicas: **120 vs 108, i.e. +12**.
+/// * theoretical maximum — all 8 values `normalize_status` can produce ×
+///   2 replicas: **320 vs 288, i.e. +32**.
+///
+/// Thirty-two series is not a cardinality risk on any axis that matters; the
+/// risk in this metric was never the boundary count but the label set, and
+/// that is untouched. No label is added, and every label value remains a
+/// compile-time `&'static str` from the closed `normalize_status` set — no
+/// caller-derived value can reach it.
+///
+/// ## Mechanism
+///
+/// Set via `HistogramBuilder::with_boundaries` on the instrument rather than a
+/// `SdkMeterProvider` View. A View is a `Fn(&Instrument) -> Option<Stream>`
+/// that runs against EVERY instrument and must re-match this one by name, so
+/// it can silently re-bucket a sibling histogram if the predicate is ever
+/// loosened; `with_boundaries` cannot target anything but the instrument it is
+/// written on. Both are read once at instrument construction and cost nothing
+/// per `record()`, so there is no hot-path difference. (Precedence, if a View
+/// is ever added: the View's aggregation WINS over these boundaries.)
+///
+/// Boundaries must be finite, sorted and duplicate-free or the SDK returns a
+/// NO-OP instrument and logs — i.e. the failure mode is a silently dead
+/// histogram, not a startup error. `execution_duration_boundaries_are_valid`
+/// in `metrics_tests.rs` asserts those properties directly, and
+/// `exported_prometheus_names_are_stable_and_idle_seeds_at_zero` pins the
+/// exported `le=` set that `observability/rules/alerts.yml` selects on.
+///
+/// SIBLING DEFECT, DELIBERATELY NOT FIXED HERE: `wasm.llm.duration_ms` still
+/// uses the SDK defaults and is saturated the same way — 206 calls over the
+/// same window, mean 3945.8 ms, and 12.1 % of them past its 10 000 ms top
+/// bound. Nothing selects on its `le=` values (no rule, no dashboard), so it
+/// orphans nothing and can be re-bucketed independently. It is left alone
+/// because re-bucketing it is a second re-bucketing, and each one is a
+/// boundary-change event that has to be verified against the guard on its own.
+pub(crate) const EXECUTION_DURATION_BOUNDARIES_MS: &[f64] = &[
+    // Sub-100 ms: the 45 % of executions that never touch the network.
+    5.0, 10.0, 25.0, 100.0,
+    // The healthy band. 19.5 % of ALL executions land in (250, 500] and the
+    // healthy p95 sits inside it; 400 is the one interior split.
+    250.0, 400.0, 500.0,
+    // Seconds. 2500 and 10000 are selected BY NAME from
+    // observability/rules/alerts.yml and must not move without moving the
+    // alert thresholds with them. 7500 is kept for INTERPOLATION WIDTH, not
+    // for its own occupancy — see the region-by-region note above.
+    1000.0, 2500.0, 5000.0, 7500.0, 10000.0,
+    // The LLM tail — previously one undifferentiated overflow bucket.
+    // 120000 is the worker's default per-node wall-clock timeout, so a single
+    // successful attempt cannot exceed it.
+    15000.0, 20000.0, 30000.0, 60000.0, 120000.0,
+];
+
 // ========================================================================
 // 🔥 SECURITY: Label Normalization
 // Prevent unbounded cardinality which can cause memory exhaustion
@@ -249,9 +432,14 @@ impl RuntimeMetrics {
                 .with_description("WASM executions COMPLETED, by terminal status")
                 .build(),
 
+            // Explicit boundaries — see EXECUTION_DURATION_BOUNDARIES_MS for
+            // the measured distribution they were sized against. The SDK
+            // defaults top out at 10 000 ms, below the LLM-bearing population
+            // this histogram exists to measure.
             execution_duration: meter
                 .f64_histogram("wasm.execution.duration_ms")
                 .with_description("Execution duration in milliseconds")
+                .with_boundaries(EXECUTION_DURATION_BOUNDARIES_MS.to_vec())
                 .build(),
 
             cache_hits: meter

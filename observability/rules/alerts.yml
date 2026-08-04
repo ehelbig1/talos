@@ -176,8 +176,16 @@ groups:
       #     the cron cadence rather than on health.
       #   * The 10 s saturation defect survives any `for:` too. Keeping the
       #     quantile keeps an expression whose VALUE is uninterpretable in
-      #     exactly the state that matters (see the note in
-      #     VerySlowWASMExecution).
+      #     exactly the state that matters.
+      #     THIS THIRD REASON EXPIRED ON 2026-08-04 and is left here rather
+      #     than deleted, because anyone re-weighing `for: 16m` must know the
+      #     argument is now down to two legs. The histogram's boundaries were
+      #     made explicit and now reach 120 s (see the note on
+      #     WASMLatencyBucketMissing below), so `histogram_quantile` no longer
+      #     saturates and its value IS interpretable. The first two reasons —
+      #     16 min being a 30-second coincidence against one 13.75 h sample,
+      #     and n≈4 defeating any `for:` — are untouched, and they are the
+      #     load-bearing ones.
       # If the fraction rules are ever revisited, `for: 16m` on the old
       # expression is the alternative to weigh, with those numbers.
       #
@@ -361,18 +369,58 @@ groups:
           description: >-
             {{ $value | humanizePercentage }} of WASM executions on
             {{ $labels.instance }} exceeded 10s over the last 15m, sustained
-            for 10m (threshold: 50%). 10s is the histogram's highest finite
-            bucket bound, so these executions are only known to be SLOWER than
-            10s — the exact latency is not recoverable from this metric.
+            for 10m (threshold: 50%). 10s is no longer the histogram's top
+            bound, so HOW slow is now answerable: read the buckets above it
+            (15s/20s/30s/60s/120s) or histogram_quantile, both of which return
+            a real value rather than a ceiling. LLM inference time is nested
+            inside execution duration — check wasm_llm_duration_ms first.
 
       # The boundary guard for the two rules above. They select fixed `le`
       # values, so they are only as alive as those bucket bounds. If the
-      # `wasm.execution.duration_ms` boundaries are ever changed — and there
-      # is a live reason to change them, see the note on saturation in
-      # VerySlowWASMExecution — the numerator goes absent, the division
-      # matches nothing, and BOTH rules above go silent forever with no error
-      # anywhere. That is the same shape as a rule_files entry that globs to
-      # zero files: configured, plausible-looking, and dead.
+      # `wasm.execution.duration_ms` boundaries are ever changed the numerator
+      # goes absent, the division matches nothing, and BOTH rules above go
+      # silent forever with no error anywhere. That is the same shape as a
+      # rule_files entry that globs to zero files: configured,
+      # plausible-looking, and dead.
+      #
+      # THE BOUNDARIES HAVE NOW ACTUALLY CHANGED ONCE, on 2026-08-04, and this
+      # guard is why that was safe to do. The histogram had been running on the
+      # OTEL SDK's DEFAULTS (no `with_boundaries`, no View anywhere in the
+      # workspace), whose top finite bound is 10 000 ms — below the population
+      # it measures, because Ollama `llm::complete` time is nested inside
+      # execution duration. `histogram_quantile` returns the highest finite
+      # bound when the quantile lands in `+Inf`, so the dashboard's p95 read
+      # exactly 10000.0 for 19 % of evaluated points over 13.75 h: a FLOOR
+      # rendered as a value. Recovering individual durations from raw counter
+      # deltas found executions at 26 s, 50 s and 81.9 s — 8.2× the old bound.
+      #
+      # The replacement set is DECLARED IN CODE, not here:
+      # `EXECUTION_DURATION_BOUNDARIES_MS` in talos-worker-runtime/src/metrics.rs,
+      # which carries the measured distribution each region was sized against.
+      # Two properties of it matter to THIS file:
+      #
+      #   * `2500` and `10000` were deliberately KEPT AT THEIR EXACT VALUES.
+      #     They are alert thresholds calibrated in #628, and moving a
+      #     threshold is a different decision from re-bucketing a histogram —
+      #     riding both in one change would have re-calibrated two alerts
+      #     under cover of a metrics refactor. So this particular boundary
+      #     change orphans NOTHING: the two selectors below still name live
+      #     buckets, and both latency rules keep their semantics byte for byte.
+      #     (What the old set lost — `0`, `50`, `75`, `750` — no rule,
+      #     dashboard or recording rule ever selected on. Verified by sweeping
+      #     every `le=` in the repo: there are exactly FOUR live selectors,
+      #     all in this file, all naming 2500 or 10000. The Grafana panels use
+      #     `histogram_quantile` with no `le=` at all, so they adapt on their
+      #     own — and stop reporting a ceiling as a value.)
+      #   * The set is now pinned at BUILD time as well as here, by
+      #     `exported_prometheus_names_are_stable_and_idle_seeds_at_zero` in
+      #     talos-worker-runtime/src/metrics_tests.rs, which asserts the
+      #     exported `le=` labels equal the constant and that these two
+      #     specific selectors are among them. That is strictly earlier than
+      #     this rule: a boundary change that drops one now fails `cargo test`
+      #     instead of waiting 15 minutes to page. This guard remains the net
+      #     for what a unit test cannot see — a worker whose BUILD predates the
+      #     rules, or a rolling deploy midway between two boundary sets.
       #
       # Gated on the histogram being LIVE, so an idle stack (where no bucket
       # series exists at all, legitimately) does not trip it.

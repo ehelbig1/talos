@@ -344,5 +344,91 @@ mod tests {
                  alert rule selects on.\n{out}"
             );
         }
+
+        // ── the exported `le=` set ───────────────────────────────────────
+        // The bucket BOUNDARIES are as load-bearing as the metric NAME, and
+        // for the same reason: `SlowWASMExecution` and `VerySlowWASMExecution`
+        // select fixed `le=` values, so a boundary that disappears takes its
+        // rule with it. `WASMLatencyBucketMissing` is the runtime net for
+        // that; this is the build-time one, and it is strictly earlier.
+        //
+        // Asserted against the exported text rather than against the constant
+        // so it also covers the exporter's float FORMATTING — Prometheus `le`
+        // labels are string-matched, and `le="10000"` and `le="10000.0"` are
+        // different selectors to a rule that names one of them.
+        let exported_les: std::collections::BTreeSet<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("wasm_execution_duration_ms_bucket{"))
+            .filter_map(|l| l.split("le=\"").nth(1))
+            .filter_map(|rest| rest.split('"').next())
+            .collect();
+        let expected_les: std::collections::BTreeSet<String> =
+            crate::metrics::EXECUTION_DURATION_BOUNDARIES_MS
+                .iter()
+                .map(|b| format!("{b}"))
+                .chain(std::iter::once("+Inf".to_string()))
+                .collect();
+        let expected_refs: std::collections::BTreeSet<&str> =
+            expected_les.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            exported_les, expected_refs,
+            "exported bucket boundaries drifted from \
+             EXECUTION_DURATION_BOUNDARIES_MS. Every `le=` selector in \
+             observability/rules/alerts.yml and every promtool fixture in \
+             observability/alerts_test.yml is coupled to this set."
+        );
+
+        // Named individually, because these two are not merely PRESENT — they
+        // are the exact values `observability/rules/alerts.yml` selects on.
+        // Changing either one re-calibrates an alert threshold, which is a
+        // different decision from re-bucketing a histogram and must not ride
+        // along inside one.
+        for alert_selected in [r#"le="2500""#, r#"le="10000""#] {
+            assert!(
+                out.contains(alert_selected),
+                "boundary {alert_selected} is selected by name in \
+                 observability/rules/alerts.yml (SlowWASMExecution / \
+                 VerySlowWASMExecution). Removing it silences that rule with \
+                 no error anywhere.\n{out}"
+            );
+        }
+    }
+
+    /// The SDK's failure mode for bad boundaries is a NO-OP instrument plus an
+    /// internal log line — not a build error and not a startup panic. A
+    /// histogram that silently stops recording is indistinguishable from a
+    /// worker that is not executing, so the preconditions are asserted here
+    /// where they fail loudly.
+    #[test]
+    fn execution_duration_boundaries_are_valid() {
+        let b = crate::metrics::EXECUTION_DURATION_BOUNDARIES_MS;
+        assert!(
+            !b.is_empty(),
+            "empty boundaries would fall back to defaults"
+        );
+        assert!(
+            b.iter().all(|v| v.is_finite()),
+            "NaN/±Inf boundaries make the SDK return a no-op instrument: {b:?}"
+        );
+        assert!(
+            b.windows(2).all(|w| w[0] < w[1]),
+            "boundaries must be strictly ascending (sorted, no duplicates): {b:?}"
+        );
+        assert!(
+            b[0] > 0.0,
+            "a `le=0` bucket can never be non-empty: duration_ms is an \
+             as_millis() truncation, so nothing records below 1 ms. The SDK \
+             default carried one and it counted zero executions over 15 days."
+        );
+        // The top bound is the worker's default per-node wall-clock timeout
+        // (`WASM_EXECUTION_TIMEOUT_SECS`, default 120s). A single successful
+        // attempt cannot exceed it, so the overflow bucket means "retries
+        // accumulated", not "we stopped being able to measure". The slowest
+        // execution actually observed on the dev stack was 81.9 s; a top bound
+        // below that is the defect this constant exists to fix.
+        assert!(
+            *b.last().expect("non-empty") >= 120_000.0,
+            "top finite bound must cover the 120s per-node timeout: {b:?}"
+        );
     }
 }
