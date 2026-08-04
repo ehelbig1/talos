@@ -383,13 +383,35 @@ mod tests {
         // Changing either one re-calibrates an alert threshold, which is a
         // different decision from re-bucketing a histogram and must not ride
         // along inside one.
-        for alert_selected in [r#"le="2500""#, r#"le="10000""#] {
+        //
+        // ASSERTED AGAINST `exported_les`, NOT AGAINST `out`. The first
+        // version of this loop did `out.contains(r#"le="10000""#)` over the
+        // WHOLE exposition, and that assertion was VACUOUS — proven by
+        // mutation on 2026-08-04: delete `10000.0` from
+        // EXECUTION_DURATION_BOUNDARIES_MS, rebuild, and the test still
+        // passed. Two reasons compounded. (1) `exported_les` and
+        // `expected_les` are BOTH derived from the constant, so they agree
+        // with each other however the constant changes — that assert_eq
+        // catches exporter FORMATTING drift, which is what it is for, and
+        // cannot catch a boundary being removed. (2) THREE sibling histograms
+        // — `wasm_compilation_duration_ms`, `wasm_llm_duration_ms`,
+        // `wasm_host_function_duration_ms` — are still on the SDK defaults and
+        // therefore still export `le="2500"` and `le="10000"` of their own, so
+        // the substring was satisfied by a metric no alert rule selects on.
+        // Verified on a live scrape: all four names carry both labels.
+        //
+        // The whole point of this pin is to fail `cargo test` instead of
+        // waiting 15 minutes for `WASMLatencyBucketMissing` to page, so an
+        // assertion that cannot fail is worse than none — it is a gate that
+        // reports coverage it does not have.
+        for alert_selected in ["2500", "10000"] {
             assert!(
-                out.contains(alert_selected),
-                "boundary {alert_selected} is selected by name in \
+                exported_les.contains(alert_selected),
+                "wasm_execution_duration_ms has no le=\"{alert_selected}\" \
+                 bucket. That boundary is selected BY NAME in \
                  observability/rules/alerts.yml (SlowWASMExecution / \
-                 VerySlowWASMExecution). Removing it silences that rule with \
-                 no error anywhere.\n{out}"
+                 VerySlowWASMExecution); removing it silences that rule with \
+                 no error anywhere. Exported set: {exported_les:?}\n{out}"
             );
         }
     }
@@ -402,9 +424,15 @@ mod tests {
     #[test]
     fn execution_duration_boundaries_are_valid() {
         let b = crate::metrics::EXECUTION_DURATION_BOUNDARIES_MS;
+        // NOT "would fall back to defaults" — that was wrong and is worth
+        // correcting rather than deleting, because the wrong version made an
+        // empty set sound harmless. An explicitly empty boundary vec means NO
+        // bucket information at all: the histogram exports `+Inf` only, which
+        // is strictly WORSE than the SDK defaults this constant replaced.
         assert!(
             !b.is_empty(),
-            "empty boundaries would fall back to defaults"
+            "empty boundaries export a +Inf bucket and nothing else — no \
+             quantile, no le= selector, and both latency rules go silent"
         );
         assert!(
             b.iter().all(|v| v.is_finite()),
@@ -414,18 +442,29 @@ mod tests {
             b.windows(2).all(|w| w[0] < w[1]),
             "boundaries must be strictly ascending (sorted, no duplicates): {b:?}"
         );
+        // The justification here is EMPIRICAL, not structural, and the
+        // difference is not pedantry: an earlier version of this message said
+        // a `le=0` bucket "can never be non-empty" because duration_ms is an
+        // `as_millis()` truncation. That inverts the mechanism. Truncation
+        // sends every sub-millisecond execution to exactly `0.0`, and the
+        // lowest bucket is `(-inf, 0]`, which INCLUDES `0.0` — so truncation
+        // is precisely what would POPULATE `le=0`. It is empty because nothing
+        // on this workload has ever completed in under 1 ms (0 observations
+        // across 15 d), which is a fact about the workload and could change.
         assert!(
             b[0] > 0.0,
-            "a `le=0` bucket can never be non-empty: duration_ms is an \
-             as_millis() truncation, so nothing records below 1 ms. The SDK \
-             default carried one and it counted zero executions over 15 days."
+            "`le=0` counted zero executions over 15 d, so it is a series \
+             permanently equal to its neighbour on this workload. (It is \
+             reachable in principle: as_millis() truncation records a \
+             sub-millisecond execution as exactly 0.0, which lands in it.)"
         );
-        // The top bound is the worker's default per-node wall-clock timeout
-        // (`WASM_EXECUTION_TIMEOUT_SECS`, default 120s). A single successful
-        // attempt cannot exceed it, so the overflow bucket means "retries
-        // accumulated", not "we stopped being able to measure". The slowest
-        // execution actually observed on the dev stack was 81.9 s; a top bound
-        // below that is the defect this constant exists to fix.
+        // The top bound is the worker's DEFAULT per-node wall-clock timeout
+        // (`WASM_EXECUTION_TIMEOUT_SECS`, default 120s) — a default, not a
+        // clamp. A node with an explicit `timeout_secs` runs past it in a
+        // single attempt, so overflow means EITHER accumulated retries OR a
+        // raised per-node timeout. The slowest execution actually observed on
+        // the dev stack was 81.9 s; a top bound below that is the defect this
+        // constant exists to fix.
         assert!(
             *b.last().expect("non-empty") >= 120_000.0,
             "top finite bound must cover the 120s per-node timeout: {b:?}"

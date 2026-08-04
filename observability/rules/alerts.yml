@@ -177,12 +177,16 @@ groups:
       #   * The 10 s saturation defect survives any `for:` too. Keeping the
       #     quantile keeps an expression whose VALUE is uninterpretable in
       #     exactly the state that matters.
-      #     THIS THIRD REASON EXPIRED ON 2026-08-04 and is left here rather
-      #     than deleted, because anyone re-weighing `for: 16m` must know the
-      #     argument is now down to two legs. The histogram's boundaries were
-      #     made explicit and now reach 120 s (see the note on
-      #     WASMLatencyBucketMissing below), so `histogram_quantile` no longer
-      #     saturates and its value IS interpretable. The first two reasons —
+      #     THIS THIRD REASON LARGELY EXPIRED ON 2026-08-04 and is left here
+      #     rather than deleted, because anyone re-weighing `for: 16m` must
+      #     know the argument is now down to two-and-a-bit legs. The
+      #     histogram's boundaries were made explicit and now reach 120 s (see
+      #     the note on WASMLatencyBucketMissing below), so
+      #     `histogram_quantile` saturates FAR less often — but it has not
+      #     stopped saturating: the ceiling simply moved from 10 s to 120 s,
+      #     and a quantile landing in `+Inf` still reads back a flat 120000.
+      #     "No longer saturates" would be the same overstatement in the other
+      #     direction. The first two reasons —
       #     16 min being a 30-second coincidence against one 13.75 h sample,
       #     and n≈4 defeating any `for:` — are untouched, and they are the
       #     load-bearing ones.
@@ -372,8 +376,11 @@ groups:
             for 10m (threshold: 50%). 10s is no longer the histogram's top
             bound, so HOW slow is now answerable: read the buckets above it
             (15s/20s/30s/60s/120s) or histogram_quantile, both of which return
-            a real value rather than a ceiling. LLM inference time is nested
-            inside execution duration — check wasm_llm_duration_ms first.
+            a real value up to 120s. Past 120s the quantile saturates again and
+            reads back a flat 120000 — the bucket counts stay well-defined
+            there, so prefer them when this alert is firing. LLM inference time
+            is nested inside execution duration — check wasm_llm_duration_ms
+            first.
 
       # The boundary guard for the two rules above. They select fixed `le`
       # values, so they are only as alive as those bucket bounds. If the

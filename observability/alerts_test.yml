@@ -455,6 +455,15 @@ tests:
   # operator reads at 3 a.m., and it made a claim about the METRIC's limits
   # that a change to the metric silently falsified. Pinning it means that kind
   # of drift fails a test rather than surviving as confidently-wrong prose.
+  #
+  # The pin earned its keep immediately. The first replacement text said the
+  # buckets and histogram_quantile "both return a real value rather than a
+  # ceiling" — wrong in the OPPOSITE direction from the text it replaced, and
+  # wrong in exactly the state this alert fires in: >50% of executions past
+  # 10 s is when the quantile is most likely to land in `+Inf`, where it reads
+  # back a flat 120000. Same field, same 3 a.m., opposite error. The shipped
+  # text bounds the claim at 120 s and points at the bucket counts, which stay
+  # well-defined under saturation.
   - interval: 1m
     name: sustained over-10s regression fires the critical tier
     input_series:
@@ -475,7 +484,7 @@ tests:
               instance: worker:9090
             exp_annotations:
               summary: "Sustained very slow WASM executions"
-              description: "100% of WASM executions on worker:9090 exceeded 10s over the last 15m, sustained for 10m (threshold: 50%). 10s is no longer the histogram's top bound, so HOW slow is now answerable: read the buckets above it (15s/20s/30s/60s/120s) or histogram_quantile, both of which return a real value rather than a ceiling. LLM inference time is nested inside execution duration — check wasm_llm_duration_ms first."
+              description: "100% of WASM executions on worker:9090 exceeded 10s over the last 15m, sustained for 10m (threshold: 50%). 10s is no longer the histogram's top bound, so HOW slow is now answerable: read the buckets above it (15s/20s/30s/60s/120s) or histogram_quantile, both of which return a real value up to 120s. Past 120s the quantile saturates again and reads back a flat 120000 — the bucket counts stay well-defined there, so prefer them when this alert is firing. LLM inference time is nested inside execution duration — check wasm_llm_duration_ms first."
 
   # ── (5) The boundary guard ───────────────────────────────────────────
   # Rules (1)-(4) all select fixed `le` values, so they are exactly as alive
