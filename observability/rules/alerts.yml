@@ -112,15 +112,25 @@ groups:
       # `SlowWASMExecution` 8 times, and NOT ONCE on a real problem. Three
       # compounding causes, each confirmed in the raw bucket deltas:
       #
-      #  1. THE POPULATION IS TINY. This worker completes 5-8 executions per
-      #     5 m window (measured peak 8.3). p95 over 8 samples is not a
-      #     quantile, it is the MAXIMUM. A single slow execution moved the
-      #     expression from 450 ms to the top of the histogram.
+      #  1. THE POPULATION IS TINY. Per (job, instance), the MEDIAN 5 m window
+      #     holds 4.14 executions; the mean is 3.79 and the max 20.83. (An
+      #     earlier draft of this comment said "5-8 per window, measured peak
+      #     8.3" — that peak is wrong by ~2.5x in the flattering direction:
+      #     12 % of windows exceed it. The argument is unchanged and if
+      #     anything stronger, because the number that matters is the MEDIAN.)
+      #     `histogram_quantile(0.95, …)` over 4 samples is not a quantile, it
+      #     is the MAXIMUM: the expression asks "was any single execution
+      #     slow", and one slow execution moved it from 450 ms to the top of
+      #     the histogram. No `for:` value changes WHAT that expression
+      #     measures — see the rejection note below.
       #
       #  2. LLM TIME IS NESTED INSIDE EXECUTION TIME. 70 of 457 executions
       #     (15 %) made an Ollama call; mean LLM latency 3.2 s, and 7 calls
-      #     exceeded 10 s. Every execution observed over 10 s contained an
-      #     LLM call over 10 s — a 1:1 match in the bucket deltas. A 2000 ms
+      #     exceeded 10 s. In the fresh-worker window after the 01:01 restart
+      #     the match was 1:1 — every execution over 10 s contained an LLM
+      #     call over 10 s. Over the whole 457-execution population it is
+      #     WEAKER than that: 7 of 10, with the two counters diverging three
+      #     times. The weaker claim still carries the argument. A 2000 ms
       #     ceiling cannot hold over a population that legitimately contains
       #     multi-second local inference. Compilation is NOT the cause and
       #     must not be blamed for it: 15 cold compiles averaged 95 ms and
@@ -140,9 +150,36 @@ groups:
       #
       # ALSO REJECTED, on measurement rather than taste: widening the rate
       # window while keeping the quantile (a 30 m window HELD the transient
-      # longer — 12 min of breach instead of 10); and raising `for:` alone
-      # (still fired twice in 13 h, and the longest healthy breach was 19 min,
-      # so no `for:` both suppresses it and stays useful).
+      # longer — 12 min of breach instead of 10).
+      #
+      # RAISING `for:` ALONE was also rejected, and the FIRST version of this
+      # paragraph rejected it on a number that is false. It said "the longest
+      # healthy breach was 19 min, so no `for:` both suppresses it and stays
+      # useful". Re-measured at 15 s resolution over the complete dataset: the
+      # longest continuous breach is 15.50 min on BOTH tiers (33 and 24
+      # episodes; second-longest 14.75 min; ZERO episodes over 19 min). So the
+      # claim is not merely imprecise, it is backwards — `for: 16m` on the
+      # UNCHANGED p95 expression yields zero firings across the whole 13.75 h,
+      # at ~16.3 min detection latency for a total regression, which is FASTER
+      # than the 18 min below and carries neither the volume-floor blind band
+      # nor the 500 ms → 2500 ms threshold loss that this rule does.
+      #
+      # It is still rejected, now for the reasons that are actually true:
+      #   * 16 min clears the longest observed burst by 30 SECONDS, against a
+      #     sample of one 13.75 h window. That is not a threshold, it is a
+      #     coincidence; one heavier scheduled batch breaks it. The volume
+      #     bursts in this same data run 14-54 min long, so the headroom is
+      #     well inside the natural variation of the workload.
+      #   * The n≈4 defect SURVIVES any `for:`. A `for:` gate changes how long
+      #     the single slow execution must keep recurring, not what is being
+      #     measured — and it recurs on a schedule, so the gate is a bet on
+      #     the cron cadence rather than on health.
+      #   * The 10 s saturation defect survives any `for:` too. Keeping the
+      #     quantile keeps an expression whose VALUE is uninterpretable in
+      #     exactly the state that matters (see the note in
+      #     VerySlowWASMExecution).
+      # If the fraction rules are ever revisited, `for: 16m` on the old
+      # expression is the alternative to weigh, with those numbers.
       #
       # THE REPLACEMENT asks the question a small population CAN answer: what
       # FRACTION of executions is slow, sustained long enough that a bounded
@@ -151,7 +188,7 @@ groups:
       #
       # THE VOLUME FLOOR IS NOT DECORATION. A fraction is meaningful at n=5
       # in a way a p95 is not, but it is still not meaningful at n=4. The
-      # first draft of this rule had no floor, and over the same 13 h it
+      # first draft of this rule had no floor, and over the same 13.75 h it
       # still produced one firing: the worker being REPLACED during a restart
       # trails 4 executions into the 15 m window, 3 of them slow, and 3/4 =
       # 0.75 clears any fraction threshold worth having. That is the same
@@ -160,35 +197,119 @@ groups:
       # executions-per-15m-window for this worker, so two thirds of windows
       # remain evaluable while a dying container's tail cannot reach it.
       #
-      # It costs something, and the cost is the familiar one: during a
-      # genuinely quiet stretch the rules cannot fire at all, so a regression
-      # that starts in a lull is not detected until volume recovers. That is
-      # tolerable ONLY because the low-volume and zero-volume cases have
-      # their own detectors — `NoWASMExecutions` and `WASMMetricsPipelineDead`
-      # — and would not be tolerable without them.
+      # `for: 10m` needs that floor CONTINUOUSLY, not just at an instant, so
+      # "two thirds of windows" had to be checked against contiguity before it
+      # could be believed: 66 % of instants clear the floor, and 65 % of
+      # recorded wall-clock time sits inside a contiguous above-floor run of
+      # at least 10 min (20 of 21 runs qualify; run lengths 14-54 min). The
+      # workload is block-structured — busy scheduled batches, quiet gaps —
+      # rather than oscillating around the median, which is the only reason a
+      # MEDIAN floor survives a 10-minute sustain requirement at all. On a
+      # smoother workload it would not, and this is the first number to
+      # re-measure if the cadence changes.
       #
-      # CALIBRATION, over 13.5 h spanning three container restarts, measured
-      # per (job, instance) exactly as the rules aggregate — NOT summed
-      # fleet-wide, which dilutes a single bad instance and reported a
-      # flattering number in an earlier draft of this comment — it read 0.36
-      # only because summing fleet-wide happened to hide the 0.75 outlier
-      # that the floor now excludes on its merits. With the floor applied the
-      # 15 m slow-fraction peaked at 0.36 (p99 0.36) at the 2.5 s boundary
-      # and 0.22 (p99 0.21) at the 10 s boundary, over 556 evaluable windows.
-      # The 0.5 thresholds were not crossed once, by either tier, and neither
-      # rule would have fired at any point in that period.
+      # THE FLOOR'S COST IS A BLIND BAND, AND IT IS NOT COVERED BY ANOTHER
+      # RULE. An earlier draft of this comment said the low-volume case was
+      # "tolerable ONLY because the low-volume and zero-volume cases have
+      # their own detectors — NoWASMExecutions and WASMMetricsPipelineDead".
+      # That sentence was FALSE, and false in precisely the way this whole
+      # file exists to eliminate: it claimed coverage that the cited
+      # expressions structurally cannot provide. Both are ZERO-ONLY —
+      # `absent(x) or sum(rate(x[30m])) == 0` and `up == 1 and on() absent(x)`.
+      # Neither can match at ANY non-zero execution rate. So a worker running
+      # 1-9 executions per 15 m is below this floor, above their `== 0`, and
+      # present for the pipeline check: invisible to all three.
       #
-      # WHAT THIS MISSES, stated plainly rather than implied. A PARTIAL
-      # regression leaving 36-50 % of executions slower than 2.5 s sits under
-      # the threshold and will not page; the old expression would have caught
-      # that, at the cost of the 23 false pages per 13.75 h measured above. And
-      # detection latency for a TOTAL regression grows to 18 min, from ~3 min
-      # before: the 15 m
-      # rate window has to ramp the fraction past 0.5 (8 min after onset),
-      # then `for: 10m` has to elapse. That figure is MEASURED, not estimated
-      # — `observability/alerts_test.yml` asserts silence at 37 m and firing
-      # at 38 m against an onset at 20 m, so if you retune the window or the
-      # `for:`, those two eval_times move and this number must move with them.
+      # Measured on the same 13.75 h: 32.0 % of recorded 15 m (job, instance)
+      # windows sit in that 1-9 band (543 of 1696 at a 30 s step), against
+      # 1.9 % at true zero — so the two rules cited as covering the low-volume
+      # case cover under a sixteenth of the windows they were credited with.
+      # Driven
+      # through promtool, a worker at 6 executions per 15 m with EVERY
+      # execution over 10 s for three hours raises nothing at all — not these
+      # two rules, not NoWASMExecutions, not WASMMetricsPipelineDead, not the
+      # bucket guard. The old p95 expression DID fire on that shape. This is
+      # a real loss, it is pinned by the "KNOWN GAP" case in
+      # observability/alerts_test.yml so it cannot be mistaken for coverage,
+      # and it is OPEN DEBT rather than something fixed here: a low-volume
+      # tier needs its own threshold, and calibrating a second threshold off
+      # the same single 13.75 h sample is how the 31 firings this change
+      # removes got shipped in the first place.
+      #
+      # CALIBRATION, over 13.75 h spanning three container restarts, measured
+      # per (job, instance) exactly as the rules aggregate. With the floor
+      # applied the 15 m slow-fraction peaked at 0.357 (p99 0.357) at the
+      # 2.5 s boundary and 0.217 (p99 0.211) at the 10 s boundary, over 1121
+      # evaluable 30 s-step windows. The 0.5 thresholds were not crossed once,
+      # by either tier, and neither rule would have fired at any point.
+      # The 0.75 outlier the floor excludes is a dying container's 4-execution
+      # tail; it is the VOLUME FLOOR that excludes it, in either aggregation —
+      # an earlier draft credited per-instance aggregation with catching it and
+      # then quoted the same 0.36 for both the "flattering" and corrected
+      # figures, which was self-contradictory. Ungated, the fleet-wide
+      # fraction reaches 0.75 too.
+      #
+      # WHAT THIS MISSES, stated plainly rather than implied — largest first.
+      #
+      #   * THE THRESHOLD MOVED 500 ms → 2500 ms, and that is the biggest
+      #     loss, larger than the prevalence band below. A UNIFORM slowdown
+      #     that stays under 2.5 s is invisible at ANY prevalence: 100 % of
+      #     executions at 2400 ms scores a slow-fraction of 0.00 and never
+      #     pages, where `p95 > 500` fired at once. The quiet-period floor of
+      #     the p95 series is 456 ms (p10 and p25 both sit there; the median
+      #     is 875 ms — do NOT quote 450 ms as "the healthy p95", it is the
+      #     floor, and over a quarter of windows saturate at the 10 000 ms
+      #     ceiling). So the new rule tolerates a ~3-5x slowdown in silence,
+      #     and 41 of the 613 executions in the calibration window already sit
+      #     between the two thresholds (and 18 exceeded 10 000 ms, i.e. landed
+      #     in the overflow bucket where the metric cannot say how slow they
+      #     were). The 500 ms boundary was abandoned
+      #     because a population containing multi-second local inference
+      #     cannot hold it — but nothing replaced it, and nothing here watches
+      #     the sub-2.5 s range.
+      #   * A PARTIAL regression is invisible at ANY duration up to 50 %
+      #     prevalence — measured through promtool at 1 % granularity: 50 %
+      #     of executions permanently over 2.5 s NEVER pages, 51 % pages in
+      #     24 min. (The healthy peak measured below is 0.357, so the usable
+      #     margin is 0.357 → 0.50, not 0 → 0.50.)
+      #   * A SHORT regression is invisible however total it is. Measured:
+      #     under a constant arrival rate a 9-minute stretch with every
+      #     execution over 2.5 s never pages and a 10-minute one pages at
+      #     18 min — the condition holds for roughly the outage's own
+      #     duration, so `for: 10m` is a hard 10-minute floor. On the real
+      #     bursty arrival pattern the floor is worse: a 25-minute total
+      #     outage paged at all five onsets tested, 20 min at four, 15 min at
+      #     three, 10 min at one. The old expression caught these in ~3 min.
+      #   * A regression starting in the 1-9 executions/15 m band is not
+      #     detected until volume recovers (above).
+      #   * EVERYTHING ABOVE ASSUMES ONE WORKER. The rules aggregate
+      #     `by (job, instance)`, so `>= 10` is a PER-REPLICA floor, and it
+      #     was calibrated against traffic measured on a one-replica stack
+      #     (`make up` forces `--scale worker=1`). docker-compose.yml defaults
+      #     to `replicas: ${WORKER_REPLICAS:-2}` and loads this same file, so
+      #     a plain `docker compose up -d` splits the identical total traffic
+      #     two ways. Dividing the recorded per-instance volume by the replica
+      #     count: 1 replica clears the floor in 66 % of windows, 2 in 3.7 %,
+      #     3 or more in 0.0 %. Both rules are structurally DEAD on any fleet
+      #     larger than one, silently. Pinned by the two-replica "KNOWN GAP"
+      #     case in alerts_test.yml. Fixing it properly means choosing between
+      #     a fleet-wide floor (which readmits the dying-container tail the
+      #     floor exists to exclude) and a replica-aware threshold, and
+      #     neither can be calibrated from a one-replica sample — so it is
+      #     recorded here rather than guessed at.
+      #
+      # DETECTION LATENCY, for a TOTAL regression, in a window that clears the
+      # floor: 18 min, from ~3 min before. The 15 m rate window has to ramp the
+      # fraction past 0.5 (8 min after onset), then `for: 10m` has to elapse.
+      # That figure is MEASURED — alerts_test.yml asserts silence at 37 m and
+      # firing at 38 m against an onset at 20 m, so if you retune the window or
+      # the `for:`, those two eval_times move and this number must move with
+      # them. It is also the BEST case, and the number to quote at 3 a.m. is
+      # the worse one: 18 min assumes a constant arrival rate. Replayed
+      # against this worker's ACTUAL recorded arrival pattern (9.3 h, 418
+      # executions, 14 onsets), a permanent total regression was detected at
+      # every onset — but in 16 to 60 min, median ~23. Below 51 % prevalence
+      # it is never, and inside the blind band it is never.
       #
       # ABSENCE: no absent() arm, deliberately — absence of the series means
       # no executions were observed, which is `NoWASMExecutions`'s job. But

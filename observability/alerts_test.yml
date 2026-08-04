@@ -309,21 +309,29 @@ tests:
 
   # ══════════════════════════════════════════════════════════════════════
   # LATENCY: the slow-FRACTION rules that replaced the p95 quantile on
-  # 2026-08-04. Four cases, and the pair of them is the point — a rule that
-  # only proves it stays SILENT has proved it might be blind.
+  # 2026-08-04. Eleven cases, and the PAIRING is the point — a rule that only
+  # proves it stays SILENT has proved it might be blind.
   #
-  # The expression they replaced fired 20 times in 13 h of healthy dev
-  # traffic and never once on a real problem, because p95 over the 5-8
-  # executions this worker completes per 5 m window is not a quantile, it is
-  # the maximum. See the block comment above the rules for the full
-  # measurement. These cases pin the two properties that fix depends on.
+  # The expression they replaced fired 31 times in 13.75 h of healthy dev
+  # traffic (23 VerySlow + 8 Slow, from Prometheus's own ALERTS series) and
+  # never once on a real problem, because histogram_quantile(0.95, …) over the
+  # median 4.14 executions this worker completes per 5 m window is not a
+  # quantile, it is the maximum. See the block comment above the rules for the
+  # full measurement.
+  #
+  # Cases (1)-(7) landed with the rules. Cases (8)-(11) were added in review
+  # after mutation testing found three properties the first seven did not
+  # pin — the critical tier's `for:`, the bucket guard's volume gate and its
+  # own `for:` — plus the low-volume gap, which is pinned so it cannot be
+  # mistaken for coverage.
   # ══════════════════════════════════════════════════════════════════════
 
   # ── (1) SILENT across a bounded transient ────────────────────────────
   # Models the real shape: healthy 1 execution/min, then a 5-minute stretch
   # where every execution is slower than 2.5 s, then recovery. Peak 15 m
-  # slow-fraction is 5/15 = 0.33, which is the 0.36 actually measured on the
-  # live stack across BOTH container restarts. Nothing fires.
+  # slow-fraction is 5/15 = 0.33, close to the 0.357 actually measured as the
+  # gated peak on the live stack over 13.75 h spanning three container
+  # restarts (the peaks are not at the restarts). Nothing fires.
   #
   # le=10000 tracks the count exactly here: the executions are slow but not
   # past 10 s, so the critical tier must stay silent for a second, independent
@@ -537,3 +545,178 @@ tests:
       - {eval_time: 45m, alertname: SlowWASMExecution, exp_alerts: []}
       - {eval_time: 30m, alertname: VerySlowWASMExecution, exp_alerts: []}
       - {eval_time: 45m, alertname: VerySlowWASMExecution, exp_alerts: []}
+
+  # ── (8) `for:` on the CRITICAL tier is load-bearing too ───────────────
+  # Case (2) proves it for the warning tier only. Without this one,
+  # `VerySlowWASMExecution`'s `for: 10m` can be shortened to 2m and the whole
+  # suite still passes — verified by mutation 2026-08-04. That tier is the one
+  # that fired 23 times in 13.75 h before this change, so its sustain
+  # requirement is exactly the part a future edit must not quietly undo.
+  #
+  # A 9-minute stall where every execution exceeds 10 s: the 15 m fraction
+  # reaches 0.60, past the threshold, but not for the 10 minutes required.
+  # Executions over 10 s are also over 2.5 s, so the warning tier breaches
+  # here as well — deliberately realistic, and it is asserted silent too.
+  - interval: 1m
+    name: critical tier - threshold-crossing burst shorter than for:; still silent
+    input_series:
+      - series: 'wasm_execution_duration_ms_count{job="talos-worker", instance="worker:9090", status="success"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="2500"}'
+        values: "0+1x10 10+0x8 11+1x41"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="10000"}'
+        values: "0+1x10 10+0x8 11+1x41"
+    alert_rule_test:
+      - {eval_time: 24m, alertname: VerySlowWASMExecution, exp_alerts: []}
+      - {eval_time: 26m, alertname: VerySlowWASMExecution, exp_alerts: []}
+      - {eval_time: 24m, alertname: SlowWASMExecution,     exp_alerts: []}
+      - {eval_time: 26m, alertname: SlowWASMExecution,     exp_alerts: []}
+      - {eval_time: 60m, alertname: VerySlowWASMExecution, exp_alerts: []}
+
+  # ── (9) the guard must not page on an idle stack ─────────────────────
+  # Its comment claims it is "gated on executions actually being observed, so
+  # an idle stack does not trip it". Case (6) does not test that claim — its
+  # buckets are present, so both absent() arms are empty whether the gate is
+  # there or not. Removing the `and on() (sum(rate(count)) > 0)` gate left the
+  # whole suite green (mutation 2026-08-04), which means the one property
+  # keeping this rule off a permanently-red state was unpinned.
+  #
+  # Here NOTHING wasm_* exists at all — the genuinely idle stack. Silent.
+  - interval: 1m
+    name: idle stack, no wasm series at all; guard silent
+    input_series:
+      - series: 'up{job="talos-worker", instance="worker:9090"}'
+        values: "1+0x60"
+    alert_rule_test:
+      - {eval_time: 30m, alertname: WASMLatencyBucketMissing, exp_alerts: []}
+      - {eval_time: 60m, alertname: WASMLatencyBucketMissing, exp_alerts: []}
+
+  # ── (10) the REALISTIC boundary change, and the guard's own `for:` ────
+  # Case (5) models the buckets vanishing entirely. That is not what a
+  # boundary change looks like: the histogram keeps exporting buckets, they
+  # are simply DIFFERENT ones. This is the exact state the recommended
+  # saturation fix would produce, so it is the state the guard exists for.
+  # The 10m/30m pair also pins `for: 15m` — without the 10m assertion the
+  # guard's `for:` can be shortened to 1m unnoticed.
+  - interval: 1m
+    name: producer re-bucketed the histogram; guard fires, names both boundaries
+    input_series:
+      - series: 'wasm_execution_duration_ms_count{job="talos-worker", instance="worker:9090", status="success"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="2000"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="8000"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="60000"}'
+        values: "0+1x60"
+    alert_rule_test:
+      - {eval_time: 10m, alertname: WASMLatencyBucketMissing, exp_alerts: []}
+      - eval_time: 30m
+        alertname: WASMLatencyBucketMissing
+        exp_alerts:
+          - exp_labels: {severity: warning, component: wasm-runtime, le: "2500"}
+            exp_annotations:
+              summary: "WASM latency alerts have lost their bucket boundaries"
+              description: "Executions are being recorded but the le=2500 / le=10000 buckets of wasm_execution_duration_ms are absent, so SlowWASMExecution and VerySlowWASMExecution cannot fire. The histogram's bucket boundaries have most likely changed; update the le= selectors in observability/rules/alerts.yml to match."
+          - exp_labels: {severity: warning, component: wasm-runtime, le: "10000"}
+            exp_annotations:
+              summary: "WASM latency alerts have lost their bucket boundaries"
+              description: "Executions are being recorded but the le=2500 / le=10000 buckets of wasm_execution_duration_ms are absent, so SlowWASMExecution and VerySlowWASMExecution cannot fire. The histogram's bucket boundaries have most likely changed; update the le= selectors in observability/rules/alerts.yml to match."
+      # …and while that is true both latency rules are blind, which is the
+      # point of the guard: every execution here is over 8 s and neither can
+      # say so.
+      - {eval_time: 45m, alertname: SlowWASMExecution,     exp_alerts: []}
+      - {eval_time: 45m, alertname: VerySlowWASMExecution, exp_alerts: []}
+
+  # ── (11) THE KNOWN GAP, pinned so it cannot be mistaken for coverage ──
+  # A live, reachable, instrumented worker doing 6 executions per 15 m — under
+  # the volume floor — where EVERY execution has exceeded 10 s and stayed
+  # there for three hours. Nothing fires. Not the two latency rules (floor),
+  # not NoWASMExecutions (executions ARE happening, so its rate is non-zero),
+  # not WASMMetricsPipelineDead (the series exists), not the bucket guard.
+  #
+  # This is asserted, not lamented, because the comment in alerts.yml used to
+  # say the low-volume case was covered BY those two rules. It is not: they
+  # detect the ABSENCE of executions, and this is a latency defect with
+  # executions present. They cover the ZERO-volume case only. Measured on the
+  # live stack 2026-08-04: 32 % of recorded 15 m (job, instance) windows sat
+  # in this 1-9 executions band. The old p95 expression DID fire on this
+  # shape — that is what the floor cost, and it is a real cost.
+  #
+  # If a future change closes the gap (a low-volume tier, an absolute
+  # slow-count arm, per-instance `up` join), this case will fail. That is the
+  # intent: closing it should require deleting this case deliberately.
+  - interval: 1m
+    name: KNOWN GAP - permanent 100% over-10s regression below the volume floor is invisible to every rule
+    input_series:
+      - series: 'up{job="talos-worker", instance="worker:9090"}'
+        values: "1+0x180"
+      - series: 'wasm_executions_total{job="talos-worker", instance="worker:9090", status="success"}'
+        values: "0+0.4x180"
+      - series: 'wasm_execution_duration_ms_count{job="talos-worker", instance="worker:9090", status="success"}'
+        values: "0+0.4x180"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="2500"}'
+        values: "0+0x180"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="10000"}'
+        values: "0+0x180"
+    alert_rule_test:
+      - {eval_time: 60m,  alertname: SlowWASMExecution,        exp_alerts: []}
+      - {eval_time: 60m,  alertname: VerySlowWASMExecution,    exp_alerts: []}
+      - {eval_time: 60m,  alertname: NoWASMExecutions,         exp_alerts: []}
+      - {eval_time: 60m,  alertname: WASMMetricsPipelineDead,  exp_alerts: []}
+      - {eval_time: 60m,  alertname: WASMLatencyBucketMissing, exp_alerts: []}
+      - {eval_time: 180m, alertname: SlowWASMExecution,        exp_alerts: []}
+      - {eval_time: 180m, alertname: VerySlowWASMExecution,    exp_alerts: []}
+      - {eval_time: 180m, alertname: NoWASMExecutions,         exp_alerts: []}
+      - {eval_time: 180m, alertname: WASMMetricsPipelineDead,  exp_alerts: []}
+
+  # ── (12) THE FLOOR DOES NOT SURVIVE A SCALED FLEET ───────────────────
+  # The rules aggregate `by (job, instance)`, so the `>= 10` floor is a
+  # PER-REPLICA floor — but it was calibrated against a workload measured on a
+  # ONE-replica stack (`make up` forces `--scale worker=1`). docker-compose.yml
+  # defaults to `replicas: ${WORKER_REPLICAS:-2}`, and the same rule file is
+  # loaded by both compose stacks, so a plain `docker compose up -d` splits the
+  # identical total traffic two ways and halves every per-instance window.
+  #
+  # Replayed against the recorded 13.75 h, dividing the measured per-instance
+  # volume by the replica count: 1 replica clears the floor in 66 % of windows,
+  # 2 replicas in 3.7 %, 3 or more in 0.0 %. Both latency rules are therefore
+  # structurally dead on any fleet larger than one — silently, with no error
+  # and nothing else firing, which is this file's whole subject.
+  #
+  # Modelled here: two replicas, 6 executions per 15 m EACH (12 total, above
+  # the floor fleet-wide and below it per-instance), every execution over 10 s,
+  # for three hours. Nothing fires. Asserted rather than lamented, so that a
+  # future fix — a fleet-wide floor, a replica-aware threshold, an absolute
+  # slow-count arm — has to delete this case on purpose.
+  - interval: 1m
+    name: KNOWN GAP - two replicas halve every window; the per-instance floor is never reached
+    input_series:
+      - series: 'up{job="talos-worker", instance="worker-a:9090"}'
+        values: "1+0x180"
+      - series: 'up{job="talos-worker", instance="worker-b:9090"}'
+        values: "1+0x180"
+      - series: 'wasm_executions_total{job="talos-worker", instance="worker-a:9090", status="success"}'
+        values: "0+0.4x180"
+      - series: 'wasm_executions_total{job="talos-worker", instance="worker-b:9090", status="success"}'
+        values: "0+0.4x180"
+      - series: 'wasm_execution_duration_ms_count{job="talos-worker", instance="worker-a:9090", status="success"}'
+        values: "0+0.4x180"
+      - series: 'wasm_execution_duration_ms_count{job="talos-worker", instance="worker-b:9090", status="success"}'
+        values: "0+0.4x180"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker-a:9090", status="success", le="2500"}'
+        values: "0+0x180"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker-b:9090", status="success", le="2500"}'
+        values: "0+0x180"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker-a:9090", status="success", le="10000"}'
+        values: "0+0x180"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker-b:9090", status="success", le="10000"}'
+        values: "0+0x180"
+    alert_rule_test:
+      - {eval_time: 60m,  alertname: SlowWASMExecution,        exp_alerts: []}
+      - {eval_time: 60m,  alertname: VerySlowWASMExecution,    exp_alerts: []}
+      - {eval_time: 60m,  alertname: NoWASMExecutions,         exp_alerts: []}
+      - {eval_time: 60m,  alertname: WASMMetricsPipelineDead,  exp_alerts: []}
+      - {eval_time: 60m,  alertname: WASMLatencyBucketMissing, exp_alerts: []}
+      - {eval_time: 180m, alertname: SlowWASMExecution,        exp_alerts: []}
+      - {eval_time: 180m, alertname: VerySlowWASMExecution,    exp_alerts: []}
