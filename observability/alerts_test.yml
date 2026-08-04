@@ -441,11 +441,29 @@ tests:
         exp_alerts: []
 
   # ── (4) The critical tier fires when executions really do exceed 10 s ──
-  # Same shape as (3) but the 10 s boundary stalls too. Both tiers fire; the
-  # description must say the 10 s figure is a FLOOR, because 10000 is the
-  # histogram's highest finite bucket bound and the real latency is not
-  # recoverable from this metric (that saturation is why the previous
-  # expression reported a flat 10000.0 every time it fired).
+  # Same shape as (3) but the 10 s boundary stalls too. Both tiers fire.
+  #
+  # The description used to have to say the 10 s figure was a FLOOR, because
+  # 10000 WAS the histogram's highest finite bucket bound — that saturation is
+  # why the pre-#628 quantile expression reported a flat 10000.0 every time it
+  # fired. As of 2026-08-04 the boundaries are explicit and reach 120 s
+  # (`EXECUTION_DURATION_BOUNDARIES_MS`, talos-worker-runtime/src/metrics.rs),
+  # so the annotation now points the reader at the buckets above 10 s instead
+  # of warning them off a number they cannot get.
+  #
+  # The exact string is pinned here on purpose: this annotation is what an
+  # operator reads at 3 a.m., and it made a claim about the METRIC's limits
+  # that a change to the metric silently falsified. Pinning it means that kind
+  # of drift fails a test rather than surviving as confidently-wrong prose.
+  #
+  # The pin earned its keep immediately. The first replacement text said the
+  # buckets and histogram_quantile "both return a real value rather than a
+  # ceiling" — wrong in the OPPOSITE direction from the text it replaced, and
+  # wrong in exactly the state this alert fires in: >50% of executions past
+  # 10 s is when the quantile is most likely to land in `+Inf`, where it reads
+  # back a flat 120000. Same field, same 3 a.m., opposite error. The shipped
+  # text bounds the claim at 120 s and points at the bucket counts, which stay
+  # well-defined under saturation.
   - interval: 1m
     name: sustained over-10s regression fires the critical tier
     input_series:
@@ -466,7 +484,7 @@ tests:
               instance: worker:9090
             exp_annotations:
               summary: "Sustained very slow WASM executions"
-              description: "100% of WASM executions on worker:9090 exceeded 10s over the last 15m, sustained for 10m (threshold: 50%). 10s is the histogram's highest finite bucket bound, so these executions are only known to be SLOWER than 10s — the exact latency is not recoverable from this metric."
+              description: "100% of WASM executions on worker:9090 exceeded 10s over the last 15m, sustained for 10m (threshold: 50%). 10s is no longer the histogram's top bound, so HOW slow is now answerable: read the buckets above it (15s/20s/30s/60s/120s) or histogram_quantile, both of which return a real value up to 120s. Past 120s the quantile saturates again and reads back a flat 120000 — the bucket counts stay well-defined there, so prefer them when this alert is firing. LLM inference time is nested inside execution duration — check wasm_llm_duration_ms first."
 
   # ── (5) The boundary guard ───────────────────────────────────────────
   # Rules (1)-(4) all select fixed `le` values, so they are exactly as alive
@@ -601,10 +619,17 @@ tests:
   # ── (10) the REALISTIC boundary change, and the guard's own `for:` ────
   # Case (5) models the buckets vanishing entirely. That is not what a
   # boundary change looks like: the histogram keeps exporting buckets, they
-  # are simply DIFFERENT ones. This is the exact state the recommended
-  # saturation fix would produce, so it is the state the guard exists for.
+  # are simply DIFFERENT ones. That is the state the guard exists for.
   # The 10m/30m pair also pins `for: 15m` — without the 10m assertion the
   # guard's `for:` can be shortened to 1m unnoticed.
+  #
+  # UNTIL 2026-08-04 this comment claimed the 2000/8000/60000 set below was
+  # "the exact state the recommended saturation fix would produce". The
+  # saturation fix has now SHIPPED and it produces nothing of the sort: it
+  # deliberately preserved `2500` and `10000` so no selector would be
+  # orphaned. The boundary set here is therefore a HYPOTHETICAL re-bucket,
+  # which is still worth pinning — it is what a careless one looks like — but
+  # it is not a model of the real one. Case (10b) below covers that.
   - interval: 1m
     name: producer re-bucketed the histogram; guard fires, names both boundaries
     input_series:
@@ -634,6 +659,109 @@ tests:
       # say so.
       - {eval_time: 45m, alertname: SlowWASMExecution,     exp_alerts: []}
       - {eval_time: 45m, alertname: VerySlowWASMExecution, exp_alerts: []}
+
+  # ── (10b) THE BOUNDARY SET THAT ACTUALLY SHIPPED — guard stays SILENT ──
+  # The re-bucketing done on 2026-08-04
+  # (`EXECUTION_DURATION_BOUNDARIES_MS`, talos-worker-runtime/src/metrics.rs)
+  # replaced the OTEL SDK defaults, whose 10 000 ms top bound sat BELOW the
+  # population the histogram measures. Every `le=` below is the literal
+  # exported set from that constant.
+  #
+  # The assertion is that the guard is SILENT — because the new set keeps
+  # `2500` and `10000` at their exact values on purpose, so the two latency
+  # rules' selectors still name live buckets. A boundary change that orphans
+  # nothing is the goal, not a lucky accident, and this case is what stops a
+  # later "tidy-up" of the constant from quietly dropping one: delete `2500`
+  # or `10000` from it and this case flips to firing.
+  #
+  # It is deliberately paired with (10c), which drops ONE boundary from this
+  # same set. Silence here would prove nothing on its own — a test that
+  # asserts "no alert" passes just as happily against a broken rule.
+  - interval: 1m
+    name: shipped boundary set keeps both alert-selected buckets; guard silent
+    input_series:
+      - series: 'wasm_execution_duration_ms_count{job="talos-worker", instance="worker:9090", status="success"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="5"}'
+        values: "0+0x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="10"}'
+        values: "0+0x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="25"}'
+        values: "0+0x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="100"}'
+        values: "0+0x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="250"}'
+        values: "0+0x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="400"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="500"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="1000"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="2500"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="5000"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="7500"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="10000"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="15000"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="20000"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="30000"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="60000"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="120000"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="+Inf"}'
+        values: "0+1x60"
+    alert_rule_test:
+      - {eval_time: 30m, alertname: WASMLatencyBucketMissing, exp_alerts: []}
+      - {eval_time: 60m, alertname: WASMLatencyBucketMissing, exp_alerts: []}
+      # And the latency rules are NOT blind on the new set: every execution
+      # here is above 400 ms and below 400 ms is empty, so the 2.5 s
+      # slow-fraction is 0 and both rules correctly stay quiet.
+      - {eval_time: 60m, alertname: SlowWASMExecution,     exp_alerts: []}
+      - {eval_time: 60m, alertname: VerySlowWASMExecution, exp_alerts: []}
+
+  # ── (10c) …and the same set with ONE boundary dropped — guard FIRES ────
+  # Identical to (10b) except `le="10000"` is gone, which is what a partial
+  # rollout looks like (a worker built before the boundary change alongside
+  # one built after), or what a future edit to
+  # `EXECUTION_DURATION_BOUNDARIES_MS` that trims "an unused bucket" would
+  # produce. `VerySlowWASMExecution` selects that exact boundary by name, so
+  # it goes permanently silent with no error anywhere — and the guard must
+  # say so, naming 10000 and NOT 2500 (which is still present).
+  #
+  # This is the half of the pair that carries the proof. (10b) shows the
+  # shipped set is clean; this shows the check that established it can still
+  # fail.
+  - interval: 1m
+    name: shipped set minus le=10000; guard fires naming only the orphaned boundary
+    input_series:
+      - series: 'wasm_execution_duration_ms_count{job="talos-worker", instance="worker:9090", status="success"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="2500"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="15000"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="120000"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="+Inf"}'
+        values: "0+1x60"
+    alert_rule_test:
+      # `for: 15m` not yet elapsed.
+      - {eval_time: 10m, alertname: WASMLatencyBucketMissing, exp_alerts: []}
+      - eval_time: 30m
+        alertname: WASMLatencyBucketMissing
+        exp_alerts:
+          - exp_labels: {severity: warning, component: wasm-runtime, job: talos-worker, instance: worker:9090, le: "10000"}
+            exp_annotations:
+              summary: "WASM latency alerts have lost their bucket boundaries"
+              description: "The wasm_execution_duration_ms histogram is live on worker:9090 but its le=10000 bucket is absent, so SlowWASMExecution and VerySlowWASMExecution cannot fire for that instance. The histogram's bucket boundaries have most likely changed; update the le= selectors in observability/rules/alerts.yml to match."
 
   # ── (11) THE KNOWN GAP, pinned so it cannot be mistaken for coverage ──
   # A live, reachable, instrumented worker doing 6 executions per 15 m — under
