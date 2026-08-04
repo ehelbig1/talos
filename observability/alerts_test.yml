@@ -475,8 +475,11 @@ tests:
   # boundaries would produce. Without this guard both latency rules would go
   # silent forever and nothing would say so.
   #
-  # Both absent() arms match, so TWO alerts fire, one per missing boundary.
-  # That is intended: it names which boundary went.
+  # Both arms match, so TWO alerts fire, one per missing boundary. That is
+  # intended: it names which boundary went. Since 2026-08-04 they also name
+  # the INSTANCE — the guard matches per (job, instance) rather than
+  # fleet-globally, so an alert is scoped to the replica that lost its
+  # buckets.
   - interval: 1m
     name: bucket boundaries changed; guard fires
     input_series:
@@ -489,17 +492,21 @@ tests:
           - exp_labels:
               severity: warning
               component: wasm-runtime
+              job: talos-worker
+              instance: worker:9090
               le: "2500"
             exp_annotations:
               summary: "WASM latency alerts have lost their bucket boundaries"
-              description: "Executions are being recorded but the le=2500 / le=10000 buckets of wasm_execution_duration_ms are absent, so SlowWASMExecution and VerySlowWASMExecution cannot fire. The histogram's bucket boundaries have most likely changed; update the le= selectors in observability/rules/alerts.yml to match."
+              description: "The wasm_execution_duration_ms histogram is live on worker:9090 but its le=2500 bucket is absent, so SlowWASMExecution and VerySlowWASMExecution cannot fire for that instance. The histogram's bucket boundaries have most likely changed; update the le= selectors in observability/rules/alerts.yml to match."
           - exp_labels:
               severity: warning
               component: wasm-runtime
+              job: talos-worker
+              instance: worker:9090
               le: "10000"
             exp_annotations:
               summary: "WASM latency alerts have lost their bucket boundaries"
-              description: "Executions are being recorded but the le=2500 / le=10000 buckets of wasm_execution_duration_ms are absent, so SlowWASMExecution and VerySlowWASMExecution cannot fire. The histogram's bucket boundaries have most likely changed; update the le= selectors in observability/rules/alerts.yml to match."
+              description: "The wasm_execution_duration_ms histogram is live on worker:9090 but its le=10000 bucket is absent, so SlowWASMExecution and VerySlowWASMExecution cannot fire for that instance. The histogram's bucket boundaries have most likely changed; update the le= selectors in observability/rules/alerts.yml to match."
 
   # ── (6) …and the guard must NOT fire on a healthy stack ──────────────
   # The buckets are present, so the guard is silent even though the worker is
@@ -614,14 +621,14 @@ tests:
       - eval_time: 30m
         alertname: WASMLatencyBucketMissing
         exp_alerts:
-          - exp_labels: {severity: warning, component: wasm-runtime, le: "2500"}
+          - exp_labels: {severity: warning, component: wasm-runtime, job: talos-worker, instance: worker:9090, le: "2500"}
             exp_annotations:
               summary: "WASM latency alerts have lost their bucket boundaries"
-              description: "Executions are being recorded but the le=2500 / le=10000 buckets of wasm_execution_duration_ms are absent, so SlowWASMExecution and VerySlowWASMExecution cannot fire. The histogram's bucket boundaries have most likely changed; update the le= selectors in observability/rules/alerts.yml to match."
-          - exp_labels: {severity: warning, component: wasm-runtime, le: "10000"}
+              description: "The wasm_execution_duration_ms histogram is live on worker:9090 but its le=2500 bucket is absent, so SlowWASMExecution and VerySlowWASMExecution cannot fire for that instance. The histogram's bucket boundaries have most likely changed; update the le= selectors in observability/rules/alerts.yml to match."
+          - exp_labels: {severity: warning, component: wasm-runtime, job: talos-worker, instance: worker:9090, le: "10000"}
             exp_annotations:
               summary: "WASM latency alerts have lost their bucket boundaries"
-              description: "Executions are being recorded but the le=2500 / le=10000 buckets of wasm_execution_duration_ms are absent, so SlowWASMExecution and VerySlowWASMExecution cannot fire. The histogram's bucket boundaries have most likely changed; update the le= selectors in observability/rules/alerts.yml to match."
+              description: "The wasm_execution_duration_ms histogram is live on worker:9090 but its le=10000 bucket is absent, so SlowWASMExecution and VerySlowWASMExecution cannot fire for that instance. The histogram's bucket boundaries have most likely changed; update the le= selectors in observability/rules/alerts.yml to match."
       # …and while that is true both latency rules are blind, which is the
       # point of the guard: every execution here is over 8 s and neither can
       # say so.
@@ -720,3 +727,275 @@ tests:
       - {eval_time: 60m,  alertname: WASMLatencyBucketMissing, exp_alerts: []}
       - {eval_time: 180m, alertname: SlowWASMExecution,        exp_alerts: []}
       - {eval_time: 180m, alertname: VerySlowWASMExecution,    exp_alerts: []}
+
+  # ── (13) THE INVERSE HOLE, closed 2026-08-04 ─────────────────────────
+  # #628 accepted this as stated debt: `absent()` is fleet-global, so ONE
+  # replica losing its buckets while another kept them was invisible — the
+  # absence arm sees the healthy replica's series and returns empty.
+  #
+  # That is not a corner case, it is THE SHAPE OF A ROLLING DEPLOY, and a
+  # rolling deploy is exactly how the histogram-boundary change this guard
+  # exists to protect would land. Modelled here: worker-a still on the old
+  # boundaries, worker-b already re-bucketed to le=2000/8000. Half the fleet
+  # is blind to SlowWASMExecution and VerySlowWASMExecution.
+  #
+  # THIS CASE IS DISCRIMINATING at the alert level: against the pre-fix
+  # fleet-global expression it yields NO alerts at all (verified by mutation
+  # 2026-08-04 — reverting the expr makes exactly this case fail). The
+  # per-instance `unless` form names the replica that went blind.
+  - interval: 1m
+    name: rolling deploy - one replica re-bucketed, one not; guard names only the blind replica
+    input_series:
+      - series: 'wasm_execution_duration_ms_count{job="talos-worker", instance="worker-a:9090", status="success"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker-a:9090", status="success", le="2500"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker-a:9090", status="success", le="10000"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_count{job="talos-worker", instance="worker-b:9090", status="success"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker-b:9090", status="success", le="2000"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker-b:9090", status="success", le="8000"}'
+        values: "0+1x60"
+    alert_rule_test:
+      # `for: 15m` still respected.
+      - {eval_time: 10m, alertname: WASMLatencyBucketMissing, exp_alerts: []}
+      - eval_time: 30m
+        alertname: WASMLatencyBucketMissing
+        exp_alerts:
+          - exp_labels: {severity: warning, component: wasm-runtime, job: talos-worker, instance: worker-b:9090, le: "2500"}
+            exp_annotations:
+              summary: "WASM latency alerts have lost their bucket boundaries"
+              description: "The wasm_execution_duration_ms histogram is live on worker-b:9090 but its le=2500 bucket is absent, so SlowWASMExecution and VerySlowWASMExecution cannot fire for that instance. The histogram's bucket boundaries have most likely changed; update the le= selectors in observability/rules/alerts.yml to match."
+          - exp_labels: {severity: warning, component: wasm-runtime, job: talos-worker, instance: worker-b:9090, le: "10000"}
+            exp_annotations:
+              summary: "WASM latency alerts have lost their bucket boundaries"
+              description: "The wasm_execution_duration_ms histogram is live on worker-b:9090 but its le=10000 bucket is absent, so SlowWASMExecution and VerySlowWASMExecution cannot fire for that instance. The histogram's bucket boundaries have most likely changed; update the le= selectors in observability/rules/alerts.yml to match."
+
+  # ── (14) THE RESTART TRANSIENT — the defect this rule shipped with ────
+  # Reproduced live on the dev stack 2026-08-04 before it was fixed: worker
+  # restarted 11:33:33Z, `WASMLatencyBucketMissing` PENDING at 11:34:04Z, 31
+  # seconds later. At that instant the live worker's /metrics exposed zero
+  # wasm_execution_duration_ms_bucket lines and `count(…_count)` was EMPTY,
+  # while the rule's gate `sum(rate(…_count[15m]))` read 0.0138 — contributed
+  # ENTIRELY by 172.19.0.12:9090, a container gone for eight minutes and two
+  # restarts. The stack scrapes the worker by `dns_sd_configs` A-record, so
+  # `instance` is the container IP and every restart genuinely mints a new
+  # instance label; Prometheus stale-marks the departed one on the next
+  # scrape, which is what `stale` models below.
+  #
+  # Modelled: instance A executes for 20 minutes and vanishes; instance B
+  # appears with `up` and a seeded executions counter but NO histogram (an
+  # OTEL histogram emits no series until its first record(), so a worker that
+  # has not executed since boot has no _count and no _bucket at all). The
+  # guard must be silent throughout.
+  #
+  # WHAT EACH ASSERTION BLOCK HERE IS AND IS NOT WORTH. State this plainly,
+  # because a case that looks like a regression test and is not one is worse
+  # than no case at all:
+  #
+  #   * THIS CASE DOES NOT GATE A REVERT. Verified by mutation 2026-08-04:
+  #     restoring the pre-fix expression in alerts.yml and re-parsing it to
+  #     prove the revert landed, this entire case still PASSES. Case (13) is
+  #     the one that fails on that revert, and it is therefore the regression
+  #     test for the fix itself.
+  #
+  #   * IT DOES GATE THE OBVIOUS WRONG FIX, which is why it earns its place.
+  #     The tempting move is to gate on `wasm_executions_total` instead of the
+  #     histogram's own `_count` — it is seeded at 0 at startup, so it is
+  #     never absent, so it looks like the more robust gate. Mutated in
+  #     2026-08-04 and it fails exactly here: instance B is a healthy, freshly
+  #     started, idle worker with `wasm_executions_total` seeded and no
+  #     histogram, so that gate stands open against legitimately absent
+  #     buckets and the guard fires at 40m and 1h and never stops. Permanently
+  #     red on every idle worker — the failure this whole file exists to
+  #     remove. The gate MUST be the histogram's own `_count`, because that is
+  #     the only series that appears and disappears in lockstep with the
+  #     buckets it is vouching for.
+  #
+  #   * The reason no alert-level assertion can gate it: THE PRE-FIX RULE
+  #     COULD NOT ACTUALLY FIRE HERE. promtool reports FIRING alerts only, so
+  #     `exp_alerts: []` passes on a PENDING rule too — and measured, not
+  #     reasoned about, the pre-fix expression is true from 21m to 34m
+  #     inclusive and empty at 20m and 35m.
+  #
+  #     TWO NUMBERS IN THE FIRST VERSION OF THIS COMMENT WERE WRONG, while
+  #     its conclusion was right. Corrected here rather than inherited:
+  #
+  #       - 34 − 21 = THIRTEEN minutes of continuous truth, not fourteen.
+  #         Fourteen is the count of evaluation POINTS at this file's 1m
+  #         interval; it is a fencepost, not a duration.
+  #       - `for:` elapses against the RULE GROUP's interval. Group
+  #         `wasm_performance` sets `interval: 30s` — neither the 10s worker
+  #         scrape interval nor the 15s global `evaluation_interval`. So the
+  #         shortfall is minutes and several evaluations, NOT "one evaluation
+  #         / ten seconds".
+  #
+  #     The bound is structural but the mechanism is not "the lookback minus
+  #     one scrape interval": the gate closes at the counter's last
+  #     INCREMENT plus the lookback, because `rate()` over a flat tail is 0
+  #     and `> 0` filters it out. A worker already quiet before it died has a
+  #     proportionally SHORTER window — insert a 6-minute flat tail and the
+  #     13-minute window collapses to 7. The margin is therefore LARGER than
+  #     originally claimed, never smaller.
+  #
+  #     PROMETHEUS VERSION DEPENDENCE of the four assertions below: they are
+  #     2.x measurements. 3.x made range selectors left-OPEN, moving the
+  #     closing edge to 33m so the 34m assertion fails there (checked against
+  #     promtool v3.1.0; the pinned rate value at 25m also differs by one
+  #     ULP). Every assertion on the SHIPPED expression passes under both.
+  #
+  #     So the honest severity is: the pre-fix guard pended on every restart
+  #     and could not reach firing. It is one ordinary edit from doing so —
+  #     `for: 10m`, or widening the gate to `[30m]`, or any second source
+  #     refreshing the tail, each carries it over. Observed live it
+  #     self-cleared once the worker executed again (~3.5 minutes, restart of
+  #     2026-08-04), so it is a recurring false PENDING rather than a stuck
+  #     alert. That is a correction to the premise this change was written
+  #     against, recorded rather than quietly dropped.
+  #
+  #   * The post-fix expression is duplicated into the `promql_expr_test`
+  #     below because promtool cannot reference a rule's expr by name. It is a
+  #     COPY and can drift from alerts.yml without failing anything. Case (13)
+  #     is what notices a revert; this copy documents the property.
+  - interval: 1m
+    name: restart transient - instance A departs, instance B has no histogram yet; guard silent
+    input_series:
+      # Instance A: alive and executing for 20m, then the container is gone.
+      - series: 'up{job="talos-worker", instance="worker-a:9090"}'
+        values: "1+0x20 stale"
+      - series: 'wasm_executions_total{job="talos-worker", instance="worker-a:9090", status="success"}'
+        values: "0+1x20 stale"
+      - series: 'wasm_execution_duration_ms_count{job="talos-worker", instance="worker-a:9090", status="success"}'
+        values: "0+1x20 stale"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker-a:9090", status="success", le="2500"}'
+        values: "0+1x20 stale"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker-a:9090", status="success", le="10000"}'
+        values: "0+1x20 stale"
+      # Instance B: the replacement. Up, metrics subsystem alive (the
+      # executions counter IS seeded at 0 at startup), but the histogram has
+      # never been recorded into, so none of its series exist.
+      - series: 'up{job="talos-worker", instance="worker-b:9090"}'
+        values: "_x21 1+0x39"
+      - series: 'wasm_executions_total{job="talos-worker", instance="worker-b:9090", status="success"}'
+        values: "_x21 0+0x39"
+    alert_rule_test:
+      - {eval_time: 22m, alertname: WASMLatencyBucketMissing, exp_alerts: []}
+      - {eval_time: 25m, alertname: WASMLatencyBucketMissing, exp_alerts: []}
+      - {eval_time: 30m, alertname: WASMLatencyBucketMissing, exp_alerts: []}
+      - {eval_time: 40m, alertname: WASMLatencyBucketMissing, exp_alerts: []}
+      - {eval_time: 60m, alertname: WASMLatencyBucketMissing, exp_alerts: []}
+    promql_expr_test:
+      # The gate itself: no instance is exporting the histogram, so there is
+      # nothing to test for missing buckets on.
+      - expr: count by (job, instance) (wasm_execution_duration_ms_count)
+        eval_time: 25m
+        exp_samples: []
+      # …while the PRE-FIX gate is wide open on the departed instance's tail.
+      # Pinned so the mechanism cannot be mistaken for a modelling artifact:
+      # if this ever returns empty, the scenario has stopped reproducing the
+      # defect and the assertions above stop meaning anything.
+      - expr: sum(rate(wasm_execution_duration_ms_count[15m])) > 0
+        eval_time: 25m
+        exp_samples:
+          - labels: '{}'
+            value: 1.1666666666666667e-2
+      # …and the pre-fix absence arm is simultaneously true, which is the
+      # desynchronisation in one line.
+      - expr: absent(wasm_execution_duration_ms_bucket{le="2500"})
+        eval_time: 25m
+        exp_samples:
+          - labels: '{le="2500"}'
+            value: 1
+      # THE PRE-FIX EXPRESSION'S TRUTH WINDOW, pinned at both edges. It is
+      # true at 21m and still true at 34m — 14 evaluation points, i.e. 13
+      # minutes — and empty on either side. This is the evidence for "pends
+      # on every restart but cannot reach firing" in the comment above.
+      #
+      # WHAT THESE FOUR ASSERTIONS DO AND DO NOT COUPLE TO, since the earlier
+      # wording implied more than they deliver: they embed their OWN `[15m]`
+      # copy of an expression that alerts.yml no longer contains, so they are
+      # decoupled from the live rule exactly as the post-fix copy below is —
+      # editing alerts.yml cannot move them. What they ARE pinned to is this
+      # case's INPUT MODEL: verified by mutation 2026-08-04, shifting instance
+      # A's departure +1m fails the 21m and 35m assertions and shifting it
+      # −1m fails the 20m and 34m assertions, so all four edges are
+      # load-bearing and the measurement cannot drift silently.
+      - expr: |
+          (
+            absent(wasm_execution_duration_ms_bucket{le="2500"})
+            or
+            absent(wasm_execution_duration_ms_bucket{le="10000"})
+          )
+          and on() (sum(rate(wasm_execution_duration_ms_count[15m])) > 0)
+        eval_time: 20m
+        exp_samples: []
+      - expr: |
+          (
+            absent(wasm_execution_duration_ms_bucket{le="2500"})
+            or
+            absent(wasm_execution_duration_ms_bucket{le="10000"})
+          )
+          and on() (sum(rate(wasm_execution_duration_ms_count[15m])) > 0)
+        eval_time: 21m
+        exp_samples:
+          - labels: '{le="2500"}'
+            value: 1
+          - labels: '{le="10000"}'
+            value: 1
+      - expr: |
+          (
+            absent(wasm_execution_duration_ms_bucket{le="2500"})
+            or
+            absent(wasm_execution_duration_ms_bucket{le="10000"})
+          )
+          and on() (sum(rate(wasm_execution_duration_ms_count[15m])) > 0)
+        eval_time: 34m
+        exp_samples:
+          - labels: '{le="2500"}'
+            value: 1
+          - labels: '{le="10000"}'
+            value: 1
+      - expr: |
+          (
+            absent(wasm_execution_duration_ms_bucket{le="2500"})
+            or
+            absent(wasm_execution_duration_ms_bucket{le="10000"})
+          )
+          and on() (sum(rate(wasm_execution_duration_ms_count[15m])) > 0)
+        eval_time: 35m
+        exp_samples: []
+      # THE ACTUAL GATE: the live rule expression, verbatim, must be empty.
+      - expr: |
+          label_replace(
+            count by (job, instance) (wasm_execution_duration_ms_count)
+            unless
+            count by (job, instance) (wasm_execution_duration_ms_bucket{le="2500"}),
+            "le", "2500", "", ""
+          )
+          or
+          label_replace(
+            count by (job, instance) (wasm_execution_duration_ms_count)
+            unless
+            count by (job, instance) (wasm_execution_duration_ms_bucket{le="10000"}),
+            "le", "10000", "", ""
+          )
+        eval_time: 25m
+        exp_samples: []
+      - expr: |
+          label_replace(
+            count by (job, instance) (wasm_execution_duration_ms_count)
+            unless
+            count by (job, instance) (wasm_execution_duration_ms_bucket{le="2500"}),
+            "le", "2500", "", ""
+          )
+          or
+          label_replace(
+            count by (job, instance) (wasm_execution_duration_ms_count)
+            unless
+            count by (job, instance) (wasm_execution_duration_ms_bucket{le="10000"}),
+            "le", "10000", "", ""
+          )
+        eval_time: 30m
+        exp_samples: []
