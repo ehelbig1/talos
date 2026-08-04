@@ -374,16 +374,96 @@ groups:
       # anywhere. That is the same shape as a rule_files entry that globs to
       # zero files: configured, plausible-looking, and dead.
       #
-      # Gated on executions actually being observed, so an idle stack (where
-      # no bucket series exists at all, legitimately) does not trip it.
+      # Gated on the histogram being LIVE, so an idle stack (where no bucket
+      # series exists at all, legitimately) does not trip it.
+      #
+      # THE GATE THIS RULE SHIPPED WITH WAS THE BUG THE RULES ABOVE HAD JUST
+      # FIXED. Until 2026-08-04 it read
+      #   (absent(bucket{le="2500"}) or absent(bucket{le="10000"}))
+      #   and on() (sum(rate(wasm_execution_duration_ms_count[15m])) > 0)
+      # — a fleet-global `absent()` (an INSTANT selector, so it sees only what
+      # is being scraped NOW) ANDed with a fleet-global 15-minute `rate()` (a
+      # RANGE selector, so it sees samples from targets that no longer exist).
+      # The two halves therefore describe DIFFERENT WORKERS, and a restart is
+      # all it takes to separate them: the fresh container has no histogram
+      # yet (histograms are deliberately unseeded — a bucket series appears on
+      # its first observation, not at startup), while the departed container's
+      # samples sit in the window for another 15 minutes and hold the gate
+      # open.
+      #
+      # Measured on the dev stack, not reasoned about. Worker restarted
+      # 11:33:33Z; the guard went PENDING at 11:34:04Z, 31 seconds later. At
+      # that instant the live worker's /metrics exposed 0
+      # wasm_execution_duration_ms_bucket lines and `count(…_count)` was
+      # EMPTY, yet the gate read 0.0138 — contributed entirely by
+      # 172.19.0.12:9090, a container that had been gone for eight minutes and
+      # TWO restarts. Replayed over the recorded window, the pre-fix
+      # expression is true for 7 consecutive 15 s steps across that restart
+      # and the post-fix expression is true at none of them.
+      #
+      # HOW BAD IT WAS, stated precisely rather than dramatically — the
+      # temptation here is to say it FIRES, and it does not. `for: 15m` very
+      # nearly saves it: the gate is a `[15m]` rate over a series whose last
+      # sample is the instant the container died, so the condition can hold
+      # for at most the lookback minus one scrape interval. Driven through
+      # promtool the window is 21m→34m inclusive — FOURTEEN minutes against
+      # `for: 15m`, i.e. it pends on every single restart and stops one
+      # evaluation short of paging (at the real 10 s scrape interval it misses
+      # by ten seconds). So the shipped defect is a guard that spends ~14 of
+      # every 15 minutes after a restart in PENDING, one ordinary edit away
+      # from paging: `for: 10m`, a `[30m]` gate window, or any second source
+      # refreshing the tail each carries it over. That is still the
+      # permanently-red pattern this file exists to remove, reproduced inside
+      # the change that removed it (#628 fixed the same trailing-sample defect
+      # for the two latency rules with `by (job, instance)`) — and the four
+      # boundary assertions in alerts_test.yml case (14) pin the 14-minute
+      # measurement so this paragraph stays falsifiable.
+      #
+      # THE FIX: no range vector anywhere, and both halves per-instance.
+      # `count by (job, instance) (…_count)` replaces the windowed rate as the
+      # gate — the histogram's OWN count series, which appears and disappears
+      # in lockstep with its buckets on the same instance. So the gate and the
+      # absence test are now the same instant-selector regime over the same
+      # instance, and they go stale TOGETHER: a departed instance drops out of
+      # both sides at once, whether Prometheus stale-marks it (what happens
+      # live, on the next scrape) or it merely ages out of the 5m lookback.
+      # The trailing-sample separation is structurally unavailable, not merely
+      # unlikely.
+      #
+      # `unless` rather than `absent()` also closes the inverse hole #628
+      # accepted as debt: `absent()` is fleet-global, so one replica losing
+      # its buckets while another kept them was invisible. Per-instance
+      # matching catches it — and that is the SHAPE OF A ROLLING DEPLOY, i.e.
+      # exactly how the boundary change this guard protects would land.
+      #
+      # WHAT THIS STILL CANNOT SEE, stated rather than implied: if the
+      # histogram disappears ENTIRELY (renamed, or the instrument removed),
+      # the gate disappears with it and this rule goes quiet. Gating on
+      # `wasm_executions_total` instead would cover that — and would page on
+      # every idle worker, because that counter IS seeded at 0 at startup
+      # while the histogram is not, so the gate would be open with the buckets
+      # legitimately absent. The whole-histogram case is `WASMMetricsPipelineDead`'s
+      # subject for `wasm_executions_total`; for this histogram specifically it
+      # is open debt, and closing it needs a producer-side seed, not PromQL.
+      #
+      # `label_replace` re-attaches the `le` the aggregation drops, so the
+      # alert still names WHICH boundary went. Both values are literals — a
+      # closed, compile-time set of exactly two, no caller-derived cardinality.
       - alert: WASMLatencyBucketMissing
         expr: |
-          (
-            absent(wasm_execution_duration_ms_bucket{le="2500"})
-            or
-            absent(wasm_execution_duration_ms_bucket{le="10000"})
+          label_replace(
+            count by (job, instance) (wasm_execution_duration_ms_count)
+            unless
+            count by (job, instance) (wasm_execution_duration_ms_bucket{le="2500"}),
+            "le", "2500", "", ""
           )
-          and on() (sum(rate(wasm_execution_duration_ms_count[15m])) > 0)
+          or
+          label_replace(
+            count by (job, instance) (wasm_execution_duration_ms_count)
+            unless
+            count by (job, instance) (wasm_execution_duration_ms_bucket{le="10000"}),
+            "le", "10000", "", ""
+          )
         for: 15m
         labels:
           severity: warning
@@ -391,10 +471,11 @@ groups:
         annotations:
           summary: "WASM latency alerts have lost their bucket boundaries"
           description: >-
-            Executions are being recorded but the le=2500 / le=10000 buckets of
-            wasm_execution_duration_ms are absent, so SlowWASMExecution and
-            VerySlowWASMExecution cannot fire. The histogram's bucket
-            boundaries have most likely changed; update the le= selectors in
+            The wasm_execution_duration_ms histogram is live on
+            {{ $labels.instance }} but its le={{ $labels.le }} bucket is
+            absent, so SlowWASMExecution and VerySlowWASMExecution cannot fire
+            for that instance. The histogram's bucket boundaries have most
+            likely changed; update the le= selectors in
             observability/rules/alerts.yml to match.
 
       # Low cache hit rate (< 70%).
