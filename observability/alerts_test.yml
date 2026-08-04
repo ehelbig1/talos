@@ -818,22 +818,42 @@ tests:
   #     COULD NOT ACTUALLY FIRE HERE. promtool reports FIRING alerts only, so
   #     `exp_alerts: []` passes on a PENDING rule too — and measured, not
   #     reasoned about, the pre-fix expression is true from 21m to 34m
-  #     inclusive and empty at 20m and 35m. That is FOURTEEN minutes of
-  #     continuous truth against `for: 15m`: it pends on every restart and
-  #     stops ONE EVALUATION SHORT of firing. The bound is structural, not
-  #     accidental — the gate is a `[15m]` rate over a series whose last
-  #     sample is the moment the container died, so the truth window can never
-  #     exceed the lookback minus one scrape interval (at the real 10s scrape
-  #     interval, 14m50s: it misses by ten seconds). The four boundary
-  #     assertions below pin that measurement so the claim stays falsifiable.
+  #     inclusive and empty at 20m and 35m.
   #
-  #     So the honest severity is: the pre-fix guard sat in PENDING for ~14 of
-  #     every 15 minutes after a restart and came within one tick of paging,
-  #     rather than paging outright. It is one ordinary edit from doing so —
+  #     TWO NUMBERS IN THE FIRST VERSION OF THIS COMMENT WERE WRONG, while
+  #     its conclusion was right. Corrected here rather than inherited:
+  #
+  #       - 34 − 21 = THIRTEEN minutes of continuous truth, not fourteen.
+  #         Fourteen is the count of evaluation POINTS at this file's 1m
+  #         interval; it is a fencepost, not a duration.
+  #       - `for:` elapses against the RULE GROUP's interval. Group
+  #         `wasm_performance` sets `interval: 30s` — neither the 10s worker
+  #         scrape interval nor the 15s global `evaluation_interval`. So the
+  #         shortfall is minutes and several evaluations, NOT "one evaluation
+  #         / ten seconds".
+  #
+  #     The bound is structural but the mechanism is not "the lookback minus
+  #     one scrape interval": the gate closes at the counter's last
+  #     INCREMENT plus the lookback, because `rate()` over a flat tail is 0
+  #     and `> 0` filters it out. A worker already quiet before it died has a
+  #     proportionally SHORTER window — insert a 6-minute flat tail and the
+  #     13-minute window collapses to 7. The margin is therefore LARGER than
+  #     originally claimed, never smaller.
+  #
+  #     PROMETHEUS VERSION DEPENDENCE of the four assertions below: they are
+  #     2.x measurements. 3.x made range selectors left-OPEN, moving the
+  #     closing edge to 33m so the 34m assertion fails there (checked against
+  #     promtool v3.1.0; the pinned rate value at 25m also differs by one
+  #     ULP). Every assertion on the SHIPPED expression passes under both.
+  #
+  #     So the honest severity is: the pre-fix guard pended on every restart
+  #     and could not reach firing. It is one ordinary edit from doing so —
   #     `for: 10m`, or widening the gate to `[30m]`, or any second source
-  #     refreshing the tail, each carries it over. That is a correction to the
-  #     premise this change was written against, recorded rather than quietly
-  #     dropped.
+  #     refreshing the tail, each carries it over. Observed live it
+  #     self-cleared once the worker executed again (~3.5 minutes, restart of
+  #     2026-08-04), so it is a recurring false PENDING rather than a stuck
+  #     alert. That is a correction to the premise this change was written
+  #     against, recorded rather than quietly dropped.
   #
   #   * The post-fix expression is duplicated into the `promql_expr_test`
   #     below because promtool cannot reference a rule's expr by name. It is a
@@ -889,11 +909,19 @@ tests:
           - labels: '{le="2500"}'
             value: 1
       # THE PRE-FIX EXPRESSION'S TRUTH WINDOW, pinned at both edges. It is
-      # true at 21m and still true at 34m — fourteen minutes — and empty on
-      # either side. This is the evidence for "pends on every restart, one
-      # evaluation short of firing" in the comment above; if a future edit
-      # changes the gate window, these four assertions move and the claim has
-      # to be rewritten rather than silently inherited.
+      # true at 21m and still true at 34m — 14 evaluation points, i.e. 13
+      # minutes — and empty on either side. This is the evidence for "pends
+      # on every restart but cannot reach firing" in the comment above.
+      #
+      # WHAT THESE FOUR ASSERTIONS DO AND DO NOT COUPLE TO, since the earlier
+      # wording implied more than they deliver: they embed their OWN `[15m]`
+      # copy of an expression that alerts.yml no longer contains, so they are
+      # decoupled from the live rule exactly as the post-fix copy below is —
+      # editing alerts.yml cannot move them. What they ARE pinned to is this
+      # case's INPUT MODEL: verified by mutation 2026-08-04, shifting instance
+      # A's departure +1m fails the 21m and 35m assertions and shifting it
+      # −1m fails the 20m and 34m assertions, so all four edges are
+      # load-bearing and the measurement cannot drift silently.
       - expr: |
           (
             absent(wasm_execution_duration_ms_bucket{le="2500"})
