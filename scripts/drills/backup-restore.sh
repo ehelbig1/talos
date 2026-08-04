@@ -168,6 +168,30 @@ emit_metric() {
         warn "textfile dir $TEXTFILE_DIR not writable — metric NOT emitted ($status)"
         return 0
     fi
+    # Resolve the carried-forward success timestamp BEFORE the temp file
+    # exists, and never let it fail the shell.
+    #
+    # This lookup used to live inside the here-block below, unguarded. With
+    # `set -e -o pipefail`, an existing $TEXTFILE that does NOT contain a
+    # `…_last_success_timestamp_seconds` line makes `grep` exit 1, the pipeline
+    # exit 1, and the assignment exit 1 — which killed the shell INSIDE
+    # emit_metric. Measured: the failure metric was never written, `die`'s
+    # `exit 1` never ran, and the temp file was orphaned in the collector's
+    # directory. A fail-open in the failure-REPORTING path is the same defect
+    # class as the sentinel it sits next to, so it is `|| true` plus a default.
+    local prev="0"
+    if [[ "$status" != "success" && -f "$TEXTFILE" ]]; then
+        prev=$(grep -E '^talos_backup_drill_last_success_timestamp_seconds ' "$TEXTFILE" 2>/dev/null \
+            | awk '{print $2}' | head -1 || true)
+        [[ -z "$prev" ]] && prev="0"
+    fi
+
+    # Sweep temp files orphaned by an earlier aborted emit. node_exporter's
+    # textfile collector only reads `*.prom`, so these never corrupted a
+    # scrape — but nothing else ever cleans this directory and they accumulate
+    # one per aborted run. Swept BEFORE mktemp so the current one is safe.
+    rm -f "$TEXTFILE_DIR"/.talos_backup_drill.?????? 2>/dev/null || true
+
     local tmp; tmp=$(mktemp "$TEXTFILE_DIR/.talos_backup_drill.XXXXXX")
     {
         echo "# HELP talos_backup_drill_last_run_timestamp_seconds Unix timestamp of the most recent drill attempt."
@@ -180,12 +204,6 @@ emit_metric() {
         else
             # Preserve previous success timestamp when available so the
             # alert threshold compares against the last actually-green run.
-            local prev="0"
-            if [[ -f "$TEXTFILE" ]]; then
-                prev=$(grep -E '^talos_backup_drill_last_success_timestamp_seconds ' "$TEXTFILE" \
-                    | awk '{print $2}' | head -1)
-                [[ -z "$prev" ]] && prev="0"
-            fi
             echo "talos_backup_drill_last_success_timestamp_seconds $prev"
         fi
         echo "# HELP talos_backup_drill_last_status Status of the most recent drill (1=success, 0=failure)."
@@ -221,6 +239,12 @@ cleanup_scratch() {
     local code=$?
     (( CLEANED == 1 )) && return
     CLEANED=1
+    # `--keep-scratch` skips the TEARDOWN. It must NOT skip the completion
+    # sentinel below: an early `return` here (the original shape) meant a
+    # --keep-scratch run that aborted with a bogus exit 0 exited 0 and emitted
+    # no failure metric — the precise hole the sentinel exists to close, left
+    # open on one opt-in path. Structured as if/else so the sentinel is on the
+    # single path out of this function.
     if (( KEEP_SCRATCH == 1 )) && (( code == 0 )); then
         warn "--keep-scratch: leaving scratch stack UP. It holds REAL restored data."
         warn "  containers: $SCRATCH_PG_NAME $SCRATCH_VAULT_NAME"
@@ -228,28 +252,28 @@ cleanup_scratch() {
         warn "  remove with: docker rm -fv $SCRATCH_PG_NAME $SCRATCH_VAULT_NAME &&"
         warn "               docker volume rm $SCRATCH_PG_VOLUME $SCRATCH_VAULT_VOLUME $SCRATCH_VAULT_LOGS &&"
         warn "               docker network rm $SCRATCH_NETWORK && rm -rf ${WORK_DIR:-<workdir>}"
-        return
-    fi
-    # `-v` is load-bearing: without it the container's ANONYMOUS volumes
-    # survive, and for the Postgres image that anonymous volume IS the
-    # restored database (421 MB of real user data on the 2026-08-03 run).
-    docker rm -fv "$SCRATCH_PG_NAME" "$SCRATCH_VAULT_NAME" >/dev/null 2>&1 || true
-    docker volume rm "$SCRATCH_PG_VOLUME" "$SCRATCH_VAULT_VOLUME" "$SCRATCH_VAULT_LOGS" >/dev/null 2>&1 || true
-    docker network rm "$SCRATCH_NETWORK" >/dev/null 2>&1 || true
-    [[ -n "${WORK_DIR:-}" && -d "${WORK_DIR:-}" ]] && rm -rf "$WORK_DIR"
+    else
+        # `-v` is load-bearing: without it the container's ANONYMOUS volumes
+        # survive, and for the Postgres image that anonymous volume IS the
+        # restored database (421 MB of real user data on the 2026-08-03 run).
+        docker rm -fv "$SCRATCH_PG_NAME" "$SCRATCH_VAULT_NAME" >/dev/null 2>&1 || true
+        docker volume rm "$SCRATCH_PG_VOLUME" "$SCRATCH_VAULT_VOLUME" "$SCRATCH_VAULT_LOGS" >/dev/null 2>&1 || true
+        docker network rm "$SCRATCH_NETWORK" >/dev/null 2>&1 || true
+        [[ -n "${WORK_DIR:-}" && -d "${WORK_DIR:-}" ]] && rm -rf "$WORK_DIR"
 
-    # Assert, don't assume. A cleanup that silently failed is how note 2
-    # above survived from May to August.
-    local leaked=""
-    for c in "$SCRATCH_PG_NAME" "$SCRATCH_VAULT_NAME"; do
-        docker inspect "$c" >/dev/null 2>&1 && leaked="$leaked container:$c"
-    done
-    for v in "$SCRATCH_PG_VOLUME" "$SCRATCH_VAULT_VOLUME" "$SCRATCH_VAULT_LOGS"; do
-        docker volume inspect "$v" >/dev/null 2>&1 && leaked="$leaked volume:$v"
-    done
-    [[ -n "${WORK_DIR:-}" && -d "${WORK_DIR:-}" ]] && leaked="$leaked workdir:$WORK_DIR"
-    if [[ -n "$leaked" ]]; then
-        printf '\033[1;31m✗ CLEANUP INCOMPLETE — remove by hand:%s\033[0m\n' "$leaked" >&2
+        # Assert, don't assume. A cleanup that silently failed is how note 2
+        # above survived from May to August.
+        local leaked=""
+        for c in "$SCRATCH_PG_NAME" "$SCRATCH_VAULT_NAME"; do
+            docker inspect "$c" >/dev/null 2>&1 && leaked="$leaked container:$c"
+        done
+        for v in "$SCRATCH_PG_VOLUME" "$SCRATCH_VAULT_VOLUME" "$SCRATCH_VAULT_LOGS"; do
+            docker volume inspect "$v" >/dev/null 2>&1 && leaked="$leaked volume:$v"
+        done
+        [[ -n "${WORK_DIR:-}" && -d "${WORK_DIR:-}" ]] && leaked="$leaked workdir:$WORK_DIR"
+        if [[ -n "$leaked" ]]; then
+            printf '\033[1;31m✗ CLEANUP INCOMPLETE — remove by hand:%s\033[0m\n' "$leaked" >&2
+        fi
     fi
 
     # Did not reach step 7 ⇒ this run is a FAILURE, whatever the shell says
@@ -617,7 +641,13 @@ fi
 # ── 6. Verify against the restored stack ──────────────────────────
 log "[6/7] verifying the restored stack"
 DATABASE_URL="postgres://${SCRATCH_PG_USER}:${SCRATCH_PG_PASSWORD}@127.0.0.1:${SCRATCH_PG_PORT}/${SCRATCH_PG_DB}"
-EXPECT_MIGRATION="$(ls -1 "$REPO_ROOT"/migrations/*.sql 2>/dev/null | sed 's#.*/##' | cut -d_ -f1 | sort -n | tail -1)"
+# EVERY migration version this checkout ships, not just the newest. The
+# verifier used to be handed only the newest and required equality, which
+# false-reds on a good backup: an artifact taken before a migration landed
+# cannot contain it, and migrations land most weeks. See verify_restore.rs.
+MIGRATION_VERSIONS="$(ls -1 "$REPO_ROOT"/migrations/*.sql 2>/dev/null \
+    | sed 's#.*/##' | cut -d_ -f1 | sort -n | paste -sd, -)"
+EXPECT_MIGRATION="${MIGRATION_VERSIONS##*,}"
 
 run_verifier() {
     local bin="$1"; local label="$2"
@@ -627,7 +657,7 @@ run_verifier() {
     VAULT_ADDR="$VAULT_ADDR" \
     VAULT_TOKEN="$VAULT_TOKEN" \
     VAULT_TRANSIT_KEY_NAME="${VAULT_TRANSIT_KEY_NAME:-talos-kek}" \
-    TALOS_DRILL_EXPECT_MIGRATION_VERSION="$EXPECT_MIGRATION" \
+    TALOS_DRILL_MIGRATION_VERSIONS="$MIGRATION_VERSIONS" \
         "$bin" || die "$label against the restored stack FAILED — backups not restorable"
     ok "$label passed against the restored stack"
 }
@@ -649,7 +679,41 @@ printf '\033[1;32m╚═══════════════════�
 printf '  Source:          %s\n' "$SOURCE_MODE"
 [[ "$SOURCE_MODE" == "artifact" ]] && printf '  Postgres backup: %s\n' "$(basename "${PG_ARTIFACT:-?}")"
 [[ "$SOURCE_MODE" == "artifact" ]] && printf '  Vault backup:    %s\n' "$(basename "${VAULT_ARTIFACT:-?}")"
-printf '  Schema version:  %s\n' "$EXPECT_MIGRATION"
+# The RESTORED schema version is reported by verify_restore (which is the only
+# thing that has read it); this line is the checkout's, labelled as such so the
+# two are never confused.
+printf '  Checkout schema: %s (newest migration in this working tree)\n' "$EXPECT_MIGRATION"
 printf '  Metric:          %s\n' "$TEXTFILE"
 printf '  Next drill:      within 7 days (alert fires at 14)\n'
+
+# WHAT A PASS DOES NOT MEAN. Printed inside the banner on purpose: a caveat
+# forty lines above the result is a caveat nobody reads, and this arc exists
+# because verifications quietly proved less than they implied.
+#
+# The KEK is read from the LIVE controller's environment (step 2). NOTHING in
+# scripts/dev-backup/ copies it into an artifact and `.env` is gitignored, so
+# what this drill establishes is:
+#
+#     artifacts + TODAY'S LIVE KEK  ⇒  readable
+#
+# and NOT `artifacts ⇒ readable`. In the disaster this rehearses — the host is
+# gone — the KEK is gone with it and every byte in $BACKUP_DIR is
+# cryptographically inert, with this drill green the whole time. Where the KEK
+# should live is a security-architecture decision with real tradeoffs (parking
+# a copy next to the artifacts hands it to anyone who steals them), so it is
+# deliberately NOT decided here. It is stated here so it cannot be assumed
+# away. See scripts/drills/README.md § What this drill doesn't cover, item 8.
+printf '\n'
+printf '\033[1;33m  ⚠ WHAT THIS DOES NOT PROVE\033[0m\n'
+printf '\033[1;33m    KEK provenance: TALOS_MASTER_KEY was read from the LIVE %s.\033[0m\n' "$LIVE_CONTROLLER"
+printf '\033[1;33m      Proven: artifacts + today'"'"'s live KEK are readable.\033[0m\n'
+printf '\033[1;33m      NOT proven: artifacts alone. No backup contains the KEK — lose the\033[0m\n'
+printf '\033[1;33m      host and these artifacts are unreadable, with this drill still green.\033[0m\n'
+if [[ "$KEK_PROVIDER_LIVE" != "vault" ]]; then
+    printf '\033[1;33m    KEK_PROVIDER=%s: the restored Vault is NOT on the decryption path here.\033[0m\n' "$KEK_PROVIDER_LIVE"
+    printf '\033[1;33m      Its file backend restored, unsealed, authenticated and mounted —\033[0m\n'
+    printf '\033[1;33m      but no transit-wrapped DEK was unwrapped, because this deployment\033[0m\n'
+    printf '\033[1;33m      does not wrap them that way.\033[0m\n'
+fi
+printf '\033[1;33m    Column families: only actor_memory and secrets ciphertext was decrypted.\033[0m\n'
 printf '\n'

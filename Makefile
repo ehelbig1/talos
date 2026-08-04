@@ -309,7 +309,7 @@ ci: lint lint-frontend audit test check-catalog ## Full local gate matching GitH
 drill: ## Restore the newest backup artifacts into a scratch stack and verify them (ARGS=--source live)
 	@bash scripts/drills/backup-restore.sh $(ARGS)
 
-drill-schedule: ## Install the weekly drill LaunchAgent (macOS). Prints the plist and asks before loading.
+drill-schedule: ## Install + load the weekly drill LaunchAgent (macOS). Writes ~/Library/LaunchAgents and loads it immediately.
 	@bash scripts/drills/schedule.sh install
 
 drill-unschedule: ## Remove the weekly drill LaunchAgent (macOS)

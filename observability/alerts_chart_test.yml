@@ -98,11 +98,19 @@ tests:
         exp_alerts:
           # NOTE the extra `job` label, which the absent() case above does
           # NOT carry: `absent()` synthesises a bare sample, while the stale
-          # comparison keeps the source series' labels. So the two arms of
-          # one alert reach Alertmanager with DIFFERENT label sets and group
-          # separately. Discovered by this test failing on its first run —
-          # which is the sort of thing a "the alert works" assertion never
-          # notices.
+          # comparison keeps the source series' labels (on a live stack that
+          # is `job`, `instance`, plus the `service`/`component` labels the
+          # scrape config attaches). So the two arms of one alert reach
+          # Alertmanager as two DIFFERENT alert identities — different
+          # fingerprints, so an arm change reads as one alert resolving and
+          # another firing, and a silence or inhibition matched on `job`
+          # covers only the stale arm. They do NOT land in different
+          # notification groups: deploy/observability/alertmanager-route.yaml
+          # sets `group_by: [alertname, category]` and both arms agree on
+          # both of those (and, being absent-vs-present, they can never be
+          # firing at the same time anyway). Discovered by this test failing
+          # on its first run — which is the sort of thing a "the alert works"
+          # assertion never notices.
           - exp_labels:
               severity: warning
               category: ops-hygiene

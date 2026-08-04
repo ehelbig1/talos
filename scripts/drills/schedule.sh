@@ -9,9 +9,12 @@
 # the drill stays a host-side job and this installs a host-side timer.
 #
 # CADENCE. Weekly. TalosBackupRestoreDrillFailed fires when the last green run
-# is 14 days old, so a weekly cadence gives exactly two missed runs of slack —
-# enough that one skipped week (a closed laptop, a stack that was down) does
-# not page, few enough that the alert still means something. Do NOT stretch
+# is 14 days old, so a weekly cadence tolerates exactly ONE missed run — enough
+# that one skipped week (a closed laptop, a stack that was down) does not page,
+# few enough that the alert still means something. The margin on that one miss
+# is thin: the 14-day threshold falls on the recovery run's own scheduled slot,
+# and only the alert's `for: 1h` covers the gap, so a run launchd defers by more
+# than an hour (a laptop woken late) pages regardless. Do NOT stretch
 # this to fortnightly: a cadence equal to the alert window guarantees the
 # alert fires on ordinary jitter, and an alert that fires on healthy operation
 # is the failure mode this whole arc exists to remove.

@@ -945,10 +945,19 @@ services:
   #     (two unix timestamps and a 1/0). No secret, no path, no hostname.
   #   * node_textfile_mtime_seconds / node_textfile_scrape_error — the
   #     collector's own health, which usefully catches a malformed .prom.
+  #     The mtime series carries a `file=` label, and it is the CONTAINER
+  #     path (`/textfile/talos_backup_drill.prom`), not a host path.
+  #   * node_scrape_collector_duration_seconds / node_scrape_collector_success,
+  #     both labelled `collector="textfile"` only.
   #   * the exporter's Go/process/promhttp self-metrics and
   #     node_exporter_build_info.
-  # There is no node_cpu_*, node_filesystem_*, node_network_* — nothing about
-  # the host at all.
+  # There is no node_cpu_*, node_filesystem_*, node_network_*, node_memory_*,
+  # node_disk_*, node_load*, node_uname_* — nothing about the host at all.
+  # Re-audited 2026-08-03 by scraping a container started with exactly these
+  # flags and enumerating every series name it returned: 47 names total
+  # (3 talos_backup_drill_*, 5 node_* — the 4 above plus
+  # node_exporter_build_info — and 39 go_/process_/promhttp_ self metrics),
+  # and every one of the 8 forbidden prefixes above at zero.
   #
   # The directory is mounted READ-ONLY: the exporter can never write there,
   # and a compromised exporter cannot forge a green drill on disk.
