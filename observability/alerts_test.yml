@@ -306,3 +306,234 @@ tests:
       - eval_time: 31m
         alertname: LowCacheHitRate
         exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # LATENCY: the slow-FRACTION rules that replaced the p95 quantile on
+  # 2026-08-04. Four cases, and the pair of them is the point — a rule that
+  # only proves it stays SILENT has proved it might be blind.
+  #
+  # The expression they replaced fired 20 times in 13 h of healthy dev
+  # traffic and never once on a real problem, because p95 over the 5-8
+  # executions this worker completes per 5 m window is not a quantile, it is
+  # the maximum. See the block comment above the rules for the full
+  # measurement. These cases pin the two properties that fix depends on.
+  # ══════════════════════════════════════════════════════════════════════
+
+  # ── (1) SILENT across a bounded transient ────────────────────────────
+  # Models the real shape: healthy 1 execution/min, then a 5-minute stretch
+  # where every execution is slower than 2.5 s, then recovery. Peak 15 m
+  # slow-fraction is 5/15 = 0.33, which is the 0.36 actually measured on the
+  # live stack across BOTH container restarts. Nothing fires.
+  #
+  # le=10000 tracks the count exactly here: the executions are slow but not
+  # past 10 s, so the critical tier must stay silent for a second, independent
+  # reason. If a future edit makes the two tiers share a boundary, this case
+  # stops distinguishing them and should be re-read.
+  - interval: 1m
+    name: bounded slow transient; neither latency rule fires
+    input_series:
+      - series: 'wasm_execution_duration_ms_count{job="talos-worker", instance="worker:9090", status="success"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="2500"}'
+        values: "0+1x10 10+0x4 11+1x45"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="10000"}'
+        values: "0+1x60"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SlowWASMExecution
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: SlowWASMExecution
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: SlowWASMExecution
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: VerySlowWASMExecution
+        exp_alerts: []
+
+  # ── (2) SILENT across a burst that DOES cross the threshold ──────────
+  # This is the case that proves `for: 10m` is load-bearing rather than
+  # decorative. A 9-minute stall pushes the 15 m slow-fraction to 0.60 —
+  # well past the 0.5 threshold — but not for the 10 minutes the rule
+  # requires, so it never fires.
+  #
+  # THE EVAL TIMES ARE THE WHOLE POINT and were wrong on the first attempt:
+  # the breach runs from ~19m to ~27m (measured: 0.60 at 19m and 25m, 0.40 by
+  # 28m), so assertions at 30m/60m sat entirely AFTER it and passed happily
+  # with `for:` shortened to 2m — a case that proved nothing while claiming to
+  # prove the `for:`. Silence has to be asserted DURING the breach. 24m and
+  # 26m are inside it; with `for: 2m` the rule is firing at both, so the
+  # mutation is caught here rather than only in case (3).
+  - interval: 1m
+    name: threshold-crossing burst shorter than for:; still silent
+    input_series:
+      - series: 'wasm_execution_duration_ms_count{job="talos-worker", instance="worker:9090", status="success"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="2500"}'
+        values: "0+1x10 10+0x8 11+1x41"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="10000"}'
+        values: "0+1x60"
+    alert_rule_test:
+      # Inside the breach: the expression is over 0.5 at both of these, and
+      # only `for: 10m` is holding the alert back.
+      - eval_time: 24m
+        alertname: SlowWASMExecution
+        exp_alerts: []
+      - eval_time: 26m
+        alertname: SlowWASMExecution
+        exp_alerts: []
+      # …and after it has passed, with the pending state discarded.
+      - eval_time: 30m
+        alertname: SlowWASMExecution
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: SlowWASMExecution
+        exp_alerts: []
+
+  # ── (3) FIRES on a sustained steady-state regression, at a PINNED time ─
+  # The other half, and the one that keeps case (1) honest. Healthy for
+  # 20 minutes, then every execution goes over 2.5 s and stays there.
+  #
+  # This case exists to MEASURE the detection latency, not to assert it. The
+  # 15 m rate window must ramp the slow-fraction past 0.5 (it crosses at
+  # t=28m, 8 min after onset) and then `for: 10m` must elapse — so the alert
+  # fires at t=38m, 18 MINUTES after the regression began, against ~3 min for
+  # the p95 expression it replaced. The 37m/38m pair below is what makes that
+  # number a measurement; if you retune the window or `for:`, these two
+  # eval_times move and the figure quoted in alerts.yml must move with them.
+  - interval: 1m
+    name: sustained regression fires; detection latency pinned at 18m
+    input_series:
+      - series: 'wasm_execution_duration_ms_count{job="talos-worker", instance="worker:9090", status="success"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="2500"}'
+        values: "0+1x20 20+0x40"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="10000"}'
+        values: "0+1x60"
+    alert_rule_test:
+      # Onset is t=20m. Still not firing one minute short of the pinned time.
+      - eval_time: 37m
+        alertname: SlowWASMExecution
+        exp_alerts: []
+      - eval_time: 38m
+        alertname: SlowWASMExecution
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: wasm-runtime
+              job: talos-worker
+              instance: worker:9090
+            exp_annotations:
+              summary: "Sustained slow WASM executions"
+              description: "100% of WASM executions on worker:9090 took longer than 2.5s over the last 15m, sustained for 10m (threshold: 50%). LLM inference time is included in execution duration — check wasm_llm_duration_ms before suspecting the WASM runtime itself."
+      # The critical tier stays silent: nothing crossed 10 s.
+      - eval_time: 38m
+        alertname: VerySlowWASMExecution
+        exp_alerts: []
+
+  # ── (4) The critical tier fires when executions really do exceed 10 s ──
+  # Same shape as (3) but the 10 s boundary stalls too. Both tiers fire; the
+  # description must say the 10 s figure is a FLOOR, because 10000 is the
+  # histogram's highest finite bucket bound and the real latency is not
+  # recoverable from this metric (that saturation is why the previous
+  # expression reported a flat 10000.0 every time it fired).
+  - interval: 1m
+    name: sustained over-10s regression fires the critical tier
+    input_series:
+      - series: 'wasm_execution_duration_ms_count{job="talos-worker", instance="worker:9090", status="success"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="2500"}'
+        values: "0+1x20 20+0x40"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="10000"}'
+        values: "0+1x20 20+0x40"
+    alert_rule_test:
+      - eval_time: 38m
+        alertname: VerySlowWASMExecution
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: wasm-runtime
+              job: talos-worker
+              instance: worker:9090
+            exp_annotations:
+              summary: "Sustained very slow WASM executions"
+              description: "100% of WASM executions on worker:9090 exceeded 10s over the last 15m, sustained for 10m (threshold: 50%). 10s is the histogram's highest finite bucket bound, so these executions are only known to be SLOWER than 10s — the exact latency is not recoverable from this metric."
+
+  # ── (5) The boundary guard ───────────────────────────────────────────
+  # Rules (1)-(4) all select fixed `le` values, so they are exactly as alive
+  # as those bucket bounds. Executions are flowing here but the le=2500 and
+  # le=10000 series do not exist — the state a change to the histogram's
+  # boundaries would produce. Without this guard both latency rules would go
+  # silent forever and nothing would say so.
+  #
+  # Both absent() arms match, so TWO alerts fire, one per missing boundary.
+  # That is intended: it names which boundary went.
+  - interval: 1m
+    name: bucket boundaries changed; guard fires
+    input_series:
+      - series: 'wasm_execution_duration_ms_count{job="talos-worker", instance="worker:9090", status="success"}'
+        values: "0+1x60"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: WASMLatencyBucketMissing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: wasm-runtime
+              le: "2500"
+            exp_annotations:
+              summary: "WASM latency alerts have lost their bucket boundaries"
+              description: "Executions are being recorded but the le=2500 / le=10000 buckets of wasm_execution_duration_ms are absent, so SlowWASMExecution and VerySlowWASMExecution cannot fire. The histogram's bucket boundaries have most likely changed; update the le= selectors in observability/rules/alerts.yml to match."
+          - exp_labels:
+              severity: warning
+              component: wasm-runtime
+              le: "10000"
+            exp_annotations:
+              summary: "WASM latency alerts have lost their bucket boundaries"
+              description: "Executions are being recorded but the le=2500 / le=10000 buckets of wasm_execution_duration_ms are absent, so SlowWASMExecution and VerySlowWASMExecution cannot fire. The histogram's bucket boundaries have most likely changed; update the le= selectors in observability/rules/alerts.yml to match."
+
+  # ── (6) …and the guard must NOT fire on a healthy stack ──────────────
+  # The buckets are present, so the guard is silent even though the worker is
+  # completely idle in the second half. An idle stack has no bucket series at
+  # all, which is why the guard is gated on executions being observed rather
+  # than on absence alone — otherwise it would page on every quiet stack,
+  # the permanently-red failure this file exists to remove.
+  - interval: 1m
+    name: healthy buckets present; guard silent
+    input_series:
+      - series: 'wasm_execution_duration_ms_count{job="talos-worker", instance="worker:9090", status="success"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="2500"}'
+        values: "0+1x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="10000"}'
+        values: "0+1x60"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: WASMLatencyBucketMissing
+        exp_alerts: []
+
+  # ── (7) The volume floor: 100 % slow, but too few executions to mean it ─
+  # A dying container trails a handful of executions into the 15 m window as
+  # it is replaced. Here EVERY one of them is slow — the fraction is a clean
+  # 1.0, the strongest possible signal the ratio can produce — and the rules
+  # must still stay silent, because 6 executions per 15 m cannot support a
+  # claim about the fleet. Without the `>= 10` floor this exact shape fired
+  # once in the 13.5 h of live data the rules were calibrated against, on a
+  # container that had already stopped existing.
+  #
+  # 0.4/min = 6 per 15 m window, comfortably under the floor.
+  - interval: 1m
+    name: entirely slow but below the volume floor; still silent
+    input_series:
+      - series: 'wasm_execution_duration_ms_count{job="talos-worker", instance="worker:9090", status="success"}'
+        values: "0+0.4x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="2500"}'
+        values: "0+0x60"
+      - series: 'wasm_execution_duration_ms_bucket{job="talos-worker", instance="worker:9090", status="success", le="10000"}'
+        values: "0+0x60"
+    alert_rule_test:
+      - {eval_time: 30m, alertname: SlowWASMExecution, exp_alerts: []}
+      - {eval_time: 45m, alertname: SlowWASMExecution, exp_alerts: []}
+      - {eval_time: 30m, alertname: VerySlowWASMExecution, exp_alerts: []}
+      - {eval_time: 45m, alertname: VerySlowWASMExecution, exp_alerts: []}

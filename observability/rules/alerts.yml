@@ -101,29 +101,180 @@ groups:
           summary: "Critical WASM execution error rate"
           description: "WASM error rate is {{ $value | humanize }} errors/sec (threshold: 1.0/sec)"
 
-      # Slow execution time (P95 > 500ms). No absent() arm: absence means no
-      # executions were observed in the window, and a latency quantile over an
-      # empty population is undefined, not slow. "No executions" has its own
-      # alert (NoWASMExecutions).
+      # ────────────────────────────────────────────────────────────────────
+      # LATENCY: a sustained SLOW FRACTION, not a small-sample quantile.
+      #
+      # WHAT WAS WRONG. Until 2026-08-04 both rules below were
+      #   histogram_quantile(0.95, rate(wasm_execution_duration_ms_bucket[5m]))
+      # against 500 ms / 2000 ms. Measured, not reasoned about: over 13.75 h
+      # of recorded dev-stack traffic Prometheus's own ALERTS series shows
+      # `VerySlowWASMExecution` firing 23 separate times and
+      # `SlowWASMExecution` 8 times, and NOT ONCE on a real problem. Three
+      # compounding causes, each confirmed in the raw bucket deltas:
+      #
+      #  1. THE POPULATION IS TINY. This worker completes 5-8 executions per
+      #     5 m window (measured peak 8.3). p95 over 8 samples is not a
+      #     quantile, it is the MAXIMUM. A single slow execution moved the
+      #     expression from 450 ms to the top of the histogram.
+      #
+      #  2. LLM TIME IS NESTED INSIDE EXECUTION TIME. 70 of 457 executions
+      #     (15 %) made an Ollama call; mean LLM latency 3.2 s, and 7 calls
+      #     exceeded 10 s. Every execution observed over 10 s contained an
+      #     LLM call over 10 s — a 1:1 match in the bucket deltas. A 2000 ms
+      #     ceiling cannot hold over a population that legitimately contains
+      #     multi-second local inference. Compilation is NOT the cause and
+      #     must not be blamed for it: 15 cold compiles averaged 95 ms and
+      #     none exceeded 250 ms.
+      #
+      #  3. IT WAS NEVER ABOUT DEPLOYS. The firings cluster at :03 past the
+      #     hour and :23 past every second hour — the scheduled-workflow
+      #     cadence. Only 2 of the 23 recorded episodes fell within 10 min of a
+      #     container restart, and one of THOSE was driven entirely by the
+      #     OUTGOING worker's final 10 executions still inside the 5 m rate
+      #     window: the replacement container had emitted no samples at all
+      #     when the alert fired. So a worker-uptime gate would have
+      #     suppressed 2 of those 23 firings, and is rejected on that evidence —
+      #     it would also silence these rules permanently on a crash-looping
+      #     worker, the detector-silenced-by-its-own-condition defect this
+      #     file exists to close.
+      #
+      # ALSO REJECTED, on measurement rather than taste: widening the rate
+      # window while keeping the quantile (a 30 m window HELD the transient
+      # longer — 12 min of breach instead of 10); and raising `for:` alone
+      # (still fired twice in 13 h, and the longest healthy breach was 19 min,
+      # so no `for:` both suppresses it and stays useful).
+      #
+      # THE REPLACEMENT asks the question a small population CAN answer: what
+      # FRACTION of executions is slow, sustained long enough that a bounded
+      # burst cannot satisfy it. A fraction is well defined at n=5 (it is
+      # 1/5); a p95 is not.
+      #
+      # THE VOLUME FLOOR IS NOT DECORATION. A fraction is meaningful at n=5
+      # in a way a p95 is not, but it is still not meaningful at n=4. The
+      # first draft of this rule had no floor, and over the same 13 h it
+      # still produced one firing: the worker being REPLACED during a restart
+      # trails 4 executions into the 15 m window, 3 of them slow, and 3/4 =
+      # 0.75 clears any fraction threshold worth having. That is the same
+      # rate-window carryover described in (3) — the series belongs to a
+      # container that no longer exists. `>= 10` is the measured median
+      # executions-per-15m-window for this worker, so two thirds of windows
+      # remain evaluable while a dying container's tail cannot reach it.
+      #
+      # It costs something, and the cost is the familiar one: during a
+      # genuinely quiet stretch the rules cannot fire at all, so a regression
+      # that starts in a lull is not detected until volume recovers. That is
+      # tolerable ONLY because the low-volume and zero-volume cases have
+      # their own detectors — `NoWASMExecutions` and `WASMMetricsPipelineDead`
+      # — and would not be tolerable without them.
+      #
+      # CALIBRATION, over 13.5 h spanning three container restarts, measured
+      # per (job, instance) exactly as the rules aggregate — NOT summed
+      # fleet-wide, which dilutes a single bad instance and reported a
+      # flattering number in an earlier draft of this comment — it read 0.36
+      # only because summing fleet-wide happened to hide the 0.75 outlier
+      # that the floor now excludes on its merits. With the floor applied the
+      # 15 m slow-fraction peaked at 0.36 (p99 0.36) at the 2.5 s boundary
+      # and 0.22 (p99 0.21) at the 10 s boundary, over 556 evaluable windows.
+      # The 0.5 thresholds were not crossed once, by either tier, and neither
+      # rule would have fired at any point in that period.
+      #
+      # WHAT THIS MISSES, stated plainly rather than implied. A PARTIAL
+      # regression leaving 36-50 % of executions slower than 2.5 s sits under
+      # the threshold and will not page; the old expression would have caught
+      # that, at the cost of the 23 false pages per 13.75 h measured above. And
+      # detection latency for a TOTAL regression grows to 18 min, from ~3 min
+      # before: the 15 m
+      # rate window has to ramp the fraction past 0.5 (8 min after onset),
+      # then `for: 10m` has to elapse. That figure is MEASURED, not estimated
+      # — `observability/alerts_test.yml` asserts silence at 37 m and firing
+      # at 38 m against an onset at 20 m, so if you retune the window or the
+      # `for:`, those two eval_times move and this number must move with them.
+      #
+      # ABSENCE: no absent() arm, deliberately — absence of the series means
+      # no executions were observed, which is `NoWASMExecutions`'s job. But
+      # the `le=` selectors DO couple these rules to the histogram's bucket
+      # boundaries, and a boundary change would make the numerator absent and
+      # silence both rules forever. That specific absence gets its own
+      # detector, `WASMLatencyBucketMissing`, immediately below.
       - alert: SlowWASMExecution
-        expr: histogram_quantile(0.95, rate(wasm_execution_duration_ms_bucket[5m])) > 500
-        for: 5m
+        expr: |
+          (
+            1 - (
+              sum by (job, instance) (rate(wasm_execution_duration_ms_bucket{le="2500"}[15m]))
+              /
+              sum by (job, instance) (rate(wasm_execution_duration_ms_count[15m]))
+            ) > 0.5
+          )
+          and
+          sum by (job, instance) (increase(wasm_execution_duration_ms_count[15m])) >= 10
+        for: 10m
         labels:
           severity: warning
           component: wasm-runtime
         annotations:
-          summary: "Slow WASM execution detected"
-          description: "P95 execution time is {{ $value | humanize }}ms (threshold: 500ms)"
+          summary: "Sustained slow WASM executions"
+          description: >-
+            {{ $value | humanizePercentage }} of WASM executions on
+            {{ $labels.instance }} took longer than 2.5s over the last 15m,
+            sustained for 10m (threshold: 50%). LLM inference time is included
+            in execution duration — check wasm_llm_duration_ms before
+            suspecting the WASM runtime itself.
 
       - alert: VerySlowWASMExecution
-        expr: histogram_quantile(0.95, rate(wasm_execution_duration_ms_bucket[5m])) > 2000
-        for: 2m
+        expr: |
+          (
+            1 - (
+              sum by (job, instance) (rate(wasm_execution_duration_ms_bucket{le="10000"}[15m]))
+              /
+              sum by (job, instance) (rate(wasm_execution_duration_ms_count[15m]))
+            ) > 0.5
+          )
+          and
+          sum by (job, instance) (increase(wasm_execution_duration_ms_count[15m])) >= 10
+        for: 10m
         labels:
           severity: critical
           component: wasm-runtime
         annotations:
-          summary: "Very slow WASM execution detected"
-          description: "P95 execution time is {{ $value | humanize }}ms (threshold: 2000ms)"
+          summary: "Sustained very slow WASM executions"
+          description: >-
+            {{ $value | humanizePercentage }} of WASM executions on
+            {{ $labels.instance }} exceeded 10s over the last 15m, sustained
+            for 10m (threshold: 50%). 10s is the histogram's highest finite
+            bucket bound, so these executions are only known to be SLOWER than
+            10s — the exact latency is not recoverable from this metric.
+
+      # The boundary guard for the two rules above. They select fixed `le`
+      # values, so they are only as alive as those bucket bounds. If the
+      # `wasm.execution.duration_ms` boundaries are ever changed — and there
+      # is a live reason to change them, see the note on saturation in
+      # VerySlowWASMExecution — the numerator goes absent, the division
+      # matches nothing, and BOTH rules above go silent forever with no error
+      # anywhere. That is the same shape as a rule_files entry that globs to
+      # zero files: configured, plausible-looking, and dead.
+      #
+      # Gated on executions actually being observed, so an idle stack (where
+      # no bucket series exists at all, legitimately) does not trip it.
+      - alert: WASMLatencyBucketMissing
+        expr: |
+          (
+            absent(wasm_execution_duration_ms_bucket{le="2500"})
+            or
+            absent(wasm_execution_duration_ms_bucket{le="10000"})
+          )
+          and on() (sum(rate(wasm_execution_duration_ms_count[15m])) > 0)
+        for: 15m
+        labels:
+          severity: warning
+          component: wasm-runtime
+        annotations:
+          summary: "WASM latency alerts have lost their bucket boundaries"
+          description: >-
+            Executions are being recorded but the le=2500 / le=10000 buckets of
+            wasm_execution_duration_ms are absent, so SlowWASMExecution and
+            VerySlowWASMExecution cannot fire. The histogram's bucket
+            boundaries have most likely changed; update the le= selectors in
+            observability/rules/alerts.yml to match.
 
       # Low cache hit rate (< 70%).
       #
