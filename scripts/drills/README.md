@@ -11,17 +11,41 @@ incident.
 
 What it does:
 
-1. Dumps the live Postgres (`pg_dump --format=custom`).
-2. Tars `/vault/file` from the live Vault container.
-3. Spins up a scratch Postgres container on a non-colliding port.
-4. Spins up a scratch Vault container with a fresh volume, restores
-   the tarball, and unseals using the restored `bootstrap.json`.
-5. Runs `cargo run --example verify_phase_b -p controller` against
-   the restored pair — the same verifier we use in development to
-   confirm Phase B encryption works end-to-end.
-6. Emits Prometheus textfile metrics for the
-   `TalosBackupRestoreDrillFailed` alert.
-7. Cleans up the scratch containers (unless `--keep-scratch`).
+1. Selects the **newest backup artifacts** written by the
+   `postgres-backup` / `vault-backup` compose sidecars, and checks the
+   Vault archive against the `sha256` in its own manifest.
+2. Builds the two verifier binaries — **before** anything holds real
+   data, so the slow step is not the one with a database full of
+   restored user rows sitting on a loopback port.
+3. Spins up a scratch Postgres on a throwaway network, with throwaway
+   credentials and a named (removable) volume, on an ephemeral
+   loopback-only port.
+4. `pg_restore --exit-on-error` into it.
+5. Spins up a scratch Vault, restores the tarball into a fresh volume,
+   unseals with the restored `bootstrap.json`, then checks that the
+   root token is accepted and that secret engines are mounted.
+6. Runs `verify_restore` (schema version, table row counts, and
+   decryption of **pre-existing** `actor_memory` + `secrets` rows)
+   followed by `verify_phase_b` (a fresh write/read round-trip).
+   Sampling is per distinct `(format, DEK)` on **both** tables —
+   `(value_format, value_key_id)` for `actor_memory` and
+   `(encryption_format_version, encryption_key_id)` for `secrets` — so
+   every on-disk AEAD format and every DEK actually in use is exercised
+   at least once. (`secrets` grouped by format *alone* until review:
+   with per-ORG v4 DEKs that touched whichever org sorted first and a
+   second org's secrets-only DEK went unexercised.) **Expired rows are
+   excluded from both samples**, because `recall_exact` and
+   `get_secret` refuse them by design — sampling them made an intact
+   backup report "a sampled row vanished on read" / "DECRYPT FAILED".
+   Row counts are **reported, not compared** against any baseline; only
+   `encryption_keys` and `actors` are asserted non-empty. The schema
+   check requires the restored `_sqlx_migrations` max version to be a
+   migration point this checkout ships — *not* equality with the newest,
+   which false-red on every good artifact taken before the last
+   migration landed.
+7. Removes every scratch container, volume and network — and asserts
+   afterwards that none survived.
+8. Emits the Prometheus textfile metric.
 
 Exit code:
 - `0` — restore works, verify passes, backups are actually restorable.
@@ -30,38 +54,153 @@ Exit code:
   [`deploy/observability/alerts.yaml`](../../deploy/observability/alerts.yaml)
   will fire within 14 days of the last successful drill.
 
+**Prefer the metric over the exit code.** macOS ships bash 3.2, where a
+`set -u` violation inside a `cmd || die` list aborts the script and
+still reports exit **0** — measured, not theorised. **The exit-0 half
+needs an `EXIT` trap installed**, which this script always has: without
+one the same violation exits **1**, so an isolated reproduction that
+omits the trap will "disprove" the bug. Measured both ways on bash
+3.2.57 (arm64-apple-darwin25): no trap → `$?` is 1; `trap … EXIT`
+installed → the trap sees `$?` as 0 and the shell exits 0. The script now
+carries a completion sentinel that turns any such abort into a
+non-zero exit *and* a failure metric, but the metric is the signal
+that only ever advances on a run that reached the end, so that is what
+`TalosBackupRestoreDrillFailed` reads and what
+`make drill-schedule-status` reports.
+
+**Runtime.** Steps 3–7 take about 20 seconds. Step 2 (building the
+verifiers) dominates, and in a **git worktree** it currently rebuilds
+`talos-mcp-handlers` on *every* invocation — ~16 minutes — because that
+crate's `build.rs` declares `rerun-if-changed=../.git/HEAD` and
+`../.git/index`, and in a worktree `.git` is a *file*, so neither path
+resolves and cargo re-runs the script (which re-stamps `BUILD_TIME`)
+every time. In a normal clone the build is a no-op after the first run.
+That is a build-system issue, not a drill one, but budget for it when
+scheduling.
+
 #### Running manually
 
 ```bash
-./scripts/drills/backup-restore.sh
+make drill                      # restore the newest ARTIFACT (default)
+make drill ARGS="--source live" # dump the live stack now and restore that
 ```
+
+`--source artifact` is the default on purpose. Until 2026-08-03 this
+script only ever took a **fresh** `pg_dump` and restored that, which
+tests `pg_dump`/`pg_restore` but leaves the dumps the sidecars have
+been writing every night still un-restored — the backup nobody has
+ever restored. `--source live` keeps that older behaviour for the case
+where you want to prove the *current* database is dumpable.
 
 Tunables (all env vars):
 
 | Var | Default | What it does |
 |---|---|---|
-| `TALOS_DRILL_WORKDIR` | `/tmp/drill-<ts>` | Where to stage the dump + tarball. Auto-cleaned on success. |
-| `TALOS_DRILL_PG_PORT` | `55432` | Host port for scratch Postgres. |
-| `TALOS_DRILL_VAULT_PORT` | `58200` | Host port for scratch Vault. |
-| `TALOS_DRILL_LIVE_PG` | `talos-postgres` | Name of the live Postgres container. |
-| `TALOS_DRILL_LIVE_VAULT` | `talos-vault` | Name of the live Vault container. |
-| `TALOS_DRILL_LIVE_CONTROLLER` | `talos-controller` | Name of the live controller container (used to resolve `TALOS_MASTER_KEY`). |
-| `TALOS_DRILL_PG_IMAGE` | digest-pinned pgvector:pg16 | Scratch Postgres image. |
+| `TALOS_DRILL_BACKUP_DIR` | `$TALOS_BACKUP_DIR` or `~/.talos/backups` | Where the sidecars write. `--source artifact` restores the newest file here. |
+| `TALOS_DRILL_TEXTFILE_DIR` | `~/.talos/metrics/textfile_collector` | Where to write the drill metric. Must be a directory a collector reads. **Not writable ⇒ the drill fails**, unless `TALOS_DRILL_ALLOW_NO_METRIC=1`. |
+| `TALOS_DRILL_LIVE_PG` | `talos-postgres` | Live Postgres container (`--source live` only). |
+| `TALOS_DRILL_LIVE_VAULT` | `talos-vault` | Live Vault container (`--source live` only). |
+| `TALOS_DRILL_LIVE_CONTROLLER` | `talos-controller` | Live controller — the KEK (`TALOS_MASTER_KEY`) and `KEK_PROVIDER` are read from it. |
+| `TALOS_DRILL_PG_IMAGE` | digest-pinned pgvector:pg16 | Scratch Postgres image. **Must be ≥ the major version the dump came from.** The compose stack is pg16 so the default matches; the Helm chart deploys `pgvector/pgvector:pg17`, and a pg17 dump will not restore into pg16. On a pg17 deployment set this to a pg17 image. The failure is loud (`pg_restore` aborts under `--exit-on-error`), not silent. |
 | `TALOS_DRILL_VAULT_IMAGE` | digest-pinned hashicorp/vault:1.18 | Scratch Vault image. |
-| `TALOS_DRILL_TEXTFILE_DIR` | `/var/lib/node_exporter/textfile_collector` | Where to write drill metrics. Absent dir = metric emission skipped with warning. |
+| `TALOS_DRILL_ALLOW_PRODUCTION` | unset | Required to run when a production environment is detected. Don't. |
+| `TALOS_DRILL_ALLOW_NO_METRIC` | unset | Waive the "metric must be publishable" precondition. Accepts a permanently-firing alert. |
 
 Flags:
 
-- `--keep-scratch` — leave scratch containers running after success so
-  you can `psql`/`vault` into them manually. Useful when you want to
-  explore restored data.
+- `--source artifact|live` — what to restore (default `artifact`).
+- `--keep-scratch` — leave the scratch stack up after a *successful*
+  run so you can `psql`/`vault` into it. It holds **real restored
+  data**; the script prints the exact teardown commands.
+
+#### Safety properties
+
+These are the invariants, not aspirations — check them if you change
+the script.
+
+- **Scratch is isolated.** Its own bridge network (never
+  `talos-network`), its own randomly generated Postgres password (never
+  the live one), its own named volumes. The only host exposure is a
+  kernel-assigned Postgres port bound to `127.0.0.1`, which exists
+  because the verifiers are host-arch binaries and Docker Desktop
+  cannot share a unix socket across the VM boundary. Vault publishes no
+  port at all unless `KEK_PROVIDER=vault`.
+- **Cleanup runs on every exit path a shell can observe** — success,
+  failure, and `INT`/`TERM`/`HUP`, which are trapped explicitly rather
+  than being left to the `EXIT` trap. `docker rm -fv` is used: without
+  `-v` the Postgres image's *anonymous* data volume survives, and that
+  volume is the restored database (421 MB of real user data leaked this
+  way on the 2026-08-03 run, before it was fixed). Cleanup then
+  re-inspects and shouts if anything survived.
+- **…but "every exit path" is not a property any trap has.** Stated
+  rather than left implied, because that phrasing is how a limit becomes
+  a false assurance:
+  - **`SIGKILL`, an OOM kill, and a host crash / power loss are
+    untrappable.** A drill killed with `kill -9` leaves its scratch
+    containers, volumes and network behind — holding restored user data.
+    There is no in-process fix. Recovery:
+    `docker rm -fv $(docker ps -aq --filter name=talos-drill-)` then
+    `docker volume rm $(docker volume ls -q --filter name=talos-drill-)`.
+  - **A trapped signal arriving during a long foreground step is
+    deferred** until that step returns — bash's own semantics. `Ctrl-C`
+    during the multi-minute step 2 build does not tear down immediately;
+    it tears down when `cargo` exits.
+  - **The `INT` trap is inert if the drill is started as a BACKGROUND
+    job from a non-interactive shell** (`… backup-restore.sh &`,
+    `nohup … &`, a CI step that backgrounds it). POSIX has the shell set
+    `SIGINT`/`SIGQUIT` to *ignored* in an asynchronous child, and a
+    signal ignored on entry **cannot be trapped** — so `trap 'on_signal
+    INT' INT` silently does nothing and the drill runs straight through
+    a `kill -INT`. Measured both ways: backgrounded → the trap never
+    fires; started with a default `SIGINT` disposition (which is what a
+    terminal `Ctrl-C` and launchd both give it) → it fires, tears down,
+    and re-raises so the exit status is still "killed by signal 2".
+    `TERM` and `HUP` are unaffected in either case, so **send `TERM`,
+    not `INT`, to a backgrounded drill.**
+  - **`--keep-scratch` leaves a full restored database up on purpose.**
+    That is the flag's job, but the containers hold real user data until
+    you remove them by hand, using the command the script prints.
+- **It refuses to run against production.** `RUST_ENV`/`TALOS_ENV`/
+  `NODE_ENV` in the shell, and `RUST_ENV`/`TALOS_ENV` inside the live
+  controller, are all checked.
+- **Nothing decrypted is ever printed.** The verifiers report counts
+  and byte lengths only. Staged dumps live in a `mktemp -d` 0700
+  directory that is removed on exit.
 
 #### Scheduling
 
-Weekly at 3am Monday local time is a reasonable cadence — quiet enough
-to avoid competing with business-hours traffic, frequent enough that
-`TalosBackupRestoreDrillFailed` (triggered at 14 days since last green
-run) gives two missed-run cycles before paging.
+Weekly. `TalosBackupRestoreDrillFailed` fires when the last green run is
+14 days old, so a weekly cadence tolerates exactly **one** missed run:
+one skipped week (closed laptop, stack down) does not page, the second
+consecutive miss does. Note the margin on that single miss is thin — the
+14-day threshold lands on the recovery run's own scheduled time, and only
+the alert's `for: 1h` absorbs the gap, so a run deferred more than an
+hour past its slot (a laptop woken late) pages anyway. **Do not stretch
+this to fortnightly** — a
+cadence equal to the alert window guarantees the alert fires on ordinary
+jitter, and an alert that fires during healthy operation is the failure
+mode this whole area exists to remove.
+
+**macOS / the docker-compose dev stack** — a launchd agent:
+
+```bash
+make drill-schedule         # install + load (Sunday 03:00 local)
+make drill-schedule-status  # is it scheduled, and when did it last pass?
+make drill-unschedule
+```
+
+`StartCalendarInterval` runs missed jobs once the machine wakes, which
+is what makes a weekly cadence workable on a laptop — the same
+wake-aware property the backup sidecars get from their hourly tick.
+Installing it is a deliberate act (it writes to
+`~/Library/LaunchAgents`), so it is a target rather than something
+`make up` does behind your back.
+
+A compose sidecar was considered and rejected: the drill creates and
+destroys containers, so a containerised version needs
+`/var/run/docker.sock`, and mounting the docker socket into a
+long-lived `restart: unless-stopped` service to gain a weekly tick is
+root-on-the-host in exchange for a cron entry.
 
 **systemd timer** (preferred for single-node k3s Phase 1):
 
@@ -100,6 +239,15 @@ systemctl list-timers talos-drill.timer
 journalctl -u talos-drill.service --since "last week"
 ```
 
+**This unit will refuse to run on a production host** — the drill checks
+`RUST_ENV`/`TALOS_ENV` in its own environment *and* inside the live
+controller container, and exits 1 if either says `production`. That is
+deliberate: the drill dumps the live database to a temp directory and
+stands a second copy of it up on the same host, which is a rehearsal
+you want on isolated infrastructure, not on the machine you are trying
+to protect. `TALOS_DRILL_ALLOW_PRODUCTION=1` overrides it if you have
+read the safety properties above and accept them.
+
 **cron** (acceptable if you prefer):
 
 ```cron
@@ -111,7 +259,7 @@ docker daemon, which K8s pods can't do by default. Port it to
 `kubectl exec` + in-cluster scratch Job patterns. Left as a follow-up
 when Phase 2 onboards — file an RFC before reaching for it.
 
-### Wiring the Prometheus textfile metric
+### Wiring the metric into Prometheus
 
 `backup-restore.sh` writes `talos_backup_drill.prom` with three series:
 
@@ -122,27 +270,59 @@ when Phase 2 onboards — file an RFC before reaching for it.
   last actually-green run, not the most recent failed run.
 - `talos_backup_drill_last_status` — `1` on success, `0` on failure.
 
-To scrape:
+**Until 2026-08-03 there was no collector for any of them.** The script
+wrote to `/var/lib/node_exporter/textfile_collector`, a path that
+existed nowhere in this repo, and no `node_exporter` was deployed
+anywhere — zero matches in `docker-compose.yml` or
+`observability/prometheus/prometheus.yml`. It degraded *silently*
+("textfile dir not writable — skipping metric emission"), so
+`TalosBackupRestoreDrillFailed` was permanently red **by
+construction**: a perfect drill run could not clear it. That is now
+fixed for the dev stack, and the script fails loudly rather than
+skipping when it cannot publish.
 
-1. Run `node_exporter` on the drill host with
-   `--collector.textfile.directory=/var/lib/node_exporter/textfile_collector`.
-2. Scrape node_exporter's `/metrics` from Prometheus.
-3. The alert in `deploy/observability/alerts.yaml`
-   (`TalosBackupRestoreDrillFailed`) compares
-   `talos_backup_drill_last_success_timestamp_seconds` against
-   `time() - 14*86400`.
+#### Which deployments can clear this alert
 
-If you don't have node_exporter yet, that's the quickest Grafana-Cloud-
-compatible exporter to add — it also gives you host metrics (disk,
-network, load average) you'll want soon anyway.
+| Deployment | Can it clear? | How |
+|---|---|---|
+| `docker-compose` dev stack | **Yes** | `docker-compose.yml` runs `node-exporter` with `--collector.disable-defaults --collector.textfile`, mounting `~/.talos/metrics/textfile_collector` read-only; the `node-exporter` job in `observability/prometheus/prometheus.yml` scrapes it. `make drill` clears the alert. |
+| VM / bare metal running the stack | **Yes** | Install a system `node_exporter` with `--collector.textfile.directory=/var/lib/node_exporter/textfile_collector`, set `TALOS_DRILL_TEXTFILE_DIR` to match, scrape it, and schedule the drill (systemd timer above). |
+| `docker-compose.observability.yml` | **No** | That stack defines no `node-exporter` service (and cannot reach Talos at all — see its header). The job is red there, like `talos-controller`. |
+| Kubernetes / the Helm chart | **No, not yet** | The drill drives the docker socket directly, which a pod does not have. Nothing publishes the series in-cluster, so the alert fires permanently. This is *accurate* — nobody has verified those backups — but it is not actionable in-cluster today. Either accept it as a standing "restore is unverified here" marker, or drop the rule from your `PrometheusRule` and track the gap elsewhere. Porting the drill to a CronJob (`kubectl exec` + an in-cluster scratch Job) is the open follow-up; file an RFC before reaching for it. |
+
+The alert itself is in `deploy/helm/talos/files/alerts.yaml` (symlinked
+as `deploy/observability/alerts.yaml`) and compares
+`talos_backup_drill_last_success_timestamp_seconds` against
+`time() - 14*86400`, with an `absent()` arm so a series that was never
+published fires rather than silently matching nothing.
+
+There is deliberately **no separate alert on the collector itself**.
+The `absent()` arm already covers it: if node-exporter stops, its
+scrape fails, the series disappears, and `TalosBackupRestoreDrillFailed`
+fires an hour later. "The drill's result is not visible" and "the drill
+has not run" are the same operational fact and want one alert, not two.
+
+The transitions are unit-tested against the real expression in
+`observability/alerts_chart_test.yml` (`promtool test rules`), because
+`for: 1h` makes them impossible to demonstrate on a live stack inside a
+review — and "the alert is clearable" is exactly the kind of claim this
+repo has learned not to take on trust.
 
 ## What this drill doesn't cover
 
 Honest list so future-you doesn't develop false confidence:
 
-1. **Neo4j graph data.** The drill tests Postgres + Vault. If your
-   actor memory is used primarily for graph-RAG, add a `neo4j-admin
-   database dump` + restore step.
+1. **Neo4j graph data.** The drill tests Postgres + Vault only. This is
+   not a hypothetical gap: the `neo4j-backup` compose sidecar has been
+   writing `~/.talos/backups/neo4j/neo4j-*.tar.gz` daily since July, and
+   those artifacts get tar-integrity + expected-paths verification and
+   nothing else — they are, today, exactly the "backup nobody has ever
+   restored" that this drill was rewritten to eliminate for Postgres and
+   Vault. Community Edition can't host a scratch database, so a restore
+   drill means standing up a throwaway Neo4j on the tarball and counting
+   nodes/relationships against the manifest. Mitigating factor, not an
+   excuse: the graph is reconstructible from `actor_memory` via
+   `graph_backfill`.
 2. **MinIO object storage.** Audit logs and artifacts live there.
    Not in scope today because the blast radius of a MinIO loss is
    smaller than DEK loss — but worth adding.
@@ -150,16 +330,57 @@ Honest list so future-you doesn't develop false confidence:
    data is restorable *on the same host*. We don't test that data
    survives a host loss. For Phase 2 enterprise SaaS, run the drill
    against a separately-hosted scratch environment.
-4. **The backup's own integrity over time.** A freshly-taken backup
-   restored five minutes later doesn't prove a 6-month-old backup
-   still works. Rotate drill artifacts: occasionally restore from a
-   month-old pg_dump + Vault tarball from the archive, not the
-   live dump.
+4. **Artifact freshness — in BOTH directions.** `--source artifact`
+   restores the **newest** dump, so a green run proves last night's
+   backup is good and says nothing about a six-month-old one; point
+   `--source artifact` at an archived directory occasionally. The more
+   dangerous direction is the other one: the drill *prints* the artifact's
+   mtime but never asserts it, so if the `postgres-backup` sidecar dies,
+   the drill keeps restoring the last good artifact and keeps going green
+   for as long as that file survives retention. Nothing alerts on backup
+   AGE — `TalosBackupRestoreDrillFailed` measures drill recency, not
+   artifact recency. Read the "taken …" line in the drill's step 1 output.
+5. **Everything in Postgres beyond the sampled rows, and every encrypted
+   column family other than two.** `verify_restore` decrypts a sample,
+   not every row: it catches "this DEK/format is unreadable", not "row
+   4,821 is individually corrupt". It also only touches `actor_memory`
+   and `secrets` — `workflow_executions` output, module payloads, TOTP
+   secrets, webhook secrets and `integration_state` all carry their own
+   `*_format` / `*_key_id` columns and are never decrypt-verified, so a
+   format or DEK used *only* by one of those is unexercised. Restore
+   *completeness* (as opposed to readability) is covered separately by
+   `pg_restore --exit-on-error`, which fails the drill if any object
+   failed to load.
+6. **Transit-wrapped KEKs, when the deployment doesn't use them.** With
+   `KEK_PROVIDER=env` (the dev-stack default) the KEK is
+   `TALOS_MASTER_KEY` and the restored Vault is not on the decryption
+   path at all. The Vault half still proves the file backend restores,
+   unseals, authenticates and mounts its engines — but "the restored
+   Vault can unwrap a DEK" is only proven when `KEK_PROVIDER=vault`, in
+   which case the drill additionally checks the transit key is present.
+   The drill prints which of these two it did.
+7. **In-cluster backups.** The chart's CronJob + PVC path is untested by
+   this script; see the deployment table above.
+8. **The KEK itself — and therefore the disaster this rehearses.** The
+   drill reads `TALOS_MASTER_KEY` out of the **running** controller
+   container and refuses to start without it. So a green run proves
+   *"these artifacts + today's live KEK ⇒ readable data"*, which is not
+   the same claim as *"these artifacts ⇒ readable data"*. With
+   `KEK_PROVIDER=env` the KEK lives in `.env`, which is gitignored and
+   which **no backup sidecar copies** — lose the host and the artifacts
+   decrypt to nothing, with this drill green the whole way. Keep
+   `TALOS_MASTER_KEY` escrowed somewhere off-box; the drill structurally
+   cannot tell you whether you have.
 
 ## Related
 
 - Alerts that fire when the drill hasn't run: `deploy/observability/alerts.yaml` → `TalosBackupRestoreDrillFailed`.
-- The verifier the drill runs end-to-end:
-  `controller/examples/verify_phase_b.rs`.
+- The verifiers the drill runs end-to-end:
+  `controller/examples/verify_restore.rs` (reads what the backup
+  contained) and `controller/examples/verify_phase_b.rs` (writes a
+  fresh round-trip).
+- The collector that carries the drill's metric: the `node-exporter`
+  service in `docker-compose.yml` and the job of the same name in
+  `observability/prometheus/prometheus.yml`.
 - Memory on why this matters: `memory/vault_persistence_fix.md` —
   the 2026-04-24 incident that motivated the drill.
