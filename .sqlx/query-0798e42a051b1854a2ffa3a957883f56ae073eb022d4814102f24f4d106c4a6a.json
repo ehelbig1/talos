@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE worker_identities SET last_liveness_at = now()\n             WHERE worker_id = $1 AND public_key = $2 AND active",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0798e42a051b1854a2ffa3a957883f56ae073eb022d4814102f24f4d106c4a6a"
+}

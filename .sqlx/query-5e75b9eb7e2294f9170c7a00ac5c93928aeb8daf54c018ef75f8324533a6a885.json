@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT worker_id, public_key, supports_sealing, active, created_at, last_seen_at,\n                    build_version\n             FROM worker_identities\n             ORDER BY worker_id, created_at, public_key",
+  "query": "SELECT worker_id, public_key, supports_sealing, active, created_at, last_seen_at,\n                    build_version, last_liveness_at\n             FROM worker_identities\n             ORDER BY worker_id, created_at, public_key",
   "describe": {
     "columns": [
       {
@@ -37,6 +37,11 @@
         "ordinal": 6,
         "name": "build_version",
         "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "last_liveness_at",
+        "type_info": "Timestamptz"
       }
     ],
     "parameters": {
@@ -49,8 +54,9 @@
       false,
       false,
       false,
+      true,
       true
     ]
   },
-  "hash": "5a556782223360ecd20bf078913cbab2679972be0f131ecbf09c6bd59c61a46a"
+  "hash": "5e75b9eb7e2294f9170c7a00ac5c93928aeb8daf54c018ef75f8324533a6a885"
 }

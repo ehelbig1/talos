@@ -76,6 +76,11 @@ pub struct WorkerIdentityRow {
     /// by the registration proof-of-possession, so nothing may branch on it
     /// beyond logging and operator reporting.
     pub build_version: Option<String>,
+    /// Last Ed25519 proof-of-possession liveness ping, or `None` if this row
+    /// has never participated in the liveness protocol. See the column comment
+    /// in migration `20260804120000_worker_identities_liveness.sql` — `None`
+    /// means UNKNOWN liveness, never "departed".
+    pub last_liveness_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// One row of the fleet build-identity listing surfaced by
@@ -90,6 +95,12 @@ pub struct WorkerBuildRow {
     pub build_version: Option<String>,
     pub supports_sealing: bool,
     pub last_seen_at: chrono::DateTime<chrono::Utc>,
+    /// Last liveness proof, or `None` for a row that has never participated in
+    /// the liveness protocol. The build-skew gauge uses this to drop rows it
+    /// can PROVE are departed from its population; a `None` row stays counted,
+    /// because a build-skew detector that goes quiet on unknown liveness would
+    /// be silenced by exactly the fleet it exists to watch.
+    pub last_liveness_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// The `+sha[-dirty]` half of a composite build string (`{pkg}+{sha}[-dirty]`),
@@ -677,6 +688,132 @@ impl WorkerIdentityRepository {
             .collect()
     }
 
+    /// Record a liveness proof for one ACTIVE key — the ONLY writer of
+    /// `last_liveness_at`. Returns whether a live row was refreshed.
+    ///
+    /// The caller (the `/internal/worker-liveness` endpoint) has already
+    /// verified an Ed25519 proof-of-possession over `(worker_id, public_key,
+    /// issued_at_ms, nonce)`, so reaching here means the pinger demonstrably
+    /// holds this key's private half.
+    ///
+    /// GRANTS NOTHING. This is a single guarded UPDATE that moves one timestamp
+    /// forward. It cannot INSERT (a never-registered key gets `false`, not a
+    /// row), cannot re-activate (`AND active` excludes a deactivated key, so a
+    /// revoked or reaped worker cannot ping itself back into the trust ring),
+    /// and cannot touch `public_key` / `supports_sealing` / `build_version` /
+    /// `active`. So the endpoint adds no trust surface: every capability it
+    /// could confer, registration already conferred.
+    ///
+    /// A `false` return is meaningful to the caller and must stay
+    /// distinguishable: it means "this key is not an active identity", which
+    /// the worker logs loudly (it has been revoked or reaped and its results
+    /// will not verify) — but the response must not tell an unauthenticated
+    /// caller WHICH of those it is, so the endpoint collapses it to one status.
+    pub async fn touch_liveness(&self, worker_id: &str, public_key: &[u8; 32]) -> Result<bool> {
+        let res = sqlx::query!(
+            "UPDATE worker_identities SET last_liveness_at = now()
+             WHERE worker_id = $1 AND public_key = $2 AND active",
+            worker_id,
+            &public_key[..],
+        )
+        .execute(&self.db_pool)
+        .await
+        .context("touch worker liveness")?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Reap identities whose worker PROVED it speaks the liveness protocol and
+    /// then went silent for longer than `max_silence_hours`. Returns the number
+    /// of keys deactivated.
+    ///
+    /// **This is a trust-boundary write with fleet-wide blast radius, so read
+    /// the predicate as three separate guards:**
+    ///
+    /// 1. `active` — never re-touch a row an operator already retired.
+    /// 2. `last_liveness_at IS NOT NULL` — the row must have DEMONSTRATED
+    ///    participation. A NULL row's liveness is unknown in both directions
+    ///    (it may be a healthy worker on a pre-liveness build), and unknown
+    ///    must never be read as departed. This single clause is what makes the
+    ///    sweep safe to enable on a mixed fleet mid-rollout, and it is why the
+    ///    obvious `last_seen_at` decay — which cannot make this distinction —
+    ///    is wrong.
+    /// 3. `last_liveness_at < now() - interval` — evaluated by POSTGRES against
+    ///    POSTGRES's clock, the same clock that wrote every `last_liveness_at`.
+    ///    Nothing is compared across two machines' clocks, so controller clock
+    ///    skew cannot shorten the window.
+    ///
+    /// CONCURRENCY — a worker pinging while the sweep runs must not be reaped,
+    /// and is not: this is ONE statement, never a read-then-write. Under READ
+    /// COMMITTED, if a concurrent `touch_liveness` holds the row lock, the
+    /// UPDATE blocks, then RE-EVALUATES its WHERE against the committed row —
+    /// which now carries a fresh `last_liveness_at` — and skips it. In the
+    /// other order the ping's own `AND active` fails and it reports `false`.
+    /// Either interleaving is correct; neither can reap a worker that pinged.
+    ///
+    /// FAIL-SAFE: an error propagates with `?` and deactivates NOTHING (a
+    /// single statement either applies or does not). The caller leaves the
+    /// fleet exactly as it was.
+    ///
+    /// Deactivation is SOFT (`active = false`), never a DELETE. A DELETE would
+    /// erase the worker_id's registration history and hand it back to the
+    /// trust-on-first-use path as a never-before-seen id — i.e. it would let
+    /// any holder of a shared registration token claim a reaped worker's
+    /// identity. Soft-retiring keeps the TOFU conflict path intact: a reaped
+    /// worker that returns is refused (`TofuOutcome::IdentityConflict`) and
+    /// needs an operator `register-worker-identity`, exactly like a revoked
+    /// key. That lockout is the deliberate cost of not weakening TOFU; it is
+    /// why the default window is long enough that only a genuinely departed
+    /// worker can cross it.
+    pub async fn reap_departed_identities(&self, max_silence_hours: i32) -> Result<u64> {
+        let res = sqlx::query!(
+            "UPDATE worker_identities SET active = false
+             WHERE active
+               AND last_liveness_at IS NOT NULL
+               AND last_liveness_at < now() - make_interval(hours => $1::int)",
+            max_silence_hours,
+        )
+        .execute(&self.db_pool)
+        .await
+        .context("reap departed worker identities")?;
+        Ok(res.rows_affected())
+    }
+
+    /// Reap PRE-PROTOCOL identities — rows that have never demonstrated
+    /// liveness participation and have not re-registered in
+    /// `max_age_hours`. Returns the number of keys deactivated.
+    ///
+    /// **Deliberately a separate method behind a separate, default-OFF operator
+    /// switch, because it is the unsafe direction of the same idea.** It keys
+    /// on `last_seen_at`, which is written only at boot registration, so it
+    /// CANNOT distinguish a departed pod from a healthy worker that has simply
+    /// been up a long time on a pre-liveness build. Enabling it is the operator
+    /// asserting a fact the controller cannot check: that their fleet has
+    /// finished rolling onto a build that pings.
+    ///
+    /// It exists because the population it addresses is real and unbounded —
+    /// every row registered before the liveness protocol shipped is one, and on
+    /// a pod-name-keyed fleet that is every roll and every scale-down ever
+    /// performed. The alternative is per-key `deactivate-worker-identity` runs
+    /// forever. But it must never be the default, and
+    /// [`Self::reap_departed_identities`] must never grow this behaviour.
+    ///
+    /// Same single-statement, guarded-predicate, fail-safe properties as its
+    /// sibling; `last_liveness_at IS NULL` keeps the two populations strictly
+    /// disjoint so a participating worker can never be caught by this arm.
+    pub async fn reap_pre_protocol_identities(&self, max_age_hours: i32) -> Result<u64> {
+        let res = sqlx::query!(
+            "UPDATE worker_identities SET active = false
+             WHERE active
+               AND last_liveness_at IS NULL
+               AND last_seen_at < now() - make_interval(hours => $1::int)",
+            max_age_hours,
+        )
+        .execute(&self.db_pool)
+        .await
+        .context("reap pre-protocol worker identities")?;
+        Ok(res.rows_affected())
+    }
+
     /// Soft-retire one key (rotation). Returns `true` if a live key was
     /// deactivated, `false` if it was already inactive / absent. Idempotent.
     pub async fn deactivate(&self, worker_id: &str, public_key: &[u8; 32]) -> Result<bool> {
@@ -717,7 +854,7 @@ impl WorkerIdentityRepository {
         // columns are NOT NULL, so the macro binds them non-optionally.
         let rows = sqlx::query!(
             "SELECT worker_id, public_key, supports_sealing, active, created_at, last_seen_at,
-                    build_version
+                    build_version, last_liveness_at
              FROM worker_identities
              ORDER BY worker_id, created_at, public_key",
         )
@@ -736,6 +873,7 @@ impl WorkerIdentityRepository {
                     created_at: r.created_at,
                     last_seen_at: r.last_seen_at,
                     build_version: r.build_version,
+                    last_liveness_at: r.last_liveness_at,
                 })
             })
             .collect()
@@ -762,7 +900,7 @@ impl WorkerIdentityRepository {
         // anywhere on this path).
         let rows = sqlx::query_as!(
             WorkerBuildRow,
-            "SELECT worker_id, build_version, supports_sealing, last_seen_at
+            "SELECT worker_id, build_version, supports_sealing, last_seen_at, last_liveness_at
              FROM worker_identities
              WHERE active
              ORDER BY worker_id, public_key
@@ -1559,6 +1697,517 @@ mod tests {
             !active.iter().any(|e| e.public_key == key(0)),
             "deactivated key must not load"
         );
+
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
+    }
+
+    // ===================== liveness + reaper =====================
+    //
+    // These cover a TRUST-BOUNDARY write whose blast radius is fleet-wide job
+    // dispatch, so the negative direction is tested harder than the positive
+    // one: every way a LIVE worker could be reaped gets its own assertion, and
+    // the positive case gets one.
+
+    /// The reaper is TABLE-WIDE by design — it sweeps every worker, not one —
+    /// so unlike every other test in this module these cannot isolate
+    /// themselves with a distinct `worker_id` alone. Two of them aging rows
+    /// concurrently makes each one's returned count include the other's rows.
+    /// Serialise them against each other; the non-reaper tests are unaffected
+    /// because they never age a row, so their fresh `last_seen_at` /
+    /// `last_liveness_at` can never fall inside a sweep window.
+    ///
+    /// `tokio::sync::Mutex` (not `std`) because the guard is held across
+    /// `.await`s.
+    static REAP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Age a row's liveness/registration clocks directly, so the window tests
+    /// don't have to sleep for hours. Writes the same columns the production
+    /// paths write; the reaper's predicate is unchanged and still evaluated by
+    /// Postgres against Postgres's clock.
+    async fn age_row(
+        repo: &WorkerIdentityRepository,
+        worker_id: &str,
+        public_key: &[u8; 32],
+        liveness_hours_ago: Option<i32>,
+        seen_hours_ago: i32,
+    ) {
+        sqlx::query(
+            "UPDATE worker_identities
+             SET last_liveness_at = CASE WHEN $3::int IS NULL THEN NULL
+                                         ELSE now() - make_interval(hours => $3::int) END,
+                 last_seen_at = now() - make_interval(hours => $4::int)
+             WHERE worker_id = $1 AND public_key = $2",
+        )
+        .bind(worker_id)
+        .bind(&public_key[..])
+        .bind(liveness_hours_ago)
+        .bind(seen_hours_ago)
+        .execute(&repo.db_pool)
+        .await
+        .expect("age row");
+    }
+
+    async fn is_active(repo: &WorkerIdentityRepository, worker_id: &str, pk: &[u8; 32]) -> bool {
+        repo.load_active_registry()
+            .await
+            .unwrap()
+            .into_iter()
+            .any(|e| e.worker_id == worker_id && e.public_key == *pk)
+    }
+
+    /// THE LOAD-BEARING NEGATIVE TEST. A worker that is pinging must survive
+    /// repeated sweeps — deactivating it would break job-result verification
+    /// fleet-wide, and because TOFU refuses to re-activate a deactivated key it
+    /// could not recover without an operator.
+    #[tokio::test]
+    async fn a_live_worker_survives_repeated_sweeps() {
+        let _reap_guard = REAP_LOCK.lock().await;
+        let Some(pool) = pool_or_skip().await else {
+            return;
+        };
+        let repo = WorkerIdentityRepository::new(pool);
+        let wid = "test-reap-live-worker";
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
+
+        assert_eq!(
+            repo.register_tofu(wid, &key(1), false, Some("0.1.0+aaaaaaa"))
+                .await
+                .unwrap(),
+            TofuOutcome::Registered
+        );
+
+        // Ten ping-then-sweep cycles with an aggressive 1h window.
+        for _ in 0..10 {
+            assert!(
+                repo.touch_liveness(wid, &key(1)).await.unwrap(),
+                "ping must find the active row"
+            );
+            repo.reap_departed_identities(1).await.unwrap();
+            assert!(
+                is_active(&repo, wid, &key(1)).await,
+                "a pinging worker must never be reaped"
+            );
+        }
+
+        // Even the pre-protocol arm cannot touch it: it has participated, so
+        // `last_liveness_at IS NULL` excludes it regardless of how old its
+        // boot-time `last_seen_at` is.
+        age_row(&repo, wid, &key(1), Some(0), 10_000).await;
+        assert_eq!(
+            repo.reap_pre_protocol_identities(1).await.unwrap(),
+            0,
+            "a participating row is never in the pre-protocol population"
+        );
+        assert!(is_active(&repo, wid, &key(1)).await);
+
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
+    }
+
+    /// A row that has NEVER pinged is never reaped by the automatic sweep, no
+    /// matter how old. This is "absence of evidence is not evidence of
+    /// departure" as an executable assertion — it is what makes the sweep safe
+    /// to enable on a fleet still rolling onto the liveness build, and it is
+    /// the guard the obvious `last_seen_at` decay does not have.
+    #[tokio::test]
+    async fn a_never_pinging_row_is_never_auto_reaped() {
+        let _reap_guard = REAP_LOCK.lock().await;
+        let Some(pool) = pool_or_skip().await else {
+            return;
+        };
+        let repo = WorkerIdentityRepository::new(pool);
+        let wid = "test-reap-legacy-worker";
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
+
+        assert_eq!(
+            repo.register_tofu(wid, &key(1), false, None).await.unwrap(),
+            TofuOutcome::Registered
+        );
+        // Registered a decade ago and never pinged.
+        age_row(&repo, wid, &key(1), None, 87_600).await;
+
+        assert_eq!(
+            repo.reap_departed_identities(1).await.unwrap(),
+            0,
+            "unknown liveness must never be read as departed"
+        );
+        assert!(is_active(&repo, wid, &key(1)).await);
+
+        // Only the explicitly opt-in pre-protocol arm may act on it.
+        assert_eq!(repo.reap_pre_protocol_identities(1).await.unwrap(), 1);
+        assert!(!is_active(&repo, wid, &key(1)).await);
+
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
+    }
+
+    /// The positive case, and the window boundary: a participating worker that
+    /// goes silent past the window is reaped, and one still inside it is not.
+    #[tokio::test]
+    async fn a_departed_worker_is_reaped_only_past_the_window() {
+        let _reap_guard = REAP_LOCK.lock().await;
+        let Some(pool) = pool_or_skip().await else {
+            return;
+        };
+        let repo = WorkerIdentityRepository::new(pool);
+        let wid = "test-reap-departed-worker";
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
+
+        assert_eq!(
+            repo.register_tofu(wid, &key(1), false, None).await.unwrap(),
+            TofuOutcome::Registered
+        );
+        assert!(repo.touch_liveness(wid, &key(1)).await.unwrap());
+
+        // Silent for 5h under a 24h window — inside, so still trusted.
+        age_row(&repo, wid, &key(1), Some(5), 5).await;
+        assert_eq!(repo.reap_departed_identities(24).await.unwrap(), 0);
+        assert!(is_active(&repo, wid, &key(1)).await);
+
+        // Silent for 25h — past the window, so reaped.
+        age_row(&repo, wid, &key(1), Some(25), 25).await;
+        assert_eq!(repo.reap_departed_identities(24).await.unwrap(), 1);
+        assert!(!is_active(&repo, wid, &key(1)).await);
+
+        // The sweep is idempotent: a second pass finds nothing to do.
+        assert_eq!(repo.reap_departed_identities(24).await.unwrap(), 0);
+
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
+    }
+
+    /// A liveness ping GRANTS NOTHING. It cannot create a row for an
+    /// unregistered key, and it cannot resurrect a deactivated one — so a
+    /// reaped (or operator-revoked) worker cannot ping its way back into the
+    /// trust ring, and the TOFU conflict path still governs its return.
+    #[tokio::test]
+    async fn liveness_ping_cannot_create_or_resurrect_an_identity() {
+        let _reap_guard = REAP_LOCK.lock().await;
+        let Some(pool) = pool_or_skip().await else {
+            return;
+        };
+        let repo = WorkerIdentityRepository::new(pool);
+        let wid = "test-liveness-noauthz-worker";
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
+
+        // Never registered → the ping is a no-op, NOT an insert.
+        assert!(!repo.touch_liveness(wid, &key(1)).await.unwrap());
+        assert!(repo
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.worker_id != wid));
+
+        // Registered, then reaped.
+        assert_eq!(
+            repo.register_tofu(wid, &key(1), false, None).await.unwrap(),
+            TofuOutcome::Registered
+        );
+        assert!(repo.touch_liveness(wid, &key(1)).await.unwrap());
+        age_row(&repo, wid, &key(1), Some(48), 48).await;
+        assert_eq!(repo.reap_departed_identities(24).await.unwrap(), 1);
+
+        // The reaped key cannot ping itself back to active.
+        assert!(
+            !repo.touch_liveness(wid, &key(1)).await.unwrap(),
+            "a deactivated key must not be refreshable"
+        );
+        assert!(!is_active(&repo, wid, &key(1)).await);
+
+        // TOFU is NOT weakened by reaping: the returning worker is refused on
+        // the network path exactly as a revoked key is, and a NEW key cannot
+        // claim the reaped worker_id either.
+        assert_eq!(
+            repo.register_tofu(wid, &key(1), false, None).await.unwrap(),
+            TofuOutcome::IdentityConflict
+        );
+        assert_eq!(
+            repo.register_tofu(wid, &key(2), false, None).await.unwrap(),
+            TofuOutcome::IdentityConflict
+        );
+        // The operator path remains the documented remedy.
+        assert_eq!(
+            repo.register(wid, &key(1), false, None).await.unwrap(),
+            RegisterOutcome::Registered
+        );
+        assert!(is_active(&repo, wid, &key(1)).await);
+
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
+    }
+
+    /// Concurrency: a worker pinging while the sweep runs must not be reaped.
+    /// Both operations are single guarded statements, so whichever order
+    /// Postgres picks is correct — the UPDATE re-evaluates its predicate after
+    /// taking the row lock. Asserted as an invariant over many interleavings
+    /// rather than a fixed order, since the schedule is not ours to choose.
+    #[tokio::test]
+    async fn a_worker_pinging_during_a_sweep_is_not_reaped() {
+        let _reap_guard = REAP_LOCK.lock().await;
+        let Some(pool) = pool_or_skip().await else {
+            return;
+        };
+        let repo = std::sync::Arc::new(WorkerIdentityRepository::new(pool));
+        let wid = "test-reap-race-worker";
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
+
+        for _ in 0..25 {
+            // Reset to a row that is exactly AT the edge: last pinged 2h ago
+            // with a 1h window, so a sweep that lands first WOULD reap it.
+            cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
+            repo.register_tofu(wid, &key(1), false, None).await.unwrap();
+            age_row(&repo, wid, &key(1), Some(2), 2).await;
+
+            let (pinged, _reaped) = tokio::join!(
+                {
+                    let repo = repo.clone();
+                    async move { repo.touch_liveness(wid, &key(1)).await.unwrap() }
+                },
+                {
+                    let repo = repo.clone();
+                    async move { repo.reap_departed_identities(1).await.unwrap() }
+                }
+            );
+
+            // THE INVARIANT: if the ping observed a live row, that row must
+            // still be live. A `false` ping means the sweep won the race and
+            // legitimately reaped a row that had been silent past the window —
+            // the worker learns this from the ping's own return value.
+            if pinged {
+                assert!(
+                    is_active(&repo, wid, &key(1)).await,
+                    "a ping that succeeded must not be followed by a reap of that row"
+                );
+            }
+        }
+
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
+    }
+
+    /// Reproduce the EXACT state that motivated this change and drive the real
+    /// mechanism against it, rather than asserting the fix in the abstract
+    /// ([[gate-that-doesnt-gate]] — prove it against the broken tree).
+    ///
+    /// Observed live 2026-08-04 in `worker_identities`:
+    ///
+    /// ```text
+    /// worker_id          active  build          last_seen
+    /// dev-worker-fleet   t       0.1.0+3ffb611  19:39:08   <- the running worker
+    /// worker-wt-cddef6d  t       0.1.0+cddef6d  15:36:31   <- deleted hours earlier
+    /// ```
+    ///
+    /// Note both rows carried the SAME public key: the throwaway review
+    /// container inherited the fleet's `TALOS_WORKER_SIGNING_KEY` and registered
+    /// it under a second `worker_id`. So the leak is not "an extra key" but an
+    /// extra TRUSTED IDENTITY — which is exactly what the verify path keys on.
+    #[tokio::test]
+    async fn reproduces_the_2026_08_04_leftover_state_and_reaps_it() {
+        let _reap_guard = REAP_LOCK.lock().await;
+        let Some(pool) = pool_or_skip().await else {
+            return;
+        };
+        let repo = WorkerIdentityRepository::new(pool);
+        let live = "test-repro-dev-worker-fleet";
+        let ghost = "test-repro-worker-wt-cddef6d";
+        cleanup_worker_rows(&repo.db_pool, &[live, ghost], &[]).await;
+
+        // The shared key, as observed.
+        let shared = key(42);
+        repo.register_tofu(live, &shared, false, Some("0.1.0+3ffb611"))
+            .await
+            .unwrap();
+        repo.register_tofu(ghost, &shared, false, Some("0.1.0+cddef6d"))
+            .await
+            .unwrap();
+
+        // BEFORE: the broken state. Two active identities; the ghost's is as
+        // trusted as the live worker's, indefinitely.
+        let active_ids = |repo: &WorkerIdentityRepository| {
+            let repo = WorkerIdentityRepository::new(repo.db_pool.clone());
+            async move {
+                let mut v: Vec<String> = repo
+                    .load_active_registry()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|e| e.worker_id)
+                    .filter(|w| w.starts_with("test-repro-"))
+                    .collect();
+                v.sort();
+                v
+            }
+        };
+        assert_eq!(
+            active_ids(&repo).await,
+            vec![live.to_string(), ghost.to_string()],
+            "reproduce the two-active-row state first"
+        );
+
+        // Both workers roll onto a build that pings; the ghost then departs and
+        // the live worker keeps pinging.
+        assert!(repo.touch_liveness(live, &shared).await.unwrap());
+        assert!(repo.touch_liveness(ghost, &shared).await.unwrap());
+        age_row(&repo, ghost, &shared, Some(48), 48).await;
+
+        // AFTER: the mechanism removes exactly one identity from the ring.
+        assert_eq!(repo.reap_departed_identities(24).await.unwrap(), 1);
+        assert_eq!(
+            active_ids(&repo).await,
+            vec![live.to_string()],
+            "only the departed identity leaves the trust ring"
+        );
+
+        // And the live worker is still verifiable — the whole point.
+        assert!(is_active(&repo, live, &shared).await);
+
+        cleanup_worker_rows(&repo.db_pool, &[live, ghost], &[]).await;
+    }
+
+    /// The two reaper arms address strictly disjoint populations, so enabling
+    /// the opt-in pre-protocol arm can never widen what the automatic arm
+    /// touches. Guards against a future edit collapsing them into one query.
+    #[tokio::test]
+    async fn the_two_reaper_arms_are_disjoint() {
+        let _reap_guard = REAP_LOCK.lock().await;
+        let Some(pool) = pool_or_skip().await else {
+            return;
+        };
+        let repo = WorkerIdentityRepository::new(pool);
+        let live = "test-reap-disjoint-live";
+        let legacy = "test-reap-disjoint-legacy";
+        let gone = "test-reap-disjoint-gone";
+        cleanup_worker_rows(&repo.db_pool, &[live, legacy, gone], &[]).await;
+
+        for w in [live, legacy, gone] {
+            repo.register_tofu(w, &key(1), false, None).await.unwrap();
+        }
+        // live: pinging now. legacy: never pinged, ancient. gone: pinged, silent.
+        age_row(&repo, live, &key(1), Some(0), 5_000).await;
+        age_row(&repo, legacy, &key(1), None, 5_000).await;
+        age_row(&repo, gone, &key(1), Some(72), 5_000).await;
+
+        assert_eq!(
+            repo.reap_departed_identities(24).await.unwrap(),
+            1,
+            "automatic arm takes only the departed participant"
+        );
+        assert!(is_active(&repo, live, &key(1)).await);
+        assert!(is_active(&repo, legacy, &key(1)).await);
+        assert!(!is_active(&repo, gone, &key(1)).await);
+
+        assert_eq!(
+            repo.reap_pre_protocol_identities(24).await.unwrap(),
+            1,
+            "opt-in arm takes only the never-participating row"
+        );
+        assert!(
+            is_active(&repo, live, &key(1)).await,
+            "live worker untouched"
+        );
+        assert!(!is_active(&repo, legacy, &key(1)).await);
+
+        cleanup_worker_rows(&repo.db_pool, &[live, legacy, gone], &[]).await;
+    }
+
+    /// REVIEW 2A ATTACK: can a LIVE worker be reaped?
+    ///
+    /// Yes — via ONE-WAY liveness participation, and this test PINS that
+    /// residual exposure rather than asserting it away.
+    ///
+    /// `last_liveness_at` is set by the first successful ping and NOTHING ever
+    /// clears it: neither `register` nor `register_tofu` resets it. So a worker
+    /// that pings once and then stops pinging WHILE STILL RUNNING is reaped
+    /// after the window, even though it re-registers on EVERY boot and
+    /// `last_seen_at` is seconds old. Remaining ways to enter that state:
+    ///   * rolling the worker image BACK to a pre-liveness build,
+    ///   * dropping `TALOS_CONTROLLER_URL` from the worker env,
+    ///   * `TALOS_WORKER_LIVENESS_INTERVAL_SECS=0` (explicit opt-out),
+    ///   * a one-way worker→controller network block outlasting the window.
+    /// A MISTYPED interval is no longer one of them — that used to silently
+    /// disable the pinger and was the cheapest path from a config typo to a
+    /// fleet-wide outage; `resolve_liveness_interval` now WARNs and keeps
+    /// pinging at the default.
+    ///
+    /// The migration's safety claim ("An old worker never pings and stays NULL
+    /// (never reaped)") holds only for a row that has NEVER pinged. It does
+    /// not hold on the way back, and there is no code path that puts a row
+    /// back into the NULL population.
+    #[tokio::test]
+    async fn a_live_worker_that_stopped_pinging_is_still_reaped() {
+        let _reap_guard = REAP_LOCK.lock().await;
+        let Some(pool) = pool_or_skip().await else {
+            return;
+        };
+        let repo = WorkerIdentityRepository::new(pool);
+        let wid = "test-2a-rollback-live-worker";
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
+
+        // Day 0: worker on the liveness build registers and pings.
+        repo.register_tofu(wid, &key(1), false, Some("0.1.0+new1111"))
+            .await
+            .unwrap();
+        assert!(repo.touch_liveness(wid, &key(1)).await.unwrap());
+
+        // Day 1: operator rolls the image BACK to a pre-liveness build. The
+        // worker is alive and re-registers on boot; nothing clears liveness.
+        age_row(&repo, wid, &key(1), Some(25), 25).await;
+        assert_eq!(
+            repo.register_tofu(wid, &key(1), false, Some("0.1.0+old0000"))
+                .await
+                .unwrap(),
+            TofuOutcome::Registered,
+            "the worker is demonstrably alive: it just re-registered"
+        );
+
+        let seen_age_secs: f64 = sqlx::query_scalar(
+            "SELECT extract(epoch from (now() - last_seen_at))::float8 FROM worker_identities
+             WHERE worker_id = $1",
+        )
+        .bind(wid)
+        .fetch_one(&repo.db_pool)
+        .await
+        .unwrap();
+        assert!(
+            seen_age_secs < 60.0,
+            "last_seen_at proves the process is alive right now ({seen_age_secs}s old)"
+        );
+
+        // The automatic arm reaps it anyway.
+        assert_eq!(
+            repo.reap_departed_identities(24).await.unwrap(),
+            1,
+            "ATTACK SUCCEEDS: a live, just-re-registered worker was deactivated"
+        );
+        assert!(!is_active(&repo, wid, &key(1)).await);
+
+        // And it cannot recover on its own — needs an operator.
+        assert_eq!(
+            repo.register_tofu(wid, &key(1), false, None).await.unwrap(),
+            TofuOutcome::IdentityConflict
+        );
+
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
+    }
+
+    /// REVIEW 2A CONTROL: the same worker that had NEVER pinged survives the
+    /// identical sequence. Proves the finding above is specifically about the
+    /// one-way transition, not about `last_seen_at` age.
+    #[tokio::test]
+    async fn a_never_pinged_worker_survives_the_same_sequence() {
+        let _reap_guard = REAP_LOCK.lock().await;
+        let Some(pool) = pool_or_skip().await else {
+            return;
+        };
+        let repo = WorkerIdentityRepository::new(pool);
+        let wid = "test-2a-control-live-worker";
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
+
+        repo.register_tofu(wid, &key(1), false, Some("0.1.0+old0000"))
+            .await
+            .unwrap();
+        age_row(&repo, wid, &key(1), None, 25).await;
+        repo.register_tofu(wid, &key(1), false, Some("0.1.0+old0000"))
+            .await
+            .unwrap();
+        assert_eq!(repo.reap_departed_identities(24).await.unwrap(), 0);
+        assert!(is_active(&repo, wid, &key(1)).await);
 
         cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
     }

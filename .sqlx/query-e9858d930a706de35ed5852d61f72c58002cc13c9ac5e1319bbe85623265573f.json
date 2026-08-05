@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE worker_identities SET active = false\n             WHERE active\n               AND last_liveness_at IS NOT NULL\n               AND last_liveness_at < now() - make_interval(hours => $1::int)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e9858d930a706de35ed5852d61f72c58002cc13c9ac5e1319bbe85623265573f"
+}

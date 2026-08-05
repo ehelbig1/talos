@@ -97,12 +97,19 @@ pub(crate) async fn run_worker_identity_cli(sub: &str, args: &[String]) -> anyho
             }
             for r in rows {
                 println!(
-                    "{wid}\t{key}\tsealing={sealing}\tactive={active}\tlast_seen={seen}\tbuild={build}",
+                    "{wid}\t{key}\tsealing={sealing}\tactive={active}\tlast_seen={seen}\tlast_liveness={live}\tbuild={build}",
                     wid = r.worker_id,
                     key = hex::encode(r.public_key),
                     sealing = r.supports_sealing,
                     active = r.active,
                     seen = r.last_seen_at.to_rfc3339(),
+                    // "-" = never proved liveness. That is UNKNOWN liveness,
+                    // not "departed": the automatic reaper skips these rows.
+                    // `last_seen` is boot registration only.
+                    live = r
+                        .last_liveness_at
+                        .map(|t| t.to_rfc3339())
+                        .unwrap_or_else(|| "-".to_string()),
                     // "-" reads as "never reported", distinct from a real
                     // string; a pre-handshake worker legitimately has none.
                     build = r.build_version.as_deref().unwrap_or("-"),
