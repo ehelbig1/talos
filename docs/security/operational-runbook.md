@@ -438,7 +438,7 @@ curl -sH "Authorization: Bearer $PROMETHEUS_SCRAPE_TOKEN" \
   | grep -E '^talos_worker_(liveness|identity_reaps)'
 ```
 
-Expect all four, present even at zero:
+Expect all five, present even at zero:
 
 | Series | Meaning |
 |---|---|
@@ -446,10 +446,23 @@ Expect all four, present even at zero:
 | `talos_worker_liveness_recent_participants` | the subset still pinging (last ping within 2h) |
 | `talos_worker_liveness_pings_total{outcome}` | pings received, by response class |
 | `talos_worker_identity_reaps_total{arm}` | keys deactivated, by arm |
+| `talos_worker_liveness_population_truncated` | **must be 0** — see below |
 
-And confirm the two alerts are loaded (`/api/v1/rules` on your
-Prometheus): `TalosWorkerLivenessParticipationDropped` and
-`TalosWorkerIdentityReaped`.
+`talos_worker_liveness_population_truncated` is the one to read first,
+because it says whether the other four can be trusted at all. The two
+participation gauges come from a query bounded at 200 active identity
+rows (`MAX_FLEET_BUILD_ROWS`); the reap `UPDATE` has no such bound. Above
+200 they describe different populations, and a worker whose row sorts
+past the 200th is invisible to the alert while remaining fully reapable.
+While this reads 1, the controller **refuses to reap at all**
+(`event_kind="worker_identity_reap_skipped_unobservable"`), the
+step-4 gate below is uncheckable, and `participants` is an undercount
+rather than a census. Drain retired rows with
+`deactivate-worker-identity` until it reads 0 before going further.
+
+And confirm the three alerts are loaded (`/api/v1/rules` on your
+Prometheus): `TalosWorkerLivenessParticipationDropped`,
+`TalosWorkerIdentityReaped` and `TalosWorkerIdentityReapBlinded`.
 
 #### Step 1 — open the network path in BOTH directions
 
@@ -480,18 +493,36 @@ deactivated key, and cannot change `active` / `supports_sealing` /
 `build_version`. If your threat model does not permit opening the port,
 do not enable the reaper — the two decisions are inseparable.
 
-Verify from inside a worker pod:
+Verify from a pod on the worker's network identity. **The worker image
+has no HTTP client** — `worker/Dockerfile` purges `curl` and the
+`debian:trixie-slim` base has no `wget` — so `kubectl exec … curl`
+returns `command not found`, which is easy to misread as a network
+failure. Use an ephemeral debug container sharing the worker pod's
+network namespace (it is therefore subject to the same NetworkPolicy):
 
 ```bash
-kubectl exec -it <worker-pod> -- \
-  curl -s -o /dev/null -w '%{http_code}\n' -XPOST \
+kubectl debug -it <worker-pod> --image=curlimages/curl:latest \
+  --target=worker -- \
+  curl -s -o /dev/null -w '%{http_code}\n' --max-time 5 -XPOST \
   http://<release>-talos-controller.<ns>.svc.cluster.local:8000/internal/worker-liveness \
   -H 'content-type: application/json' -d '{}'
 ```
 
-`400` is SUCCESS here — it means the request reached the handler and was
-rejected as malformed, which is exactly what an empty body should do. A
-hang or connection error means the path is still blocked.
+**`422` is SUCCESS here.** An empty JSON object is valid JSON of the
+wrong shape, and axum's `Json` extractor rejects it with
+`422 Unprocessable Entity` before the handler runs. Any HTTP status at
+all proves the path is open; a hang, a timeout, or a connection error
+means it is still blocked (check both opt-ins, not just the ingress one).
+
+Two things this probe does **not** do, stated so you do not read it as
+more than it is:
+
+- it does not increment `talos_worker_liveness_pings_total`. The
+  extractor rejects the body before `worker_liveness_handler` is
+  entered, so nothing is counted. A flat ping counter after this probe
+  is expected and is not evidence of anything.
+- it does not exercise proof-of-possession, the freshness window, or the
+  database write. Only a real worker ping does that, which is step 2.
 
 #### Step 2 — roll the workers onto a build that pings
 
@@ -514,9 +545,20 @@ meaningfully.
 **This is the gate. Do not skip it, and do not do it by inference.**
 
 ```promql
+talos_worker_liveness_population_truncated  # must be 0, FIRST
 talos_worker_liveness_participants          # must equal your worker count
 talos_worker_liveness_recent_participants   # must equal the same number
 ```
+
+Read the truncation flag before the other two, every time. It is 1 when
+the active identity population has outgrown the bounded query the two
+gauges are computed from, and in that state **this gate cannot be
+evaluated**: `participants` is an undercount, `participants < worker
+count` will send you looking for a worker that is pinging perfectly
+well, and the pre-reap warning cannot cover the rows past the bound. The
+controller has already stopped reaping (that is the fail-safe), so there
+is no rush — but there is also no shortcut. Drain the ghost rows and
+come back.
 
 Cross-check against reality:
 
@@ -552,12 +594,31 @@ gauge cannot:
 talos_worker_liveness_pings_total
 ```
 
-- everything flat, including `outcome="accepted"` → pings are not
-  ARRIVING. Network path (step 1) or worker-side config.
+All five labels are meaningful; read all five, because between them they
+separate "not arriving" from "arriving and refused" from "arriving and
+lost", which need opposite responses:
+
+- everything flat, including `outcome="accepted"` → the pings are not
+  arriving **or not parseable**. This label set covers only requests that
+  reached the handler; a body rejected by the extractor first — wrong
+  shape (422), malformed JSON (400), over the 4096-byte limit (413),
+  wrong content-type (415) — is counted nowhere, and looks identical to
+  a network block from here. Check the network path (step 1) first, then
+  worker-side config, then whether the worker and controller builds
+  agree on the request shape.
 - `outcome="error"` climbing → pings ARE arriving and the controller is
   failing to record them. That is a database fault, and the workers are
   innocent. **Do not enable the reaper while this is non-flat** — the
   reaper would measure silence that the workers did not produce.
+- `outcome="rejected_request"` climbing → arriving and refused *before*
+  the database. Overwhelmingly this is **clock skew**: `issued_at_ms` is
+  checked against a 300s past / 60s future window, so a worker drifting
+  more than a minute ahead of the controller fails every ping while
+  running perfectly. Same treatment as `error` — the worker is pinging,
+  so do not let the reaper read it as silence.
+- `outcome="rejected_proof"` climbing → arriving with a signature that
+  does not verify: a key rotated outside the registration path, or a
+  worker presenting a key it never registered.
 - `outcome="inactive_identity"` climbing → some worker is pinging with a
   key that is not an active identity. It has already been revoked or
   reaped; re-register it.
@@ -582,9 +643,14 @@ kubectl logs deploy/<release>-talos-controller | grep worker-identity
 # want: "worker-identity reaper enabled: ..."
 ```
 
-On `silenceHours`: **this number is the security property** — a departed
-worker's key is trusted for at most that long plus one 300s sweep plus
-one worker-key overlay refresh (~24h+11m at defaults). Shortening it is a
+On `silenceHours`: **this number is the security property**, and it is
+the first of three additive terms rather than the whole of it. A departed
+worker's key is trusted for at most that long, **plus** the 300s
+ping-replay window (a captured ping stays valid that long, so
+`last_liveness_at` can be advanced past the worker's true last ping),
+**plus** one 300s reaper sweep, **plus** one worker-key overlay refresh
+(`TALOS_WORKER_KEY_REFRESH_SECS`, 60s) — ~24h+11m at defaults, which is
+where the 11 minutes comes from. Shortening it is a
 real trade, not a free tightening, because it also shortens the warning
 `TalosWorkerLivenessParticipationDropped` can give you, which is
 `silenceHours - 2h (participation horizon) - 1h (the alert's `for`)`.
@@ -641,6 +707,16 @@ any of them:**
   window. (A mutual outage self-heals — the reaper lives in the
   controller, and workers re-ping within 60s of its return. A one-way
   partition does not.)
+- **worker clock skew of more than 60 seconds AHEAD of the controller** —
+  the only entry on this list with no configuration change behind it, so
+  auditing recent changes will never find it. `issued_at_ms` is signed
+  and checked against a 300s past / 60s future window *before* the
+  database is touched, so a drifting worker gets a 400 on every ping
+  while running and pinging perfectly. Its fingerprint is
+  `talos_worker_liveness_pings_total{outcome="rejected_request"}`
+  climbing while `accepted` stays flat. NTP loss on a node is enough; a
+  cluster where node clocks are not disciplined should not run the
+  reaper.
 
 A **mistyped** interval is not one of these: a non-numeric value WARNs
 (`event_kind="worker_liveness_interval_unparseable"`) and keeps pinging at

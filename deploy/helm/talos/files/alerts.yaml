@@ -614,9 +614,14 @@ groups:
       # NO absent() ARM, and the reason is not the usual one. Both series are
       # plain IntGauges, exported from registration, so on any running
       # controller they always have a sample (reason 1 in this file's absence
-      # audit). If they are missing the controller is down or predates this
-      # build — TalosControllerDown and TalosWorkerBuildSkew own those. An
-      # absent() arm here would page on every pre-upgrade controller.
+      # audit). If they are missing, the controller is DOWN — which
+      # TalosControllerDown owns — or it PREDATES this build, which NO alert
+      # owns and none should: an absent() arm here would page on every
+      # controller during every upgrade that crosses this version, i.e. it
+      # would fire loudest exactly when nothing is wrong. Runbook step 0
+      # ("confirm the observability exists") is the deliberate manual
+      # substitute, and it is a step precisely because a rule cannot tell
+      # "old controller" from "gauge stopped publishing".
       #
       # AGGREGATION: the subtraction matches on ALL labels, so it is evaluated
       # PER CONTROLLER REPLICA (default replicaCount: 2) against that replica's
@@ -687,15 +692,26 @@ groups:
             the liveness signal you would need before enabling it is broken.
 
             Two causes, and they need opposite responses:
-              * THE WORKERS ARE GONE (scale-down, retired pods). Expected; the
-                reaper will clear the rows and this alert resolves itself.
+              * THE WORKERS ARE GONE (scale-down, retired pods). Expected —
+                but whether it CLEARS depends on the reaper, see action 1.
               * THE WORKERS ARE ALIVE AND STOPPED PINGING. This is the
                 dangerous one and it is a configuration fault every time —
                 see the action below.
           action: |
             1. Are the workers running? `kubectl get pods -l
-               app.kubernetes.io/component=worker`. If the pods are gone, this
-               is an expected scale-down: no action, it clears on the reap.
+               app.kubernetes.io/component=worker`. If the pods are gone this
+               is an expected scale-down, and what happens next depends on the
+               reaper: WITH it enabled the rows are deactivated one window
+               later and this alert clears itself, no action. With it DISABLED
+               — the default, and the state throughout every step of the
+               enablement runbook before the last one — nothing ever clears
+               them and this alert STAYS FIRING. That is a true finding, not a
+               false positive: it is reading "N signing keys are still trusted
+               by workers that no longer exist". Drain them
+               (`deactivate-worker-identity` per key) or enable the reaper. Do
+               not silence the rule, and do not wait for a self-resolution
+               that is not coming. See docs/security/operational-runbook.md
+               § 2.8.
             2. If they ARE running, DISABLE THE REAPER FIRST
                (TALOS_WORKER_IDENTITY_REAP_ENABLED unset, restart controller)
                and only then diagnose. Disabling costs nothing — it restores
@@ -705,14 +721,32 @@ groups:
                a rollback to a pre-liveness worker image; TALOS_CONTROLLER_URL
                missing from the worker env; TALOS_WORKER_LIVENESS_INTERVAL_SECS
                set to 0; a NetworkPolicy or ingress change that broke
-               worker→controller HTTP one-way. Check
-               talos_worker_liveness_pings_total on the controller: if
-               outcome="accepted" is flat AND every other outcome is flat too,
-               the pings are not ARRIVING (network or worker-side); if
-               outcome="error" is climbing, they are arriving and the
-               controller is failing to record them (a database fault — the
-               workers are innocent and must not be reaped).
-            4. Grep the worker logs for event_kind="worker_liveness_rejected",
+               worker→controller HTTP one-way; or WORKER CLOCK SKEW, the only
+               cause with no configuration change behind it — a worker drifting
+               more than 60s AHEAD of the controller fails the freshness check
+               on every ping while running perfectly, so auditing recent
+               changes will never find it.
+            4. Read talos_worker_liveness_pings_total on the controller. All
+               five outcomes matter and they separate the causes above:
+                 * every outcome flat, including accepted → nothing reached the
+                   handler. Either the pings are not ARRIVING (network path, or
+                   the worker is not pinging) or they are arriving and being
+                   refused by the extractor before the handler — wrong body
+                   shape, oversized body, wrong content-type — which this label
+                   set does not cover and which looks identical from here.
+                 * error climbing → they ARE arriving and the controller is
+                   failing to record them (a database fault). The workers are
+                   innocent and MUST NOT be reaped — disable the reaper.
+                 * rejected_request climbing → arriving and refused before the
+                   database: freshness (clock skew, in both directions) or a
+                   malformed field. This is the clock-skew fingerprint.
+                 * rejected_proof climbing → arriving with a signature that
+                   does not verify: a key rotated outside the registration
+                   path, or a worker signing with a key it never registered.
+                 * inactive_identity climbing → the key is already deactivated
+                   (revoked or previously reaped). Re-register it; the damage
+                   has already happened for that worker.
+            5. Grep the worker logs for event_kind="worker_liveness_rejected",
                "worker_liveness_not_found" or
                "worker_liveness_interval_unparseable".
 
@@ -723,9 +757,15 @@ groups:
       # on. Every count here is a trust-boundary write that a live worker
       # cannot undo by itself.
       #
-      # `sum by (arm)` collapses the controller replicas (only one wins the
-      # guarded UPDATE, but which one is arbitrary) while keeping the two arms
-      # apart, because they mean different things: `departed` is the automatic
+      # `sum by (arm)` ADDS across the controller replicas — it does not
+      # deduplicate them, and the distinction matters. It is correct here only
+      # because a reap is ONE guarded UPDATE: whichever replica's sweep wins
+      # gets `rows_affected = n` and every other replica gets 0, so the sum is
+      # the fleet total rather than a multiple of it. (Verified live against a
+      # two-replica scrape: forcing BOTH replicas to export 3 makes this rule
+      # report 6, which is what the arithmetic does, and is a state the reap
+      # path cannot produce.) It keeps the two arms apart because they mean
+      # different things: `departed` is the automatic
       # window firing, `pre_protocol` is the opt-in arm an operator explicitly
       # enabled. The counter is pre-seeded at 0 for both arms in talos-metrics,
       # so `increase()` has a series to reference before the first reap —
@@ -772,6 +812,79 @@ groups:
                the participation gauges are not being published — check that
                talos_worker_liveness_participants is present on
                /metrics/prometheus at all.
+
+      # THE DETECTOR AND THE ACTOR MUST SEE THE SAME POPULATION, and this is
+      # the alert for the state where they cannot.
+      #
+      # The two participation gauges above are computed from a BOUNDED query
+      # (`list_active_builds`, ORDER BY worker_id, public_key LIMIT 200). The
+      # reap UPDATE is UNBOUNDED. Above 200 active rows those two populations
+      # diverge, and a worker whose row sorts past the 200th is invisible to
+      # TalosWorkerLivenessParticipationDropped while still being fully
+      # reapable — i.e. the silent false reap this entire subsystem exists to
+      # prevent, reintroduced above a fleet size nothing announces. Runbook
+      # step 4's gate ("participants must equal your worker count") silently
+      # becomes uncheckable in that state, and its `participants < worker
+      # count` branch sends the operator after a phantom.
+      #
+      # It is not a hypothetical size: the feature's own premise is that every
+      # registration leaves a permanently ACTIVE row, so a pod-name-keyed
+      # fleet doing daily rolls reaches 200 in weeks.
+      #
+      # THE CONTROLLER ALREADY FAILED SAFE BY THE TIME YOU SEE THIS. While
+      # this gauge is 1 the reaper skips its sweep entirely and deactivates
+      # nothing (event_kind="worker_identity_reap_skipped_unobservable"), so
+      # this is not an outage — it is the security feature switched off by its
+      # own precondition, which is a state you must not sit in silently.
+      # Severity is warning for that reason, and it is deliberately NOT
+      # dependent on whether the reaper is enabled: an operator working
+      # through the enablement runbook needs to know the gate is uncheckable
+      # BEFORE they turn it on, not after.
+      #
+      # No absent() arm, same reason as the pair above: plain IntGauge,
+      # exported from registration on every controller carrying this build.
+      - alert: TalosWorkerIdentityReapBlinded
+        expr: max(talos_worker_liveness_population_truncated) > 0
+        for: 15m
+        labels:
+          severity: warning
+          category: fleet-identity
+        annotations:
+          summary: "worker-identity liveness detector is truncated; the reaper has stopped acting"
+          description: |
+            The ACTIVE worker_identities population is at or past the bound on
+            the query the liveness participation gauges are computed from (200
+            rows). Above that bound the detector and the reaper no longer
+            describe the same set of rows, so
+            TalosWorkerLivenessParticipationDropped can no longer promise to
+            warn before a key is deactivated.
+
+            The controller has therefore STOPPED REAPING — nothing is being
+            deactivated while this fires. The trust-bounding property is off,
+            which is the pre-#631 status quo, not a regression in progress.
+
+            talos_worker_liveness_participants and
+            talos_worker_liveness_recent_participants are both UNDERSTATED
+            while this fires. Do not read them as a fleet census, and do not
+            use them for the runbook's step-4 gate until this clears.
+          action: |
+            1. `list-worker-identities` and count ACTIVE rows. The overwhelming
+               likely cause is accumulated ghosts — every retired pod that ever
+               registered leaves an active row behind, which is the backlog the
+               reaper exists to drain and cannot drain while blinded.
+            2. Drain them: `deactivate-worker-identity` for every worker_id
+               with no corresponding running pod. This is safe for a departed
+               worker and recoverable (`register-worker-identity`) if you
+               retire one by mistake.
+            3. Confirm talos_worker_liveness_population_truncated returns to 0
+               and that talos_worker_liveness_participants now matches your
+               real worker count before relying on either gauge again.
+            4. If your fleet is LEGITIMATELY larger than 200 active identities,
+               this is not drainable and the cap must be raised in code
+               (MAX_FLEET_BUILD_ROWS in talos-worker-identity-repository, which
+               bounds the gauge query) — do not work around it by removing the
+               reaper's precondition, which is the only thing keeping the
+               detector and the reaper honest with each other.
 
   # ────────────────────────────────────────────────────────────────────
   - name: talos.vault

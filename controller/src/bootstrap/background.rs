@@ -349,7 +349,34 @@ pub(crate) fn publish_worker_liveness_participation(
             .set(i64::try_from(participants).unwrap_or(i64::MAX));
         m.worker_liveness_recent_participants
             .set(i64::try_from(recent).unwrap_or(i64::MAX));
+        m.worker_liveness_population_truncated
+            .set(i64::from(liveness_population_is_truncated(rows.len())));
     }
+}
+
+/// Did the bounded fleet query see the WHOLE active population, or did it stop
+/// at the cap?
+///
+/// **The detector and the reaper must operate on the same population, and
+/// without this they do not.** `list_active_builds` is
+/// `ORDER BY worker_id, public_key LIMIT MAX_FLEET_BUILD_ROWS` (200);
+/// `reap_departed_identities` is an UNBOUNDED `UPDATE`. So at 201+ active rows
+/// the row sorting 201st is invisible to both participation gauges and fully
+/// reapable — the silent false reap this whole area exists to prevent,
+/// reintroduced above a fleet size nothing announced. And the feature's own
+/// premise (every registration leaves a permanently ACTIVE row) means a
+/// pod-name-keyed fleet doing daily rolls reaches 200 in weeks, so this is not
+/// a hypothetical size.
+///
+/// SATURATING, and deliberately so: `len == LIMIT` means "at least 200 active
+/// rows, possibly many more". Learning the true count needs a second query, and
+/// it would not change the answer — the reaper must not act either way.
+///
+/// `>=`, not `>`: a fetch that returned exactly the cap may or may not have
+/// been truncated, and "may have been" is the same as "was" for a gate in front
+/// of an irreversible write.
+pub(crate) fn liveness_population_is_truncated(active_rows_seen: usize) -> bool {
+    active_rows_seen as i64 >= talos_worker_identity_repository::MAX_FLEET_BUILD_ROWS
 }
 
 /// Pure half of [`publish_worker_liveness_participation`]: returns
@@ -414,10 +441,16 @@ pub(crate) fn count_liveness_participants(
 /// permanently in this population, and a LIVE worker crosses the window
 /// whenever its pinger stops for a non-departure reason: an image rollback to a
 /// pre-liveness build, `TALOS_CONTROLLER_URL` removed, the interval env set to
-/// `0` or mistyped (a non-numeric value silently disables the pinger), or a
-/// one-way worker→controller network block outlasting the window. Length is the
-/// only defence against those, and length alone is not one. Before disabling a
-/// running worker's pinger, disable the reaper.
+/// `0`, a one-way worker→controller network block outlasting the window, or —
+/// the one with no config change behind it, so auditing recent changes never
+/// finds it — a worker clock drifting more than `WORKER_REG_FUTURE_MS` (60s)
+/// AHEAD of the controller, which makes every ping fail the freshness check
+/// with a 400 while the worker runs perfectly. (A MISTYPED interval is NOT one
+/// of these: since #631 a non-numeric value WARNs
+/// `worker_liveness_interval_unparseable` and keeps pinging at the default,
+/// precisely because silently disabling was the shape that escalated a typo
+/// into an outage.) Length is the only defence against those, and length alone
+/// is not one. Before disabling a running worker's pinger, disable the reaper.
 pub(crate) const DEFAULT_REAP_SILENCE_HOURS: i64 = 24;
 
 /// Hours of liveness silence that mark a participating worker as departed.
@@ -691,6 +724,57 @@ pub(crate) fn spawn_metrics_gauge_tasks(db_pool: sqlx::Pool<sqlx::Postgres>) {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
+
+                // ── THE OBSERVABILITY PRECONDITION ────────────────────────
+                //
+                // REFUSE TO SWEEP WHEN THE DETECTOR CANNOT SEE THE WHOLE
+                // POPULATION. The participation gauges — and therefore
+                // `TalosWorkerLivenessParticipationDropped`, the only warning
+                // that arrives BEFORE a reap — are computed from the bounded
+                // `list_active_builds` (LIMIT 200). This UPDATE is unbounded.
+                // Above the cap those two populations diverge, and a worker
+                // sorting past the 200th row is simultaneously invisible to
+                // the alert and fully reapable: exactly the silent false reap
+                // the whole feature exists to make impossible.
+                //
+                // So the invariant is enforced here rather than documented:
+                // THE REAPER NEVER ACTS ON A ROW THE DETECTOR CANNOT SEE. It
+                // costs one bounded SELECT per 300s sweep (the same query the
+                // gauge task already runs) and it fails in the direction that
+                // leaves keys trusted, which is the status quo.
+                //
+                // An ERROR here also skips: we cannot establish that the
+                // population is observable, and "could not check" must not
+                // read as "checked and fine" in front of an irreversible
+                // write. Same fail-safe direction as the reap statement's own.
+                match repo.list_active_builds().await {
+                    Ok(rows) if liveness_population_is_truncated(rows.len()) => {
+                        tracing::warn!(
+                            target: "worker_registry",
+                            event_kind = "worker_identity_reap_skipped_unobservable",
+                            active_rows_seen = rows.len(),
+                            "worker-identity reap sweep SKIPPED: the active identity \
+                             population is at or past the fleet-query cap, so the \
+                             liveness participation gauges no longer describe every row \
+                             this sweep could deactivate and no alert could warn before \
+                             a false reap. Nothing was deactivated. Drain retired rows \
+                             with deactivate-worker-identity until \
+                             talos_worker_liveness_population_truncated reads 0"
+                        );
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "worker_registry",
+                            error = %e,
+                            "worker-identity reap sweep SKIPPED: could not establish that \
+                             the liveness detector sees the whole active population; \
+                             nothing was deactivated"
+                        );
+                        continue;
+                    }
+                }
 
                 // i32 for the SQL `make_interval(hours => $1::int)` bind
                 // (check 27 — the pg arg is int4). Saturating, so an absurd
@@ -4514,5 +4598,49 @@ mod worker_liveness_reaper_metric_tests {
             ..row("w-1", None)
         };
         assert_eq!(count_liveness_participants(&[ahead], 2, now), (1, 1));
+    }
+
+    // ── detector/reaper population agreement ────────────────────────────
+
+    /// THE INVARIANT: the reaper must never act on a row the detector cannot
+    /// see. The detector reads a query capped at `MAX_FLEET_BUILD_ROWS`; the
+    /// reap `UPDATE` has no cap. So the cap is where the two populations
+    /// diverge, and this pins the boundary in both directions — an off-by-one
+    /// here is a row that is reapable and un-alertable.
+    #[test]
+    fn the_truncation_flag_trips_exactly_at_the_fleet_query_cap() {
+        let cap = talos_worker_identity_repository::MAX_FLEET_BUILD_ROWS as usize;
+        assert!(!liveness_population_is_truncated(0));
+        assert!(!liveness_population_is_truncated(cap - 1));
+        // `>=`, not `>`: a fetch that returned exactly the cap MAY have been
+        // truncated, and "may have been" is "was" in front of an
+        // irreversible write.
+        assert!(liveness_population_is_truncated(cap));
+        assert!(liveness_population_is_truncated(cap + 1));
+    }
+
+    /// The flag is PUBLISHED, not merely computed — an unpublished fail-safe
+    /// is a silent state, which is the same defect one level up. Driven
+    /// through the production publisher so a gauge that stopped being set
+    /// fails here.
+    #[test]
+    fn the_truncation_flag_is_published_and_drains() {
+        install_metrics();
+        let truncated = || {
+            talos_metrics::global()
+                .expect("global installed")
+                .worker_liveness_population_truncated
+                .get()
+        };
+        let cap = talos_worker_identity_repository::MAX_FLEET_BUILD_ROWS as usize;
+        let big: Vec<WorkerBuildRow> = (0..cap)
+            .map(|i| row(&format!("w-{i:04}"), Some(0)))
+            .collect();
+        publish_worker_liveness_participation(&big, 24, chrono::Utc::now());
+        assert_eq!(truncated(), 1, "at the cap the detector is not whole");
+        // ...and it must FALL again once the ghost rows are drained, or the
+        // alert on it is permanently red and therefore ignored.
+        publish_worker_liveness_participation(&big[..cap - 1], 24, chrono::Utc::now());
+        assert_eq!(truncated(), 0);
     }
 }

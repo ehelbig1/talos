@@ -577,6 +577,26 @@ pub(crate) struct WorkerLivenessRequest {
 /// Every returned value is a compile-time `&'static str` from a closed set of
 /// five — never caller-derived text, which at an unauthenticated endpoint
 /// would be attacker-controlled series cardinality.
+///
+/// **WHAT THIS COUNTER DOES NOT SEE, because the converse of the property
+/// above is not symmetric and reading it as if it were will send an operator
+/// the wrong way.** The counter cannot out-resolve the response — but the
+/// response CAN out-resolve the counter: every rejection that happens in an
+/// EXTRACTOR, before [`worker_liveness_handler`] is entered, is counted
+/// nowhere at all. Measured against the live endpoint 2026-08-05:
+/// `{}` (valid JSON, wrong shape) → **422**, malformed JSON → **400**, a body
+/// over `DefaultBodyLimit::max(4096)` → **413**, a non-JSON content-type →
+/// **415**. All four leave every one of the five labels flat.
+///
+/// That matters for exactly one reading: "every outcome is flat, therefore the
+/// pings are not ARRIVING" is what the runbook and the alert's action tell an
+/// operator, and it is not quite true — a worker whose request body fails to
+/// deserialize (wire skew between worker and controller builds) is arriving
+/// and being refused, while looking identical to a network block. Counting
+/// extractor rejections would need a middleware on this route, which is a
+/// larger change than it looks (it would also count anything else that ever
+/// mounts there); the honest interim is that the flat-everything case means
+/// "not arriving OR not parseable", and the runbook says so.
 /// Matched on `as_u16()` rather than on `StatusCode::UNAUTHORIZED` patterns:
 /// `StatusCode` wraps a `NonZeroU16`, which is not a structural-match type, so
 /// its associated constants are not usable as match patterns.
@@ -4259,11 +4279,20 @@ mod worker_liveness_metric_tests {
         // reaped; the metric must not resolve them further. If a future change
         // makes the response distinguish them, this assert is where the
         // metric's blast radius gets re-argued.
-        assert_eq!(
-            label(StatusCode::NOT_FOUND),
-            label(StatusCode::NOT_FOUND),
-            "never-registered / revoked / reaped share one status and one label"
-        );
+        // Never-registered, operator-revoked and reaped all leave the handler
+        // through the SAME `Ok(false)` arm as one 404, so `inactive_identity`
+        // must be reachable from that status and from NO other — otherwise the
+        // metric would resolve a distinction the response does not make, which
+        // is the existence-oracle failure this mapping exists to prevent.
+        // (An equality of `label(404)` with itself, which this replaced, pinned
+        // nothing at all.)
+        for code in [200u16, 201, 400, 401, 403, 409, 429, 500, 502, 503] {
+            assert_ne!(
+                label(StatusCode::from_u16(code).unwrap()),
+                "inactive_identity",
+                "status {code} must not resolve to the identity-existence label"
+            );
+        }
         // Closed set: no status maps outside these five.
         for code in [200u16, 201, 400, 401, 403, 404, 409, 429, 500, 502, 503] {
             let l = label(StatusCode::from_u16(code).unwrap());

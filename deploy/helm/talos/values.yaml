@@ -488,6 +488,18 @@ controller:
   # Turning ON the reaper without them is safe but pointless; turning them on
   # LATER, after some workers have already pinged, is the dangerous ordering
   # (see the `enabled` note).
+  #
+  # THERE IS A FLEET-SIZE CEILING, and it is enforced rather than documented.
+  # The liveness DETECTOR (the participation gauges, and therefore the only
+  # alert that warns before a reap) is computed from a query bounded at 200
+  # ACTIVE worker_identities rows; the reap statement is unbounded. Above that
+  # bound the two would describe different populations, so the reaper REFUSES
+  # to sweep and publishes `talos_worker_liveness_population_truncated 1`
+  # (alert: TalosWorkerIdentityReapBlinded). Nothing is deactivated in that
+  # state — it is the pre-feature behaviour, not an outage — but the feature is
+  # off until you drain retired rows with `deactivate-worker-identity`. Note
+  # that ghost rows are exactly what accumulates on a pod-name-keyed fleet, so
+  # a long-lived cluster can reach 200 without ever having 200 workers.
   workerIdentityReaper:
     # TALOS_WORKER_IDENTITY_REAP_ENABLED. Nothing is ever deactivated while
     # this is false — identical to the pre-feature behaviour.
@@ -499,9 +511,14 @@ controller:
     enabled: false
     # TALOS_WORKER_IDENTITY_REAP_HOURS — hours of liveness silence after
     # which a PARTICIPATING worker's key is deactivated. **This number is the
-    # security property**: a departed worker's key is trusted for at most
-    # this long plus one 300s sweep plus one worker-key overlay refresh
-    # (TALOS_WORKER_KEY_REFRESH_SECS, default 60s) — ~24h+11m at defaults.
+    # security property**, and it is the FIRST of three additive terms, not
+    # the whole of it. A departed worker's key is trusted for at most this
+    # long, plus the 300s ping-replay window (a captured ping stays valid that
+    # long, so `last_liveness_at` can be advanced past the worker's real last
+    # ping), plus one 300s reaper sweep interval, plus one worker-key overlay
+    # refresh (TALOS_WORKER_KEY_REFRESH_SECS, default 60s) — ~24h+11m at
+    # defaults. Two of those terms were previously left implicit while the
+    # total counted all three.
     #
     # 24h is chosen so that no transient outage crosses it: against the
     # worker's 60s default ping interval it is 1440 consecutive missed pings.

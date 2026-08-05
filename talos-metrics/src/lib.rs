@@ -155,7 +155,7 @@ pub struct TalosMetrics {
     // worst failure — deactivating the signing key of a LIVE worker — is
     // silent for a whole trust window (24h by default) and then presents as
     // fleet-wide signature-verification failure with nothing pointing at the
-    // cause. The three series below exist so that failure is visible BEFORE
+    // cause. The five series below exist so that failure is visible BEFORE
     // it happens, which is the precondition for turning the reaper on at all.
     /// Liveness pings received at `POST /internal/worker-liveness`.
     /// Labels: `outcome=accepted|rejected_request|rejected_proof|
@@ -222,6 +222,33 @@ pub struct TalosMetrics {
     /// does not ping (the chart default: the liveness ping is blocked at the
     /// network layer unless two opt-in NetworkPolicy rules are enabled).
     pub worker_liveness_recent_participants: IntGauge,
+    /// 1 when the liveness DETECTOR can no longer see the whole population the
+    /// REAPER can act on, 0 otherwise.
+    ///
+    /// **This closes the one gap that would have reintroduced the exact silent
+    /// false reap the pair above exists to prevent.** The two participation
+    /// gauges are computed from
+    /// `WorkerIdentityRepository::list_active_builds`, which is bounded
+    /// (`ORDER BY worker_id, public_key LIMIT MAX_FLEET_BUILD_ROWS`, 200). The
+    /// reaper's `UPDATE` is NOT bounded. So above 200 active rows a worker
+    /// whose row sorts after the 200th was invisible to both gauges and fully
+    /// reapable — `TalosWorkerLivenessParticipationDropped` could not warn
+    /// about it, and the runbook's "participants must equal your worker count"
+    /// gate silently became uncheckable.
+    ///
+    /// The fix is FAIL-SAFE rather than cosmetic: while this gauge is 1 the
+    /// reaper SKIPS its sweep entirely and deactivates nothing (see
+    /// `controller::bootstrap::background`). This series is what makes that
+    /// refusal visible — a fail-safe you cannot see is just a silent state,
+    /// which is the defect one level up. `TalosWorkerIdentityReapBlinded`
+    /// alerts on it.
+    ///
+    /// SATURATING, not a count: the bounded SELECT returning exactly 200 rows
+    /// means "at least 200 active rows, possibly more". Knowing HOW many are
+    /// unobserved would need a second query, and the number does not change
+    /// the response — drain the ghost rows with `deactivate-worker-identity`
+    /// until the detector is whole again.
+    pub worker_liveness_population_truncated: IntGauge,
 
     // Rate limiting metrics
     pub rate_limit_hits_total: CounterVec,
@@ -553,9 +580,10 @@ impl TalosMetrics {
         // label is derived from the status and each status class is reachable
         // (`liveness_outcome_label` maps 2xx/400/401/404/5xx). Seeding matters
         // more here than for most detectors: the steady state of the two
-        // failure-shaped values is 0, and during the enablement runbook's
-        // step 2 an operator reads these series to decide whether the fleet
-        // is pinging at all. An ABSENT series and a 0 one answer that question
+        // failure-shaped values is 0, and at the enablement runbook's step 0
+        // (does the instrumentation exist at all) and step 4 (THE GATE) an
+        // operator reads these series to decide whether the fleet is pinging
+        // at all. An ABSENT series and a 0 one answer that question
         // differently, and absent is the answer that gets a fleet reaped.
         for outcome in [
             "accepted",
@@ -616,6 +644,17 @@ impl TalosMetrics {
              that have stopped proving liveness and are heading for a reap.",
         )?;
         registry.register(Box::new(worker_liveness_recent_participants.clone()))?;
+
+        let worker_liveness_population_truncated = IntGauge::new(
+            "talos_worker_liveness_population_truncated",
+            "1 when the ACTIVE worker_identities population exceeds the bound \
+             on the query the participation gauges are computed from \
+             (MAX_FLEET_BUILD_ROWS = 200), i.e. the liveness detector can no \
+             longer see every row the reaper could act on. The reaper REFUSES \
+             to sweep while this is 1, so nothing is deactivated blind. Drain \
+             ghost rows with deactivate-worker-identity to clear it.",
+        )?;
+        registry.register(Box::new(worker_liveness_population_truncated.clone()))?;
 
         // Rate limiting metrics
         let rate_limit_hits_total = CounterVec::new(
@@ -847,6 +886,7 @@ impl TalosMetrics {
             worker_identity_reaps_total,
             worker_liveness_participants,
             worker_liveness_recent_participants,
+            worker_liveness_population_truncated,
             rate_limit_hits_total,
             cache_hits_total,
             cache_misses_total,
@@ -1013,6 +1053,10 @@ mod tests {
             // silently yields NO RESULT, i.e. a detector that cannot fire.
             "talos_worker_liveness_participants 0",
             "talos_worker_liveness_recent_participants 0",
+            // The detector-completeness flag. 0 = the participation pair
+            // above describes the WHOLE reapable population; the reaper only
+            // sweeps in that state.
+            "talos_worker_liveness_population_truncated 0",
         ] {
             assert!(
                 rendered.contains(expected),
