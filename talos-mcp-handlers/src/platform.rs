@@ -988,6 +988,14 @@ fn assemble_fleet_report(
                 "build_status": status,
                 "supports_sealing": r.supports_sealing,
                 "last_seen_at": r.last_seen_at.to_rfc3339(),
+                // null = this row has NEVER proved liveness, which means
+                // UNKNOWN, not departed — the automatic reaper deliberately
+                // refuses to act on it. A timestamp means the worker held this
+                // key's private half at that instant, and its key is trusted
+                // for at most TALOS_WORKER_IDENTITY_REAP_HOURS past it.
+                // `last_seen_at` above is BOOT REGISTRATION only and is not a
+                // liveness signal; do not read the two the same way.
+                "last_liveness_at": r.last_liveness_at.map(|t| t.to_rfc3339()),
             })
         })
         .collect();
@@ -2377,6 +2385,7 @@ mod fleet_report_tests {
             build_version: build.map(str::to_string),
             supports_sealing: false,
             last_seen_at: chrono::Utc::now(),
+            last_liveness_at: None,
         }
     }
 

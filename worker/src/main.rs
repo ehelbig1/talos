@@ -1842,6 +1842,15 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(worker::self_register::register_worker_identity_at_boot(
             rpc_signing_key,
         ));
+
+        // Periodic liveness ping. Registration alone told the controller this
+        // key EXISTS; nothing told it the process was still running, so a
+        // departed worker's public key stayed in the trusted verify ring
+        // forever. This is the refresh that lets the controller bound that.
+        // Detached and best-effort like the registration above — a failed ping
+        // never touches job processing, and the controller's window is many
+        // multiples of the interval so only sustained silence reaps a key.
+        tokio::spawn(worker::liveness::run_liveness_pinger(rpc_signing_key));
     }
 
     // M-3 (2026-05-22): log the SQL empty-allowlist policy at startup

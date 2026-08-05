@@ -500,6 +500,147 @@ pub(crate) async fn register_worker_key_handler(
     }
 }
 
+// ===== Worker liveness ping — bounding how long a departed key stays trusted =====
+//
+// `POST /internal/worker-liveness` — a running worker proves, on an interval,
+// that it still holds the private half of a key that is ALREADY in the trusted
+// verify ring. That proof is the only liveness signal this platform has about
+// registered identities, and it had to be built because the one that looked like
+// it existed does not: `WorkerHeartbeat` is constructed nowhere but tests,
+// `start_worker_management` has no call sites, and the heartbeat's `worker_id`
+// is a Uuid while `worker_identities.worker_id` is operator/pod text — so the
+// fleet view is permanently empty AND unjoinable. Intersecting the registry
+// against it would have reaped the entire fleet.
+//
+// WHY NO BEARER TOKEN. Possession of the registered private key is both the
+// stronger credential (it is worker-specific, where the registration bearer is
+// fleet-shared) and the only one every worker still has: a worker admitted by a
+// SINGLE-USE provisioning token has burned it and holds no reusable bearer. A
+// scheme that re-used the registration endpoint's auth could not refresh those
+// workers, and the sweep would then reap live ones — the exact fleet-wide
+// failure this whole change exists to avoid.
+//
+// WHY THIS GRANTS NOTHING. The handler's only write is
+// `WorkerIdentityRepository::touch_liveness`, one guarded UPDATE that moves
+// `last_liveness_at` forward on an ALREADY-ACTIVE row. It cannot insert, cannot
+// re-activate, and cannot alter `supports_sealing` / `build_version` / `active`.
+// So mounting it unconditionally (unlike the registration route, which is gated
+// on a configured credential) adds no trust surface — including for fleets that
+// register purely via the operator CLI, whose workers must be able to ping or
+// their identities could never be reaped.
+
+/// A liveness ping. Every field is bound into `proof`; there is nothing here a
+/// replayed or tampered request could change, because the only effect is a
+/// timestamp refresh on a row the proof already demonstrates ownership of.
+#[derive(serde::Deserialize)]
+pub(crate) struct WorkerLivenessRequest {
+    worker_id: String,
+    /// Hex Ed25519 verifying key (32 bytes) whose liveness is being asserted.
+    public_key: String,
+    /// Unix-millis when the worker built the request (freshness).
+    issued_at_ms: u64,
+    /// Anti-grinding nonce, bound into the proof.
+    nonce: String,
+    /// Hex Ed25519 signature (64 bytes) over the canonical liveness PoP message.
+    proof: String,
+}
+
+pub(crate) async fn worker_liveness_handler(
+    Extension(db_pool): Extension<sqlx::PgPool>,
+    axum::Json(req): axum::Json<WorkerLivenessRequest>,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    // Same asymmetric freshness window as registration, so a captured ping
+    // cannot be replayed indefinitely to keep a departed worker's key alive.
+    if let Err((status, msg)) = check_registration_freshness(req.issued_at_ms, now_ms) {
+        return worker_reg_error(status, msg);
+    }
+
+    if let Err(e) = talos_workflow_job_protocol::validate_worker_id(&req.worker_id) {
+        return worker_reg_error(StatusCode::BAD_REQUEST, leak_safe_validation(&e));
+    }
+    let public_key = match hex::decode(req.public_key.trim())
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+    {
+        Some(pk) => pk,
+        None => {
+            return worker_reg_error(
+                StatusCode::BAD_REQUEST,
+                "public_key must be 64-char hex (32-byte Ed25519 key)",
+            )
+        }
+    };
+    let proof = match hex::decode(req.proof.trim()) {
+        Ok(p) => p,
+        Err(_) => return worker_reg_error(StatusCode::BAD_REQUEST, "proof must be hex"),
+    };
+
+    // Proof-of-possession over a DOMAIN-SEPARATED message, so a captured
+    // registration proof cannot be replayed here (nor this one there).
+    if talos_workflow_job_protocol::verify_worker_liveness_proof(
+        &public_key,
+        &req.worker_id,
+        req.issued_at_ms,
+        &req.nonce,
+        &proof,
+    )
+    .is_err()
+    {
+        // Generic — do not distinguish "bad key" from "bad signature".
+        return worker_reg_error(StatusCode::UNAUTHORIZED, "proof-of-possession failed");
+    }
+
+    let repo = talos_worker_identity_repository::WorkerIdentityRepository::new(db_pool);
+    match repo.touch_liveness(&req.worker_id, &public_key).await {
+        Ok(true) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({ "status": "alive" })),
+        ),
+        Ok(false) => {
+            // The key is not an ACTIVE identity: never registered, revoked by an
+            // operator, or reaped. ONE response for all three — the caller has
+            // proven key possession but must not be handed a probe that
+            // distinguishes "unknown worker_id" from "revoked", and the worker
+            // itself does not need the distinction (its remedy is the same:
+            // an operator `register-worker-identity`).
+            //
+            // Logged, because for a REAL worker this is the loud case: its
+            // results are no longer verifying. `worker_id` is caller-supplied,
+            // so it goes in the log (which the DLP/allowlist path already
+            // handles for the registration WARNs) and never in a metric label.
+            tracing::warn!(
+                target: "talos_security",
+                event_kind = "worker_liveness_unknown_identity",
+                worker_id = %req.worker_id,
+                "worker liveness ping for a key that is not an active identity \
+                 (never registered, revoked, or reaped); its signed results will \
+                 not verify until an operator re-registers it"
+            );
+            worker_reg_error(StatusCode::NOT_FOUND, "no active identity for this key")
+        }
+        Err(e) => {
+            // Full error server-side, generic message out (no schema leak).
+            tracing::error!(
+                target: "talos_engine",
+                worker_id = %req.worker_id,
+                error = %e,
+                "worker liveness refresh DB write failed"
+            );
+            worker_reg_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "liveness refresh failed (see server logs)",
+            )
+        }
+    }
+}
+
 /// Refuse a worker-key registration that lost the trust-on-first-use rule:
 /// counts `talos_worker_key_tofu_conflicts_total`, emits the security WARN, and
 /// returns the 409.
@@ -3336,6 +3477,21 @@ pub(crate) fn build_router(
         Router::new()
     };
 
+    // Worker liveness ping — mounted UNCONDITIONALLY, unlike the registration
+    // route above. It needs no configured credential (the worker's own
+    // registered key IS the credential) and its only effect is refreshing
+    // `last_liveness_at` on an already-active row, so there is nothing to fail
+    // closed about. Gating it on the registration config would silently make
+    // CLI-registered fleets unable to participate, and a worker that cannot
+    // ping is a worker whose key can never be reaped.
+    let worker_liveness_routes = Router::new()
+        .route(
+            "/internal/worker-liveness",
+            axum::routing::post(worker_liveness_handler),
+        ) // no-nginx-route: in-cluster worker liveness ping, worker pods only
+        .layer(axum::extract::DefaultBodyLimit::max(4096))
+        .layer(Extension(db_pool.clone()));
+
     let app = Router::new()
         // Authenticated user-facing metrics dashboard. Stays inside the
         // rate-limited router; the unauthenticated Prometheus scrape lives
@@ -3494,6 +3650,7 @@ pub(crate) fn build_router(
         // RFC 0010 P2 inc.4c worker self-registration (empty router when the
         // token is unset, so this merge is a no-op in that mode).
         .merge(internal_routes)
+        .merge(worker_liveness_routes)
         // Request ID for tracing and audit logging (generates/propagates X-Request-ID)
         .layer(from_fn(request_id::request_id_middleware))
         // Security headers (apply to all responses)

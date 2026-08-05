@@ -55,22 +55,42 @@ fn scrub_wasm_log_for_broadcast(message: &str) -> String {
 /// it without any bookkeeping. A rise-only wiring would pin the alert firing
 /// forever after one rolling deploy.
 ///
-/// WHAT "ACTIVE" MEANS HERE, stated because the word is easy to over-read:
-/// `worker_identities.active`, i.e. a row that was registered and has not been
-/// explicitly deactivated. It is NOT "currently running". Nothing reaps rows for
-/// pods that no longer exist — `last_seen_at` is written only at boot
-/// registration (there is no periodic re-register, and the NATS fleet heartbeat
-/// does not touch this table), so an age filter cannot separate a departed pod
-/// from a long-lived healthy one and none is applied. In the chart's default
-/// posture the worker is a `Deployment` with an HPA and `worker_id` defaults to
-/// the pod name, so EVERY rolling deploy and scale-down leaves behind rows
-/// carrying the build those pods reported. Once the controller moves on, those
-/// rows are provably skewed forever and this gauge stays above zero until an
-/// operator runs `deactivate-worker-identity` for each. Pin `TALOS_WORKER_ID`
-/// per replica (stable ids re-register onto the same rows) or expect to drain
-/// the alert by hand. Do NOT "fix" this by decaying on `last_seen_at`: that
-/// would blind the gauge to a genuinely stale worker that has been up for days,
-/// which is the case it exists to catch.
+/// WHAT THE POPULATION IS, stated because "active" is easy to over-read.
+/// The base set is `worker_identities.active` — registered and not explicitly
+/// deactivated — which is NOT the same as "currently running". Two exclusions
+/// narrow it toward workers that plausibly ARE running:
+///
+/// * Rows the reaper has already deactivated drop out for free (they are no
+///   longer `active`). That is what finally lets this gauge DRAIN: it shipped
+///   as a gauge precisely so it could, but it previously had no population that
+///   ever shrank, because nothing ever cleared a row.
+/// * Rows that PROVED they speak the liveness protocol and have since gone
+///   silent past [`departed_liveness_cutoff_hours`] are excluded here too, so
+///   the gauge stops counting a departed worker in the window between its last
+///   ping and the reaper's next sweep. Without this the gauge would lag the
+///   truth by up to a sweep interval on every scale-down.
+///
+/// Rows with NO liveness evidence (`last_liveness_at IS NULL`) STAY COUNTED,
+/// and that asymmetry is deliberate. The reaper refuses to act on them because
+/// unknown liveness is not evidence of departure — but a DETECTOR must not go
+/// quiet on the same uncertainty, or a genuinely skewed fleet running a
+/// pre-liveness build would silence the very alert that exists to catch it
+/// (the #625 shape: a detector disabled by exactly the condition it detects).
+/// So the reaper under-acts on unknowns and the gauge over-reports them; each
+/// errs toward its own safe direction.
+///
+/// The practical consequence, unchanged from before for that population: on a
+/// pod-name-keyed fleet, rows left by pre-liveness pods keep this gauge above
+/// zero until either their workers roll onto a build that pings (after which
+/// they become reapable normally) or an operator drains them — with
+/// `deactivate-worker-identity` per key, or by enabling
+/// `TALOS_WORKER_IDENTITY_REAP_PRE_PROTOCOL_HOURS`.
+///
+/// Do NOT "fix" the NULL case by decaying on `last_seen_at`: that column is
+/// written only at boot registration, so it cannot tell a departed pod from a
+/// healthy long-lived one, and using it here would blind the gauge to a
+/// genuinely stale worker that has been up for days — the case it exists to
+/// catch.
 ///
 /// Counted per distinct `worker_id`, not per row: `list_active_builds` returns
 /// one row per (worker_id, key) and a worker mid-rotation legitimately holds
@@ -102,12 +122,47 @@ fn scrub_wasm_log_for_broadcast(message: &str) -> String {
 pub(crate) fn publish_worker_build_skew(
     controller_build: &str,
     rows: &[talos_worker_identity_repository::WorkerBuildRow],
+    departed_after_hours: i64,
+    now: chrono::DateTime<chrono::Utc>,
 ) {
+    let skewed = count_skewed_live_workers(controller_build, rows, departed_after_hours, now);
+    if let Some(m) = metrics::global() {
+        m.worker_build_skew_workers
+            .set(i64::try_from(skewed).unwrap_or(i64::MAX));
+    }
+}
+
+/// Whether a row is PROVABLY departed: it participated in the liveness protocol
+/// and has been silent longer than the reaper's window.
+///
+/// `None` is NOT departed — it is unknown, and the two must never collapse.
+/// Split out as a named predicate so that distinction is a thing a reader (and
+/// a test) can point at rather than an inline `is_some_and` to skim past.
+fn row_is_provably_departed(
+    row: &talos_worker_identity_repository::WorkerBuildRow,
+    departed_after_hours: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    row.last_liveness_at.is_some_and(|seen| {
+        now.signed_duration_since(seen) > chrono::Duration::hours(departed_after_hours)
+    })
+}
+
+/// Pure half of [`publish_worker_build_skew`] — counts distinct `worker_id`s
+/// that are (a) not provably departed and (b) proven to be on a different build
+/// than the controller. Extracted so the population rule is unit-testable
+/// without a metrics registry or a DB.
+pub(crate) fn count_skewed_live_workers(
+    controller_build: &str,
+    rows: &[talos_worker_identity_repository::WorkerBuildRow],
+    departed_after_hours: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> usize {
     use talos_worker_identity_repository::{build_is_verifiable, builds_match};
 
     let controller_verifiable = build_is_verifiable(controller_build);
-    let skewed = rows
-        .iter()
+    rows.iter()
+        .filter(|r| !row_is_provably_departed(r, departed_after_hours, now))
         .filter(|r| {
             r.build_version.as_deref().is_some_and(|wb| {
                 controller_verifiable
@@ -117,11 +172,37 @@ pub(crate) fn publish_worker_build_skew(
         })
         .map(|r| r.worker_id.as_str())
         .collect::<std::collections::HashSet<_>>()
-        .len();
-    if let Some(m) = metrics::global() {
-        m.worker_build_skew_workers
-            .set(i64::try_from(skewed).unwrap_or(i64::MAX));
-    }
+        .len()
+}
+
+/// Default hours of liveness silence after which a PARTICIPATING worker's key
+/// is treated as departed — both by the reaper and by the skew gauge's
+/// population.
+///
+/// **This number IS the security property**: a worker's signing key is trusted
+/// for at most this long after the worker stops proving it is alive. 24h against
+/// the worker's default 60s ping interval means 1440 consecutive missed pings.
+///
+/// Why not shorter, when a tighter bound is strictly better for the key-exposure
+/// half: because the cost of being WRONG is asymmetric and severe. A reaped key
+/// cannot be re-registered over the network — `register_tofu` refuses to
+/// re-activate a deactivated key, which is the anti-revocation-bypass rule we
+/// must not weaken — so a falsely-reaped worker needs an operator
+/// `register-worker-identity` before its results verify again. 24h is chosen so
+/// that only a genuinely departed worker can cross it, and it is configurable
+/// downward by operators who can accept that trade.
+pub(crate) const DEFAULT_REAP_SILENCE_HOURS: i64 = 24;
+
+/// Hours of liveness silence that mark a participating worker as departed.
+/// `TALOS_WORKER_IDENTITY_REAP_HOURS`, clamped to a floor of 1h so a typo
+/// cannot make the window instantaneous.
+pub(crate) fn departed_liveness_cutoff_hours() -> i64 {
+    std::env::var("TALOS_WORKER_IDENTITY_REAP_HOURS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|h| *h > 0)
+        .unwrap_or(DEFAULT_REAP_SILENCE_HOURS)
+        .max(1)
 }
 
 /// Embedding-provider re-probe loop + crypto-invariant orphan gauges +
@@ -231,7 +312,12 @@ pub(crate) fn spawn_metrics_gauge_tasks(db_pool: sqlx::Pool<sqlx::Postgres>) {
             loop {
                 ticker.tick().await;
                 match repo.list_active_builds().await {
-                    Ok(rows) => publish_worker_build_skew(&controller_build, &rows),
+                    Ok(rows) => publish_worker_build_skew(
+                        &controller_build,
+                        &rows,
+                        departed_liveness_cutoff_hours(),
+                        chrono::Utc::now(),
+                    ),
                     Err(e) => {
                         // Leave the gauge at its last value rather than
                         // publishing a 0 we did not measure — a DB blip must
@@ -241,6 +327,145 @@ pub(crate) fn spawn_metrics_gauge_tasks(db_pool: sqlx::Pool<sqlx::Postgres>) {
                             error = %e,
                             "worker build-skew gauge sweep could not list active builds"
                         );
+                    }
+                }
+            }
+        });
+    }
+
+    // Background task: worker-identity reaper — bounds how long a DEPARTED
+    // worker's Ed25519 public key stays in the controller's trusted verify
+    // ring.
+    //
+    // THE PROBLEM IT SOLVES. A key entered the ring at boot registration and
+    // left it only via an operator's `deactivate-worker-identity`. So every
+    // worker that ever registered — CI container, review rig, scaled-down
+    // replica, crashed pod — left a permanently trusted signing identity.
+    //
+    // WHY IT KEYS ON `last_liveness_at` AND NOT `last_seen_at`. `last_seen_at`
+    // is written ONLY at boot registration: there is no periodic re-register,
+    // and the NATS fleet heartbeat does not touch this table (nothing publishes
+    // that heartbeat at all — `WorkerHeartbeat` is constructed only in tests,
+    // `start_worker_management` has no call sites, and its `worker_id` is a
+    // Uuid where this table's is operator/pod text, so the fleet view is both
+    // empty and unjoinable). Decaying on `last_seen_at` would deactivate a
+    // long-lived HEALTHY worker. `last_liveness_at` is written by the worker's
+    // periodic proof-of-possession ping, so silence on it is real evidence.
+    //
+    // FAIL-SAFE DIRECTION — argued, not assumed. "Safe" here is DO NOT
+    // DEACTIVATE, because the two errors are wildly asymmetric:
+    //   * Falsely reaping a LIVE worker breaks verification of its signed
+    //     results, and it cannot recover on its own — `register_tofu` refuses
+    //     to re-activate a deactivated key (the rule that stops a shared-token
+    //     holder undoing a revocation, which we must not weaken). It needs an
+    //     operator. A sweep bug therefore manufactures a fleet-wide outage.
+    //   * Failing to reap a DEAD worker leaves its PUBLIC key verifying. To
+    //     exploit that, an attacker must already hold the corresponding PRIVATE
+    //     key — i.e. must already have compromised that worker. So the miss
+    //     widens an existing compromise window; it does not create one. It is
+    //     also exactly the status quo this task improves on.
+    // Every branch below therefore biases toward inaction: disabled unless
+    // explicitly configured, NULL-liveness rows untouchable, and a DB error
+    // deactivates nothing (the reap is a single guarded UPDATE, so an error
+    // leaves the fleet exactly as it was).
+    {
+        let pool = db_pool.clone();
+        tokio::spawn(async move {
+            let repo = talos_worker_identity_repository::WorkerIdentityRepository::new(pool);
+            let silence_hours = departed_liveness_cutoff_hours();
+
+            // Opt-in second arm for rows that NEVER participated (registered
+            // before the liveness protocol existed). Default OFF and separate
+            // on purpose: it keys on `last_seen_at`, so it cannot tell a
+            // departed pod from a healthy long-lived one on an old build.
+            // Setting it is the operator asserting a fact the controller cannot
+            // check — that their fleet has finished rolling onto a build that
+            // pings. See `reap_pre_protocol_identities`.
+            let pre_protocol_hours: Option<i64> =
+                std::env::var("TALOS_WORKER_IDENTITY_REAP_PRE_PROTOCOL_HOURS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<i64>().ok())
+                    .filter(|h| *h > 0);
+
+            let enabled = std::env::var("TALOS_WORKER_IDENTITY_REAP_ENABLED")
+                .map(|v| {
+                    let v = v.trim().to_ascii_lowercase();
+                    matches!(v.as_str(), "1" | "true" | "yes" | "on")
+                })
+                .unwrap_or(false);
+            if !enabled {
+                tracing::info!(
+                    target: "worker_registry",
+                    "worker-identity reaper disabled (TALOS_WORKER_IDENTITY_REAP_ENABLED unset); \
+                     departed workers' keys stay in the trusted verify ring until an operator \
+                     runs deactivate-worker-identity"
+                );
+                return;
+            }
+            tracing::info!(
+                target: "worker_registry",
+                silence_hours,
+                pre_protocol_hours = ?pre_protocol_hours,
+                "worker-identity reaper enabled: a key is trusted for at most \
+                 silence_hours after its worker stops proving liveness"
+            );
+
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+
+                // i32 for the SQL `make_interval(hours => $1::int)` bind
+                // (check 27 — the pg arg is int4). Saturating, so an absurd
+                // configured value cannot wrap into a SHORT window; it can only
+                // produce an even longer one, which is the safe direction.
+                let hours_i32 = i32::try_from(silence_hours).unwrap_or(i32::MAX);
+                match repo.reap_departed_identities(hours_i32).await {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        // Count only, never worker_id or key material — this is
+                        // an operator-facing log on a trust boundary, and the
+                        // identifying detail is already available via
+                        // list-worker-identities.
+                        tracing::warn!(
+                            target: "worker_registry",
+                            event_kind = "worker_identity_reaped",
+                            keys = n,
+                            silence_hours,
+                            "deactivated worker signing keys whose workers stopped \
+                             proving liveness; they must be re-registered by an \
+                             operator if those workers return"
+                        );
+                    }
+                    Err(e) => {
+                        // Nothing was deactivated (single guarded statement).
+                        tracing::warn!(
+                            target: "worker_registry",
+                            error = %e,
+                            "worker-identity reap sweep failed; no keys were deactivated"
+                        );
+                    }
+                }
+
+                if let Some(hours) = pre_protocol_hours {
+                    let hours_i32 = i32::try_from(hours).unwrap_or(i32::MAX);
+                    match repo.reap_pre_protocol_identities(hours_i32).await {
+                        Ok(0) => {}
+                        Ok(n) => tracing::warn!(
+                            target: "worker_registry",
+                            event_kind = "worker_identity_reaped_pre_protocol",
+                            keys = n,
+                            max_age_hours = hours,
+                            "deactivated worker signing keys that never participated in \
+                             the liveness protocol and have not re-registered within the \
+                             operator-configured window"
+                        ),
+                        Err(e) => tracing::warn!(
+                            target: "worker_registry",
+                            error = %e,
+                            "pre-protocol worker-identity reap sweep failed; no keys were \
+                             deactivated"
+                        ),
                     }
                 }
             }
@@ -3319,13 +3544,32 @@ mod detector_metric_tests {
         GAUGE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// A row with NO liveness evidence — the shape every pre-liveness worker
+    /// and every row predating the feature has. These STAY in the gauge's
+    /// population (unknown liveness must not silence a detector), so the
+    /// existing expectations below are unchanged by the population rule.
     fn row(worker: &str, build: Option<&str>) -> WorkerBuildRow {
         WorkerBuildRow {
             worker_id: worker.to_string(),
             build_version: build.map(str::to_string),
             supports_sealing: true,
             last_seen_at: chrono::Utc::now(),
+            last_liveness_at: None,
         }
+    }
+
+    /// A row whose worker pinged `hours_ago`.
+    fn row_pinged(worker: &str, build: Option<&str>, hours_ago: i64) -> WorkerBuildRow {
+        WorkerBuildRow {
+            last_liveness_at: Some(chrono::Utc::now() - chrono::Duration::hours(hours_ago)),
+            ..row(worker, build)
+        }
+    }
+
+    /// Drive the gauge with a fixed 24h departure cutoff and `now`, so the
+    /// tests below read as "what population is counted", not "what time is it".
+    fn publish(controller_build: &str, rows: &[WorkerBuildRow]) {
+        publish_worker_build_skew(controller_build, rows, 24, chrono::Utc::now());
     }
 
     /// The gauge must RISE with skewed workers and RETURN TO 0 when they
@@ -3339,7 +3583,7 @@ mod detector_metric_tests {
         let controller = "1.0.0-r400+aaaaaaa";
 
         // Two provably different commits + one match.
-        publish_worker_build_skew(
+        publish(
             controller,
             &[
                 row("w1", Some("0.1.0+bbbbbbb")),
@@ -3351,7 +3595,7 @@ mod detector_metric_tests {
 
         // The skewed workers redeploy onto the controller's commit. The gauge
         // must fall on its own — nothing decrements it explicitly.
-        publish_worker_build_skew(
+        publish(
             controller,
             &[
                 row("w1", Some("0.1.0+aaaaaaa")),
@@ -3362,9 +3606,9 @@ mod detector_metric_tests {
         assert_eq!(m.worker_build_skew_workers.get(), 0);
 
         // A skewed worker leaving the fleet also lowers it (empty row set).
-        publish_worker_build_skew(controller, &[row("w1", Some("0.1.0+bbbbbbb"))]);
+        publish(controller, &[row("w1", Some("0.1.0+bbbbbbb"))]);
         assert_eq!(m.worker_build_skew_workers.get(), 1);
-        publish_worker_build_skew(controller, &[]);
+        publish(controller, &[]);
         assert_eq!(m.worker_build_skew_workers.get(), 0);
     }
 
@@ -3378,7 +3622,7 @@ mod detector_metric_tests {
         let m = install_metrics();
         let controller = "1.0.0-r400+aaaaaaa";
 
-        publish_worker_build_skew(
+        publish(
             controller,
             &[
                 row("pre-handshake", None),
@@ -3390,11 +3634,11 @@ mod detector_metric_tests {
         assert_eq!(m.worker_build_skew_workers.get(), 0);
 
         // Controller itself unverifiable → nothing is provable either way.
-        publish_worker_build_skew("0.1.0+unknown", &[row("w1", Some("0.1.0+bbbbbbb"))]);
+        publish("0.1.0+unknown", &[row("w1", Some("0.1.0+bbbbbbb"))]);
         assert_eq!(m.worker_build_skew_workers.get(), 0);
 
         // A -dirty tree on ONE side only IS skew: same commit, different bytes.
-        publish_worker_build_skew(controller, &[row("w1", Some("0.1.0+aaaaaaa-dirty"))]);
+        publish(controller, &[row("w1", Some("0.1.0+aaaaaaa-dirty"))]);
         assert_eq!(m.worker_build_skew_workers.get(), 1);
     }
 
@@ -3410,7 +3654,7 @@ mod detector_metric_tests {
         let controller = "1.0.0-r400+aaaaaaa";
 
         // One worker, two active keys, both reporting the same skewed build.
-        publish_worker_build_skew(
+        publish(
             controller,
             &[
                 row("w1", Some("0.1.0+bbbbbbb")),
@@ -3421,7 +3665,7 @@ mod detector_metric_tests {
 
         // Mid-rotation disagreement: one key already on the controller's build,
         // the other still stale. The worker is still (partly) skewed — once.
-        publish_worker_build_skew(
+        publish(
             controller,
             &[
                 row("w1", Some("0.1.0+aaaaaaa")),
@@ -3431,7 +3675,7 @@ mod detector_metric_tests {
         assert_eq!(m.worker_build_skew_workers.get(), 1);
 
         // Distinct workers still add up.
-        publish_worker_build_skew(
+        publish(
             controller,
             &[
                 row("w1", Some("0.1.0+bbbbbbb")),
@@ -3439,5 +3683,137 @@ mod detector_metric_tests {
             ],
         );
         assert_eq!(m.worker_build_skew_workers.get(), 2);
+    }
+
+    /// The population rule that finally lets this gauge DRAIN: a worker that
+    /// PROVED it speaks the liveness protocol and then went silent past the
+    /// window is excluded, so the gauge stops counting it immediately rather
+    /// than waiting for the reaper's next sweep to clear the row.
+    #[test]
+    fn build_skew_gauge_drops_provably_departed_workers() {
+        let _g = gauge_guard();
+        let m = install_metrics();
+        let controller = "1.0.0-r400+aaaaaaa";
+
+        // Skewed and pinging 1h ago → still counted; it is really out there.
+        publish(controller, &[row_pinged("w1", Some("0.1.0+bbbbbbb"), 1)]);
+        assert_eq!(m.worker_build_skew_workers.get(), 1);
+
+        // Same worker, same skew, but silent for 48h under the 24h cutoff →
+        // provably departed, so it is no longer evidence of a skewed FLEET.
+        publish(controller, &[row_pinged("w1", Some("0.1.0+bbbbbbb"), 48)]);
+        assert_eq!(m.worker_build_skew_workers.get(), 0);
+
+        // Boundary: just inside the window is still counted.
+        publish(controller, &[row_pinged("w1", Some("0.1.0+bbbbbbb"), 23)]);
+        assert_eq!(m.worker_build_skew_workers.get(), 1);
+    }
+
+    /// The asymmetry between the reaper and the gauge, asserted so a future
+    /// edit cannot quietly "unify" them. The reaper refuses to act on a row
+    /// with NO liveness evidence; the gauge KEEPS counting it. If the gauge
+    /// dropped unknown-liveness rows too, a fleet running an entirely
+    /// pre-liveness build would silence the build-skew alert — a detector
+    /// disabled by exactly the condition it exists to detect (#625).
+    #[test]
+    fn build_skew_gauge_still_counts_workers_with_unknown_liveness() {
+        let _g = gauge_guard();
+        let m = install_metrics();
+        let controller = "1.0.0-r400+aaaaaaa";
+
+        // No liveness evidence at all, registered long ago. Unknown ≠ departed.
+        let mut ancient = row("w1", Some("0.1.0+bbbbbbb"));
+        ancient.last_seen_at = chrono::Utc::now() - chrono::Duration::days(365);
+        publish(controller, &[ancient]);
+        assert_eq!(
+            m.worker_build_skew_workers.get(),
+            1,
+            "a row with unknown liveness must stay visible to the detector"
+        );
+    }
+
+    /// The gauge half of the 2026-08-04 reproduction: drive
+    /// `talos_worker_build_skew_workers` with the EXACT rows observed live and
+    /// show it go 1 → 0 through the mechanism, not through an assertion.
+    ///
+    /// Live state, controller on `3ffb611`:
+    /// ```text
+    /// dev-worker-fleet   0.1.0+3ffb611  (running)
+    /// worker-wt-cddef6d  0.1.0+cddef6d  (container deleted hours earlier)
+    /// ```
+    /// The gauge read 1, and nothing could ever lower it: the ghost row was
+    /// `active` forever and its build was provably skewed forever.
+    #[test]
+    fn reproduces_the_2026_08_04_skew_gauge_and_drains_it() {
+        let _g = gauge_guard();
+        let m = install_metrics();
+        let controller = "1.0.0-r400+3ffb611";
+
+        // BEFORE — both rows active, neither has liveness evidence (nothing
+        // pinged yet). This is the observed reading, and it is stuck.
+        publish(
+            controller,
+            &[
+                row("dev-worker-fleet", Some("0.1.0+3ffb611")),
+                row("worker-wt-cddef6d", Some("0.1.0+cddef6d")),
+            ],
+        );
+        assert_eq!(
+            m.worker_build_skew_workers.get(),
+            1,
+            "reproduce the live reading before claiming to fix it"
+        );
+
+        // AFTER — both workers roll onto a build that pings. The live one keeps
+        // pinging; the ghost's last ping recedes past the window. The gauge
+        // drains on its own, before the reaper's sweep even clears the row.
+        publish(
+            controller,
+            &[
+                row_pinged("dev-worker-fleet", Some("0.1.0+3ffb611"), 0),
+                row_pinged("worker-wt-cddef6d", Some("0.1.0+cddef6d"), 48),
+            ],
+        );
+        assert_eq!(m.worker_build_skew_workers.get(), 0);
+
+        // ...and once the reaper deactivates it, the row is gone from
+        // `list_active_builds` entirely, so the gauge stays at 0 for the second
+        // reason too.
+        publish(
+            controller,
+            &[row("dev-worker-fleet", Some("0.1.0+3ffb611"))],
+        );
+        assert_eq!(m.worker_build_skew_workers.get(), 0);
+    }
+
+    /// The window is the security property, so pin its default and the shape of
+    /// its override rather than leaving both to a code read.
+    #[test]
+    fn departed_cutoff_default_and_floor() {
+        // Mutates process env; borrow the same lock the gauge tests use so a
+        // thread-parallel `cargo test` can't interleave with them.
+        let _g = gauge_guard();
+        // The stated property: "a key is trusted for at most 24h after its
+        // worker stops proving liveness."
+        assert_eq!(DEFAULT_REAP_SILENCE_HOURS, 24);
+        // Unset → the default. (Set via the env only in the two cases below,
+        // which are read through the same accessor the sweep uses.)
+        std::env::remove_var("TALOS_WORKER_IDENTITY_REAP_HOURS");
+        assert_eq!(departed_liveness_cutoff_hours(), 24);
+
+        std::env::set_var("TALOS_WORKER_IDENTITY_REAP_HOURS", "6");
+        assert_eq!(departed_liveness_cutoff_hours(), 6);
+
+        // Zero / negative / garbage fall back to the default rather than
+        // producing an instantaneous window — a typo must not reap the fleet.
+        for bad in ["0", "-5", "immediately", ""] {
+            std::env::set_var("TALOS_WORKER_IDENTITY_REAP_HOURS", bad);
+            assert_eq!(
+                departed_liveness_cutoff_hours(),
+                24,
+                "a bad window value must fall back to the safe default, got {bad:?}"
+            );
+        }
+        std::env::remove_var("TALOS_WORKER_IDENTITY_REAP_HOURS");
     }
 }

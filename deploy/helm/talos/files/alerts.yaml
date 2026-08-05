@@ -493,18 +493,31 @@ groups:
       # population converges.
       #
       # READ "ACTIVE" NARROWLY — this is the one thing about this alert that is
-      # easy to get wrong. The population is rows in `worker_identities` that
-      # have not been explicitly deactivated. It is NOT "processes currently
-      # running". Nothing reaps the row of a pod that is gone, and
-      # `last_seen_at` is written only at boot registration (there is no
-      # periodic re-register and the NATS fleet heartbeat does not touch this
-      # table), so no age filter can distinguish a departed pod from a healthy
-      # long-lived one and none is applied. With the chart's default worker
-      # `Deployment` + HPA, `worker_id` is the pod name, so every roll and
-      # scale-down leaves rows behind: after the FIRST controller upgrade that
-      # follows, this gauge counts those ghosts and STAYS above zero until an
-      # operator deactivates their keys. It does not self-drain on that posture.
-      # Give workers stable ids (TALOS_WORKER_ID per replica) if you want it to.
+      # easy to get wrong. The base population is rows in `worker_identities`
+      # that have not been deactivated. It is NOT "processes currently running".
+      # Two exclusions narrow it toward workers that plausibly ARE:
+      #   * rows the worker-identity reaper has deactivated (they stop being
+      #     active) — which is what finally lets this gauge DRAIN, and
+      #   * rows that PROVED liveness and then went silent past
+      #     TALOS_WORKER_IDENTITY_REAP_HOURS, so the gauge does not lag the
+      #     reaper's sweep interval on a scale-down.
+      #
+      # Rows with NO liveness evidence (`last_liveness_at IS NULL` — every row
+      # registered by a pre-liveness worker) STAY COUNTED, and the asymmetry is
+      # deliberate: the reaper refuses to act on unknown liveness because
+      # absence of evidence is not evidence of departure, but a DETECTOR must
+      # not go quiet on that same uncertainty or a fleet running an entirely
+      # pre-liveness build would silence the alert that exists to catch it.
+      #
+      # So on a pod-name-keyed fleet whose workers predate the liveness
+      # protocol, this gauge STILL counts the ghosts each roll and scale-down
+      # leaves behind, and still needs draining — either by rolling those
+      # workers onto a build that pings (after which they reap normally) or by
+      # an operator, via `deactivate-worker-identity` per key or by setting
+      # TALOS_WORKER_IDENTITY_REAP_PRE_PROTOCOL_HOURS. Stable ids
+      # (TALOS_WORKER_ID per replica) avoid accumulating them in the first
+      # place. `last_seen_at` remains boot-registration-only and is NOT a
+      # liveness signal — do not build an age filter on it.
       #
       # `for: 30m` outlasts any rolling deploy (workers re-register within
       # seconds of their pod starting) and catches the case the WARN cannot
