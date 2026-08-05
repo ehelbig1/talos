@@ -147,6 +147,82 @@ pub struct TalosMetrics {
     /// not evidence of skew — #578).
     pub worker_build_skew_workers: IntGauge,
 
+    // ---- Worker-identity liveness + reaper (2026-08) ----
+    //
+    // Before these, the entire proof-of-possession liveness path and the
+    // reaper that consumes it were UNINSTRUMENTED: no metric, no alert. That
+    // is not a gap like an ordinary missing counter, because the reaper's
+    // worst failure — deactivating the signing key of a LIVE worker — is
+    // silent for a whole trust window (24h by default) and then presents as
+    // fleet-wide signature-verification failure with nothing pointing at the
+    // cause. The three series below exist so that failure is visible BEFORE
+    // it happens, which is the precondition for turning the reaper on at all.
+    /// Liveness pings received at `POST /internal/worker-liveness`.
+    /// Labels: `outcome=accepted|rejected_request|rejected_proof|
+    /// inactive_identity|error` — a closed set of `&'static str` DERIVED FROM
+    /// THE RESPONSE STATUS the endpoint already returns
+    /// (`controller::bootstrap::router::liveness_outcome_label`).
+    ///
+    /// TWO PROPERTIES THAT MUST NOT BE WEAKENED, both because this endpoint
+    /// is unauthenticated and reachable by any caller that can open a socket
+    /// to the controller:
+    ///  * NO caller-derived label. Not `worker_id`, not the presented public
+    ///    key, not an error string — each would hand an unauthenticated
+    ///    caller control of series cardinality (an OOM DoS on the scrape
+    ///    path). The identifying detail lives in the `talos_security` log,
+    ///    which is rate-limited and DLP-scrubbed; a metric label is neither.
+    ///  * NO new distinction. Deriving the label from the HTTP status makes
+    ///    it STRUCTURALLY impossible for this counter to tell an observer
+    ///    anything the endpoint's own response does not already — so it can
+    ///    never become an existence oracle for "is this worker registered".
+    ///    (The endpoint already answers 401 for a bad proof and 404 for a key
+    ///    that is not an active identity, and 404 is only reachable AFTER a
+    ///    valid proof-of-possession, i.e. by someone who already holds the
+    ///    private key.) Do not "improve" this by labelling from inside the
+    ///    handler's branches.
+    pub worker_liveness_pings_total: CounterVec,
+    /// Worker signing keys deactivated by the reaper. Labels:
+    /// `arm=departed|pre_protocol` — `departed` is the automatic arm keyed on
+    /// liveness silence, `pre_protocol` the opt-in arm keyed on registration
+    /// age for rows that never participated. Counts KEYS, not workers (a
+    /// worker mid-rotation holds two rows).
+    ///
+    /// This is the "what just happened" pointer for the failure this whole
+    /// area exists to survive: a false reap manifests as signature failures
+    /// across the fleet, and without this counter there is nothing in the
+    /// metrics tying that to a trust-boundary write. UNLABELLED by worker —
+    /// same cardinality rule as above, and the reaper's own WARN already
+    /// carries the count.
+    pub worker_identity_reaps_total: CounterVec,
+    /// Distinct `worker_id`s with an ACTIVE `worker_identities` row that have
+    /// proved liveness at least once — i.e. **the automatic reaper's
+    /// population**. A row enters it on its first ping and never leaves
+    /// (nothing clears `last_liveness_at`) until the row is deactivated, so
+    /// this is exactly the set of identities the reaper is able to act on.
+    ///
+    /// A GAUGE recomputed from the fleet query each sweep (always `set`), for
+    /// the same reason as `worker_build_skew_workers`: it must be able to
+    /// fall as well as rise.
+    pub worker_liveness_participants: IntGauge,
+    /// The subset of [`Self::worker_liveness_participants`] whose most recent
+    /// liveness proof is inside the participation horizon — i.e. **the set
+    /// still actively pinging**.
+    ///
+    /// THE PAIR IS THE POINT, and neither number is useful alone. The
+    /// difference `participants - recent_participants` is the count of keys
+    /// that are in the reaper's population and have STOPPED proving liveness:
+    /// the pre-reap signature of a false reap, visible for the whole gap
+    /// between the horizon and the trust window (~22h at defaults) BEFORE any
+    /// key is deactivated. Publishing only the difference would have hidden
+    /// the denominator — "3 silent" reads very differently at 3 participants
+    /// than at 300 — so both are exported and the alert does the subtraction.
+    ///
+    /// On a fleet that has NEVER participated both are 0 and the difference
+    /// is 0, which is why the alert cannot fire on a fleet that legitimately
+    /// does not ping (the chart default: the liveness ping is blocked at the
+    /// network layer unless two opt-in NetworkPolicy rules are enabled).
+    pub worker_liveness_recent_participants: IntGauge,
+
     // Rate limiting metrics
     pub rate_limit_hits_total: CounterVec,
 
@@ -457,6 +533,90 @@ impl TalosMetrics {
         )?;
         registry.register(Box::new(worker_build_skew_workers.clone()))?;
 
+        // ---- Worker-identity liveness + reaper ----
+        let worker_liveness_pings_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_worker_liveness_pings_total",
+                "Proof-of-possession liveness pings received at \
+                 POST /internal/worker-liveness. Labels: outcome=accepted|\
+                 rejected_request|rejected_proof|inactive_identity|error, \
+                 derived from the response status so the counter can never \
+                 distinguish more than the endpoint's own reply. Never \
+                 labelled by worker_id or key — the endpoint is \
+                 unauthenticated and a caller-derived label is unbounded \
+                 cardinality.",
+            ),
+            &["outcome"],
+        )?;
+        registry.register(Box::new(worker_liveness_pings_total.clone()))?;
+        // Seed ALL FIVE: every value has a live emitting site, because the
+        // label is derived from the status and each status class is reachable
+        // (`liveness_outcome_label` maps 2xx/400/401/404/5xx). Seeding matters
+        // more here than for most detectors: the steady state of the two
+        // failure-shaped values is 0, and during the enablement runbook's
+        // step 2 an operator reads these series to decide whether the fleet
+        // is pinging at all. An ABSENT series and a 0 one answer that question
+        // differently, and absent is the answer that gets a fleet reaped.
+        for outcome in [
+            "accepted",
+            "rejected_request",
+            "rejected_proof",
+            "inactive_identity",
+            "error",
+        ] {
+            worker_liveness_pings_total
+                .with_label_values(&[outcome])
+                .inc_by(0.0);
+        }
+
+        let worker_identity_reaps_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_worker_identity_reaps_total",
+                "Worker signing keys deactivated by the worker-identity \
+                 reaper. Labels: arm=departed|pre_protocol. `departed` is the \
+                 automatic arm (liveness silence past \
+                 TALOS_WORKER_IDENTITY_REAP_HOURS); `pre_protocol` is the \
+                 opt-in arm for rows that never participated. A reaped key \
+                 cannot re-register itself — every count here needs an \
+                 operator if the worker is still alive.",
+            ),
+            &["arm"],
+        )?;
+        registry.register(Box::new(worker_identity_reaps_total.clone()))?;
+        // Both arms seeded: both have a live emitting site in the reaper
+        // sweep. `pre_protocol` only ever moves when an operator sets its env
+        // var, but the code path exists unconditionally — same case as
+        // crash_recovery_total's `reclaimed`. The expected steady state of
+        // BOTH is 0 forever, which is precisely why they must be present
+        // rather than absent: `increase(...) > 0` over an absent series
+        // matches nothing, so an un-seeded counter would leave the reap alert
+        // unfireable until the first reap it was supposed to warn about.
+        for arm in ["departed", "pre_protocol"] {
+            worker_identity_reaps_total
+                .with_label_values(&[arm])
+                .inc_by(0.0);
+        }
+
+        let worker_liveness_participants = IntGauge::new(
+            "talos_worker_liveness_participants",
+            "Distinct worker_ids with an ACTIVE worker_identities row that \
+             have proved liveness at least once — the automatic reaper's \
+             population. Recomputed each sweep. Rows that never pinged \
+             (last_liveness_at IS NULL) are NOT counted: the automatic reaper \
+             cannot act on them.",
+        )?;
+        registry.register(Box::new(worker_liveness_participants.clone()))?;
+
+        let worker_liveness_recent_participants = IntGauge::new(
+            "talos_worker_liveness_recent_participants",
+            "The subset of talos_worker_liveness_participants whose last \
+             liveness proof is inside the participation horizon (2h, or the \
+             configured trust window if shorter) — i.e. still actively \
+             pinging. participants MINUS this is the number of trusted keys \
+             that have stopped proving liveness and are heading for a reap.",
+        )?;
+        registry.register(Box::new(worker_liveness_recent_participants.clone()))?;
+
         // Rate limiting metrics
         let rate_limit_hits_total = CounterVec::new(
             prometheus::Opts::new(
@@ -683,6 +843,10 @@ impl TalosMetrics {
             audit_verification_failures_total,
             worker_key_tofu_conflicts_total,
             worker_build_skew_workers,
+            worker_liveness_pings_total,
+            worker_identity_reaps_total,
+            worker_liveness_participants,
+            worker_liveness_recent_participants,
             rate_limit_hits_total,
             cache_hits_total,
             cache_misses_total,
@@ -832,6 +996,23 @@ mod tests {
             r#"talos_module_payload_encryption_failures_total{op="decrypt",stage="input"} 0"#,
             r#"talos_module_payload_encryption_failures_total{op="decrypt",stage="output"} 0"#,
             r#"talos_module_payload_encryption_failures_total{op="decrypt",stage="trigger_metadata"} 0"#,
+            // Worker-identity liveness + reaper. The steady state of every
+            // one of these is 0 forever on a healthy fleet, which is exactly
+            // the case where "absent" and "zero" diverge: the reap alert is
+            // an `increase(...) > 0`, and an absent counter matches nothing.
+            r#"talos_worker_liveness_pings_total{outcome="accepted"} 0"#,
+            r#"talos_worker_liveness_pings_total{outcome="rejected_request"} 0"#,
+            r#"talos_worker_liveness_pings_total{outcome="rejected_proof"} 0"#,
+            r#"talos_worker_liveness_pings_total{outcome="inactive_identity"} 0"#,
+            r#"talos_worker_liveness_pings_total{outcome="error"} 0"#,
+            r#"talos_worker_identity_reaps_total{arm="departed"} 0"#,
+            r#"talos_worker_identity_reaps_total{arm="pre_protocol"} 0"#,
+            // The D2 pair. Plain IntGauges, so they are exported from
+            // registration — asserted anyway because the alert subtracts one
+            // from the other and a vector match against a missing series
+            // silently yields NO RESULT, i.e. a detector that cannot fire.
+            "talos_worker_liveness_participants 0",
+            "talos_worker_liveness_recent_participants 0",
         ] {
             assert!(
                 rendered.contains(expected),

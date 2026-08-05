@@ -55,6 +55,18 @@ spec:
     # registration; leave off for the static TALOS_WORKER_PUBLIC_KEYS / CLI path.
     # A dedicated internal listener port would isolate this fully — tracked as a
     # hardening follow-up.
+    #
+    # IT IS NOT ONLY REGISTRATION. The same rule is what lets a worker reach
+    # POST /internal/worker-liveness, the proof-of-possession ping the
+    # worker-identity reaper measures silence against — so it is needed even
+    # by fleets that register purely via the operator CLI and never use the
+    # registration endpoint. Enabling it opens the port; it does not enable
+    # the reaper (controller.workerIdentityReaper, default off).
+    #
+    # AND IT IS NOT SUFFICIENT ON ITS OWN. This is the controller's INGRESS
+    # half; the worker's own egress policy has no worker→controller rule at
+    # all, so `networkPolicy.workerControllerEgress` must be enabled too or
+    # the connection is still blocked at the worker.
     {{- if .Values.networkPolicy.workerRegistrationIngress.enabled }}
     - from:
         - podSelector:

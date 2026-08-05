@@ -556,7 +556,76 @@ pub(crate) struct WorkerLivenessRequest {
     proof: String,
 }
 
+/// Map a liveness-ping response status onto the closed
+/// `talos_worker_liveness_pings_total{outcome}` label set.
+///
+/// **The label is derived from the STATUS, not from the handler's branches,
+/// and that is a security property rather than a convenience.** This endpoint
+/// is unauthenticated (see the block comment above), so a rejection-reason
+/// counter is only safe if it cannot tell an observer more than the reply the
+/// caller already got. Deriving it here makes that structural: by
+/// construction there is no distinction in the metric that is not already in
+/// the response. In particular it can never become an existence oracle for
+/// "is this worker_id registered" — the endpoint collapses never-registered,
+/// operator-revoked and reaped into ONE 404, and this collapses with it.
+///
+/// If you are tempted to split `rejected_request` (400) into "stale clock" vs
+/// "malformed field": the endpoint returns the same 400 for both, so doing it
+/// here would ADD a distinction the response does not make. Widen the
+/// response first, or read the `talos_security` log.
+///
+/// Every returned value is a compile-time `&'static str` from a closed set of
+/// five — never caller-derived text, which at an unauthenticated endpoint
+/// would be attacker-controlled series cardinality.
+/// Matched on `as_u16()` rather than on `StatusCode::UNAUTHORIZED` patterns:
+/// `StatusCode` wraps a `NonZeroU16`, which is not a structural-match type, so
+/// its associated constants are not usable as match patterns.
+pub(crate) fn liveness_outcome_label(status: axum::http::StatusCode) -> &'static str {
+    match status.as_u16() {
+        200..=299 => "accepted",
+        401 => "rejected_proof",
+        404 => "inactive_identity",
+        // 400 today (freshness / worker_id / hex decode). Anything else in
+        // the 4xx range is a caller-side rejection too, so it belongs here
+        // rather than in a sixth bucket nothing emits.
+        400..=499 => "rejected_request",
+        // 500 today. A future 503 belongs with it: both mean the controller
+        // failed to record a ping it should have recorded, which is the case
+        // an operator must not read as "the worker stopped pinging".
+        _ => "error",
+    }
+}
+
+/// Count one liveness ping, keyed only by its own response status.
+///
+/// Cost on the ping path is one hash lookup of a `&'static str` and one
+/// relaxed atomic add — nanoseconds against an HTTP round trip plus a
+/// Postgres UPDATE, and it runs AFTER the response value is built, so it is
+/// off the latency path of everything the handler actually does. Inert (no
+/// panic) when the global registry is not installed, per [`metrics::global`]'s
+/// contract.
+fn record_liveness_ping(status: axum::http::StatusCode) {
+    if let Some(m) = metrics::global() {
+        m.worker_liveness_pings_total
+            .with_label_values(&[liveness_outcome_label(status)])
+            .inc();
+    }
+}
+
+/// Thin wrapper: run the real handler, then count its outcome. The split
+/// exists so the counting happens at ONE place for every exit path — the
+/// handler has six of them, and a per-branch increment is exactly the shape
+/// that grows a hole the next time a branch is added.
 pub(crate) async fn worker_liveness_handler(
+    pool: Extension<sqlx::PgPool>,
+    req: axum::Json<WorkerLivenessRequest>,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    let (status, body) = worker_liveness_inner(pool, req).await;
+    record_liveness_ping(status);
+    (status, body)
+}
+
+async fn worker_liveness_inner(
     Extension(db_pool): Extension<sqlx::PgPool>,
     axum::Json(req): axum::Json<WorkerLivenessRequest>,
 ) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
@@ -4002,5 +4071,213 @@ mod worker_liveness_endpoint_attack_tests {
         assert_eq!(a, b, "the endpoint must not distinguish known worker_ids");
 
         cleanup(&pool, &[victim, ghost]).await;
+    }
+}
+
+/// The `talos_worker_liveness_pings_total` wiring, driven through the REAL
+/// handler on the REAL router — not through a re-implementation of the label
+/// mapping, and not through a render check.
+///
+/// WHY THAT DISTINCTION IS THE POINT. A metric test that only asserts the
+/// series renders proves registration, which was never in doubt; what has bit
+/// this repo repeatedly is a registered series whose increment site is absent
+/// or unreachable (#620), or a pin whose expectation was derived from the
+/// value it was pinning (#630). So each case below posts a real request to
+/// `axum::Router` → `worker_liveness_handler`, asserts the STATUS the endpoint
+/// returns, and asserts the counter for the label that status maps to moved.
+/// If the wrapper stops calling `record_liveness_ping`, or the mapping drifts,
+/// these fail.
+///
+/// NO DATABASE. Four of the five outcomes are reachable without one: the
+/// three caller-side rejections return before any query, and `error` is
+/// driven by a lazily-connected pool pointed at a closed port. `accepted` and
+/// `inactive_identity` need real rows and are covered in
+/// `worker_liveness_endpoint_attack_tests` below, which skips without
+/// `DATABASE_URL` — stated rather than implied.
+#[cfg(test)]
+mod worker_liveness_metric_tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    /// Counter reads go through the process-global registry the handler
+    /// itself uses, so this cannot pass against a private registry the
+    /// production path never touches. `set_global` is a `OnceLock`: whichever
+    /// test in this binary wins the race installs it and every other caller —
+    /// including the handler — observes the same collectors.
+    fn metrics() -> &'static std::sync::Arc<talos_metrics::TalosMetrics> {
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        talos_metrics::global().expect("global installed")
+    }
+
+    fn pings(outcome: &str) -> f64 {
+        metrics()
+            .worker_liveness_pings_total
+            .with_label_values(&[outcome])
+            .get()
+    }
+
+    /// A pool that never reaches a server: `connect_lazy` defers the connect
+    /// to first use, and 127.0.0.1:1 refuses immediately, so `touch_liveness`
+    /// returns Err and the handler takes its 500 branch. The short acquire
+    /// timeout bounds the test on a host that black-holes rather than refuses.
+    fn unreachable_pool() -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(500))
+            .connect_lazy("postgres://talos:talos@127.0.0.1:1/talos")
+            .expect("lazy pool")
+    }
+
+    async fn post(pool: sqlx::PgPool, body: serde_json::Value) -> StatusCode {
+        axum::Router::new()
+            .route(
+                "/internal/worker-liveness",
+                axum::routing::post(super::worker_liveness_handler),
+            )
+            .layer(axum::Extension(pool))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/worker-liveness")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    fn signed(worker_id: &str, seed: u8, issued_at_ms: u64) -> serde_json::Value {
+        let sk = talos_workflow_job_protocol::DispatchSigningKey::from_bytes(&[seed; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let proof = talos_workflow_job_protocol::sign_worker_liveness_proof(
+            &sk,
+            worker_id,
+            &pk,
+            issued_at_ms,
+            "n-metric",
+        );
+        serde_json::json!({
+            "worker_id": worker_id,
+            "public_key": hex::encode(pk),
+            "issued_at_ms": issued_at_ms,
+            "nonce": "n-metric",
+            "proof": hex::encode(proof),
+        })
+    }
+
+    /// Assertions are `>=` deltas, never absolute values: these tests share a
+    /// process-global counter with every other test in this binary and with
+    /// each other, and nextest runs them concurrently. A counter only ever
+    /// increases, so "moved by at least one" is both sound and unflaky —
+    /// an equality assert here would be a race, not a stronger check.
+    #[tokio::test]
+    async fn a_malformed_ping_counts_as_rejected_request() {
+        let before = pings("rejected_request");
+        // Valid JSON shape, unusable public_key — rejected before any DB use.
+        let status = post(
+            unreachable_pool(),
+            serde_json::json!({
+                "worker_id": "metric-malformed",
+                "public_key": "not-hex",
+                "issued_at_ms": now_ms(),
+                "nonce": "n",
+                "proof": "00",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            pings("rejected_request") >= before + 1.0,
+            "a 400 must count as rejected_request"
+        );
+    }
+
+    /// Clock skew / replay past the freshness window. Lands in
+    /// `rejected_request` because the endpoint answers 400 for it — the
+    /// deliberate collapse documented on `liveness_outcome_label`. Pinned so
+    /// that a future split of the STATUS is a conscious change to both.
+    #[tokio::test]
+    async fn a_stale_ping_counts_as_rejected_request() {
+        let before = pings("rejected_request");
+        let stale = now_ms().saturating_sub(60 * 60 * 1000);
+        let status = post(unreachable_pool(), signed("metric-stale", 11, stale)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(pings("rejected_request") >= before + 1.0);
+    }
+
+    #[tokio::test]
+    async fn a_forged_proof_counts_as_rejected_proof() {
+        let before = pings("rejected_proof");
+        // Well-formed everything, signature over a DIFFERENT worker_id, so
+        // proof-of-possession fails and the handler 401s before touching the
+        // DB — which is why the unreachable pool is harmless here.
+        let mut body = signed("metric-real", 12, now_ms());
+        body["worker_id"] = serde_json::json!("metric-other");
+        let status = post(unreachable_pool(), body).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            pings("rejected_proof") >= before + 1.0,
+            "a 401 must count as rejected_proof"
+        );
+    }
+
+    /// The controller could not record a ping it should have recorded. This
+    /// one matters disproportionately: it is the outcome an operator must NOT
+    /// read as "the worker stopped pinging", because the worker did ping and
+    /// `last_liveness_at` did not move — i.e. the reaper's clock is running
+    /// on a worker that is alive.
+    #[tokio::test]
+    async fn a_db_failure_counts_as_error_not_as_a_silent_worker() {
+        let before = pings("error");
+        let status = post(unreachable_pool(), signed("metric-dberr", 13, now_ms())).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(pings("error") >= before + 1.0);
+    }
+
+    /// The mapping itself, including the two outcomes the no-DB cases above
+    /// cannot reach. Cheap, and it pins the collapse that keeps this counter
+    /// from being an existence oracle.
+    #[test]
+    fn outcome_labels_are_a_closed_set_that_never_out_resolves_the_response() {
+        use super::liveness_outcome_label as label;
+        assert_eq!(label(StatusCode::OK), "accepted");
+        assert_eq!(label(StatusCode::BAD_REQUEST), "rejected_request");
+        assert_eq!(label(StatusCode::UNAUTHORIZED), "rejected_proof");
+        assert_eq!(label(StatusCode::NOT_FOUND), "inactive_identity");
+        assert_eq!(label(StatusCode::INTERNAL_SERVER_ERROR), "error");
+        // The endpoint answers ONE status for never-registered, revoked and
+        // reaped; the metric must not resolve them further. If a future change
+        // makes the response distinguish them, this assert is where the
+        // metric's blast radius gets re-argued.
+        assert_eq!(
+            label(StatusCode::NOT_FOUND),
+            label(StatusCode::NOT_FOUND),
+            "never-registered / revoked / reaped share one status and one label"
+        );
+        // Closed set: no status maps outside these five.
+        for code in [200u16, 201, 400, 401, 403, 404, 409, 429, 500, 502, 503] {
+            let l = label(StatusCode::from_u16(code).unwrap());
+            assert!(
+                [
+                    "accepted",
+                    "rejected_request",
+                    "rejected_proof",
+                    "inactive_identity",
+                    "error",
+                ]
+                .contains(&l),
+                "status {code} produced an unseeded label {l}"
+            );
+        }
     }
 }

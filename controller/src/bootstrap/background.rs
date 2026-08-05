@@ -185,6 +185,200 @@ pub(crate) fn count_skewed_live_workers(
         .len()
 }
 
+/// How recent a liveness proof must be for its worker to count as STILL
+/// PINGING in `talos_worker_liveness_recent_participants`.
+///
+/// Two hours, chosen against the two numbers it sits between rather than
+/// picked round:
+///   * Above it must clear the worker's ping interval with room to spare. That
+///     interval is `TALOS_WORKER_LIVENESS_INTERVAL_SECS`, clamped by the worker
+///     to at most 3600s, so 2h is 2× the slowest configuration a worker can be
+///     in — a worker must miss two consecutive pings at the worst-case interval
+///     (or sixty at the 60s default) before it drops out. That headroom is what
+///     stops this gauge flapping, and flapping here would be worse than useless:
+///     the alert built on it is the one an operator is asked to trust before
+///     enabling a fleet-wide trust-boundary write.
+///   * Below it must leave usable warning time inside the trust window. The
+///     ALERT'S LEAD TIME IS `window - horizon`, and saying so is the honest form
+///     — at defaults that is 24h - 2h = 22h of visible warning before the first
+///     key is deactivated, but an operator who sets
+///     `TALOS_WORKER_IDENTITY_REAP_HOURS=3` gets one hour, and one who sets it
+///     to 2 or less gets NONE. [`liveness_participation_horizon_hours`] clamps
+///     the horizon to the window so the gauge can never count a row that is
+///     already past the reap cutoff, but no clamp can manufacture lead time
+///     that the configuration did not leave. If you shorten the window, shorten
+///     the ping interval with it and treat this constant as part of the change.
+pub(crate) const LIVENESS_PARTICIPATION_HORIZON_HOURS: i64 = 2;
+
+/// The effective participation horizon: [`LIVENESS_PARTICIPATION_HORIZON_HOURS`],
+/// never longer than the configured trust window.
+///
+/// The clamp is not cosmetic. Without it, an operator running
+/// `TALOS_WORKER_IDENTITY_REAP_HOURS=1` would have `recent_participants` count
+/// rows whose last ping was 90 minutes ago — rows the reaper is already
+/// entitled to deactivate — so `participants - recent` would read 0 while a
+/// reap was imminent. The detector would be silent in exactly the
+/// configuration that gives an operator the least time to react.
+///
+/// Written as a `clamp` of the WINDOW rather than a `min`/`max` chain on the
+/// constant — same answers for every input, but it says the two bounds in one
+/// place (and avoids clippy's `manual_clamp`). The lower bound of 1 is
+/// belt-and-braces: [`departed_liveness_cutoff_hours`] already floors the
+/// window at 1, and a 0h horizon would classify every row as silent and pin
+/// the alert permanently red.
+pub(crate) fn liveness_participation_horizon_hours(window_hours: i64) -> i64 {
+    window_hours.clamp(1, LIVENESS_PARTICIPATION_HORIZON_HOURS)
+}
+
+/// Which reaper arm deactivated a key. A closed, compile-time set — this is a
+/// Prometheus label value, and the reaper is the last place that should learn
+/// the unbounded-cardinality lesson the hard way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReapArm {
+    /// The automatic arm: a worker PROVED liveness and then went silent past
+    /// `TALOS_WORKER_IDENTITY_REAP_HOURS`.
+    Departed,
+    /// The opt-in arm: a row that never participated and has not re-registered
+    /// within `TALOS_WORKER_IDENTITY_REAP_PRE_PROTOCOL_HOURS`.
+    PreProtocol,
+}
+
+impl ReapArm {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            ReapArm::Departed => "departed",
+            ReapArm::PreProtocol => "pre_protocol",
+        }
+    }
+}
+
+/// Count keys deactivated by one reaper arm onto
+/// `talos_worker_identity_reaps_total{arm}`.
+///
+/// A no-op at `keys == 0` so the counter measures REAPS, not sweeps: the
+/// sweep runs every 300s forever and its overwhelmingly common outcome is
+/// "nothing to do". Counting those would put a large constant under any
+/// `increase()` and drown the signal — the metric exists to answer "did this
+/// controller deactivate a signing key, and when", which is the question an
+/// operator has after the fleet's results stop verifying.
+///
+/// TEST SCOPE, stated rather than implied — the same residual
+/// [`publish_worker_build_skew`] carries. The unit tests drive THIS function,
+/// which is the whole recording path; they do not prove the reaper loop still
+/// calls it, and structural check 58 cannot either (it matches the increment
+/// textually, so deleting both call sites leaves the lint green — the
+/// documented limit (b) on that check). The honest guard for the call sites is
+/// review plus the post-merge live check.
+pub(crate) fn record_identity_reap(arm: ReapArm, keys: u64) {
+    if keys == 0 {
+        return;
+    }
+    if let Some(m) = metrics::global() {
+        m.worker_identity_reaps_total
+            .with_label_values(&[arm.label()])
+            .inc_by(keys as f64);
+    }
+}
+
+/// Recompute and publish the D2 pair —
+/// `talos_worker_liveness_participants` and
+/// `talos_worker_liveness_recent_participants` — from one snapshot of the
+/// ACTIVE `worker_identities` rows.
+///
+/// **This is the detector that makes the reaper safe to enable.** The reaper's
+/// worst failure is deactivating a LIVE worker's signing key, and that failure
+/// is silent for the whole trust window before it presents as fleet-wide
+/// signature-verification failure. But it is not silent in its CAUSE: every
+/// false reap is preceded, by a full window minus the horizon, by workers that
+/// were pinging and stopped. These two gauges make that preceding state a
+/// number, and `TalosWorkerLivenessParticipationDropped` alerts on it.
+///
+/// ALWAYS `set`, never `inc`/`dec`, for the same reason as the skew gauge: both
+/// populations must be able to FALL. A worker that resumes pinging re-enters
+/// `recent` with no bookkeeping, and a reaped or operator-deactivated row
+/// leaves both because it is no longer `active`.
+///
+/// WHY BOTH, when the alert only needs the difference: because a bare "3 keys
+/// have stopped pinging" is unreadable without its denominator — it is the
+/// whole fleet at 3 participants and a rounding error at 300 — and the
+/// operator reading this during an incident is deciding whether to disable the
+/// reaper. Publishing only the difference would repeat the mistake of a judge
+/// that cannot see how many runs it scored.
+///
+/// WHAT IS AND IS NOT IN THE POPULATION, because "participating" is easy to
+/// over-read:
+///   * Rows with `last_liveness_at IS NULL` are in NEITHER gauge. They have
+///     never proved liveness, so the automatic reaper cannot act on them and
+///     they are not at risk from it. Counting them as participants would put a
+///     permanent floor under the difference on any fleet with pre-protocol
+///     rows, and the alert would fire forever on a condition the reaper will
+///     never act on — a permanently-firing alert is a disabled one. (They are
+///     still counted by `talos_worker_build_skew_workers`, which is a different
+///     question with a different safe direction; see that function.)
+///   * A row past the trust window is still a participant. It is about to be
+///     reaped, which is precisely what the operator needs to see.
+///
+/// NOTE THE CLOCK. `last_liveness_at` is written by Postgres; `now` here is the
+/// CONTROLLER's. Controller clock skew therefore moves this DETECTOR (a
+/// controller running fast under-reports `recent` and can make the alert fire
+/// on a healthy fleet) but not the reaper, which compares both sides against
+/// Postgres's own clock. Same asymmetry, same reason, as
+/// [`row_is_provably_departed`]: erring toward firing is the safe direction for
+/// a detector whose job is to precede a destructive write.
+///
+/// Counted per distinct `worker_id`, not per row — a worker mid-rotation holds
+/// two rows and must not read as two workers. Both gauges use the same key, so
+/// their difference is always a count of WORKERS.
+///
+/// TEST SCOPE: the unit tests drive this function and its pure half. They do
+/// not prove the 60s sweep still calls it — see the identical note on
+/// [`publish_worker_build_skew`]; the guard is the post-merge live check that
+/// both series are present on `/metrics/prometheus`.
+pub(crate) fn publish_worker_liveness_participation(
+    rows: &[talos_worker_identity_repository::WorkerBuildRow],
+    window_hours: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let (participants, recent) = count_liveness_participants(
+        rows,
+        liveness_participation_horizon_hours(window_hours),
+        now,
+    );
+    if let Some(m) = metrics::global() {
+        m.worker_liveness_participants
+            .set(i64::try_from(participants).unwrap_or(i64::MAX));
+        m.worker_liveness_recent_participants
+            .set(i64::try_from(recent).unwrap_or(i64::MAX));
+    }
+}
+
+/// Pure half of [`publish_worker_liveness_participation`]: returns
+/// `(participants, recent_participants)` as distinct-`worker_id` counts.
+///
+/// `recent` is by construction a SUBSET of `participants` — it filters the
+/// same rows further — so the difference the alert computes can never be
+/// negative. That is worth stating because a negative difference would make
+/// the alert's `> 0` silently correct-looking while measuring nothing.
+pub(crate) fn count_liveness_participants(
+    rows: &[talos_worker_identity_repository::WorkerBuildRow],
+    horizon_hours: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (usize, usize) {
+    let horizon = chrono::Duration::hours(horizon_hours);
+    let mut participants = std::collections::HashSet::new();
+    let mut recent = std::collections::HashSet::new();
+    for row in rows {
+        let Some(seen) = row.last_liveness_at else {
+            continue;
+        };
+        participants.insert(row.worker_id.as_str());
+        if now.signed_duration_since(seen) <= horizon {
+            recent.insert(row.worker_id.as_str());
+        }
+    }
+    (participants.len(), recent.len())
+}
+
 /// Default hours of liveness silence after which a PARTICIPATING worker's key
 /// is treated as departed — both by the reaper and by the skew gauge's
 /// population.
@@ -369,12 +563,20 @@ pub(crate) fn spawn_metrics_gauge_tasks(db_pool: sqlx::Pool<sqlx::Postgres>) {
             loop {
                 ticker.tick().await;
                 match repo.list_active_builds().await {
-                    Ok(rows) => publish_worker_build_skew(
-                        &controller_build,
-                        &rows,
-                        departed_liveness_cutoff_hours(),
-                        chrono::Utc::now(),
-                    ),
+                    Ok(rows) => {
+                        let window_hours = departed_liveness_cutoff_hours();
+                        let now = chrono::Utc::now();
+                        publish_worker_build_skew(&controller_build, &rows, window_hours, now);
+                        // The D2 pair rides the SAME snapshot, deliberately:
+                        // `list_active_builds` already returns
+                        // `last_liveness_at` for every active row, so the
+                        // liveness-participation gauges cost zero extra
+                        // queries and zero extra DB round trips. A separate
+                        // sweep would have added a second bounded SELECT for
+                        // data already in hand — and would have let the two
+                        // gauges disagree about which instant they describe.
+                        publish_worker_liveness_participation(&rows, window_hours, now);
+                    }
                     Err(e) => {
                         // Leave the gauge at its last value rather than
                         // publishing a 0 we did not measure — a DB blip must
@@ -525,6 +727,7 @@ pub(crate) fn spawn_metrics_gauge_tasks(db_pool: sqlx::Pool<sqlx::Postgres>) {
                              proving liveness; they must be re-registered by an \
                              operator if those workers return"
                         );
+                        record_identity_reap(ReapArm::Departed, n);
                         reaped_any = true;
                     }
                     Err(e) => {
@@ -551,6 +754,7 @@ pub(crate) fn spawn_metrics_gauge_tasks(db_pool: sqlx::Pool<sqlx::Postgres>) {
                                  the liveness protocol and have not re-registered within the \
                                  operator-configured window"
                             );
+                            record_identity_reap(ReapArm::PreProtocol, n);
                             reaped_any = true;
                         }
                         Err(e) => tracing::warn!(
@@ -3990,5 +4194,325 @@ mod detector_metric_tests {
             count_skewed_live_workers("0.1.0+bbbbbbb", &rows, clamped, chrono::Utc::now()),
             1
         );
+    }
+}
+
+/// The worker-identity liveness/reaper observability wiring — the D1/D2 half
+/// of "make the reaper safely enableable".
+///
+/// These drive the PRODUCTION recording functions, not copies of them, and
+/// assert the counter moved. That is deliberate and it is the whole point: the
+/// defect this instrumentation exists to prevent is a registered metric with
+/// no live increment, which renders every alert built on it permanently
+/// unfireable (#620), and a test that only re-implements the arithmetic or
+/// asserts the series renders would pass in exactly that state.
+#[cfg(test)]
+mod worker_liveness_reaper_metric_tests {
+    use super::*;
+    use talos_worker_identity_repository::WorkerBuildRow;
+
+    fn install_metrics() -> &'static std::sync::Arc<talos_metrics::TalosMetrics> {
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        talos_metrics::global().expect("global installed")
+    }
+
+    fn reaps(arm: &str) -> f64 {
+        talos_metrics::global()
+            .expect("global installed")
+            .worker_identity_reaps_total
+            .with_label_values(&[arm])
+            .get()
+    }
+
+    fn row(worker: &str, pinged_hours_ago: Option<i64>) -> WorkerBuildRow {
+        WorkerBuildRow {
+            worker_id: worker.to_string(),
+            build_version: Some("0.1.0+aaaaaaa".to_string()),
+            supports_sealing: true,
+            last_seen_at: chrono::Utc::now(),
+            last_liveness_at: pinged_hours_ago
+                .map(|h| chrono::Utc::now() - chrono::Duration::hours(h)),
+        }
+    }
+
+    // ── talos_worker_identity_reaps_total ───────────────────────────────
+
+    /// The counter must move by the NUMBER OF KEYS, on the same function the
+    /// reaper sweep calls. Deltas rather than absolutes: the global registry
+    /// is shared with every other test in this binary.
+    #[test]
+    fn a_reap_counts_keys_on_the_production_recording_path() {
+        install_metrics();
+        let before = reaps("departed");
+        record_identity_reap(ReapArm::Departed, 3);
+        assert_eq!(
+            reaps("departed") - before,
+            3.0,
+            "the counter measures KEYS deactivated, not sweeps that reaped"
+        );
+
+        let before = reaps("pre_protocol");
+        record_identity_reap(ReapArm::PreProtocol, 1);
+        assert_eq!(reaps("pre_protocol") - before, 1.0);
+    }
+
+    /// The arms must stay separable. A reap on the opt-in `pre_protocol` arm
+    /// is an operator asserting a fact the controller cannot check; a reap on
+    /// `departed` is the automatic trust-boundary write. Collapsing them would
+    /// make the reap alert unable to say which one just fired.
+    #[test]
+    fn the_two_arms_do_not_contaminate_each_other() {
+        install_metrics();
+        let (d0, p0) = (reaps("departed"), reaps("pre_protocol"));
+        record_identity_reap(ReapArm::Departed, 2);
+        assert_eq!(
+            reaps("pre_protocol"),
+            p0,
+            "departed must not move pre_protocol"
+        );
+        assert_eq!(reaps("departed") - d0, 2.0);
+        assert_eq!(ReapArm::Departed.label(), "departed");
+        assert_eq!(ReapArm::PreProtocol.label(), "pre_protocol");
+    }
+
+    /// A sweep that reaped nothing must not move the counter. The sweep runs
+    /// every 300s forever and almost always reaps zero; counting those would
+    /// put a large constant under `increase(...)` and make the reap alert
+    /// meaningless.
+    #[test]
+    fn a_sweep_that_reaped_nothing_is_not_counted() {
+        install_metrics();
+        let before = reaps("departed");
+        record_identity_reap(ReapArm::Departed, 0);
+        assert_eq!(reaps("departed"), before);
+    }
+
+    /// Inert without a registry, like every other `metrics::global()` caller.
+    /// The reaper task runs in processes (and tests) where `set_global` may
+    /// not have happened, and a panic there would kill the sweep permanently.
+    #[test]
+    fn recording_is_inert_without_a_global_registry() {
+        record_identity_reap(ReapArm::Departed, 5);
+        record_identity_reap(ReapArm::PreProtocol, 0);
+    }
+
+    // ── the D2 pair ─────────────────────────────────────────────────────
+
+    fn participants() -> (i64, i64) {
+        let m = talos_metrics::global().expect("global installed");
+        (
+            m.worker_liveness_participants.get(),
+            m.worker_liveness_recent_participants.get(),
+        )
+    }
+
+    /// A healthy pinging fleet: every participant is recent, so the DIFFERENCE
+    /// the alert reads is 0. This is the state the alert must stay silent in.
+    #[test]
+    fn a_pinging_fleet_has_zero_silent_participants() {
+        install_metrics();
+        let rows = [
+            row("w-1", Some(0)),
+            row("w-2", Some(0)),
+            row("w-3", Some(0)),
+        ];
+        publish_worker_liveness_participation(&rows, 24, chrono::Utc::now());
+        assert_eq!(participants(), (3, 3));
+    }
+
+    /// THE CASE THIS WHOLE DELIVERABLE EXISTS FOR. A fleet that was pinging
+    /// and stopped — an image rollback, a dropped TALOS_CONTROLLER_URL, a
+    /// one-way network block — shows up here 22h before the reaper touches a
+    /// key, as `participants` holding at 3 while `recent` falls to 0.
+    #[test]
+    fn a_fleet_that_stopped_pinging_is_visible_before_the_reap() {
+        install_metrics();
+        // Silent for 6h: well past the 2h horizon, nowhere near the 24h
+        // window, so NOTHING has been reaped yet and every one of these keys
+        // is still trusted. That gap is the warning.
+        let rows = [
+            row("w-1", Some(6)),
+            row("w-2", Some(6)),
+            row("w-3", Some(6)),
+        ];
+        publish_worker_liveness_participation(&rows, 24, chrono::Utc::now());
+        let (all, recent) = participants();
+        assert_eq!((all, recent), (3, 0));
+        assert!(
+            all - recent > 0,
+            "the alert's expression must be positive here"
+        );
+    }
+
+    /// THE OTHER DIRECTION, which matters just as much: a fleet that has NEVER
+    /// participated must read (0, 0), so the alert cannot fire on it. This is
+    /// the chart default — the liveness ping is blocked at the network layer
+    /// unless two opt-in NetworkPolicy rules are enabled — and an alert that
+    /// fired there would be permanently red on every default install, i.e.
+    /// trained-to-ignore, i.e. no alert at all.
+    #[test]
+    fn a_fleet_that_never_participated_cannot_fire_the_alert() {
+        install_metrics();
+        let rows = [row("w-1", None), row("w-2", None), row("w-3", None)];
+        publish_worker_liveness_participation(&rows, 24, chrono::Utc::now());
+        let (all, recent) = participants();
+        assert_eq!((all, recent), (0, 0));
+        assert_eq!(
+            all - recent,
+            0,
+            "no liveness evidence is not evidence of silence"
+        );
+    }
+
+    /// Mixed fleet: pre-protocol rows must not dilute the signal in either
+    /// direction. Two pinging + two never-pinged reads (2, 2) — a NULL row is
+    /// not a silent participant, because the automatic reaper cannot act on it.
+    #[test]
+    fn null_liveness_rows_are_in_neither_population() {
+        install_metrics();
+        let rows = [
+            row("w-live-1", Some(0)),
+            row("w-live-2", Some(0)),
+            row("w-legacy-1", None),
+            row("w-legacy-2", None),
+        ];
+        publish_worker_liveness_participation(&rows, 24, chrono::Utc::now());
+        assert_eq!(participants(), (2, 2));
+    }
+
+    /// Counted per WORKER, not per row. A worker mid-key-rotation legitimately
+    /// holds two active rows; counting rows would render one worker as two and
+    /// make every number in the alert annotation wrong.
+    #[test]
+    fn a_rotating_worker_counts_once_in_both_gauges() {
+        install_metrics();
+        let rows = [row("w-rotating", Some(0)), row("w-rotating", Some(0))];
+        publish_worker_liveness_participation(&rows, 24, chrono::Utc::now());
+        assert_eq!(participants(), (1, 1));
+        // ...and once even when only ONE of its two keys is fresh: the worker
+        // IS pinging. The difference stays 0, which is correct — no key of a
+        // pinging worker is heading for a reap on the automatic arm... except
+        // the stale one, which is exactly why this gauge pair is a fleet-level
+        // detector and `list-worker-identities` is the per-key surface.
+        let rows = [row("w-rotating", Some(0)), row("w-rotating", Some(9))];
+        publish_worker_liveness_participation(&rows, 24, chrono::Utc::now());
+        assert_eq!(participants(), (1, 1));
+    }
+
+    /// The gauges must FALL, not just rise — they are recomputed and `set`
+    /// each sweep. A rise-only wiring would pin the alert firing forever after
+    /// the first scale-down, which is the failure mode that made the
+    /// build-skew signal a gauge in the first place.
+    #[test]
+    fn the_gauges_drain_when_rows_leave_the_active_set() {
+        install_metrics();
+        publish_worker_liveness_participation(
+            &[row("w-1", Some(0)), row("w-2", Some(9))],
+            24,
+            chrono::Utc::now(),
+        );
+        assert_eq!(participants(), (2, 1));
+        // The reaper deactivates w-2, so it leaves `list_active_builds`
+        // entirely: both gauges follow, and the alert clears.
+        publish_worker_liveness_participation(&[row("w-1", Some(0))], 24, chrono::Utc::now());
+        assert_eq!(participants(), (1, 1));
+        // Fleet scaled to zero.
+        publish_worker_liveness_participation(&[], 24, chrono::Utc::now());
+        assert_eq!(participants(), (0, 0));
+    }
+
+    /// `recent` is a subset of `participants` by construction, so the alert's
+    /// expression can never go negative. Asserted over a spread of ages
+    /// because a negative difference would make `> 0` read as "healthy" while
+    /// measuring nothing at all.
+    #[test]
+    fn recent_is_always_a_subset_of_participants() {
+        for hours in [0i64, 1, 2, 3, 12, 23, 24, 100] {
+            let rows = [row("w-1", Some(hours)), row("w-2", None)];
+            let (all, recent) = count_liveness_participants(&rows, 2, chrono::Utc::now());
+            assert!(
+                recent <= all,
+                "recent {recent} > participants {all} at {hours}h"
+            );
+        }
+    }
+
+    // ── the horizon ─────────────────────────────────────────────────────
+
+    /// The horizon must clear the worker's slowest legal ping interval. The
+    /// worker clamps TALOS_WORKER_LIVENESS_INTERVAL_SECS to at most 3600s, so
+    /// a 2h horizon gives two whole intervals of slack at the worst case and
+    /// sixty at the 60s default. If this constant is ever lowered below 1h the
+    /// gauge starts flapping on a legally-configured fleet.
+    #[test]
+    fn the_horizon_clears_the_slowest_legal_ping_interval() {
+        assert!(
+            LIVENESS_PARTICIPATION_HORIZON_HOURS >= 2,
+            "the worker's max ping interval is 3600s; a horizon under 2h flaps"
+        );
+        let now = chrono::Utc::now();
+        let h = liveness_participation_horizon_hours(24);
+        // A worker on the maximum 1h interval that just missed ONE ping is
+        // still counted as pinging.
+        let rows = [row("w-slow", Some(1))];
+        assert_eq!(count_liveness_participants(&rows, h, now), (1, 1));
+    }
+
+    /// The clamp: a configured window SHORTER than the horizon must shrink the
+    /// horizon, or `recent` would count rows the reaper is already entitled to
+    /// deactivate and the detector would read 0 while a reap was imminent —
+    /// silent in exactly the configuration that leaves the least time to react.
+    #[test]
+    fn a_short_window_shrinks_the_horizon_rather_than_blinding_the_detector() {
+        assert_eq!(liveness_participation_horizon_hours(24), 2);
+        assert_eq!(liveness_participation_horizon_hours(2), 2);
+        assert_eq!(liveness_participation_horizon_hours(1), 1);
+        // Never zero or negative: a 0h horizon would make EVERY row silent and
+        // the alert permanently red. `departed_liveness_cutoff_hours` already
+        // floors the window at 1, so this is belt-and-braces.
+        assert_eq!(liveness_participation_horizon_hours(0), 1);
+        assert_eq!(liveness_participation_horizon_hours(-5), 1);
+
+        // With a 1h window, a row silent for 90m is past the reap cutoff and
+        // MUST NOT be counted as recent.
+        install_metrics();
+        publish_worker_liveness_participation(&[row("w-1", Some(2))], 1, chrono::Utc::now());
+        assert_eq!(participants(), (1, 0));
+    }
+
+    /// The boundary itself: at exactly the horizon a row is still recent
+    /// (`<=`), one hour past it is not. Pinned so the comparison direction
+    /// cannot be flipped silently — an off-by-one here changes when the alert
+    /// fires on every fleet.
+    #[test]
+    fn the_horizon_boundary_is_inclusive() {
+        let now = chrono::Utc::now();
+        // Exactly 2h old, built from `now` so the arithmetic is exact.
+        let at_boundary = WorkerBuildRow {
+            last_liveness_at: Some(now - chrono::Duration::hours(2)),
+            ..row("w-1", None)
+        };
+        assert_eq!(count_liveness_participants(&[at_boundary], 2, now), (1, 1));
+        let past = WorkerBuildRow {
+            last_liveness_at: Some(now - chrono::Duration::hours(2) - chrono::Duration::seconds(1)),
+            ..row("w-1", None)
+        };
+        assert_eq!(count_liveness_participants(&[past], 2, now), (1, 0));
+    }
+
+    /// A `last_liveness_at` in the FUTURE (Postgres ahead of the controller,
+    /// or a clock step) must count as recent, not as silent. The signed
+    /// duration goes negative there, and a `>=`-shaped comparison would have
+    /// classified a worker that pinged one second ago as departed — the #625
+    /// shape, a detector silenced by a benign condition, except firing rather
+    /// than silent.
+    #[test]
+    fn a_future_timestamp_counts_as_recent_not_as_silent() {
+        let now = chrono::Utc::now();
+        let ahead = WorkerBuildRow {
+            last_liveness_at: Some(now + chrono::Duration::minutes(5)),
+            ..row("w-1", None)
+        };
+        assert_eq!(count_liveness_participants(&[ahead], 2, now), (1, 1));
     }
 }

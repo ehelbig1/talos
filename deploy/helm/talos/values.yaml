@@ -440,6 +440,92 @@ controller:
   workerRegistration:
     requireBoundToken: false
 
+  # ──────────────────────────────────────────────────────────────────────
+  # Worker-identity reaper — bounding how long a DEPARTED worker's Ed25519
+  # signing key stays in the controller's trusted verify ring.
+  # ──────────────────────────────────────────────────────────────────────
+  #
+  # WHAT IT FIXES. A worker's public key enters the verify ring at boot
+  # registration and, without this, leaves it only when an operator runs
+  # `deactivate-worker-identity` by hand. Every worker that ever registered —
+  # a CI container, a review rig, a scaled-down replica, a crashed pod — left
+  # a permanently trusted signing identity behind. The reaper deactivates the
+  # key of any worker that PROVED liveness (a periodic Ed25519
+  # proof-of-possession ping) and then went silent for `silenceHours`.
+  #
+  # WHAT IT COSTS IF IT IS WRONG, stated first because it drives everything
+  # below. Falsely reaping a LIVE worker breaks verification of everything it
+  # signs, and the worker CANNOT recover on its own: trust-on-first-use
+  # refuses to re-activate a deactivated key (the rule that stops a
+  # shared-token holder undoing a revocation). Recovery is an operator
+  # `register-worker-identity` per key. The failure is also silent for a full
+  # `silenceHours` and then presents as fleet-wide signature failure.
+  #
+  # So: DEFAULT OFF, and there is an enablement ORDER that must not be
+  # improvised. The full runbook is docs/security/operational-runbook.md
+  # § "Enabling the worker-identity reaper"; the short form is:
+  #
+  #   1. Open the network path in BOTH directions (see the two NetworkPolicy
+  #      opt-ins below) and roll the workers onto a build that pings.
+  #   2. CONFIRM the fleet is actually pinging — on the controller's
+  #      /metrics/prometheus, `talos_worker_liveness_participants` must equal
+  #      the number of workers you expect, and
+  #      `talos_worker_liveness_recent_participants` must equal it. Any gap
+  #      is a worker that would be reaped.
+  #   3. ONLY THEN set `enabled: true`.
+  #
+  # Doing 3 before 2 reaps the fleet `silenceHours` later. There is no
+  # step that undoes that except re-registering every key by hand.
+  #
+  # THE NETWORK PATH IS THE PART EVERYONE MISSES. With the chart's default
+  # `networkPolicy.enabled: true`, worker→controller HTTP is blocked in BOTH
+  # directions and NO worker can ping, so every row keeps a NULL
+  # `last_liveness_at` and the automatic arm is inert (it refuses to act on
+  # NULL — unknown liveness is not evidence of departure). Two opt-ins, both
+  # default false, both required:
+  #   * networkPolicy.workerRegistrationIngress — controller side.
+  #   * networkPolicy.workerControllerEgress    — worker side.
+  # Turning ON the reaper without them is safe but pointless; turning them on
+  # LATER, after some workers have already pinged, is the dangerous ordering
+  # (see the `enabled` note).
+  workerIdentityReaper:
+    # TALOS_WORKER_IDENTITY_REAP_ENABLED. Nothing is ever deactivated while
+    # this is false — identical to the pre-feature behaviour.
+    #
+    # Do not enable this in the same `helm upgrade` that first opens the
+    # network path. A worker that pings ONCE is in the reaper's population
+    # forever (nothing clears last_liveness_at), so a fleet where only some
+    # workers can reach the endpoint will have the rest reaped on schedule.
+    enabled: false
+    # TALOS_WORKER_IDENTITY_REAP_HOURS — hours of liveness silence after
+    # which a PARTICIPATING worker's key is deactivated. **This number is the
+    # security property**: a departed worker's key is trusted for at most
+    # this long plus one 300s sweep plus one worker-key overlay refresh
+    # (TALOS_WORKER_KEY_REFRESH_SECS, default 60s) — ~24h+11m at defaults.
+    #
+    # 24h is chosen so that no transient outage crosses it: against the
+    # worker's 60s default ping interval it is 1440 consecutive missed pings.
+    # Shortening it is a real trade, not a free tightening — it also shortens
+    # the warning the TalosWorkerLivenessParticipationDropped alert can give
+    # you, which is `silenceHours - 2h (the participation horizon) - 1h (the
+    # alert's `for`)`. Below ~4h there is effectively no warning left, and at
+    # 2h or less there is none at all. Clamped at runtime to [1, 87600].
+    silenceHours: 24
+    # TALOS_WORKER_IDENTITY_REAP_PRE_PROTOCOL_HOURS — the OPT-IN second arm,
+    # for rows that never pinged at all (registered before the liveness
+    # protocol existed). 0 = OFF, and OFF is correct until you are certain.
+    #
+    # It is default-off and separate because it is the UNSAFE direction of the
+    # same idea: it keys on `last_seen_at`, which is written only at boot
+    # registration, so it cannot distinguish a departed pod from a healthy
+    # worker that has simply been up a long time on an old build. Setting it
+    # is you asserting a fact the controller cannot check — that your fleet
+    # has finished rolling onto a build that pings. Confirm
+    # `talos_worker_liveness_participants` equals your worker count first.
+    # Its reaps are counted separately (arm="pre_protocol") for exactly this
+    # reason. Clamped at runtime to [1, 87600] when non-zero.
+    preProtocolHours: 0
+
   # Extra arbitrary env vars rendered as name/value pairs into the Deployment.
   # Use this for non-sensitive per-deploy overrides.
   extraEnv: []
@@ -594,6 +680,31 @@ worker:
     required: ""              # "" | "audit" | "true"
     identityRegexp: ""        # e.g. "^https://github\\.com/OWNER/talos/\\.github/workflows/template-publish\\.yml@"
     oidcIssuer: "https://token.actions.githubusercontent.com"
+
+  # TALOS_WORKER_LIVENESS_INTERVAL_SECS — seconds between this worker's
+  # proof-of-possession liveness pings to the controller. Empty ("") = leave
+  # the env unset and use the worker's own default of 60s; that is the right
+  # answer for almost everyone. The worker clamps any value into [10, 3600].
+  #
+  # THE ONLY VALUE THAT DESERVES A WARNING IS `0`, which DISABLES pinging.
+  # That is safe exactly once — for a worker whose identity has NEVER pinged
+  # (its row keeps last_liveness_at NULL and the automatic reaper is
+  # structurally unable to touch it). It is NOT safe for a worker that has
+  # pinged even once: nothing ever clears last_liveness_at, so that identity
+  # is in the reaper's population permanently and only continued pinging
+  # keeps it out of range. Setting 0 on a participating worker arms a reap of
+  # a LIVE worker one `controller.workerIdentityReaper.silenceHours` later,
+  # recoverable only by an operator re-registering its key.
+  #
+  # Same for every other way of stopping the pings: rolling back to a
+  # pre-liveness worker image, dropping TALOS_CONTROLLER_URL, or closing the
+  # NetworkPolicy path. Disable the reaper BEFORE any of them.
+  #
+  # A MISTYPED value is not an off switch — a non-numeric value WARNs
+  # (event_kind="worker_liveness_interval_unparseable") and keeps pinging at
+  # the default, because silently disabling was once a config typo that
+  # escalated into a fleet-wide outage.
+  livenessIntervalSecs: ""
 
   extraEnv: []
 
@@ -1159,6 +1270,35 @@ networkPolicy:
   # full rollout story); leave off for the static TALOS_WORKER_PUBLIC_KEYS or
   # register-worker-identity CLI path.
   workerRegistrationIngress:
+    enabled: false
+  # The WORKER-SIDE half of the same path, and it is genuinely required: the
+  # worker's own egress policy has no rule permitting worker → controller at
+  # all. Its external-egress rules cover ports 443/80 only and EXCLUDE every
+  # RFC1918 range, which is where an in-cluster ClusterIP lives — so enabling
+  # `workerRegistrationIngress` alone does NOT open the path. Both must be on.
+  #
+  # THIS IS WHY, ON A DEFAULT CHART INSTALL WITH NETWORK POLICIES ON, NO
+  # WORKER CAN REACH `POST /internal/worker-liveness` OR
+  # `POST /internal/worker-key`. Every worker_identities row keeps
+  # `last_liveness_at` NULL, the automatic reaper (which refuses to act on
+  # NULL) is inert, and dynamic self-registration cannot complete either.
+  # Nothing is broken by that — it is the pre-feature behaviour — but do not
+  # read a quiet `talos_worker_liveness_participants` as "the fleet is
+  # healthy" until this is on.
+  #
+  # OFF by default for the same reason as its ingress twin: NetworkPolicy is
+  # port-level, not path-level, so this opens the controller's whole API port
+  # to worker pods. The endpoints' own auth is the real gate — the liveness
+  # ping requires an Ed25519 proof of possession of an ALREADY-REGISTERED
+  # key and its single effect is to move one timestamp forward on an already
+  # active row; it cannot insert, re-activate, or change anything else.
+  #
+  # ORDERING WARNING: turning this on is step 1 of the reaper enablement
+  # runbook, not a step you take after enabling the reaper. See
+  # controller.workerIdentityReaper and
+  # docs/security/operational-runbook.md § "Enabling the worker-identity
+  # reaper".
+  workerControllerEgress:
     enabled: false
   # CIDRs the controller is allowed to reach for outbound LLM / SaaS calls.
   # Restrict in production to the exact hostnames' IP ranges if desired.

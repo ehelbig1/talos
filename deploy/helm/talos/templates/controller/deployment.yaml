@@ -284,6 +284,32 @@ spec:
                   name: {{ include "talos.bootstrapSecretName" . }}
                   key: TALOS_CONTROLLER_SIGNING_KEY
                   optional: true
+            # Worker-identity reaper — bounds how long a DEPARTED worker's
+            # Ed25519 signing key stays in the trusted verify ring. Renders
+            # NOTHING when disabled (the default), so a default install's
+            # manifest is byte-identical to the pre-feature one and the
+            # controller takes its own "reaper disabled" branch.
+            #
+            # DO NOT enable this before the workers are demonstrably pinging:
+            # falsely reaping a live worker is not self-recoverable
+            # (trust-on-first-use refuses to re-activate a deactivated key).
+            # The ordered runbook is docs/security/operational-runbook.md
+            # § "Enabling the worker-identity reaper"; the values.yaml block
+            # controller.workerIdentityReaper states it in short.
+            {{- if .Values.controller.workerIdentityReaper.enabled }}
+            - name: TALOS_WORKER_IDENTITY_REAP_ENABLED
+              value: "1"
+            - name: TALOS_WORKER_IDENTITY_REAP_HOURS
+              value: {{ .Values.controller.workerIdentityReaper.silenceHours | quote }}
+            {{- if gt (int .Values.controller.workerIdentityReaper.preProtocolHours) 0 }}
+            # The opt-in arm for rows that NEVER pinged. Keys on registration
+            # AGE, so it cannot tell a departed pod from a healthy long-lived
+            # one on an old build — setting it asserts a fact the controller
+            # cannot check.
+            - name: TALOS_WORKER_IDENTITY_REAP_PRE_PROTOCOL_HOURS
+              value: {{ .Values.controller.workerIdentityReaper.preProtocolHours | quote }}
+            {{- end }}
+            {{- end }}
             {{- with .Values.controller.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

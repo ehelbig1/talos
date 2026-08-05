@@ -68,6 +68,36 @@ spec:
         - protocol: TCP
           port: 11434
     {{- end }}
+    # Worker → controller, for POST /internal/worker-key (Ed25519
+    # self-registration) and POST /internal/worker-liveness (the periodic
+    # proof-of-possession ping the worker-identity reaper measures silence
+    # against). OPT-IN, default false, and REQUIRED IN ADDITION TO
+    # networkPolicy.workerRegistrationIngress — that rule is the controller's
+    # ingress half; without this one the worker's own egress policy still
+    # blocks the connection, because the external-egress rules below permit
+    # only ports 443/80 and explicitly EXCLUDE every RFC1918 range, which is
+    # where an in-cluster ClusterIP lives.
+    #
+    # Consequence when it is off (the default): no worker can ping, every
+    # worker_identities row keeps last_liveness_at NULL, and the automatic
+    # reaper — which refuses to act on NULL — is inert. That is the
+    # pre-feature behaviour, not a fault.
+    #
+    # Same port-level-not-path-level tradeoff as the controller's ingress
+    # rule: this opens the controller's whole API port to worker pods, and
+    # the endpoints' own auth is the gate. The liveness ping in particular
+    # grants nothing — it requires a proof of possession of an ALREADY-ACTIVE
+    # registered key and its only effect is moving one timestamp forward.
+    {{- if .Values.networkPolicy.workerControllerEgress.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: controller
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.controller.service.port }}
+    {{- end }}
     # External HTTP/HTTPS — required for module HTTP calls. The host deny
     # list (job_protocol::EXTERNAL_LLM_HOSTS + per-actor tier gate) is
     # enforced in the worker itself; NetworkPolicy is the coarse outer
