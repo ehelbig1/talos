@@ -199,6 +199,23 @@ spec:
                   name: {{ include "talos.bootstrapSecretName" . }}
                   key: TALOS_WORKER_SIGNING_KEY
                   optional: true
+            # Periodic proof-of-possession liveness ping
+            # (POST controller /internal/worker-liveness). Rendered only when
+            # the operator sets a value — empty leaves the env unset and the
+            # worker uses its own 60s default, so a default install's manifest
+            # is unchanged. `ne (toString …) ""` rather than `with`, because
+            # `with` treats the meaningful value 0 (explicitly DISABLE
+            # pinging) as absent.
+            #
+            # Setting 0 on a worker that has ALREADY pinged arms a reap of a
+            # live worker — see values.yaml worker.livenessIntervalSecs. Note
+            # also that with networkPolicy.enabled and the two
+            # worker↔controller opt-ins off (the defaults), these pings cannot
+            # leave the pod at all.
+            {{- if ne (toString .Values.worker.livenessIntervalSecs) "" }}
+            - name: TALOS_WORKER_LIVENESS_INTERVAL_SECS
+              value: {{ .Values.worker.livenessIntervalSecs | quote }}
+            {{- end }}
             {{- with .Values.worker.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

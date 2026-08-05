@@ -144,3 +144,534 @@ tests:
       - eval_time: 180m
         alertname: TalosBackupRestoreDrillFailed
         exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # WORKER-IDENTITY LIVENESS — the detector that makes the reaper safely
+  # enableable. Both directions, because either one alone is worthless:
+  # an alert that fires on a stopped fleet but ALSO on a fleet that never
+  # pinged is permanently red on every default chart install, and a
+  # permanently red alert is an ignored one.
+  # ══════════════════════════════════════════════════════════════════════
+
+  # DIRECTION 1 — THE ONE THAT MATTERS. A fleet of 3 workers is pinging, then
+  # stops (image rollback / dropped TALOS_CONTROLLER_URL / one-way network
+  # block). `participants` holds at 3 because nothing clears last_liveness_at;
+  # `recent_participants` falls to 0 once the 2h horizon lapses. The controller
+  # publishes both from one snapshot, so this is what the series actually do.
+  #
+  # The timeline is in the gauges' own terms: minutes 0-120 healthy, then
+  # `recent` drops. `for: 1h` means the alert is pending, not firing, for the
+  # first hour after the drop — asserted below, because "it fires eventually"
+  # is not the property; "it does not fire on a 20-minute blip" is half of it.
+  - interval: 1m
+    name: a participating fleet goes silent — fires, with the denominator intact
+    input_series:
+      - series: 'talos_worker_liveness_participants{job="talos-controller",instance="ctl-0"}'
+        values: "3x300"
+      - series: 'talos_worker_liveness_recent_participants{job="talos-controller",instance="ctl-0"}'
+        values: "3x120 0x180"
+    alert_rule_test:
+      # Healthy: every participant is recent, difference 0.
+      - eval_time: 60m
+        alertname: TalosWorkerLivenessParticipationDropped
+        exp_alerts: []
+      # Silent for 30m — inside `for: 1h`, so pending and NOT firing. This is
+      # what stops a rolling deploy or a node drain from paging.
+      - eval_time: 151m
+        alertname: TalosWorkerLivenessParticipationDropped
+        exp_alerts: []
+      # Silent for over an hour: firing. In wall-clock terms the workers have
+      # been quiet for ~3h (2h horizon + 1h `for`) and the reaper will not act
+      # for another ~21h — the whole point of the detector.
+      - eval_time: 190m
+        alertname: TalosWorkerLivenessParticipationDropped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: fleet-identity
+            exp_annotations:
+              summary: "3 worker signing key(s) stopped proving liveness and are heading for a reap"
+              description: |
+                3 worker_id(s) with an ACTIVE worker_identities row have
+                proved liveness in the past and have not pinged for over 2 hours.
+                Read the denominator alongside this number:
+                talos_worker_liveness_participants is the total population that has
+                ever pinged, talos_worker_liveness_recent_participants the subset
+                still pinging. If the two have converged to (N, 0) the WHOLE fleet
+                stopped, which is a configuration change, not N simultaneous
+                departures.
+
+                This is a WARNING and not yet damage. Nothing has been deactivated:
+                with TALOS_WORKER_IDENTITY_REAP_ENABLED set, the first key is
+                reaped one full TALOS_WORKER_IDENTITY_REAP_HOURS (default 24h)
+                after its last ping. You have roughly that window minus 3 hours to
+                act. With the reaper unset (the default) nothing will ever be
+                deactivated and this is purely informational — but it still means
+                the liveness signal you would need before enabling it is broken.
+
+                Two causes, and they need opposite responses:
+                  * THE WORKERS ARE GONE (scale-down, retired pods). Expected —
+                    but whether it CLEARS depends on the reaper, see action 1.
+                  * THE WORKERS ARE ALIVE AND STOPPED PINGING. This is the
+                    dangerous one and it is a configuration fault every time —
+                    see the action below.
+              action: |
+                1. Are the workers running? `kubectl get pods -l
+                   app.kubernetes.io/component=worker`. If the pods are gone this
+                   is an expected scale-down, and what happens next depends on the
+                   reaper: WITH it enabled the rows are deactivated one window
+                   later and this alert clears itself, no action. With it DISABLED
+                   — the default, and the state throughout every step of the
+                   enablement runbook before the last one — nothing ever clears
+                   them and this alert STAYS FIRING. That is a true finding, not a
+                   false positive: it is reading "N signing keys are still trusted
+                   by workers that no longer exist". Drain them
+                   (`deactivate-worker-identity` per key) or enable the reaper. Do
+                   not silence the rule, and do not wait for a self-resolution
+                   that is not coming. See docs/security/operational-runbook.md
+                   § 2.8.
+                2. If they ARE running, DISABLE THE REAPER FIRST
+                   (TALOS_WORKER_IDENTITY_REAP_ENABLED unset, restart controller)
+                   and only then diagnose. Disabling costs nothing — it restores
+                   the pre-feature behaviour of keys never expiring. Not disabling
+                   costs a fleet-wide, non-self-recoverable outage in ~21h.
+                3. Then find why they stopped. In order of observed likelihood:
+                   a rollback to a pre-liveness worker image; TALOS_CONTROLLER_URL
+                   missing from the worker env; TALOS_WORKER_LIVENESS_INTERVAL_SECS
+                   set to 0; a NetworkPolicy or ingress change that broke
+                   worker→controller HTTP one-way; or WORKER CLOCK SKEW, the only
+                   cause with no configuration change behind it — a worker drifting
+                   more than 60s AHEAD of the controller fails the freshness check
+                   on every ping while running perfectly, so auditing recent
+                   changes will never find it.
+                4. Read talos_worker_liveness_pings_total on the controller. All
+                   five outcomes matter and they separate the causes above:
+                     * every outcome flat, including accepted → nothing reached the
+                       handler. Either the pings are not ARRIVING (network path, or
+                       the worker is not pinging) or they are arriving and being
+                       refused by the extractor before the handler — wrong body
+                       shape, oversized body, wrong content-type — which this label
+                       set does not cover and which looks identical from here.
+                     * error climbing → they ARE arriving and the controller is
+                       failing to record them (a database fault). The workers are
+                       innocent and MUST NOT be reaped — disable the reaper.
+                     * rejected_request climbing → arriving and refused before the
+                       database: freshness (clock skew, in both directions) or a
+                       malformed field. This is the clock-skew fingerprint.
+                     * rejected_proof climbing → arriving with a signature that
+                       does not verify: a key rotated outside the registration
+                       path, or a worker signing with a key it never registered.
+                     * inactive_identity climbing → the key is already deactivated
+                       (revoked or previously reaped). Re-register it; the damage
+                       has already happened for that worker.
+                5. Grep the worker logs for event_kind="worker_liveness_rejected",
+                   "worker_liveness_not_found" or
+                   "worker_liveness_interval_unparseable".
+
+  # DIRECTION 2 — THE FALSE-POSITIVE GUARD, and the one a "does it fire?"
+  # review would skip. THIS IS THE CHART DEFAULT: with networkPolicy.enabled
+  # (default true) and both worker↔controller opt-ins off (default), no worker
+  # can reach the ping endpoint, every row keeps last_liveness_at NULL, and the
+  # controller publishes (0, 0) forever. The alert must be silent across the
+  # WHOLE timeline — a single firing sample here would make this alert red on
+  # every default install from the moment it shipped.
+  - interval: 1m
+    name: a fleet that never participated — silent forever (the chart default)
+    input_series:
+      - series: 'talos_worker_liveness_participants{job="talos-controller",instance="ctl-0"}'
+        values: "0x300"
+      - series: 'talos_worker_liveness_recent_participants{job="talos-controller",instance="ctl-0"}'
+        values: "0x300"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: TalosWorkerLivenessParticipationDropped
+        exp_alerts: []
+      - eval_time: 120m
+        alertname: TalosWorkerLivenessParticipationDropped
+        exp_alerts: []
+      - eval_time: 300m
+        alertname: TalosWorkerLivenessParticipationDropped
+        exp_alerts: []
+
+  # DIRECTION 2b — a fleet that IS pinging, for the whole timeline. Distinct
+  # from the (0,0) case above: it proves the alert is quiet on a NON-zero
+  # healthy population, so a rule that fired on `participants > 0` (rather than
+  # on the difference) would fail here while passing every other test.
+  - interval: 1m
+    name: a healthy pinging fleet — silent forever
+    input_series:
+      - series: 'talos_worker_liveness_participants{job="talos-controller",instance="ctl-0"}'
+        values: "12x300"
+      - series: 'talos_worker_liveness_recent_participants{job="talos-controller",instance="ctl-0"}'
+        values: "12x300"
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: TalosWorkerLivenessParticipationDropped
+        exp_alerts: []
+      - eval_time: 300m
+        alertname: TalosWorkerLivenessParticipationDropped
+        exp_alerts: []
+
+  # RECOVERY. The workers come back and resume pinging: `recent` climbs back to
+  # `participants` and the alert CLEARS. Asserted because a gauge wired
+  # rise-only (or a `max_over_time` expression) would stay firing forever after
+  # one scale-down — the exact defect that made the build-skew signal a
+  # recomputed gauge rather than a counter.
+  #
+  # The firing half is asserted on the EXPRESSION rather than through
+  # `alert_rule_test`, deliberately: promtool compares annotations exactly, so
+  # a third copy of the 30-line annotation blob would have to be kept in step
+  # by hand, and the ANNOTATION is not what this case is testing — the drop
+  # from 3 to 0 in the value the rule reads is. Direction 1 above owns the
+  # annotation contract.
+  - interval: 1m
+    name: the fleet resumes pinging — the alert clears
+    input_series:
+      - series: 'talos_worker_liveness_participants{job="talos-controller",instance="ctl-0"}'
+        values: "3x400"
+      - series: 'talos_worker_liveness_recent_participants{job="talos-controller",instance="ctl-0"}'
+        values: "3x60 0x180 3x160"
+    promql_expr_test:
+      # Silent for over an hour: the rule's value is 3, i.e. above its `> 0`
+      # threshold and (per Direction 1's identical timeline) firing.
+      - expr: |
+          max(
+            talos_worker_liveness_participants
+            - talos_worker_liveness_recent_participants
+          )
+        eval_time: 190m
+        exp_samples:
+          - labels: "{}"
+            value: 3
+      # `recent` recovers at t=241m and the value falls back to 0 — the gauge
+      # DRAINS. A rise-only wiring would still read 3 here.
+      - expr: |
+          max(
+            talos_worker_liveness_participants
+            - talos_worker_liveness_recent_participants
+          )
+        eval_time: 245m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+    alert_rule_test:
+      # ...and the alert itself is gone, not merely below threshold.
+      - eval_time: 245m
+        alertname: TalosWorkerLivenessParticipationDropped
+        exp_alerts: []
+
+  # PER-REPLICA AGGREGATION. Two controller replicas publish their own pair
+  # from their own snapshot: replica ctl-0 sees 5 participants / 3 recent
+  # (difference 2), replica ctl-1 sees 5/5 (difference 0).
+  #
+  # Three things are pinned here, and the third is the one a reviewer would
+  # otherwise take on trust:
+  #   * The subtraction is PER INSTANCE. It matches on all labels, so ctl-0's
+  #     participants can only meet ctl-0's recent count — never ctl-1's,
+  #     scraped at a different instant.
+  #   * `max()` reports the WORST replica (2), not 0 and not the total.
+  #   * `max()` COLLAPSES the label set to `{}` — exactly ONE sample, so
+  #     exactly one alert. A `by (instance)` form would emit two alerts for
+  #     one fleet condition, and Alertmanager groups on
+  #     [alertname, category] (deploy/observability/alertmanager-route.yaml),
+  #     which would merge them into one notification whose $value is
+  #     arbitrary. Asserting the empty label set is what rules that out.
+  - interval: 1m
+    name: two controller replicas — max() over the per-replica difference, one alert
+    input_series:
+      - series: 'talos_worker_liveness_participants{job="talos-controller",instance="ctl-0"}'
+        values: "5x300"
+      - series: 'talos_worker_liveness_recent_participants{job="talos-controller",instance="ctl-0"}'
+        values: "3x300"
+      - series: 'talos_worker_liveness_participants{job="talos-controller",instance="ctl-1"}'
+        values: "5x300"
+      - series: 'talos_worker_liveness_recent_participants{job="talos-controller",instance="ctl-1"}'
+        values: "5x300"
+    promql_expr_test:
+      - expr: |
+          max(
+            talos_worker_liveness_participants
+            - talos_worker_liveness_recent_participants
+          )
+        eval_time: 120m
+        exp_samples:
+          # ONE sample, and `{}` — max() dropped instance and job. If this
+          # rule were ever rewritten with `by (instance)` this line fails.
+          - labels: "{}"
+            value: 2
+    alert_rule_test:
+      # One alert, not two, and it carries no per-replica identity.
+      - eval_time: 120m
+        alertname: TalosWorkerLivenessParticipationDropped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: fleet-identity
+            exp_annotations:
+              summary: "2 worker signing key(s) stopped proving liveness and are heading for a reap"
+              description: |
+                2 worker_id(s) with an ACTIVE worker_identities row have
+                proved liveness in the past and have not pinged for over 2 hours.
+                Read the denominator alongside this number:
+                talos_worker_liveness_participants is the total population that has
+                ever pinged, talos_worker_liveness_recent_participants the subset
+                still pinging. If the two have converged to (N, 0) the WHOLE fleet
+                stopped, which is a configuration change, not N simultaneous
+                departures.
+
+                This is a WARNING and not yet damage. Nothing has been deactivated:
+                with TALOS_WORKER_IDENTITY_REAP_ENABLED set, the first key is
+                reaped one full TALOS_WORKER_IDENTITY_REAP_HOURS (default 24h)
+                after its last ping. You have roughly that window minus 3 hours to
+                act. With the reaper unset (the default) nothing will ever be
+                deactivated and this is purely informational — but it still means
+                the liveness signal you would need before enabling it is broken.
+
+                Two causes, and they need opposite responses:
+                  * THE WORKERS ARE GONE (scale-down, retired pods). Expected —
+                    but whether it CLEARS depends on the reaper, see action 1.
+                  * THE WORKERS ARE ALIVE AND STOPPED PINGING. This is the
+                    dangerous one and it is a configuration fault every time —
+                    see the action below.
+              action: |
+                1. Are the workers running? `kubectl get pods -l
+                   app.kubernetes.io/component=worker`. If the pods are gone this
+                   is an expected scale-down, and what happens next depends on the
+                   reaper: WITH it enabled the rows are deactivated one window
+                   later and this alert clears itself, no action. With it DISABLED
+                   — the default, and the state throughout every step of the
+                   enablement runbook before the last one — nothing ever clears
+                   them and this alert STAYS FIRING. That is a true finding, not a
+                   false positive: it is reading "N signing keys are still trusted
+                   by workers that no longer exist". Drain them
+                   (`deactivate-worker-identity` per key) or enable the reaper. Do
+                   not silence the rule, and do not wait for a self-resolution
+                   that is not coming. See docs/security/operational-runbook.md
+                   § 2.8.
+                2. If they ARE running, DISABLE THE REAPER FIRST
+                   (TALOS_WORKER_IDENTITY_REAP_ENABLED unset, restart controller)
+                   and only then diagnose. Disabling costs nothing — it restores
+                   the pre-feature behaviour of keys never expiring. Not disabling
+                   costs a fleet-wide, non-self-recoverable outage in ~21h.
+                3. Then find why they stopped. In order of observed likelihood:
+                   a rollback to a pre-liveness worker image; TALOS_CONTROLLER_URL
+                   missing from the worker env; TALOS_WORKER_LIVENESS_INTERVAL_SECS
+                   set to 0; a NetworkPolicy or ingress change that broke
+                   worker→controller HTTP one-way; or WORKER CLOCK SKEW, the only
+                   cause with no configuration change behind it — a worker drifting
+                   more than 60s AHEAD of the controller fails the freshness check
+                   on every ping while running perfectly, so auditing recent
+                   changes will never find it.
+                4. Read talos_worker_liveness_pings_total on the controller. All
+                   five outcomes matter and they separate the causes above:
+                     * every outcome flat, including accepted → nothing reached the
+                       handler. Either the pings are not ARRIVING (network path, or
+                       the worker is not pinging) or they are arriving and being
+                       refused by the extractor before the handler — wrong body
+                       shape, oversized body, wrong content-type — which this label
+                       set does not cover and which looks identical from here.
+                     * error climbing → they ARE arriving and the controller is
+                       failing to record them (a database fault). The workers are
+                       innocent and MUST NOT be reaped — disable the reaper.
+                     * rejected_request climbing → arriving and refused before the
+                       database: freshness (clock skew, in both directions) or a
+                       malformed field. This is the clock-skew fingerprint.
+                     * rejected_proof climbing → arriving with a signature that
+                       does not verify: a key rotated outside the registration
+                       path, or a worker signing with a key it never registered.
+                     * inactive_identity climbing → the key is already deactivated
+                       (revoked or previously reaped). Re-register it; the damage
+                       has already happened for that worker.
+                5. Grep the worker logs for event_kind="worker_liveness_rejected",
+                   "worker_liveness_not_found" or
+                   "worker_liveness_interval_unparseable".
+
+  # ══════════════════════════════════════════════════════════════════════
+  # THE REAP COUNTER. A pre-seeded CounterVec that sits flat at 0 forever on
+  # a healthy fleet — which is exactly the shape where absent-vs-zero decides
+  # whether an alert can fire at all. Both directions.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: no reaps — flat at the seeded zero, silent
+    input_series:
+      - series: 'talos_worker_identity_reaps_total{job="talos-controller",instance="ctl-0",arm="departed"}'
+        values: "0+0x300"
+      - series: 'talos_worker_identity_reaps_total{job="talos-controller",instance="ctl-0",arm="pre_protocol"}'
+        values: "0+0x300"
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: TalosWorkerIdentityReaped
+        exp_alerts: []
+      - eval_time: 300m
+        alertname: TalosWorkerIdentityReaped
+        exp_alerts: []
+
+  # Keys get deactivated on the automatic arm. `for: 0m` — this is a
+  # trust-boundary write and there is nothing to wait out. The `pre_protocol`
+  # arm stays flat, so exactly ONE alert must appear: `sum by (arm)` keeps the
+  # two apart, and which arm fired changes the operator's response.
+  - interval: 1m
+    name: the automatic arm reaps — fires immediately, on that arm only
+    input_series:
+      - series: 'talos_worker_identity_reaps_total{job="talos-controller",instance="ctl-0",arm="departed"}'
+        values: "0+0x60 3+0x240"
+      - series: 'talos_worker_identity_reaps_total{job="talos-controller",instance="ctl-0",arm="pre_protocol"}'
+        values: "0+0x300"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: TalosWorkerIdentityReaped
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: TalosWorkerIdentityReaped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: fleet-identity
+              arm: departed
+            exp_annotations:
+              summary: "3 worker signing key(s) deactivated by the departed reaper arm"
+              description: |
+                The worker-identity reaper deactivated 3 signing key(s)
+                in the last hour on the `departed` arm. Those keys are out
+                of the controller's trusted verify ring: any results those workers
+                sign from now on will FAIL verification, and they cannot re-register
+                themselves — trust-on-first-use refuses to re-activate a
+                deactivated key.
+
+                If those workers are genuinely gone, this is the feature working
+                and needs no action.
+
+                If any of them is still running, this is the failure this whole
+                subsystem is built to survive, and you are seeing it at the moment
+                it happened rather than inferring it from signature errors later.
+                arm="departed" means the worker stopped proving liveness for a full
+                window; arm="pre_protocol" means an operator enabled
+                TALOS_WORKER_IDENTITY_REAP_PRE_PROTOCOL_HOURS, which reaps on
+                registration AGE and cannot tell a departed pod from a healthy
+                long-lived one on an old build.
+              action: |
+                1. `list-worker-identities` on the controller CLI; compare the
+                   inactive rows against the pods that actually exist.
+                2. For any worker that is still running:
+                   `register-worker-identity --worker-id <id> --public-key <hex>`.
+                   Nothing else restores it.
+                3. Then disable the reaper (TALOS_WORKER_IDENTITY_REAP_ENABLED)
+                   until the cause of the missed pings is fixed, or it will reap
+                   the same worker again one window later.
+                4. This alert should be preceded by
+                   TalosWorkerLivenessParticipationDropped by ~21h. If it was not,
+                   the participation gauges are not being published — check that
+                   talos_worker_liveness_participants is present on
+                   /metrics/prometheus at all.
+
+  # ══════════════════════════════════════════════════════════════════════
+  # THE DETECTOR-COMPLETENESS FLAG. Above MAX_FLEET_BUILD_ROWS (200) active
+  # identities the participation gauges stop describing the whole population
+  # the reaper can act on — a worker sorting past the 200th row would be
+  # invisible to TalosWorkerLivenessParticipationDropped and still fully
+  # reapable. The controller fails safe (it stops reaping) and publishes this
+  # flag; without an alert on it, that refusal is itself a silent state.
+  #
+  # Both directions, because the false-positive half is what decides whether
+  # this rule survives contact with an operator: every fleet under the cap
+  # publishes a hard 0 forever, so a rule that fired there would be red on
+  # every install that has ever existed.
+  # ══════════════════════════════════════════════════════════════════════
+
+  # DIRECTION 1 — a normal fleet. Flat 0 for the whole timeline: silent.
+  - interval: 1m
+    name: population within the fleet-query cap — silent forever
+    input_series:
+      - series: 'talos_worker_liveness_population_truncated{job="talos-controller",instance="ctl-0"}'
+        values: "0x300"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: TalosWorkerIdentityReapBlinded
+        exp_alerts: []
+      - eval_time: 300m
+        alertname: TalosWorkerIdentityReapBlinded
+        exp_alerts: []
+
+  # DIRECTION 2 — the population crosses the cap and the reaper blinds itself.
+  # `for: 15m` is asserted on both sides: silent 10 minutes after the flip (so
+  # a single truncated scrape during a registration burst does not page),
+  # firing at 40. Then it CLEARS once the ghost rows are drained — a flag that
+  # could not fall would leave this permanently red, which is the same as no
+  # alert at all.
+  - interval: 1m
+    name: population past the cap — fires after 15m, and clears when drained
+    input_series:
+      - series: 'talos_worker_liveness_population_truncated{job="talos-controller",instance="ctl-0"}'
+        values: "0x60 1x60 0x180"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: TalosWorkerIdentityReapBlinded
+        exp_alerts: []
+      # 10 minutes past the flip: inside `for`, still pending.
+      - eval_time: 71m
+        alertname: TalosWorkerIdentityReapBlinded
+        exp_alerts: []
+      - eval_time: 100m
+        alertname: TalosWorkerIdentityReapBlinded
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: fleet-identity
+            exp_annotations:
+              summary: "worker-identity liveness detector is truncated; the reaper has stopped acting"
+              description: |
+                The ACTIVE worker_identities population is at or past the bound on
+                the query the liveness participation gauges are computed from (200
+                rows). Above that bound the detector and the reaper no longer
+                describe the same set of rows, so
+                TalosWorkerLivenessParticipationDropped can no longer promise to
+                warn before a key is deactivated.
+
+                The controller has therefore STOPPED REAPING — nothing is being
+                deactivated while this fires. The trust-bounding property is off,
+                which is the pre-#631 status quo, not a regression in progress.
+
+                talos_worker_liveness_participants and
+                talos_worker_liveness_recent_participants are both UNDERSTATED
+                while this fires. Do not read them as a fleet census, and do not
+                use them for the runbook's step-4 gate until this clears.
+              action: |
+                1. `list-worker-identities` and count ACTIVE rows. The overwhelming
+                   likely cause is accumulated ghosts — every retired pod that ever
+                   registered leaves an active row behind, which is the backlog the
+                   reaper exists to drain and cannot drain while blinded.
+                2. Drain them: `deactivate-worker-identity` for every worker_id
+                   with no corresponding running pod. This is safe for a departed
+                   worker and recoverable (`register-worker-identity`) if you
+                   retire one by mistake.
+                3. Confirm talos_worker_liveness_population_truncated returns to 0
+                   and that talos_worker_liveness_participants now matches your
+                   real worker count before relying on either gauge again.
+                4. If your fleet is LEGITIMATELY larger than 200 active identities,
+                   this is not drainable and the cap must be raised in code
+                   (MAX_FLEET_BUILD_ROWS in talos-worker-identity-repository, which
+                   bounds the gauge query) — do not work around it by removing the
+                   reaper's precondition, which is the only thing keeping the
+                   detector and the reaper honest with each other.
+      # Drained at t=121m: the gauge falls and the alert is gone.
+      - eval_time: 150m
+        alertname: TalosWorkerIdentityReapBlinded
+        exp_alerts: []
+
+  # PER-REPLICA. One replica sees the truncation and the other does not (they
+  # scrape at different instants during a drain). `max()` reports the worst
+  # replica and collapses to `{}` — ONE alert for one fleet condition, the
+  # same property pinned for the participation rule above.
+  - interval: 1m
+    name: two controller replicas — max() takes the worst, one alert
+    input_series:
+      - series: 'talos_worker_liveness_population_truncated{job="talos-controller",instance="ctl-0"}'
+        values: "1x300"
+      - series: 'talos_worker_liveness_population_truncated{job="talos-controller",instance="ctl-1"}'
+        values: "0x300"
+    promql_expr_test:
+      - expr: max(talos_worker_liveness_population_truncated)
+        eval_time: 60m
+        exp_samples:
+          - labels: "{}"
+            value: 1
