@@ -5380,6 +5380,84 @@ else
 fi
 echo
 
+# ── 67. The fleet heartbeat must never touch the trust boundary ───────
+# A NATS `WorkerHeartbeat` is HMAC-signed under `WORKER_SHARED_KEY`, which is
+# FLEET-SHARED: any process holding that key can mint one naming any
+# `worker_id`. A #631 liveness ping is an Ed25519 proof of possession of THAT
+# worker's own registered private key. The two look alike from a distance and
+# are worlds apart as evidence.
+#
+# So if the fleet-view code could write `worker_identities.last_liveness_at`,
+# any shared-key holder could keep any worker's signing key trusted forever
+# and the identity reaper would never act — the unbounded-trust gap #631 was
+# built to close, reopened by an observability feature. The temptation is
+# real and specific: "the heartbeat already tells us the worker is alive, why
+# make it ping over HTTP too?"
+#
+# The in-crate unit test `heartbeat_never_touches_the_trust_boundary` asserts
+# the same thing, but a test can be deleted in the same commit that
+# introduces the write. This is the gate that cannot.
+#
+# Two directions, both scoped to `talos-worker-fleet/` (the crate that OWNS
+# the fleet view):
+#   (a) no source line may name the trust-boundary column or its writer;
+#   (b) its `[dependencies]` may not include anything it could reach the
+#       identity registry through (sqlx, the worker-identity repository, an
+#       HTTP client) — (a) alone would be defeated by a helper in another
+#       crate, so the dependency edge is cut too.
+# Comment lines are exempt: the crate documents this rule at length, and a
+# rule you may not explain is worse than no rule.
+bold "▶ check 67: the fleet heartbeat must not reach the identity trust boundary"
+HB_FAIL=0
+HB_SRC_DIR="$ROOT/talos-worker-fleet/src"
+if [ -d "$HB_SRC_DIR" ]; then
+    # `#[cfg(test)]` regions are dropped from the haystack, exactly like check
+    # 58 does, and for a reason that is not hypothetical: the in-crate test
+    # `heartbeat_never_touches_the_trust_boundary` asserts this same rule by
+    # scanning for these strings, so it necessarily CONTAINS them. Without the
+    # strip this check fails on a clean tree — the rule's own guard tripping
+    # the gate. A region ends at the first column-0 `}`, so code AFTER a test
+    # module is still scanned (a truncate-to-EOF strip would have made the
+    # mutation used to validate this check invisible). Stated limit: a write
+    # performed inside a `#[cfg(test)] mod` is not seen — the safe direction,
+    # since test code is not production code.
+    HB_HAYSTACK="$(mktemp)"
+    for f in $(find "$HB_SRC_DIR" -name '*.rs' 2>/dev/null); do
+        awk -v F="$f" '
+            /^#\[cfg\(test\)\]/ { intest=1 }
+            intest && /^\}/        { intest=0; next }
+            !intest                 { print F ":" NR ":" $0 }
+        ' "$f" >> "$HB_HAYSTACK"
+    done
+    while IFS= read -r hit; do
+        [ -z "$hit" ] && continue
+        red "✗ talos-worker-fleet touches the identity trust boundary: $hit"
+        yellow "  → a heartbeat is minted under the FLEET-SHARED key, so it must never"
+        yellow "    write last_liveness_at, re-activate an identity, or otherwise keep a"
+        yellow "    signing key trusted. That is the Ed25519 liveness ping's job (#631)."
+        HB_FAIL=1
+    done < <(grep -E '(last_liveness_at|touch_liveness|worker_identities)' "$HB_HAYSTACK" \
+             | grep -vE ':[0-9]+:[[:space:]]*(//|\*)' || true)
+    rm -f "$HB_HAYSTACK"
+
+    HB_DEPS="$(awk '/^\[dependencies\]/{f=1;next} /^\[/{f=0} f' "$ROOT/talos-worker-fleet/Cargo.toml" 2>/dev/null || true)"
+    for forbidden in sqlx talos-worker-identity-repository reqwest; do
+        if echo "$HB_DEPS" | grep -q "$forbidden"; then
+            red "✗ talos-worker-fleet depends on '$forbidden'"
+            yellow "  → the fleet view must have no path to the identity registry at all;"
+            yellow "    cutting the dependency edge is what makes the rule structural"
+            yellow "    rather than a matter of which line got written today."
+            HB_FAIL=1
+        fi
+    done
+fi
+if [ "$HB_FAIL" -eq 1 ]; then
+    EXIT_CODE=1
+else
+    green "✓ the fleet heartbeat cannot reach the identity trust boundary"
+fi
+echo
+
 # ── 54. Lint self-consistency (meta-check) ────────────────────────────
 # The system whose purpose is catching drift drifted from its own docs:
 # by 2026-07-01 the script had 49 checks while CLAUDE.md said 43 and the

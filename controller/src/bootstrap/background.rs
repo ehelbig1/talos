@@ -124,12 +124,53 @@ pub(crate) fn publish_worker_build_skew(
     rows: &[talos_worker_identity_repository::WorkerBuildRow],
     departed_after_hours: i64,
     now: chrono::DateTime<chrono::Utc>,
+    heartbeating: Option<&std::collections::HashSet<String>>,
 ) {
-    let skewed = count_skewed_live_workers(controller_build, rows, departed_after_hours, now);
+    let skewed = count_skewed_live_workers(
+        controller_build,
+        rows,
+        departed_after_hours,
+        now,
+        heartbeating,
+    );
     if let Some(m) = metrics::global() {
         m.worker_build_skew_workers
             .set(i64::try_from(skewed).unwrap_or(i64::MAX));
     }
+}
+
+/// Whether the operator has asserted that heartbeat SILENCE is meaningful in
+/// this fleet — i.e. that every worker here runs a build that publishes fleet
+/// heartbeats.
+///
+/// **This gate exists because the exclusion it enables is not safe by
+/// default, and the controller cannot check the fact it depends on.**
+///
+/// The registry-backed skew gauge counts a row with no liveness evidence, on
+/// purpose: unknown liveness is not evidence of departure, and a detector that
+/// went quiet on that uncertainty would be silenced by exactly the condition it
+/// exists to catch (#625). A fleet heartbeat does NOT remove that ambiguity by
+/// its ABSENCE. A worker on a build too old to publish heartbeats and a worker
+/// that has departed look identical from here — that is a property of the
+/// evidence, not a gap in the implementation, and it is precisely the case
+/// during the rolling deploy when build skew matters most.
+///
+/// So the exclusion is opt-in, in the same shape and for the same reason as
+/// `TALOS_WORKER_IDENTITY_REAP_PRE_PROTOCOL_HOURS`: setting it is the operator
+/// asserting a fact the controller cannot verify. Turn it on only once the
+/// whole fleet is known to run a heartbeat-publishing build; until then, a
+/// ghost row keeps the gauge above zero, which is the honest reading.
+///
+/// The heartbeat-DERIVED gauges (`talos_worker_fleet_*`) are unconditional and
+/// unaffected by this flag — they report only positive observations, so they
+/// need no such assertion.
+pub(crate) fn heartbeat_silence_is_authoritative() -> bool {
+    std::env::var("TALOS_WORKER_FLEET_HEARTBEAT_AUTHORITATIVE")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
 }
 
 /// Whether a row is PROVABLY departed: it participated in the liveness protocol
@@ -162,17 +203,29 @@ fn row_is_provably_departed(
 /// that are (a) not provably departed and (b) proven to be on a different build
 /// than the controller. Extracted so the population rule is unit-testable
 /// without a metrics registry or a DB.
+///
+/// `heartbeating` is `Some(set)` ONLY when [`heartbeat_silence_is_authoritative`]
+/// is on AND the fleet view is non-empty; a row absent from that set is then
+/// treated as departed. **The non-empty requirement is load-bearing**: an empty
+/// fleet view means "the subscription is broken or no worker has published
+/// yet", not "no worker exists", and passing it through would zero the gauge on
+/// a fleet it should be watching — absent is not zero (#625).
 pub(crate) fn count_skewed_live_workers(
     controller_build: &str,
     rows: &[talos_worker_identity_repository::WorkerBuildRow],
     departed_after_hours: i64,
     now: chrono::DateTime<chrono::Utc>,
+    heartbeating: Option<&std::collections::HashSet<String>>,
 ) -> usize {
     use talos_worker_identity_repository::{build_is_verifiable, builds_match};
 
     let controller_verifiable = build_is_verifiable(controller_build);
     rows.iter()
         .filter(|r| !row_is_provably_departed(r, departed_after_hours, now))
+        .filter(|r| match heartbeating {
+            None => true,
+            Some(live) => live.contains(&r.worker_id),
+        })
         .filter(|r| {
             r.build_version.as_deref().is_some_and(|wb| {
                 controller_verifiable
@@ -489,10 +542,135 @@ pub(crate) fn departed_liveness_cutoff_hours() -> i64 {
 /// consumers it protects.
 pub(crate) const MAX_REAP_SILENCE_HOURS: i64 = 24 * 365 * 10;
 
+/// Recompute and publish the four `talos_worker_fleet_*` gauges from one
+/// snapshot of the NATS heartbeat view.
+///
+/// Purely ADDITIVE to the registry-backed gauges: it reports only positive
+/// observations (workers that just spoke), so unlike a population NARROWING it
+/// needs no operator assertion and cannot silence anything. See
+/// [`heartbeat_silence_is_authoritative`] for the narrowing that does.
+///
+/// `worker_id` never reaches a label here — the summary is computed from
+/// [`talos_worker_fleet::WorkerManager::live_build_versions`], which hands out
+/// builds WITHOUT the identities they belong to, precisely so a caller-supplied
+/// string cannot become unbounded series cardinality.
+pub(crate) fn publish_worker_fleet_gauges(
+    controller_build: &str,
+    live_builds: &[Option<String>],
+    capacity_drops: u64,
+) {
+    let (skewed, unverifiable) = count_heartbeat_build_skew(controller_build, live_builds);
+    if let Some(m) = metrics::global() {
+        m.worker_fleet_live_workers
+            .set(i64::try_from(live_builds.len()).unwrap_or(i64::MAX));
+        m.worker_fleet_build_skew_workers
+            .set(i64::try_from(skewed).unwrap_or(i64::MAX));
+        m.worker_fleet_unverifiable_builds
+            .set(i64::try_from(unverifiable).unwrap_or(i64::MAX));
+        m.worker_fleet_capacity_dropped_heartbeats
+            .set(i64::try_from(capacity_drops).unwrap_or(i64::MAX));
+    }
+}
+
+/// Pure half of [`publish_worker_fleet_gauges`]: `(provably skewed,
+/// unverifiable)` over the heartbeating workers' self-reported builds.
+///
+/// Uses the SAME `builds_match` / `build_is_verifiable` pair as the
+/// registration WARN, `get_platform_info.fleet` and the registry-backed gauge,
+/// so the four surfaces cannot disagree about whether a build is skewed.
+/// A worker (or controller) reporting no usable sha is unverifiable and is NOT
+/// counted as skewed — absence of evidence is not evidence of skew (#578) —
+/// which is why the unverifiable count is returned rather than discarded.
+pub(crate) fn count_heartbeat_build_skew(
+    controller_build: &str,
+    live_builds: &[Option<String>],
+) -> (usize, usize) {
+    use talos_worker_identity_repository::{build_is_verifiable, builds_match};
+    let controller_verifiable = build_is_verifiable(controller_build);
+    let mut skewed = 0usize;
+    let mut unverifiable = 0usize;
+    for b in live_builds {
+        match b.as_deref() {
+            Some(wb) if controller_verifiable && build_is_verifiable(wb) => {
+                if !builds_match(controller_build, wb) {
+                    skewed += 1;
+                }
+            }
+            _ => unverifiable += 1,
+        }
+    }
+    (skewed, unverifiable)
+}
+
+/// Subscribe to the NATS worker-fleet heartbeat and publish the fleet gauges.
+///
+/// **This is the call site `start_worker_management` never had.** Until 2026-08
+/// it had zero callers, nothing published a heartbeat, and the message keyed on
+/// a `Uuid` where the identity registry keys on operator/pod text — so the
+/// fleet view was permanently empty AND unjoinable. It nonetheless read as
+/// live, and twice led a design toward intersecting the identity registry
+/// against it, which would have deactivated the whole fleet's signing keys on
+/// the first sweep.
+///
+/// VERIFY-ONCE (CLAUDE.md). `WorkerManager::handle_heartbeat` is the single
+/// primary `verify()` caller for `WorkerHeartbeat` in this process. The gauge
+/// task below reads the MAP that verification populates — it never touches the
+/// message — so it cannot become a second `verify()` and collide on the shared
+/// process-local nonce cache (the r300/r301 total outage).
+pub(crate) fn spawn_worker_fleet_tasks(
+    worker_manager: std::sync::Arc<talos_worker_fleet::WorkerManager>,
+    nats_client: Option<std::sync::Arc<async_nats::Client>>,
+) {
+    let Some(nats) = nats_client else {
+        tracing::warn!(
+            target: "talos_worker_fleet",
+            "worker-fleet heartbeat listener not started: NATS_URL not configured. \
+             talos_worker_fleet_live_workers will stay at 0 — read that as 'not \
+             observed', not as 'no workers'."
+        );
+        return;
+    };
+
+    {
+        let manager = worker_manager.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                talos_worker_fleet::start_worker_management(manager, (*nats).clone()).await
+            {
+                tracing::error!(
+                    target: "talos_worker_fleet",
+                    error = %e,
+                    "failed to start worker-fleet heartbeat management"
+                );
+            }
+        });
+    }
+
+    // Gauge sweep. Same 60s cadence as the registry-backed build-skew sweep so
+    // the two views of the fleet are never more than one interval apart when an
+    // operator reads them side by side.
+    tokio::spawn(async move {
+        let controller_build = crate::bootstrap::router::controller_build_version();
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            publish_worker_fleet_gauges(
+                &controller_build,
+                &worker_manager.live_build_versions(),
+                worker_manager.capacity_drops(),
+            );
+        }
+    });
+}
+
 /// Embedding-provider re-probe loop + crypto-invariant orphan gauges +
 /// worker build-skew gauge + DB-pool saturation gauges. Extracted verbatim from
 /// `main()`; spawn order preserved.
-pub(crate) fn spawn_metrics_gauge_tasks(db_pool: sqlx::Pool<sqlx::Postgres>) {
+pub(crate) fn spawn_metrics_gauge_tasks(
+    db_pool: sqlx::Pool<sqlx::Postgres>,
+    worker_manager: std::sync::Arc<talos_worker_fleet::WorkerManager>,
+) {
     // Background refresh — every 5 min, re-probe the provider so that
     // operator config rotations (key swap, URL change, tier upgrade) are
     // picked up without a controller restart. The interval is intentionally
@@ -586,9 +764,23 @@ pub(crate) fn spawn_metrics_gauge_tasks(db_pool: sqlx::Pool<sqlx::Postgres>) {
     // SELECT over a fleet-sized table (MAX_FLEET_BUILD_ROWS = 200).
     {
         let pool = db_pool.clone();
+        let fleet = worker_manager.clone();
         tokio::spawn(async move {
             let repo = talos_worker_identity_repository::WorkerIdentityRepository::new(pool);
             let controller_build = crate::bootstrap::router::controller_build_version();
+            let heartbeat_authoritative = heartbeat_silence_is_authoritative();
+            if heartbeat_authoritative {
+                tracing::info!(
+                    target: "worker_registry",
+                    "TALOS_WORKER_FLEET_HEARTBEAT_AUTHORITATIVE is set: registry rows with \
+                     no recent NATS fleet heartbeat are excluded from \
+                     talos_worker_build_skew_workers. This is an OPERATOR ASSERTION that \
+                     every worker in this fleet runs a build that publishes heartbeats — \
+                     the controller cannot check it, and if it is false a genuinely \
+                     skewed worker on an older build is silenced. The heartbeat-derived \
+                     talos_worker_fleet_* gauges are unaffected either way."
+                );
+            }
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
             // First tick fires immediately — skip it so startup isn't noisy and
             // workers get a moment to register.
@@ -599,7 +791,28 @@ pub(crate) fn spawn_metrics_gauge_tasks(db_pool: sqlx::Pool<sqlx::Postgres>) {
                     Ok(rows) => {
                         let window_hours = departed_liveness_cutoff_hours();
                         let now = chrono::Utc::now();
-                        publish_worker_build_skew(&controller_build, &rows, window_hours, now);
+                        // `Some(..)` ONLY when the operator has asserted that
+                        // silence is meaningful AND the view is non-empty. An
+                        // empty view means "nothing observed" — passing it
+                        // through would zero the gauge on a fleet it should be
+                        // watching, which is absent-read-as-zero (#625).
+                        let live_ids = if heartbeat_authoritative {
+                            let ids = fleet.live_worker_ids();
+                            if ids.is_empty() {
+                                None
+                            } else {
+                                Some(ids)
+                            }
+                        } else {
+                            None
+                        };
+                        publish_worker_build_skew(
+                            &controller_build,
+                            &rows,
+                            window_hours,
+                            now,
+                            live_ids.as_ref(),
+                        );
                         // The D2 pair rides the SAME snapshot, deliberately:
                         // `list_active_builds` already returns
                         // `last_liveness_at` for every active row, so the
@@ -3982,7 +4195,7 @@ mod detector_metric_tests {
     /// Drive the gauge with a fixed 24h departure cutoff and `now`, so the
     /// tests below read as "what population is counted", not "what time is it".
     fn publish(controller_build: &str, rows: &[WorkerBuildRow]) {
-        publish_worker_build_skew(controller_build, rows, 24, chrono::Utc::now());
+        publish_worker_build_skew(controller_build, rows, 24, chrono::Utc::now(), None);
     }
 
     /// The gauge must RISE with skewed workers and RETURN TO 0 when they
@@ -4266,7 +4479,7 @@ mod detector_metric_tests {
         }];
         // The hazard, still live if the clamp is ever removed.
         let raw = std::panic::catch_unwind(|| {
-            count_skewed_live_workers("0.1.0+bbbbbbb", &rows, i64::MAX, chrono::Utc::now())
+            count_skewed_live_workers("0.1.0+bbbbbbb", &rows, i64::MAX, chrono::Utc::now(), None)
         });
         assert!(
             raw.is_err(),
@@ -4275,9 +4488,171 @@ mod detector_metric_tests {
         );
         // The clamped value is safe: an un-departed row still counts as skewed.
         assert_eq!(
-            count_skewed_live_workers("0.1.0+bbbbbbb", &rows, clamped, chrono::Utc::now()),
+            count_skewed_live_workers("0.1.0+bbbbbbb", &rows, clamped, chrono::Utc::now(), None),
             1
         );
+    }
+
+    // ── NATS fleet heartbeat: the live-process view (2026-08) ──────────────
+
+    fn live(ids: &[&str]) -> std::collections::HashSet<String> {
+        ids.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// **THE DEFAULT IS UNCHANGED, and this is the assertion that says so.**
+    /// With `heartbeating: None` — what every deployment gets unless an
+    /// operator sets `TALOS_WORKER_FLEET_HEARTBEAT_AUTHORITATIVE` — a row with
+    /// no liveness evidence still counts, exactly as before. The heartbeat
+    /// cannot silently narrow this detector.
+    #[test]
+    fn heartbeat_absence_does_not_narrow_the_population_by_default() {
+        let rows = vec![row("ghost", Some("0.1.0+bbbbbbb"))];
+        assert_eq!(
+            count_skewed_live_workers("0.1.0+aaaaaaa", &rows, 24, chrono::Utc::now(), None),
+            1,
+            "unknown liveness must keep a row counted — a detector must not go \
+             quiet on the same uncertainty the reaper refuses to act on"
+        );
+    }
+
+    /// With the operator assertion ON, a row that is not heartbeating leaves
+    /// the population — this is the ONLY thing that drains a ghost row's
+    /// contribution to `TalosWorkerBuildSkew` without deactivating it.
+    #[test]
+    fn an_authoritative_fleet_view_excludes_a_row_that_is_not_heartbeating() {
+        let rows = vec![
+            row("ghost", Some("0.1.0+bbbbbbb")),
+            row("running", Some("0.1.0+ccccccc")),
+        ];
+        let now = chrono::Utc::now();
+        assert_eq!(
+            count_skewed_live_workers("0.1.0+aaaaaaa", &rows, 24, now, Some(&live(&["running"]))),
+            1,
+            "only the heartbeating worker is counted"
+        );
+        assert_eq!(
+            count_skewed_live_workers("0.1.0+aaaaaaa", &rows, 24, now, Some(&live(&["ghost"]))),
+            1
+        );
+        assert_eq!(
+            count_skewed_live_workers(
+                "0.1.0+aaaaaaa",
+                &rows,
+                24,
+                now,
+                Some(&live(&["ghost", "running"]))
+            ),
+            2,
+            "both heartbeating ⇒ both counted, i.e. the exclusion is not a \
+             blanket reduction"
+        );
+    }
+
+    /// The two rules compose in the SAFE direction: a heartbeating row that is
+    /// nonetheless provably departed by the liveness clock stays excluded.
+    /// Whichever rule says "gone" wins.
+    #[test]
+    fn a_provably_departed_row_stays_excluded_even_if_something_heartbeats_as_it() {
+        let rows = vec![row_pinged("w", Some("0.1.0+bbbbbbb"), 48)];
+        assert_eq!(
+            count_skewed_live_workers(
+                "0.1.0+aaaaaaa",
+                &rows,
+                24,
+                chrono::Utc::now(),
+                Some(&live(&["w"]))
+            ),
+            0
+        );
+    }
+
+    /// `count_heartbeat_build_skew` splits skewed from unverifiable rather than
+    /// folding the second into the first — so a 0 skew count can be read
+    /// correctly. 0 out of 0 comparable workers is not "the fleet agrees".
+    #[test]
+    fn heartbeat_skew_keeps_unverifiable_builds_separate() {
+        let builds = vec![
+            Some("0.1.0+aaaaaaa".to_string()),
+            Some("0.1.0+bbbbbbb".to_string()),
+            Some("0.1.0+unknown".to_string()),
+            None,
+        ];
+        assert_eq!(
+            count_heartbeat_build_skew("0.1.0+aaaaaaa", &builds),
+            (1, 2),
+            "one provably skewed; the unknown-sha and the absent build are \
+             unverifiable, not agreeing"
+        );
+        // An unverifiable CONTROLLER build makes every comparison impossible:
+        // the count must fall to 0, not read every worker as skewed.
+        assert_eq!(count_heartbeat_build_skew("0.1.0+unknown", &builds), (0, 4));
+        // Empty fleet view: nothing observed, nothing claimed.
+        assert_eq!(count_heartbeat_build_skew("0.1.0+aaaaaaa", &[]), (0, 0));
+    }
+
+    /// The gauges are published from the production function, and they FALL as
+    /// well as rise — a heartbeat view that only ever grew would pin the alert
+    /// on forever after one rolling deploy, the exact defect the registry gauge
+    /// was made level-triggered to avoid.
+    #[test]
+    fn fleet_gauges_rise_and_fall_and_never_carry_a_worker_label() {
+        let _g = gauge_guard();
+        let m = install_metrics();
+
+        publish_worker_fleet_gauges(
+            "0.1.0+aaaaaaa",
+            &[
+                Some("0.1.0+aaaaaaa".to_string()),
+                Some("0.1.0+bbbbbbb".to_string()),
+                None,
+            ],
+            7,
+        );
+        assert_eq!(m.worker_fleet_live_workers.get(), 3);
+        assert_eq!(m.worker_fleet_build_skew_workers.get(), 1);
+        assert_eq!(m.worker_fleet_unverifiable_builds.get(), 1);
+        assert_eq!(m.worker_fleet_capacity_dropped_heartbeats.get(), 7);
+
+        // Fleet converges and scales down.
+        publish_worker_fleet_gauges("0.1.0+aaaaaaa", &[Some("0.1.0+aaaaaaa".to_string())], 7);
+        assert_eq!(m.worker_fleet_live_workers.get(), 1);
+        assert_eq!(m.worker_fleet_build_skew_workers.get(), 0);
+
+        // `worker_id` is caller-supplied on the bus, so it must not appear in
+        // the exposition at all — these are plain label-free IntGauges and the
+        // rendered text is the proof.
+        let rendered = m.render_prometheus().expect("render");
+        for line in rendered.lines() {
+            if line.starts_with("talos_worker_fleet_") {
+                assert!(
+                    !line.contains('{'),
+                    "fleet gauges must carry NO labels (unbounded cardinality \
+                     from a caller-supplied worker_id): {line}"
+                );
+            }
+        }
+    }
+
+    /// The operator assertion is OFF unless explicitly set, and only the
+    /// documented truthy spellings turn it on. Fail-closed: an unrecognised
+    /// value leaves the detector at its safe, over-reporting default.
+    #[test]
+    fn the_heartbeat_authority_gate_is_off_by_default_and_fails_closed() {
+        let _g = gauge_guard();
+        std::env::remove_var("TALOS_WORKER_FLEET_HEARTBEAT_AUTHORITATIVE");
+        assert!(!heartbeat_silence_is_authoritative());
+        for on in ["1", "true", "TRUE", "yes", "on"] {
+            std::env::set_var("TALOS_WORKER_FLEET_HEARTBEAT_AUTHORITATIVE", on);
+            assert!(heartbeat_silence_is_authoritative(), "{on} must enable it");
+        }
+        for off in ["0", "false", "no", "maybe", ""] {
+            std::env::set_var("TALOS_WORKER_FLEET_HEARTBEAT_AUTHORITATIVE", off);
+            assert!(
+                !heartbeat_silence_is_authoritative(),
+                "{off:?} must leave it off"
+            );
+        }
+        std::env::remove_var("TALOS_WORKER_FLEET_HEARTBEAT_AUTHORITATIVE");
     }
 }
 

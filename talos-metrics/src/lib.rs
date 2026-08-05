@@ -250,6 +250,56 @@ pub struct TalosMetrics {
     /// until the detector is whole again.
     pub worker_liveness_population_truncated: IntGauge,
 
+    // ---- NATS fleet heartbeat (2026-08) ----
+    //
+    // A THIRD, INDEPENDENT view of the fleet, and the only one that works in
+    // the chart's DEFAULT posture. The two series above describe registered
+    // `worker_identities` rows and are structurally silent on a fleet pinned
+    // through the static `TALOS_WORKER_PUBLIC_KEYS` ring (no registration
+    // endpoint, no rows); the liveness ping needs worker→controller HTTP,
+    // which `networkPolicy.workerControllerEgress` blocks unless enabled.
+    // The heartbeat needs neither — every worker already speaks NATS.
+    //
+    // WHAT THE EVIDENCE IS WORTH, because it is weaker than it looks: a
+    // heartbeat is HMAC-signed under the FLEET-SHARED `WORKER_SHARED_KEY`, so
+    // any process holding that key can mint one naming any worker. These are
+    // liveness HINTS for observability. Nothing here may gate trust, and
+    // `worker_id` is caller-supplied so it is NOT a label on any of them.
+    /// Distinct `worker_id`s that published a fleet heartbeat within the
+    /// staleness window. A GAUGE recomputed from the fleet view each sweep
+    /// (always `set`) so a scaled-down worker lowers it.
+    ///
+    /// 0 is AMBIGUOUS and must be read as "no heartbeat observed": it covers
+    /// a genuinely empty fleet, a fleet on a build too old to publish, and a
+    /// broken subscription. It is not evidence that workers are absent.
+    pub worker_fleet_live_workers: IntGauge,
+    /// Of [`Self::worker_fleet_live_workers`], those reporting a build that
+    /// PROVABLY differs from this controller's.
+    ///
+    /// The live-process twin of `worker_build_skew_workers`: that one counts
+    /// REGISTERED ROWS (which include pods that no longer exist), this one
+    /// counts PROCESSES THAT JUST SPOKE. Neither subsumes the other — a ghost
+    /// row appears only in the former, and a worker on a static-key fleet with
+    /// no registry row appears only in the latter.
+    pub worker_fleet_build_skew_workers: IntGauge,
+    /// Of [`Self::worker_fleet_live_workers`], those whose build cannot be
+    /// compared at all (no sha, or `unknown`).
+    ///
+    /// Exported so a 0 on the skew gauge is readable: 0 skewed out of 0
+    /// comparable workers is not "the fleet agrees" (#578). Same deliberate
+    /// under-count as the registry-backed gauge, made visible.
+    pub worker_fleet_unverifiable_builds: IntGauge,
+    /// Heartbeats refused because the fleet view was at its hard cap
+    /// (`talos_worker_fleet::MAX_TRACKED_WORKERS`), cumulative since process
+    /// start.
+    ///
+    /// An IntGauge rather than a Counter because it is republished from the
+    /// subscriber's own running total each sweep rather than incremented here;
+    /// it is monotonic within a process and resets on restart. Non-zero means
+    /// either a misconfigured fleet or someone using the shared key to flood
+    /// distinct worker ids — the bound held, but say so out loud.
+    pub worker_fleet_capacity_dropped_heartbeats: IntGauge,
+
     // Rate limiting metrics
     pub rate_limit_hits_total: CounterVec,
 
@@ -656,6 +706,60 @@ impl TalosMetrics {
         )?;
         registry.register(Box::new(worker_liveness_population_truncated.clone()))?;
 
+        // ---- NATS fleet heartbeat ----
+        let worker_fleet_live_workers = IntGauge::new(
+            "talos_worker_fleet_live_workers",
+            "Distinct worker_ids that published a NATS fleet heartbeat within \
+             the staleness window. Recomputed each sweep. 0 is AMBIGUOUS — it \
+             covers an empty fleet, a fleet on a build too old to publish \
+             heartbeats, and a broken subscription alike, so it is not \
+             evidence that workers are absent. Heartbeats are HMAC-signed \
+             under the FLEET-SHARED key, so this is a liveness hint for \
+             observability and never a trust signal.",
+        )?;
+        registry.register(Box::new(worker_fleet_live_workers.clone()))?;
+
+        let worker_fleet_build_skew_workers = IntGauge::new(
+            "talos_worker_fleet_build_skew_workers",
+            "Heartbeating workers whose reported build PROVABLY differs from \
+             this controller's. The live-process twin of \
+             talos_worker_build_skew_workers, which counts REGISTERED ROWS. \
+             Neither subsumes the other: a ghost row appears only in that one, \
+             a static-key worker with no registry row only in this one.",
+        )?;
+        registry.register(Box::new(worker_fleet_build_skew_workers.clone()))?;
+
+        let worker_fleet_unverifiable_builds = IntGauge::new(
+            "talos_worker_fleet_unverifiable_builds",
+            "Heartbeating workers reporting no usable commit sha, so their \
+             build cannot be compared. Exported so a 0 on \
+             talos_worker_fleet_build_skew_workers is readable: 0 skewed out \
+             of 0 comparable workers is not 'the fleet agrees'.",
+        )?;
+        registry.register(Box::new(worker_fleet_unverifiable_builds.clone()))?;
+
+        let worker_fleet_capacity_dropped_heartbeats = IntGauge::new(
+            "talos_worker_fleet_capacity_dropped_heartbeats",
+            "Heartbeats refused because the controller's fleet view was at its \
+             hard cap (MAX_TRACKED_WORKERS). Cumulative within a controller \
+             process; resets on restart. Non-zero means the bound held but \
+             something is publishing under more distinct worker ids than the \
+             fleet has.",
+        )?;
+        registry.register(Box::new(worker_fleet_capacity_dropped_heartbeats.clone()))?;
+
+        // Seed all four at 0. A gauge that has never been `set` is ABSENT, not
+        // zero, and every common PromQL idiom reads absent as "no match" — so
+        // an alert on a fleet that has never heartbeated could not fire on the
+        // cold-dead case, which is the one that matters (#625). These are
+        // closed, label-free series with live `set` sites in
+        // `controller::bootstrap::background::publish_worker_fleet_gauges`, so
+        // seeding them asserts nothing that is not wired.
+        worker_fleet_live_workers.set(0);
+        worker_fleet_build_skew_workers.set(0);
+        worker_fleet_unverifiable_builds.set(0);
+        worker_fleet_capacity_dropped_heartbeats.set(0);
+
         // Rate limiting metrics
         let rate_limit_hits_total = CounterVec::new(
             prometheus::Opts::new(
@@ -887,6 +991,10 @@ impl TalosMetrics {
             worker_liveness_participants,
             worker_liveness_recent_participants,
             worker_liveness_population_truncated,
+            worker_fleet_live_workers,
+            worker_fleet_build_skew_workers,
+            worker_fleet_unverifiable_builds,
+            worker_fleet_capacity_dropped_heartbeats,
             rate_limit_hits_total,
             cache_hits_total,
             cache_misses_total,
@@ -1057,6 +1165,16 @@ mod tests {
             // above describes the WHOLE reapable population; the reaper only
             // sweeps in that state.
             "talos_worker_liveness_population_truncated 0",
+            // The NATS fleet-heartbeat view. Same reasoning one step further:
+            // the state these sit in on a fleet that has never published a
+            // heartbeat is precisely the state an operator most needs to be
+            // able to distinguish from "the controller stopped publishing",
+            // and `absent()` cannot tell them apart if the series never
+            // existed.
+            "talos_worker_fleet_live_workers 0",
+            "talos_worker_fleet_build_skew_workers 0",
+            "talos_worker_fleet_unverifiable_builds 0",
+            "talos_worker_fleet_capacity_dropped_heartbeats 0",
         ] {
             assert!(
                 rendered.contains(expected),

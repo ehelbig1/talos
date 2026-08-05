@@ -675,3 +675,78 @@ tests:
         exp_samples:
           - labels: "{}"
             value: 1
+
+  # ══════════════════════════════════════════════════════════════════════
+  # THE LIVE-PROCESS BUILD-SKEW DETECTOR (NATS fleet heartbeat, 2026-08).
+  #
+  # Two properties worth driving rather than asserting:
+  #  1. it FIRES on a running worker that is on the wrong build, and CLEARS
+  #     once that worker rolls — a level-triggered gauge, not a counter that
+  #     would pin the alert on forever after one deploy;
+  #  2. it stays SILENT while every heartbeating worker is unverifiable. That
+  #     is the #578 rule — absence of evidence is not evidence of skew — and
+  #     it is the direction a future "tidy-up" is most likely to break, by
+  #     folding the unverifiable count into the skew count so the alert looks
+  #     more sensitive.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: a running worker on the wrong build fires, and clears when it rolls
+    input_series:
+      # Skewed for 60m, then the worker rolls onto the controller's build.
+      - series: 'talos_worker_fleet_build_skew_workers{job="talos-controller"}'
+        values: "1x60 0x60"
+      - series: 'talos_worker_fleet_live_workers{job="talos-controller"}'
+        values: "3x120"
+    alert_rule_test:
+      # `for: 30m` — pending, not firing, before the half hour is up.
+      - eval_time: 20m
+        alertname: TalosWorkerFleetBuildSkew
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: TalosWorkerFleetBuildSkew
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: fleet-identity
+              job: talos-controller
+            exp_annotations:
+              summary: "1 RUNNING worker process(es) on a different build than the controller"
+              description: |
+                At least one worker process has published a fleet heartbeat within
+                the last minute reporting a build that provably differs from this
+                controller's, and has done so for 30m. Unlike TalosWorkerBuildSkew
+                this cannot be a ghost registry row — the process spoke. Signed wire
+                formats are version-coupled, so a live skew breaks jobs in ways that
+                read as signature bugs.
+                Read it beside talos_worker_fleet_live_workers (the denominator) and
+                talos_worker_fleet_unverifiable_builds: workers reporting no usable
+                commit sha are NOT counted here, so a 0 is not "the fleet agrees".
+              action: |
+                1. Compare the controller and worker image digests — they must come
+                   from the same published tree.
+                2. get_platform_info → `fleet` for the per-worker detail; the
+                   heartbeat gauges are counts only (worker_id is caller-supplied on
+                   the bus and is deliberately never a metric label).
+                3. Roll the worker onto the controller's build. Do NOT silence: this
+                   one names running processes, not stale rows.
+      # Rolled at t=61m: the gauge falls and the alert clears.
+      - eval_time: 100m
+        alertname: TalosWorkerFleetBuildSkew
+        exp_alerts: []
+
+  # A fleet whose workers all report an unusable sha is UNVERIFIABLE, not
+  # agreeing. The skew gauge is 0 and the alert must stay silent — reporting
+  # skew we cannot prove would page on every dev build.
+  - interval: 1m
+    name: an all-unverifiable fleet does not fire
+    input_series:
+      - series: 'talos_worker_fleet_build_skew_workers{job="talos-controller"}'
+        values: "0x120"
+      - series: 'talos_worker_fleet_unverifiable_builds{job="talos-controller"}'
+        values: "3x120"
+      - series: 'talos_worker_fleet_live_workers{job="talos-controller"}'
+        values: "3x120"
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: TalosWorkerFleetBuildSkew
+        exp_alerts: []
