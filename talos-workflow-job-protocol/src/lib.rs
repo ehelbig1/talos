@@ -598,8 +598,11 @@ const WORKER_LIVENESS_POP_DOMAIN: &[u8] = b"talos/worker-key-liveness/v1";
 /// collide onto the same bytes. Pure and deterministic.
 ///
 /// Note there is no `supports_sealing` field: a liveness ping is not allowed to
-/// change any property of the row it touches, only `last_liveness_at`. Nothing
-/// to bind means nothing a replayed proof could alter.
+/// change any property of the row it touches, only `last_liveness_at`. So there
+/// is no row PROPERTY a replayed proof could alter — but it can still move that
+/// one timestamp, which is the value the reaper's window is measured from. The
+/// bound on that is freshness (`issued_at_ms` is signed and the endpoint
+/// enforces a 300s past window), not this field list.
 #[must_use]
 pub fn worker_liveness_pop_message(
     worker_id: &str,

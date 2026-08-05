@@ -2105,4 +2105,110 @@ mod tests {
 
         cleanup_worker_rows(&repo.db_pool, &[live, legacy, gone], &[]).await;
     }
+
+    /// REVIEW 2A ATTACK: can a LIVE worker be reaped?
+    ///
+    /// Yes — via ONE-WAY liveness participation, and this test PINS that
+    /// residual exposure rather than asserting it away.
+    ///
+    /// `last_liveness_at` is set by the first successful ping and NOTHING ever
+    /// clears it: neither `register` nor `register_tofu` resets it. So a worker
+    /// that pings once and then stops pinging WHILE STILL RUNNING is reaped
+    /// after the window, even though it re-registers on EVERY boot and
+    /// `last_seen_at` is seconds old. Remaining ways to enter that state:
+    ///   * rolling the worker image BACK to a pre-liveness build,
+    ///   * dropping `TALOS_CONTROLLER_URL` from the worker env,
+    ///   * `TALOS_WORKER_LIVENESS_INTERVAL_SECS=0` (explicit opt-out),
+    ///   * a one-way worker→controller network block outlasting the window.
+    /// A MISTYPED interval is no longer one of them — that used to silently
+    /// disable the pinger and was the cheapest path from a config typo to a
+    /// fleet-wide outage; `resolve_liveness_interval` now WARNs and keeps
+    /// pinging at the default.
+    ///
+    /// The migration's safety claim ("An old worker never pings and stays NULL
+    /// (never reaped)") holds only for a row that has NEVER pinged. It does
+    /// not hold on the way back, and there is no code path that puts a row
+    /// back into the NULL population.
+    #[tokio::test]
+    async fn a_live_worker_that_stopped_pinging_is_still_reaped() {
+        let _reap_guard = REAP_LOCK.lock().await;
+        let Some(pool) = pool_or_skip().await else {
+            return;
+        };
+        let repo = WorkerIdentityRepository::new(pool);
+        let wid = "test-2a-rollback-live-worker";
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
+
+        // Day 0: worker on the liveness build registers and pings.
+        repo.register_tofu(wid, &key(1), false, Some("0.1.0+new1111"))
+            .await
+            .unwrap();
+        assert!(repo.touch_liveness(wid, &key(1)).await.unwrap());
+
+        // Day 1: operator rolls the image BACK to a pre-liveness build. The
+        // worker is alive and re-registers on boot; nothing clears liveness.
+        age_row(&repo, wid, &key(1), Some(25), 25).await;
+        assert_eq!(
+            repo.register_tofu(wid, &key(1), false, Some("0.1.0+old0000"))
+                .await
+                .unwrap(),
+            TofuOutcome::Registered,
+            "the worker is demonstrably alive: it just re-registered"
+        );
+
+        let seen_age_secs: f64 = sqlx::query_scalar(
+            "SELECT extract(epoch from (now() - last_seen_at))::float8 FROM worker_identities
+             WHERE worker_id = $1",
+        )
+        .bind(wid)
+        .fetch_one(&repo.db_pool)
+        .await
+        .unwrap();
+        assert!(
+            seen_age_secs < 60.0,
+            "last_seen_at proves the process is alive right now ({seen_age_secs}s old)"
+        );
+
+        // The automatic arm reaps it anyway.
+        assert_eq!(
+            repo.reap_departed_identities(24).await.unwrap(),
+            1,
+            "ATTACK SUCCEEDS: a live, just-re-registered worker was deactivated"
+        );
+        assert!(!is_active(&repo, wid, &key(1)).await);
+
+        // And it cannot recover on its own — needs an operator.
+        assert_eq!(
+            repo.register_tofu(wid, &key(1), false, None).await.unwrap(),
+            TofuOutcome::IdentityConflict
+        );
+
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
+    }
+
+    /// REVIEW 2A CONTROL: the same worker that had NEVER pinged survives the
+    /// identical sequence. Proves the finding above is specifically about the
+    /// one-way transition, not about `last_seen_at` age.
+    #[tokio::test]
+    async fn a_never_pinged_worker_survives_the_same_sequence() {
+        let _reap_guard = REAP_LOCK.lock().await;
+        let Some(pool) = pool_or_skip().await else {
+            return;
+        };
+        let repo = WorkerIdentityRepository::new(pool);
+        let wid = "test-2a-control-live-worker";
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
+
+        repo.register_tofu(wid, &key(1), false, Some("0.1.0+old0000"))
+            .await
+            .unwrap();
+        age_row(&repo, wid, &key(1), None, 25).await;
+        repo.register_tofu(wid, &key(1), false, Some("0.1.0+old0000"))
+            .await
+            .unwrap();
+        assert_eq!(repo.reap_departed_identities(24).await.unwrap(), 0);
+        assert!(is_active(&repo, wid, &key(1)).await);
+
+        cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
+    }
 }

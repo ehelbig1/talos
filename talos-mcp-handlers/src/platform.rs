@@ -992,7 +992,10 @@ fn assemble_fleet_report(
                 // UNKNOWN, not departed — the automatic reaper deliberately
                 // refuses to act on it. A timestamp means the worker held this
                 // key's private half at that instant, and its key is trusted
-                // for at most TALOS_WORKER_IDENTITY_REAP_HOURS past it.
+                // for at most TALOS_WORKER_IDENTITY_REAP_HOURS past it plus the
+                // reaper sweep interval plus one worker-key overlay refresh
+                // (see DEFAULT_REAP_SILENCE_HOURS) — and only while the reaper
+                // is enabled at all, which it is not by default.
                 // `last_seen_at` above is BOOT REGISTRATION only and is not a
                 // liveness signal; do not read the two the same way.
                 "last_liveness_at": r.last_liveness_at.map(|t| t.to_rfc3339()),

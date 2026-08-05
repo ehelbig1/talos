@@ -529,9 +529,20 @@ pub(crate) async fn register_worker_key_handler(
 // register purely via the operator CLI, whose workers must be able to ping or
 // their identities could never be reaped.
 
-/// A liveness ping. Every field is bound into `proof`; there is nothing here a
-/// replayed or tampered request could change, because the only effect is a
-/// timestamp refresh on a row the proof already demonstrates ownership of.
+/// A liveness ping. Every field is bound into `proof`, so a TAMPERED request
+/// changes nothing — the signature stops covering it.
+///
+/// A REPLAYED one is not nothing, and saying so would be exactly the kind of
+/// claim this trust boundary cannot afford: the single effect of a ping is to
+/// move `last_liveness_at` forward, and that timestamp IS the security-relevant
+/// state (it is what the reaper's window is measured from). An on-path attacker
+/// who captures one ping can therefore keep a DEPARTED worker's key trusted for
+/// as long as that captured message stays fresh. What bounds it is the
+/// freshness window below, not the field binding: `issued_at_ms` is signed, so
+/// a capture is replayable for at most `WORKER_REG_PAST_MS` (300s) past the
+/// instant the real worker minted it. There is no nonce replay cache on this
+/// path; the 300s ceiling is the whole mitigation, and it is why the endpoint
+/// checks freshness before touching the DB.
 #[derive(serde::Deserialize)]
 pub(crate) struct WorkerLivenessRequest {
     worker_id: String,
@@ -3741,5 +3752,255 @@ mod worker_tofu_metric_tests {
         let _ =
             worker_key_tofu_conflict_refusal("worker-b", &[9u8; 32], RegBearerPath::Provisioning);
         assert_eq!(read() - before, 2.0);
+    }
+}
+
+/// REVIEW 2A: attack the unauthenticated `POST /internal/worker-liveness`
+/// endpoint end-to-end through a real axum router and a real Postgres.
+///
+/// The commit's central authorization claim is that the endpoint "GRANTS
+/// NOTHING". That is a claim about the HANDLER, not just about
+/// `touch_liveness`, so it has to be attacked at the HTTP boundary: everything
+/// between the socket and the guarded UPDATE (freshness, id validation, hex
+/// decode, proof-of-possession, error mapping) is what an attacker actually
+/// reaches. Skips without `DATABASE_URL`, like the repository crate's tests.
+#[cfg(test)]
+mod worker_liveness_endpoint_attack_tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn ts_now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    async fn pool_or_skip() -> Option<sqlx::PgPool> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .ok()
+    }
+
+    fn app(pool: sqlx::PgPool) -> axum::Router {
+        axum::Router::new()
+            .route(
+                "/internal/worker-liveness",
+                axum::routing::post(super::worker_liveness_handler),
+            )
+            .layer(axum::Extension(pool))
+    }
+
+    async fn post(pool: &sqlx::PgPool, body: serde_json::Value) -> StatusCode {
+        app(pool.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/worker-liveness")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    fn ping_body(
+        sk: &talos_workflow_job_protocol::DispatchSigningKey,
+        worker_id: &str,
+        pk: &[u8; 32],
+        issued_at_ms: u64,
+    ) -> serde_json::Value {
+        let proof = talos_workflow_job_protocol::sign_worker_liveness_proof(
+            sk,
+            worker_id,
+            pk,
+            issued_at_ms,
+            "n-1",
+        );
+        serde_json::json!({
+            "worker_id": worker_id,
+            "public_key": hex::encode(pk),
+            "issued_at_ms": issued_at_ms,
+            "nonce": "n-1",
+            "proof": hex::encode(proof),
+        })
+    }
+
+    async fn row(
+        pool: &sqlx::PgPool,
+        wid: &str,
+    ) -> Option<(
+        bool,
+        bool,
+        Option<String>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )> {
+        sqlx::query_as::<
+            _,
+            (
+                bool,
+                bool,
+                Option<String>,
+                Option<chrono::DateTime<chrono::Utc>>,
+            ),
+        >(
+            "SELECT active, supports_sealing, build_version, last_liveness_at
+             FROM worker_identities WHERE worker_id = $1",
+        )
+        .bind(wid)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn cleanup(pool: &sqlx::PgPool, wids: &[&str]) {
+        for w in wids {
+            sqlx::query("DELETE FROM worker_identities WHERE worker_id = $1")
+                .bind(w)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The whole (b) attack set in one place, each with its own assertion.
+    #[tokio::test]
+    async fn the_unauthenticated_endpoint_grants_nothing() {
+        let Some(pool) = pool_or_skip().await else {
+            return;
+        };
+        let repo = talos_worker_identity_repository::WorkerIdentityRepository::new(pool.clone());
+        let victim = "test-2a-ep-victim";
+        let ghost = "test-2a-ep-never-registered";
+        cleanup(&pool, &[victim, ghost]).await;
+
+        let sk = talos_workflow_job_protocol::DispatchSigningKey::from_bytes(&[3u8; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let attacker = talos_workflow_job_protocol::DispatchSigningKey::from_bytes(&[4u8; 32]);
+        let attacker_pk = attacker.verifying_key().to_bytes();
+
+        // ATTACK 1 — can an unauthenticated caller INSERT an identity?
+        // A perfectly-signed ping for a key that was never registered.
+        assert_eq!(
+            post(&pool, ping_body(&sk, ghost, &pk, ts_now_ms())).await,
+            StatusCode::NOT_FOUND
+        );
+        assert!(
+            row(&pool, ghost).await.is_none(),
+            "ATTACK 1 FAILED TO BE BLOCKED: the endpoint created a row"
+        );
+
+        // Register the victim so the remaining attacks have a real target.
+        repo.register(victim, &pk, false, Some("0.1.0+aaaaaaa"))
+            .await
+            .unwrap();
+        let before = row(&pool, victim).await.unwrap();
+        assert!(before.0 && !before.1 && before.3.is_none());
+
+        // ATTACK 2 — forged proof (right key claimed, attacker's signature).
+        let mut forged = ping_body(&sk, victim, &pk, ts_now_ms());
+        forged["proof"] = serde_json::json!(hex::encode(
+            talos_workflow_job_protocol::sign_worker_liveness_proof(
+                &attacker,
+                victim,
+                &pk,
+                ts_now_ms(),
+                "n-1"
+            )
+        ));
+        assert_eq!(post(&pool, forged).await, StatusCode::UNAUTHORIZED);
+        assert!(row(&pool, victim).await.unwrap().3.is_none(), "no write");
+
+        // ATTACK 3 — mismatched public key: attacker signs correctly for a key
+        // they DO hold, but claims the victim's worker_id. The UPDATE is keyed
+        // on (worker_id, public_key), so it must not touch the victim's row.
+        assert_eq!(
+            post(
+                &pool,
+                ping_body(&attacker, victim, &attacker_pk, ts_now_ms())
+            )
+            .await,
+            StatusCode::NOT_FOUND
+        );
+        assert!(row(&pool, victim).await.unwrap().3.is_none(), "no write");
+
+        // ATTACK 4 — wrong-domain proof: a REGISTRATION proof replayed here.
+        let reg = talos_workflow_job_protocol::sign_worker_registration_proof(
+            &sk,
+            victim,
+            &pk,
+            false,
+            ts_now_ms(),
+            "n-1",
+        );
+        let mut cross = ping_body(&sk, victim, &pk, ts_now_ms());
+        cross["proof"] = serde_json::json!(hex::encode(reg));
+        assert_eq!(post(&pool, cross).await, StatusCode::UNAUTHORIZED);
+        assert!(row(&pool, victim).await.unwrap().3.is_none(), "no write");
+
+        // ATTACK 5 — stale `issued_at_ms` (a captured ping replayed later) and
+        // a future-dated one. Both must be refused BEFORE the DB is touched.
+        let stale = ts_now_ms() - 10 * 60 * 1000;
+        assert_eq!(
+            post(&pool, ping_body(&sk, victim, &pk, stale)).await,
+            StatusCode::BAD_REQUEST
+        );
+        let future = ts_now_ms() + 10 * 60 * 1000;
+        assert_eq!(
+            post(&pool, ping_body(&sk, victim, &pk, future)).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(row(&pool, victim).await.unwrap().3.is_none(), "no write");
+
+        // ATTACK 6 — extra fields: can a caller smuggle `active`,
+        // `supports_sealing` or `build_version` past the deserializer?
+        let mut smuggle = ping_body(&sk, victim, &pk, ts_now_ms());
+        smuggle["active"] = serde_json::json!(false);
+        smuggle["supports_sealing"] = serde_json::json!(true);
+        smuggle["build_version"] = serde_json::json!("0.1.0+deadbee");
+        assert_eq!(post(&pool, smuggle).await, StatusCode::OK);
+        let after = row(&pool, victim).await.unwrap();
+        assert!(after.0, "active untouched");
+        assert!(!after.1, "supports_sealing untouched");
+        assert_eq!(
+            after.2.as_deref(),
+            Some("0.1.0+aaaaaaa"),
+            "build_version untouched"
+        );
+        assert!(after.3.is_some(), "only last_liveness_at moved");
+
+        // ATTACK 7 — resurrection: deactivate the victim (as the reaper would)
+        // and try to ping it back into the trust ring with a VALID proof.
+        assert!(repo.deactivate(victim, &pk).await.unwrap());
+        assert_eq!(
+            post(&pool, ping_body(&sk, victim, &pk, ts_now_ms())).await,
+            StatusCode::NOT_FOUND
+        );
+        assert!(
+            !row(&pool, victim).await.unwrap().0,
+            "ATTACK 7 FAILED TO BE BLOCKED: a reaped identity was reactivated"
+        );
+
+        // ATTACK 8 — existence oracle: a caller WITHOUT the private key gets
+        // the same answer for a registered and an unregistered worker_id.
+        let a = post(
+            &pool,
+            ping_body(&attacker, victim, &attacker_pk, ts_now_ms()),
+        )
+        .await;
+        let b = post(
+            &pool,
+            ping_body(&attacker, ghost, &attacker_pk, ts_now_ms()),
+        )
+        .await;
+        assert_eq!(a, b, "the endpoint must not distinguish known worker_ids");
+
+        cleanup(&pool, &[victim, ghost]).await;
     }
 }

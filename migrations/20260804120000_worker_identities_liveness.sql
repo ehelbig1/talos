@@ -43,7 +43,7 @@ ALTER TABLE worker_identities
     ADD COLUMN IF NOT EXISTS last_liveness_at TIMESTAMPTZ;
 
 COMMENT ON COLUMN worker_identities.last_liveness_at IS
-    'Last Ed25519 proof-of-possession liveness ping for this key, or NULL if this row has never participated in the liveness protocol. NULL rows are NEVER auto-reaped (unknown liveness is not evidence of departure). Written only by POST /internal/worker-liveness.';
+    'Last Ed25519 proof-of-possession liveness ping for this key, or NULL if this row has never participated in the liveness protocol. NULL rows are exempt from the AUTOMATIC reaper (unknown liveness is not evidence of departure), but they are exactly the population of the separate opt-in TALOS_WORKER_IDENTITY_REAP_PRE_PROTOCOL_HOURS arm, which ages them on last_seen_at — so NULL is not unconditionally unreapable. Written only by POST /internal/worker-liveness.';
 
 -- The reaper sweep's predicate: active rows that have participated and gone
 -- silent. Partial on `active` (matching idx_worker_identities_active) because

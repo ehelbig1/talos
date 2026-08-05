@@ -138,6 +138,16 @@ pub(crate) fn publish_worker_build_skew(
 /// `None` is NOT departed — it is unknown, and the two must never collapse.
 /// Split out as a named predicate so that distinction is a thing a reader (and
 /// a test) can point at rather than an inline `is_some_and` to skim past.
+///
+/// NOTE THE CLOCK, because it differs from the reaper's. The reaper compares
+/// `last_liveness_at` against Postgres's own `now()`, so controller clock skew
+/// cannot move the TRUST boundary. This predicate compares it against the
+/// CONTROLLER's `now`, so skew does move the DETECTOR: a controller clock
+/// running far ahead would classify live, currently-pinging workers as departed
+/// and drop them from the skew gauge's population — the gauge going quiet on a
+/// fleet it should be watching (#625's shape). It cannot cause a reap; only an
+/// under-report. Deliberate (the gauge must not add a DB round-trip per tick),
+/// but do not read "compared by Postgres" as covering this call.
 fn row_is_provably_departed(
     row: &talos_worker_identity_repository::WorkerBuildRow,
     departed_after_hours: i64,
@@ -180,8 +190,21 @@ pub(crate) fn count_skewed_live_workers(
 /// population.
 ///
 /// **This number IS the security property**: a worker's signing key is trusted
-/// for at most this long after the worker stops proving it is alive. 24h against
-/// the worker's default 60s ping interval means 1440 consecutive missed pings.
+/// for at most this long PLUS the two pipeline delays below, after the worker
+/// stops proving it is alive. 24h against the worker's default 60s ping
+/// interval means 1440 consecutive missed pings.
+///
+/// STATE THE ADDITIVE TERMS RATHER THAN ROUNDING THEM AWAY — "at most 24h" is
+/// the DB predicate, not the end-to-end bound. Deactivation of the row happens
+/// on the next reaper tick (this module's sweep interval, 300s), and the key
+/// only leaves the in-process verify ring on the next
+/// `refresh_worker_key_overlay` (`TALOS_WORKER_KEY_REFRESH_SECS`, default 60s,
+/// clamped 10..=3600). A captured ping can also be replayed by an on-path
+/// attacker for up to `WORKER_REG_PAST_MS` (300s) past its `issued_at_ms`,
+/// which shifts the start of the window by that much. So with defaults the
+/// honest statement is **≤ 24h + ~11 minutes** from the worker's last genuine
+/// ping; with `TALOS_WORKER_KEY_REFRESH_SECS=3600` it is ≤ 24h + ~1h10m. All
+/// three terms are bounded and none can shorten the window.
 ///
 /// Why not shorter, when a tighter bound is strictly better for the key-exposure
 /// half: because the cost of being WRONG is asymmetric and severe. A reaped key
@@ -189,21 +212,55 @@ pub(crate) fn count_skewed_live_workers(
 /// re-activate a deactivated key, which is the anti-revocation-bypass rule we
 /// must not weaken — so a falsely-reaped worker needs an operator
 /// `register-worker-identity` before its results verify again. 24h is chosen so
-/// that only a genuinely departed worker can cross it, and it is configurable
-/// downward by operators who can accept that trade.
+/// that no transient outage crosses it, and it is configurable downward by
+/// operators who can accept that trade.
+///
+/// It does NOT follow that "only a genuinely departed worker can cross it".
+/// Nothing ever clears `last_liveness_at`, so a worker that has pinged once is
+/// permanently in this population, and a LIVE worker crosses the window
+/// whenever its pinger stops for a non-departure reason: an image rollback to a
+/// pre-liveness build, `TALOS_CONTROLLER_URL` removed, the interval env set to
+/// `0` or mistyped (a non-numeric value silently disables the pinger), or a
+/// one-way worker→controller network block outlasting the window. Length is the
+/// only defence against those, and length alone is not one. Before disabling a
+/// running worker's pinger, disable the reaper.
 pub(crate) const DEFAULT_REAP_SILENCE_HOURS: i64 = 24;
 
 /// Hours of liveness silence that mark a participating worker as departed.
-/// `TALOS_WORKER_IDENTITY_REAP_HOURS`, clamped to a floor of 1h so a typo
-/// cannot make the window instantaneous.
+/// `TALOS_WORKER_IDENTITY_REAP_HOURS`.
+///
+/// A non-positive or unparseable value falls back to [`DEFAULT_REAP_SILENCE_HOURS`]
+/// (24), NOT to the 1h floor — the `filter(|h| *h > 0)` is what stops a typo
+/// producing an instantaneous window, and the trailing `.max(1)` is therefore
+/// unreachable belt-and-braces, not the live guard. Pinned by
+/// `departed_cutoff_default_and_floor`.
+///
+/// CLAMPED AT THE TOP END TOO, and that half is not cosmetic (review 2A). The
+/// value flows into two consumers that both break on an absurd one:
+///   * the gauge's `chrono::Duration::hours(...)`, which PANICS above
+///     ~2.56e12 hours — and the gauge sweep is a detached `tokio::spawn`, so
+///     one env typo kills it permanently and freezes
+///     `talos_worker_build_skew_workers` at its last value; and
+///   * Postgres `now() - make_interval(hours => …)`, which raises "timestamp
+///     out of range" above ~5.9e7 hours, turning the sweep into a per-tick
+///     WARN rather than the "even longer window" the saturating `i32::try_from`
+///     was described as producing.
+/// [`MAX_REAP_SILENCE_HOURS`] (10 years) is far below both limits, so neither
+/// consumer can be driven out of range by configuration. Clamping UP to a very
+/// long window is the safe direction (it deactivates less, never more).
 pub(crate) fn departed_liveness_cutoff_hours() -> i64 {
     std::env::var("TALOS_WORKER_IDENTITY_REAP_HOURS")
         .ok()
         .and_then(|v| v.trim().parse::<i64>().ok())
         .filter(|h| *h > 0)
         .unwrap_or(DEFAULT_REAP_SILENCE_HOURS)
-        .max(1)
+        .clamp(1, MAX_REAP_SILENCE_HOURS)
 }
+
+/// Upper bound on the configured trust window: 10 years in hours. Not a policy
+/// number — a range guard. See [`departed_liveness_cutoff_hours`] for the two
+/// consumers it protects.
+pub(crate) const MAX_REAP_SILENCE_HOURS: i64 = 24 * 365 * 10;
 
 /// Embedding-provider re-probe loop + crypto-invariant orphan gauges +
 /// worker build-skew gauge + DB-pool saturation gauges. Extracted verbatim from
@@ -352,6 +409,16 @@ pub(crate) fn spawn_metrics_gauge_tasks(db_pool: sqlx::Pool<sqlx::Postgres>) {
     // long-lived HEALTHY worker. `last_liveness_at` is written by the worker's
     // periodic proof-of-possession ping, so silence on it is real evidence.
     //
+    // SCOPE — what reaping a row does NOT remove. The verify ring is
+    // `union(TALOS_WORKER_PUBLIC_KEYS env base, active DB rows)`, rebuilt by
+    // `set_dynamic_worker_public_keys` from an IMMUTABLE env base. So a
+    // worker_id pinned in the env keeps verifying after its DB row is reaped —
+    // the bound below applies to the DB overlay ONLY. State it that way rather
+    // than as "an env-pinned fleet has no rows": it may well have rows (the dev
+    // stack pins `dev-worker-fleet` in the env AND has its registered row), and
+    // reaping them changes nothing for that identity. Un-pinning the env entry
+    // is the only way to put an env-listed key under this window.
+    //
     // FAIL-SAFE DIRECTION — argued, not assumed. "Safe" here is DO NOT
     // DEACTIVATE, because the two errors are wildly asymmetric:
     //   * Falsely reaping a LIVE worker breaks verification of its signed
@@ -385,7 +452,12 @@ pub(crate) fn spawn_metrics_gauge_tasks(db_pool: sqlx::Pool<sqlx::Postgres>) {
                 std::env::var("TALOS_WORKER_IDENTITY_REAP_PRE_PROTOCOL_HOURS")
                     .ok()
                     .and_then(|v| v.trim().parse::<i64>().ok())
-                    .filter(|h| *h > 0);
+                    .filter(|h| *h > 0)
+                    // Same top-end range guard as the automatic arm: an absurd
+                    // value must not push `make_interval` past Postgres's
+                    // minimum timestamp and turn the sweep into a per-tick
+                    // error. See `departed_liveness_cutoff_hours`.
+                    .map(|h| h.clamp(1, MAX_REAP_SILENCE_HOURS));
 
             let enabled = std::env::var("TALOS_WORKER_IDENTITY_REAP_ENABLED")
                 .map(|v| {
@@ -406,8 +478,11 @@ pub(crate) fn spawn_metrics_gauge_tasks(db_pool: sqlx::Pool<sqlx::Postgres>) {
                 target: "worker_registry",
                 silence_hours,
                 pre_protocol_hours = ?pre_protocol_hours,
-                "worker-identity reaper enabled: a key is trusted for at most \
-                 silence_hours after its worker stops proving liveness"
+                sweep_interval_secs = 300,
+                "worker-identity reaper enabled: a key stops being trusted at \
+                 most silence_hours + one sweep interval + one worker-key \
+                 overlay refresh (TALOS_WORKER_KEY_REFRESH_SECS) after its \
+                 worker stops proving liveness"
             );
 
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
@@ -417,8 +492,22 @@ pub(crate) fn spawn_metrics_gauge_tasks(db_pool: sqlx::Pool<sqlx::Postgres>) {
 
                 // i32 for the SQL `make_interval(hours => $1::int)` bind
                 // (check 27 — the pg arg is int4). Saturating, so an absurd
-                // configured value cannot wrap into a SHORT window; it can only
-                // produce an even longer one, which is the safe direction.
+                // configured value cannot wrap into a SHORT window.
+                //
+                // Precisely, since "it can only produce a longer interval" is
+                // not quite what happens at the top end: above roughly 5.9e7
+                // hours (~6700 years, the distance to Postgres's minimum
+                // timestamp) `now() - make_interval(...)` raises "timestamp out
+                // of range" and the sweep ERRORS instead of widening. That is
+                // still the safe direction — an erroring sweep deactivates
+                // nothing, i.e. an effectively infinite window — but it is a
+                // per-tick WARN, not a silently-longer window. Verified against
+                // Postgres 16.
+
+                // Set by either arm when a row actually changed, so the verify
+                // ring is republished exactly once per sweep that reaped.
+                let mut reaped_any = false;
+
                 let hours_i32 = i32::try_from(silence_hours).unwrap_or(i32::MAX);
                 match repo.reap_departed_identities(hours_i32).await {
                     Ok(0) => {}
@@ -436,6 +525,7 @@ pub(crate) fn spawn_metrics_gauge_tasks(db_pool: sqlx::Pool<sqlx::Postgres>) {
                              proving liveness; they must be re-registered by an \
                              operator if those workers return"
                         );
+                        reaped_any = true;
                     }
                     Err(e) => {
                         // Nothing was deactivated (single guarded statement).
@@ -451,20 +541,55 @@ pub(crate) fn spawn_metrics_gauge_tasks(db_pool: sqlx::Pool<sqlx::Postgres>) {
                     let hours_i32 = i32::try_from(hours).unwrap_or(i32::MAX);
                     match repo.reap_pre_protocol_identities(hours_i32).await {
                         Ok(0) => {}
-                        Ok(n) => tracing::warn!(
-                            target: "worker_registry",
-                            event_kind = "worker_identity_reaped_pre_protocol",
-                            keys = n,
-                            max_age_hours = hours,
-                            "deactivated worker signing keys that never participated in \
-                             the liveness protocol and have not re-registered within the \
-                             operator-configured window"
-                        ),
+                        Ok(n) => {
+                            tracing::warn!(
+                                target: "worker_registry",
+                                event_kind = "worker_identity_reaped_pre_protocol",
+                                keys = n,
+                                max_age_hours = hours,
+                                "deactivated worker signing keys that never participated in \
+                                 the liveness protocol and have not re-registered within the \
+                                 operator-configured window"
+                            );
+                            reaped_any = true;
+                        }
                         Err(e) => tracing::warn!(
                             target: "worker_registry",
                             error = %e,
                             "pre-protocol worker-identity reap sweep failed; no keys were \
                              deactivated"
+                        ),
+                    }
+                }
+
+                // EAGERLY DROP REAPED KEYS FROM THE IN-PROCESS VERIFY RING.
+                //
+                // Marking the row inactive is NOT what stops a key verifying:
+                // verification reads the `ArcSwap` overlay installed by
+                // `refresh_worker_key_overlay`, republished by a SEPARATE
+                // periodic task (TALOS_WORKER_KEY_REFRESH_SECS, default 60s,
+                // clamped up to 3600s). Without this call a reaped key stays
+                // trusted for up to one whole refresh interval AFTER the reap —
+                // the difference between "trusted for at most 24h" and "24h
+                // plus up to an hour", on the one number this feature exists to
+                // state. Best-effort: a failure only defers the republish to
+                // the next periodic refresh, so it can lengthen the window but
+                // never shorten it, and it can never re-trust a live key (the
+                // overlay is rebuilt from `WHERE active`).
+                if reaped_any {
+                    match refresh_worker_key_overlay(&repo).await {
+                        Ok(installed) => tracing::info!(
+                            target: "talos_engine",
+                            event_kind = "worker_key_overlay_refresh",
+                            installed,
+                            "republished the worker verify-key overlay immediately after \
+                             a reap"
+                        ),
+                        Err(e) => tracing::warn!(
+                            target: "talos_engine",
+                            error = %e,
+                            "post-reap worker-key overlay refresh failed; reaped keys stay \
+                             trusted until the next periodic refresh"
                         ),
                     }
                 }
@@ -3793,8 +3918,9 @@ mod detector_metric_tests {
         // Mutates process env; borrow the same lock the gauge tests use so a
         // thread-parallel `cargo test` can't interleave with them.
         let _g = gauge_guard();
-        // The stated property: "a key is trusted for at most 24h after its
-        // worker stops proving liveness."
+        // The stated property: "a key is trusted for at most 24h (plus one
+        // sweep interval and one key-overlay refresh — see
+        // DEFAULT_REAP_SILENCE_HOURS) after its worker stops proving liveness."
         assert_eq!(DEFAULT_REAP_SILENCE_HOURS, 24);
         // Unset → the default. (Set via the env only in the two cases below,
         // which are read through the same accessor the sweep uses.)
@@ -3815,5 +3941,54 @@ mod detector_metric_tests {
             );
         }
         std::env::remove_var("TALOS_WORKER_IDENTITY_REAP_HOURS");
+    }
+
+    /// REGRESSION GUARD (review 2A): a huge but i64-parseable window must be
+    /// clamped, not passed through.
+    ///
+    /// Pre-fix, `departed_liveness_cutoff_hours` only filtered `<= 0`, so
+    /// `TALOS_WORKER_IDENTITY_REAP_HOURS=9223372036854775807` flowed through to
+    /// two consumers that both break on it — asserted here in BOTH directions
+    /// so the guard cannot rot into a tautology:
+    ///   * the raw value still panics `chrono::Duration::hours` (the hazard is
+    ///     real, and the gauge sweep is a detached `tokio::spawn`, so the panic
+    ///     would kill it and freeze `talos_worker_build_skew_workers` forever);
+    ///   * the CLAMPED value does not — which is what production now passes.
+    #[test]
+    fn huge_reap_window_is_clamped_before_it_reaches_chrono() {
+        let _g = gauge_guard();
+        std::env::set_var("TALOS_WORKER_IDENTITY_REAP_HOURS", "9223372036854775807");
+        let clamped = departed_liveness_cutoff_hours();
+        std::env::remove_var("TALOS_WORKER_IDENTITY_REAP_HOURS");
+        assert_eq!(clamped, MAX_REAP_SILENCE_HOURS, "clamped to the 10y guard");
+        // Well inside Postgres's `make_interval` range too (~5.9e7 hours), so
+        // the sweep widens rather than erroring.
+        assert!(clamped < 59_000_000);
+        assert_eq!(
+            i32::try_from(clamped).unwrap(),
+            MAX_REAP_SILENCE_HOURS as i32
+        );
+
+        let rows = vec![talos_worker_identity_repository::WorkerBuildRow {
+            worker_id: "w-1".to_string(),
+            build_version: Some("0.1.0+aaaaaaa".to_string()),
+            supports_sealing: false,
+            last_seen_at: chrono::Utc::now(),
+            last_liveness_at: Some(chrono::Utc::now()),
+        }];
+        // The hazard, still live if the clamp is ever removed.
+        let raw = std::panic::catch_unwind(|| {
+            count_skewed_live_workers("0.1.0+bbbbbbb", &rows, i64::MAX, chrono::Utc::now())
+        });
+        assert!(
+            raw.is_err(),
+            "chrono::Duration::hours(i64::MAX) is expected to panic — that is WHY \
+             the clamp exists; if this stops panicking, re-derive the bound"
+        );
+        // The clamped value is safe: an un-departed row still counts as skewed.
+        assert_eq!(
+            count_skewed_live_workers("0.1.0+bbbbbbb", &rows, clamped, chrono::Utc::now()),
+            1
+        );
     }
 }
