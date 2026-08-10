@@ -712,15 +712,19 @@ tests:
             exp_annotations:
               summary: "1 RUNNING worker process(es) on a different build than the controller"
               description: |
-                At least one worker process has published a fleet heartbeat within
-                the last minute reporting a build that provably differs from this
-                controller's, and has done so for 30m. Unlike TalosWorkerBuildSkew
-                this cannot be a ghost registry row — the process spoke. Signed wire
-                formats are version-coupled, so a live skew breaks jobs in ways that
-                read as signature bugs.
-                Read it beside talos_worker_fleet_live_workers (the denominator) and
-                talos_worker_fleet_unverifiable_builds: workers reporting no usable
-                commit sha are NOT counted here, so a 0 is not "the fleet agrees".
+                At least one worker process has published a fleet heartbeat
+                recently — up to ~150s ago, being 60s of staleness plus a 30s prune
+                tick plus one 60s gauge sweep — reporting a build that provably
+                differs from this controller's, and has done so for 30m. Unlike
+                TalosWorkerBuildSkew this cannot be a ghost registry row: a process
+                spoke. Signed wire formats are version-coupled, so a live skew
+                breaks jobs in ways that read as signature bugs.
+                Read it beside talos_worker_fleet_live_workers (the denominator)
+                and talos_worker_fleet_unverifiable_builds, which counts every
+                heartbeating worker whose build could not be compared — either it
+                reported no usable commit sha, or THIS CONTROLLER has none, in
+                which case nothing is comparable. Uncomparable workers are not
+                counted here, so a 0 is not "the fleet agrees".
               action: |
                 1. Compare the controller and worker image digests — they must come
                    from the same published tree.

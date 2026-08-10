@@ -849,13 +849,23 @@ pub(crate) fn spawn_metrics_gauge_tasks(
     //
     // WHY IT KEYS ON `last_liveness_at` AND NOT `last_seen_at`. `last_seen_at`
     // is written ONLY at boot registration: there is no periodic re-register,
-    // and the NATS fleet heartbeat does not touch this table (nothing publishes
-    // that heartbeat at all — `WorkerHeartbeat` is constructed only in tests,
-    // `start_worker_management` has no call sites, and its `worker_id` is a
-    // Uuid where this table's is operator/pod text, so the fleet view is both
-    // empty and unjoinable). Decaying on `last_seen_at` would deactivate a
-    // long-lived HEALTHY worker. `last_liveness_at` is written by the worker's
-    // periodic proof-of-possession ping, so silence on it is real evidence.
+    // so decaying on it would deactivate a long-lived HEALTHY worker.
+    // `last_liveness_at` is written by the worker's periodic Ed25519
+    // proof-of-possession ping, so silence on it is real evidence.
+    //
+    // AND WHY NOT THE NATS FLEET HEARTBEAT, which since 2026-08 IS published
+    // by every worker and IS keyed on the same text `worker_id` as this table
+    // — i.e. it is now perfectly joinable, which it was not when this comment
+    // was first written. Because joinability was never the reason. A heartbeat
+    // is an HMAC under the FLEET-SHARED `WORKER_SHARED_KEY`: any process
+    // holding that key can mint one naming ANY worker_id, so feeding it into
+    // this window would let one fleet member keep every other member's signing
+    // key trusted indefinitely — exactly the unbounded trust this reaper
+    // exists to bound. The heartbeat is an observability hint; the ping is a
+    // credential. `talos-worker-fleet` cannot reach this table at all
+    // (structural lint check 67 cuts both the code path and the dependency
+    // edge), which is what makes the separation structural rather than a
+    // matter of which line got written today.
     //
     // SCOPE — what reaping a row does NOT remove. The verify ring is
     // `union(TALOS_WORKER_PUBLIC_KEYS env base, active DB rows)`, rebuilt by

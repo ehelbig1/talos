@@ -15,7 +15,10 @@ futures = "0.3"
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 tracing.workspace = true
-uuid.workspace = true
+# NOTE: `uuid` was dropped in 2026-08 with the Uuid -> String change to
+# `WorkerHeartbeat.worker_id`. Nothing in this crate constructs an id any
+# more; keeping the dep would have left a stale edge that reads as if the
+# fleet view still had a key space of its own.
 
 [lints]
 workspace = true

@@ -38,7 +38,12 @@
 //! * **Hard cap** [`MAX_TRACKED_WORKERS`]. At the cap, a heartbeat naming an
 //!   id that is not already tracked is dropped with a rate-limited WARN.
 //!   Existing entries keep updating, so a full map degrades to "no NEW workers
-//!   are visible" rather than to eviction churn of the real fleet.
+//!   are visible" rather than to eviction churn of the real fleet. State that
+//!   precisely: what a flood cannot displace is the ALREADY-TRACKED fleet. A
+//!   worker that boots, is renamed, or is rescheduled DURING a flood presents
+//!   a new id and is refused like any other, so it stays invisible until the
+//!   flood ages out — which is why `capacity_drops` is exported as a gauge
+//!   rather than only logged.
 //! * **Staleness prune** every [`PRUNE_INTERVAL`], removing entries not seen
 //!   within [`STALE_AFTER`]. A worker that stops heartbeating therefore leaves
 //!   the view within `STALE_AFTER + PRUNE_INTERVAL` (90s at defaults) — the
@@ -123,11 +128,22 @@ impl WorkerManager {
         //    is the stated replay bound: outside it the message is refused on
         //    freshness; inside it the nonce cache refuses a second use.
         if let Err(e) = hb.verify(&self.shared_key, WORKER_HEARTBEAT_MAX_AGE_SECS) {
-            return Err(anyhow::anyhow!(
-                "Invalid heartbeat signature from worker {}: {}",
-                hb.worker_id,
-                e
-            ));
+            // The id is echoed ONLY once `validate_worker_id` has accepted it
+            // — bounded to MAX_WORKER_ID_LEN and to `[A-Za-z0-9._-]`, so it
+            // cannot inject newlines into the log or carry a megabyte of bus
+            // payload into it. `verify()` runs that charset check FIRST, so a
+            // rejected id is exactly the one we must not print; the caller
+            // gets its length instead, which is the diagnostic that matters.
+            let id_is_wellformed =
+                talos_workflow_job_protocol::validate_worker_id(&hb.worker_id).is_ok();
+            return Err(if id_is_wellformed {
+                anyhow::anyhow!("Invalid heartbeat from worker {}: {e}", hb.worker_id)
+            } else {
+                anyhow::anyhow!(
+                    "Invalid heartbeat from a malformed worker_id ({} bytes, not echoed): {e}",
+                    hb.worker_id.len()
+                )
+            });
         }
 
         // 2. Bound the map. Checked AFTER verification so an unsigned flood
@@ -139,7 +155,7 @@ impl WorkerManager {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Log the first drop and then every 1000th: the flood case is
             // exactly when an unrated log line becomes its own DoS.
-            if n == 0 || n % 1000 == 0 {
+            if n == 0 || n.is_multiple_of(1000) {
                 tracing::warn!(
                     target: "talos_worker_fleet",
                     event_kind = "fleet_view_at_capacity",
@@ -441,9 +457,12 @@ mod tests {
     /// claim is "this code CANNOT write to the trust boundary", not "this
     /// particular call did not". Two independent legs:
     ///  * the crate has no dependency it could reach the identity table
-    ///    through (no sqlx, no worker-identity repository — the repository
-    ///    crate is a dev-dependency for `builds_match` only... which would be
-    ///    a hole, so the check is on the DEPENDENCIES table specifically);
+    ///    through — no sqlx, no worker-identity repository, no HTTP client.
+    ///    (The scan is deliberately on the `[dependencies]` table only. This
+    ///    crate happens to have no `[dev-dependencies]` section at all, so
+    ///    today the distinction is moot; it is written this way so that
+    ///    ADDING one for a test helper cannot quietly re-open the path, and
+    ///    so the assertion keeps meaning the same thing if it does.)
     ///  * no source line in this crate names the trust-boundary column or its
     ///    writer.
     ///
@@ -512,17 +531,42 @@ mod tests {
     /// Scanned over the production half only, for the same reason as the test
     /// above — the predicate below necessarily contains the string it looks
     /// for.
+    ///
+    /// THREE SCOPE LIMITS, two of which were holes until they were closed by
+    /// mutation during review; stating them is the point, since a guard
+    /// believed to be tighter than it is, is worse than a loose one.
+    /// (1) It matched the literal receiver name `hb.verify(`, so a second
+    /// call site on a differently-named binding (`beat.verify(`) was
+    /// invisible. Now it matches `.verify(` on any receiver — which does NOT
+    /// also match `verify_no_replay(`, because the paren must follow
+    /// `verify` immediately, so the passive-observer entry point stays legal.
+    /// (2) It counted LINES, so two calls on one line read as one. It now
+    /// counts occurrences.
+    /// (3) It reads THIS FILE only, via `include_str!`. A second file in this
+    /// crate would be invisible, so the crate being single-file is asserted
+    /// directly below rather than assumed — adding a `mod` fails here and
+    /// forces the scan to be widened (structural lint check 67 already scans
+    /// the whole `src/` directory and is the model to copy).
     #[test]
     fn exactly_one_primary_verify_call_site() {
         let full = include_str!("lib.rs");
         let production = full.split("\n#[cfg(test)]").next().unwrap_or(full);
-        let primary = production
+
+        for (i, line) in production.lines().enumerate() {
+            let t = line.trim_start();
+            assert!(
+                !(t.starts_with("mod ") || t.starts_with("pub mod ")),
+                "line {}: this crate gained a second source file, which this test \
+                 cannot see — widen the scan before adding it: {line}",
+                i + 1
+            );
+        }
+
+        let primary: usize = production
             .lines()
-            .filter(|l| {
-                let t = l.trim_start();
-                !t.starts_with("//") && t.contains("hb.verify(")
-            })
-            .count();
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .map(|l| l.matches(".verify(").count())
+            .sum();
         assert_eq!(
             primary, 1,
             "WorkerHeartbeat must have exactly one primary verify() caller; a passive \

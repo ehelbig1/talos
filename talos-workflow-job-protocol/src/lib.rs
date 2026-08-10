@@ -243,6 +243,56 @@ pub enum Verifier {
 
 const NONCE_CACHE_HARD_CAP: usize = 200_000;
 
+/// Retention floor for the shared nonce cache, in seconds.
+///
+/// **THE CACHE IS SHARED BY EVERY SIGNED TYPE IN THE PROCESS, SO ITS SWEEP
+/// MUST NOT BE DERIVED FROM ONE CALLER'S WINDOW.** Both sweeps below used to
+/// compute their cutoff from the `max_age_secs` of whichever verifier
+/// happened to trigger them. That is only sound while every verifier in the
+/// process passes the same window — which was true (300 everywhere) until the
+/// 2026-08 fleet heartbeat verified at 60. A 60-second caller then swept at
+/// `now - 120`, evicting `JobResult` nonces the 300-second verifier was still
+/// relying on, and a captured result replayed in the `(120s, 300s]` band
+/// passed freshness, passed its MAC, found no cache entry, and was applied a
+/// second time. Effective single-use protection silently narrowed from 300s
+/// to 120s on any controller holding more than 1024 nonces.
+///
+/// This floor is the widest window any verifier in the workspace passes today
+/// (300s, in `verify_dispatch` for `JobResult` / `PipelineJobResult` /
+/// `JobRequest` / `PipelineJobRequest`), so a fresh process is correct from
+/// its very first verify rather than from its first WIDE verify.
+/// [`WIDEST_VERIFY_WINDOW_SECS`] then covers a future caller that is wider
+/// still, so this constant does not have to be kept in sync by hand.
+///
+/// Raising retention is always safe: a nonce outside its own freshness window
+/// is refused by the freshness check before the cache is ever consulted, so a
+/// longer-lived entry can never cause a false replay rejection — only bounded
+/// extra memory.
+const NONCE_RETENTION_FLOOR_SECS: u64 = 300;
+
+/// Ceiling on how far [`WIDEST_VERIFY_WINDOW_SECS`] may be dragged upward by a
+/// caller, so a pathological `max_age_secs` (a test, a misconfiguration,
+/// `u64::MAX`) cannot disable the sweep and turn the cache into an unbounded
+/// allocation.
+const NONCE_RETENTION_CEILING_SECS: u64 = 3600;
+
+/// High-water mark of every freshness window this process has verified under,
+/// clamped to [`NONCE_RETENTION_CEILING_SECS`].
+///
+/// The sweep honours `max(floor, high-water)`, never the caller's own value,
+/// so a narrow verifier can never evict a wider verifier's live nonces.
+static WIDEST_VERIFY_WINDOW_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(NONCE_RETENTION_FLOOR_SECS);
+
+/// How long the shared cache must remember a nonce, given that *this* call
+/// arrived with `max_age_secs`. See [`NONCE_RETENTION_FLOOR_SECS`].
+fn nonce_retention_secs(max_age_secs: u64) -> u64 {
+    let clamped = max_age_secs.min(NONCE_RETENTION_CEILING_SECS);
+    let previous =
+        WIDEST_VERIFY_WINDOW_SECS.fetch_max(clamped, std::sync::atomic::Ordering::Relaxed);
+    previous.max(clamped).max(NONCE_RETENTION_FLOOR_SECS)
+}
+
 struct JobNonceCache {
     seen: std::sync::Mutex<HashMap<String, u64>>,
 }
@@ -269,10 +319,15 @@ impl JobNonceCache {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        // Sweep entries older than 2× max_age_secs. The 2× slack absorbs
-        // clock skew and avoids an admitting-then-rejecting race when
-        // (now, ts) straddle the boundary.
-        let cutoff = now.saturating_sub(max_age_secs.saturating_mul(2));
+        // Sweep entries older than 2× the RETENTION window — never 2× this
+        // caller's own `max_age_secs`. The cache is shared by every signed
+        // type in the process, so a narrow verifier computing the cutoff from
+        // its own window evicts a wider verifier's still-live nonces (see
+        // `NONCE_RETENTION_FLOOR_SECS`). The 2× slack absorbs clock skew and
+        // avoids an admitting-then-rejecting race when (now, ts) straddle the
+        // boundary.
+        let retention = nonce_retention_secs(max_age_secs);
+        let cutoff = now.saturating_sub(retention.saturating_mul(2));
         if g.len() > 1024 {
             // Skip the sweep at small sizes — pure overhead. Above 1k
             // entries it's worth it.
@@ -281,11 +336,13 @@ impl JobNonceCache {
         if g.contains_key(nonce) {
             return false;
         }
-        // Hard cap: if rate × 2× max_age_secs exceeds 200k entries,
-        // we're under abnormal load (or a flood). Drop everything older
-        // than the strict freshness window to free space.
+        // Hard cap: if rate × 2× retention exceeds 200k entries, we're under
+        // abnormal load (or a flood). Drop everything older than the strict
+        // freshness window to free space — again the RETENTION window, so the
+        // emergency valve cannot open a replay hole for a wider verifier that
+        // this one knows nothing about.
         if g.len() >= NONCE_CACHE_HARD_CAP {
-            let aggressive_cutoff = now.saturating_sub(max_age_secs);
+            let aggressive_cutoff = now.saturating_sub(retention);
             g.retain(|_, t| *t > aggressive_cutoff);
         }
         g.insert(nonce.to_string(), ts);
@@ -1209,6 +1266,119 @@ pub const JOB_NONCE_CACHE_CAPACITY: usize = NONCE_CACHE_HARD_CAP;
 fn clear_job_nonce_cache_for_test() {
     if let Ok(mut g) = JOB_NONCE_CACHE.seen.lock() {
         g.clear();
+    }
+}
+
+/// The shared nonce cache is cross-type: a narrow verifier must never sweep
+/// away a wider verifier's live nonces.
+///
+/// This is not a hypothetical. Until the 2026-08 fix, both sweeps derived
+/// their cutoff from the `max_age_secs` of whichever call happened to trigger
+/// them, which was sound only while every verifier in the process passed the
+/// same window. The controller passed 300 everywhere until the fleet
+/// heartbeat began verifying at 60; a 60-second caller then swept at
+/// `now - 120`, and a `JobResult` captured off the bus and replayed in the
+/// `(120s, 300s]` band passed freshness, passed its MAC, found no cache
+/// entry, and was applied a SECOND time. Single-use protection for job
+/// results narrowed from 300s to 120s on any controller holding more than
+/// 1024 nonces — which is ~1.7 verifies/second sustained, i.e. an ordinary
+/// busy controller.
+///
+/// The test drives the cache directly rather than through a message type
+/// because the defect is in the shared cache, not in any one signed type, and
+/// because a message-level test would have to fabricate a 150-second-old
+/// signature to see it.
+#[cfg(test)]
+mod shared_nonce_cache_retention_tests {
+    use super::*;
+
+    /// Guards the process-global cache + high-water mark against interleaving
+    /// with other tests in this binary.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs()
+    }
+
+    #[test]
+    fn a_narrow_verifier_must_not_evict_a_wider_verifiers_live_nonces() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        clear_job_nonce_cache_for_test();
+        let now = now_secs();
+
+        // A JobResult verified under the 300s dispatch window, stamped 150s
+        // ago: comfortably INSIDE its own freshness window, so replaying it
+        // must still be refused.
+        let victim = "victim-job-result-nonce";
+        assert!(
+            JOB_NONCE_CACHE.check_and_record(victim, now - 150, 300),
+            "first observation must be admitted"
+        );
+
+        // Push the map past the sweep threshold (the sweep is skipped at or
+        // below 1024 entries, which is why the defect needs a busy process).
+        for i in 0..1100 {
+            JOB_NONCE_CACHE.check_and_record(&format!("filler-{i}"), now, 300);
+        }
+
+        // Now the fleet heartbeat verifies under its 60s window. Pre-fix this
+        // swept at `now - 120` and took the victim with it.
+        assert!(JOB_NONCE_CACHE.check_and_record("heartbeat-nonce", now, 60));
+
+        assert!(
+            !JOB_NONCE_CACHE.check_and_record(victim, now - 150, 300),
+            "a 60-second verifier swept a 300-second verifier's live nonce: a \
+             captured JobResult replayed between 120s and 300s after its \
+             timestamp would now be applied twice"
+        );
+        // Leave the shared cache as we found it: the 1100 fillers are inert
+        // (unique keys), but a test that grows a process-global by 1100
+        // entries and walks away is how the next reader's size assertion
+        // becomes order-dependent.
+        clear_job_nonce_cache_for_test();
+    }
+
+    /// The same rule on the hard-cap emergency valve, which had the identical
+    /// defect one branch down: at 200k entries it re-swept at
+    /// `now - max_age_secs`, so a 60-second caller would drop everything
+    /// older than 60 seconds. Asserted at the retention level rather than by
+    /// allocating 200k entries.
+    #[test]
+    fn the_retention_window_is_never_narrower_than_the_widest_verifier() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            nonce_retention_secs(60),
+            NONCE_RETENTION_FLOOR_SECS,
+            "a narrow caller must be lifted to the floor, not honoured"
+        );
+        assert_eq!(
+            nonce_retention_secs(300),
+            300,
+            "the workspace-wide window is the floor"
+        );
+        // A wider future caller raises the high-water mark for everyone…
+        assert_eq!(nonce_retention_secs(900), 900);
+        assert_eq!(
+            nonce_retention_secs(60),
+            900,
+            "…and a narrow caller arriving afterwards still cannot narrow it"
+        );
+        // …but not without bound, or the sweep would stop reclaiming.
+        assert_eq!(
+            nonce_retention_secs(u64::MAX),
+            NONCE_RETENTION_CEILING_SECS,
+            "a pathological window must not disable the sweep"
+        );
+        // Reset the high-water mark so ordering between tests in this binary
+        // stays irrelevant. (Raising it is always SAFE — it can only cost
+        // memory — so a leak here would not corrupt another test's result.)
+        WIDEST_VERIFY_WINDOW_SECS.store(
+            NONCE_RETENTION_FLOOR_SECS,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 }
 
@@ -4842,13 +5012,18 @@ impl WorkerHeartbeat {
     /// length-prefixed, in the same construction as
     /// [`worker_liveness_pop_message`].
     ///
-    /// The old form was `format!("heartbeat:{id}:{nonce}:{cpu}:{caps}")` — a
-    /// colon-delimited string whose field boundaries a capability containing
-    /// `:` or `,` could shift, so two distinct field tuples could collide onto
-    /// the same bytes and one HMAC could verify under two readings. Length
-    /// prefixes make that impossible; the leading domain tag makes cross-type
-    /// confusion impossible. Neither change needed a compatibility shim
-    /// because nothing had ever published this message.
+    /// The old form was `format!("heartbeat:{id}:{nonce}:{cpu}:{caps}")`, a
+    /// delimited string in which two distinct field tuples could collide onto
+    /// the same bytes, so one HMAC could verify under two readings. Be exact
+    /// about which delimiter carried the hazard: `capabilities` were joined
+    /// on `,` and are UNVALIDATED, so `["a,b"]` and `["a", "b"]` genuinely
+    /// produced identical bytes. The `:` separators were NOT reachable the
+    /// same way — `worker_id` is charset-checked by [`validate_worker_id`],
+    /// the nonce is machine-generated and the cpu is a float — and in any
+    /// case the whole thing was theoretical rather than exploitable, because
+    /// this message had never had a producer. Length prefixes close the
+    /// ambiguity outright; the leading domain tag closes cross-type confusion.
+    /// Neither change needed a compatibility shim, for the same reason.
     fn signing_payload(&self) -> Vec<u8> {
         fn put(v: &mut Vec<u8>, field: &[u8]) {
             v.extend_from_slice(&(field.len() as u64).to_le_bytes());
@@ -5200,12 +5375,25 @@ mod worker_heartbeat_domain_separation_tests {
         assert!(err.contains("too old"), "unexpected error: {err}");
     }
 
-    /// The publish interval must stay inside the freshness window with room
-    /// to spare, or healthy heartbeats would be rejected as stale on a slow
-    /// bus. Pinned here because the two constants live in different crates.
+    /// A floor under the freshness window, and NOT the cross-crate pinning it
+    /// was originally named for.
+    ///
+    /// This crate cannot see the worker's publish interval — `worker` depends
+    /// on it, not the other way round — so it cannot assert the relationship
+    /// "interval < window". The real pinning is worker-side, in
+    /// `worker::heartbeat`'s `the_slowest_configurable_interval_still_keeps_a_
+    /// worker_visible`, which derives its own clamp ceiling FROM this
+    /// constant. What this test contributes is the other half: that shrinking
+    /// this constant below a minute — which would silently tighten that
+    /// derived ceiling and could push it under the default publish interval —
+    /// is a deliberate act rather than a passing edit.
     #[test]
-    fn the_freshness_window_leaves_headroom_over_the_publish_interval() {
-        assert!(WORKER_HEARTBEAT_MAX_AGE_SECS >= 60);
+    fn the_freshness_window_has_a_floor_the_worker_can_derive_its_clamp_from() {
+        assert!(
+            WORKER_HEARTBEAT_MAX_AGE_SECS >= 60,
+            "worker::heartbeat clamps its publish interval to 3/4 of this \
+             value; below 60s that ceiling drops under the 30s default"
+        );
     }
 }
 

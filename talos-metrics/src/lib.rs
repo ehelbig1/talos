@@ -283,7 +283,14 @@ pub struct TalosMetrics {
     /// no registry row appears only in the latter.
     pub worker_fleet_build_skew_workers: IntGauge,
     /// Of [`Self::worker_fleet_live_workers`], those whose build cannot be
-    /// compared at all (no sha, or `unknown`).
+    /// compared with the controller's.
+    ///
+    /// TWO CAUSES, and the second is easy to misread off the number alone:
+    /// the WORKER reported no usable sha (none, or `unknown`), **or the
+    /// CONTROLLER's own build has no usable sha** — in which case nothing is
+    /// comparable and every heartbeating worker lands here regardless of what
+    /// it reported. So this gauge equalling `live_workers` says "no comparison
+    /// was possible", not "no worker reported a build".
     ///
     /// Exported so a 0 on the skew gauge is readable: 0 skewed out of 0
     /// comparable workers is not "the fleet agrees" (#578). Same deliberate
@@ -298,6 +305,12 @@ pub struct TalosMetrics {
     /// it is monotonic within a process and resets on restart. Non-zero means
     /// either a misconfigured fleet or someone using the shared key to flood
     /// distinct worker ids — the bound held, but say so out loud.
+    ///
+    /// **TRAP FOR THE FIRST ALERT WRITTEN ON THIS.** It has COUNTER semantics
+    /// but a GAUGE type and no `_total` suffix, so `rate()` / `increase()`
+    /// will not apply counter reset handling and will misread every
+    /// controller restart. Alert on the level (`> 0`) or on
+    /// `delta(...[1h]) > 0`, not on a rate. No alert consumes it today.
     pub worker_fleet_capacity_dropped_heartbeats: IntGauge,
 
     // Rate limiting metrics
@@ -731,8 +744,11 @@ impl TalosMetrics {
 
         let worker_fleet_unverifiable_builds = IntGauge::new(
             "talos_worker_fleet_unverifiable_builds",
-            "Heartbeating workers reporting no usable commit sha, so their \
-             build cannot be compared. Exported so a 0 on \
+            "Heartbeating workers whose build cannot be compared with the \
+             controller's. Counts a worker reporting no usable commit sha AND \
+             — for every heartbeating worker at once — the case where the \
+             CONTROLLER's own build has no usable sha, since nothing can be \
+             compared then. Exported so a 0 on \
              talos_worker_fleet_build_skew_workers is readable: 0 skewed out \
              of 0 comparable workers is not 'the fleet agrees'.",
         )?;
