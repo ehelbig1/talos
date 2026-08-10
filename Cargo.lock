@@ -8836,6 +8836,7 @@ dependencies = [
  "talos-engine",
  "talos-execution-repository",
  "talos-memory",
+ "talos-metrics",
  "talos-module-executions",
  "talos-registry",
  "talos-secrets-manager",

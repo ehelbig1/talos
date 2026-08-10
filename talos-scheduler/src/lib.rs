@@ -417,12 +417,96 @@ pub struct SchedulerService {
     /// rate. Sized from `SCHEDULER_MAX_CONCURRENT_EXECUTIONS` (default
     /// [`DEFAULT_SCHEDULER_MAX_CONCURRENT_EXECUTIONS`]).
     spawn_semaphore: Arc<tokio::sync::Semaphore>,
+    /// A SECOND, tighter ceiling applied only to the **startup backlog** —
+    /// the schedules found due by the first poll after this process booted.
+    ///
+    /// The M6 semaphore above did not prevent the 2026-08-10 outage because
+    /// its default (16) never bound: exactly 15 schedules came due at boot, so
+    /// all fifteen ran at once. They started within 20 ms of each other, their
+    /// WASM jobs opened ~16 simultaneous TLS connects to `gmail.googleapis.com`
+    /// / `www.googleapis.com`, and the connects began failing
+    /// (`tcp connect error: deadline has elapsed`, `Connection refused`).
+    /// Five consecutive failures tripped the worker's per-host circuit
+    /// breaker, after which every remaining workflow declaring that host
+    /// failed instantly against an OPEN breaker — 8 of 19 runs, on a boot
+    /// where Gmail itself was demonstrably healthy (HTTP 200 sixteen seconds
+    /// earlier). Three more schedules were refused outright by the actor
+    /// budget backstop, which the burst had exhausted; two of those are DAILY
+    /// crons, so "the next scheduled occurrence will retry" meant tomorrow.
+    ///
+    /// Backlog executions acquire from BOTH semaphores, so startup
+    /// concurrency is `min(startup, steady)`. This is admission control, not
+    /// a delay: the first backlog run starts immediately, the rest queue
+    /// behind permits and drain as those complete.
+    startup_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Flips to `true` once the first poll has run, so the startup ceiling
+    /// applies to exactly one batch — the accumulated backlog — and steady
+    /// state is untouched.
+    first_poll_done: Arc<std::sync::atomic::AtomicBool>,
+    /// Consecutive polls held by the fleet-readiness barrier, and the latch
+    /// that stops it holding once that count passes
+    /// [`DEFAULT_SCHEDULER_READINESS_MAX_HOLDS`]. See
+    /// [`SchedulerService::fleet_is_visible`] for why an empty fleet view is
+    /// not proof that the fleet is absent, and therefore why the barrier must
+    /// have a give-up point.
+    consecutive_holds: Arc<std::sync::atomic::AtomicUsize>,
+    readiness_degraded: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Default ceiling on concurrently-running scheduled executions (see
 /// [`SchedulerService::spawn_semaphore`]). Override via
 /// `SCHEDULER_MAX_CONCURRENT_EXECUTIONS`.
 pub const DEFAULT_SCHEDULER_MAX_CONCURRENT_EXECUTIONS: usize = 16;
+
+/// Default ceiling on concurrently-running executions from the STARTUP
+/// BACKLOG (see [`SchedulerService::startup_semaphore`]). Override via
+/// `SCHEDULER_STARTUP_MAX_CONCURRENT`.
+///
+/// **This is a large reduction, not a proven-sufficient bound**, and saying so
+/// is the point. The observed herd was 15 concurrent executions producing
+/// ~16 simultaneous outbound connects; 4 is a ~4x reduction in concurrent
+/// executions. It is NOT a hard cap on concurrent outbound connections — one
+/// execution can still fan out across loop iterations and pipeline steps — so
+/// the honest claim is "much smaller burst", not "burst impossible".
+/// `talos_scheduler_dispatches_total{phase="startup",outcome="failed"}` and
+/// the alert built on it are what tell us whether 4 was actually enough;
+/// tuning belongs there, driven by that signal rather than by this comment.
+pub const DEFAULT_SCHEDULER_STARTUP_MAX_CONCURRENT: usize = 4;
+
+/// Default bound on how long the first poll waits for the worker fleet to
+/// become visible before giving up on THAT poll. Override via
+/// `SCHEDULER_READINESS_TIMEOUT_SECS`.
+///
+/// Sized from the heartbeat protocol, not guessed: workers publish every
+/// `TALOS_WORKER_HEARTBEAT_INTERVAL_SECS` (default 30 s) and NATS core
+/// delivery is not retained, so a worker that booted BEFORE the controller
+/// subscribed loses its first heartbeat entirely — this is not hypothetical,
+/// it is what happened on 2026-08-10 (worker published at 13:45:27.71, the
+/// controller's listener subscribed at 13:45:29.33). The controller therefore
+/// learns about such a worker on its SECOND heartbeat. 90 s = two default
+/// intervals plus a full interval of margin.
+pub const DEFAULT_SCHEDULER_READINESS_TIMEOUT_SECS: u64 = 90;
+
+/// How many CONSECUTIVE polls the readiness barrier may hold before it gives
+/// up and dispatches anyway. Override via `SCHEDULER_READINESS_MAX_HOLDS`.
+///
+/// **This is the "must not block forever" bound, and it is not a formality.**
+/// An empty fleet view is ambiguous, not proof of absence — the metric's own
+/// description in `talos_metrics` says so — and one of the readings it covers
+/// is a deployment where an operator set
+/// `TALOS_WORKER_HEARTBEAT_INTERVAL_SECS=0`, which disables heartbeat
+/// publishing entirely and is a supported configuration the worker logs as
+/// such. A barrier that refused to dispatch until it saw a heartbeat would, on
+/// that deployment, silently stop EVERY scheduled workflow forever on a
+/// completely healthy fleet. That failure is strictly worse than the boot herd
+/// this barrier exists to prevent, so the barrier degrades rather than wedges.
+///
+/// 20 polls at the 15 s interval ≈ 5 minutes — comfortably longer than the
+/// worst honest case (a missed first heartbeat costs one interval, 30 s) and
+/// short enough that a genuinely misconfigured fleet is not stalled for long.
+/// Crossing it sets `talos_scheduler_readiness_degraded` to 1 and logs at WARN;
+/// schedules run, but without the readiness guarantee, so a herd can recur.
+pub const DEFAULT_SCHEDULER_READINESS_MAX_HOLDS: usize = 20;
 
 impl SchedulerService {
     pub fn new(
@@ -452,7 +536,172 @@ impl SchedulerService {
             worker_shared_key,
             nats_client,
             spawn_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
+            startup_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                talos_config::positive_env_or_default(
+                    "SCHEDULER_STARTUP_MAX_CONCURRENT",
+                    DEFAULT_SCHEDULER_STARTUP_MAX_CONCURRENT,
+                ),
+            )),
+            first_poll_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            consecutive_holds: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            readiness_degraded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Whether the controller can currently SEE a worker able to run what the
+    /// scheduler is about to dispatch.
+    ///
+    /// Reads [`talos_worker_fleet::WorkerManager`] directly — the in-process
+    /// view updated synchronously on each verified NATS heartbeat — and
+    /// deliberately NOT the `talos_worker_fleet_live_workers` gauge, which is
+    /// republished on a 60 s sweep and so lags the truth by up to a minute.
+    /// On 2026-08-10 that distinction is the difference between learning about
+    /// the worker at 13:45:57 and at 13:46:40.
+    ///
+    /// **What this does and does not certify.** It certifies that some process
+    /// published a signed heartbeat recently — i.e. there is a fleet. It does
+    /// NOT certify that a given third-party dependency is reachable, and it
+    /// cannot: the per-host HTTP circuit breaker that actually failed those 8
+    /// runs is a `static OnceLock` inside the WORKER process
+    /// (`talos_worker_runtime::circuit_breaker`), invisible to the controller,
+    /// with no signal on the wire. The controller must not synthesise one by
+    /// probing Gmail either — that is a credentialed request storm against a
+    /// third party. So this barrier is honestly scoped to the readiness it can
+    /// observe, and the burst itself is defused by
+    /// [`Self::startup_semaphore`] rather than by waiting on something
+    /// unobservable.
+    fn fleet_is_visible(&self) -> bool {
+        self.worker_manager.worker_count() > 0
+    }
+
+    /// Wait, bounded, for the fleet to become visible before the first poll.
+    ///
+    /// Returns `true` if a worker became visible (dispatch may proceed) and
+    /// `false` if the bound elapsed with an empty fleet, or shutdown fired.
+    ///
+    /// FAIL-SAFE DIRECTION. A `false` means the caller SKIPS the poll
+    /// entirely — it never opens the transaction, so `last_triggered_at` /
+    /// `next_trigger_at` are not advanced and every due schedule is still due
+    /// on the next 15 s tick. Holding therefore cannot lose a run; it can only
+    /// delay one.
+    ///
+    /// And it cannot wedge, in TWO separate senses, because one alone would
+    /// not be enough:
+    ///   * after this initial bounded wait the check is a cheap non-blocking
+    ///     predicate re-evaluated every tick, so the backlog drains the moment
+    ///     a worker appears; and
+    ///   * holding itself is bounded — [`Self::hold_or_degrade`] gives up
+    ///     after [`DEFAULT_SCHEDULER_READINESS_MAX_HOLDS`] consecutive polls
+    ///     and dispatches anyway. Without that second bound, a deployment with
+    ///     heartbeats disabled would have every scheduled workflow silently
+    ///     stopped forever by a barrier that was supposed to protect it.
+    async fn await_fleet_visible(&self, shutdown: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+        if self.fleet_is_visible() {
+            return true;
+        }
+        let bound = std::time::Duration::from_secs(talos_config::positive_env_or_default(
+            "SCHEDULER_READINESS_TIMEOUT_SECS",
+            DEFAULT_SCHEDULER_READINESS_TIMEOUT_SECS,
+        ));
+        tracing::info!(
+            target: "talos_scheduler",
+            event_kind = "scheduler_awaiting_fleet",
+            bound_secs = bound.as_secs(),
+            "Scheduler: no worker visible in the NATS fleet heartbeat view yet — \
+             holding the first dispatch. Nothing is lost while held: no schedule \
+             state is advanced until a poll actually runs."
+        );
+        let deadline = tokio::time::Instant::now() + bound;
+        // Poll the manager rather than awaiting a notification: the fleet view
+        // has no change signal, and a 1 s probe against an in-memory DashMap
+        // costs nothing next to the 15 s poll interval it gates.
+        let mut probe = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = probe.tick() => {
+                    if self.fleet_is_visible() {
+                        return true;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                }
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Decide whether this poll may dispatch, given that the fleet is not
+    /// visible. Returns `true` to proceed anyway (degraded), `false` to hold.
+    ///
+    /// Holding is lossless — a held poll never opens its transaction, so no
+    /// schedule state advances and everything is still due next tick — but it
+    /// cannot be unbounded, because a zero fleet view is not proof of an
+    /// absent fleet (see [`DEFAULT_SCHEDULER_READINESS_MAX_HOLDS`]). Past the
+    /// bound this latches into a degraded mode that dispatches without the
+    /// readiness evidence and reports that fact on
+    /// `talos_scheduler_readiness_degraded`.
+    fn hold_or_degrade(&self) -> bool {
+        use std::sync::atomic::Ordering;
+
+        if self.readiness_degraded.load(Ordering::SeqCst) {
+            // Already gave up; don't re-log or re-count every 15 s.
+            return true;
+        }
+
+        let max_holds = talos_config::positive_env_or_default(
+            "SCHEDULER_READINESS_MAX_HOLDS",
+            DEFAULT_SCHEDULER_READINESS_MAX_HOLDS,
+        );
+        let holds = self.consecutive_holds.fetch_add(1, Ordering::SeqCst) + 1;
+
+        if holds <= max_holds {
+            if let Some(m) = talos_metrics::global() {
+                m.scheduler_readiness_holds_total.inc();
+            }
+            tracing::warn!(
+                target: "talos_scheduler",
+                event_kind = "scheduler_dispatch_held_fleet_unready",
+                holds,
+                max_holds,
+                "Scheduler: holding dispatch — the controller's NATS fleet heartbeat \
+                 view still contains no live worker. Due schedules are NOT advanced \
+                 and NOT lost; they fire as soon as a worker becomes visible."
+            );
+            return false;
+        }
+
+        self.readiness_degraded.store(true, Ordering::SeqCst);
+        if let Some(m) = talos_metrics::global() {
+            m.scheduler_readiness_degraded.set(1);
+        }
+        tracing::warn!(
+            target: "talos_scheduler",
+            event_kind = "scheduler_readiness_degraded",
+            holds,
+            max_holds,
+            "Scheduler: no worker has become visible after {max_holds} consecutive \
+             polls — dispatching WITHOUT fleet-readiness evidence from now on. A \
+             zero fleet view is ambiguous (empty fleet, a build too old to publish \
+             heartbeats, a broken subscription, or heartbeats disabled outright via \
+             TALOS_WORKER_HEARTBEAT_INTERVAL_SECS=0), and refusing forever would \
+             silently stop every scheduled workflow on a healthy fleet — which is \
+             worse than the boot herd this barrier prevents. Schedules will run; the \
+             startup-herd protection is weakened until heartbeats are seen."
+        );
+        true
+    }
+
+    /// Called on every poll that finds the fleet visible: clears the hold
+    /// streak so a transient blip does not accumulate toward the give-up
+    /// bound across an otherwise healthy day.
+    fn note_fleet_visible(&self) {
+        self.consecutive_holds
+            .store(0, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Start the scheduler loop. This runs indefinitely, polling every 15
@@ -474,11 +723,51 @@ impl SchedulerService {
         // Without this they are silently invisible to the scheduler's IS NOT NULL filter.
         self.backfill_null_trigger_times().await;
 
+        // READINESS BARRIER (bounded). `tokio::time::interval` fires its first
+        // tick IMMEDIATELY, so without this the first poll runs ~1.7 s after
+        // the controller starts and dispatches the entire accumulated backlog
+        // into a fleet the controller cannot yet see. On 2026-08-10 that view
+        // read ZERO live workers for the whole failure window — the herd fired
+        // at 13:45:29.94 and the fleet did not become visible until 13:45:57.
+        //
+        // This wait happens ONCE, before the loop, and only when the fleet is
+        // not already visible. On timeout we do not dispatch; the per-tick
+        // check below re-evaluates cheaply, so the backlog is deferred, never
+        // dropped.
+        if self.await_fleet_visible(&mut shutdown).await {
+            self.note_fleet_visible();
+        }
+        // `await_fleet_visible` consumes the shutdown notification via its own
+        // `changed()`, and `watch::Receiver::changed()` only resolves on a
+        // change the receiver has not yet seen. So the loop below would NOT
+        // observe a shutdown that arrived during the barrier wait — it would
+        // sit until the next tick and then dispatch, on a controller that is
+        // going away. Re-read the current value instead of relying on a second
+        // edge.
+        if *shutdown.borrow() {
+            tracing::info!("Scheduler received shutdown while awaiting fleet readiness");
+            return;
+        }
+        // If it timed out we deliberately do NOTHING here and fall through: the
+        // loop's first tick fires immediately and runs the same
+        // `fleet_is_visible` / `hold_or_degrade` accounting every later tick
+        // uses. Counting the hold here as well would inflate
+        // `talos_scheduler_readiness_holds_total` by one on every boot that
+        // waits, and the alert on it is threshold-based.
+
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
 
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    // Re-check every tick. Cheap (an in-memory count) and
+                    // non-blocking: a poll held here advances no schedule
+                    // state, so the same schedules are still due next tick.
+                    if self.fleet_is_visible() {
+                        self.note_fleet_visible();
+                    } else if !self.hold_or_degrade() {
+                        continue;
+                    }
                     if let Err(e) = self.poll_and_trigger().await {
                         tracing::error!("Scheduler poll error: {}", e);
                     }
@@ -619,6 +908,26 @@ impl SchedulerService {
 
     /// Single poll iteration: find due schedules and trigger them.
     async fn poll_and_trigger(&self) -> Result<(), String> {
+        // Classify the phase FIRST — before the query, and before the
+        // empty-batch early return below.
+        //
+        // "Startup backlog" means THE FIRST POLL ITERATION after boot, not
+        // "the first poll that happened to find something". Deciding it later
+        // would mislabel a clean boot's second poll: a controller that
+        // restarts with nothing overdue returns early here, and the next `*/15`
+        // cron to come due 15 s later would then be counted as startup — firing
+        // TalosSchedulerStartupHerdNotAbsorbed on an ordinary steady-state
+        // failure. A detector that cries wolf on the common case is how
+        // operators learn to ignore it.
+        let is_startup_backlog = !self
+            .first_poll_done
+            .swap(true, std::sync::atomic::Ordering::SeqCst);
+        let phase = if is_startup_backlog {
+            talos_metrics::SCHEDULER_PHASE_STARTUP
+        } else {
+            talos_metrics::SCHEDULER_PHASE_STEADY
+        };
+
         // Use a transaction with FOR UPDATE SKIP LOCKED to prevent
         // double-firing in multi-instance deployments.
         let mut tx = self
@@ -755,8 +1064,18 @@ impl SchedulerService {
         // between commit and spawn would lose at most this batch's
         // triggers (no double-fire); the next poll sees them as already
         // "scheduled forward" because the UPDATE committed.
+        if is_startup_backlog {
+            tracing::info!(
+                target: "talos_scheduler",
+                event_kind = "scheduler_startup_backlog",
+                backlog = to_spawn.len(),
+                "Scheduler: first poll after boot — draining the accumulated backlog \
+                 under the startup concurrency ceiling rather than all at once"
+            );
+        }
+
         for (workflow_id, user_id, schedule_id) in to_spawn {
-            self.spawn_workflow_execution(workflow_id, user_id, schedule_id);
+            self.spawn_workflow_execution(workflow_id, user_id, schedule_id, phase);
         }
 
         Ok(())
@@ -764,7 +1083,13 @@ impl SchedulerService {
 
     /// Trigger a workflow execution in the background, mirroring the pattern
     /// used by `trigger_workflow` in the GraphQL mutation.
-    fn spawn_workflow_execution(&self, workflow_id: Uuid, user_id: Uuid, schedule_id: Uuid) {
+    fn spawn_workflow_execution(
+        &self,
+        workflow_id: Uuid,
+        user_id: Uuid,
+        schedule_id: Uuid,
+        phase: &'static str,
+    ) {
         let db_pool = self.db_pool.clone();
         let db_pool_for_timeout = self.db_pool.clone();
         let sender = self.event_sender.clone();
@@ -775,6 +1100,8 @@ impl SchedulerService {
         let worker_shared_key = self.worker_shared_key.clone();
         let nats_client = self.nats_client.clone();
         let spawn_semaphore = self.spawn_semaphore.clone();
+        let startup_semaphore = self.startup_semaphore.clone();
+        let is_startup = phase == talos_metrics::SCHEDULER_PHASE_STARTUP;
 
         tokio::spawn(async move {
             // M6: bound concurrent scheduled executions. Acquire INSIDE the
@@ -787,6 +1114,37 @@ impl SchedulerService {
             // closed, which never happens (the Arc lives as long as the
             // service); on the impossible error we skip rather than run
             // unbounded.
+            // Startup-backlog runs take the tighter startup permit FIRST, then
+            // the steady-state one, so the boot burst is `min(startup, steady)`
+            // wide instead of "however many happened to come due".
+            //
+            // The order is load-bearing and is the opposite of the obvious one.
+            // Taking the steady permit first would let all 15 parked backlog
+            // tasks sit on steady permits while queueing for a startup permit,
+            // leaving ~1 of 16 for anything else — so a `*/15` cron coming due
+            // mid-drain would be starved by a backlog that is deliberately
+            // draining slowly. This way at most `startup` backlog tasks hold a
+            // steady permit at once and the rest of the steady pool stays
+            // available.
+            //
+            // No deadlock: every backlog task acquires in the same order
+            // (startup → steady) and steady-state tasks never touch the startup
+            // semaphore at all, so there is no cycle. Both permits are held for
+            // the execution's lifetime and released on drop. `acquire_owned`
+            // only errors if the semaphore is closed, which never happens (the
+            // Arc lives as long as the service); on the impossible error we skip
+            // rather than run unbounded.
+            let _startup_permit = if is_startup {
+                match startup_semaphore.acquire_owned().await {
+                    Ok(p) => Some(p),
+                    Err(_) => {
+                        tracing::error!("Scheduler startup semaphore closed — skipping execution");
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             let _permit = match spawn_semaphore.acquire_owned().await {
                 Ok(p) => p,
                 Err(_) => {
@@ -835,10 +1193,15 @@ impl SchedulerService {
                     module_execution_service,
                     worker_shared_key,
                     nats_client,
+                    phase,
                 ),
             )
             .await
             {
+                // The timeout drops `run_scheduled_execution` mid-flight, so
+                // its own terminal arms never run — count the failure here or
+                // a timed-out scheduled run is invisible to the detector.
+                record_dispatch(phase, talos_metrics::SCHEDULER_OUTCOME_FAILED);
                 tracing::error!(
                     execution_id = %execution_id,
                     workflow_id = %workflow_id,
@@ -950,7 +1313,23 @@ impl SchedulerDispatch {
     }
 }
 
+/// Record one terminal scheduler dispatch outcome on
+/// `talos_scheduler_dispatches_total{phase,outcome}`.
+///
+/// Inert when metrics are not wired (unit tests, any process without
+/// `set_global`) — never unwraps, per [`talos_metrics::global`]'s contract.
+/// Both label values come from the `talos_metrics::SCHEDULER_*` constants that
+/// the pre-seed loop iterates, so an emitted series is always a seeded one.
+fn record_dispatch(phase: &'static str, outcome: &'static str) {
+    if let Some(m) = talos_metrics::global() {
+        m.scheduler_dispatches_total
+            .with_label_values(&[phase, outcome])
+            .inc();
+    }
+}
+
 /// Runs a single scheduled workflow execution to completion.
+#[allow(clippy::too_many_arguments)]
 async fn run_scheduled_execution(
     execution_id: Uuid,
     workflow_id: Uuid,
@@ -964,6 +1343,11 @@ async fn run_scheduled_execution(
     _module_execution_service: Arc<ModuleExecutionService>,
     worker_shared_key: Option<WorkerSharedKey>,
     nats_client: Arc<async_nats::Client>,
+    // Which dispatch phase this run belongs to — `startup` for the backlog
+    // drained by the first poll after boot, `steady` otherwise. Carried only
+    // so the terminal outcome lands on the right series; it changes no
+    // behaviour inside this function.
+    phase: &'static str,
 ) {
     // 1. Fetch the workflow's actor binding + description BEFORE inserting the
     //    execution row so the row carries the workflow's bound actor_id from the
@@ -1237,6 +1621,7 @@ async fn run_scheduled_execution(
             // skipped fire simply drops to the next occurrence — consistent with the
             // scheduler's skip-to-next philosophy (no catch-up storm) and the
             // MCP-708 auth-gate skip semantics already in this function.
+            record_dispatch(phase, talos_metrics::SCHEDULER_OUTCOME_SKIPPED);
             tracing::warn!(
                 execution_id = %execution_id,
                 workflow_id = %workflow_id,
@@ -1260,6 +1645,13 @@ async fn run_scheduled_execution(
             // so this arm is reachable deterministically, not just via race.
             // Skip-to-next semantics, same as LimitReached; trigger.rs
             // rejects the same variant on the manual path.
+            // The branch that silently cost two DAILY crons a full day on
+            // 2026-08-10 (`pa-autonomy-digest` 0 6 * * *, `pa-inbox-triage`
+            // 37 7 * * 1-5): the boot herd burned the actor's per-minute
+            // budget, these were refused, and "the next scheduled occurrence
+            // will retry" meant tomorrow. Counting it is what makes a skip
+            // EXPLICITLY VISIBLE rather than a WARN nobody reads.
+            record_dispatch(phase, talos_metrics::SCHEDULER_OUTCOME_SKIPPED);
             tracing::warn!(
                 execution_id = %execution_id,
                 workflow_id = %workflow_id,
@@ -1579,6 +1971,7 @@ async fn run_scheduled_execution(
                 output: None,
             });
 
+            record_dispatch(phase, talos_metrics::SCHEDULER_OUTCOME_COMPLETED);
             tracing::info!(
                 execution_id = %execution_id,
                 schedule_id = %schedule_id,
@@ -1665,6 +2058,7 @@ async fn run_scheduled_execution(
                 output: None,
             });
 
+            record_dispatch(phase, talos_metrics::SCHEDULER_OUTCOME_FAILED);
             tracing::error!(
                 execution_id = %execution_id,
                 schedule_id = %schedule_id,
@@ -1672,6 +2066,133 @@ async fn run_scheduled_execution(
                 error_msg
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_herd_tests {
+    //! Guards on the startup-herd fix (2026-08-10). The defect these exist
+    //! for is not "the counter is wrong" — it is "the counter never moves",
+    //! which is invisible to `cargo check` and to any behavioural test that
+    //! only asserts the scheduler still runs.
+
+    /// Check 58's stated blind spot is that a metric incremented ONLY through
+    /// a wrapper reads as live even when nothing calls the wrapper. So drive
+    /// the PRODUCTION function — `record_dispatch`, the exact one the four
+    /// terminal arms call — against a real registry and assert the series
+    /// actually moves, for every (phase, outcome) pair.
+    ///
+    /// This is the only test in the crate that installs the process-global
+    /// metrics registry (`set_global` is one-shot per process); keep it that
+    /// way or the others will silently observe each other's increments.
+    #[test]
+    fn record_dispatch_moves_every_seeded_series() {
+        let m = talos_metrics::TalosMetrics::new().expect("metrics registry");
+        talos_metrics::set_global(m.clone());
+
+        for phase in talos_metrics::SCHEDULER_DISPATCH_PHASES {
+            for outcome in talos_metrics::SCHEDULER_DISPATCH_OUTCOMES {
+                let before = m
+                    .scheduler_dispatches_total
+                    .with_label_values(&[phase, outcome])
+                    .get();
+                super::record_dispatch(phase, outcome);
+                let after = m
+                    .scheduler_dispatches_total
+                    .with_label_values(&[phase, outcome])
+                    .get();
+                assert_eq!(
+                    after,
+                    before + 1.0,
+                    "record_dispatch({phase}, {outcome}) must move its own series — \
+                     a wrapper whose call sites were deleted still looks 'live' to \
+                     the dead-metric lint, so this assertion is the real guard"
+                );
+            }
+        }
+    }
+
+    /// The label values the emitting sites use must be exactly the ones the
+    /// pre-seed loop iterates. If they drift, the emitted series is a
+    /// DIFFERENT, unseeded one — and an unseeded counter is absent, which
+    /// every `increase(...) > 0` alert reads as "no match". The alert would
+    /// then be silenced by precisely the failure it exists to catch.
+    #[test]
+    fn emitted_labels_are_the_seeded_labels() {
+        assert!(talos_metrics::SCHEDULER_DISPATCH_PHASES
+            .contains(&talos_metrics::SCHEDULER_PHASE_STARTUP));
+        assert!(talos_metrics::SCHEDULER_DISPATCH_PHASES
+            .contains(&talos_metrics::SCHEDULER_PHASE_STEADY));
+        for outcome in [
+            talos_metrics::SCHEDULER_OUTCOME_COMPLETED,
+            talos_metrics::SCHEDULER_OUTCOME_FAILED,
+            talos_metrics::SCHEDULER_OUTCOME_SKIPPED,
+        ] {
+            assert!(
+                talos_metrics::SCHEDULER_DISPATCH_OUTCOMES.contains(&outcome),
+                "{outcome} is emitted but not seeded"
+            );
+        }
+    }
+
+    /// The startup ceiling has to actually BIND on the herd that motivated
+    /// it. The pre-existing M6 semaphore did not: its default was 16 and
+    /// exactly 15 schedules came due, so every one of them ran at once and
+    /// the mitigation was a no-op on the only sample we have. A default that
+    /// does not bind is the same defect one level up.
+    #[test]
+    fn startup_ceiling_binds_on_the_observed_herd() {
+        const OBSERVED_HERD: usize = 15;
+        assert!(
+            super::DEFAULT_SCHEDULER_STARTUP_MAX_CONCURRENT < OBSERVED_HERD,
+            "the startup ceiling must be below the observed boot herd ({OBSERVED_HERD}); \
+             at or above it the fix cannot have changed anything"
+        );
+        assert!(
+            super::DEFAULT_SCHEDULER_MAX_CONCURRENT_EXECUTIONS >= OBSERVED_HERD,
+            "documents WHY the pre-existing ceiling did not bind — if this ever \
+             drops below the herd size, the comment above the startup semaphore \
+             is stale and needs rewriting"
+        );
+    }
+
+    /// The barrier must GIVE UP, and it must give up after the alert has had
+    /// a chance to fire. This is the invariant that stops the fix from being
+    /// worse than the bug: an empty fleet view is ambiguous, and one of the
+    /// readings it covers is `TALOS_WORKER_HEARTBEAT_INTERVAL_SECS=0` — a
+    /// supported setting that disables heartbeat publishing entirely. A
+    /// barrier with no give-up point would, on such a deployment, stop every
+    /// scheduled workflow forever on a perfectly healthy fleet.
+    #[test]
+    fn readiness_barrier_gives_up_after_the_alert_can_fire() {
+        // TalosSchedulerDispatchHeldNoFleet fires above 10 holds.
+        const ALERT_HOLDS_THRESHOLD: usize = 10;
+        assert!(
+            super::DEFAULT_SCHEDULER_READINESS_MAX_HOLDS > ALERT_HOLDS_THRESHOLD,
+            "the barrier must not give up before the hold alert can fire — an \
+             operator should hear that dispatch is blocked while the guarantee \
+             is still in force, not after it has been silently dropped"
+        );
+        // And it must be finite. A `usize::MAX` "bound" is not a bound.
+        assert!(
+            super::DEFAULT_SCHEDULER_READINESS_MAX_HOLDS < 1_000,
+            "the give-up bound must be a real bound: at the 15s poll interval \
+             this is the number of polls scheduled work can be withheld for"
+        );
+    }
+
+    /// The readiness bound must clear TWO heartbeat intervals. A worker that
+    /// boots before the controller subscribes loses its first heartbeat
+    /// outright (NATS core delivery is not retained), so the controller can
+    /// only learn about it on the second. A bound below 2x would time out on
+    /// a perfectly healthy fleet and hold a dispatch for no reason.
+    #[test]
+    fn readiness_bound_clears_two_heartbeat_intervals() {
+        const DEFAULT_HEARTBEAT_SECS: u64 = 30;
+        assert!(
+            super::DEFAULT_SCHEDULER_READINESS_TIMEOUT_SECS > 2 * DEFAULT_HEARTBEAT_SECS,
+            "readiness bound must exceed two heartbeat intervals with margin"
+        );
     }
 }
 
