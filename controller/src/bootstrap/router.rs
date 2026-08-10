@@ -504,13 +504,27 @@ pub(crate) async fn register_worker_key_handler(
 //
 // `POST /internal/worker-liveness` — a running worker proves, on an interval,
 // that it still holds the private half of a key that is ALREADY in the trusted
-// verify ring. That proof is the only liveness signal this platform has about
-// registered identities, and it had to be built because the one that looked like
-// it existed does not: `WorkerHeartbeat` is constructed nowhere but tests,
-// `start_worker_management` has no call sites, and the heartbeat's `worker_id`
-// is a Uuid while `worker_identities.worker_id` is operator/pod text — so the
-// fleet view is permanently empty AND unjoinable. Intersecting the registry
-// against it would have reaped the entire fleet.
+// verify ring. That proof is the only TRUST-BEARING liveness signal this
+// platform has about registered identities.
+//
+// It had to be built because the thing that looked like it was already doing
+// the job was not: until 2026-08 `WorkerHeartbeat` was constructed nowhere but
+// tests, `start_worker_management` had no call sites, and the heartbeat's
+// `worker_id` was a Uuid while `worker_identities.worker_id` is operator/pod
+// text — so the fleet view was permanently empty AND unjoinable, and
+// intersecting the registry against it would have reaped the entire fleet.
+//
+// THAT HISTORY IS NOW HALF FALSE, AND THE CONCLUSION STILL HOLDS — read both
+// halves. The heartbeat is wired up: workers publish it, the controller
+// subscribes, and the id is text in the same key space as this table. What has
+// NOT changed is why the heartbeat may not stand in for this endpoint: it is
+// an HMAC under the FLEET-SHARED `WORKER_SHARED_KEY`, so any process holding
+// that key can mint one naming any `worker_id`. It is evidence that *a*
+// process is running, never proof that THIS worker's key holder is. Letting it
+// refresh `last_liveness_at` would let any fleet member keep any other
+// worker's key trusted forever. Structural lint check 67 and
+// `talos-worker-fleet`'s `heartbeat_never_touches_the_trust_boundary` enforce
+// the separation.
 //
 // WHY NO BEARER TOKEN. Possession of the registered private key is both the
 // stronger credential (it is worker-specific, where the registration bearer is

@@ -11,11 +11,27 @@
 //!
 //! The obvious fix (decay on `worker_identities.last_seen_at`) is wrong, because
 //! that column is written ONLY at boot registration: age-based reaping would
-//! deactivate a long-lived HEALTHY worker. And the liveness signal that appears
-//! to exist does not — nothing publishes `talos.workers.heartbeat.*`
-//! (`WorkerHeartbeat` is built only in tests), `start_worker_management` has no
-//! call sites, and its `worker_id` is a `Uuid` where `worker_identities` uses
-//! operator/pod text. So the refresh had to be built. This is it.
+//! deactivate a long-lived HEALTHY worker. So the refresh had to be built. This
+//! is it.
+//!
+//! # Not to be confused with the fleet heartbeat in `crate::heartbeat`
+//!
+//! When this module was written, `talos.workers.heartbeat.*` had no publisher
+//! at all. Since 2026-08 it has one — this same binary spawns it — so "there is
+//! no other liveness signal" is no longer the reason to keep the two apart.
+//! The reason is the CREDENTIAL, and it has not changed:
+//!
+//! * the heartbeat is an HMAC under the FLEET-SHARED `WORKER_SHARED_KEY`, so
+//!   any process holding that key can mint one naming any `worker_id` — it
+//!   shows that *a* process is running and claims an identity;
+//! * this ping is an Ed25519 proof of possession of THIS worker's own
+//!   registered private key — it shows that the key holder is running.
+//!
+//! Only the second may keep a signing key trusted. If the heartbeat could
+//! refresh `last_liveness_at`, one fleet member could keep every other
+//! member's key trusted forever, which is precisely the unbounded trust the
+//! reaper exists to bound. Structural lint check 67 makes that unreachable
+//! rather than merely discouraged.
 //!
 //! # What it sends
 //!

@@ -1,17 +1,25 @@
+//! `WorkerManager` behaviour over the NATS fleet heartbeat.
+//!
+//! `worker_id` is TEXT here, in the same key space as
+//! `worker_identities.worker_id` and `JobResult.worker_id`. It was a `Uuid`
+//! until 2026-08, which left the fleet view structurally unjoinable with the
+//! identity registry — the mismatch that twice nearly produced a design
+//! intersecting the registry against an (always empty) fleet map.
+
 use controller::worker_manager::WorkerManager;
 use std::time::Duration;
 use talos_workflow_job_protocol::WorkerHeartbeat;
-use uuid::Uuid;
 
 fn test_key() -> Vec<u8> {
     vec![0x42u8; 32]
 }
 
-fn create_heartbeat(id: Uuid, cpu: f32, caps: Vec<String>) -> WorkerHeartbeat {
+fn create_heartbeat(id: &str, cpu: f32, caps: Vec<String>) -> WorkerHeartbeat {
     let mut hb = WorkerHeartbeat {
-        worker_id: id,
+        worker_id: id.to_string(),
         capabilities: caps,
         cpu_usage_pct: cpu,
+        build_version: Some("0.1.0+abc1234".to_string()),
         signature: vec![],
         heartbeat_nonce: String::new(),
     };
@@ -22,7 +30,7 @@ fn create_heartbeat(id: Uuid, cpu: f32, caps: Vec<String>) -> WorkerHeartbeat {
 #[tokio::test]
 async fn test_handle_heartbeat() {
     let manager = WorkerManager::new(test_key());
-    let id = Uuid::new_v4();
+    let id = "talos-worker-0";
     let hb = create_heartbeat(id, 10.0, vec!["wasm".to_string()]);
 
     manager
@@ -37,8 +45,8 @@ async fn test_handle_heartbeat() {
 #[tokio::test]
 async fn test_find_best_worker_cpu_heuristic() {
     let manager = WorkerManager::new(test_key());
-    let id1 = Uuid::new_v4();
-    let id2 = Uuid::new_v4();
+    let id1 = "talos-worker-1";
+    let id2 = "talos-worker-2";
 
     // Worker 1: 50% CPU
     let hb1 = create_heartbeat(id1, 50.0, vec!["wasm".to_string()]);
@@ -60,8 +68,8 @@ async fn test_find_best_worker_cpu_heuristic() {
 #[tokio::test]
 async fn test_find_best_worker_capability_filtering() {
     let manager = WorkerManager::new(test_key());
-    let id1 = Uuid::new_v4();
-    let id2 = Uuid::new_v4();
+    let id1 = "talos-worker-1";
+    let id2 = "talos-worker-2";
 
     // Worker 1: has 'gpu'
     let hb1 = create_heartbeat(id1, 10.0, vec!["gpu".to_string()]);
@@ -83,7 +91,7 @@ async fn test_find_best_worker_capability_filtering() {
 #[tokio::test]
 async fn test_prune_stale_workers() {
     let manager = WorkerManager::new(test_key());
-    let id = Uuid::new_v4();
+    let id = "talos-worker-0";
     let hb = create_heartbeat(id, 10.0, vec![]);
 
     manager.handle_heartbeat(hb).unwrap();
@@ -100,10 +108,10 @@ async fn test_load_balancing_many_workers() {
 
     // Add 100 workers with varying CPU usage
     for i in 0..100 {
-        let id = Uuid::new_v4();
+        let id = format!("talos-worker-{i}");
         // CPU usage from 0% to 99%
         let cpu = i as f32;
-        let hb = create_heartbeat(id, cpu, vec!["wasm".to_string()]);
+        let hb = create_heartbeat(&id, cpu, vec!["wasm".to_string()]);
         manager.handle_heartbeat(hb).unwrap();
     }
 
@@ -120,7 +128,7 @@ async fn test_load_balancing_many_workers() {
 #[tokio::test]
 async fn test_worker_updates_existing_entry() {
     let manager = WorkerManager::new(test_key());
-    let id = Uuid::new_v4();
+    let id = "talos-worker-0";
 
     // Initial heartbeat: 50% CPU
     let hb1 = create_heartbeat(id, 50.0, vec!["wasm".to_string()]);

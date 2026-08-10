@@ -528,6 +528,33 @@ groups:
       # "unverifiable" and is NOT counted — absence of evidence is not evidence
       # of skew (#578) — so a clean 0 here is not "everything checked out". Use
       # get_platform_info.fleet for the unverifiable population.
+      # THE NATS FLEET HEARTBEAT CAN NARROW THIS, BUT ONLY ON AN OPERATOR'S
+      # ASSERTION — and by default it does not, so nothing below changed for an
+      # existing deployment.
+      #
+      # Since 2026-08 workers publish a signed heartbeat on
+      # `talos.workers.heartbeat.<worker_id>`, giving the controller a live view
+      # of which worker PROCESSES are running. It is tempting to intersect that
+      # against this gauge's population and let a ghost row drop out
+      # automatically. That is exactly what
+      # TALOS_WORKER_FLEET_HEARTBEAT_AUTHORITATIVE does, and it is DEFAULT OFF
+      # because the inference is not sound in general:
+      #
+      #   a worker on a build too old to publish heartbeats, and a worker that
+      #   has departed, are INDISTINGUISHABLE from here.
+      #
+      # That is a property of the evidence, not a gap in the implementation, and
+      # the case it gets wrong — a live worker on an older build — is precisely
+      # the case this alert exists to catch, during precisely the rolling deploy
+      # when it matters. Setting the flag is the operator asserting a fact the
+      # controller cannot check (the same shape as
+      # TALOS_WORKER_IDENTITY_REAP_PRE_PROTOCOL_HOURS): that every worker here
+      # runs a heartbeat-publishing build. With it unset this gauge counts
+      # exactly what it counted before.
+      #
+      # The heartbeat's OWN gauges (talos_worker_fleet_*, below) are
+      # unconditional and unaffected — they report positive observations only,
+      # so they can silence nothing.
       - alert: TalosWorkerBuildSkew
         expr: talos_worker_build_skew_workers > 0
         for: 30m
@@ -550,16 +577,96 @@ groups:
           action: |
             1. get_platform_info → `fleet`. Cross-check last_seen_at against
                the pods that actually exist.
+            1b. Faster: compare this gauge with talos_worker_fleet_live_workers
+               and talos_worker_fleet_build_skew_workers. The pair separates the
+               two causes — a REGISTERED row with no running process (ghost) vs
+               a PROCESS that just spoke and is on the wrong build. If the
+               live-skew gauge is 0 while this one is not, you are looking at
+               ghost rows. Read a 0 on the live gauge carefully though: it also
+               reads 0 when nothing publishes heartbeats at all.
             2. If the offending worker_id has no running pod, this is a GHOST
                ROW, not a live skew: the registry has no reaper, so a retired
                pod's identity stays ACTIVE forever. Find it with the controller
                CLI `list-worker-identities` and clear it with
                `deactivate-worker-identity --worker-id <id> --public-key <hex>`;
-               the gauge drops on the next 60s sweep.
+               the gauge drops on the next 60s sweep. Once the WHOLE fleet runs
+               a heartbeat-publishing build you may instead set
+               TALOS_WORKER_FLEET_HEARTBEAT_AUTHORITATIVE=1 so silent rows drop
+               out automatically — but read the caveat above first: that flag
+               also silences a live worker on a pre-heartbeat build.
             3. If the pod IS running, it is genuinely on another image — roll it
                onto the controller's build. Do NOT silence this one: a skewed
                live worker fails signature verification in ways that read as
                crypto bugs.
+
+      # ── The LIVE-PROCESS view of build skew (NATS fleet heartbeat) ──────
+      #
+      # Every series above is about REGISTERED ROWS. This one is about
+      # PROCESSES THAT JUST SPOKE, and neither subsumes the other:
+      #   * a ghost row appears only above (registered, no process);
+      #   * a worker on a fleet pinned purely through the static
+      #     TALOS_WORKER_PUBLIC_KEYS ring appears only here — such a deployment
+      #     has no registration endpoint and NO worker_identities rows at all,
+      #     so every registry-backed series sits at 0 permanently. This is the
+      #     first fleet signal that works in that posture, and in the chart
+      #     default where the liveness ping is blocked at the network layer
+      #     (networkPolicy.workerControllerEgress is opt-in, default false).
+      #
+      # WHAT THE EVIDENCE IS WORTH: a heartbeat is HMAC-signed under the
+      # FLEET-SHARED WORKER_SHARED_KEY, so any process holding that key can
+      # mint one naming any worker_id. It proves a process is running and
+      # claims an identity — a liveness HINT. It is NOT a proof of possession
+      # (that is the Ed25519 liveness ping) and nothing here gates trust: a
+      # heartbeat never writes last_liveness_at and never satisfies the reaper.
+      #
+      # NO absent() ARM, for the same reason as the participation pair: these
+      # are plain IntGauges seeded at 0 at registration, so a running
+      # controller always exports them. Missing ⇒ the controller is down
+      # (TalosControllerDown owns it) or predates this build.
+      #
+      # NO ALERT ON talos_worker_fleet_live_workers == 0, deliberately. Zero is
+      # ambiguous — empty fleet, pre-heartbeat build, or broken subscription —
+      # and an alert that cannot tell those apart would fire loudest on the
+      # deployments where it means least. TalosWorkerDown owns "the worker is
+      # gone" (it selects on the worker scrape job); this gauge is the
+      # denominator you read beside the skew count, and the annotation says so.
+      #
+      # Structural check 65(a) scans this file TEXTUALLY, not just `expr:`
+      # blocks, so spelling a job selector out in prose here would make that
+      # job REQUIRED in prometheus.yml. Naming the rule instead of quoting its
+      # selector is deliberate — the first draft of this comment quoted a job
+      # name that does not exist and failed the lint, which is the check
+      # working as documented.
+      - alert: TalosWorkerFleetBuildSkew
+        expr: talos_worker_fleet_build_skew_workers > 0
+        for: 30m
+        labels:
+          severity: warning
+          category: fleet-identity
+        annotations:
+          summary: "{{ $value }} RUNNING worker process(es) on a different build than the controller"
+          description: |
+            At least one worker process has published a fleet heartbeat
+            recently — up to ~150s ago, being 60s of staleness plus a 30s prune
+            tick plus one 60s gauge sweep — reporting a build that provably
+            differs from this controller's, and has done so for 30m. Unlike
+            TalosWorkerBuildSkew this cannot be a ghost registry row: a process
+            spoke. Signed wire formats are version-coupled, so a live skew
+            breaks jobs in ways that read as signature bugs.
+            Read it beside talos_worker_fleet_live_workers (the denominator)
+            and talos_worker_fleet_unverifiable_builds, which counts every
+            heartbeating worker whose build could not be compared — either it
+            reported no usable commit sha, or THIS CONTROLLER has none, in
+            which case nothing is comparable. Uncomparable workers are not
+            counted here, so a 0 is not "the fleet agrees".
+          action: |
+            1. Compare the controller and worker image digests — they must come
+               from the same published tree.
+            2. get_platform_info → `fleet` for the per-worker detail; the
+               heartbeat gauges are counts only (worker_id is caller-supplied on
+               the bus and is deliberately never a metric label).
+            3. Roll the worker onto the controller's build. Do NOT silence: this
+               one names running processes, not stale rows.
 
       # ══════════════════════════════════════════════════════════════════
       # THE DETECTOR THAT MAKES THE WORKER-IDENTITY REAPER SAFE TO ENABLE

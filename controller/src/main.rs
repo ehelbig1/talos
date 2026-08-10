@@ -408,7 +408,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Embedding re-probe + crypto-invariant orphan gauges + worker build-skew
     // gauge + DB-pool gauges.
-    spawn_metrics_gauge_tasks(db_pool.clone());
+    spawn_metrics_gauge_tasks(db_pool.clone(), services.worker_manager.clone());
+
+    // Worker-fleet NATS heartbeat: the subscriber + the four
+    // `talos_worker_fleet_*` gauges. `start_worker_management` had ZERO call
+    // sites until 2026-08 — this is it.
+    crate::bootstrap::background::spawn_worker_fleet_tasks(
+        services.worker_manager.clone(),
+        nats_client.clone(),
+    );
 
     // Seed templates on first run
     seed_templates(&core.registry, core.compiler.clone()).await?;

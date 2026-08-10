@@ -11,13 +11,17 @@
 //! Only genuinely bin-only modules remain declared here:
 //! `metrics_server` (worker-process Prometheus endpoint), `secret_claim`
 //! (worker-side envelope-seal claim client), `self_register`
-//! (boot-time worker-identity registration), and `liveness` (the periodic
+//! (boot-time worker-identity registration), `liveness` (the periodic
 //! proof-of-possession ping that bounds how long this worker's key stays in
-//! the controller's trusted verify ring after the process departs). New
-//! runtime logic goes in `talos-worker-runtime`, not here.
+//! the controller's trusted verify ring after the process departs), and
+//! `heartbeat` (the periodic NATS fleet heartbeat — an observability signal
+//! under the FLEET-SHARED key, deliberately weaker than `liveness` and
+//! forbidden from touching the trust boundary). New runtime logic goes in
+//! `talos-worker-runtime`, not here.
 
 pub use talos_worker_runtime::*;
 
+pub mod heartbeat;
 pub mod liveness;
 pub mod metrics_server;
 pub mod secret_claim;

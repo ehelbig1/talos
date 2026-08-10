@@ -216,6 +216,17 @@ spec:
             - name: TALOS_WORKER_LIVENESS_INTERVAL_SECS
               value: {{ .Values.worker.livenessIntervalSecs | quote }}
             {{- end }}
+            # NATS fleet heartbeat — a DIFFERENT signal from the liveness ping
+            # above, and deliberately weaker: it is HMAC-signed under the
+            # fleet-shared WORKER_SHARED_KEY, so any process holding that key
+            # can mint one naming any worker_id. Observability only; it can
+            # never keep a signing key trusted. It needs no controller HTTP
+            # path, so unlike the ping it works with the worker↔controller
+            # NetworkPolicy opt-ins off (the defaults).
+            {{- if ne (toString .Values.worker.heartbeatIntervalSecs) "" }}
+            - name: TALOS_WORKER_HEARTBEAT_INTERVAL_SECS
+              value: {{ .Values.worker.heartbeatIntervalSecs | quote }}
+            {{- end }}
             {{- with .Values.worker.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

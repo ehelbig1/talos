@@ -310,6 +310,16 @@ spec:
               value: {{ .Values.controller.workerIdentityReaper.preProtocolHours | quote }}
             {{- end }}
             {{- end }}
+            # Let NATS fleet-heartbeat SILENCE narrow the build-skew detector's
+            # population. Default off, and it is an OPERATOR ASSERTION the
+            # controller cannot check — see values.yaml
+            # controller.fleetHeartbeatAuthoritative. It affects ONLY
+            # talos_worker_build_skew_workers; it grants nothing, and the
+            # heartbeat-derived talos_worker_fleet_* gauges ignore it.
+            {{- if .Values.controller.fleetHeartbeatAuthoritative }}
+            - name: TALOS_WORKER_FLEET_HEARTBEAT_AUTHORITATIVE
+              value: "1"
+            {{- end }}
             {{- with .Values.controller.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

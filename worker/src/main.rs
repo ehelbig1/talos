@@ -2114,6 +2114,25 @@ async fn main() -> anyhow::Result<()> {
         pipeline_job_topic, pipeline_queue_group
     );
 
+    // ---------- Fleet heartbeat ----------
+    // Publish a signed heartbeat on `talos.workers.heartbeat.<worker_id>` so
+    // the controller has a live view of which worker PROCESSES are running.
+    //
+    // TWO THINGS THIS IS NOT, both easy to over-read. It is not the liveness
+    // ping spawned above: that is an Ed25519 proof of possession of THIS
+    // worker's own registered key, and it is the only thing that may keep a
+    // signing key trusted. This heartbeat is an HMAC under the FLEET-SHARED
+    // `WORKER_SHARED_KEY`, so any process holding that key can mint one naming
+    // any worker_id — observability, never trust. And it is not a dispatch
+    // input: nothing routes jobs on the fleet view.
+    //
+    // Detached and best-effort like the two registrations above; ceasing to
+    // heartbeat costs visibility only, never trust.
+    tokio::spawn(worker::heartbeat::run_heartbeat_publisher(
+        nc.clone(),
+        shared_key.signing_key().as_bytes().to_vec(),
+    ));
+
     // ========================================================================
     // RUNTIME INITIALIZATION (with NATS client for logging)
     // ========================================================================

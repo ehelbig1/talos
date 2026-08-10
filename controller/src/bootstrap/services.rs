@@ -456,8 +456,27 @@ pub(crate) async fn build_platform_services(
         };
 
     // ---------- Initialize WorkerManager (tracks live worker heartbeats) ----------
-    // Uses the same shared key as the worker so heartbeat HMAC signatures can be verified.
-    // An empty key is safe here: WorkerManager only gates scheduling health warnings, not auth.
+    // Uses the same shared key as the worker so heartbeat HMAC signatures can
+    // be verified. Since 2026-08 this is a REAL consumer — the subscriber runs
+    // and four `talos_worker_fleet_*` gauges are published from it — so the
+    // old note that it "only gates scheduling health warnings, not auth" no
+    // longer describes what it feeds.
+    //
+    // The empty-key fallback is still safe, but for a different reason than
+    // before, and the reason is worth stating because it is fail-CLOSED rather
+    // than harmless: with no WORKER_SHARED_KEY, every real heartbeat fails its
+    // HMAC and the fleet view stays empty. An empty view publishes zeros and,
+    // critically, is passed as `None` to the build-skew narrowing (see
+    // `heartbeat_silence_is_authoritative`), so it cannot silence a detector
+    // even with the operator flag on. Read a zero on
+    // `talos_worker_fleet_live_workers` as "nothing observed", never as
+    // "no workers".
+    //
+    // NOTE the single key: heartbeats are NOT verified against the staged
+    // `WorkerKeyRing` that job results get, so a worker still signing under
+    // WORKER_SHARED_KEY_PREVIOUS is invisible here while its results still
+    // verify. That asymmetry is documented at
+    // `deploy/helm/talos/values.yaml` -> controller.fleetHeartbeatAuthoritative.
     let worker_manager = std::sync::Arc::new(crate::worker_manager::WorkerManager::new(
         worker_shared_key
             .as_ref()

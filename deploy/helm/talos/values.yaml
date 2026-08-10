@@ -500,6 +500,53 @@ controller:
   # off until you drain retired rows with `deactivate-worker-identity`. Note
   # that ghost rows are exactly what accumulates on a pod-name-keyed fleet, so
   # a long-lived cluster can reach 200 without ever having 200 workers.
+  # TALOS_WORKER_FLEET_HEARTBEAT_AUTHORITATIVE — let NATS fleet-heartbeat
+  # SILENCE narrow the build-skew detector's population.
+  #
+  # Since 2026-08 workers publish a signed heartbeat on
+  # `talos.workers.heartbeat.<worker_id>`, so the controller has a live view of
+  # which worker PROCESSES are running. With this true, a registered
+  # `worker_identities` row whose worker is not heartbeating drops out of
+  # `talos_worker_build_skew_workers` — which is what lets a GHOST ROW (a
+  # retired pod's identity, which nothing reaps) stop holding
+  # `TalosWorkerBuildSkew` firing forever.
+  #
+  # IT IS FALSE BY DEFAULT BECAUSE THE INFERENCE IS NOT SOUND IN GENERAL. A
+  # worker on a build too old to publish heartbeats and a worker that has
+  # departed are INDISTINGUISHABLE from the controller's side. That is a
+  # property of the evidence, not a gap in the implementation, and the case it
+  # gets wrong — a live worker on an older build — is exactly what the alert
+  # exists to catch, during exactly the rolling deploy when it matters. So
+  # setting this is you asserting a fact the controller cannot check. Same
+  # shape as workerIdentityReaper.preProtocolHours below.
+  #
+  # BE PRECISE ABOUT WHAT YOU ARE ASSERTING — IT IS NOT ONE FACT BUT FOUR.
+  # The controller reads "no heartbeat" as "departed", and a LIVE worker goes
+  # silent for any of:
+  #   1. it runs a build that predates the heartbeat publisher (the case
+  #      above);
+  #   2. its worker.heartbeatIntervalSecs is `0`, which disables publishing —
+  #      documented ~250 lines below as carrying no trust consequence, which
+  #      is true, and as costing only fleet-view visibility, which stops being
+  #      true the moment you set THIS flag;
+  #   3. the controller's fleet view is at its 4096-id cap, so heartbeats from
+  #      ids it is not already tracking are dropped (visible as
+  #      talos_worker_fleet_capacity_dropped_heartbeats > 0);
+  #   4. WORKER_SHARED_KEY is mid-rotation. Heartbeats are verified against
+  #      the SINGLE current key, not the staged ring that job results get, so
+  #      a worker still signing under the previous key is silent here while
+  #      its results still verify.
+  # Only (1) is a transient you can wait out. Check
+  # talos_worker_fleet_live_workers against your actual replica count before
+  # setting this, and again after.
+  #
+  # SCOPE: it changes ONE gauge's population. It grants nothing, writes
+  # nothing, and cannot affect trust — a heartbeat never touches
+  # last_liveness_at and never satisfies the reaper. The heartbeat's own
+  # `talos_worker_fleet_*` gauges report positive observations only and ignore
+  # this flag entirely, so they stay honest either way.
+  fleetHeartbeatAuthoritative: false
+
   workerIdentityReaper:
     # TALOS_WORKER_IDENTITY_REAP_ENABLED. Nothing is ever deactivated while
     # this is false — identical to the pre-feature behaviour.
@@ -722,6 +769,37 @@ worker:
   # the default, because silently disabling was once a config typo that
   # escalated into a fleet-wide outage.
   livenessIntervalSecs: ""
+
+  # TALOS_WORKER_HEARTBEAT_INTERVAL_SECS — seconds between this worker's NATS
+  # FLEET HEARTBEATS. Empty ("") = leave the env unset and use the worker's
+  # own default of 30s, which is right for almost everyone. The worker clamps
+  # any value into [5, 45]; `0` disables publishing.
+  #
+  # DO NOT CONFUSE THIS WITH livenessIntervalSecs ABOVE. That one is an
+  # Ed25519 proof of possession of THIS worker's own registered private key,
+  # and it is the only thing that keeps that key in the controller's trusted
+  # verify ring. This one is an HMAC under the FLEET-SHARED WORKER_SHARED_KEY,
+  # so any process holding that key can mint one naming any worker_id — it is
+  # a liveness HINT for the controller's fleet view and nothing more. It never
+  # writes last_liveness_at and never satisfies the identity reaper.
+  #
+  # Consequently `0` here carries NO TRUST consequence, unlike `0` there:
+  # nothing is persisted, no reaper consumes it, and there is nothing to
+  # un-arm. On a default cluster the only cost is that this worker stops
+  # appearing in talos_worker_fleet_live_workers.
+  #
+  # IT IS NOT UNCONDITIONALLY SAFE, THOUGH, AND THE OTHER HALF OF THE PAIR IS
+  # ~250 LINES AWAY. If controller.fleetHeartbeatAuthoritative is true, the
+  # controller treats heartbeat SILENCE as departure — so setting this to `0`
+  # takes this worker's registered row out of talos_worker_build_skew_workers
+  # and SILENCES TalosWorkerBuildSkew for it. A genuinely skewed worker then
+  # goes unreported. Set both knobs together or neither.
+  #
+  # The ceiling is 45s because the controller drops a worker from its fleet
+  # view after 60s of silence; a slower interval would make a healthy worker
+  # flap in and out. A MISTYPED value WARNs and keeps publishing at the
+  # default rather than switching off, matching livenessIntervalSecs.
+  heartbeatIntervalSecs: ""
 
   extraEnv: []
 
