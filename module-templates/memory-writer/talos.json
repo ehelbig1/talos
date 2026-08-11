@@ -7,9 +7,6 @@
   "capability_world": "minimal-node",
   "allowed_hosts": [],
   "requires_secrets": [],
-  "dependencies": {
-    "chrono": "0.4"
-  },
   "config_schema": {
     "type": "object",
     "properties": {

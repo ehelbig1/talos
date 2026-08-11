@@ -67,7 +67,14 @@ async fn second_compile_for_same_user_is_warm() {
 
     let t0 = std::time::Instant::now();
     let cold = svc
-        .compile_to_wasm(user, uuid::Uuid::new_v4(), "cache-probe-a", SOURCE_A)
+        .compile_to_wasm_with_config(
+            user,
+            uuid::Uuid::new_v4(),
+            "cache-probe-a",
+            SOURCE_A,
+            &serde_json::json!({}),
+            None,
+        )
         .await
         .expect("cold compile ran");
     let cold_elapsed = t0.elapsed();
@@ -81,7 +88,14 @@ async fn second_compile_for_same_user_is_warm() {
 
     let t1 = std::time::Instant::now();
     let warm = svc
-        .compile_to_wasm(user, uuid::Uuid::new_v4(), "cache-probe-b", SOURCE_B)
+        .compile_to_wasm_with_config(
+            user,
+            uuid::Uuid::new_v4(),
+            "cache-probe-b",
+            SOURCE_B,
+            &serde_json::json!({}),
+            None,
+        )
         .await
         .expect("warm compile ran");
     let warm_elapsed = t1.elapsed();

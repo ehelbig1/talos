@@ -483,10 +483,16 @@ pub(crate) async fn run_publish_templates_cli(args: &[String]) -> anyhow::Result
             continue;
         }
 
+        // Manifest AND source come from the ONE catalog reader so the OCI
+        // artifact is built from exactly the inputs the disk seeder uses —
+        // this path used to call the dependency-less `compile_to_wasm`, so a
+        // template declaring a crate in `talos.json` could not be published
+        // at all (the compile produced no bytes and aborted the whole run).
+        let template = talos_compilation::CatalogTemplate::load(&path)
+            .with_context(|| format!("read catalog template at {}", path.display()))?;
         let manifest_str = std::fs::read_to_string(&manifest_path)
             .with_context(|| format!("read {}", manifest_path.display()))?;
-        let manifest_json: serde_json::Value = serde_json::from_str(&manifest_str)
-            .with_context(|| format!("parse {}", manifest_path.display()))?;
+        let manifest_json = template.manifest();
 
         // `name` is the OCI repo name (kebab-case, lowercase, no spaces);
         // `version` becomes the OCI tag. Both are required for publishing.
@@ -501,14 +507,11 @@ pub(crate) async fn run_publish_templates_cli(args: &[String]) -> anyhow::Result
             .unwrap_or("latest")
             .to_string();
 
-        let source = std::fs::read_to_string(&template_path)
-            .with_context(|| format!("read {}", template_path.display()))?;
-
         eprintln!("publish-templates: compiling {name} v{tag}");
         let result = svc
-            .compile_to_wasm(uuid::Uuid::nil(), uuid::Uuid::new_v4(), &name, &source)
+            .compile_catalog_template(uuid::Uuid::nil(), uuid::Uuid::new_v4(), &name, &template)
             .await
-            .with_context(|| format!("compile_to_wasm({name})"))?;
+            .with_context(|| format!("compile_catalog_template({name})"))?;
         let wasm = result
             .wasm_bytes
             .ok_or_else(|| anyhow::anyhow!("compile produced no WASM bytes for {name}"))?;

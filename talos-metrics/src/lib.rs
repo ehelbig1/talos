@@ -206,6 +206,47 @@ pub struct TalosMetrics {
     /// not evidence of skew — #578).
     pub worker_build_skew_workers: IntGauge,
 
+    /// Catalog templates (`kind='catalog' AND user_id IS NULL`) whose
+    /// `wasm_bytes` is NULL or empty **and which carry no `oci_url`** — i.e.
+    /// templates with neither local bytes nor a registry reference, which
+    /// therefore **cannot run at all**.
+    ///
+    /// The `oci_url` half of that predicate is not defensive trimming. In OCI
+    /// mode `talos_registry::sync` inserts every catalog row with
+    /// `source_code = ''` and no `wasm_bytes` BY DESIGN — the worker pulls the
+    /// bytes from the registry at execution time — so a count without it
+    /// equals the entire healthy catalog and this gauge's alert pages on a
+    /// working cluster.
+    ///
+    /// A GAUGE, recomputed from one query after each boot's background
+    /// compiles settle (always `set`, never `inc`), because the condition is
+    /// durable state rather than an event: a template with no WASM stays
+    /// broken until someone fixes it, and a counter would go quiet exactly
+    /// while the fleet stayed broken.
+    ///
+    /// This exists because the failure it detects was, for its whole
+    /// lifetime, visible ONLY as a boot-time WARN whose text
+    /// ("keeping existing wasm_bytes") actively implied there were bytes to
+    /// keep. Three shipped templates sat at NULL for months.
+    ///
+    /// UNLABELLED on purpose. In OCI mode the template name is
+    /// registry-supplied, so a per-template label is an unbounded-cardinality
+    /// surface; the names live in `get_catalog_status` → `never_compiled`,
+    /// which is a queried surface rather than a scraped one.
+    ///
+    /// Recomputed at BOOT ONLY, on every exit of the seeding pass (disk seed,
+    /// OCI early return, and missing-`module-templates/` early return) so the
+    /// alert is fireable in every supported mode.
+    ///
+    /// How stale that makes it DEPENDS ON THE MODE, and the difference is not
+    /// cosmetic. In DISK mode nothing but the seeder writes these rows, so a
+    /// long-lived controller's value stays correct. In OCI mode the registry
+    /// sync loop rewrites catalog rows every 5 minutes, so the value can lag
+    /// reality by an entire controller lifetime — a firing alert is real,
+    /// a quiet one is weak evidence. Either way this is not a continuously
+    /// refreshed gauge and must not be read as one.
+    pub catalog_templates_missing_wasm: IntGauge,
+
     // ---- Worker-identity liveness + reaper (2026-08) ----
     //
     // Before these, the entire proof-of-possession liveness path and the
@@ -758,6 +799,19 @@ impl TalosMetrics {
         )?;
         registry.register(Box::new(worker_build_skew_workers.clone()))?;
 
+        let catalog_templates_missing_wasm = IntGauge::new(
+            "talos_catalog_templates_missing_wasm",
+            "Catalog templates whose wasm_bytes is NULL/empty AND which carry no \
+             oci_url — they have neither local bytes nor a registry reference and \
+             cannot run at all. Recomputed at boot only, after that boot's \
+             background compiles settle, so it falls back to 0 once the templates \
+             build; in OCI mode the sync loop rewrites rows between boots, so the \
+             value can lag. Names are in get_catalog_status → never_compiled \
+             (deliberately not a label: template names are registry-supplied in \
+             OCI mode).",
+        )?;
+        registry.register(Box::new(catalog_templates_missing_wasm.clone()))?;
+
         // ---- Worker-identity liveness + reaper ----
         let worker_liveness_pings_total = CounterVec::new(
             prometheus::Opts::new(
@@ -1206,6 +1260,7 @@ impl TalosMetrics {
             audit_verification_failures_total,
             worker_key_tofu_conflicts_total,
             worker_build_skew_workers,
+            catalog_templates_missing_wasm,
             worker_liveness_pings_total,
             worker_identity_reaps_total,
             worker_liveness_participants,

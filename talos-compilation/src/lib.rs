@@ -10,6 +10,7 @@ use handlebars::Handlebars;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 mod analyze;
+pub mod catalog;
 pub mod container;
 pub mod dependency_allowlist;
 pub mod js_templates;
@@ -19,6 +20,7 @@ mod target_cache;
 // Re-export the allowlist gate at the crate root so callers (and the
 // `mcp::utils` re-export shim in controller) can keep importing
 // `validate_dependencies` from a stable location.
+pub use catalog::{CatalogTemplate, CatalogTemplateError};
 pub use dependency_allowlist::{get_allowed_dependencies, validate_dependencies};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -700,21 +702,35 @@ impl CompilationService {
         Ok(())
     }
 
-    /// Compile Rust source to WASM (with optional template rendering)
-    pub async fn compile_to_wasm(
+    /// Compile a catalog template, forwarding the dependencies its
+    /// `talos.json` declares.
+    ///
+    /// **This replaced the old `compile_to_wasm(user, job, name, source)`
+    /// convenience, which defaulted `dependencies` to `None`.** That default
+    /// was silently wrong at every catalog call site: the source came from a
+    /// template directory whose manifest declared the crates it needed, and
+    /// dropping them produced `unresolved import` at runtime while CI — which
+    /// reads the manifest — stayed green. The convenience was deleted rather
+    /// than fixed, so no future caller can re-acquire the footgun; taking a
+    /// [`CatalogTemplate`] makes the dependency source structural.
+    ///
+    /// The declared dependencies are still gated by
+    /// [`dependency_allowlist::validate_dependencies`] inside
+    /// `create_workspace` — see [`catalog`] for the exact supply-chain bound.
+    pub async fn compile_catalog_template(
         &self,
         user_id: Uuid,
         job_id: Uuid,
         name: &str,
-        source_code: &str,
+        template: &CatalogTemplate,
     ) -> Result<CompilationResult> {
         self.compile_to_wasm_with_config(
             user_id,
             job_id,
             name,
-            source_code,
+            template.source(),
             &serde_json::json!({}),
-            None,
+            template.dependencies(),
         )
         .await
     }

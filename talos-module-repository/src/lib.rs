@@ -2685,6 +2685,57 @@ impl ModuleRepository {
             .collect()
     }
 
+    /// The query behind [`Self::list_catalog_rows_without_wasm`], hoisted to a
+    /// constant so `catalog_rows_without_wasm_sql_excludes_registry_rows` can
+    /// pin its predicates without a database. Must stay in agreement with the
+    /// controller's `CATALOG_MISSING_WASM_SQL`, which COUNTS the same
+    /// population for `talos_catalog_templates_missing_wasm` — a gauge and a
+    /// name list that disagree is the misleading-report class again.
+    pub const CATALOG_ROWS_WITHOUT_WASM_SQL: &'static str =
+        "SELECT name, catalog_slug FROM modules \
+             WHERE user_id IS NULL AND kind = 'catalog' \
+               AND (wasm_bytes IS NULL OR octet_length(wasm_bytes) = 0) \
+               AND (oci_url IS NULL OR oci_url = '') \
+             ORDER BY name";
+
+    /// Catalog templates that have NO compiled WASM — i.e. the seeder could
+    /// not build them, so they cannot run at all.
+    ///
+    /// The condition existed for months with no surface but a boot-time WARN
+    /// whose text ("keeping existing wasm_bytes") implied there were bytes to
+    /// keep; there were not — the rows were NULL. `get_catalog_status`
+    /// reports this as `never_compiled` so an operator can see it without
+    /// reading controller logs, and `talos_catalog_templates_missing_wasm`
+    /// carries the count for alerting.
+    ///
+    /// Returns `(name, catalog_slug)` ordered by name. Shared catalog scope
+    /// only (`user_id IS NULL`) — a per-user install with no WASM is a
+    /// different condition (`restore_pinned_modules` owns it).
+    ///
+    /// **A row with an `oci_url` is NOT a defect and is excluded.** In OCI
+    /// mode (`TALOS_REGISTRY_URL` set) `talos_registry::sync` inserts every
+    /// catalog row with `source_code = ''` and no `wasm_bytes` BY DESIGN —
+    /// the worker pulls the bytes from the registry at execution time. Without
+    /// this predicate the query returns EVERY row on a perfectly healthy OCI
+    /// cluster, so `get_catalog_status` reports "N template(s) … CANNOT RUN"
+    /// and `TalosCatalogTemplateNeverCompiled` pages, for nothing. The same
+    /// "empty bytes AND no oci_url" test is what
+    /// `talos_registry::ModuleRegistry`'s module resolution already uses to
+    /// decide a row is unrunnable — kept in agreement deliberately.
+    pub async fn list_catalog_rows_without_wasm(&self) -> Result<Vec<(String, Option<String>)>> {
+        let rows = sqlx::query(Self::CATALOG_ROWS_WITHOUT_WASM_SQL)
+            .fetch_all(&self.db_pool)
+            .await?;
+        rows.iter()
+            .map(|r| -> Result<(String, Option<String>)> {
+                Ok((
+                    r.try_get("name")?,
+                    r.try_get::<Option<String>, _>("catalog_slug")?,
+                ))
+            })
+            .collect()
+    }
+
     /// Phase 5: reconciliation sweep is now a no-op. The legacy tables it
     /// used to read from (`wasm_modules`, `node_templates`) are being
     /// dropped in the Phase 5 migration — there are no un-mirrored rows
@@ -3228,5 +3279,32 @@ mod tests {
     fn passes_through_unknown() {
         // Caller decides whether `unknown` is acceptable; we don't append a suffix.
         assert_eq!(normalise_capability_world("unknown".into()), "unknown");
+    }
+
+    /// A detector that fabricates an alarm in a supported mode is worse than
+    /// no detector. In OCI mode `talos_registry::sync` inserts EVERY catalog
+    /// row with `source_code = ''` and no `wasm_bytes` on purpose — the worker
+    /// pulls the bytes from the registry — so without the `oci_url` predicate
+    /// this query returns the entire healthy catalog and `get_catalog_status`
+    /// reports "N template(s) … CANNOT RUN" on a working cluster.
+    #[test]
+    fn catalog_rows_without_wasm_sql_excludes_registry_rows() {
+        let sql = super::ModuleRepository::CATALOG_ROWS_WITHOUT_WASM_SQL;
+        assert!(
+            sql.contains("oci_url IS NULL"),
+            "registry-backed catalog rows are healthy by design and must not \
+             be reported as unrunnable: {sql}"
+        );
+        for needle in [
+            "kind = 'catalog'",
+            "user_id IS NULL",
+            "wasm_bytes IS NULL",
+            "octet_length(wasm_bytes) = 0",
+            // check 28's principle: a name list with no unique ORDER BY is a
+            // different list run to run.
+            "ORDER BY name",
+        ] {
+            assert!(sql.contains(needle), "lost `{needle}`: {sql}");
+        }
     }
 }
