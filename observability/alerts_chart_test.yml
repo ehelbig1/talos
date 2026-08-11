@@ -1129,3 +1129,91 @@ tests:
                 2. Otherwise treat it as TalosSchedulerDispatchHeldNoFleet that was
                    not acted on: the worker is not reaching
                    `talos.workers.heartbeat.>`.
+
+  # ══════════════════════════════════════════════════════════════════════
+  # TalosCatalogTemplateNeverCompiled
+  #
+  # Added with the alert's remediation pass (2026-08-11). The alert shipped
+  # with no test at all, in a file that exists to drive alert transitions —
+  # so "it fires when a template cannot run, and it clears" was asserted and
+  # not demonstrated. Three transitions are driven here:
+  #   1. the healthy ZERO case stays silent (this is the case that makes the
+  #      deliberate absence of an `absent()` arm defensible: the gauge is
+  #      published on every boot in every mode, including at 0);
+  #   2. a non-zero value is still PENDING inside `for: 15m` — a cold start
+  #      whose background compiles have not settled must not page;
+  #   3. it fires past 15m, and clears the moment the count returns to 0
+  #      (which in practice needs a controller restart, since the gauge is
+  #      recomputed at boot only — the alert clears, the operator's work is
+  #      what makes the underlying count drop).
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: catalog gauge at 0 is silent — the healthy published-zero case
+    input_series:
+      - series: 'talos_catalog_templates_missing_wasm{job="talos-controller"}'
+        values: "0x60"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: TalosCatalogTemplateNeverCompiled
+        exp_alerts: []
+      - eval_time: 55m
+        alertname: TalosCatalogTemplateNeverCompiled
+        exp_alerts: []
+
+  - interval: 1m
+    name: catalog gauge non-zero pends for 15m, fires, then clears at 0
+    input_series:
+      # 3 unrunnable templates for 40m, then a healthy boot republishes 0.
+      - series: 'talos_catalog_templates_missing_wasm{job="talos-controller"}'
+        values: "3x40 0x40"
+    alert_rule_test:
+      # Inside `for: 15m` — a cold start still settling must not page.
+      - eval_time: 10m
+        alertname: TalosCatalogTemplateNeverCompiled
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: TalosCatalogTemplateNeverCompiled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: catalog
+              job: talos-controller
+            exp_annotations:
+              summary: "3 catalog template(s) have no compiled WASM and cannot run"
+              description: |
+                A catalog template row exists (it appears in list_templates and in
+                the dynamic `Name-v1` tool surface) but its wasm_bytes is NULL or
+                empty — the seeder's background compile failed for it, at every
+                controller boot, and nothing downstream can execute it.
+
+                This is worse than a missing template: it is advertised and then
+                fails only when something tries to run it. Three shipped templates
+                were in this state indefinitely before 2026-08-11, visible only as
+                a boot WARN whose own text ("keeping existing wasm_bytes") implied
+                there were bytes to keep.
+              action: |
+                1. get_catalog_status → `db_catalog.never_compiled` names them.
+                2. Controller log, "Background compilation failed", carries the
+                   compiler diagnostic for each.
+                3. The usual cause is a crate used in the template's source that
+                   its `talos.json` `dependencies` field does not declare —
+                   talos.json is the ONLY dependency declaration production reads
+                   (talos_compilation::CatalogTemplate). A crate declared in the
+                   template's own Cargo.toml does not count; `make check-catalog`
+                   fails on exactly that divergence.
+                4. Fix the manifest, rebuild the controller image, restart. The
+                   gauge is recomputed after each boot's compiles settle, so it
+                   drops to 0 on the next healthy start — it is NOT continuously
+                   refreshed, so do not expect it to clear without a restart.
+                5. In OCI mode (`TALOS_REGISTRY_URL` set) steps 2-4 do not apply:
+                   there is no disk seeder and no local compile. A counted row is
+                   one the registry sync wrote WITHOUT an `oci_url`, so start at
+                   the sync loop's logs and the published `_index` artifact.
+                   Because the sync loop rewrites catalog rows every 5 minutes
+                   while this gauge is only recomputed at boot, an OCI cluster's
+                   value can lag reality by a whole controller lifetime — treat a
+                   firing alert as real and a quiet one as weaker evidence there.
+      # Republished at 0 from t=40m — clears immediately, no `for:` on recovery.
+      - eval_time: 45m
+        alertname: TalosCatalogTemplateNeverCompiled
+        exp_alerts: []

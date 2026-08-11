@@ -4062,14 +4062,31 @@ async fn handle_get_catalog_status(
         ));
     }
     if !never_compiled.is_empty() {
+        // The repository query excludes rows carrying an `oci_url`, so this
+        // means the same thing in both modes: neither local bytes nor a
+        // registry reference. The REMEDY differs, though — in OCI mode there
+        // is no disk seeder and no local compile, so the disk-mode advice
+        // below would send an operator hunting a log line that cannot exist.
+        // (Before 2026-08-11 the query had no `oci_url` predicate at all and
+        // this tip fired on EVERY row of a healthy OCI cluster; the adjacent
+        // `on_disk_not_in_db` tip was already `mode == "disk"`-gated and this
+        // one was not.)
+        let cause = if mode == "disk" {
+            "The seeder's background compile failed for them at every \
+             controller boot. Check the controller log for 'Background \
+             compilation failed' naming each one; the usual cause is a crate \
+             used in template.rs that talos.json's `dependencies` does not \
+             declare (talos.json is the only declaration the runtime reads)."
+        } else {
+            "In OCI mode nothing compiles these locally — a row with no WASM \
+             and no oci_url is one the registry sync wrote without a registry \
+             reference, so start at the sync loop's logs and the published \
+             `_index` artifact rather than at any compiler output."
+        };
         tips.push(format!(
-            "{} catalog template(s) have NO compiled WASM and CANNOT RUN — the \
-             seeder's background compile failed for them at every controller \
-             boot. Check the controller log for 'Background compilation \
-             failed' naming each one; the usual cause is a crate used in \
-             template.rs that talos.json's `dependencies` does not declare \
-             (talos.json is the only declaration the runtime reads). Names: {}",
+            "{} catalog template(s) have NO compiled WASM and CANNOT RUN — {} Names: {}",
             never_compiled.len(),
+            cause,
             never_compiled
                 .iter()
                 .map(|(n, _)| n.as_str())

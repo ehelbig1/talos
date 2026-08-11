@@ -207,8 +207,16 @@ pub struct TalosMetrics {
     pub worker_build_skew_workers: IntGauge,
 
     /// Catalog templates (`kind='catalog' AND user_id IS NULL`) whose
-    /// `wasm_bytes` is NULL or empty — i.e. templates the seeder could not
-    /// build, which therefore **cannot run at all**.
+    /// `wasm_bytes` is NULL or empty **and which carry no `oci_url`** — i.e.
+    /// templates with neither local bytes nor a registry reference, which
+    /// therefore **cannot run at all**.
+    ///
+    /// The `oci_url` half of that predicate is not defensive trimming. In OCI
+    /// mode `talos_registry::sync` inserts every catalog row with
+    /// `source_code = ''` and no `wasm_bytes` BY DESIGN — the worker pulls the
+    /// bytes from the registry at execution time — so a count without it
+    /// equals the entire healthy catalog and this gauge's alert pages on a
+    /// working cluster.
     ///
     /// A GAUGE, recomputed from one query after each boot's background
     /// compiles settle (always `set`, never `inc`), because the condition is
@@ -226,9 +234,17 @@ pub struct TalosMetrics {
     /// surface; the names live in `get_catalog_status` → `never_compiled`,
     /// which is a queried surface rather than a scraped one.
     ///
-    /// Recomputed at BOOT ONLY — nothing but the seeder changes the
-    /// underlying rows, so a long-lived controller's value stays correct, but
-    /// it is not a continuously refreshed gauge and must not be read as one.
+    /// Recomputed at BOOT ONLY, on every exit of the seeding pass (disk seed,
+    /// OCI early return, and missing-`module-templates/` early return) so the
+    /// alert is fireable in every supported mode.
+    ///
+    /// How stale that makes it DEPENDS ON THE MODE, and the difference is not
+    /// cosmetic. In DISK mode nothing but the seeder writes these rows, so a
+    /// long-lived controller's value stays correct. In OCI mode the registry
+    /// sync loop rewrites catalog rows every 5 minutes, so the value can lag
+    /// reality by an entire controller lifetime — a firing alert is real,
+    /// a quiet one is weak evidence. Either way this is not a continuously
+    /// refreshed gauge and must not be read as one.
     pub catalog_templates_missing_wasm: IntGauge,
 
     // ---- Worker-identity liveness + reaper (2026-08) ----
@@ -785,10 +801,12 @@ impl TalosMetrics {
 
         let catalog_templates_missing_wasm = IntGauge::new(
             "talos_catalog_templates_missing_wasm",
-            "Catalog templates whose wasm_bytes is NULL/empty — they failed to \
-             compile at seed time and cannot run at all. Recomputed after each \
-             boot's background compiles settle, so it falls back to 0 once the \
-             templates build. Names are in get_catalog_status → never_compiled \
+            "Catalog templates whose wasm_bytes is NULL/empty AND which carry no \
+             oci_url — they have neither local bytes nor a registry reference and \
+             cannot run at all. Recomputed at boot only, after that boot's \
+             background compiles settle, so it falls back to 0 once the templates \
+             build; in OCI mode the sync loop rewrites rows between boots, so the \
+             value can lag. Names are in get_catalog_status → never_compiled \
              (deliberately not a label: template names are registry-supplied in \
              OCI mode).",
         )?;

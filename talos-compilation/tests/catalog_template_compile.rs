@@ -27,6 +27,19 @@
 //! declare a dependency (the class that broke), not all 75 — three real WASM
 //! builds is already minutes. Full-catalog coverage is `make check-catalog`'s
 //! job, and the two are complementary, not redundant.
+//!
+//! # The byte counts this prints are NOT a fingerprint
+//!
+//! The `<slug>: N bytes, hash H` lines below are diagnostic output for a
+//! human reading `--nocapture`, and nothing asserts on them. They are not
+//! reproducible: two consecutive runs on the same tree and toolchain gave
+//! 120339/106586/141471 and 120338/106586/141470, with a DIFFERENT
+//! `content_hash` every time (the artifacts embed build-varying data). The
+//! assertion here is deliberately `bytes.len() > 1024` — "real WASM came
+//! out", which is the property that was false before 2026-08-11 — and it
+//! must stay that shape. Do not tighten it to an expected size, and do not
+//! quote a run's numbers anywhere as if they identified a build; a specific
+//! figure is one sample of a distribution, not an identity.
 
 // ci-ungated: runs real `cargo component build`s and needs the HOST
 // cargo-component toolchain plus the wasm32-wasip2 target — minutes per

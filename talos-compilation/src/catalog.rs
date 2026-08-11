@@ -35,13 +35,35 @@
 //!
 //! `dependencies()` is fed to the same
 //! [`crate::dependency_allowlist::validate_dependencies`] gate that
-//! `create_workspace` enforces unconditionally for *every* caller. A
-//! `talos.json` may therefore name only crates on
-//! `DEFAULT_ALLOWED_DEPENDENCIES` (15 crates today), with a version string
-//! that is neither `*` nor empty and that contains no `git`/`path`/quote/
-//! bracket/newline characters. Path deps, git deps and registry overrides
-//! remain impossible — the generated manifest is a fixed `format!` template
-//! and the only interpolated dependency lines are `name = "version"`.
+//! `create_workspace` enforces unconditionally for *every* caller.
+//!
+//! The NET bound on a `talos.json` is: only crates on
+//! `DEFAULT_ALLOWED_DEPENDENCIES` (16 today — `serde`, `serde_json`,
+//! `chrono`, `uuid`, `base64`, `url`, `urlencoding`, `percent-encoding`,
+//! `regex`, `tokio`, `anyhow`, `thiserror`, `rand`, `sha2`, `hmac`, `http`),
+//! at a version string that is neither `*` nor empty and that contains no
+//! `git`/`path`/quote/brace/newline characters. Path deps, git deps and
+//! registry overrides remain impossible — the generated manifest is a fixed
+//! `format!` template and the only interpolated dependency lines are
+//! `name = "version"`.
+//!
+//! **That bound is enforced by TWO separate gates, not one, and the
+//! distinction is operationally load-bearing.**
+//! `validate_dependencies` enforces the allowlist and the `*`/empty-version
+//! rule *only*; the crate-name charset check and the `git`/`path`/quote/
+//! brace rejection live in a separate block inside `create_workspace`. So
+//! [`CatalogTemplate::validate_dependencies`] — the pre-flight below — sees
+//! the allowlist half and nothing else. A manifest naming an allowlisted
+//! crate at a *malformed version* passes the pre-flight and is refused later,
+//! by `create_workspace`, which is the correct outcome but not an early one.
+//! Do not describe the pre-flight as covering the whole bound.
+//!
+//! The allowlist is also not a constant: `MCP_ALLOWED_CRATE_DEPENDENCIES`
+//! replaces it wholesale and `MCP_ALLOWED_CRATE_DEPENDENCIES_EXTRA` extends
+//! it, both read from the controller's environment
+//! (`dependency_allowlist::get_allowed_dependencies`). "16 crates" is the
+//! default, not a ceiling — an operator can widen it, and this path inherits
+//! whatever they set.
 //!
 //! An attacker who controls a `talos.json` (i.e. who can already write to the
 //! image's `module-templates/`, or to the signed OCI artifact) gains exactly
@@ -155,11 +177,22 @@ impl CatalogTemplate {
         }
     }
 
-    /// Reject a manifest whose declared dependencies would be refused by the
-    /// compiler's allowlist, *before* spending a compile slot on it.
+    /// Reject a manifest whose declared dependencies are outside the
+    /// compiler's crate allowlist, with a message naming the crate.
     ///
-    /// Purely an early-error convenience — `create_workspace` enforces the
-    /// same gate unconditionally, so skipping this cannot widen anything.
+    /// Purely a diagnostic convenience — `create_workspace` calls the very
+    /// same function unconditionally, so skipping this cannot widen anything,
+    /// and calling it saves no meaningful work either (`create_workspace`
+    /// bails before `cargo generate-lockfile` / `cargo audit` /
+    /// `cargo component build`, so a rejected manifest costs a compilation
+    /// permit for microseconds, not a compile).
+    ///
+    /// **It is NOT the whole gate.** This covers the allowlist and the
+    /// `*`/empty-version rule. The crate-name charset check and the
+    /// `git`/`path`/quote/brace/newline version rejection are a separate
+    /// block inside `create_workspace`, so an allowlisted crate at a
+    /// malformed version passes here and is refused there. A caller that
+    /// treats `Ok(())` as "this will build" is wrong.
     pub fn validate_dependencies(&self) -> Result<(), String> {
         crate::dependency_allowlist::validate_dependencies(self.dependencies())
     }
@@ -278,6 +311,65 @@ mod catalog_template_tests {
             CatalogTemplate::load(d),
             Err(CatalogTemplateError::ReadSource(_))
         ));
+    }
+
+    /// `seed_templates` behaviour change #1, pinned at its precondition: a
+    /// template dir with a manifest but NO source used to be seeded with an
+    /// EMPTY `source_code` (and then failed to compile on every boot,
+    /// permanently, producing a row that was advertised and could not run).
+    /// The seeder can no longer do that because there is no way to obtain a
+    /// `CatalogTemplate` for such a dir — `load` fails, and the only thing a
+    /// caller can do with the failure is skip.
+    ///
+    /// Scope, stated: this pins the PRECONDITION, not the seeder's control
+    /// flow. Exercising `seed_templates` itself needs a Postgres pool and a
+    /// `ModuleRegistry`; what is testable without them is that the type makes
+    /// the empty-source row unconstructible, which is the load-bearing half.
+    #[test]
+    fn manifest_without_source_cannot_produce_a_template() {
+        let td = tmpdir();
+        let d = td.path();
+        write(d, "talos.json", r#"{"name":"x","display_name":"X"}"#);
+        let err = CatalogTemplate::load(d).expect_err("a source-less dir must not load");
+        assert!(matches!(err, CatalogTemplateError::ReadSource(_)));
+    }
+
+    /// `seed_templates` behaviour change #2, pinned at its precondition: a
+    /// manifest declaring a non-allowlisted crate must still LOAD, and must
+    /// still surface its metadata and dependencies, so the seeder can upsert
+    /// the row and let the compile fail loudly.
+    ///
+    /// An earlier revision `continue`d before the upsert on this condition.
+    /// That looked like fail-fast and was actually silent staleness: a
+    /// template seeded under an OLDER manifest kept its previously compiled
+    /// `wasm_bytes`, stayed in `list_templates`, and was invisible to
+    /// `never_compiled` (it HAS bytes), to
+    /// `talos_catalog_templates_missing_wasm`, and to `on_disk_not_in_db`
+    /// (the row exists). It also could not save a compile: `create_workspace`
+    /// runs this same `validate_dependencies` and bails BEFORE
+    /// `cargo generate-lockfile` / `cargo audit` / `cargo component build`.
+    #[test]
+    fn disallowed_dependency_template_still_loads_and_reports_its_metadata() {
+        let td = tmpdir();
+        let d = td.path();
+        write(
+            d,
+            "talos.json",
+            r#"{"name":"x","display_name":"X","dependencies":{"reqwest":"0.11"}}"#,
+        );
+        write(d, "template.rs", "fn main() {}");
+        let t = CatalogTemplate::load(d).expect("a bad dependency must not block loading");
+        assert_eq!(
+            t.manifest().get("display_name").and_then(|v| v.as_str()),
+            Some("X"),
+            "the seeder needs the metadata to upsert the row"
+        );
+        assert!(
+            t.dependencies().is_some(),
+            "the seeder writes modules.dependencies verbatim so the failure is \
+             diagnosable from the row, not only from a log line"
+        );
+        assert!(t.validate_dependencies().is_err());
     }
 
     /// Every shipped catalog template must declare, in `talos.json`, every

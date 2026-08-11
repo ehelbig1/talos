@@ -1425,7 +1425,16 @@ pub struct NodeTemplate {
     pub capability_world: String,
     /// Third-party crate dependencies used when compiling this template.
     /// Stored as a JSON object mapping crate names to version strings,
-    /// e.g. `{"base64": "0.21"}`. `None` for catalog templates.
+    /// e.g. `{"base64": "0.21"}`.
+    ///
+    /// This used to say "`None` for catalog templates", and it was true —
+    /// every one of the 75 catalog rows had the column NULL, because no
+    /// catalog path ever wrote it. That is exactly the defect fixed on
+    /// 2026-08-11: the disk seeder now writes `talos.json`'s `dependencies`
+    /// through `talos_compilation::CatalogTemplate`, so a catalog row's value
+    /// is `Some(..)` whenever its manifest declares a crate. Any consumer
+    /// that reads this field must forward it — a hardcoded `None` no longer
+    /// coincides with the data (structural lint check 68 leg (d)).
     pub dependencies: Option<JsonValue>,
 }
 

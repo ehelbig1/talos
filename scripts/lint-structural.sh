@@ -476,12 +476,22 @@ bold "▶ check 7: cargo clippy --workspace --no-deps -- -D warnings"
 # This check is gated behind TALOS_LINT_CLIPPY=1 by default because
 # clippy is a 60-90s build for a fresh tree. CI sets the env. Local
 # `make lint` callers can opt in by exporting it.
+#
+# The output is CAPTURED, not discarded. It used to be `>/dev/null 2>&1` with
+# a "re-run for diagnostics" hint, which made every clippy failure cost the
+# build TWICE — and in a cold worktree that second build is tens of minutes.
+# Same reasoning as check 35. Keeping the log on disk (rather than streaming
+# it) preserves the one-line-per-check output shape on the passing path.
 if [ "${TALOS_LINT_CLIPPY:-0}" = "1" ]; then
-    if cargo clippy --workspace --no-deps -- -D warnings >/dev/null 2>&1; then
+    CLIPPY_LOG="$(mktemp "${TMPDIR:-/tmp}/talos-clippy.XXXXXX")"
+    if cargo clippy --workspace --no-deps -- -D warnings >"$CLIPPY_LOG" 2>&1; then
         green "✓ clippy --workspace --no-deps clean (-D warnings)"
+        rm -f "$CLIPPY_LOG"
     else
         red "✗ clippy --workspace --no-deps failed (-D warnings)"
-        yellow "  → re-run \`cargo clippy --workspace --no-deps -- -D warnings\` for diagnostics"
+        # Only the diagnostics, not the "Compiling …" progress noise.
+        grep -E '^(error|warning)' -A 12 "$CLIPPY_LOG" | head -200 || cat "$CLIPPY_LOG"
+        yellow "  → full log: $CLIPPY_LOG"
         EXIT_CODE=1
     fi
 else
@@ -2678,14 +2688,34 @@ bold "▶ check 35: cargo fmt --all -- --check (rustfmt drift)"
 # (check 7, ~60-90s, env-gated), `cargo fmt --check` is ~1s — cheap enough to
 # run by default. There is no rustfmt.toml; this is plain default rustfmt
 # under the pinned toolchain (rust-toolchain.toml).
+#
+# This is the ONLY rustfmt run in `make lint`. The Makefile used to run
+# `cargo fmt --all -- --check` as well, immediately before invoking this
+# script — identical coverage, twice the wall-clock. This copy is the one
+# kept because it NAMES the drifted files.
+#
+# The output is CAPTURED rather than discarded: the previous
+# `>/dev/null 2>&1` + "re-run to see it" made the operator pay for the check
+# a second time to learn anything from it.
 if ! command -v cargo >/dev/null 2>&1; then
     yellow "⊘ fmt check skipped (cargo not on PATH)"
-elif cargo fmt --all -- --check >/dev/null 2>&1; then
-    green "✓ rustfmt clean (cargo fmt --all -- --check)"
 else
-    red "✗ rustfmt drift detected"
-    yellow "  → run \`cargo fmt --all\` to fix (formatting-only, AST-token-preserving)"
-    EXIT_CODE=1
+    FMT_LOG="$(mktemp "${TMPDIR:-/tmp}/talos-fmt.XXXXXX")"
+    if cargo fmt --all -- --check >"$FMT_LOG" 2>&1; then
+        green "✓ rustfmt clean (cargo fmt --all -- --check)"
+        rm -f "$FMT_LOG"
+    else
+        red "✗ rustfmt drift detected"
+        # `cargo fmt --check` emits `Diff in <path> at line N:` headers; those
+        # are the actionable part. Fall back to the raw log if the format ever
+        # changes, so this can never print nothing.
+        if grep -E '^Diff in ' "$FMT_LOG" | sort -u | head -60; then :; else
+            head -60 "$FMT_LOG"
+        fi
+        yellow "  → run \`cargo fmt --all\` to fix (formatting-only, AST-token-preserving)"
+        yellow "  → full diff: $FMT_LOG"
+        EXIT_CODE=1
+    fi
 fi
 echo
 
@@ -5477,30 +5507,71 @@ echo
 # dependency-less `compile_to_wasm(user, job, name, source)` convenience was
 # DELETED so the footgun cannot be re-acquired.
 #
-# Two directions:
+# It was not five paths. It was SIX — and the sixth is what makes this a
+# lint rather than a patch. `talos-api`'s `createModuleFromTemplate` resolves
+# a template row through the SAME `registry.get_template_for_user` as its MCP
+# twin `handle_compile_template`, and passed `None` where the twin passes
+# `template.dependencies.as_ref()`. While `modules.dependencies` was NULL for
+# all 75 catalog rows the two were equally (invisibly) broken; the moment the
+# seeder started populating that column, the same template compiled under MCP
+# and failed under GraphQL. A uniform bug became a protocol-dependent one —
+# inside the change whose thesis is "patching a site is not fixing a class".
+# Leg (d) exists because neither (a) nor (b) could see that file: it contains
+# neither `module-templates` nor a manifest read.
+#
+# Four directions:
 #   (a) the manifest key `"dependencies"` may be read from a parsed
 #       `talos.json` in exactly one place — `catalog.rs`. Scoped to receivers
-#       named meta/manifest/manifest_json/tpl (the shapes a manifest is bound
-#       to), so caller-supplied `args.get("dependencies")` — a different
-#       thing entirely — is not swept up.
+#       whose NAME CONTAINS meta/manifest/tpl/talos_json (so `manifest_json`,
+#       `template_manifest` and `raw_meta` are all covered), in both the
+#       `.get("dependencies")` and `["dependencies"]` spellings, so
+#       caller-supplied `args.get("dependencies")` — a different thing
+#       entirely — is not swept up.
 #   (b) any non-test source file that resolves a catalog template directory
 #       (`module-templates`) AND calls into the compiler must name
-#       `CatalogTemplate`. This is what catches a NEW site that reads
-#       template.rs by hand and passes `None`.
+#       `CatalogTemplate`. "Calls into the compiler" is matched as
+#       `compile_*wasm` (so `compile_js_to_wasm` / `compile_python_to_wasm`
+#       count, which the original literal `compile_to_wasm` grep missed)
+#       or `compile_catalog_template`.
+#   (c) the dependency-less `compile_to_wasm(user, job, name, source)`
+#       convenience must stay deleted — its existence is what made `None` the
+#       path of least resistance at four call sites. Scanned across ALL of
+#       `talos-compilation/src/`, not just `lib.rs`, and tolerant of a
+#       generic parameter list, because both were trivial evasions.
+#   (d) a compile of a TEMPLATE ROW must forward its `dependencies`. Scoped
+#       per-CALL (paren-balanced argument window, so it is the call and not
+#       the file that must be clean) to files that resolve a row via
+#       `get_template_for_user` — the one resolver returning a `NodeTemplate`
+#       that carries the column. A call there whose arguments never mention
+#       `dependencies` is the GraphQL regression above.
 #
-# STATED LIMITS, because a lint is only worth what it actually checks:
-#   * Both legs are TEXTUAL greps. (a) is defeated by binding the manifest to
-#     a variable with an unanticipated name; (b) by resolving the catalog
-#     directory through a constant defined in another file. The type is the
-#     real control — this is the backstop that makes bypassing it deliberate.
+# STATED LIMITS, because a lint is only worth what it actually checks — and
+# overstating one is the defect class this arc keeps finding (CLAUDE.md check
+# 58). Every limit below was confirmed by mutation, not inferred:
+#   * Every leg is TEXTUAL. (a) is defeated by a receiver whose name contains
+#     none of the four stems (`let j: Value = …; j.get("dependencies")`) and
+#     by any indirection (`let k = "dependencies"; m.get(k)`). (b) is defeated
+#     by resolving the catalog directory through a constant defined in another
+#     file. (c) is defeated by a differently-NAMED dependency-less convenience
+#     (`compile_simple(…)`) — it pins one identifier, not a shape. The TYPE is
+#     the real control; this is the backstop that makes bypassing it
+#     deliberate.
 #   * (b) fires on the FILE, not the call. A file that legitimately compiles
 #     non-catalog source AND separately mentions `module-templates` satisfies
 #     it merely by also using `CatalogTemplate` somewhere.
-#   * Neither leg can prove the forwarded value is correct, only that it is
-#     forwarded. `talos-compilation`'s `catalog_template_tests` cover the
-#     value; `scripts/check-catalog.sh` covers the templates.
+#   * (d) is scoped by an ADJACENT string (`get_template_for_user` present in
+#     the same file), so a future handler that resolves a template row through
+#     a NEW repository method, or in a different file from the compile call,
+#     is invisible to it. It also only proves the token `dependencies` appears
+#     in the argument list — `dependencies: None` would satisfy it. Neither
+#     (d) nor any other leg can prove the forwarded VALUE is right, only that
+#     something was forwarded. `talos-compilation`'s `catalog_template_tests`
+#     cover the value; `scripts/check-catalog.sh` covers the templates.
 # Opt-outs: `// allow-raw-catalog-deps: <reason>` (a),
-#           `// allow-uncatalogued-compile: <reason>` (b).
+#           `// allow-uncatalogued-compile: <reason>` (b),
+#           `// allow-depless-compile: <reason>` (d) — on or within 8 lines
+#           above the call, for a compile of caller-supplied source that has
+#           no template row behind it.
 bold "▶ check 68: catalog compiles must go through CatalogTemplate"
 CT_FAIL=0
 CT_HOME="talos-compilation/src/catalog.rs"
@@ -5515,8 +5586,8 @@ while IFS= read -r hit; do
     yellow "  → use talos_compilation::CatalogTemplate::dependencies(). One reader is"
     yellow "    what stops the next compile path from quietly omitting the field."
     CT_FAIL=1
-done < <(cd "$ROOT" && grep -rnE '\b(meta|manifest|manifest_json|tpl)\s*\.\s*get\("dependencies"\)' \
-         --include='*.rs' . 2>/dev/null \
+done < <(cd "$ROOT" && grep -rnE '\b[A-Za-z_][A-Za-z0-9_]*(meta|manifest|tpl|talos_json)[A-Za-z0-9_]*\s*(\.\s*get\("dependencies"\)|\["dependencies"\])|\b(meta|manifest|tpl|talos_json)\s*(\.\s*get\("dependencies"\)|\["dependencies"\])' \
+         --include='*.rs' --exclude-dir=target . 2>/dev/null \
          | sed 's|^\./||' | grep -v '^target/' || true)
 
 # (b) catalog-dir readers that compile must use the type
@@ -5525,7 +5596,7 @@ while IFS= read -r file; do
     [ "$file" = "$CT_HOME" ] && continue
     case "$file" in */tests/*|*_tests.rs|*/test_support.rs) continue ;; esac
     grep -q 'module-templates' "$ROOT/$file" || continue
-    grep -q 'compile_to_wasm' "$ROOT/$file" || continue
+    grep -qE 'compile_[a-z_]*wasm|compile_catalog_template' "$ROOT/$file" || continue
     grep -q 'allow-uncatalogued-compile' "$ROOT/$file" && continue
     grep -q 'CatalogTemplate' "$ROOT/$file" && continue
     red "✗ $file resolves a catalog template dir and compiles, but never names CatalogTemplate"
@@ -5533,18 +5604,53 @@ while IFS= read -r file; do
     yellow "    CompilationService::compile_catalog_template, so the template's declared"
     yellow "    dependencies cannot be dropped on this path."
     CT_FAIL=1
-done < <(cd "$ROOT" && grep -rl 'module-templates' --include='*.rs' . 2>/dev/null \
+done < <(cd "$ROOT" && grep -rl 'module-templates' --include='*.rs' --exclude-dir=target . 2>/dev/null \
          | sed 's|^\./||' | grep -v '^target/' || true)
 
-# The dependency-less convenience must stay deleted — its existence is what
-# made `None` the path of least resistance at four call sites.
-if (cd "$ROOT" && grep -qE 'pub async fn compile_to_wasm\s*\(' talos-compilation/src/lib.rs 2>/dev/null); then
+# (c) the dependency-less convenience must stay deleted. Whole crate, and a
+# generic parameter list does not hide it.
+if (cd "$ROOT" && grep -rqE 'fn compile_to_wasm\s*(<[^>]*>)?\s*\(' talos-compilation/src/ 2>/dev/null); then
     red "✗ CompilationService::compile_to_wasm (the dependency-less convenience) is back"
     yellow "  → it defaults dependencies to None. Catalog callers must take a CatalogTemplate;"
     yellow "    non-catalog callers should pass their deps explicitly to"
     yellow "    compile_to_wasm_with_config."
     CT_FAIL=1
 fi
+
+# (d) template-row compiles must forward the row's dependencies
+while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    case "$file" in */tests/*|*_tests.rs|*/test_support.rs) continue ;; esac
+    grep -q 'get_template_for_user' "$ROOT/$file" || continue
+    while IFS= read -r ln; do
+        [ -z "$ln" ] && continue
+        red "✗ $file:$ln compiles a template row without forwarding its \`dependencies\`"
+        yellow "  → pass template.dependencies.as_ref(). Its twin does; when the two disagree,"
+        yellow "    the SAME template compiles on one protocol and fails E0433 on the other."
+        yellow "  → if this call builds caller-supplied source with no template row behind it,"
+        yellow "    mark it \`// allow-depless-compile: <reason>\`."
+        CT_FAIL=1
+    done < <(cd "$ROOT" && perl -0777 -ne '
+        my @lines = split /\n/, $_, -1;
+        while (/compile_to_wasm_with_config\s*\(/g) {
+            my $start = pos($_);
+            my ($depth, $i, $len) = (1, $start, length($_));
+            while ($i < $len && $depth > 0) {
+                my $c = substr($_, $i, 1);
+                $depth++ if $c eq "(";
+                $depth-- if $c eq ")";
+                $i++;
+            }
+            my $args = substr($_, $start, $i - $start - 1);
+            next if $args =~ /dependencies/;
+            my $lnum = (substr($_, 0, $start) =~ tr/\n//) + 1;
+            my $lo = $lnum - 9; $lo = 0 if $lo < 0;
+            my $hi = $lnum + 2; $hi = $#lines if $hi > $#lines;
+            next if join("\n", @lines[$lo .. $hi]) =~ /allow-depless-compile/;
+            print "$lnum\n";
+        }' "$file" || true)
+done < <(cd "$ROOT" && grep -rl 'compile_to_wasm_with_config' --include='*.rs' --exclude-dir=target . 2>/dev/null \
+         | sed 's|^\./||' | grep -v '^target/' || true)
 
 if [ "$CT_FAIL" -eq 1 ]; then
     EXIT_CODE=1

@@ -1957,12 +1957,25 @@ pub(crate) async fn seed_templates(
             "TALOS_REGISTRY_URL set — disk template seeding disabled. \
              OCI registry is the source of truth."
         );
+        // The gauge must still be published. It was originally set only on
+        // the disk-seeding path, below BOTH of these early returns, so in OCI
+        // mode `talos_catalog_templates_missing_wasm` was never touched and
+        // `TalosCatalogTemplateNeverCompiled` was structurally unfireable —
+        // an alert that cannot fire in a supported mode. The query itself is
+        // mode-agnostic (it excludes rows carrying an `oci_url`, which are
+        // healthy by design), so publishing it here is meaningful: it counts
+        // catalog rows that have neither bytes nor a registry reference.
+        spawn_catalog_missing_wasm_gauge(registry.db_pool.clone(), Vec::new());
         return Ok(());
     }
 
     let templates_dir = std::path::Path::new("module-templates");
     if !templates_dir.exists() {
         tracing::info!("No module-templates/ directory found — skipping template seeding");
+        // Same reasoning as the OCI early return: a DB seeded by a previous
+        // image can hold unrunnable rows even when this image ships no
+        // `module-templates/` at all.
+        spawn_catalog_missing_wasm_gauge(registry.db_pool.clone(), Vec::new());
         return Ok(());
     }
 
@@ -2108,17 +2121,40 @@ pub(crate) async fn seed_templates(
             continue;
         }
 
-        // Fail EARLY and loudly on a manifest that declares a crate outside
-        // the compiler allowlist, instead of spending a compile slot to learn
-        // the same thing 30-60 s later. `create_workspace` enforces the same
-        // gate unconditionally, so this cannot widen anything.
+        // Name the disallowed crate PRECISELY, then fall through. This
+        // deliberately does NOT `continue`.
+        //
+        // An earlier revision skipped the template outright, justified as
+        // "instead of spending a compile slot to learn the same thing 30-60 s
+        // later". That justification is false: `create_workspace` runs
+        // `validate_dependencies` and `bail!`s BEFORE `cargo generate-lockfile`,
+        // `cargo audit` or `cargo component build`, so the real cost is a
+        // compilation permit held for microseconds — not a compile.
+        //
+        // And the skip had a cost that was not free at all: it `continue`d
+        // BEFORE the upsert, so a template that had been seeded under an
+        // OLDER manifest kept its previously compiled `wasm_bytes`, stayed
+        // visible in `list_templates` and in the dynamic tool surface, and was
+        // invisible to every detector this commit added — `never_compiled`
+        // skips it (it HAS bytes), the gauge does not count it, and
+        // `on_disk_not_in_db` does not flag it (the row exists). Silent
+        // staleness, introduced by the change whose whole point was to make
+        // unrunnable templates visible.
+        //
+        // Falling through makes an unbuildable manifest behave exactly like
+        // every other failing compile: the row's metadata/source/dependencies
+        // track disk, the compile fails loudly with
+        // "Dependency allowlist violation: …" inside the existing
+        // "Background compilation failed" WARN, and a never-compiled template
+        // reaches `never_compiled` + the gauge. It does not clobber working
+        // bytes, so a manifest typo cannot brick a live template.
         if let Err(msg) = template.validate_dependencies() {
             tracing::warn!(
-                "Skipping template '{}': disallowed dependencies in talos.json: {}",
+                "Template '{}' declares disallowed dependencies in talos.json — \
+                 its compile below will fail with the same error: {}",
                 name,
                 msg
             );
-            continue;
         }
 
         // Read capability_world from talos.json; default to 'automation-node' when absent
@@ -2164,7 +2200,7 @@ pub(crate) async fn seed_templates(
                 category: &category,
                 description: &description,
                 config_schema: &config_schema,
-                source_code: &code_template,
+                source_code: code_template,
                 allowed_hosts: &allowed_hosts,
                 allowed_secrets: &allowed_secrets,
                 requires_approval_for: &requires_approval_for,
@@ -2271,45 +2307,88 @@ pub(crate) async fn seed_templates(
         Err(e) => tracing::warn!(error = %e, "catalog duplicate reconciler failed"),
     }
 
-    // D3 (2026-08-11): a template that cannot compile must not be visible
-    // only in boot logs. Three catalog templates sat with `wasm_bytes IS
-    // NULL` — never compiled, therefore unable to run at all — for as long
-    // as the dependency-plumbing bug existed, and nothing but a WARN at boot
-    // said so. Publish the durable count so an alert can fire on it, once
-    // the compiles this boot spawned have settled.
-    //
-    // Stated limits: (a) this is recomputed at BOOT ONLY, so on a controller
-    // that runs for days the gauge is as old as the last restart — it is the
-    // count of templates the seeder could not build, which only the seeder
-    // changes; (b) it is per-process, so each replica publishes its own
-    // (they agree, since the underlying rows are shared); (c) the named
-    // detail lives in `get_catalog_status` → `never_compiled`, because a
-    // per-template label here would be an unbounded-cardinality surface in
-    // OCI mode where template names are registry-supplied.
-    let pool_gauge = registry.db_pool.clone();
+    spawn_catalog_missing_wasm_gauge(registry.db_pool.clone(), compile_tasks);
+
+    Ok(())
+}
+
+/// The one query behind `talos_catalog_templates_missing_wasm`.
+///
+/// Must stay in agreement with
+/// `ModuleRepository::list_catalog_rows_without_wasm`, which produces the
+/// NAMES for the same population (`get_catalog_status` → `never_compiled`) —
+/// a gauge that counts a different set than the tool that names them sends
+/// an operator looking for templates the tool will not show.
+///
+/// The `oci_url` predicate is load-bearing, not defensive. In OCI mode
+/// `talos_registry::sync` inserts every catalog row with `source_code = ''`
+/// and no `wasm_bytes` on purpose (the worker pulls bytes from the registry),
+/// so without it this counts the entire healthy catalog.
+pub(crate) const CATALOG_MISSING_WASM_SQL: &str = "SELECT COUNT(*) FROM modules \
+     WHERE kind = 'catalog' AND user_id IS NULL \
+       AND (wasm_bytes IS NULL OR octet_length(wasm_bytes) = 0) \
+       AND (oci_url IS NULL OR oci_url = '')";
+
+/// Set the gauge (and warn when non-zero). Split out from the spawned task so
+/// a unit test can drive the PRODUCTION path and assert the gauge actually
+/// moved — CLAUDE.md's check-58 guidance: a wrapper that nothing calls, or
+/// calls with the wrong value, is invisible to the textual dead-metric lint.
+///
+/// Takes the collector explicitly rather than reading `metrics::global()` so
+/// the test does not have to win a race for a process-wide `OnceLock`.
+pub(crate) fn publish_catalog_missing_wasm(
+    metrics: Option<&talos_metrics::TalosMetrics>,
+    missing: i64,
+) {
+    if let Some(m) = metrics {
+        m.catalog_templates_missing_wasm.set(missing);
+    }
+    if missing > 0 {
+        tracing::warn!(
+            missing_wasm = missing,
+            "catalog templates have NO compiled WASM and cannot run — \
+             call get_catalog_status for the names"
+        );
+    }
+}
+
+/// D3 (2026-08-11): a template that cannot compile must not be visible only
+/// in boot logs. Three catalog templates sat with `wasm_bytes IS NULL` —
+/// never compiled, therefore unable to run at all — for as long as the
+/// dependency-plumbing bug existed, and nothing but a WARN at boot said so.
+/// Publish the durable count so an alert can fire on it, once the compiles
+/// this boot spawned have settled.
+///
+/// `compile_tasks` are awaited (not detached) so the gauge reflects
+/// POST-compile truth; the joiner is itself spawned, so boot is not delayed.
+/// Callers with nothing to await pass an empty vec — the OCI and
+/// no-`module-templates/` paths do exactly that, because a gauge published on
+/// only one of three exits is an alert that cannot fire in the other two.
+///
+/// Stated limits: (a) recomputed at BOOT ONLY, so on a controller that runs
+/// for days the value is as old as the last restart. In DISK mode that is
+/// benign — only the seeder writes these rows. In OCI mode it is NOT: the
+/// registry sync loop rewrites catalog rows every 5 minutes, so a row that
+/// becomes unrunnable mid-life (sync drops its `oci_url`) is not reflected
+/// until the next boot. (b) It is per-process, so each replica publishes its
+/// own (they agree — the rows are shared). (c) The named detail lives in
+/// `get_catalog_status` → `never_compiled`, because a per-template label here
+/// would be an unbounded-cardinality surface in OCI mode where template names
+/// are registry-supplied.
+pub(crate) fn spawn_catalog_missing_wasm_gauge(
+    pool: sqlx::PgPool,
+    compile_tasks: Vec<tokio::task::JoinHandle<()>>,
+) {
     tokio::spawn(async move {
         for h in compile_tasks {
             let _ = h.await;
         }
-        match sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM modules \
-             WHERE kind = 'catalog' AND user_id IS NULL \
-               AND (wasm_bytes IS NULL OR octet_length(wasm_bytes) = 0)",
-        )
-        .fetch_one(&pool_gauge)
-        .await
+        match sqlx::query_scalar::<_, i64>(CATALOG_MISSING_WASM_SQL)
+            .fetch_one(&pool)
+            .await
         {
             Ok(missing) => {
-                if let Some(m) = metrics::global() {
-                    m.catalog_templates_missing_wasm.set(missing);
-                }
-                if missing > 0 {
-                    tracing::warn!(
-                        missing_wasm = missing,
-                        "catalog templates have NO compiled WASM and cannot run — \
-                         call get_catalog_status for the names"
-                    );
-                }
+                publish_catalog_missing_wasm(metrics::global().map(|m| m.as_ref()), missing)
             }
             Err(e) => tracing::warn!(
                 error = %e,
@@ -2317,8 +2396,6 @@ pub(crate) async fn seed_templates(
             ),
         }
     });
-
-    Ok(())
 }
 
 /// Publish first-party catalog modules to module_marketplace that aren't already listed.
@@ -2395,5 +2472,114 @@ pub(crate) async fn seed_marketplace(pool: &sqlx::PgPool) {
             r.rows_affected()
         ),
         Err(e) => tracing::warn!("seed_marketplace: {}", e),
+    }
+}
+
+#[cfg(test)]
+mod catalog_seed_tests {
+    use super::*;
+
+    /// EVERY exit of `seed_templates` must publish the gauge.
+    ///
+    /// This is the defect itself, guarded: the gauge was published from ONE
+    /// place at the tail of the disk-seeding path, BELOW two early returns
+    /// (`TALOS_REGISTRY_URL` set → OCI mode; no `module-templates/` dir). So
+    /// in OCI mode `talos_catalog_templates_missing_wasm` was never touched
+    /// and `TalosCatalogTemplateNeverCompiled` was structurally unfireable —
+    /// an alert that cannot fire in a supported mode.
+    ///
+    /// Structural: `seed_templates` needs a Postgres pool and a
+    /// `ModuleRegistry`, so its control flow cannot be exercised in a unit
+    /// test. What CAN be checked without them is that every `return Ok(())`
+    /// in its body is matched by a publish call — which is exactly the shape
+    /// of the regression (someone adds a fourth early return above the
+    /// publish). Scanning the source is a blunt instrument and is used
+    /// deliberately: the alternative was no guard at all on the property that
+    /// broke.
+    #[test]
+    fn every_seed_templates_exit_publishes_the_gauge() {
+        const SRC: &str = include_str!("services.rs");
+        let start = SRC
+            .find("pub(crate) async fn seed_templates(")
+            .expect("seed_templates moved — update this guard rather than deleting it");
+        let body = &SRC[start..];
+        let end = body
+            .find("\n}\n")
+            .expect("could not find the end of seed_templates");
+        let body = &body[..end];
+
+        let returns = body.matches("return Ok(())").count();
+        let publishes = body.matches("spawn_catalog_missing_wasm_gauge(").count();
+        // The tail `Ok(())` is an expression, not a `return`, so it is counted
+        // via its own publish call sitting immediately above it.
+        assert_eq!(
+            returns + 1,
+            publishes,
+            "seed_templates has {returns} early return(s) and {publishes} gauge \
+             publish(es). Every exit — including the OCI-mode and \
+             missing-module-templates early returns — must call \
+             spawn_catalog_missing_wasm_gauge, or the alert built on that gauge \
+             cannot fire in that mode."
+        );
+    }
+
+    /// CLAUDE.md check-58 guidance: "ship a per-metric unit test that drives
+    /// the PRODUCTION path and asserts the counter moved." The structural
+    /// lint is textual — it sees `.set(` in this file and calls the gauge
+    /// live even if `spawn_catalog_missing_wasm_gauge` were never called and
+    /// even if it set the wrong value. This drives the real function.
+    #[test]
+    fn publish_catalog_missing_wasm_moves_the_gauge() {
+        let m = talos_metrics::TalosMetrics::new().expect("build metrics");
+        assert_eq!(
+            m.catalog_templates_missing_wasm.get(),
+            0,
+            "a freshly registered gauge must idle at 0 — an alert on a series \
+             that is never published cannot fire (PromQL treats absent and \
+             zero differently)"
+        );
+
+        publish_catalog_missing_wasm(Some(&m), 3);
+        assert_eq!(m.catalog_templates_missing_wasm.get(), 3);
+
+        // The healthy case must be PUBLISHED, not skipped. This is what makes
+        // `TalosCatalogTemplateNeverCompiled`'s deliberate lack of an
+        // `absent()` arm defensible: a zero is a real observation.
+        publish_catalog_missing_wasm(Some(&m), 0);
+        assert_eq!(m.catalog_templates_missing_wasm.get(), 0);
+
+        // No collector (metrics not initialised yet) must not panic — the
+        // seeder runs during boot and can race global metrics init.
+        publish_catalog_missing_wasm(None, 7);
+    }
+
+    /// The gauge COUNTS a population; `get_catalog_status` → `never_compiled`
+    /// NAMES it. If the two queries diverge, an operator is told "N templates
+    /// cannot run" by a tool that then lists a different set — which is the
+    /// misleading-report class this whole change exists to remove.
+    ///
+    /// Textual, deliberately: the two live in different crates and there is no
+    /// shared query object to assert on. It pins the predicates that carry
+    /// meaning, not the whitespace.
+    #[test]
+    fn gauge_query_matches_the_named_population() {
+        let sql = CATALOG_MISSING_WASM_SQL;
+        for needle in [
+            "kind = 'catalog'",
+            "user_id IS NULL",
+            "wasm_bytes IS NULL",
+            "octet_length(wasm_bytes) = 0",
+        ] {
+            assert!(sql.contains(needle), "gauge query lost `{needle}`: {sql}");
+        }
+        // The OCI predicate is the one that was MISSING. Without it the gauge
+        // counts every row of a healthy OCI catalog (sync inserts them with
+        // empty source and no wasm_bytes by design, bytes come from the
+        // registry), so the alert pages on a working cluster. Must stay in
+        // agreement with `ModuleRepository::list_catalog_rows_without_wasm`.
+        assert!(
+            sql.contains("oci_url IS NULL"),
+            "gauge query must exclude registry-backed rows: {sql}"
+        );
     }
 }

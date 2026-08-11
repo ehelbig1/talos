@@ -1661,6 +1661,12 @@ async fn handle_run_sandbox(
     let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
     let job_id = uuid::Uuid::new_v4();
     // Step 1b: Compile (with timeout)
+    // allow-depless-compile: run_sandbox builds CALLER-SUPPLIED inline Rust.
+    // There is no template row behind it and therefore no declared
+    // `dependencies` to forward — `compile_custom_sandbox` is the path that
+    // takes an explicit dependencies argument. (This file is in check 68 leg
+    // (d)'s scope only because `handle_compile_template`, further down, does
+    // resolve a row via `get_template_for_user`.)
     let compilation_result = tokio::time::timeout(
         std::time::Duration::from_secs(60),
         state.compiler.compile_to_wasm_with_config(

@@ -215,6 +215,18 @@ impl ModulesMutations {
             // Compile template with config rendering
             // Config is rendered into template at compile-time for optimal performance
             let job_id = input.job_id.unwrap_or_else(Uuid::new_v4);
+            // Forward the template row's declared `dependencies` — the SIXTH
+            // divergent compile path (2026-08-11). Its MCP twin
+            // (`talos_mcp_handlers::sandbox::handle_compile_template`) resolves
+            // the same row through the same `get_template_for_user` and passes
+            // `template.dependencies.as_ref()`; this site passed `None`.
+            //
+            // Until the seeder started writing `modules.dependencies`, every
+            // catalog row had it NULL, so the two protocols were equally
+            // (invisibly) broken. The moment the column is populated, the SAME
+            // template compiles under MCP and fails under GraphQL with E0433 —
+            // a uniform bug turned into a protocol-dependent one. Structural
+            // lint check 68 leg (d) now gates this call.
             let result = compiler
                 .compile_to_wasm_with_config(
                     user_id,
@@ -222,7 +234,7 @@ impl ModulesMutations {
                     &module_name,
                     &template.code_template,
                     &config,
-                    None,
+                    template.dependencies.as_ref(),
                 )
                 .await
                 .map_err(|e| {

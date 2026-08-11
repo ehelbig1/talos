@@ -74,9 +74,18 @@ if ! command -v cargo-component >/dev/null 2>&1; then
 fi
 
 # Crates the generated manifest already bundles. Must stay in lockstep with
-# `talos_compilation::create_workspace`'s PRE_BUNDLED list — a crate that is
-# pre-bundled there but not here reads as an undeclared Cargo.toml dep in
-# leg 2 (loud false positive, not a silent miss).
+# `talos_compilation::create_workspace`'s PRE_BUNDLED list — and BOTH legs
+# depend on that lockstep, not just leg 2:
+#
+#   leg 2: a crate pre-bundled there but not here reads as an undeclared
+#          Cargo.toml dep (loud false positive, not a silent miss).
+#   leg 1: `create_workspace` SKIPS a pre-bundled crate when it emits the
+#          `[dependencies]` block, precisely so a `talos.json` declaring e.g.
+#          `serde` cannot produce a duplicate-key Cargo.toml. The scaffold
+#          below must skip the same names or it emits `serde = "1.0"` twice
+#          and the template fails this gate with a TOML parse error while
+#          production compiles it fine — a false positive that would look
+#          like a broken template.
 PRE_BUNDLED="serde serde_json wit-bindgen wit-bindgen-rt talos_sdk_macros talos-sdk-macros"
 
 # 1. Sync WIT first — every template references ../../wit/talos.wit OR has its
@@ -191,10 +200,18 @@ scaffold_and_check() {
     # Extra crates declared in talos.json `dependencies` — the ONLY
     # dependency source the runtime reads.
     local extra_deps
-    extra_deps="$(python3 - "$dir/talos.json" <<'PY'
-import json, sys
+    extra_deps="$(PRE_BUNDLED="$PRE_BUNDLED" python3 - "$dir/talos.json" <<'PY'
+import json, os, sys
 meta = json.load(open(sys.argv[1]))
+# Mirror create_workspace's PRE_BUNDLED skip. Without it a talos.json that
+# legitimately declares `serde` (allowlisted, and production silently drops
+# it as already-bundled) emits a second `serde = ...` line into a manifest
+# that already has one, and cargo fails with `duplicate key` — this gate
+# would report a template as broken that production builds fine.
+pre_bundled = {c.lower() for c in os.environ.get("PRE_BUNDLED", "").split()}
 for name, ver in (meta.get("dependencies") or {}).items():
+    if name.lower() in pre_bundled:
+        continue
     # Mirror the two feature-flag special cases in
     # talos_compilation::create_workspace — without them a template
     # declaring uuid/tokio compiles here and fails in production.
