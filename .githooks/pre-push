@@ -2,24 +2,51 @@
 # Pre-push gate — runs `make lint` + `make lint-frontend` so the CI-parity
 # quality gates can't silently regress between manual runs.
 #
-# `make lint` covers: rustfmt --check, WIT drift, the structural lints
-# (`bash scripts/lint-structural.sh --count` for the live number — this
-# comment deliberately doesn't state one; a hardcoded count drifted 40→49
-# undetected by 2026-07-01),
-# `cargo clippy --workspace --no-deps -- -D warnings` (TALOS_LINT_CLIPPY=1),
-# and offline cargo-deny (bans/licenses/sources).
+# `make lint` covers: WIT drift, the structural lints (`bash
+# scripts/lint-structural.sh --count` for the live number — this comment
+# deliberately doesn't state one; a hardcoded count drifted 40→49 undetected
+# by 2026-07-01) including rustfmt (check 35) and
+# `cargo clippy --workspace --no-deps -- -D warnings` (check 7,
+# TALOS_LINT_CLIPPY=1), and offline cargo-deny (bans/licenses/sources).
 # `make lint-frontend` covers: frontend eslint + prettier + vitest.
 # Both are the single source of truth for "the gate" — this hook deliberately
 # does NOT re-spell the checks so it can't drift from the Make targets.
 #
-# Why pre-push (not pre-commit): a cold clippy build is 60-90s. Running it on
-# every commit is too heavy; running it once before a push is the right
-# trade-off. The existing `.githooks/pre-commit` keeps the fast checks
-# (secret/migration/compile) on every commit.
+# Why pre-push (not pre-commit): a cold clippy build is 60-90s on a warm tree
+# and tens of minutes on a cold one. Running it on every commit is too heavy;
+# running it once before a push is the right trade-off. The existing
+# `.githooks/pre-commit` keeps the fast checks (secret/migration/compile) on
+# every commit.
+#
+# ── PATH GATING ──────────────────────────────────────────────────────────
+# Both gates used to run UNCONDITIONALLY, so a docs-only push paid for a
+# full-workspace clippy and a Rust-only push paid for the entire frontend
+# eslint+prettier+vitest suite. Each gate now runs only when the pushed range
+# touches files it can possibly have an opinion about.
+#
+# This does not weaken CI: `quality.yml` runs both suites unconditionally on
+# every PR to main and nightly, so anything skipped here is still gated
+# before merge. What changes is only WHERE you find out.
+#
+# THE ONE REAL COUPLING, stated rather than buried: the frontend consumes
+# TypeScript types generated from the Rust GraphQL schema, so a Rust-only
+# change CAN invalidate frontend types. That is a pre-existing gap, not one
+# introduced here — nothing in this hook (before or after path gating) re-runs
+# codegen, so the frontend suite it used to run was type-checking STALE
+# generated types and would not have caught the break either. Path gating
+# makes that gap marginally easier to reach, and the honest fix is a codegen
+# step in the gate, not an unconditional `npm run lint`. Until then: after a
+# GraphQL schema change, run `make lint-frontend` yourself once codegen has
+# been re-run.
+#
+# Detection is deliberately conservative — anything it cannot classify runs
+# BOTH gates (see the "unknown range" fallback below), so the failure
+# direction is "ran too much", never "skipped a gate".
 #
 # Install with `make hooks` (sets core.hooksPath=.githooks).
 # Emergency bypass for a WIP/docs push: `git push --no-verify`,
-# or `SKIP_LINT=1 git push`.
+# or `SKIP_LINT=1 git push`. Force both gates regardless of paths with
+# `FORCE_LINT=1 git push`.
 set -euo pipefail
 
 if [ "${SKIP_LINT:-0}" = "1" ]; then
@@ -29,20 +56,88 @@ fi
 
 repo_root="$(git rev-parse --show-toplevel)"
 
-echo "pre-push: running 'make lint' (CI-parity gate; bypass with --no-verify)…"
-if ! make -C "$repo_root" lint; then
-    echo
-    echo "✗ pre-push: 'make lint' failed — push blocked."
-    echo "  Fix the reported issues, or for an emergency push bypass with:"
-    echo "      git push --no-verify"
-    exit 1
+# ── Which files does this push actually contain? ─────────────────────────
+# git feeds pre-push `<local ref> <local sha> <remote ref> <remote sha>` on
+# stdin, one line per ref. A remote sha of all-zeros means a NEW branch, for
+# which there is no meaningful "range" — fall back to running everything.
+changed_files=""
+unknown_range=0
+zero="0000000000000000000000000000000000000000"
+
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+    [ -z "${local_sha:-}" ] && continue
+    # Deleting a remote branch — nothing to lint.
+    [ "$local_sha" = "$zero" ] && continue
+    if [ "${remote_sha:-$zero}" = "$zero" ] || \
+       ! git -C "$repo_root" cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+        unknown_range=1
+        break
+    fi
+    range_files="$(git -C "$repo_root" diff --name-only "$remote_sha" "$local_sha" 2>/dev/null || true)"
+    if [ -z "$range_files" ] && [ "$remote_sha" != "$local_sha" ]; then
+        # Could not compute a diff for a range we thought was valid.
+        unknown_range=1
+        break
+    fi
+    changed_files="$changed_files
+$range_files"
+done
+
+# Non-interactive callers (or a manual `bash .githooks/pre-push`) give no
+# stdin at all; treat that as "cannot tell" rather than "nothing changed".
+if [ "${FORCE_LINT:-0}" = "1" ]; then
+    unknown_range=1
+elif [ -z "$(printf '%s' "$changed_files" | tr -d '[:space:]')" ] && [ "$unknown_range" -eq 0 ]; then
+    unknown_range=1
 fi
 
-echo "pre-push: running 'make lint-frontend' (eslint + prettier + vitest)…"
-if ! make -C "$repo_root" lint-frontend; then
-    echo
-    echo "✗ pre-push: 'make lint-frontend' failed — push blocked."
-    echo "  Fix the reported issues, or for an emergency push bypass with:"
-    echo "      git push --no-verify"
-    exit 1
+if [ "$unknown_range" -eq 1 ]; then
+    run_rust=1
+    run_frontend=1
+    echo "pre-push: could not scope the pushed range (new branch, or FORCE_LINT) — running both gates."
+else
+    run_rust=0
+    run_frontend=0
+    # Rust gate: anything clippy/rustfmt/cargo-deny/structural-lint can see.
+    # Deliberately broad — the structural lints read shell scripts, Helm
+    # charts, alert rules and migrations too, so a narrow `*.rs` filter would
+    # skip the gate on exactly the files checks 5/44/65/66 exist for.
+    # `CLAUDE.md` is in the list because meta-check 54 compares its
+    # "N checks today" sentence against the script's live count, so a
+    # CLAUDE.md-only edit CAN break the gate.
+    if printf '%s\n' "$changed_files" | grep -qE '\.(rs|toml|lock|sql|wit|sh|ya?ml)$|^wit/|^migrations/|^scripts/|^deploy/|^observability/|^Makefile$|^CLAUDE\.md$'; then
+        run_rust=1
+    fi
+    if printf '%s\n' "$changed_files" | grep -qE '^frontend/'; then
+        run_frontend=1
+    fi
+    if [ "$run_rust" -eq 0 ] && [ "$run_frontend" -eq 0 ]; then
+        echo "pre-push: pushed range touches neither Rust/infra nor frontend files — no gate applies."
+    fi
+fi
+
+if [ "$run_rust" -eq 1 ]; then
+    echo "pre-push: running 'make lint' (CI-parity gate; bypass with --no-verify)…"
+    if ! make -C "$repo_root" lint; then
+        echo
+        echo "✗ pre-push: 'make lint' failed — push blocked."
+        echo "  Fix the reported issues, or for an emergency push bypass with:"
+        echo "      git push --no-verify"
+        exit 1
+    fi
+else
+    echo "pre-push: no Rust/infra files in this push — skipping 'make lint' (quality.yml still runs it)."
+fi
+
+if [ "$run_frontend" -eq 1 ]; then
+    echo "pre-push: running 'make lint-frontend' (eslint + prettier + vitest)…"
+    if ! make -C "$repo_root" lint-frontend; then
+        echo
+        echo "✗ pre-push: 'make lint-frontend' failed — push blocked."
+        echo "  Fix the reported issues, or for an emergency push bypass with:"
+        echo "      git push --no-verify"
+        exit 1
+    fi
+else
+    echo "pre-push: no frontend/ files in this push — skipping 'make lint-frontend' (quality.yml still runs it)."
 fi

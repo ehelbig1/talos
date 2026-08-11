@@ -186,9 +186,14 @@ lint: ## Rustfmt + WIT drift + structural + clippy (-D warnings) + offline cargo
 	@diff -q wit/talos.wit module-templates/wit/talos.wit >/dev/null 2>&1 \
 	    || { printf '\033[1;31m✗ wit/talos.wit and module-templates/wit/talos.wit have drifted\033[0m\n'; \
 	         printf '  fix: cp wit/talos.wit module-templates/wit/talos.wit\n'; exit 1; }
-	@printf '▶ cargo fmt --check\n'
-	@cargo fmt --all -- --check
-	@printf '▶ structural lints (incl. clippy --workspace --no-deps -D warnings)\n'
+# NOTE: no `cargo fmt --all -- --check` here. It ran TWICE per `make lint` —
+# once from this target and again as structural check 35 — which is pure
+# duplicated wall-clock for identical coverage. Check 35 is the copy that was
+# kept: it names the offending files with a fix hint, where bare
+# `cargo fmt --check` prints a diff and exits 1. Do NOT renumber the
+# structural checks to "tidy up" — meta-check 54 pins the count, and
+# CLAUDE.md's "N checks today" sentence to it.
+	@printf '▶ structural lints (incl. rustfmt + clippy --workspace --no-deps -D warnings)\n'
 	@TALOS_LINT_CLIPPY=1 bash scripts/lint-structural.sh
 	@printf '▶ cargo-deny (offline: bans + licenses + sources)\n'
 	@if command -v cargo-deny >/dev/null 2>&1; then \
