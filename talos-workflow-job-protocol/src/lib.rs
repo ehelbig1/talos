@@ -1269,6 +1269,33 @@ fn clear_job_nonce_cache_for_test() {
     }
 }
 
+/// Serializes EVERY test in this binary that touches the process-global
+/// [`JOB_NONCE_CACHE`] — both the ones that wipe or bulk-fill it and the ones
+/// that depend on a nonce they just recorded still being there.
+///
+/// It lives at crate scope rather than inside
+/// `shared_nonce_cache_retention_tests` because the tests it has to serialize
+/// against are in a DIFFERENT module. As a module-private static its doc
+/// comment claimed to guard "against interleaving with other tests in this
+/// binary", and it could not: nothing outside that module could name it. So
+/// `clear_job_nonce_cache_for_test` wiped the cache out from under whichever
+/// replay test happened to be running in parallel, and its
+/// "second verify() on the same nonce must fail" assertion failed — observed
+/// intermittently at roughly 1 run in 5 across
+/// `ed25519_primary_verify_records_replay`,
+/// `job_request_verify_no_replay_does_not_poison_cache` and
+/// `worker_heartbeat_verify_no_replay_does_not_poison_cache`, and green under
+/// `--test-threads=1`.
+///
+/// A flaky replay-protection test is worse than a missing one: it trains the
+/// reader to re-run rather than to look, on the one assertion that says a
+/// captured message cannot be applied twice.
+///
+/// Locked with `unwrap_or_else(|p| p.into_inner())` everywhere — a panicking
+/// test must not poison the mutex and convert one failure into N.
+#[cfg(test)]
+pub(crate) static NONCE_CACHE_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The shared nonce cache is cross-type: a narrow verifier must never sweep
 /// away a wider verifier's live nonces.
 ///
@@ -1293,8 +1320,10 @@ mod shared_nonce_cache_retention_tests {
     use super::*;
 
     /// Guards the process-global cache + high-water mark against interleaving
-    /// with other tests in this binary.
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// with other tests in this binary. The static is crate-scoped
+    /// ([`NONCE_CACHE_TEST_SERIAL`]) precisely so that claim is true — a
+    /// module-private one could only ever guard this module.
+    use super::NONCE_CACHE_TEST_SERIAL as SERIAL;
 
     fn now_secs() -> u64 {
         std::time::SystemTime::now()
@@ -4957,6 +4986,27 @@ pub const WORKER_HEARTBEAT_DOMAIN: &[u8] = b"talos/worker-fleet-heartbeat/v1";
 /// legitimate heartbeats would be rejected as stale on a slow bus.
 pub const WORKER_HEARTBEAT_MAX_AGE_SECS: u64 = 60;
 
+/// The LARGEST publish interval a worker will actually use, whatever
+/// `TALOS_WORKER_HEARTBEAT_INTERVAL_SECS` is set to.
+///
+/// The worker clamps its configured interval to this (`worker::heartbeat`), and
+/// the clamp is derived rather than written as a literal: an interval at or
+/// above [`WORKER_HEARTBEAT_MAX_AGE_SECS`] would let a healthy worker age out
+/// of the fleet view between publishes, so the ceiling is three quarters of the
+/// window.
+///
+/// **It lives here, in the protocol crate, because the worker is not its only
+/// consumer.** Anything sizing a timeout against "how long can a healthy worker
+/// go without being seen" must size against the WORST configuration an operator
+/// can produce, not against the default — and it cannot do that from a private
+/// const in another binary. The scheduler's fleet-readiness bound
+/// (`talos_scheduler::DEFAULT_SCHEDULER_READINESS_TIMEOUT_SECS`) was derived
+/// from the 30 s DEFAULT and came out at exactly 2x the clamped maximum, i.e.
+/// with the "full interval of margin" it claimed reduced to zero, and its guard
+/// test hardcoded the same 30 s so it could not see that. Deriving both sides
+/// from this constant is what makes the guard a guard.
+pub const WORKER_HEARTBEAT_MAX_INTERVAL_SECS: u64 = WORKER_HEARTBEAT_MAX_AGE_SECS * 3 / 4;
+
 /// Heartbeat message published by workers so the controller can track fleet health.
 ///
 /// # What this message proves, and what it does NOT
@@ -5804,6 +5854,12 @@ mod tests {
         // Sign a request, verify it once (admitted), then verify the
         // same bytes again — the nonce cache should reject the second
         // verify as a replay even though HMAC + freshness still pass.
+        //
+        // Serialized against the tests that wipe/bulk-fill the process-global
+        // nonce cache — see NONCE_CACHE_TEST_SERIAL.
+        let _serial = crate::NONCE_CACHE_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let key = test_key();
         let mut req = JobRequest {
             crypto_scheme: 0,
@@ -6000,6 +6056,11 @@ mod tests {
     /// first call).
     #[test]
     fn verifier_primary_records_replay_observer_does_not() {
+        // Serialized against the tests that wipe/bulk-fill the process-global
+        // nonce cache — see NONCE_CACHE_TEST_SERIAL.
+        let _serial = crate::NONCE_CACHE_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let key = test_key();
         let mut a = JobResult {
             llm_usage: vec![],
@@ -7156,6 +7217,11 @@ mod tests {
 
     #[test]
     fn ed25519_primary_verify_records_replay() {
+        // Serialized against the tests that wipe/bulk-fill the process-global
+        // nonce cache — see NONCE_CACHE_TEST_SERIAL.
+        let _serial = crate::NONCE_CACHE_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let sk = ed_keypair();
         let pk = sk.verifying_key();
         let mut req = make_test_request(None);
@@ -8185,6 +8251,12 @@ mod tests {
         // same message would fail with "already seen" — the dual-
         // consumer regression the architectural mandate exists to
         // prevent.
+        //
+        // Serialized against the tests that wipe/bulk-fill the process-global
+        // nonce cache — see NONCE_CACHE_TEST_SERIAL.
+        let _serial = crate::NONCE_CACHE_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let key = test_key();
         let mut req = make_test_request(None);
         req.sign(&key).unwrap();
@@ -8241,6 +8313,11 @@ mod tests {
 
     #[test]
     fn pipeline_job_request_verify_no_replay_does_not_poison_cache() {
+        // Serialized against the tests that wipe/bulk-fill the process-global
+        // nonce cache — see NONCE_CACHE_TEST_SERIAL.
+        let _serial = crate::NONCE_CACHE_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let key = test_key();
         let step = make_test_pipeline_step();
         let mut req = make_test_pipeline(vec![step]);
@@ -8268,6 +8345,11 @@ mod tests {
 
     #[test]
     fn worker_heartbeat_verify_no_replay_does_not_poison_cache() {
+        // Serialized against the tests that wipe/bulk-fill the process-global
+        // nonce cache — see NONCE_CACHE_TEST_SERIAL.
+        let _serial = crate::NONCE_CACHE_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let key = test_key();
         let mut hb = make_test_heartbeat();
         hb.sign(&key).unwrap();

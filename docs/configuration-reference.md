@@ -185,6 +185,7 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `WORKER_MAX_OCI_LAYER_BYTES` | 32 MiB | worker | Max OCI layer size pulled when fetching modules | |
 | `WORKER_ALLOW_PRIVATE_HOST_TARGETS` | `false` | worker | Allow module egress to private/internal IPs (SSRF gate) | 🔒 |
 | `METRICS_PORT` | `9090` | worker | Worker Prometheus port | |
+| `TALOS_WORKER_HEARTBEAT_INTERVAL_SECS` | `30` (clamped to 5..45) | worker | Seconds between signed NATS fleet heartbeats. `0` disables publishing entirely — a supported setting, but the controller cannot detect it, so pair it with `SCHEDULER_FLEET_READINESS_BARRIER=false` on the controller or the scheduler's readiness barrier will hold, give up, and report degraded forever. Unparseable values fall back to the default and are logged, never silently disabling the publisher | |
 | `TALOS_INLINE_WASM_MAX_BYTES` | built-in default | both | Cap on inline-dispatched WASM bytes | |
 | `TALOS_ENCRYPT_EXECUTION_OUTPUT` | flag | both | Encrypt stored execution output | 🔒 |
 | `TALOS_SQL_PERMISSIVE_EMPTY_ALLOWLIST` | unset | worker | Permit an empty SQL allowlist in the sandbox | 🔒 |
@@ -310,6 +311,11 @@ Script-level publish knobs (`scripts/publish-images.sh`, not Rust reads):
 | `EXECUTION_RESUME_STALE_MINS` | `5` | controller | Stale threshold to resume executions | |
 | `STALE_EXECUTION_MINUTES` | `60` | controller | Stale-execution sweep threshold | |
 | `SCHEDULER_EXECUTION_TIMEOUT_SECS` | `3600` | talos-scheduler | Scheduled-execution timeout | |
+| `SCHEDULER_MAX_CONCURRENT_EXECUTIONS` | `16` | talos-scheduler | Ceiling on concurrently-running scheduled executions (steady state). See the boot-herd knobs below — raising this makes a boot burst **worse**, not better | |
+| `SCHEDULER_STARTUP_MAX_CONCURRENT` | `4` | talos-scheduler | Tighter ceiling applied only to the **startup backlog** (the schedules found due by the first poll after a controller boot). Admission control, not delay: the first run starts immediately, the rest queue behind permits. This is the load-bearing protection against the 2026-08-10 boot herd; `TalosSchedulerStartupHerdNotAbsorbed` is the signal that tells you whether it was enough | |
+| `SCHEDULER_FLEET_READINESS_BARRIER` | `true` | talos-scheduler | Whether the first poll waits for a worker to become visible in the NATS heartbeat view. Set `false` **only** on a deployment whose workers publish no heartbeats (`TALOS_WORKER_HEARTBEAT_INTERVAL_SECS=0`); the controller cannot detect that setting, and with it left on, the barrier can only hold, give up, and report degraded forever | |
+| `SCHEDULER_READINESS_TIMEOUT_SECS` | `135` | talos-scheduler | Bound on that one pre-loop wait. Derived from the protocol (3× the largest configurable heartbeat interval, `WORKER_HEARTBEAT_MAX_INTERVAL_SECS` = 45 s), not guessed — a worker that booted before the controller subscribed loses its unretained first heartbeat and is only learned about on the second. Overshooting is nearly free: the wait returns the instant a worker appears | |
+| `SCHEDULER_READINESS_MAX_HOLDS` | `20` | talos-scheduler | Consecutive polls the barrier may hold (≈5 min at the 15 s interval) before giving up and dispatching anyway, setting `talos_scheduler_readiness_degraded`. An empty fleet view is ambiguous, not proof of absence, so the barrier degrades rather than wedging. The gauge re-arms by itself once a heartbeat is seen | |
 | `TALOS_APPROVAL_TIMEOUT_SECS` | `86400` | both | Human-approval-gate timeout | |
 | `TALOS_SEAL_ORPHAN_TTL_SECS` | `600` | both | Envelope-seal orphan lease TTL | |
 | `TALOS_SEAL_SWEEP_INTERVAL_SECS` | `60` | both | Envelope-seal sweep cadence | |

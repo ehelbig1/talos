@@ -35,7 +35,7 @@
 
 use std::time::Duration;
 
-use talos_workflow_job_protocol::{subjects, WorkerHeartbeat, WORKER_HEARTBEAT_MAX_AGE_SECS};
+use talos_workflow_job_protocol::{subjects, WorkerHeartbeat, WORKER_HEARTBEAT_MAX_INTERVAL_SECS};
 
 /// Default seconds between heartbeats.
 ///
@@ -49,12 +49,13 @@ pub(crate) const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 /// Lower clamp: a typo must not turn the publisher into a bus flood.
 const MIN_HEARTBEAT_INTERVAL_SECS: u64 = 5;
 
-/// Upper clamp, DERIVED from the protocol's freshness window rather than
-/// written as a literal: an interval at or above `WORKER_HEARTBEAT_MAX_AGE_SECS`
-/// would let a healthy worker age out of the fleet view between publishes, so
-/// the ceiling is three quarters of the window. Deriving it means a change to
-/// the window cannot silently invalidate this clamp.
-const MAX_HEARTBEAT_INTERVAL_SECS: u64 = WORKER_HEARTBEAT_MAX_AGE_SECS * 3 / 4;
+/// Upper clamp. Lives in the PROTOCOL crate
+/// ([`WORKER_HEARTBEAT_MAX_INTERVAL_SECS`]) rather than here, because the
+/// controller-side scheduler must size its fleet-readiness bound against the
+/// worst interval a worker can be configured with — and it cannot read a
+/// private const in this binary. Derived from the freshness window there, so a
+/// change to the window cannot silently invalidate the clamp on either side.
+const MAX_HEARTBEAT_INTERVAL_SECS: u64 = WORKER_HEARTBEAT_MAX_INTERVAL_SECS;
 
 /// Resolve the publish interval. ONLY an explicit `0` disables publishing;
 /// anything unparseable falls back to the default and is reported so the caller
@@ -201,6 +202,9 @@ pub async fn run_heartbeat_publisher(nats: async_nats::Client, shared_key: Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Test-only: the freshness window is what the clamp is checked AGAINST, so
+    // production code here only needs the derived ceiling.
+    use talos_workflow_job_protocol::WORKER_HEARTBEAT_MAX_AGE_SECS;
 
     const KEY: [u8; 32] = [0x42; 32];
 

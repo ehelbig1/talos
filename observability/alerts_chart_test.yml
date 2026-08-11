@@ -762,31 +762,85 @@ tests:
   # demonstrably healthy. Nothing alerted, which is why it survived repeated
   # deploys.
   #
-  # The transition under test is the one that matters: a clean boot must be
-  # SILENT (otherwise the alert trains operators to ignore it — the
-  # permanently-firing-alert defect), and a boot whose backlog still fails
-  # must fire.
+  # FOUR transitions, because the first version of this alert (`> 0` on
+  # failed|skipped) fired on ANY engine error on ANY boot workflow while
+  # asserting "the backlog still overwhelmed something" — a diagnosis the
+  # number could not support. So the silent cases carry as much weight here
+  # as the firing ones: a clean boot must be silent (otherwise the alert
+  # trains operators to ignore it), a lone broken workflow must be silent,
+  # and a couple of chronically broken workflows inside a healthy backlog
+  # must be silent. Only a broad failure across the backlog fires.
   # ══════════════════════════════════════════════════════════════════════
   - interval: 1m
     name: a clean boot is silent — startup backlog completes, nothing fires
     input_series:
-      # The whole backlog completed. The failed/skipped series EXIST at 0
-      # (they are pre-seeded at registration) — which is the point: an
-      # absent counter would match nothing and the alert could not fire on
-      # the cold case either.
+      # The whole backlog completed. The other four series EXIST at 0 (they
+      # are pre-seeded at registration) — which is the point twice over: an
+      # absent counter would match nothing so the alert could not fire on
+      # the cold case either, AND the ratio arm divides by the sum over all
+      # outcomes, which an absent term would make silently wrong.
       - series: 'talos_scheduler_dispatches_total{phase="startup",outcome="completed",job="talos-controller"}'
         values: "0+1x60"
       - series: 'talos_scheduler_dispatches_total{phase="startup",outcome="failed",job="talos-controller"}'
         values: "0x60"
       - series: 'talos_scheduler_dispatches_total{phase="startup",outcome="skipped",job="talos-controller"}'
         values: "0x60"
+      - series: 'talos_scheduler_dispatches_total{phase="startup",outcome="denied",job="talos-controller"}'
+        values: "0x60"
+      - series: 'talos_scheduler_dispatches_total{phase="startup",outcome="fenced",job="talos-controller"}'
+        values: "0x60"
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: TalosSchedulerStartupHerdNotAbsorbed
+        exp_alerts: []
+
+  # ONE failing workflow is not a herd. It is the single most common thing
+  # an operator sees on a real fleet (an expired OAuth token), and firing on
+  # it with herd language is how a detector becomes noise.
+  - interval: 1m
+    name: a single failed startup run does not fire
+    input_series:
+      - series: 'talos_scheduler_dispatches_total{phase="startup",outcome="failed",job="talos-controller"}'
+        values: "0x30 1x31"
+      - series: 'talos_scheduler_dispatches_total{phase="startup",outcome="completed",job="talos-controller"}'
+        values: "0x60"
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: TalosSchedulerStartupHerdNotAbsorbed
+        exp_alerts: []
+
+  # Two broken workflows inside a healthy 30-run backlog: over the count
+  # arm, under the majority arm. This is the case that would have fired on
+  # most deploys under the original `> 0` condition.
+  - interval: 1m
+    name: a couple of broken workflows in a healthy backlog does not fire
+    input_series:
+      - series: 'talos_scheduler_dispatches_total{phase="startup",outcome="failed",job="talos-controller"}'
+        values: "0x30 2x31"
+      - series: 'talos_scheduler_dispatches_total{phase="startup",outcome="completed",job="talos-controller"}'
+        values: "0+1x60"
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: TalosSchedulerStartupHerdNotAbsorbed
+        exp_alerts: []
+
+  # Policy refusals are excluded by the outcome selector: an archived actor
+  # or a capability-ceiling violation is a chronic configuration state,
+  # unchanged by how many schedules came due at once.
+  - interval: 1m
+    name: denied and fenced startup runs never reach this alert
+    input_series:
+      - series: 'talos_scheduler_dispatches_total{phase="startup",outcome="denied",job="talos-controller"}'
+        values: "0+1x60"
+      - series: 'talos_scheduler_dispatches_total{phase="startup",outcome="fenced",job="talos-controller"}'
+        values: "0+1x60"
     alert_rule_test:
       - eval_time: 45m
         alertname: TalosSchedulerStartupHerdNotAbsorbed
         exp_alerts: []
 
   - interval: 1m
-    name: the herd is not absorbed — startup failures fire
+    name: the herd is not absorbed — a failing majority of the backlog fires
     input_series:
       - series: 'talos_scheduler_dispatches_total{phase="startup",outcome="failed",job="talos-controller"}'
         values: "0+1x60"
@@ -808,37 +862,49 @@ tests:
               description: |
                 30 scheduled workflow run(s) from the STARTUP BACKLOG —
                 the schedules that came due while the controller was restarting —
-                ended `failed`. The startup concurrency ceiling and
-                the fleet-readiness barrier are supposed to make this zero on every
-                deploy.
+                ended `failed`, and the failed+skipped runs are a
+                MAJORITY of that backlog.
 
-                outcome="failed": the backlog still overwhelmed something. The
-                signature to look for is the worker's per-host circuit breaker
-                opening — grep the worker log for "Circuit breaker opened" and
-                "outbound HTTP request failed (sanitized transport detail)". Note
-                the breaker lives in the WORKER process and is invisible to the
+                What this number knows: the outcome of each startup-phase dispatch.
+                What it does NOT know: why. A broad failure across the boot backlog
+                is the SIGNATURE of the 2026-08-10 herd, and the majority arm is
+                what distinguishes it from a couple of individually-broken
+                workflows — but a shared upstream outage, an expired credential
+                common to several workflows, or a bad deploy produce the same shape.
+                Confirm the cause below rather than assuming the ceiling failed.
+
+                outcome="failed": first hypothesis is the worker's per-host circuit
+                breaker opening — grep the worker log for "Circuit breaker opened"
+                and "outbound HTTP request failed (sanitized transport detail)".
+                The breaker lives in the WORKER process and is invisible to the
                 controller, so the controller-side error text ("circuit open for
                 host X") is a CONSEQUENCE reported minutes into the incident, not
-                its cause.
+                its cause. If the worker log shows no breaker and no transport
+                errors, this is not a herd — read the individual error_messages.
 
-                outcome="skipped": the burst exhausted an actor's per-minute
-                execution budget and runs were refused outright. For a daily cron
-                that means the run is lost until tomorrow, not retried shortly.
+                outcome="skipped": runs were refused for CAPACITY — the
+                per-workflow concurrency cap, or an actor's per-minute execution
+                budget the burst exhausted. For a daily cron that means the run is
+                lost until tomorrow, not retried shortly.
               action: |
                 1. Correlate: `talos_scheduler_dispatches_total{phase="startup"}`
-                   against the controller log line
-                   `event_kind="scheduler_startup_backlog"`, which records how many
-                   schedules the boot backlog contained.
-                2. If the backlog is large, lower SCHEDULER_STARTUP_MAX_CONCURRENT
-                   (default 4). Do NOT raise SCHEDULER_MAX_CONCURRENT_EXECUTIONS —
-                   that is the steady-state ceiling and raising it makes the burst
-                   worse.
-                3. If outcome="skipped" dominates, the actor's per-minute budget is
+                   (all five outcomes; they partition the backlog) against the
+                   controller log line `event_kind="scheduler_startup_backlog"`,
+                   which records how many schedules the boot backlog contained. The
+                   two should agree — every terminal path is counted.
+                2. Check the worker log for the breaker signature above. If it is
+                   absent, treat this as N individual workflow failures and read
+                   their error_messages; the ceiling is not implicated.
+                3. If the herd signature IS present, lower
+                   SCHEDULER_STARTUP_MAX_CONCURRENT (default 4). Do NOT raise
+                   SCHEDULER_MAX_CONCURRENT_EXECUTIONS — that is the steady-state
+                   ceiling and raising it makes the burst worse.
+                4. If outcome="skipped" dominates, the actor's per-minute budget is
                    the binding constraint rather than egress; raise the budget or
                    stagger the cron expressions so fewer schedules share a boot.
 
-  # A run refused by the actor budget is a LOST run, not a soft outcome —
-  # two of the three refused on 2026-08-10 were daily crons, so "the next
+  # A run refused for CAPACITY is a LOST run, not a soft outcome — two of
+  # the three refused on 2026-08-10 were daily crons, so "the next
   # occurrence will retry" meant tomorrow. It must reach the same alert.
   - interval: 1m
     name: budget-skipped startup runs fire too, on their own label
@@ -858,32 +924,44 @@ tests:
               description: |
                 30 scheduled workflow run(s) from the STARTUP BACKLOG —
                 the schedules that came due while the controller was restarting —
-                ended `skipped`. The startup concurrency ceiling and
-                the fleet-readiness barrier are supposed to make this zero on every
-                deploy.
+                ended `skipped`, and the failed+skipped runs are a
+                MAJORITY of that backlog.
 
-                outcome="failed": the backlog still overwhelmed something. The
-                signature to look for is the worker's per-host circuit breaker
-                opening — grep the worker log for "Circuit breaker opened" and
-                "outbound HTTP request failed (sanitized transport detail)". Note
-                the breaker lives in the WORKER process and is invisible to the
+                What this number knows: the outcome of each startup-phase dispatch.
+                What it does NOT know: why. A broad failure across the boot backlog
+                is the SIGNATURE of the 2026-08-10 herd, and the majority arm is
+                what distinguishes it from a couple of individually-broken
+                workflows — but a shared upstream outage, an expired credential
+                common to several workflows, or a bad deploy produce the same shape.
+                Confirm the cause below rather than assuming the ceiling failed.
+
+                outcome="failed": first hypothesis is the worker's per-host circuit
+                breaker opening — grep the worker log for "Circuit breaker opened"
+                and "outbound HTTP request failed (sanitized transport detail)".
+                The breaker lives in the WORKER process and is invisible to the
                 controller, so the controller-side error text ("circuit open for
                 host X") is a CONSEQUENCE reported minutes into the incident, not
-                its cause.
+                its cause. If the worker log shows no breaker and no transport
+                errors, this is not a herd — read the individual error_messages.
 
-                outcome="skipped": the burst exhausted an actor's per-minute
-                execution budget and runs were refused outright. For a daily cron
-                that means the run is lost until tomorrow, not retried shortly.
+                outcome="skipped": runs were refused for CAPACITY — the
+                per-workflow concurrency cap, or an actor's per-minute execution
+                budget the burst exhausted. For a daily cron that means the run is
+                lost until tomorrow, not retried shortly.
               action: |
                 1. Correlate: `talos_scheduler_dispatches_total{phase="startup"}`
-                   against the controller log line
-                   `event_kind="scheduler_startup_backlog"`, which records how many
-                   schedules the boot backlog contained.
-                2. If the backlog is large, lower SCHEDULER_STARTUP_MAX_CONCURRENT
-                   (default 4). Do NOT raise SCHEDULER_MAX_CONCURRENT_EXECUTIONS —
-                   that is the steady-state ceiling and raising it makes the burst
-                   worse.
-                3. If outcome="skipped" dominates, the actor's per-minute budget is
+                   (all five outcomes; they partition the backlog) against the
+                   controller log line `event_kind="scheduler_startup_backlog"`,
+                   which records how many schedules the boot backlog contained. The
+                   two should agree — every terminal path is counted.
+                2. Check the worker log for the breaker signature above. If it is
+                   absent, treat this as N individual workflow failures and read
+                   their error_messages; the ceiling is not implicated.
+                3. If the herd signature IS present, lower
+                   SCHEDULER_STARTUP_MAX_CONCURRENT (default 4). Do NOT raise
+                   SCHEDULER_MAX_CONCURRENT_EXECUTIONS — that is the steady-state
+                   ceiling and raising it makes the burst worse.
+                4. If outcome="skipped" dominates, the actor's per-minute budget is
                    the binding constraint rather than egress; raise the budget or
                    stagger the cron expressions so fewer schedules share a boot.
 
@@ -959,6 +1037,54 @@ tests:
   # but without the readiness evidence, so a herd can recur. A healthy
   # controller sits at 0 here forever — which is exactly why the gauge is
   # pre-seeded rather than left absent.
+  # The gauge RE-ARMS: a worker appearing puts it back to 0 and the alert
+  # resolves. As a one-way latch it pinned at 1 on a healthy fleet — a slow
+  # image pull outlasts the give-up bound, the worker arrives, and this fired
+  # until the controller was restarted. A red that cannot go green is the
+  # permanently-firing-alert defect the whole arc has been mining.
+  - interval: 1m
+    name: a re-armed barrier resolves the alert
+    input_series:
+      - series: 'talos_scheduler_readiness_degraded{job="talos-controller"}'
+        values: "0x10 1x20 0x40"
+    alert_rule_test:
+      # Firing while degraded (latched at t=11m, `for: 5m`).
+      - eval_time: 25m
+        alertname: TalosSchedulerReadinessDegraded
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: reliability-degraded
+              job: talos-controller
+            exp_annotations:
+              summary: "Scheduler is dispatching without fleet-readiness evidence"
+              description: |
+                The scheduler waited for a worker heartbeat, never saw one, and has
+                given up waiting. Scheduled workflows ARE running — nothing is
+                blocked and nothing was lost — but they are being dispatched
+                without any evidence that a worker is there to run them, which is
+                the condition that produced the 2026-08-10 boot herd.
+
+                This clears ITSELF the moment a heartbeat is seen — the barrier
+                re-arms and the gauge returns to 0. So a firing alert means the
+                fleet is invisible RIGHT NOW, not that it once was.
+              action: |
+                1. Confirm whether heartbeats are disabled on purpose
+                   (TALOS_WORKER_HEARTBEAT_INTERVAL_SECS=0 on the worker). If they
+                   are, this deployment can never satisfy the barrier and must
+                   switch it off: set SCHEDULER_FLEET_READINESS_BARRIER=false on
+                   the CONTROLLER. The controller cannot detect the worker-side
+                   setting, which is why this is an explicit switch. The startup
+                   concurrency ceiling — the load-bearing herd protection — stays
+                   in force either way. Do NOT simply tolerate this firing.
+                2. Otherwise treat it as TalosSchedulerDispatchHeldNoFleet that was
+                   not acted on: the worker is not reaching
+                   `talos.workers.heartbeat.>`.
+      # Re-armed at t=31m — resolved, without a controller restart.
+      - eval_time: 40m
+        alertname: TalosSchedulerReadinessDegraded
+        exp_alerts: []
+
   - interval: 1m
     name: barrier healthy at 0 is silent; latching to 1 fires after 5m
     input_series:
@@ -988,13 +1114,18 @@ tests:
                 without any evidence that a worker is there to run them, which is
                 the condition that produced the 2026-08-10 boot herd.
 
-                The latch does not clear on its own; it is reset by a controller
-                restart once heartbeats are actually flowing.
+                This clears ITSELF the moment a heartbeat is seen — the barrier
+                re-arms and the gauge returns to 0. So a firing alert means the
+                fleet is invisible RIGHT NOW, not that it once was.
               action: |
                 1. Confirm whether heartbeats are disabled on purpose
                    (TALOS_WORKER_HEARTBEAT_INTERVAL_SECS=0 on the worker). If they
-                   are, this alert is expected for this deployment and the startup
-                   ceiling is the only herd protection in force.
+                   are, this deployment can never satisfy the barrier and must
+                   switch it off: set SCHEDULER_FLEET_READINESS_BARRIER=false on
+                   the CONTROLLER. The controller cannot detect the worker-side
+                   setting, which is why this is an explicit switch. The startup
+                   concurrency ceiling — the load-bearing herd protection — stays
+                   in force either way. Do NOT simply tolerate this firing.
                 2. Otherwise treat it as TalosSchedulerDispatchHeldNoFleet that was
                    not acted on: the worker is not reaching
                    `talos.workers.heartbeat.>`.
