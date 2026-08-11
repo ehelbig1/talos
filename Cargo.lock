@@ -1668,7 +1668,6 @@ dependencies = [
  "image",
  "ipnetwork",
  "jsonwebtoken",
- "lru 0.16.4",
  "neo4rs",
  "oauth2",
  "oci-distribution",
