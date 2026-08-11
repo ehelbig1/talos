@@ -3074,34 +3074,27 @@ async fn handle_install_module_from_catalog(
         }
     };
 
-    // Read talos.json metadata
-    let meta_path = module_dir.join("talos.json");
-    let meta_bytes = match std::fs::read(&meta_path) {
-        Ok(b) => b,
-        Err(e) => {
+    // Metadata AND source come from the ONE catalog reader
+    // (`talos_compilation::CatalogTemplate`) so this path and the disk
+    // seeder cannot disagree about which source they compile or which
+    // dependencies they declare. Error strings preserved verbatim.
+    let template = match talos_compilation::CatalogTemplate::load(&module_dir) {
+        Ok(t) => t,
+        Err(talos_compilation::CatalogTemplateError::ReadManifest(e)) => {
             return mcp_error(
                 req_id,
                 -32000,
                 &format!("Failed to read talos.json for '{}': {}", name, e),
             )
         }
-    };
-    let meta: serde_json::Value = match serde_json::from_slice(&meta_bytes) {
-        Ok(v) => v,
-        Err(e) => {
+        Err(talos_compilation::CatalogTemplateError::ParseManifest(e)) => {
             return mcp_error(
                 req_id,
                 -32000,
                 &format!("Failed to parse talos.json for '{}': {}", name, e),
             )
         }
-    };
-
-    // Read source code — catalog modules use template.rs at the module root.
-    let src_path = module_dir.join("template.rs");
-    let rust_code = match std::fs::read_to_string(&src_path) {
-        Ok(s) => s,
-        Err(_) => {
+        Err(talos_compilation::CatalogTemplateError::ReadSource(_)) => {
             return mcp_error(
                 req_id,
                 -32000,
@@ -3113,6 +3106,8 @@ async fn handle_install_module_from_catalog(
             )
         }
     };
+    let meta = template.manifest().clone();
+    let rust_code = template.source().to_string();
 
     // Extract metadata fields.
     // capability_world: prefer talos.json, fall back to the #[talos_module(world = "...")] attribute
@@ -3210,23 +3205,15 @@ async fn handle_install_module_from_catalog(
         .and_then(|n| n.to_str())
         .unwrap_or(name);
 
-    // Compile the module. Forward the template's declared `dependencies` from
-    // talos.json — previously hard-coded to `None`, so a template that declared
-    // e.g. `"dependencies": {"chrono": "0.4"}` and `use chrono::...` in
-    // template.rs failed to install with "unresolved import `chrono`" even
-    // though the manifest was correct. Templates are author-signed; the
-    // compiler still gates deps through the allowlist (validate_dependencies).
+    // Compile the module. The template's declared `dependencies` ride along
+    // inside `CatalogTemplate`, so this path cannot lose them the way the
+    // seeder, the OCI publisher and restore_pinned_modules all did. Templates
+    // are author-signed; the compiler still gates deps through the allowlist
+    // (validate_dependencies) inside create_workspace.
     let job_id = uuid::Uuid::new_v4();
     let compilation = state
         .compiler
-        .compile_to_wasm_with_config(
-            user_id,
-            job_id,
-            compile_name,
-            &rust_code,
-            &serde_json::json!({}),
-            meta.get("dependencies"),
-        )
+        .compile_catalog_template(user_id, job_id, compile_name, &template)
         .await;
 
     match compilation {
@@ -3498,11 +3485,14 @@ async fn handle_restore_pinned_modules(
             continue;
         }
 
-        // Need to reinstall — look up the catalog template
+        // Need to reinstall — look up the catalog template through the ONE
+        // catalog reader, so the rebuild gets the same declared dependencies
+        // the original install did. This site used to pass `None`, which meant
+        // restoring a pinned module that needs e.g. chrono silently rebuilt it
+        // without chrono and failed.
         let module_dir = catalog_dir.join(&module_name);
-        let src_path = module_dir.join("template.rs");
-        let rust_code = match std::fs::read_to_string(&src_path) {
-            Ok(s) => s,
+        let template = match talos_compilation::CatalogTemplate::load(&module_dir) {
+            Ok(t) => t,
             Err(_) => {
                 failed.push(serde_json::json!({
                     "module": module_name,
@@ -3515,14 +3505,7 @@ async fn handle_restore_pinned_modules(
         let job_id = uuid::Uuid::new_v4();
         let compilation = state
             .compiler
-            .compile_to_wasm_with_config(
-                user_id,
-                job_id,
-                &module_name,
-                &rust_code,
-                &serde_json::json!({}),
-                None,
-            )
+            .compile_catalog_template(user_id, job_id, &module_name, &template)
             .await;
 
         match compilation {
@@ -3998,6 +3981,17 @@ async fn handle_get_catalog_status(
         .await
         .unwrap_or_default();
 
+    // Catalog rows that have NO compiled WASM. Until 2026-08-11 the only
+    // evidence of this condition was a boot-time WARN whose own text
+    // ("keeping existing wasm_bytes") implied there were bytes to keep —
+    // there were not. Three shipped templates sat at NULL indefinitely, so
+    // every workflow node pointing at one had nothing to dispatch.
+    let never_compiled = state
+        .module_repo
+        .list_catalog_rows_without_wasm()
+        .await
+        .unwrap_or_default();
+
     // Diff disk ↔ DB. A DB row matches a disk template when its stamped
     // slug equals the dir slug, or (pre-backfill rows) its name equals the
     // template's display_name or slug.
@@ -4067,6 +4061,22 @@ async fn handle_get_catalog_status(
             hidden_by_category.len()
         ));
     }
+    if !never_compiled.is_empty() {
+        tips.push(format!(
+            "{} catalog template(s) have NO compiled WASM and CANNOT RUN — the \
+             seeder's background compile failed for them at every controller \
+             boot. Check the controller log for 'Background compilation \
+             failed' naming each one; the usual cause is a crate used in \
+             template.rs that talos.json's `dependencies` does not declare \
+             (talos.json is the only declaration the runtime reads). Names: {}",
+            never_compiled.len(),
+            never_compiled
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
 
     let report = serde_json::json!({
         "mode": mode,
@@ -4080,6 +4090,13 @@ async fn handle_get_catalog_status(
             "row_count": db_rows.len(),
             "list_templates_visible": visible,
             "hidden_by_category": hidden_by_category,
+            // Seeded but unbuildable. A row here is strictly worse than a
+            // missing row: it appears in list_templates and in the dynamic
+            // tool surface, and fails only when something tries to run it.
+            "never_compiled": never_compiled
+                .iter()
+                .map(|(name, slug)| serde_json::json!({ "name": name, "catalog_slug": slug }))
+                .collect::<Vec<_>>(),
         },
         "diff": {
             "on_disk_not_in_db": on_disk_not_in_db,

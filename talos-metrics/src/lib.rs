@@ -206,6 +206,31 @@ pub struct TalosMetrics {
     /// not evidence of skew — #578).
     pub worker_build_skew_workers: IntGauge,
 
+    /// Catalog templates (`kind='catalog' AND user_id IS NULL`) whose
+    /// `wasm_bytes` is NULL or empty — i.e. templates the seeder could not
+    /// build, which therefore **cannot run at all**.
+    ///
+    /// A GAUGE, recomputed from one query after each boot's background
+    /// compiles settle (always `set`, never `inc`), because the condition is
+    /// durable state rather than an event: a template with no WASM stays
+    /// broken until someone fixes it, and a counter would go quiet exactly
+    /// while the fleet stayed broken.
+    ///
+    /// This exists because the failure it detects was, for its whole
+    /// lifetime, visible ONLY as a boot-time WARN whose text
+    /// ("keeping existing wasm_bytes") actively implied there were bytes to
+    /// keep. Three shipped templates sat at NULL for months.
+    ///
+    /// UNLABELLED on purpose. In OCI mode the template name is
+    /// registry-supplied, so a per-template label is an unbounded-cardinality
+    /// surface; the names live in `get_catalog_status` → `never_compiled`,
+    /// which is a queried surface rather than a scraped one.
+    ///
+    /// Recomputed at BOOT ONLY — nothing but the seeder changes the
+    /// underlying rows, so a long-lived controller's value stays correct, but
+    /// it is not a continuously refreshed gauge and must not be read as one.
+    pub catalog_templates_missing_wasm: IntGauge,
+
     // ---- Worker-identity liveness + reaper (2026-08) ----
     //
     // Before these, the entire proof-of-possession liveness path and the
@@ -758,6 +783,17 @@ impl TalosMetrics {
         )?;
         registry.register(Box::new(worker_build_skew_workers.clone()))?;
 
+        let catalog_templates_missing_wasm = IntGauge::new(
+            "talos_catalog_templates_missing_wasm",
+            "Catalog templates whose wasm_bytes is NULL/empty — they failed to \
+             compile at seed time and cannot run at all. Recomputed after each \
+             boot's background compiles settle, so it falls back to 0 once the \
+             templates build. Names are in get_catalog_status → never_compiled \
+             (deliberately not a label: template names are registry-supplied in \
+             OCI mode).",
+        )?;
+        registry.register(Box::new(catalog_templates_missing_wasm.clone()))?;
+
         // ---- Worker-identity liveness + reaper ----
         let worker_liveness_pings_total = CounterVec::new(
             prometheus::Opts::new(
@@ -1206,6 +1242,7 @@ impl TalosMetrics {
             audit_verification_failures_total,
             worker_key_tofu_conflicts_total,
             worker_build_skew_workers,
+            catalog_templates_missing_wasm,
             worker_liveness_pings_total,
             worker_identity_reaps_total,
             worker_liveness_participants,

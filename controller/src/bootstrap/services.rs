@@ -1967,6 +1967,13 @@ pub(crate) async fn seed_templates(
     }
 
     let mut count = 0u32;
+    // Handles for the per-template background compiles. Collected (rather
+    // than fire-and-forget) purely so ONE task can await them all and then
+    // publish `talos_catalog_templates_missing_wasm` from a single query —
+    // the gauge must reflect the state AFTER the compiles settle, otherwise
+    // it reports the pre-compile count on every boot. Awaiting them does not
+    // delay boot: the joiner is itself spawned.
+    let mut compile_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let entries = std::fs::read_dir(templates_dir)
         .map_err(|e| anyhow::anyhow!("Failed to read module-templates directory: {}", e))?;
 
@@ -1988,21 +1995,37 @@ pub(crate) async fn seed_templates(
             continue;
         }
 
-        let manifest_str = match std::fs::read_to_string(&manifest_path) {
-            Ok(s) => s,
-            Err(e) => {
+        // Manifest AND source come from the ONE catalog reader — see
+        // `talos_compilation::catalog`. Before this, the source was read
+        // inline further down and `dependencies` was never read at all, so
+        // every boot recompiled the templates that declare a crate and every
+        // boot failed with `unresolved import`, leaving their `wasm_bytes`
+        // NULL forever while `make check-catalog` stayed green.
+        //
+        // Behaviour note: a dir with a `talos.json` but NO
+        // `template.rs`/`src/lib.rs` used to be seeded with an EMPTY source
+        // (and then failed to compile on every boot, permanently). It is now
+        // skipped with a warning — the row it produced could never run.
+        let template = match talos_compilation::CatalogTemplate::load(&path) {
+            Ok(t) => t,
+            Err(talos_compilation::CatalogTemplateError::ReadManifest(e)) => {
                 tracing::warn!("Failed to read {}: {}", manifest_path.display(), e);
                 continue;
             }
-        };
-
-        let manifest: serde_json::Value = match serde_json::from_str(&manifest_str) {
-            Ok(v) => v,
-            Err(e) => {
+            Err(talos_compilation::CatalogTemplateError::ParseManifest(e)) => {
                 tracing::warn!("Failed to parse {}: {}", manifest_path.display(), e);
                 continue;
             }
+            Err(talos_compilation::CatalogTemplateError::ReadSource(e)) => {
+                tracing::warn!(
+                    "Skipping template dir {}: no readable template.rs or src/lib.rs: {}",
+                    path.display(),
+                    e
+                );
+                continue;
+            }
         };
+        let manifest = template.manifest();
 
         let name = manifest
             .get("display_name")
@@ -2079,12 +2102,22 @@ pub(crate) async fn seed_templates(
             })
             .unwrap_or_default();
 
-        // Read the code template if available
-        let code_template = std::fs::read_to_string(path.join("template.rs"))
-            .or_else(|_| std::fs::read_to_string(path.join("src/lib.rs")))
-            .unwrap_or_default();
+        let code_template = template.source();
 
         if name.is_empty() {
+            continue;
+        }
+
+        // Fail EARLY and loudly on a manifest that declares a crate outside
+        // the compiler allowlist, instead of spending a compile slot to learn
+        // the same thing 30-60 s later. `create_workspace` enforces the same
+        // gate unconditionally, so this cannot widen anything.
+        if let Err(msg) = template.validate_dependencies() {
+            tracing::warn!(
+                "Skipping template '{}': disallowed dependencies in talos.json: {}",
+                name,
+                msg
+            );
             continue;
         }
 
@@ -2137,6 +2170,7 @@ pub(crate) async fn seed_templates(
                 requires_approval_for: &requires_approval_for,
                 capability_world_long: &cw_long,
                 catalog_slug: &catalog_slug,
+                dependencies: template.dependencies(),
             },
         )
         .await;
@@ -2153,19 +2187,19 @@ pub(crate) async fn seed_templates(
                     let pool_bg = registry.db_pool.clone();
                     let compiler_bg = compiler.clone();
                     let name_bg = name.clone();
-                    let code_bg = code_template.clone();
+                    let template_bg = template.clone();
                     let slug_bg = catalog_slug.clone();
-                    tokio::spawn(async move {
+                    compile_tasks.push(tokio::spawn(async move {
                         tracing::info!(
                             template = %name_bg,
                             "Catalog template needs WASM — background compilation started"
                         );
                         match compiler_bg
-                            .compile_to_wasm(
+                            .compile_catalog_template(
                                 uuid::Uuid::nil(),
                                 uuid::Uuid::new_v4(),
                                 &name_bg,
-                                &code_bg,
+                                &template_bg,
                             )
                             .await
                         {
@@ -2200,18 +2234,24 @@ pub(crate) async fn seed_templates(
                                 tracing::warn!(
                                     template = %name_bg,
                                     errors = ?result.errors,
-                                    "Background compilation failed — keeping existing wasm_bytes"
+                                    "Background compilation failed — this template keeps whatever \
+                                     wasm_bytes it already had (NULL for a template that has never \
+                                     compiled, i.e. it cannot run at all). Surfaced without logs \
+                                     via get_catalog_status → never_compiled and the \
+                                     talos_catalog_templates_missing_wasm gauge."
                                 );
                             }
                             Err(e) => {
                                 tracing::warn!(
                                     template = %name_bg,
                                     error = %e,
-                                    "Background compilation error — keeping existing wasm_bytes"
+                                    "Background compilation error — this template keeps whatever \
+                                     wasm_bytes it already had (see get_catalog_status → \
+                                     never_compiled)"
                                 );
                             }
                         }
-                    });
+                    }));
                 }
             }
             Err(e) => tracing::warn!("Failed to seed template '{}': {}", name, e),
@@ -2230,6 +2270,53 @@ pub(crate) async fn seed_templates(
         ),
         Err(e) => tracing::warn!(error = %e, "catalog duplicate reconciler failed"),
     }
+
+    // D3 (2026-08-11): a template that cannot compile must not be visible
+    // only in boot logs. Three catalog templates sat with `wasm_bytes IS
+    // NULL` — never compiled, therefore unable to run at all — for as long
+    // as the dependency-plumbing bug existed, and nothing but a WARN at boot
+    // said so. Publish the durable count so an alert can fire on it, once
+    // the compiles this boot spawned have settled.
+    //
+    // Stated limits: (a) this is recomputed at BOOT ONLY, so on a controller
+    // that runs for days the gauge is as old as the last restart — it is the
+    // count of templates the seeder could not build, which only the seeder
+    // changes; (b) it is per-process, so each replica publishes its own
+    // (they agree, since the underlying rows are shared); (c) the named
+    // detail lives in `get_catalog_status` → `never_compiled`, because a
+    // per-template label here would be an unbounded-cardinality surface in
+    // OCI mode where template names are registry-supplied.
+    let pool_gauge = registry.db_pool.clone();
+    tokio::spawn(async move {
+        for h in compile_tasks {
+            let _ = h.await;
+        }
+        match sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM modules \
+             WHERE kind = 'catalog' AND user_id IS NULL \
+               AND (wasm_bytes IS NULL OR octet_length(wasm_bytes) = 0)",
+        )
+        .fetch_one(&pool_gauge)
+        .await
+        {
+            Ok(missing) => {
+                if let Some(m) = metrics::global() {
+                    m.catalog_templates_missing_wasm.set(missing);
+                }
+                if missing > 0 {
+                    tracing::warn!(
+                        missing_wasm = missing,
+                        "catalog templates have NO compiled WASM and cannot run — \
+                         call get_catalog_status for the names"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "could not publish talos_catalog_templates_missing_wasm"
+            ),
+        }
+    });
 
     Ok(())
 }

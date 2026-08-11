@@ -4,7 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-base64 = "0.13.0"
+# NOTE: no `base64` crate. template.rs hand-rolls base64/base64url
+# (`base64_standard` / `base64url_encode`) precisely because the crate is not
+# on the compiler's dependency allowlist, and `talos.json` — the ONLY
+# dependency declaration production reads — never listed it. The vestigial
+# `base64 = "0.13.0"` line that used to sit here was dead: it made this crate
+# build differently in local dev than in production, which is the same class
+# of divergence that left `create-calendar-event` unable to compile at boot.
 wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

@@ -1387,6 +1387,57 @@ groups:
             Unbounded growth = a cache-invalidation bug or many distinct
             DEKs in flight (shouldn't normally happen).
 
+      # A catalog template that failed to compile serves NOTHING.
+      #
+      # DELIBERATELY NO `absent()` ARM, and the reason is the opposite of
+      # the usual one: this gauge is published from ONE place, at the end of
+      # the boot seeding pass, and it is published on EVERY boot including
+      # the healthy zero case. So `absent()` here would not mean "no broken
+      # templates" — it would mean "the controller has not finished (or has
+      # not reached) template seeding", which `TalosControllerDown` and the
+      # readiness probe already own. Adding an arm would fire on every cold
+      # start for the seconds before the compiles settle, i.e. train
+      # operators to ignore it. If seeding stops publishing this entirely
+      # that is a code defect, and structural lint check 58 is its gate.
+      #
+      # `> 0` rather than a threshold: one uncompilable template is one
+      # workflow node with nothing to dispatch. `for: 15m` only so a
+      # controller whose background compiles are still running on a cold
+      # start does not page — the compiles take well under a minute.
+      - alert: TalosCatalogTemplateNeverCompiled
+        expr: talos_catalog_templates_missing_wasm > 0
+        for: 15m
+        labels:
+          severity: warning
+          category: catalog
+        annotations:
+          summary: "{{ $value }} catalog template(s) have no compiled WASM and cannot run"
+          description: |
+            A catalog template row exists (it appears in list_templates and in
+            the dynamic `Name-v1` tool surface) but its wasm_bytes is NULL or
+            empty — the seeder's background compile failed for it, at every
+            controller boot, and nothing downstream can execute it.
+
+            This is worse than a missing template: it is advertised and then
+            fails only when something tries to run it. Three shipped templates
+            were in this state indefinitely before 2026-08-11, visible only as
+            a boot WARN whose own text ("keeping existing wasm_bytes") implied
+            there were bytes to keep.
+          action: |
+            1. get_catalog_status → `db_catalog.never_compiled` names them.
+            2. Controller log, "Background compilation failed", carries the
+               compiler diagnostic for each.
+            3. The usual cause is a crate used in the template's source that
+               its `talos.json` `dependencies` field does not declare —
+               talos.json is the ONLY dependency declaration production reads
+               (talos_compilation::CatalogTemplate). A crate declared in the
+               template's own Cargo.toml does not count; `make check-catalog`
+               fails on exactly that divergence.
+            4. Fix the manifest, rebuild the controller image, restart. The
+               gauge is recomputed after each boot's compiles settle, so it
+               drops to 0 on the next healthy start — it is NOT continuously
+               refreshed, so do not expect it to clear without a restart.
+
   # ────────────────────────────────────────────────────────────────────
   - name: talos.backups
     interval: 1m

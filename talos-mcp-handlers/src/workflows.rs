@@ -8892,6 +8892,14 @@ async fn handle_swap_node_module(
     }
 
     // ── Read talos.json for the new module to get display_name ──────────────
+    // allow-uncatalogued-compile: this file's only `module-templates` read is
+    // this display-name lookup — it never compiles a catalog template. The
+    // `compile_to_wasm_with_config(..., None)` call it does make (workflow
+    // bundle import, ~line 4800) builds CALLER-SUPPLIED module source from an
+    // import bundle, which has no talos.json and therefore no declared
+    // dependencies to forward. Limit worth stating: check 68 leg (b) is
+    // file-scoped, so this marker also blinds the check to a FUTURE catalog
+    // compile added to this file.
     let catalog_path = format!("/app/module-templates/{}/talos.json", catalog_name);
     let talos_json_str = match tokio::fs::read_to_string(&catalog_path).await {
         Ok(s) => s,

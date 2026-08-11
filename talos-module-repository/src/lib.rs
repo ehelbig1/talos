@@ -2685,6 +2685,38 @@ impl ModuleRepository {
             .collect()
     }
 
+    /// Catalog templates that have NO compiled WASM — i.e. the seeder could
+    /// not build them, so they cannot run at all.
+    ///
+    /// The condition existed for months with no surface but a boot-time WARN
+    /// whose text ("keeping existing wasm_bytes") implied there were bytes to
+    /// keep; there were not — the rows were NULL. `get_catalog_status`
+    /// reports this as `never_compiled` so an operator can see it without
+    /// reading controller logs, and `talos_catalog_templates_missing_wasm`
+    /// carries the count for alerting.
+    ///
+    /// Returns `(name, catalog_slug)` ordered by name. Shared catalog scope
+    /// only (`user_id IS NULL`) — a per-user install with no WASM is a
+    /// different condition (`restore_pinned_modules` owns it).
+    pub async fn list_catalog_rows_without_wasm(&self) -> Result<Vec<(String, Option<String>)>> {
+        let rows = sqlx::query(
+            "SELECT name, catalog_slug FROM modules \
+             WHERE user_id IS NULL AND kind = 'catalog' \
+               AND (wasm_bytes IS NULL OR octet_length(wasm_bytes) = 0) \
+             ORDER BY name",
+        )
+        .fetch_all(&self.db_pool)
+        .await?;
+        rows.iter()
+            .map(|r| -> Result<(String, Option<String>)> {
+                Ok((
+                    r.try_get("name")?,
+                    r.try_get::<Option<String>, _>("catalog_slug")?,
+                ))
+            })
+            .collect()
+    }
+
     /// Phase 5: reconciliation sweep is now a no-op. The legacy tables it
     /// used to read from (`wasm_modules`, `node_templates`) are being
     /// dropped in the Phase 5 migration — there are no un-mirrored rows

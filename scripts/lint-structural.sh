@@ -5458,6 +5458,101 @@ else
 fi
 echo
 
+# ── 68. Catalog templates must be compiled through CatalogTemplate ────
+#
+# `talos.json`'s `dependencies` field is the ONLY dependency declaration the
+# runtime reads for a catalog template. Between 2026-07 and 2026-08-11 FIVE
+# code paths compiled a catalog template and only ONE forwarded it:
+# the disk seeder (every controller boot), the `publish-templates` OCI
+# publisher, `restore_pinned_modules`, and — via a `modules.dependencies`
+# column the seeder never wrote — `compile_template`. Three shipped templates
+# consequently failed to compile at every single boot with
+# `use of unresolved module or unlinked crate`, their `wasm_bytes` stayed
+# NULL (they could not run at all), and `make check-catalog` was green the
+# whole time because IT read the manifest.
+#
+# The fix is `talos_compilation::catalog::CatalogTemplate` — the one reader
+# of a template directory, carrying source and declared dependencies as a
+# unit, consumed by `CompilationService::compile_catalog_template`. The
+# dependency-less `compile_to_wasm(user, job, name, source)` convenience was
+# DELETED so the footgun cannot be re-acquired.
+#
+# Two directions:
+#   (a) the manifest key `"dependencies"` may be read from a parsed
+#       `talos.json` in exactly one place — `catalog.rs`. Scoped to receivers
+#       named meta/manifest/manifest_json/tpl (the shapes a manifest is bound
+#       to), so caller-supplied `args.get("dependencies")` — a different
+#       thing entirely — is not swept up.
+#   (b) any non-test source file that resolves a catalog template directory
+#       (`module-templates`) AND calls into the compiler must name
+#       `CatalogTemplate`. This is what catches a NEW site that reads
+#       template.rs by hand and passes `None`.
+#
+# STATED LIMITS, because a lint is only worth what it actually checks:
+#   * Both legs are TEXTUAL greps. (a) is defeated by binding the manifest to
+#     a variable with an unanticipated name; (b) by resolving the catalog
+#     directory through a constant defined in another file. The type is the
+#     real control — this is the backstop that makes bypassing it deliberate.
+#   * (b) fires on the FILE, not the call. A file that legitimately compiles
+#     non-catalog source AND separately mentions `module-templates` satisfies
+#     it merely by also using `CatalogTemplate` somewhere.
+#   * Neither leg can prove the forwarded value is correct, only that it is
+#     forwarded. `talos-compilation`'s `catalog_template_tests` cover the
+#     value; `scripts/check-catalog.sh` covers the templates.
+# Opt-outs: `// allow-raw-catalog-deps: <reason>` (a),
+#           `// allow-uncatalogued-compile: <reason>` (b).
+bold "▶ check 68: catalog compiles must go through CatalogTemplate"
+CT_FAIL=0
+CT_HOME="talos-compilation/src/catalog.rs"
+
+# (a) single manifest reader
+while IFS= read -r hit; do
+    [ -z "$hit" ] && continue
+    file="${hit%%:*}"
+    [ "$file" = "$CT_HOME" ] && continue
+    case "$hit" in *allow-raw-catalog-deps*) continue ;; esac
+    red "✗ catalog manifest \`dependencies\` read outside $CT_HOME: $hit"
+    yellow "  → use talos_compilation::CatalogTemplate::dependencies(). One reader is"
+    yellow "    what stops the next compile path from quietly omitting the field."
+    CT_FAIL=1
+done < <(cd "$ROOT" && grep -rnE '\b(meta|manifest|manifest_json|tpl)\s*\.\s*get\("dependencies"\)' \
+         --include='*.rs' . 2>/dev/null \
+         | sed 's|^\./||' | grep -v '^target/' || true)
+
+# (b) catalog-dir readers that compile must use the type
+while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    [ "$file" = "$CT_HOME" ] && continue
+    case "$file" in */tests/*|*_tests.rs|*/test_support.rs) continue ;; esac
+    grep -q 'module-templates' "$ROOT/$file" || continue
+    grep -q 'compile_to_wasm' "$ROOT/$file" || continue
+    grep -q 'allow-uncatalogued-compile' "$ROOT/$file" && continue
+    grep -q 'CatalogTemplate' "$ROOT/$file" && continue
+    red "✗ $file resolves a catalog template dir and compiles, but never names CatalogTemplate"
+    yellow "  → load it with talos_compilation::CatalogTemplate::load(dir) and compile via"
+    yellow "    CompilationService::compile_catalog_template, so the template's declared"
+    yellow "    dependencies cannot be dropped on this path."
+    CT_FAIL=1
+done < <(cd "$ROOT" && grep -rl 'module-templates' --include='*.rs' . 2>/dev/null \
+         | sed 's|^\./||' | grep -v '^target/' || true)
+
+# The dependency-less convenience must stay deleted — its existence is what
+# made `None` the path of least resistance at four call sites.
+if (cd "$ROOT" && grep -qE 'pub async fn compile_to_wasm\s*\(' talos-compilation/src/lib.rs 2>/dev/null); then
+    red "✗ CompilationService::compile_to_wasm (the dependency-less convenience) is back"
+    yellow "  → it defaults dependencies to None. Catalog callers must take a CatalogTemplate;"
+    yellow "    non-catalog callers should pass their deps explicitly to"
+    yellow "    compile_to_wasm_with_config."
+    CT_FAIL=1
+fi
+
+if [ "$CT_FAIL" -eq 1 ]; then
+    EXIT_CODE=1
+else
+    green "✓ catalog template compiles route through CatalogTemplate"
+fi
+echo
+
 # ── 54. Lint self-consistency (meta-check) ────────────────────────────
 # The system whose purpose is catching drift drifted from its own docs:
 # by 2026-07-01 the script had 49 checks while CLAUDE.md said 43 and the

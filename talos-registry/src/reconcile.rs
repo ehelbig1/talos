@@ -21,8 +21,9 @@
 //! The safe fixes (no user-data-destructive migration):
 //! - [`upsert_catalog_template_by_slug`] keys on `catalog_slug` so a rename
 //!   updates the existing row instead of minting a twin (prevents NEW twins).
-//! - [`needs_recompile`] recompiles when the source changed **or** the row
-//!   has no WASM yet (fixes the metadata-only first-seed row).
+//! - [`needs_recompile`] recompiles when the source changed, the declared
+//!   `dependencies` changed, **or** the row has no WASM yet (the last fixes
+//!   the metadata-only first-seed row).
 //! - [`refresh_catalog_wasm_by_slug`] writes the freshly compiled bytes to
 //!   EVERY row sharing the slug, so any existing stale twin also gets new
 //!   code (the safe alternative to rewriting workflow graph_json).
@@ -40,9 +41,19 @@ use uuid::Uuid;
 /// (a genuine template update) OR when the row has no compiled WASM yet
 /// (`has_wasm == false`) — the latter is the metadata-only first-seed case
 /// that previously slipped through because there was no "prior" row to
-/// diff against. Pure so it is unit-testable without a database.
-pub fn needs_recompile(source_changed: bool, has_wasm: bool) -> bool {
-    source_changed || !has_wasm
+/// diff against — OR when the template's declared `dependencies` changed.
+///
+/// The dependency arm was added 2026-08-11 alongside the fix that made the
+/// disk-seeding path forward `talos.json`'s `dependencies` at all. Without
+/// it, editing only the manifest (adding a crate a future `template.rs`
+/// edit will need, or REMOVING one that is no longer used) leaves the
+/// previously compiled WASM in place, so the declared dependency set and
+/// the shipped binary silently disagree until some unrelated source edit
+/// happens to trigger a rebuild.
+///
+/// Pure so it is unit-testable without a database.
+pub fn needs_recompile(source_changed: bool, has_wasm: bool, deps_changed: bool) -> bool {
+    source_changed || deps_changed || !has_wasm
 }
 
 /// Outcome of [`upsert_catalog_template_by_slug`].
@@ -51,7 +62,7 @@ pub struct RegisteredCatalog {
     /// The canonical row id for this template identity (slug) + catalog scope.
     pub id: Uuid,
     /// Whether the WASM should be (re)compiled after this upsert
-    /// (`needs_recompile(source_changed, had_wasm)`).
+    /// (`needs_recompile(source_changed, had_wasm, deps_changed)`).
     pub needs_recompile: bool,
 }
 
@@ -140,6 +151,16 @@ pub struct CatalogUpsert<'a> {
     pub requires_approval_for: &'a [String],
     pub capability_world_long: &'a str,
     pub catalog_slug: &'a str,
+    /// The template's declared extra crate dependencies, straight from
+    /// `talos_compilation::CatalogTemplate::dependencies`.
+    ///
+    /// Persisted into `modules.dependencies` so the OTHER compile path that
+    /// reads that column — `compile_template`, which instantiates a catalog
+    /// template into a user module — gets the same crates the seeder used.
+    /// The column was never written for catalog rows before 2026-08-11 (all
+    /// 75 shipped rows had `dependencies IS NULL`), which made
+    /// `compile_template` a fifth way to lose them.
+    pub dependencies: Option<&'a serde_json::Value>,
 }
 
 /// Idempotently register a disk/OCI catalog template into the `modules`
@@ -160,7 +181,7 @@ pub async fn upsert_catalog_template_by_slug(
 ) -> Result<RegisteredCatalog> {
     // Look up the existing canonical row by slug (shared catalog scope).
     let existing = sqlx::query(
-        "SELECT id, source_code, (wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0) AS has_wasm \
+        "SELECT id, source_code, dependencies, (wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0) AS has_wasm \
          FROM modules \
          WHERE catalog_slug = $1 AND user_id IS NULL \
          ORDER BY compiled_at DESC NULLS LAST, id ASC \
@@ -173,15 +194,18 @@ pub async fn upsert_catalog_template_by_slug(
     if let Some(row) = existing {
         let id: Uuid = row.try_get("id")?;
         let prev_source: Option<String> = row.try_get("source_code")?;
+        let prev_deps: Option<serde_json::Value> = row.try_get("dependencies")?;
         let has_wasm: bool = row.try_get::<Option<bool>, _>("has_wasm")?.unwrap_or(false);
         let source_changed = prev_source.as_deref() != Some(params.source_code);
+        let deps_changed = prev_deps.as_ref() != params.dependencies;
 
         // Rename-safe in-place update keyed on the canonical id.
         sqlx::query(
             "UPDATE modules SET \
                  name = $2, category = $3, description = $4, config_schema = $5, \
                  source_code = $6, allowed_hosts = $7, allowed_secrets = $8, \
-                 requires_approval_for = $9, capability_world = $10, updated_at = NOW() \
+                 requires_approval_for = $9, capability_world = $10, \
+                 dependencies = $11, updated_at = NOW() \
              WHERE id = $1",
         )
         .bind(id)
@@ -194,12 +218,13 @@ pub async fn upsert_catalog_template_by_slug(
         .bind(params.allowed_secrets)
         .bind(params.requires_approval_for)
         .bind(params.capability_world_long)
+        .bind(params.dependencies)
         .execute(pool)
         .await?;
 
         return Ok(RegisteredCatalog {
             id,
-            needs_recompile: needs_recompile(source_changed, has_wasm),
+            needs_recompile: needs_recompile(source_changed, has_wasm, deps_changed),
         });
     }
 
@@ -209,18 +234,18 @@ pub async fn upsert_catalog_template_by_slug(
     // brand-new insert has no WASM yet so `needs_recompile` is true anyway.
     let row = sqlx::query(
         "WITH prev AS ( \
-             SELECT source_code AS prev_source, \
+             SELECT source_code AS prev_source, dependencies AS prev_deps, \
                     (wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0) AS prev_has_wasm \
              FROM modules WHERE name = $1 AND user_id IS NULL \
          ), upsert AS ( \
              INSERT INTO modules ( \
                  user_id, name, kind, category, description, config_schema, \
                  source_code, allowed_hosts, allowed_secrets, requires_approval_for, \
-                 capability_world, catalog_slug, language, created_at, updated_at \
+                 capability_world, catalog_slug, dependencies, language, created_at, updated_at \
              ) VALUES ( \
                  NULL, $1, 'catalog', $2, $3, $4, \
                  $5, $6, $7, $8, \
-                 $9, $10, 'rust', NOW(), NOW() \
+                 $9, $10, $11, 'rust', NOW(), NOW() \
              ) \
              ON CONFLICT (name) WHERE user_id IS NULL DO UPDATE SET \
                  category = EXCLUDED.category, \
@@ -232,12 +257,14 @@ pub async fn upsert_catalog_template_by_slug(
                  allowed_secrets = EXCLUDED.allowed_secrets, \
                  requires_approval_for = EXCLUDED.requires_approval_for, \
                  capability_world = EXCLUDED.capability_world, \
+                 dependencies = EXCLUDED.dependencies, \
                  updated_at = NOW() \
              RETURNING id, \
                  (wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0) AS has_wasm \
          ) \
          SELECT upsert.id, upsert.has_wasm, \
-                prev.prev_source, COALESCE(prev.prev_has_wasm, false) AS prev_has_wasm \
+                prev.prev_source, prev.prev_deps, \
+                COALESCE(prev.prev_has_wasm, false) AS prev_has_wasm \
          FROM upsert LEFT JOIN prev ON true",
     )
     .bind(params.name)
@@ -250,17 +277,20 @@ pub async fn upsert_catalog_template_by_slug(
     .bind(params.requires_approval_for)
     .bind(params.capability_world_long)
     .bind(params.catalog_slug)
+    .bind(params.dependencies)
     .fetch_one(pool)
     .await?;
 
     let id: Uuid = row.try_get("id")?;
     let has_wasm: bool = row.try_get::<Option<bool>, _>("has_wasm")?.unwrap_or(false);
     let prev_source: Option<String> = row.try_get("prev_source")?;
+    let prev_deps: Option<serde_json::Value> = row.try_get("prev_deps")?;
     let source_changed = prev_source.as_deref() != Some(params.source_code);
+    let deps_changed = prev_deps.as_ref() != params.dependencies;
 
     Ok(RegisteredCatalog {
         id,
-        needs_recompile: needs_recompile(source_changed, has_wasm),
+        needs_recompile: needs_recompile(source_changed, has_wasm, deps_changed),
     })
 }
 
@@ -411,19 +441,30 @@ mod tests {
 
     #[test]
     fn recompiles_when_source_changed() {
-        assert!(needs_recompile(true, true));
+        assert!(needs_recompile(true, true, false));
     }
 
     #[test]
     fn recompiles_when_no_wasm_even_if_source_unchanged() {
         // The metadata-only first-seed case: source "unchanged" (there was
         // no prior row) but the row has no WASM → must compile.
-        assert!(needs_recompile(false, false));
+        assert!(needs_recompile(false, false, false));
     }
 
     #[test]
     fn skips_when_source_unchanged_and_wasm_present() {
-        assert!(!needs_recompile(false, true));
+        assert!(!needs_recompile(false, true, false));
+    }
+
+    /// A manifest-only edit — adding or removing a declared crate without
+    /// touching `template.rs` — must rebuild. Before the seeder forwarded
+    /// `talos.json` `dependencies` at all this could not matter; now that it
+    /// does, skipping here would leave the compiled WASM disagreeing with the
+    /// declared dependency set until some unrelated source edit happened to
+    /// trigger a rebuild.
+    #[test]
+    fn recompiles_when_only_dependencies_changed() {
+        assert!(needs_recompile(false, true, true));
     }
 
     // ── find_duplicate_catalog_sets ─────────────────────────────────────
