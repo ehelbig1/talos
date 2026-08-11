@@ -258,6 +258,237 @@ groups:
             tail_worker_logs on a recent failed execution for the node-level
             cause.
 
+      # ── The boot herd: every deploy failing every due schedule.
+      # Grounded 2026-08-10. The controller starts, its scheduler's first
+      # poll fires ~1.7s later, and EVERY schedule that came due while the
+      # process was down is dispatched at once. That boot released 15
+      # executions within 20ms; their WASM jobs opened ~16 simultaneous TLS
+      # connects to gmail.googleapis.com / www.googleapis.com, the connects
+      # started failing, five consecutive failures tripped the WORKER's
+      # per-host circuit breaker, and the remaining workflows then failed
+      # instantly against an OPEN breaker. 8 of 19 runs failed; three more
+      # were refused by the actor-budget backstop the burst had exhausted,
+      # two of them DAILY crons (so "the next occurrence will retry" meant
+      # tomorrow). Gmail itself was healthy throughout — it returned HTTP 200
+      # sixteen seconds before the first failure. Everything recovered on its
+      # own within a minute and NOTHING ALERTED, which is why it survived
+      # repeated deploys: the platform looks fine by the time anyone looks.
+      #
+      # Why phase= exists at all: a startup-window failure and a steady-state
+      # failure have completely different causes, and pooling them buries a
+      # defect that fires on EVERY deploy inside TalosWorkflowFailureRateHigh's
+      # background rate — 8 failures against a day of traffic never reaches a
+      # 25% ratio over 15m.
+      #
+      # WHAT THE CONDITION CAN AND CANNOT SUPPORT. This was `> 0` on
+      # failed|skipped, i.e. ANY engine error on ANY workflow in the boot
+      # backlog, while the text told operators "the backlog still overwhelmed
+      # something" and "that ceiling was NOT enough". A single expired OAuth
+      # token trips that, and on a fleet with 15 boot schedules it would fire
+      # on most deploys with a wrong cause — the misleading-report-field class
+      # this whole arc has been mining. Two arms now, and neither alone is
+      # sufficient:
+      #   * more than ONE run — a lone chronically-broken workflow is not a
+      #     herd, and it fires every deploy. The threshold is 1.5, not 1,
+      #     because increase() EXTRAPOLATES to the window edges: a single
+      #     event over a 30m window commonly reads as ~1.03 on real scrape
+      #     alignment, so `> 1` would fire on exactly the case being excluded.
+      #     1.5 is how you say "more than one" to an extrapolating estimator;
+      #   * a MAJORITY of the startup backlog — herd damage is broad by
+      #     construction (5 consecutive connect failures open a per-host
+      #     breaker and every later workflow declaring that host dies against
+      #     it), whereas chronic per-workflow breakage is a small fixed
+      #     fraction of a growing backlog.
+      # On the 2026-08-10 sample: 15 dispatched, 8 failed + 3 skipped = 0.73.
+      # Both arms clear comfortably. The description no longer asserts a cause;
+      # the herd signature is offered as the first hypothesis to check.
+      #
+      # outcome="skipped" is included on purpose: a run refused for CAPACITY
+      # (concurrency cap or actor budget) is not a soft outcome, it is a lost
+      # run. outcome="denied" (actor archived, capability ceiling) is NOT —
+      # those are chronic configuration states, unchanged by how many schedules
+      # came due at once, so folding them in would reintroduce the fire-on-every
+      # -deploy defect through the other door. "fenced" (superseded by a
+      # crash-recovery reclaim) is excluded for the same reason.
+      #
+      # All ten talos_scheduler_dispatches_total series are pre-seeded to 0 at
+      # registration, so `increase(...)` is well-defined from the first scrape.
+      # Without that seeding this detector would be silenced by exactly the
+      # condition it detects — an absent counter matches nothing, so a
+      # controller whose scheduler never dispatched anything would look
+      # identical to one dispatching cleanly (#625). The seeding also makes the
+      # ratio arm safe on a cold controller: numerator and denominator are both
+      # 0, 0/0 is NaN, and NaN > 0.5 is false, so the alert stays silent rather
+      # than dividing by an absent series.
+      - alert: TalosSchedulerStartupHerdNotAbsorbed
+        expr: |
+          (
+            sum by (outcome) (
+              increase(talos_scheduler_dispatches_total{phase="startup",outcome=~"failed|skipped"}[30m])
+            ) > 1.5
+          )
+          and on()
+          (
+            sum(increase(talos_scheduler_dispatches_total{phase="startup",outcome=~"failed|skipped"}[30m]))
+            /
+            sum(increase(talos_scheduler_dispatches_total{phase="startup"}[30m]))
+            > 0.5
+          )
+        for: 0m
+        labels:
+          severity: warning
+          category: reliability-degraded
+        annotations:
+          summary: "Startup schedule backlog not absorbed ({{ $value }} {{ $labels.outcome }})"
+          description: |
+            {{ $value }} scheduled workflow run(s) from the STARTUP BACKLOG —
+            the schedules that came due while the controller was restarting —
+            ended `{{ $labels.outcome }}`, and the failed+skipped runs are a
+            MAJORITY of that backlog.
+
+            What this number knows: the outcome of each startup-phase dispatch.
+            What it does NOT know: why. A broad failure across the boot backlog
+            is the SIGNATURE of the 2026-08-10 herd, and the majority arm is
+            what distinguishes it from a couple of individually-broken
+            workflows — but a shared upstream outage, an expired credential
+            common to several workflows, or a bad deploy produce the same shape.
+            Confirm the cause below rather than assuming the ceiling failed.
+
+            outcome="failed": first hypothesis is the worker's per-host circuit
+            breaker opening — grep the worker log for "Circuit breaker opened"
+            and "outbound HTTP request failed (sanitized transport detail)".
+            The breaker lives in the WORKER process and is invisible to the
+            controller, so the controller-side error text ("circuit open for
+            host X") is a CONSEQUENCE reported minutes into the incident, not
+            its cause. If the worker log shows no breaker and no transport
+            errors, this is not a herd — read the individual error_messages.
+
+            outcome="skipped": runs were refused for CAPACITY — the
+            per-workflow concurrency cap, or an actor's per-minute execution
+            budget the burst exhausted. For a daily cron that means the run is
+            lost until tomorrow, not retried shortly.
+          action: |
+            1. Correlate: `talos_scheduler_dispatches_total{phase="startup"}`
+               (all five outcomes; they partition the backlog) against the
+               controller log line `event_kind="scheduler_startup_backlog"`,
+               which records how many schedules the boot backlog contained. The
+               two should agree — every terminal path is counted.
+            2. Check the worker log for the breaker signature above. If it is
+               absent, treat this as N individual workflow failures and read
+               their error_messages; the ceiling is not implicated.
+            3. If the herd signature IS present, lower
+               SCHEDULER_STARTUP_MAX_CONCURRENT (default 4). Do NOT raise
+               SCHEDULER_MAX_CONCURRENT_EXECUTIONS — that is the steady-state
+               ceiling and raising it makes the burst worse.
+            4. If outcome="skipped" dominates, the actor's per-minute budget is
+               the binding constraint rather than egress; raise the budget or
+               stagger the cron expressions so fewer schedules share a boot.
+
+      # ── The scheduler is running but dispatching NOTHING.
+      # The fleet-readiness barrier refuses to dispatch while the controller's
+      # NATS heartbeat view contains no live worker — dispatching into an
+      # invisible fleet is what produced the herd above. A hold is safe and
+      # lossless (no schedule state is advanced, so everything still fires
+      # once a worker appears) and a couple of holds at boot are NORMAL: a
+      # worker that booted before the controller subscribed loses its first
+      # heartbeat outright, because NATS core delivery is not retained.
+      #
+      # SUSTAINED holding is a different thing entirely: it means no scheduled
+      # work is running at all, silently, while the controller is up and
+      # healthy by every other measure. TalosWorkerDown covers the worker's own
+      # absence; this covers the consequence that actually costs the user
+      # something. Threshold ~10 holds ≈ 2.5 minutes of continuous holding at
+      # the 15s poll interval, so a normal boot cannot reach it.
+      - alert: TalosSchedulerDispatchHeldNoFleet
+        expr: increase(talos_scheduler_readiness_holds_total[15m]) > 10
+        for: 0m
+        labels:
+          severity: warning
+          category: reliability-degraded
+        annotations:
+          summary: "Scheduler is holding all dispatch — no worker visible in the fleet view"
+          description: |
+            The scheduler has held {{ $value }} poll iterations in the last 15m
+            because `talos_worker_fleet::WorkerManager` reports zero live
+            workers. No scheduled workflow is running right now.
+
+            Nothing is being LOST — a held poll never opens its transaction, so
+            `next_trigger_at` is not advanced and every due schedule fires as
+            soon as a worker becomes visible. But nothing is running either.
+
+            This alert is deliberately tuned to fire BEFORE the barrier gives
+            up (10 holds ≈ 2.5m, give-up at 20 ≈ 5m), so an operator hears
+            about it while the guarantee is still in force rather than after it
+            has been dropped. If it is ignored, TalosSchedulerReadinessDegraded
+            follows.
+
+            Note this reads the in-process heartbeat view, not the
+            `talos_worker_fleet_live_workers` gauge, which is republished on a
+            60s sweep and therefore lags. A disagreement between the two for
+            under a minute is expected.
+          action: |
+            1. Are worker pods running at all? Check TalosWorkerDown.
+            2. If workers ARE running, they are not reaching
+               `talos.workers.heartbeat.>` — check NATS connectivity from the
+               worker and whether TALOS_WORKER_HEARTBEAT_INTERVAL_SECS is 0,
+               which disables heartbeat publishing entirely (a supported
+               configuration, but one this barrier cannot see through).
+
+      # ── The barrier gave up. Schedules run, the guarantee does not.
+      # A zero fleet view is AMBIGUOUS — empty fleet, a build too old to
+      # publish heartbeats, a broken subscription, or heartbeats disabled via
+      # TALOS_WORKER_HEARTBEAT_INTERVAL_SECS=0 all read identically. So the
+      # barrier degrades after a bounded number of holds instead of refusing
+      # forever: refusing forever would silently stop every scheduled workflow
+      # on a healthy fleet, which is a worse failure than the herd the barrier
+      # prevents. This alert is the price of that safety valve being honest —
+      # it says the valve opened.
+      #
+      # Level alert on a pre-seeded gauge (0 at registration), so `== 1` is
+      # well-defined from the first scrape rather than depending on a
+      # transition being observed.
+      #
+      # THE GAUGE IS A LEVEL, NOT A LATCH. It returns to 0 the moment any
+      # heartbeat is seen. As a one-way latch it pinned at 1 on a healthy
+      # fleet — a slow worker image pull outlasts the give-up bound, the
+      # worker then arrives, and this fired until the controller restarted.
+      # And on a deployment with heartbeats disabled outright it fired
+      # forever, which the runbook below used to describe as "expected". An
+      # alert that is documented as expected-to-fire is an alert nobody reads
+      # in any configuration; that deployment now disables the barrier
+      # instead (SCHEDULER_FLEET_READINESS_BARRIER=false on the controller),
+      # so the gauge stays 0 and this stays silent.
+      - alert: TalosSchedulerReadinessDegraded
+        expr: talos_scheduler_readiness_degraded == 1
+        for: 5m
+        labels:
+          severity: warning
+          category: reliability-degraded
+        annotations:
+          summary: "Scheduler is dispatching without fleet-readiness evidence"
+          description: |
+            The scheduler waited for a worker heartbeat, never saw one, and has
+            given up waiting. Scheduled workflows ARE running — nothing is
+            blocked and nothing was lost — but they are being dispatched
+            without any evidence that a worker is there to run them, which is
+            the condition that produced the 2026-08-10 boot herd.
+
+            This clears ITSELF the moment a heartbeat is seen — the barrier
+            re-arms and the gauge returns to 0. So a firing alert means the
+            fleet is invisible RIGHT NOW, not that it once was.
+          action: |
+            1. Confirm whether heartbeats are disabled on purpose
+               (TALOS_WORKER_HEARTBEAT_INTERVAL_SECS=0 on the worker). If they
+               are, this deployment can never satisfy the barrier and must
+               switch it off: set SCHEDULER_FLEET_READINESS_BARRIER=false on
+               the CONTROLLER. The controller cannot detect the worker-side
+               setting, which is why this is an explicit switch. The startup
+               concurrency ceiling — the load-bearing herd protection — stays
+               in force either way. Do NOT simply tolerate this firing.
+            2. Otherwise treat it as TalosSchedulerDispatchHeldNoFleet that was
+               not acted on: the worker is not reaching
+               `talos.workers.heartbeat.>`.
+
       # ── WASM log lines that reached no execution row.
       # Reachability: this series is produced by the controller's `wasm.log.*`
       # NATS subscriber, which is only spawned when a NATS client exists. NATS

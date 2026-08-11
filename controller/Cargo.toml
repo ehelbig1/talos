@@ -8,7 +8,6 @@ publish = false
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-lru = "0.16.3"
 # HTML sanitisation for user-facing rendered output (briefing endpoint).
 ammonia = "4"
 # Atomic hot-swap for the Pub/Sub JWK cache (gmail::pubsub_jwt).

@@ -11,6 +11,65 @@
 use prometheus::{exponential_buckets, Counter, CounterVec, HistogramVec, IntGauge, Registry};
 use std::sync::{Arc, OnceLock};
 
+/// The complete, closed set of `phase` label values on
+/// `talos_scheduler_dispatches_total`.
+///
+/// Shared by the pre-seed loop in [`TalosMetrics::new`] and by every emitting
+/// site in `talos_scheduler`, so a new value cannot be emitted without also
+/// being seeded — the drift that makes an `increase(...) > 0` alert
+/// unfireable on the one series that matters.
+pub const SCHEDULER_DISPATCH_PHASES: [&str; 2] = [SCHEDULER_PHASE_STARTUP, SCHEDULER_PHASE_STEADY];
+
+/// The startup backlog: schedules found due by the FIRST poll after boot.
+pub const SCHEDULER_PHASE_STARTUP: &str = "startup";
+/// Every poll after the first one.
+pub const SCHEDULER_PHASE_STEADY: &str = "steady";
+
+/// The complete, closed set of `outcome` label values on
+/// `talos_scheduler_dispatches_total`. See [`SCHEDULER_DISPATCH_PHASES`].
+///
+/// **These five values PARTITION the scheduler's dispatch attempts**, and that
+/// is a load-bearing property rather than a tidiness one: the alert runbook
+/// tells operators to reconcile this counter against the boot backlog size
+/// logged by `event_kind="scheduler_startup_backlog"`, and a counter with
+/// uncounted terminal paths cannot reconcile against anything. Every task
+/// spawned by `talos_scheduler::SchedulerService::spawn_workflow_execution`
+/// records exactly one of these before it returns. When adding a terminal
+/// `return` to that path, add its `record_dispatch` in the same edit — the
+/// crate's `every_terminal_path_records_an_outcome` test documents the
+/// enumeration, but only a human keeps it true.
+pub const SCHEDULER_DISPATCH_OUTCOMES: [&str; 5] = [
+    SCHEDULER_OUTCOME_COMPLETED,
+    SCHEDULER_OUTCOME_FAILED,
+    SCHEDULER_OUTCOME_SKIPPED,
+    SCHEDULER_OUTCOME_DENIED,
+    SCHEDULER_OUTCOME_FENCED,
+];
+
+/// The execution reached a terminal success.
+pub const SCHEDULER_OUTCOME_COMPLETED: &str = "completed";
+/// The run errored — engine failure, engine-build failure, or a DB error on
+/// any of the pre-dispatch loads (workflow row, graph, execution-row INSERT,
+/// fail-closed auth-gate lookup).
+pub const SCHEDULER_OUTCOME_FAILED: &str = "failed";
+/// The fire was refused before it ran because CAPACITY was exhausted — the
+/// per-workflow concurrency cap, the actor-budget pre-check, or the atomic
+/// actor-budget backstop. Visibly skipped, not silently dropped: for a daily
+/// cron this means the run is lost until tomorrow. This is the herd-shaped
+/// refusal, which is why the startup-herd alert selects it alongside `failed`.
+pub const SCHEDULER_OUTCOME_SKIPPED: &str = "skipped";
+/// The fire was refused by POLICY — the bound actor is archived/terminated/
+/// not-runnable, or a node exceeds the actor's capability ceiling. Deliberately
+/// NOT `skipped`: these are chronic configuration states that are unchanged by
+/// how many schedules came due at once, so folding them into the herd alert
+/// would make it fire on every deploy with a cause it cannot support.
+pub const SCHEDULER_OUTCOME_DENIED: &str = "denied";
+/// The run was superseded mid-flight by a crash-recovery reclaim (the execution
+/// row's epoch advanced under it). Neither a success nor a failure of THIS
+/// dispatch — the row now belongs to the resumer — but it is a terminal path,
+/// and an uncounted terminal path is what stops the counter being a partition.
+pub const SCHEDULER_OUTCOME_FENCED: &str = "fenced";
+
 /// Process-global metrics registry.
 ///
 /// Initialised once in `main.rs` after [`TalosMetrics::new`] succeeds.
@@ -312,6 +371,82 @@ pub struct TalosMetrics {
     /// controller restart. Alert on the level (`> 0`) or on
     /// `delta(...[1h]) > 0`, not on a rate. No alert consumes it today.
     pub worker_fleet_capacity_dropped_heartbeats: IntGauge,
+
+    /// Terminal outcomes of scheduler-driven workflow dispatches, split by
+    /// whether the dispatch belonged to the **startup backlog** or to steady
+    /// state.
+    ///
+    /// `phase=startup` is the set of schedules found due by the FIRST poll
+    /// after a controller boot — i.e. the runs that accumulated while the
+    /// process was down. That set is dispatched under a tighter concurrency
+    /// ceiling than steady state precisely because releasing it all at once
+    /// self-inflicts an outage: on 2026-08-10 fifteen schedules fired within
+    /// 20 ms of each other, their WASM jobs opened ~16 simultaneous TLS
+    /// connects to Google hosts, five consecutive connect failures tripped
+    /// the worker's per-host circuit breaker, and the remaining eight
+    /// workflows then failed instantly against an OPEN breaker. Nothing
+    /// alerted, and the platform looked healthy minutes later.
+    ///
+    /// Splitting on `phase` is the whole point: a steady-state failure and a
+    /// startup-window failure have completely different causes, and pooling
+    /// them hides a defect that fires on EVERY deploy inside a background
+    /// failure rate. `outcome=skipped` is the visibly-refused branch (the
+    /// per-workflow concurrency cap and the actor budget) — it is NOT a
+    /// success, and it is how a dropped daily cron becomes observable rather
+    /// than a WARN nobody reads.
+    ///
+    /// The five outcomes are a PARTITION of dispatch attempts, not a sample:
+    /// see [`SCHEDULER_DISPATCH_OUTCOMES`]. Ten closed series, all pre-seeded.
+    /// Deliberately carries NO workflow name, schedule id or user id — those
+    /// are unbounded cardinality.
+    pub scheduler_dispatches_total: CounterVec,
+
+    /// Scheduler poll iterations HELD by the fleet-readiness barrier because
+    /// the controller's NATS heartbeat view contained no live worker.
+    ///
+    /// A hold advances nothing: the barrier runs before the poll's
+    /// transaction opens, so `next_trigger_at` is untouched and every due
+    /// schedule is still due on the next tick.
+    ///
+    /// The ORDINARY boot case does not appear here. A worker that booted
+    /// before the controller subscribed loses its first heartbeat outright
+    /// (NATS core delivery is not retained), so the controller typically waits
+    /// most of one heartbeat interval to see it — measured at ~50 s on
+    /// 2026-08-10. That wait is absorbed by the scheduler's ONE bounded
+    /// pre-loop wait, which deliberately does not count a hold, so a healthy
+    /// boot leaves this at 0. It only starts moving once that bound has
+    /// already elapsed, i.e. the fleet has been invisible far longer than the
+    /// protocol can explain.
+    pub scheduler_readiness_holds_total: Counter,
+
+    /// 1 when the scheduler has GIVEN UP waiting for the fleet to become
+    /// visible and is dispatching without that evidence; 0 while the barrier
+    /// is functioning normally.
+    ///
+    /// This exists because an empty fleet view is **ambiguous, not proof of
+    /// absence** — the same reading covers a genuinely empty fleet, a fleet on
+    /// a build too old to publish heartbeats, a broken subscription, and an
+    /// operator who set `TALOS_WORKER_HEARTBEAT_INTERVAL_SECS=0` (a supported
+    /// configuration that disables heartbeat publishing outright). A barrier
+    /// that treated 0 as "known cold" and refused forever would therefore
+    /// silently stop ALL scheduled work on a perfectly healthy fleet — strictly
+    /// worse than the boot herd it was added to prevent. So the barrier gives
+    /// up after a bounded number of consecutive holds and says so here, rather
+    /// than blocking indefinitely on a signal it cannot fully trust.
+    ///
+    /// 1 means: schedules ARE running, but the readiness guarantee is not in
+    /// force, so a boot herd could recur.
+    ///
+    /// **This is a level, not a latch.** It returns to 0 the moment any
+    /// heartbeat is seen. As a one-way latch it pinned at 1 on a healthy fleet
+    /// — a slow worker image pull outlasts the give-up bound, the worker then
+    /// arrives, and the alert fires until the controller restarts. On a
+    /// deployment that publishes no heartbeats at all (worker-side
+    /// `TALOS_WORKER_HEARTBEAT_INTERVAL_SECS=0`, which the controller cannot
+    /// detect) the barrier is switched off wholesale with
+    /// `SCHEDULER_FLEET_READINESS_BARRIER=false` and this stays 0, rather than
+    /// documenting an alert as expected-to-fire-forever.
+    pub scheduler_readiness_degraded: IntGauge,
 
     // Rate limiting metrics
     pub rate_limit_hits_total: CounterVec,
@@ -776,6 +911,75 @@ impl TalosMetrics {
         worker_fleet_unverifiable_builds.set(0);
         worker_fleet_capacity_dropped_heartbeats.set(0);
 
+        // ---- Scheduler startup-herd detection ----
+        let scheduler_dispatches_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_scheduler_dispatches_total",
+                "Terminal outcomes of scheduler-driven workflow dispatches. \
+                 Labels: phase=startup|steady (startup = the backlog found \
+                 due by the first poll after a controller boot), \
+                 outcome=completed|failed|skipped|denied|fenced. skipped = \
+                 refused for CAPACITY (concurrency cap or actor budget), \
+                 which for a daily cron means the run is lost until tomorrow; \
+                 denied = refused by POLICY (actor not runnable, capability \
+                 ceiling); fenced = superseded by a crash-recovery reclaim. \
+                 The five outcomes PARTITION every dispatch attempt, so the \
+                 total reconciles against the boot backlog size. Ten closed \
+                 series; never labelled by workflow, schedule or user — \
+                 unbounded cardinality.",
+            ),
+            &["phase", "outcome"],
+        )?;
+        registry.register(Box::new(scheduler_dispatches_total.clone()))?;
+        // Seed all ten. The healthy steady state of every startup-phase
+        // series is 0 forever, which is exactly the case where absent and
+        // zero diverge: the herd alert is built on `increase(...)` — a
+        // threshold arm and a ratio arm — and an absent counter matches
+        // nothing, so the detector would be silenced by precisely the
+        // condition it exists to catch (#625). The ratio arm needs the
+        // seeding twice over: an absent denominator term does not make the
+        // ratio absent, it makes it WRONG. Every (phase,
+        // outcome) pair is reachable from a live site in
+        // `talos_scheduler::SchedulerService`, so seeding asserts nothing
+        // that is not wired.
+        for phase in SCHEDULER_DISPATCH_PHASES {
+            for outcome in SCHEDULER_DISPATCH_OUTCOMES {
+                scheduler_dispatches_total
+                    .with_label_values(&[phase, outcome])
+                    .inc_by(0.0);
+            }
+        }
+
+        let scheduler_readiness_holds_total = Counter::new(
+            "talos_scheduler_readiness_holds_total",
+            "Scheduler poll iterations held because the controller's NATS \
+             fleet heartbeat view contained no live worker. A hold advances \
+             no schedule state, so nothing is lost — the same schedules are \
+             still due on the next tick. Non-zero at boot is normal (a \
+             worker that booted first loses its unretained first heartbeat); \
+             sustained growth means the fleet is genuinely absent.",
+        )?;
+        registry.register(Box::new(scheduler_readiness_holds_total.clone()))?;
+        // Same reasoning as above: on a healthy single-node stack this is 0
+        // forever, and an absent counter cannot be distinguished from a
+        // scheduler that never started.
+        scheduler_readiness_holds_total.inc_by(0.0);
+
+        let scheduler_readiness_degraded = IntGauge::new(
+            "talos_scheduler_readiness_degraded",
+            "1 when the scheduler has given up waiting for the worker fleet to \
+             become visible and is dispatching without that evidence. An empty \
+             fleet view is ambiguous (empty fleet / old build / broken \
+             subscription / heartbeats deliberately disabled), so the barrier \
+             degrades after a bounded number of holds instead of stopping all \
+             scheduled work forever on a signal it cannot fully trust.",
+        )?;
+        registry.register(Box::new(scheduler_readiness_degraded.clone()))?;
+        // 0 is the healthy value AND the value this sits at forever on a
+        // working fleet, so it must be exported rather than absent — an alert
+        // on `== 1` over an absent series can never fire.
+        scheduler_readiness_degraded.set(0);
+
         // Rate limiting metrics
         let rate_limit_hits_total = CounterVec::new(
             prometheus::Opts::new(
@@ -1011,6 +1215,9 @@ impl TalosMetrics {
             worker_fleet_build_skew_workers,
             worker_fleet_unverifiable_builds,
             worker_fleet_capacity_dropped_heartbeats,
+            scheduler_dispatches_total,
+            scheduler_readiness_holds_total,
+            scheduler_readiness_degraded,
             rate_limit_hits_total,
             cache_hits_total,
             cache_misses_total,
@@ -1191,6 +1398,28 @@ mod tests {
             "talos_worker_fleet_build_skew_workers 0",
             "talos_worker_fleet_unverifiable_builds 0",
             "talos_worker_fleet_capacity_dropped_heartbeats 0",
+            // The scheduler startup-herd detector. On a healthy fleet the
+            // startup-phase series sit at 0 forever, and the alert on them is
+            // built on `increase(...)` — so an absent series is a
+            // detector that cannot fire on the very condition it exists to
+            // catch. All ten are asserted, not just the alerted ones: an
+            // operator comparing startup against steady needs both halves to
+            // exist before either number means anything, and the herd alert's
+            // ratio arm divides by the sum over ALL outcomes — an absent
+            // denominator term makes the ratio silently wrong rather than
+            // absent.
+            r#"talos_scheduler_dispatches_total{outcome="completed",phase="startup"} 0"#,
+            r#"talos_scheduler_dispatches_total{outcome="failed",phase="startup"} 0"#,
+            r#"talos_scheduler_dispatches_total{outcome="skipped",phase="startup"} 0"#,
+            r#"talos_scheduler_dispatches_total{outcome="denied",phase="startup"} 0"#,
+            r#"talos_scheduler_dispatches_total{outcome="fenced",phase="startup"} 0"#,
+            r#"talos_scheduler_dispatches_total{outcome="completed",phase="steady"} 0"#,
+            r#"talos_scheduler_dispatches_total{outcome="failed",phase="steady"} 0"#,
+            r#"talos_scheduler_dispatches_total{outcome="skipped",phase="steady"} 0"#,
+            r#"talos_scheduler_dispatches_total{outcome="denied",phase="steady"} 0"#,
+            r#"talos_scheduler_dispatches_total{outcome="fenced",phase="steady"} 0"#,
+            "talos_scheduler_readiness_holds_total 0",
+            "talos_scheduler_readiness_degraded 0",
         ] {
             assert!(
                 rendered.contains(expected),

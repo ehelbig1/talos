@@ -123,6 +123,72 @@ retry code is next touched: `backon` or `tokio-retry`.
 drop automatically when upstream consumers migrate to the new API.
 """ },
 
+    { id = "RUSTSEC-2026-0249", reason = """
+`smartstring` is unmaintained. Advisory published 2026-08-10/11; it
+turned CI red on main at an UNCHANGED sha (1f5eefe passed 08-10 13:40Z,
+failed 08-11 08:10Z), so this is a new advisory against an existing
+dependency, not a new dependency.
+
+Pulled by: `rhai` 1.24 only (`cargo tree -i smartstring` → a single
+edge). rhai is our expression sandbox — `verdict_expr`, `skip_condition`
+and dispatch expressions, the one engine required by structural check 63.
+
+No escape hatch exists, verified rather than assumed:
+  * NOT optional — `[dependencies.smartstring]` in rhai's manifest has no
+    `optional = true` and no feature gate; rhai's own `std` feature
+    requires `smartstring/std`.
+  * Upgrading does NOT help — rhai 1.25.1 (tested by resolving to it)
+    still depends on smartstring 1.0.1.
+
+No vulnerability — maintenance flag only (cargo-deny reports it as
+`error[unmaintained]`). The residual risk is the absence of FUTURE
+patches, not a present defect.
+
+The only real fixes are upstream rhai moving off smartstring, or Talos
+dropping rhai — the latter is an architectural change to the expression
+sandbox, deliberately not undertaken to clear a maintenance flag.
+Re-review 2026-Q4, or sooner if rhai publishes a release that drops it.
+""" },
+
+    # --- Unsound, but unreachable given our key types ---
+
+    { id = "RUSTSEC-2026-0253", reason = """
+`lru` `LruCache::pop()` is not panic-safe: if a stored KEY's `Drop`
+panics during `pop()`, `detach()` is skipped and a dangling pointer
+stays linked in the internal list, so a later eviction writes to freed
+memory (CWE-416 / CWE-415).
+
+Reachability — the trigger is specifically a panicking `Drop` ON THE
+KEY, so the key TYPE decides it. Every path in this tree stores keys
+that cannot panic on drop:
+  * talos-audit-ledger/src/lib.rs:293 — our ONLY direct use —
+    `LruCache<Uuid, SdkTracerProvider>`. `Uuid` is `Copy` with a
+    trivial drop.
+  * async-graphql 7.2.1 — `LruCache<String, ExecutableDocument>`
+    (persisted queries) and a generic dataloader cache whose keys in
+    Talos are `Uuid`/`String`. `String`'s drop frees a buffer; it does
+    not panic.
+  * aws-sdk-s3 1.119 (via lru 0.12.5) — internal endpoint cache,
+    string-keyed.
+A panicking `Drop` on a key is not something Talos can introduce
+accidentally: it would require writing a custom key type with a
+panicking `Drop` impl. If a future cache does that, this exemption is
+void — that is the condition to re-check, not the version number.
+
+Why not simply upgrade: the fix is lru >=0.18.2, but the affected
+versions are pinned by two INDEPENDENT upstreams we do not control —
+`async-graphql` 7.2.1 requires `^0.16.2` and `aws-sdk-s3` 1.119 pulls
+0.12.5. Bumping our own declarations cannot remove either, so it would
+add a THIRD lru version to the tree without clearing the advisory.
+
+Done anyway as defence in depth: `controller`'s `lru` declaration was
+removed outright — it had ZERO usages (vestigial after the workspace
+decomposition), so the crate no longer links lru at all.
+
+Re-review 2026-Q4, or when async-graphql/aws-sdk-s3 ship releases on
+lru >=0.18.2 — at which point this entry should be DELETED, not bumped.
+""" },
+
 ]
 
 # ============================================================================
