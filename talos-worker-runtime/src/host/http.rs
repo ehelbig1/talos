@@ -463,6 +463,50 @@ impl wit_http::Host for TalosContext {
             return Err(wit_http::Error::Networkerror);
         }
 
+        // ── KNOWN DEFECT, REPORTED AND DELIBERATELY NOT FIXED HERE ──────────
+        // (2026-08-11; deferred so a behaviour change does not land in the same
+        // commit as the breaker's first real counters and destroy attribution.)
+        //
+        // `allow_request` above SPENDS a HalfOpen trial token. The token is
+        // repaid only by `record_success` / `record_failure`, which live on the
+        // `builder.send()` match ~130 lines below. Every exit between the two
+        // spends a token and repays nothing, and because `HalfOpen` has NO time
+        // bound (it leaves only when `test_successes + test_failures >=
+        // test_requests`), a host whose tokens are all leaked is stranded at
+        // HalfOpen-with-0-tokens PERMANENTLY — every later request is refused
+        // `half_open_exhausted` until the process restarts.
+        //
+        // There are FOUR such paths, not three. The count was previously stated
+        // as three because it was derived from a grep for `return`, which is
+        // blind to the third one below:
+        //
+        //   1. the `MAX_OUTBOUND_HEADERS` cap  → `return Err(Forbiddenhost)`
+        //   2. the `MAX_OUTBOUND_HTTP_BODY_BYTES` cap
+        //                                      → `return Err(Forbiddenhost)`
+        //   3. `resolve_vault_header(...)?`    → a `?`, NOT a `return`
+        //   4. the idempotency dedup short-circuit
+        //                                      → `return Ok(cached)`
+        //
+        // (3) is the one most likely to fire in production: it is deterministic
+        // on an unresolvable `vault://oauth/...` header — precisely the header
+        // shape the calendar nodes use — so a host whose OAuth secret is
+        // missing or expired drains all three trial tokens on its first three
+        // recovery attempts and is then stranded for the life of the worker.
+        // (1) and (2) require a guest-authored oversized request; (4) requires
+        // an engine-stamped idempotency key that already completed.
+        //
+        // A FIFTH path is not a code path at all: task cancellation. Any
+        // `.await` between the spend and the send can be dropped (execution
+        // timeout, worker shutdown, a sibling failing a `try_join`), which
+        // leaks the token with no statement executing. This is the path that
+        // fits the 2026-08-11 11:35 stranding — see the note on `allow_request`
+        // in `circuit_breaker.rs`.
+        //
+        // The fix is an RAII guard that repays the token on `Drop` unless the
+        // outcome was recorded; it must cover all five, so it cannot be a
+        // per-`return` patch. `fetch_all` needs no entry here — it never calls
+        // `allow_request` at all (see the note at its `send()`).
+
         // Build the async reqwest request
         let method = req.method;
         // MCP-1105 (2026-05-16): cap header count BEFORE the body-size
@@ -1349,6 +1393,61 @@ impl wit_http::Host for TalosContext {
                     builder = builder.body(body);
                 }
 
+                // ── THE CIRCUIT BREAKER DOES NOT PARTICIPATE IN `fetch_all` ──
+                // Deliberate as of 2026-08-11, not an oversight — and the
+                // reason it is written HERE is that this send is the site an
+                // extension would have to touch.
+                //
+                // `wit_http::fetch` calls `allow_request` before its send and
+                // `record_success`/`record_failure` after it. This path does
+                // NEITHER: a batch cannot trip the breaker, cannot be refused
+                // by it, and contributes nothing to
+                // `talos_circuit_breaker_{opens,blocks}_total`. Both counters
+                // are therefore structurally blind to batch HTTP, and the
+                // runbook's "if opens and blocks are both flat, this is not a
+                // herd" is a FALSE NEGATIVE for any module built on
+                // `fetch_all`. The alert description says so in as many words.
+                //
+                // Latent today: no shipped module template calls `fetch_all`
+                // (the name appears only in generated `bindings.rs`). It is a
+                // real gap the moment one does.
+                //
+                // NOT extended in the same change, for two reasons.
+                //
+                // (a) It is a behaviour change to a fail-closed control, and it
+                //     touches the exact token accounting whose leak (see the
+                //     inventory at `fetch`'s `allow_request`) is already
+                //     deferred. Landing both at once would make neither
+                //     attributable.
+                //
+                // (b) The per-request semantics are a DESIGN question, not a
+                //     line. A batch of N requests to one host is not N
+                //     independent trials, and treating it as such is wrong in
+                //     all three breaker states:
+                //       Closed   — `failure_threshold` is 5 CONSECUTIVE
+                //                  failures. One 10-wide batch against a dead
+                //                  host would record 10 and trip the breaker
+                //                  inside a single guest call, where `fetch`
+                //                  needs five separate ones. The breaker would
+                //                  open N× faster on identical guest intent.
+                //       HalfOpen — 3 trial tokens. A 10-wide batch consumes all
+                //                  3 and is refused for the other 7, and the
+                //                  3 outcomes it does record are one instant
+                //                  against one host — a single sample dressed
+                //                  as three, feeding a `success_rate` that then
+                //                  decides close-vs-reopen.
+                //       Open     — the honest count is ONE block per batch, not
+                //                  N. The alert threshold is `> 0`, calibrated
+                //                  on incidents that produced one or two
+                //                  blocks; a single refused 100-wide batch
+                //                  would render as 100 and misstate the size of
+                //                  the outage by two orders of magnitude.
+                //     The defensible shape is per-BATCH-per-HOST admission: one
+                //     `allow_request` per distinct host in the batch, one
+                //     recorded outcome per distinct host. That needs host
+                //     bookkeeping this moved future cannot reach — it captures
+                //     no `self` (the same constraint the reason-latch comment
+                //     after the join describes).
                 let response = builder.send().await.map_err(|e| {
                     if e.is_timeout() {
                         wit_http::Error::Timeout

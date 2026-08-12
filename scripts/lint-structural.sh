@@ -4091,14 +4091,47 @@ if [ -f "$METRICS_LIB" ]; then
     #
     # File set is DERIVED (a hardcoded list rots — check 65's own lesson): the
     # canonical chart rule file, every mounted dev rule file, and every
-    # dashboard JSON under the two observability trees. `deploy/observability/
-    # alerts.yaml` is a symlink to the chart file, so it may be scanned twice;
-    # a duplicate hit is harmless.
+    # dashboard JSON under the two observability trees.
     #
     # Matched as `talos_<field>`, the exported name — TalosMetrics registers
     # every field under exactly that spelling. The bare field name is NOT used
     # as the needle: `cache_hits_total` would match the worker's unrelated
     # `wasm_cache_hits_total` and fail this check on a false positive.
+    #
+    # WHAT THIS ESTABLISHES, stated precisely rather than aspirationally
+    # (overstating a lint is check 58's own lesson one level up). The needle is
+    # `grep -l` over whole FILES, so what it proves is that the exported name
+    # appears as TEXT in an alert-rule or dashboard file — NOT that an `expr:`
+    # or a panel target selects on it. A bare YAML COMMENT naming a baselined
+    # metric fails this check (mutation-proved 2026-08-11). That is the safe
+    # direction and it is left as-is: a metric worth writing down next to the
+    # alerts is a metric worth wiring or deleting, and narrowing the match to
+    # `expr:` would reintroduce the "technically true, substantively false"
+    # shape this check exists to kill. The failure text below says "named in"
+    # rather than "referenced by" so it matches what was actually found.
+    #
+    # THREE FURTHER LIMITS:
+    #
+    #  (i) The DIRECTORIES are hardcoded even though the file enumeration
+    #      inside them is globbed. Renaming `observability/rules/` — or moving
+    #      `deploy/helm/talos/files/alerts.yaml` — blinds this check to
+    #      everything under it, exactly the way check 65 documents about its own
+    #      `$PROM_CFG`. Deriving them from the compose mounts is the real fix
+    #      and is not done here.
+    #
+    # (ii) The vacuity guard below fires only when EVERY source vanishes
+    #      (`${#B58_REF_FILES[@]}` -eq 0). If ONE of the three sources moves,
+    #      the array is still non-empty, the check reports success, and that
+    #      source is silently unscanned. Consequence of (i), and the reason (i)
+    #      matters more than it looks.
+    #
+    #(iii) `deploy/observability/alerts.yaml` is a symlink to the chart file,
+    #      and it is NOT scanned — not even once, let alone "twice" as this
+    #      comment previously claimed. The `find` over that tree is
+    #      `-type f -name '*.json'`: the name does not match, and `-type f` is
+    #      false for a symlink without `-L` anyway. Harmless (the chart file is
+    #      added explicitly on its own line), but the claim was wrong and a
+    #      wrong claim about coverage is the defect class this check polices.
     B58_REF_FILES=()
     while IFS= read -r f; do
         [ -n "$f" ] && B58_REF_FILES+=("$f")
@@ -4125,12 +4158,15 @@ if [ -f "$METRICS_LIB" ]; then
 "
         done
         if [ -n "$BASELINE_REFERENCED" ]; then
-            red "✗ baselined DEAD metric(s) are referenced by an alert rule or dashboard (check 58):"
+            red "✗ baselined DEAD metric(s) are NAMED in an alert-rule or dashboard file (check 58):"
             printf '%s' "$BASELINE_REFERENCED"
-            yellow "  → the rule/panel can never fire or can only ever read 0. Wire the metric"
-            yellow "    (add a real increment at its chokepoint) and remove it from BASELINE_DEAD,"
-            yellow "    or drop the reference. Baselining a metric something already alerts on"
-            yellow "    converts observability debt into a false assurance."
+            yellow "  → the match is file-global text, so this is 'the name appears in that file',"
+            yellow "    which includes a bare comment — not proof that an expr or panel selects on"
+            yellow "    it. Check the hit before acting. If a rule or panel DOES select on it, it"
+            yellow "    can never fire or can only ever read 0: wire the metric (add a real"
+            yellow "    increment at its chokepoint) and remove it from BASELINE_DEAD. Baselining a"
+            yellow "    metric something already alerts on converts observability debt into a false"
+            yellow "    assurance. If it is only a comment, say so in the comment or drop the name."
             DEAD58_FAIL=1
         fi
     fi

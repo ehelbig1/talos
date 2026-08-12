@@ -363,13 +363,25 @@ groups:
             cannot see it, so the controller-side error text ("circuit open for
             host X") is a CONSEQUENCE reported minutes into the incident, not
             its cause. `blocks{reason="cooldown"}` = HTTP requests rejected
-            without being sent; `blocks{reason="retry_gate"}` = job retries
-            skipped, which is the arm that produces that controller-side text.
+            without being sent; `blocks{reason="retry_gate"}` = a job or step
+            that failed while one of its declared hosts had an open circuit,
+            which is the arm that produces that controller-side text.
             The counters deliberately carry NO host label, so for WHICH host
-            grep the worker log for "Circuit breaker opened" and "outbound HTTP
-            request failed (sanitized transport detail)". If opens and blocks
-            are both flat and the worker log shows no transport errors, this is
-            not a herd — read the individual error_messages.
+            grep the worker log for "Circuit breaker open - rejecting HTTP
+            request" (fires on every refused request, both block arms, and
+            carries host=) and "outbound HTTP request failed (sanitized
+            transport detail)". Do NOT grep only for "Circuit breaker opened":
+            that line is emitted on the STATE TRANSITION, which may be many
+            hours before the failure you are reading — in the 2026-08-11
+            incident the last one was 22 hours earlier — and the
+            half_open_exhausted arm emits no line of its own at all.
+            If opens and blocks are both flat and the worker log shows no
+            transport errors, this is not a herd — read the individual
+            error_messages. ONE EXCEPTION to that last sentence: the breaker
+            does not participate in `wit_http::fetch_all`, so a module built on
+            BATCH http contributes to neither counter. No shipped template uses
+            it today; if one does, flat counters do not exonerate the breaker
+            for that module.
 
             outcome="skipped": runs were refused for CAPACITY — the
             per-workflow concurrency cap, or an actor's per-minute execution
@@ -385,7 +397,8 @@ groups:
                `talos_circuit_breaker_blocks_total` (and the worker log for the
                host). If both are flat, treat this as N individual workflow
                failures and read their error_messages; the ceiling is not
-               implicated.
+               implicated — unless the workflows use batch HTTP
+               (`wit_http::fetch_all`), which the breaker does not instrument.
             3. If the herd signature IS present, lower
                SCHEDULER_STARTUP_MAX_CONCURRENT (default 4). Do NOT raise
                SCHEDULER_MAX_CONCURRENT_EXECUTIONS — that is the steady-state
@@ -431,6 +444,24 @@ groups:
       # than evaluating over an absent series. No absent() arm: absence here
       # means the worker is not being scraped at all, which is TalosWorkerDown's
       # job, not this rule's.
+      #
+      # WHAT THIS RULE IS BLIND TO, stated because the description tells an
+      # operator to reason from it: the breaker does not instrument
+      # `wit_http::fetch_all`. A module using BATCH http can neither trip it nor
+      # be refused by it, so both counters stay flat no matter how badly that
+      # module's upstream is failing. Latent today — no shipped template calls
+      # `fetch_all` — and argued at that function's `send()` in
+      # `talos-worker-runtime/src/host/http.rs`, including why closing it is a
+      # design change (a batch of N to one host is not N independent trials)
+      # rather than a line.
+      #
+      # `{{ $value }}` is rendered through `printf "%.0f"` everywhere it
+      # appears. `increase()` over a counter extrapolates and returns a FLOAT:
+      # a single block in a 15m window renders as
+      # "refused 1.6666666666666667 request(s)" un-formatted, which reads as a
+      # broken page rather than an incident. The extrapolation is also why the
+      # rounded number is an ESTIMATE of the count, not the count — the
+      # description says so.
       - alert: TalosWorkerCircuitBreakerBlocking
         expr: sum by (reason) (increase(talos_circuit_breaker_blocks_total[15m])) > 0
         for: 0m
@@ -438,50 +469,94 @@ groups:
           severity: warning
           category: reliability-degraded
         annotations:
-          summary: "Worker circuit breaker refused {{ $value }} request(s) ({{ $labels.reason }})"
+          summary: "Worker circuit breaker refused ~{{ $value | printf \"%.0f\" }} request(s) ({{ $labels.reason }})"
           description: |
-            The worker's per-host outbound-HTTP circuit breaker refused
-            {{ $value }} unit(s) of work in the last 15m with
-            reason="{{ $labels.reason }}". Each one is a request that was never
-            sent or a retry that never ran, so this is lost work, not a warning
-            about future work.
+            The worker's per-host outbound-HTTP circuit breaker refused about
+            {{ $value | printf "%.0f" }} unit(s) of work in the last 15m with
+            reason="{{ $labels.reason }}". ("About": `increase()` extrapolates
+            to the window edges, so treat the number as a magnitude and the
+            alert firing at all as the fact.) Every unit is a request that was
+            never sent or a job that failed with the breaker as its stated
+            reason — see the per-arm meanings below, which differ in whether
+            work was actually lost.
 
             What the reason arm means:
               cooldown            — the circuit for some host is OPEN and still
                                     inside its cooldown; the HTTP call was
-                                    rejected without leaving the box. The guest
-                                    sees `networkerror` and the execution's
-                                    error carries `[reason_class=circuit-open]`.
-              retry_gate          — a job or pipeline step declared a host whose
-                                    circuit was already open, so its in-worker
-                                    retries were skipped and it failed fast.
+                                    rejected without leaving the box. Lost work,
+                                    unambiguously.
+              half_open_exhausted — the circuit is under trial and its trial
+                                    tokens are spent, so this call was refused
+                                    to protect the trial. Expected in small
+                                    numbers during recovery; sustained means
+                                    either the trials keep failing or the
+                                    circuit is STRANDED — see the known defect
+                                    at the end of this description.
+              retry_gate          — a job or pipeline step failed while one of
+                                    its DECLARED hosts had an open circuit, so
+                                    the breaker supplied the failure reason and
+                                    skipped any remaining in-worker retries.
                                     This is the arm behind the controller-side
                                     text "circuit open for host X".
-              half_open_exhausted — the circuit is under trial and its trial
-                                    tokens are spent. Expected in small numbers
-                                    during recovery; sustained means the trials
-                                    keep failing.
+
+            Do NOT read retry_gate as "a retry was lost". The gate is evaluated
+            BEFORE the retry-budget test on both of its paths, so it also counts
+            jobs and steps that had NO retries configured — and zero retries is
+            the platform's documented default for state-changing and
+            governance-world modules, including both calendar nodes in the
+            2026-08-11 incident. For those the outcome was identical with and
+            without the gate; only the error TEXT changed. What the arm reliably
+            means is "this failure happened with the breaker already open for a
+            host it declared", which is what you want for attribution.
+
+            The two request-refusing arms are NOT distinguishable from the
+            execution record. `cooldown` and `half_open_exhausted` share one
+            emit site in the worker (`host/http.rs`), so both surface to the
+            guest as `networkerror` and both stamp the execution error with
+            `[reason_class=circuit-open]`. Only this metric's `reason` label
+            separates them — which is the whole reason the label exists. Do not
+            infer the arm from an execution's error text.
 
             What this number does NOT know: WHICH host, and WHY it was failing.
             The counters carry no host label on purpose — the host reaching the
             breaker derives from a guest-supplied URL bounded only by a module's
             own `allowed_hosts` (which may be `*`), so it is not a bounded label
-            source. The host is in the worker log, on every breaker transition.
+            source. The host is in the worker log, on every refused request.
 
             Also NOT knowable from here: whether the upstream is genuinely down.
             The breaker counts reqwest TRANSPORT errors only — an HTTP 401 or
             500 is a successful transport and does not trip it — so a trip means
             connect/DNS/TLS/reset failures, OR the worker's own client timeout
             (30s default), which a slow-but-alive upstream can produce.
+
+            KNOWN DEFECT that changes how you read a SUSTAINED
+            half_open_exhausted: the half-open state has no time bound, and
+            there are paths that spend a trial token without ever recording an
+            outcome (an unresolvable `vault://` header is the deterministic one;
+            task cancellation is the other). A host that leaks all its tokens is
+            stranded half-open with zero tokens PERMANENTLY — every later
+            request to it is refused, with no transport error and no state
+            change, until the worker process restarts. Steady
+            half_open_exhausted against a host you have independently confirmed
+            is HEALTHY is that condition, and restarting the worker is the only
+            current remedy. Inventoried in
+            `talos-worker-runtime/src/host/http.rs` at `fetch`'s
+            `allow_request`; fix deferred to its own change.
           action: |
             1. `sum(increase(talos_circuit_breaker_opens_total[30m])) by (transition)`
                — `opened` is a first trip, `reopened` means a host came back and
                immediately failed its trial again, i.e. a longer outage than the
                first open suggested.
-            2. Worker log, same window: "Circuit breaker opened" (gives the
-               host) and "outbound HTTP request failed (sanitized transport
-               detail)" (gives the transport cause). Container logs are lost on
-               recreate — pull them before restarting anything.
+            2. Worker log, same window. The line that fires on EVERY refused
+               request, in both request-refusing arms, and carries the host is
+               "Circuit breaker open - rejecting HTTP request". Use that one.
+               "Circuit breaker opened" marks the STATE TRANSITION, which can
+               predate the failure you are investigating by hours — on
+               2026-08-11 the circuit had been half-open for 22 of them — and
+               the half_open_exhausted arm logs nothing of its own at all. For
+               the transport cause, "outbound HTTP request failed (sanitized
+               transport detail)". Container logs are lost on recreate — pull
+               them before restarting anything.
             3. Confirm the upstream independently before tuning the breaker. Do
                NOT raise CIRCUIT_BREAKER_FAILURE_THRESHOLD to make the alert
                stop; that removes the protection, not the outage.

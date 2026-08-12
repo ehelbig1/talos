@@ -34,6 +34,26 @@ use std::time::{Duration, Instant};
 // exactly one process produces these series and there is no ambiguity about
 // which `job` label is authoritative.
 //
+// A THIRD dead breaker-observability surface exists and is NOT addressed here:
+// the Postgres table `circuit_breaker_metrics` (migration
+// `20260329000000_new_modules_tables.sql`, plus an index on
+// `(service_name, recorded_at)`). It is real, empty, and has no writer or
+// reader anywhere in the workspace. Left alone deliberately — dropping a table
+// is a migration, not an observability change — but recorded so the next person
+// who greps `circuit_breaker` and finds it does not mistake it for a data
+// source. All three surfaces failed the same way: something that LOOKS like it
+// holds breaker history and holds nothing.
+//
+// ## What these counters cannot see
+//
+// `wit_http::fetch_all` does not interact with the breaker at all — it neither
+// consults it nor records outcomes — so BOTH series are structurally blind to
+// batch HTTP. Latent today (no shipped module template calls it) and argued at
+// length at that function's `send()` in `host/http.rs`, including why extending
+// it is a design question rather than a line. Any runbook sentence of the form
+// "if these are flat, the breaker is not involved" must be read with that
+// exception attached; the alert description states it.
+//
 // ## Why the `prometheus` crate here and not OTEL like the rest of `metrics.rs`
 //
 // The worker's `/metrics` endpoint renders `prometheus::gather()` — the
@@ -51,7 +71,17 @@ use std::time::{Duration, Instant};
 // 2. **Not gated on `OTEL_METRICS_ENABLED`.** `RuntimeMetrics` is constructed
 //    only when that env is true (default FALSE). A fail-closed control that
 //    silently fails production jobs must not have its only signal behind an
-//    optional flag.
+//    optional flag. This is not hypothetical: `OTEL_METRICS_ENABLED` is set in
+//    `docker-compose.yml` (dev, default `true`) and NOWHERE in the Helm chart,
+//    so in a chart-deployed cluster it is unset and every `wasm_*` series is
+//    dark. The counters below are ungated precisely so they do not inherit
+//    that. NOTE the corollary for anyone citing the worker's existing
+//    `/metrics` surface as evidence: the "105 `wasm_*` series live" figure is a
+//    DEV-STACK observation and does not hold in production today. The argument
+//    it supports — that a scraped `/metrics` endpoint already exists, so no new
+//    worker→controller channel is needed — is unaffected, since the endpoint is
+//    served and scraped regardless of that flag. Filed as its own finding in
+//    `docs/backlog.md`; not fixed here.
 // 3. **A concrete child counter is a single atomic add.** The five label
 //    combinations below are resolved ONCE at init, so the increment on the
 //    breaker's path is `IntCounter::inc()` — no map lookup, no lock. See the
@@ -89,15 +119,34 @@ pub(crate) enum OpenTransition {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BlockReason {
     /// The circuit is `Open` and still inside its cooldown window; the HTTP
-    /// request was rejected without being sent (`host/http.rs`, surfaced to
-    /// the guest as `networkerror` with `reason_class=circuit-open`).
+    /// request was rejected without being sent.
+    ///
+    /// NOTE this and [`Self::HalfOpenExhausted`] are INDISTINGUISHABLE
+    /// downstream: `allow_request` returns `false` for both, and `host/http.rs`
+    /// has a single `emit_network_failure` behind that one `false`, so both
+    /// surface to the guest as `networkerror` and both stamp the execution
+    /// error with `reason_class=circuit-open`. This label is the only thing
+    /// that separates them — which is why it is a label and not a log line.
     Cooldown,
-    /// The circuit is `HalfOpen` and its trial-request tokens are spent.
+    /// The circuit is `HalfOpen` and its trial-request tokens are spent. Same
+    /// downstream signature as [`Self::Cooldown`]; see the note there.
     HalfOpenExhausted,
-    /// A job / pipeline-step retry was skipped because a declared host's
-    /// circuit was already `Open` (`runtime.rs::circuit_open_error`). No HTTP
-    /// request was attempted at all — this is the path whose controller-side
-    /// error text reads "circuit open for host X".
+    /// A job or pipeline step failed while one of its DECLARED hosts had an
+    /// open circuit, so the breaker supplied the failure reason and skipped any
+    /// remaining in-worker retries (`runtime.rs::circuit_open_error`). No HTTP
+    /// request was attempted — this is the path whose controller-side error
+    /// text reads "circuit open for host X".
+    ///
+    /// Do NOT read this as "a retry was skipped". Both call sites reach
+    /// `circuit_open_error` BEFORE any retry-budget test — `runtime.rs`'s
+    /// single-module site sits above `if attempt < retry_policy.max_attempts`,
+    /// and the pipeline site is reached when `step.max_retries == 0` because
+    /// `should_retry_pipeline_step` is guarded on `> 0`. Zero retries is the
+    /// platform's documented default for state-changing and governance-world
+    /// modules, so this arm routinely counts failures where no retry existed to
+    /// skip and the gate changed only the error TEXT. What it does reliably
+    /// mean is "this failure happened with the breaker already open for a host
+    /// the job declared", which is what it is worth counting for.
     RetryGate,
 }
 
@@ -191,15 +240,23 @@ pub fn seed_circuit_breaker_series() {
     LazyLock::force(&BREAKER_METRICS);
 }
 
-/// Count a retry / pipeline-step fast-fail caused by an already-open circuit.
+/// Count a job / pipeline-step fast-fail attributed to an already-open circuit.
 ///
 /// The single chokepoint is `runtime.rs::circuit_open_error`, through which
 /// both fast-fail return sites pass. This is a DISTINCT event from a rejected
 /// HTTP request (`BlockReason::Cooldown`): no request is attempted, and it is
 /// the path whose failure text reaches the controller as "circuit open for
 /// host X". Keeping the two apart is the difference between an operator
-/// knowing the breaker rejected a call and knowing it cancelled the retries
-/// that would have recovered it.
+/// knowing the breaker rejected a CALL and knowing it decided the outcome of a
+/// whole job.
+///
+/// See [`BlockReason::RetryGate`] for why this must not be described as "a
+/// retry that was skipped" — the gate is evaluated before the retry budget is
+/// consulted, so it also counts jobs that had no retries to skip.
+///
+/// Because the increment is here, only real refusals may call
+/// `circuit_open_error`. Anything wanting the message text uses
+/// `runtime::circuit_open_message`.
 pub(crate) fn record_retry_gate_block() {
     BREAKER_METRICS.record_block(BlockReason::RetryGate);
 }
@@ -435,6 +492,43 @@ impl HttpCircuitBreaker {
     /// Check if a request to the given host should be allowed.
     ///
     /// Returns `true` if the request should proceed, `false` if it should be rejected.
+    ///
+    /// # The 2026-08-11 11:35 stranding, and which way the causation runs
+    ///
+    /// Stated here because getting the direction wrong is what made the
+    /// incident hard to read, and the wrong direction was asserted once in the
+    /// change that added these counters.
+    ///
+    /// **Token EXHAUSTION caused the observed failure. The token LEAK is the
+    /// consequence, not the cause.** In order:
+    ///
+    /// ```text
+    /// 08-10 13:45:29  #634's startup herd trips www.googleapis.com   → Open
+    /// +30 s           → HalfOpen, 3 trial tokens (HalfOpen has NO time bound)
+    /// 08-11 11:12:09  pa-daily-brief spends 2, both succeed; 2 < 3 so the
+    ///                 circuit STAYS HalfOpen                         → 1 left
+    /// 08-11 11:35:10  cal_work + cal_personal fan out in parallel. cal_work
+    ///                 takes the LAST token; cal_personal is REFUSED
+    ///                 (`half_open_exhausted`) — this is the visible failure
+    /// 08-11 11:35:10.5288  cal_personal is cancelled before recording an
+    ///                 outcome, leaking its token                     → 0
+    /// … → www.googleapis.com stranded at HalfOpen-with-0-tokens until the
+    ///     23:06 container recreate cleared the process-local map.
+    /// ```
+    ///
+    /// So the leak explains the 11½ hours of stranding AFTER 11:35; it does not
+    /// explain 11:35 itself, which was simply the third token being spent.
+    ///
+    /// **This reconstruction is CONSISTENT with the evidence, not FORCED by
+    /// it.** The competing hypothesis — the host was already at 0 tokens from
+    /// an EARLIER leak, and both nodes were refused — is tilted against by
+    /// `execution_events`, which holds a `node_failed` for `cal_work` and none
+    /// for `cal_personal`: under the competing story both should have failed.
+    /// That is not conclusive. Sibling cancellation could have suppressed
+    /// `cal_personal`'s event, which would make an originally SYMMETRIC block
+    /// look asymmetric — the same cancellation the leak turns on. The two are
+    /// separable only by `talos_circuit_breaker_blocks_total{reason=...}`,
+    /// which is why it now exists.
     ///
     /// The decision is taken while the per-host DashMap entry is held; the
     /// metric is recorded AFTER that guard drops. Nothing was added inside the
@@ -898,24 +992,41 @@ mod tests {
     // Metric wiring
     // =======================================================================
 
-    /// Read one exported counter's value out of the rendered exposition, or 0
-    /// when the series is absent.
+    /// Read one exported counter's value out of the rendered exposition.
     ///
     /// Deliberately parses the RENDERED TEXT rather than reading the
     /// `IntCounter` handle: the handle would go up even if the collector had
     /// failed to register, which is the exact failure mode that leaves an
     /// operator with a silent metric. Only the exposition proves the value
     /// reaches a scrape.
+    ///
+    /// PANICS when the series is absent or unparseable, and that is the point.
+    /// This helper previously ended `.unwrap_or(0)` — the check-52 silent-
+    /// default shape, inside the guard for a check-58 defect. A missing series
+    /// is precisely the bug these tests exist to catch, and reading it as the
+    /// number zero is how the original defect presented in production. Every
+    /// caller seeds first (`seed_circuit_breaker_series` is idempotent), so
+    /// absence here means the registration broke, not that nothing has happened
+    /// yet.
     fn exported(metric: &str, label: &str, value: &str) -> u64 {
+        seed_circuit_breaker_series();
         let text = crate::metrics::get_prometheus_metrics();
-        let needle_a = format!("{metric}{{{label}=\"{value}\"");
-        text.lines()
-            .filter(|l| l.starts_with(&needle_a))
-            .filter_map(|l| l.rsplit(' ').next())
-            .filter_map(|v| v.parse::<f64>().ok())
-            .map(|v| v as u64)
-            .next()
-            .unwrap_or(0)
+        let needle = format!("{metric}{{{label}=\"{value}\"");
+        let line = text
+            .lines()
+            .find(|l| l.starts_with(&needle))
+            .unwrap_or_else(|| {
+                panic!(
+                    "series {needle}...}} is ABSENT from the rendered exposition — the \
+                     collector is not registered, so any alert over it is silent.\n{text}"
+                )
+            });
+        let raw = line.rsplit(' ').next().unwrap_or_else(|| {
+            panic!("exposition line for {needle}...}} has no value field: {line:?}")
+        });
+        raw.parse::<f64>()
+            .unwrap_or_else(|e| panic!("value {raw:?} on line {line:?} is unparseable: {e}"))
+            as u64
     }
 
     /// The whole point of the change: BOTH counters must move when the real
