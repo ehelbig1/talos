@@ -499,3 +499,95 @@ pre-publish gate) + the pre-push hook — so a release is always cut from an
 already-green commit without re-incurring CI image builds. `release.yml` is now
 dispatchable and actionlint-clean. Reversible: if releases later move back onto
 paid GHA, re-add a `ci` job + a `workflow_call:` trigger on `ci.yml`.
+
+---
+
+## Every `wasm_*` worker series is dark in production — `OTEL_METRICS_ENABLED` is set nowhere in the Helm chart
+
+**Added:** 2026-08-11. **Priority: MEDIUM** (observability gap, no correctness
+impact). Found while moving the circuit-breaker counters from the controller's
+registry into the worker (`talos-worker-runtime/src/circuit_breaker.rs`).
+
+**What.** `talos_worker_runtime::metrics::RuntimeMetrics` — the entire OTEL
+instrument set behind the worker's `wasm_*` series (executions, fuel, cache
+hits/misses, host-function latency, retries, quota, LLM tokens, …) — is
+constructed only when `OTEL_METRICS_ENABLED` is true, and the flag defaults to
+FALSE. It is set in exactly one place in the repo:
+
+```
+docker-compose.yml:775:      OTEL_METRICS_ENABLED: ${OTEL_METRICS_ENABLED:-true}
+```
+
+`grep -rn OTEL_METRICS_ENABLED deploy/` returns nothing. So on any
+chart-deployed cluster the flag is unset, `RuntimeMetrics` is never built, and
+every `wasm_*` series is absent from the worker's `/metrics` — while the
+endpoint itself is up, authenticated, and scraped, so `up{job="talos-worker"}`
+is 1 and nothing looks wrong.
+
+**Why it matters.** Two ways, and the second is worse than the first.
+
+1. Any alert or dashboard panel selecting on a `wasm_*` series is silent in
+   production. Structural-lint check 65(c) verifies those series are
+   REGISTERED in code, which they are — registration and emission are different
+   things, and no check covers the gap between them.
+2. It falsifies a specific piece of evidence that has been cited in review: the
+   "105 `wasm_*` series live today" observation used to argue that the worker
+   already has a scraped metrics surface is a DEV-STACK reading. The
+   architectural conclusion it supported still holds (the `/metrics` endpoint is
+   served and scraped whether or not the flag is set, so no new worker→
+   controller channel is warranted), but the number does not describe
+   production and should not be repeated as though it does.
+
+The circuit-breaker counters added on 2026-08-11 are deliberately NOT gated on
+this flag — they use the `prometheus` crate directly against the default
+registry — so they are unaffected. That is one of the three reasons recorded for
+choosing `prometheus` over OTEL there.
+
+**Why not done here.** Fixing it is a chart change (`worker.env` in
+`deploy/helm/talos/values.yaml` + the worker Deployment template), and it wants
+its own verification: turning the flag on in production starts emitting a
+metric set nobody has scraped there before, so the cardinality of the
+`function=` / `metric=` label sets should be sized against the normalizers in
+`talos-worker-runtime/src/metrics.rs` before it lands, not after.
+
+**Suggested shape.** Add `OTEL_METRICS_ENABLED` to the worker env in
+`values.yaml` (default `"true"`, overridable), render it in the worker
+Deployment, and add a check-65-style leg asserting that any `wasm_*` series an
+alert selects on is not gated behind an env the chart never sets — i.e. extend
+the existing registration check to also require the producer be reachable in a
+default chart render. Verify by scraping a deployed worker's `/metrics` (the
+worker's path — `/metrics/prometheus` is the CONTROLLER's) and counting `wasm_`
+families before and after.
+
+---
+
+## Drop the empty `circuit_breaker_metrics` table — a third dead breaker-observability surface
+
+**Added:** 2026-08-11. **Priority: LOW** (cleanup; no behaviour depends on it).
+
+**What.** `circuit_breaker_metrics` (created in
+`migrations/20260329000000_new_modules_tables.sql`, with
+`idx_circuit_breaker_service` on `(service_name, recorded_at)`) is a real,
+permanently empty table. `grep -rn circuit_breaker_metrics` over the workspace
+finds the migration, the baseline schema dump, and one RFC listing it among
+org-less tables — no writer, no reader, no repository method.
+
+**Why it matters.** It is the third thing in this codebase that looks like it
+holds circuit-breaker history and holds nothing. The other two were
+`talos_circuit_breaker_opens_total` and `_blocks_total`, registered on the
+controller's registry with zero increment sites — both fixed 2026-08-11 by moving
+the producer into the worker. Someone debugging a breaker incident who finds this
+table will spend time on it before concluding it is empty by construction rather
+than empty because nothing happened. That is the same false-negative-dressed-as-
+data shape, in Postgres instead of Prometheus.
+
+**Why not done here.** Dropping a table is a migration, and it did not belong in
+an observability change whose whole premise was landing a signal without a
+behaviour change. Structural-lint check 58 covers Prometheus metrics only; there
+is no equivalent for "table with no writer", and inventing one for a single
+instance is not warranted.
+
+**Suggested shape.** A `DROP TABLE IF EXISTS circuit_breaker_metrics;` migration
+(the index goes with it). Confirm the grep is still empty at the time of the drop.
+Note the header comment in `talos-worker-runtime/src/circuit_breaker.rs` points
+here; update it when this lands.

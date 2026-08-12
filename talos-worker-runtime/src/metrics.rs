@@ -913,6 +913,27 @@ impl Default for RuntimeMetrics {
 /// Initialize OpenTelemetry with Prometheus exporter
 /// This sets up the global meter provider with Prometheus metrics collection
 pub fn init_telemetry() -> Result<(), Box<dyn std::error::Error>> {
+    // The per-host outbound-HTTP circuit breaker publishes through the
+    // `prometheus` crate rather than OTEL (see the header comment in
+    // `circuit_breaker.rs` for the three reasons). It registers into the same
+    // default registry the exporter below writes to, so it lands on the same
+    // `/metrics` output. Forced here so an idle worker EXPORTS all five series
+    // at 0 instead of omitting them until the breaker first trips — an
+    // `increase(...) > 0` rule over an ABSENT series is silent on exactly the
+    // worker that has never been observed to fail.
+    //
+    // THIS RUNS FIRST, BEFORE THE `?` BELOW, AND THAT ORDER IS LOAD-BEARING.
+    // The exporter build is fallible and its failure is NON-FATAL: the worker's
+    // caller (`worker/src/main.rs`) logs a warning and continues serving. If
+    // the seed sat after the `?`, an exporter-build failure would leave
+    // `/metrics` up and scraped but WITHOUT these five series, and the alert
+    // built on them would go quiet with no other symptom — the same
+    // "observability coupled to an optional component" failure this metric's
+    // whole design argues against. Seeding only touches the default registry,
+    // which `get_prometheus_metrics` gathers directly and which exists whether
+    // or not OTEL initialises, so nothing here depends on the exporter.
+    crate::circuit_breaker::seed_circuit_breaker_series();
+
     // Create Prometheus exporter (version 0.17+ API)
     let registry = prometheus::default_registry();
     let exporter = opentelemetry_prometheus::exporter()

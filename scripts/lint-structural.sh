@@ -4017,9 +4017,36 @@ if [ -f "$METRICS_LIB" ]; then
     # burned down because an alert (TalosControllerHighErrorRate) was already
     # shipping against them and therefore could never fire. That is the
     # priority order for the rest of this list: a dead metric with NO alert is
-    # debt; a dead metric WITH an alert is a false assurance. Every remaining
-    # entry below has been checked against deploy/helm/talos/files/alerts.yaml
-    # and deploy/observability/*.json — none is referenced by an alert.
+    # debt; a dead metric WITH an alert is a false assurance.
+    #
+    # 2026-08-11: 12 → 10. `circuit_breaker_opens_total` +
+    # `circuit_breaker_blocks_total` were not burned down where they stood —
+    # they were DELETED from talos-metrics, because they were declared in the
+    # wrong process. The breaker they name is a per-process singleton in the
+    # WORKER (`talos-worker-runtime/src/circuit_breaker.rs`); no controller-side
+    # increment site could ever have existed. They are now produced there, under
+    # the same names, via the worker's already-scraped `/metrics`.
+    #
+    # THE CLAIM THAT USED TO SIT HERE, AND WHY IT IS NOW A CHECK. This comment
+    # asserted "Every remaining entry below has been checked against
+    # deploy/helm/talos/files/alerts.yaml and deploy/observability/*.json — none
+    # is referenced by an alert." That was unenforced prose, i.e. exactly the
+    # class this arc keeps finding: a documented invariant nothing verifies.
+    # It is now verified below, on every run, over a file set derived from the
+    # tree rather than hardcoded.
+    #
+    # STATE ITS LIMIT RATHER THAN IMPLY MORE (overstating a lint is check 58's
+    # own lesson one level up): the check matches the LITERAL exported series
+    # name. It cannot see a runbook that names the underlying MECHANISM instead
+    # of the metric — and that is not hypothetical, it is precisely how the two
+    # circuit-breaker entries survived here. `alerts.yaml` told operators the
+    # per-host circuit breaker was the "first hypothesis" for a failed dispatch
+    # for months without ever writing `talos_circuit_breaker_opens_total`, so
+    # the literal claim above stayed TRUE while the substance of it — "no
+    # operator is being sent to a signal that cannot exist" — was false. A grep
+    # cannot close that gap; only reading the runbook can. What the check does
+    # close is the strictly easier direction: someone writing an alert or a
+    # dashboard panel directly on a baselined metric.
     BASELINE_DEAD="$(printf '%s\n' \
         webhook_requests_total \
         webhook_request_duration_seconds \
@@ -4031,8 +4058,6 @@ if [ -f "$METRICS_LIB" ]; then
         rate_limit_hits_total \
         cache_hits_total \
         cache_misses_total \
-        circuit_breaker_opens_total \
-        circuit_breaker_blocks_total \
         | sort)"
     DEAD_SORTED="$(printf '%s' "$DEAD_METRICS" | grep -vE '^$' | sort || true)"
     # NEW dead = flagged now but not in the baseline → hard fail.
@@ -4056,6 +4081,94 @@ if [ -f "$METRICS_LIB" ]; then
         yellow "  → the burn-down list must shrink, never rot: delete these names from"
         yellow "    BASELINE_DEAD in scripts/lint-structural.sh."
         DEAD58_FAIL=1
+    fi
+    # ── 58(b): no baselined dead metric may be referenced by an alert rule or
+    # a dashboard. Enforces what the comment above BASELINE_DEAD used to merely
+    # assert. A dead metric with no alert is debt you can schedule; a dead
+    # metric an alert or a panel selects on is a detector that can never fire
+    # and a panel that reads "healthy" for a signal nobody collects. Baselining
+    # is not an option for those — wire it or delete it.
+    #
+    # File set is DERIVED (a hardcoded list rots — check 65's own lesson): the
+    # canonical chart rule file, every mounted dev rule file, and every
+    # dashboard JSON under the two observability trees.
+    #
+    # Matched as `talos_<field>`, the exported name — TalosMetrics registers
+    # every field under exactly that spelling. The bare field name is NOT used
+    # as the needle: `cache_hits_total` would match the worker's unrelated
+    # `wasm_cache_hits_total` and fail this check on a false positive.
+    #
+    # WHAT THIS ESTABLISHES, stated precisely rather than aspirationally
+    # (overstating a lint is check 58's own lesson one level up). The needle is
+    # `grep -l` over whole FILES, so what it proves is that the exported name
+    # appears as TEXT in an alert-rule or dashboard file — NOT that an `expr:`
+    # or a panel target selects on it. A bare YAML COMMENT naming a baselined
+    # metric fails this check (mutation-proved 2026-08-11). That is the safe
+    # direction and it is left as-is: a metric worth writing down next to the
+    # alerts is a metric worth wiring or deleting, and narrowing the match to
+    # `expr:` would reintroduce the "technically true, substantively false"
+    # shape this check exists to kill. The failure text below says "named in"
+    # rather than "referenced by" so it matches what was actually found.
+    #
+    # THREE FURTHER LIMITS:
+    #
+    #  (i) The DIRECTORIES are hardcoded even though the file enumeration
+    #      inside them is globbed. Renaming `observability/rules/` — or moving
+    #      `deploy/helm/talos/files/alerts.yaml` — blinds this check to
+    #      everything under it, exactly the way check 65 documents about its own
+    #      `$PROM_CFG`. Deriving them from the compose mounts is the real fix
+    #      and is not done here.
+    #
+    # (ii) The vacuity guard below fires only when EVERY source vanishes
+    #      (`${#B58_REF_FILES[@]}` -eq 0). If ONE of the three sources moves,
+    #      the array is still non-empty, the check reports success, and that
+    #      source is silently unscanned. Consequence of (i), and the reason (i)
+    #      matters more than it looks.
+    #
+    #(iii) `deploy/observability/alerts.yaml` is a symlink to the chart file,
+    #      and it is NOT scanned — not even once, let alone "twice" as this
+    #      comment previously claimed. The `find` over that tree is
+    #      `-type f -name '*.json'`: the name does not match, and `-type f` is
+    #      false for a symlink without `-L` anyway. Harmless (the chart file is
+    #      added explicitly on its own line), but the claim was wrong and a
+    #      wrong claim about coverage is the defect class this check polices.
+    B58_REF_FILES=()
+    while IFS= read -r f; do
+        [ -n "$f" ] && B58_REF_FILES+=("$f")
+    done < <(
+        {
+            [ -f "$ROOT/deploy/helm/talos/files/alerts.yaml" ] \
+                && echo "$ROOT/deploy/helm/talos/files/alerts.yaml"
+            find "$ROOT/observability/rules" -type f \( -name '*.yml' -o -name '*.yaml' \) 2>/dev/null
+            find "$ROOT/deploy/observability" "$ROOT/observability/grafana" \
+                -type f -name '*.json' 2>/dev/null
+        } | sort -u
+    )
+    if [ "${#B58_REF_FILES[@]}" -eq 0 ]; then
+        red "✗ check 58(b): no alert-rule or dashboard files found to check the burn-down"
+        yellow "  → the baseline's 'not referenced by an alert' guarantee would be vacuous."
+        yellow "    Did deploy/helm/talos/files/alerts.yaml or observability/rules/ move?"
+        DEAD58_FAIL=1
+    else
+        BASELINE_REFERENCED=""
+        for name in $BASELINE_DEAD; do
+            [ -n "$name" ] || continue
+            hits="$(grep -l -- "talos_${name}" "${B58_REF_FILES[@]}" 2>/dev/null | tr '\n' ' ' || true)"
+            [ -n "$hits" ] && BASELINE_REFERENCED="${BASELINE_REFERENCED}    talos_${name} → ${hits}
+"
+        done
+        if [ -n "$BASELINE_REFERENCED" ]; then
+            red "✗ baselined DEAD metric(s) are NAMED in an alert-rule or dashboard file (check 58):"
+            printf '%s' "$BASELINE_REFERENCED"
+            yellow "  → the match is file-global text, so this is 'the name appears in that file',"
+            yellow "    which includes a bare comment — not proof that an expr or panel selects on"
+            yellow "    it. Check the hit before acting. If a rule or panel DOES select on it, it"
+            yellow "    can never fire or can only ever read 0: wire the metric (add a real"
+            yellow "    increment at its chokepoint) and remove it from BASELINE_DEAD. Baselining a"
+            yellow "    metric something already alerts on converts observability debt into a false"
+            yellow "    assurance. If it is only a comment, say so in the comment or drop the name."
+            DEAD58_FAIL=1
+        fi
     fi
     if [ "$DEAD58_FAIL" -gt 0 ]; then
         EXIT_CODE=1

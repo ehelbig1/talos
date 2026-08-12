@@ -496,9 +496,19 @@ pub struct TalosMetrics {
     pub cache_hits_total: CounterVec,
     pub cache_misses_total: CounterVec,
 
-    // Circuit breaker metrics
-    pub circuit_breaker_opens_total: Counter,
-    pub circuit_breaker_blocks_total: Counter,
+    // NOTE — no circuit-breaker metrics here, deliberately.
+    //
+    // `talos_circuit_breaker_opens_total` / `_blocks_total` were declared and
+    // registered on THIS registry from the day this crate was written, and
+    // could never have been incremented: the breaker they name is a
+    // per-process `OnceLock<HttpCircuitBreaker>` inside `talos-worker-runtime`,
+    // running in the WORKER. Both exported a flat 0 forever while the breaker
+    // was, in fact, failing scheduled workflows. They now live with their
+    // producer (`talos-worker-runtime/src/circuit_breaker.rs`) and are exported
+    // under the SAME names by the worker's already-scraped `/metrics`
+    // (`job="talos-worker"`). Do not re-declare them here: two producers for
+    // one series name, one of them permanently zero, is the false-negative
+    // this move removed.
 
     // DLQ metrics
     pub dlq_entries_total: Counter,
@@ -1057,18 +1067,8 @@ impl TalosMetrics {
         )?;
         registry.register(Box::new(cache_misses_total.clone()))?;
 
-        // Circuit breaker metrics
-        let circuit_breaker_opens_total = Counter::new(
-            "talos_circuit_breaker_opens_total",
-            "Total number of circuit breaker opens",
-        )?;
-        registry.register(Box::new(circuit_breaker_opens_total.clone()))?;
-
-        let circuit_breaker_blocks_total = Counter::new(
-            "talos_circuit_breaker_blocks_total",
-            "Total number of requests blocked by circuit breaker",
-        )?;
-        registry.register(Box::new(circuit_breaker_blocks_total.clone()))?;
+        // (circuit-breaker metrics moved to talos-worker-runtime — see the
+        // note on the struct definition above.)
 
         // DLQ metrics
         let dlq_entries_total = Counter::new(
@@ -1276,8 +1276,6 @@ impl TalosMetrics {
             rate_limit_hits_total,
             cache_hits_total,
             cache_misses_total,
-            circuit_breaker_opens_total,
-            circuit_breaker_blocks_total,
             dlq_entries_total,
             dlq_drops_total,
             dlq_db_errors_total,

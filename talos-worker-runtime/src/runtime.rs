@@ -1637,8 +1637,32 @@ pub(crate) fn should_retry_pipeline_step(
 /// controller-side `talos_retry_intelligence::classify_error` both treat
 /// "circuit open" as non-transient, so the fast-fail does not itself
 /// trigger another round of retries.
+///
+/// This is also the single chokepoint for the `retry_gate` arm of
+/// `talos_circuit_breaker_blocks_total` — both fast-fail return sites (the
+/// single-module retry loop and the pipeline-step loop) construct their error
+/// here, so counting here cannot drift from the behaviour it measures the way
+/// two independent call-site increments would.
+///
+/// Because the increment lives here, this function must be called ONLY on a
+/// real refusal. Anything that merely wants the message text — a test
+/// asserting the wording, a classifier fixture — must use
+/// [`circuit_open_message`], which is pure. Two unit tests previously called
+/// this constructor for its string and silently incremented `retry_gate`,
+/// making the counter count error CONSTRUCTION rather than the refusals it is
+/// named for.
 pub(crate) fn circuit_open_error(host: &str) -> anyhow::Error {
-    anyhow::anyhow!(
+    crate::circuit_breaker::record_retry_gate_block();
+    anyhow::anyhow!("{}", circuit_open_message(host))
+}
+
+/// The message text of [`circuit_open_error`], with NO metric side effect.
+///
+/// Split out so the wording can be asserted without inflating
+/// `talos_circuit_breaker_blocks_total{reason="retry_gate"}`. Callers that are
+/// actually refusing work want `circuit_open_error`.
+pub(crate) fn circuit_open_message(host: &str) -> String {
+    format!(
         "circuit open for host {host}: cooling down after repeated failures — \
          skipping retries until the host recovers"
     )
@@ -5361,10 +5385,13 @@ mod pipeline_step_retry_tests {
         let msg = r#"Component returned error: fetch: Error { code: 2, name: "networkerror", message: "" } [reason_class=circuit-open]"#;
         assert!(msg.contains("networkerror"), "test premise");
         assert!(!is_transient_error_text(msg));
-        // The fixed fast-fail message shape too.
-        assert!(!is_transient_error_text(
-            &super::circuit_open_error("gmail.googleapis.com").to_string()
-        ));
+        // The fixed fast-fail message shape too. `circuit_open_message`, not
+        // `circuit_open_error` — the latter increments the `retry_gate` arm of
+        // `talos_circuit_breaker_blocks_total`, and a test asserting wording is
+        // not a refusal.
+        assert!(!is_transient_error_text(&super::circuit_open_message(
+            "gmail.googleapis.com"
+        )));
     }
 
     /// Every deterministic class carved out of the transient-by-default
@@ -5646,8 +5673,11 @@ mod pipeline_step_retry_tests {
 
     #[test]
     fn circuit_open_error_is_host_only_and_non_transient() {
-        let err = circuit_open_error("gmail.googleapis.com");
-        let msg = err.to_string();
+        // `circuit_open_message`, not `circuit_open_error`: the constructor
+        // increments the `retry_gate` block counter, and this test refuses
+        // nothing. `production_path_moves_both_counters` in `circuit_breaker`
+        // is the test that deliberately drives the counting path.
+        let msg = circuit_open_message("gmail.googleapis.com");
         // Names the host (breaker key) …
         assert!(msg.contains("gmail.googleapis.com"));
         // … carries NO transient token, so neither the worker gate nor
