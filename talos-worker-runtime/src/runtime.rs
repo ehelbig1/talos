@@ -1637,7 +1637,14 @@ pub(crate) fn should_retry_pipeline_step(
 /// controller-side `talos_retry_intelligence::classify_error` both treat
 /// "circuit open" as non-transient, so the fast-fail does not itself
 /// trigger another round of retries.
+///
+/// This is also the single chokepoint for the `retry_gate` arm of
+/// `talos_circuit_breaker_blocks_total` — both fast-fail return sites (the
+/// single-module retry loop and the pipeline-step loop) construct their error
+/// here, so counting here cannot drift from the behaviour it measures the way
+/// two independent call-site increments would.
 pub(crate) fn circuit_open_error(host: &str) -> anyhow::Error {
+    crate::circuit_breaker::record_retry_gate_block();
     anyhow::anyhow!(
         "circuit open for host {host}: cooling down after repeated failures — \
          skipping retries until the host recovers"

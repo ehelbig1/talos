@@ -874,13 +874,21 @@ tests:
                 Confirm the cause below rather than assuming the ceiling failed.
 
                 outcome="failed": first hypothesis is the worker's per-host circuit
-                breaker opening — grep the worker log for "Circuit breaker opened"
-                and "outbound HTTP request failed (sanitized transport detail)".
-                The breaker lives in the WORKER process and is invisible to the
-                controller, so the controller-side error text ("circuit open for
+                breaker opening. Check it directly:
+                `sum(increase(talos_circuit_breaker_opens_total[30m]))` and
+                `sum by (reason) (increase(talos_circuit_breaker_blocks_total[30m]))`.
+                Those series are produced by the WORKER (`job="talos-worker"`) —
+                the breaker is a per-process singleton there and the controller
+                cannot see it, so the controller-side error text ("circuit open for
                 host X") is a CONSEQUENCE reported minutes into the incident, not
-                its cause. If the worker log shows no breaker and no transport
-                errors, this is not a herd — read the individual error_messages.
+                its cause. `blocks{reason="cooldown"}` = HTTP requests rejected
+                without being sent; `blocks{reason="retry_gate"}` = job retries
+                skipped, which is the arm that produces that controller-side text.
+                The counters deliberately carry NO host label, so for WHICH host
+                grep the worker log for "Circuit breaker opened" and "outbound HTTP
+                request failed (sanitized transport detail)". If opens and blocks
+                are both flat and the worker log shows no transport errors, this is
+                not a herd — read the individual error_messages.
 
                 outcome="skipped": runs were refused for CAPACITY — the
                 per-workflow concurrency cap, or an actor's per-minute execution
@@ -892,9 +900,11 @@ tests:
                    controller log line `event_kind="scheduler_startup_backlog"`,
                    which records how many schedules the boot backlog contained. The
                    two should agree — every terminal path is counted.
-                2. Check the worker log for the breaker signature above. If it is
-                   absent, treat this as N individual workflow failures and read
-                   their error_messages; the ceiling is not implicated.
+                2. Check `talos_circuit_breaker_opens_total` /
+                   `talos_circuit_breaker_blocks_total` (and the worker log for the
+                   host). If both are flat, treat this as N individual workflow
+                   failures and read their error_messages; the ceiling is not
+                   implicated.
                 3. If the herd signature IS present, lower
                    SCHEDULER_STARTUP_MAX_CONCURRENT (default 4). Do NOT raise
                    SCHEDULER_MAX_CONCURRENT_EXECUTIONS — that is the steady-state
@@ -936,13 +946,21 @@ tests:
                 Confirm the cause below rather than assuming the ceiling failed.
 
                 outcome="failed": first hypothesis is the worker's per-host circuit
-                breaker opening — grep the worker log for "Circuit breaker opened"
-                and "outbound HTTP request failed (sanitized transport detail)".
-                The breaker lives in the WORKER process and is invisible to the
-                controller, so the controller-side error text ("circuit open for
+                breaker opening. Check it directly:
+                `sum(increase(talos_circuit_breaker_opens_total[30m]))` and
+                `sum by (reason) (increase(talos_circuit_breaker_blocks_total[30m]))`.
+                Those series are produced by the WORKER (`job="talos-worker"`) —
+                the breaker is a per-process singleton there and the controller
+                cannot see it, so the controller-side error text ("circuit open for
                 host X") is a CONSEQUENCE reported minutes into the incident, not
-                its cause. If the worker log shows no breaker and no transport
-                errors, this is not a herd — read the individual error_messages.
+                its cause. `blocks{reason="cooldown"}` = HTTP requests rejected
+                without being sent; `blocks{reason="retry_gate"}` = job retries
+                skipped, which is the arm that produces that controller-side text.
+                The counters deliberately carry NO host label, so for WHICH host
+                grep the worker log for "Circuit breaker opened" and "outbound HTTP
+                request failed (sanitized transport detail)". If opens and blocks
+                are both flat and the worker log shows no transport errors, this is
+                not a herd — read the individual error_messages.
 
                 outcome="skipped": runs were refused for CAPACITY — the
                 per-workflow concurrency cap, or an actor's per-minute execution
@@ -954,9 +972,11 @@ tests:
                    controller log line `event_kind="scheduler_startup_backlog"`,
                    which records how many schedules the boot backlog contained. The
                    two should agree — every terminal path is counted.
-                2. Check the worker log for the breaker signature above. If it is
-                   absent, treat this as N individual workflow failures and read
-                   their error_messages; the ceiling is not implicated.
+                2. Check `talos_circuit_breaker_opens_total` /
+                   `talos_circuit_breaker_blocks_total` (and the worker log for the
+                   host). If both are flat, treat this as N individual workflow
+                   failures and read their error_messages; the ceiling is not
+                   implicated.
                 3. If the herd signature IS present, lower
                    SCHEDULER_STARTUP_MAX_CONCURRENT (default 4). Do NOT raise
                    SCHEDULER_MAX_CONCURRENT_EXECUTIONS — that is the steady-state
@@ -1216,4 +1236,248 @@ tests:
       # Republished at 0 from t=40m — clears immediately, no `for:` on recovery.
       - eval_time: 45m
         alertname: TalosCatalogTemplateNeverCompiled
+        exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # TalosWorkerCircuitBreakerBlocking — the detector for a signal that did
+  # not exist until 2026-08-11.
+  #
+  # `talos_circuit_breaker_blocks_total` was registered on the CONTROLLER's
+  # registry with zero increment sites anywhere in the workspace, naming a
+  # breaker that lives in the WORKER process. It exported a flat 0 forever,
+  # including through two `pa-meeting-prep` failures it had itself caused.
+  # The producer moved to the worker; this is the consumer side.
+  #
+  # The `0+1x60` shape (one block per minute, perfectly linear) is chosen so
+  # `increase(...[15m])` renders as EXACTLY 15 — the same trick the
+  # StartupHerd fixtures above use. A step function would render an
+  # extrapolated fraction and make the annotation assertion unmaintainable.
+  # ══════════════════════════════════════════════════════════════════════
+
+  # The pre-seeded, never-tripped worker. This is the state EVERY healthy
+  # worker is in, so it is the case the rule must be silent on — and it is
+  # the case that only exists at all because the worker seeds the series at
+  # 0 (`circuit_breaker.rs::seed_circuit_breaker_series`). Present-and-zero,
+  # not absent.
+  - interval: 1m
+    name: seeded at zero, breaker never tripped — silent
+    input_series:
+      - series: 'talos_circuit_breaker_blocks_total{reason="cooldown",job="talos-worker",instance="worker:9090"}'
+        values: "0+0x60"
+      - series: 'talos_circuit_breaker_blocks_total{reason="retry_gate",job="talos-worker",instance="worker:9090"}'
+        values: "0+0x60"
+      - series: 'talos_circuit_breaker_blocks_total{reason="half_open_exhausted",job="talos-worker",instance="worker:9090"}'
+        values: "0+0x60"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: TalosWorkerCircuitBreakerBlocking
+        exp_alerts: []
+      - eval_time: 55m
+        alertname: TalosWorkerCircuitBreakerBlocking
+        exp_alerts: []
+
+  - interval: 1m
+    name: cooldown blocks fire
+    input_series:
+      - series: 'talos_circuit_breaker_blocks_total{reason="cooldown",job="talos-worker",instance="worker:9090"}'
+        values: "0+1x60"
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: TalosWorkerCircuitBreakerBlocking
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: reliability-degraded
+              reason: cooldown
+            exp_annotations:
+              summary: "Worker circuit breaker refused 15 request(s) (cooldown)"
+              description: |
+                The worker's per-host outbound-HTTP circuit breaker refused
+                15 unit(s) of work in the last 15m with
+                reason="cooldown". Each one is a request that was never
+                sent or a retry that never ran, so this is lost work, not a warning
+                about future work.
+
+                What the reason arm means:
+                  cooldown            — the circuit for some host is OPEN and still
+                                        inside its cooldown; the HTTP call was
+                                        rejected without leaving the box. The guest
+                                        sees `networkerror` and the execution's
+                                        error carries `[reason_class=circuit-open]`.
+                  retry_gate          — a job or pipeline step declared a host whose
+                                        circuit was already open, so its in-worker
+                                        retries were skipped and it failed fast.
+                                        This is the arm behind the controller-side
+                                        text "circuit open for host X".
+                  half_open_exhausted — the circuit is under trial and its trial
+                                        tokens are spent. Expected in small numbers
+                                        during recovery; sustained means the trials
+                                        keep failing.
+
+                What this number does NOT know: WHICH host, and WHY it was failing.
+                The counters carry no host label on purpose — the host reaching the
+                breaker derives from a guest-supplied URL bounded only by a module's
+                own `allowed_hosts` (which may be `*`), so it is not a bounded label
+                source. The host is in the worker log, on every breaker transition.
+
+                Also NOT knowable from here: whether the upstream is genuinely down.
+                The breaker counts reqwest TRANSPORT errors only — an HTTP 401 or
+                500 is a successful transport and does not trip it — so a trip means
+                connect/DNS/TLS/reset failures, OR the worker's own client timeout
+                (30s default), which a slow-but-alive upstream can produce.
+              action: |
+                1. `sum(increase(talos_circuit_breaker_opens_total[30m])) by (transition)`
+                   — `opened` is a first trip, `reopened` means a host came back and
+                   immediately failed its trial again, i.e. a longer outage than the
+                   first open suggested.
+                2. Worker log, same window: "Circuit breaker opened" (gives the
+                   host) and "outbound HTTP request failed (sanitized transport
+                   detail)" (gives the transport cause). Container logs are lost on
+                   recreate — pull them before restarting anything.
+                3. Confirm the upstream independently before tuning the breaker. Do
+                   NOT raise CIRCUIT_BREAKER_FAILURE_THRESHOLD to make the alert
+                   stop; that removes the protection, not the outage.
+                4. If the trips cluster at controller boot, this is the startup herd
+                   — see TalosSchedulerStartupHerdNotAbsorbed and lower
+                   SCHEDULER_STARTUP_MAX_CONCURRENT rather than touching the breaker.
+
+  # The retry-gate arm reaches the same alert on its OWN label. This is the
+  # arm the 2026-08-10 pa-meeting-prep failure took (job retries skipped,
+  # controller-side text "circuit open for host www.googleapis.com"), and
+  # 08-11 took the cooldown arm — two incidents, two arms, and an operator
+  # who cannot tell them apart is left where they started.
+  - interval: 1m
+    name: retry-gate blocks fire on their own label, alongside cooldown
+    input_series:
+      - series: 'talos_circuit_breaker_blocks_total{reason="cooldown",job="talos-worker",instance="worker:9090"}'
+        values: "0+1x60"
+      - series: 'talos_circuit_breaker_blocks_total{reason="retry_gate",job="talos-worker",instance="worker:9090"}'
+        values: "0+1x60"
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: TalosWorkerCircuitBreakerBlocking
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: reliability-degraded
+              reason: cooldown
+            exp_annotations:
+              summary: "Worker circuit breaker refused 15 request(s) (cooldown)"
+              description: |
+                The worker's per-host outbound-HTTP circuit breaker refused
+                15 unit(s) of work in the last 15m with
+                reason="cooldown". Each one is a request that was never
+                sent or a retry that never ran, so this is lost work, not a warning
+                about future work.
+
+                What the reason arm means:
+                  cooldown            — the circuit for some host is OPEN and still
+                                        inside its cooldown; the HTTP call was
+                                        rejected without leaving the box. The guest
+                                        sees `networkerror` and the execution's
+                                        error carries `[reason_class=circuit-open]`.
+                  retry_gate          — a job or pipeline step declared a host whose
+                                        circuit was already open, so its in-worker
+                                        retries were skipped and it failed fast.
+                                        This is the arm behind the controller-side
+                                        text "circuit open for host X".
+                  half_open_exhausted — the circuit is under trial and its trial
+                                        tokens are spent. Expected in small numbers
+                                        during recovery; sustained means the trials
+                                        keep failing.
+
+                What this number does NOT know: WHICH host, and WHY it was failing.
+                The counters carry no host label on purpose — the host reaching the
+                breaker derives from a guest-supplied URL bounded only by a module's
+                own `allowed_hosts` (which may be `*`), so it is not a bounded label
+                source. The host is in the worker log, on every breaker transition.
+
+                Also NOT knowable from here: whether the upstream is genuinely down.
+                The breaker counts reqwest TRANSPORT errors only — an HTTP 401 or
+                500 is a successful transport and does not trip it — so a trip means
+                connect/DNS/TLS/reset failures, OR the worker's own client timeout
+                (30s default), which a slow-but-alive upstream can produce.
+              action: |
+                1. `sum(increase(talos_circuit_breaker_opens_total[30m])) by (transition)`
+                   — `opened` is a first trip, `reopened` means a host came back and
+                   immediately failed its trial again, i.e. a longer outage than the
+                   first open suggested.
+                2. Worker log, same window: "Circuit breaker opened" (gives the
+                   host) and "outbound HTTP request failed (sanitized transport
+                   detail)" (gives the transport cause). Container logs are lost on
+                   recreate — pull them before restarting anything.
+                3. Confirm the upstream independently before tuning the breaker. Do
+                   NOT raise CIRCUIT_BREAKER_FAILURE_THRESHOLD to make the alert
+                   stop; that removes the protection, not the outage.
+                4. If the trips cluster at controller boot, this is the startup herd
+                   — see TalosSchedulerStartupHerdNotAbsorbed and lower
+                   SCHEDULER_STARTUP_MAX_CONCURRENT rather than touching the breaker.
+          - exp_labels:
+              severity: warning
+              category: reliability-degraded
+              reason: retry_gate
+            exp_annotations:
+              summary: "Worker circuit breaker refused 15 request(s) (retry_gate)"
+              description: |
+                The worker's per-host outbound-HTTP circuit breaker refused
+                15 unit(s) of work in the last 15m with
+                reason="retry_gate". Each one is a request that was never
+                sent or a retry that never ran, so this is lost work, not a warning
+                about future work.
+
+                What the reason arm means:
+                  cooldown            — the circuit for some host is OPEN and still
+                                        inside its cooldown; the HTTP call was
+                                        rejected without leaving the box. The guest
+                                        sees `networkerror` and the execution's
+                                        error carries `[reason_class=circuit-open]`.
+                  retry_gate          — a job or pipeline step declared a host whose
+                                        circuit was already open, so its in-worker
+                                        retries were skipped and it failed fast.
+                                        This is the arm behind the controller-side
+                                        text "circuit open for host X".
+                  half_open_exhausted — the circuit is under trial and its trial
+                                        tokens are spent. Expected in small numbers
+                                        during recovery; sustained means the trials
+                                        keep failing.
+
+                What this number does NOT know: WHICH host, and WHY it was failing.
+                The counters carry no host label on purpose — the host reaching the
+                breaker derives from a guest-supplied URL bounded only by a module's
+                own `allowed_hosts` (which may be `*`), so it is not a bounded label
+                source. The host is in the worker log, on every breaker transition.
+
+                Also NOT knowable from here: whether the upstream is genuinely down.
+                The breaker counts reqwest TRANSPORT errors only — an HTTP 401 or
+                500 is a successful transport and does not trip it — so a trip means
+                connect/DNS/TLS/reset failures, OR the worker's own client timeout
+                (30s default), which a slow-but-alive upstream can produce.
+              action: |
+                1. `sum(increase(talos_circuit_breaker_opens_total[30m])) by (transition)`
+                   — `opened` is a first trip, `reopened` means a host came back and
+                   immediately failed its trial again, i.e. a longer outage than the
+                   first open suggested.
+                2. Worker log, same window: "Circuit breaker opened" (gives the
+                   host) and "outbound HTTP request failed (sanitized transport
+                   detail)" (gives the transport cause). Container logs are lost on
+                   recreate — pull them before restarting anything.
+                3. Confirm the upstream independently before tuning the breaker. Do
+                   NOT raise CIRCUIT_BREAKER_FAILURE_THRESHOLD to make the alert
+                   stop; that removes the protection, not the outage.
+                4. If the trips cluster at controller boot, this is the startup herd
+                   — see TalosSchedulerStartupHerdNotAbsorbed and lower
+                   SCHEDULER_STARTUP_MAX_CONCURRENT rather than touching the breaker.
+
+  # Clearing. The breaker stops refusing work at t=20m; once that leaves the
+  # 15m window the alert goes inactive on its own, with no `for:` to unwind.
+  # An alert that fires on a real incident but never clears is the same
+  # defect as one that never fires — it just costs the operator later.
+  - interval: 1m
+    name: blocking stops — alert clears once the window passes
+    input_series:
+      - series: 'talos_circuit_breaker_blocks_total{reason="cooldown",job="talos-worker",instance="worker:9090"}'
+        values: "0+1x20 20+0x40"
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: TalosWorkerCircuitBreakerBlocking
         exp_alerts: []

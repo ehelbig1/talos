@@ -926,6 +926,16 @@ pub fn init_telemetry() -> Result<(), Box<dyn std::error::Error>> {
 
     opentelemetry::global::set_meter_provider(provider);
 
+    // The per-host outbound-HTTP circuit breaker publishes through the
+    // `prometheus` crate rather than OTEL (see the header comment in
+    // `circuit_breaker.rs` for the three reasons). It registers into the same
+    // default registry this exporter writes to, so it lands on the same
+    // `/metrics` output. Forced here so an idle worker EXPORTS all five series
+    // at 0 instead of omitting them until the breaker first trips — an
+    // `increase(...) > 0` rule over an absent series is silent on exactly the
+    // worker that has never been observed to fail.
+    crate::circuit_breaker::seed_circuit_breaker_series();
+
     println!("[METRICS] OpenTelemetry initialized with Prometheus exporter");
     println!("[METRICS] Metrics will be available at /metrics endpoint");
     Ok(())

@@ -6,8 +6,203 @@
 
 use dashmap::DashMap;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+// ===========================================================================
+// Prometheus counters — the breaker's only externally observable signal
+// ===========================================================================
+//
+// ## Why these live HERE, in the worker, and not in `talos-metrics`
+//
+// `talos_circuit_breaker_opens_total` / `_blocks_total` were declared,
+// constructed and registered in `talos-metrics` — the CONTROLLER's registry —
+// from the day that crate was written, with ZERO increment sites anywhere in
+// the workspace. They could not have had one: this breaker is a per-PROCESS
+// `OnceLock` singleton living in the worker, and no controller-side code path
+// observes it. Both series exported a flat 0 forever, on a platform where the
+// breaker demonstrably opened (two `pa-meeting-prep` scheduled runs failed on
+// it on 2026-08-10 and 2026-08-11, and 6 of the 8 failures in the #634 startup
+// herd were the same breaker). An operator who queried the obvious metric name
+// got `0` and would have concluded the breaker was not involved — a false
+// negative dressed as data, which is worse than no metric at all.
+//
+// The fix keeps the NAMES (so the name an operator would guess is the name
+// that carries the signal) and moves the producer to the process that owns the
+// truth. The controller-side declarations are deleted in the same change, so
+// exactly one process produces these series and there is no ambiguity about
+// which `job` label is authoritative.
+//
+// ## Why the `prometheus` crate here and not OTEL like the rest of `metrics.rs`
+//
+// The worker's `/metrics` endpoint renders `prometheus::gather()` — the
+// DEFAULT registry — and `metrics::init_telemetry` wires the OTEL exporter
+// into that same default registry. So a `prometheus`-crate collector
+// registered here is exported by exactly the surface that already exists and
+// is already scraped (`job="talos-worker"`), with no new plumbing. Three
+// properties the OTEL path could not give us:
+//
+// 1. **No initialisation-order hazard.** An OTEL instrument built before
+//    `set_meter_provider` binds to the no-op provider FOREVER. The breaker
+//    fires from arbitrary points in a worker's life and from unit tests in
+//    other modules of this crate, so a lazily-built OTEL instrument could be
+//    permanently poisoned by whichever caller happened to be first.
+// 2. **Not gated on `OTEL_METRICS_ENABLED`.** `RuntimeMetrics` is constructed
+//    only when that env is true (default FALSE). A fail-closed control that
+//    silently fails production jobs must not have its only signal behind an
+//    optional flag.
+// 3. **A concrete child counter is a single atomic add.** The five label
+//    combinations below are resolved ONCE at init, so the increment on the
+//    breaker's path is `IntCounter::inc()` — no map lookup, no lock. See the
+//    "recorded outside the entry lock" note on `allow_request`.
+//
+// ## Label discipline
+//
+// Both label sets are CLOSED and enumerated by a Rust enum, so an unbounded
+// value is not merely discouraged, it is unrepresentable. There is
+// deliberately **no `host` label**: the host reaching the breaker is the
+// authority of a guest-supplied URL. It is constrained by the module's
+// declared `allowed_hosts`, but `allowed_hosts` is authored per module by any
+// user who can compile one and may be the wildcard `*`, so the union over a
+// shared worker's lifetime is unbounded. `cleanup()` exists in this very file
+// because the breaker's own per-host map grows that way. Which host tripped is
+// answered by the worker log (`host=` on every breaker transition), which is
+// bounded by retention rather than by resident memory in the Prometheus TSDB.
+//
+// All five children are instantiated at registration, so an idle worker
+// EXPORTS them at 0 rather than omitting them: `increase(...) > 0` is
+// well-defined on a worker that has never tripped the breaker, instead of
+// evaluating over an absent series. (Absent and zero are different — see the
+// PromQL note in CLAUDE.md and `metrics::seed_zero_series`.)
+
+/// How a circuit entered the `Open` state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenTransition {
+    /// `Closed` → `Open`: consecutive failures crossed the threshold.
+    Opened,
+    /// `HalfOpen` → `Open`: the trial requests did not meet the success rate.
+    Reopened,
+}
+
+/// Why a request or retry was refused by the breaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockReason {
+    /// The circuit is `Open` and still inside its cooldown window; the HTTP
+    /// request was rejected without being sent (`host/http.rs`, surfaced to
+    /// the guest as `networkerror` with `reason_class=circuit-open`).
+    Cooldown,
+    /// The circuit is `HalfOpen` and its trial-request tokens are spent.
+    HalfOpenExhausted,
+    /// A job / pipeline-step retry was skipped because a declared host's
+    /// circuit was already `Open` (`runtime.rs::circuit_open_error`). No HTTP
+    /// request was attempted at all — this is the path whose controller-side
+    /// error text reads "circuit open for host X".
+    RetryGate,
+}
+
+struct BreakerMetrics {
+    opened: prometheus::IntCounter,
+    reopened: prometheus::IntCounter,
+    block_cooldown: prometheus::IntCounter,
+    block_half_open_exhausted: prometheus::IntCounter,
+    block_retry_gate: prometheus::IntCounter,
+}
+
+impl BreakerMetrics {
+    fn new() -> Self {
+        let opens = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "talos_circuit_breaker_opens_total",
+                "Per-host outbound-HTTP circuit breaker transitions INTO the open state",
+            ),
+            &["transition"],
+        )
+        .expect("static circuit-breaker opens metric definition is valid");
+        let blocks = prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "talos_circuit_breaker_blocks_total",
+                "Outbound HTTP requests and in-worker retries refused by the circuit breaker",
+            ),
+            &["reason"],
+        )
+        .expect("static circuit-breaker blocks metric definition is valid");
+
+        // Registration can only fail on a duplicate name, which a single
+        // `LazyLock` initialiser cannot produce. Warn rather than panic: the
+        // breaker's CONTROL behaviour must never be taken down by its own
+        // observability. Unregistered children still increment, they are just
+        // not exported.
+        let registry = prometheus::default_registry();
+        for c in [
+            Box::new(opens.clone()) as Box<dyn prometheus::core::Collector>,
+            Box::new(blocks.clone()),
+        ] {
+            if let Err(e) = registry.register(c) {
+                tracing::warn!(
+                    target: "talos_worker",
+                    error = %e,
+                    "failed to register circuit-breaker metrics; the breaker still \
+                     functions but its counters will not be exported"
+                );
+            }
+        }
+
+        // Resolve every child ONCE. Two effects, both load-bearing: the
+        // increment on the breaker path becomes a plain atomic add, and the
+        // series exist at 0 on a worker that has never tripped the breaker.
+        Self {
+            opened: opens.with_label_values(&["opened"]),
+            reopened: opens.with_label_values(&["reopened"]),
+            block_cooldown: blocks.with_label_values(&["cooldown"]),
+            block_half_open_exhausted: blocks.with_label_values(&["half_open_exhausted"]),
+            block_retry_gate: blocks.with_label_values(&["retry_gate"]),
+        }
+    }
+
+    fn record_open(&self, transition: OpenTransition) {
+        match transition {
+            OpenTransition::Opened => self.opened.inc(),
+            OpenTransition::Reopened => self.reopened.inc(),
+        }
+    }
+
+    fn record_block(&self, reason: BlockReason) {
+        match reason {
+            BlockReason::Cooldown => self.block_cooldown.inc(),
+            BlockReason::HalfOpenExhausted => self.block_half_open_exhausted.inc(),
+            BlockReason::RetryGate => self.block_retry_gate.inc(),
+        }
+    }
+}
+
+static BREAKER_METRICS: LazyLock<BreakerMetrics> = LazyLock::new(BreakerMetrics::new);
+
+/// Force the breaker's counters into existence so an idle worker exports all
+/// five series at 0.
+///
+/// Called from [`crate::metrics::init_telemetry`], i.e. once at worker
+/// startup, before any job has run. Without it the first export would omit
+/// these series entirely until the breaker first tripped — and an alert of the
+/// shape `increase(...) > 0` over an ABSENT series matches nothing, so the
+/// detector would be silent on exactly the worker that had never been observed
+/// to trip. Idempotent.
+pub fn seed_circuit_breaker_series() {
+    LazyLock::force(&BREAKER_METRICS);
+}
+
+/// Count a retry / pipeline-step fast-fail caused by an already-open circuit.
+///
+/// The single chokepoint is `runtime.rs::circuit_open_error`, through which
+/// both fast-fail return sites pass. This is a DISTINCT event from a rejected
+/// HTTP request (`BlockReason::Cooldown`): no request is attempted, and it is
+/// the path whose failure text reaches the controller as "circuit open for
+/// host X". Keeping the two apart is the difference between an operator
+/// knowing the breaker rejected a call and knowing it cancelled the retries
+/// that would have recovered it.
+pub(crate) fn record_retry_gate_block() {
+    BREAKER_METRICS.record_block(BlockReason::RetryGate);
+}
 
 /// Global circuit breaker instance.
 /// Initialized on first access with default configuration.
@@ -240,147 +435,195 @@ impl HttpCircuitBreaker {
     /// Check if a request to the given host should be allowed.
     ///
     /// Returns `true` if the request should proceed, `false` if it should be rejected.
+    ///
+    /// The decision is taken while the per-host DashMap entry is held; the
+    /// metric is recorded AFTER that guard drops. Nothing was added inside the
+    /// critical section, so the lock-free-in-the-common-case shape of this
+    /// path is unchanged — and the allowed path (a Closed circuit, i.e. every
+    /// request on a healthy worker) records nothing at all.
     pub fn allow_request(&self, host: &str) -> bool {
-        let now = Instant::now();
-        let mut entry = self
-            .records
-            .entry(host.to_string())
-            .or_insert_with(CircuitRecord::new);
-        let record = entry.value_mut();
+        let blocked = {
+            let now = Instant::now();
+            let mut entry = self
+                .records
+                .entry(host.to_string())
+                .or_insert_with(CircuitRecord::new);
+            let record = entry.value_mut();
 
-        // Check if we should transition from Open to HalfOpen
-        if record.state == CircuitState::Open {
-            if now.duration_since(record.last_state_change) >= self.config.open_duration {
-                record.state = CircuitState::HalfOpen;
-                record.test_requests_remaining = self.config.test_requests;
-                record.test_successes = 0;
-                record.test_failures = 0;
-                record.last_state_change = now;
-                tracing::info!(host = %host, "Circuit breaker entering half-open state");
-            } else {
-                // Circuit is still open, reject the request
-                tracing::warn!(
-                    host = %host,
-                    remaining_secs = (record.last_state_change + self.config.open_duration)
-                        .saturating_duration_since(now)
-                        .as_secs(),
-                    "Circuit breaker rejecting request"
-                );
-                return false;
+            let mut blocked: Option<BlockReason> = None;
+
+            // Check if we should transition from Open to HalfOpen
+            if record.state == CircuitState::Open {
+                if now.duration_since(record.last_state_change) >= self.config.open_duration {
+                    record.state = CircuitState::HalfOpen;
+                    record.test_requests_remaining = self.config.test_requests;
+                    record.test_successes = 0;
+                    record.test_failures = 0;
+                    record.last_state_change = now;
+                    tracing::info!(host = %host, "Circuit breaker entering half-open state");
+                } else {
+                    // Circuit is still open, reject the request
+                    tracing::warn!(
+                        host = %host,
+                        remaining_secs = (record.last_state_change + self.config.open_duration)
+                            .saturating_duration_since(now)
+                            .as_secs(),
+                        "Circuit breaker rejecting request"
+                    );
+                    blocked = Some(BlockReason::Cooldown);
+                }
             }
-        }
 
-        // In half-open state, only allow test requests
-        if record.state == CircuitState::HalfOpen {
-            if record.test_requests_remaining == 0 {
-                // No more test requests allowed, reject
-                return false;
+            // In half-open state, only allow test requests
+            if blocked.is_none() && record.state == CircuitState::HalfOpen {
+                if record.test_requests_remaining == 0 {
+                    // No more test requests allowed, reject
+                    blocked = Some(BlockReason::HalfOpenExhausted);
+                } else {
+                    record.test_requests_remaining -= 1;
+                }
             }
-            record.test_requests_remaining -= 1;
-        }
 
-        true
+            blocked
+        };
+
+        match blocked {
+            Some(reason) => {
+                BREAKER_METRICS.record_block(reason);
+                false
+            }
+            None => true,
+        }
     }
 
     /// Record a successful request to the given host.
+    ///
+    /// Metric recorded after the entry guard drops (see [`Self::allow_request`]).
+    /// The overwhelmingly common case — a success on a Closed circuit — takes
+    /// no metric path at all.
     pub fn record_success(&self, host: &str) {
-        let now = Instant::now();
-        let mut entry = self
-            .records
-            .entry(host.to_string())
-            .or_insert_with(CircuitRecord::new);
-        let record = entry.value_mut();
+        let opened = {
+            let now = Instant::now();
+            let mut entry = self
+                .records
+                .entry(host.to_string())
+                .or_insert_with(CircuitRecord::new);
+            let record = entry.value_mut();
 
-        match record.state {
-            CircuitState::Closed => {
-                // Reset failure counter on success
-                if record.consecutive_failures > 0 {
-                    record.consecutive_failures = 0;
-                    tracing::debug!(host = %host, "Circuit breaker: reset failure counter");
-                }
-            }
-            CircuitState::HalfOpen => {
-                record.test_successes += 1;
-                // Check if we should close the circuit
-                let total_tests = record.test_successes + record.test_failures;
-                if total_tests >= self.config.test_requests {
-                    let success_rate = record.test_successes as f64 / total_tests as f64;
-                    if success_rate >= self.config.success_rate_threshold {
-                        record.state = CircuitState::Closed;
+            let mut opened: Option<OpenTransition> = None;
+
+            match record.state {
+                CircuitState::Closed => {
+                    // Reset failure counter on success
+                    if record.consecutive_failures > 0 {
                         record.consecutive_failures = 0;
-                        record.last_state_change = now;
-                        tracing::info!(
-                            host = %host,
-                            success_rate = %success_rate,
-                            "Circuit breaker closed"
-                        );
-                    } else {
-                        // Not enough successes, go back to open
-                        record.state = CircuitState::Open;
-                        record.last_state_change = now;
-                        tracing::warn!(
-                            host = %host,
-                            success_rate = %success_rate,
-                            "Circuit breaker re-opened due to low success rate"
-                        );
+                        tracing::debug!(host = %host, "Circuit breaker: reset failure counter");
                     }
                 }
+                CircuitState::HalfOpen => {
+                    record.test_successes += 1;
+                    // Check if we should close the circuit
+                    let total_tests = record.test_successes + record.test_failures;
+                    if total_tests >= self.config.test_requests {
+                        let success_rate = record.test_successes as f64 / total_tests as f64;
+                        if success_rate >= self.config.success_rate_threshold {
+                            record.state = CircuitState::Closed;
+                            record.consecutive_failures = 0;
+                            record.last_state_change = now;
+                            tracing::info!(
+                                host = %host,
+                                success_rate = %success_rate,
+                                "Circuit breaker closed"
+                            );
+                        } else {
+                            // Not enough successes, go back to open
+                            record.state = CircuitState::Open;
+                            record.last_state_change = now;
+                            tracing::warn!(
+                                host = %host,
+                                success_rate = %success_rate,
+                                "Circuit breaker re-opened due to low success rate"
+                            );
+                            opened = Some(OpenTransition::Reopened);
+                        }
+                    }
+                }
+                CircuitState::Open => {
+                    // Shouldn't happen, but just in case
+                }
             }
-            CircuitState::Open => {
-                // Shouldn't happen, but just in case
-            }
+
+            opened
+        };
+
+        if let Some(transition) = opened {
+            BREAKER_METRICS.record_open(transition);
         }
     }
 
     /// Record a failed request to the given host.
+    ///
+    /// Metric recorded after the entry guard drops (see [`Self::allow_request`]).
     pub fn record_failure(&self, host: &str) {
-        let now = Instant::now();
-        let mut entry = self
-            .records
-            .entry(host.to_string())
-            .or_insert_with(CircuitRecord::new);
-        let record = entry.value_mut();
+        let opened = {
+            let now = Instant::now();
+            let mut entry = self
+                .records
+                .entry(host.to_string())
+                .or_insert_with(CircuitRecord::new);
+            let record = entry.value_mut();
 
-        // Reset if outside the failure window
-        if now.duration_since(record.last_failure) >= self.config.failure_window {
-            record.consecutive_failures = 0;
-        }
-
-        record.last_failure = now;
-
-        match record.state {
-            CircuitState::Closed => {
-                record.consecutive_failures += 1;
-                if record.consecutive_failures >= self.config.failure_threshold {
-                    record.state = CircuitState::Open;
-                    record.last_state_change = now;
-                    tracing::warn!(
-                        host = %host,
-                        consecutive_failures = record.consecutive_failures,
-                        "Circuit breaker opened"
-                    );
-                }
+            // Reset if outside the failure window
+            if now.duration_since(record.last_failure) >= self.config.failure_window {
+                record.consecutive_failures = 0;
             }
-            CircuitState::HalfOpen => {
-                record.test_failures += 1;
-                // Check if we should re-open
-                let total_tests = record.test_successes + record.test_failures;
-                if total_tests >= self.config.test_requests {
-                    let success_rate = record.test_successes as f64 / total_tests as f64;
-                    if success_rate < self.config.success_rate_threshold {
+
+            record.last_failure = now;
+
+            let mut opened: Option<OpenTransition> = None;
+
+            match record.state {
+                CircuitState::Closed => {
+                    record.consecutive_failures += 1;
+                    if record.consecutive_failures >= self.config.failure_threshold {
                         record.state = CircuitState::Open;
                         record.last_state_change = now;
                         tracing::warn!(
                             host = %host,
-                            success_rate = %success_rate,
-                            "Circuit breaker re-opened"
+                            consecutive_failures = record.consecutive_failures,
+                            "Circuit breaker opened"
                         );
+                        opened = Some(OpenTransition::Opened);
                     }
                 }
+                CircuitState::HalfOpen => {
+                    record.test_failures += 1;
+                    // Check if we should re-open
+                    let total_tests = record.test_successes + record.test_failures;
+                    if total_tests >= self.config.test_requests {
+                        let success_rate = record.test_successes as f64 / total_tests as f64;
+                        if success_rate < self.config.success_rate_threshold {
+                            record.state = CircuitState::Open;
+                            record.last_state_change = now;
+                            tracing::warn!(
+                                host = %host,
+                                success_rate = %success_rate,
+                                "Circuit breaker re-opened"
+                            );
+                            opened = Some(OpenTransition::Reopened);
+                        }
+                    }
+                }
+                CircuitState::Open => {
+                    // Already open, nothing to do
+                }
             }
-            CircuitState::Open => {
-                // Already open, nothing to do
-            }
+
+            opened
+        };
+
+        if let Some(transition) = opened {
+            BREAKER_METRICS.record_open(transition);
         }
     }
 
@@ -649,5 +892,190 @@ mod tests {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    // =======================================================================
+    // Metric wiring
+    // =======================================================================
+
+    /// Read one exported counter's value out of the rendered exposition, or 0
+    /// when the series is absent.
+    ///
+    /// Deliberately parses the RENDERED TEXT rather than reading the
+    /// `IntCounter` handle: the handle would go up even if the collector had
+    /// failed to register, which is the exact failure mode that leaves an
+    /// operator with a silent metric. Only the exposition proves the value
+    /// reaches a scrape.
+    fn exported(metric: &str, label: &str, value: &str) -> u64 {
+        let text = crate::metrics::get_prometheus_metrics();
+        let needle_a = format!("{metric}{{{label}=\"{value}\"");
+        text.lines()
+            .filter(|l| l.starts_with(&needle_a))
+            .filter_map(|l| l.rsplit(' ').next())
+            .filter_map(|v| v.parse::<f64>().ok())
+            .map(|v| v as u64)
+            .next()
+            .unwrap_or(0)
+    }
+
+    /// The whole point of the change: BOTH counters must move when the real
+    /// breaker does the real thing.
+    ///
+    /// Before this change `talos_circuit_breaker_opens_total` and
+    /// `talos_circuit_breaker_blocks_total` were declared and registered in
+    /// `talos-metrics` (the CONTROLLER's registry) with zero increment sites
+    /// anywhere in the workspace; both exported a flat 0 on a live stack whose
+    /// breaker had demonstrably opened. A lint that only checks "is this field
+    /// mutated somewhere" cannot catch that class — CLAUDE.md's own check-58
+    /// notes say a wrapper nothing calls still reads as live. So this drives
+    /// the PRODUCTION methods (`record_failure`, `allow_request`,
+    /// `circuit_open_error`) and reads the RENDERED exposition.
+    ///
+    /// Uses strict before/after deltas rather than absolute values: the
+    /// counters are process-global and the other tests in this binary trip
+    /// breakers of their own in parallel. Counters are monotonic, so a
+    /// concurrent test can only inflate the "after" — it can never make a
+    /// genuinely-wired counter look unmoved, and it can never make an unwired
+    /// one look moved from THIS test's own events.
+    #[test]
+    fn production_path_moves_both_counters() {
+        const OPENS: &str = "talos_circuit_breaker_opens_total";
+        const BLOCKS: &str = "talos_circuit_breaker_blocks_total";
+
+        let before_opened = exported(OPENS, "transition", "opened");
+        let before_cooldown = exported(BLOCKS, "reason", "cooldown");
+        let before_retry_gate = exported(BLOCKS, "reason", "retry_gate");
+
+        let cb = HttpCircuitBreaker::new(CircuitBreakerConfig {
+            // Long enough that the reject below cannot race into HalfOpen.
+            open_duration: Duration::from_secs(60),
+            ..Default::default()
+        });
+        let host = "opens-probe.example.test";
+
+        // Closed → Open: the `opened` transition.
+        for _ in 0..5 {
+            cb.record_failure(host);
+        }
+        // Open + inside cooldown: an HTTP request refused without being sent.
+        assert!(
+            !cb.allow_request(host),
+            "circuit must be open after 5 failures"
+        );
+        // The job-level retry gate: no request attempted at all.
+        let _ = crate::runtime::circuit_open_error(host);
+
+        assert!(
+            exported(OPENS, "transition", "opened") > before_opened,
+            "{OPENS}{{transition=\"opened\"}} did not move across a real \
+             Closed→Open transition — the counter is not wired to the breaker"
+        );
+        assert!(
+            exported(BLOCKS, "reason", "cooldown") > before_cooldown,
+            "{BLOCKS}{{reason=\"cooldown\"}} did not move across a real \
+             in-cooldown request rejection"
+        );
+        assert!(
+            exported(BLOCKS, "reason", "retry_gate") > before_retry_gate,
+            "{BLOCKS}{{reason=\"retry_gate\"}} did not move across a real \
+             retry-gate fast-fail — circuit_open_error is the chokepoint for \
+             both fast-fail sites in runtime.rs"
+        );
+    }
+
+    /// The remaining two label values, which the test above cannot reach:
+    /// re-opening out of HalfOpen, and exhausting the HalfOpen trial tokens.
+    ///
+    /// These exist as separate label values because they are separate
+    /// operator situations — "the host went down" versus "the host came back
+    /// and immediately failed its trial again", which is a longer outage than
+    /// the first open suggests.
+    #[test]
+    fn half_open_reopen_and_token_exhaustion_move_their_own_labels() {
+        const OPENS: &str = "talos_circuit_breaker_opens_total";
+        const BLOCKS: &str = "talos_circuit_breaker_blocks_total";
+
+        let before_reopened = exported(OPENS, "transition", "reopened");
+        let before_exhausted = exported(BLOCKS, "reason", "half_open_exhausted");
+
+        let cb = HttpCircuitBreaker::new(CircuitBreakerConfig {
+            // Straight to HalfOpen on the next allow_request.
+            open_duration: Duration::from_millis(0),
+            test_requests: 3,
+            ..Default::default()
+        });
+        let host = "reopen-probe.example.test";
+
+        for _ in 0..5 {
+            cb.record_failure(host);
+        }
+        // Spend all three trial tokens on failures → success_rate 0.0 < 0.8 →
+        // back to Open.
+        for _ in 0..3 {
+            assert!(
+                cb.allow_request(host),
+                "half-open must grant its trial tokens"
+            );
+            cb.record_failure(host);
+        }
+        assert_eq!(cb.get_state(host), Some("open".to_string()));
+        assert!(
+            exported(OPENS, "transition", "reopened") > before_reopened,
+            "{OPENS}{{transition=\"reopened\"}} did not move across a real \
+             HalfOpen→Open re-open"
+        );
+
+        // Now the token-exhaustion block: force HalfOpen again and drain the
+        // tokens without recording outcomes, so the next request is refused
+        // with no state change.
+        let cb2 = HttpCircuitBreaker::new(CircuitBreakerConfig {
+            open_duration: Duration::from_millis(0),
+            test_requests: 1,
+            ..Default::default()
+        });
+        let host2 = "exhaust-probe.example.test";
+        for _ in 0..5 {
+            cb2.record_failure(host2);
+        }
+        assert!(cb2.allow_request(host2), "first half-open trial is granted");
+        assert!(
+            !cb2.allow_request(host2),
+            "second request must be refused — the single trial token is spent"
+        );
+        assert!(
+            exported(BLOCKS, "reason", "half_open_exhausted") > before_exhausted,
+            "{BLOCKS}{{reason=\"half_open_exhausted\"}} did not move"
+        );
+    }
+
+    /// All five series must EXIST after seeding, so `increase(...) > 0` is
+    /// well-defined on a worker that has never tripped the breaker rather than
+    /// evaluating over an absent series and matching nothing.
+    ///
+    /// LIMITATION, stated rather than implied: this asserts PRESENCE, not
+    /// "present AND zero". The counters are process-global and this binary's
+    /// other tests trip breakers in parallel, so no test in this binary can
+    /// observe a genuinely cold value. The at-zero half follows structurally —
+    /// `IntCounterVec::with_label_values` materialises each child at 0 at
+    /// registration time, before any breaker exists — and is checkable on a
+    /// real worker by scraping `/metrics` before its first trip.
+    #[test]
+    fn seeding_exports_every_label_combination() {
+        seed_circuit_breaker_series();
+        let text = crate::metrics::get_prometheus_metrics();
+        for expected in [
+            r#"talos_circuit_breaker_opens_total{transition="opened""#,
+            r#"talos_circuit_breaker_opens_total{transition="reopened""#,
+            r#"talos_circuit_breaker_blocks_total{reason="cooldown""#,
+            r#"talos_circuit_breaker_blocks_total{reason="half_open_exhausted""#,
+            r#"talos_circuit_breaker_blocks_total{reason="retry_gate""#,
+        ] {
+            assert!(
+                text.contains(expected),
+                "seeded series {expected} is absent from the exposition; an \
+                 alert of the shape increase(...) > 0 would be silent on a \
+                 worker that has never tripped the breaker.\n{text}"
+            );
+        }
     }
 }
