@@ -591,3 +591,45 @@ instance is not warranted.
 (the index goes with it). Confirm the grep is still empty at the time of the drop.
 Note the header comment in `talos-worker-runtime/src/circuit_breaker.rs` points
 here; update it when this lands.
+
+---
+
+## A response body that fails MID-TRANSFER is recorded as a circuit-breaker SUCCESS
+
+**Added:** 2026-08-12. **Priority: LOW** (a missed failure signal, not a wrong
+one). Found while fixing the half-open token strand and the trial verdict in
+`talos-worker-runtime/src/host/http.rs`.
+
+**What.** `wit_http::fetch` settles the breaker at `builder.send()`, i.e. the
+moment response HEADERS arrive. The body is then streamed
+(`response.bytes_stream()`), and a transport reset partway through that stream
+returns `Err(wit_http::Error::Networkerror)` to the guest with
+`reason_class::RESPONSE_STREAM` — but the breaker has already been told the
+request succeeded. A host that accepts connections, returns 200 headers and
+then resets every body cannot trip the circuit.
+
+**Why it matters.** A mid-transfer reset is a genuine TRANSPORT failure, which
+is the one class this breaker is entitled to open circuits on. It is
+categorically different from the HTTP-status question settled on 2026-08-12
+(status can fail a recovery trial but can never open a circuit, because the
+breaker is host-keyed and process-global and a 401 belongs to one user) — a
+connection reset belongs to the host and the network path, exactly like the
+connect and TLS failures that already count.
+
+**Why not done here.** Fixing it means keeping the permit alive past the send
+and settling after the body completes, which WIDENS the set of events that can
+open a circuit. The change that found it deliberately kept the open decision
+byte-identical so that any movement in
+`talos_circuit_breaker_opens_total{transition="opened"}` after deploy is
+attributable to the environment and not to the change. Landing both together
+would have destroyed that attribution — the same reason #636 deferred the
+strand fix out of the counters commit.
+
+**Suggested shape.** Move the settle to after the body loop: `settle_response`
+on completion, `settle_transport_failure` on a stream error, and keep the
+existing `settle_transport_failure` for the send error. Note the ordering
+hazard — the permit must not be settled twice, and `RequestPermit::settled`
+already makes a second settle a no-op rather than a double count, so the
+mechanical risk is low. Verify with `opens_total{transition="opened"}` before
+and after on a worker with a known-flaky upstream, and state the expected
+increase up front.

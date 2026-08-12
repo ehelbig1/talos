@@ -430,6 +430,121 @@ impl Default for CircuitBreakerConfig {
     }
 }
 
+// ===========================================================================
+// What counts as a failure — the connectivity-vs-health decision (2026-08-12)
+// ===========================================================================
+//
+// Read this before adding any new call to `record_failure`.
+//
+// ## The constraint that decides it: the breaker is HOST-KEYED and
+// ## PROCESS-GLOBAL
+//
+// `GLOBAL_CIRCUIT_BREAKER` is one `OnceLock` per worker process, and its map
+// is keyed by hostname and NOTHING else. A worker consumes jobs for every
+// user, every actor and every workflow on the platform, so a circuit opened
+// for `www.googleapis.com` refuses that host for ALL of them until it closes.
+//
+// That is defensible for a TRANSPORT failure: a failed TCP connect, a TLS
+// handshake error or a DNS failure is a property of the host and the network
+// path, which every tenant genuinely shares. It is NOT defensible for an HTTP
+// status, because no status code is a property of the host alone:
+//
+//   * 401 / 403 — a property of ONE user's credential. The expired-OAuth-token
+//     case is not hypothetical; it is the routine steady state of this
+//     platform's Google integrations. If 4xx opened circuits, one user's stale
+//     refresh token would take `www.googleapis.com` away from every other
+//     user's calendar, Gmail and Drive workflows. A reliability feature would
+//     have manufactured a cross-tenant outage.
+//   * 404 / 400 / 422 — a property of one REQUEST (or one module's bug).
+//   * 429 — usually a property of one user's QUOTA. On Google APIs
+//     `userRateLimitExceeded` is per-user; backing off is right for the user
+//     who is being limited, and the breaker cannot express "for that user"
+//     because it is not keyed by user. Blocking everyone else converts A's
+//     rate limit into B's outage.
+//   * 5xx — the closest to a host property, and still not one: a 500 can be
+//     provoked by one tenant's payload while the host serves everyone else
+//     perfectly.
+//
+// ## The decision
+//
+// **An HTTP status can NEVER open a circuit.** The Closed→Open transition
+// stays keyed to reqwest transport errors exactly as before this change, so
+// the population that can be newly blocked by this change is EMPTY.
+//
+// **An HTTP status CAN fail a half-open recovery trial.** See
+// [`status_fails_recovery_trial`]. That decision can only keep an
+// ALREADY-OPEN circuit open for one more cooldown; it can never block anyone
+// who was not already blocked, and without it the breaker had a real defect:
+// a host answering nothing but `503` returned `Ok(resp)` to every trial,
+// scored a 100% success rate, and CLOSED the circuit against an upstream that
+// was serving nothing. Resuming full traffic onto a host that just told you it
+// is failing is the exact outcome the breaker exists to prevent.
+//
+// The asymmetry is enforced STRUCTURALLY, not by comment: the status is only
+// consulted when the admission consumed a half-open trial token, and the
+// resulting failure is routed to [`HttpCircuitBreaker::record_trial_failure`],
+// which refuses to act on any state other than `HalfOpen` and never touches
+// `consecutive_failures`. There is no code path by which a status reaches the
+// open decision.
+//
+// ## The residual cross-tenant tail, stated rather than implied
+//
+// It is NOT zero. If user A's requests are the ones probing a host, and A's
+// requests specifically get 5xx (or A's quota specifically is exhausted, for
+// 429), the trials keep failing and the circuit stays open for user B too —
+// one 30-second cooldown at a time, indefinitely, for as long as A keeps
+// probing. What bounds it is that the circuit was ALREADY open when this
+// began: the change can prolong an outage, never start one, and every cycle
+// re-admits traffic for a fresh trial. The pre-change alternative is strictly
+// worse for B, since it closes the circuit and sends B's traffic to a host
+// that is answering 503.
+//
+// ## Fail-safe direction of each new path
+//
+//   * Trial gets 5xx/429 → trial FAILS → circuit stays open. Fails toward
+//     BLOCKING work on a host that answered with a server error or a
+//     back-off. Right, because the trial's question is "has it recovered?"
+//     and the answer was no. Bounded by `open_duration`; self-clearing.
+//   * Trial gets 4xx (not 429) → trial SUCCEEDS → circuit may close. Fails
+//     toward ADMITTING work. Right, and not a compromise: a 401 proves the
+//     host is alive and serving, which is precisely what the trial asks. The
+//     credential problem behind it is per-user and must not be encoded in
+//     shared state.
+//   * A reqwest BUILDER error (an invalid header name or value the guest
+//     authored) → NO evidence recorded either way. Fails toward ADMITTING
+//     work. Right, because the request never left the process, so there is no
+//     evidence about the host in either direction — and the pre-change
+//     behaviour, counting it as a host failure, was a live cross-tenant
+//     vector: five `fetch` calls carrying a malformed header name would open
+//     `www.googleapis.com` for every tenant on the worker without a single
+//     packet being sent.
+//
+// ## What is deliberately NOT changed
+//
+// A response body that fails MID-TRANSFER (`bytes_stream` yields an `Err`
+// after the headers arrived) is still recorded as a SUCCESS, because the
+// outcome is settled at the send. That is a genuine transport failure and
+// arguably should count; changing it would widen the OPEN decision, which is
+// the surface this change is deliberately keeping still. Left as-is and
+// recorded here.
+
+/// Does this HTTP status mean a half-open recovery trial FAILED?
+///
+/// **Consulted only for the trial verdict — never for the Closed→Open
+/// decision.** See the "connectivity-vs-health" note above for the full
+/// argument, in particular why 4xx is deliberately absent (a 401 is one
+/// user's credential, and this breaker is shared by every user on the worker).
+///
+/// * `5xx` — the host answered and admitted it failed. Not evidence of
+///   recovery.
+/// * `429` — the host answered "stop". Resuming full traffic on the strength
+///   of a rate-limit response is how a degraded upstream is kept degraded.
+/// * everything else, including every other 4xx — the host is alive and
+///   serving, which is the only question a recovery trial is entitled to ask.
+fn status_fails_recovery_trial(status: u16) -> bool {
+    status >= 500 || status == 429
+}
+
 /// State of a circuit breaker for a specific host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CircuitState {
@@ -535,58 +650,192 @@ impl HttpCircuitBreaker {
     /// critical section, so the lock-free-in-the-common-case shape of this
     /// path is unchanged — and the allowed path (a Closed circuit, i.e. every
     /// request on a healthy worker) records nothing at all.
-    pub fn allow_request(&self, host: &str) -> bool {
-        let blocked = {
-            let now = Instant::now();
-            let mut entry = self
-                .records
-                .entry(host.to_string())
-                .or_insert_with(CircuitRecord::new);
-            let record = entry.value_mut();
-
-            let mut blocked: Option<BlockReason> = None;
-
-            // Check if we should transition from Open to HalfOpen
-            if record.state == CircuitState::Open {
-                if now.duration_since(record.last_state_change) >= self.config.open_duration {
-                    record.state = CircuitState::HalfOpen;
-                    record.test_requests_remaining = self.config.test_requests;
-                    record.test_successes = 0;
-                    record.test_failures = 0;
-                    record.last_state_change = now;
-                    tracing::info!(host = %host, "Circuit breaker entering half-open state");
-                } else {
-                    // Circuit is still open, reject the request
-                    tracing::warn!(
-                        host = %host,
-                        remaining_secs = (record.last_state_change + self.config.open_duration)
-                            .saturating_duration_since(now)
-                            .as_secs(),
-                        "Circuit breaker rejecting request"
-                    );
-                    blocked = Some(BlockReason::Cooldown);
-                }
-            }
-
-            // In half-open state, only allow test requests
-            if blocked.is_none() && record.state == CircuitState::HalfOpen {
-                if record.test_requests_remaining == 0 {
-                    // No more test requests allowed, reject
-                    blocked = Some(BlockReason::HalfOpenExhausted);
-                } else {
-                    record.test_requests_remaining -= 1;
-                }
-            }
-
-            blocked
-        };
-
-        match blocked {
-            Some(reason) => {
+    ///
+    /// # This is the RAW primitive and it LEAKS. Production must not call it.
+    ///
+    /// An admission taken here is never repaid. In `HalfOpen` that is the
+    /// stranding bug above: the caller owes an outcome and nothing in the type
+    /// system says so. Production goes through [`Self::begin_request`], which
+    /// returns a [`RequestPermit`] that repays the token on `Drop`.
+    ///
+    /// Retained, test-only, for exactly one reason: it is the PRE-FIX
+    /// behaviour, and
+    /// `strand_reproduction_the_raw_primitive_leaks_and_never_recovers` uses
+    /// it to reproduce the 2026-08-11 stranding on demand. A fix whose baseline
+    /// cannot be reproduced is unfalsifiable. `#[cfg(test)]` is what makes
+    /// "no production caller can leak a token" a COMPILE-TIME property rather
+    /// than a review convention.
+    #[cfg(test)]
+    pub(crate) fn allow_request(&self, host: &str) -> bool {
+        match self.admit(host) {
+            Ok(_) => true,
+            Err(reason) => {
                 BREAKER_METRICS.record_block(reason);
                 false
             }
-            None => true,
+        }
+    }
+
+    /// Ask for admission and take the accompanying obligation with it.
+    ///
+    /// `None` = refused (the block metric has already been recorded, exactly
+    /// as the pre-permit code did). `Some(permit)` = admitted; the caller MUST
+    /// settle the permit with the outcome, and if it does not — by an early
+    /// return, a `?`, a panic, or the whole future being dropped mid-flight —
+    /// `Drop` repays any half-open trial token that the admission spent.
+    ///
+    /// This is the ONLY admission path production has. See
+    /// [`Self::allow_request`] for why the raw primitive is `#[cfg(test)]`.
+    pub fn begin_request(&self, host: &str) -> Option<RequestPermit<'_>> {
+        match self.admit(host) {
+            Ok(trial_epoch) => Some(RequestPermit {
+                breaker: self,
+                host: host.to_string(),
+                trial_epoch,
+                settled: false,
+            }),
+            Err(reason) => {
+                BREAKER_METRICS.record_block(reason);
+                None
+            }
+        }
+    }
+
+    /// The admission decision itself, with no metric side effect.
+    ///
+    /// * `Ok(None)` — admitted with NO trial token spent (the Closed circuit,
+    ///   i.e. every request on a healthy worker). Nothing is owed.
+    /// * `Ok(Some(epoch))` — admitted by spending one `HalfOpen` trial token.
+    ///   `epoch` is the `last_state_change` of the half-open period the token
+    ///   came from, so a repayment arriving after the circuit has moved on can
+    ///   be recognised and dropped instead of crediting a later period.
+    /// * `Err(reason)` — refused.
+    fn admit(&self, host: &str) -> Result<Option<Instant>, BlockReason> {
+        let now = Instant::now();
+        let mut entry = self
+            .records
+            .entry(host.to_string())
+            .or_insert_with(CircuitRecord::new);
+        let record = entry.value_mut();
+
+        // Check if we should transition from Open to HalfOpen
+        if record.state == CircuitState::Open {
+            if now.duration_since(record.last_state_change) >= self.config.open_duration {
+                record.state = CircuitState::HalfOpen;
+                record.test_requests_remaining = self.config.test_requests;
+                record.test_successes = 0;
+                record.test_failures = 0;
+                record.last_state_change = now;
+                tracing::info!(host = %host, "Circuit breaker entering half-open state");
+            } else {
+                // Circuit is still open, reject the request
+                tracing::warn!(
+                    host = %host,
+                    remaining_secs = (record.last_state_change + self.config.open_duration)
+                        .saturating_duration_since(now)
+                        .as_secs(),
+                    "Circuit breaker rejecting request"
+                );
+                return Err(BlockReason::Cooldown);
+            }
+        }
+
+        // In half-open state, only allow test requests
+        if record.state == CircuitState::HalfOpen {
+            if record.test_requests_remaining == 0 {
+                // No more test requests allowed, reject
+                return Err(BlockReason::HalfOpenExhausted);
+            }
+            record.test_requests_remaining -= 1;
+            return Ok(Some(record.last_state_change));
+        }
+
+        Ok(None)
+    }
+
+    /// Return an unused half-open trial token to the pool.
+    ///
+    /// The third outcome the two-state model never had: the trial did not
+    /// CONCLUDE. Neither `test_successes` nor `test_failures` moves — an
+    /// abandoned probe is not evidence that the host is healthy (which would
+    /// let a leak CLOSE a circuit against a dead host) and not evidence that
+    /// it is sick (which would let a guest-side rejection RE-OPEN one against
+    /// a healthy host, and would hand any guest that can provoke an early
+    /// return a lever on shared state). It is evidence of nothing, so the only
+    /// correct move is to put the token back and let a real request answer the
+    /// question.
+    ///
+    /// Epoch-gated: a repayment is credited only if the circuit is STILL in
+    /// the same half-open period the token was taken from. A permit that
+    /// outlives its period (the circuit re-opened, or closed and re-opened,
+    /// while the request was in flight) is dropped on the floor rather than
+    /// granting a fourth trial in a three-trial period.
+    ///
+    /// No metric, and the entry guard is dropped before returning, so this
+    /// holds no DashMap shard across anything.
+    fn repay_trial_token(&self, host: &str, epoch: Instant) {
+        let Some(mut entry) = self.records.get_mut(host) else {
+            return;
+        };
+        let record = entry.value_mut();
+        if record.state != CircuitState::HalfOpen || record.last_state_change != epoch {
+            return;
+        }
+        record.test_requests_remaining = record
+            .test_requests_remaining
+            .saturating_add(1)
+            .min(self.config.test_requests);
+    }
+
+    /// Record a half-open trial that FAILED on the strength of its HTTP
+    /// status, rather than on a transport error.
+    ///
+    /// This is the only place an HTTP status influences breaker state, and it
+    /// is deliberately unable to influence the OPEN decision:
+    ///
+    /// * it no-ops unless the circuit is still `HalfOpen` in the same period
+    ///   the trial token came from — so a status arriving after the circuit
+    ///   closed cannot be replayed into the Closed-state failure counter;
+    /// * it never touches `consecutive_failures`, which is the only field the
+    ///   Closed→Open transition reads.
+    ///
+    /// Net: an HTTP status can prolong an outage for one cooldown, and can
+    /// never start one. That is the whole cross-tenant safety argument, held
+    /// up by control flow instead of by a comment. See the
+    /// "connectivity-vs-health" note at the top of this file.
+    fn record_trial_failure(&self, host: &str, epoch: Instant) {
+        let opened = {
+            let now = Instant::now();
+            let Some(mut entry) = self.records.get_mut(host) else {
+                return;
+            };
+            let record = entry.value_mut();
+            if record.state != CircuitState::HalfOpen || record.last_state_change != epoch {
+                return;
+            }
+
+            record.test_failures += 1;
+            let mut opened: Option<OpenTransition> = None;
+            let total_tests = record.test_successes + record.test_failures;
+            if total_tests >= self.config.test_requests {
+                let success_rate = record.test_successes as f64 / total_tests as f64;
+                if success_rate < self.config.success_rate_threshold {
+                    record.state = CircuitState::Open;
+                    record.last_state_change = now;
+                    tracing::warn!(
+                        host = %host,
+                        success_rate = %success_rate,
+                        "Circuit breaker re-opened — the recovery trial got an unhealthy \
+                         HTTP status (5xx or 429), which is not evidence of recovery"
+                    );
+                    opened = Some(OpenTransition::Reopened);
+                }
+            }
+            opened
+        };
+
+        if let Some(transition) = opened {
+            BREAKER_METRICS.record_open(transition);
         }
     }
 
@@ -777,6 +1026,149 @@ impl HttpCircuitBreaker {
             }
             retain
         });
+    }
+
+    /// Put a host straight into `HalfOpen` with `tokens` trial tokens.
+    ///
+    /// Test-only. The alternative for a test that needs a half-open circuit is
+    /// to trip it and then sleep past `open_duration`, which on the GLOBAL
+    /// breaker means the default 30 s (its config is read from the environment
+    /// once, under a `OnceLock`, so a test cannot shorten it without racing
+    /// every other test in the binary).
+    #[cfg(test)]
+    pub(crate) fn force_half_open(&self, host: &str, tokens: u32) {
+        let mut entry = self
+            .records
+            .entry(host.to_string())
+            .or_insert_with(CircuitRecord::new);
+        let record = entry.value_mut();
+        record.state = CircuitState::HalfOpen;
+        record.test_requests_remaining = tokens;
+        record.test_successes = 0;
+        record.test_failures = 0;
+        record.last_state_change = Instant::now();
+    }
+
+    /// Unspent half-open trial tokens for `host`. Test-only: this is the
+    /// quantity the stranding bug destroyed, so it is the quantity the fix's
+    /// tests have to be able to read.
+    #[cfg(test)]
+    pub(crate) fn trial_tokens_remaining(&self, host: &str) -> Option<u32> {
+        self.records.get(host).map(|r| r.test_requests_remaining)
+    }
+
+    /// `(test_successes, test_failures)` for `host`. Test-only. An abandoned
+    /// trial must move NEITHER, which is a different assertion from "the token
+    /// came back".
+    #[cfg(test)]
+    pub(crate) fn trial_tally(&self, host: &str) -> Option<(u32, u32)> {
+        self.records
+            .get(host)
+            .map(|r| (r.test_successes, r.test_failures))
+    }
+
+    /// The Closed-state failure counter — the ONLY field the Closed→Open
+    /// transition reads. Test-only, and the assertion target for "an HTTP
+    /// status can never open a circuit".
+    #[cfg(test)]
+    pub(crate) fn consecutive_failures(&self, host: &str) -> Option<u32> {
+        self.records.get(host).map(|r| r.consecutive_failures)
+    }
+}
+
+/// An outstanding admission from [`HttpCircuitBreaker::begin_request`], and
+/// the obligation that comes with it.
+///
+/// # Why this is a guard and not four `return` sites
+///
+/// The stranding fixed here (`www.googleapis.com`, 2026-08-11 11:35 →
+/// 23:06) came from `allow_request` spending a half-open trial token roughly
+/// 180 lines above the `send()` that repaid it, with four statement exits and
+/// two `.await` points in between. Patching those six sites would have been
+/// correct on the day and wrong on the next day somebody adds a seventh — and
+/// two of the six are not patchable that way at all: a `?` is not a `return`
+/// (the previous inventory, built by grepping for `return`, missed the one
+/// that fires deterministically in production), and a dropped future does not
+/// execute any statement to patch.
+///
+/// A `Drop` impl is the only construction that covers a cancelled future, and
+/// it covers every future early exit for free, including ones not yet written
+/// and including a panic unwinding through the middle. That property — "you
+/// cannot add a leaking path to this function" — is the deliverable; repaying
+/// the specific tokens is just what it does.
+///
+/// # Cost on the healthy path
+///
+/// A permit issued against a CLOSED circuit — every request on a healthy
+/// worker — carries `trial_epoch: None`, and its `Drop` is an `Option`
+/// discriminant test that touches no map, takes no lock and emits no metric.
+/// The only per-request cost added to the hot path is one `String` clone of
+/// the host, alongside the one `allow_request` already made for the DashMap
+/// entry key.
+pub struct RequestPermit<'a> {
+    breaker: &'a HttpCircuitBreaker,
+    host: String,
+    /// `Some(epoch)` iff this admission spent a half-open trial token, where
+    /// `epoch` identifies the half-open period it came from.
+    trial_epoch: Option<Instant>,
+    settled: bool,
+}
+
+impl RequestPermit<'_> {
+    /// The peer answered with `status`.
+    ///
+    /// On a CLOSED circuit this is a success unconditionally — byte-identical
+    /// to the pre-change `record_success` on `Ok(resp)`, and deliberately so:
+    /// letting a status reach the Closed→Open transition is the cross-tenant
+    /// failure mode argued against at the top of this file.
+    ///
+    /// On a half-open TRIAL the status decides the verdict, via
+    /// [`status_fails_recovery_trial`].
+    pub fn settle_response(&mut self, status: u16) {
+        self.settled = true;
+        match self.trial_epoch {
+            Some(epoch) if status_fails_recovery_trial(status) => {
+                self.breaker.record_trial_failure(&self.host, epoch);
+            }
+            _ => self.breaker.record_success(&self.host),
+        }
+    }
+
+    /// The request failed in transport — connect, DNS, TLS, reset, or the
+    /// client's own timeout. Evidence about the HOST, and the only kind of
+    /// evidence allowed to open a circuit.
+    pub fn settle_transport_failure(&mut self) {
+        self.settled = true;
+        self.breaker.record_failure(&self.host);
+    }
+
+    /// The request never left this process, so nothing was learned about the
+    /// host in either direction.
+    ///
+    /// The caller for this is a reqwest BUILDER error: an invalid header name
+    /// or value, which on this path is guest-authored. Before the permit
+    /// existed those were fed to `record_failure`, which means five `fetch`
+    /// calls carrying a malformed header name could open a shared,
+    /// process-global circuit for a perfectly healthy host without emitting a
+    /// packet. Settling as no-evidence repays the trial token and records
+    /// neither outcome.
+    pub fn settle_no_evidence(&mut self) {
+        self.settled = true;
+        self.repay();
+    }
+
+    fn repay(&self) {
+        if let Some(epoch) = self.trial_epoch {
+            self.breaker.repay_trial_token(&self.host, epoch);
+        }
+    }
+}
+
+impl Drop for RequestPermit<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.repay();
+        }
     }
 }
 
@@ -1039,7 +1431,7 @@ mod tests {
     /// breaker had demonstrably opened. A lint that only checks "is this field
     /// mutated somewhere" cannot catch that class — CLAUDE.md's own check-58
     /// notes say a wrapper nothing calls still reads as live. So this drives
-    /// the PRODUCTION methods (`record_failure`, `allow_request`,
+    /// the PRODUCTION methods (`record_failure`, `begin_request`,
     /// `circuit_open_error`) and reads the RENDERED exposition.
     ///
     /// Uses strict before/after deltas rather than absolute values: the
@@ -1070,7 +1462,7 @@ mod tests {
         }
         // Open + inside cooldown: an HTTP request refused without being sent.
         assert!(
-            !cb.allow_request(host),
+            cb.begin_request(host).is_none(),
             "circuit must be open after 5 failures"
         );
         // The job-level retry gate: no request attempted at all.
@@ -1101,6 +1493,13 @@ mod tests {
     /// operator situations — "the host went down" versus "the host came back
     /// and immediately failed its trial again", which is a longer outage than
     /// the first open suggests.
+    ///
+    /// Note the exhaustion half is driven by holding permits CONCURRENTLY,
+    /// which is the only way `half_open_exhausted` is reachable now that an
+    /// unsettled permit repays its token on drop. Before 2026-08-12 it was
+    /// also reachable by leaking, and a leaked token never came back — which
+    /// is precisely why this arm firing steadily used to mean "stranded" and
+    /// now means "in flight".
     #[test]
     fn half_open_reopen_and_token_exhaustion_move_their_own_labels() {
         const OPENS: &str = "talos_circuit_breaker_opens_total";
@@ -1110,7 +1509,7 @@ mod tests {
         let before_exhausted = exported(BLOCKS, "reason", "half_open_exhausted");
 
         let cb = HttpCircuitBreaker::new(CircuitBreakerConfig {
-            // Straight to HalfOpen on the next allow_request.
+            // Straight to HalfOpen on the next admission.
             open_duration: Duration::from_millis(0),
             test_requests: 3,
             ..Default::default()
@@ -1120,14 +1519,13 @@ mod tests {
         for _ in 0..5 {
             cb.record_failure(host);
         }
-        // Spend all three trial tokens on failures → success_rate 0.0 < 0.8 →
-        // back to Open.
+        // Spend all three trial tokens on transport failures → success_rate
+        // 0.0 < 0.8 → back to Open.
         for _ in 0..3 {
-            assert!(
-                cb.allow_request(host),
-                "half-open must grant its trial tokens"
-            );
-            cb.record_failure(host);
+            let mut permit = cb
+                .begin_request(host)
+                .expect("half-open must grant its trial tokens");
+            permit.settle_transport_failure();
         }
         assert_eq!(cb.get_state(host), Some("open".to_string()));
         assert!(
@@ -1136,9 +1534,8 @@ mod tests {
              HalfOpen→Open re-open"
         );
 
-        // Now the token-exhaustion block: force HalfOpen again and drain the
-        // tokens without recording outcomes, so the next request is refused
-        // with no state change.
+        // Now the token-exhaustion block: hold the only trial token in flight
+        // and ask for a second admission.
         let cb2 = HttpCircuitBreaker::new(CircuitBreakerConfig {
             open_duration: Duration::from_millis(0),
             test_requests: 1,
@@ -1148,15 +1545,449 @@ mod tests {
         for _ in 0..5 {
             cb2.record_failure(host2);
         }
-        assert!(cb2.allow_request(host2), "first half-open trial is granted");
+        let inflight = cb2
+            .begin_request(host2)
+            .expect("first half-open trial is granted");
         assert!(
-            !cb2.allow_request(host2),
-            "second request must be refused — the single trial token is spent"
+            cb2.begin_request(host2).is_none(),
+            "second request must be refused — the single trial token is still in flight"
         );
+        drop(inflight);
         assert!(
             exported(BLOCKS, "reason", "half_open_exhausted") > before_exhausted,
             "{BLOCKS}{{reason=\"half_open_exhausted\"}} did not move"
         );
+    }
+
+    // =======================================================================
+    // The stranding: baseline, then the guard
+    // =======================================================================
+
+    /// **The pre-fix baseline, kept executable.**
+    ///
+    /// `allow_request` is the raw admission primitive as it stood on
+    /// 2026-08-11 — it spends and never repays. Spend all three trial tokens
+    /// through it and the circuit is stranded: `HalfOpen` has no time bound,
+    /// so no amount of elapsed time produces another admission, and nothing in
+    /// the code closes the loop. On the live worker this ran from 11:35 until
+    /// a container recreate at 23:06.
+    ///
+    /// This test exists so "fixed" is falsifiable. Delete it and the only
+    /// evidence that the bug was real becomes prose. It also pins the reason
+    /// `allow_request` is `#[cfg(test)]`: the leak is a property of the
+    /// primitive, not of its caller, so the primitive is not available to
+    /// production code at all.
+    #[test]
+    fn strand_reproduction_the_raw_primitive_leaks_and_never_recovers() {
+        let cb = HttpCircuitBreaker::new(CircuitBreakerConfig {
+            open_duration: Duration::from_millis(10),
+            test_requests: 3,
+            ..Default::default()
+        });
+        let host = "strand-baseline.example.test";
+
+        for _ in 0..5 {
+            cb.record_failure(host);
+        }
+        assert_eq!(cb.get_state(host), Some("open".to_string()));
+
+        // Past the cooldown → the next admission enters HalfOpen with three
+        // trial tokens and immediately spends the first.
+        std::thread::sleep(Duration::from_millis(20));
+        for i in 0..3 {
+            assert!(
+                cb.allow_request(host),
+                "trial {i} must be granted — the circuit has tokens"
+            );
+        }
+        assert_eq!(cb.trial_tokens_remaining(host), Some(0));
+        assert_eq!(cb.get_state(host), Some("half_open".to_string()));
+
+        // No outcome was ever recorded for any of the three. Elapsed time is
+        // irrelevant: the Open→HalfOpen re-entry that refills the tokens is
+        // reachable only FROM Open, and this circuit is HalfOpen forever.
+        for round in 0..5 {
+            std::thread::sleep(Duration::from_millis(15));
+            assert!(
+                !cb.allow_request(host),
+                "round {round}: still refused after {}ms — this is the strand",
+                20 + 15 * (round + 1)
+            );
+        }
+        assert_eq!(cb.trial_tokens_remaining(host), Some(0));
+        assert_eq!(
+            cb.trial_tally(host),
+            Some((0, 0)),
+            "no trial ever concluded, which is why the state machine cannot leave"
+        );
+    }
+
+    /// The guard's whole job: an admission that is never settled costs
+    /// nothing. Ten leaked permits in a row leave the circuit exactly where it
+    /// started — which under `allow_request` (test above) would have stranded
+    /// it on the third.
+    #[test]
+    fn dropping_a_permit_unsettled_repays_the_trial_token() {
+        let cb = HttpCircuitBreaker::default();
+        let host = "permit-drop.example.test";
+        cb.force_half_open(host, 3);
+
+        for i in 0..10 {
+            let permit = cb
+                .begin_request(host)
+                .unwrap_or_else(|| panic!("admission {i} refused — a repaid token was not repaid"));
+            drop(permit);
+        }
+
+        assert_eq!(cb.trial_tokens_remaining(host), Some(3));
+        assert_eq!(cb.get_state(host), Some("half_open".to_string()));
+        assert_eq!(
+            cb.trial_tally(host),
+            Some((0, 0)),
+            "an abandoned trial is evidence of NOTHING: recording a synthetic \
+             success could close the circuit against a dead host, and a \
+             synthetic failure would hand any guest that can provoke an early \
+             return a lever on shared state"
+        );
+    }
+
+    /// `settle_no_evidence` — the reqwest-builder-error path — behaves like a
+    /// drop for accounting purposes, and explicitly not like a failure.
+    #[test]
+    fn settling_with_no_evidence_repays_and_records_nothing() {
+        let cb = HttpCircuitBreaker::default();
+        let host = "no-evidence.example.test";
+        cb.force_half_open(host, 2);
+
+        let mut permit = cb.begin_request(host).expect("half-open admits");
+        assert_eq!(cb.trial_tokens_remaining(host), Some(1));
+        permit.settle_no_evidence();
+
+        assert_eq!(cb.trial_tokens_remaining(host), Some(2));
+        assert_eq!(cb.trial_tally(host), Some((0, 0)));
+        assert_eq!(cb.get_state(host), Some("half_open".to_string()));
+    }
+
+    /// A guest that can provoke a client-side builder error must not be able
+    /// to open a circuit that every other tenant on this worker shares.
+    ///
+    /// Pre-permit, `wit_http::fetch`'s `Err(e)` arm called `record_failure`
+    /// unconditionally, and a malformed header NAME is a reqwest builder
+    /// error — five such calls opened the host for everybody with no packet
+    /// leaving the process.
+    #[test]
+    fn no_evidence_settlements_cannot_open_a_closed_circuit() {
+        let cb = HttpCircuitBreaker::default();
+        let host = "no-evidence-open.example.test";
+        for _ in 0..20 {
+            let mut permit = cb.begin_request(host).expect("closed circuit admits");
+            permit.settle_no_evidence();
+        }
+        assert_eq!(cb.get_state(host), Some("closed".to_string()));
+        assert_eq!(cb.consecutive_failures(host), Some(0));
+    }
+
+    /// Cancellation — the path that is not a statement and therefore cannot be
+    /// patched per-`return`.
+    ///
+    /// The future is dropped while parked on an `.await` between the
+    /// admission and the settle, exactly as an execution timeout, a worker
+    /// shutdown, or a sibling failing a parallel fan-out drops it. On
+    /// 2026-08-11 this is the shape that leaked `cal_personal`'s token.
+    #[tokio::test]
+    async fn a_cancelled_future_repays_its_trial_token() {
+        let cb = HttpCircuitBreaker::default();
+        let host = "cancelled.example.test";
+        cb.force_half_open(host, 1);
+
+        let inflight = async {
+            let mut permit = cb.begin_request(host).expect("half-open admits");
+            // Stand in for `resolve_vault_header().await` / `send().await`.
+            futures_util::future::pending::<()>().await;
+            permit.settle_response(200);
+        };
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), inflight)
+                .await
+                .is_err(),
+            "the probe future must still be parked when the timeout drops it"
+        );
+
+        assert_eq!(
+            cb.trial_tokens_remaining(host),
+            Some(1),
+            "a dropped future must repay its trial token — this is the leak that \
+             stranded www.googleapis.com for eleven and a half hours"
+        );
+        assert_eq!(cb.trial_tally(host), Some((0, 0)));
+    }
+
+    /// A permit that outlives its half-open period must not credit the NEXT
+    /// one. Without the epoch stamp a slow in-flight request could hand a
+    /// three-trial period a fourth trial.
+    #[test]
+    fn a_repayment_from_a_stale_half_open_period_is_discarded() {
+        let cb = HttpCircuitBreaker::default();
+        let host = "stale-epoch.example.test";
+        cb.force_half_open(host, 1);
+
+        let permit = cb.begin_request(host).expect("half-open admits");
+        assert_eq!(cb.trial_tokens_remaining(host), Some(0));
+
+        // A new half-open period begins while the request is still in flight.
+        std::thread::sleep(Duration::from_millis(2));
+        cb.force_half_open(host, 3);
+
+        drop(permit);
+        assert_eq!(
+            cb.trial_tokens_remaining(host),
+            Some(3),
+            "a token from a previous period must not inflate the current one"
+        );
+    }
+
+    // =======================================================================
+    // Connectivity vs health — the cross-tenant boundary
+    // =======================================================================
+
+    /// **The single most important test in this file.**
+    ///
+    /// The breaker is keyed by HOST and is one instance per worker PROCESS,
+    /// which serves every user on the platform. If an HTTP status could open a
+    /// circuit, one user's expired OAuth token (401) or exhausted per-user
+    /// quota (429) would take `www.googleapis.com` away from every other
+    /// user's calendar, Gmail and Drive workflows — a cross-tenant outage
+    /// manufactured by a reliability feature.
+    ///
+    /// Four hundred settled responses across the whole status space, twenty
+    /// per code against a threshold of five, and the circuit stays Closed.
+    #[test]
+    fn no_http_status_can_open_a_circuit() {
+        for status in [400u16, 401, 403, 404, 422, 429, 500, 502, 503, 504] {
+            let cb = HttpCircuitBreaker::default();
+            let host = format!("status-cannot-open-{status}.example.test");
+            for _ in 0..20 {
+                let mut permit = cb
+                    .begin_request(&host)
+                    .expect("a closed circuit admits everything");
+                permit.settle_response(status);
+            }
+            assert_eq!(
+                cb.get_state(&host).as_deref(),
+                Some("closed"),
+                "HTTP {status} opened a process-global, host-keyed circuit — that is \
+                 one tenant's credential, quota or payload deciding availability for \
+                 every other tenant on this worker"
+            );
+            assert_eq!(
+                cb.consecutive_failures(&host),
+                Some(0),
+                "HTTP {status} reached consecutive_failures, the only field the \
+                 Closed→Open transition reads"
+            );
+        }
+    }
+
+    /// A recovery trial that gets a 401 CLOSES the circuit, and that is
+    /// correct rather than a compromise: the trial asks "is this host alive
+    /// and serving?", and a 401 answers yes. The credential problem behind it
+    /// belongs to one user and must not be encoded in state every user shares.
+    #[test]
+    fn a_4xx_trial_closes_the_circuit_because_the_host_is_alive() {
+        for status in [400u16, 401, 403, 404] {
+            let cb = HttpCircuitBreaker::default();
+            let host = format!("trial-4xx-{status}.example.test");
+            cb.force_half_open(&host, 3);
+            for _ in 0..3 {
+                let mut permit = cb.begin_request(&host).expect("half-open admits");
+                permit.settle_response(status);
+            }
+            assert_eq!(
+                cb.get_state(&host).as_deref(),
+                Some("closed"),
+                "HTTP {status} during a trial must count as recovery — the host answered"
+            );
+        }
+    }
+
+    /// The half of bug 2 that was a genuine correctness defect: pre-change,
+    /// every trial that got an `Ok(resp)` counted as a success regardless of
+    /// status, so a host answering nothing but 503 scored a 100% success rate
+    /// and had its circuit CLOSED — full traffic resumed onto an upstream that
+    /// was serving nothing.
+    ///
+    /// Also the D4 attribution check: this is the transition that should make
+    /// `talos_circuit_breaker_opens_total{transition="reopened"}` move after
+    /// this change, on hosts where it previously showed a close.
+    #[test]
+    fn a_5xx_or_429_trial_reopens_the_circuit_instead_of_closing_it() {
+        const OPENS: &str = "talos_circuit_breaker_opens_total";
+        let before_reopened = exported(OPENS, "transition", "reopened");
+
+        for status in [429u16, 500, 502, 503, 504] {
+            let cb = HttpCircuitBreaker::default();
+            let host = format!("trial-unhealthy-{status}.example.test");
+            cb.force_half_open(&host, 3);
+            for _ in 0..3 {
+                let mut permit = cb.begin_request(&host).expect("half-open admits");
+                permit.settle_response(status);
+            }
+            assert_eq!(
+                cb.get_state(&host).as_deref(),
+                Some("open"),
+                "a trial answered with HTTP {status} is not evidence of recovery; \
+                 pre-2026-08-12 this closed the circuit"
+            );
+            assert_eq!(cb.trial_tally(&host), Some((0, 3)));
+        }
+
+        assert!(
+            exported(OPENS, "transition", "reopened") > before_reopened,
+            "{OPENS}{{transition=\"reopened\"}} did not move — the status-driven \
+             trial verdict is not wired to the counter that is supposed to attribute it"
+        );
+    }
+
+    /// The structural guarantee behind the cross-tenant argument: a trial
+    /// verdict arriving after the circuit has left `HalfOpen` is discarded, so
+    /// a status can never be replayed into the Closed-state failure counter.
+    ///
+    /// Without this, a permit taken during a trial and settled with a 500
+    /// after a concurrent trial had already closed the circuit would land in
+    /// `record_failure`'s Closed arm — and five of those would open a
+    /// host-keyed, process-global circuit off nothing but HTTP status.
+    #[test]
+    fn a_trial_status_failure_cannot_reach_the_closed_state_failure_counter() {
+        let cb = HttpCircuitBreaker::default();
+        let host = "trial-late-settle.example.test";
+        // Four tokens so one permit can stay in flight while three others
+        // conclude the trial period.
+        cb.force_half_open(host, 4);
+
+        let mut inflight = cb.begin_request(host).expect("half-open admits");
+        for _ in 0..3 {
+            let mut permit = cb.begin_request(host).expect("half-open admits");
+            permit.settle_response(200);
+        }
+        assert_eq!(
+            cb.get_state(host),
+            Some("closed".to_string()),
+            "three clean trials must close the circuit"
+        );
+
+        // The straggler now reports a 500 against a circuit that has already
+        // closed.
+        inflight.settle_response(500);
+
+        assert_eq!(cb.get_state(host), Some("closed".to_string()));
+        assert_eq!(
+            cb.consecutive_failures(host),
+            Some(0),
+            "a half-open trial verdict leaked into the Closed-state counter"
+        );
+    }
+
+    /// A transport failure still opens circuits exactly as before. The point
+    /// of the change is that STATUS cannot; connectivity must be untouched.
+    #[test]
+    fn transport_failures_still_open_circuits_unchanged() {
+        let cb = HttpCircuitBreaker::default();
+        let host = "transport-still-opens.example.test";
+        for _ in 0..5 {
+            let mut permit = cb.begin_request(host).expect("closed circuit admits");
+            permit.settle_transport_failure();
+        }
+        assert_eq!(cb.get_state(host), Some("open".to_string()));
+    }
+
+    /// No breaker method may hold a DashMap shard across a call into another
+    /// breaker method, because same-shard re-entry self-deadlocks. The metric
+    /// increments are likewise taken after every entry guard has dropped.
+    ///
+    /// Eight threads hammer a small host pool — small on purpose, so the
+    /// entries collide on the same shards — mixing every settle path plus the
+    /// unsettled drop, under a watchdog. A held guard hangs; the watchdog
+    /// turns the hang into a failure.
+    ///
+    /// NEGATIVE CONTROL, RUN 2026-08-12 so this assertion is not vacuous.
+    /// `RequestPermit::settle_transport_failure` was temporarily changed to
+    /// take the host's entry guard and hold it across its `record_failure`
+    /// call — the exact "simplification" a future reader might make — and the
+    /// suite reported:
+    ///
+    /// ```text
+    /// test circuit_breaker::tests::concurrent_admissions_and_settlements_never_deadlock ... FAILED
+    /// worker 0 did not finish within 30s (timed out waiting on channel)
+    ///   — a breaker method is holding a DashMap shard across a call that
+    ///     re-enters the map
+    /// ```
+    ///
+    /// The mutation was reverted immediately. The result is recorded here
+    /// rather than shipped, because a test that must hang cannot live in a
+    /// suite.
+    ///
+    /// LIMITATION, stated rather than implied: what this catches is re-entry
+    /// into the BREAKER. It does NOT catch a metric increment moved inside an
+    /// entry guard, because `prometheus::IntCounter::inc` never re-enters the
+    /// map and so cannot deadlock — that half of the property (every
+    /// `record_*` computes its transition inside a block and increments after
+    /// the block closes) is held by the code's shape and by review, not by
+    /// this test.
+    #[test]
+    fn concurrent_admissions_and_settlements_never_deadlock() {
+        let cb = Arc::new(HttpCircuitBreaker::new(CircuitBreakerConfig {
+            open_duration: Duration::from_millis(0),
+            test_requests: 3,
+            ..Default::default()
+        }));
+        let hosts = ["shard-a.example.test", "shard-b.example.test"];
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+
+        let mut handles = Vec::new();
+        for t in 0..8u32 {
+            let cb = cb.clone();
+            let tx = tx.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..250u32 {
+                    let host = hosts[(t as usize + i as usize) % hosts.len()];
+                    if let Some(mut permit) = cb.begin_request(host) {
+                        match (t + i) % 4 {
+                            0 => permit.settle_response(200),
+                            1 => permit.settle_response(503),
+                            2 => permit.settle_transport_failure(),
+                            // The unsettled drop.
+                            _ => {}
+                        }
+                    }
+                }
+                let _ = tx.send(());
+            }));
+        }
+        drop(tx);
+
+        for worker in 0..8 {
+            rx.recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "worker {worker} did not finish within 30s ({e}) — a breaker method \
+                     is holding a DashMap shard across a call that re-enters the map"
+                    )
+                });
+        }
+        for h in handles {
+            h.join().expect("no worker may panic");
+        }
+
+        for host in hosts {
+            if let Some(remaining) = cb.trial_tokens_remaining(host) {
+                assert!(
+                    remaining <= 3,
+                    "{host}: {remaining} trial tokens outstanding against a \
+                     three-token budget — repayment is over-crediting"
+                );
+            }
+        }
     }
 
     /// All five series must EXIST after seeding, so `increase(...) > 0` is
