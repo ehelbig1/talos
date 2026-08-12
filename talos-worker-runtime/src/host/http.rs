@@ -625,9 +625,12 @@ impl wit_http::Host for TalosContext {
                 // previous `record_success` — a status can never open a
                 // circuit, because this breaker is host-keyed and
                 // process-global and a 401 belongs to one user's credential.
-                // On a HALF-OPEN trial a 5xx or 429 now fails the trial
-                // instead of closing the circuit against a host that is
-                // answering nothing but errors. Full argument, including the
+                // On a HALF-OPEN trial a 5xx — and ONLY a 5xx — now fails the
+                // trial instead of closing the circuit against a host that is
+                // answering nothing but errors. A 429 deliberately PASSES the
+                // trial: it is per-caller (`userRateLimitExceeded`), so
+                // failing a trial on it turns one tenant's routine quota error
+                // into every tenant's outage. Full argument, including the
                 // residual cross-tenant tail it accepts, in
                 // `circuit_breaker.rs`.
                 permit.settle_response(resp.status().as_u16());
@@ -1414,15 +1417,25 @@ impl wit_http::Host for TalosContext {
                 // `begin_request` before its send and settles it after. This
                 // path does NEITHER: a batch cannot trip the breaker, cannot be refused
                 // by it, and contributes nothing to
-                // `talos_circuit_breaker_{opens,blocks}_total`. Both counters
-                // are therefore structurally blind to batch HTTP, and the
-                // runbook's "if opens and blocks are both flat, this is not a
-                // herd" is a FALSE NEGATIVE for any module built on
-                // `fetch_all`. The alert description says so in as many words.
+                // `talos_circuit_breaker_{opens,blocks}_total`.
                 //
-                // Latent today: no shipped module template calls `fetch_all`
-                // (the name appears only in generated `bindings.rs`). It is a
-                // real gap the moment one does.
+                // SCOPE, corrected 2026-08-12 in review: this is not a
+                // batch-HTTP exception, it is the general case.
+                // `wit_http::fetch` is the ONLY outbound-HTTP surface in this
+                // worker that touches the breaker at all — `wit_webhook::send`,
+                // `wit_graphql::execute`, `host/http_stream.rs`, the four S3
+                // operations in `host/object_storage.rs`, `host/llm_tools.rs`,
+                // `host/llm.rs` and `host/email.rs` all egress without
+                // consulting it or recording an outcome. So the runbook's "if
+                // opens and blocks are both flat, this is not a herd" is a
+                // FALSE NEGATIVE for every one of them, not just for
+                // `fetch_all`. The full list is in `circuit_breaker.rs`'s
+                // header and in the alert description.
+                //
+                // `fetch_all` specifically is still LATENT — no shipped module
+                // template calls it (the name appears only in generated
+                // `bindings.rs`) — but the LLM, webhook and GraphQL paths are
+                // on the hot path today, so the blindness as a whole is live.
                 //
                 // NOT extended in the same change, for two reasons.
                 //

@@ -46,13 +46,37 @@ use std::time::{Duration, Instant};
 //
 // ## What these counters cannot see
 //
-// `wit_http::fetch_all` does not interact with the breaker at all — it neither
-// consults it nor records outcomes — so BOTH series are structurally blind to
-// batch HTTP. Latent today (no shipped module template calls it) and argued at
-// length at that function's `send()` in `host/http.rs`, including why extending
-// it is a design question rather than a line. Any runbook sentence of the form
-// "if these are flat, the breaker is not involved" must be read with that
-// exception attached; the alert description states it.
+// **`wit_http::fetch` is the ONLY outbound-HTTP surface in this worker that
+// touches the breaker at all.** Every other egress path neither consults it
+// nor records an outcome, so both series are structurally blind to all of
+// them. Enumerated rather than summarised, because the boundary is the thing
+// an operator has to reason from:
+//
+//   * `wit_http::fetch_all`          (`host/http.rs`, batch HTTP)
+//   * `wit_webhook::send`            (`host/webhook.rs`)
+//   * `wit_graphql::execute`         (`host/graphql.rs`)
+//   * `wit_http_stream`              (`host/http_stream.rs`)
+//   * the four S3 operations         (`host/object_storage.rs`)
+//   * the LLM tool-call client       (`host/llm_tools.rs`)
+//   * the LLM + embedding clients    (`host/llm.rs`)
+//   * the transactional-email client (`host/email.rs`)
+//
+// This was previously written as "structurally blind to batch HTTP", with the
+// mitigation that no shipped module template calls `fetch_all`. That
+// understated it in the direction that matters: `fetch_all` is indeed latent,
+// but the LLM, webhook and GraphQL paths are on this platform's hot path
+// TODAY, so the blindness is live, not latent. The honest statement is
+// "everything except `wit_http::fetch`".
+//
+// Consequence for the runbook: a sentence of the form "if these are flat, the
+// breaker is not involved" is sound only for modules whose egress goes
+// through `wit_http::fetch`. It cannot exonerate — or implicate — any of the
+// surfaces above. The alert description carries the same list.
+//
+// Extending the breaker to those surfaces is deliberately NOT done here: it
+// is a design question, not a line, and it is argued at `fetch_all`'s
+// `send()` in `host/http.rs`. This section is documentation of the existing
+// boundary only.
 //
 // ## Why the `prometheus` crate here and not OTEL like the rest of `metrics.rs`
 //
@@ -85,7 +109,7 @@ use std::time::{Duration, Instant};
 // 3. **A concrete child counter is a single atomic add.** The five label
 //    combinations below are resolved ONCE at init, so the increment on the
 //    breaker's path is `IntCounter::inc()` — no map lookup, no lock. See the
-//    "recorded outside the entry lock" note on `allow_request`.
+//    "recorded outside the entry lock" note on `admit`.
 //
 // ## Label discipline
 //
@@ -122,8 +146,8 @@ pub(crate) enum BlockReason {
     /// request was rejected without being sent.
     ///
     /// NOTE this and [`Self::HalfOpenExhausted`] are INDISTINGUISHABLE
-    /// downstream: `allow_request` returns `false` for both, and `host/http.rs`
-    /// has a single `emit_network_failure` behind that one `false`, so both
+    /// downstream: `begin_request` returns `None` for both, and `host/http.rs`
+    /// has a single `emit_network_failure` behind that one `None`, so both
     /// surface to the guest as `networkerror` and both stamp the execution
     /// error with `reason_class=circuit-open`. This label is the only thing
     /// that separates them — which is why it is a label and not a log line.
@@ -456,7 +480,7 @@ impl Default for CircuitBreakerConfig {
 //     user's calendar, Gmail and Drive workflows. A reliability feature would
 //     have manufactured a cross-tenant outage.
 //   * 404 / 400 / 422 — a property of one REQUEST (or one module's bug).
-//   * 429 — usually a property of one user's QUOTA. On Google APIs
+//   * 429 — a property of one user's QUOTA. On Google APIs
 //     `userRateLimitExceeded` is per-user; backing off is right for the user
 //     who is being limited, and the breaker cannot express "for that user"
 //     because it is not keyed by user. Blocking everyone else converts A's
@@ -468,10 +492,10 @@ impl Default for CircuitBreakerConfig {
 // ## The decision
 //
 // **An HTTP status can NEVER open a circuit.** The Closed→Open transition
-// stays keyed to reqwest transport errors exactly as before this change, so
-// the population that can be newly blocked by this change is EMPTY.
+// stays keyed to reqwest transport errors, so the population that can be
+// newly blocked by a status is EMPTY.
 //
-// **An HTTP status CAN fail a half-open recovery trial.** See
+// **A 5xx, and ONLY a 5xx, can fail a half-open recovery trial.** See
 // [`status_fails_recovery_trial`]. That decision can only keep an
 // ALREADY-OPEN circuit open for one more cooldown; it can never block anyone
 // who was not already blocked, and without it the breaker had a real defect:
@@ -480,36 +504,79 @@ impl Default for CircuitBreakerConfig {
 // was serving nothing. Resuming full traffic onto a host that just told you it
 // is failing is the exact outcome the breaker exists to prevent.
 //
+// ## Why 429 is NOT a trial failure (reversed 2026-08-12, review; do not
+// ## re-litigate without re-reading this paragraph and the arithmetic in it)
+//
+// The first version of this change failed a trial on `5xx || 429`. That
+// applied the tenancy argument above to OPENING and then abandoned it at
+// CLOSING, which is the same mistake one step later in the state machine.
+//
+// The arithmetic is what makes it not merely inelegant. Defaults are
+// `test_requests = 3` and `success_rate_threshold = 0.8`, so a period closes
+// only on 3/3 — 2/3 is 0.667 and re-opens. A 429 is ROUTINE on this
+// platform's Google integrations and is per-CALLER by construction
+// (`userRateLimitExceeded`), so ONE rate-limited tenant taking one trial
+// token was enough to re-open the circuit for EVERY tenant, one cooldown at a
+// time, for as long as that tenant kept probing. Before the change a 429
+// counted as a trial success, the circuit closed, everyone proceeded, and the
+// rate-limited tenant kept getting their own 429s — correctly isolated,
+// because a per-user quota is exactly the kind of fact this shared,
+// host-keyed structure must not learn.
+//
+// "It can prolong an outage, it cannot start one" is true and thin: to a
+// tenant who is blocked, a circuit that never closes is indistinguishable
+// from one that opened. 429 therefore gets the same treatment as every other
+// 4xx — it PASSES the trial, because it proves the host is alive and serving,
+// which is the only question a trial is entitled to ask.
+//
 // The asymmetry is enforced STRUCTURALLY, not by comment: the status is only
 // consulted when the admission consumed a half-open trial token, and the
 // resulting failure is routed to [`HttpCircuitBreaker::record_trial_failure`],
-// which refuses to act on any state other than `HalfOpen` and never touches
-// `consecutive_failures`. There is no code path by which a status reaches the
-// open decision.
+// which refuses to act on any state other than `HalfOpen` in the same epoch
+// and never touches `consecutive_failures`. There is no code path by which a
+// status reaches the open decision.
 //
-// ## The residual cross-tenant tail, stated rather than implied
+// ## The residual cross-tenant tail with 429 removed, stated accurately
 //
-// It is NOT zero. If user A's requests are the ones probing a host, and A's
-// requests specifically get 5xx (or A's quota specifically is exhausted, for
-// 429), the trials keep failing and the circuit stays open for user B too —
-// one 30-second cooldown at a time, indefinitely, for as long as A keeps
-// probing. What bounds it is that the circuit was ALREADY open when this
-// began: the change can prolong an outage, never start one, and every cycle
-// re-admits traffic for a fresh trial. The pre-change alternative is strictly
-// worse for B, since it closes the circuit and sends B's traffic to a host
-// that is answering 503.
+// It is smaller and it is NOT zero, and the arithmetic above still applies:
+// one 5xx anywhere in a three-trial period guarantees that period ends in a
+// re-open (2/3 = 0.667 < 0.8). It does not re-open on the spot — the rate
+// check runs only once all three verdicts are in — but the period is decided
+// the moment the first 5xx lands. So if user A's payload specifically draws a
+// 500 from a host that serves user B perfectly, and A's request happens to
+// take a trial token, B stays blocked for another `open_duration`.
+//
+// That is ACCEPTED, for three reasons, and it is the whole of the remaining
+// tail:
+//
+//   1. Direction. A 5xx is the host asserting its own failure. Of the
+//      statuses, it is the only one whose subject is the server, so it is the
+//      only one whose fail-safe direction is legitimately toward blocking. A
+//      429's subject is the CALLER, and a 4xx's is the request — for those,
+//      blocking is a category error, which is why they now all pass.
+//   2. It is bounded and self-clearing. The circuit was already open when
+//      this began; each cooldown is `open_duration` (30 s default) and
+//      re-admits a fresh full set of trial tokens. Nothing latches. The
+//      pre-change alternative is strictly worse for B, because it CLOSES the
+//      circuit and sends B's traffic to a host that is answering 503.
+//   3. Widening the tolerance is a THRESHOLD change, not a semantics one.
+//      Making one 5xx survivable means `test_requests` up or
+//      `success_rate_threshold` down, which changes how every trial verdict
+//      is reached — including the transport-driven ones this change does not
+//      touch. That is a separate, measurable decision and is deliberately not
+//      bundled here.
 //
 // ## Fail-safe direction of each new path
 //
-//   * Trial gets 5xx/429 → trial FAILS → circuit stays open. Fails toward
-//     BLOCKING work on a host that answered with a server error or a
-//     back-off. Right, because the trial's question is "has it recovered?"
-//     and the answer was no. Bounded by `open_duration`; self-clearing.
-//   * Trial gets 4xx (not 429) → trial SUCCEEDS → circuit may close. Fails
-//     toward ADMITTING work. Right, and not a compromise: a 401 proves the
-//     host is alive and serving, which is precisely what the trial asks. The
-//     credential problem behind it is per-user and must not be encoded in
-//     shared state.
+//   * Trial gets 5xx → trial FAILS → circuit stays open. Fails toward
+//     BLOCKING work on a host that answered with a server error. Right,
+//     because the trial's question is "has it recovered?" and the host itself
+//     answered no. Bounded by `open_duration`; self-clearing.
+//   * Trial gets 4xx, INCLUDING 429 → trial SUCCEEDS → circuit may close.
+//     Fails toward ADMITTING work. Right, and not a compromise: a 401 or a
+//     429 proves the host is alive and serving, which is precisely what the
+//     trial asks. The credential or quota problem behind it is per-user and
+//     must not be encoded in shared state.
 //   * A reqwest BUILDER error (an invalid header name or value the guest
 //     authored) → NO evidence recorded either way. Fails toward ADMITTING
 //     work. Right, because the request never left the process, so there is no
@@ -532,17 +599,27 @@ impl Default for CircuitBreakerConfig {
 ///
 /// **Consulted only for the trial verdict — never for the Closed→Open
 /// decision.** See the "connectivity-vs-health" note above for the full
-/// argument, in particular why 4xx is deliberately absent (a 401 is one
+/// argument, in particular why every 4xx is deliberately absent (a 401 is one
 /// user's credential, and this breaker is shared by every user on the worker).
 ///
-/// * `5xx` — the host answered and admitted it failed. Not evidence of
-///   recovery.
-/// * `429` — the host answered "stop". Resuming full traffic on the strength
-///   of a rate-limit response is how a degraded upstream is kept degraded.
-/// * everything else, including every other 4xx — the host is alive and
-///   serving, which is the only question a recovery trial is entitled to ask.
+/// * `5xx` — the host answered and admitted its own failure. The only status
+///   whose SUBJECT is the server, and therefore the only one whose fail-safe
+///   direction is legitimately toward blocking. Not evidence of recovery.
+/// * everything else, including `429` — the host is alive and serving, which
+///   is the only question a recovery trial is entitled to ask.
+///
+/// **`429` is deliberately NOT here, and was removed in review on 2026-08-12
+/// after the first version of this function included it.** A 429 is
+/// per-CALLER by construction (`userRateLimitExceeded` on Google APIs is
+/// per-user) and routine on this platform. With `test_requests = 3` and
+/// `success_rate_threshold = 0.8` a period closes only on 3/3, so a single
+/// 429 taken by ONE rate-limited tenant re-opened the circuit for EVERY
+/// tenant, one cooldown at a time, indefinitely. Adding it back re-creates a
+/// cross-tenant outage out of one tenant's routine quota error. If you are
+/// here to add a status, the test that will stop you is
+/// `a_429_trial_closes_the_circuit_because_the_quota_is_one_tenants`.
 fn status_fails_recovery_trial(status: u16) -> bool {
-    status >= 500 || status == 429
+    status >= 500
 }
 
 /// State of a circuit breaker for a specific host.
@@ -685,7 +762,10 @@ impl HttpCircuitBreaker {
     /// `Drop` repays any half-open trial token that the admission spent.
     ///
     /// This is the ONLY admission path production has. See
-    /// [`Self::allow_request`] for why the raw primitive is `#[cfg(test)]`.
+    /// `allow_request` (test-only, so deliberately NOT linked — an intra-doc
+    /// link from a public item to a `#[cfg(test)]` target does not resolve
+    /// under `cargo doc`) for why the raw primitive cannot be called from
+    /// production.
     pub fn begin_request(&self, host: &str) -> Option<RequestPermit<'_>> {
         match self.admit(host) {
             Ok(trial_epoch) => Some(RequestPermit {
@@ -788,10 +868,11 @@ impl HttpCircuitBreaker {
     }
 
     /// Record a half-open trial that FAILED on the strength of its HTTP
-    /// status, rather than on a transport error.
+    /// status (a 5xx), rather than on a transport error.
     ///
-    /// This is the only place an HTTP status influences breaker state, and it
-    /// is deliberately unable to influence the OPEN decision:
+    /// This is the only place an HTTP status can move breaker state in the
+    /// failing direction, and it is deliberately unable to influence the OPEN
+    /// decision:
     ///
     /// * it no-ops unless the circuit is still `HalfOpen` in the same period
     ///   the trial token came from — so a status arriving after the circuit
@@ -799,10 +880,22 @@ impl HttpCircuitBreaker {
     /// * it never touches `consecutive_failures`, which is the only field the
     ///   Closed→Open transition reads.
     ///
-    /// Net: an HTTP status can prolong an outage for one cooldown, and can
-    /// never start one. That is the whole cross-tenant safety argument, held
-    /// up by control flow instead of by a comment. See the
-    /// "connectivity-vs-health" note at the top of this file.
+    /// Net: a 5xx can prolong an outage for one cooldown, and can never start
+    /// one. That is the whole cross-tenant safety argument, held up by control
+    /// flow instead of by a comment. See the "connectivity-vs-health" note at
+    /// the top of this file.
+    ///
+    /// The epoch gate is NOT unique to the failing side: its twin
+    /// [`Self::record_trial_success`] carries the identical gate, added in
+    /// review on 2026-08-12. Before that the success side was ungated (via
+    /// the bare `record_success`) and a straggler from a dead half-open
+    /// period credited the CURRENT period's `test_successes` — so this
+    /// doc-comment's "structural guarantee" framing described only half of
+    /// the structure. Keep the two in lockstep.
+    ///
+    /// The gate covers the two STATUS paths and NOT
+    /// [`RequestPermit::settle_transport_failure`], which is deliberate and
+    /// argued there.
     fn record_trial_failure(&self, host: &str, epoch: Instant) {
         let opened = {
             let now = Instant::now();
@@ -825,8 +918,88 @@ impl HttpCircuitBreaker {
                     tracing::warn!(
                         host = %host,
                         success_rate = %success_rate,
-                        "Circuit breaker re-opened — the recovery trial got an unhealthy \
-                         HTTP status (5xx or 429), which is not evidence of recovery"
+                        "Circuit breaker re-opened — the recovery trial got a 5xx, which \
+                         is the host asserting its own failure and is not evidence of \
+                         recovery"
+                    );
+                    opened = Some(OpenTransition::Reopened);
+                }
+            }
+            opened
+        };
+
+        if let Some(transition) = opened {
+            BREAKER_METRICS.record_open(transition);
+        }
+    }
+
+    /// Record a half-open trial that SUCCEEDED, scoped to the period its
+    /// token came from.
+    ///
+    /// The epoch-gated twin of [`Self::record_trial_failure`], added in review
+    /// on 2026-08-12 because the failure side was gated and the success side
+    /// was not. The asymmetry was reachable: a permit whose request outlived
+    /// its half-open period — client timeouts run to 120 s, cooldown is 30 s —
+    /// settled through the ungated `record_success`, whose `HalfOpen` arm
+    /// credited whatever period was current, tally `(0,0) → (1,0)`. A
+    /// straggler could therefore help CLOSE a period that had not earned it.
+    ///
+    /// The correction is small on purpose: a stale success is discarded, not
+    /// redirected. It is evidence from a window that has already been decided,
+    /// and the only alternatives — crediting the current period (the bug) or
+    /// re-deriving a Closed-state effect from it — either restore the defect
+    /// or invent an outcome the request never had.
+    ///
+    /// Two of the three other states are genuinely unchanged, which is why
+    /// this is a narrow fix rather than a rewrite: settling into an `Open`
+    /// circuit hit `record_success`'s explicit no-op arm, and settling into
+    /// the SAME half-open period behaves exactly as before.
+    ///
+    /// The third does change, in the same direction and worth stating rather
+    /// than glossing: a straggler settling into a circuit that has since
+    /// CLOSED used to reach `record_success`'s Closed arm and zero
+    /// `consecutive_failures`, and now does nothing. Those failures may have
+    /// accumulated AFTER the close, from live requests — so the old behaviour
+    /// let evidence from a decided period suppress a current failure streak,
+    /// and delaying an open on the strength of a stale success is not a
+    /// property worth keeping. Losing it is an improvement, not a cost.
+    fn record_trial_success(&self, host: &str, epoch: Instant) {
+        let opened = {
+            let now = Instant::now();
+            let Some(mut entry) = self.records.get_mut(host) else {
+                return;
+            };
+            let record = entry.value_mut();
+            if record.state != CircuitState::HalfOpen || record.last_state_change != epoch {
+                return;
+            }
+
+            record.test_successes += 1;
+            let mut opened: Option<OpenTransition> = None;
+            let total_tests = record.test_successes + record.test_failures;
+            if total_tests >= self.config.test_requests {
+                let success_rate = record.test_successes as f64 / total_tests as f64;
+                if success_rate >= self.config.success_rate_threshold {
+                    record.state = CircuitState::Closed;
+                    record.consecutive_failures = 0;
+                    record.last_state_change = now;
+                    tracing::info!(
+                        host = %host,
+                        success_rate = %success_rate,
+                        "Circuit breaker closed"
+                    );
+                } else {
+                    // The period concluded ON a success and still missed the
+                    // bar — one 5xx earlier in a 3-trial / 0.8 period is
+                    // enough, and that period was decided the moment the 5xx
+                    // landed. Re-open.
+                    record.state = CircuitState::Open;
+                    record.last_state_change = now;
+                    tracing::warn!(
+                        host = %host,
+                        success_rate = %success_rate,
+                        "Circuit breaker re-opened — the recovery trial did not meet the \
+                         success-rate threshold"
                     );
                     opened = Some(OpenTransition::Reopened);
                 }
@@ -841,9 +1014,16 @@ impl HttpCircuitBreaker {
 
     /// Record a successful request to the given host.
     ///
-    /// Metric recorded after the entry guard drops (see [`Self::allow_request`]).
-    /// The overwhelmingly common case — a success on a Closed circuit — takes
-    /// no metric path at all.
+    /// Metric recorded after the entry guard drops (see the note on
+    /// `admit`). The overwhelmingly common case — a success on a Closed
+    /// circuit — takes no metric path at all.
+    ///
+    /// NOTE this is the UNGATED primitive: its `HalfOpen` arm credits whatever
+    /// half-open period is current, with no epoch check. Production reaches it
+    /// only for admissions that spent NO trial token (a Closed circuit);
+    /// trial settlements go through [`Self::record_trial_success`]. Kept
+    /// `pub` for the pre-permit two-state tests that drive the state machine
+    /// directly.
     pub fn record_success(&self, host: &str) {
         let opened = {
             let now = Instant::now();
@@ -906,7 +1086,7 @@ impl HttpCircuitBreaker {
 
     /// Record a failed request to the given host.
     ///
-    /// Metric recorded after the entry guard drops (see [`Self::allow_request`]).
+    /// Metric recorded after the entry guard drops (see the note on `admit`).
     pub fn record_failure(&self, host: &str) {
         let opened = {
             let now = Instant::now();
@@ -973,7 +1153,7 @@ impl HttpCircuitBreaker {
     /// Read-only peek: is the circuit for `host` currently OPEN and
     /// still within its cooldown window?
     ///
-    /// Distinct from [`Self::allow_request`], which MUTATES (drives the
+    /// Distinct from [`Self::begin_request`], which MUTATES (drives the
     /// Open→HalfOpen transition and the half-open test-token accounting).
     /// `is_open` never mutates — it is the retry-decision gate: when a
     /// host's circuit is OPEN and cooling down, in-worker retries against
@@ -983,7 +1163,7 @@ impl HttpCircuitBreaker {
     ///
     /// Returns `false` once the cooldown has elapsed (the circuit is
     /// ready for a half-open trial) so the next real request still gets
-    /// its single probe via `allow_request`, and `false` for a host with
+    /// its single probe via `begin_request`, and `false` for a host with
     /// no record or a Closed/HalfOpen circuit.
     pub fn is_open(&self, host: &str) -> bool {
         self.records
@@ -1123,22 +1303,61 @@ impl RequestPermit<'_> {
     /// failure mode argued against at the top of this file.
     ///
     /// On a half-open TRIAL the status decides the verdict, via
-    /// [`status_fails_recovery_trial`].
+    /// [`status_fails_recovery_trial`] — a 5xx fails it, everything else
+    /// (including 429) passes it. **Both verdicts are EPOCH-GATED**: a trial
+    /// settlement is credited only to the half-open period whose token this
+    /// permit spent. A settlement that arrives after that period ended is
+    /// discarded rather than applied to whatever period is current — which
+    /// matters because the client timeout runs to 120 s against a 30 s
+    /// cooldown, so a straggler outliving its period is a real window, not a
+    /// theoretical one. The failing side has been gated since the permit
+    /// existed; the SUCCEEDING side was gated in review on 2026-08-12, after
+    /// it was found to credit the current period's `test_successes`.
+    ///
+    /// See [`HttpCircuitBreaker::record_trial_success`] /
+    /// [`HttpCircuitBreaker::record_trial_failure`].
     pub fn settle_response(&mut self, status: u16) {
-        self.settled = true;
+        if self.claim_settle() {
+            return;
+        }
         match self.trial_epoch {
             Some(epoch) if status_fails_recovery_trial(status) => {
                 self.breaker.record_trial_failure(&self.host, epoch);
             }
-            _ => self.breaker.record_success(&self.host),
+            Some(epoch) => self.breaker.record_trial_success(&self.host, epoch),
+            None => self.breaker.record_success(&self.host),
         }
     }
 
     /// The request failed in transport — connect, DNS, TLS, reset, or the
     /// client's own timeout. Evidence about the HOST, and the only kind of
     /// evidence allowed to open a circuit.
+    ///
+    /// # The one settle path that is still NOT epoch-gated, stated rather than
+    /// # implied
+    ///
+    /// This routes to the ungated `record_failure`, so a straggler transport
+    /// failure from a DEAD half-open period is counted against whatever period
+    /// is current. That is the same shape as the success-side asymmetry closed
+    /// on 2026-08-12, and it is left in place deliberately, for two reasons —
+    /// not because it was missed:
+    ///
+    /// * `record_failure`'s `Closed` arm is the OPEN decision, and unlike a
+    ///   status, a transport failure is genuine host evidence whenever it
+    ///   arrives. Gating it would NARROW the open decision, which is the one
+    ///   axis this area of the code is holding still so that post-deploy
+    ///   movement in `opens_total{transition="opened"}` stays attributable.
+    /// * It is pre-existing, not a regression: `record_failure` was equally
+    ///   ungated before the permit existed.
+    ///
+    /// So "trial settlements are epoch-gated" is true of the two STATUS paths
+    /// and not of this one. Note the fail-safe direction differs too — a
+    /// misattributed transport failure fails toward BLOCKING, where the
+    /// misattributed success it mirrors failed toward ADMITTING.
     pub fn settle_transport_failure(&mut self) {
-        self.settled = true;
+        if self.claim_settle() {
+            return;
+        }
         self.breaker.record_failure(&self.host);
     }
 
@@ -1152,9 +1371,50 @@ impl RequestPermit<'_> {
     /// process-global circuit for a perfectly healthy host without emitting a
     /// packet. Settling as no-evidence repays the trial token and records
     /// neither outcome.
+    ///
+    /// # What this predicts for `opens_total{transition="opened"}`
+    ///
+    /// It should FALL. Stated here because the first version of the change
+    /// that introduced this method predicted the opposite — it called the open
+    /// decision "byte-identical", so any post-deploy movement in that counter
+    /// was to be read as environmental. That is wrong for exactly this path:
+    /// `record_failure`'s `Closed` arm is the sole emitter of `Opened`, and
+    /// this method REMOVES a class of input (guest-authored builder errors)
+    /// from it. A decline after deploy is a direct, expected consequence of
+    /// this change and specifically not noise. Only the STATUS half of that
+    /// change was open-decision-neutral.
     pub fn settle_no_evidence(&mut self) {
-        self.settled = true;
+        if self.claim_settle() {
+            return;
+        }
         self.repay();
+    }
+
+    /// Take the permit's single settlement, returning `true` if it was
+    /// already taken and the caller must do NOTHING.
+    ///
+    /// # Why `settled` is read and not merely written
+    ///
+    /// It used to be write-only: all three settle methods set it and only
+    /// `Drop` read it, so a second settle recorded a SECOND outcome against
+    /// the same request. That was not a hypothetical — the filed follow-up for
+    /// moving the settle past the response body (`docs/backlog.md`) originally
+    /// asserted "`RequestPermit::settled` already makes a second settle a
+    /// no-op rather than a double count, so the mechanical risk is low", and
+    /// then suggested the exact shape that double-settles: settle at the send
+    /// error AND after the body loop. On a half-open trial that posts one
+    /// success and one failure from a single probe, consumes two of the three
+    /// slots, and — at the default 3 trials / 0.8 threshold — GUARANTEES a
+    /// re-open at 2/3.
+    ///
+    /// A permit is one request and therefore one datapoint. Making the flag
+    /// load-bearing is what turns that sentence from a convention into a
+    /// property, so the trap cannot be walked into by a caller who believes
+    /// the doc.
+    fn claim_settle(&mut self) -> bool {
+        let already = self.settled;
+        self.settled = true;
+        already
     }
 
     fn repay(&self) {
@@ -1726,24 +1986,175 @@ mod tests {
     /// A permit that outlives its half-open period must not credit the NEXT
     /// one. Without the epoch stamp a slow in-flight request could hand a
     /// three-trial period a fourth trial.
+    ///
+    /// # This test was VACUOUS as shipped, and the fix is the interesting part
+    ///
+    /// The first version left the NEW period at exactly `test_requests` (3)
+    /// and asserted the straggler's drop left it at 3. But `repay_trial_token`
+    /// ends `.saturating_add(1).min(self.config.test_requests)`, so 3 is what
+    /// it returns whether or not the epoch gate ran — the clamp alone
+    /// satisfied the assertion. Confirmed by mutation on 2026-08-12: with the
+    /// gate deleted outright, the shipped test still reported `ok`. A guard
+    /// whose removal no test notices is not guarded.
+    ///
+    /// The fix is to put the current period BELOW the clamp ceiling before the
+    /// straggler drops, so 2→2 (gate present) and 2→3 (gate absent) are
+    /// distinguishable. Re-verified by mutation after the fix: deleting the
+    /// gate fails this test.
+    ///
+    /// The new period's token is spent through `allow_request`, the retained
+    /// leaking primitive, precisely because it takes a token WITHOUT creating
+    /// a second permit whose own `Drop` would repay it and re-hide the bug.
     #[test]
     fn a_repayment_from_a_stale_half_open_period_is_discarded() {
         let cb = HttpCircuitBreaker::default();
         let host = "stale-epoch.example.test";
         cb.force_half_open(host, 1);
 
-        let permit = cb.begin_request(host).expect("half-open admits");
+        let straggler = cb.begin_request(host).expect("half-open admits");
         assert_eq!(cb.trial_tokens_remaining(host), Some(0));
 
         // A new half-open period begins while the request is still in flight.
+        // The sleep is what makes the two epochs distinguishable `Instant`s.
         std::thread::sleep(Duration::from_millis(2));
         cb.force_half_open(host, 3);
 
-        drop(permit);
+        // Spend one of the NEW period's three tokens, so the count sits at 2 —
+        // strictly below the clamp ceiling. Without this the assertion below
+        // holds for the wrong reason.
+        assert!(cb.allow_request(host));
         assert_eq!(
             cb.trial_tokens_remaining(host),
-            Some(3),
-            "a token from a previous period must not inflate the current one"
+            Some(2),
+            "precondition: the current period must be BELOW its ceiling, or this \
+             test cannot tell the gate from the clamp"
+        );
+
+        drop(straggler);
+        assert_eq!(
+            cb.trial_tokens_remaining(host),
+            Some(2),
+            "a token from a previous period must not inflate the current one; \
+             seeing 3 here means the epoch gate in repay_trial_token is not running"
+        );
+    }
+
+    /// The success side of a settle is epoch-gated too — the half of the
+    /// symmetry that was MISSING until review on 2026-08-12.
+    ///
+    /// Both reviewers found it independently. `settle_response(200)` used to
+    /// route through the ungated `record_success`, whose `HalfOpen` arm
+    /// credits whatever period is current: a permit from a period that had
+    /// already ended moved the CURRENT period's tally `(0,0) → (1,0)`, so a
+    /// straggler could help close a period that did not earn it. The client
+    /// timeout runs to 120 s against a 30 s cooldown, so the window is real.
+    ///
+    /// Fails without the gate in `record_trial_success` (the tally reads
+    /// `(1,0)`), which is why it is a separate test from the tokens above.
+    #[test]
+    fn a_success_from_a_stale_half_open_period_is_discarded() {
+        let cb = HttpCircuitBreaker::default();
+        let host = "stale-epoch-success.example.test";
+        cb.force_half_open(host, 1);
+
+        let mut straggler = cb.begin_request(host).expect("half-open admits");
+
+        std::thread::sleep(Duration::from_millis(2));
+        cb.force_half_open(host, 3);
+        assert_eq!(cb.trial_tally(host), Some((0, 0)));
+
+        // The straggler's 200 belongs to a period that has already ended.
+        straggler.settle_response(200);
+
+        assert_eq!(
+            cb.trial_tally(host),
+            Some((0, 0)),
+            "a success from a dead half-open period credited the current one — a \
+             straggler must not help close a period it never ran in"
+        );
+        assert_eq!(cb.get_state(host).as_deref(), Some("half_open"));
+    }
+
+    /// A permit is ONE request and therefore ONE datapoint. The second settle
+    /// must record nothing.
+    ///
+    /// `settled` was write-only until review on 2026-08-12 — all three settle
+    /// methods set it and only `Drop` read it — while the filed follow-up for
+    /// moving the settle past the response body asserted the opposite ("a
+    /// second settle is a no-op rather than a double count") and then proposed
+    /// the shape that double-settles. On a half-open trial that posts a
+    /// success AND a failure from one probe, spends two of three slots, and at
+    /// the default 3 trials / 0.8 threshold guarantees a re-open at 2/3.
+    #[test]
+    fn a_second_settle_records_nothing() {
+        let cb = HttpCircuitBreaker::default();
+        let host = "double-settle.example.test";
+        cb.force_half_open(host, 3);
+
+        let mut permit = cb.begin_request(host).expect("half-open admits");
+        permit.settle_response(200);
+        assert_eq!(cb.trial_tally(host), Some((1, 0)));
+
+        // The shape the backlog entry proposed: settle again on the way out.
+        permit.settle_response(500);
+        permit.settle_transport_failure();
+        permit.settle_no_evidence();
+
+        assert_eq!(
+            cb.trial_tally(host),
+            Some((1, 0)),
+            "one request produced more than one trial verdict"
+        );
+        assert_eq!(
+            cb.consecutive_failures(host),
+            Some(0),
+            "a repeat settle reached the Closed-state failure counter"
+        );
+        assert_eq!(
+            cb.trial_tokens_remaining(host),
+            Some(2),
+            "a repeat settle_no_evidence repaid a token that was already accounted for"
+        );
+    }
+
+    /// `half_open_exhausted` does NOT require three-way concurrency.
+    ///
+    /// The change's own D4 note claimed it "now requires genuine 3-way
+    /// concurrency", and the runbook told operators to look for requests
+    /// racing. Both overstate it: trials that CONCLUDE do not repay their
+    /// tokens, so two sequential failing trials leave one token, and a single
+    /// caller arriving while the third trial is still in flight is refused.
+    /// That is two-way — one in-flight trial and one arrival — and this test
+    /// demonstrates it on ONE thread with no concurrency primitives at all.
+    ///
+    /// It also got MORE likely with this change, not less: before 2026-08-12 a
+    /// 5xx trial counted as a success, and now it concludes the trial as a
+    /// failure.
+    #[test]
+    fn half_open_exhausted_needs_no_three_way_concurrency() {
+        let cb = HttpCircuitBreaker::default();
+        let host = "sequential-exhaustion.example.test";
+        cb.force_half_open(host, 3);
+
+        // Two trials conclude, one strictly after the other. Neither re-opens:
+        // the rate check runs only once all three verdicts are in.
+        for i in 0..2 {
+            let mut permit = cb
+                .begin_request(host)
+                .unwrap_or_else(|| panic!("trial {i} must be admitted"));
+            permit.settle_response(503);
+        }
+        assert_eq!(cb.get_state(host).as_deref(), Some("half_open"));
+        assert_eq!(cb.trial_tokens_remaining(host), Some(1));
+
+        // The third trial is in flight. This is the ONLY outstanding request.
+        let _third = cb.begin_request(host).expect("the last token");
+        assert_eq!(cb.trial_tokens_remaining(host), Some(0));
+
+        assert!(
+            cb.begin_request(host).is_none(),
+            "a caller arriving during a single in-flight trial must be refused \
+             half_open_exhausted — no third concurrent request is needed"
         );
     }
 
@@ -1795,7 +2206,7 @@ mod tests {
     /// belongs to one user and must not be encoded in state every user shares.
     #[test]
     fn a_4xx_trial_closes_the_circuit_because_the_host_is_alive() {
-        for status in [400u16, 401, 403, 404] {
+        for status in [400u16, 401, 403, 404, 422] {
             let cb = HttpCircuitBreaker::default();
             let host = format!("trial-4xx-{status}.example.test");
             cb.force_half_open(&host, 3);
@@ -1811,6 +2222,91 @@ mod tests {
         }
     }
 
+    /// **429 must NOT fail a trial.** The guard on the reversal made in review
+    /// on 2026-08-12; if you are adding a status to
+    /// `status_fails_recovery_trial`, this is the test that should stop you.
+    ///
+    /// A 429 is per-CALLER by construction — Google's `userRateLimitExceeded`
+    /// is per-user — and this breaker is keyed by HOST and shared by every
+    /// tenant on the worker process. With the shipped defaults
+    /// (`test_requests = 3`, `success_rate_threshold = 0.8`) a period closes
+    /// only on 3/3, so ONE rate-limited tenant taking ONE trial token dragged
+    /// the period to 2/3 = 0.667 and re-opened the circuit for EVERYONE, one
+    /// cooldown at a time, for as long as that tenant kept probing. That is a
+    /// routine quota error manufacturing a cross-tenant outage.
+    ///
+    /// The pre-2026-08-12 behaviour was right here for the wrong reason (it
+    /// counted every `Ok(resp)` as a success); the behaviour is restored on
+    /// purpose, with the reason attached.
+    #[test]
+    fn a_429_trial_closes_the_circuit_because_the_quota_is_one_tenants() {
+        let cb = HttpCircuitBreaker::default();
+        let host = "trial-429.example.test";
+        cb.force_half_open(host, 3);
+        for _ in 0..3 {
+            let mut permit = cb.begin_request(host).expect("half-open admits");
+            permit.settle_response(429);
+        }
+        assert_eq!(
+            cb.get_state(host).as_deref(),
+            Some("closed"),
+            "a 429 failed a recovery trial — one tenant's per-user quota just decided \
+             availability for every other tenant sharing this worker's breaker"
+        );
+    }
+
+    /// One 429 mixed into an otherwise clean trial period must not re-open
+    /// either — the arithmetic, not just the unanimous case.
+    ///
+    /// This is the shape that actually occurs: one rate-limited tenant among
+    /// several healthy ones. At 3 trials / 0.8 a single failed verdict is
+    /// enough to force 2/3, so the unanimous test above would pass even if
+    /// only two of three 429s counted.
+    #[test]
+    fn a_single_429_among_healthy_trials_still_closes_the_circuit() {
+        let cb = HttpCircuitBreaker::default();
+        let host = "trial-429-mixed.example.test";
+        cb.force_half_open(host, 3);
+
+        for status in [200u16, 429, 200] {
+            let mut permit = cb.begin_request(host).expect("half-open admits");
+            permit.settle_response(status);
+        }
+        assert_eq!(
+            cb.get_state(host).as_deref(),
+            Some("closed"),
+            "one tenant's 429 re-opened a circuit shared by every other tenant"
+        );
+        assert_eq!(cb.trial_tally(host), Some((3, 0)));
+    }
+
+    /// The residual tail, asserted rather than asserted-about: with 429
+    /// removed, ONE 5xx anywhere in a three-trial period still re-opens.
+    ///
+    /// Stated in the "connectivity-vs-health" note and accepted there. It is
+    /// pinned here so the acceptance is a measured property and not a claim —
+    /// and so that any future tuning of `test_requests` /
+    /// `success_rate_threshold` has to come past a test that says what the
+    /// current numbers mean.
+    #[test]
+    fn one_5xx_in_a_trial_period_is_enough_to_reopen() {
+        let cb = HttpCircuitBreaker::default();
+        let host = "trial-one-5xx.example.test";
+        cb.force_half_open(host, 3);
+
+        for status in [200u16, 500, 200] {
+            let mut permit = cb.begin_request(host).expect("half-open admits");
+            permit.settle_response(status);
+        }
+        assert_eq!(
+            cb.get_state(host).as_deref(),
+            Some("open"),
+            "2/3 = 0.667 is below the 0.8 threshold, so the period re-opens — this is \
+             the accepted residual tail, not a surprise"
+        );
+        assert_eq!(cb.trial_tally(host), Some((2, 1)));
+    }
+
     /// The half of bug 2 that was a genuine correctness defect: pre-change,
     /// every trial that got an `Ok(resp)` counted as a success regardless of
     /// status, so a host answering nothing but 503 scored a 100% success rate
@@ -1821,11 +2317,11 @@ mod tests {
     /// `talos_circuit_breaker_opens_total{transition="reopened"}` move after
     /// this change, on hosts where it previously showed a close.
     #[test]
-    fn a_5xx_or_429_trial_reopens_the_circuit_instead_of_closing_it() {
+    fn a_5xx_trial_reopens_the_circuit_instead_of_closing_it() {
         const OPENS: &str = "talos_circuit_breaker_opens_total";
         let before_reopened = exported(OPENS, "transition", "reopened");
 
-        for status in [429u16, 500, 502, 503, 504] {
+        for status in [500u16, 502, 503, 504] {
             let cb = HttpCircuitBreaker::default();
             let host = format!("trial-unhealthy-{status}.example.test");
             cb.force_half_open(&host, 3);
