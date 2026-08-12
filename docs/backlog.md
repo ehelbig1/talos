@@ -591,3 +591,64 @@ instance is not warranted.
 (the index goes with it). Confirm the grep is still empty at the time of the drop.
 Note the header comment in `talos-worker-runtime/src/circuit_breaker.rs` points
 here; update it when this lands.
+
+---
+
+## A response body that fails MID-TRANSFER is recorded as a circuit-breaker SUCCESS
+
+**Added:** 2026-08-12. **Priority: LOW** (a missed failure signal, not a wrong
+one). Found while fixing the half-open token strand and the trial verdict in
+`talos-worker-runtime/src/host/http.rs`.
+
+**What.** `wit_http::fetch` settles the breaker at `builder.send()`, i.e. the
+moment response HEADERS arrive. The body is then streamed
+(`response.bytes_stream()`), and a transport reset partway through that stream
+returns `Err(wit_http::Error::Networkerror)` to the guest with
+`reason_class::RESPONSE_STREAM` — but the breaker has already been told the
+request succeeded. A host that accepts connections, returns 200 headers and
+then resets every body cannot trip the circuit.
+
+**Why it matters.** A mid-transfer reset is a genuine TRANSPORT failure, which
+is the one class this breaker is entitled to open circuits on. It is
+categorically different from the HTTP-status question settled on 2026-08-12 (a
+5xx can fail a recovery trial but no status can ever open a circuit, because
+the breaker is host-keyed and process-global and a 401 belongs to one user) — a
+connection reset belongs to the host and the network path, exactly like the
+connect and TLS failures that already count.
+
+**Why not done here.** Fixing it means keeping the permit alive past the send
+and settling after the body completes, which WIDENS the set of events that can
+open a circuit, and widening and narrowing the open decision in the same deploy
+makes neither measurable.
+
+Note the direction the widening has to be measured AGAINST, because the
+original version of this entry got it backwards. The 2026-08-12 change did NOT
+keep the open decision byte-identical: it NARROWED it, by routing reqwest
+BUILDER errors to `settle_no_evidence` instead of `record_failure`.
+`record_failure`'s `Closed` arm is the sole emitter of
+`opens_total{transition="opened"}`, so removing a class of input from it means
+that counter should FALL after deploy — a fall is a direct, expected
+consequence of the change and specifically NOT "environmental". Reading a
+decline as environment noise, or a later rise as a regression, is the
+misreading this paragraph now exists to prevent. Only the STATUS half of that
+change was open-decision-neutral.
+
+**Suggested shape.** Move the settle to after the body loop: `settle_response`
+on completion, `settle_transport_failure` on a stream error, and keep the
+existing `settle_transport_failure` for the send error.
+
+**Do NOT settle at the send error AND after the body loop.** That is the shape
+this entry originally suggested, on the strength of a claim that was false when
+written: `RequestPermit::settled` was WRITE-ONLY — all three settle methods set
+it and only `Drop` read it — so a second settle recorded a second outcome. On a
+half-open trial that posts one success and one failure from a single probe,
+consumes two of the three trial slots, and at the shipped defaults (3 trials,
+0.8 threshold) GUARANTEES a re-open at 2/3. The flag is now load-bearing: every
+settle method early-returns if the permit is already settled, and
+`a_second_settle_records_nothing` pins it. The structural rule behind it is
+that a permit is one request and therefore one datapoint — so the correct shape
+is a single settle on each mutually exclusive branch, not a belt-and-braces
+second one.
+
+Verify with `opens_total{transition="opened"}` before and after on a worker
+with a known-flaky upstream, and state the expected increase up front.

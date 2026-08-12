@@ -450,7 +450,38 @@ impl wit_http::Host for TalosContext {
 
         // Check circuit breaker before making request
         let host_str = host.to_string();
-        if !get_global_circuit_breaker().allow_request(&host_str) {
+        // ── The permit, and why the admission is not a bool ─────────────────
+        //
+        // `begin_request` returns an RAII `RequestPermit`. Admission on a
+        // HALF-OPEN circuit spends one of that host's three trial tokens, and
+        // the permit is the obligation to account for it. Everything between
+        // here and `builder.send()` below can exit without reaching the
+        // settle — four statement exits (the header cap, the body cap, the
+        // `?` on `resolve_vault_header`, the idempotency dedup's
+        // `return Ok(cached)`), two `.await` points at which the whole future
+        // can be DROPPED (execution timeout, worker shutdown, a sibling
+        // failing a fan-out), and a panic unwinding through any of it. The
+        // `?` and the cancellation are the two that no per-`return` patch can
+        // cover, and they are the two that actually fired: an unresolvable
+        // `vault://oauth/...` header is deterministic on exactly the header
+        // shape the calendar nodes use.
+        //
+        // Pre-permit, each of those spent a token and repaid nothing, and
+        // `HalfOpen` has NO time bound — it is left only by concluding
+        // `test_requests` trials. A host that leaked all three sat at
+        // half-open-with-zero-tokens for the life of the process, refusing
+        // every later request as `half_open_exhausted`. That is what took
+        // `www.googleapis.com` out from 2026-08-11 11:35 until the 23:06
+        // container recreate.
+        //
+        // Dropping the permit without settling repays the token and records
+        // NEITHER outcome — see `RequestPermit` for why "the trial did not
+        // conclude" is a third state and why recording a synthetic success or
+        // failure instead would each be a distinct bug.
+        //
+        // `fetch_all` needs no permit: it never asks for admission at all (see
+        // the note at its `send()`).
+        let Some(mut permit) = get_global_circuit_breaker().begin_request(&host_str) else {
             tracing::warn!(host = %host, "Circuit breaker open - rejecting HTTP request");
             self.emit_network_failure(
                 reason_class::CIRCUIT_OPEN,
@@ -461,51 +492,7 @@ impl wit_http::Host for TalosContext {
             )
             .await;
             return Err(wit_http::Error::Networkerror);
-        }
-
-        // ── KNOWN DEFECT, REPORTED AND DELIBERATELY NOT FIXED HERE ──────────
-        // (2026-08-11; deferred so a behaviour change does not land in the same
-        // commit as the breaker's first real counters and destroy attribution.)
-        //
-        // `allow_request` above SPENDS a HalfOpen trial token. The token is
-        // repaid only by `record_success` / `record_failure`, which live on the
-        // `builder.send()` match ~130 lines below. Every exit between the two
-        // spends a token and repays nothing, and because `HalfOpen` has NO time
-        // bound (it leaves only when `test_successes + test_failures >=
-        // test_requests`), a host whose tokens are all leaked is stranded at
-        // HalfOpen-with-0-tokens PERMANENTLY — every later request is refused
-        // `half_open_exhausted` until the process restarts.
-        //
-        // There are FOUR such paths, not three. The count was previously stated
-        // as three because it was derived from a grep for `return`, which is
-        // blind to the third one below:
-        //
-        //   1. the `MAX_OUTBOUND_HEADERS` cap  → `return Err(Forbiddenhost)`
-        //   2. the `MAX_OUTBOUND_HTTP_BODY_BYTES` cap
-        //                                      → `return Err(Forbiddenhost)`
-        //   3. `resolve_vault_header(...)?`    → a `?`, NOT a `return`
-        //   4. the idempotency dedup short-circuit
-        //                                      → `return Ok(cached)`
-        //
-        // (3) is the one most likely to fire in production: it is deterministic
-        // on an unresolvable `vault://oauth/...` header — precisely the header
-        // shape the calendar nodes use — so a host whose OAuth secret is
-        // missing or expired drains all three trial tokens on its first three
-        // recovery attempts and is then stranded for the life of the worker.
-        // (1) and (2) require a guest-authored oversized request; (4) requires
-        // an engine-stamped idempotency key that already completed.
-        //
-        // A FIFTH path is not a code path at all: task cancellation. Any
-        // `.await` between the spend and the send can be dropped (execution
-        // timeout, worker shutdown, a sibling failing a `try_join`), which
-        // leaks the token with no statement executing. This is the path that
-        // fits the 2026-08-11 11:35 stranding — see the note on `allow_request`
-        // in `circuit_breaker.rs`.
-        //
-        // The fix is an RAII guard that repays the token on `Drop` unless the
-        // outcome was recorded; it must cover all five, so it cannot be a
-        // per-`return` patch. `fetch_all` needs no entry here — it never calls
-        // `allow_request` at all (see the note at its `send()`).
+        };
 
         // Build the async reqwest request
         let method = req.method;
@@ -633,7 +620,20 @@ impl wit_http::Host for TalosContext {
 
         let response = match builder.send().await {
             Ok(resp) => {
-                get_global_circuit_breaker().record_success(&host_str);
+                // Settled with the STATUS, not merely with "the transport
+                // worked". On a Closed circuit that is identical to the
+                // previous `record_success` — a status can never open a
+                // circuit, because this breaker is host-keyed and
+                // process-global and a 401 belongs to one user's credential.
+                // On a HALF-OPEN trial a 5xx — and ONLY a 5xx — now fails the
+                // trial instead of closing the circuit against a host that is
+                // answering nothing but errors. A 429 deliberately PASSES the
+                // trial: it is per-caller (`userRateLimitExceeded`), so
+                // failing a trial on it turns one tenant's routine quota error
+                // into every tenant's outage. Full argument, including the
+                // residual cross-tenant tail it accepts, in
+                // `circuit_breaker.rs`.
+                permit.settle_response(resp.status().as_u16());
                 // Clear the reason latch: the module's most recent HTTP
                 // outcome is a success, so a class recorded by an earlier,
                 // recovered failure must not be attributed to whatever this
@@ -642,7 +642,22 @@ impl wit_http::Host for TalosContext {
                 resp
             }
             Err(e) => {
-                get_global_circuit_breaker().record_failure(&host_str);
+                if e.is_builder() {
+                    // The request was never constructed, so it never left the
+                    // process and nothing was learned about the host. On this
+                    // path that means a header name or value the GUEST wrote
+                    // that `http::HeaderName`/`HeaderValue` refused —
+                    // `RequestBuilder::header` stores the error and surfaces
+                    // it here at `send()`. Feeding it to `record_failure`
+                    // (the pre-2026-08-12 behaviour) let a module open a
+                    // shared, process-global circuit for a healthy host with
+                    // five malformed-header fetches and zero packets. The
+                    // guest-visible error and the reason class below are
+                    // unchanged; only the breaker's accounting is.
+                    permit.settle_no_evidence();
+                } else {
+                    permit.settle_transport_failure();
+                }
                 // D3 — the ONE place the real transport error is surfaced.
                 // Worker log only (never host→guest, never a stored payload):
                 // URL erased, DLP-redacted, then IP/path-sanitized. Before
@@ -1398,27 +1413,40 @@ impl wit_http::Host for TalosContext {
                 // reason it is written HERE is that this send is the site an
                 // extension would have to touch.
                 //
-                // `wit_http::fetch` calls `allow_request` before its send and
-                // `record_success`/`record_failure` after it. This path does
-                // NEITHER: a batch cannot trip the breaker, cannot be refused
+                // `wit_http::fetch` takes a `RequestPermit` from
+                // `begin_request` before its send and settles it after. This
+                // path does NEITHER: a batch cannot trip the breaker, cannot be refused
                 // by it, and contributes nothing to
-                // `talos_circuit_breaker_{opens,blocks}_total`. Both counters
-                // are therefore structurally blind to batch HTTP, and the
-                // runbook's "if opens and blocks are both flat, this is not a
-                // herd" is a FALSE NEGATIVE for any module built on
-                // `fetch_all`. The alert description says so in as many words.
+                // `talos_circuit_breaker_{opens,blocks}_total`.
                 //
-                // Latent today: no shipped module template calls `fetch_all`
-                // (the name appears only in generated `bindings.rs`). It is a
-                // real gap the moment one does.
+                // SCOPE, corrected 2026-08-12 in review: this is not a
+                // batch-HTTP exception, it is the general case.
+                // `wit_http::fetch` is the ONLY outbound-HTTP surface in this
+                // worker that touches the breaker at all — `wit_webhook::send`,
+                // `wit_graphql::execute`, `host/http_stream.rs`, the four S3
+                // operations in `host/object_storage.rs`, `host/llm_tools.rs`,
+                // `host/llm.rs` and `host/email.rs` all egress without
+                // consulting it or recording an outcome. So the runbook's "if
+                // opens and blocks are both flat, this is not a herd" is a
+                // FALSE NEGATIVE for every one of them, not just for
+                // `fetch_all`. The full list is in `circuit_breaker.rs`'s
+                // header and in the alert description.
+                //
+                // `fetch_all` specifically is still LATENT — no shipped module
+                // template calls it (the name appears only in generated
+                // `bindings.rs`) — but the LLM, webhook and GraphQL paths are
+                // on the hot path today, so the blindness as a whole is live.
                 //
                 // NOT extended in the same change, for two reasons.
                 //
                 // (a) It is a behaviour change to a fail-closed control, and it
-                //     touches the exact token accounting whose leak (see the
-                //     inventory at `fetch`'s `allow_request`) is already
-                //     deferred. Landing both at once would make neither
-                //     attributable.
+                //     touches the exact token accounting whose leak was fixed
+                //     separately on 2026-08-12 (see `fetch`'s permit note and
+                //     `RequestPermit`). Landing both at once would have made
+                //     neither attributable; the same reasoning still defers
+                //     this one, since the strand fix's own effect on
+                //     `half_open_exhausted` has not been observed in
+                //     production yet.
                 //
                 // (b) The per-request semantics are a DESIGN question, not a
                 //     line. A batch of N requests to one host is not N
@@ -1443,8 +1471,8 @@ impl wit_http::Host for TalosContext {
                 //                  would render as 100 and misstate the size of
                 //                  the outage by two orders of magnitude.
                 //     The defensible shape is per-BATCH-per-HOST admission: one
-                //     `allow_request` per distinct host in the batch, one
-                //     recorded outcome per distinct host. That needs host
+                //     `begin_request` per distinct host in the batch, one
+                //     settled permit per distinct host. That needs host
                 //     bookkeeping this moved future cannot reach — it captures
                 //     no `self` (the same constraint the reason-latch comment
                 //     after the join describes).
@@ -1660,6 +1688,280 @@ impl wit_http::Host for TalosContext {
         drop(header_value);
         req.headers.insert(0, (header_name, owned_value));
         self.fetch(req).await
+    }
+}
+
+/// Every exit that sits between the circuit breaker's admission and the
+/// outcome settle in [`wit_http::Host::fetch`], driven through the real
+/// `fetch` on a real [`TalosContext`], asserting that the half-open trial
+/// token comes back.
+///
+/// The enumeration these cover is by CONTROL FLOW, not by grepping for
+/// `return` — the inventory that shipped with #636 was built that way and
+/// missed the `?` on `resolve_vault_header`, which is the one that fires
+/// deterministically in production (an unresolvable `vault://oauth/...`
+/// header, exactly the shape the calendar nodes use).
+///
+/// **Why each test targets its own TEST-NET-3 (RFC 5737) IP literal.** The
+/// breaker is a process-global singleton keyed by host, so tests must not
+/// share a host or they interfere. An IP literal is used rather than a
+/// hostname because `fetch` resolves DNS for domain hosts BEFORE reaching the
+/// breaker, and a name that does not resolve returns early — the request would
+/// never reach the code under test. `url::Host::Ipv4` skips that block
+/// entirely, and 203.0.113.0/24 is reserved-for-documentation, so it is not
+/// classified private (it reaches the breaker) and can never be routed
+/// anywhere (no test emits a packet).
+///
+/// LIMITATION, stated rather than implied: cancellation is NOT covered here.
+/// Dropping `fetch`'s future mid-flight requires it to be parked on an await,
+/// and the only awaits between the admission and the settle are the vault
+/// resolve and `send()` itself — a race, not a fixture. Cancellation is
+/// covered deterministically at the permit level by
+/// `circuit_breaker::tests::a_cancelled_future_repays_its_trial_token`, which
+/// parks on a `pending()` in exactly that window.
+#[cfg(test)]
+mod breaker_permit_leak_path_tests {
+    use super::*;
+    // The `fetch` under test is a trait method; without the trait in scope the
+    // call does not resolve.
+    use crate::bindings::talos::core::http::Host as _;
+    use crate::circuit_breaker::get_global_circuit_breaker;
+    use crate::context::TalosContext;
+    use crate::wit_inspector::CapabilityWorld;
+    use std::collections::HashMap;
+    use talos_workflow_job_protocol::LlmTier;
+
+    fn ctx_for(host: &str) -> TalosContext {
+        TalosContext::new(
+            CapabilityWorld::Http,
+            vec![host.to_string()],
+            // Empty secret grant: this is what makes the `vault://` resolve
+            // below fail deterministically.
+            vec![],
+            128,
+            HashMap::new(),
+            None,
+            None,
+            false,
+            None,
+            std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+            LlmTier::default(),
+            None,
+        )
+        .expect("test context")
+    }
+
+    fn get(host: &str) -> wit_http::Request {
+        wit_http::Request {
+            method: wit_http::Method::Get,
+            url: format!("https://{host}/probe"),
+            headers: vec![],
+            body: vec![],
+            timeout_ms: Some(1_000),
+        }
+    }
+
+    /// Drive one leak path twice and assert BOTH halves of the claim.
+    ///
+    /// **Leg 1, the anti-vacuity leg.** With the circuit half-open and ZERO
+    /// tokens, this request shape must be REFUSED by the breaker, which
+    /// `fetch` surfaces as `Networkerror` from the circuit-open branch. Without
+    /// this leg the whole module could pass for the wrong reason: a request
+    /// rejected BEFORE the breaker — a DNS failure, a host-allowlist miss, a
+    /// capability deny — also leaves the token count untouched, and "the token
+    /// was never spent" is indistinguishable from "the token was spent and
+    /// repaid" if you only look at the count. This leg proves the request
+    /// reaches `begin_request` at all.
+    ///
+    /// **Leg 2, the repayment.** One token, a fresh context, the same request:
+    /// the exit under test is taken and the token must come back, with neither
+    /// trial tally moved.
+    async fn assert_reaches_breaker_and_repays<C, B>(host: &str, what: &str, ctx: C, build: B)
+    where
+        C: Fn() -> TalosContext,
+        B: Fn() -> wit_http::Request,
+    {
+        let cb = get_global_circuit_breaker();
+
+        // Leg 1 — the breaker is genuinely on this request's path.
+        cb.force_half_open(host, 0);
+        let refused = ctx().fetch(build()).await;
+        assert!(
+            matches!(refused, Err(wit_http::Error::Networkerror)),
+            "{what}: a zero-token half-open circuit did not refuse this request \
+             ({refused:?}) — so this shape never reaches the breaker and the \
+             repayment assertion below would pass vacuously"
+        );
+
+        // Leg 2 — the exit under test repays its token.
+        cb.force_half_open(host, 1);
+        assert_eq!(cb.trial_tokens_remaining(host), Some(1));
+        let _ = ctx().fetch(build()).await;
+
+        assert_eq!(
+            cb.trial_tokens_remaining(host),
+            Some(1),
+            "{what}: the half-open trial token was spent and never repaid. Three of \
+             these strand the host at half-open-with-zero-tokens for the life of the \
+             worker process — HalfOpen has no time bound and nothing refills it."
+        );
+        assert_eq!(
+            cb.get_state(host).as_deref(),
+            Some("half_open"),
+            "{what}: the circuit must be exactly where it started"
+        );
+        assert_eq!(
+            cb.trial_tally(host),
+            Some((0, 0)),
+            "{what}: an abandoned trial must record neither a success nor a failure"
+        );
+    }
+
+    /// Leak path 1 — the outbound header-count cap. `return Err(...)`.
+    #[tokio::test]
+    async fn header_cap_rejection_repays_the_trial_token() {
+        let host = "203.0.113.11";
+        assert_reaches_breaker_and_repays(
+            host,
+            "header cap",
+            || ctx_for(host),
+            || {
+                let mut req = get(host);
+                req.headers = (0..=MAX_OUTBOUND_HEADERS)
+                    .map(|i| (format!("x-probe-{i}"), "v".to_string()))
+                    .collect();
+                req
+            },
+        )
+        .await;
+    }
+
+    /// Leak path 2 — the outbound body-size cap. `return Err(...)`.
+    #[tokio::test]
+    async fn body_cap_rejection_repays_the_trial_token() {
+        let host = "203.0.113.12";
+        assert_reaches_breaker_and_repays(
+            host,
+            "body cap",
+            || ctx_for(host),
+            || {
+                let mut req = get(host);
+                req.body = vec![0u8; MAX_OUTBOUND_HTTP_BODY_BYTES + 1];
+                req
+            },
+        )
+        .await;
+    }
+
+    /// Leak path 3 — `resolve_vault_header(...)?`. **A `?`, not a `return`**,
+    /// which is why the previous grep-based inventory missed it, and the one
+    /// that fires deterministically in production: an OAuth secret that is
+    /// missing, expired or not granted to the module denies here every time,
+    /// on the exact header shape the calendar nodes use.
+    #[tokio::test]
+    async fn unresolvable_vault_header_repays_the_trial_token() {
+        let host = "203.0.113.13";
+        assert_reaches_breaker_and_repays(
+            host,
+            "unresolvable vault:// header",
+            || ctx_for(host),
+            || {
+                let mut req = get(host);
+                req.headers = vec![(
+                    "authorization".to_string(),
+                    "Bearer vault://oauth/gcal/nobody/access_token".to_string(),
+                )];
+                req
+            },
+        )
+        .await;
+    }
+
+    /// Leak path 4 — the idempotency dedup short-circuit. `return Ok(cached)`,
+    /// i.e. a leak on a path that SUCCEEDS, which no failure-shaped audit of
+    /// this function would have looked at.
+    #[tokio::test]
+    async fn idempotency_dedup_short_circuit_repays_the_trial_token() {
+        let host = "203.0.113.14";
+        let key = "breaker-permit-dedup-probe";
+        get_global_idempotency_store().complete(
+            key,
+            DedupResponse {
+                status: 200,
+                headers: vec![],
+                body: b"cached".to_vec(),
+            },
+        );
+
+        assert_reaches_breaker_and_repays(
+            host,
+            "idempotency dedup short-circuit",
+            || {
+                let mut ctx = ctx_for(host);
+                ctx.idempotency_key = Some(key.to_string());
+                ctx
+            },
+            || {
+                let mut req = get(host);
+                // The dedup store is only consulted for MUTATING verbs.
+                req.method = wit_http::Method::Post;
+                req.body = b"{}".to_vec();
+                req
+            },
+        )
+        .await;
+    }
+
+    /// The dedup path must still return the cached response — the permit must
+    /// not have changed what `fetch` does, only what it accounts for.
+    #[tokio::test]
+    async fn the_dedup_short_circuit_still_returns_the_cached_response() {
+        let host = "203.0.113.15";
+        let key = "breaker-permit-dedup-passthrough";
+        get_global_idempotency_store().complete(
+            key,
+            DedupResponse {
+                status: 201,
+                headers: vec![],
+                body: b"cached-body".to_vec(),
+            },
+        );
+
+        let mut ctx = ctx_for(host);
+        ctx.idempotency_key = Some(key.to_string());
+        let mut req = get(host);
+        req.method = wit_http::Method::Post;
+        req.body = b"{}".to_vec();
+
+        let resp = ctx.fetch(req).await.expect("dedup hit returns Ok");
+        assert_eq!(resp.status, 201);
+        assert_eq!(resp.body, b"cached-body".to_vec());
+    }
+
+    /// A CLOSED circuit — every request on a healthy worker — must be wholly
+    /// unaffected by the permit. No token exists to repay, the guard's `Drop`
+    /// touches no map, and the same leak paths leave no trace at all.
+    #[tokio::test]
+    async fn a_closed_circuit_is_untouched_by_any_of_the_leak_paths() {
+        let host = "203.0.113.16";
+        let cb = get_global_circuit_breaker();
+        let mut ctx = ctx_for(host);
+        let mut req = get(host);
+        req.headers = (0..=MAX_OUTBOUND_HEADERS)
+            .map(|i| (format!("x-probe-{i}"), "v".to_string()))
+            .collect();
+
+        assert!(matches!(
+            ctx.fetch(req).await,
+            Err(wit_http::Error::Forbiddenhost)
+        ));
+
+        assert_eq!(
+            cb.get_state(host).as_deref(),
+            Some("closed"),
+            "a guest-side rejection must not move a healthy circuit in any direction"
+        );
+        assert_eq!(cb.consecutive_failures(host), Some(0));
     }
 }
 

@@ -896,11 +896,14 @@ tests:
                 half_open_exhausted arm emits no line of its own at all.
                 If opens and blocks are both flat and the worker log shows no
                 transport errors, this is not a herd — read the individual
-                error_messages. ONE EXCEPTION to that last sentence: the breaker
-                does not participate in `wit_http::fetch_all`, so a module built on
-                BATCH http contributes to neither counter. No shipped template uses
-                it today; if one does, flat counters do not exonerate the breaker
-                for that module.
+                error_messages. THE LIMIT ON THAT LAST SENTENCE, and it is wider
+                than it looks: `wit_http::fetch` is the ONLY egress surface the
+                breaker instruments. Webhook sends, GraphQL, HTTP streaming, S3,
+                the LLM and embedding clients, transactional email and batch
+                `wit_http::fetch_all` all leave the worker without touching it, so
+                flat counters neither exonerate nor implicate the breaker for a
+                module built on any of those. The LLM path in particular is on the
+                hot path of most workflows here.
 
                 outcome="skipped": runs were refused for CAPACITY — the
                 per-workflow concurrency cap, or an actor's per-minute execution
@@ -916,8 +919,9 @@ tests:
                    `talos_circuit_breaker_blocks_total` (and the worker log for the
                    host). If both are flat, treat this as N individual workflow
                    failures and read their error_messages; the ceiling is not
-                   implicated — unless the workflows use batch HTTP
-                   (`wit_http::fetch_all`), which the breaker does not instrument.
+                   implicated — unless the workflows egress by any route other than
+                   `wit_http::fetch` (LLM, webhook, GraphQL, stream, S3, email,
+                   batch `fetch_all`), none of which the breaker instruments.
                 3. If the herd signature IS present, lower
                    SCHEDULER_STARTUP_MAX_CONCURRENT (default 4). Do NOT raise
                    SCHEDULER_MAX_CONCURRENT_EXECUTIONS — that is the steady-state
@@ -981,11 +985,14 @@ tests:
                 half_open_exhausted arm emits no line of its own at all.
                 If opens and blocks are both flat and the worker log shows no
                 transport errors, this is not a herd — read the individual
-                error_messages. ONE EXCEPTION to that last sentence: the breaker
-                does not participate in `wit_http::fetch_all`, so a module built on
-                BATCH http contributes to neither counter. No shipped template uses
-                it today; if one does, flat counters do not exonerate the breaker
-                for that module.
+                error_messages. THE LIMIT ON THAT LAST SENTENCE, and it is wider
+                than it looks: `wit_http::fetch` is the ONLY egress surface the
+                breaker instruments. Webhook sends, GraphQL, HTTP streaming, S3,
+                the LLM and embedding clients, transactional email and batch
+                `wit_http::fetch_all` all leave the worker without touching it, so
+                flat counters neither exonerate nor implicate the breaker for a
+                module built on any of those. The LLM path in particular is on the
+                hot path of most workflows here.
 
                 outcome="skipped": runs were refused for CAPACITY — the
                 per-workflow concurrency cap, or an actor's per-minute execution
@@ -1001,8 +1008,9 @@ tests:
                    `talos_circuit_breaker_blocks_total` (and the worker log for the
                    host). If both are flat, treat this as N individual workflow
                    failures and read their error_messages; the ceiling is not
-                   implicated — unless the workflows use batch HTTP
-                   (`wit_http::fetch_all`), which the breaker does not instrument.
+                   implicated — unless the workflows egress by any route other than
+                   `wit_http::fetch` (LLM, webhook, GraphQL, stream, S3, email,
+                   batch `fetch_all`), none of which the breaker instruments.
                 3. If the herd signature IS present, lower
                    SCHEDULER_STARTUP_MAX_CONCURRENT (default 4). Do NOT raise
                    SCHEDULER_MAX_CONCURRENT_EXECUTIONS — that is the steady-state
@@ -1335,10 +1343,14 @@ tests:
                   half_open_exhausted — the circuit is under trial and its trial
                                         tokens are spent, so this call was refused
                                         to protect the trial. Expected in small
-                                        numbers during recovery; sustained means
-                                        either the trials keep failing or the
-                                        circuit is STRANDED — see the known defect
-                                        at the end of this description.
+                                        numbers during recovery; sustained means the
+                                        trials keep failing. It does NOT imply
+                                        concurrent traffic: a trial that CONCLUDES
+                                        does not return its token, so two failed
+                                        trials plus one still in flight is enough
+                                        to refuse the next caller. It no longer
+                                        means the circuit is STRANDED — see the end
+                                        of this description.
                   retry_gate          — a job or pipeline step failed while one of
                                         its DECLARED hosts had an open circuit, so
                                         the breaker supplied the failure reason and
@@ -1371,24 +1383,58 @@ tests:
                 source. The host is in the worker log, on every refused request.
 
                 Also NOT knowable from here: whether the upstream is genuinely down.
-                The breaker counts reqwest TRANSPORT errors only — an HTTP 401 or
-                500 is a successful transport and does not trip it — so a trip means
+                OPENING a circuit still requires reqwest TRANSPORT errors — an HTTP
+                401, 429 or 500 cannot open one — so a first trip means
                 connect/DNS/TLS/reset failures, OR the worker's own client timeout
-                (30s default), which a slow-but-alive upstream can produce.
+                (30s default), which a slow-but-alive upstream can produce. That
+                restriction is a TENANCY boundary, not an oversight: the breaker is
+                keyed by host alone and there is one instance per worker process,
+                shared by every user on the platform, so letting a 401 (one user's
+                expired token) or a 429 (one user's quota) open a circuit would take
+                that host away from every other user.
 
-                KNOWN DEFECT that changes how you read a SUSTAINED
-                half_open_exhausted: the half-open state has no time bound, and
-                there are paths that spend a trial token without ever recording an
-                outcome (an unresolvable `vault://` header is the deterministic one;
-                task cancellation is the other). A host that leaks all its tokens is
-                stranded half-open with zero tokens PERMANENTLY — every later
-                request to it is refused, with no transport error and no state
-                change, until the worker process restarts. Steady
-                half_open_exhausted against a host you have independently confirmed
-                is HEALTHY is that condition, and restarting the worker is the only
-                current remedy. Inventoried in
-                `talos-worker-runtime/src/host/http.rs` at `fetch`'s
-                `allow_request`; fix deferred to its own change.
+                A 5xx DOES decide a recovery trial, as of 2026-08-12. Once a
+                circuit is already open, a half-open trial answered with 5xx counts
+                as a FAILED trial and the circuit stays open — where it previously
+                counted as a success and could CLOSE the circuit against a host
+                serving nothing but 503. So a `reopened` transition can now mean
+                "the host answered, badly", not only "the host was unreachable".
+                EVERY 4xx, INCLUDING 429, still counts as a SUCCESSFUL trial: the
+                host is alive and serving, which is the only question a trial is
+                entitled to ask, and the credential behind a 401 or the quota
+                behind a 429 belongs to one user rather than to the host this
+                breaker is keyed by. (429 briefly failed a trial during development
+                and was reversed before release — a per-user quota error would have
+                re-opened the circuit for every other tenant.) The accepted cost,
+                stated so it is not discovered during an incident: with the shipped
+                defaults of 3 trial requests and a 0.8 success rate, ONE 5xx
+                anywhere in a trial period re-opens it. So if one tenant's payload
+                draws a 500 from a host that serves everyone else perfectly, and
+                that request takes a trial token, the others stay blocked for
+                another cooldown. It can prolong an outage; it cannot start one.
+
+                How to read a SUSTAINED half_open_exhausted, and what changed on
+                2026-08-12: it used to be the signature of a STRANDED circuit. The
+                half-open state has no time bound, and paths existed that spent a
+                trial token without ever recording an outcome (an unresolvable
+                `vault://` header was the deterministic one; task cancellation the
+                other), so a host that leaked all three tokens refused every later
+                request for the life of the worker process — this is what took
+                www.googleapis.com out from 2026-08-11 11:35 until a container
+                recreate at 23:06. Fixed: admission is now an RAII permit whose
+                `Drop` repays an unused trial token, so an unsettled request — early
+                return, `?`, panic, or a cancelled future — costs nothing. Sustained
+                half_open_exhausted now means what it says: trials are being taken
+                and concluding badly. Do NOT go hunting for three concurrent
+                requests — a trial that concludes does not repay its token, so two
+                sequential failed trials leave one, and a single caller arriving
+                while that last trial is in flight is refused. Two-way is enough,
+                and this change made it MORE likely rather than less, because a 5xx
+                now CONCLUDES a trial as a failure where it previously counted as a
+                success. Against a host you have independently confirmed is
+                HEALTHY it is a NEW defect rather than the old one — capture the
+                worker log BEFORE restarting anything, since a restart destroys the
+                evidence and used to be the only remedy.
               action: |
                 1. `sum(increase(talos_circuit_breaker_opens_total[30m])) by (transition)`
                    — `opened` is a first trip, `reopened` means a host came back and
@@ -1458,10 +1504,14 @@ tests:
                   half_open_exhausted — the circuit is under trial and its trial
                                         tokens are spent, so this call was refused
                                         to protect the trial. Expected in small
-                                        numbers during recovery; sustained means
-                                        either the trials keep failing or the
-                                        circuit is STRANDED — see the known defect
-                                        at the end of this description.
+                                        numbers during recovery; sustained means the
+                                        trials keep failing. It does NOT imply
+                                        concurrent traffic: a trial that CONCLUDES
+                                        does not return its token, so two failed
+                                        trials plus one still in flight is enough
+                                        to refuse the next caller. It no longer
+                                        means the circuit is STRANDED — see the end
+                                        of this description.
                   retry_gate          — a job or pipeline step failed while one of
                                         its DECLARED hosts had an open circuit, so
                                         the breaker supplied the failure reason and
@@ -1494,24 +1544,58 @@ tests:
                 source. The host is in the worker log, on every refused request.
 
                 Also NOT knowable from here: whether the upstream is genuinely down.
-                The breaker counts reqwest TRANSPORT errors only — an HTTP 401 or
-                500 is a successful transport and does not trip it — so a trip means
+                OPENING a circuit still requires reqwest TRANSPORT errors — an HTTP
+                401, 429 or 500 cannot open one — so a first trip means
                 connect/DNS/TLS/reset failures, OR the worker's own client timeout
-                (30s default), which a slow-but-alive upstream can produce.
+                (30s default), which a slow-but-alive upstream can produce. That
+                restriction is a TENANCY boundary, not an oversight: the breaker is
+                keyed by host alone and there is one instance per worker process,
+                shared by every user on the platform, so letting a 401 (one user's
+                expired token) or a 429 (one user's quota) open a circuit would take
+                that host away from every other user.
 
-                KNOWN DEFECT that changes how you read a SUSTAINED
-                half_open_exhausted: the half-open state has no time bound, and
-                there are paths that spend a trial token without ever recording an
-                outcome (an unresolvable `vault://` header is the deterministic one;
-                task cancellation is the other). A host that leaks all its tokens is
-                stranded half-open with zero tokens PERMANENTLY — every later
-                request to it is refused, with no transport error and no state
-                change, until the worker process restarts. Steady
-                half_open_exhausted against a host you have independently confirmed
-                is HEALTHY is that condition, and restarting the worker is the only
-                current remedy. Inventoried in
-                `talos-worker-runtime/src/host/http.rs` at `fetch`'s
-                `allow_request`; fix deferred to its own change.
+                A 5xx DOES decide a recovery trial, as of 2026-08-12. Once a
+                circuit is already open, a half-open trial answered with 5xx counts
+                as a FAILED trial and the circuit stays open — where it previously
+                counted as a success and could CLOSE the circuit against a host
+                serving nothing but 503. So a `reopened` transition can now mean
+                "the host answered, badly", not only "the host was unreachable".
+                EVERY 4xx, INCLUDING 429, still counts as a SUCCESSFUL trial: the
+                host is alive and serving, which is the only question a trial is
+                entitled to ask, and the credential behind a 401 or the quota
+                behind a 429 belongs to one user rather than to the host this
+                breaker is keyed by. (429 briefly failed a trial during development
+                and was reversed before release — a per-user quota error would have
+                re-opened the circuit for every other tenant.) The accepted cost,
+                stated so it is not discovered during an incident: with the shipped
+                defaults of 3 trial requests and a 0.8 success rate, ONE 5xx
+                anywhere in a trial period re-opens it. So if one tenant's payload
+                draws a 500 from a host that serves everyone else perfectly, and
+                that request takes a trial token, the others stay blocked for
+                another cooldown. It can prolong an outage; it cannot start one.
+
+                How to read a SUSTAINED half_open_exhausted, and what changed on
+                2026-08-12: it used to be the signature of a STRANDED circuit. The
+                half-open state has no time bound, and paths existed that spent a
+                trial token without ever recording an outcome (an unresolvable
+                `vault://` header was the deterministic one; task cancellation the
+                other), so a host that leaked all three tokens refused every later
+                request for the life of the worker process — this is what took
+                www.googleapis.com out from 2026-08-11 11:35 until a container
+                recreate at 23:06. Fixed: admission is now an RAII permit whose
+                `Drop` repays an unused trial token, so an unsettled request — early
+                return, `?`, panic, or a cancelled future — costs nothing. Sustained
+                half_open_exhausted now means what it says: trials are being taken
+                and concluding badly. Do NOT go hunting for three concurrent
+                requests — a trial that concludes does not repay its token, so two
+                sequential failed trials leave one, and a single caller arriving
+                while that last trial is in flight is refused. Two-way is enough,
+                and this change made it MORE likely rather than less, because a 5xx
+                now CONCLUDES a trial as a failure where it previously counted as a
+                success. Against a host you have independently confirmed is
+                HEALTHY it is a NEW defect rather than the old one — capture the
+                worker log BEFORE restarting anything, since a restart destroys the
+                evidence and used to be the only remedy.
               action: |
                 1. `sum(increase(talos_circuit_breaker_opens_total[30m])) by (transition)`
                    — `opened` is a first trip, `reopened` means a host came back and
@@ -1557,10 +1641,14 @@ tests:
                   half_open_exhausted — the circuit is under trial and its trial
                                         tokens are spent, so this call was refused
                                         to protect the trial. Expected in small
-                                        numbers during recovery; sustained means
-                                        either the trials keep failing or the
-                                        circuit is STRANDED — see the known defect
-                                        at the end of this description.
+                                        numbers during recovery; sustained means the
+                                        trials keep failing. It does NOT imply
+                                        concurrent traffic: a trial that CONCLUDES
+                                        does not return its token, so two failed
+                                        trials plus one still in flight is enough
+                                        to refuse the next caller. It no longer
+                                        means the circuit is STRANDED — see the end
+                                        of this description.
                   retry_gate          — a job or pipeline step failed while one of
                                         its DECLARED hosts had an open circuit, so
                                         the breaker supplied the failure reason and
@@ -1593,24 +1681,58 @@ tests:
                 source. The host is in the worker log, on every refused request.
 
                 Also NOT knowable from here: whether the upstream is genuinely down.
-                The breaker counts reqwest TRANSPORT errors only — an HTTP 401 or
-                500 is a successful transport and does not trip it — so a trip means
+                OPENING a circuit still requires reqwest TRANSPORT errors — an HTTP
+                401, 429 or 500 cannot open one — so a first trip means
                 connect/DNS/TLS/reset failures, OR the worker's own client timeout
-                (30s default), which a slow-but-alive upstream can produce.
+                (30s default), which a slow-but-alive upstream can produce. That
+                restriction is a TENANCY boundary, not an oversight: the breaker is
+                keyed by host alone and there is one instance per worker process,
+                shared by every user on the platform, so letting a 401 (one user's
+                expired token) or a 429 (one user's quota) open a circuit would take
+                that host away from every other user.
 
-                KNOWN DEFECT that changes how you read a SUSTAINED
-                half_open_exhausted: the half-open state has no time bound, and
-                there are paths that spend a trial token without ever recording an
-                outcome (an unresolvable `vault://` header is the deterministic one;
-                task cancellation is the other). A host that leaks all its tokens is
-                stranded half-open with zero tokens PERMANENTLY — every later
-                request to it is refused, with no transport error and no state
-                change, until the worker process restarts. Steady
-                half_open_exhausted against a host you have independently confirmed
-                is HEALTHY is that condition, and restarting the worker is the only
-                current remedy. Inventoried in
-                `talos-worker-runtime/src/host/http.rs` at `fetch`'s
-                `allow_request`; fix deferred to its own change.
+                A 5xx DOES decide a recovery trial, as of 2026-08-12. Once a
+                circuit is already open, a half-open trial answered with 5xx counts
+                as a FAILED trial and the circuit stays open — where it previously
+                counted as a success and could CLOSE the circuit against a host
+                serving nothing but 503. So a `reopened` transition can now mean
+                "the host answered, badly", not only "the host was unreachable".
+                EVERY 4xx, INCLUDING 429, still counts as a SUCCESSFUL trial: the
+                host is alive and serving, which is the only question a trial is
+                entitled to ask, and the credential behind a 401 or the quota
+                behind a 429 belongs to one user rather than to the host this
+                breaker is keyed by. (429 briefly failed a trial during development
+                and was reversed before release — a per-user quota error would have
+                re-opened the circuit for every other tenant.) The accepted cost,
+                stated so it is not discovered during an incident: with the shipped
+                defaults of 3 trial requests and a 0.8 success rate, ONE 5xx
+                anywhere in a trial period re-opens it. So if one tenant's payload
+                draws a 500 from a host that serves everyone else perfectly, and
+                that request takes a trial token, the others stay blocked for
+                another cooldown. It can prolong an outage; it cannot start one.
+
+                How to read a SUSTAINED half_open_exhausted, and what changed on
+                2026-08-12: it used to be the signature of a STRANDED circuit. The
+                half-open state has no time bound, and paths existed that spent a
+                trial token without ever recording an outcome (an unresolvable
+                `vault://` header was the deterministic one; task cancellation the
+                other), so a host that leaked all three tokens refused every later
+                request for the life of the worker process — this is what took
+                www.googleapis.com out from 2026-08-11 11:35 until a container
+                recreate at 23:06. Fixed: admission is now an RAII permit whose
+                `Drop` repays an unused trial token, so an unsettled request — early
+                return, `?`, panic, or a cancelled future — costs nothing. Sustained
+                half_open_exhausted now means what it says: trials are being taken
+                and concluding badly. Do NOT go hunting for three concurrent
+                requests — a trial that concludes does not repay its token, so two
+                sequential failed trials leave one, and a single caller arriving
+                while that last trial is in flight is refused. Two-way is enough,
+                and this change made it MORE likely rather than less, because a 5xx
+                now CONCLUDES a trial as a failure where it previously counted as a
+                success. Against a host you have independently confirmed is
+                HEALTHY it is a NEW defect rather than the old one — capture the
+                worker log BEFORE restarting anything, since a restart destroys the
+                evidence and used to be the only remedy.
               action: |
                 1. `sum(increase(talos_circuit_breaker_opens_total[30m])) by (transition)`
                    — `opened` is a first trip, `reopened` means a host came back and
