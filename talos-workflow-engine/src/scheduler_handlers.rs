@@ -2016,9 +2016,11 @@ impl ParallelWorkflowEngine {
     /// sweeps read that status, and "running" rows that nothing will ever
     /// complete are exactly the phantom the race-safe INSERT exists to avoid.
     ///
-    /// Payload/error redaction mirrors the pipeline-step path
-    /// (`engine_dispatch_pipeline.rs`); the store redacts again at the bind
-    /// boundary, which is the intended defense in depth, not a duplication.
+    /// Payload/error redaction and the best-effort contract live in the
+    /// shared `finalize_module_execution_row` chokepoint
+    /// (`engine_dispatch_single.rs`), which every engine dispatch path now
+    /// routes through. This wrapper stays for the loop path's call sites and
+    /// for the name the surrounding code reads by.
     async fn complete_loop_iteration_row(
         &self,
         iter_exec_id: Uuid,
@@ -2027,26 +2029,14 @@ impl ParallelWorkflowEngine {
         duration_ms: i32,
         error_message: Option<&str>,
     ) {
-        let Some(ref store) = self.module_execution_store else {
-            return;
-        };
-        let redacted_error = error_message.map(|e| self.redact_str(e));
-        if let Err(db_err) = store
-            .record_completed(
-                iter_exec_id,
-                status,
-                &self.redact_json(output),
-                duration_ms,
-                redacted_error.as_deref(),
-            )
-            .await
-        {
-            tracing::error!(
-                %iter_exec_id,
-                "module_execution_store.record_completed failed for loop iteration: {}",
-                db_err
-            );
-        }
+        self.finalize_module_execution_row(
+            iter_exec_id,
+            status,
+            output,
+            duration_ms,
+            error_message,
+        )
+        .await;
     }
 
     /// Body of the [`SystemNodeKind::Loop`] iteration loop. Kept on

@@ -8500,6 +8500,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "talos-dlp-provider",
+ "talos-metrics",
  "talos-module-payload-encryption",
  "talos-ops-alerts-repository",
  "talos-secrets-manager",

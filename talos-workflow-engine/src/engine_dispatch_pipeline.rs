@@ -622,13 +622,57 @@ impl ParallelWorkflowEngine {
 
         let chain_result = match dispatcher.dispatch_chain(chain_request).await {
             Ok(r) => r,
-            Err(e) => return (chain_tail, Err(e.to_string())),
+            Err(e) => {
+                // A FRESH INSTANCE OF THE CLASS THIS CHANGE FIXES, found in
+                // review of the change itself. This arm used to be a bare
+                // `return`, sitting BELOW the per-step `record_started` loop —
+                // so on a chain-level dispatch failure every one of the N step
+                // rows was abandoned in `'running'` and swept 30 minutes later
+                // to `'timeout'`/`error_type='stuck'`. Exactly the single-node
+                // defect, in the file that was edited to fix it.
+                //
+                // And this is the LIKELY arm, not an exotic one:
+                // `dispatch_with_retry` returns `"Job execution timed out"`
+                // against the AGGREGATE chain deadline, which is the SUM of the
+                // per-step budgets — so the longer the pipeline, the more rows
+                // one timeout strands.
+                //
+                // Same chokepoint, same classifier as the single-node path: the
+                // dispatcher's own timeout sentinel records `'timeout'`,
+                // anything else `'failed'`.
+                let message = e.to_string();
+                let status =
+                    crate::engine_dispatch_single::classify_dispatch_failure_status(&message);
+                for &step_exec_id in &step_exec_ids {
+                    // `duration_ms: 0`, matching the aborted-trailing-step loop
+                    // below. We know the chain's wall time but NOT any step's,
+                    // and stamping the whole chain duration onto each of N rows
+                    // would fabricate N× the elapsed work. The value is moot in
+                    // practice — the `calculate_module_execution_duration`
+                    // BEFORE UPDATE trigger overwrites it with
+                    // `completed_at - started_at` on this, the row's first
+                    // terminal write — but 0 is the honest thing to pass.
+                    self.finalize_module_execution_row(
+                        step_exec_id,
+                        status,
+                        &serde_json::Value::Null,
+                        0,
+                        Some(&message),
+                    )
+                    .await;
+                }
+                return (chain_tail, Err(message));
+            }
         };
 
         // Per-step post-processing: update `module_executions` rows
         // with status/output/error; persist `__memory_write__`
         // payloads for successful steps via the node-lifecycle hook.
-        if let Some(ref store) = self.module_execution_store {
+        // The `is_some()` gate is redundant now that
+        // `finalize_module_execution_row` returns early without a store, but
+        // it still short-circuits the per-step loop (and the memory-write
+        // hook is nested inside it) — keep the shape, drop the unused bind.
+        if self.module_execution_store.is_some() {
             for (i, step_result) in chain_result.steps.iter().enumerate() {
                 if let Some(&step_exec_id) = step_exec_ids.get(i) {
                     let status_str = match step_result.status {
@@ -644,21 +688,17 @@ impl ParallelWorkflowEngine {
                     };
                     let error_msg = step_result.error.as_deref().map(|s| self.redact_str(s));
                     let duration = i32::try_from(step_result.execution_time_ms).unwrap_or(i32::MAX);
-                    if let Err(db_err) = store
-                        .record_completed(
-                            step_exec_id,
-                            status_str,
-                            &self.redact_json(&step_result.output),
-                            duration,
-                            error_msg.as_deref(),
-                        )
-                        .await
-                    {
-                        tracing::error!(
-                            "module_execution_store.record_completed failed: {}",
-                            db_err
-                        );
-                    }
+                    // Shared chokepoint (`engine_dispatch_single.rs`): owns
+                    // the redact-record-log shape for every engine path that
+                    // closes a `module_executions` row.
+                    self.finalize_module_execution_row(
+                        step_exec_id,
+                        status_str,
+                        &step_result.output,
+                        duration,
+                        error_msg.as_deref(),
+                    )
+                    .await;
 
                     // `__memory_write__` protocol for pipeline steps:
                     // only fire the hook on success (failed steps may
@@ -680,18 +720,14 @@ impl ParallelWorkflowEngine {
             // than lingering forever in "running".
             for i in chain_result.steps.len()..step_exec_ids.len() {
                 if let Some(&step_exec_id) = step_exec_ids.get(i) {
-                    if let Err(db_err) = store
-                        .record_completed(
-                            step_exec_id,
-                            "failed",
-                            &serde_json::Value::Null,
-                            0,
-                            Some("Pipeline aborted before this step"),
-                        )
-                        .await
-                    {
-                        tracing::error!("Database operation failed in engine: {}", db_err);
-                    }
+                    self.finalize_module_execution_row(
+                        step_exec_id,
+                        "failed",
+                        &serde_json::Value::Null,
+                        0,
+                        Some("Pipeline aborted before this step"),
+                    )
+                    .await;
                 }
             }
         }
@@ -866,6 +902,213 @@ impl ParallelWorkflowEngine {
                     }
                 }
             });
+        }
+    }
+}
+
+#[cfg(test)]
+mod pipeline_ledger_finalize_tests {
+    //! Guard for the 2026-08-13 finding: `run_pipeline_chain_dispatch`'s
+    //! `dispatch_chain` ERROR arm was a bare `return`, sitting below the loop
+    //! that `record_started`s one `module_executions` row per step. Every one
+    //! of those N rows was therefore abandoned in `'running'` and swept 30
+    //! minutes later to `'timeout'` / `error_type='stuck'` — the same defect
+    //! the single-node path was fixed for, in the same commit, one file over.
+    //!
+    //! These drive the REAL `run_pipeline_chain_dispatch` through the
+    //! in-memory adapters, and the pre-fix failure was DEMONSTRATED, not
+    //! asserted: with only the `dispatch_chain` Err arm reverted to its bare
+    //! `return` (file copied in and back out, never `git checkout` — the tree
+    //! is uncommitted), both tests FAIL with `left: 0, right: 2` terminal
+    //! calls, rc 101. The restore diffs clean.
+    //!
+    //! What they do NOT prove: that the Postgres UPDATE lands — the capture
+    //! store records the call, it does not write a row.
+    //!
+    //! ON REACHABILITY, WITH THE EVIDENCE GRADED. The bug is believed LATENT
+    //! rather than live: `engine.rs`'s `is_fresh_run = initial_results
+    //! .is_empty()` gate means `chains` is empty whenever a trigger has already
+    //! seeded a synthetic `__trigger__` node into `initial_results`, which is
+    //! every trigger path — so `run_pipeline_chain_dispatch` may never be
+    //! called at all. That reading is a code argument, not a measurement, and
+    //! two obvious DB cross-checks do NOT settle it: all three engine paths
+    //! stamp `trigger_type: "webhook"` on the row, so the column cannot tell
+    //! them apart, and the worker's container logs only cover the current
+    //! process lifetime. Fixed regardless — reachability is a separate question
+    //! from correctness, and it can change. The reachability question itself is
+    //! escalated on its own, not decided here.
+
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use petgraph::graph::NodeIndex;
+    use serde_json::json;
+    use talos_workflow_engine_core::{
+        BoxError, ChainDispatchRequest, ChainDispatchResult, DispatchJob, DispatchResult,
+        NodeDispatcher, WasmModuleArtifact,
+    };
+    use talos_workflow_engine_test_utils::capture::{
+        CaptureModuleExecutionStore, ExecutionStoreCall,
+    };
+    use talos_workflow_engine_test_utils::memory::InMemoryModuleFetcher;
+    use uuid::Uuid;
+
+    use crate::engine::ParallelWorkflowEngine;
+
+    /// A dispatcher whose `dispatch_chain` fails at the CHAIN level — the
+    /// shape `ScriptedDispatcher` cannot produce, because its default
+    /// `dispatch_chain` body (`dispatch_chain_sequential`) folds per-step
+    /// errors into a `ChainDispatchResult` and never returns `Err`.
+    struct ChainErrorDispatcher {
+        message: String,
+    }
+
+    #[async_trait]
+    impl NodeDispatcher for ChainErrorDispatcher {
+        async fn dispatch(&self, _job: DispatchJob) -> Result<DispatchResult, BoxError> {
+            Err("pipeline test: per-step dispatch should not be reached".into())
+        }
+
+        async fn dispatch_chain(
+            &self,
+            _request: ChainDispatchRequest,
+        ) -> Result<ChainDispatchResult, BoxError> {
+            Err(self.message.clone().into())
+        }
+    }
+
+    fn stub_artifact(module_id: Uuid) -> WasmModuleArtifact {
+        WasmModuleArtifact {
+            module_id,
+            content_hash: "stub".into(),
+            wasm_bytes: vec![1, 2, 3],
+            oci_url: None,
+            max_fuel: 1_000_000,
+            capability_world: "stub".into(),
+            allowed_hosts: vec![],
+            allowed_methods: vec![],
+            allowed_secrets: vec![],
+            requires_approval_for: vec![],
+            integration_name: None,
+            config: None,
+        }
+    }
+
+    /// Two-step chain, both steps backed by real artifacts so the pre-dispatch
+    /// step loop runs to completion and both `record_started` rows are opened.
+    async fn dispatch_chain_once(
+        error_message: &str,
+    ) -> (
+        Arc<CaptureModuleExecutionStore>,
+        Result<serde_json::Value, String>,
+    ) {
+        let store = Arc::new(CaptureModuleExecutionStore::new());
+        let mod_a = Uuid::new_v4();
+        let mod_b = Uuid::new_v4();
+        let node_a = Uuid::new_v4();
+        let node_b = Uuid::new_v4();
+
+        let mut engine = ParallelWorkflowEngine::new();
+        engine.set_user_id(Uuid::new_v4());
+        // Bare `set_actor_id` needs no opt-out: lint check 29 excludes
+        // `talos-workflow-engine/**` wholesale.
+        engine.set_actor_id(Uuid::new_v4());
+        engine.set_module_execution_store(store.clone());
+        engine.set_module_fetcher(Arc::new(
+            InMemoryModuleFetcher::new()
+                .with_module(mod_a, stub_artifact(mod_a))
+                .with_module(mod_b, stub_artifact(mod_b)),
+        ));
+        engine.add_node(node_a, Some(mod_a), None, None);
+        engine.add_node(node_b, Some(mod_b), None, None);
+
+        let chain: Vec<NodeIndex> = vec![
+            *engine.node_map.get(&node_a).expect("node a in graph"),
+            *engine.node_map.get(&node_b).expect("node b in graph"),
+        ];
+
+        let dispatcher: Arc<dyn NodeDispatcher> = Arc::new(ChainErrorDispatcher {
+            message: error_message.to_string(),
+        });
+
+        let out = engine
+            .run_pipeline_chain_dispatch(
+                chain,
+                json!({ "seed": 1 }),
+                None,
+                Uuid::new_v4(),
+                dispatcher,
+                None,
+            )
+            .await
+            .1;
+        (store, out)
+    }
+
+    fn started_ids(store: &CaptureModuleExecutionStore) -> Vec<Uuid> {
+        store
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                ExecutionStoreCall::Started { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn terminal_calls(store: &CaptureModuleExecutionStore) -> Vec<(Uuid, String)> {
+        store
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                ExecutionStoreCall::Completed { id, status, .. } => Some((id, status)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// THE regression. EVERY step row opened before the chain dispatch is
+    /// closed when the chain dispatch itself fails — not "at least one", and
+    /// not the rows of some other chain.
+    #[tokio::test]
+    async fn a_chain_dispatch_error_finalizes_every_step_row_it_opened() {
+        let (store, out) = dispatch_chain_once("transport exploded").await;
+        assert!(out.is_err(), "the chain error propagates to the caller");
+
+        let opened = started_ids(&store);
+        assert_eq!(opened.len(), 2, "one start row per pipeline step");
+        let mut closed = terminal_calls(&store);
+        assert_eq!(
+            closed.len(),
+            2,
+            "every step row must be finalized — pre-fix this was 0 and all N \
+             rows were swept to 'timeout'/'stuck' 30 minutes later"
+        );
+        closed.sort_by_key(|(id, _)| *id);
+        let mut expected = opened;
+        expected.sort();
+        let closed_ids: Vec<Uuid> = closed.iter().map(|(id, _)| *id).collect();
+        assert_eq!(closed_ids, expected, "finalized exactly the rows it opened");
+        for (_, status) in &closed {
+            assert_eq!(status, "failed", "a non-timeout chain error is 'failed'");
+        }
+    }
+
+    /// The chain deadline is the SUM of the per-step budgets, so the
+    /// dispatcher's timeout sentinel is the arm this path hits most. It must
+    /// record `'timeout'`, using the same narrow classifier as the single-node
+    /// path — not a substring match on the module's own error text.
+    #[tokio::test]
+    async fn a_chain_timeout_records_timeout_on_every_step_row() {
+        let (store, out) =
+            dispatch_chain_once("Job dispatch failed after 1 attempts: Job execution timed out")
+                .await;
+        assert!(out.is_err());
+
+        let closed = terminal_calls(&store);
+        assert_eq!(closed.len(), 2);
+        for (_, status) in &closed {
+            assert_eq!(status, "timeout");
         }
     }
 }

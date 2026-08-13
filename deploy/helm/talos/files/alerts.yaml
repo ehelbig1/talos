@@ -818,6 +818,96 @@ groups:
             Vault) and the INSERT itself (check the DB-pool saturation alerts).
             The per-failure detail is in the controller log at the calling site.
 
+      # ── module_executions rows nothing ever finalized.
+      # The CLOSING half of the pair above. `record_started` opens a row;
+      # something must close it. Until 2026-08-12 the engine's single-node
+      # dispatch path — by volume nearly every row in the table — never did,
+      # so the 30-minute stuck-execution sweep rewrote all of them to
+      # 'timeout'/'stuck'. Measured the day of the fix: 21,065 timeout rows,
+      # ZERO 'completed' rows in the table's entire history, and 20,252 of the
+      # timeouts had a parent workflow_executions row whose status was
+      # 'completed'. Their duration_ms recorded time until the sweep noticed
+      # (minimum 1,800,301 ms = the 30-minute threshold plus 301 ms), not work
+      # time. `replay_module_regression`'s corpus selects WHERE
+      # status='completed', so that shipped feature was a silent no-op from the
+      # day it landed.
+      #
+      # It hid for over a month because the sweep's return value had exactly
+      # one consumer: a WARN log in the controller's background loop. Every
+      # alert this platform ships is metric-based, so a fleet in which EVERY
+      # node reached the sweep looked identical to a healthy one. This alert is
+      # the check the ledger never had — and it is deliberately on the SYMPTOM
+      # (rows reaching the sweep) rather than on the specific 2026-08-12 cause,
+      # because the failure mode to defend against is a FUTURE change
+      # redirecting results somewhere nobody is looking.
+      #
+      # WARNING, not critical, and NOT `> 0`: a genuinely dead worker or a
+      # controller killed mid-execution legitimately strands its in-flight
+      # rows here, so a non-zero reading is not by itself a defect.
+      #
+      # SEPARATING THE TWO POPULATIONS — and why `for:` alone cannot do it.
+      # `increase(...[1h])` stays positive for a full hour after ONE increment,
+      # so any `for:` shorter than the range window only DELAYS the page, never
+      # suppresses it (the same trap spelled out on
+      # TalosModuleExecutionStartRowFailures above). Suppressing a one-off
+      # needs a THRESHOLD on the value, and separating "one burst" from
+      # "sustained" needs `for:` LONGER than the range window so a decaying
+      # burst cannot hold the condition true across it. Hence `> 10` for `2h`
+      # over `[1h]`: a single burst — even a large one — falls out of the 1h
+      # window and breaks the 2h `for` before it can page; a ledger that is
+      # actually broken never stops feeding the window. Both directions are
+      # driven at synthetic time in observability/alerts_chart_test.yml rather
+      # than asserted here.
+      # Sizing: the pathology ran at ~710 rows/day (~30/h) on the fleet that
+      # motivated this, comfortably over 10/h, and a FULLY broken ledger is
+      # bounded below by the workflow-node rate rather than by anything about
+      # the sweep.
+      #
+      # WHAT IT DELIBERATELY DOES NOT CATCH, stated rather than implied:
+      #  * a LOW-VOLUME leak — one rarely-run dispatch path that opens rows
+      #    nobody closes stays under 10/h forever and is invisible here. The
+      #    PR-time guard for that class is the unit test in
+      #    talos-workflow-engine (engine_dispatch_single.rs), not this alert.
+      #  * the sweep TASK dying, which freezes the counter rather than
+      #    removing it — the ledger then breaks silently again with this alert
+      #    quiet. Nothing in this file covers that today.
+      #
+      # ABSENT vs ZERO: `talos_module_executions_swept_stuck_total` is an
+      # UNLABELLED Counter, so registration alone exports it at 0 from
+      # controller start — this expression is never silenced by the series
+      # simply not existing.
+      - alert: TalosModuleExecutionsNeverFinalize
+        expr: increase(talos_module_executions_swept_stuck_total[1h]) > 10
+        for: 2h
+        labels:
+          severity: warning
+          category: observability-loss
+        annotations:
+          summary: "module_executions rows are being swept, not finalized"
+          description: |
+            {{ $value | printf "%.0f" }} module_executions row(s) in the last hour were
+            converted to status='timeout' / error_type='stuck' by the
+            stuck-execution sweep because nothing finalized them within 30
+            minutes, sustained for 2h. This is a broken LEDGER rather than a
+            broken fleet.
+            First: is it a broken fleet? Check TalosWorkerDown and the worker's
+            own metrics. A dead worker mid-execution legitimately lands rows
+            here — but a one-off burst cannot hold this alert for 2h.
+            If the fleet is healthy, some dispatch path is opening rows it
+            never closes. Confirm with
+            `SELECT status, count(*) FROM module_executions WHERE started_at >
+            NOW() - INTERVAL '1 day' GROUP BY 1` — a population with no
+            'completed' rows at all is the signature. Every engine dispatch
+            path closes its row through
+            ParallelWorkflowEngine::finalize_module_execution_row; a new path
+            that dispatches without routing through it is the first thing to
+            look for.
+            Blast radius while this is firing: `replay_module_regression` and
+            `find_latest_completed_execution_io` both select WHERE
+            status='completed' and will return NOTHING, silently. Per-node
+            duration_ms is fabricated (it measures the sweep, not the module),
+            so latency archaeology over this table is invalid for the window.
+
   # ────────────────────────────────────────────────────────────────────
   # WORM audit-ledger integrity. Two independent verification layers, one
   # series: `stage=event` is the inline per-message check at ingest (the

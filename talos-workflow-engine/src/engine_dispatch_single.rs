@@ -460,12 +460,385 @@ impl ParallelWorkflowEngine {
             emit_retry_events: true,
         };
 
-        match dispatcher.dispatch(job).await {
+        // Wall clock for the ledger row's `duration_ms`. Started immediately
+        // before the dispatch so it measures the same span the pipeline path
+        // reports as `execution_time_ms` and the loop path measures with its
+        // own `iter_started.elapsed()` — dispatch + worker run + any retry
+        // backoff, not the config/secret resolution above it.
+        //
+        // SAY WHAT THIS NUMBER ACTUALLY BECOMES, because the name promises
+        // more than it delivers. `module_executions` carries a BEFORE UPDATE
+        // trigger (`calculate_module_execution_duration`) that OVERWRITES
+        // `duration_ms` with `completed_at - started_at` whenever
+        // `completed_at` transitions off NULL — which is exactly the first
+        // finalize. So on the row's first terminal write the value measured
+        // here is discarded and the stored number is wall time from the
+        // `record_started` INSERT instead. The two differ only by the
+        // secret-resolution and config-merge work between them (small, and
+        // arguably the honest thing to include), so this is left as-is rather
+        // than changed under a fix about something else. It is stated because
+        // the same trigger is what turned the sweep's `completed_at = NOW()`
+        // into the fabricated 1,800,301 ms minimum this change exists to
+        // stop, and the pipeline path's `execution_time_ms` has always been
+        // discarded the same way.
+        let dispatch_started = std::time::Instant::now();
+        let outcome = dispatcher.dispatch(job).await;
+        let duration_ms = i32::try_from(dispatch_started.elapsed().as_millis()).unwrap_or(i32::MAX);
+
+        // THE 2026-08-12 finding: this arm used to return without ever closing
+        // the `module_executions` row `record_started` opened ~140 lines above.
+        // The loop path (`complete_loop_iteration_row`) and the pipeline path
+        // (`engine_dispatch_pipeline`) both finalize their rows; single-node
+        // dispatch — by volume, nearly every row in the table — did not. The
+        // row therefore sat in `'running'` until the 30-minute stuck-execution
+        // sweep rewrote it to `'timeout'` with `error_type='stuck'`, so every
+        // successful workflow node was recorded as a dead worker and its
+        // `duration_ms` recorded *time until the sweep noticed*, not work time.
+        // Downstream that emptied `WHERE status='completed'` populations
+        // outright: `replay_module_regression`'s corpus and
+        // `find_latest_completed_execution_io` have both been silently
+        // returning nothing for as long as the table has had rows.
+        match outcome {
             Ok(result) => {
                 tracing::info!(%node_id, "Node execution succeeded");
+                self.finalize_module_execution_row(
+                    job_id,
+                    "completed",
+                    &result.output,
+                    duration_ms,
+                    None,
+                )
+                .await;
                 (node_idx, Ok(result.output))
             }
-            Err(e) => (node_idx, Err(e.to_string())),
+            Err(e) => {
+                let message = e.to_string();
+                self.finalize_module_execution_row(
+                    job_id,
+                    classify_dispatch_failure_status(&message),
+                    &JsonValue::Null,
+                    duration_ms,
+                    Some(&message),
+                )
+                .await;
+                (node_idx, Err(message))
+            }
         }
+    }
+
+    /// Close out one `module_executions` row — the single chokepoint every
+    /// engine dispatch path uses to move a row it opened with
+    /// `record_started` into a terminal state.
+    ///
+    /// Consolidated 2026-08-12: single-node dispatch had no finalize at all,
+    /// and the loop / pipeline paths each carried their own copy of the
+    /// redact-then-record-then-log-on-error shape.
+    ///
+    /// STATE THE INVARIANT PRECISELY, because the loose version of it is what
+    /// let a second instance of the same bug ship inside the fix. A chokepoint
+    /// does NOT by itself make "did this path finalize?" a one-place question;
+    /// what does is the invariant **every control-flow exit below a
+    /// `record_started` must pass through this function**. Reviewing the fix
+    /// found `engine_dispatch_pipeline`'s `dispatch_chain` error arm doing a
+    /// bare `return` under N already-INSERTed step rows — a call site of this
+    /// chokepoint that simply was not on that path. So when adding an early
+    /// exit anywhere below a `record_started`, the question to ask is not
+    /// "does this file call the chokepoint?" but "does THIS exit?".
+    ///
+    /// The three engine paths and their exits, as of 2026-08-13:
+    /// * single-node — both match arms on `dispatcher.dispatch`.
+    /// * loop — both match arms per iteration, including the `__error`-envelope
+    ///   break (`complete_loop_iteration_row`).
+    /// * pipeline — the `dispatch_chain` Err arm, the per-step result loop, and
+    ///   the aborted-trailing-step loop. Its EIGHT other returns (two on user
+    ///   context, one on module fetch, four on the approval gate, one on the
+    ///   freshness contract) all sit ABOVE its `record_started` loop — no row
+    ///   is open yet — which is why they are correct as bare returns.
+    ///
+    /// Payload/error redaction here is deliberate defense in depth: the
+    /// Postgres store redacts again at the bind boundary.
+    ///
+    /// Best-effort by contract. A finalize failure must NOT fail the job —
+    /// the node already ran and its result is already in the caller's hands.
+    /// The stuck-execution sweep remains the backstop for a row this never
+    /// reaches (a dropped reactor future under a workflow-level wall-clock
+    /// timeout, a DB outage during this write).
+    pub(crate) async fn finalize_module_execution_row(
+        &self,
+        id: Uuid,
+        status: &str,
+        output: &JsonValue,
+        duration_ms: i32,
+        error_message: Option<&str>,
+    ) {
+        let Some(ref store) = self.module_execution_store else {
+            return;
+        };
+        let redacted_error = error_message.map(|e| self.redact_str(e));
+        if let Err(db_err) = store
+            .record_completed(
+                id,
+                status,
+                &self.redact_json(output),
+                duration_ms,
+                redacted_error.as_deref(),
+            )
+            .await
+        {
+            tracing::error!(
+                module_execution_id = %id,
+                status,
+                "module_execution_store.record_completed failed: {}",
+                db_err
+            );
+        }
+    }
+}
+
+/// Map a single-node dispatch failure onto a `module_executions.status`.
+///
+/// Deliberately NARROW: only the dispatcher's own timeout sentinel
+/// (`"Job execution timed out"`, returned by both `execute_job_with_retry`
+/// and `dispatch_with_retry` in `talos-workflow-engine-nats`) is recorded as
+/// `'timeout'`. Everything else is `'failed'`.
+///
+/// A substring search for "timeout" would be wrong in the direction that
+/// matters: a module whose own HTTP call timed out returns an application
+/// error whose text says "timeout", and recording that as a worker-level
+/// timeout fabricates a signal an operator would then chase. Under-reporting
+/// timeouts as failures loses a distinction; over-reporting invents one. The
+/// cost of this narrowness is that a future dispatcher timeout string that
+/// does not match lands in `'failed'` — still terminal, still not a sweep
+/// artefact, which is what this whole change is about.
+pub(crate) fn classify_dispatch_failure_status(error: &str) -> &'static str {
+    if error.contains("Job execution timed out") {
+        "timeout"
+    } else {
+        "failed"
+    }
+}
+
+#[cfg(test)]
+mod single_node_ledger_finalize_tests {
+    //! D5 guard: a dispatched single node must leave its `module_executions`
+    //! row in a TERMINAL state.
+    //!
+    //! Regression cover for the 2026-08-12 finding. `run_single_node_dispatch`
+    //! opened a row with `record_started` and never closed it, so the
+    //! 30-minute stuck-execution sweep rewrote every one of them to
+    //! `'timeout'` / `error_type='stuck'`. Live evidence at the time of the
+    //! fix: 21,065 `timeout` rows, 0 `completed` rows EVER, and 20,252 of the
+    //! timeouts had a parent `workflow_executions` row whose status was
+    //! `completed`.
+    //!
+    //! These tests drive the REAL `run_single_node_dispatch` (not a
+    //! re-implementation of its tail) through the in-memory adapters and
+    //! assert on the recorded store calls. They FAIL on the pre-fix tree:
+    //! before the fix the store saw exactly one call — `Started` — and no
+    //! `Completed` for any outcome.
+    //!
+    //! What they deliberately do NOT prove: that the Postgres UPDATE lands.
+    //! `CaptureModuleExecutionStore` records the call, it does not write a
+    //! row. The status guard that makes the write idempotent lives in
+    //! `talos-engine`'s `PostgresModuleExecutionStore` and is covered there
+    //! and end-to-end against the live stack, not here.
+
+    use std::sync::Arc;
+
+    use petgraph::graph::NodeIndex;
+    use serde_json::json;
+    use talos_workflow_engine_core::{NodeDispatcher, WasmModuleArtifact};
+    use talos_workflow_engine_test_utils::capture::{
+        CaptureModuleExecutionStore, ExecutionStoreCall,
+    };
+    use talos_workflow_engine_test_utils::dispatch::ScriptedDispatcher;
+    use talos_workflow_engine_test_utils::memory::InMemoryModuleFetcher;
+    use uuid::Uuid;
+
+    use crate::engine::ParallelWorkflowEngine;
+
+    fn stub_artifact(module_id: Uuid) -> WasmModuleArtifact {
+        WasmModuleArtifact {
+            module_id,
+            content_hash: "stub".into(),
+            wasm_bytes: vec![1, 2, 3],
+            oci_url: None,
+            max_fuel: 1_000_000,
+            capability_world: "stub".into(),
+            allowed_hosts: vec![],
+            allowed_methods: vec![],
+            allowed_secrets: vec![],
+            requires_approval_for: vec![],
+            integration_name: None,
+            config: None,
+        }
+    }
+
+    fn engine_with_node(
+        node_id: Uuid,
+        module_id: Uuid,
+        store: Arc<CaptureModuleExecutionStore>,
+    ) -> ParallelWorkflowEngine {
+        let mut engine = ParallelWorkflowEngine::new();
+        engine.set_user_id(Uuid::new_v4());
+        // Bare `set_actor_id` needs no opt-out: lint check 29 excludes
+        // `talos-workflow-engine/**` wholesale.
+        engine.set_actor_id(Uuid::new_v4());
+        engine.set_module_execution_store(store);
+        engine.set_module_fetcher(Arc::new(
+            InMemoryModuleFetcher::new().with_module(module_id, stub_artifact(module_id)),
+        ));
+        engine.add_node(node_id, Some(module_id), None, None);
+        engine
+    }
+
+    /// `node_idx` is a pass-through: `run_single_node_dispatch` only ever
+    /// returns it, never indexes the graph with it. A literal keeps the test
+    /// from depending on private graph internals.
+    const PASSTHROUGH_IDX: usize = 0;
+
+    async fn dispatch_once(
+        dispatcher: Arc<dyn NodeDispatcher>,
+        store: Arc<CaptureModuleExecutionStore>,
+        node_id: Uuid,
+        module_id: Uuid,
+    ) -> Result<serde_json::Value, String> {
+        let engine = engine_with_node(node_id, module_id, store);
+        engine
+            .run_single_node_dispatch(
+                NodeIndex::new(PASSTHROUGH_IDX),
+                node_id,
+                Uuid::new_v4(),
+                dispatcher,
+                None,
+                json!({ "seed": 1 }),
+                None,
+                None,
+                None,
+            )
+            .await
+            .1
+    }
+
+    fn terminal_calls(store: &CaptureModuleExecutionStore) -> Vec<(Uuid, String)> {
+        store
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                ExecutionStoreCall::Completed { id, status, .. } => Some((id, status)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn started_ids(store: &CaptureModuleExecutionStore) -> Vec<Uuid> {
+        store
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                ExecutionStoreCall::Started { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// THE regression. A successful node closes its own row as `completed` —
+    /// and closes the SAME row it opened, not merely "some" row.
+    #[tokio::test]
+    async fn a_successful_node_finalizes_the_row_it_opened() {
+        let store = Arc::new(CaptureModuleExecutionStore::new());
+        let node_id = Uuid::new_v4();
+        let module_id = Uuid::new_v4();
+        let dispatcher: Arc<dyn NodeDispatcher> =
+            Arc::new(ScriptedDispatcher::new().with_response(module_id, json!({ "ok": true })));
+
+        let out = dispatch_once(dispatcher, store.clone(), node_id, module_id).await;
+        assert_eq!(out.expect("dispatch succeeded"), json!({ "ok": true }));
+
+        let opened = started_ids(&store);
+        assert_eq!(opened.len(), 1, "one start row per single-node dispatch");
+        let closed = terminal_calls(&store);
+        assert_eq!(
+            closed.len(),
+            1,
+            "the row must be finalized exactly once — pre-fix this was 0 and the \
+             30-minute stuck sweep rewrote the row to 'timeout'/'stuck'"
+        );
+        assert_eq!(closed[0].0, opened[0], "finalized the row it opened");
+        assert_eq!(
+            closed[0].1, "completed",
+            "a successful node is 'completed' — the status \
+             `replay_module_regression`'s corpus selects on"
+        );
+    }
+
+    /// The output the caller receives is the output recorded. A `completed`
+    /// row with no payload is what a backfill would have produced, and it is
+    /// useless as a replay baseline.
+    #[tokio::test]
+    async fn the_finalized_row_carries_the_dispatch_output() {
+        let store = Arc::new(CaptureModuleExecutionStore::new());
+        let node_id = Uuid::new_v4();
+        let module_id = Uuid::new_v4();
+        let dispatcher: Arc<dyn NodeDispatcher> =
+            Arc::new(ScriptedDispatcher::new().with_response(module_id, json!({ "answer": 42 })));
+
+        dispatch_once(dispatcher, store.clone(), node_id, module_id)
+            .await
+            .expect("dispatch succeeded");
+
+        let recorded = store
+            .calls()
+            .into_iter()
+            .find_map(|c| match c {
+                ExecutionStoreCall::Completed { output, .. } => Some(output),
+                _ => None,
+            })
+            .expect("a terminal call was recorded");
+        assert_eq!(
+            recorded,
+            json!({ "answer": 42 }),
+            "an output-less 'completed' row is an empty replay baseline"
+        );
+    }
+
+    /// A failing node is `failed`, not left for the sweep to call `timeout`.
+    /// The distinction is the whole point: pre-fix EVERY outcome became
+    /// `timeout`/`stuck`, so "the worker died" and "the module returned an
+    /// error" were indistinguishable in the ledger.
+    #[tokio::test]
+    async fn a_failing_node_finalizes_as_failed_not_timeout() {
+        let store = Arc::new(CaptureModuleExecutionStore::new());
+        let node_id = Uuid::new_v4();
+        let module_id = Uuid::new_v4();
+        let dispatcher: Arc<dyn NodeDispatcher> = Arc::new(
+            ScriptedDispatcher::new().with_error(module_id, "boom: module returned error"),
+        );
+
+        let out = dispatch_once(dispatcher, store.clone(), node_id, module_id).await;
+        assert!(out.is_err(), "scripted error propagates to the caller");
+
+        let closed = terminal_calls(&store);
+        assert_eq!(closed.len(), 1, "a failing node still closes its row");
+        assert_eq!(closed[0].1, "failed");
+    }
+
+    /// The dispatcher's own timeout sentinel — and ONLY it — records
+    /// `'timeout'`.
+    #[test]
+    fn dispatch_failure_status_classification_is_narrow() {
+        use super::classify_dispatch_failure_status as classify;
+        assert_eq!(classify("Job execution timed out"), "timeout");
+        assert_eq!(
+            classify("Job dispatch failed after 3 attempts: Job execution timed out"),
+            "timeout"
+        );
+        // A module's OWN error text mentioning a timeout must not be
+        // laundered into a worker-level timeout.
+        assert_eq!(
+            classify("Job failed (non-transient: auth): upstream connection timeout"),
+            "failed"
+        );
+        assert_eq!(classify("Missing AUTH_HEADER config"), "failed");
     }
 }

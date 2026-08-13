@@ -174,6 +174,26 @@ pub struct TalosMetrics {
     /// independently it means `get_execution_logs` / `get_node_io` / cost
     /// attribution are quietly missing rows.
     pub module_execution_record_started_failures_total: Counter,
+    /// `module_executions` rows the stuck-execution sweep had to convert to
+    /// `'timeout'` because nothing ever finalized them.
+    ///
+    /// A HEALTHY fleet increments this rarely — a genuinely dead worker, a
+    /// controller killed mid-execution. Sustained non-zero means rows are
+    /// being opened and never closed, which is a broken LEDGER rather than a
+    /// broken fleet, and it is the shape that hid for over a month: from the
+    /// table's first row until 2026-08-12 every single-node workflow dispatch
+    /// landed here (21,065 rows, zero `completed` rows ever), silently
+    /// emptying `replay_module_regression`'s `WHERE status='completed'`
+    /// corpus. Nothing observed the sweep's return value except a WARN log.
+    ///
+    /// Unlabelled deliberately. The sweep's `UPDATE … LIMIT 100` returns a
+    /// row count and nothing else — it does not know which module, user or
+    /// workflow the rows belonged to, and any of those would be unbounded
+    /// cardinality. An unlabelled `Counter` is also exported at 0 from
+    /// process start (unlike a `CounterVec`, which emits nothing until a
+    /// label set is touched), so an alert on it is never silenced by the
+    /// absent-is-not-zero trap.
+    pub module_executions_swept_stuck_total: Counter,
     /// WORM audit-ledger verification failures. Labels:
     /// `stage=event|chain` — `event` is the inline per-message
     /// authenticity/integrity check at ingest (the message is quarantined,
@@ -768,6 +788,16 @@ impl TalosMetrics {
             module_execution_record_started_failures_total.clone(),
         ))?;
 
+        let module_executions_swept_stuck_total = Counter::new(
+            "talos_module_executions_swept_stuck_total",
+            "module_executions rows the stuck-execution sweep converted to \
+             'timeout' because nothing ever finalized them. Sustained non-zero \
+             means rows are opened and never closed — a broken ledger, not a \
+             broken fleet. Registration alone exports it at 0, so an alert on \
+             it cannot be silenced by the series being absent.",
+        )?;
+        registry.register(Box::new(module_executions_swept_stuck_total.clone()))?;
+
         let audit_verification_failures_total = CounterVec::new(
             prometheus::Opts::new(
                 "talos_audit_verification_failures_total",
@@ -1257,6 +1287,7 @@ impl TalosMetrics {
             crash_recovery_total,
             wasm_log_orphaned_total,
             module_execution_record_started_failures_total,
+            module_executions_swept_stuck_total,
             audit_verification_failures_total,
             worker_key_tofu_conflicts_total,
             worker_build_skew_workers,
