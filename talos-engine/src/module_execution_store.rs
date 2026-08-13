@@ -312,34 +312,86 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
         //
         // Byte-for-byte the same predicate
         // `ModuleExecutionService::complete_execution_from_worker` has always
-        // carried; this impl was the sibling that never grew it. Three
-        // concrete writers can now reach one row, and the guard is what makes
-        // that safe by construction rather than by an invariant nobody checks:
+        // carried; this impl was the sibling that never grew it. The guard
+        // earns its place on TWO writers that genuinely race this one, plus a
+        // third that is currently excluded for a reason worth writing down
+        // correctly:
         //
-        //  1. The engine's own `finalize_module_execution_row` (2026-08-12).
-        //  2. The global-audit-topic result subscriber, via
-        //     `complete_execution_from_worker`. Today it cannot collide with
-        //     (1) for an engine dispatch, because `NatsNodeDispatcher` stamps
-        //     `reply_topic` from `JobTransport::new_reply_inbox()` and the
-        //     worker publishes to the reply inbox XOR the audit topic. But
-        //     the TRAIT DEFAULT for `new_reply_inbox` is `None` — only the
-        //     concrete `NatsTransport` overrides it — so the exclusion rests
-        //     on an override a future transport could simply not write, and
-        //     the unsafe direction is the default one.
-        //  3. The stuck-execution sweep. Without the guard a node that
-        //     outlived the 30-minute threshold would be swept to `'timeout'`
-        //     and then re-clobbered to `'completed'`, erasing the sweep's
-        //     record of a worker that had already been given up on.
+        //  1. THE STUCK-EXECUTION SWEEP — a real, unavoidable writer of the
+        //     same row, and the reason this guard is not merely defensive. It
+        //     converts any row still `'running'` after 30 minutes to
+        //     `'timeout'` / `error_type='stuck'`. It races nothing and asks
+        //     nobody: a node that legitimately runs longer than the threshold
+        //     (or whose finalize is delayed behind a DB hiccup) is swept, and
+        //     then this UPDATE would arrive and re-clobber it to `'completed'`
+        //     — erasing the record that the platform had already given up on
+        //     that worker. First-writer-wins is the right resolution because
+        //     the sweep's write is a STATEMENT ABOUT THE LEDGER ("no
+        //     completion was recorded in 30 minutes") that a later arrival
+        //     does not retroactively falsify.
         //
-        // It also stops a race-safe `'cancelled'` row (the parent workflow
-        // failed while this INSERT was in flight) from being resurrected as
-        // `'completed'` — the very phantom `race_safe_status` exists to
-        // prevent, undone one statement later.
+        //  2. THE SIBLING-CANCEL WRITER (`talos-engine`'s node hook, on
+        //     workflow failure: `UPDATE … SET status='cancelled' WHERE
+        //     workflow_execution_id = $1 AND status='running'`). Without the
+        //     guard a node whose result lands after its parent workflow failed
+        //     resurrects a `'cancelled'` row as `'completed'` — the very
+        //     phantom `race_safe_status` exists to prevent, undone one
+        //     statement later. This is not hypothetical: it is the largest
+        //     non-sweep terminal population in the live table.
+        //
+        //  3. `complete_execution_from_worker`, hanging off the global
+        //     audit-topic result subscriber. It does NOT reach these rows
+        //     today — but NOT for the reason an earlier draft of this comment
+        //     gave, and the wrong reason is worth naming so it is not
+        //     re-derived. That draft said the trait default of
+        //     `JobTransport::new_reply_inbox` is `None` and `None` routes
+        //     results to the audit topic. It does not. When
+        //     `new_reply_inbox()` returns `None`, `send_with_optional_inbox`
+        //     falls back to `transport.request(topic, payload)`; core NATS
+        //     allocates its OWN reply inbox and puts it on the wire, so the
+        //     worker's `pick_trusted_reply_topic` takes the
+        //     `(signed: None, wire: Some(inbox))` arm and publishes THERE.
+        //     Only `(None, None)` reaches the audit topic, and that needs a
+        //     transport whose `request` carries no reply subject at all — in
+        //     which case `request()` never returns, the dispatcher times out,
+        //     and THIS finalize writes `'timeout'` first anyway. So the
+        //     exclusion is structural rather than an override a future
+        //     transport might forget: there is no transport shape that both
+        //     routes to the audit subscriber AND lets the engine's dispatch
+        //     return before it.
+        //
+        // The guard's value therefore rests on (1) and (2), which are live,
+        // not on (3). Keeping it costs one predicate and makes
+        // first-writer-wins a property of the statement instead of an
+        // invariant maintained by argument.
+        //
+        // Also note this predicate makes the UPDATE idempotent, which is what
+        // lets every caller treat finalize as best-effort and retry-free.
         //
         // A no-op UPDATE is NOT an error here: `record_completed`'s callers
         // are all best-effort, and "someone else already closed this row" is
         // a correct outcome, not a failure to report.
-        sqlx::query(
+        //
+        // BUT IT MUST NOT BE INVISIBLE. Discarding `rows_affected()` means a
+        // future regression in which the guard ALWAYS refuses this write —
+        // a sweep threshold dropped to zero, a status literal renamed, a
+        // second writer that now always wins the race — would look exactly
+        // like success at the only place that can see it, and would present
+        // downstream as the same silent symptom this whole change exists to
+        // stop: an empty `WHERE status='completed'` population. Note the
+        // asymmetry that made that plausible: `record_started` has a failure
+        // counter (`talos_module_execution_record_started_failures_total`) and
+        // `record_completed` had no counterpart of any kind.
+        //
+        // `debug!`, deliberately, not `warn!`: a refusal is a LEGITIMATE and
+        // expected outcome (the sweep or the sibling-cancel writer got here
+        // first), so warning on it would train operators to ignore it. What is
+        // wanted is a line that exists to be grepped when the population goes
+        // empty — cheap, silent by default, and enough to distinguish "the
+        // engine never called finalize" from "the engine called it and the
+        // guard refused". Distinguishing those two took a full DB census the
+        // first time.
+        let refused = sqlx::query(
             "UPDATE module_executions \
              SET status = $1, output_data = $2, output_data_enc = $3, \
                  payload_enc_key_id = COALESCE(payload_enc_key_id, $4), \
@@ -357,8 +409,21 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
         .bind(id)
         .execute(&self.pool)
         .await
-        .map(|_| ())
-        .map_err(|e| -> BoxError { e.into() })
+        .map_err(|e| -> BoxError { e.into() })?
+        .rows_affected()
+            == 0;
+        if refused {
+            tracing::debug!(
+                module_execution_id = %id,
+                status,
+                "record_completed matched no row — already terminal (swept, \
+                 sibling-cancelled, or finalized by another writer), or the id \
+                 names no row. Expected in isolation; a SUSTAINED run of these \
+                 means the ledger's 'completed' population is being written by \
+                 nobody."
+            );
+        }
+        Ok(())
     }
 
     async fn resolve_module_id(&self, id_or_template: Uuid) -> Uuid {

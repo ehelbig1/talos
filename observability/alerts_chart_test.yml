@@ -1782,12 +1782,19 @@ tests:
   # ══════════════════════════════════════════════════════════════════════
 
   # The pathology. Every workflow node reaches the sweep, forever. Observed
-  # rate on the fleet that motivated this was ~30/h; 40/h here.
+  # rate on the fleet that motivated this was ~30/h; 45/h here.
+  #
+  # THE PER-SAMPLE STEP IS 0.75 AND THAT IS NOT COSMETIC — see the seam note on
+  # the clearing case below. promtool builds a ramp by REPEATED ADDITION, so a
+  # step with no exact binary representation accumulates error (0.667 added 300
+  # times lands on 200.10000000000042, not 200.1). 0.75 is exact, so the ramp
+  # hits a value a later segment can continue from without inventing a counter
+  # reset.
   - interval: 1m
     name: broken ledger — sustained sweeping fires after the 2h `for`
     input_series:
       - series: 'talos_module_executions_swept_stuck_total{job="talos-controller",instance="controller:8080"}'
-        values: "0+0.667x600"
+        values: "0+0.75x600"
     alert_rule_test:
       # Not yet: the condition has not held for 2h.
       - eval_time: 1h30m
@@ -1804,7 +1811,7 @@ tests:
             exp_annotations:
               summary: "module_executions rows are being swept, not finalized"
               description: |
-                40 module_executions row(s) in the last hour were
+                45 module_executions row(s) in the last hour were
                 converted to status='timeout' / error_type='stuck' by the
                 stuck-execution sweep because nothing finalized them within 30
                 minutes, sustained for 2h. This is a broken LEDGER rather than a
@@ -1853,11 +1860,31 @@ tests:
   # the last increment leaves the 1h window the alert goes inactive. An alert
   # that fires on a real incident but never clears is the same defect as one
   # that never fires.
+  #
+  # THE SEAM MUST NOT BE A COUNTER RESET, AND GETTING THAT RIGHT TOOK TWO
+  # ATTEMPTS. The original series was `0+0.667x300 200+0x400`. The ramp ends at
+  # 0.667*300 = 200.1, so a second segment starting at 200 is a DECREASE, which
+  # PromQL reads as a COUNTER RESET: `increase()` credits the whole post-reset
+  # value across the seam, injecting a ~+200 spike at exactly the instant this
+  # case means to show quiescence. It still cleared by 6h30m, so the assertions
+  # passed for the wrong reason — a green test over a fabricated transition is
+  # the same defect as a green gate over zero assertions.
+  #
+  # The obvious repair — continue from `200.1` — DOES NOT WORK, and asserting
+  # it would have re-shipped the bug. promtool builds a ramp by repeated
+  # addition, and 0.667 has no exact binary representation: 300 additions land
+  # on 200.10000000000042, so the literal `200.1` is still smaller and still a
+  # reset. Measured, not reasoned: `probe - 200.1` at 5h evaluates to 4.26e-13.
+  #
+  # So the step is 0.75 — exactly representable, 0.75*300 = 225 exactly — and
+  # the flat segment continues from 225. `increase[1h]` is then exactly 45 while
+  # the ramp runs and exactly 0 once it has left the window, with no seam
+  # artefact in either direction.
   - interval: 1m
     name: ledger fixed — alert clears once sweeping stops
     input_series:
       - series: 'talos_module_executions_swept_stuck_total{job="talos-controller",instance="controller:8080"}'
-        values: "0+0.667x300 200+0x400"
+        values: "0+0.75x300 225+0x400"
     alert_rule_test:
       - eval_time: 4h
         alertname: TalosModuleExecutionsNeverFinalize
@@ -1870,7 +1897,7 @@ tests:
             exp_annotations:
               summary: "module_executions rows are being swept, not finalized"
               description: |
-                40 module_executions row(s) in the last hour were
+                45 module_executions row(s) in the last hour were
                 converted to status='timeout' / error_type='stuck' by the
                 stuck-execution sweep because nothing finalized them within 30
                 minutes, sustained for 2h. This is a broken LEDGER rather than a

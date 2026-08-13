@@ -532,10 +532,28 @@ impl ParallelWorkflowEngine {
     ///
     /// Consolidated 2026-08-12: single-node dispatch had no finalize at all,
     /// and the loop / pipeline paths each carried their own copy of the
-    /// redact-then-record-then-log-on-error shape. One chokepoint is what
-    /// makes "did this path finalize?" a question with one place to look —
-    /// the property whose absence let the single-node gap survive unnoticed
-    /// from the table's first row.
+    /// redact-then-record-then-log-on-error shape.
+    ///
+    /// STATE THE INVARIANT PRECISELY, because the loose version of it is what
+    /// let a second instance of the same bug ship inside the fix. A chokepoint
+    /// does NOT by itself make "did this path finalize?" a one-place question;
+    /// what does is the invariant **every control-flow exit below a
+    /// `record_started` must pass through this function**. Reviewing the fix
+    /// found `engine_dispatch_pipeline`'s `dispatch_chain` error arm doing a
+    /// bare `return` under N already-INSERTed step rows — a call site of this
+    /// chokepoint that simply was not on that path. So when adding an early
+    /// exit anywhere below a `record_started`, the question to ask is not
+    /// "does this file call the chokepoint?" but "does THIS exit?".
+    ///
+    /// The three engine paths and their exits, as of 2026-08-13:
+    /// * single-node — both match arms on `dispatcher.dispatch`.
+    /// * loop — both match arms per iteration, including the `__error`-envelope
+    ///   break (`complete_loop_iteration_row`).
+    /// * pipeline — the `dispatch_chain` Err arm, the per-step result loop, and
+    ///   the aborted-trailing-step loop. Its EIGHT other returns (two on user
+    ///   context, one on module fetch, four on the approval gate, one on the
+    ///   freshness contract) all sit ABOVE its `record_started` loop — no row
+    ///   is open yet — which is why they are correct as bare returns.
     ///
     /// Payload/error redaction here is deliberate defense in depth: the
     /// Postgres store redacts again at the bind boundary.
