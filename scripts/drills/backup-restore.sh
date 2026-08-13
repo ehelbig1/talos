@@ -4,6 +4,7 @@
 # "A backup you haven't restored is a hypothesis." This script tests
 # the hypothesis end-to-end:
 #
+#  0b. Obtain the KEK from ESCROW              (NEVER from the live stack)
 #   1. Select the backup artifacts to restore   (newest sidecar dump + vault tar)
 #   2. Build the verifiers                      (before anything holds real data)
 #   3. Spin up scratch Postgres + Vault         (throwaway net, creds, volumes)
@@ -12,6 +13,12 @@
 #   6. Verify against the restored pair         (verify_restore + verify_phase_b)
 #   7. Clean up every scratch container/volume/network
 #   8. Emit the Prometheus textfile metric
+#
+# THE KEK COMES FROM ESCROW AND ONLY FROM ESCROW. Set exactly one of:
+#   TALOS_DRILL_ESCROW_KEY_CMD='op read "op://Private/Talos KEK/password"'
+#   TALOS_DRILL_ESCROW_KEY_FILE=/Volumes/escrow/talos-master.key
+# or run attached to a TTY and paste it at the hidden prompt. There is no
+# flag that reads it back off the running controller — see step 0b for why.
 #
 # Exit codes:
 #   0  drill passed — backups are restorable
@@ -370,6 +377,149 @@ if ! mkdir -p "$TEXTFILE_DIR" 2>/dev/null || [[ ! -w "$TEXTFILE_DIR" ]]; then
     fi
 fi
 
+# ── 0b. Obtain the KEK from ESCROW — never from the live host ─────
+#
+# THIS IS THE POINT OF THE DRILL, and until 2026-08-13 it was inverted.
+# The line that stood here was:
+#
+#     TALOS_MASTER_KEY=$(docker exec "$LIVE_CONTROLLER" printenv TALOS_MASTER_KEY)
+#     [[ -n "$TALOS_MASTER_KEY" ]] || die "could not read … from $LIVE_CONTROLLER"
+#
+# so the drill could only pass while the host it insures was still alive. It
+# proved `artifacts + TODAY'S LIVE KEK ⇒ readable`, which is not the claim a
+# restore rehearsal is asked for and is trivially true on a healthy host. In
+# the disaster it rehearses — the host is gone — the drill could not even
+# START, so it had never once tested the property it exists to test. A gate
+# that cannot fail for the reason it exists is not a gate.
+#
+# THE LIVE-CONTAINER READ IS NOT KEPT AS A FALLBACK. Not as a `--live` flag,
+# not as a "try escrow, else the container" convenience: a path that can
+# quietly succeed the old way leaves the defect in place and makes it look
+# fixed. Absent escrow is FATAL, with a message naming what to create.
+#
+# Three escrow sources, in precedence order. None of them defaults to
+# anything inside this repo or inside $BACKUP_DIR — a key stored beside the
+# ciphertext it unlocks is not encryption, it is a filename change.
+#
+#   1. TALOS_DRILL_ESCROW_KEY_CMD  — a command whose STDOUT is the key.
+#      The preferred shape, because the key never lands on disk:
+#        TALOS_DRILL_ESCROW_KEY_CMD='op read "op://Private/Talos KEK/password"'
+#      Its stderr is left attached so a password manager can prompt.
+#   2. TALOS_DRILL_ESCROW_KEY_FILE — a file containing the key (first line).
+#      Rejected if it resolves inside the repo or the backup directory.
+#   3. An interactive prompt, only when stdin is a TTY. `read -rs`: no echo.
+#
+# The value is never printed, never written to a file, never passed on a
+# command line (which would put it in `ps`), and never reaches the scratch
+# database. It lives in one shell variable — deliberately NOT exported, so it
+# reaches only the verifier invocation that names it explicitly (step 6).
+#
+# A pre-existing `TALOS_MASTER_KEY` in the caller's environment is CLEARED
+# here and never used. `source .env && make drill` would otherwise sail
+# through on the live key while looking like an escrow run, which is the same
+# "quietly succeeds the old way" hole as a fallback, just spelled differently.
+KEK_SOURCE=""
+TALOS_MASTER_KEY=""
+ESCROW_ATTEMPTED=""
+if [[ -n "${TALOS_DRILL_ESCROW_KEY_CMD:-}" ]]; then
+    # `|| true` so a failing helper produces the empty-key die below (with
+    # the actionable message) rather than a bare `set -e` abort.
+    TALOS_MASTER_KEY="$(eval "$TALOS_DRILL_ESCROW_KEY_CMD" 2>/dev/null | head -1 || true)"
+    KEK_SOURCE="TALOS_DRILL_ESCROW_KEY_CMD"
+    ESCROW_ATTEMPTED="TALOS_DRILL_ESCROW_KEY_CMD ran but produced NO OUTPUT (exit status
+   is not consulted — only what it printed). Check it works in this shell, and
+   that it writes the key to STDOUT rather than prompting on it."
+elif [[ -n "${TALOS_DRILL_ESCROW_KEY_FILE:-}" ]]; then
+    ESCROW_ATTEMPTED="TALOS_DRILL_ESCROW_KEY_FILE was set but its first line is EMPTY."
+    ESCROW_FILE="${TALOS_DRILL_ESCROW_KEY_FILE}"
+    [[ -r "$ESCROW_FILE" ]] || die "TALOS_DRILL_ESCROW_KEY_FILE='$ESCROW_FILE' is not readable"
+    # Resolve symlinks AND relatives before the containment checks, or
+    # `../../talos/.env` walks straight past them.
+    #
+    # `cd "$(dirname f)" && pwd -P` — the obvious portable realpath, and what
+    # this used at first — resolves a symlinked DIRECTORY and not a symlinked
+    # FILE. Caught by testing the bypass rather than by reading the code: a
+    # symlink in /tmp pointing at a key file inside the repo was ACCEPTED, and
+    # the README had already been written claiming "symlinks are resolved
+    # before the check". Same defect one level up as the drill itself.
+    # `python3 -c os.path.realpath` resolves both; python3 is already a hard
+    # dependency of this script (steps 2 and 5). macOS ships no coreutils
+    # `realpath`, so it is not an option here.
+    ESCROW_REAL="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$ESCROW_FILE")" \
+        || die "could not resolve TALOS_DRILL_ESCROW_KEY_FILE='$ESCROW_FILE'"
+    ESCROW_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+    ESCROW_REPO_ROOT="$(cd "$ESCROW_SCRIPT_DIR/../.." && pwd -P)"
+    case "$ESCROW_REAL" in
+        "$ESCROW_REPO_ROOT"/*)
+            die "escrow key file '$ESCROW_REAL' is INSIDE the repository ($ESCROW_REPO_ROOT).
+   The KEK must not live where the code lives — a checkout, a container image
+   layer or a stray \`git add -f\` then carries it. Move it off-box." ;;
+    esac
+    if [[ -d "$BACKUP_DIR" ]]; then
+        BACKUP_REAL="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$BACKUP_DIR")"
+        case "$ESCROW_REAL" in
+            "$BACKUP_REAL"/*)
+                die "escrow key file '$ESCROW_REAL' is INSIDE the backup directory ($BACKUP_REAL).
+   Whoever steals the artifacts then also has the key that unlocks them, which
+   makes the encryption decorative. Keep the KEK on a different medium." ;;
+        esac
+    fi
+    TALOS_MASTER_KEY="$(head -1 "$ESCROW_FILE" || true)"
+    KEK_SOURCE="TALOS_DRILL_ESCROW_KEY_FILE ($ESCROW_REAL)"
+elif [[ -t 0 ]]; then
+    # -s: no echo. The prompt goes to stderr so a redirected stdout keeps
+    # only drill output.
+    printf 'Escrowed TALOS_MASTER_KEY (input hidden): ' >&2
+    read -rs TALOS_MASTER_KEY || true
+    printf '\n' >&2
+    KEK_SOURCE="interactive prompt"
+    ESCROW_ATTEMPTED="Nothing was entered at the prompt."
+fi
+
+# Strip a trailing CR so a key escrowed through a Windows-y clipboard or a
+# CRLF file does not fail as "wrong key" — the single most confusing possible
+# outcome of a correct escrow.
+TALOS_MASTER_KEY="${TALOS_MASTER_KEY%$'\r'}"
+
+if [[ -z "$TALOS_MASTER_KEY" ]]; then
+    [[ -n "$ESCROW_ATTEMPTED" ]] && warn "$ESCROW_ATTEMPTED"
+    die "no escrowed KEK available — REFUSING to read it from the live stack.
+
+   This drill answers ONE question: 'if the host is gone, can the backups be
+   read?' Sourcing the key from the running controller answers a different,
+   much easier question, so it is not offered here at any flag.
+
+   Supply the escrowed TALOS_MASTER_KEY by ONE of:
+
+     1P / secret manager (preferred — the key never touches disk):
+        TALOS_DRILL_ESCROW_KEY_CMD='op read \"op://Private/Talos KEK/password\"' \\
+          $0 ${*:-}
+
+     A file on removable or otherwise off-box media:
+        TALOS_DRILL_ESCROW_KEY_FILE=/Volumes/escrow/talos-master.key $0 ${*:-}
+        (refused if that path is inside this repo or inside $BACKUP_DIR)
+
+     Interactively: run this script attached to a terminal and paste the key
+     at the hidden prompt.
+
+   If you cannot produce the key from an off-box source, THAT IS THE DRILL
+   RESULT: every byte in $BACKUP_DIR is currently unreadable after a host
+   loss. Escrow the KEK first — see scripts/drills/README.md item 8."
+fi
+
+# Which provider wrapped the DEKs. This ALSO used to come from the live
+# container; same objection, same fix. `env` is the default because it is
+# what docker-compose.yml defaults KEK_PROVIDER to, so the common case needs
+# no flag — and because being wrong here fails loudly at the first decrypt
+# rather than passing.
+KEK_PROVIDER_MODE="${TALOS_DRILL_KEK_PROVIDER:-env}"
+case "$KEK_PROVIDER_MODE" in
+    env|vault) ;;
+    *) die "TALOS_DRILL_KEK_PROVIDER must be 'env' or 'vault', got '$KEK_PROVIDER_MODE'" ;;
+esac
+# Length only. The key itself must never reach a terminal, a log or an issue.
+ok "KEK obtained from ESCROW via $KEK_SOURCE (${#TALOS_MASTER_KEY} chars; provider '$KEK_PROVIDER_MODE')"
+
 # WORK_DIR holds a full database dump and the Vault file backend in the
 # clear. mktemp gives an unpredictable name with 0700 — a fixed
 # /tmp/drill-<timestamp>, which is what this used, is guessable and
@@ -453,14 +603,6 @@ for b in "$VERIFY_RESTORE_BIN" "$VERIFY_PHASE_B_BIN"; do
     [[ -x "$b" ]] || die "verifier binary missing after build: $b"
 done
 ok "verifiers built"
-
-# The KEK material must match how the DEKs were wrapped, so it comes from the
-# live controller — this is the one live secret the drill needs, it is never
-# logged, and it never leaves this process's environment.
-docker inspect "$LIVE_CONTROLLER" >/dev/null 2>&1 || die "live controller '$LIVE_CONTROLLER' not running (needed for the KEK)"
-TALOS_MASTER_KEY=$(docker exec "$LIVE_CONTROLLER" printenv TALOS_MASTER_KEY 2>/dev/null || echo "")
-[[ -n "$TALOS_MASTER_KEY" ]] || die "could not read TALOS_MASTER_KEY from $LIVE_CONTROLLER"
-KEK_PROVIDER_LIVE=$(docker exec "$LIVE_CONTROLLER" printenv KEK_PROVIDER 2>/dev/null || echo "vault")
 
 # ── 3. Spin up scratch Postgres ───────────────────────────────────
 # A dedicated bridge network: the scratch stack must never be able to reach
@@ -561,7 +703,7 @@ chmod 644 "$WORK_DIR/vault.hcl"
 # status 0. That is precisely how the second run of this rewrite "passed"
 # while stopping at step 5.
 VAULT_PORT_ARGS=()
-if [[ "$KEK_PROVIDER_LIVE" == "vault" ]]; then
+if [[ "$KEK_PROVIDER_MODE" == "vault" ]]; then
     VAULT_PORT_ARGS=(-p "127.0.0.1::8200")
 fi
 docker run -d \
@@ -619,7 +761,7 @@ MOUNTS=$(docker exec -e VAULT_TOKEN="$VAULT_TOKEN" "$SCRATCH_VAULT_NAME" \
 [[ -n "$MOUNTS" ]] || die "restored vault exposes no secret engines — the logical backend is empty"
 ok "scratch vault unsealed; token accepted; mounts: $MOUNTS"
 
-if [[ "$KEK_PROVIDER_LIVE" == "vault" ]]; then
+if [[ "$KEK_PROVIDER_MODE" == "vault" ]]; then
     TK="${VAULT_TRANSIT_KEY_NAME:-talos-kek}"
     docker exec -e VAULT_TOKEN="$VAULT_TOKEN" "$SCRATCH_VAULT_NAME" \
         vault read "transit/keys/$TK" >/dev/null 2>&1 \
@@ -635,7 +777,7 @@ else
     # transit-wrapped DEK can be unwrapped, because this deployment does not
     # wrap them that way.
     VAULT_ADDR="http://127.0.0.1:8200"
-    warn "KEK_PROVIDER=$KEK_PROVIDER_LIVE — the restored Vault is not on the KEK path here"
+    warn "KEK_PROVIDER=$KEK_PROVIDER_MODE — the restored Vault is not on the KEK path here"
 fi
 
 # ── 6. Verify against the restored stack ──────────────────────────
@@ -653,7 +795,7 @@ run_verifier() {
     local bin="$1"; local label="$2"
     DATABASE_URL="$DATABASE_URL" \
     TALOS_MASTER_KEY="$TALOS_MASTER_KEY" \
-    KEK_PROVIDER="$KEK_PROVIDER_LIVE" \
+    KEK_PROVIDER="$KEK_PROVIDER_MODE" \
     VAULT_ADDR="$VAULT_ADDR" \
     VAULT_TOKEN="$VAULT_TOKEN" \
     VAULT_TRANSIT_KEY_NAME="${VAULT_TRANSIT_KEY_NAME:-talos-kek}" \
@@ -683,37 +825,41 @@ printf '  Source:          %s\n' "$SOURCE_MODE"
 # thing that has read it); this line is the checkout's, labelled as such so the
 # two are never confused.
 printf '  Checkout schema: %s (newest migration in this working tree)\n' "$EXPECT_MIGRATION"
+printf '  KEK source:      %s (ESCROW — the live stack was never asked)\n' "$KEK_SOURCE"
 printf '  Metric:          %s\n' "$TEXTFILE"
 printf '  Next drill:      within 7 days (alert fires at 14)\n'
 
-# WHAT A PASS DOES NOT MEAN. Printed inside the banner on purpose: a caveat
-# forty lines above the result is a caveat nobody reads, and this arc exists
-# because verifications quietly proved less than they implied.
+# WHAT A PASS NOW MEANS, AND WHAT IT STILL DOES NOT. Printed inside the banner
+# on purpose: a caveat forty lines above the result is a caveat nobody reads,
+# and this arc exists because verifications quietly proved less than they
+# implied.
 #
-# The KEK is read from the LIVE controller's environment (step 2). NOTHING in
-# scripts/dev-backup/ copies it into an artifact and `.env` is gitignored, so
-# what this drill establishes is:
+# As of 2026-08-13 the KEK comes from ESCROW, never from the live controller,
+# and its absence is fatal. So the claim has been upgraded from
 #
-#     artifacts + TODAY'S LIVE KEK  ⇒  readable
+#     artifacts + TODAY'S LIVE KEK  ⇒  readable        (untestable in a disaster)
+# to
+#     artifacts + ESCROWED KEK      ⇒  readable        (what recovery actually is)
 #
-# and NOT `artifacts ⇒ readable`. In the disaster this rehearses — the host is
-# gone — the KEK is gone with it and every byte in $BACKUP_DIR is
-# cryptographically inert, with this drill green the whole time. Where the KEK
-# should live is a security-architecture decision with real tradeoffs (parking
-# a copy next to the artifacts hands it to anyone who steals them), so it is
-# deliberately NOT decided here. It is stated here so it cannot be assumed
-# away. See scripts/drills/README.md § What this drill doesn't cover, item 8.
+# The remaining gap is now a CIPHERTEXT-LOCATION one, not a key one: the
+# artifacts themselves still live only on this host's filesystem. Losing the
+# disk loses them, escrowed key or not. That is Tier 2 and it is an open
+# operator decision (encrypted off-host replication vs. object storage with an
+# append-only credential) — see docker-compose.yml's `postgres-backup` comment
+# and scripts/drills/README.md § What this drill doesn't cover, item 8.
 printf '\n'
 printf '\033[1;33m  ⚠ WHAT THIS DOES NOT PROVE\033[0m\n'
-printf '\033[1;33m    KEK provenance: TALOS_MASTER_KEY was read from the LIVE %s.\033[0m\n' "$LIVE_CONTROLLER"
-printf '\033[1;33m      Proven: artifacts + today'"'"'s live KEK are readable.\033[0m\n'
-printf '\033[1;33m      NOT proven: artifacts alone. No backup contains the KEK — lose the\033[0m\n'
-printf '\033[1;33m      host and these artifacts are unreadable, with this drill still green.\033[0m\n'
-if [[ "$KEK_PROVIDER_LIVE" != "vault" ]]; then
-    printf '\033[1;33m    KEK_PROVIDER=%s: the restored Vault is NOT on the decryption path here.\033[0m\n' "$KEK_PROVIDER_LIVE"
+printf '\033[1;33m    Artifact location: the dumps exist only on THIS host filesystem.\033[0m\n'
+printf '\033[1;33m      Proven: escrowed KEK + these artifacts are readable on a clean stack.\033[0m\n'
+printf '\033[1;33m      NOT proven: that the artifacts survive losing this disk. Off-host\033[0m\n'
+printf '\033[1;33m      replication (Tier 2) is an OPEN decision, not a solved problem.\033[0m\n'
+if [[ "$KEK_PROVIDER_MODE" != "vault" ]]; then
+    printf '\033[1;33m    KEK_PROVIDER=%s: the restored Vault is NOT on the decryption path here.\033[0m\n' "$KEK_PROVIDER_MODE"
     printf '\033[1;33m      Its file backend restored, unsealed, authenticated and mounted —\033[0m\n'
     printf '\033[1;33m      but no transit-wrapped DEK was unwrapped, because this deployment\033[0m\n'
     printf '\033[1;33m      does not wrap them that way.\033[0m\n'
 fi
-printf '\033[1;33m    Column families: only actor_memory and secrets ciphertext was decrypted.\033[0m\n'
+printf '\033[1;33m    Column families: only actor_memory, secrets and ml_examples ciphertext\033[0m\n'
+printf '\033[1;33m      was decrypted and content-checked. workflow_executions output, module\033[0m\n'
+printf '\033[1;33m      payloads, TOTP/webhook secrets and integration_state were not.\033[0m\n'
 printf '\n'

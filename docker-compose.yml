@@ -34,11 +34,31 @@ services:
       - talos-network
 
   # Local training-gold backup — nightly-equivalent pg_dump of the dev
-  # database to the HOST filesystem (survives docker volume wipes /
-  # `make clean`; rides Time Machine off-box). The dev DB holds the only
-  # copy of human corrections + the ML gold slice; code is in git,
-  # labels aren't. Wake-aware + restore-verified — see
-  # scripts/dev-backup/dev-backup-loop.sh. Override dir with TALOS_BACKUP_DIR.
+  # database to the HOST filesystem. The dev DB holds the only copy of
+  # human corrections + the ML gold slice; code is in git, labels aren't.
+  # Wake-aware + restore-verified — see scripts/dev-backup/dev-backup-loop.sh.
+  # Override dir with TALOS_BACKUP_DIR.
+  #
+  # WHAT THESE DUMPS ARE PROTECTED AGAINST, stated exactly (corrected
+  # 2026-08-13). They live on the host filesystem, so they survive
+  # `docker volume rm`, `make clean`, and a full stack rebuild — that is the
+  # whole of it.
+  #
+  # They are NOT replicated off-host. This comment previously said they
+  # "ride Time Machine off-box"; `tmutil destinationinfo` on this machine
+  # answers "No destinations configured", and has for as long as anyone
+  # checked. Losing this disk loses every artifact in TALOS_BACKUP_DIR
+  # along with the database they were taken from — a claim of off-box
+  # protection that isn't true is worse than no claim, because it stops
+  # anyone from arranging the real thing.
+  #
+  # Getting them off-host is "Tier 2" and is an OPEN operator decision
+  # (encrypted Time Machine / other local replication vs. object storage
+  # with an append-only credential), deliberately not settled here. The
+  # KEY half is closed: the KEK is escrowed off-box, and
+  # scripts/drills/backup-restore.sh now REFUSES to run without it, so the
+  # restore drill proves "escrowed key + these artifacts ⇒ readable"
+  # rather than the untestable "artifacts + the live host ⇒ readable".
   postgres-backup:
     restart: unless-stopped
     image: pgvector/pgvector:pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff

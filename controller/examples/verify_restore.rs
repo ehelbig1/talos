@@ -27,24 +27,55 @@
 //!      per distinct `encryption_format_version`. Secrets are what a restore
 //!      is FOR (OAuth tokens, provider keys); a backup that restores rows
 //!      whose plaintext is unrecoverable has restored nothing.
-//!   5. Referential integrity of the key material: every `encryption_key_id`
+//!   5. `ml_examples` — the irreplaceable family. Code is in git; a month of
+//!      human labelling is not. Decrypted through the production
+//!      `DatasetService::sample_examples` path so the AAD derivation cannot
+//!      drift from the one the platform writes with.
+//!   6. Referential integrity of the key material: every `encryption_key_id`
 //!      referenced by data has a row in `encryption_keys`.
+//!
+//! CONTENT IS ASSERTED, NOT JUST SUCCESS (2026-08-13). Until this change the
+//! `actor_memory` arm matched `Ok(Some(_))` and counted it. That accepts a row
+//! whose decrypted value is JSON `null` — which is exactly what
+//! `resolve_stored_value` returns for a row with no ciphertext at all, i.e.
+//! the shape a half-restored or column-dropped table produces. "A row came
+//! back" and "the data is there" are different claims and only the second one
+//! is what a restore is asked for. Every decrypt now asserts on the PLAINTEXT:
+//! non-null, non-empty, not whitespace-only.
+//!
+//! AND IT CANNOT PASS VACUOUSLY. The same arm printed "no rows to decrypt
+//! (empty table — nothing asserted)" and returned success — so a restore that
+//! moved zero encrypted rows was indistinguishable from one that moved them
+//! all and read them back. Each family now reports an ELIGIBLE population
+//! alongside its verified count and fails when eligible > 0 and verified == 0,
+//! and the run fails outright when NOTHING anywhere was decrypted. See
+//! `Tally` below for the exact rule and its one stated limit.
 //!
 //! WHAT THIS DOES **NOT** CHECK — stated here because the failure mode this
 //! file exists to prevent is a verifier that implies more than it sampled:
-//!   * Only `actor_memory` and `secrets` ciphertext is decrypted. The other
-//!     encrypted column families — `workflow_executions` output, module
-//!     payloads, TOTP secrets, webhook secrets, `integration_state` — are
-//!     counted at most, never decrypted. They ride the same KEK→DEK→AEAD
-//!     chain, so a SYSTEMIC crypto failure surfaces in the two that are
-//!     sampled; a fault confined to one of the others would not.
-//!   * Expired rows are excluded from sampling on both tables. `recall_exact`
-//!     and `get_secret` refuse them by design, so including them made an
-//!     intact backup fail (see the comments at each sampling query).
-//!   * The KEK itself. The drill sources `TALOS_MASTER_KEY` from the LIVE
-//!     controller, so a pass means "these artifacts + today's live KEK are
-//!     readable" — NOT "these artifacts are readable". Nothing here can see
-//!     that gap; the drill's banner states it.
+//!   * Only `actor_memory`, `secrets` and `ml_examples` ciphertext is
+//!     decrypted. The other encrypted column families —
+//!     `workflow_executions` output, module payloads, TOTP secrets, webhook
+//!     secrets, `integration_state` — are counted at most, never decrypted.
+//!     They ride the same KEK→DEK→AEAD chain, so a SYSTEMIC crypto failure
+//!     surfaces in the three that are sampled; a fault confined to one of the
+//!     others would not.
+//!   * Expired rows are excluded from sampling on `actor_memory` and
+//!     `secrets`. `recall_exact` and `get_secret` refuse them by design, so
+//!     including them made an intact backup fail (see the comments at each
+//!     sampling query). `ml_examples` has no expiry.
+//!   * Non-classification `ml_examples` rows. The sampler selects on
+//!     `label_json ? 'label'`, so a regression dataset's ciphertext is never
+//!     read here — and is excluded from that family's eligible count too, so
+//!     it cannot trip the anti-vacuity rule either way.
+//!   * The KEK's PROVENANCE. This binary decrypts with whatever
+//!     `TALOS_MASTER_KEY` it is handed and cannot tell where that came from.
+//!     Sourcing it from escrow rather than the live container is enforced by
+//!     the DRILL (`scripts/drills/backup-restore.sh` step 0b), not here — so
+//!     running this verifier by hand with a key copied out of a container
+//!     proves the same thing it always did. That gate lives one layer up on
+//!     purpose: this file's job is "is the ciphertext readable with this key",
+//!     the drill's job is "is this key one a disaster survivor would have".
 //!
 //! NOTHING DECRYPTED IS EVER PRINTED. Every success line reports a count or a
 //! byte length. The drill runs this against real user data in a scratch
@@ -80,6 +111,65 @@ const CRITICAL_TABLES: &[(&str, bool)] = &[
 /// tested (wrong/missing DEK, truncated ciphertext, wrong AAD) is uniform
 /// within a group, so a small sample finds it.
 const SAMPLE_PER_GROUP: i64 = 5;
+
+/// Rows sampled per label per `ml_examples` dataset. Small on purpose: the
+/// question is "is this dataset's DEK+AAD readable", which is uniform across
+/// the dataset, not "is row 4,821 individually intact".
+const ML_SAMPLE_PER_LABEL: i64 = 2;
+
+/// Per-family decrypt bookkeeping — the anti-vacuity machinery.
+///
+/// `eligible` is the count of rows a correct restore SHOULD have been able to
+/// hand this verifier: unexpired for the TTL'd tables, label-bearing for
+/// `ml_examples`. `verified` counts plaintexts that came back AND passed the
+/// content assertion. The rule is then simply: `eligible > 0 && verified == 0`
+/// is a failure, and a run where every family verified nothing is a failure
+/// whatever the individual counts say.
+///
+/// STATED LIMIT, because a check that overstates itself is the defect this
+/// file exists to remove: when `eligible` is 0 the family is SKIPPED, not
+/// failed. A restore that silently moved zero `ml_examples` rows therefore
+/// passes this particular rule — it is caught, if at all, by
+/// `pg_restore --exit-on-error` and by the row counts printed above, not here.
+/// Making "eligible == 0" fatal per-family would false-red every deployment
+/// that legitimately has no ML datasets, which is the detector-fires-on-
+/// healthy-operation trade this repo has repeatedly refused. The global floor
+/// below is the part that has no healthy-state false positive.
+struct Tally {
+    family: &'static str,
+    eligible: i64,
+    verified: usize,
+}
+
+impl Tally {
+    fn new(family: &'static str) -> Self {
+        Self {
+            family,
+            eligible: 0,
+            verified: 0,
+        }
+    }
+}
+
+/// Assert on decrypted PLAINTEXT rather than on "a value came back".
+///
+/// Returns `Err(reason)` for content that is present-but-meaningless. JSON
+/// `null` is called out specifically: it is what `resolve_stored_value`
+/// produces when a row carries no ciphertext, so accepting it would let the
+/// exact half-restored shape this verifier guards against read as success.
+fn assert_decrypted_json(v: &serde_json::Value) -> Result<(), String> {
+    match v {
+        serde_json::Value::Null => {
+            Err("decrypted to JSON null (a row with no ciphertext reads this way)".into())
+        }
+        serde_json::Value::String(s) if s.trim().is_empty() => {
+            Err("decrypted to an empty/whitespace-only string".into())
+        }
+        serde_json::Value::Array(a) if a.is_empty() => Err("decrypted to an empty array".into()),
+        serde_json::Value::Object(o) if o.is_empty() => Err("decrypted to an empty object".into()),
+        _ => Ok(()),
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -209,8 +299,9 @@ async fn main() -> Result<()> {
     .fetch_all(&pool)
     .await?;
 
+    let mut mem_tally = Tally::new("actor_memory");
     if groups.is_empty() {
-        println!("  actor_memory: no rows to decrypt (empty table — nothing asserted)");
+        println!("  actor_memory: no rows present (eligible 0 — family SKIPPED, see Tally docs)");
     }
     for g in &groups {
         let fmt: i16 = g.try_get("value_format")?;
@@ -241,13 +332,22 @@ async fn main() -> Result<()> {
         .fetch_all(&pool)
         .await?;
 
+        mem_tally.eligible += live;
+
         let mut ok = 0usize;
         for r in &rows {
             let actor_id: Uuid = r.try_get("actor_id")?;
             let key: String = r.try_get("key")?;
             match talos_memory::recall_exact(&pool, actor_id, &key).await {
-                // The value is never printed — only that it decrypted.
-                Ok(Some(_)) => ok += 1,
+                // The value is never printed — only whether its CONTENT is
+                // real. `Ok(Some(_))` was the old test and it passes on a
+                // JSON-null plaintext; see `assert_decrypted_json`.
+                Ok(Some(row)) => match assert_decrypted_json(&row.value) {
+                    Ok(()) => ok += 1,
+                    Err(why) => failures.push(format!(
+                        "actor_memory v{fmt}/dek {key_id}: row decrypted but {why}"
+                    )),
+                },
                 Ok(None) => failures.push(format!(
                     "actor_memory v{fmt}/dek {key_id}: a sampled row vanished on read"
                 )),
@@ -256,9 +356,10 @@ async fn main() -> Result<()> {
                 )),
             }
         }
+        mem_tally.verified += ok;
         println!(
             "✓ actor_memory format v{fmt} (dek {key_id}): {ok}/{} sampled rows decrypted \
-             ({live} unexpired of {total} rows in group)",
+             with non-empty content ({live} unexpired of {total} rows in group)",
             rows.len()
         );
     }
@@ -287,8 +388,9 @@ async fn main() -> Result<()> {
     .fetch_all(&pool)
     .await?;
 
+    let mut secret_tally = Tally::new("secrets");
     if secret_groups.is_empty() {
-        println!("  secrets: no rows to decrypt (empty table — nothing asserted)");
+        println!("  secrets: no rows present (eligible 0 — family SKIPPED, see Tally docs)");
     }
     for g in &secret_groups {
         let fmt: i16 = g.try_get("encryption_format_version")?;
@@ -342,7 +444,7 @@ async fn main() -> Result<()> {
             {
                 // Length only — a decrypted secret must never reach a log.
                 Ok(v) => {
-                    if v.is_empty() {
+                    if v.trim().is_empty() {
                         failures.push(format!(
                             "secrets v{fmt}: key_hash {ph} decrypted to an EMPTY value"
                         ));
@@ -355,11 +457,101 @@ async fn main() -> Result<()> {
                 )),
             }
         }
+        secret_tally.eligible += live;
+        secret_tally.verified += ok;
         println!(
             "✓ secrets format v{fmt} (dek {key_id}): {ok}/{} sampled rows decrypted \
-             ({live} unexpired of {total} rows in group)",
+             with non-empty content ({live} unexpired of {total} rows in group)",
             paths.len()
         );
+    }
+
+    // ── 5b. Decrypt PRE-EXISTING ml_examples ─────────────────────────────
+    // The irreplaceable family, and the reason this drill's stakes are what
+    // they are: every other encrypted table holds something derivable from
+    // code, configuration or a provider that can re-issue it. `ml_examples`
+    // holds human labelling decisions. Nothing regenerates those.
+    //
+    // Decrypted through the PRODUCTION `DatasetService::sample_examples`, not
+    // a local re-implementation of the AAD scheme. `ml_examples` binds AAD on
+    // (`dataset_id`, `example_key`-or-`id`) — a re-derivation here would be a
+    // second copy of that rule, free to drift from the writer's, and a drifted
+    // copy fails CLOSED in a way that looks exactly like corrupt ciphertext.
+    let mut ml_tally = Tally::new("ml_examples");
+    {
+        use talos_ml::dataset::DatasetService;
+        let ds = DatasetService::new(secrets.clone());
+
+        // Only datasets with label-bearing rows: `sample_examples` selects on
+        // `label_json ? 'label'` and `decrypt_row` errors on a row without
+        // one, so a regression dataset would be reported as a decrypt failure
+        // when nothing is wrong with its ciphertext.
+        let datasets = sqlx::query(
+            "SELECT d.id, COUNT(e.id) AS n FROM ml_datasets d \
+             JOIN ml_examples e ON e.dataset_id = d.id AND e.label_json ? 'label' \
+             GROUP BY d.id ORDER BY d.id",
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        if datasets.is_empty() {
+            println!("  ml_examples: no label-bearing rows present (eligible 0 — family SKIPPED)");
+        }
+        for d in &datasets {
+            let dataset_id: Uuid = d.try_get("id")?;
+            let n: i64 = d.try_get("n")?;
+            ml_tally.eligible += n;
+
+            let mut conn = pool.acquire().await?;
+            match ds
+                .sample_examples(&mut conn, dataset_id, ML_SAMPLE_PER_LABEL)
+                .await
+            {
+                Ok(samples) => {
+                    let mut ok = 0usize;
+                    for s in &samples {
+                        // NEITHER the features nor the label is printed. The
+                        // features are the source content the label was
+                        // applied to (email bodies, alert text); the label is
+                        // a category name but the pair is the training datum.
+                        if s.features_text.trim().is_empty() {
+                            failures.push(format!(
+                                "ml_examples dataset {dataset_id}: example {} decrypted to \
+                                 empty/whitespace-only features",
+                                s.id
+                            ));
+                        } else if s.label.trim().is_empty() {
+                            failures.push(format!(
+                                "ml_examples dataset {dataset_id}: example {} decrypted with \
+                                 an empty label",
+                                s.id
+                            ));
+                        } else {
+                            ok += 1;
+                        }
+                    }
+                    if samples.is_empty() {
+                        failures.push(format!(
+                            "ml_examples dataset {dataset_id}: {n} label-bearing rows present \
+                             but the sampler returned none"
+                        ));
+                    }
+                    ml_tally.verified += ok;
+                    println!(
+                        "✓ ml_examples dataset {dataset_id}: {ok}/{} sampled rows decrypted \
+                         with non-empty features+label ({n} label-bearing rows in dataset)",
+                        samples.len()
+                    );
+                }
+                // `sample_examples` fails the whole batch on the first bad
+                // row (`?` inside its loop), which is the right shape here:
+                // one unreadable row in a dataset means the DEK/AAD for that
+                // dataset is wrong, not that one row is unlucky.
+                Err(e) => failures.push(format!(
+                    "ml_examples dataset {dataset_id}: DECRYPT FAILED — {e}"
+                )),
+            }
+        }
     }
 
     // ── 6. Every referenced DEK survived the restore ─────────────────────
@@ -395,20 +587,66 @@ async fn main() -> Result<()> {
         referenced.len()
     );
 
+    // ── 7. Anti-vacuity: the check must be able to fail ──────────────────
+    // Everything above this line reports on what it found. This block is the
+    // part that refuses to certify a run that found nothing — the property
+    // whose absence made the old drill worthless at the level above.
+    let tallies = [&mem_tally, &secret_tally, &ml_tally];
+    println!("\n  decrypt coverage (eligible → content-verified):");
+    for t in tallies {
+        println!(
+            "    {:<14} {:>8} → {:>6}{}",
+            t.family,
+            t.eligible,
+            t.verified,
+            if t.eligible == 0 { "   [skipped]" } else { "" }
+        );
+        if t.eligible > 0 && t.verified == 0 {
+            failures.push(format!(
+                "{}: {} row(s) were eligible for decryption and NOT ONE was read back with \
+                 usable content — the restore did not preserve readable data for this family",
+                t.family, t.eligible
+            ));
+        }
+    }
+    let total_verified: usize = tallies.iter().map(|t| t.verified).sum();
+    if total_verified == 0 {
+        // No family verified anything. Either the database is empty of
+        // ciphertext or the key is wrong; both are answers a restore drill
+        // must not report as success. Waivable ONLY for a genuinely fresh
+        // deployment, because "we have no data yet" is a real state and
+        // failing it forever would train operators to ignore the result.
+        if std::env::var("TALOS_DRILL_ALLOW_NO_CIPHERTEXT").as_deref() == Ok("1") {
+            println!(
+                "⚠ nothing was decrypted anywhere — WAIVED by TALOS_DRILL_ALLOW_NO_CIPHERTEXT=1. \
+                 This run proves the schema restored and NOTHING about readability."
+            );
+        } else {
+            failures.push(
+                "NOTHING was decrypted in any family — this run proves the schema restored and \
+                 nothing whatsoever about whether the data is readable. That is the failure mode \
+                 this verifier exists to make impossible. If the deployment genuinely holds no \
+                 encrypted data yet, set TALOS_DRILL_ALLOW_NO_CIPHERTEXT=1 and accept that the \
+                 drill certifies nothing about readability."
+                    .into(),
+            );
+        }
+    }
+
     // ── Verdict ──────────────────────────────────────────────────────────
     if failures.is_empty() {
-        // Say what was SAMPLED, not what would be reassuring. `actor_memory`
-        // and `secrets` are two of the encrypted column families in this
-        // schema; `workflow_executions` output, module payloads, TOTP secrets,
-        // webhook secrets and `integration_state` are NOT decrypt-verified
-        // here. They share the same KEK→DEK→AEAD chain, so a systemic crypto
-        // failure would show up in the two that are sampled — but a fault
-        // confined to one of the others would not, and "pre-existing data is
-        // readable" claimed otherwise.
+        // Say what was SAMPLED, not what would be reassuring. `actor_memory`,
+        // `secrets` and `ml_examples` are three of the encrypted column
+        // families in this schema; `workflow_executions` output, module
+        // payloads, TOTP secrets, webhook secrets and `integration_state` are
+        // NOT decrypt-verified here. They share the same KEK→DEK→AEAD chain,
+        // so a systemic crypto failure would show up in the three that are
+        // sampled — but a fault confined to one of the others would not, and
+        // "pre-existing data is readable" claimed otherwise.
         println!(
-            "\n🎉 Restore verification PASSED — sampled pre-existing actor_memory \
-             and secrets ciphertext decrypted (other encrypted column families \
-             not sampled; see this file's header)"
+            "\n🎉 Restore verification PASSED — {total_verified} pre-existing ciphertext row(s) \
+             across actor_memory / secrets / ml_examples decrypted AND content-checked \
+             (other encrypted column families not sampled; see this file's header)"
         );
         Ok(())
     } else {

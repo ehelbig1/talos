@@ -69,10 +69,18 @@
 # ── Same-dir, per-target subdirs ───────────────────────────────────────
 # Backups land under the SAME host backup dir as Postgres
 # (${TALOS_BACKUP_DIR:-~/.talos/backups}), in a per-target subdir
-# (/backups/vault, /backups/neo4j) so Time Machine / host backups ride along
-# off-box for free — the whole reason the Postgres sidecar writes to a host
-# bind mount and not a docker volume. (Postgres itself writes to the backup
-# root for backward compatibility with existing dumps.)
+# (/backups/vault, /backups/neo4j). Writing to a host bind mount rather than
+# a docker volume is what makes them survive `docker volume rm` and
+# `make clean`, and it is what PUTS THEM IN REACH of a host-level backup
+# tool — it does not constitute one.
+#
+# Corrected 2026-08-13: this said the artifacts "ride along off-box for
+# free" via Time Machine. They do not. `tmutil destinationinfo` on the dev
+# host reports "No destinations configured", so today these files are
+# single-disk and nothing replicates them. Getting them off-host is an open
+# operator decision (Tier 2) — see the `postgres-backup` service comment in
+# docker-compose.yml. (Postgres itself writes to the backup root for
+# backward compatibility with existing dumps.)
 #
 # Wake-aware cadence, .partial atomicity, loud ERROR logs, and retention
 # pruning all mirror scripts/dev-backup/dev-backup-loop.sh.

@@ -404,6 +404,89 @@ pub(crate) use crate::engine_dispatch_subflow::{
 };
 pub use crate::engine_dispatch_subflow::{JudgeVerdict, SubflowError};
 
+/// Whether the pipeline-chain optimisation (`NodeDispatcher::dispatch_chain`)
+/// is live for one run. Threaded from the entry point; never inferred.
+///
+/// ## Why this is a parameter (2026-08-13)
+///
+/// The gate used to be `let is_fresh_run = initial_results.is_empty();`. That
+/// reads as a description of the run and is not one — it is a decision, made
+/// by accident, and the accident is total:
+///
+/// * `run_with_transport` passes an EMPTY map, so chains are enabled.
+/// * `run_with_seed_with_transport` is seeded, so chains are disabled. Correct
+///   and intended — the detector would otherwise build chains spanning
+///   already-completed nodes and re-dispatch them.
+/// * `run_with_trigger_input_transport` seeds a synthetic `__trigger__` node
+///   and then delegates to the seeded path, so chains are disabled — **not**
+///   because anyone decided a trigger-driven run should not batch, but as a
+///   side effect of how the trigger is implemented.
+///
+/// The third bullet is the whole problem, because it is EVERY production run.
+/// A sweep of this workspace finds no non-test caller of `run_with_transport`
+/// at all: triggers, the scheduler, retries, replays, webhooks, continuations
+/// and crash-recovery resumes all reach the engine through the trigger-input
+/// or seeded wrappers. So `dispatch_chain` — and with it every line of
+/// `engine_dispatch_pipeline.rs` — is DEAD on the deployed platform, and has
+/// been for as long as the trigger wrapper has existed.
+///
+/// ## Why the value here is `Disabled` and not a fix
+///
+/// Making this explicit is deliberately NOT the same act as turning chains
+/// back on, and the flag must not be read as an invitation to flip it. Two
+/// findings stand between the current value and a working one:
+///
+/// 1. **It would recover almost nothing.** The chain filter drops any chain
+///    containing a node whose `module_id` is `None`, and the synthetic
+///    `__trigger__` node has exactly that. Since the trigger is wired to every
+///    root, most graphs' head chains are disqualified regardless.
+/// 2. **It would send suppressed notifications.** The chain-head branch in the
+///    scheduler `continue`s before the skip-condition check, and
+///    `engine_dispatch_pipeline.rs` contains no `skip_condition` handling at
+///    all. Every workflow currently using `skip_condition` is a SEND node —
+///    including `pa-followup-approval-notifier`, which runs ~434×/week. A
+///    naive flip mails the messages those conditions exist to suppress.
+///
+/// Enabling chains therefore requires fixing the trigger-node filter AND
+/// teaching the pipeline path about skip conditions, and it is an
+/// architectural call (fix vs. delete `dispatch_chain` outright) that belongs
+/// to the operator, not to a rename. What this type buys today is that the
+/// next reader sees a decision with its consequences written down instead of
+/// an emergent property of a `HashMap::is_empty()` call.
+///
+/// ## The ONE behavioural delta this change makes, stated rather than buried
+///
+/// Threading the flag is otherwise a pure rename — every entry point passes
+/// the value `initial_results.is_empty()` would have produced. There is
+/// exactly one exception, and it is reachable: a SEEDED run whose seed map is
+/// EMPTY. `crash_recovery::resume_execution` produces that whenever no
+/// checkpoint was found ("resuming from scratch (at-least-once)"), and the
+/// old gate read the empty map as "fresh" and turned chain batching ON for
+/// that run — the only production route into `engine_dispatch_pipeline.rs`
+/// that existed. It now passes `Disabled` like every other seeded call.
+///
+/// That is a change, not a no-op, and it was made deliberately rather than
+/// reproduced bit-for-bit: the direction is strictly safer (it removes the
+/// one live path into a dispatcher with no `skip_condition` handling), and
+/// `Disabled` is what the seeded path's own documented rationale asks for.
+/// Preserving the old value here would have meant re-deriving it from
+/// `is_empty()` — reinstating the exact inference this type exists to delete.
+///
+/// `chain_dispatch_is_disabled_on_the_production_entrypoint` in
+/// `talos-workflow-engine/tests/chain_dispatch_gate.rs` pins the behaviour
+/// through the real entry point so a future flip cannot be silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChainDispatch {
+    /// Detect linear chains and batch them through
+    /// `NodeDispatcher::dispatch_chain`. Reachable only from
+    /// `run_with_transport` / `run_with_transport_cancellable`, which no
+    /// production path in this workspace calls.
+    Enabled,
+    /// Dispatch every node individually. What every production entry point
+    /// passes; see the type docs.
+    Disabled,
+}
+
 // Suppress dead‑code warnings to keep the CI passing.
 #[allow(dead_code)]
 /// Parallel execution engine based on Kahn's algorithm.
@@ -1252,7 +1335,15 @@ impl ParallelWorkflowEngine {
             self.execution_timeout_secs,
             self.cancellation_token.clone(),
             self.progress.clone(),
-            self.run_inner(dispatcher, worker_shared_key, HashMap::new(), execution_id),
+            // The ONE entry point that batches chains — and the one no
+            // production caller in this workspace uses. See `ChainDispatch`.
+            self.run_inner(
+                dispatcher,
+                worker_shared_key,
+                HashMap::new(),
+                execution_id,
+                ChainDispatch::Enabled,
+            ),
         )
         .await
     }
@@ -1291,7 +1382,13 @@ impl ParallelWorkflowEngine {
             self.execution_timeout_secs,
             Some(cancel),
             self.progress.clone(),
-            self.run_inner(dispatcher, worker_shared_key, HashMap::new(), execution_id),
+            self.run_inner(
+                dispatcher,
+                worker_shared_key,
+                HashMap::new(),
+                execution_id,
+                ChainDispatch::Enabled,
+            ),
         )
         .await
     }
@@ -1338,6 +1435,33 @@ impl ParallelWorkflowEngine {
     ) -> Pin<
         Box<dyn Future<Output = Result<WorkflowContext, crate::WorkflowEngineError>> + Send + '_>,
     > {
+        // A seeded resume must not batch chains: the detector would build
+        // chains spanning already-completed nodes and re-dispatch them.
+        self.run_seeded_with_chain_policy(
+            dispatcher,
+            worker_shared_key,
+            initial_results,
+            execution_id,
+            ChainDispatch::Disabled,
+        )
+    }
+
+    /// Shared body of the seeded entry points, taking the chain policy
+    /// EXPLICITLY so each caller states its own answer rather than
+    /// inheriting one. `run_with_trigger_input_transport` routes through
+    /// here for exactly that reason — before this it delegated to
+    /// `run_with_seed_with_transport` and got `Disabled` as an invisible
+    /// side effect of seeding a synthetic node. See [`ChainDispatch`].
+    fn run_seeded_with_chain_policy(
+        &self,
+        dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
+        worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
+        initial_results: HashMap<Uuid, JsonValue>,
+        execution_id: Uuid,
+        chain_dispatch: ChainDispatch,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<WorkflowContext, crate::WorkflowEngineError>> + Send + '_>,
+    > {
         // Abstract-entry guard mirrors `run_with_transport`.
         if let Err(e) = self.precheck_runnable() {
             return Box::pin(async move { Err(e) });
@@ -1346,7 +1470,13 @@ impl ParallelWorkflowEngine {
         // Engine-level cancel propagation; see set_cancellation_token.
         let cancel = self.cancellation_token.clone();
         let progress = self.progress.clone();
-        let inner = self.run_inner(dispatcher, worker_shared_key, initial_results, execution_id);
+        let inner = self.run_inner(
+            dispatcher,
+            worker_shared_key,
+            initial_results,
+            execution_id,
+            chain_dispatch,
+        );
         Box::pin(
             async move { run_with_workflow_timeout(timeout_secs, cancel, progress, inner).await },
         )
@@ -1372,7 +1502,15 @@ impl ParallelWorkflowEngine {
         }
         let timeout_secs = self.execution_timeout_secs;
         let progress = self.progress.clone();
-        let inner = self.run_inner(dispatcher, worker_shared_key, initial_results, execution_id);
+        // Seeded resume: chains stay off, same reason as the non-cancellable
+        // twin above.
+        let inner = self.run_inner(
+            dispatcher,
+            worker_shared_key,
+            initial_results,
+            execution_id,
+            ChainDispatch::Disabled,
+        );
         Box::pin(async move {
             run_with_workflow_timeout(timeout_secs, Some(cancel), progress, inner).await
         })
@@ -1419,11 +1557,21 @@ impl ParallelWorkflowEngine {
         let trigger_node_id = self.ensure_trigger_node_wired_to_roots();
         let mut initial_results = HashMap::new();
         initial_results.insert(trigger_node_id, trigger_input);
-        self.run_with_seed_with_transport(
+        // THE PRODUCTION ENTRY POINT, and the reason `ChainDispatch` exists as
+        // a parameter. This is a FRESH run — nothing here is resuming past
+        // work — yet chains are off, because they were never on: the synthetic
+        // trigger node made `initial_results` non-empty and the old
+        // `is_empty()` gate silently drew the resume conclusion. `Disabled` is
+        // now stated rather than inherited, so the next person to look sees a
+        // decision. Read `ChainDispatch`'s docs BEFORE changing this value:
+        // flipping it as-is mails notifications that `skip_condition` exists
+        // to suppress.
+        self.run_seeded_with_chain_policy(
             dispatcher,
             worker_shared_key,
             initial_results,
             execution_id,
+            ChainDispatch::Disabled,
         )
         .await
     }
@@ -1444,6 +1592,8 @@ impl ParallelWorkflowEngine {
         let trigger_node_id = self.ensure_trigger_node_wired_to_roots();
         let mut initial_results = HashMap::new();
         initial_results.insert(trigger_node_id, trigger_input);
+        // Same policy as the non-cancellable twin, stated for the same
+        // reason — see `ChainDispatch`.
         self.run_with_seed_with_transport_cancellable(
             dispatcher,
             worker_shared_key,
@@ -1529,10 +1679,10 @@ impl ParallelWorkflowEngine {
     ///   single-node future is pushed to `executing`. Previously only
     ///   emitted by the seeded path.
     ///
-    /// Pipeline chain detection still runs only when
-    /// `initial_results.is_empty()` — seeded resumes would otherwise
-    /// build chains spanning already-completed nodes and re-dispatch
-    /// them.
+    /// Pipeline chain detection runs only when the caller passes
+    /// [`ChainDispatch::Enabled`] — see that type for why the decision
+    /// is now an explicit parameter instead of an inference from
+    /// `initial_results.is_empty()`.
     ///
     /// Kept on a `String` error type so the reactor loop can use `?`
     /// against the internal `Result<_, String>` paths without
@@ -1567,6 +1717,7 @@ impl ParallelWorkflowEngine {
         worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
         initial_results: HashMap<Uuid, JsonValue>,
         execution_id: Uuid,
+        chain_dispatch: ChainDispatch,
     ) -> Result<WorkflowContext, String> {
         // Workflow-level timeout enforcement was hoisted into the
         // public wrappers (`run_with_transport` /
@@ -1574,8 +1725,14 @@ impl ParallelWorkflowEngine {
         // `WorkflowEngineError::Timeout` variant can be constructed
         // with the configured cap directly. Per-node timeouts and
         // sub-workflow timeouts still live inside the reactor.
-        self.run_scheduler_loop(dispatcher, worker_shared_key, initial_results, execution_id)
-            .await
+        self.run_scheduler_loop(
+            dispatcher,
+            worker_shared_key,
+            initial_results,
+            execution_id,
+            chain_dispatch,
+        )
+        .await
     }
 
     /// The actual reactor loop, lifted out of [`run_inner`] so the
@@ -1588,6 +1745,7 @@ impl ParallelWorkflowEngine {
         worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
         initial_results: HashMap<Uuid, JsonValue>,
         execution_id: Uuid,
+        chain_dispatch: ChainDispatch,
     ) -> Result<WorkflowContext, String> {
         // Per-run DLP sanitizer — built once from resolved node
         // configs and used to scrub error messages before persistence.
@@ -1632,11 +1790,15 @@ impl ParallelWorkflowEngine {
         // previous run's node.
         self.progress.reset();
 
-        let is_fresh_run = initial_results.is_empty();
+        // Whether the pipeline-chain optimisation is live for THIS run.
+        // Named for what it gates, and supplied by the caller — see
+        // `ChainDispatch` for the whole history, including why the value
+        // every production entry point passes is `Disabled`.
+        let chains_live = chain_dispatch == ChainDispatch::Enabled;
 
-        // Pipeline chain detection runs ONLY on fresh runs. On seeded
-        // resume the detector would build chains spanning
-        // already-completed nodes and re-dispatch them.
+        // On seeded resume the detector would build chains spanning
+        // already-completed nodes and re-dispatch them, which is why the
+        // resume entry points pass `Disabled`.
         //
         // After detection, drop any chain that touches a system node:
         // pipeline dispatch tries to resolve a wasm artifact for every
@@ -1644,7 +1806,7 @@ impl ParallelWorkflowEngine {
         // chain spanning a `Wait` would also defeat the pause-on-Wait
         // contract because the chain dispatch is atomic — there's no
         // way to short-circuit mid-chain.
-        let chains: Vec<Vec<NodeIndex>> = if is_fresh_run {
+        let chains: Vec<Vec<NodeIndex>> = if chains_live {
             detect_linear_chains(&self.graph)
                 .into_iter()
                 .filter(|chain| {
@@ -1853,7 +2015,7 @@ impl ParallelWorkflowEngine {
                     .try_dispatch_ops_alerts_digest(node_id, execution_id)
                     .await
                 {
-                    let chains_ctx = if is_fresh_run {
+                    let chains_ctx = if chains_live {
                         Some((chains.as_slice(), &node_to_chain))
                     } else {
                         None
@@ -1881,7 +2043,7 @@ impl ParallelWorkflowEngine {
                     .try_dispatch_pending_approvals(node_id, execution_id)
                     .await
                 {
-                    let chains_ctx = if is_fresh_run {
+                    let chains_ctx = if chains_live {
                         Some((chains.as_slice(), &node_to_chain))
                     } else {
                         None
@@ -1907,7 +2069,7 @@ impl ParallelWorkflowEngine {
                     .try_dispatch_assistant_report(node_id, execution_id)
                     .await
                 {
-                    let chains_ctx = if is_fresh_run {
+                    let chains_ctx = if chains_live {
                         Some((chains.as_slice(), &node_to_chain))
                     } else {
                         None
@@ -1933,7 +2095,7 @@ impl ParallelWorkflowEngine {
                     .try_dispatch_operator_digest(node_id, execution_id)
                     .await
                 {
-                    let chains_ctx = if is_fresh_run {
+                    let chains_ctx = if chains_live {
                         Some((chains.as_slice(), &node_to_chain))
                     } else {
                         None
@@ -1981,7 +2143,7 @@ impl ParallelWorkflowEngine {
                             self.unblock_successors(node_idx, &mut pending, &mut ready);
                         }
                         Err(error_msg) => {
-                            let chains_ctx = if is_fresh_run {
+                            let chains_ctx = if chains_live {
                                 Some((chains.as_slice(), &node_to_chain))
                             } else {
                                 None
@@ -2030,7 +2192,7 @@ impl ParallelWorkflowEngine {
                     // Observe-only: record the verdict for the weekly
                     // self-report before the output is routed onward.
                     self.record_judge_score(node_id, execution_id, &output);
-                    let chains_ctx = if is_fresh_run {
+                    let chains_ctx = if chains_live {
                         Some((chains.as_slice(), &node_to_chain))
                     } else {
                         None
@@ -2064,7 +2226,7 @@ impl ParallelWorkflowEngine {
                     // Observe-only: record the verdict for the weekly
                     // self-report before the output is routed onward.
                     self.record_judge_score(node_id, execution_id, &output);
-                    let chains_ctx = if is_fresh_run {
+                    let chains_ctx = if chains_live {
                         Some((chains.as_slice(), &node_to_chain))
                     } else {
                         None
@@ -2095,7 +2257,7 @@ impl ParallelWorkflowEngine {
                     )
                     .await
                 {
-                    let chains_ctx = if is_fresh_run {
+                    let chains_ctx = if chains_live {
                         Some((chains.as_slice(), &node_to_chain))
                     } else {
                         None
@@ -2141,7 +2303,7 @@ impl ParallelWorkflowEngine {
                             // completion-failure path so the workflow
                             // actually fails (and continue_on_error /
                             // error edges still get to participate).
-                            let chains_ctx = if is_fresh_run {
+                            let chains_ctx = if chains_live {
                                 Some((chains.as_slice(), &node_to_chain))
                             } else {
                                 None
@@ -2175,7 +2337,7 @@ impl ParallelWorkflowEngine {
                     )
                     .await
                 {
-                    let chains_ctx = if is_fresh_run {
+                    let chains_ctx = if chains_live {
                         Some((chains.as_slice(), &node_to_chain))
                     } else {
                         None
@@ -2206,7 +2368,7 @@ impl ParallelWorkflowEngine {
                     )
                     .await
                 {
-                    let chains_ctx = if is_fresh_run {
+                    let chains_ctx = if chains_live {
                         Some((chains.as_slice(), &node_to_chain))
                     } else {
                         None
@@ -2356,7 +2518,7 @@ impl ParallelWorkflowEngine {
                             self.unblock_successors(node_idx, &mut pending, &mut ready);
                         }
                         Err(error_msg) => {
-                            let chains_ctx = if is_fresh_run {
+                            let chains_ctx = if chains_live {
                                 Some((chains.as_slice(), &node_to_chain))
                             } else {
                                 None
@@ -2569,7 +2731,7 @@ impl ParallelWorkflowEngine {
                 } else {
                     0
                 };
-                let chains_ctx = if is_fresh_run {
+                let chains_ctx = if chains_live {
                     Some((chains.as_slice(), &node_to_chain))
                 } else {
                     None

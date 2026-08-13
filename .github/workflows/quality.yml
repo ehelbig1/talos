@@ -214,6 +214,7 @@ jobs:
         run: |
           cargo nextest run -p talos-workflow-engine \
             --test cancellation \
+            --test chain_dispatch_gate \
             --test checkpointing \
             --test fan_in_join \
             --test precheck_errors \
