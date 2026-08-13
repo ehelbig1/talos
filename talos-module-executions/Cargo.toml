@@ -13,6 +13,7 @@ serde.workspace = true
 serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
+talos-metrics = { path = "../talos-metrics" }
 talos-module-payload-encryption = { path = "../talos-module-payload-encryption" }
 talos-ops-alerts-repository = { path = "../talos-ops-alerts-repository" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }

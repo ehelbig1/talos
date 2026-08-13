@@ -1550,6 +1550,25 @@ impl ModuleExecutionService {
         .await
         .context("Failed to cleanup stuck executions")?;
 
-        Ok(result.rows_affected())
+        // The sweep's own count, made observable. Until 2026-08-12 the ONLY
+        // consumer of this number was a `tracing::warn!` in the controller's
+        // background loop — so a fleet where EVERY workflow node reached the
+        // sweep (the single-node dispatch path never finalized its rows) was
+        // indistinguishable from a healthy one to every alert and dashboard
+        // this platform ships. The engine-side fix stops rows arriving here;
+        // this counter is what would notice if anything ever redirects them
+        // again, whatever the cause — a code change, a subscriber outage, a
+        // transport that stops binding a reply inbox.
+        //
+        // Incremented at the chokepoint rather than at the single call site
+        // so a future second caller cannot silently bypass it. `global()` is
+        // `None` when no registry is installed (tests, tools), which is why
+        // this is best-effort and not a hard dependency.
+        let swept = result.rows_affected();
+        if let Some(m) = talos_metrics::global() {
+            m.module_executions_swept_stuck_total.inc_by(swept as f64);
+        }
+
+        Ok(swept)
     }
 }

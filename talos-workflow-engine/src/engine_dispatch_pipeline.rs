@@ -628,7 +628,11 @@ impl ParallelWorkflowEngine {
         // Per-step post-processing: update `module_executions` rows
         // with status/output/error; persist `__memory_write__`
         // payloads for successful steps via the node-lifecycle hook.
-        if let Some(ref store) = self.module_execution_store {
+        // The `is_some()` gate is redundant now that
+        // `finalize_module_execution_row` returns early without a store, but
+        // it still short-circuits the per-step loop (and the memory-write
+        // hook is nested inside it) — keep the shape, drop the unused bind.
+        if self.module_execution_store.is_some() {
             for (i, step_result) in chain_result.steps.iter().enumerate() {
                 if let Some(&step_exec_id) = step_exec_ids.get(i) {
                     let status_str = match step_result.status {
@@ -644,21 +648,17 @@ impl ParallelWorkflowEngine {
                     };
                     let error_msg = step_result.error.as_deref().map(|s| self.redact_str(s));
                     let duration = i32::try_from(step_result.execution_time_ms).unwrap_or(i32::MAX);
-                    if let Err(db_err) = store
-                        .record_completed(
-                            step_exec_id,
-                            status_str,
-                            &self.redact_json(&step_result.output),
-                            duration,
-                            error_msg.as_deref(),
-                        )
-                        .await
-                    {
-                        tracing::error!(
-                            "module_execution_store.record_completed failed: {}",
-                            db_err
-                        );
-                    }
+                    // Shared chokepoint (`engine_dispatch_single.rs`): owns
+                    // the redact-record-log shape for every engine path that
+                    // closes a `module_executions` row.
+                    self.finalize_module_execution_row(
+                        step_exec_id,
+                        status_str,
+                        &step_result.output,
+                        duration,
+                        error_msg.as_deref(),
+                    )
+                    .await;
 
                     // `__memory_write__` protocol for pipeline steps:
                     // only fire the hook on success (failed steps may
@@ -680,18 +680,14 @@ impl ParallelWorkflowEngine {
             // than lingering forever in "running".
             for i in chain_result.steps.len()..step_exec_ids.len() {
                 if let Some(&step_exec_id) = step_exec_ids.get(i) {
-                    if let Err(db_err) = store
-                        .record_completed(
-                            step_exec_id,
-                            "failed",
-                            &serde_json::Value::Null,
-                            0,
-                            Some("Pipeline aborted before this step"),
-                        )
-                        .await
-                    {
-                        tracing::error!("Database operation failed in engine: {}", db_err);
-                    }
+                    self.finalize_module_execution_row(
+                        step_exec_id,
+                        "failed",
+                        &serde_json::Value::Null,
+                        0,
+                        Some("Pipeline aborted before this step"),
+                    )
+                    .await;
                 }
             }
         }

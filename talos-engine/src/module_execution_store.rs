@@ -308,13 +308,44 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
         } else {
             None
         };
+        // Status guard — FIRST terminal writer wins.
+        //
+        // Byte-for-byte the same predicate
+        // `ModuleExecutionService::complete_execution_from_worker` has always
+        // carried; this impl was the sibling that never grew it. Three
+        // concrete writers can now reach one row, and the guard is what makes
+        // that safe by construction rather than by an invariant nobody checks:
+        //
+        //  1. The engine's own `finalize_module_execution_row` (2026-08-12).
+        //  2. The global-audit-topic result subscriber, via
+        //     `complete_execution_from_worker`. Today it cannot collide with
+        //     (1) for an engine dispatch, because `NatsNodeDispatcher` stamps
+        //     `reply_topic` from `JobTransport::new_reply_inbox()` and the
+        //     worker publishes to the reply inbox XOR the audit topic. But
+        //     the TRAIT DEFAULT for `new_reply_inbox` is `None` — only the
+        //     concrete `NatsTransport` overrides it — so the exclusion rests
+        //     on an override a future transport could simply not write, and
+        //     the unsafe direction is the default one.
+        //  3. The stuck-execution sweep. Without the guard a node that
+        //     outlived the 30-minute threshold would be swept to `'timeout'`
+        //     and then re-clobbered to `'completed'`, erasing the sweep's
+        //     record of a worker that had already been given up on.
+        //
+        // It also stops a race-safe `'cancelled'` row (the parent workflow
+        // failed while this INSERT was in flight) from being resurrected as
+        // `'completed'` — the very phantom `race_safe_status` exists to
+        // prevent, undone one statement later.
+        //
+        // A no-op UPDATE is NOT an error here: `record_completed`'s callers
+        // are all best-effort, and "someone else already closed this row" is
+        // a correct outcome, not a failure to report.
         sqlx::query(
             "UPDATE module_executions \
              SET status = $1, output_data = $2, output_data_enc = $3, \
                  payload_enc_key_id = COALESCE(payload_enc_key_id, $4), \
                  payload_format = COALESCE($5, payload_format), \
                  duration_ms = $6, error_message = $7, completed_at = NOW() \
-             WHERE id = $8",
+             WHERE id = $8 AND status IN ('pending', 'running')",
         )
         .bind(status)
         .bind(pt_output)
