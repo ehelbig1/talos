@@ -54,6 +54,61 @@ yellow(){ printf '\033[33m%s\033[0m\n' "$*"; }
     exit 1
 }
 
+# XML-escape a value destined for plist element content. Only `&` and `<`
+# are structurally significant there; `"` (which `op read "op://…"` contains)
+# is not, but is escaped anyway so the rendered plist survives being pasted
+# into an attribute by someone editing it later.
+xml_escape() {
+    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'
+}
+
+# Escrow passthrough. Since 2026-08-13 the drill REFUSES to source the KEK
+# from the live stack, so an unattended run needs an escrow source in its own
+# environment — launchd gives it neither your shell's env nor a TTY for the
+# interactive prompt.
+#
+# What is propagated is the COMMAND or the PATH, never the key. A plist is
+# `chmod 600` but it is still a plaintext file on the same disk as the
+# ciphertext, which is the arrangement the escrow rule exists to prevent; a
+# `TALOS_DRILL_ESCROW_KEY` variable is therefore deliberately not supported.
+#
+# The command must run NON-INTERACTIVELY at 03:00 on a Sunday. `op read` with
+# a service-account token qualifies; `op read` that pops a Touch ID prompt does
+# not.
+#
+# What happens to a prompting helper, stated as the mechanism rather than as a
+# vague reassurance: the drill runs it under a WATCHDOG bounded by
+# TALOS_DRILL_ESCROW_TIMEOUT_SECS (default 120), kills the whole process tree
+# when it expires, and fails the run with a message naming the knob. This text
+# used to say it would "hang until the drill's own step ordering gives up",
+# which was simply false — `grep -n timeout scripts/drills/*.sh` found nothing,
+# nothing bounded the command, and under launchd a prompt no one can answer
+# waits forever. That matters more than a hung run: launchd will not start the
+# next weekly job while this one is still alive, so the drill stops running
+# altogether and the only signal is the 14-day staleness alert.
+render_escrow_env() {
+    if [[ -n "${TALOS_DRILL_ESCROW_KEY_CMD:-}" ]]; then
+        printf '    <key>TALOS_DRILL_ESCROW_KEY_CMD</key><string>%s</string>\n' \
+            "$(xml_escape "$TALOS_DRILL_ESCROW_KEY_CMD")"
+    fi
+    if [[ -n "${TALOS_DRILL_ESCROW_KEY_FILE:-}" ]]; then
+        printf '    <key>TALOS_DRILL_ESCROW_KEY_FILE</key><string>%s</string>\n' \
+            "$(xml_escape "$TALOS_DRILL_ESCROW_KEY_FILE")"
+    fi
+    if [[ -n "${TALOS_DRILL_KEK_PROVIDER:-}" ]]; then
+        printf '    <key>TALOS_DRILL_KEK_PROVIDER</key><string>%s</string>\n' \
+            "$(xml_escape "$TALOS_DRILL_KEK_PROVIDER")"
+    fi
+    # Propagated for the same reason as the escrow source itself: an operator
+    # who raised the timeout because their helper is genuinely slow would
+    # otherwise silently get the 120 s default in the unattended run — the one
+    # place the value actually matters.
+    if [[ -n "${TALOS_DRILL_ESCROW_TIMEOUT_SECS:-}" ]]; then
+        printf '    <key>TALOS_DRILL_ESCROW_TIMEOUT_SECS</key><string>%s</string>\n' \
+            "$(xml_escape "$TALOS_DRILL_ESCROW_TIMEOUT_SECS")"
+    fi
+}
+
 render_plist() {
     cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -78,7 +133,7 @@ render_plist() {
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-  </dict>
+$(render_escrow_env)  </dict>
   <key>RunAtLoad</key><false/>
 </dict>
 </plist>
@@ -96,6 +151,23 @@ install)
     green "  weekly: Sunday $(printf '%02d:%02d' "$HOUR" "$MINUTE") local, logging to $LOG"
     yellow "  NOTE: launchd runs this without your interactive shell. If 'docker'"
     yellow "  or 'cargo' live somewhere unusual, add them to the plist's PATH."
+    if [[ -n "${TALOS_DRILL_ESCROW_KEY_CMD:-}${TALOS_DRILL_ESCROW_KEY_FILE:-}" ]]; then
+        green "  escrow source propagated into the plist (command/path only, never the key)."
+        yellow "  Verify it runs NON-INTERACTIVELY. A Touch ID prompt at 03:00 has nobody to"
+        yellow "  answer it: the drill's watchdog kills it after"
+        yellow "  \${TALOS_DRILL_ESCROW_TIMEOUT_SECS:-120}s and the run fails."
+    else
+        red   "  ⚠ NO ESCROW SOURCE — this scheduled drill WILL FAIL every week."
+        yellow "    The drill no longer reads the KEK from the live controller (that was the"
+        yellow "    defect: it made the drill pass only while the host it insures was alive)."
+        yellow "    launchd gives it no TTY, so the interactive prompt is unavailable too."
+        yellow "    Re-run with the escrow source in your environment so it is propagated:"
+        yellow "      TALOS_DRILL_ESCROW_KEY_CMD='op read \"op://Private/Talos KEK/password\"' \\"
+        yellow "        make drill-schedule"
+        yellow "    Leaving it as-is means TalosBackupRestoreDrillFailed fires permanently."
+        yellow "    That is TRUE — you currently cannot prove recoverability unattended — but a"
+        yellow "    permanently-red alert trains you to ignore red. Fix it or unschedule."
+    fi
     ;;
 uninstall)
     if [[ -f "$PLIST" ]]; then

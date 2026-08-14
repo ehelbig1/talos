@@ -925,18 +925,36 @@ mod pipeline_ledger_finalize_tests {
     //! What they do NOT prove: that the Postgres UPDATE lands — the capture
     //! store records the call, it does not write a row.
     //!
-    //! ON REACHABILITY, WITH THE EVIDENCE GRADED. The bug is believed LATENT
-    //! rather than live: `engine.rs`'s `is_fresh_run = initial_results
-    //! .is_empty()` gate means `chains` is empty whenever a trigger has already
-    //! seeded a synthetic `__trigger__` node into `initial_results`, which is
-    //! every trigger path — so `run_pipeline_chain_dispatch` may never be
-    //! called at all. That reading is a code argument, not a measurement, and
-    //! two obvious DB cross-checks do NOT settle it: all three engine paths
-    //! stamp `trigger_type: "webhook"` on the row, so the column cannot tell
-    //! them apart, and the worker's container logs only cover the current
-    //! process lifetime. Fixed regardless — reachability is a separate question
-    //! from correctness, and it can change. The reachability question itself is
-    //! escalated on its own, not decided here.
+    //! ON REACHABILITY, WITH THE EVIDENCE GRADED. The bug is LATENT rather
+    //! than live: the chain gate in `engine.rs` was `is_fresh_run =
+    //! initial_results.is_empty()`, and a trigger has always seeded a
+    //! synthetic `__trigger__` node into `initial_results`, so `chains` is
+    //! empty on every trigger path and `run_pipeline_chain_dispatch` is never
+    //! called. That was a code argument when this was written, and two obvious
+    //! DB cross-checks do NOT settle it — all three engine paths stamp
+    //! `trigger_type: "webhook"` on the row, so the column cannot tell them
+    //! apart, and the worker's container logs only cover the current process
+    //! lifetime. Fixed regardless: reachability is a separate question from
+    //! correctness, and it can change.
+    //!
+    //! 2026-08-13 UPDATE — the reachability question was taken up separately
+    //! and the gate is now an explicit `ChainDispatch` parameter threaded from
+    //! each entry point (`engine.rs`), rather than a property inferred from a
+    //! `HashMap::is_empty()` call. Every production entry point passes
+    //! `Disabled`, so this file remains unreached on the deployed platform,
+    //! and `tests/chain_dispatch_gate.rs` pins that through the real entry
+    //! point. Turning it on is NOT a one-line flip — see `ChainDispatch`'s
+    //! docs: this file has no `skip_condition` HANDLING whatsoever, and the
+    //! workflows that use `skip_condition` today are mostly, but not entirely,
+    //! SEND nodes (5 workflows / 7 nodes; two are a sub-workflow node and a
+    //! Gmail label mutation — see `ChainDispatch` for the census).
+    //!
+    //! The instruction here used to be "(grep it)", which now falsifies itself:
+    //! `grep -c skip_condition` on this file returns 2, and both hits are
+    //! inside this very sentence. A claim whose stated verification method
+    //! disproves it is worse than no claim — the property to check is that no
+    //! CODE path in this file consults a skip condition, which a grep for the
+    //! identifier cannot distinguish from prose about it.
 
     use std::sync::Arc;
 
