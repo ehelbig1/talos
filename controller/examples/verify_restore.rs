@@ -34,14 +34,42 @@
 //!   6. Referential integrity of the key material: every `encryption_key_id`
 //!      referenced by data has a row in `encryption_keys`.
 //!
-//! CONTENT IS ASSERTED, NOT JUST SUCCESS (2026-08-13). Until this change the
-//! `actor_memory` arm matched `Ok(Some(_))` and counted it. That accepts a row
-//! whose decrypted value is JSON `null` — which is exactly what
-//! `resolve_stored_value` returns for a row with no ciphertext at all, i.e.
-//! the shape a half-restored or column-dropped table produces. "A row came
-//! back" and "the data is there" are different claims and only the second one
-//! is what a restore is asked for. Every decrypt now asserts on the PLAINTEXT:
-//! non-null, non-empty, not whitespace-only.
+//! CONTENT IS REPORTED, AND THE FAILURE LINE IS DRAWN PER FAMILY (2026-08-13,
+//! corrected the same day). Until this change the `actor_memory` arm matched
+//! `Ok(Some(_))` and counted it. Tightening that was right; the JUSTIFICATION
+//! written beside it was wrong, and the first correction over-tightened.
+//!
+//! The stated reason was that `Ok(Some(Value::Null))` is what
+//! `resolve_stored_value` returns for a row with no ciphertext, so accepting it
+//! would let a half-restored table read as success. **That scenario cannot
+//! occur.** In the restored schema `actor_memory.value_enc` and `value_key_id`
+//! are `NOT NULL` (migration `20260424010000_actor_memory_value_drop_phase_b`),
+//! `value_format` is `NOT NULL DEFAULT 0` (`20260528120000`), and the legacy
+//! plaintext `value` column is dropped — so no real row can reach the
+//! null-because-no-ciphertext path. A successful decrypt IS the readability
+//! proof; there is no ciphertext-free row for it to be confused with.
+//!
+//! And treating a trivial plaintext as a FAILURE false-reds an intact backup.
+//! `__memory_write__`'s `value` field **defaults to JSON `null`** (CLAUDE.md),
+//! and `[]` / `{}` / `""` are legitimate stored payloads — a "nothing today"
+//! result from a workflow that found no work. With only 5 rows sampled per
+//! (format, DEK) group, one such row reds the drill on a perfectly good
+//! backup: the exact detector-fires-on-healthy-operation class this file
+//! removes elsewhere (the expiry predicate, the migration-version relaxation).
+//!
+//! So the line is drawn where the WRITER makes it meaningful:
+//!   * `actor_memory` — a trivial plaintext is REPORTED and counted separately,
+//!     never failed. The platform writes those on purpose.
+//!   * `secrets` — an empty plaintext IS a failure. Nothing writes an empty
+//!     OAuth token or an empty provider key; there is no "no secret today".
+//!   * `ml_examples` — an empty features blob or label IS a failure, same
+//!     reasoning: a training datum with no content is not a datum.
+//! The decrypt itself failing (`Err`) or the row vanishing on read (`Ok(None)`)
+//! remains fatal for every family — that is what "unreadable" actually is.
+//!
+//! The tightening is still strictly stronger than the `Ok(Some(_))` it
+//! replaced: `Err` and `Ok(None)` were already caught, and now the plaintext is
+//! inspected and reported rather than discarded.
 //!
 //! AND IT CANNOT PASS VACUOUSLY. The same arm printed "no rows to decrypt
 //! (empty table — nothing asserted)" and returned success — so a restore that
@@ -49,7 +77,8 @@
 //! all and read them back. Each family now reports an ELIGIBLE population
 //! alongside its verified count and fails when eligible > 0 and verified == 0,
 //! and the run fails outright when NOTHING anywhere was decrypted. See
-//! `Tally` below for the exact rule and its one stated limit.
+//! `Tally` below for the exact rule and its stated limit — which applies to
+//! EVERY family, not only `ml_examples`.
 //!
 //! WHAT THIS DOES **NOT** CHECK — stated here because the failure mode this
 //! file exists to prevent is a verifier that implies more than it sampled:
@@ -128,17 +157,24 @@ const ML_SAMPLE_PER_LABEL: i64 = 2;
 ///
 /// STATED LIMIT, because a check that overstates itself is the defect this
 /// file exists to remove: when `eligible` is 0 the family is SKIPPED, not
-/// failed. A restore that silently moved zero `ml_examples` rows therefore
-/// passes this particular rule — it is caught, if at all, by
-/// `pg_restore --exit-on-error` and by the row counts printed above, not here.
-/// Making "eligible == 0" fatal per-family would false-red every deployment
-/// that legitimately has no ML datasets, which is the detector-fires-on-
-/// healthy-operation trade this repo has repeatedly refused. The global floor
-/// below is the part that has no healthy-state false positive.
+/// failed — and that applies to **every** family here, `secrets` and
+/// `actor_memory` exactly as much as `ml_examples`. (The docs framed it only
+/// around ML datasets, which reads as if the other two were covered. They are
+/// not: a restore that moved zero `secrets` rows skips the same way.) Such a
+/// restore is caught, if at all, by `pg_restore --exit-on-error` and by the row
+/// counts printed above, not here. Making "eligible == 0" fatal per-family
+/// would false-red every deployment that legitimately has no ML datasets — the
+/// detector-fires-on-healthy-operation trade this repo has repeatedly refused.
+/// The global floor below is the part that has no healthy-state false positive.
 struct Tally {
     family: &'static str,
     eligible: i64,
+    /// Rows whose ciphertext was successfully decrypted. This is the
+    /// readability population and what the anti-vacuity rule reads.
     verified: usize,
+    /// Of `verified`, how many carried a trivial plaintext. Reported, never
+    /// failed — see `classify_decrypted_json`.
+    trivial: usize,
 }
 
 impl Tally {
@@ -147,27 +183,29 @@ impl Tally {
             family,
             eligible: 0,
             verified: 0,
+            trivial: 0,
         }
     }
 }
 
-/// Assert on decrypted PLAINTEXT rather than on "a value came back".
+/// Describe a decrypted plaintext that is present but carries no content.
 ///
-/// Returns `Err(reason)` for content that is present-but-meaningless. JSON
-/// `null` is called out specifically: it is what `resolve_stored_value`
-/// produces when a row carries no ciphertext, so accepting it would let the
-/// exact half-restored shape this verifier guards against read as success.
-fn assert_decrypted_json(v: &serde_json::Value) -> Result<(), String> {
+/// Returns `Some(reason)` for JSON `null`, an empty/whitespace-only string, an
+/// empty array or an empty object; `None` otherwise.
+///
+/// **This is a classifier, not an assertion**, and the distinction is the point.
+/// Every one of those shapes is something the platform legitimately writes:
+/// `__memory_write__`'s `value` defaults to JSON `null`, and `[]` is what a
+/// workflow stores when it found nothing to report. Callers decide whether a
+/// trivial plaintext is a defect for THEIR family — for `actor_memory` it is
+/// not, and failing on it reds an intact backup.
+fn classify_decrypted_json(v: &serde_json::Value) -> Option<&'static str> {
     match v {
-        serde_json::Value::Null => {
-            Err("decrypted to JSON null (a row with no ciphertext reads this way)".into())
-        }
-        serde_json::Value::String(s) if s.trim().is_empty() => {
-            Err("decrypted to an empty/whitespace-only string".into())
-        }
-        serde_json::Value::Array(a) if a.is_empty() => Err("decrypted to an empty array".into()),
-        serde_json::Value::Object(o) if o.is_empty() => Err("decrypted to an empty object".into()),
-        _ => Ok(()),
+        serde_json::Value::Null => Some("JSON null"),
+        serde_json::Value::String(s) if s.trim().is_empty() => Some("empty/whitespace-only string"),
+        serde_json::Value::Array(a) if a.is_empty() => Some("empty array"),
+        serde_json::Value::Object(o) if o.is_empty() => Some("empty object"),
+        _ => None,
     }
 }
 
@@ -305,7 +343,24 @@ async fn main() -> Result<()> {
     }
     for g in &groups {
         let fmt: i16 = g.try_get("value_format")?;
-        let key_id: Uuid = g.try_get("value_key_id")?;
+        // Read as `Option<Uuid>` and report, rather than `?`-ing a decode
+        // error. `value_key_id` is `NOT NULL` in the schema this checkout
+        // ships, so a NULL here means the RESTORED table does not match it —
+        // which is a restore finding and deserves to be named. Bailing on the
+        // raw sqlx decode error aborted the whole verifier with a message
+        // ("mismatched types; Rust type `Uuid` is not compatible with SQL type
+        // `UUID`") that says nothing about what an operator should do.
+        let key_id: Uuid = match g.try_get::<Option<Uuid>, _>("value_key_id")? {
+            Some(k) => k,
+            None => {
+                failures.push(format!(
+                    "actor_memory v{fmt}: a group has a NULL value_key_id — the DEK reference \
+                     did not survive the restore, so those rows name no key and can never be \
+                     decrypted (the column is NOT NULL in this checkout's schema)"
+                ));
+                continue;
+            }
+        };
         let total: i64 = g.try_get("n")?;
         let live: i64 = g.try_get("live")?;
 
@@ -335,19 +390,23 @@ async fn main() -> Result<()> {
         mem_tally.eligible += live;
 
         let mut ok = 0usize;
+        let mut trivial = 0usize;
         for r in &rows {
             let actor_id: Uuid = r.try_get("actor_id")?;
             let key: String = r.try_get("key")?;
             match talos_memory::recall_exact(&pool, actor_id, &key).await {
                 // The value is never printed — only whether its CONTENT is
-                // real. `Ok(Some(_))` was the old test and it passes on a
-                // JSON-null plaintext; see `assert_decrypted_json`.
-                Ok(Some(row)) => match assert_decrypted_json(&row.value) {
-                    Ok(()) => ok += 1,
-                    Err(why) => failures.push(format!(
-                        "actor_memory v{fmt}/dek {key_id}: row decrypted but {why}"
-                    )),
-                },
+                // trivial. A trivial plaintext is NOT a failure here: the
+                // `__memory_write__` protocol defaults `value` to JSON null and
+                // `[]` is a legitimate "nothing today" payload, so failing on
+                // one reds an intact backup. The decrypt succeeding is the
+                // readability proof; see `classify_decrypted_json`.
+                Ok(Some(row)) => {
+                    ok += 1;
+                    if classify_decrypted_json(&row.value).is_some() {
+                        trivial += 1;
+                    }
+                }
                 Ok(None) => failures.push(format!(
                     "actor_memory v{fmt}/dek {key_id}: a sampled row vanished on read"
                 )),
@@ -357,10 +416,24 @@ async fn main() -> Result<()> {
             }
         }
         mem_tally.verified += ok;
+        mem_tally.trivial += trivial;
+        // The marker reflects the RESULT. A leading `✓` was printed
+        // unconditionally, so a group that decrypted 0 of 5 rows announced
+        // itself with a tick and the failure only appeared further down.
         println!(
-            "✓ actor_memory format v{fmt} (dek {key_id}): {ok}/{} sampled rows decrypted \
-             with non-empty content ({live} unexpired of {total} rows in group)",
-            rows.len()
+            "{} actor_memory format v{fmt} (dek {key_id}): {ok}/{} sampled rows decrypted{} \
+             ({live} unexpired of {total} rows in group)",
+            if !rows.is_empty() && ok == rows.len() {
+                "✓"
+            } else {
+                "✗"
+            },
+            rows.len(),
+            if trivial > 0 {
+                format!(", {trivial} with a trivially-empty payload (not a defect)")
+            } else {
+                String::new()
+            },
         );
     }
 
@@ -443,6 +516,11 @@ async fn main() -> Result<()> {
                 .await
             {
                 // Length only — a decrypted secret must never reach a log.
+                //
+                // An EMPTY secret IS a failure, unlike a trivial actor_memory
+                // payload: nothing writes an empty OAuth token or an empty
+                // provider key, so there is no "no secret today" to false-red
+                // on. See the header's per-family reasoning.
                 Ok(v) => {
                     if v.trim().is_empty() {
                         failures.push(format!(
@@ -452,16 +530,34 @@ async fn main() -> Result<()> {
                         ok += 1;
                     }
                 }
-                Err(e) => failures.push(format!(
-                    "secrets v{fmt}: key_hash {ph} DECRYPT FAILED — {e}"
-                )),
+                // The ERROR TEXT carries the path too, and interpolating it
+                // raw undid the `key_hash` change on the line right above:
+                // `get_secret`'s expiry arm is
+                // `anyhow!("Secret has expired: {}", key_path)`
+                // (talos-secrets-manager/src/manager.rs:1460), so `{e}` put a
+                // real email address and org/user UUIDs back into the drill
+                // transcript. Hashing the path and then printing an error that
+                // spells it out is a redaction that redacts nothing.
+                Err(e) => {
+                    let redacted = e
+                        .to_string()
+                        .replace(p.as_str(), &format!("<key_hash {ph}>"));
+                    failures.push(format!(
+                        "secrets v{fmt}: key_hash {ph} DECRYPT FAILED — {redacted}"
+                    ))
+                }
             }
         }
         secret_tally.eligible += live;
         secret_tally.verified += ok;
         println!(
-            "✓ secrets format v{fmt} (dek {key_id}): {ok}/{} sampled rows decrypted \
+            "{} secrets format v{fmt} (dek {key_id}): {ok}/{} sampled rows decrypted \
              with non-empty content ({live} unexpired of {total} rows in group)",
+            if !paths.is_empty() && ok == paths.len() {
+                "✓"
+            } else {
+                "✗"
+            },
             paths.len()
         );
     }
@@ -538,8 +634,13 @@ async fn main() -> Result<()> {
                     }
                     ml_tally.verified += ok;
                     println!(
-                        "✓ ml_examples dataset {dataset_id}: {ok}/{} sampled rows decrypted \
+                        "{} ml_examples dataset {dataset_id}: {ok}/{} sampled rows decrypted \
                          with non-empty features+label ({n} label-bearing rows in dataset)",
+                        if !samples.is_empty() && ok == samples.len() {
+                            "✓"
+                        } else {
+                            "✗"
+                        },
                         samples.len()
                     );
                 }
@@ -592,19 +693,26 @@ async fn main() -> Result<()> {
     // part that refuses to certify a run that found nothing — the property
     // whose absence made the old drill worthless at the level above.
     let tallies = [&mem_tally, &secret_tally, &ml_tally];
-    println!("\n  decrypt coverage (eligible → content-verified):");
+    println!("\n  decrypt coverage (eligible → decrypted):");
     for t in tallies {
         println!(
-            "    {:<14} {:>8} → {:>6}{}",
+            "    {:<14} {:>8} → {:>6}{}{}",
             t.family,
             t.eligible,
             t.verified,
+            if t.trivial > 0 {
+                format!("  ({} trivially-empty payload(s))", t.trivial)
+            } else {
+                String::new()
+            },
+            // "[skipped]" applies to EVERY family with no eligible rows, not
+            // just ml_examples — see `Tally`'s stated limit.
             if t.eligible == 0 { "   [skipped]" } else { "" }
         );
         if t.eligible > 0 && t.verified == 0 {
             failures.push(format!(
-                "{}: {} row(s) were eligible for decryption and NOT ONE was read back with \
-                 usable content — the restore did not preserve readable data for this family",
+                "{}: {} row(s) were eligible for decryption and NOT ONE was read back — \
+                 the restore did not preserve readable data for this family",
                 t.family, t.eligible
             ));
         }
@@ -645,7 +753,7 @@ async fn main() -> Result<()> {
         // "pre-existing data is readable" claimed otherwise.
         println!(
             "\n🎉 Restore verification PASSED — {total_verified} pre-existing ciphertext row(s) \
-             across actor_memory / secrets / ml_examples decrypted AND content-checked \
+             across actor_memory / secrets / ml_examples decrypted \
              (other encrypted column families not sampled; see this file's header)"
         );
         Ok(())

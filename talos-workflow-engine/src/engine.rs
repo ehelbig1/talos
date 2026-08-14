@@ -443,9 +443,26 @@ pub use crate::engine_dispatch_subflow::{JudgeVerdict, SubflowError};
 /// 2. **It would send suppressed notifications.** The chain-head branch in the
 ///    scheduler `continue`s before the skip-condition check, and
 ///    `engine_dispatch_pipeline.rs` contains no `skip_condition` handling at
-///    all. Every workflow currently using `skip_condition` is a SEND node —
-///    including `pa-followup-approval-notifier`, which runs ~434×/week. A
-///    naive flip mails the messages those conditions exist to suppress.
+///    all.
+///
+///    The blast radius is **5 workflows / 7 nodes**, not the three this
+///    originally claimed. `engine_graph_load.rs` reads the key from more than
+///    one place in `graph_json` — node top-level, `data`, and `config` — and a
+///    census that looked at one shape missed the others. Live count: `send`
+///    (`cxai-commitment-nudge`, archived), `send_critical`
+///    (`ops-critical-notifier`), `ask` + `mark_read` + `send_reply`
+///    (`pa-ask-email`), `send` (`pa-followup-approval-notifier`, ~434
+///    runs/week), `send` (`pa-opportunity-nudge`, archived).
+///
+///    And **two of the seven are not sends**, so "every workflow using
+///    `skip_condition` is a SEND node" was wrong as well: `pa-ask-email`'s
+///    `ask` is a `system:sub_workflow` node, and its `mark_read` is a Gmail
+///    label mutation (`REMOVE_LABELS: [INBOX, UNREAD]`) — a state-changing API
+///    call whose suppression matters just as much as an unsent mail.
+///
+///    The conclusion is unaffected and slightly stronger: a naive flip
+///    delivers messages AND performs mailbox mutations that those conditions
+///    exist to suppress, across a larger surface than first counted.
 ///
 /// Enabling chains therefore requires fixing the trigger-node filter AND
 /// teaching the pipeline path about skip conditions, and it is an
@@ -472,7 +489,7 @@ pub use crate::engine_dispatch_subflow::{JudgeVerdict, SubflowError};
 /// Preserving the old value here would have meant re-deriving it from
 /// `is_empty()` — reinstating the exact inference this type exists to delete.
 ///
-/// `chain_dispatch_is_disabled_on_the_production_entrypoint` in
+/// `production_entrypoint_never_batches_chains` in
 /// `talos-workflow-engine/tests/chain_dispatch_gate.rs` pins the behaviour
 /// through the real entry point so a future flip cannot be silent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1442,6 +1459,7 @@ impl ParallelWorkflowEngine {
             worker_shared_key,
             initial_results,
             execution_id,
+            None,
             ChainDispatch::Disabled,
         )
     }
@@ -1452,12 +1470,21 @@ impl ParallelWorkflowEngine {
     /// here for exactly that reason — before this it delegated to
     /// `run_with_seed_with_transport` and got `Disabled` as an invisible
     /// side effect of seeding a synthetic node. See [`ChainDispatch`].
+    ///
+    /// `cancel_override` carries the one-off token taken by the `_cancellable`
+    /// entry points; `None` means "use the engine-level token". It exists so
+    /// those entry points can route through HERE rather than through
+    /// `run_with_seed_with_transport_cancellable` — which would hand them a
+    /// chain policy as a side effect of the delegation target, the exact shape
+    /// [`ChainDispatch`] was introduced to delete. Every caller now names its
+    /// policy in its own body.
     fn run_seeded_with_chain_policy(
         &self,
         dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
         worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
         initial_results: HashMap<Uuid, JsonValue>,
         execution_id: Uuid,
+        cancel_override: Option<tokio_util::sync::CancellationToken>,
         chain_dispatch: ChainDispatch,
     ) -> Pin<
         Box<dyn Future<Output = Result<WorkflowContext, crate::WorkflowEngineError>> + Send + '_>,
@@ -1467,8 +1494,9 @@ impl ParallelWorkflowEngine {
             return Box::pin(async move { Err(e) });
         }
         let timeout_secs = self.execution_timeout_secs;
-        // Engine-level cancel propagation; see set_cancellation_token.
-        let cancel = self.cancellation_token.clone();
+        // A caller-supplied token wins; otherwise engine-level cancel
+        // propagation, see set_cancellation_token.
+        let cancel = cancel_override.or_else(|| self.cancellation_token.clone());
         let progress = self.progress.clone();
         let inner = self.run_inner(
             dispatcher,
@@ -1497,23 +1525,17 @@ impl ParallelWorkflowEngine {
     ) -> Pin<
         Box<dyn Future<Output = Result<WorkflowContext, crate::WorkflowEngineError>> + Send + '_>,
     > {
-        if let Err(e) = self.precheck_runnable() {
-            return Box::pin(async move { Err(e) });
-        }
-        let timeout_secs = self.execution_timeout_secs;
-        let progress = self.progress.clone();
         // Seeded resume: chains stay off, same reason as the non-cancellable
-        // twin above.
-        let inner = self.run_inner(
+        // twin above. Routed through the shared body so the policy is stated
+        // once per entry point rather than re-inlined.
+        self.run_seeded_with_chain_policy(
             dispatcher,
             worker_shared_key,
             initial_results,
             execution_id,
+            Some(cancel),
             ChainDispatch::Disabled,
-        );
-        Box::pin(async move {
-            run_with_workflow_timeout(timeout_secs, Some(cancel), progress, inner).await
-        })
+        )
     }
 
     /// Execute the graph with a caller-supplied **trigger input** —
@@ -1571,6 +1593,7 @@ impl ParallelWorkflowEngine {
             worker_shared_key,
             initial_results,
             execution_id,
+            None,
             ChainDispatch::Disabled,
         )
         .await
@@ -1592,14 +1615,20 @@ impl ParallelWorkflowEngine {
         let trigger_node_id = self.ensure_trigger_node_wired_to_roots();
         let mut initial_results = HashMap::new();
         initial_results.insert(trigger_node_id, trigger_input);
-        // Same policy as the non-cancellable twin, stated for the same
-        // reason — see `ChainDispatch`.
-        self.run_with_seed_with_transport_cancellable(
+        // Same policy as the non-cancellable twin, and stated HERE for the same
+        // reason. This used to delegate to
+        // `run_with_seed_with_transport_cancellable`, which meant it inherited
+        // `Disabled` as a side effect of its delegation target with only a
+        // comment saying so — the identical shape `ChainDispatch` was created
+        // to delete, left in place on the cancellable twin. It now names its
+        // own policy like every other entry point.
+        self.run_seeded_with_chain_policy(
             dispatcher,
             worker_shared_key,
             initial_results,
             execution_id,
-            cancel,
+            Some(cancel),
+            ChainDispatch::Disabled,
         )
         .await
     }

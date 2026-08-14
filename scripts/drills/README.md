@@ -11,9 +11,17 @@ incident.
 
 What it does:
 
+0b. Obtains the KEK from **escrow** — never from the live stack — under a
+   bounded timeout, refusing the shapes that would re-create the deleted
+   live-container read. Before the verifier build, so a missing escrow
+   fails in seconds rather than after a six-minute compile.
 1. Selects the **newest backup artifacts** written by the
-   `postgres-backup` / `vault-backup` compose sidecars, and checks the
-   Vault archive against the `sha256` in its own manifest.
+   `postgres-backup` / `vault-backup` compose sidecars, checks the
+   Vault archive against the `sha256` in its own manifest, and **asserts
+   both artifacts are younger than
+   `TALOS_DRILL_MAX_ARTIFACT_AGE_HOURS`** (default 168 h) so a dead
+   backup sidecar fails the drill instead of leaving it green on the
+   last good file.
 2. Builds the two verifier binaries — **before** anything holds real
    data, so the slow step is not the one with a database full of
    restored user rows sitting on a loopback port.
@@ -113,8 +121,10 @@ Tunables (all env vars):
 | `TALOS_DRILL_LIVE_PG` | `talos-postgres` | Live Postgres container (`--source live` only). |
 | `TALOS_DRILL_LIVE_VAULT` | `talos-vault` | Live Vault container (`--source live` only). |
 | `TALOS_DRILL_LIVE_CONTROLLER` | `talos-controller` | Live controller. Used **only** for the production-environment guard. The KEK is no longer read from it — see below. |
-| `TALOS_DRILL_ESCROW_KEY_CMD` | unset | Command whose stdout is the escrowed `TALOS_MASTER_KEY`. Preferred: the key never lands on disk. Its stderr stays attached so a password manager can prompt. Takes precedence over the file. |
-| `TALOS_DRILL_ESCROW_KEY_FILE` | unset | File whose first line is the escrowed `TALOS_MASTER_KEY`. **Refused if it resolves inside this repo or inside `$TALOS_DRILL_BACKUP_DIR`** — a key stored beside the ciphertext it unlocks is not encryption. Symlinks are resolved before the check. |
+| `TALOS_DRILL_ESCROW_KEY_CMD` | unset | Command whose stdout is the escrowed `TALOS_MASTER_KEY`. Preferred: the key never lands on disk (it is captured through a pipe, never spooled to a file). Its stderr really does stay attached — it carried a `2>/dev/null` until 2026-08-13, which contradicted the line above it and swallowed both a password-manager prompt and a failing helper's diagnostic. Refused if it names `docker exec`/`docker inspect`/`printenv TALOS_MASTER_KEY`, or if a path-shaped argument resolves inside a checkout or `$BACKUP_DIR`. Setting this **and** `_FILE` is refused. |
+| `TALOS_DRILL_ESCROW_KEY_FILE` | unset | File whose first line is the escrowed `TALOS_MASTER_KEY`. **Refused if it resolves inside a checkout (this one *or* the main clone when you are in a worktree) or inside `$TALOS_DRILL_BACKUP_DIR`** — a key stored beside the ciphertext it unlocks is not encryption. Symlinks are resolved before the check; hard links are not, and cannot be. Setting this **and** `_CMD` is refused rather than resolved by precedence. |
+| `TALOS_DRILL_ESCROW_TIMEOUT_SECS` | `120` | Wall-clock bound on `_CMD`. On expiry the whole process tree is killed and the drill fails naming this knob. Without it a helper that prompts (Touch ID) hangs forever under launchd, which also stops launchd starting the *next* weekly run — the drill silently stops running with only the 14-day alert as signal. |
+| `TALOS_DRILL_MAX_ARTIFACT_AGE_HOURS` | `168` | Maximum age of the newest Postgres dump **and** the newest Vault archive. Older ⇒ the drill fails. Without this the age was computed, printed, and never compared, so a sidecar that died left the drill green for as long as its last artifact survived retention. `0` disables (use only to drill an archived artifact deliberately). Default is deliberately loose: the sidecars tick only while the laptop is awake, and a real two-day gap exists in the artifact history. |
 | `TALOS_DRILL_KEK_PROVIDER` | `env` | Which provider wrapped the DEKs. Was read from the live container; now stated, because in a real recovery there is no live container. Matches `docker-compose.yml`'s `KEK_PROVIDER` default. Being wrong fails loudly at the first decrypt. |
 | `TALOS_DRILL_ALLOW_NO_CIPHERTEXT` | unset | Read by `verify_restore`, not the script. Waives the "something, anywhere, must have decrypted" floor. Only correct for a genuinely fresh deployment, and it means the run certifies nothing about readability. |
 | `TALOS_DRILL_PG_IMAGE` | digest-pinned pgvector:pg16 | Scratch Postgres image. **Must be ≥ the major version the dump came from.** The compose stack is pg16 so the default matches; the Helm chart deploys `pgvector/pgvector:pg17`, and a pg17 dump will not restore into pg16. On a pg17 deployment set this to a pg17 image. The failure is loud (`pg_restore` aborts under `--exit-on-error`), not silent. |
@@ -189,11 +199,29 @@ the script.
   command-line argument (which would put it in `ps`), and never reaches
   the scratch database. The drill prints its LENGTH, so a truncated or
   empty escrow read is diagnosable without exposing the value.
+  - A caller's pre-existing `TALOS_MASTER_KEY` is **`unset`**, not
+    assigned `""`. Assignment does not remove the export attribute —
+    `export FOO=live; FOO=""; FOO=escrow` leaves `FOO` **exported** with
+    the new value (measured). The `""` form therefore put the *escrowed*
+    key into the environment of every child on exactly the
+    `source .env && make drill` path this rule exists for, including the
+    multi-minute `cargo build` in step 2. `TALOS_MASTER_KEY_FILE` is
+    unset alongside it: it was inert only because `read_env_or_file`
+    happens to prefer a non-empty env var, i.e. by another crate's
+    precedence rather than by anything the drill does.
 - **The drill certifies a real decrypt, not an exit code.** Before
-  2026-08-13 `verify_restore`'s memory arm counted `Ok(Some(_))` — which
-  a JSON-`null` plaintext satisfies, and a row with no ciphertext at all
-  decodes to exactly that. It now asserts on content, and it fails when
-  a family had rows eligible for decryption and read none of them back.
+  2026-08-13 `verify_restore`'s memory arm counted `Ok(Some(_))` and
+  nothing more. It now inspects the plaintext and fails when a family had
+  rows eligible for decryption and read none of them back.
+  - The *reason* first given for tightening it was wrong and is worth
+    not repeating: it said a row with no ciphertext decodes to JSON
+    `null`, so `null` had to be rejected. In the restored schema
+    `actor_memory.value_enc` and `value_key_id` are `NOT NULL` and the
+    legacy plaintext `value` column is dropped, so **no real row can
+    reach that path** — a successful decrypt is itself the readability
+    proof. The tightening was right; the justification was not, and
+    acting on it made `null`/`[]`/`{}` fatal, which would have red-ed an
+    intact backup carrying an ordinary "nothing today" payload.
 
 #### Scheduling
 
@@ -381,16 +409,32 @@ Honest list so future-you doesn't develop false confidence:
    data is restorable *on the same host*. We don't test that data
    survives a host loss. For Phase 2 enterprise SaaS, run the drill
    against a separately-hosted scratch environment.
-4. **Artifact freshness — in BOTH directions.** `--source artifact`
-   restores the **newest** dump, so a green run proves last night's
-   backup is good and says nothing about a six-month-old one; point
-   `--source artifact` at an archived directory occasionally. The more
-   dangerous direction is the other one: the drill *prints* the artifact's
-   mtime but never asserts it, so if the `postgres-backup` sidecar dies,
-   the drill keeps restoring the last good artifact and keeps going green
-   for as long as that file survives retention. Nothing alerts on backup
-   AGE — `TalosBackupRestoreDrillFailed` measures drill recency, not
-   artifact recency. Read the "taken …" line in the drill's step 1 output.
+4. **Artifact freshness — one direction now closed, one still open.**
+   `--source artifact` restores the **newest** dump, so a green run
+   proves last night's backup is good and says nothing about a
+   six-month-old one; point `--source artifact` at an archived
+   directory occasionally. That direction is still uncovered.
+   The other one — the dangerous one — is closed as of 2026-08-13.
+   The drill used to *print* the artifact's mtime and never compare it,
+   so if the `postgres-backup` sidecar died the drill kept restoring the
+   last good artifact and kept going green for as long as that file
+   survived retention: a value computed, displayed and never asserted,
+   which is the same shape as the defect the drill itself exists to
+   catch, one level up. Both artifacts are now age-gated by
+   `TALOS_DRILL_MAX_ARTIFACT_AGE_HOURS` (default 168 h) and an over-age
+   artifact **fails** the run. `TalosBackupRestoreDrillFailed` still
+   measures drill recency, not artifact recency — the age gate is what
+   converts a stale artifact into a failed drill, which the alert then
+   sees.
+
+   **Still unclosed, and worth knowing:** the newest dump and the newest
+   Vault archive are selected **independently**, so nothing makes them a
+   matched pair. If only one sidecar dies, a fresh dump can be restored
+   beside a Vault backend from days earlier; a DEK created after the
+   older of the two was taken would simply be missing. The age gate
+   bounds how far apart they can drift, it does not make them
+   consistent. Pairing them properly needs the sidecars to write a joint
+   manifest.
 5. **Everything in Postgres beyond the sampled rows, and every encrypted
    column family other than three.** `verify_restore` decrypts a sample,
    not every row: it catches "this DEK/format is unreadable", not "row
@@ -403,13 +447,25 @@ Honest list so future-you doesn't develop false confidence:
    `pg_restore --exit-on-error`, which fails the drill if any object
    failed to load.
 
-   Since 2026-08-13 each decrypt asserts on the PLAINTEXT (non-null,
-   non-empty) rather than on "a row came back", and the verifier fails
-   when a family had eligible rows and read none of them back, or when
-   nothing anywhere decrypted. The stated hole in that rule: a family with
-   **zero** eligible rows is skipped, not failed — making it fatal would
-   false-red every deployment that legitimately has no ML datasets. So a
-   restore that silently moved no `ml_examples` rows at all is caught by
+   Since 2026-08-13 the verifier fails when a family had eligible rows
+   and read none of them back, or when nothing anywhere decrypted, and it
+   inspects the decrypted PLAINTEXT rather than only "a row came back".
+   Where the plaintext is *trivial* (JSON `null`, `""`, `[]`, `{}`) the
+   line is drawn per family, by what the writer makes meaningful:
+   for `actor_memory` it is **reported, not failed** — `__memory_write__`
+   defaults `value` to JSON `null` and `[]` is a legitimate "nothing
+   today" payload, so failing on one would red an intact backup — while
+   for `secrets` and `ml_examples` an empty plaintext **is** a failure,
+   because nothing writes an empty OAuth token or a contentless training
+   datum. A decrypt that errors, or a row that vanishes on read, is fatal
+   everywhere.
+
+   The stated hole in the anti-vacuity rule: a family with **zero**
+   eligible rows is skipped, not failed — and that applies to **every**
+   family, `secrets` and `actor_memory` exactly as much as `ml_examples`,
+   not just the ML one this used to name. Making it fatal would false-red
+   every deployment that legitimately has no ML datasets. So a restore
+   that silently moved no rows for a family is caught by
    `pg_restore --exit-on-error` and the printed row counts, not by the
    decrypt check.
 6. **Transit-wrapped KEKs, when the deployment doesn't use them.** With
@@ -437,7 +493,7 @@ Honest list so future-you doesn't develop false confidence:
    (`TALOS_DRILL_ESCROW_KEY_CMD`, `TALOS_DRILL_ESCROW_KEY_FILE`, or an
    interactive hidden prompt), the live-container read is **deleted rather
    than demoted** — there is no flag that restores it — and its absence is
-   fatal with a message naming what to create. See step 2b of the script.
+   fatal with a message naming what to create. See step 0b of the script.
 
    The claim a green run now supports is
    *"these artifacts + the escrowed KEK ⇒ readable data"*, which is what a
@@ -453,16 +509,37 @@ Honest list so future-you doesn't develop false confidence:
    object storage with an append-only credential is an operator decision
    and is deliberately not made here.
 
-   Two limits of the fix, stated rather than implied:
-   * **The drill enforces the key's PROVENANCE; `verify_restore` does
-     not.** Running `cargo run --example verify_restore` by hand with a
-     key copied out of a container proves exactly what it always did. The
-     gate is in the shell script, one layer up, on purpose.
-   * **An escrow source is not audited for being genuinely off-box.** The
-     script refuses a key FILE inside the repo or inside `$BACKUP_DIR`
-     (key beside ciphertext is not encryption), and it resolves symlinks
-     before checking. It cannot tell that `/Volumes/escrow` is a RAM disk
-     or that your `op` vault is synced to the same laptop.
+   Limits of the fix, stated rather than implied — and note the first
+   two bullets used to contradict each other, one claiming provenance is
+   enforced and the next admitting it is not audited. Only the second was
+   ever true:
+   * **The drill does NOT establish the key's PROVENANCE.** It refuses
+     specific shapes; it cannot verify a source. What is actually
+     enforced: the live-container read is deleted (no flag restores it);
+     a `_CMD` naming `docker exec` / `docker inspect` or `printenv
+     TALOS_MASTER_KEY` is refused; a `_FILE`, and any existing
+     path-shaped argument of a `_CMD`, that resolves inside a checkout
+     (this one *or* the main clone when you are in a worktree) or inside
+     `$BACKUP_DIR` is refused, symlinks resolved first; setting both
+     `_CMD` and `_FILE` is refused rather than silently resolved by
+     precedence. Until 2026-08-13 the banner printed "(ESCROW — the live
+     stack was never asked)" unconditionally, so
+     `TALOS_DRILL_ESCROW_KEY_CMD='docker exec talos-controller printenv
+     TALOS_MASTER_KEY'` passed every check and printed exactly that while
+     the live stack was the only thing asked. That spelling is now
+     refused; the general claim is unverifiable and is no longer made.
+   * **An escrow source is not audited for being genuinely off-box.** It
+     cannot tell that `/Volumes/escrow` is a RAM disk, that your `op`
+     vault syncs to this same laptop, or that a **hard link** inside a
+     checkout points at a file outside it — a hard link is a genuinely
+     different path with no symlink to resolve, so `realpath` cannot see
+     through it. The `_CMD` scan is a token scan, not a shell parser: a
+     path built from a variable, or assembled inside the helper, is
+     invisible to it.
+   * **`verify_restore` enforces none of this.** Running `cargo run
+     --example verify_restore` by hand with a key copied out of a
+     container proves exactly what it always did. The gate is in the
+     shell script, one layer up, on purpose.
 
 ## Related
 

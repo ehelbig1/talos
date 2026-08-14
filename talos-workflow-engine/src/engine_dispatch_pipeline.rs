@@ -944,8 +944,17 @@ mod pipeline_ledger_finalize_tests {
     //! `Disabled`, so this file remains unreached on the deployed platform,
     //! and `tests/chain_dispatch_gate.rs` pins that through the real entry
     //! point. Turning it on is NOT a one-line flip — see `ChainDispatch`'s
-    //! docs: this file has no `skip_condition` handling whatsoever (grep it),
-    //! and every workflow that uses `skip_condition` today is a SEND node.
+    //! docs: this file has no `skip_condition` HANDLING whatsoever, and the
+    //! workflows that use `skip_condition` today are mostly, but not entirely,
+    //! SEND nodes (5 workflows / 7 nodes; two are a sub-workflow node and a
+    //! Gmail label mutation — see `ChainDispatch` for the census).
+    //!
+    //! The instruction here used to be "(grep it)", which now falsifies itself:
+    //! `grep -c skip_condition` on this file returns 2, and both hits are
+    //! inside this very sentence. A claim whose stated verification method
+    //! disproves it is worse than no claim — the property to check is that no
+    //! CODE path in this file consults a skip condition, which a grep for the
+    //! identifier cannot distinguish from prose about it.
 
     use std::sync::Arc;
 

@@ -21,11 +21,29 @@
 //! vacuous — it would keep passing after someone enabled chain dispatch, which
 //! is precisely the regression it is supposed to catch.
 //!
-//! So the assertions here are paired. Each control runs the SAME graph as its
-//! pin through `run_with_transport` — the one entry point that passes
-//! `ChainDispatch::Enabled` — and requires a chain dispatch to happen. If a
-//! control ever goes red, its pin has stopped meaning anything and must not be
-//! trusted until the control is green again.
+//! So the assertions here are paired. Each control loads the same graph JSON as
+//! its pin and runs it through `run_with_transport` — the one entry point that
+//! passes `ChainDispatch::Enabled` — and requires a chain dispatch to happen.
+//! If a control ever goes red, its pin has stopped meaning anything and must
+//! not be trusted until the control is green again.
+//!
+//! BUT THE CONTROL DOES NOT RUN THE GRAPH THE PIN RUNS, and saying it did was
+//! wrong in exactly the variable that made the first version of this pin
+//! vacuous. `run_with_transport` never calls
+//! `ensure_trigger_node_wired_to_roots`, so the control runs the **6-node**
+//! graph while the pin runs a **7-node** one containing the synthetic
+//! `__trigger__` — and whether the trigger absorbs the chains is precisely what
+//! decides if the pin can fail at all. A control that differs from its pin in
+//! the one dimension under test is not a control for that dimension.
+//!
+//! So the pin carries its OWN non-vacuity assertion rather than borrowing the
+//! control's: after the run it re-derives `detect_linear_chains` on the graph
+//! the pin ACTUALLY ran and requires two 3-node chains with no trigger in them.
+//! That establishes in-test what was previously established only in a commit
+//! message — the chains survived the filter on the pin's own graph, so zero
+//! chain dispatches can only be the gate. (`the_synthetic_trigger_absorbs_the_
+//! chain_it_is_wired_into` already does this at the bottom of the file; the pin
+//! simply needed the same treatment.)
 //!
 //! ## The version of this file that could not fail, and why it was replaced
 //!
@@ -322,6 +340,46 @@ async fn production_entrypoint_never_batches_chains() {
         single, expected,
         "all six nodes must have been dispatched individually"
     );
+
+    // NON-VACUITY, ON THE GRAPH THIS TEST ACTUALLY RAN.
+    //
+    // The control above cannot establish this: it runs through
+    // `run_with_transport`, which never installs the synthetic `__trigger__`,
+    // so it exercises the 6-node graph while this test's engine now holds a
+    // 7-node one. The trigger is the whole variable — on a single-root graph it
+    // absorbs the only chain and the engine's `module_id.is_some()` filter
+    // discards it, which is what made the FIRST version of this pin unable to
+    // fail. Asserting it here, on the post-run graph, is what stops that
+    // regressing quietly; previously it lived only in a commit message.
+    let chains = detect_linear_chains(engine.graph());
+    assert_eq!(
+        chains.len(),
+        2,
+        "VACUITY GUARD: the graph this pin ran must still yield two chains AFTER the \
+         synthetic trigger was wired in. If it does not, zero chain dispatches proves \
+         nothing about the gate. got: {chains:?}"
+    );
+    for c in &chains {
+        assert_eq!(
+            c.len(),
+            3,
+            "each surviving chain must span its three module nodes, i.e. NOT have absorbed \
+             the trigger; got {c:?}"
+        );
+        let has_trigger = c.iter().any(|&idx| {
+            let node_id = engine.graph()[idx];
+            engine
+                .node_labels()
+                .get(&node_id)
+                .map(|l| l.as_str() == talos_workflow_engine_core::reserved_keys::TRIGGER)
+                .unwrap_or(false)
+        });
+        assert!(
+            !has_trigger,
+            "a chain containing the synthetic trigger is dropped by the engine's module_id \
+             filter, which would make this pin vacuous; got {c:?}"
+        );
+    }
 }
 
 /// The MECHANISM behind one of the two blockers, demonstrated rather than

@@ -14,11 +14,19 @@
 #   7. Clean up every scratch container/volume/network
 #   8. Emit the Prometheus textfile metric
 #
-# THE KEK COMES FROM ESCROW AND ONLY FROM ESCROW. Set exactly one of:
+# THE KEK COMES FROM ESCROW AND ONLY FROM ESCROW. Set exactly one of
+# (setting both is refused, not silently resolved by precedence):
 #   TALOS_DRILL_ESCROW_KEY_CMD='op read "op://Private/Talos KEK/password"'
 #   TALOS_DRILL_ESCROW_KEY_FILE=/Volumes/escrow/talos-master.key
 # or run attached to a TTY and paste it at the hidden prompt. There is no
 # flag that reads it back off the running controller — see step 0b for why.
+# The escrow command is bounded by TALOS_DRILL_ESCROW_TIMEOUT_SECS (default
+# 120) so a helper that prompts cannot hang a scheduled run forever.
+#
+# WHAT THE ESCROW CHECKS DO AND DO NOT ESTABLISH. Step 0b refuses the shapes
+# that re-create the deleted live-stack read and the shapes that put the key
+# beside the ciphertext. It cannot establish that a source is genuinely
+# off-box — see step 0b's "STATED LIMITS".
 #
 # Exit codes:
 #   0  drill passed — backups are restorable
@@ -404,66 +412,258 @@ fi
 #   1. TALOS_DRILL_ESCROW_KEY_CMD  — a command whose STDOUT is the key.
 #      The preferred shape, because the key never lands on disk:
 #        TALOS_DRILL_ESCROW_KEY_CMD='op read "op://Private/Talos KEK/password"'
-#      Its stderr is left attached so a password manager can prompt.
+#      Its stderr is left attached so a password manager can prompt, and it is
+#      bounded by TALOS_DRILL_ESCROW_TIMEOUT_SECS.
 #   2. TALOS_DRILL_ESCROW_KEY_FILE — a file containing the key (first line).
-#      Rejected if it resolves inside the repo or the backup directory.
+#      Rejected if it resolves inside a checkout or the backup directory.
 #   3. An interactive prompt, only when stdin is a TTY. `read -rs`: no echo.
+#
+# Setting BOTH 1 and 2 is refused. The header says "set exactly one of", and a
+# silent precedence rule means the operator who set the guarded `_FILE` and the
+# unguarded `_CMD` gets the unguarded one without being told.
 #
 # The value is never printed, never written to a file, never passed on a
 # command line (which would put it in `ps`), and never reaches the scratch
 # database. It lives in one shell variable — deliberately NOT exported, so it
 # reaches only the verifier invocation that names it explicitly (step 6).
 #
-# A pre-existing `TALOS_MASTER_KEY` in the caller's environment is CLEARED
-# here and never used. `source .env && make drill` would otherwise sail
-# through on the live key while looking like an escrow run, which is the same
-# "quietly succeeds the old way" hole as a fallback, just spelled differently.
+# A pre-existing `TALOS_MASTER_KEY` in the caller's environment is UNSET here
+# and never used. `source .env && make drill` would otherwise sail through on
+# the live key while looking like an escrow run, which is the same "quietly
+# succeeds the old way" hole as a fallback, just spelled differently.
+#
+# `TALOS_MASTER_KEY=""` was the first shape of that clear and it is NOT
+# equivalent: assignment does not remove the export attribute, so
+# `export FOO=live; FOO=""; FOO=escrow` leaves FOO **exported** with the new
+# value (measured: `env | grep -c '^FOO='` is 1, and 0 only after `unset`).
+# On exactly the `source .env && make drill` path the comment above
+# anticipates, that put the ESCROWED key into the environment of every child —
+# including the multi-minute `cargo build` in step 2. `TALOS_MASTER_KEY_FILE`
+# is unset alongside it: it is inert today only because `read_env_or_file`
+# happens to prefer a non-empty env var, i.e. by another crate's precedence
+# rather than by anything here.
+unset TALOS_MASTER_KEY TALOS_MASTER_KEY_FILE
 KEK_SOURCE=""
 TALOS_MASTER_KEY=""
 ESCROW_ATTEMPTED=""
+
+# Roots a KEK must not live under, one per line. Two of them:
+#
+#   * the checkout this script is running from, and
+#   * the MAIN checkout when this is a git WORKTREE. `${BASH_SOURCE[0]}` and
+#     `../..` resolve to the WORKTREE root, whose subtree does not contain the
+#     main clone — so running the worktree copy ACCEPTED a key file sitting in
+#     the main checkout (a parent directory of it, in this repo's layout).
+#     `git rev-parse --git-common-dir` names the shared `.git`, whose parent is
+#     the main working tree.
+escrow_forbidden_roots() {
+    local script_dir root common
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+    root="$(cd "$script_dir/../.." && pwd -P)"
+    printf '%s\n' "$root"
+    common="$(cd "$script_dir" && git rev-parse --git-common-dir 2>/dev/null || true)"
+    if [[ -n "$common" ]]; then
+        # `--git-common-dir` may answer relatively; resolve from the script dir.
+        (cd "$script_dir" && cd "$common/.." && pwd -P) 2>/dev/null || true
+    fi
+}
+
+# Portable realpath. `cd "$(dirname f)" && pwd -P` — the obvious one, and what
+# this used at first — resolves a symlinked DIRECTORY and not a symlinked FILE.
+# Caught by testing the bypass rather than by reading the code: a symlink in
+# /tmp pointing at a key file inside the repo was ACCEPTED, and the README had
+# already been written claiming "symlinks are resolved before the check". Same
+# defect one level up as the drill itself. python3 is already a hard dependency
+# of this script (steps 2 and 5); macOS ships no coreutils `realpath`.
+escrow_realpath() {
+    python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"
+}
+
+# Refuse a path that resolves under a checkout or under $BACKUP_DIR.
+# `$2` names what is being checked so the message fits both callers.
+assert_escrow_path_contained() {
+    local real="$1" what="$2" r backup_real
+    while IFS= read -r r; do
+        [[ -n "$r" ]] || continue
+        case "$real" in
+            "$r"|"$r"/*)
+                die "$what resolves to '$real', INSIDE a checkout ($r).
+   The KEK must not live where the code lives — a checkout, a container image
+   layer or a stray \`git add -f\` then carries it. Move it off-box." ;;
+        esac
+    done < <(escrow_forbidden_roots)
+    if [[ -d "$BACKUP_DIR" ]]; then
+        backup_real="$(escrow_realpath "$BACKUP_DIR")"
+        case "$real" in
+            "$backup_real"|"$backup_real"/*)
+                die "$what resolves to '$real', INSIDE the backup directory ($backup_real).
+   Whoever steals the artifacts then also has the key that unlocks them, which
+   makes the encryption decorative. Keep the KEK on a different medium." ;;
+        esac
+    fi
+}
+
+# The `_CMD` shapes that RE-CREATE the deleted live-stack read.
+#
+# `TALOS_DRILL_ESCROW_KEY_CMD='docker exec talos-controller printenv
+# TALOS_MASTER_KEY'` passed every other check in this file and printed
+# "KEK obtained from ESCROW … the live stack was never asked" while the live
+# stack was the only thing that was asked. The refusal is cheap and closes that
+# specific hole; the honest wording in the banner is what stops the transcript
+# lying to a future operator about the rest.
+assert_escrow_cmd_is_not_the_live_stack() {
+    local c="$1"
+    if printf '%s' "$c" | grep -Eq 'docker([[:space:]]+[^|;&]*)?[[:space:]]+(exec|inspect)([[:space:]]|$)'; then
+        die "TALOS_DRILL_ESCROW_KEY_CMD invokes 'docker exec'/'docker inspect'.
+   That is the live-stack read this drill deleted, spelled as an escrow source.
+   A drill sourcing the KEK from the running host proves 'artifacts + TODAY'S
+   LIVE KEK ⇒ readable', which is trivially true on a healthy host and
+   untestable in the disaster it rehearses. Point it at real escrow."
+    fi
+    if printf '%s' "$c" | grep -Eq 'printenv[[:space:]]+TALOS_MASTER_KEY'; then
+        die "TALOS_DRILL_ESCROW_KEY_CMD reads TALOS_MASTER_KEY out of an environment.
+   Whatever process that is, it is not escrow: escrow is a copy that survives
+   losing this host. See scripts/drills/README.md item 8."
+    fi
+}
+
+# Cheap containment for `_CMD`, matching what `_FILE` already gets.
+# `TALOS_DRILL_ESCROW_KEY_CMD="cat <repo>/.key"` sailed through every check
+# while `TALOS_DRILL_ESCROW_KEY_FILE=<repo>/.key` was refused — the guarded
+# branch was the one nobody is told to use.
+#
+# STATED LIMIT: this is a token scan, not a shell parser. It resolves each
+# whitespace-separated token that looks like a path AND exists, then applies the
+# same containment. A path assembled from a variable, built by the helper
+# itself, or reached through a HARD LINK (which `realpath` cannot see through —
+# a hard link inside the repo to a file outside it has no symlink to resolve and
+# is a genuinely different path) is invisible to it.
+assert_escrow_cmd_paths_contained() {
+    local c="$1" tok real
+    # Word-splitting is the point here.
+    # shellcheck disable=SC2086
+    for tok in $c; do
+        tok="${tok%\"}"; tok="${tok#\"}"
+        tok="${tok%\'}"; tok="${tok#\'}"
+        [[ "$tok" == */* ]] || continue
+        [[ -e "$tok" ]] || continue
+        real="$(escrow_realpath "$tok" 2>/dev/null || true)"
+        [[ -n "$real" ]] || continue
+        assert_escrow_path_contained "$real" "escrow command argument '$tok'"
+    done
+}
+
+# Run the escrow command under a WATCHDOG and print its stdout.
+#
+# Nothing bounded this command before, while `schedule.sh` claimed the drill
+# "gives up" — it did not, and `grep -n timeout scripts/drills/*.sh` found
+# nothing. Under launchd an `op read` that raises a Touch ID prompt waits
+# forever, launchd will not start the next weekly run while this one is alive,
+# and the drill silently stops running with only the 14-day staleness alert as
+# signal.
+#
+# A watchdog rather than `timeout(1)` because macOS ships no coreutils.
+#
+# STDERR IS LEFT ATTACHED. The `2>/dev/null` this used to carry contradicted
+# the line directly above it and swallowed BOTH a password manager's prompt and
+# a failing helper's diagnostic — worst under `make drill-schedule`, where the
+# log is the only channel.
+#
+# STDIN is restored from the terminal when there is one: bash points an
+# asynchronous command's stdin at /dev/null when job control is off, which is
+# correct for launchd and wrong for an interactive run.
+#
+# The key is returned through a PIPE, never a temp file — `_CMD` is the
+# preferred source precisely because the key does not land on disk, and a
+# spool-to-file timeout implementation would have quietly given that up. Only
+# the watchdog's verdict touches the filesystem.
+#
+# THE WATCHDOG MUST KILL THE WHOLE TREE, and the difference is a HANG rather
+# than a slow path. `eval "$CMD" &` forks a SUBSHELL, which then forks the real
+# command as a GRANDCHILD; that grandchild inherits the capture pipe's write
+# end, so TERMing only the direct child leaves `head` waiting for an EOF that
+# never comes and the drill blocks forever on the very timeout meant to rescue
+# it. Measured while building this: `sleep 300` survived as a PID-1 orphan and
+# the run wedged past 45 s with a 3 s limit. The tree is enumerated BEFORE the
+# first signal, because a killed intermediate erases the parent links the
+# second pass would need.
+escrow_descendants() {
+    local p="$1" c
+    printf '%s\n' "$p"
+    for c in $(pgrep -P "$p" 2>/dev/null || true); do
+        escrow_descendants "$c"
+    done
+}
+run_escrow_cmd_bounded() {
+    local flag="$1" secs="$2" cmd_pid wd_pid
+    if [[ -t 0 ]]; then
+        eval "$TALOS_DRILL_ESCROW_KEY_CMD" < /dev/tty &
+    else
+        eval "$TALOS_DRILL_ESCROW_KEY_CMD" < /dev/null &
+    fi
+    cmd_pid=$!
+    (
+        sleep "$secs"
+        if kill -0 "$cmd_pid" 2>/dev/null; then
+            printf 'timeout' > "$flag"
+            # `pgrep -P` ships on macOS and on Linux (procps). Where it is
+            # missing this degrades to the direct kill — i.e. to the
+            # pre-existing "no effective timeout", not to a wrong answer.
+            tree="$(escrow_descendants "$cmd_pid")"
+            for p in $tree; do kill -TERM "$p" 2>/dev/null || true; done
+            sleep 2
+            for p in $tree; do kill -KILL "$p" 2>/dev/null || true; done
+        fi
+    ) >/dev/null 2>&1 &
+    wd_pid=$!
+    wait "$cmd_pid" 2>/dev/null || true
+    kill -TERM "$wd_pid" 2>/dev/null || true
+    wait "$wd_pid" 2>/dev/null || true
+}
+
+if [[ -n "${TALOS_DRILL_ESCROW_KEY_CMD:-}" && -n "${TALOS_DRILL_ESCROW_KEY_FILE:-}" ]]; then
+    die "both TALOS_DRILL_ESCROW_KEY_CMD and TALOS_DRILL_ESCROW_KEY_FILE are set.
+   This script says 'set exactly one of'. Resolving it by precedence would
+   silently ignore one of them — and the one that loses is the FILE, the branch
+   that carries the containment checks. Unset whichever you did not mean."
+fi
+
+ESCROW_TIMEOUT_SECS="${TALOS_DRILL_ESCROW_TIMEOUT_SECS:-120}"
+case "$ESCROW_TIMEOUT_SECS" in
+    ''|*[!0-9]*|0) die "TALOS_DRILL_ESCROW_TIMEOUT_SECS must be a positive integer, got '$ESCROW_TIMEOUT_SECS'" ;;
+esac
+
 if [[ -n "${TALOS_DRILL_ESCROW_KEY_CMD:-}" ]]; then
+    assert_escrow_cmd_is_not_the_live_stack "$TALOS_DRILL_ESCROW_KEY_CMD"
+    assert_escrow_cmd_paths_contained "$TALOS_DRILL_ESCROW_KEY_CMD"
+    ESCROW_TIMEOUT_FLAG="$(mktemp "${TMPDIR:-/tmp}/talos-drill-escrow.XXXXXX")"
     # `|| true` so a failing helper produces the empty-key die below (with
     # the actionable message) rather than a bare `set -e` abort.
-    TALOS_MASTER_KEY="$(eval "$TALOS_DRILL_ESCROW_KEY_CMD" 2>/dev/null | head -1 || true)"
+    TALOS_MASTER_KEY="$(run_escrow_cmd_bounded "$ESCROW_TIMEOUT_FLAG" "$ESCROW_TIMEOUT_SECS" | head -1 || true)"
+    ESCROW_TIMED_OUT="$(cat "$ESCROW_TIMEOUT_FLAG" 2>/dev/null || true)"
+    rm -f "$ESCROW_TIMEOUT_FLAG"
     KEK_SOURCE="TALOS_DRILL_ESCROW_KEY_CMD"
-    ESCROW_ATTEMPTED="TALOS_DRILL_ESCROW_KEY_CMD ran but produced NO OUTPUT (exit status
-   is not consulted — only what it printed). Check it works in this shell, and
-   that it writes the key to STDOUT rather than prompting on it."
+    if [[ "$ESCROW_TIMED_OUT" == "timeout" ]]; then
+        ESCROW_ATTEMPTED="TALOS_DRILL_ESCROW_KEY_CMD did not finish within
+   ${ESCROW_TIMEOUT_SECS}s and was killed. A helper that PROMPTS (Touch ID, a
+   passphrase) cannot work unattended — under launchd there is no one to answer
+   it, and an unbounded wait would stop the weekly drill running at all. Use a
+   service-account token, or raise TALOS_DRILL_ESCROW_TIMEOUT_SECS if the
+   helper is merely slow."
+    else
+        ESCROW_ATTEMPTED="TALOS_DRILL_ESCROW_KEY_CMD ran but produced NO OUTPUT (exit status
+   is not consulted — only what it printed; its stderr is above). Check it works
+   in this shell, and that it writes the key to STDOUT rather than prompting on it."
+    fi
 elif [[ -n "${TALOS_DRILL_ESCROW_KEY_FILE:-}" ]]; then
     ESCROW_ATTEMPTED="TALOS_DRILL_ESCROW_KEY_FILE was set but its first line is EMPTY."
     ESCROW_FILE="${TALOS_DRILL_ESCROW_KEY_FILE}"
     [[ -r "$ESCROW_FILE" ]] || die "TALOS_DRILL_ESCROW_KEY_FILE='$ESCROW_FILE' is not readable"
     # Resolve symlinks AND relatives before the containment checks, or
     # `../../talos/.env` walks straight past them.
-    #
-    # `cd "$(dirname f)" && pwd -P` — the obvious portable realpath, and what
-    # this used at first — resolves a symlinked DIRECTORY and not a symlinked
-    # FILE. Caught by testing the bypass rather than by reading the code: a
-    # symlink in /tmp pointing at a key file inside the repo was ACCEPTED, and
-    # the README had already been written claiming "symlinks are resolved
-    # before the check". Same defect one level up as the drill itself.
-    # `python3 -c os.path.realpath` resolves both; python3 is already a hard
-    # dependency of this script (steps 2 and 5). macOS ships no coreutils
-    # `realpath`, so it is not an option here.
-    ESCROW_REAL="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$ESCROW_FILE")" \
+    ESCROW_REAL="$(escrow_realpath "$ESCROW_FILE")" \
         || die "could not resolve TALOS_DRILL_ESCROW_KEY_FILE='$ESCROW_FILE'"
-    ESCROW_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-    ESCROW_REPO_ROOT="$(cd "$ESCROW_SCRIPT_DIR/../.." && pwd -P)"
-    case "$ESCROW_REAL" in
-        "$ESCROW_REPO_ROOT"/*)
-            die "escrow key file '$ESCROW_REAL' is INSIDE the repository ($ESCROW_REPO_ROOT).
-   The KEK must not live where the code lives — a checkout, a container image
-   layer or a stray \`git add -f\` then carries it. Move it off-box." ;;
-    esac
-    if [[ -d "$BACKUP_DIR" ]]; then
-        BACKUP_REAL="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$BACKUP_DIR")"
-        case "$ESCROW_REAL" in
-            "$BACKUP_REAL"/*)
-                die "escrow key file '$ESCROW_REAL' is INSIDE the backup directory ($BACKUP_REAL).
-   Whoever steals the artifacts then also has the key that unlocks them, which
-   makes the encryption decorative. Keep the KEK on a different medium." ;;
-        esac
-    fi
+    assert_escrow_path_contained "$ESCROW_REAL" "escrow key file"
     TALOS_MASTER_KEY="$(head -1 "$ESCROW_FILE" || true)"
     KEK_SOURCE="TALOS_DRILL_ESCROW_KEY_FILE ($ESCROW_REAL)"
 elif [[ -t 0 ]]; then
@@ -518,7 +718,31 @@ case "$KEK_PROVIDER_MODE" in
     *) die "TALOS_DRILL_KEK_PROVIDER must be 'env' or 'vault', got '$KEK_PROVIDER_MODE'" ;;
 esac
 # Length only. The key itself must never reach a terminal, a log or an issue.
-ok "KEK obtained from ESCROW via $KEK_SOURCE (${#TALOS_MASTER_KEY} chars; provider '$KEK_PROVIDER_MODE')"
+ok "KEK read from $KEK_SOURCE (${#TALOS_MASTER_KEY} chars; provider '$KEK_PROVIDER_MODE')"
+
+# STATED LIMITS OF THE ESCROW CHECKS — here rather than only in the README,
+# because the reader who needs them is the one reading a green transcript.
+#
+# What IS enforced:
+#   * the live-container read is deleted, not demoted — no flag restores it;
+#   * a `_CMD` naming `docker exec`/`docker inspect` or `printenv
+#     TALOS_MASTER_KEY` is refused, so the deleted read cannot be spelled as an
+#     escrow source;
+#   * a `_FILE`, and any existing path-shaped argument of a `_CMD`, that
+#     resolves under a checkout (this one OR the main clone when this is a
+#     worktree) or under $BACKUP_DIR is refused, symlinks resolved first;
+#   * setting both `_CMD` and `_FILE` is refused rather than silently resolved.
+#
+# What is NOT, and cannot be, established here:
+#   * that the source is genuinely OFF-BOX. `/Volumes/escrow` may be a RAM
+#     disk; a 1Password vault may sync to this same laptop; a HARD LINK inside
+#     a checkout to a file outside it is a different path with no symlink to
+#     resolve, so `realpath` cannot see through it;
+#   * that the `_CMD` does not reach the live stack by some spelling this file
+#     does not enumerate (a wrapper script, a variable, an API call). The
+#     refusals above are a specific hole closed, not a proof of provenance.
+# The banner at the end says exactly this, in those words, rather than
+# "the live stack was never asked".
 
 # WORK_DIR holds a full database dump and the Vault file backend in the
 # clear. mktemp gives an unpredictable name with 0700 — a fixed
@@ -560,8 +784,65 @@ if [[ "$SOURCE_MODE" == "artifact" ]]; then
     # date is the first thing to look at when a drill result is surprising.
     PG_ARTIFACT_MTIME="$(stat -f %m "$PG_ARTIFACT" 2>/dev/null || stat -c %Y "$PG_ARTIFACT" 2>/dev/null || echo '')"
     PG_ARTIFACT_AGE="$([[ -n "$PG_ARTIFACT_MTIME" ]] && date -u -r "$PG_ARTIFACT_MTIME" +%FT%TZ 2>/dev/null || echo '?')"
+    VAULT_ARTIFACT_MTIME="$(stat -f %m "$VAULT_ARTIFACT" 2>/dev/null || stat -c %Y "$VAULT_ARTIFACT" 2>/dev/null || echo '')"
+    VAULT_ARTIFACT_AGE="$([[ -n "$VAULT_ARTIFACT_MTIME" ]] && date -u -r "$VAULT_ARTIFACT_MTIME" +%FT%TZ 2>/dev/null || echo '?')"
     ok "postgres artifact: $(basename "$PG_ARTIFACT") ($(wc -c < "$WORK_DIR/pg.dump") bytes, taken $PG_ARTIFACT_AGE)"
-    ok "vault artifact:    $(basename "$VAULT_ARTIFACT") ($(wc -c < "$WORK_DIR/vault.tgz") bytes)"
+    ok "vault artifact:    $(basename "$VAULT_ARTIFACT") ($(wc -c < "$WORK_DIR/vault.tgz") bytes, taken $VAULT_ARTIFACT_AGE)"
+
+    # ARTIFACT AGE IS ASSERTED, NOT MERELY PRINTED.
+    #
+    # This used to compute the mtime, print it, and stop. So if the
+    # `postgres-backup` sidecar died, the drill kept restoring the last good
+    # artifact and kept going GREEN for as long as that file survived
+    # retention — and `TalosBackupRestoreDrillFailed` could not help, because
+    # it measures DRILL recency, not ARTIFACT recency. That is the same shape
+    # as the defect this drill exists to catch, one level up: a value computed,
+    # displayed, and never compared to anything.
+    #
+    # The default is 168 h (7 days) against a 24 h sidecar interval and a 14 d
+    # retention. Deliberately loose: this is a laptop dev stack whose sidecars
+    # only tick while the machine is awake, and the artifact history shows a
+    # real two-day gap (2026-08-08/09) from a closed laptop. A 48 h threshold
+    # would have false-red on that — an alert that fires during healthy
+    # operation is the failure mode this whole area exists to remove. 7 days
+    # still fires well before the newest artifact ages out of retention.
+    #
+    # BOTH artifacts are checked. They are selected INDEPENDENTLY (newest dump,
+    # newest vault tarball), so nothing here makes them a matched pair: a fresh
+    # dump can be restored beside a Vault backend from days earlier if only one
+    # sidecar died. The age gate bounds how far apart they can drift; it does
+    # not make them consistent, and a DEK created after the older of the two
+    # was taken would be missing. Pairing them properly needs the sidecars to
+    # write a joint manifest and is not attempted here.
+    MAX_ARTIFACT_AGE_HOURS="${TALOS_DRILL_MAX_ARTIFACT_AGE_HOURS:-168}"
+    case "$MAX_ARTIFACT_AGE_HOURS" in
+        ''|*[!0-9]*) die "TALOS_DRILL_MAX_ARTIFACT_AGE_HOURS must be a non-negative integer, got '$MAX_ARTIFACT_AGE_HOURS'" ;;
+    esac
+    assert_artifact_fresh() {
+        local mtime="$1" label="$2" path="$3" age_h now
+        if [[ -z "$mtime" ]]; then
+            warn "could not read the mtime of $label ($path) — age NOT asserted on this run"
+            return 0
+        fi
+        now="$(date +%s)"
+        age_h=$(( (now - mtime) / 3600 ))
+        if (( MAX_ARTIFACT_AGE_HOURS == 0 )); then
+            warn "$label is ${age_h}h old — age gate DISABLED (TALOS_DRILL_MAX_ARTIFACT_AGE_HOURS=0)"
+            return 0
+        fi
+        if (( age_h > MAX_ARTIFACT_AGE_HOURS )); then
+            die "$label is ${age_h}h old (limit ${MAX_ARTIFACT_AGE_HOURS}h): $path
+   The newest artifact on disk is stale, which means the sidecar that writes it
+   has stopped. Restoring it would go green and certify a backup pipeline that
+   is no longer running — the drill measures its OWN recency, nothing measures
+   the artifacts'. Check 'docker logs talos-postgres-backup' /
+   'docker logs talos-vault-backup'. Raise TALOS_DRILL_MAX_ARTIFACT_AGE_HOURS
+   (or set it to 0) only to deliberately drill an ARCHIVED artifact."
+        fi
+        ok "$label age ${age_h}h (limit ${MAX_ARTIFACT_AGE_HOURS}h)"
+    }
+    assert_artifact_fresh "$PG_ARTIFACT_MTIME"    "postgres artifact" "$PG_ARTIFACT"
+    assert_artifact_fresh "$VAULT_ARTIFACT_MTIME" "vault artifact"    "$VAULT_ARTIFACT"
 else
     log "[1/7] dumping LIVE postgres + vault (--source live)"
     docker inspect "$LIVE_PG_CONTAINER" >/dev/null 2>&1 || die "live postgres container '$LIVE_PG_CONTAINER' not running"
@@ -825,7 +1106,15 @@ printf '  Source:          %s\n' "$SOURCE_MODE"
 # thing that has read it); this line is the checkout's, labelled as such so the
 # two are never confused.
 printf '  Checkout schema: %s (newest migration in this working tree)\n' "$EXPECT_MIGRATION"
-printf '  KEK source:      %s (ESCROW — the live stack was never asked)\n' "$KEK_SOURCE"
+# The KEK line states the SOURCE THAT WAS CONFIGURED, not a verdict about it.
+# It used to read "(ESCROW — the live stack was never asked)" unconditionally,
+# which is a claim this script cannot check:
+# `TALOS_DRILL_ESCROW_KEY_CMD='docker exec talos-controller printenv
+# TALOS_MASTER_KEY'` printed exactly that line while the live stack was the
+# only thing asked. That specific spelling is now REFUSED (step 0b), but the
+# general claim is still unverifiable, so it is not made.
+printf '  KEK source:      %s\n' "$KEK_SOURCE"
+printf '                   (as configured; provenance is NOT verified — see step 0b STATED LIMITS)\n'
 printf '  Metric:          %s\n' "$TEXTFILE"
 printf '  Next drill:      within 7 days (alert fires at 14)\n'
 
@@ -849,6 +1138,10 @@ printf '  Next drill:      within 7 days (alert fires at 14)\n'
 # and scripts/drills/README.md § What this drill doesn't cover, item 8.
 printf '\n'
 printf '\033[1;33m  ⚠ WHAT THIS DOES NOT PROVE\033[0m\n'
+printf '\033[1;33m    KEK provenance: the live-container read is deleted and the shapes that\033[0m\n'
+printf '\033[1;33m      re-create it are refused, but nothing here can show the configured\033[0m\n'
+printf '\033[1;33m      source is genuinely off-box (a RAM disk, a vault synced to this same\033[0m\n'
+printf '\033[1;33m      laptop, or a hard link past the containment check all read as escrow).\033[0m\n'
 printf '\033[1;33m    Artifact location: the dumps exist only on THIS host filesystem.\033[0m\n'
 printf '\033[1;33m      Proven: escrowed KEK + these artifacts are readable on a clean stack.\033[0m\n'
 printf '\033[1;33m      NOT proven: that the artifacts survive losing this disk. Off-host\033[0m\n'
