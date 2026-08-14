@@ -52,6 +52,10 @@ pub(crate) fn local_llm_http_client() -> &'static reqwest::Client {
 }
 
 #[cfg(test)]
+#[path = "llm_failure_metrics_tests.rs"]
+mod llm_failure_metrics_tests;
+
+#[cfg(test)]
 mod llm_tier_decision_tests {
     use super::{decide_llm_tier_access, LlmTierDecision};
     use talos_workflow_job_protocol::LlmTier;
@@ -393,35 +397,113 @@ impl wit_llm::Host for TalosContext {
     }
 }
 
+/// Metric/adapter label for a WIT provider. Total over the closed enum, so
+/// `normalize_llm_provider`'s `"other"` fold is unreachable from here.
+pub(crate) const fn llm_provider_label(provider: wit_llm::Provider) -> &'static str {
+    match provider {
+        wit_llm::Provider::Anthropic => "anthropic",
+        wit_llm::Provider::Openai => "openai",
+        wit_llm::Provider::Gemini => "gemini",
+        wit_llm::Provider::Ollama => "ollama",
+    }
+}
+
+/// An exit from `complete_inner` that did not produce a completion: the
+/// guest-visible `wit_llm::Error` plus the closed metric outcome for it.
+///
+/// The pairing is the point. Before 2026-08-14 `complete_impl` returned
+/// `wit_llm::Error` directly and the only metric call sat below every early
+/// return, so every failure exit incremented nothing. **Nine exits, not the
+/// eight the grounding note counted** — the eight call failures below, plus the
+/// pre-flight cancellation abort, which was excluded there because it already
+/// had a metric of its own (`wasm_executions_cancelled_total`). It is counted
+/// here as well so that `llm_requests + llm_failures` has no unaccounted gap.
+///
+/// Classifying from the error variant afterwards would not have fixed it — four
+/// distinct outcomes (network, non-2xx, oversized body, decode) all surface as
+/// `Error::ApiError(String)`, and the only thing separating them is a
+/// provider-supplied string that must never reach a Prometheus label.
+///
+/// Carrying the outcome out of the site that knows it makes the classification
+/// exhaustive BY CONSTRUCTION: `complete_inner`'s error type is this struct, so
+/// a new early return cannot be added without naming an `LlmFailure`. That is a
+/// compiler guarantee, not a code-review one.
+struct LlmCallFailure {
+    outcome: crate::metrics::LlmFailure,
+    error: wit_llm::Error,
+}
+
+impl LlmCallFailure {
+    fn new(outcome: crate::metrics::LlmFailure, error: wit_llm::Error) -> Self {
+        Self { outcome, error }
+    }
+}
+
 impl TalosContext {
     /// Shared completion kernel behind `complete` (no overlay),
     /// `complete_json` (structured-output overlay), and
     /// `complete_with_options` (arbitrary provider-options overlay).
-    /// Provider-INDEPENDENT concerns live here in exactly one place —
-    /// tier gate, key resolution, SSRF client selection, timeouts,
-    /// bounded body read, metrics — while every wire format (body shape,
-    /// structured-output spelling, options guardrails, response parse)
-    /// is delegated to the provider's `llm_providers::ProviderAdapter`.
+    ///
+    /// This wrapper owns exactly one concern: turning every non-success exit of
+    /// `complete_inner` into a `wasm_llm_failures_total` increment before
+    /// handing the error back to the guest unchanged. All the logic is in
+    /// `complete_inner`.
     async fn complete_impl(
         &mut self,
         req: wit_llm::CompletionRequest,
         json_mode: JsonMode,
         extra_options: Option<serde_json::Value>,
     ) -> Result<wit_llm::CompletionResponse, wit_llm::Error> {
+        // Resolved HERE, above everything that can fail, so that even the
+        // pre-flight cancellation exit — which returns before the provider is
+        // otherwise needed — carries a real provider label instead of an
+        // "unknown" bucket. Both lines are pure; hoisting them changes no
+        // behaviour.
+        let provider = req.provider.unwrap_or(wit_llm::Provider::Anthropic);
+        let provider_label = llm_provider_label(provider);
+
+        match self
+            .complete_inner(req, provider, provider_label, json_mode, extra_options)
+            .await
+        {
+            Ok(resp) => Ok(resp),
+            Err(LlmCallFailure { outcome, error }) => {
+                if let Some(ref m) = self.metrics {
+                    m.record_llm_failure(provider_label, outcome);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Provider-INDEPENDENT concerns live here in exactly one place —
+    /// tier gate, key resolution, SSRF client selection, timeouts,
+    /// bounded body read, metrics — while every wire format (body shape,
+    /// structured-output spelling, options guardrails, response parse)
+    /// is delegated to the provider's `llm_providers::ProviderAdapter`.
+    async fn complete_inner(
+        &mut self,
+        req: wit_llm::CompletionRequest,
+        provider: wit_llm::Provider,
+        provider_label: &'static str,
+        json_mode: JsonMode,
+        extra_options: Option<serde_json::Value>,
+    ) -> Result<wit_llm::CompletionResponse, LlmCallFailure> {
         // Check cancellation before making an expensive API call.
         if self.is_cancelled() {
             tracing::info!(module_id = ?self.module_id, "Execution cancelled");
             if let Some(ref m) = self.metrics {
                 m.record_execution_cancelled();
             }
-            return Err(wit_llm::Error::BudgetExhausted);
+            return Err(LlmCallFailure::new(
+                crate::metrics::LlmFailure::Cancelled,
+                wit_llm::Error::BudgetExhausted,
+            ));
         }
 
         let llm_start = std::time::Instant::now();
 
-        // Resolve provider and look up the API key.
         // Ollama (Tier 1) runs locally and needs no API key.
-        let provider = req.provider.unwrap_or(wit_llm::Provider::Anthropic);
         let is_local = matches!(provider, wit_llm::Provider::Ollama);
 
         let api_key = if is_local {
@@ -442,17 +524,17 @@ impl TalosContext {
                         vault_path, env_name
                     );
                     tracing::warn!(vault_path, env_name, module_id = ?self.module_id, "{}", msg);
-                    return Err(wit_llm::Error::NotConfigured(msg));
+                    // Also the Tier-1-refusal exit: `get_llm_api_key` returns
+                    // `None` for a ceiling denial too, and cannot be told apart
+                    // from a genuinely missing key here. See `LlmFailure::NotConfigured`.
+                    return Err(LlmCallFailure::new(
+                        crate::metrics::LlmFailure::NotConfigured,
+                        wit_llm::Error::NotConfigured(msg),
+                    ));
                 }
             }
         };
 
-        let provider_label = match provider {
-            wit_llm::Provider::Anthropic => "anthropic",
-            wit_llm::Provider::Openai => "openai",
-            wit_llm::Provider::Gemini => "gemini",
-            wit_llm::Provider::Ollama => "ollama",
-        };
         let adapter = llm_providers::adapter_for(provider_label);
 
         let model = req.model.unwrap_or_else(|| match provider {
@@ -511,7 +593,10 @@ impl TalosContext {
         let auth_headers = adapter.auth_headers(&api_key);
 
         let body_bytes = serde_json::to_vec(&body).map_err(|e| {
-            wit_llm::Error::InvalidRequest(format!("Failed to serialize request body: {e}"))
+            LlmCallFailure::new(
+                crate::metrics::LlmFailure::InvalidRequest,
+                wit_llm::Error::InvalidRequest(format!("Failed to serialize request body: {e}")),
+            )
         })?;
         tracing::info!(
             module_id = ?self.module_id,
@@ -555,14 +640,20 @@ impl TalosContext {
                     .await
                     .map_err(|e| {
                         tracing::error!(error = %e, provider = provider_label, "LLM API request failed");
-                        wit_llm::Error::ApiError(format!("Network error: {e}"))
+                        LlmCallFailure::new(
+                            crate::metrics::LlmFailure::Network,
+                            wit_llm::Error::ApiError(format!("Network error: {e}")),
+                        )
                     })?;
 
                 if !response.status().is_success() {
                     let status = response.status().as_u16();
                     tracing::warn!(status, "LLM API returned error status");
                     if status == 429 {
-                        return Err(wit_llm::Error::RateLimited);
+                        return Err(LlmCallFailure::new(
+                            crate::metrics::LlmFailure::RateLimited,
+                            wit_llm::Error::RateLimited,
+                        ));
                     }
                     // MCP-528 + MCP-1213: DLP-scrub the body preview AND
                     // bound it by MAX_LLM_BODY_BYTES. Pre-fix `.text()`
@@ -585,9 +676,10 @@ impl TalosContext {
                         body_preview = %preview_redacted,
                         "LLM API returned error"
                     );
-                    return Err(wit_llm::Error::ApiError(format!(
-                        "LLM API returned HTTP {status}"
-                    )));
+                    return Err(LlmCallFailure::new(
+                        crate::metrics::LlmFailure::HttpStatus,
+                        wit_llm::Error::ApiError(format!("LLM API returned HTTP {status}")),
+                    ));
                 }
 
                 // MCP-1213: bounded streaming body read, NOT unbounded
@@ -597,22 +689,30 @@ impl TalosContext {
                 read_llm_response_body_bounded(response, MAX_LLM_BODY_BYTES)
                     .await
                     .ok_or_else(|| {
-                        wit_llm::Error::ApiError(format!(
-                            "LLM response exceeded {} bytes; aborted body read",
-                            MAX_LLM_BODY_BYTES
-                        ))
+                        LlmCallFailure::new(
+                            crate::metrics::LlmFailure::OversizedResponse,
+                            wit_llm::Error::ApiError(format!(
+                                "LLM response exceeded {} bytes; aborted body read",
+                                MAX_LLM_BODY_BYTES
+                            )),
+                        )
                     })
             },
         )
         .await
-        .map_err(|_| wit_llm::Error::Timeout)??;
+        .map_err(|_| {
+            LlmCallFailure::new(crate::metrics::LlmFailure::Timeout, wit_llm::Error::Timeout)
+        })??;
 
         // Typed, adapter-owned parse (2026-05-28 audit Perf#1 lineage:
         // format-specific serde structs, no full `Value` tree). The
         // adapter error is a plain description — wrap, never echo bodies.
-        let parsed = adapter
-            .parse_completion(&resp_bytes)
-            .map_err(wit_llm::Error::ApiError)?;
+        let parsed = adapter.parse_completion(&resp_bytes).map_err(|e| {
+            LlmCallFailure::new(
+                crate::metrics::LlmFailure::Decode,
+                wit_llm::Error::ApiError(e),
+            )
+        })?;
 
         // R2 token ledger: fold provider-reported usage into the per-job
         // accumulator (drained into the signed JobResult at completion).

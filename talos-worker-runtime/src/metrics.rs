@@ -286,6 +286,181 @@ pub(crate) const EXECUTION_DURATION_BOUNDARIES_MS: &[f64] = &[
     15000.0, 20000.0, 30000.0, 60000.0, 120000.0,
 ];
 
+/// Explicit bucket boundaries (milliseconds) for `wasm.llm.duration_ms`.
+///
+/// The sibling defect `EXECUTION_DURATION_BOUNDARIES_MS` names in its own
+/// header ("SIBLING DEFECT, DELIBERATELY NOT FIXED HERE"), fixed 2026-08-14 as
+/// its own boundary-change event with its own verification, exactly as that
+/// note asked for.
+///
+/// ## What this histogram actually measures — read this before the numbers
+///
+/// **It is SUCCESS-ONLY, and that is not fixed here.** `record_llm_request` is
+/// called at ONE site, after every early return in `complete_impl`, so a call
+/// that times out at 60 s — the single worst latency event this system can
+/// produce — contributes NOTHING to this distribution. It increments
+/// `wasm.llm.failures{outcome="timeout"}` instead. So "p99 LLM latency" from
+/// this histogram means *p99 among calls that succeeded*, and it under-reports
+/// true tail latency by exactly the timeout population. Widening the buckets to
+/// 120 s does not change that; it only stops the SUCCESSFUL tail from being
+/// clipped. Recording failed durations here would change what the series means
+/// and is a separate decision.
+///
+/// It also covers `complete_impl` only — not streaming, tool-calling,
+/// embeddings, or any controller-side LLM call. See `llm_failures`.
+///
+/// ## Why not the defaults
+///
+/// The SDK defaults (`0, 5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500,
+/// 5000, 7500, 10000`) top out at 10 000 ms against exchange timeouts of 60 s
+/// local / 120 s external, and `histogram_quantile` cannot interpolate inside
+/// `+Inf` — it returns the highest finite bound. Measured on the dev stack
+/// 2026-08-14 over 15 d at a 300 s step, `rate(...[1h])`: **756 of 2315
+/// non-NaN p95 points (32.7 %) read exactly 10000.0, and so did 757 of 2315
+/// p99 points.** A third of every latency reading this panel produced was a
+/// FLOOR reported as a value.
+///
+/// (An earlier grounding pass put the over-10 s share at 12.1 %; measured over
+/// this window it is 7.72 %. The fraction moves with the window — as the
+/// sibling constant found too — the saturation does not.)
+///
+/// ## The live distribution (15 d, 1606 calls, unbiased)
+///
+/// `sum by (le) (increase(wasm_llm_duration_ms_bucket[15d]))`, cumulative %:
+///
+/// | ≤ ms  | 250 |  500 |  750 | 1000 | 2500 | 5000 | 7500 | 10000 | +Inf |
+/// |-------|-----|------|------|------|------|------|------|-------|------|
+/// | cum % | 0.0 | 1.25 | 46.0 | 75.2 | 81.0 | 85.7 | 89.0 |  92.3 | 100  |
+///
+/// Every default boundary at or below 250 counted **zero** observations —
+/// eight of the fifteen, resolving a region that does not occur on this
+/// workload at all. Counting `500` as well, nine of fifteen were spent on
+/// 1.25 % of the mass, while the 7.7 % above 10 s got one undifferentiated
+/// overflow bucket.
+///
+/// The tail above 10 s was recovered exactly, by the method the sibling
+/// constant established: over-sample `_count`/`_sum` at a 10 s step, compress
+/// runs of identical state, keep only intervals where `_count` advanced by
+/// exactly 1 — then `Δ_sum` IS that one call's duration. 243 calls isolated;
+/// 86 exceeded 10 s; **the slowest was 57.5 s**, just under the 60 s local
+/// timeout, and NOTHING was above 60 s (consistent with 100 % of this stack's
+/// LLM traffic being local Ollama).
+///
+/// That sample is tail-BIASED and is used for SHAPE only: 35 % of it is above
+/// 10 s versus 7.7 % of the population, a ~4.5× enrichment. Isolated calls are
+/// over-represented among slow ones because a slow call is more likely to be
+/// alone in a scrape interval.
+///
+/// ## Region-by-region
+///
+/// * **Nothing below `500`.** 1.25 % of calls land there and the fastest call
+///   ever recovered was 510 ms, so the bottom bucket is `(-∞, 500]` with no
+///   interior resolution — deliberately, on the same rule the sibling constant
+///   used to drop `le=0`. **Stated as a live risk, not glossed:** if this
+///   deployment ever moves to a faster/smaller local model the whole
+///   distribution collapses into that one bucket and this histogram goes
+///   blind at the bottom. That is the trigger to revisit; it is not a reason
+///   to spend boundaries on a region that measures zero today.
+/// * **`500, 750, 1000`** — the mode, and the one place the SDK defaults were
+///   already right. `(500,750]` alone holds **44.8 %** of all calls and
+///   `(750,1000]` a further **29.2 %**: 74 % of the population inside a 500 ms
+///   span. `750` is KEPT here for exactly the reason the sibling constant
+///   DROPPED it — there it split 1.8 %, here it splits the mode.
+/// * **`2500, 5000, 7500, 10000`** — the shoulder, 5.7 / 4.8 / 3.3 / 3.2 % per
+///   bucket. Kept at the defaults' values. Nothing selects on them by `le=`
+///   (see "Coupling" below), so this is continuity for its own sake: these
+///   four survive the re-bucketing, which is what keeps a quantile below 10 s
+///   computable across the deploy.
+/// * **`15000, 17500, 20000`** — where the p95 actually lives, and the reason
+///   the tail is bucketed at all. 92.28 % of the population is inside 10 s, so
+///   the 95th percentile sits `(0.95 − 0.9228) / 0.0772` = **35.2 % into the
+///   overflow mass**; read off the recovered tail as a conditional
+///   distribution that is **≈15.6 s**. `17500` is the boundary that earns its
+///   place: it puts p95 inside a **2500 ms** bucket, the tightest in the tail.
+///   Same criterion that saved `7500` in the sibling constant — a boundary's
+///   worth is the WIDTH it gives the bucket a quantile of interest lands in,
+///   not its own occupancy. (Occupancy is fine too: the recovered tail splits
+///   24 / 18 / 11 across `(10,15]`, `(15,17.5]`, `(17.5,20]`.)
+///
+///   **Corrected during implementation, and worth recording because the wrong
+///   version was plausible:** a first draft placed a boundary at `12500` for a
+///   p95 estimated at ≈14.5 s. That estimate mis-indexed the conditional
+///   tail. At the correct ≈15.6 s, `12500` splits a bucket no quantile of
+///   interest occupies and `17500` is what is actually needed. An estimate
+///   this arithmetic drives a boundary directly, so getting it wrong silently
+///   spends a series in the wrong decade.
+/// * **`30000, 40000`** — where the p99 lives: 87.0 % into the overflow mass,
+///   **≈35.6 s**. `40000` rather than `45000` deliberately — and NOT `35000`,
+///   which is the estimate itself. A boundary placed AT a quantile makes the
+///   reported value a bucket EDGE, which is the failure mode #628 recorded for
+///   a p95 pinned at a bound; bracketing it in `(30000, 40000]` leaves it
+///   interpolated. Recovered occupancy `(20,30]` = 19, `(30,40]` = 6,
+///   `(40,60]` = 8.
+/// * **`60000`** — `LOCAL_LLM_EXCHANGE_TIMEOUT_SECS`. A local call cannot
+///   exceed it, so `le="60000"` is the "every Ollama call that succeeded" mark
+///   and the bucket above it is structurally external-only.
+/// * **`120000`** — `EXTERNAL_LLM_EXCHANGE_TIMEOUT_SECS`. **No boundary
+///   between 60 s and 120 s**: that entire region is reachable only by
+///   external-provider traffic, of which this deployment currently has none
+///   (see the provider note below). Splitting it would be imagination, not
+///   measurement.
+///
+/// ## Why `+Inf` is near-empty here, unlike the sibling
+///
+/// `EXECUTION_DURATION_BOUNDARIES_MS`'s top bound is a per-node *default* that
+/// a node can legitimately run past. This one is closer to a clamp: the
+/// `tokio::time::timeout` around the HTTP exchange is unconditional at 60/120 s
+/// with no per-request override. **Not a hard guarantee, and the difference is
+/// worth stating rather than rounding off:** `llm_start` is taken before key
+/// resolution (a vault RPC) and the duration is read after response parsing, so
+/// a recorded value CAN exceed the timeout — but only by time spent outside the
+/// exchange, never by provider latency. Overflow past 120 s therefore means
+/// "vault or parse was pathological", not "the provider was slow".
+///
+/// ## Cardinality and coupling
+///
+/// 14 finite boundaries → 15 bucket series, against the defaults' 15 → 16.
+/// This is one series FEWER per label set while covering a decade more range —
+/// the reallocation is the whole change. Labels are untouched: one `provider`
+/// key, values from the closed `normalize_llm_provider` set.
+///
+/// **Nothing selects on this metric's `le=` values.** Verified 2026-08-14:
+/// `wasm_llm_duration_ms` appears in `observability/rules/alerts.yml` only
+/// inside `annotations.description` prose (`SlowWASMExecution`,
+/// `VerySlowWASMExecution` point on-call at it as a triage step), never in an
+/// `expr:`. So unlike `EXECUTION_DURATION_BOUNDARIES_MS` — whose `2500` and
+/// `10000` are alert thresholds that must not move — no boundary here is
+/// load-bearing for a rule, and re-bucketing re-calibrates nothing.
+///
+/// ## One-time discontinuity (do not read this as seamless)
+///
+/// Boundary changes are not retroactive. On the deploy that lands this, eight
+/// `le` values STOP being reported (`0, 5, 10, 25, 50, 75, 100, 250`) and seven
+/// START (`15000, 17500, 20000, 30000, 40000, 60000, 120000`). `500, 750, 1000,
+/// 2500, 5000, 7500, 10000, +Inf` are preserved, which bounds the damage: any
+/// quantile at or below 10 s stays computable across the change, and only
+/// quantiles that land in the new region are meaningless over a window spanning
+/// it. A `[15d]` quantile is mixing two layouts for 15 days afterwards.
+///
+/// The `provider` label flips from `other` to `ollama` in the SAME deploy (see
+/// `normalize_llm_provider`). `sum by (le)` aggregations are unaffected; any
+/// per-provider selection is not.
+pub(crate) const LLM_DURATION_BOUNDARIES_MS: &[f64] = &[
+    // The mode: 74 % of all calls live in (500, 1000].
+    500.0, 750.0, 1000.0, //
+    // The shoulder — kept at the defaults' values so a sub-10 s quantile
+    // survives the re-bucketing.
+    2500.0, 5000.0, 7500.0, 10000.0, //
+    // Where p95 (≈15.6 s) and p99 (≈35.6 s) actually are. This region did not
+    // exist before and is the point of the change. 17500 puts p95 in a 2500 ms
+    // bucket; 30000/40000 bracket p99 rather than sitting on it.
+    15000.0, 17500.0, 20000.0, 30000.0, 40000.0, //
+    // The two exchange timeouts. Local calls cannot exceed 60 s; the bucket
+    // above it is structurally external-only, and this stack has no external
+    // LLM traffic, so it gets no interior boundary.
+    60000.0, 120000.0,
+];
+
 // ========================================================================
 // 🔥 SECURITY: Label Normalization
 // Prevent unbounded cardinality which can cause memory exhaustion
@@ -354,14 +529,168 @@ fn normalize_approval_decision(decision: &str) -> &'static str {
     }
 }
 
-/// Normalize LLM provider labels to fixed set
-fn normalize_llm_provider(provider: &str) -> &'static str {
+/// Normalize LLM provider labels to fixed set.
+///
+/// ## The `ollama` arm was missing until 2026-08-14, and a test said that was
+/// correct
+///
+/// The only caller (`record_llm_request` / `record_llm_failure`, both fed from
+/// `complete_impl`) passes one of a CLOSED four-variant enum —
+/// `anthropic | openai | gemini | ollama`. Three had arms; the fourth fell
+/// through to `"other"`. This is a tier-1 stack whose LLM traffic is 100 %
+/// local Ollama, so **every** LLM measurement it has ever produced was filed
+/// under `provider="other"`. Confirmed live on the dev stack 2026-08-14:
+/// `sum by (provider) (wasm_llm_requests_total)` returned exactly one series,
+/// `{provider="other"} 93`.
+///
+/// What kept it alive is worth naming, because the mechanism generalises:
+/// `metrics_tests.rs` carried
+/// `test_normalize_llm_provider_unknown_defaults_to_other`, and its body was
+/// `assert_eq!(normalize_llm_provider("ollama"), "other")`. Adding the arm
+/// turned that test red, under a NAME asserting the person adding it was
+/// wrong. A test can pin a bug as a requirement; when it does, the name is
+/// what does the damage. It is fixed, not deleted — see
+/// `normalize_llm_provider_labels_every_live_provider_and_folds_only_unknowns`.
+///
+/// `"other"` remains as the fold for a genuinely unknown string. It is now
+/// UNREACHABLE from `complete_impl` (closed enum, all four arms present) and
+/// is kept for the string-keyed callers a future provider could add — which is
+/// also why no `provider="other"` series is pre-seeded.
+///
+/// **Series discontinuity**: on the deploy that lands this, the existing
+/// `{provider="other"}` series stops advancing and `{provider="ollama"}`
+/// starts from zero. Nothing aggregates by provider today (no rule, no
+/// dashboard panel), so nothing breaks — but a `[15d]` per-provider query
+/// spanning the deploy sees a series end and another begin, not a rename.
+pub(crate) fn normalize_llm_provider(provider: &str) -> &'static str {
     match provider {
         "anthropic" => "anthropic",
         "openai" => "openai",
         "gemini" => "gemini",
+        "ollama" => "ollama",
         _ => "other",
     }
+}
+
+/// Why an `llm::complete*` call did not return a completion.
+///
+/// **This is a closed Rust enum on purpose and must stay one.** It is the
+/// `outcome` label of `wasm.llm.failures`, and the alternative — classifying
+/// from the provider's error text — would put an attacker- and
+/// prompt-influenced string into a Prometheus label. An LLM error body can
+/// echo the prompt back; a model name, a URL, or an HTTP body in a label is
+/// both an unbounded-cardinality memory-exhaustion surface and a data-leak
+/// surface. Every value below is a compile-time `&'static str` chosen by the
+/// call site, never derived from a response.
+///
+/// The variants are a partition of the exits from
+/// `TalosContext::complete_inner`, which returns `Result<_, LlmCallFailure>`
+/// specifically so that adding a new early return without choosing an outcome
+/// does not compile. That is the structural guarantee behind "every failure
+/// path is counted"; it is not an inspection of the current code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LlmFailure {
+    /// The execution's cancellation flag was already set on entry, so no
+    /// request was made. Counted for completeness — see the note on
+    /// `record_llm_failure` about the overlap with
+    /// `wasm_executions_cancelled_total`.
+    Cancelled,
+    /// No API key could be resolved for an external provider. Covers BOTH a
+    /// genuinely absent key AND a Tier-1 ceiling refusing external egress:
+    /// `get_llm_api_key` returns `None` for both, and `complete_inner` cannot
+    /// tell them apart. The tier refusal is separately visible as a
+    /// capability-denied event; do not read this label as "misconfigured".
+    NotConfigured,
+    /// The outbound request body could not be serialized.
+    ///
+    /// **Expect this to read a permanent 0, and do not "fix" it.** The exit is
+    /// a real `?` on `serde_json::to_vec`, but the value being serialized is a
+    /// `serde_json::Value` the adapter just built — `Value::Number` cannot
+    /// hold NaN/Inf and object keys are always `String`, so there is no input,
+    /// including a hostile `complete_with_options` payload (JSON has no NaN
+    /// literal and serde_json rejects one), that makes it fail. It is
+    /// classified rather than folded into another outcome so that if it ever
+    /// DOES fire, the label says what happened instead of blaming the network.
+    /// It is the one outcome below that no test drives through the production
+    /// path, for this reason.
+    InvalidRequest,
+    /// The HTTP request never completed — connect refused, DNS, TLS, reset.
+    Network,
+    /// The whole exchange exceeded `LOCAL_/EXTERNAL_LLM_EXCHANGE_TIMEOUT_SECS`.
+    Timeout,
+    /// HTTP 429 from the provider.
+    RateLimited,
+    /// Any other non-2xx HTTP status. The status code itself is deliberately
+    /// NOT a label: it is provider-controlled and would multiply the series
+    /// count by the size of the HTTP status space.
+    HttpStatus,
+    /// The response body exceeded `MAX_LLM_BODY_BYTES` and the read was
+    /// aborted.
+    OversizedResponse,
+    /// A 2xx response arrived but the adapter could not parse it.
+    Decode,
+}
+
+impl LlmFailure {
+    /// The Prometheus label value. `&'static str`, so building the `KeyValue`
+    /// allocates nothing.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            LlmFailure::Cancelled => "cancelled",
+            LlmFailure::NotConfigured => "not_configured",
+            LlmFailure::InvalidRequest => "invalid_request",
+            LlmFailure::Network => "network",
+            LlmFailure::Timeout => "timeout",
+            LlmFailure::RateLimited => "rate_limited",
+            LlmFailure::HttpStatus => "http_status",
+            LlmFailure::OversizedResponse => "oversized_response",
+            LlmFailure::Decode => "decode",
+        }
+    }
+
+    /// Every variant, for exhaustiveness tests and seeding.
+    pub(crate) const ALL: [LlmFailure; 9] = [
+        LlmFailure::Cancelled,
+        LlmFailure::NotConfigured,
+        LlmFailure::InvalidRequest,
+        LlmFailure::Network,
+        LlmFailure::Timeout,
+        LlmFailure::RateLimited,
+        LlmFailure::HttpStatus,
+        LlmFailure::OversizedResponse,
+        LlmFailure::Decode,
+    ];
+}
+
+/// The provider label values `complete_impl` can actually produce — the four
+/// variants of the WIT `Provider` enum, normalized. Deliberately NOT including
+/// `"other"`: with all four arms present in `normalize_llm_provider`, no call
+/// from `complete_impl` can reach it.
+pub(crate) const LLM_PROVIDER_LABELS: [&str; 4] = ["anthropic", "openai", "gemini", "ollama"];
+
+/// The `(provider, outcome)` pairs a live code path can actually write, and
+/// therefore the exact set `seed_zero_series` pre-seeds at 0.
+///
+/// Two carve-outs, both in the SAFE direction (under-seeding means a series
+/// appears on its first real event; over-seeding asserts a watched signal that
+/// does not exist, which `seed_zero_series`' own doc calls the worse error):
+///
+/// * **`provider="other"`** — excluded entirely. Unreachable from
+///   `complete_impl`; see `normalize_llm_provider`.
+/// * **`(ollama, not_configured)`** — excluded. `complete_impl` branches on
+///   `is_local` and skips key resolution for Ollama altogether, so the
+///   `NotConfigured` exit is unreachable for it. This is why the seed set is
+///   an irregular 35 and not a tidy 36; regularising it would be a
+///   regression, which is what this comment and
+///   `seeded_llm_failure_series_excludes_unreachable_combinations` exist to
+///   prevent.
+pub(crate) fn seeded_llm_failure_series() -> impl Iterator<Item = (&'static str, LlmFailure)> {
+    LLM_PROVIDER_LABELS.into_iter().flat_map(|provider| {
+        LlmFailure::ALL
+            .into_iter()
+            .filter(move |outcome| !(provider == "ollama" && *outcome == LlmFailure::NotConfigured))
+            .map(move |outcome| (provider, outcome))
+    })
 }
 
 /// Normalize LLM token direction labels to fixed set
@@ -452,12 +781,56 @@ pub struct RuntimeMetrics {
     /// Approval gate decisions by decision (approved, denied)
     pub approval_decided: Counter<u64>,
 
-    /// LLM API requests by provider (anthropic, openai, gemini)
+    /// SUCCESSFUL `llm::complete*` calls by provider.
+    ///
+    /// Named `requests`, counts only successes — the read-side trap this
+    /// metric's own sibling `llm_failures` was added to close. `requests +
+    /// failures` is the attempt count; neither alone is.
+    ///
+    /// Scope is `complete_impl` ONLY (see `llm_failures`).
     pub llm_requests: Counter<u64>,
-    /// LLM token usage by direction (input, output)
+    /// LLM token usage by direction (input, output). Successful calls only —
+    /// a failed call reports no usage.
     pub llm_token_usage: Counter<u64>,
-    /// LLM request duration (milliseconds)
+    /// Duration of SUCCESSFUL `llm::complete*` calls (milliseconds).
+    /// Buckets: `LLM_DURATION_BOUNDARIES_MS`, whose header explains why a
+    /// timeout contributes nothing here.
     pub llm_duration: Histogram<f64>,
+
+    /// `llm::complete*` calls that did NOT return a completion, by
+    /// `(provider, outcome)`. → `wasm_llm_failures_total`.
+    ///
+    /// ## Scope — this counter does NOT cover LLM traffic in general
+    ///
+    /// Stated up front because a metric whose name implies whole-surface
+    /// coverage is the defect this counter was added to fix: before
+    /// 2026-08-14 `wasm.llm.requests` was incremented at exactly one site,
+    /// below eight early returns, so it counted successes while being named
+    /// for attempts, and no LLM failure anywhere in this system incremented
+    /// anything at all.
+    ///
+    /// **Covered:** `TalosContext::complete_impl`, i.e. the WIT `llm::complete`,
+    /// `llm::complete-json` and `llm::complete-with-options` host functions.
+    ///
+    /// **NOT covered, and unchanged by this work:**
+    /// * streaming completions (`host/llm_streaming.rs`)
+    /// * tool-calling completions (`host/llm_tools.rs`)
+    /// * embeddings (`host/llm.rs`, `embedding` interface)
+    /// * every controller-side LLM call — `talos-llm`, graph-RAG entity
+    ///   extraction, `local_llm_complete`, workflow-engine LLM nodes
+    ///
+    /// Those emit no metrics of any kind, before or after this change. A zero
+    /// here means "no `complete_impl` failure", never "no LLM failure".
+    ///
+    /// ## Cardinality
+    ///
+    /// Two labels, both closed compile-time sets: `provider` from
+    /// `normalize_llm_provider` (4 reachable values) × `outcome` from
+    /// `LlmFailure` (9). 35 reachable pairs (see `seeded_llm_failure_series`),
+    /// all pre-seeded at 0, ×2 for the compose file's declared
+    /// `WORKER_REPLICAS:-2` = 70 series. No response text, status code, model
+    /// name, URL, or error string is or may become a label value.
+    pub llm_failures: Counter<u64>,
 
     /// Executions cancelled via cancellation token
     pub executions_cancelled: Counter<u64>,
@@ -618,17 +991,34 @@ impl RuntimeMetrics {
                 .with_description("Approval gate decisions")
                 .build(),
 
+            // Descriptions say "successful" because these three instruments
+            // are written at one site AFTER every early return in
+            // `complete_impl`. The `# HELP` line is the only place an
+            // operator reading /metrics can learn that.
             llm_requests: meter
                 .u64_counter("wasm.llm.requests")
-                .with_description("LLM API requests by provider")
+                .with_description(
+                    "Successful llm::complete* calls by provider \
+                     (failures: wasm_llm_failures_total)",
+                )
                 .build(),
             llm_token_usage: meter
                 .u64_counter("wasm.llm.token_usage")
-                .with_description("LLM token usage by direction")
+                .with_description("LLM token usage by direction (successful calls only)")
                 .build(),
             llm_duration: meter
                 .f64_histogram("wasm.llm.duration_ms")
-                .with_description("LLM request duration in milliseconds")
+                .with_description("Successful llm::complete* duration in milliseconds")
+                .with_boundaries(LLM_DURATION_BOUNDARIES_MS.to_vec())
+                .build(),
+            // → `wasm_llm_failures_total`. See the field doc for the scope
+            // this does and does not cover.
+            llm_failures: meter
+                .u64_counter("wasm.llm.failures")
+                .with_description(
+                    "Failed llm::complete* calls by provider and outcome \
+                     (complete_impl only; not streaming/tools/embeddings)",
+                )
                 .build(),
 
             executions_cancelled: meter
@@ -710,13 +1100,29 @@ impl RuntimeMetrics {
     ///   seeded, which also makes `LowCacheHitRate`'s
     ///   `hits / (hits + misses)` well-defined instead of dropping to an
     ///   empty vector whenever one leg had never been touched.
-    /// * `errors` / `retries` / `llm.*` / `approval.*` / `quota.*` /
+    /// * `errors` / `retries` / `llm.token_usage` / `approval.*` / `quota.*` /
     ///   `host_function.*` — NOT seeded. Their label populations are driven
     ///   by which failure or which host call actually happened, so a seeded
     ///   combination would assert a class of event is being watched for when
     ///   nothing distinguishes "zero timeouts" from "the timeout path was
     ///   deleted". Their alerts are `> threshold` shapes, which behave
     ///   correctly over an absent series (no data, no alert).
+    /// * `llm.failures` and `llm.requests` — **seeded, 2026-08-14, breaking
+    ///   the `llm.*` blanket above.** The `> threshold` argument is what
+    ///   justifies leaving a counter unseeded, and it does not apply to
+    ///   these two. The questions actually asked of a failure counter are
+    ///   "is anything failing" (`increase(...) == 0`, EMPTY over an absent
+    ///   series, so it matches nothing and reads as healthy on a worker that
+    ///   has never reported) and "what fraction is failing"
+    ///   (`failures / (failures + requests)`, which drops to an empty vector
+    ///   whenever either leg has never been touched). That is the same
+    ///   `a / (a + b)` shape already cited above as the reason `cache.hits`
+    ///   and `cache.misses` are both seeded; this is that precedent applied,
+    ///   not an exception to it. `llm.requests` is seeded per provider for
+    ///   the four values `complete_impl` can emit; `llm.failures` for the 35
+    ///   reachable `(provider, outcome)` pairs — the reachability carve-outs
+    ///   live in `seeded_llm_failure_series`, and both legs must be seeded
+    ///   or the ratio is no better defined than before.
     ///
     /// SECURITY: every label value below is a compile-time `&'static str`
     /// from a closed set. No worker id, execution id, module name, user id,
@@ -730,6 +1136,20 @@ impl RuntimeMetrics {
         }
         self.cache_hits.add(0, &[]);
         self.cache_misses.add(0, &[]);
+        // Both legs of `failures / (failures + requests)` — see the doc above.
+        for provider in LLM_PROVIDER_LABELS {
+            self.llm_requests
+                .add(0, &[KeyValue::new("provider", provider)]);
+        }
+        for (provider, outcome) in seeded_llm_failure_series() {
+            self.llm_failures.add(
+                0,
+                &[
+                    KeyValue::new("provider", provider),
+                    KeyValue::new("outcome", outcome.label()),
+                ],
+            );
+        }
     }
 
     /// Record execution completion
@@ -843,7 +1263,42 @@ impl RuntimeMetrics {
             .add(1, &[KeyValue::new("decision", normalized)]);
     }
 
-    /// Record an LLM API request.
+    /// Record an `llm::complete*` call that did not return a completion.
+    ///
+    /// SECURITY: both label values are compile-time `&'static str` from closed
+    /// sets — `normalize_llm_provider` folds anything unrecognised to
+    /// `"other"`, and `outcome` comes from the `LlmFailure` enum, never from a
+    /// provider response. Nothing caller-, guest- or provider-controlled can
+    /// reach a label here.
+    ///
+    /// PERF: this sits on the LLM host path. The `KeyValue` array is two
+    /// borrowed `&'static str`s on the stack — no allocation — and the SDK
+    /// does one attribute-set lookup. Note the OTEL Rust API has no
+    /// bound-instrument / "label children" concept (that is the `prometheus`
+    /// crate's `with_label_values`), so the lookup cannot be hoisted to init;
+    /// it is the same per-call cost every other recorder in this file pays,
+    /// against a call that just spent between 0.5 s and 120 s on the network.
+    ///
+    /// OVERLAP, stated so nobody double-counts: `LlmFailure::Cancelled` is
+    /// also counted by `record_execution_cancelled` →
+    /// `wasm_executions_cancelled_total`. It is included here anyway so that
+    /// `llm_requests + llm_failures` is exactly the number of entries into
+    /// `complete_impl`, with no unaccounted exit. It is a pre-flight abort,
+    /// not a provider failure; the label says so.
+    pub fn record_llm_failure(&self, provider: &str, outcome: LlmFailure) {
+        let normalized = normalize_llm_provider(provider);
+        self.llm_failures.add(
+            1,
+            &[
+                KeyValue::new("provider", normalized),
+                KeyValue::new("outcome", outcome.label()),
+            ],
+        );
+    }
+
+    /// Record a SUCCESSFUL LLM API request. Failures go to
+    /// `record_llm_failure`; this site is below every early return in
+    /// `complete_impl`.
     /// SECURITY: Provider labels are normalized to prevent unbounded cardinality.
     pub fn record_llm_request(&self, provider: &str, duration_ms: f64) {
         let normalized = normalize_llm_provider(provider);
@@ -950,6 +1405,27 @@ pub fn init_telemetry() -> Result<(), Box<dyn std::error::Error>> {
     println!("[METRICS] OpenTelemetry initialized with Prometheus exporter");
     println!("[METRICS] Metrics will be available at /metrics endpoint");
     Ok(())
+}
+
+/// `init_telemetry` for tests, callable from anywhere in the binary.
+///
+/// The exporter registers a collector into `prometheus::default_registry()`,
+/// which is process-global, so a second call returns
+/// `InternalFailure("Duplicate metrics collector registration attempted")`.
+/// That was harmless while `metrics_tests` was the only caller and could
+/// document itself as such; it stopped being harmless the moment a second
+/// module (`host::llm::llm_failure_metrics_tests`) also needed a live
+/// exporter, because which one hit the duplicate depended on test scheduling.
+///
+/// Deliberately NOT solved by making `init_telemetry` itself idempotent:
+/// production calls it exactly once and a real double-init there is a bug
+/// worth surfacing, not swallowing.
+#[cfg(test)]
+pub(crate) fn init_telemetry_for_tests() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        init_telemetry().expect("telemetry init");
+    });
 }
 
 /// Get Prometheus metrics in text format
