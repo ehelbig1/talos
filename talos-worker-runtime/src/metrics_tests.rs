@@ -149,17 +149,40 @@ mod tests {
         assert_eq!(normalize_llm_provider(""), "other");
     }
 
-    /// The seed set is deliberately irregular (35, not 4 × 9 = 36) and this
-    /// pins the two carve-outs so a future "tidy-up" has to argue with a test.
+    /// The seed set is deliberately irregular (31, not 4 × 9 = 36) and this
+    /// pins every carve-out so a future "tidy-up" has to argue with a test.
+    ///
+    /// **This test was itself the defect once.** Its first version asserted
+    /// `len() == product - 1` and then looped the whole product asserting
+    /// "everything else IS reachable and must be seeded" — which was false for
+    /// the four `invalid_request` pairs the crate documents as permanently
+    /// unreachable. Removing those dead seeds, the correct move under
+    /// `seed_zero_series`' own rule, turned this test RED under a name claiming
+    /// it excluded unreachable combinations. That is the pinned-bug shape the
+    /// parent commit exists to remove. The loop below now walks the SAME
+    /// carve-out predicate the production iterator uses, so the two cannot
+    /// drift apart into that state again.
     #[test]
     fn seeded_llm_failure_series_excludes_unreachable_combinations() {
         use crate::metrics::{seeded_llm_failure_series, LlmFailure, LLM_PROVIDER_LABELS};
         let seeded: Vec<(&str, LlmFailure)> = seeded_llm_failure_series().collect();
 
+        // The single source of truth for "is this pair reachable at all".
+        let unreachable = |provider: &str, outcome: LlmFailure| {
+            (provider == "ollama" && outcome == LlmFailure::NotConfigured)
+                || outcome == LlmFailure::InvalidRequest
+        };
+
+        let expected = LLM_PROVIDER_LABELS
+            .into_iter()
+            .flat_map(|p| LlmFailure::ALL.into_iter().map(move |o| (p, o)))
+            .filter(|(p, o)| !unreachable(p, *o))
+            .count();
         assert_eq!(
             seeded.len(),
-            LLM_PROVIDER_LABELS.len() * LlmFailure::ALL.len() - 1,
-            "expected exactly one carve-out from the full product"
+            expected,
+            "seed set must be exactly the reachable pairs: 1 ollama/not_configured \
+             carve-out + 4 invalid_request carve-outs removed from the 36-pair product"
         );
         assert!(
             !seeded.contains(&("ollama", LlmFailure::NotConfigured)),
@@ -168,14 +191,22 @@ mod tests {
              watched signal that does not exist"
         );
         assert!(
+            !seeded.iter().any(|(_, o)| *o == LlmFailure::InvalidRequest),
+            "InvalidRequest documents itself as a permanent 0 — the `?` is on \
+             serde_json::to_vec over a Value the adapter just built, which cannot \
+             fail for any input. That is a STRONGER unreachability argument than \
+             the ollama branch, so seeding it while excluding ollama was backwards"
+        );
+        assert!(
             !seeded.iter().any(|(p, _)| *p == "other"),
             "`other` is unreachable from complete_impl now that every arm of \
              the closed provider enum is present in normalize_llm_provider"
         );
-        // Everything else in the product IS reachable and must be seeded.
+        // Every pair the predicate calls REACHABLE must be seeded — an absent
+        // series makes `increase(...) == 0` match nothing.
         for provider in LLM_PROVIDER_LABELS {
             for outcome in LlmFailure::ALL {
-                if provider == "ollama" && outcome == LlmFailure::NotConfigured {
+                if unreachable(provider, outcome) {
                     continue;
                 }
                 assert!(
@@ -389,8 +420,20 @@ mod tests {
             }
             seeded_count += 1;
         }
+        // 31 = 4 providers × 9 outcomes, minus (ollama, not_configured) and
+        // minus all four (*, invalid_request). Was 35 until 2026-08-14, when
+        // review found the invalid_request pairs seeded despite the enum's own
+        // doc calling them a permanent 0 — see `seeded_llm_failure_series`.
+        //
+        // This assertion is a TRIPWIRE and it worked: when the carve-out
+        // changed, it failed with a message telling the reader to go re-read
+        // the carve-outs, which is exactly what it is for. Worth contrasting
+        // with the sibling test's first version, which asserted "everything
+        // else IS reachable and must be seeded" — a claim that was FALSE and
+        // would have made the correct fix look like the regression. A tripwire
+        // states what changed; a booby trap states that the bug is correct.
         assert_eq!(
-            seeded_count, 35,
+            seeded_count, 31,
             "the reachable (provider, outcome) set changed size; \
              seeded_llm_failure_series' carve-outs need re-reading"
         );

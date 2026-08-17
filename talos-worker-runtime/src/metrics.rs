@@ -351,6 +351,24 @@ pub(crate) const EXECUTION_DURATION_BOUNDARIES_MS: &[f64] = &[
 /// over-represented among slow ones because a slow call is more likely to be
 /// alone in a scrape interval.
 ///
+/// **The bias is NOT confined to the 10 s line, and the p95 below is therefore
+/// an upper bound rather than a point estimate.** Added in review (2026-08-14),
+/// because the paragraph further down correctly warns that "an estimate this
+/// arithmetic drives a boundary directly" and then quotes p95 ≈ 15.6 s with no
+/// error bar. The isolation mechanism is monotone in duration, so it thins the
+/// FAST end of the tail as well: the population holds ≈124 calls over 10 s and
+/// this sample recovered 86, and the ≈38 missing ones are missing precisely
+/// because they were less isolated, i.e. faster. Redistributing all 38 into
+/// `(10, 15]` — the extreme, but the correct DIRECTION — moves p95 to ≈13.5 s,
+/// below the `15000` bound. So the honest reading is **p95 ∈ [13.5 s, 15.9 s]**
+/// and p99 ≈ 35 s with the same downward skew.
+///
+/// Nothing breaks either way: `15000` and `17500` are both present, so a p95
+/// anywhere in that interval lands in a 2500 ms bucket. The reason to say this
+/// out loud is that the rejected first draft put p95 at ≈14.5 s and spent a
+/// boundary at `12500` — and under this correction that draft was closer to
+/// right than the confident number that replaced it.
+///
 /// ## Region-by-region
 ///
 /// * **Nothing below `500`.** 1.25 % of calls land there and the fastest call
@@ -679,16 +697,34 @@ pub(crate) const LLM_PROVIDER_LABELS: [&str; 4] = ["anthropic", "openai", "gemin
 ///   `complete_impl`; see `normalize_llm_provider`.
 /// * **`(ollama, not_configured)`** — excluded. `complete_impl` branches on
 ///   `is_local` and skips key resolution for Ollama altogether, so the
-///   `NotConfigured` exit is unreachable for it. This is why the seed set is
-///   an irregular 35 and not a tidy 36; regularising it would be a
-///   regression, which is what this comment and
-///   `seeded_llm_failure_series_excludes_unreachable_combinations` exist to
-///   prevent.
+///   `NotConfigured` exit is unreachable for it.
+///
+/// * **`(*, invalid_request)`** — all four excluded. `LlmFailure::InvalidRequest`
+///   documents itself as reading "a permanent 0, and do not `fix` it": the exit
+///   is a real `?` on `serde_json::to_vec` over a `Value` the adapter just
+///   built, which cannot fail for any input. **This is a STRICTLY STRONGER
+///   unreachability argument than the ollama one** — that pair is unreachable
+///   by a branch, these are unreachable by any input at all — so excluding the
+///   weaker case while seeding the stronger one was backwards.
+///
+/// Caught in review of the commit that introduced this seeding (2026-08-14).
+/// The seed set is 31, not 35 and not a tidy 36. The rule this obeys is
+/// `seed_zero_series`' own: over-seeding asserts a watched signal that does
+/// not exist, which is the worse error. Four flat-zero children are cheap in
+/// isolation — the reason they had to go is that the previous test
+/// `seeded_llm_failure_series_excludes_unreachable_combinations` PINNED them:
+/// its final loop asserted "everything else in the product IS reachable and
+/// must be seeded", so removing the dead seeds — the correct move under this
+/// crate's own stated rule — turned red a test whose NAME claimed it excluded
+/// unreachable combinations. That is exactly the shape of
+/// `test_normalize_llm_provider_unknown_defaults_to_other`, the pinned-bug
+/// pattern the parent commit exists to remove, reproduced inside the fix.
 pub(crate) fn seeded_llm_failure_series() -> impl Iterator<Item = (&'static str, LlmFailure)> {
     LLM_PROVIDER_LABELS.into_iter().flat_map(|provider| {
         LlmFailure::ALL
             .into_iter()
             .filter(move |outcome| !(provider == "ollama" && *outcome == LlmFailure::NotConfigured))
+            .filter(|outcome| *outcome != LlmFailure::InvalidRequest)
             .map(move |outcome| (provider, outcome))
     })
 }
@@ -809,10 +845,22 @@ pub struct RuntimeMetrics {
     /// for attempts, and no LLM failure anywhere in this system incremented
     /// anything at all.
     ///
-    /// **Covered:** `TalosContext::complete_impl`, i.e. the WIT `llm::complete`,
-    /// `llm::complete-json` and `llm::complete-with-options` host functions.
+    /// **Covered:** `TalosContext::complete_impl` — every exit inside
+    /// `complete_inner`, which is where `llm::complete` and `llm::complete-json`
+    /// go in their entirety.
     ///
     /// **NOT covered, and unchanged by this work:**
+    /// * **Two `complete-with-options` PRE-FLIGHT exits.** `wit_llm::Host::
+    ///   complete_with_options` validates the options blob BEFORE calling
+    ///   `complete_impl` and returns `Error::InvalidRequest` directly on an
+    ///   oversized payload and on a non-object payload. Those two returns
+    ///   increment nothing. So a guest failing every call on a malformed
+    ///   options blob shows a FLAT ZERO here. Caught in review of this commit
+    ///   (2026-08-14): the first version of this doc listed
+    ///   `complete-with-options` as covered outright, which is the same
+    ///   name-implies-more-than-it-counts defect the counter exists to fix,
+    ///   one level over. The rest of that host function — everything after
+    ///   validation — IS covered, because it routes through `complete_impl`.
     /// * streaming completions (`host/llm_streaming.rs`)
     /// * tool-calling completions (`host/llm_tools.rs`)
     /// * embeddings (`host/llm.rs`, `embedding` interface)
