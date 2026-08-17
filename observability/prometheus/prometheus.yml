@@ -177,10 +177,15 @@ scrape_configs:
   # ========================================================================
   # node-exporter — TEXTFILE COLLECTOR ONLY
   # ========================================================================
-  # The scrape path for metrics produced by SCRIPTS rather than by a Rust
-  # process. Today that is exactly one producer:
-  # `scripts/drills/backup-restore.sh` writes `talos_backup_drill_*` into a
-  # textfile directory that the exporter mounts read-only.
+  # The scrape path for metrics that are written to a FILE rather than served
+  # from a process. Two producers today, both host-side:
+  #   * `scripts/drills/backup-restore.sh` writes `talos_backup_drill_*`;
+  #   * the `talos-offhost-backup` binary (driven by
+  #     `scripts/offhost-backup/upload.sh`) writes `talos_offhost_backup_*`.
+  # Both land in the same textfile directory, which the exporter mounts
+  # read-only, in separate `.prom` files — node_exporter discards a whole
+  # file on a parse error, so sharing one would couple the two producers'
+  # failure modes.
   #
   # Before 2026-08-03 no node_exporter and no textfile collector existed
   # anywhere in this repo, so `talos_backup_drill_last_success_timestamp_seconds`

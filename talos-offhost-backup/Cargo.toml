@@ -1,0 +1,51 @@
+[package]
+name = "talos-offhost-backup"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Off-host backup egress (Tier 2). A LEAF crate on purpose: it must be
+# buildable and testable with no database, no NATS and no credentials, because
+# the whole point is that every part of it can be exercised BEFORE the
+# operator's B2 bucket exists. Nothing in the controller or worker depends on
+# it — it is driven by `scripts/offhost-backup/*.sh` and by the restore drill.
+#
+# `age` is a LIBRARY dependency rather than a shell-out to the `age` CLI, and
+# that is a forced choice, not a preference: the CLI has no non-interactive
+# passphrase input (it reads the passphrase from /dev/tty and fails with
+# ENOTTY on a pipe), so a scheduled, unattended encrypt is impossible through
+# it. The library takes the passphrase as a value, so it never touches a tty,
+# a temp file or an argv. The FILES ARE STANDARD age files: `age -d` with the
+# escrowed passphrase opens them by hand, which is the property that matters
+# in a disaster — recovery must not depend on this workspace compiling.
+#
+# SUPPLY-CHAIN COST, stated rather than discovered later. `age` is pinned at
+# 0.11 and not 0.12 deliberately: 0.12 adds post-quantum recipients and drags
+# in `hpke`, `ml-kem`, `p256` and `sha3` for a feature nothing here uses.
+# Even at 0.11 it brings ~40 transitive crates, mostly the `i18n-embed` /
+# `fluent` stack that localises age's own error strings. `cargo audit` on the
+# resulting tree reports ZERO vulnerabilities and one NEW warning —
+# `proc-macro-error2` RUSTSEC-2026-0173 "unmaintained", a build-time
+# proc-macro helper reached via `i18n-embed-fl`, with no runtime surface.
+# Recorded here so a future reviewer weighing "why is fluent in a backup
+# crate?" gets the answer without re-deriving it.
+[dependencies]
+age = "0.11"
+chrono.workspace = true
+# Only to parse `aws --output json` listings. Deliberately not a whole SDK:
+# `aws-sdk-s3` would drag a large async stack into a crate whose entire job is
+# to be small enough that the operator can read it before trusting it with the
+# only off-host copy of their data.
+serde_json.workspace = true
+thiserror.workspace = true
+# The escrow-command watchdog must kill the whole PROCESS GROUP, not just the
+# direct child. `sh -c 'cmd'` forks the real command as a GRANDCHILD which
+# inherits the capture pipe, so TERMing only the child leaves the read blocked
+# forever on an EOF that never comes — measured in #639, where a `sleep 300`
+# survived as a PID-1 orphan and wedged a run past a 3 s limit.
+libc = "0.2"
+
+[lints]
+workspace = true

@@ -963,10 +963,24 @@ services:
   #   * talos_backup_drill_{last_run,last_success}_timestamp_seconds and
   #     talos_backup_drill_last_status — the three gauges the drill writes
   #     (two unix timestamps and a 1/0). No secret, no path, no hostname.
+  #   * talos_offhost_backup_* — the SECOND textfile producer, added with the
+  #     Tier-2 off-host egress: talos_offhost_backup_enabled (1/0),
+  #     _last_run_timestamp_seconds, _last_success_timestamp_seconds{kind},
+  #     _uploads_total{kind,outcome} and _failures_total{reason}. Every label
+  #     value is from a CLOSED compile-time set (2 kinds × 2 outcomes, 7
+  #     reasons) — none is derived from provider error text, so this cannot
+  #     become a cardinality bomb, and no bucket name, key id, object key or
+  #     path appears in any of them. Written by the `talos-offhost-backup`
+  #     binary into its OWN file, talos_offhost_backup.prom, rather than into
+  #     the drill's: node_exporter drops a whole .prom on a parse error, and
+  #     sharing one file would let a malformed write from either producer take
+  #     the other's metric down with it.
   #   * node_textfile_mtime_seconds / node_textfile_scrape_error — the
   #     collector's own health, which usefully catches a malformed .prom.
   #     The mtime series carries a `file=` label, and it is the CONTAINER
-  #     path (`/textfile/talos_backup_drill.prom`), not a host path.
+  #     path (`/textfile/talos_backup_drill.prom`,
+  #     `/textfile/talos_offhost_backup.prom`), not a host path. There is now
+  #     one mtime series per producer file.
   #   * node_scrape_collector_duration_seconds / node_scrape_collector_success,
   #     both labelled `collector="textfile"` only.
   #   * the exporter's Go/process/promhttp self-metrics and
@@ -977,7 +991,13 @@ services:
   # flags and enumerating every series name it returned: 47 names total
   # (3 talos_backup_drill_*, 5 node_* — the 4 above plus
   # node_exporter_build_info — and 39 go_/process_/promhttp_ self metrics),
-  # and every one of the 8 forbidden prefixes above at zero.
+  # and every one of the 8 forbidden prefixes above at zero. The
+  # talos_offhost_backup_* family is enumerated from its producer
+  # (talos-offhost-backup/src/metrics.rs, whose `render` emits exactly 15
+  # samples across 5 families and is pinned by a unit test) rather than from a
+  # live scrape, because the bucket it needs does not exist yet — stated
+  # rather than implied, since that is a weaker form of evidence than the 2026-08-03
+  # audit above.
   #
   # The directory is mounted READ-ONLY: the exporter can never write there,
   # and a compromised exporter cannot forge a green drill on disk.

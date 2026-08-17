@@ -5,7 +5,9 @@
 # the hypothesis end-to-end:
 #
 #  0b. Obtain the KEK from ESCROW              (NEVER from the live stack)
-#   1. Select the backup artifacts to restore   (newest sidecar dump + vault tar)
+#   1. Select the backup artifacts to restore   (local sidecar artifacts, or
+#                                                --source b2: fetch + age-decrypt
+#                                                the OFF-HOST copy)
 #   2. Build the verifiers                      (before anything holds real data)
 #   3. Spin up scratch Postgres + Vault         (throwaway net, creds, volumes)
 #   4. Restore the Postgres dump into scratch   (pg_restore --exit-on-error)
@@ -34,8 +36,21 @@
 #
 # Usage:
 #   ./scripts/drills/backup-restore.sh                 # restore the newest ARTIFACT
+#   ./scripts/drills/backup-restore.sh --source b2     # restore the OFF-HOST copy
 #   ./scripts/drills/backup-restore.sh --source live   # dump live now, restore that
 #   ./scripts/drills/backup-restore.sh --keep-scratch  # leave scratch up to inspect
+#
+# `--source b2` is the Tier-2 mode and it answers a strictly harder question
+# than the default: it fetches from object storage, age-decrypts with the
+# ESCROWED passphrase, and only then restores. It needs an age passphrase
+# source, set exactly one of (both is refused, same rule as the KEK):
+#   TALOS_OFFHOST_AGE_PASSPHRASE_CMD='op read "op://Private/Talos age backup/password"'
+#   TALOS_OFFHOST_AGE_PASSPHRASE_FILE=/Volumes/escrow/talos-age.pass
+# It FAILS — it does not fall back to the local copy — when the bucket is
+# unreachable, when the bucket holds no archive, when the newest archive is
+# older than TALOS_DRILL_MAX_ARTIFACT_AGE_HOURS, or when the passphrase is
+# wrong. A drill that silently restored the local artifact after failing to
+# reach the bucket would certify an off-host copy that does not exist.
 #
 # See scripts/drills/README.md for scheduling and for what this does NOT cover.
 
@@ -154,8 +169,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 case "$SOURCE_MODE" in
-    artifact|live) ;;
-    *) echo "--source must be 'artifact' (default) or 'live', got '$SOURCE_MODE'" >&2; exit 1 ;;
+    artifact|live|b2) ;;
+    *) echo "--source must be 'artifact' (default), 'b2' or 'live', got '$SOURCE_MODE'" >&2; exit 1 ;;
 esac
 
 # ── Output helpers. No ansi codes go to the textfile. ─────────────
@@ -751,6 +766,11 @@ ok "KEK read from $KEK_SOURCE (${#TALOS_MASTER_KEY} chars; provider '$KEK_PROVID
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/talos-drill-XXXXXXXX")"
 chmod 700 "$WORK_DIR"
 
+# Hoisted out of step 2: the `--source b2` branch below needs the repo root
+# to build and locate the off-host helper, and step 1 runs first.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
 # ── 1. Select the artifacts to restore ────────────────────────────
 if [[ "$SOURCE_MODE" == "artifact" ]]; then
     log "[1/7] selecting backup artifacts from $BACKUP_DIR"
@@ -843,6 +863,104 @@ if [[ "$SOURCE_MODE" == "artifact" ]]; then
     }
     assert_artifact_fresh "$PG_ARTIFACT_MTIME"    "postgres artifact" "$PG_ARTIFACT"
     assert_artifact_fresh "$VAULT_ARTIFACT_MTIME" "vault artifact"    "$VAULT_ARTIFACT"
+elif [[ "$SOURCE_MODE" == "b2" ]]; then
+    # ── TIER 2: restore the OFF-HOST copy ─────────────────────────
+    #
+    # WHY THIS MODE EXISTS. `--source artifact` restores a file from the very
+    # disk whose loss the backups insure against, so a green run says nothing
+    # about surviving that loss. Until this mode existed, the off-host egress
+    # could have been shipping corrupt archives, or nothing at all, and every
+    # drill would still have passed — the same "re-tests the copy already
+    # known to work" defect the 2026-08-03 rewrite found one level in.
+    #
+    # THERE IS NO FALLBACK TO THE LOCAL COPY, deliberately, and for exactly
+    # the reason step 0b keeps no fallback to the live KEK: a path that can
+    # quietly succeed the easy way leaves the defect in place while looking
+    # fixed. Unreachable bucket, empty bucket, stale archive and wrong
+    # passphrase are all FATAL here.
+    log "[1/7] fetching backup artifacts from OFF-HOST object storage (--source b2)"
+
+    # The age passphrase is a SECOND fatal secret — losing it makes every
+    # uploaded archive unreadable, exactly as losing the KEK does. Same
+    # containment rules, reusing the same helpers rather than similar ones.
+    if [[ -n "${TALOS_OFFHOST_AGE_PASSPHRASE_CMD:-}" && -n "${TALOS_OFFHOST_AGE_PASSPHRASE_FILE:-}" ]]; then
+        die "both TALOS_OFFHOST_AGE_PASSPHRASE_CMD and TALOS_OFFHOST_AGE_PASSPHRASE_FILE are set.
+   Set exactly one. Resolving it by precedence would silently ignore one of them
+   — and the one that loses is the FILE, the branch that carries the containment
+   checks. Unset whichever you did not mean."
+    fi
+    if [[ -z "${TALOS_OFFHOST_AGE_PASSPHRASE_CMD:-}${TALOS_OFFHOST_AGE_PASSPHRASE_FILE:-}" ]]; then
+        die "no age passphrase source configured — the off-host archives cannot be opened.
+
+   This mode answers 'if the host is gone, can the OFF-HOST copy be read?'.
+   Supply the escrowed passphrase by ONE of:
+
+     TALOS_OFFHOST_AGE_PASSPHRASE_CMD='op read \"op://Private/Talos age backup/password\"'
+     TALOS_OFFHOST_AGE_PASSPHRASE_FILE=/Volumes/escrow/talos-age.pass
+       (refused if that path is inside this repo or inside $BACKUP_DIR)
+
+   If you cannot produce it from an off-box source, THAT IS THE DRILL RESULT:
+   every archive in the bucket is currently unreadable. See docs/offhost-backup.md."
+    fi
+    if [[ -n "${TALOS_OFFHOST_AGE_PASSPHRASE_FILE:-}" ]]; then
+        [[ -r "$TALOS_OFFHOST_AGE_PASSPHRASE_FILE" ]] \
+            || die "TALOS_OFFHOST_AGE_PASSPHRASE_FILE='$TALOS_OFFHOST_AGE_PASSPHRASE_FILE' is not readable"
+        AGE_PASS_REAL="$(escrow_realpath "$TALOS_OFFHOST_AGE_PASSPHRASE_FILE")" \
+            || die "could not resolve TALOS_OFFHOST_AGE_PASSPHRASE_FILE"
+        assert_escrow_path_contained "$AGE_PASS_REAL" "age passphrase file"
+    else
+        assert_escrow_cmd_paths_contained "$TALOS_OFFHOST_AGE_PASSPHRASE_CMD"
+    fi
+
+    # The helper re-applies the same containment in Rust (pure, unit-tested),
+    # and fails closed if it cannot determine the roots. Both checkout roots:
+    # this one AND the main clone when we are in a worktree.
+    TALOS_OFFHOST_CHECKOUT_ROOTS="$(escrow_forbidden_roots | paste -sd: -)"
+    export TALOS_OFFHOST_CHECKOUT_ROOTS
+    # One knob, two gates. The drill's local artifact-age limit governs the
+    # off-host archive too, so "stale" cannot mean two different things
+    # depending on which source you asked for.
+    TALOS_OFFHOST_MAX_AGE_HOURS="${TALOS_DRILL_MAX_ARTIFACT_AGE_HOURS:-168}"
+    export TALOS_OFFHOST_MAX_AGE_HOURS
+
+    OFFHOST_BIN="${TALOS_OFFHOST_BIN:-}"
+    if [[ -z "$OFFHOST_BIN" ]]; then
+        # `env -u DATABASE_URL` for the same reason as step 2: DATABASE_URL is
+        # part of the sqlx macro fingerprint and its presence rebuilds a large
+        # part of the workspace.
+        (cd "$REPO_ROOT" && env -u DATABASE_URL cargo build --quiet \
+            -p talos-offhost-backup --bin talos-offhost-backup) \
+            || die "could not build talos-offhost-backup — fix the build before trusting a drill result"
+        OFFHOST_TARGET_DIR="$(cd "$REPO_ROOT" && env -u DATABASE_URL cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+        OFFHOST_BIN="$OFFHOST_TARGET_DIR/debug/talos-offhost-backup"
+    fi
+    [[ -x "$OFFHOST_BIN" ]] || die "off-host helper missing after build: $OFFHOST_BIN"
+
+    # Fetch = list + GET + age-decrypt + AGE-ASSERT, all inside the helper.
+    # Its stdout is the object key and nothing else; every diagnostic is on
+    # stderr and is visible above.
+    PG_OBJECT="$("$OFFHOST_BIN" fetch --kind postgres --dest "$WORK_DIR/pg.dump")" \
+        || die "could not fetch + decrypt the off-host POSTGRES archive.
+   This is the whole point of --source b2: there is no usable off-host copy of
+   the database right now. Check scripts/offhost-backup/upload.sh, its log at
+   ~/.talos/logs/offhost-backup.log, and talos_offhost_backup_failures_total."
+    VAULT_OBJECT="$("$OFFHOST_BIN" fetch --kind vault --dest "$WORK_DIR/vault.tgz")" \
+        || die "could not fetch + decrypt the off-host VAULT archive.
+   Without Vault the restored database is ciphertext nobody can read: it holds
+   every OAuth token, and the transit key when KEK_PROVIDER=vault."
+    # Uploaded artifacts ARE the sidecar tarballs, which are rooted at the
+    # CONTENTS of /vault/file — not the vault/file/ prefix a --source live
+    # tar carries. Extracting the wrong one yields an empty file backend and
+    # a vault that "starts" uninitialised.
+    VAULT_TAR_ROOT="contents"
+    ok "postgres object: $PG_OBJECT ($(wc -c < "$WORK_DIR/pg.dump") bytes decrypted)"
+    ok "vault object:    $VAULT_OBJECT ($(wc -c < "$WORK_DIR/vault.tgz") bytes decrypted)"
+    # Age was asserted inside the helper against
+    # TALOS_OFFHOST_MAX_AGE_HOURS (set above from the drill's own knob), so a
+    # stale bucket has already failed the run by this point rather than being
+    # printed and ignored.
+    ok "off-host archives are within ${TALOS_OFFHOST_MAX_AGE_HOURS}h"
 else
     log "[1/7] dumping LIVE postgres + vault (--source live)"
     docker inspect "$LIVE_PG_CONTAINER" >/dev/null 2>&1 || die "live postgres container '$LIVE_PG_CONTAINER' not running"
@@ -871,8 +989,6 @@ fi
 # listening on a loopback port for every second of it. Build first, with
 # DATABASE_URL scrubbed, then execute the binaries directly.
 log "[2/7] building verifiers (this is the slow step; nothing is staged yet)"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 env -u DATABASE_URL cargo build --quiet --example verify_restore --example verify_phase_b -p controller \
     || die "could not build the verifiers — fix the build before trusting a drill result"
@@ -1102,6 +1218,8 @@ printf '\033[1;32m╚═══════════════════�
 printf '  Source:          %s\n' "$SOURCE_MODE"
 [[ "$SOURCE_MODE" == "artifact" ]] && printf '  Postgres backup: %s\n' "$(basename "${PG_ARTIFACT:-?}")"
 [[ "$SOURCE_MODE" == "artifact" ]] && printf '  Vault backup:    %s\n' "$(basename "${VAULT_ARTIFACT:-?}")"
+[[ "$SOURCE_MODE" == "b2" ]] && printf '  Postgres object: %s\n' "${PG_OBJECT:-?}"
+[[ "$SOURCE_MODE" == "b2" ]] && printf '  Vault object:    %s\n' "${VAULT_OBJECT:-?}"
 # The RESTORED schema version is reported by verify_restore (which is the only
 # thing that has read it); this line is the checkout's, labelled as such so the
 # two are never confused.
@@ -1142,10 +1260,23 @@ printf '\033[1;33m    KEK provenance: the live-container read is deleted and the
 printf '\033[1;33m      re-create it are refused, but nothing here can show the configured\033[0m\n'
 printf '\033[1;33m      source is genuinely off-box (a RAM disk, a vault synced to this same\033[0m\n'
 printf '\033[1;33m      laptop, or a hard link past the containment check all read as escrow).\033[0m\n'
-printf '\033[1;33m    Artifact location: the dumps exist only on THIS host filesystem.\033[0m\n'
-printf '\033[1;33m      Proven: escrowed KEK + these artifacts are readable on a clean stack.\033[0m\n'
-printf '\033[1;33m      NOT proven: that the artifacts survive losing this disk. Off-host\033[0m\n'
-printf '\033[1;33m      replication (Tier 2) is an OPEN decision, not a solved problem.\033[0m\n'
+if [[ "$SOURCE_MODE" == "b2" ]]; then
+    printf '\033[1;33m    Artifact location: this run READ FROM OBJECT STORAGE, so the claim is\033[0m\n'
+    printf '\033[1;33m      the strong one: escrowed KEK + escrowed age passphrase + the OFF-HOST\033[0m\n'
+    printf '\033[1;33m      copy are readable on a clean stack. Losing this disk does not lose it.\033[0m\n'
+    printf '\033[1;33m      STILL NOT proven: that the bucket cannot be emptied. Delete/overwrite\033[0m\n'
+    printf '\033[1;33m      refusal is the PROVIDER'"'"'s job and is checked separately by\033[0m\n'
+    printf '\033[1;33m      `scripts/offhost-backup/upload.sh probe-append-only`, not by this drill.\033[0m\n'
+    printf '\033[1;33m      Nor that the age passphrase source is genuinely off-box — same limit,\033[0m\n'
+    printf '\033[1;33m      same reasons, as the KEK provenance bullet above.\033[0m\n'
+else
+    printf '\033[1;33m    Artifact location: this run read the LOCAL copy, on the very disk the\033[0m\n'
+    printf '\033[1;33m      backups insure against losing.\033[0m\n'
+    printf '\033[1;33m      Proven: escrowed KEK + these artifacts are readable on a clean stack.\033[0m\n'
+    printf '\033[1;33m      NOT proven: that anything survives losing this disk. Run\033[0m\n'
+    printf '\033[1;33m      `make drill ARGS="--source b2"` for that — it is a strictly harder\033[0m\n'
+    printf '\033[1;33m      question and it is the one a recovery actually asks.\033[0m\n'
+fi
 if [[ "$KEK_PROVIDER_MODE" != "vault" ]]; then
     printf '\033[1;33m    KEK_PROVIDER=%s: the restored Vault is NOT on the decryption path here.\033[0m\n' "$KEK_PROVIDER_MODE"
     printf '\033[1;33m      Its file backend restored, unsealed, authenticated and mounted —\033[0m\n'
