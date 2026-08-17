@@ -308,6 +308,39 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
         } else {
             None
         };
+        // `module_executions.fuel_consumed` was a DEAD COLUMN until 2026-08:
+        // 0 of 25,213 rows populated. Its only writer
+        // (`ModuleExecutionService::complete_execution`) is reachable solely
+        // through `complete_execution_best_effort`, which has no callers
+        // workspace-wide, so the column — and the `fuelConsumed` field the
+        // GraphQL `ModuleExecution` type exposes from it — always read NULL.
+        // A column that always reads NULL is worse than an absent one: the
+        // next person doing fuel archaeology reads "no fuel was used" instead
+        // of "nobody ever wrote this".
+        //
+        // `record_completed` is the live terminal writer on the engine path,
+        // and the worker already stamps `__fuel_consumed__` into the node
+        // output — the same key `ControllerNodeHook::on_node_completed` reads
+        // for `execution_cost_rollup`. Reading it here costs one JSON lookup
+        // and makes the two ledgers agree by construction.
+        //
+        // Scope of what this does and does NOT fix, stated rather than
+        // implied: `execution_cost_rollup` remains the authoritative per-node
+        // fuel record and is the only one with the `max_fuel` ceiling
+        // alongside. This write makes the standalone-module row honest (those
+        // never get a rollup row at all — rollups are keyed by workflow node)
+        // and stops the GraphQL field lying. It does NOT retro-fill the 25,213
+        // historical rows, which stay NULL.
+        //
+        // Absent key ⇒ NULL, not 0: a pre-stamp worker, a system node, or a
+        // failure path that never ran the module has no measurement, and
+        // writing 0 would assert one. Same reason the message rewrite above
+        // refuses to print the limit where a measurement belongs.
+        let fuel_consumed: Option<i64> = output
+            .get(talos_workflow_engine_core::reserved_keys::FUEL_CONSUMED)
+            .and_then(JsonValue::as_i64)
+            .filter(|f| *f > 0);
+
         // Status guard — FIRST terminal writer wins.
         //
         // Byte-for-byte the same predicate
@@ -396,8 +429,9 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
              SET status = $1, output_data = $2, output_data_enc = $3, \
                  payload_enc_key_id = COALESCE(payload_enc_key_id, $4), \
                  payload_format = COALESCE($5, payload_format), \
-                 duration_ms = $6, error_message = $7, completed_at = NOW() \
-             WHERE id = $8 AND status IN ('pending', 'running')",
+                 duration_ms = $6, error_message = $7, \
+                 fuel_consumed = COALESCE($8, fuel_consumed), completed_at = NOW() \
+             WHERE id = $9 AND status IN ('pending', 'running')",
         )
         .bind(status)
         .bind(pt_output)
@@ -406,6 +440,7 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
         .bind(format_arg)
         .bind(duration_ms)
         .bind(redacted_error.as_deref())
+        .bind(fuel_consumed)
         .bind(id)
         .execute(&self.pool)
         .await

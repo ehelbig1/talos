@@ -81,6 +81,144 @@ pub fn spawn_epoch_ticker(engine: Engine) -> tokio::task::JoinHandle<()> {
     })
 }
 
+/// Build the operator-facing message for a fuel-exhaustion trap.
+///
+/// **Why this is a function and not four inline `format!`s.** Every one of
+/// the four exhaustion sites used to interpolate the *limit* into BOTH the
+/// "after N instructions" slot and the "Current fuel limit: N" slot, so a
+/// real failure read:
+///
+/// ```text
+/// WASM fuel exhausted after 1404000 instructions. … Current fuel limit: 1404000
+/// ```
+///
+/// The first number LOOKS like a measurement of what the module needed and is
+/// not one — it is the limit, printed twice. Anyone sizing a new budget from
+/// that line (the `pa-read-later-digest/digest` case, 2026-08) reads "it wanted
+/// 1.4M, it had 1.4M, bump it a little" when the true requirement is unbounded
+/// above by that line alone.
+///
+/// The honest statement is narrower and is what this emits:
+/// * `consumed` — what the store actually reported burning, when the trap left
+///   the fuel counter readable. At exhaustion this equals `limit` *by
+///   construction* (the module drained the budget), which is exactly why it
+///   must be labelled as "of a N budget" rather than as a demand figure.
+/// * `limit` — the ceiling that proved insufficient.
+/// * The requirement is stated as UNKNOWN and `> limit`, because the trap
+///   stops the module mid-instruction: nothing in the system observed how much
+///   more it would have taken.
+///
+/// `consumed: None` is the path where `Store::get_fuel` was not read (the
+/// single-shot `execute_component`-style path); it says so rather than
+/// substituting the limit.
+///
+/// Format stability: downstream consumers parse `fuel exhausted` (retry
+/// classification — `talos_retry_intelligence::classify_error`, ops-alert
+/// labelling) and `Current fuel limit: N`
+/// (`talos_mcp_handlers::analytics::detect_fuel_bump_antipattern`, which reads
+/// the ladder of distinct limits a node has been raised through). Both
+/// substrings are preserved verbatim; only the misleading leading number
+/// changed.
+///
+/// `pub` rather than `pub(crate)` on purpose: `talos-mcp-handlers` already
+/// depends on this crate, and its `detect_fuel_bump_antipattern` tests build
+/// their fixtures by calling THIS function instead of retyping the message.
+/// A detector tested against a message production no longer emits is a gate
+/// that does not gate — the same defect one level up from the one this
+/// function fixes.
+pub fn fuel_exhausted_message(
+    consumed: Option<u64>,
+    limit: u64,
+    pipeline_step: Option<&str>,
+) -> String {
+    let where_ = match pipeline_step {
+        Some(step) => format!(" in pipeline step '{step}'"),
+        None => String::new(),
+    };
+    let observed = match consumed {
+        Some(c) => format!("consumed {c} instructions of a {limit}-instruction budget"),
+        None => format!("did not finish within its {limit}-instruction budget"),
+    };
+    format!(
+        "WASM fuel exhausted{where_}: the module {observed} and did not finish, \
+         so its actual requirement is UNKNOWN — only that it exceeds {limit}. \
+         Split into smaller modules or reduce payload size. \
+         Current fuel limit: {limit} (configurable via WASM_FUEL_LIMIT or per-node max_fuel config)."
+    )
+}
+
+#[cfg(test)]
+mod fuel_exhausted_message_tests {
+    use super::fuel_exhausted_message;
+
+    /// The regression guard for the defect this helper exists to close.
+    ///
+    /// `consumed` and `limit` are deliberately DIFFERENT values here. If a
+    /// future edit reverts to formatting one variable into both slots, one of
+    /// the two numbers disappears from the string and this fails. A test using
+    /// equal values could not distinguish the two spellings.
+    #[test]
+    fn consumption_and_limit_are_never_the_same_variable() {
+        let msg = fuel_exhausted_message(Some(900_000), 1_404_000, None);
+        assert!(
+            msg.contains("consumed 900000 instructions"),
+            "measured consumption must be printed as itself: {msg}"
+        );
+        assert!(
+            msg.contains("of a 1404000-instruction budget"),
+            "the limit must be printed as the limit: {msg}"
+        );
+        assert!(
+            !msg.contains("exhausted after 1404000 instructions"),
+            "the old limit-as-measurement phrasing must not come back: {msg}"
+        );
+    }
+
+    /// The message must never assert a demand figure it does not have.
+    #[test]
+    fn requirement_is_stated_as_unknown_not_as_the_limit() {
+        let msg = fuel_exhausted_message(Some(1_404_000), 1_404_000, None);
+        assert!(msg.contains("actual requirement is UNKNOWN"), "{msg}");
+        assert!(msg.contains("exceeds 1404000"), "{msg}");
+    }
+
+    /// Unmeasurable consumption says so; it does not silently print the limit.
+    #[test]
+    fn absent_consumption_is_reported_as_absent() {
+        let msg = fuel_exhausted_message(None, 2_000_000, None);
+        assert!(msg.contains("did not finish within its 2000000-instruction budget"));
+        assert!(
+            !msg.contains("consumed"),
+            "must not invent a measurement: {msg}"
+        );
+    }
+
+    /// Downstream parsers must keep working across this rewording.
+    ///
+    /// `detect_fuel_bump_antipattern` extracts `Current fuel limit: (\d+)` and
+    /// gates on the substring `fuel exhausted`; the retry classifier and the
+    /// ops-alert labeller gate on `fuel exhausted` too. A reword that drops
+    /// either silently turns those detectors off.
+    #[test]
+    fn downstream_parse_contract_is_preserved() {
+        for msg in [
+            fuel_exhausted_message(Some(1), 1_404_000, None),
+            fuel_exhausted_message(Some(1), 1_404_000, Some("step-a")),
+            fuel_exhausted_message(None, 1_404_000, None),
+        ] {
+            assert!(msg.contains("fuel exhausted"), "{msg}");
+            assert!(msg.contains("Current fuel limit: 1404000"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn pipeline_step_is_named_when_present() {
+        let msg = fuel_exhausted_message(Some(5), 10, Some("enrich"));
+        assert!(msg.contains("in pipeline step 'enrich'"), "{msg}");
+        assert!(!fuel_exhausted_message(Some(5), 10, None).contains("pipeline step"));
+    }
+}
+
 #[cfg(test)]
 mod epoch_helper_tests {
     use super::*;
@@ -1767,7 +1905,24 @@ fn is_transient_error_text(error_str: &str) -> bool {
     // message ALSO contains "networkerror", so the specific check must run
     // first. Same precedence shape as the controller-side classifier's
     // hoisted circuit-open bucket.
-    if error_str.contains("circuit open")
+    // Fuel exhaustion is hoisted here for the same "ordering is load-bearing"
+    // reason. It was previously non-transient only BY FALLTHROUGH — it matched
+    // no transient token, so it reached the `false` at the bottom. That held
+    // only as long as no transient token appeared in the message, and the
+    // message INTERPOLATES THE FUEL NUMBERS. The HTTP bucket below matches the
+    // bare substrings "429", "502", "503" and "504", so a node whose ceiling is
+    // (say) 1_429_000 renders "1429000", matches "429", and its fuel exhaustion
+    // is classified TRANSIENT — earning a retry that can only burn another full
+    // budget (on an LLM node, another complete ~28 s generation) before failing
+    // identically. Digit-substring collisions are not exotic: four three-digit
+    // needles against every fuel figure in the string.
+    //
+    // Pre-existing (the old wording interpolated the limit twice); made
+    // structural here rather than left to depend on which numbers an operator
+    // happens to pick. Retrying a resource-limit denial is never right — the
+    // limit does not change between attempts.
+    if error_str.contains("fuel exhausted")
+        || error_str.contains("circuit open")
         || error_str.contains("forbiddenhost")
         || crate::reason_class::NON_TRANSIENT
             .iter()
@@ -3357,7 +3512,8 @@ impl TalosRuntime {
                         // function into a user-facing message:
                         //   "Component returned error: ..."  — WIT Err(String) return
                         //   "PANIC: ..."                     — panic via WASI stderr capture
-                        //   "WASM fuel exhausted after ..."  — fuel budget exhausted
+                        //   "WASM fuel exhausted: ..."       — fuel budget exhausted
+                        //                                      (`fuel_exhausted_message`)
                         //   "WASM execution timed out ..."   — wall-clock timeout
                         //   "WASM trap encountered"          — unexpected trap (sanitized above)
                         // Do NOT replace e with a generic string — that would destroy the
@@ -3826,10 +3982,8 @@ impl TalosRuntime {
                     || err_debug.contains("OutOfFuel")
                 {
                     return Err(anyhow::anyhow!(
-                        "WASM fuel exhausted after {} instructions. Your module ran out of computation budget. \
-                         Split into smaller modules or reduce payload size. \
-                         Current fuel limit: {} (configurable via WASM_FUEL_LIMIT or per-node max_fuel config).",
-                        effective_fuel_limit, effective_fuel_limit
+                        "{}",
+                        fuel_exhausted_message(fuel_consumed, effective_fuel_limit, None)
                     ));
                 }
                 // Fallback: when a trap carries WASI stderr output, try to extract a
@@ -4193,10 +4347,8 @@ impl TalosRuntime {
                     || err_debug.contains("OutOfFuel")
                 {
                     return Err(anyhow::anyhow!(
-                        "WASM fuel exhausted after {} instructions. Your module ran out of computation budget. \
-                         Split into smaller modules or reduce payload size. \
-                         Current fuel limit: {} (configurable via WASM_FUEL_LIMIT).",
-                        self.fuel_limit, self.fuel_limit
+                        "{}",
+                        fuel_exhausted_message(fuel_consumed, self.fuel_limit, None)
                     ));
                 }
                 return Err(e.into());
@@ -4620,14 +4772,21 @@ impl TalosRuntime {
                     }
                     let err_str = format!("{}", e);
                     if err_str.contains("fuel") || err_str.contains("all fuel consumed") {
+                        // `step_max_fuel` — NOT `self.fuel_limit`. This site
+                        // reported the runtime-wide default as "Current fuel
+                        // limit" while `store.set_fuel(step.max_fuel)` above is
+                        // what the step actually ran under, so on any pipeline
+                        // with a per-step override the operator was told a
+                        // ceiling that was never enforced (and
+                        // `detect_fuel_bump_antipattern`'s limit ladder read the
+                        // same wrong number).
                         anyhow::bail!(
-                            "WASM fuel exhausted in pipeline step '{}' after {} instructions. \
-                             Your module ran out of computation budget. \
-                             Split into smaller modules or reduce payload size. \
-                             Current fuel limit: {} (configurable via WASM_FUEL_LIMIT).",
-                            step.module_id,
-                            self.fuel_limit,
-                            self.fuel_limit
+                            "{}",
+                            fuel_exhausted_message(
+                                fuel_consumed,
+                                step_max_fuel,
+                                Some(&step.module_id.to_string()),
+                            )
                         );
                     }
                     return Err(e.into());
@@ -5186,12 +5345,18 @@ impl TalosRuntime {
                 .await
                 .map(|(r,)| r);
             let oom_msg = store.data().oom_error_message.clone();
-            (res, oom_msg)
+            // Read the fuel counter on the way out for the same reason the
+            // other three exhaustion paths do: without it the failure message
+            // can only quote the limit, and a limit quoted where a measurement
+            // is expected is the misleading-report defect this pass closes.
+            let remaining_fuel = store.get_fuel().ok();
+            (res, oom_msg, remaining_fuel)
         })
         .await
         .map_err(|_| anyhow::anyhow!("WASM execution timed out after {:?}", timeout))?;
 
-        let (call_result, oom_msg) = call_result;
+        let (call_result, oom_msg, remaining_fuel) = call_result;
+        let fuel_consumed = remaining_fuel.map(|r| self.fuel_limit.saturating_sub(r));
 
         let call_result = match call_result {
             Err(e) => {
@@ -5208,10 +5373,8 @@ impl TalosRuntime {
                     || err_debug.contains("OutOfFuel")
                 {
                     return Err(anyhow::anyhow!(
-                        "WASM fuel exhausted after {} instructions. Your module ran out of computation budget. \
-                         Split into smaller modules or reduce payload size. \
-                         Current fuel limit: {} (configurable via WASM_FUEL_LIMIT).",
-                        self.fuel_limit, self.fuel_limit
+                        "{}",
+                        fuel_exhausted_message(fuel_consumed, self.fuel_limit, None)
                     ));
                 }
                 return Err(e.into());
@@ -5577,11 +5740,39 @@ mod pipeline_step_retry_tests {
     #[test]
     fn permanent_errors_are_not_transient() {
         assert!(!is_transient_error_text("401 unauthorized"));
+        // Pre-2026-08 wording — historical messages must still classify.
         assert!(!is_transient_error_text(
             "fuel exhausted after 6000000 instructions"
         ));
+        // Current wording, from the real producer.
+        assert!(!is_transient_error_text(&fuel_exhausted_message(
+            Some(6_000_000),
+            6_000_000,
+            None
+        )));
         assert!(!is_transient_error_text("invalid json: expected value"));
         assert!(!is_transient_error_text("missing AUTH_HEADER config"));
+    }
+
+    /// A fuel ceiling whose DIGITS contain an HTTP status needle.
+    ///
+    /// The transient bucket matches the bare substrings "429"/"502"/"503"/"504",
+    /// and the exhaustion message interpolates the fuel figures, so before the
+    /// hoist a ceiling of 1_429_000 rendered "1429000", matched "429", and the
+    /// step was retried — spending a second full budget to fail identically.
+    /// Retrying a resource-limit denial is never correct.
+    #[test]
+    fn fuel_exhaustion_stays_permanent_even_when_the_number_looks_like_an_http_status() {
+        for limit in [1_429_000u64, 1_502_000, 5_030_000, 5_040_000] {
+            let msg = fuel_exhausted_message(Some(limit), limit, None);
+            assert!(
+                !is_transient_error_text(&msg),
+                "fuel exhaustion at limit {limit} must not be retried: {msg}"
+            );
+        }
+        // Same hazard on the pipeline-step spelling.
+        let msg = fuel_exhausted_message(Some(1_429_000), 1_429_000, Some("enrich"));
+        assert!(!is_transient_error_text(&msg), "{msg}");
     }
 
     #[test]

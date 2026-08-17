@@ -35,6 +35,7 @@ Last indexed: 2026-07-24.
 | Doc | What it is |
 |---|---|
 | [module-authoring.md](module-authoring.md) | Module authoring guide — WIT worlds, capabilities, fuel |
+| [fuel-budget-sizing.md](fuel-budget-sizing.md) | How to size a node's `max_fuel`, the adaptive-fuel dead zone, and what raising a budget does NOT bound |
 | [runtime-enforced-best-practices.md](runtime-enforced-best-practices.md) | Runtime-enforced WASM best practices (dated 2026-02-17 — verify against current lint set) |
 | [wasm-automatic-logging.md](wasm-automatic-logging.md) | WASM automatic-logging architecture (dated 2026-02-17) |
 | [wasmtime-version-tracking.md](wasmtime-version-tracking.md) | Policy for tracking wasmtime releases/CVEs (sandbox trust anchor) |

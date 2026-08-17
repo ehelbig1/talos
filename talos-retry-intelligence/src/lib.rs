@@ -422,8 +422,20 @@ mod tests {
 
     #[test]
     fn error_classification() {
+        // Both wordings: the pre-2026-08 "exhausted after N" form (still
+        // present in historical rows) and the current
+        // `fuel_exhausted_message` form, which has no "after". Retyped rather
+        // than bound to the producer — this crate deliberately carries no
+        // dependency on `talos-worker-runtime`.
         assert_eq!(
             classify_error("WASM fuel exhausted after 10000000"),
+            "fuel_exhaustion"
+        );
+        assert_eq!(
+            classify_error(
+                "WASM fuel exhausted: the module consumed 10000000 instructions of a \
+                 10000000-instruction budget and did not finish"
+            ),
             "fuel_exhaustion"
         );
         assert_eq!(classify_error("Job execution timed out"), "timeout");

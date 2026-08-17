@@ -2882,10 +2882,25 @@ fn detect_fuel_bump_antipattern(error_msgs: &[String]) -> Vec<serde_json::Value>
 mod fuel_bump_tests {
     use super::detect_fuel_bump_antipattern;
 
+    /// Build the fixture from the REAL producer
+    /// (`talos_worker_runtime::runtime::fuel_exhausted_message`) rather than a
+    /// hand-typed copy of it, wrapped in the engine/dispatcher prefixes the
+    /// controller adds on the way to `workflow_executions.error_message`.
+    ///
+    /// The hand-typed version drifted the moment the worker's message was
+    /// reworded (2026-08): these tests kept passing against a string production
+    /// no longer emitted, so they proved the regex worked on a museum piece.
+    /// Binding to the producer means a future reword that drops
+    /// `Current fuel limit: N` fails HERE, in the detector's own suite.
+    ///
+    /// Limitation worth stating: this binds the SHAPE, not the call sites. A
+    /// worker path that stops calling `fuel_exhausted_message` altogether is
+    /// still invisible to this test.
     fn msg(node: &str, limit: u64) -> String {
         format!(
-            "node '{}' failed: Job failed after 1 attempts: execution failure: WASM fuel exhausted after {} instructions. Your module ran out of computation budget. Current fuel limit: {} (configurable via WASM_FUEL_LIMIT).",
-            node, limit, limit
+            "node '{}' failed: Job failed after 1 attempts: execution failure: {}",
+            node,
+            talos_worker_runtime::runtime::fuel_exhausted_message(Some(limit), limit, None)
         )
     }
 
@@ -6302,9 +6317,12 @@ mod retry_classifier_tests {
 
     #[test]
     fn fuel_exhausted_is_deterministic() {
-        let msg = lower(
-            "WASM fuel exhausted after 1710000 instructions. Your module ran out of computation budget.",
-        );
+        // Real producer, not a retyped copy — see `fuel_bump_tests::msg`.
+        let msg = lower(&talos_worker_runtime::runtime::fuel_exhausted_message(
+            Some(1_710_000),
+            1_710_000,
+            None,
+        ));
         assert!(is_deterministic_failure(&msg));
     }
 
