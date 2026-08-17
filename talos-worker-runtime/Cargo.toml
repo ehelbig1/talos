@@ -114,6 +114,17 @@ oci-distribution = "0.11.0"
 bytes = "1.11.1"
 thiserror = "2.0.18"
 
+[dev-dependencies]
+# `test-util` for `tokio::time::pause`/`advance`. The LLM failure-counter
+# tests drive the real `complete_impl` against a loopback mock provider, and
+# one of its exits is the 60 s `LOCAL_LLM_EXCHANGE_TIMEOUT_SECS` wrapper —
+# proving that path with a real clock would mean a 60 s unit test. The clock
+# is paused only AFTER the mock server confirms it has the full request, so
+# no connect timer is pending when time jumps and the exit under test is the
+# only one that can fire. Same dev-only pattern as
+# `talos-integration-helpers`, which already enables this feature.
+tokio = { version = "1.41", features = ["full", "test-util"] }
+
 [features]
 default = []
 

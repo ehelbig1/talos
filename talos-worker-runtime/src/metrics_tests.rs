@@ -108,16 +108,114 @@ mod tests {
     // normalize_llm_provider tests
     // ========================================================================
 
+    /// Replaces `test_normalize_llm_provider_known_values` +
+    /// `test_normalize_llm_provider_unknown_defaults_to_other`, whose bodies
+    /// were `assert_eq!(normalize_llm_provider("ollama"), "other")` — the bug
+    /// pinned as a requirement, under a name asserting the bug was correct.
+    ///
+    /// **Fixed rather than deleted, deliberately.** The "unknown folds to
+    /// other" half is a real property worth keeping; only its EVIDENCE was
+    /// wrong, because `ollama` is not an unknown provider — it is a variant of
+    /// the closed WIT enum the only caller passes, and on this tier-1 stack it
+    /// is 100 % of live LLM traffic. Deleting the test would have removed the
+    /// good half with the bad; keeping the name would have left the next
+    /// person to add the arm facing a red test telling them they were wrong.
+    ///
+    /// This test FAILS on the pre-fix tree (verified against c528d0a by
+    /// removing only the `"ollama" =>` arm: it fails on the `ollama` assertion,
+    /// not on compilation), which is what makes it a regression guard rather
+    /// than a restatement.
     #[test]
-    fn test_normalize_llm_provider_known_values() {
+    fn normalize_llm_provider_labels_every_live_provider_and_folds_only_unknowns() {
+        // Every variant of the closed `wit_llm::Provider` enum — the only
+        // thing `record_llm_request` / `record_llm_failure` are ever fed.
+        // None of these may fold.
         assert_eq!(normalize_llm_provider("anthropic"), "anthropic");
         assert_eq!(normalize_llm_provider("openai"), "openai");
         assert_eq!(normalize_llm_provider("gemini"), "gemini");
+        assert_eq!(
+            normalize_llm_provider("ollama"),
+            "ollama",
+            "ollama is a first-class provider, not an unknown one: it is the \
+             ONLY provider this tier-1 deployment uses, so folding it to \
+             `other` mislabelled 100% of live LLM measurements"
+        );
+
+        // The fold itself is still the right behaviour — for genuinely
+        // unrecognised strings, which by construction can no longer come from
+        // `complete_impl`.
+        assert_eq!(normalize_llm_provider("cohere"), "other");
+        assert_eq!(normalize_llm_provider("Ollama"), "other", "match is exact");
+        assert_eq!(normalize_llm_provider(""), "other");
     }
 
+    /// The seed set is deliberately irregular (31, not 4 × 9 = 36) and this
+    /// pins every carve-out so a future "tidy-up" has to argue with a test.
+    ///
+    /// **This test was itself the defect once.** Its first version asserted
+    /// `len() == product - 1` and then looped the whole product asserting
+    /// "everything else IS reachable and must be seeded" — which was false for
+    /// the four `invalid_request` pairs the crate documents as permanently
+    /// unreachable. Removing those dead seeds, the correct move under
+    /// `seed_zero_series`' own rule, turned this test RED under a name claiming
+    /// it excluded unreachable combinations. That is the pinned-bug shape the
+    /// parent commit exists to remove. The loop below now walks the SAME
+    /// carve-out predicate the production iterator uses, so the two cannot
+    /// drift apart into that state again.
     #[test]
-    fn test_normalize_llm_provider_unknown_defaults_to_other() {
-        assert_eq!(normalize_llm_provider("ollama"), "other");
+    fn seeded_llm_failure_series_excludes_unreachable_combinations() {
+        use crate::metrics::{seeded_llm_failure_series, LlmFailure, LLM_PROVIDER_LABELS};
+        let seeded: Vec<(&str, LlmFailure)> = seeded_llm_failure_series().collect();
+
+        // The single source of truth for "is this pair reachable at all".
+        let unreachable = |provider: &str, outcome: LlmFailure| {
+            (provider == "ollama" && outcome == LlmFailure::NotConfigured)
+                || outcome == LlmFailure::InvalidRequest
+        };
+
+        let expected = LLM_PROVIDER_LABELS
+            .into_iter()
+            .flat_map(|p| LlmFailure::ALL.into_iter().map(move |o| (p, o)))
+            .filter(|(p, o)| !unreachable(p, *o))
+            .count();
+        assert_eq!(
+            seeded.len(),
+            expected,
+            "seed set must be exactly the reachable pairs: 1 ollama/not_configured \
+             carve-out + 4 invalid_request carve-outs removed from the 36-pair product"
+        );
+        assert!(
+            !seeded.contains(&("ollama", LlmFailure::NotConfigured)),
+            "complete_impl branches on `is_local` and never resolves a key for \
+             Ollama, so this pair cannot be written; seeding it would assert a \
+             watched signal that does not exist"
+        );
+        assert!(
+            !seeded.iter().any(|(_, o)| *o == LlmFailure::InvalidRequest),
+            "InvalidRequest documents itself as a permanent 0 — the `?` is on \
+             serde_json::to_vec over a Value the adapter just built, which cannot \
+             fail for any input. That is a STRONGER unreachability argument than \
+             the ollama branch, so seeding it while excluding ollama was backwards"
+        );
+        assert!(
+            !seeded.iter().any(|(p, _)| *p == "other"),
+            "`other` is unreachable from complete_impl now that every arm of \
+             the closed provider enum is present in normalize_llm_provider"
+        );
+        // Every pair the predicate calls REACHABLE must be seeded — an absent
+        // series makes `increase(...) == 0` match nothing.
+        for provider in LLM_PROVIDER_LABELS {
+            for outcome in LlmFailure::ALL {
+                if unreachable(provider, outcome) {
+                    continue;
+                }
+                assert!(
+                    seeded.contains(&(provider, outcome)),
+                    "{provider}/{outcome:?} is reachable but unseeded — \
+                     `increase(...) == 0` over an absent series matches nothing"
+                );
+            }
+        }
     }
 
     // ========================================================================
@@ -238,8 +336,10 @@ mod tests {
     #[test]
     fn exported_prometheus_names_are_stable_and_idle_seeds_at_zero() {
         // Installs the global meter provider over `prometheus::default_registry()`.
-        // Safe to do once per test binary; no other test in this module touches it.
-        init_telemetry().expect("telemetry init");
+        // Once per BINARY, not once per module: `host::llm::llm_failure_metrics_tests`
+        // needs a live exporter too, and a bare `init_telemetry()` in both places
+        // makes whichever runs second fail on duplicate collector registration.
+        crate::metrics::init_telemetry_for_tests();
 
         // Cold process: construct the metrics and record NOTHING.
         let _m = RuntimeMetrics::new();
@@ -275,6 +375,85 @@ mod tests {
              imply a dispatch path was observed when none has run yet:\n{cold}"
         );
 
+        // ── the LLM seed ────────────────────────────────────────────────
+        // Asserted by PRESENCE of the full reachable set rather than by
+        // "every wasm_llm_* line reads 0", and the difference is not
+        // pedantry: `llm_failure_metrics_tests` shares this test BINARY and
+        // increments some of these series, with no ordering guarantee
+        // between them. A value assertion over all of them would be a test
+        // that passes or fails on scheduling. Presence of all 35 pairs can
+        // only come from seeding — nothing else writes `invalid_request` at
+        // all — so it pins the property without the race.
+        // Matched label-by-label, never against a concatenated prefix: the
+        // exporter emits labels sorted, and interleaves `otel_scope_*` among
+        // them, so a prefix assertion would be pinning the exporter's
+        // ordering by accident and would break on an unrelated SDK bump.
+        let llm_failure_line = |p: &str, o: &str| -> Option<&str> {
+            cold.lines().find(|l| {
+                l.starts_with("wasm_llm_failures_total{")
+                    && l.contains(&format!(r#"provider="{p}""#))
+                    && l.contains(&format!(r#"outcome="{o}""#))
+            })
+        };
+        let mut seeded_count = 0usize;
+        for (p, o) in crate::metrics::seeded_llm_failure_series() {
+            let line = llm_failure_line(p, o.label()).unwrap_or_else(|| {
+                panic!(
+                    "idle worker must EXPORT wasm_llm_failures_total{{provider=\"{p}\",\
+                     outcome=\"{}\"}} at 0. An absent series is not a zero: \
+                     `increase(...) == 0` over it matches NOTHING, and \
+                     `failures / (failures + requests)` collapses to an empty \
+                     vector.\n{cold}",
+                    o.label()
+                )
+            });
+            // Value asserted only for pairs no other test in this BINARY can
+            // touch. `llm_failure_metrics_tests` shares this process and
+            // increments the Ollama/Anthropic pairs with no ordering
+            // guarantee, so asserting 0 across the board would be a test that
+            // passes or fails on scheduling. Gemini is driven by nothing.
+            if p == "gemini" {
+                assert!(
+                    line.ends_with(" 0"),
+                    "seeded series must read 0 on a cold process, got: {line}"
+                );
+            }
+            seeded_count += 1;
+        }
+        // 31 = 4 providers × 9 outcomes, minus (ollama, not_configured) and
+        // minus all four (*, invalid_request). Was 35 until 2026-08-14, when
+        // review found the invalid_request pairs seeded despite the enum's own
+        // doc calling them a permanent 0 — see `seeded_llm_failure_series`.
+        //
+        // This assertion is a TRIPWIRE and it worked: when the carve-out
+        // changed, it failed with a message telling the reader to go re-read
+        // the carve-outs, which is exactly what it is for. Worth contrasting
+        // with the sibling test's first version, which asserted "everything
+        // else IS reachable and must be seeded" — a claim that was FALSE and
+        // would have made the correct fix look like the regression. A tripwire
+        // states what changed; a booby trap states that the bug is correct.
+        assert_eq!(
+            seeded_count, 31,
+            "the reachable (provider, outcome) set changed size; \
+             seeded_llm_failure_series' carve-outs need re-reading"
+        );
+        for provider in crate::metrics::LLM_PROVIDER_LABELS {
+            assert!(
+                cold.lines()
+                    .any(|l| l.starts_with("wasm_llm_requests_total{")
+                        && l.contains(&format!(r#"provider="{provider}""#))),
+                "the success leg must be seeded too ({provider}), or the failure \
+                 RATIO is no better defined than before\n{cold}"
+            );
+        }
+        // `other` is unreachable from complete_impl; seeding it would assert a
+        // signal nothing can produce.
+        assert!(
+            llm_failure_line("other", "cancelled").is_none(),
+            "provider=\"other\" must NOT be seeded — it is unreachable from \
+             complete_impl\n{cold}"
+        );
+
         // ── the exported-name mapping ────────────────────────────────────
         let m = RuntimeMetrics::new();
         m.record_execution(1.0, "success");
@@ -290,6 +469,10 @@ mod tests {
         // assertion below has nothing to observe and fails — which is not a
         // naming bug but a gap in what this block exercises.
         m.total_executions.add(1, &[]);
+        // A histogram exports no series at all until its first observation, so
+        // the `le=` pin below needs one. Through the production recorder, not
+        // the raw instrument.
+        m.record_llm_request("ollama", 1.0);
         let out = get_prometheus_metrics();
 
         // Exactly the spellings observability/rules/alerts.yml and the Grafana
@@ -309,6 +492,9 @@ mod tests {
             "wasm_execution_duration_ms_count{",
             "wasm_instances_active{", // i64_up_down_counter wasm.instances.active
             "wasm_cache_hit_ratio{",  // f64_gauge    wasm.cache.hit_ratio
+            "wasm_llm_requests_total{", // u64_counter  wasm.llm.requests
+            "wasm_llm_failures_total{", // u64_counter  wasm.llm.failures
+            "wasm_llm_duration_ms_bucket{", // f64_histogram wasm.llm.duration_ms
         ] {
             assert!(
                 out.contains(expected),
@@ -414,6 +600,47 @@ mod tests {
                  no error anywhere. Exported set: {exported_les:?}\n{out}"
             );
         }
+
+        // ── the LLM histogram's exported `le=` set ───────────────────────
+        // Same reason as above, minus the alert coupling: NO rule selects on
+        // this metric's `le=` values (verified 2026-08-14 — it appears in
+        // observability/rules/alerts.yml only inside annotation prose). What
+        // this pins is that `with_boundaries` TOOK EFFECT at all. The SDK's
+        // failure mode for invalid boundaries is a silently no-op instrument,
+        // and its failure mode for a forgotten `with_boundaries` is the
+        // defaults — both of which look like a working histogram until a
+        // quantile is read. Comparing against the SDK default set is what
+        // makes the assertion non-vacuous: it fails if the call is dropped.
+        let llm_les: std::collections::BTreeSet<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("wasm_llm_duration_ms_bucket{"))
+            .filter_map(|l| l.split("le=\"").nth(1))
+            .filter_map(|rest| rest.split('"').next())
+            .collect();
+        let expected_llm: std::collections::BTreeSet<String> =
+            crate::metrics::LLM_DURATION_BOUNDARIES_MS
+                .iter()
+                .map(|b| format!("{b}"))
+                .chain(std::iter::once("+Inf".to_string()))
+                .collect();
+        assert_eq!(
+            llm_les,
+            expected_llm.iter().map(String::as_str).collect(),
+            "wasm_llm_duration_ms exported bucket boundaries drifted from \
+             LLM_DURATION_BOUNDARIES_MS"
+        );
+        assert!(
+            llm_les.contains("120000"),
+            "the top bound must reach the 120 s EXTERNAL_LLM_EXCHANGE_TIMEOUT_SECS, \
+             or p95/p99 saturate exactly as they did before (32.7 % of evaluated \
+             points read a flat 10000). Exported: {llm_les:?}"
+        );
+        assert!(
+            !llm_les.contains("50") && !llm_les.contains("75"),
+            "`50`/`75` are SDK defaults; their presence means with_boundaries \
+             was dropped and this histogram is back on the default layout: \
+             {llm_les:?}"
+        );
     }
 
     /// The SDK's failure mode for bad boundaries is a NO-OP instrument plus an
@@ -469,5 +696,166 @@ mod tests {
             *b.last().expect("non-empty") >= 120_000.0,
             "top finite bound must cover the 120s per-node timeout: {b:?}"
         );
+    }
+
+    /// The SEMANTIC half of the boundary change, as distinct from the `le=`
+    /// set pinned in `exported_prometheus_names_…`: a tail observation must
+    /// land in a FINITE bucket.
+    ///
+    /// This is what "p95 stops returning a flat 10000" reduces to.
+    /// `histogram_quantile` cannot interpolate inside `+Inf` — it returns the
+    /// highest finite bound — so on the old layout every call slower than 10 s
+    /// was indistinguishable from every other, and a quantile landing in that
+    /// mass read back exactly 10000.0 (measured on the dev stack over 15 d:
+    /// 32.7 % of evaluated p95 AND p99 points).
+    ///
+    /// Two observations, chosen rather than arbitrary. **35 600 ms is the
+    /// measured p99 estimate** — 87.0 % into the overflow mass against the
+    /// recovered tail — and the assertion that it lands in `(30000, 40000]`
+    /// IS the claim that p99 became an interpolated number instead of a
+    /// ceiling. **45 000 ms** is a plain tail sample well past the old top
+    /// bound.
+    ///
+    /// `gemini` is used because nothing else in this binary records a duration
+    /// under that provider, so the counts are exact rather than deltas — the
+    /// metric registry is process-global and shared with
+    /// `host::llm::llm_failure_metrics_tests`.
+    #[test]
+    fn tail_observations_land_in_finite_buckets_instead_of_plus_inf() {
+        crate::metrics::init_telemetry_for_tests();
+        let m = RuntimeMetrics::new();
+        // Through the production recorder, not the raw instrument.
+        m.record_llm_request("gemini", 35_600.0);
+        m.record_llm_request("gemini", 45_000.0);
+        let out = get_prometheus_metrics();
+
+        let bucket = |le: &str| -> Option<u64> {
+            out.lines()
+                .find(|l| {
+                    l.starts_with("wasm_llm_duration_ms_bucket{")
+                        && l.contains(r#"provider="gemini""#)
+                        && l.contains(&format!(r#"le="{le}""#))
+                })
+                .and_then(|l| l.rsplit(' ').next())
+                .and_then(|v| v.parse::<f64>().ok())
+                .map(|v| v as u64)
+        };
+
+        // The old top finite bound. Under the SDK defaults BOTH observations
+        // would have been counted only in +Inf, with nothing above this.
+        assert_eq!(
+            bucket("10000"),
+            Some(0),
+            "sanity: both observations are above the old top finite bound\n{out}"
+        );
+        assert_eq!(
+            bucket("30000"),
+            Some(0),
+            "neither observation is at or below 30 s\n{out}"
+        );
+        assert_eq!(
+            bucket("40000"),
+            Some(1),
+            "the p99 estimate (35.6 s) must land in the FINITE (30000, 40000] \
+             bucket. If this is None the boundary is gone; if it is 0 the \
+             observation overflowed to +Inf, which is the pre-2026-08-14 \
+             behaviour that made p95 and p99 unreadable.\n{out}"
+        );
+        assert_eq!(
+            bucket("60000"),
+            Some(2),
+            "the 45 s observation must land in (40000, 60000], below the local \
+             exchange timeout\n{out}"
+        );
+        assert_eq!(
+            bucket("+Inf"),
+            Some(2),
+            "cumulative buckets: +Inf must agree with the finite tail — if it \
+             exceeds it, something overflowed\n{out}"
+        );
+    }
+
+    /// Same SDK preconditions as its sibling — invalid boundaries yield a
+    /// silently no-op instrument, not an error — plus the two properties that
+    /// are specific to the LLM histogram.
+    #[test]
+    fn llm_duration_boundaries_are_valid() {
+        let b = crate::metrics::LLM_DURATION_BOUNDARIES_MS;
+        assert!(
+            !b.is_empty(),
+            "empty boundaries export +Inf and nothing else"
+        );
+        assert!(
+            b.iter().all(|v| v.is_finite()),
+            "NaN/±Inf boundaries make the SDK return a no-op instrument: {b:?}"
+        );
+        assert!(
+            b.windows(2).all(|w| w[0] < w[1]),
+            "boundaries must be strictly ascending (sorted, no duplicates): {b:?}"
+        );
+
+        // The defect this constant exists to fix. The SDK default top bound is
+        // 10 000 ms against an exchange timeout of 120 s, and
+        // `histogram_quantile` returns the top FINITE bound whenever the
+        // quantile lands in `+Inf`. Measured on the dev stack over 15 d:
+        // 756/2315 p95 points and 757/2315 p99 points read exactly 10000.0.
+        assert!(
+            *b.last().expect("non-empty") >= 120_000.0,
+            "top finite bound must reach EXTERNAL_LLM_EXCHANGE_TIMEOUT_SECS \
+             (120 s) — below it, the tail an operator would react to is one \
+             undifferentiated overflow bucket: {b:?}"
+        );
+        // The local exchange timeout must be representable too: on this
+        // deployment every LLM call is local Ollama, so `le=60000` is the mark
+        // beyond which no successful local call can land.
+        assert!(
+            b.contains(&60_000.0),
+            "LOCAL_LLM_EXCHANGE_TIMEOUT_SECS (60 s) must be a boundary: {b:?}"
+        );
+        // Measured: the mode is (500, 1000], holding ~74 % of all calls, and
+        // 750 is what splits it (44.8 % / 29.2 %). Dropping it collapses the
+        // modal population into one bucket.
+        assert!(
+            b.contains(&750.0) && b.contains(&500.0) && b.contains(&1000.0),
+            "the (500,1000] mode holds ~74% of calls and needs its interior \
+             split: {b:?}"
+        );
+        assert!(
+            b[0] > 0.0,
+            "`le=0` is degenerate: duration_ms truncation puts sub-ms calls at \
+             exactly 0.0, and the lowest bucket already includes them"
+        );
+
+        // #628's lesson, encoded: a quantile that lands ON a boundary is
+        // reported as a bucket EDGE rather than an interpolated value — the
+        // same "a floor reported as a value" defect the whole change exists to
+        // fix, one decade further out. The two measured estimates must sit
+        // strictly INSIDE a bucket, and inside a NARROW one, or the number this
+        // histogram is being re-bucketed to report is still not a measurement.
+        for (name, estimate_ms, max_width) in [
+            ("p95", 15_600.0_f64, 2_500.0_f64),
+            ("p99", 35_600.0, 10_000.0),
+        ] {
+            assert!(
+                !b.contains(&estimate_ms),
+                "{name} estimate {estimate_ms} sits exactly ON a boundary, so \
+                 histogram_quantile reports the edge instead of interpolating"
+            );
+            let lo = b.iter().filter(|v| **v < estimate_ms).next_back().copied();
+            let hi = b.iter().find(|v| **v > estimate_ms).copied();
+            let (lo, hi) = (
+                lo.unwrap_or_else(|| panic!("{name} below every boundary: {b:?}")),
+                hi.unwrap_or_else(|| {
+                    panic!("{name} estimate {estimate_ms} overflows to +Inf: {b:?}")
+                }),
+            );
+            assert!(
+                hi - lo <= max_width,
+                "{name} (~{estimate_ms} ms) lands in ({lo}, {hi}], width \
+                 {} ms — wider than the {max_width} ms this set is supposed to \
+                 give it",
+                hi - lo
+            );
+        }
     }
 }
