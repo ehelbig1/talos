@@ -12,6 +12,13 @@
 //! survives retention. The off-host copy has exactly the same failure mode
 //! one hop further out, so it gets the same treatment: the drill asserts the
 //! age of the object it pulled, and refuses a stale one.
+//!
+//! **An age gate has two ends.** [`age_hours`] saturates to 0 on a future
+//! stamp, so a stale-only check re-creates the very defect it was written
+//! against — one future-dated key reads as fresh FOREVER, and a replay of an
+//! old-but-valid archive under such a key passes every downstream verifier.
+//! [`is_implausibly_future`] is the other end, and both are asserted
+//! together.
 
 use crate::key::{object_key, parse_object_key, stamp_of_local, ArtifactKind, KeyError};
 
@@ -143,24 +150,62 @@ pub fn newest_for_kind(remote_keys: &[String], kind: ArtifactKind) -> Option<(St
         .max_by_key(|(_, at)| *at)
 }
 
+/// How far into the future a key stamp may sit before it is REFUSED rather
+/// than believed.
+///
+/// 24 h is chosen to be far wider than any clock error that survives on a
+/// networked host (NTP keeps a laptop inside seconds; a dead RTC battery or a
+/// wrong timezone offset lands inside a day) and far narrower than any useful
+/// replay window. See [`is_implausibly_future`] for why a bound is needed at
+/// all.
+pub const MAX_FUTURE_SKEW_HOURS: i64 = 24;
+
 /// Whole hours between `taken_at_unix` and `now_unix`.
 ///
 /// Saturates at 0 for a future timestamp rather than returning a negative
 /// number, so callers never have to reason about a negative age.
 ///
-/// STATED CONSEQUENCE, in the permissive direction: **a future-dated key
-/// therefore reads as fresh.** Combined with [`newest_for_kind`] picking the
-/// highest key stamp, anyone holding the write credential can upload a
-/// far-future object and have it shadow the real newest archive
-/// indefinitely. That is a denial/poisoning vector, not a data-loss one —
-/// the real archives are untouched under their own keys, and the drill fails
-/// LOUDLY on the poisoned object (its decrypt or its `pg_restore` will not
-/// succeed) rather than going green. It is the same residual as "an attacker
-/// with the credential can upload garbage", which `docs/offhost-backup.md`
-/// states, and it is not closed here.
+/// **That saturation is why [`is_implausibly_future`] exists and why every
+/// freshness gate MUST call it.** A future stamp reads as 0 h old — i.e. as
+/// permanently fresh — so on its own this function cannot fail a
+/// future-dated object, ever.
 #[must_use]
 pub fn age_hours(taken_at_unix: i64, now_unix: i64) -> i64 {
-    ((now_unix - taken_at_unix) / 3600).max(0)
+    (now_unix.saturating_sub(taken_at_unix) / 3600).max(0)
+}
+
+/// Is this stamp further in the future than any real clock error?
+///
+/// **This closes a REPLAY, not merely a poisoning.** The uploader's
+/// credential holds `readFiles` as well as `writeFiles` — the restore drill
+/// needs it — so anyone holding it can `GET` the current newest archive and
+/// `PUT` those exact bytes back under a future-dated key. That object is a
+/// genuine, correctly-encrypted archive: it decrypts, `pg_restore
+/// --exit-on-error` succeeds, and every verifier the drill runs passes. The
+/// drill would report SUCCESS while restoring a replay of an arbitrarily old
+/// database. And because [`newest_for_kind`] picks the highest stamp while
+/// [`age_hours`] saturates to 0, that one object shadows every real archive
+/// AND reads as 0 h old forever — disabling the freshness gate permanently
+/// rather than for a day.
+///
+/// No attacker is needed for the same outcome: the stamp comes from the
+/// sidecar's filename, so a single upload from a host with a skewed clock
+/// does it by accident.
+///
+/// The choice is NOT "reject future keys or accept false-reds on skew" — a
+/// BOUNDED tolerance closes it with neither cost. A stamp inside
+/// [`MAX_FUTURE_SKEW_HOURS`] is accepted and (per [`age_hours`]) reads as
+/// 0 h old; beyond it the object is refused and the caller says so.
+#[must_use]
+pub fn is_implausibly_future(taken_at_unix: i64, now_unix: i64) -> bool {
+    taken_at_unix.saturating_sub(now_unix) > MAX_FUTURE_SKEW_HOURS * 3600
+}
+
+/// Whole hours a stamp sits in the FUTURE, 0 if it does not. For messages
+/// only — the decision is [`is_implausibly_future`].
+#[must_use]
+pub fn future_skew_hours(taken_at_unix: i64, now_unix: i64) -> i64 {
+    (taken_at_unix.saturating_sub(now_unix) / 3600).max(0)
 }
 
 #[cfg(test)]
@@ -264,11 +309,49 @@ mod tests {
     fn age_hours_never_goes_negative() {
         assert_eq!(age_hours(1000, 1000 + 3600 * 5), 5);
         assert_eq!(age_hours(1000, 1000 + 3599), 0);
-        // A future stamp saturates at 0 rather than going negative — which
-        // means it reads as FRESH. Pinned here so the permissive direction is
-        // a decision on record, not an accident; see the doc comment for why
-        // it is left open and what catches the poisoned-object case instead.
+        // A future stamp still saturates at 0 — i.e. reads as FRESH. That is
+        // now a documented property of THIS function only, and it is exactly
+        // why no caller may use it as its whole freshness gate: the future
+        // end is `is_implausibly_future`, asserted below.
         assert_eq!(age_hours(9_999_999, 1000), 0);
+    }
+
+    #[test]
+    fn a_replayable_future_stamp_is_refused_but_ordinary_clock_skew_is_not() {
+        // THE property. A future-dated key is not merely "junk that fails
+        // loudly": with `readFiles` on the same credential, an attacker (or
+        // one host with a skewed clock) can re-PUT the CURRENT newest archive
+        // under a future key. It decrypts, it restores, every verifier
+        // passes — and because `age_hours` saturates, that key reads 0h old
+        // forever, disabling the freshness gate permanently.
+        let now = 1_786_961_877;
+        let h = 3600;
+
+        // Ordinary skew is accepted, so this is not a false-red machine.
+        assert!(!is_implausibly_future(now, now));
+        assert!(!is_implausibly_future(now + h, now));
+        assert!(!is_implausibly_future(now + 23 * h, now));
+        // Exactly at the bound is still accepted; strictly beyond is not.
+        assert!(!is_implausibly_future(now + MAX_FUTURE_SKEW_HOURS * h, now));
+        assert!(is_implausibly_future(
+            now + MAX_FUTURE_SKEW_HOURS * h + 1,
+            now
+        ));
+        assert!(is_implausibly_future(now + 48 * h, now));
+        assert!(is_implausibly_future(now + 365 * 24 * h, now));
+
+        // A past stamp is never "future", however old — staleness is the
+        // other gate's job.
+        assert!(!is_implausibly_future(now - 365 * 24 * h, now));
+
+        // No overflow panic on the extremes a hand-made key could carry.
+        assert!(is_implausibly_future(i64::MAX, now));
+        assert!(!is_implausibly_future(i64::MIN, now));
+        assert_eq!(age_hours(i64::MIN, i64::MAX), i64::MAX / 3600);
+
+        // The reporting helper, used only in the refusal message.
+        assert_eq!(future_skew_hours(now + 50 * h, now), 50);
+        assert_eq!(future_skew_hours(now - 50 * h, now), 0);
     }
 
     #[test]

@@ -131,10 +131,25 @@ pub fn classify_aws_failure(exit_code: Option<i32>, stderr: &str) -> FailureReas
     // 4. Object genuinely absent. Also after auth: B2, like S3, may answer
     //    403 rather than 404 for a key you may not read, and calling that
     //    "not found" would hide a permissions regression.
+    //
+    //    THE ONE ARM WHERE BEING WRONG COSTS DATA, so the markers are
+    //    specific rather than substring-y. `do_upload` treats NotFound from
+    //    `head-object` as "the key is absent" and PUTs over it — that is the
+    //    pre-flight which stops an overwrite. A bare `contains("not found")`
+    //    filed anything whose text merely happened to contain the phrase
+    //    (a proxy's "upstream not found", a plugin's "profile not found", a
+    //    future botocore wording) as "absent", bypassing the guard and
+    //    overwriting a real archive. The accepted forms are the ones the AWS
+    //    CLI actually emits: `An error occurred (404) … operation: Not
+    //    Found` for HeadObject and `(NoSuchKey) … The specified key does not
+    //    exist` for GetObject. Anything else falls through to `other`, which
+    //    fails the upload of that artifact rather than proceeding — the safe
+    //    direction.
     if s.contains("nosuchkey")
         || s.contains("(404)")
         || s.contains("status code: 404")
-        || s.contains("not found")
+        || s.contains("operation: not found")
+        || s.contains("the specified key does not exist")
     {
         return FailureReason::NotFound;
     }
@@ -283,6 +298,34 @@ mod tests {
             ),
             FailureReason::Auth
         );
+        // The exact HeadObject-on-a-missing-key wording, which is what the
+        // upload pre-flight actually sees.
+        assert_eq!(
+            classify_aws_failure(
+                Some(254),
+                "An error occurred (404) when calling the HeadObject operation: Not Found"
+            ),
+            FailureReason::NotFound
+        );
+    }
+
+    #[test]
+    fn only_a_real_missing_key_is_not_found_because_that_arm_authorises_a_put() {
+        // `do_upload` reads NotFound from `head-object` as "the key is
+        // absent" and PUTs. So a message that merely CONTAINS "not found"
+        // must not reach this arm: doing so bypasses the only pre-flight
+        // standing between a transient oddity and an overwritten archive.
+        for msg in [
+            "An error occurred (BadGateway): upstream not found",
+            "aws: error: the config profile (talos) could not be found: profile not found",
+            "SomeFutureError when calling the HeadObject operation: object not found in cache",
+        ] {
+            assert_eq!(
+                classify_aws_failure(Some(1), msg),
+                FailureReason::Other,
+                "must NOT be treated as an absent key: {msg}"
+            );
+        }
     }
 
     #[test]

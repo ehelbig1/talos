@@ -31,7 +31,7 @@
 //! `observability/prometheus/prometheus.yml`, and whether the running
 //! Prometheus actually reads them is `make observability-verify`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::classify::FailureReason;
 use crate::key::ArtifactKind;
@@ -78,6 +78,25 @@ impl Outcome {
 
 /// Everything the `.prom` file holds. Cumulative fields are carried forward
 /// from the previous file; `last_run`/`enabled` describe this run only.
+///
+/// # The two counters count DIFFERENT THINGS, on purpose
+///
+/// * [`MetricState::uploads`] `{kind,outcome="failure"}` counts ARTIFACTS.
+///   Three archives failing in one run is three, because that is what an
+///   operator asking "how much did not get off this host" wants.
+/// * [`MetricState::failures`] `{reason}` counts RUNS — **at most one per
+///   reason per run**, enforced by `run_reasons` below.
+///
+/// The second is not a stylistic choice. `TalosOffhostBackupUploadFailing`
+/// alerts on `increase(failures_total[50h]) > 1.5` and its description says
+/// "has failed on at least two of the last two daily runs". Before this,
+/// `do_upload` called `record_failure` once per artifact AND returned an
+/// error on which `cmd_upload` called `record_run_failure` — so one bad
+/// night on the encrypt/head/put paths scored 2–3 and the alert fired on a
+/// single flaky tether, which is exactly the tightening from `> 0`/6 h to
+/// `> 1.5`/50 h being defeated. The `.prom` fixture in the promtool suite
+/// could not see it, because that fixture supplies counter values directly
+/// instead of driving this producer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MetricState {
     /// `1` when a bucket and an endpoint are configured. The staleness alert
@@ -89,6 +108,10 @@ pub struct MetricState {
     pub uploads: BTreeMap<(ArtifactKind, Outcome), u64>,
     pub failures: BTreeMap<FailureReason, u64>,
     pub last_success: BTreeMap<ArtifactKind, i64>,
+    /// Reasons already counted into `failures` during THIS run. Never
+    /// rendered, never carried forward — a fresh run starts with an empty
+    /// set, which is what makes `failures` a per-run counter.
+    run_reasons: BTreeSet<FailureReason>,
 }
 
 impl MetricState {
@@ -152,17 +175,32 @@ impl MetricState {
         }
     }
 
+    /// One ARTIFACT failed. Bumps the per-artifact counter unconditionally
+    /// and the per-run reason counter at most once — see the type docs.
     pub fn record_failure(&mut self, kind: ArtifactKind, reason: FailureReason) {
         *self.uploads.entry((kind, Outcome::Failure)).or_insert(0) += 1;
-        *self.failures.entry(reason).or_insert(0) += 1;
+        self.count_reason_once(reason);
     }
 
     /// A failure with no artifact in hand (bad config, missing `aws`,
     /// unreachable bucket at the listing step). It still has to be counted,
     /// or "the uploader cannot even start" is the one failure mode that
     /// produces no signal at all.
+    ///
+    /// Idempotent per reason within a run, so the normal path — `do_upload`
+    /// records the per-artifact failure and then RETURNS that same failure,
+    /// which `cmd_upload` records again as the run's outcome — counts one,
+    /// not two. Both call sites are correct on their own terms; the
+    /// de-duplication belongs here, where the invariant is stated and
+    /// testable, rather than in a caller remembering not to.
     pub fn record_run_failure(&mut self, reason: FailureReason) {
-        *self.failures.entry(reason).or_insert(0) += 1;
+        self.count_reason_once(reason);
+    }
+
+    fn count_reason_once(&mut self, reason: FailureReason) {
+        if self.run_reasons.insert(reason) {
+            *self.failures.entry(reason).or_insert(0) += 1;
+        }
     }
 }
 
@@ -366,6 +404,48 @@ mod tests {
         // timestamp claiming it did.
         assert!(!back.enabled);
         assert_eq!(back.last_run, 0);
+    }
+
+    #[test]
+    fn one_failed_run_counts_exactly_one_per_reason() {
+        // The alert reads `increase(failures_total[50h]) > 1.5` and claims
+        // that means "failed on at least two of the last two daily runs".
+        // That claim is only true if ONE run can only ever add 1.
+        let mut run = MetricState::default();
+        // Three artifacts fail the same way, then the run itself fails with
+        // that reason — the real do_upload/cmd_upload sequence.
+        run.record_failure(ArtifactKind::Postgres, FailureReason::Network);
+        run.record_failure(ArtifactKind::Vault, FailureReason::Network);
+        run.record_failure(ArtifactKind::Postgres, FailureReason::Network);
+        run.record_run_failure(FailureReason::Network);
+        assert_eq!(
+            run.failures.get(&FailureReason::Network),
+            Some(&1),
+            "one run must move failures_total{{reason}} by exactly 1"
+        );
+        // The per-ARTIFACT counter is unaffected: it is a different question
+        // ("how much did not get off this host") and 3 is the right answer.
+        assert_eq!(
+            run.uploads.get(&(ArtifactKind::Postgres, Outcome::Failure)),
+            Some(&2)
+        );
+        assert_eq!(
+            run.uploads.get(&(ArtifactKind::Vault, Outcome::Failure)),
+            Some(&1)
+        );
+
+        // Distinct reasons in one run are still distinct — the dedupe is per
+        // reason, not per run, so `sum by (reason)` stays meaningful.
+        run.record_failure(ArtifactKind::Vault, FailureReason::Encrypt);
+        assert_eq!(run.failures.get(&FailureReason::Encrypt), Some(&1));
+
+        // And the NEXT run counts again: the dedupe must not be baked into
+        // the carried-forward file, or a persistent failure would be
+        // counted once and then never again — silence, which is the defect
+        // one level worse.
+        let mut next = MetricState::carried_forward(Some(&render(&run)));
+        next.record_run_failure(FailureReason::Network);
+        assert_eq!(next.failures.get(&FailureReason::Network), Some(&2));
     }
 
     #[test]

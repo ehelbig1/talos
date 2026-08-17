@@ -340,7 +340,7 @@ offhost-backfill: ## One-time: upload every retained local artifact the bucket l
 offhost-plan: ## Show what would be uploaded, without touching the network
 	@bash scripts/offhost-backup/upload.sh plan --offline
 
-offhost-probe: ## PROVE append-only: attempt an overwrite and a delete; both must be refused
+offhost-probe: ## PROVE append-only: attempt an overwrite and a delete; both must be refused BY THE PROVIDER (unreached = NOT PROVEN, exits 1)
 	@bash scripts/offhost-backup/upload.sh probe-append-only
 
 offhost-schedule: ## Install + load the DAILY off-host upload LaunchAgent (macOS)

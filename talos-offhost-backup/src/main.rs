@@ -31,13 +31,14 @@ use talos_offhost_backup::aws::{
 };
 use talos_offhost_backup::classify::{classify_aws_failure, FailureReason};
 use talos_offhost_backup::crypto::{decrypt_file, encrypt_file};
-use talos_offhost_backup::key::{ArtifactKind, KEY_ROOT};
+use talos_offhost_backup::key::{parse_object_key, ArtifactKind, KEY_ROOT};
 use talos_offhost_backup::metrics::{self, MetricState, TEXTFILE_NAME};
 use talos_offhost_backup::passphrase::{
     assert_contained, assert_non_empty, choose_source, path_like_tokens, PassphraseSource,
 };
 use talos_offhost_backup::plan::{
-    age_hours, newest_for_kind, plan_uploads, LocalArtifact, UploadMode,
+    age_hours, future_skew_hours, is_implausibly_future, newest_for_kind, plan_uploads,
+    LocalArtifact, UploadMode, MAX_FUTURE_SKEW_HOURS,
 };
 
 // ── Small output helpers. Nothing here ever prints a secret. ──────────
@@ -680,8 +681,14 @@ fn do_upload(cfg: &Config, mode: UploadMode, st: &mut MetricState) -> R<usize> {
     }
 }
 
-fn cmd_fetch(cfg: &Config, kind: ArtifactKind, dest: &Path, assert_fresh: bool) -> i32 {
-    match do_fetch(cfg, kind, dest, assert_fresh) {
+fn cmd_fetch(
+    cfg: &Config,
+    kind: ArtifactKind,
+    dest: &Path,
+    assert_fresh: bool,
+    explicit_key: Option<&str>,
+) -> i32 {
+    match do_fetch(cfg, kind, dest, assert_fresh, explicit_key) {
         Ok(key) => {
             ok(&format!("{key} → {}", dest.display()));
             // STDOUT carries the key and nothing else, so a caller can
@@ -703,7 +710,13 @@ fn cmd_fetch(cfg: &Config, kind: ArtifactKind, dest: &Path, assert_fresh: bool) 
     }
 }
 
-fn do_fetch(cfg: &Config, kind: ArtifactKind, dest: &Path, assert_fresh: bool) -> R<String> {
+fn do_fetch(
+    cfg: &Config,
+    kind: ArtifactKind,
+    dest: &Path,
+    assert_fresh: bool,
+    explicit_key: Option<&str>,
+) -> R<String> {
     let target = cfg.target()?;
     let (passphrase, source) = resolve_passphrase(cfg)?;
     log(&format!("age passphrase from {source}"));
@@ -711,27 +724,96 @@ fn do_fetch(cfg: &Config, kind: ArtifactKind, dest: &Path, assert_fresh: bool) -
     let aws = Aws {
         bin: cfg.aws_bin.clone(),
     };
-    let remote = list_all_keys(&aws, target)?;
-    let (key, taken_at) = newest_for_kind(&remote, kind).ok_or_else(|| {
-        Failure::new(
-            FailureReason::NotFound,
-            format!(
-                "the bucket holds NO {kind} archive under {KEY_ROOT}/. There is no off-host \
-                 copy to restore — that IS the drill result."
-            ),
-        )
-    })?;
 
-    // Age is ASSERTED, not merely printed. The drill's 2026-08-13 lesson,
-    // one hop further out: if the uploader died, the bucket keeps serving
-    // the last good archive and the drill keeps going green for as long as
-    // retention holds it.
-    let age = age_hours(taken_at, now_unix());
-    if assert_fresh && cfg.max_age_hours > 0 && age > cfg.max_age_hours {
+    let (key, taken_at) = match explicit_key {
+        // An operator-named object. Still parsed rather than trusted: the
+        // string reaches `aws s3api get-object --key`, and only a
+        // well-formed key of the requested kind may go there.
+        Some(k) => {
+            let (got_kind, stamp) = parse_object_key(k).ok_or_else(|| {
+                Failure::new(
+                    FailureReason::Config,
+                    format!(
+                        "--key '{k}' is not a Talos archive key. Expected the shape \
+                         {KEY_ROOT}/<kind>/<YYYY>/<MM>/<stamp>-<kind>.age — copy one \
+                         verbatim from `aws s3api list-objects-v2`."
+                    ),
+                )
+            })?;
+            if got_kind != kind {
+                return Err(Failure::new(
+                    FailureReason::Config,
+                    format!("--key names a {got_kind} archive but --kind says {kind}"),
+                ));
+            }
+            let at = stamp.to_unix().ok_or_else(|| {
+                Failure::new(
+                    FailureReason::Config,
+                    format!("--key '{k}' carries an unrepresentable timestamp"),
+                )
+            })?;
+            (k.to_string(), at)
+        }
+        None => newest_for_kind(&list_all_keys(&aws, target)?, kind).ok_or_else(|| {
+            Failure::new(
+                FailureReason::NotFound,
+                format!(
+                    "the bucket holds NO {kind} archive under {KEY_ROOT}/. There is no off-host \
+                     copy to restore — that IS the drill result."
+                ),
+            )
+        })?,
+    };
+
+    // ── The age gate, BOTH ENDS. ──────────────────────────────────────
+    //
+    // Stale end: the drill's 2026-08-13 lesson one hop further out — if the
+    // uploader died, the bucket keeps serving the last good archive and the
+    // drill keeps going green for as long as retention holds it.
+    //
+    // Future end: `age_hours` saturates to 0, so without this a future-dated
+    // key reads as fresh FOREVER. That is not only a poisoning vector. The
+    // upload credential also holds `readFiles` (the drill needs it), so
+    // anyone holding it can re-PUT today's real archive under a future key:
+    // it decrypts, `pg_restore --exit-on-error` succeeds, both verifiers
+    // pass, and the drill certifies a REPLAY. One skewed-clock upload does
+    // the same by accident. See plan::is_implausibly_future.
+    let now = now_unix();
+    let which = if explicit_key.is_some() {
+        "the requested"
+    } else {
+        "the newest"
+    };
+    if assert_fresh && is_implausibly_future(taken_at, now) {
+        let skew = future_skew_hours(taken_at, now);
         return Err(Failure::new(
             FailureReason::NotFound,
             format!(
-                "the newest off-host {kind} archive is {age}h old (limit {}h): {key}\n   \
+                "{which} off-host {kind} archive is stamped {skew}h in the FUTURE \
+                 (tolerance {MAX_FUTURE_SKEW_HOURS}h): {key}\n   \
+                 REFUSED rather than read as fresh. A future-dated key sorts above every \
+                 real archive and its age saturates to 0, so accepting it would hide the \
+                 real newest copy AND disable this freshness check permanently — including \
+                 for a byte-exact REPLAY of an old archive, which restores and verifies \
+                 cleanly. Either this host's clock is wrong by more than a day, or the \
+                 uploader's clock was, or someone with the write credential put it there. \
+                 Check the clock first, then list the bucket and name a known-good key \
+                 with --key (a named object is exempt from the STALENESS limit, not from \
+                 this one)."
+            ),
+        ));
+    }
+    let age = age_hours(taken_at, now);
+    // An explicitly-named object is not a claim about the pipeline's
+    // recency, so the STALE end does not apply to it — you asked for that
+    // object by name. The FUTURE end above still does: it is a
+    // well-formedness check, not a freshness one.
+    let stale_gate = assert_fresh && explicit_key.is_none();
+    if stale_gate && cfg.max_age_hours > 0 && age > cfg.max_age_hours {
+        return Err(Failure::new(
+            FailureReason::NotFound,
+            format!(
+                "{which} off-host {kind} archive is {age}h old (limit {}h): {key}\n   \
                  The uploader has stopped. Restoring this would go green and certify a \
                  pipeline that is no longer running. Check \
                  ~/.talos/logs/offhost-backup.log and the \
@@ -740,7 +822,15 @@ fn do_fetch(cfg: &Config, kind: ArtifactKind, dest: &Path, assert_fresh: bool) -
             ),
         ));
     }
-    log(&format!("newest {kind}: {key} ({age}h old)"));
+    if explicit_key.is_some() {
+        log(&format!(
+            "explicit --key {key} ({age}h old) — the staleness gate does NOT apply to a \
+             named object; this run certifies that THIS object is readable, not that the \
+             pipeline is current"
+        ));
+    } else {
+        log(&format!("newest {kind}: {key} ({age}h old)"));
+    }
 
     let enc = dest.with_extension("age.download");
     aws.run(&get_object_argv(target, &key, &enc.to_string_lossy()))?;
@@ -748,8 +838,14 @@ fn do_fetch(cfg: &Config, kind: ArtifactKind, dest: &Path, assert_fresh: bool) -
         Failure::new(
             FailureReason::Encrypt,
             format!(
-                "{e}\n   The archive downloaded fine, so the BUCKET is reachable and the \
-                 object exists — this is the age passphrase, not the network."
+                "{e}\n   The bytes arrived, so the BUCKET is reachable and the object \
+                 exists: this is the age passphrase, OR this object is not a valid \
+                 archive. age cannot tell those apart — a truncated, bit-rotted, \
+                 non-age or deliberately-planted object fails identically to a wrong \
+                 passphrase. Before re-auditing the escrowed passphrase, check the \
+                 object's size against the bucket listing and try a different key with \
+                 --key; if a DIFFERENT archive opens with the same passphrase, the \
+                 passphrase is fine and this object is bad."
             ),
         )
     })?;
@@ -804,6 +900,15 @@ fn cmd_plan(cfg: &Config, mode: UploadMode, offline: bool) -> i32 {
 /// This uploads one tiny throwaway object, then attempts to OVERWRITE it and
 /// to DELETE it with the same credential. **Both must be refused.**
 ///
+/// **Only a 403 counts as a refusal.** An attempt that never reached the
+/// provider — no network, no `aws` binary, a bucket that is not configured —
+/// is not evidence of anything, and scoring it as "refused" would make this
+/// command answer YES precisely when it could not ask the question. That
+/// failure mode is worse than having no probe at all: this is the one
+/// command the runbook tells the operator to run BEFORE trusting the
+/// append-only property, so a false PROVEN is the whole cost. See
+/// [`ProbeOutcome`].
+///
 /// Note what it cannot do: the probe object it creates cannot be cleaned up
 /// (that would need the delete it is proving absent), so it stays in the
 /// bucket forever under a `talos/v1/_probe/` prefix. That is the correct
@@ -830,7 +935,6 @@ fn cmd_probe(cfg: &Config) -> i32 {
         return 1;
     }
 
-    let mut failures = 0;
     log(&format!("probe object: {key}"));
     if let Err(f) = aws.run(&put_object_argv(target, &key, &tmp.to_string_lossy())) {
         eprintln!(
@@ -844,46 +948,106 @@ fn cmd_probe(cfg: &Config) -> i32 {
     ok("PutObject to a NEW key succeeded — as it must");
 
     // 1. Overwrite.
-    match aws.run(&put_object_argv(target, &key, &tmp.to_string_lossy())) {
-        Err(f) => ok(&format!(
-            "OVERWRITE was refused (reason={}) — history is safe from a re-PUT",
-            f.reason.as_str()
-        )),
-        Ok(_) => {
-            eprintln!(
-                "✗ OVERWRITE SUCCEEDED. This credential can replace an existing archive with \
-                 new bytes under the same key, which destroys history without ever calling \
-                 delete. Either the bucket needs object-lock/versioning, or accept that the \
-                 unique-key derivation is the ONLY thing standing between a compromised host \
-                 and unrecoverable backups."
-            );
-            failures += 1;
+    let overwrite = score_probe_attempt(
+        aws.run(&put_object_argv(target, &key, &tmp.to_string_lossy()))
+            .err(),
+    );
+    match &overwrite {
+        ProbeOutcome::Refused => {
+            ok("OVERWRITE was refused by the PROVIDER (403) — history is safe from a re-PUT")
         }
+        ProbeOutcome::Allowed => eprintln!(
+            "✗ OVERWRITE SUCCEEDED. This credential can replace an existing archive with \
+             new bytes under the same key, which destroys history without ever calling \
+             delete. Either the bucket needs object-lock/versioning, or accept that the \
+             unique-key derivation is the ONLY thing standing between a compromised host \
+             and unrecoverable backups."
+        ),
+        ProbeOutcome::Unproven(f) => eprintln!(
+            "✗ OVERWRITE: NOT PROVEN. The attempt failed (reason={}) before the provider \
+             could answer, so this says NOTHING about whether an overwrite would be \
+             refused: {}",
+            f.reason.as_str(),
+            f.detail
+        ),
     }
 
     // 2. Delete.
-    match aws.run(&delete_object_argv(target, &key)) {
-        Err(f) => ok(&format!(
-            "DeleteObject was refused (reason={}) — the key lacks deleteFiles",
-            f.reason.as_str()
-        )),
-        Ok(_) => {
-            eprintln!(
-                "✗ DELETE SUCCEEDED. The application key has `deleteFiles`. Re-issue it \
-                 without that capability (see docs/offhost-backup.md) — a host credential \
-                 that can delete makes every off-host copy only as durable as the host."
-            );
-            failures += 1;
+    let delete = score_probe_attempt(aws.run(&delete_object_argv(target, &key)).err());
+    match &delete {
+        ProbeOutcome::Refused => {
+            ok("DeleteObject was refused by the PROVIDER (403) — the key lacks deleteFiles")
         }
+        ProbeOutcome::Allowed => eprintln!(
+            "✗ DELETE SUCCEEDED. The application key has `deleteFiles`. Re-issue it \
+             without that capability (see docs/offhost-backup.md) — a host credential \
+             that can delete makes every off-host copy only as durable as the host."
+        ),
+        ProbeOutcome::Unproven(f) => eprintln!(
+            "✗ DELETE: NOT PROVEN. The attempt failed (reason={}) before the provider \
+             could answer, so this says NOTHING about whether the key can delete: {}",
+            f.reason.as_str(),
+            f.detail
+        ),
     }
 
     let _ = std::fs::remove_file(&tmp);
-    if failures == 0 {
-        ok("append-only holds for this credential");
+    let violated = [&overwrite, &delete]
+        .iter()
+        .filter(|o| matches!(o, ProbeOutcome::Allowed))
+        .count();
+    let unproven = [&overwrite, &delete]
+        .iter()
+        .filter(|o| matches!(o, ProbeOutcome::Unproven(_)))
+        .count();
+
+    if violated > 0 {
+        eprintln!("✗ {violated} append-only propert(y/ies) NOT enforced by the provider");
+    }
+    if unproven > 0 {
+        eprintln!(
+            "✗ {unproven} append-only propert(y/ies) NOT PROVEN — the provider was never \
+             reached. This is 'I could not ask', not 'the provider refused'. Do NOT record \
+             append-only as verified on the strength of this run; fix the reason above and \
+             run `make offhost-probe` again."
+        );
+    }
+    if violated == 0 && unproven == 0 {
+        ok("append-only holds for this credential — both attempts were REFUSED by the provider");
         0
     } else {
-        eprintln!("✗ {failures} append-only propert(y/ies) NOT enforced by the provider");
         1
+    }
+}
+
+/// What one violation attempt actually established.
+#[derive(Debug)]
+enum ProbeOutcome {
+    /// The provider answered, and said no. The ONLY positive evidence.
+    Refused,
+    /// The provider answered, and did it. The property does not hold.
+    Allowed,
+    /// The attempt never reached the provider. Evidence of nothing.
+    Unproven(Failure),
+}
+
+/// Score one attempt to violate append-only.
+///
+/// **`Err` is not a refusal.** `network`, `config`, `missing_tool` and
+/// `other` all mean the request never got an answer — a closed laptop scores
+/// identically to a locked-down credential if you branch on `Err(_)`, and
+/// the command then prints "refused … history is safe" and exits 0 on a run
+/// that proved nothing. Only `auth` (a 403/AccessDenied, which by
+/// construction came FROM the provider) is evidence.
+///
+/// `not_found` is deliberately NOT evidence either: the probe object was
+/// just PUT successfully, so a 404 here means something is wrong with the
+/// request, not that the operation was denied.
+fn score_probe_attempt(err: Option<Failure>) -> ProbeOutcome {
+    match err {
+        None => ProbeOutcome::Allowed,
+        Some(f) if f.reason == FailureReason::Auth => ProbeOutcome::Refused,
+        Some(f) => ProbeOutcome::Unproven(f),
     }
 }
 
@@ -900,6 +1064,12 @@ enum Cmd {
         kind: ArtifactKind,
         dest: PathBuf,
         assert_fresh: bool,
+        /// `None` = the newest object of `kind`. `Some` = exactly this
+        /// object, which is how an operator drills an OLDER archive (the
+        /// drill otherwise only ever proves the newest one is readable)
+        /// and how they get past a future-dated key that is shadowing the
+        /// real newest.
+        key: Option<String>,
     },
     Plan {
         mode: UploadMode,
@@ -934,6 +1104,7 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                 "--offline",
                 "--kind",
                 "--dest",
+                "--key",
                 "--no-freshness-check",
             ]
             .contains(&a.as_str())
@@ -960,6 +1131,7 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
                 // Opt-OUT, never opt-in: a freshness gate you have to
                 // remember to switch on is not a gate.
                 assert_fresh: !has("--no-freshness-check"),
+                key: value("--key"),
             })
         }
         "--help" | "-h" | "help" => Ok(Cmd::Help),
@@ -976,10 +1148,17 @@ talos-offhost-backup — encrypted off-host egress for Talos backups (Tier 2)
       --backfill is the one-time opt-in that pushes the whole retained
       history. Always writes the textfile metric, including on failure.
 
-  fetch --kind postgres|vault --dest <path> [--no-freshness-check]
+  fetch --kind postgres|vault --dest <path> [--key <object-key>]
+        [--no-freshness-check]
       GET the newest archive of that kind and age-decrypt it. Fails if the
       bucket is unreachable, if it holds no such archive, if that archive is
-      older than TALOS_OFFHOST_MAX_AGE_HOURS, or if the passphrase is wrong.
+      older than TALOS_OFFHOST_MAX_AGE_HOURS, if it is stamped more than 24h
+      in the FUTURE (a future key sorts above every real archive and reads as
+      0h old forever), or if the passphrase is wrong.
+      --key fetches ONE named object instead of the newest — the way to drill
+      an OLDER archive, and the way past a future-dated key that is shadowing
+      the real newest. The staleness limit does not apply to a named object;
+      the future-stamp refusal still does.
 
   plan [--backfill] [--offline]
       Show what upload would do. --offline needs no credentials.
@@ -1018,7 +1197,8 @@ fn main() {
             kind,
             dest,
             assert_fresh,
-        } => cmd_fetch(&cfg, kind, &dest, assert_fresh),
+            key,
+        } => cmd_fetch(&cfg, kind, &dest, assert_fresh, key.as_deref()),
         Cmd::Probe => cmd_probe(&cfg),
     };
     std::process::exit(rc);
@@ -1318,6 +1498,269 @@ fi
             "{}",
             e.detail
         );
+    }
+
+    /// A config wired to a stub `aws`, with a passphrase helper that needs
+    /// no escrow and a scratch backup/textfile dir.
+    fn stub_cfg(aws_bin: String, backup_dir: PathBuf, textfile_dir: PathBuf) -> Config {
+        Config {
+            target: Some(target()),
+            backup_dir,
+            textfile_dir,
+            aws_bin,
+            checkout_roots: vec![PathBuf::from("/nonexistent-checkout-root")],
+            passphrase_cmd: Some("echo hunter2".into()),
+            passphrase_file: None,
+            escrow_timeout_secs: 5,
+            max_age_hours: 168,
+            access_key_id: None,
+        }
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "talos-offhost-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn failures_in(dir: &Path, reason: FailureReason) -> u64 {
+        load_previous(dir)
+            .failures
+            .get(&reason)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn one_failed_run_moves_the_failure_counter_by_exactly_one() {
+        // DRIVEN THROUGH THE REAL PRODUCER, deliberately. The promtool
+        // fixture supplies counter values directly, so it could not see that
+        // one bad run scored 2–3 here: `do_upload` recorded a failure per
+        // ARTIFACT and then returned the first error, on which `cmd_upload`
+        // recorded it AGAIN as the run's outcome. `increase(...) > 1.5` over
+        // 50h then fired on a single flaky tether, defeating the whole
+        // reason the threshold was moved off `> 0`/6h.
+        let backup = scratch("failcount-backups");
+        let textfile = scratch("failcount-metrics");
+        std::fs::create_dir_all(backup.join("vault")).unwrap();
+        std::fs::write(backup.join("talos-20260817-101757.dump"), b"x").unwrap();
+        std::fs::write(backup.join("vault/vault-20260817-221124.tar.gz"), b"x").unwrap();
+
+        // Listing works; every other call dies before reaching the provider.
+        let s = Stub::new(
+            "failcount",
+            r#"
+case "$*" in
+  *list-objects-v2*) echo '{}' ;;
+  *) echo 'Could not connect to the endpoint URL: "https://s3.example.invalid"' >&2; exit 255 ;;
+esac
+"#,
+        );
+        let cfg = stub_cfg(s.bin(), backup.clone(), textfile.clone());
+
+        assert_eq!(cmd_upload(&cfg, UploadMode::NewestOnly), 1);
+        assert_eq!(
+            failures_in(&textfile, FailureReason::Network),
+            1,
+            "ONE failed run must move failures_total{{reason}} by exactly 1"
+        );
+        // Both artifacts failed, and the per-ARTIFACT counter says so — the
+        // two series answer different questions and only one is deduped.
+        let st = load_previous(&textfile);
+        assert_eq!(
+            st.uploads
+                .get(&(ArtifactKind::Postgres, metrics::Outcome::Failure)),
+            Some(&1)
+        );
+        assert_eq!(
+            st.uploads
+                .get(&(ArtifactKind::Vault, metrics::Outcome::Failure)),
+            Some(&1)
+        );
+
+        // A SECOND failed run must count again — deduping across runs would
+        // turn a persistent failure into silence, which is worse.
+        assert_eq!(cmd_upload(&cfg, UploadMode::NewestOnly), 1);
+        assert_eq!(failures_in(&textfile, FailureReason::Network), 2);
+
+        std::fs::remove_dir_all(&backup).ok();
+        std::fs::remove_dir_all(&textfile).ok();
+    }
+
+    #[test]
+    fn a_failed_attempt_is_not_scored_as_a_refusal() {
+        // Only a 403 is evidence. Everything else means the request never
+        // reached the provider, and calling that "refused" makes the probe
+        // answer YES exactly when it could not ask.
+        assert!(matches!(score_probe_attempt(None), ProbeOutcome::Allowed));
+        assert!(matches!(
+            score_probe_attempt(Some(Failure::new(FailureReason::Auth, "403"))),
+            ProbeOutcome::Refused
+        ));
+        for r in [
+            FailureReason::Network,
+            FailureReason::Config,
+            FailureReason::MissingTool,
+            FailureReason::Other,
+            FailureReason::NotFound,
+            FailureReason::Encrypt,
+        ] {
+            assert!(
+                matches!(
+                    score_probe_attempt(Some(Failure::new(r, "x"))),
+                    ProbeOutcome::Unproven(_)
+                ),
+                "{r:?} must not count as a refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_exits_nonzero_when_it_could_not_reach_the_provider() {
+        // The runbook says to run this BEFORE trusting append-only, so a
+        // false PROVEN is the entire cost. First PUT succeeds, the OVERWRITE
+        // attempt dies on the network, the DELETE is genuinely refused: one
+        // proven, one unproven, and the command must NOT exit 0.
+        let s = Stub::new(
+            "probe-unproven",
+            r#"
+d=$(dirname "$0")
+case "$*" in
+  *delete-object*)
+    echo 'An error occurred (AccessDenied) when calling the DeleteObject operation' >&2
+    exit 255 ;;
+esac
+if [ -f "$d/put-seen" ]; then
+  echo 'Could not connect to the endpoint URL: "https://s3.example.invalid"' >&2
+  exit 255
+fi
+: > "$d/put-seen"
+exit 0
+"#,
+        );
+        let dir = scratch("probe-unproven-cfg");
+        let cfg = stub_cfg(s.bin(), dir.clone(), dir.clone());
+        assert_eq!(
+            cmd_probe(&cfg),
+            1,
+            "an attempt that never reached the provider must not read as a refusal"
+        );
+
+        // Control: when the provider actually refuses BOTH, it exits 0.
+        let s2 = Stub::new(
+            "probe-refused",
+            r#"
+d=$(dirname "$0")
+case "$*" in
+  *delete-object*)
+    echo 'An error occurred (AccessDenied) when calling the DeleteObject operation' >&2
+    exit 255 ;;
+esac
+if [ -f "$d/put-seen" ]; then
+  echo 'An error occurred (AccessDenied) when calling the PutObject operation' >&2
+  exit 255
+fi
+: > "$d/put-seen"
+exit 0
+"#,
+        );
+        let cfg2 = stub_cfg(s2.bin(), dir.clone(), dir.clone());
+        assert_eq!(cmd_probe(&cfg2), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_future_dated_key_is_refused_rather_than_read_as_fresh() {
+        // The replay shape: `readFiles` on the same credential lets anyone
+        // re-PUT the CURRENT archive under a future key. It decrypts and
+        // restores cleanly, so nothing downstream can catch it — and the
+        // saturating age would read it as 0h old forever.
+        let s = Stub::new(
+            "future",
+            r#"echo '{"Contents":[{"Key":"talos/v1/postgres/2026/08/20260817T101757Z-postgres.age"},{"Key":"talos/v1/postgres/2099/01/20990101T000000Z-postgres.age"}]}'"#,
+        );
+        let dir = scratch("future-cfg");
+        let cfg = stub_cfg(s.bin(), dir.clone(), dir.clone());
+        let e = do_fetch(
+            &cfg,
+            ArtifactKind::Postgres,
+            &dir.join("out.dump"),
+            true,
+            None,
+        )
+        .unwrap_err();
+        assert!(e.detail.contains("FUTURE"), "{}", e.detail);
+        assert!(e.detail.contains("2099"), "{}", e.detail);
+        // It must fail BEFORE any GET — the stub answers every call with a
+        // listing, so a get-object here would have "succeeded" and then
+        // failed on decrypt with a misleading passphrase message.
+        assert!(!dir.join("out.dump").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fetch_takes_an_explicit_key_so_an_older_archive_can_be_drilled() {
+        // docs/offhost-backup.md tells the operator to point --source b2 at
+        // an older key by hand. That instruction needs a flag to be true.
+        let Cmd::Fetch { key, kind, .. } = parse_args(&a(&[
+            "fetch",
+            "--kind",
+            "postgres",
+            "--dest",
+            "/tmp/x",
+            "--key",
+            "talos/v1/postgres/2026/08/20260810T101757Z-postgres.age",
+        ]))
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(kind, ArtifactKind::Postgres);
+        assert_eq!(
+            key.as_deref(),
+            Some("talos/v1/postgres/2026/08/20260810T101757Z-postgres.age")
+        );
+        // Absent by default: the drill always fetches the newest.
+        let Cmd::Fetch { key, .. } =
+            parse_args(&a(&["fetch", "--kind", "postgres", "--dest", "/tmp/x"])).unwrap()
+        else {
+            panic!()
+        };
+        assert!(key.is_none());
+    }
+
+    #[test]
+    fn an_explicit_key_is_parsed_not_trusted() {
+        // The string reaches `aws s3api get-object --key`. A traversal, a
+        // foreign prefix, or a key of the WRONG KIND must be refused before
+        // it gets there — and refusing on kind is what stops `--kind vault`
+        // silently restoring a postgres dump into the vault slot.
+        let dir = scratch("explicit-key");
+        let s = Stub::new("explicit", "echo '{}'");
+        let cfg = stub_cfg(s.bin(), dir.clone(), dir.clone());
+        for bad in [
+            "../../etc/passwd",
+            "talos/v1/postgres/2026/08/../../../x.age",
+            "some/other/thing.age",
+            "talos/v1/vault/2026/08/20260817T221124Z-vault.age", // wrong kind
+        ] {
+            let e = do_fetch(
+                &cfg,
+                ArtifactKind::Postgres,
+                &dir.join("out.dump"),
+                true,
+                Some(bad),
+            )
+            .unwrap_err();
+            assert_eq!(e.reason, FailureReason::Config, "{bad}: {}", e.detail);
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

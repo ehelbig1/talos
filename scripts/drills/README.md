@@ -546,12 +546,23 @@ Honest list so future-you doesn't develop false confidence:
    Three limits of the b2 mode, stated rather than implied:
    * It restores the **newest** off-host archive. A corrupt object from
      three months ago would go unnoticed — the same "newest only" hole
-     item 4 above describes for local artifacts.
+     item 4 above describes for local artifacts. Fetch an older one by
+     hand with `upload.sh fetch --kind postgres --key <object-key>
+     --dest <path>`; the drill itself has no `--key`.
+   * It restores the newest archive **that is not stamped in the
+     future**. A key more than 24 h ahead of the local clock is REFUSED
+     rather than believed, because such a key sorts above every real
+     archive and its age saturates to 0 — so a byte-exact replay of an
+     old archive under a future key would restore, verify and certify a
+     backup pipeline that had stopped. See docs/offhost-backup.md.
    * It proves the archives are READABLE. It does not prove they are
      UNDELETABLE: refusing delete and overwrite is the provider's job and
      is checked separately by
      `scripts/offhost-backup/upload.sh probe-append-only`, which attempts
-     both and expects both to be refused.
+     both and requires both to be refused **by the provider** (a 403).
+     That command exits non-zero when an attempt never reached B2 at all:
+     "I could not ask" is not "the provider refused", and a probe that
+     conflates them answers YES precisely when it knows least.
    * The age passphrase gets the same containment checks as the KEK
      (not inside a checkout, not inside `$BACKUP_DIR`, symlinks resolved,
      both-set refused) and therefore the same stated limits: nothing here

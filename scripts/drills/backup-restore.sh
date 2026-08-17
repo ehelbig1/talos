@@ -771,6 +771,20 @@ chmod 700 "$WORK_DIR"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# ONE KNOB, TWO SOURCES, ONE VALIDATION — hoisted here on purpose.
+#
+# `--source artifact` compares it against a file mtime and `--source b2`
+# hands it to the off-host helper as TALOS_OFFHOST_MAX_AGE_HOURS, so "stale"
+# cannot mean two different things depending on which source you asked for.
+# The validation was previously inside the `artifact` branch only, which left
+# the b2 path coercing a malformed value to 168 through the helper's
+# `.parse().ok().unwrap_or(168)` — a typo'd knob silently becoming the
+# default is how a gate stops being the gate you set.
+MAX_ARTIFACT_AGE_HOURS="${TALOS_DRILL_MAX_ARTIFACT_AGE_HOURS:-168}"
+case "$MAX_ARTIFACT_AGE_HOURS" in
+    ''|*[!0-9]*) die "TALOS_DRILL_MAX_ARTIFACT_AGE_HOURS must be a non-negative integer, got '$MAX_ARTIFACT_AGE_HOURS'" ;;
+esac
+
 # ── 1. Select the artifacts to restore ────────────────────────────
 if [[ "$SOURCE_MODE" == "artifact" ]]; then
     log "[1/7] selecting backup artifacts from $BACKUP_DIR"
@@ -834,10 +848,9 @@ if [[ "$SOURCE_MODE" == "artifact" ]]; then
     # not make them consistent, and a DEK created after the older of the two
     # was taken would be missing. Pairing them properly needs the sidecars to
     # write a joint manifest and is not attempted here.
-    MAX_ARTIFACT_AGE_HOURS="${TALOS_DRILL_MAX_ARTIFACT_AGE_HOURS:-168}"
-    case "$MAX_ARTIFACT_AGE_HOURS" in
-        ''|*[!0-9]*) die "TALOS_DRILL_MAX_ARTIFACT_AGE_HOURS must be a non-negative integer, got '$MAX_ARTIFACT_AGE_HOURS'" ;;
-    esac
+    #
+    # MAX_ARTIFACT_AGE_HOURS is resolved and validated above step 1, because
+    # the b2 branch uses the same knob.
     assert_artifact_fresh() {
         local mtime="$1" label="$2" path="$3" age_h now
         if [[ -z "$mtime" ]]; then
@@ -917,10 +930,10 @@ elif [[ "$SOURCE_MODE" == "b2" ]]; then
     # this one AND the main clone when we are in a worktree.
     TALOS_OFFHOST_CHECKOUT_ROOTS="$(escrow_forbidden_roots | paste -sd: -)"
     export TALOS_OFFHOST_CHECKOUT_ROOTS
-    # One knob, two gates. The drill's local artifact-age limit governs the
-    # off-host archive too, so "stale" cannot mean two different things
-    # depending on which source you asked for.
-    TALOS_OFFHOST_MAX_AGE_HOURS="${TALOS_DRILL_MAX_ARTIFACT_AGE_HOURS:-168}"
+    # One knob, two gates — resolved and validated above step 1, so a
+    # malformed value dies here instead of being coerced back to 168 inside
+    # the helper.
+    TALOS_OFFHOST_MAX_AGE_HOURS="$MAX_ARTIFACT_AGE_HOURS"
     export TALOS_OFFHOST_MAX_AGE_HOURS
 
     OFFHOST_BIN="${TALOS_OFFHOST_BIN:-}"
@@ -960,7 +973,18 @@ elif [[ "$SOURCE_MODE" == "b2" ]]; then
     # TALOS_OFFHOST_MAX_AGE_HOURS (set above from the drill's own knob), so a
     # stale bucket has already failed the run by this point rather than being
     # printed and ignored.
-    ok "off-host archives are within ${TALOS_OFFHOST_MAX_AGE_HOURS}h"
+    #
+    # ...unless the knob is 0, which DISABLES the staleness limit inside the
+    # helper. Printing "within 0h" then would be the same defect this line
+    # was written to avoid, one report further out: a ✓ asserting a bound
+    # nothing checked. The LOCAL branch already warns in that case; same
+    # knob, so the same report.
+    if (( MAX_ARTIFACT_AGE_HOURS == 0 )); then
+        warn "off-host archive staleness gate DISABLED (TALOS_DRILL_MAX_ARTIFACT_AGE_HOURS=0) — age was NOT asserted on this run
+   A future-dated key is still refused; only the upper bound is off."
+    else
+        ok "off-host archives are within ${MAX_ARTIFACT_AGE_HOURS}h"
+    fi
 else
     log "[1/7] dumping LIVE postgres + vault (--source live)"
     docker inspect "$LIVE_PG_CONTAINER" >/dev/null 2>&1 || die "live postgres container '$LIVE_PG_CONTAINER' not running"

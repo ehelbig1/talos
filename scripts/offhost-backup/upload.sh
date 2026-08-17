@@ -37,6 +37,11 @@
 #   scripts/offhost-backup/upload.sh --backfill     # one-time: whole history
 #   scripts/offhost-backup/upload.sh plan --offline # what would be sent
 #   scripts/offhost-backup/upload.sh probe-append-only
+#   scripts/offhost-backup/upload.sh fetch --kind postgres --dest /tmp/x \
+#       [--key talos/v1/postgres/2026/06/20260601T101757Z-postgres.age]
+#         # --key names ONE object instead of the newest — how to drill an
+#         # older archive, and how to get past a future-dated key shadowing
+#         # the real newest one.
 #
 # See docs/offhost-backup.md for the operator prerequisites (bucket,
 # application key, lifecycle rule, age passphrase escrow).

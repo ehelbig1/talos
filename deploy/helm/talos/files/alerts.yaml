@@ -1932,6 +1932,22 @@ groups:
       # exhibit it. Recorded this way round because a threshold defended
       # by a mechanism nobody checked is how a number outlives its reason.
       #
+      # WHAT "TWO RUNS" DEPENDS ON, which is a producer property and not
+      # a PromQL one. `failures_total{reason}` counts RUNS, at most one
+      # per reason per run (MetricState::count_reason_once). It did not
+      # at first: do_upload recorded a failure per ARTIFACT and then
+      # returned the first error, which cmd_upload recorded AGAIN as the
+      # run's outcome, so one bad night scored 2-3 on the encrypt/head/put
+      # paths and this threshold fired on a single flaky tether — the
+      # tightening below defeated by the thing it was measuring. The
+      # promtool fixture could not see it because a fixture supplies
+      # counter values directly instead of driving the producer; the guard
+      # is metrics.rs's `one_failed_run_counts_exactly_one_per_reason` and
+      # main.rs's `one_failed_run_moves_the_failure_counter_by_exactly_one`
+      # (which drives cmd_upload end to end). Anything that starts
+      # counting per artifact here again makes this description false
+      # without touching this file.
+      #
       # The cost, stated: a revoked B2 key takes up to two days to alert
       # here instead of one. That is accepted because the LOCAL dump is
       # untouched throughout, and because TalosOffhostBackupStale is the

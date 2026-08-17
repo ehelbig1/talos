@@ -100,14 +100,41 @@ the retention rule you set with the master key keeps them there. **Retention
 plus distinct keys is the whole of that guarantee.**
 
 One specific shape of that, because "upload garbage" is vague and this one is
-concrete: `fetch` picks the archive with the **highest key stamp**, and an age
-in the future saturates to 0 hours rather than going negative. So a
-**future-dated** junk object shadows the real newest one indefinitely. It is a
-poisoning/denial vector, not data loss — the real archives are untouched under
-their own keys, and the drill fails *loudly* on the poisoned object (its
-decrypt or its `pg_restore` will not succeed) rather than going green. It is
-not closed; closing it would mean rejecting future-dated keys, which trades
-this for false-reds on a skewed clock.
+concrete, and it is **closed** rather than accepted: `fetch` picks the archive
+with the **highest key stamp**, and an age in the future saturates to 0 hours
+rather than going negative. A **future-dated** object therefore shadows the
+real newest one *and reads as 0 h old forever*.
+
+This is not merely poisoning. The upload credential also holds `readFiles` —
+the drill needs it — so anyone holding it can `GET` today's real archive and
+`PUT` those exact bytes back under a future-dated key. That object decrypts,
+`pg_restore --exit-on-error` succeeds and both verifiers pass: **the drill
+would report success while restoring a replay**, with the freshness gate
+permanently disabled for that kind because the age never leaves 0. No attacker
+is required either — the stamp comes from the sidecar's filename, so one
+upload from a host with a skewed clock does the same by accident.
+
+An earlier version of this document called it "poisoning, not data loss, and
+the drill fails loudly on it". That was only true for a *junk* object, which is
+not the only shape.
+
+The stated dichotomy — reject future keys, or accept false-reds on clock skew —
+was false: a **bounded tolerance** closes it with neither cost. `fetch` refuses
+any archive stamped more than `MAX_FUTURE_SKEW_HOURS` (24 h) ahead of the local
+clock, which is far wider than any clock error that survives on a networked
+host and far narrower than any useful replay window. Ordinary drift is still
+accepted and still reads as fresh. When a future-dated key IS present, `fetch`
+fails with a message naming the skew, and the escape hatch is
+`fetch --key <object-key>` to name a known-good archive explicitly.
+
+**What that costs, stated rather than implied.** A planted future key makes
+`make drill ARGS="--source b2"` fail until the object is gone, and the host
+credential cannot delete it — that is the whole design. Clearing it needs your
+**master** Backblaze credential. That is the right trade: the alternative is a
+drill that keeps going green on a replay. Until it is cleared, `fetch --key`
+still proves a named archive is readable; only the automated drill is blocked.
+Check the host's clock first — an accidental skew is by far the likelier cause
+than an attacker, and it leaves exactly the same object behind.
 
 Object keys deliberately carry nothing sensitive: a bucket listing is
 metadata, and whoever can list learns every key name. A key is
@@ -208,10 +235,15 @@ source ~/.talos/offhost.env
 scripts/offhost-backup/upload.sh plan --offline
 
 # 1. PROVE APPEND-ONLY BEFORE TRUSTING IT. Attempts an overwrite and a
-#    delete with the upload credential; both must be refused. Leaves one
-#    un-deletable probe object behind under talos/v1/_probe/ — that object
-#    is the evidence, and it cannot be cleaned up (that would need the
-#    delete it just proved absent).
+#    delete with the upload credential; both must be REFUSED BY THE
+#    PROVIDER (a 403). Anything else — no network, no `aws`, an
+#    unconfigured bucket — exits non-zero as "NOT PROVEN", because an
+#    attempt that never reached B2 is evidence of nothing and scoring it
+#    as a refusal would make this command answer YES exactly when it
+#    could not ask the question. Leaves one un-deletable probe object
+#    behind under talos/v1/_probe/ — that object is the evidence, and it
+#    cannot be cleaned up (that would need the delete it just proved
+#    absent).
 scripts/offhost-backup/upload.sh probe-append-only
 
 # 2. First real upload: newest postgres dump + newest vault tarball.
@@ -300,6 +332,22 @@ docker run --rm -v "$PWD:/repo:ro" --entrypoint promtool \
   above).
 * That an archive older than the newest one is still readable. The drill
   restores the **newest** off-host archive; a corrupt object from three months
-  ago would go unnoticed. Point `--source b2` at an older key occasionally, by
-  hand.
+  ago would go unnoticed. Fetch an older one by hand occasionally:
+
+  ```bash
+  source ~/.talos/offhost.env
+  aws s3api list-objects-v2 --endpoint-url "$TALOS_OFFHOST_B2_ENDPOINT" \
+      --bucket "$TALOS_OFFHOST_B2_BUCKET" --prefix talos/v1/postgres/ \
+      --query 'Contents[].Key' --output text | tr '\t' '\n'
+  scripts/offhost-backup/upload.sh fetch --kind postgres \
+      --key talos/v1/postgres/2026/06/20260601T101757Z-postgres.age \
+      --dest /tmp/old.dump
+  ```
+
+  A named object is exempt from the **staleness** limit (you asked for that
+  object, so its age is not a claim about the pipeline) but not from the
+  future-stamp refusal. This is also the way past a future-dated key that is
+  shadowing the real newest archive. `--source b2` itself always takes the
+  newest and has no `--key`; driving the whole drill from an arbitrary key is
+  not wired up.
 * That B2 itself is durable. That is their claim, not a measurement of ours.
