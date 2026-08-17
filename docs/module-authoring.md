@@ -362,6 +362,16 @@ The `context-window` interface provides token estimation and model context infor
 
 Use this to check available context budget before constructing large prompts, avoiding truncation or API errors.
 
+## Fuel budgets
+
+Sizing a node's `max_fuel` has its own guide:
+**[fuel-budget-sizing.md](fuel-budget-sizing.md)**. Read it before setting or
+raising one — it covers the resolution order (`data.max_fuel` → module default
+→ adaptive floor → 50M engine clamp), the `__actor_context__` injection cost
+that memory-eligible worlds pay and that does not appear in the recorded
+input, why adaptive fuel never fires for a weekly workflow, and why the number
+in a fuel-exhaustion error is not a measurement of demand.
+
 ## Resource Quotas
 
 The `resource-quotas` interface lets modules check and record resource usage against configured limits. Available in `secrets-node`, `database-node`, and `automation-node` worlds.

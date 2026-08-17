@@ -705,9 +705,28 @@ mod tests {
         // Real messages from the 2026-07 failure post-mortem.
         let cases = [
             (
+                // PRE-2026-08 wording. Kept, not replaced: this classifier reads
+                // `workflow_executions.error_message` rows that predate the
+                // reword, so it must keep handling the old shape forever.
                 "Scheduled workflow failed: workflow execution failed: node 'compose' failed: \
                  Job failed after 1 attempts: execution failure: WASM fuel exhausted after \
                  1380000 instructions.",
+                "fuel_exhausted",
+                "high",
+            ),
+            (
+                // POST-2026-08 wording (`fuel_exhausted_message`), which no
+                // longer contains the word "after". Retyped rather than bound
+                // to the producer on purpose: this crate must NOT grow a
+                // dependency on `talos-worker-runtime` (a repository crate
+                // reaching into the WASM host is the wrong edge). The cost of
+                // that choice is that this copy can drift — the binding to the
+                // real producer lives in `talos-mcp-handlers`.
+                "Scheduled workflow failed: workflow execution failed: node 'digest' failed: \
+                 Job failed after 1 attempts: execution failure: WASM fuel exhausted: the \
+                 module consumed 1404000 instructions of a 1404000-instruction budget and \
+                 did not finish, so its actual requirement is UNKNOWN — only that it exceeds \
+                 1404000.",
                 "fuel_exhausted",
                 "high",
             ),
