@@ -189,6 +189,54 @@ Re-review 2026-Q4, or when async-graphql/aws-sdk-s3 ship releases on
 lru >=0.18.2 — at which point this entry should be DELETED, not bumped.
 """ },
 
+    # --- Unmaintained, build-time only, and introduced DELIBERATELY ---
+
+    { id = "RUSTSEC-2026-0173", reason = """
+`proc-macro-error2` is unmaintained. Both it and the `proc-macro-error` it
+forked are now flagged (RUSTSEC-2024-0370).
+
+UNLIKE EVERY OTHER ENTRY IN THIS FILE, WE INTRODUCED THIS ONE. The others are
+advisories published against dependencies we already had; this arrived because
+2026-08-17 added `age` for client-side encryption of off-host backups. Saying
+so matters — an exemption for a cost you chose deserves a different level of
+scrutiny than one for a cost that landed on you.
+
+Pulled by exactly one edge:
+  proc-macro-error2 <- i18n-embed-fl (proc-macro) <- age 0.11 <- talos-offhost-backup
+
+BUILD-TIME ONLY. `i18n-embed-fl` is a proc-macro crate — it runs in the
+compiler and is never linked into any shipped binary. The exposure is to the
+build host, not to the worker, the controller, or anything an attacker can
+reach at runtime.
+
+NOT REMOVABLE WHILE USING `age`, checked rather than assumed:
+  * `i18n-embed-fl` is an UNCONDITIONAL dependency in age's manifest — no
+    `optional = true`, no feature gate. It localises age's own error strings.
+  * We already declare `age = "0.11"` with default features `[]`; there is no
+    feature left to turn off.
+  * The alternatives are worse. The age CLI cannot do unattended encryption at
+    all (it reads its passphrase from `/dev/tty` and fails `ENOTTY` on a pipe,
+    with no `--passphrase-file` and no env var). Hand-rolling scrypt +
+    ChaCha20-Poly1305 is not on the table. Dropping client-side encryption
+    entirely would publish the plaintext columns a `pg_dump` carries —
+    workflow names, module source, `graph_json` — to the storage provider.
+
+No vulnerability: RUSTSEC-2026-0173 is a maintenance flag. The residual risk is
+the absence of FUTURE patches for a proc-macro that expands attribute macros at
+compile time.
+
+Tracking: `age` moving off the fluent/i18n stack, or `i18n-embed-fl` dropping
+`proc-macro-error2`. Re-review 2026-Q4 — and if `age` is ever removed from this
+workspace, DELETE this entry rather than leaving it to rot.
+
+NOTE ON WHY THIS REACHED CI RATHER THAN `make lint`: the local gate runs
+`cargo deny check bans licenses sources` and deliberately omits `advisories`
+(they need network); the advisory scan is CI-only plus the env-gated
+`make audit`. So an advisory introduced by a NEW dependency is structurally
+invisible locally. Run `cargo deny --all-features check advisories` by hand
+when adding a dependency — that is the only pre-CI signal for this class.
+""" },
+
 ]
 
 # ============================================================================

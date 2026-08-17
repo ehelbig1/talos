@@ -26,6 +26,8 @@ export GIT_DIRTY_OVERRIDE := $(shell test -n "$$(git status --porcelain 2>/dev/n
 .PHONY: help setup up down rebuild restart logs ps shell doctor quickstart \
         check build lint lint-frontend hooks test test-changed test-integration coverage-html audit check-catalog ci \
         drill drill-schedule drill-unschedule drill-schedule-status \
+        offhost-upload offhost-backfill offhost-plan offhost-probe \
+        offhost-schedule offhost-unschedule offhost-status \
         clean nuke smoke rls-preflight sqlx-prepare sqlx-check _wait-healthy \
         observability-reload observability-verify
 
@@ -322,6 +324,33 @@ drill-unschedule: ## Remove the weekly drill LaunchAgent (macOS)
 
 drill-schedule-status: ## Show whether the weekly drill is scheduled and when it last ran
 	@bash scripts/drills/schedule.sh status
+
+# ── Off-host backup egress (Tier 2). docs/offhost-backup.md ──────────
+# The local dumps live on the one disk they insure. These push an
+# age-encrypted copy to object storage under unique timestamped keys, with
+# a counter and two alerts so a persistent failure cannot be silent.
+# `make drill ARGS="--source b2"` is what proves the result is restorable.
+
+offhost-upload: ## Encrypt + upload the NEWEST local backup artifact of each kind to off-host storage
+	@bash scripts/offhost-backup/upload.sh
+
+offhost-backfill: ## One-time: upload every retained local artifact the bucket lacks (egress-heavy)
+	@bash scripts/offhost-backup/upload.sh --backfill
+
+offhost-plan: ## Show what would be uploaded, without touching the network
+	@bash scripts/offhost-backup/upload.sh plan --offline
+
+offhost-probe: ## PROVE append-only: attempt an overwrite and a delete; both must be refused BY THE PROVIDER (unreached = NOT PROVEN, exits 1)
+	@bash scripts/offhost-backup/upload.sh probe-append-only
+
+offhost-schedule: ## Install + load the DAILY off-host upload LaunchAgent (macOS)
+	@bash scripts/offhost-backup/schedule.sh install
+
+offhost-unschedule: ## Remove the daily off-host upload LaunchAgent (macOS)
+	@bash scripts/offhost-backup/schedule.sh uninstall
+
+offhost-status: ## Show whether the upload is scheduled and when it last succeeded
+	@bash scripts/offhost-backup/schedule.sh status
 
 deploy-prod: ## One-command production deploy: publish (gated+signed) -> pin digests -> install.sh on the VM -> external smoke. ARGS passthrough (--yes, --no-sign, ...)
 	bash scripts/deploy-prod.sh $(ARGS)

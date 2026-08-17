@@ -5,6 +5,11 @@ members = [
     "talos-secrets",
     "talos-audit-event",
     "talos-ssrf-classify",
+    # Tier-2 off-host backup egress: object-key construction, `aws` argv,
+    # failure classification, textfile-metric rendering and the age
+    # encrypt/decrypt round trip. A leaf crate so every one of those is
+    # unit-testable with no bucket, no credentials and no passphrase.
+    "talos-offhost-backup",
     "talos-http-body",
     "talos-memory",
     "talos-mcp",

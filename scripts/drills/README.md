@@ -95,6 +95,13 @@ TALOS_DRILL_ESCROW_KEY_FILE=/Volumes/escrow/talos-master.key       make drill
 make drill                      # no escrow var set → hidden prompt (TTY only)
 
 make drill ARGS="--source live" # dump the live stack now and restore that
+
+# TIER 2 — the strictly harder question. Fetch from object storage,
+# age-decrypt with the ESCROWED passphrase, restore that. Needs BOTH
+# escrowed secrets: the KEK (above) and the age passphrase.
+TALOS_DRILL_ESCROW_KEY_CMD='op read "op://Private/Talos KEK/password"' \
+TALOS_OFFHOST_AGE_PASSPHRASE_CMD='op read "op://Private/Talos age backup/password"' \
+  make drill ARGS="--source b2"
 ```
 
 **There is no way to run this drill from the live stack's key.** That was
@@ -111,6 +118,15 @@ tests `pg_dump`/`pg_restore` but leaves the dumps the sidecars have
 been writing every night still un-restored — the backup nobody has
 ever restored. `--source live` keeps that older behaviour for the case
 where you want to prove the *current* database is dumpable.
+
+`--source b2` is the mode that tests the copy which survives losing the
+disk. The other two read from the very filesystem the backups insure
+against, so however green they are they cannot answer "is there an
+off-host copy, and is it readable?". It fetches, `age`-decrypts, asserts
+the object's age, and restores — and it **fails rather than falling back**
+when the bucket is unreachable, empty, stale, or the passphrase is wrong.
+Setting up the destination is `docs/offhost-backup.md`; until that is
+done this mode fails, which is the accurate answer.
 
 Tunables (all env vars):
 
@@ -131,10 +147,15 @@ Tunables (all env vars):
 | `TALOS_DRILL_VAULT_IMAGE` | digest-pinned hashicorp/vault:1.18 | Scratch Vault image. |
 | `TALOS_DRILL_ALLOW_PRODUCTION` | unset | Required to run when a production environment is detected. Don't. |
 | `TALOS_DRILL_ALLOW_NO_METRIC` | unset | Waive the "metric must be publishable" precondition. Accepts a permanently-firing alert. |
+| `TALOS_OFFHOST_AGE_PASSPHRASE_CMD` | unset | **`--source b2` only.** Command whose stdout is the escrowed `age` passphrase. Same containment as the KEK's `_CMD`: a path-shaped argument resolving inside a checkout or `$BACKUP_DIR` is refused, and setting this **and** `_FILE` is refused rather than resolved by precedence. Bounded by `TALOS_OFFHOST_ESCROW_TIMEOUT_SECS` (default 120), whose expiry kills the whole process group. |
+| `TALOS_OFFHOST_AGE_PASSPHRASE_FILE` | unset | **`--source b2` only.** File whose first line is the escrowed `age` passphrase. Refused if it resolves inside a checkout (this one *or* the main clone from a worktree) or inside `$BACKUP_DIR`. Symlinks resolved first; hard links are not, and cannot be. |
+| `TALOS_OFFHOST_B2_BUCKET` / `_ENDPOINT` / `_REGION` | unset | **`--source b2` only.** The destination. All three or none — a bucket with no endpoint would silently address real AWS S3. |
+| `TALOS_OFFHOST_BIN` | unset | Path to a prebuilt `talos-offhost-backup`. Skips the `cargo build` in step 1. |
 
 Flags:
 
-- `--source artifact|live` — what to restore (default `artifact`).
+- `--source artifact|b2|live` — what to restore (default `artifact`).
+  `b2` reads the off-host copy; see `docs/offhost-backup.md`.
 - `--keep-scratch` — leave the scratch stack up after a *successful*
   run so you can `psql`/`vault` into it. It holds **real restored
   data**; the script prints the exact teardown commands.
@@ -499,15 +520,53 @@ Honest list so future-you doesn't develop false confidence:
    *"these artifacts + the escrowed KEK ⇒ readable data"*, which is what a
    recovery actually consists of.
 
-   **What is still open is Tier 2: getting the ciphertext off this host.**
-   The dumps live on the host filesystem. They survive `docker volume rm`
-   and `make clean` — and nothing else. They are not replicated anywhere;
-   `docker-compose.yml` used to claim they "ride Time Machine off-box" and
-   `tmutil destinationinfo` answers "No destinations configured" (that
-   comment is now corrected). Losing this disk loses every artifact,
-   escrowed key or not. The choice between encrypted local replication and
-   object storage with an append-only credential is an operator decision
-   and is deliberately not made here.
+   **Tier 2 — getting the ciphertext off this host — now has a path, and
+   the drill can test it.** `--source b2` fetches from object storage,
+   `age`-decrypts with an ESCROWED passphrase, and only then restores;
+   it FAILS rather than falling back to the local copy when the bucket is
+   unreachable, holds nothing, holds only a stale archive, or the
+   passphrase is wrong. That mode answers the strictly harder question a
+   real recovery asks. See `docs/offhost-backup.md`.
+
+   **The default `--source artifact` still does not.** It restores a file
+   from the very disk whose loss the backups insure against, so a green
+   run there says nothing about surviving that loss — the banner now says
+   so explicitly and points at `--source b2`. Run the b2 mode at least as
+   often as you would trust the claim.
+
+   At the time of writing the bucket itself **does not exist yet**: the
+   five operator prerequisites in `docs/offhost-backup.md` § Operator
+   setup need a Backblaze account and cannot be done from this repo, so
+   `--source b2` currently fails on this machine and that failure is the
+   accurate answer. The dumps still live only on the host filesystem;
+   `docker-compose.yml` used to claim they "ride Time Machine off-box"
+   while `tmutil destinationinfo` answers "No destinations configured"
+   (that comment is now corrected).
+
+   Three limits of the b2 mode, stated rather than implied:
+   * It restores the **newest** off-host archive. A corrupt object from
+     three months ago would go unnoticed — the same "newest only" hole
+     item 4 above describes for local artifacts. Fetch an older one by
+     hand with `upload.sh fetch --kind postgres --key <object-key>
+     --dest <path>`; the drill itself has no `--key`.
+   * It restores the newest archive **that is not stamped in the
+     future**. A key more than 24 h ahead of the local clock is REFUSED
+     rather than believed, because such a key sorts above every real
+     archive and its age saturates to 0 — so a byte-exact replay of an
+     old archive under a future key would restore, verify and certify a
+     backup pipeline that had stopped. See docs/offhost-backup.md.
+   * It proves the archives are READABLE. It does not prove they are
+     UNDELETABLE: refusing delete and overwrite is the provider's job and
+     is checked separately by
+     `scripts/offhost-backup/upload.sh probe-append-only`, which attempts
+     both and requires both to be refused **by the provider** (a 403).
+     That command exits non-zero when an attempt never reached B2 at all:
+     "I could not ask" is not "the provider refused", and a probe that
+     conflates them answers YES precisely when it knows least.
+   * The age passphrase gets the same containment checks as the KEK
+     (not inside a checkout, not inside `$BACKUP_DIR`, symlinks resolved,
+     both-set refused) and therefore the same stated limits: nothing here
+     can tell that the source is genuinely off-box.
 
    Limits of the fix, stated rather than implied — and note the first
    two bullets used to contradict each other, one claiming provenance is
@@ -544,6 +603,16 @@ Honest list so future-you doesn't develop false confidence:
 ## Related
 
 - Alerts that fire when the drill hasn't run: `deploy/observability/alerts.yaml` → `TalosBackupRestoreDrillFailed`.
+- Alerts that fire when the OFF-HOST copy stops advancing:
+  the same file → `TalosOffhostBackupUploadFailing` (a classified failure
+  inside a 6 h window) and `TalosOffhostBackupStale` (no successful upload
+  in 7+ days). Both are gated on `talos_offhost_backup_enabled == 1`, so a
+  deployment that does not use off-host egress stays quiet — which means
+  the "configured but never scheduled" case is caught by THIS drill's
+  `--source b2` leg and not by those alerts. See `docs/offhost-backup.md`
+  § What goes wrong.
+- The off-host egress itself: `docs/offhost-backup.md`,
+  `scripts/offhost-backup/`, `talos-offhost-backup/`.
 - The verifiers the drill runs end-to-end:
   `controller/examples/verify_restore.rs` (reads what the backup
   contained) and `controller/examples/verify_phase_b.rs` (writes a

@@ -146,6 +146,235 @@ tests:
         exp_alerts: []
 
   # ══════════════════════════════════════════════════════════════════════
+  # OFF-HOST BACKUP EGRESS (Tier 2).
+  #
+  # The upload deliberately does not fail the local dump, which is correct
+  # and which is exactly what makes a persistent failure invisible. These
+  # two alerts are the only thing standing between "the off-host copy
+  # silently stopped three weeks ago" and finding out during a recovery.
+  # So both are driven in BOTH directions here: the firing transition AND
+  # the silent case, because an alert that fires unconditionally passes
+  # every positive test ever written for it.
+  # ══════════════════════════════════════════════════════════════════════
+
+  # DIRECTION 1 — TWO failures inside the 50h window: the alert fires, then
+  # clears once the window rolls past both. Two reasons in the input, only
+  # one of which moves: that is what proves `sum by (reason)` SELECTS
+  # rather than collapsing every reason into one perpetual alert.
+  #
+  # The series runs for ~57 h of synthetic time so the CLEARING transition
+  # is a real window roll-off and not just Prometheus staleness. An alert
+  # that only "clears" because its series vanished has not been shown to
+  # clear at all.
+  - interval: 1m
+    name: off-host upload fails on two consecutive days — fires, then clears
+    input_series:
+      - series: 'talos_offhost_backup_failures_total{job="node-exporter", instance="node-exporter:9100", reason="auth"}'
+        values: "0+0x60 1+0x60 2+0x3300"
+      # Pre-seeded at 0 and never touched — the producer emits all seven
+      # reasons on every run. A flat counter must stay silent, or every
+      # healthy host alerts forever.
+      - series: 'talos_offhost_backup_failures_total{job="node-exporter", instance="node-exporter:9100", reason="network"}'
+        values: "0+0x3420"
+    alert_rule_test:
+      # ONE failure so far (t=61m). This is the night-without-a-network
+      # case and it must be SILENT — the `> 1.5` threshold exists for
+      # exactly this eval point, and a `> 0` or `> 1` expression fails
+      # here.
+      - eval_time: 100m
+        alertname: TalosOffhostBackupUploadFailing
+        exp_alerts: []
+      # Second failure at t=122m, `for: 15m`.
+      - eval_time: 180m
+        alertname: TalosOffhostBackupUploadFailing
+        exp_alerts:
+          # `sum by (reason)` drops job/instance, so the alert identity is
+          # (alertname, reason) — one alert per classified reason rather
+          # than one per host per reason.
+          - exp_labels:
+              severity: warning
+              category: data-loss
+              reason: auth
+            exp_annotations:
+              summary: "Off-host backup upload failing (reason=auth)"
+              description: |
+                The encrypted off-host push has failed on at least two of the
+                last two daily runs. The LOCAL dump is unaffected and still
+                being taken — this is about the copy that survives losing the
+                disk. reason="auth" most often means the B2 application key
+                was rotated or revoked; reason="config" means the destination
+                or the age passphrase source is not set; reason="network"
+                means two nights without egress, not one.
+                Logs: ~/.talos/logs/offhost-backup.log.
+      # CLEARS: at 56h both steps (61m, 122m) are outside the 50h lookback
+      # and the counter has been flat since, while the series is still
+      # being scraped.
+      - eval_time: 3360m
+        alertname: TalosOffhostBackupUploadFailing
+        exp_alerts: []
+
+  # DIRECTION 2 — the silent cases. Without these, an expression that fired
+  # unconditionally would pass direction 1 and ship.
+  - interval: 1m
+    name: off-host upload healthy — pre-seeded zero counters never alert
+    input_series:
+      - series: 'talos_offhost_backup_failures_total{job="node-exporter", instance="node-exporter:9100", reason="auth"}'
+        values: "0+0x450"
+      - series: 'talos_offhost_backup_failures_total{job="node-exporter", instance="node-exporter:9100", reason="config"}'
+        values: "0+0x450"
+      - series: 'talos_offhost_backup_uploads_total{job="node-exporter", instance="node-exporter:9100", kind="postgres", outcome="success"}'
+        values: "1+1x450"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: TalosOffhostBackupUploadFailing
+        exp_alerts: []
+      - eval_time: 200m
+        alertname: TalosOffhostBackupUploadFailing
+        exp_alerts: []
+      - eval_time: 440m
+        alertname: TalosOffhostBackupUploadFailing
+        exp_alerts: []
+
+  # A SINGLE transient failure. Never alerts — this is the offline-night
+  # noise case the threshold is calibrated against.
+  #
+  # THE STEP IS AT t=1001m AND THE SERIES RUNS TO t=4001m ON PURPOSE, so
+  # the 3900m eval has a 50 h window lying ENTIRELY INSIDE a densely
+  # sampled series with the step in the middle — the shape most likely to
+  # exercise `increase()`'s edge extrapolation.
+  #
+  # WHAT THIS FIXTURE DOES AND DOES NOT ESTABLISH, because the first
+  # version of it claimed more than it showed. It establishes that ONE
+  # failure does not alert. It does NOT establish that `> 1` would be
+  # wrong: measured here with a `promql_expr_test`, the single-step value
+  # is exactly 1, and mutating the shipped rule to `> 1` leaves this whole
+  # suite green. The rule's 1.5 is therefore a margin, and the comment
+  # beside it in alerts.yaml says so. Do not "restore" a claim that
+  # mutating to `> 1` must fail — it does not.
+  - interval: 1m
+    name: one offline night is not an alert
+    input_series:
+      - series: 'talos_offhost_backup_failures_total{job="node-exporter", instance="node-exporter:9100", reason="network"}'
+        values: "0+0x1000 1+0x3000"
+    alert_rule_test:
+      - eval_time: 1100m
+        alertname: TalosOffhostBackupUploadFailing
+        exp_alerts: []
+      - eval_time: 2000m
+        alertname: TalosOffhostBackupUploadFailing
+        exp_alerts: []
+      # Window [900m, 3900m], fully inside the series, step in the middle.
+      - eval_time: 3900m
+        alertname: TalosOffhostBackupUploadFailing
+        exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # STALENESS. Same clock caveat as the drill tests: promtool's `time()`
+  # starts at 0, so "a success older than 7 days" is expressed as a large
+  # NEGATIVE gauge value. Arithmetically the same comparison, which is
+  # what is under test.
+  # ══════════════════════════════════════════════════════════════════════
+
+  - interval: 1m
+    name: configured host stopped uploading — fires, then clears on a fresh upload
+    input_series:
+      - series: 'talos_offhost_backup_last_success_timestamp_seconds{job="node-exporter", instance="node-exporter:9100", kind="postgres"}'
+        values: "-700000+0x90 0+0x120"
+      - series: 'talos_offhost_backup_enabled{job="node-exporter", instance="node-exporter:9100"}'
+        values: "1+0x210"
+    alert_rule_test:
+      # `for: 1h`.
+      - eval_time: 30m
+        alertname: TalosOffhostBackupStale
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: TalosOffhostBackupStale
+        exp_alerts:
+          # `and` returns the LEFT side unchanged, so the alert keeps
+          # `kind` — a vault upload that stalls while postgres keeps
+          # working is its own alert rather than being masked.
+          - exp_labels:
+              severity: warning
+              category: data-loss
+              job: node-exporter
+              instance: node-exporter:9100
+              kind: postgres
+            exp_annotations:
+              summary: "No successful off-host backup upload in 7+ days (kind=postgres)"
+              description: |
+                An off-host destination IS configured on this host, but no
+                archive of this kind has been uploaded successfully for more
+                than 7 days. Everything since then exists only on the disk it
+                insures. Check ~/.talos/logs/offhost-backup.log and
+                talos_offhost_backup_failures_total for the classified reason,
+                then run scripts/offhost-backup/upload.sh by hand.
+      # The deliverable: a successful upload clears it.
+      - eval_time: 120m
+        alertname: TalosOffhostBackupStale
+        exp_alerts: []
+
+  # THE GATE ITSELF. A host with no off-host destination configured must be
+  # SILENT even though its (pre-seeded, zero → epoch) success timestamp is
+  # arbitrarily old. Without the `enabled == 1` conjunct this alert would
+  # fire permanently on every deployment that does not use B2, and a
+  # permanently-red alert is an ignored one.
+  - interval: 1m
+    name: unconfigured host is silent despite an ancient success timestamp
+    input_series:
+      - series: 'talos_offhost_backup_last_success_timestamp_seconds{job="node-exporter", instance="node-exporter:9100", kind="postgres"}'
+        values: "-700000+0x210"
+      - series: 'talos_offhost_backup_enabled{job="node-exporter", instance="node-exporter:9100"}'
+        values: "0+0x210"
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: TalosOffhostBackupStale
+        exp_alerts: []
+      - eval_time: 200m
+        alertname: TalosOffhostBackupStale
+        exp_alerts: []
+
+  # THE MATCHER. `and on (job, instance)` must actually match, not
+  # cross-join: another host's `enabled == 1` must not vouch for this
+  # host's stale timestamp. Written because a bare `and` (no `on`) or an
+  # `on (job)` would both pass every other test in this block while
+  # silently making a multi-host fleet's alerts meaningless.
+  - interval: 1m
+    name: another host being configured does not vouch for this one
+    input_series:
+      - series: 'talos_offhost_backup_last_success_timestamp_seconds{job="node-exporter", instance="host-a:9100", kind="postgres"}'
+        values: "-700000+0x210"
+      - series: 'talos_offhost_backup_enabled{job="node-exporter", instance="host-b:9100"}'
+        values: "1+0x210"
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: TalosOffhostBackupStale
+        exp_alerts: []
+      - eval_time: 200m
+        alertname: TalosOffhostBackupStale
+        exp_alerts: []
+
+  # A healthy configured host: silent for the whole timeline.
+  - interval: 1m
+    name: recent off-host upload — no staleness alert at any point
+    input_series:
+      - series: 'talos_offhost_backup_last_success_timestamp_seconds{job="node-exporter", instance="node-exporter:9100", kind="postgres"}'
+        values: "0+0x210"
+      - series: 'talos_offhost_backup_last_success_timestamp_seconds{job="node-exporter", instance="node-exporter:9100", kind="vault"}'
+        values: "0+0x210"
+      - series: 'talos_offhost_backup_enabled{job="node-exporter", instance="node-exporter:9100"}'
+        values: "1+0x210"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: TalosOffhostBackupStale
+        exp_alerts: []
+      - eval_time: 120m
+        alertname: TalosOffhostBackupStale
+        exp_alerts: []
+      - eval_time: 200m
+        alertname: TalosOffhostBackupStale
+        exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
   # WORKER-IDENTITY LIVENESS — the detector that makes the reaper safely
   # enableable. Both directions, because either one alone is worthless:
   # an alert that fires on a stopped fleet but ALSO on a fleet that never

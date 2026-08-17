@@ -1866,6 +1866,143 @@ groups:
             is scheduled at all and that its node_exporter textfile
             directory is being collected.
 
+      # ══════════════════════════════════════════════════════════════
+      # OFF-HOST EGRESS (Tier 2). Producer: the `talos-offhost-backup`
+      # binary, driven by scripts/offhost-backup/upload.sh. Unlike the
+      # drill's series these ARE registered in Rust
+      # (talos-offhost-backup/src/metrics.rs, as bare consts precisely so
+      # structural check 65(c) can see them), so they need no
+      # allow-unobserved-metric marker.
+      #
+      # WHY THESE EXIST AT ALL. The upload deliberately does NOT fail the
+      # local dump — a dump taken while the network is down is still worth
+      # having, and the two run as separate processes on separate
+      # schedules so that is structural rather than a promise. The cost of
+      # that decoupling is that a PERSISTENT upload failure is otherwise
+      # completely invisible: nothing goes red, the dump keeps succeeding,
+      # and the off-host copy quietly stops. A silently-failing upload is
+      # worse than no upload, because it manufactures confidence in the
+      # one thing you would reach for after losing the disk. These two
+      # alerts are the whole of that visibility.
+      #
+      # NO absent() ARM ON EITHER, and that is a deliberate departure from
+      # TalosBackupRestoreDrillFailed above. Absence here means "Tier 2 is
+      # not configured on this deployment", which is a legitimate choice —
+      # a cluster may replicate its Postgres some other way entirely. Per
+      # this file's header rule, an absent() arm belongs on a series Talos
+      # itself is supposed to produce, not on one whose absence is a
+      # deployment decision; adding one would fire permanently on every
+      # cluster that does not use B2, and a permanently-red alert trains
+      # operators to ignore red.
+      #
+      # THE GAP THAT LEAVES, STATED RATHER THAN IMPLIED. If an operator
+      # configures the bucket but never schedules the uploader, no .prom
+      # file is ever written, talos_offhost_backup_enabled does not exist,
+      # and NEITHER of these alerts can fire — the detector is silenced by
+      # a version of its own condition. That case is covered one layer
+      # out, by the restore drill: `make drill ARGS="--source b2"` FAILS
+      # when the bucket holds no archive or holds only a stale one, and
+      # TalosBackupRestoreDrillFailed then fires. The drill is the gate
+      # for "no off-host copy at all"; these alerts are the gate for "the
+      # off-host copy stopped advancing". Neither substitutes for the
+      # other.
+      #
+      # WHY `> 1.5` OVER 50h AND NOT `> 0` OVER 6h, which was the first
+      # shape here. The uploader runs ONCE A DAY, so a single failure is
+      # what one offline night looks like — a plane, a hotel, a laptop
+      # awake but unrouted. `> 0` over 6h would fire on every one of those
+      # for six hours at a time, and an alert that fires during healthy
+      # operation is the exact defect this whole area of the repo exists
+      # to remove: it trains an operator to ignore red. Two failures
+      # inside 50 h spans two daily cycles, which is a pipeline that has
+      # STOPPED rather than a night without a network.
+      #
+      # ON THE 1.5, AND WHAT WAS ACTUALLY MEASURED. It means "at least
+      # two". The first version of this comment justified the non-integer
+      # by claiming `increase()`'s edge extrapolation can push a single
+      # step above 1.0, so that `> 1` would fire on one failure. THAT WAS
+      # NOT DEMONSTRATED: measured with promtool v2.48.0 via a
+      # `promql_expr_test` on a 50 h window lying entirely inside a
+      # densely-sampled series with one step in the middle — the shape
+      # most likely to extrapolate — the value is exactly 1, and mutating
+      # this rule to `> 1` leaves the whole suite green. So `> 1` would be
+      # sufficient today and 1.5 is a MARGIN, not a fix for an observed
+      # bug: extrapolation is a real Prometheus code path and is
+      # scrape-interval dependent, and this fixture could not be made to
+      # exhibit it. Recorded this way round because a threshold defended
+      # by a mechanism nobody checked is how a number outlives its reason.
+      #
+      # WHAT "TWO RUNS" DEPENDS ON, which is a producer property and not
+      # a PromQL one. `failures_total{reason}` counts RUNS, at most one
+      # per reason per run (MetricState::count_reason_once). It did not
+      # at first: do_upload recorded a failure per ARTIFACT and then
+      # returned the first error, which cmd_upload recorded AGAIN as the
+      # run's outcome, so one bad night scored 2-3 on the encrypt/head/put
+      # paths and this threshold fired on a single flaky tether — the
+      # tightening below defeated by the thing it was measuring. The
+      # promtool fixture could not see it because a fixture supplies
+      # counter values directly instead of driving the producer; the guard
+      # is metrics.rs's `one_failed_run_counts_exactly_one_per_reason` and
+      # main.rs's `one_failed_run_moves_the_failure_counter_by_exactly_one`
+      # (which drives cmd_upload end to end). Anything that starts
+      # counting per artifact here again makes this description false
+      # without touching this file.
+      #
+      # The cost, stated: a revoked B2 key takes up to two days to alert
+      # here instead of one. That is accepted because the LOCAL dump is
+      # untouched throughout, and because TalosOffhostBackupStale is the
+      # backstop for any sustained outage this misses.
+      - alert: TalosOffhostBackupUploadFailing
+        expr: |
+          sum by (reason) (increase(talos_offhost_backup_failures_total[50h])) > 1.5
+        for: 15m
+        labels:
+          severity: warning
+          category: data-loss
+        annotations:
+          summary: "Off-host backup upload failing (reason={{ $labels.reason }})"
+          description: |
+            The encrypted off-host push has failed on at least two of the
+            last two daily runs. The LOCAL dump is unaffected and still
+            being taken — this is about the copy that survives losing the
+            disk. reason="auth" most often means the B2 application key
+            was rotated or revoked; reason="config" means the destination
+            or the age passphrase source is not set; reason="network"
+            means two nights without egress, not one.
+            Logs: ~/.talos/logs/offhost-backup.log.
+      # Every counter in this family is PRE-SEEDED at 0 by the producer on
+      # every run, including before the first upload ever happens, so
+      # `increase(...) > 0` above is well-defined rather than evaluated
+      # over an absent series. That is the producer half of the
+      # absent-is-not-zero rule; see talos-offhost-backup/src/metrics.rs.
+      #
+      # 168h, not a tighter number, and the reason is consistency rather
+      # than taste: it is the SAME threshold as the drill's local
+      # artifact-age gate (TALOS_DRILL_MAX_ARTIFACT_AGE_HOURS, default
+      # 168h) and the same default as the drill's own --source b2
+      # freshness check. All three describe one laptop whose backup
+      # sidecars only tick while it is awake, and whose artifact history
+      # shows a real two-day gap from a closed lid. A threshold here that
+      # disagreed with the gate that fails the drill would mean one signal
+      # saying "fine" while the other says "stale".
+      - alert: TalosOffhostBackupStale
+        expr: |
+          (time() - talos_offhost_backup_last_success_timestamp_seconds > 168*3600)
+          and on (job, instance) (talos_offhost_backup_enabled == 1)
+        for: 1h
+        labels:
+          severity: warning
+          category: data-loss
+        annotations:
+          summary: "No successful off-host backup upload in 7+ days (kind={{ $labels.kind }})"
+          description: |
+            An off-host destination IS configured on this host, but no
+            archive of this kind has been uploaded successfully for more
+            than 7 days. Everything since then exists only on the disk it
+            insures. Check ~/.talos/logs/offhost-backup.log and
+            talos_offhost_backup_failures_total for the classified reason,
+            then run scripts/offhost-backup/upload.sh by hand.
+
   # ────────────────────────────────────────────────────────────────────
   # Capacity / saturation. Series come from talos-controller
   # /metrics/prometheus — the DB-pool gauges are sampled every 15s by a
