@@ -5489,6 +5489,69 @@ async fn handle_get_fuel_usage_report(
         modules.push(entry);
     }
 
+    // ── Per-NODE high-utilisation nodes ─────────────────────────────────
+    //
+    // A DIFFERENT QUESTION FROM EVERYTHING ABOVE, and the difference is why
+    // `pa-read-later-digest/digest` was invisible here for 16 days at 96.9% of
+    // its budget. The per-module report aggregates by MODULE against the
+    // SHARED `modules.max_fuel`, uses p95, and hides anything below
+    // `min_executions` (default 3). `digest` had a node-scoped ceiling, a
+    // peak rather than a percentile, and TWO runs — it failed all three
+    // filters at once.
+    //
+    // So this section is per (workflow, node), peak-not-percentile, against
+    // the ceiling a worker actually enforced, and has NO sample floor. It is
+    // the operator-facing half of `talos_fuel_high_utilisation_nodes`, which
+    // carries the count but cannot carry the names (node labels are
+    // author-supplied and unbounded, i.e. unbounded metric cardinality).
+    //
+    // Owner-scoped here, fleet-wide for the gauge. Failure is non-fatal: the
+    // per-module report above is still worth returning, and a missing section
+    // is reported as such rather than as an empty one — an empty array would
+    // read as "no node is at risk".
+    const HIGH_UTILISATION_THRESHOLD: f64 = 0.80;
+    let (high_utilisation_nodes, high_utilisation_error) = match state
+        .analytics_repo
+        .get_node_fuel_headroom(Some(user_id), 30, 200)
+        .await
+    {
+        Ok(rows) => (
+            rows.iter()
+                .filter(|r| r.utilisation() >= HIGH_UTILISATION_THRESHOLD)
+                .map(|r| {
+                    serde_json::json!({
+                        "workflow_id": r.workflow_id,
+                        "workflow_name": r.workflow_name,
+                        "node": r.node_label,
+                        "samples": r.samples,
+                        "peak_fuel": r.peak_fuel,
+                        "enforced_ceiling": r.current_ceiling,
+                        "utilization_pct": talos_analytics_repository::format_percent(
+                            r.utilisation() * 100.0,
+                        ),
+                    })
+                })
+                .collect::<Vec<_>>(),
+            None,
+        ),
+        Err(e) => {
+            tracing::error!(
+                target: "talos_analytics",
+                event_kind = "fuel_headroom_query_failed",
+                error = %e,
+                "get_fuel_usage_report: per-node headroom query failed"
+            );
+            (
+                Vec::new(),
+                Some(
+                    "per-node headroom unavailable (see controller logs, target: \
+                     talos_analytics, event_kind: fuel_headroom_query_failed) — the empty \
+                     list below is NOT evidence that no node is at risk",
+                ),
+            )
+        }
+    };
+
     let result = serde_json::json!({
         "period_days": days,
         "modules_analyzed": stats.len(),
@@ -5496,10 +5559,19 @@ async fn handle_get_fuel_usage_report(
             "at_risk": at_risk.len(),
             "over_provisioned": over_provisioned.len(),
             "well_tuned": well_tuned.len(),
+            "high_utilisation_nodes": high_utilisation_nodes.len(),
         },
         "at_risk": at_risk,
         "over_provisioned": over_provisioned,
         "modules": modules,
+        "high_utilisation_nodes": high_utilisation_nodes,
+        "high_utilisation_error": high_utilisation_error,
+        "high_utilisation_note": "Per (workflow, node) over a fixed 30-day window, test \
+             executions excluded: PEAK fuel_consumed against the ceiling a worker most \
+             recently ENFORCED, flagged at >=80%. Independent of `period_days` and \
+             `min_executions` above, and deliberately UNFLOORED on sample count — a node \
+             with one or two runs is exactly the case the per-module section cannot see. \
+             Backs the TalosFuelHeadroomLow alert.",
         "note": "Apply recommendations via hot_update_module(name, fuel_budget=recommended_max_fuel) — bumps modules.max_fuel without recompiling source.",
     });
 

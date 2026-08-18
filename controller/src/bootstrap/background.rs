@@ -664,6 +664,145 @@ pub(crate) fn spawn_worker_fleet_tasks(
     });
 }
 
+// ===========================================================================
+// Fuel-headroom detector
+// ===========================================================================
+
+/// Utilisation at or above which a `(workflow, node)` pair is reported as
+/// having no fuel headroom.
+///
+/// **Derived, not guessed** — and the derivation is a floor, not a forecast.
+/// `docs/fuel-budget-sizing.md` already stated "a node sitting above ~80%
+/// utilisation on a full payload has no headroom and should be treated as
+/// already failing"; this constant is that sentence made checkable. What the
+/// live database says about the choice (2026-08-17, 30-day window, test runs
+/// excluded, ceiling taken from each node's most recent enforced limit):
+///
+/// | threshold | pairs flagged of 77 |
+/// |---|---|
+/// | 70% | 2 |
+/// | 80% | **1** |
+/// | 90% | 1 |
+///
+/// The single pair at ≥80% is `pa-read-later-digest/digest` at 96.9% on two
+/// samples — the node this detector exists for. The next-highest pair on the
+/// whole fleet is `pa-daily-brief/calendar_work` at 71.0%, so 80% sits in a
+/// genuine gap in the distribution rather than on a cliff edge: nothing between
+/// 71.0% and 96.9% exists to be moved across by a small change in the number.
+/// That gap is also not an accident — adaptive fuel's `2 × p95` ceiling settles
+/// a busy node near 50-60%, so the healthy population has a ceiling of its own.
+const FUEL_HIGH_UTILISATION_THRESHOLD: f64 = 0.80;
+
+/// Window over which peak consumption is measured. Matches
+/// `talos_engine::adaptive_fuel::WINDOW_DAYS` so the detector and the learner
+/// describe the same stretch of history — a detector on a shorter window would
+/// go quiet on exactly the low-cadence nodes the learner already cannot see.
+///
+/// Concretely: at 7 days the acceptance case is INVISIBLE. `digest` runs weekly,
+/// its two samples are older than a week, and the 7-day fleet maximum is 55.1%.
+const FUEL_HEADROOM_WINDOW_DAYS: i32 = 30;
+
+/// Hard bound on aggregate rows pulled per sweep. One row per `(workflow, node)`
+/// pair; the live fleet has 77.
+///
+/// The query orders by utilisation DESC, so truncation drops the LOWEST pairs:
+/// the numerator stays complete and only the denominator under-reports. That is
+/// the safe direction, and at 65× headroom it is remote — but it is a real
+/// limitation rather than an impossibility, so the sweep WARNs when it hits the
+/// bound instead of silently publishing a short denominator.
+const MAX_FUEL_HEADROOM_ROWS: i64 = 5_000;
+
+/// How many offenders the WARN line names. The metric is unlabelled by design,
+/// so this log is one of the two places the operator learns WHICH node — bounded
+/// because the other end of "unbounded cardinality" is an unbounded log line.
+const FUEL_HEADROOM_LOG_NAMES: usize = 10;
+
+/// Pure half of [`publish_fuel_utilisation`]: classify one snapshot.
+///
+/// Split out so the acceptance case can be asserted without a database. The
+/// unit tests drive THIS function with the real measured numbers.
+pub(crate) fn summarise_fuel_utilisation(
+    rows: &[talos_analytics_repository::NodeFuelHeadroom],
+    threshold: f64,
+) -> (i64, i64) {
+    let observed = rows.len() as i64;
+    let high = rows.iter().filter(|r| r.utilisation() >= threshold).count() as i64;
+    (observed, high)
+}
+
+/// Recompute and publish the fuel-headroom gauges from one snapshot, and name
+/// the offenders in a WARN.
+///
+/// ALWAYS `set`, never `inc` — an under-provisioned node is durable state, so
+/// the gauge must be able to fall when the budget is raised and the node next
+/// runs.
+///
+/// NO SAMPLE FLOOR ANYWHERE ON THIS PATH. The query does not apply one and
+/// neither does this function. `pa-read-later-digest/digest` had two samples;
+/// `MIN_SAMPLES = 5` is why the adaptive learner could not see it and
+/// `min_executions = 3` is why `get_fuel_usage_report` could not either. A floor
+/// here would make this the third surface blind to the same node.
+///
+/// TEST SCOPE, stated rather than implied — the same residual the build-skew
+/// gauge carries: the unit tests drive THIS function, and structural check 58
+/// matches the `.set()` textually, so deleting the call in
+/// `spawn_metrics_gauge_tasks` leaves both the tests and the lint green. The
+/// honest guard for the CALL SITE is that
+/// `talos_fuel_utilisation_observed_nodes` reads 0 forever on a fleet that has
+/// executed workflows — which is precisely what
+/// `TalosFuelHeadroomDetectorBlind` alerts on. That alert is this function's
+/// call-site test, running continuously in production.
+pub(crate) fn publish_fuel_utilisation(
+    rows: &[talos_analytics_repository::NodeFuelHeadroom],
+    threshold: f64,
+) {
+    let (observed, high) = summarise_fuel_utilisation(rows, threshold);
+
+    if let Some(m) = metrics::global() {
+        m.fuel_utilisation_observed_nodes.set(observed);
+        m.fuel_high_utilisation_nodes.set(high);
+    }
+
+    if high == 0 {
+        return;
+    }
+
+    // The metric cannot carry node identity (unbounded cardinality), so this is
+    // where the operator finds out which node. Bounded to the worst N.
+    let named: Vec<String> = rows
+        .iter()
+        .filter(|r| r.utilisation() >= threshold)
+        .take(FUEL_HEADROOM_LOG_NAMES)
+        .map(|r| {
+            format!(
+                "{}/{} {:.1}% (peak {} of {}, n={})",
+                r.workflow_name,
+                r.node_label,
+                r.utilisation() * 100.0,
+                r.peak_fuel,
+                r.current_ceiling,
+                r.samples
+            )
+        })
+        .collect();
+
+    tracing::warn!(
+        target: "talos_fuel",
+        event_kind = "fuel_headroom_low",
+        high_utilisation_nodes = high,
+        observed_nodes = observed,
+        threshold_pct = threshold * 100.0,
+        window_days = FUEL_HEADROOM_WINDOW_DAYS,
+        nodes = %named.join("; "),
+        "nodes running with no fuel headroom: peak consumption is at or above \
+         the threshold share of the ceiling last enforced for them. A node at \
+         this level fails on its next larger payload, and the sample count is \
+         NOT a reason to discount it — the case this detector was built for had \
+         two samples. Size from the node's configured maximum \
+         (docs/fuel-budget-sizing.md), not from the last observed run."
+    );
+}
+
 /// Embedding-provider re-probe loop + crypto-invariant orphan gauges +
 /// worker build-skew gauge + DB-pool saturation gauges. Extracted verbatim from
 /// `main()`; spawn order preserved.
@@ -738,6 +877,81 @@ pub(crate) fn spawn_metrics_gauge_tasks(
                     .await
                     {
                         m.workflow_execution_orphaned_rows.set(row);
+                    }
+                }
+            }
+        });
+    }
+
+    // Background task: fuel-headroom detector. Runs every 5 min and republishes
+    // `talos_fuel_high_utilisation_nodes` + its denominator from
+    // `execution_cost_rollup`.
+    //
+    // WHY A SWEEP AND NOT A HOOK. The obvious alternative is to check
+    // utilisation inline in `ControllerNodeHook::on_node_completed`, which
+    // already writes the rollup row. That would be a per-EXECUTION event, and
+    // the condition is not an event: a node stays under-provisioned between
+    // runs, and `digest` runs weekly. A counter incremented at completion would
+    // be silent for six days out of seven on exactly the node this exists for,
+    // and an alert built on `increase(...)` over it could not fire at all. A
+    // recomputed gauge is level-triggered — it holds the condition up for as
+    // long as the condition holds.
+    //
+    // WHY 5 MINUTES. The input is a 30-day aggregate; it cannot move
+    // meaningfully faster than executions arrive. The query measured ~33 ms
+    // against 24k rollup rows on 2026-08-17.
+    //
+    // Unconditional: no config gate. A detector behind a flag that defaults off
+    // is a detector that is off.
+    {
+        let pool = db_pool.clone();
+        tokio::spawn(async move {
+            let repo = talos_analytics_repository::AnalyticsRepository::new(pool);
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
+            // First tick fires immediately — skip it so the first sweep runs
+            // after the rollup has had a moment rather than during boot.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                match repo
+                    .get_node_fuel_headroom(
+                        None, // fleet-wide: this is an operator gauge, not a tenant surface
+                        FUEL_HEADROOM_WINDOW_DAYS,
+                        MAX_FUEL_HEADROOM_ROWS,
+                    )
+                    .await
+                {
+                    Ok(rows) => {
+                        if rows.len() as i64 >= MAX_FUEL_HEADROOM_ROWS {
+                            // Ordered utilisation DESC, so the offenders are all
+                            // present and only the denominator is short. Say so
+                            // rather than publish a number that reads as the
+                            // whole fleet.
+                            tracing::warn!(
+                                target: "talos_fuel",
+                                event_kind = "fuel_headroom_truncated",
+                                cap = MAX_FUEL_HEADROOM_ROWS,
+                                "fuel-headroom sweep hit its row cap; \
+                                 talos_fuel_utilisation_observed_nodes \
+                                 under-reports the fleet (the high-utilisation \
+                                 count is unaffected — the query orders by \
+                                 utilisation descending)"
+                            );
+                        }
+                        publish_fuel_utilisation(&rows, FUEL_HIGH_UTILISATION_THRESHOLD);
+                    }
+                    Err(e) => {
+                        // Leave BOTH gauges at their last values rather than
+                        // publishing a 0 we did not measure. Zeroing the
+                        // denominator on a DB blip would trip the
+                        // detector-blind alert on a healthy fleet; zeroing the
+                        // numerator would read as "all nodes fixed".
+                        tracing::warn!(
+                            target: "talos_fuel",
+                            error = %e,
+                            "fuel-headroom sweep could not read execution_cost_rollup; \
+                             gauges left at their previous values"
+                        );
                     }
                 }
             }
@@ -5027,5 +5241,218 @@ mod worker_liveness_reaper_metric_tests {
         // alert on it is permanently red and therefore ignored.
         publish_worker_liveness_participation(&big[..cap - 1], 24, chrono::Utc::now());
         assert_eq!(truncated(), 0);
+    }
+}
+
+// ===========================================================================
+// Fuel-headroom detector tests
+// ===========================================================================
+//
+// THE ACCEPTANCE TEST IS `the_detector_flags_the_node_it_was_built_for`. Every
+// number in it is a real measurement off the live database on 2026-08-17, not
+// a fixture chosen to make the assertion pass — which matters here more than
+// usual, because the failure mode this detector exists to prevent is a number
+// that was in the database and never compared to anything. A synthetic fixture
+// would reproduce that defect one level up: it would prove the arithmetic and
+// prove nothing about whether the arithmetic sees the case.
+#[cfg(test)]
+mod fuel_headroom_tests {
+    use super::*;
+    use talos_analytics_repository::NodeFuelHeadroom;
+
+    fn install_metrics() -> &'static std::sync::Arc<talos_metrics::TalosMetrics> {
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        talos_metrics::global().expect("global installed")
+    }
+
+    fn node(name: &str, samples: i64, peak: i64, ceiling: i64) -> NodeFuelHeadroom {
+        NodeFuelHeadroom {
+            workflow_id: uuid::Uuid::nil(),
+            workflow_name: "wf".into(),
+            node_label: name.into(),
+            samples,
+            peak_fuel: peak,
+            current_ceiling: ceiling,
+        }
+    }
+
+    /// The whole fleet as measured on 2026-08-17: 30-day window, test
+    /// executions excluded, each node's ceiling taken from its most recent
+    /// enforced limit. Top of the distribution only — the tail is all lower and
+    /// changes no assertion below.
+    fn live_fleet_head() -> Vec<NodeFuelHeadroom> {
+        vec![
+            // pa-read-later-digest/digest — 96.9%, TWO samples. The case.
+            node("digest", 2, 1_359_999, 1_404_000),
+            // pa-daily-brief/calendar_work — 71.0%, the next-highest pair on
+            // the whole fleet.
+            node("calendar_work", 23, 5_032_346, 7_084_790),
+            node("cal_work", 19, 5_682_721, 8_234_228),
+            node("organize_work", 217, 2_368_012, 3_791_044),
+            node("calendar", 23, 1_788_697, 2_969_360),
+            node("classify_severity", 530, 3_413_240, 5_732_830),
+        ]
+    }
+
+    /// **THE ACCEPTANCE TEST.** `pa-read-later-digest/digest` sat at 96.9% of
+    /// its budget for 16 days, across a SUCCESSFUL run, on two samples, and
+    /// then failed. If this detector would not have flagged it, it does not
+    /// solve the problem it was built for.
+    ///
+    /// The `samples == 2` is the load-bearing part, not the ratio. Two samples
+    /// is below `adaptive_fuel::MIN_SAMPLES` (5) and below
+    /// `get_fuel_usage_report`'s `min_executions` default (3) — the node was
+    /// invisible to both, which is why nothing caught it.
+    #[test]
+    fn the_detector_flags_the_node_it_was_built_for() {
+        let digest = node("digest", 2, 1_359_999, 1_404_000);
+        assert!(
+            (digest.utilisation() - 0.9687).abs() < 0.001,
+            "utilisation must reproduce the measured 96.9%, got {:.4}",
+            digest.utilisation()
+        );
+        let (observed, high) =
+            summarise_fuel_utilisation(&[digest], FUEL_HIGH_UTILISATION_THRESHOLD);
+        assert_eq!((observed, high), (1, 1), "n=2 must NOT suppress the flag");
+    }
+
+    /// The negative half, and it has to be the real fleet rather than one
+    /// hand-picked healthy node: a detector that fires on everything is as
+    /// useless as one that fires on nothing, and this is the only evidence
+    /// that 80% is a threshold rather than a wish.
+    #[test]
+    fn the_detector_is_silent_on_the_rest_of_the_live_fleet() {
+        let fleet = live_fleet_head();
+        let (observed, high) = summarise_fuel_utilisation(&fleet, FUEL_HIGH_UTILISATION_THRESHOLD);
+        assert_eq!(observed, fleet.len() as i64);
+        assert_eq!(
+            high, 1,
+            "exactly one node on the live fleet is above threshold; if this \
+             number grows, the threshold is producing noise"
+        );
+        // The margin, pinned. The runner-up is 71.0% and the flagged node is
+        // 96.9%, so 80% sits inside a 26-point gap with nothing in it. A
+        // threshold that had to be tuned to one decimal place would be a
+        // threshold fitted to one sample.
+        let runner_up = fleet
+            .iter()
+            .filter(|n| n.utilisation() < FUEL_HIGH_UTILISATION_THRESHOLD)
+            .map(|n| n.utilisation())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            runner_up < 0.72,
+            "the healthy fleet must not crowd the threshold, got {runner_up:.3}"
+        );
+    }
+
+    /// The threshold mutation the plan demands, applied to the DETECTOR rather
+    /// than only to the alert: the same input must classify differently on
+    /// either side of the boundary, or the test above is asserting a constant.
+    #[test]
+    fn the_classification_actually_depends_on_the_threshold() {
+        let fleet = live_fleet_head();
+        assert_eq!(summarise_fuel_utilisation(&fleet, 0.60).1, 5);
+        assert_eq!(summarise_fuel_utilisation(&fleet, 0.70).1, 2);
+        assert_eq!(summarise_fuel_utilisation(&fleet, 0.80).1, 1);
+        assert_eq!(summarise_fuel_utilisation(&fleet, 0.99).1, 0);
+    }
+
+    /// A node that has run EXACTLY ONCE must be flagged. Stated as its own
+    /// test because "no sample floor" is the property that distinguishes this
+    /// detector from everything the platform already had, and a floor is the
+    /// single most likely thing a future author adds to reduce noise.
+    #[test]
+    fn a_single_sample_is_enough() {
+        let (_, high) = summarise_fuel_utilisation(
+            &[node("first_run", 1, 990, 1_000)],
+            FUEL_HIGH_UTILISATION_THRESHOLD,
+        );
+        assert_eq!(
+            high, 1,
+            "n=1 must flag — a first-run mis-size has no history"
+        );
+    }
+
+    /// A ceiling that has since been LOWERED can put peak consumption above
+    /// 100%. It must flag, not saturate away or divide into a NaN.
+    #[test]
+    fn utilisation_above_one_is_representable_and_flags() {
+        let n = node("shrunk", 4, 2_000, 1_000);
+        assert!((n.utilisation() - 2.0).abs() < f64::EPSILON);
+        assert_eq!(
+            summarise_fuel_utilisation(&[n], FUEL_HIGH_UTILISATION_THRESHOLD).1,
+            1
+        );
+    }
+
+    /// A zero/absent ceiling must not become a division by zero (which reads
+    /// as `inf >= threshold`, i.e. a flag on a node about which nothing is
+    /// known). The SQL already filters `max_fuel > 0`; this pins the type's own
+    /// behaviour so the guarantee does not live only in a query string.
+    #[test]
+    fn a_missing_ceiling_reads_as_no_evidence_not_as_infinite_utilisation() {
+        assert_eq!(node("x", 3, 5_000, 0).utilisation(), 0.0);
+        assert_eq!(
+            summarise_fuel_utilisation(&[node("x", 3, 5_000, 0)], FUEL_HIGH_UTILISATION_THRESHOLD)
+                .1,
+            0
+        );
+    }
+
+    /// Both gauges are PUBLISHED, driven through the production publisher — a
+    /// computed-but-unpublished detector is a silent state. This is also the
+    /// per-metric live-increment test structural check 58 cannot substitute
+    /// for: 58 matches `.set()` textually, so it would pass on a publisher
+    /// whose body no longer ran.
+    ///
+    /// ONE TEST, not three, deliberately. `talos_metrics::set_global` is a
+    /// `OnceLock::set` — the first caller in the whole test BINARY wins and
+    /// every later call is a silent no-op — so the registry these gauges live
+    /// in is shared process-wide and cargo runs tests in parallel threads.
+    /// Splitting the empty case, the firing case and the drain into separate
+    /// `#[test]`s would make them race each other on the same two gauges and
+    /// fail intermittently, which trains re-running (the #634 lesson). The
+    /// cold-registry seeding assertion is NOT made here for the same reason —
+    /// it belongs to, and is made by, `talos-metrics`' own render test over a
+    /// freshly constructed registry.
+    #[test]
+    fn both_gauges_are_published_and_the_numerator_drains() {
+        install_metrics();
+        let read = || {
+            let m = talos_metrics::global().expect("global installed");
+            (
+                m.fuel_utilisation_observed_nodes.get(),
+                m.fuel_high_utilisation_nodes.get(),
+            )
+        };
+
+        // The empty snapshot — the case the denominator exists to make
+        // readable: 0-of-0 and 0-of-77 both render the numerator as 0, and
+        // only the denominator tells "healthy" from "measured nothing".
+        publish_fuel_utilisation(&[], FUEL_HIGH_UTILISATION_THRESHOLD);
+        assert_eq!(read(), (0, 0));
+
+        publish_fuel_utilisation(&live_fleet_head(), FUEL_HIGH_UTILISATION_THRESHOLD);
+        assert_eq!(read(), (6, 1));
+
+        // ...and the numerator must FALL once the budget is raised and the node
+        // next runs, or the alert is permanently red and therefore ignored.
+        let fixed: Vec<NodeFuelHeadroom> = live_fleet_head()
+            .into_iter()
+            .map(|mut n| {
+                if n.node_label == "digest" {
+                    n.current_ceiling = 8_000_000; // what #642 set
+                }
+                n
+            })
+            .collect();
+        publish_fuel_utilisation(&fixed, FUEL_HIGH_UTILISATION_THRESHOLD);
+        assert_eq!(
+            read(),
+            (6, 0),
+            "raising the budget must clear the flag once the node has run at \
+             the new ceiling — the denominator does NOT change, because the \
+             node is still observed"
+        );
     }
 }

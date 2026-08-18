@@ -462,6 +462,58 @@ pub struct TalosMetrics {
     /// are unbounded cardinality.
     pub scheduler_dispatches_total: CounterVec,
 
+    // ---- Fuel-headroom detector (2026-08) ----
+    //
+    // WHY THIS EXISTS, because it is not another "we had a log, add a
+    // counter" case. The number these two publish — peak `fuel_consumed`
+    // against the ceiling a worker actually enforced — was **already in the
+    // database and had never been compared to anything**.
+    // `pa-read-later-digest/digest` sat at 96.9% of its budget for 16 days,
+    // ACROSS A SUCCESSFUL RUN, and then failed two of its four scheduled
+    // runs. Every fuel surface the platform had was structurally unable to
+    // see it: `get_fuel_usage_report` aggregates per MODULE against the
+    // shared `modules.max_fuel` (so a node-scoped override reads against the
+    // wrong denominator) behind a `min_executions` default of 3, and the
+    // adaptive-fuel learner needs `MIN_SAMPLES = 5`. The node had two
+    // samples.
+    //
+    // So the defining property of this pair is that it has **NO SAMPLE
+    // FLOOR**. It fires at n=1. Adding one back — for smoothing, for
+    // noise, for any reason — deletes the only case it was built for.
+    /// `(workflow, node)` pairs whose peak observed `fuel_consumed` is at or
+    /// above [`crate`-external] threshold × the ceiling most recently enforced
+    /// for them, over the detector's window.
+    ///
+    /// A GAUGE, recomputed from one query each sweep (always `set`, never
+    /// `inc`), because the condition is durable state: an under-provisioned
+    /// node stays under-provisioned until someone changes the number, and a
+    /// counter would go quiet exactly while the fleet stayed exposed.
+    ///
+    /// UNLABELLED. `workflow_id` and the node label are both author-supplied
+    /// and unbounded — a per-node label is an unbounded-cardinality surface on
+    /// the scrape path. The names go to a WARN log
+    /// (`controller::bootstrap::background::publish_fuel_utilisation`) and to
+    /// `get_fuel_usage_report`'s `high_utilisation_nodes`, which are queried
+    /// surfaces rather than scraped ones. Same rule and same escape hatch as
+    /// `catalog_templates_missing_wasm`.
+    ///
+    /// TEST EXECUTIONS ARE EXCLUDED from the population. `test_workflow`
+    /// writes rollup rows, and a hand-crafted probe payload is traffic that
+    /// never happened.
+    pub fuel_high_utilisation_nodes: IntGauge,
+    /// The DENOMINATOR of [`Self::fuel_high_utilisation_nodes`]: every
+    /// `(workflow, node)` pair the detector could evaluate in the window.
+    ///
+    /// **Published because otherwise a 0 above is unreadable**, and unreadable
+    /// in the specific direction that matters. `high = 0` covers both "77 pairs
+    /// examined, all healthy" and "the sweep is broken / the rollup is empty /
+    /// nothing has run", and an IntGauge exports 0 from registration — so a
+    /// detector that never ran looks exactly like a healthy fleet. That is the
+    /// blindness this whole change exists to remove, one level up. Same
+    /// argument as `worker_fleet_unverifiable_builds`, and
+    /// `TalosFuelHeadroomDetectorBlind` is the alert that consumes it.
+    pub fuel_utilisation_observed_nodes: IntGauge,
+
     /// Scheduler poll iterations HELD by the fleet-readiness barrier because
     /// the controller's NATS heartbeat view contained no live worker.
     ///
@@ -1005,6 +1057,40 @@ impl TalosMetrics {
         worker_fleet_unverifiable_builds.set(0);
         worker_fleet_capacity_dropped_heartbeats.set(0);
 
+        // ---- Fuel-headroom detector ----
+        let fuel_high_utilisation_nodes = IntGauge::new(
+            "talos_fuel_high_utilisation_nodes",
+            "(workflow, node) pairs whose PEAK observed fuel_consumed is at or \
+             above the detector threshold (default 80%) of the ceiling a worker \
+             most recently ENFORCED for them. Recomputed each sweep from \
+             execution_cost_rollup. NO SAMPLE FLOOR — it fires at n=1, which is \
+             the point: the node it was built for sat at 96.9% on two samples, \
+             below every percentile-and-floor surface the platform had. Test \
+             executions are excluded. Names are in the controller WARN log and \
+             get_fuel_usage_report.high_utilisation_nodes, deliberately not \
+             labels (node labels are author-supplied and unbounded).",
+        )?;
+        registry.register(Box::new(fuel_high_utilisation_nodes.clone()))?;
+
+        let fuel_utilisation_observed_nodes = IntGauge::new(
+            "talos_fuel_utilisation_observed_nodes",
+            "The DENOMINATOR of talos_fuel_high_utilisation_nodes: every \
+             (workflow, node) pair the detector could evaluate in the window. \
+             Exported so a 0 on the numerator is readable — 0 of 77 examined is \
+             a healthy fleet, 0 of 0 is a detector that measured nothing, and an \
+             IntGauge reads 0 in both cases. TalosFuelHeadroomDetectorBlind \
+             alerts on the second.",
+        )?;
+        registry.register(Box::new(fuel_utilisation_observed_nodes.clone()))?;
+
+        // Seed the pair at 0. Same rule as the fleet gauges above: a gauge that
+        // has never been `set` is ABSENT, and `absent >= 1` matches nothing —
+        // so before the first sweep the detector would be silent for the reason
+        // it exists to make loud. Both have live `set` sites in
+        // `controller::bootstrap::background::publish_fuel_utilisation`.
+        fuel_high_utilisation_nodes.set(0);
+        fuel_utilisation_observed_nodes.set(0);
+
         // ---- Scheduler startup-herd detection ----
         let scheduler_dispatches_total = CounterVec::new(
             prometheus::Opts::new(
@@ -1301,6 +1387,8 @@ impl TalosMetrics {
             worker_fleet_build_skew_workers,
             worker_fleet_unverifiable_builds,
             worker_fleet_capacity_dropped_heartbeats,
+            fuel_high_utilisation_nodes,
+            fuel_utilisation_observed_nodes,
             scheduler_dispatches_total,
             scheduler_readiness_holds_total,
             scheduler_readiness_degraded,
@@ -1482,6 +1570,14 @@ mod tests {
             "talos_worker_fleet_build_skew_workers 0",
             "talos_worker_fleet_unverifiable_builds 0",
             "talos_worker_fleet_capacity_dropped_heartbeats 0",
+            // The fuel-headroom pair. The numerator's healthy steady state is
+            // 0 forever, and it is read by a `>= 1` alert — absent would
+            // match nothing. The DENOMINATOR is asserted for the opposite
+            // reason: its alert fires on `== 0`, and an absent series makes
+            // `== 0` match nothing too, so the meta-detector that catches a
+            // dead sweep would itself be silenced by a dead sweep.
+            "talos_fuel_high_utilisation_nodes 0",
+            "talos_fuel_utilisation_observed_nodes 0",
             // The scheduler startup-herd detector. On a healthy fleet the
             // startup-phase series sit at 0 forever, and the alert on them is
             // built on `increase(...)` — so an absent series is a

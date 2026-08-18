@@ -14,6 +14,12 @@ serde.workspace = true
 serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 # MCP-1032: bounded_preview for caller-supplied reflection in schema validation errors.
+# Fuel-sizing check: the `__actor_context__` injection budget
+# (SMART_MEMORY_CONTEXT_BYTE_BUDGET) and the memory-eligibility gate on a
+# node's capability world. Both are workspace path deps — no new external
+# crates enter the dependency graph.
+talos-capability-world = { path = "../talos-capability-world" }
+talos-config = { path = "../talos-config" }
 talos-text-util = { path = "../talos-text-util" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }

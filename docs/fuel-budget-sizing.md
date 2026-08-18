@@ -141,6 +141,66 @@ backstopping a mis-set node ceiling**.
 A node sitting above ~80% utilisation on a full payload has no headroom and
 should be treated as already failing.
 
+## The two checks that now enforce this page
+
+Both were added because everything above was true, written down, and enforced
+by nothing.
+
+### 1. `TalosFuelHeadroomLow` — a running node with no headroom
+
+`talos_fuel_high_utilisation_nodes` counts `(workflow, node)` pairs whose
+**peak** `fuel_consumed` over the last 30 days is at or above **80%** of the
+ceiling a worker **most recently enforced** for them. Test executions are
+excluded. Published every 5 minutes by
+`controller::bootstrap::background::publish_fuel_utilisation`.
+
+**It has no sample floor and must never grow one.** That is the whole reason it
+catches what nothing else did: `digest` had two runs, `MIN_SAMPLES` is 5, and
+`get_fuel_usage_report`'s `min_executions` defaults to 3. A floor here would
+make this the third surface blind to the same node.
+
+Three properties worth knowing before you read the number:
+
+* **The names are not in the metric.** Node labels are author-supplied, so a
+  per-node label is unbounded cardinality. Look in the controller WARN log
+  (`target=talos_fuel`, `event_kind=fuel_headroom_low`) or at
+  `get_fuel_usage_report` → `high_utilisation_nodes`.
+* **Raising the budget does not clear it immediately.** The ceiling read is the
+  limit a worker *enforced*, so a config change lands only after the node next
+  runs — up to a week for a weekly workflow. An unexercised budget is not
+  evidence.
+* **0 is ambiguous on its own**, which is why
+  `talos_fuel_utilisation_observed_nodes` publishes the denominator and
+  `TalosFuelHeadroomDetectorBlind` fires when the detector observes nothing
+  while executions are completing.
+
+### 2. `validate_workflow` — a budget that cannot cover its own MAX_TOKENS
+
+A node declaring `MAX_TOKENS` whose effective ceiling
+(`data.max_fuel ?? modules.max_fuel`) is below
+`3,000 × MAX_TOKENS + 40 × context_bytes` gets a `fuel-sizing` **warning** at
+authoring time, at `publish_version`, and after `hot_update_module`.
+
+This is the dead zone no estimator reaches: a node wrong on its **first** run
+has no history to learn from. `digest` was under-provisioned from execution #1.
+
+The `3,000` is calibrated, not assumed: every node an author has deliberately
+sized sits between **4,444** and **11,429** fuel per configured token, and
+pre-#642 `digest` sat at **1,002**. Nothing lies between, so any constant
+inside that band gives identical verdicts on every node that exists.
+
+The `40 × context_bytes` term is the `__actor_context__` allowance and is the
+weakest number in the check — there is no measurement of the fuel cost of an
+injected byte anywhere in the platform. It is deliberately **not
+load-bearing**: removing it entirely changes no verdict on the current fleet
+(pinned by a test). It exists so the check does not pretend the injection is
+free.
+
+**What the check does NOT claim.** It is a floor. Clearing it does not mean a
+node is correctly sized — only that it is not obviously wrong. The runtime
+detector above is the surface for everything above the floor, and the two are
+complementary: the detector needs history and this needs none.
+
 ## Reading a fuel-exhaustion error
 
 The message (`talos_worker_runtime::runtime::fuel_exhausted_message`) reports
@@ -181,3 +241,9 @@ its configured maximum output alone puts the requirement near 4M before the
    per-actor or per-tenant budget interacts.
 5. Does the workflow run often enough for adaptive fuel to ever help? If it
    runs weekly, it does not. The number you set is the number it lives with.
+6. Run `validate_workflow`. A `fuel-sizing` warning means the budget cannot
+   cover the node's own configured maximum — fix that before looking at
+   anything else.
+7. After it has run, check `get_fuel_usage_report` →
+   `high_utilisation_nodes`. Step 6 is a floor and cannot tell you whether the
+   number holds against real inputs.

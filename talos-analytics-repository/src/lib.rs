@@ -255,6 +255,50 @@ pub struct NodeFuelStat {
     pub fuel_max: u64,
 }
 
+/// One `(workflow, node)` pair's fuel-headroom picture: the worst consumption
+/// observed in the window against the ceiling a worker MOST RECENTLY enforced
+/// for it.
+///
+/// THIS IS NOT `NodeFuelStat` AND MUST NOT BE MERGED WITH IT. `NodeFuelStat`
+/// feeds the adaptive-fuel LEARNER — it is gated on `MIN_SAMPLES = 5` and
+/// aggregates a percentile so a learned ceiling is not moved by one outlier.
+/// This one feeds a DETECTOR, and its whole reason to exist is that it has **no
+/// sample floor at all**: the node that motivated it
+/// (`pa-read-later-digest/digest`) sat at 96.9% of budget for 16 days on **two**
+/// samples, structurally invisible to every percentile-and-floor surface the
+/// platform already had, and then failed. A floor here would reinstate exactly
+/// the blindness it removes.
+#[derive(Debug, Clone)]
+pub struct NodeFuelHeadroom {
+    pub workflow_id: Uuid,
+    /// Workflow name at query time — for the operator-facing log line only.
+    /// Never a metric label (see `talos_fuel_high_utilisation_nodes`).
+    pub workflow_name: String,
+    /// The engine's node label, i.e. `execution_cost_rollup.node_id`.
+    pub node_label: String,
+    /// Rows in the window. Reported so an operator can weigh the evidence;
+    /// **never used to suppress a row**.
+    pub samples: i64,
+    /// `MAX(fuel_consumed)` over the window — the peak demand actually observed.
+    pub peak_fuel: i64,
+    /// `max_fuel` from the node's MOST RECENT row in the window: the last limit
+    /// a worker genuinely enforced (the `__fuel_limit__` stamp), not a
+    /// configured value that may never have reached a dispatch.
+    pub current_ceiling: i64,
+}
+
+impl NodeFuelHeadroom {
+    /// Peak consumption as a fraction of the ceiling now in force. `>= 1.0` is
+    /// possible in principle (a ceiling that has since been LOWERED), so callers
+    /// must not assume the value is bounded by 1.
+    pub fn utilisation(&self) -> f64 {
+        if self.current_ceiling <= 0 {
+            return 0.0;
+        }
+        self.peak_fuel as f64 / self.current_ceiling as f64
+    }
+}
+
 #[derive(Debug)]
 pub struct VersionChangelogRow {
     pub version_number: Option<i32>,
@@ -4629,6 +4673,114 @@ impl AnalyticsRepository {
                         fuel_avg: favg.unwrap_or(0.0) as i64,
                         wall_time_p50_ms: wp50.unwrap_or(0.0) as i64,
                         wall_time_p95_ms: wp95.unwrap_or(0.0) as i64,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    /// Per-`(workflow, node)` fuel headroom over `days`, for the high-utilisation
+    /// DETECTOR. Fleet-wide when `user_id` is `None` (the controller's gauge
+    /// sweep), owner-scoped when `Some` (the MCP report).
+    ///
+    /// **No sample floor, deliberately** — see [`NodeFuelHeadroom`]. Every
+    /// existing fuel surface in this platform hides a node that has run once or
+    /// twice, and the node that motivated this had two samples.
+    ///
+    /// ## What the two numbers are, and why they come from different rows
+    ///
+    /// * `peak_fuel` = `MAX(fuel_consumed)` across the whole window — the worst
+    ///   demand actually observed.
+    /// * `current_ceiling` = `max_fuel` from the node's **most recent** row.
+    ///
+    /// Taking the ceiling from the latest row rather than maxing it, or taking a
+    /// per-row `consumed/limit` ratio and maxing that, is the difference between
+    /// a detector that clears when you fix it and one that stays red for a full
+    /// window. Adaptive fuel raises ceilings over time, so a per-row max ratio
+    /// keeps reporting a node's worst historical squeeze long after the squeeze
+    /// is gone: measured on the live database 2026-08-17, per-row max ratio
+    /// flagged three nodes at ≥80% of which two (`ops-critical-notifier/
+    /// critical_notify_compose` 92.8%, `pa-weekly-report/send` 83.1%) were
+    /// already fixed by a raised ceiling. A permanently-firing alert trains
+    /// operators to ignore red, which is the same defect one level up.
+    ///
+    /// It also means **a config change alone does not clear this**. The ceiling
+    /// read here is the limit a worker ENFORCED (the `__fuel_limit__` stamp), so
+    /// raising `data.max_fuel` in the graph shows up only after the node next
+    /// runs. That is the honest reading: an unexercised budget is not evidence.
+    /// For a weekly workflow it means up to a week of continued firing.
+    ///
+    /// ## Test executions are EXCLUDED
+    ///
+    /// `test_workflow` writes rollup rows (`is_test_execution = true`), and a
+    /// hand-crafted probe payload is traffic that never happened — counting it
+    /// lets an author trip a production alert with a deliberate experiment. On
+    /// the live database 34 of 77 qualifying pairs carry at least one test row,
+    /// so this is not a rounding correction. The cost is a real false negative:
+    /// a node that has ONLY ever run under test (1 pair of the 77) is invisible
+    /// here — acceptable, because it has no production traffic to protect.
+    ///
+    /// ## Bounds
+    ///
+    /// `LIMIT $N` on the aggregate (one row per pair). At 24k rollup rows the
+    /// query plans as a seq scan over the window and measures ~33 ms; it runs
+    /// once per sweep interval (300 s), so it is deliberately NOT given its own
+    /// index — the fleet-wide form has no `workflow_id` predicate for
+    /// `idx_cost_rollup_workflow` to serve, and an index earned by one caller
+    /// every five minutes is not worth the write amplification on a hot
+    /// insert path.
+    pub async fn get_node_fuel_headroom(
+        &self,
+        user_id: Option<Uuid>,
+        days: i32,
+        limit: i64,
+    ) -> Result<Vec<NodeFuelHeadroom>> {
+        let rows = sqlx::query_as::<_, (Uuid, String, String, i64, i64, i64)>(
+            "WITH scoped AS ( \
+                SELECT r.workflow_id, r.node_id, r.fuel_consumed, r.max_fuel, r.recorded_at \
+                FROM execution_cost_rollup r \
+                JOIN workflow_executions we ON we.id = r.execution_id \
+                JOIN workflows w ON w.id = r.workflow_id \
+                WHERE r.recorded_at > NOW() - make_interval(days => $1::int) \
+                  AND r.max_fuel > 0 \
+                  AND r.fuel_consumed > 0 \
+                  AND NOT we.is_test_execution \
+                  AND ($2::uuid IS NULL OR w.user_id = $2) \
+             ), latest AS ( \
+                SELECT DISTINCT ON (workflow_id, node_id) \
+                       workflow_id, node_id, max_fuel AS current_ceiling \
+                FROM scoped \
+                ORDER BY workflow_id, node_id, recorded_at DESC, max_fuel DESC \
+             ) \
+             SELECT s.workflow_id, w.name, s.node_id, \
+                    COUNT(*) AS samples, \
+                    MAX(s.fuel_consumed) AS peak_fuel, \
+                    l.current_ceiling \
+             FROM scoped s \
+             JOIN latest l ON l.workflow_id = s.workflow_id AND l.node_id = s.node_id \
+             JOIN workflows w ON w.id = s.workflow_id \
+             GROUP BY s.workflow_id, w.name, s.node_id, l.current_ceiling \
+             ORDER BY MAX(s.fuel_consumed)::numeric / l.current_ceiling DESC, \
+                      s.workflow_id, s.node_id \
+             LIMIT $3",
+        )
+        .bind(days)
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&self.db_pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(workflow_id, workflow_name, node_label, samples, peak_fuel, current_ceiling)| {
+                    NodeFuelHeadroom {
+                        workflow_id,
+                        workflow_name,
+                        node_label,
+                        samples,
+                        peak_fuel,
+                        current_ceiling,
                     }
                 },
             )

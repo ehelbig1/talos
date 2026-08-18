@@ -12,6 +12,106 @@ use talos_workflow_repository::{NodeTemplateRow, WorkflowRepository};
 // Re-use the vault path permission check from the MCP module.
 use talos_workflow_job_protocol::vault_path_permitted as _vpp;
 
+// ── Fuel sizing (authoring-time) ─────────────────────────────────────────────
+//
+// WHY THIS IS A VALIDATION WARNING AND NOT A STRUCTURAL LINT.
+// `scripts/lint-structural.sh` reads repository FILES. Workflow graphs live in
+// `workflows.graph_json`, authored at runtime through MCP / GraphQL / the
+// editor — a structural lint cannot see a single one of them. The only
+// repo-resident graphs are the handful of seeds in `workflow-templates/`, so a
+// lint would gate ~6 documents and miss every workflow an operator actually
+// runs, including the one that motivated this. Validation runs where the graph
+// is: `WorkflowValidationService::validate` is called by `validate_workflow`,
+// by `publish_version`, and after `hot_update_module`, so the check fires on
+// authoring, on publish, and on module change.
+//
+// WHAT IT CLAIMS, narrowly. A node that generates up to `MAX_TOKENS` of output
+// needs a fuel budget that can pay for generating them. If its effective
+// ceiling cannot cover its OWN CONFIGURED MAXIMUM, it is mis-sized before it
+// has ever run — which is the one dead zone no estimator over past runs can
+// reach, because there are no past runs. `pa-read-later-digest/digest` was
+// under-provisioned from execution #1.
+//
+// It does NOT claim to predict consumption. It is a FLOOR, and it is silent
+// about everything above the floor: a node that clears it can still be
+// under-provisioned for its inputs. `TalosFuelHeadroomLow` is the surface for
+// that half, and the two are complementary — the detector needs history and
+// this needs none.
+
+/// Fuel a node must be able to spend per token of configured maximum output.
+///
+/// **Calibrated against the live fleet, not assumed** (2026-08-17). Every
+/// workflow node carrying both a `MAX_TOKENS` and an explicit
+/// `data.max_fuel` — thirteen of them, i.e. every node an author has
+/// deliberately sized — yields `max_fuel / MAX_TOKENS` between **4,444**
+/// (`pa-daily-brief/brief`, 8,000,000 / 1800) and **11,429**
+/// (`pa-quality-judge/judge`). The node this check exists for sat at
+/// **1,002** (1,404,000 / 1400) before #642 raised it.
+///
+/// So 3,000 sits in an empty band 4.4× wide: nothing on the fleet lies between
+/// 1,002 and 4,444. It is a threshold, not a fitted parameter — moving it
+/// anywhere inside that band changes no verdict on any node that exists.
+pub const FUEL_PER_MAX_TOKEN: u64 = 3_000;
+
+/// Fuel allowance per byte of `__actor_context__` the engine may inject into a
+/// memory-eligible node's input, on top of its upstream payload.
+///
+/// **This is the weakest number in this file and is deliberately not
+/// load-bearing.** There is no measurement anywhere in the platform of the
+/// fuel cost of an injected context byte, and inventing a precise one from the
+/// single available anchor would be a model fitted to one sample. What can be
+/// said honestly: at the 12,000-byte default the allowance is 480,000 fuel —
+/// about 8% of a typical node's floor — and **removing it entirely changes the
+/// verdict on no node of the current fleet, in either direction** (pinned by
+/// `the_injection_allowance_is_a_margin_not_a_classifier`). It is a stated
+/// margin that keeps the check from pretending the injection is free, not a
+/// calibration anything depends on. If it ever starts driving verdicts, it
+/// needs a real measurement first.
+pub const FUEL_PER_CONTEXT_BYTE: u64 = 40;
+
+/// The minimum fuel a node needs to cover its own configured maximum output,
+/// plus — for a memory-eligible node — the `__actor_context__` injection.
+///
+/// `context_byte_budget` is `SMART_MEMORY_CONTEXT_BYTE_BUDGET` (12,000 default)
+/// and is passed in rather than read from the environment so this stays pure
+/// and testable. Pass `0` for a node that receives no injection.
+///
+/// The injection term matters disproportionately relative to its size because
+/// it is **invisible in `module_executions.input_data`** — a node sized from
+/// its own recorded input is sized short by up to the whole budget, and the
+/// recorded input is where an author naturally looks.
+#[must_use]
+pub fn required_fuel_floor(max_tokens: u64, context_byte_budget: u64) -> u64 {
+    max_tokens
+        .saturating_mul(FUEL_PER_MAX_TOKEN)
+        .saturating_add(context_byte_budget.saturating_mul(FUEL_PER_CONTEXT_BYTE))
+}
+
+/// Whether a node in `capability_world` receives `__actor_context__` by
+/// default, honouring an explicit per-node `needs_memory`.
+///
+/// Mirrors `ParallelWorkflowEngine::node_needs_memory_for_world`: the pure-
+/// egress worlds (`http` / `network` / `messaging`) default to NO memory, every
+/// other world defaults to memory, and an explicit `needs_memory` in node
+/// config always wins. Kept in agreement with the engine deliberately — a
+/// sizing check that disagreed with the injector about which nodes get the
+/// injection would be sizing the wrong nodes.
+///
+/// An UNKNOWN world (`None`) is treated as memory-eligible. That is the
+/// conservative direction for a floor: assuming the injection happens can only
+/// raise the required budget, and over-provisioning a node costs nothing at
+/// runtime (fuel is a ceiling, not an allocation), while under-provisioning is
+/// the failure this exists to prevent.
+#[must_use]
+pub fn node_receives_actor_context(capability_world: Option<&str>, explicit: Option<bool>) -> bool {
+    match explicit {
+        Some(v) => v,
+        None => capability_world
+            .map(|w| !talos_capability_world::world_defaults_no_memory(w))
+            .unwrap_or(true),
+    }
+}
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 /// Severity of a validation issue.
@@ -307,6 +407,16 @@ impl WorkflowValidationService {
                 })
                 .collect();
 
+            // Fuel-sizing inputs, captured BEFORE `template_rows` is consumed
+            // into `template_schemas`: the module's shared default ceiling and
+            // its capability world. Both are needed per node, and the node that
+            // motivated this check had NO node-scoped override — its ceiling
+            // came entirely from `modules.max_fuel`.
+            let template_fuel: HashMap<Uuid, (Option<i64>, Option<String>)> = template_rows
+                .iter()
+                .map(|r| (r.id, (r.max_fuel, r.capability_world.clone())))
+                .collect();
+
             let template_schemas: HashMap<Uuid, (String, serde_json::Value, Vec<String>)> =
                 template_rows
                     .into_iter()
@@ -318,6 +428,99 @@ impl WorkflowValidationService {
                         (r.id, (r.name, r.config_schema, effective_secrets))
                     })
                     .collect();
+
+            // ── Fuel sizing vs the node's own configured maximum (Warning) ──
+            //
+            // Runs inside this block because it needs the template rows. See
+            // the module-level rationale above `FUEL_PER_MAX_TOKEN` for why
+            // this is a validation warning rather than a structural lint, and
+            // for what it does and does not claim.
+            let context_budget = talos_config::smart_memory_context_byte_budget() as u64;
+            for node in &nodes {
+                let node_label = node.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let node_data = node.get("data").cloned().unwrap_or(serde_json::json!({}));
+                // Both shapes: config keys are written flat under `data` by
+                // `build_add_node_payload`, but nested `data.config` occurs in
+                // imported and frontend-authored graphs.
+                let cfg = node_data
+                    .get("config")
+                    .cloned()
+                    .unwrap_or(node_data.clone());
+
+                // Only a node that DECLARES a maximum output can be judged
+                // against it. Absent `MAX_TOKENS` there is nothing to size
+                // from and this check says nothing — deliberately, rather than
+                // guessing at a default.
+                let Some(max_tokens) = cfg.get("MAX_TOKENS").and_then(|v| v.as_u64()) else {
+                    continue;
+                };
+                if max_tokens == 0 {
+                    continue;
+                }
+
+                let tid: Option<Uuid> = node
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse().ok());
+                let (module_fuel, world) = tid
+                    .and_then(|t| template_fuel.get(&t))
+                    .cloned()
+                    .unwrap_or((None, None));
+
+                // Mirrors `resolve_node_max_fuel`'s baseline:
+                //   node-scoped `data.max_fuel` ?? `modules.max_fuel`.
+                // The learned adaptive ceiling is NOT folded in, and that is
+                // the point: adaptive is a runtime guard that needs five
+                // samples in thirty days, so it is structurally unavailable to
+                // a node being authored and to every weekly workflow. Sizing
+                // against a number the node cannot rely on is how a budget
+                // that never fit survives review.
+                let effective = cfg
+                    .get("max_fuel")
+                    .and_then(|v| v.as_u64())
+                    .or_else(|| module_fuel.filter(|f| *f > 0).map(|f| f as u64));
+                // No ceiling knowable ⇒ no verdict. Saying nothing is correct
+                // here; a warning would be about the module row, not the node.
+                let Some(effective) = effective.filter(|f| *f > 0) else {
+                    continue;
+                };
+
+                let injected = node_receives_actor_context(
+                    world.as_deref(),
+                    cfg.get("needs_memory").and_then(|v| v.as_bool()),
+                );
+                let budget = if injected { context_budget } else { 0 };
+                let floor = required_fuel_floor(max_tokens, budget);
+                if effective >= floor {
+                    continue;
+                }
+
+                let injection_note = if injected {
+                    format!(
+                        " That figure includes {budget} bytes of __actor_context__ the engine \
+                         injects into this node (its capability world is memory-eligible), which \
+                         is NOT visible in module_executions.input_data — set needs_memory: false \
+                         if the node does not consume memory."
+                    )
+                } else {
+                    String::new()
+                };
+                issues.push(ValidationIssue {
+                    severity: ValidationSeverity::Warning,
+                    message: format!(
+                        "Node '{node_label}' has max_fuel {effective} but its own configured \
+                         MAX_TOKENS of {max_tokens} needs at least ~{floor}. The budget cannot \
+                         pay for the output the node is configured to produce, so it is \
+                         mis-sized before it has ever run — no amount of execution history \
+                         fixes that, and adaptive fuel needs 5 runs in 30 days it may never \
+                         get.{injection_note} Size it per docs/fuel-budget-sizing.md, and \
+                         prefer a node-scoped data.max_fuel over modules.max_fuel, which is \
+                         shared by every override-less consumer of that module."
+                    ),
+                    node_id: Some(node_label.to_string()),
+                    category: "fuel-sizing".into(),
+                });
+            }
 
             for node in &nodes {
                 let node_id = node.get("id").and_then(|v| v.as_str()).unwrap_or("?");
@@ -2141,5 +2344,190 @@ mod tests {
             "expected depth-bailout error, got {:?}",
             errors
         );
+    }
+}
+
+// ===========================================================================
+// Fuel-sizing check
+// ===========================================================================
+//
+// Every number below is a real value off the live database on 2026-08-17 —
+// the thirteen workflow nodes that carry both a `MAX_TOKENS` and an explicit
+// `data.max_fuel`, plus the pre-#642 state of the node this check exists for.
+// A synthetic fixture would prove the arithmetic and prove nothing about
+// whether the arithmetic separates the fleet it has to run against.
+#[cfg(test)]
+mod fuel_sizing_tests {
+    use super::*;
+
+    /// `SMART_MEMORY_CONTEXT_BYTE_BUDGET`'s default. Hardcoded rather than
+    /// read through `talos_config` so these tests cannot be perturbed by an
+    /// env var set by another test in the same binary.
+    const CTX: u64 = 12_000;
+
+    /// (name, MAX_TOKENS, max_fuel) — every node on the live fleet with both,
+    /// i.e. every node an author has deliberately sized. All are LLM nodes in
+    /// memory-eligible worlds, so all take the injection allowance.
+    const SIZED_FLEET: &[(&str, u64, u64)] = &[
+        ("cxai-crm-capture/extract", 1600, 14_000_000),
+        ("pa-ask/answer", 1500, 8_000_000),
+        ("pa-ask-grounded/answer", 1500, 8_000_000),
+        ("pa-ask-grounded-judged/answer", 1500, 8_000_000),
+        ("pa-autonomy-digest/compose", 2000, 12_000_000),
+        ("pa-chief-of-staff/synthesize", 1800, 12_000_000),
+        ("pa-daily-brief/brief", 1800, 8_000_000), // the tightest
+        ("pa-inbox-organizer-work/classify_work", 1800, 12_000_000),
+        ("pa-inbox-triage/triage", 1800, 10_000_000),
+        ("pa-meeting-prep/prep", 1200, 8_000_000),
+        ("pa-opportunity-crm/extract", 1600, 14_000_000),
+        ("pa-quality-judge/judge", 700, 8_000_000),
+        ("pa-read-later-digest/digest", 1400, 8_000_000), // post-#642
+    ];
+
+    /// **THE ACCEPTANCE TEST.** `pa-read-later-digest/digest` before #642:
+    /// `MAX_TOKENS: 1400` against the shared `modules.max_fuel` of 1,404,000,
+    /// with no node-scoped override at all. It ran for five weeks and failed
+    /// two of its four scheduled runs.
+    ///
+    /// The 1,404,000 is the load-bearing detail: the node had NO
+    /// `data.max_fuel`, so a check that looked only at the node's own config
+    /// would have found nothing to judge and passed it silently. Reading the
+    /// module default is what makes this check able to see the case.
+    #[test]
+    fn the_check_rejects_the_budget_that_never_fit() {
+        let floor = required_fuel_floor(1400, CTX);
+        assert!(
+            1_404_000 < floor,
+            "pre-#642 digest must fail the floor; floor={floor}"
+        );
+        // And the fix must pass, or the check would still be firing on a node
+        // that is now correctly sized.
+        assert!(
+            8_000_000 >= floor,
+            "post-#642 digest must pass; floor={floor}"
+        );
+    }
+
+    /// The negative direction, over the whole sized fleet. A check that
+    /// rejects everything is as useless as one that rejects nothing.
+    #[test]
+    fn the_check_passes_every_node_an_author_has_sized() {
+        for (name, max_tokens, max_fuel) in SIZED_FLEET {
+            let floor = required_fuel_floor(*max_tokens, CTX);
+            assert!(
+                *max_fuel >= floor,
+                "{name} must pass: max_fuel {max_fuel} < floor {floor}"
+            );
+        }
+    }
+
+    /// The margin, pinned in both directions — this is the evidence that
+    /// `FUEL_PER_MAX_TOKEN` is a threshold in an empty band rather than a
+    /// parameter fitted to the one failure.
+    ///
+    /// Observed `max_fuel / MAX_TOKENS`: the sized fleet's MINIMUM is 4,444
+    /// and pre-#642 digest was 1,003. Nothing lies between. So any constant
+    /// in (1003, 4444) yields identical verdicts on every node that exists,
+    /// and 3,000 is simply the middle of that band.
+    #[test]
+    fn the_threshold_sits_in_an_empty_band_and_is_not_fitted() {
+        let fleet_min = SIZED_FLEET
+            .iter()
+            .map(|(_, mt, mf)| mf / mt)
+            .min()
+            .expect("non-empty");
+        assert_eq!(fleet_min, 4_444, "tightest sized node on the fleet");
+        // 1,404,000 / 1400 = 1002.86; integer division floors it to 1002.
+        assert_eq!(1_404_000_u64 / 1400, 1_002, "pre-#642 digest");
+        assert!(
+            (1_002..4_444).contains(&FUEL_PER_MAX_TOKEN),
+            "the constant must sit strictly inside the empty band"
+        );
+        // Non-vacuity: the verdicts must actually MOVE outside the band, or
+        // the two tests above are asserting a tautology.
+        //
+        // The low arm uses 600, not something just under 1,002, because the
+        // injection allowance is part of the floor: at the 12,000-byte default
+        // it contributes 480,000 fuel, which on its own is a third of the bad
+        // node's entire 1,404,000 budget. The per-token rate that lets that
+        // node through is therefore <= (1,404,000 - 480,000) / 1400 = 660, not
+        // 1,002. Worth stating because it also bounds the previous test's
+        // claim precisely: the allowance flips no verdict AT THE SHIPPED
+        // CONSTANT, which is not the same as never being able to flip one.
+        let too_low = |mt: u64| mt * 600 + CTX * FUEL_PER_CONTEXT_BYTE;
+        assert!(
+            1_404_000 >= too_low(1400),
+            "at 600/token the bad node passes"
+        );
+        let too_high = |mt: u64| mt * 5_000 + CTX * FUEL_PER_CONTEXT_BYTE;
+        assert!(
+            8_000_000 < too_high(1800),
+            "at 5000/token pa-daily-brief/brief would be falsely flagged"
+        );
+    }
+
+    /// The injection allowance is a stated margin, NOT a classifier. Dropping
+    /// it to zero must change no verdict on any node of the current fleet —
+    /// if it ever does, the constant has started driving decisions and needs
+    /// a real measurement behind it rather than the reasoning in its doc
+    /// comment.
+    #[test]
+    fn the_injection_allowance_is_a_margin_not_a_classifier() {
+        for (name, max_tokens, max_fuel) in SIZED_FLEET {
+            assert_eq!(
+                *max_fuel >= required_fuel_floor(*max_tokens, CTX),
+                *max_fuel >= required_fuel_floor(*max_tokens, 0),
+                "{name}: the allowance flipped a verdict"
+            );
+        }
+        assert_eq!(
+            1_404_000 >= required_fuel_floor(1400, CTX),
+            1_404_000 >= required_fuel_floor(1400, 0),
+            "pre-#642 digest: the allowance flipped a verdict"
+        );
+        // It is nonetheless PRESENT and non-zero — a margin that rounds to
+        // nothing would be a comment pretending to be a constant.
+        assert_eq!(
+            required_fuel_floor(1400, CTX) - required_fuel_floor(1400, 0),
+            480_000
+        );
+    }
+
+    /// Memory eligibility must agree with the engine's own gate, including
+    /// the explicit-override precedence — a sizing check that disagreed about
+    /// which nodes get the injection would be sizing the wrong nodes.
+    #[test]
+    fn memory_eligibility_mirrors_the_engine_gate() {
+        // Pure-egress worlds: no injection by default.
+        assert!(!node_receives_actor_context(Some("http-node"), None));
+        assert!(!node_receives_actor_context(Some("network-node"), None));
+        assert!(!node_receives_actor_context(Some("messaging-node"), None));
+        // Everything else: injected by default. `secrets-node` is the LLM
+        // template's world, i.e. the population this check judges.
+        assert!(node_receives_actor_context(Some("secrets-node"), None));
+        assert!(node_receives_actor_context(Some("agent-node"), None));
+        assert!(node_receives_actor_context(Some("minimal-node"), None));
+        // Explicit config always wins, in both directions — `needs_memory:
+        // false` on a memory-eligible world SUPPRESSES the injection (and is
+        // the documented fix for a node that does not consume memory), while
+        // `true` on a pure-egress world forces it.
+        assert!(!node_receives_actor_context(
+            Some("secrets-node"),
+            Some(false)
+        ));
+        assert!(node_receives_actor_context(Some("http-node"), Some(true)));
+        // Unknown world ⇒ assume injected. The conservative direction for a
+        // FLOOR: it can only raise the requirement.
+        assert!(node_receives_actor_context(None, None));
+    }
+
+    /// Overflow safety. `MAX_TOKENS` is caller-authored and unvalidated at the
+    /// graph level, so a `u64::MAX` must saturate rather than wrap — a wrapped
+    /// floor would come out small and turn the check into a silent pass on the
+    /// most absurd input it can be given.
+    #[test]
+    fn an_absurd_max_tokens_saturates_rather_than_wrapping() {
+        assert_eq!(required_fuel_floor(u64::MAX, CTX), u64::MAX);
+        assert_eq!(required_fuel_floor(u64::MAX, u64::MAX), u64::MAX);
     }
 }
