@@ -321,6 +321,65 @@ pub fn shutdown_tracing() {
     println!("[TRACING] ✅ Tracing shutdown complete");
 }
 
+/// Upper bound, in Unicode scalar values, on any caller-supplied string this
+/// crate writes to a span or to the process's stdout/stderr.
+///
+/// Matches `talos_worker_runtime::error_sanitize::sanitize_error_message`'s
+/// bound so the two agree. Before this existed, `end_error` had **no** bound at
+/// all and its one guest-text caller passes a WASM-authored string of arbitrary
+/// length.
+pub const MAX_SPAN_TEXT_CHARS: usize = 2000;
+
+/// Redact, then bound, a caller-supplied string before it reaches a span
+/// attribute, a span status, or one of this module's `println!`/`eprintln!`
+/// lines.
+///
+/// # Why this lives at the sink and not at the call sites
+///
+/// Callers of [`ExecutionSpan`] hand it error text that originates in untrusted
+/// WASM guest code. A module that echoes an upstream `401` routinely carries an
+/// `sk-*` / `ghp_*` / `Bearer …` value inside that text. Before this function
+/// existed, whether the secret was scrubbed depended on which caller you were:
+/// `talos-worker-runtime`'s `runtime.rs` wrapped its argument in
+/// `talos_dlp_provider::redact_str` (PR #433) while `worker/src/main.rs` passed
+/// the output of `sanitize_error_message`, which strips paths, line numbers and
+/// internal IPs and does **no** secret redaction at all. Two sinks, the same
+/// untrusted input, opposite treatment.
+///
+/// Repairing the individual call sites would leave the next caller free to make
+/// the same choice again. Redaction therefore happens **here**, on the sink
+/// side, where no caller can opt out. Callers that redact anyway are harmless:
+/// redaction is idempotent (pinned by `redaction_is_idempotent`).
+///
+/// # Order of operations
+///
+/// Redact FIRST, truncate SECOND. The reverse order can cut a token across the
+/// bound so no pattern matches it any more, and an unredacted prefix survives.
+///
+/// # Failure behaviour
+///
+/// [`talos_dlp_provider::redact_str_failsafe`] converts a panic inside the
+/// redactor into [`talos_dlp_provider::REDACTION_UNAVAILABLE`]. There is no
+/// path through this function that returns the caller's bytes unredacted.
+///
+/// # Cost
+///
+/// The `regex` crate is a finite-automaton engine with no backtracking, so
+/// matching is linear in the input length with no catastrophic-backtracking
+/// case; a pathological 2000-character input costs one combined-automaton pass
+/// (plus one Luhn-gated card scan) and, only when something actually matches,
+/// one replacement walk. On the common no-match input the result borrows and
+/// nothing is allocated. These sinks are per-job, not per-instruction.
+#[must_use]
+pub fn redact_span_text(raw: &str) -> std::borrow::Cow<'_, str> {
+    let redacted = talos_dlp_provider::redact_str_failsafe(raw);
+    if redacted.chars().count() <= MAX_SPAN_TEXT_CHARS {
+        return redacted;
+    }
+    let truncated: String = redacted.chars().take(MAX_SPAN_TEXT_CHARS).collect();
+    std::borrow::Cow::Owned(format!("{truncated}... [truncated]"))
+}
+
 /// Execution span for distributed tracing
 /// Wraps OpenTelemetry span with WASM-specific functionality
 pub struct ExecutionSpan {
@@ -429,8 +488,15 @@ impl ExecutionSpan {
     /// }
     /// ```
     pub fn set_attribute(&mut self, key: &str, value: &str) {
-        self.span
-            .set_attribute(KeyValue::new(key.to_string(), value.to_string()));
+        // Sink-side redaction: see `redact_span_text`. Every string a caller
+        // can put on this span goes through it, including keys that are not
+        // named "error" — `worker/src/main.rs` stamps guest error text under
+        // the key `"error"` on its sibling span type, and nothing stops a
+        // future caller picking any other key.
+        self.span.set_attribute(KeyValue::new(
+            key.to_string(),
+            redact_span_text(value).into_owned(),
+        ));
     }
 
     /// Set an integer attribute
@@ -460,7 +526,10 @@ impl ExecutionSpan {
     /// }
     /// ```
     pub fn add_event(&mut self, name: &str) {
-        self.span.add_event(name.to_string(), vec![]);
+        // The event NAME is a sink too — an error string used as an event name
+        // would otherwise bypass every other guard here.
+        self.span
+            .add_event(redact_span_text(name).into_owned(), vec![]);
     }
 
     /// Record an event with attributes
@@ -481,10 +550,11 @@ impl ExecutionSpan {
     pub fn add_event_with_attributes(&mut self, name: &str, attributes: Vec<(&str, &str)>) {
         let attrs: Vec<KeyValue> = attributes
             .iter()
-            .map(|(k, v)| KeyValue::new(k.to_string(), v.to_string()))
+            .map(|(k, v)| KeyValue::new(k.to_string(), redact_span_text(v).into_owned()))
             .collect();
 
-        self.span.add_event(name.to_string(), attrs);
+        self.span
+            .add_event(redact_span_text(name).into_owned(), attrs);
     }
 
     /// Get the execution duration so far
@@ -530,18 +600,31 @@ impl ExecutionSpan {
     /// }
     /// ```
     pub fn end_error(mut self, error_message: &str) {
+        // SECURITY CHOKEPOINT. `error_message` is untrusted: it reaches here
+        // from WASM guest output. Redact ONCE, then use the redacted value for
+        // all three writes below.
+        //
+        // Two of those three sinks are export-gated (the attribute and the
+        // status only leave the process when an OTLP endpoint is configured),
+        // but the `eprintln!` is NOT — it runs on every call regardless of
+        // whether tracing is enabled. Its success twin in `end_success` is
+        // observable in the running dev stack's worker log today, which is the
+        // positive evidence that this line is live rather than dormant.
+        //
+        // Deliberately NOT calling `redact_span_text` separately per sink: one
+        // call, one value, no way for the three to disagree.
+        let safe = redact_span_text(error_message);
         let duration = self.duration_ms();
         self.span
             .set_attribute(KeyValue::new("duration_ms", duration as i64));
         self.span
-            .set_attribute(KeyValue::new("error.message", error_message.to_string()));
-        self.span
-            .set_status(Status::error(error_message.to_string()));
+            .set_attribute(KeyValue::new("error.message", safe.to_string()));
+        self.span.set_status(Status::error(safe.to_string()));
         self.span.end();
 
         eprintln!(
             "[TRACE] Span '{}' failed after {}ms: {} (execution_id: {})",
-            self.name, duration, error_message, self.execution_id
+            self.name, duration, safe, self.execution_id
         );
     }
 }
@@ -584,7 +667,10 @@ impl SpanGuard {
     /// Mark the span as failed
     /// This will cause Drop to end the span with an error status
     pub fn set_error(&mut self, error: &str) {
-        self.error_message = Some(error.to_string());
+        // Sibling sink taking caller-supplied error text. `span.set_attribute`
+        // redacts on the way in, and the stored copy is redacted here so the
+        // `Drop`/`end_error` path cannot re-introduce the raw string.
+        self.error_message = Some(redact_span_text(error).into_owned());
         if let Some(span) = self.span.as_mut() {
             span.set_attribute("error", error);
         }
@@ -924,5 +1010,321 @@ mod tests {
         // Schemeless and empty inputs must not panic.
         assert_eq!(redact_endpoint("jaeger:4317"), "jaeger:4317");
         assert_eq!(redact_endpoint(""), "");
+    }
+}
+
+// ============================================================================
+// Sink-level redaction tests (D4)
+// ============================================================================
+//
+// These drive the REAL sinks — `ExecutionSpan::end_error`'s exported span and
+// its `eprintln!` line — and assert on the bytes those sinks actually emitted.
+// Nothing here re-implements the redactor: every expectation is "the fixture
+// secret must not appear in the emitted text", which is false for ANY redactor
+// that does nothing, including a hand-rolled one that misses a pattern.
+#[cfg(test)]
+mod span_sink_redaction_tests {
+    use super::*;
+
+    /// Obviously-fake fixtures. Every one is constructed to match a specific
+    /// arm of `talos_dlp_provider::PATTERN_SPECS`; none is a real credential.
+    /// `AKIAIOSFODNN7EXAMPLE` is AWS's own published documentation example.
+    const FIXTURES: &[(&str, &str)] = &[
+        ("openai_style", "sk-TESTONLYabcdefghijklmnop"),
+        ("github_pat", "ghp_TESTONLYabcdefghijklmnop"),
+        ("bearer", "Bearer TESTONLYabcdefghijklmnop"),
+        ("aws_access_key", "AKIAIOSFODNN7EXAMPLE"),
+        (
+            "jwt",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJURVNUT05MWSJ9.c2lnVEVTVE9OTFk",
+        ),
+    ];
+
+    /// The distinctive substring of each fixture that must never survive.
+    /// For `Bearer …` the word "Bearer" itself is not secret — the token is.
+    fn secret_part(fixture: &str) -> &str {
+        fixture.strip_prefix("Bearer ").unwrap_or(fixture)
+    }
+
+    /// Shape of the real thing: `worker/src/main.rs` builds
+    /// `format!("execution failure: {e}")` where `e` is guest text.
+    fn guest_error(fixture: &str) -> String {
+        format!("execution failure: upstream returned 401 for {fixture}")
+    }
+
+    // ------------------------------------------------------------------
+    // Sink 1 — the exported span (`error.message` attribute + status).
+    // ------------------------------------------------------------------
+
+    /// Install a real SDK tracer provider backed by an in-memory exporter, so
+    /// the assertions read what `ExecutionSpan` genuinely emitted rather than
+    /// what we believe it emitted. Global provider state is process-wide, so
+    /// this is installed exactly once per test binary.
+    /// A process-unique execution id, so a test can pick ITS OWN spans out of
+    /// the shared in-memory exporter. The exporter is global (the provider is
+    /// process-wide) and libtest runs these tests in parallel with the other
+    /// span-creating tests in this crate, so neither `reset()` nor a
+    /// `spans.len() == 1` assertion is safe here — both would flake.
+    fn unique_exec_id(tag: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        format!("exec-{tag}-{}", N.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// The spans this test emitted, identified by their `execution.id`.
+    fn spans_for(
+        exp: &opentelemetry_sdk::trace::InMemorySpanExporter,
+        exec_id: &str,
+    ) -> Vec<opentelemetry_sdk::trace::SpanData> {
+        exp.get_finished_spans()
+            .expect("in-memory export failed")
+            .into_iter()
+            .filter(|s| {
+                s.attributes
+                    .iter()
+                    .any(|kv| kv.key.as_str() == "execution.id" && kv.value.as_str() == exec_id)
+            })
+            .collect()
+    }
+
+    fn exporter() -> &'static opentelemetry_sdk::trace::InMemorySpanExporter {
+        static EXPORTER: OnceLock<opentelemetry_sdk::trace::InMemorySpanExporter> = OnceLock::new();
+        EXPORTER.get_or_init(|| {
+            let exp = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+            let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                .with_simple_exporter(exp.clone())
+                .build();
+            global::set_tracer_provider(provider);
+            exp
+        })
+    }
+
+    #[test]
+    fn exported_span_carries_no_fixture_secret() {
+        let exp = exporter();
+        for (name, fixture) in FIXTURES {
+            let exec_id = unique_exec_id("end-error");
+            let span = ExecutionSpan::new("wasm-execution", &exec_id);
+            span.end_error(&guest_error(fixture));
+
+            let spans = spans_for(exp, &exec_id);
+            assert_eq!(spans.len(), 1, "{name}: expected exactly one exported span");
+            let emitted = &spans[0];
+
+            // The `error.message` attribute, as actually exported.
+            let attr = emitted
+                .attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == "error.message")
+                .map(|kv| kv.value.as_str().into_owned())
+                .unwrap_or_else(|| panic!("{name}: no error.message attribute on the span"));
+            assert!(
+                !attr.contains(secret_part(fixture)),
+                "{name}: secret survived into the exported error.message attribute: {attr}"
+            );
+            assert!(
+                attr.contains("[REDACTED:"),
+                "{name}: attribute shows no redaction tag: {attr}"
+            );
+
+            // The span STATUS description — the third write in `end_error`,
+            // and the one a collector surfaces as the error text.
+            let status = format!("{:?}", emitted.status);
+            assert!(
+                !status.contains(secret_part(fixture)),
+                "{name}: secret survived into the exported span status: {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn exported_attributes_and_event_names_carry_no_secret() {
+        let exp = exporter();
+        for (name, fixture) in FIXTURES {
+            let exec_id = unique_exec_id("attrs");
+            let mut span = ExecutionSpan::new("wasm-execution", &exec_id);
+            // A future caller stuffing guest text under a non-"error" key, and
+            // an error string used as an EVENT NAME — both are sinks.
+            span.set_attribute("module.detail", &guest_error(fixture));
+            span.add_event(&guest_error(fixture));
+            span.add_event_with_attributes("outcome", vec![("detail", &guest_error(fixture))]);
+            span.end_success();
+
+            let spans = spans_for(exp, &exec_id);
+            assert_eq!(spans.len(), 1, "{name}: expected exactly one exported span");
+            let rendered = format!("{:?}", spans);
+            assert!(
+                rendered.contains("[REDACTED"),
+                "{name}: the sink emitted no redacted text at all: {rendered}"
+            );
+            assert!(
+                !rendered.contains(secret_part(fixture)),
+                "{name}: secret survived somewhere in the exported span: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn span_guard_drop_path_carries_no_secret() {
+        // `SpanGuard` has no production caller today, but it is a sink with the
+        // same shape: `set_error` writes an `error` attribute and its `Drop`
+        // ends the span with the stored message.
+        let exp = exporter();
+        for (name, fixture) in FIXTURES {
+            let exec_id = unique_exec_id("guard");
+            {
+                let mut guard = SpanGuard::new("wasm-execution", &exec_id);
+                guard.set_error(&guest_error(fixture));
+            } // Drop -> end_error
+
+            let spans = spans_for(exp, &exec_id);
+            assert_eq!(spans.len(), 1, "{name}: expected exactly one exported span");
+            let rendered = format!("{:?}", spans);
+            assert!(
+                rendered.contains("[REDACTED"),
+                "{name}: the sink emitted no redacted text at all: {rendered}"
+            );
+            assert!(
+                !rendered.contains(secret_part(fixture)),
+                "{name}: secret survived into the SpanGuard drop path: {rendered}"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Sink 2 — the ALWAYS-ON `eprintln!`.
+    // ------------------------------------------------------------------
+    //
+    // `eprintln!` writes to the process's stderr, which cannot be observed from
+    // inside the same test thread. The test therefore re-executes THIS test
+    // binary as a child process with a marker env var; the child performs the
+    // real `end_error` call and exits, and the parent asserts on the child's
+    // captured stderr. That is the actual emitted bytes, not a reconstruction.
+
+    const CHILD_MARKER: &str = "TALOS_SPAN_REDACTION_CHILD_FIXTURE";
+    const CHILD_TEST_PATH: &str =
+        "span_sink_redaction_tests::stderr_sink_carries_no_fixture_secret";
+
+    #[test]
+    fn stderr_sink_carries_no_fixture_secret() {
+        if let Ok(fixture) = std::env::var(CHILD_MARKER) {
+            // CHILD ROLE: emit through the real sink, then exit before libtest
+            // can print anything else.
+            ExecutionSpan::new("wasm-execution", "exec-child").end_error(&guest_error(&fixture));
+            std::process::exit(0);
+        }
+
+        // PARENT ROLE.
+        let exe = std::env::current_exe().expect("current_exe");
+        for (name, fixture) in FIXTURES {
+            let out = std::process::Command::new(&exe)
+                .arg(CHILD_TEST_PATH)
+                .arg("--exact")
+                .arg("--nocapture")
+                .env(CHILD_MARKER, fixture)
+                .output()
+                .expect("failed to spawn the child test process");
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+            // Guard against a vacuous pass: if the child never reached the
+            // sink there is nothing to assert about.
+            assert!(
+                stderr.contains("[TRACE] Span 'wasm-execution' failed"),
+                "{name}: the child never emitted the span line — stderr was: {stderr:?}"
+            );
+            assert!(
+                !stderr.contains(secret_part(fixture)),
+                "{name}: secret survived into the always-on stderr span line: {stderr}"
+            );
+            assert!(
+                stderr.contains("[REDACTED:"),
+                "{name}: stderr line shows no redaction tag: {stderr}"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Ordering, bounding and idempotence properties of the chokepoint.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn redaction_happens_before_truncation() {
+        // Place the token so that it STRADDLES the truncation bound. If the
+        // sink truncated first, the cut would split the token, no pattern
+        // would match the surviving prefix, and that prefix would be emitted.
+        // The AWS access-key pattern is `\bA[KS]IA[0-9A-Z]{16}\b` — it needs
+        // the WHOLE key. Cut it short and it stops matching entirely, so a
+        // truncate-first implementation emits 15 of the key's 20 characters
+        // unredacted.
+        //
+        // A shorter-prefix fixture would NOT prove this. `sk-TESTONLY…` was
+        // tried first and the mutation SURVIVED it: the API_KEY pattern only
+        // needs `sk-` plus six characters, so even the truncated stub still
+        // matched and was redacted. The chosen fixture has to be one whose
+        // surviving prefix genuinely fails to match.
+        let fixture = "AKIAIOSFODNN7EXAMPLE";
+        let leaked_prefix = "AKIAIOSFODNN7EX";
+        // Padding is space-separated because the pattern is `\b`-anchored: a
+        // token glued to a preceding word character never matches at all,
+        // which would make this test pass for the wrong reason.
+        let pad_len = MAX_SPAN_TEXT_CHARS - 16;
+        let raw = format!("{} {fixture} trailing", "p".repeat(pad_len));
+        assert!(
+            pad_len + 1 + leaked_prefix.len() == MAX_SPAN_TEXT_CHARS,
+            "fixture setup must cut the token at exactly the leaked prefix"
+        );
+        assert!(
+            raw.chars().count() > MAX_SPAN_TEXT_CHARS,
+            "fixture setup must exceed the bound"
+        );
+
+        let out = redact_span_text(&raw);
+        assert!(
+            !out.contains(leaked_prefix),
+            "an unredacted prefix survived the bound: {out}"
+        );
+        assert!(!out.contains("AKIA"), "{out}");
+        // The tag itself may be clipped by the bound — that is correct and is
+        // the whole point: what gets clipped is the REPLACEMENT, never the
+        // secret.
+        assert!(out.contains("[REDACTED"), "{out}");
+    }
+
+    #[test]
+    fn output_is_bounded() {
+        let raw = "x".repeat(MAX_SPAN_TEXT_CHARS * 3);
+        let out = redact_span_text(&raw);
+        assert!(out.ends_with("... [truncated]"), "not truncated: {out}");
+        assert!(out.chars().count() <= MAX_SPAN_TEXT_CHARS + "... [truncated]".chars().count());
+    }
+
+    #[test]
+    fn redaction_is_idempotent() {
+        // `talos-worker-runtime`'s `runtime.rs` redacts before calling the
+        // sink. Double redaction must be a no-op, or that caller would corrupt
+        // its own message.
+        for (name, fixture) in FIXTURES {
+            let once = redact_span_text(&guest_error(fixture)).into_owned();
+            let twice = redact_span_text(&once).into_owned();
+            assert_eq!(once, twice, "{name}: second pass changed the output");
+        }
+    }
+
+    #[test]
+    fn clean_operator_text_is_left_alone() {
+        // Over-redaction is its own defect: these are the real values the live
+        // call sites pass (span/attribute constants and a UUID execution id).
+        for s in [
+            "cache_hit",
+            "compilation_started",
+            "execution_completed",
+            "wasm-execution",
+            "e975a305-4907-4a89-9d85-b7ace2fda577",
+            "Signature verification failed",
+            "Timeout exceeds maximum",
+            "execution timed out after 30 seconds",
+        ] {
+            assert_eq!(redact_span_text(s), s, "over-redacted: {s}");
+        }
     }
 }

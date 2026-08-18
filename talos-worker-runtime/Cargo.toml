@@ -124,6 +124,12 @@ thiserror = "2.0.18"
 # only one that can fire. Same dev-only pattern as
 # `talos-integration-helpers`, which already enables this feature.
 tokio = { version = "1.41", features = ["full", "test-util"] }
+# `testing` unlocks `InMemorySpanExporter`, so `job_span`'s redaction tests can
+# assert on the span status/attributes the sink ACTUALLY exported rather than on
+# a reconstruction of them. `tracing-subscriber` installs the otel bridge layer
+# for the duration of those tests.
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "metrics", "trace", "testing"] }
+tracing-subscriber = "0.3"
 
 [features]
 default = []

@@ -77,10 +77,31 @@ fn internal_ip_re() -> &'static regex::Regex {
 
 /// Sanitize error messages before sending to clients.
 ///
-/// Removes: file paths, line numbers, internal IP addresses.
+/// Removes: **secrets** (DLP), file paths, line numbers, internal IP addresses.
 /// Truncates to 2000 characters (Unicode-safe).
+///
+/// # Why DLP runs here, and why it runs FIRST
+///
+/// This function is the shared truncator for the worker's error surfaces
+/// (`worker/src/main.rs` job + pipeline failure paths,
+/// [`crate::module_fetcher`], [`crate::reason_class::sanitized_transport_detail`]).
+/// It historically performed no secret redaction whatsoever, so whether an
+/// `sk-*` / `ghp_*` / `Bearer …` value echoed by an upstream API survived
+/// depended entirely on whether the individual caller had remembered to wrap
+/// its input — `sanitized_transport_detail` had, the two `main.rs` sites had
+/// not.
+///
+/// Redaction is placed **before** the truncation for a specific reason:
+/// truncating first can cut a token across the 2000-char bound so that no
+/// pattern matches it any more, leaving an unredacted prefix in the output.
+/// Order matters here even though both steps are individually correct.
+///
+/// Callers that already redact (`sanitized_transport_detail`) are unaffected —
+/// redaction is idempotent.
 pub fn sanitize_error_message(error: &str) -> String {
-    let mut sanitized = error.to_string();
+    // FIRST: secrets. See the doc comment above for why this cannot be moved
+    // below the truncation.
+    let mut sanitized = talos_dlp_provider::redact_str_failsafe(error).into_owned();
 
     sanitized = unix_path_re()
         .replace_all(&sanitized, "[FILE]")
@@ -211,6 +232,95 @@ mod sanitize_error_message_tests {
                 !s.contains("[INTERNAL_IP]"),
                 "public {ip} must NOT be redacted"
             );
+        }
+    }
+
+    // ====================================================================
+    // Secret redaction, and its ORDER relative to truncation.
+    // ====================================================================
+    //
+    // Before this, `sanitize_error_message` performed exactly four transforms
+    // (unix path, windows path, line numbers, internal IP) and then truncated
+    // — no secret redaction at any point. Its two `worker/src/main.rs` callers
+    // pass WASM guest error text straight into it.
+
+    /// Obviously-fake fixtures, one per relevant
+    /// `talos_dlp_provider::PATTERN_SPECS` arm. `AKIAIOSFODNN7EXAMPLE` is AWS's
+    /// own published documentation example.
+    const SECRET_FIXTURES: &[(&str, &str)] = &[
+        ("openai_style", "sk-TESTONLYabcdefghijklmnop"),
+        ("github_pat", "ghp_TESTONLYabcdefghijklmnop"),
+        ("bearer", "Bearer TESTONLYabcdefghijklmnop"),
+        ("aws_access_key", "AKIAIOSFODNN7EXAMPLE"),
+        (
+            "jwt",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJURVNUT05MWSJ9.c2lnVEVTVE9OTFk",
+        ),
+    ];
+
+    fn secret_part(fixture: &str) -> &str {
+        fixture.strip_prefix("Bearer ").unwrap_or(fixture)
+    }
+
+    #[test]
+    fn redacts_every_secret_fixture() {
+        for (name, fixture) in SECRET_FIXTURES {
+            let out = sanitize_error_message(&format!(
+                "execution failure: upstream returned 401 for {fixture}"
+            ));
+            assert!(
+                !out.contains(secret_part(fixture)),
+                "{name}: secret survived sanitization: {out}"
+            );
+            assert!(out.contains("[REDACTED"), "{name}: no redaction tag: {out}");
+        }
+    }
+
+    #[test]
+    fn redaction_runs_before_truncation() {
+        // A token that STRADDLES the 2000-char truncation bound. If truncation
+        // ran first, the cut would split the token, no pattern would match the
+        // surviving prefix, and that prefix would be returned.
+        //
+        // The padding is separated by a space because the DLP API_KEY pattern
+        // is `\b`-anchored: a token glued directly to a preceding word
+        // character does not match it at all, which would make this test pass
+        // for the wrong reason.
+        // The AWS access-key pattern `\bA[KS]IA[0-9A-Z]{16}\b` needs the WHOLE
+        // key, so a truncate-first implementation emits 15 of its 20
+        // characters unredacted. A short-prefix fixture would not prove this:
+        // `sk-TESTONLY…` was tried first and a truncate-first mutation
+        // SURVIVED it, because `sk-` plus six characters already matches.
+        let fixture = "AKIAIOSFODNN7EXAMPLE";
+        let leaked_prefix = "AKIAIOSFODNN7EX";
+        let pad = "p".repeat(2000 - 16);
+        let out = sanitize_error_message(&format!("{pad} {fixture} trailing"));
+        assert!(
+            !out.contains(leaked_prefix),
+            "an unredacted prefix survived the truncation bound: {out}"
+        );
+        assert!(!out.contains("AKIA"), "{out}");
+        assert!(out.contains("[REDACTED"), "{out}");
+    }
+
+    #[test]
+    fn still_strips_ips_and_paths_after_the_change() {
+        // The pre-existing contract must be unchanged by adding DLP in front.
+        let out =
+            sanitize_error_message("panic at /app/src/runtime.rs:42:7 dialing 169.254.169.254");
+        assert!(out.contains("[FILE]"), "{out}");
+        assert!(out.contains("[INTERNAL_IP]"), "{out}");
+        assert!(!out.contains("169.254.169.254"), "{out}");
+    }
+
+    #[test]
+    fn clean_operator_text_is_left_alone() {
+        for s in [
+            "execution timed out after 30 seconds",
+            "Signature verification failed",
+            "WASM trap encountered",
+        ] {
+            assert_eq!(sanitize_error_message(s), s, "over-redacted: {s}");
         }
     }
 }
