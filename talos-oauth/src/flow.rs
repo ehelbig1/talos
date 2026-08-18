@@ -58,15 +58,17 @@ pub async fn begin_oauth_authorization(
     req: &AuthorizeRequest<'_>,
     user_id: Uuid,
 ) -> Result<(String, String)> {
-    let client = BasicClient::new(
-        ClientId::new(req.client_id.clone()),
-        Some(ClientSecret::new(req.client_secret.clone())),
-        AuthUrl::new(req.auth_url.to_string()).context("invalid OAuth auth_url")?,
-        Some(TokenUrl::new(req.token_url.to_string()).context("invalid OAuth token_url")?),
-    )
-    .set_redirect_uri(
-        RedirectUrl::new(req.redirect_uri.clone()).context("invalid OAuth redirect_uri")?,
-    );
+    // oauth2 5.x replaced the 4-arg `BasicClient::new` with a type-state builder:
+    // `new(ClientId)` then one setter per endpoint. Same inputs, same validation
+    // (`AuthUrl`/`TokenUrl`/`RedirectUrl` still parse-and-reject here), same
+    // default `AuthType::BasicAuth`. Only the spelling changed.
+    let client = BasicClient::new(ClientId::new(req.client_id.clone()))
+        .set_client_secret(ClientSecret::new(req.client_secret.clone()))
+        .set_auth_uri(AuthUrl::new(req.auth_url.to_string()).context("invalid OAuth auth_url")?)
+        .set_token_uri(TokenUrl::new(req.token_url.to_string()).context("invalid OAuth token_url")?)
+        .set_redirect_uri(
+            RedirectUrl::new(req.redirect_uri.clone()).context("invalid OAuth redirect_uri")?,
+        );
 
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
