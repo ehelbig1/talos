@@ -879,6 +879,69 @@ pub fn redact_json(v: &Value) -> Value {
     GLOBAL_DLP.redact_json(v)
 }
 
+// ============================================================================
+// Fail-CLOSED redaction for log/telemetry sinks
+// ============================================================================
+
+/// Emitted in place of the caller's text when redaction could not be
+/// completed. Deliberately carries NO fragment of the input — a prefix of an
+/// unredacted secret is still a secret.
+pub const REDACTION_UNAVAILABLE: &str = "[REDACTION UNAVAILABLE — text withheld]";
+
+/// Fail-CLOSED wrapper around [`redact_str_cow`], for sinks that write
+/// untrusted text somewhere it cannot be un-written (a log line, an OTel
+/// attribute, a span status).
+///
+/// [`redact_str`] and [`redact_str_cow`] are declared infallible, but they can
+/// still *panic*, and a panic at a log sink must not be allowed to surface the
+/// raw text (or to unwind through a worker's failure path). Two real panic
+/// sources exist today:
+///
+/// * [`PATTERNS`] / `PATTERN_SET` / `CARD_PATTERN` `panic!` at first use if a
+///   hardcoded regex fails to compile — a deliberate fail-closed choice
+///   (MCP-1141) that only pays off if the *caller* also fails closed.
+/// * [`ExternalDlpProvider::send`] calls `tokio::task::block_in_place`, which
+///   panics when invoked outside a multi-threaded Tokio runtime. Span sinks
+///   run wherever their caller runs, including non-Tokio contexts.
+///
+/// On any panic this returns [`REDACTION_UNAVAILABLE`] rather than the input.
+/// The only path that yields the caller's own bytes back is a *successful*
+/// redaction pass.
+///
+/// **Not a truncation helper.** Callers that bound their output must truncate
+/// the value this returns — truncating first can split a token across the cut
+/// so no pattern matches and an unredacted prefix survives.
+///
+/// Non-UTF-8 input is unrepresentable here: the parameter is `&str`. A caller
+/// holding raw bytes must NOT reach for `String::from_utf8_lossy` first —
+/// substituting U+FFFD mid-token has the same token-splitting effect as
+/// truncating early. Decode strictly and treat a decode failure as
+/// [`REDACTION_UNAVAILABLE`].
+pub fn redact_str_failsafe(s: &str) -> std::borrow::Cow<'_, str> {
+    failsafe_with(s, redact_str_cow)
+}
+
+/// The fail-closed machinery of [`redact_str_failsafe`], with the redactor as a
+/// parameter.
+///
+/// Production has exactly one caller and it passes [`redact_str_cow`]. The
+/// parameter exists so the PANIC ARM can be exercised by a test against this
+/// same function rather than against a re-implementation of it — the panic
+/// sources named on [`redact_str_failsafe`] (a regex that fails to compile, a
+/// `block_in_place` outside a multi-threaded runtime) cannot be provoked from a
+/// unit test without poisoning the process-wide `GLOBAL_DLP` for every other
+/// test in the binary.
+fn failsafe_with<'a, F>(s: &'a str, redactor: F) -> std::borrow::Cow<'a, str>
+where
+    F: FnOnce(&'a str) -> std::borrow::Cow<'a, str> + std::panic::UnwindSafe,
+{
+    // `&str` is `RefUnwindSafe`, so the input is unwind-safe by construction.
+    match std::panic::catch_unwind(move || redactor(s)) {
+        Ok(redacted) => redacted,
+        Err(_) => std::borrow::Cow::Borrowed(REDACTION_UNAVAILABLE),
+    }
+}
+
 /// Canonical 1 MiB cap on JSONB log-metadata columns.
 ///
 /// Matches the bound applied at `actor_action_log.details` /
@@ -1825,5 +1888,49 @@ mod tests {
         );
         let bounded = bound_execution_payload(&v);
         assert!(matches!(bounded, std::borrow::Cow::Borrowed(_)));
+    }
+
+    // ========================================================================
+    // Fail-CLOSED wrapper (`redact_str_failsafe`)
+    // ========================================================================
+
+    /// Obviously-fake fixture. Matches the `sk[-_]` arm of the API_KEY pattern.
+    const FAKE_KEY: &str = "sk-TESTONLYabcdefghijklmnop";
+
+    #[test]
+    fn failsafe_redacts_on_the_happy_path() {
+        let raw = format!("upstream 401 rejected {FAKE_KEY}");
+        let out = redact_str_failsafe(&raw);
+        assert!(!out.contains(FAKE_KEY), "secret survived: {out}");
+        assert!(
+            out.contains("[REDACTED:API_KEY]"),
+            "no redaction tag: {out}"
+        );
+    }
+
+    #[test]
+    fn failsafe_returns_the_placeholder_when_the_redactor_panics() {
+        // Drives the REAL fail-closed arm with an injected panicking redactor.
+        let out = failsafe_with(FAKE_KEY, |_| panic!("simulated redactor panic"));
+        assert_eq!(out, REDACTION_UNAVAILABLE);
+        assert!(
+            !out.contains("TESTONLY"),
+            "the placeholder must carry no fragment of the input: {out}"
+        );
+    }
+
+    #[test]
+    fn the_placeholder_itself_carries_no_input() {
+        // A placeholder that echoed even a prefix would defeat the point.
+        assert!(!REDACTION_UNAVAILABLE.contains("sk-"));
+        assert!(!REDACTION_UNAVAILABLE.is_empty());
+    }
+
+    #[test]
+    fn failsafe_is_idempotent() {
+        let raw = format!("boom {FAKE_KEY}");
+        let once = redact_str_failsafe(&raw).into_owned();
+        let twice = redact_str_failsafe(&once).into_owned();
+        assert_eq!(once, twice, "second pass changed the output");
     }
 }

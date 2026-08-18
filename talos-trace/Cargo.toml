@@ -7,6 +7,10 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Fail-closed DLP redaction for every caller-supplied string that lands in a
+# span attribute, span status or the stderr/stdout span lines. See
+# `redact_span_text` in src/lib.rs.
+talos-dlp-provider = { path = "../talos-dlp-provider" }
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 # Only the gRPC/tonic exporter is used. `default-features = false` drops otlp's
@@ -16,6 +20,12 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = ["
 tracing.workspace = true
 tracing-opentelemetry = "0.33"
 tracing-subscriber = "0.3"
+
+[dev-dependencies]
+# `InMemorySpanExporter` is gated behind opentelemetry_sdk's `testing` feature.
+# It lets the span-redaction tests assert on the attributes/status the sink
+# ACTUALLY exported, rather than on a reconstruction of them.
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "testing"] }
 
 [lints]
 workspace = true
