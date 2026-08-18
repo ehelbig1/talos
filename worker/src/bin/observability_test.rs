@@ -26,6 +26,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize Jaeger tracing with OTLP
     println!("[2/4] Initializing Jaeger tracing (OTLP)...");
+    // allow-hardcoded-trace-endpoint: developer-run demo binary, launched by
+    // hand on the HOST (`cargo run --bin observability_test`), where
+    // localhost:4317 genuinely is the dev stack's Jaeger — the compose file
+    // publishes it on 127.0.0.1. The hardcoded default is a defect only inside
+    // a container, which this never runs in. The two real binaries resolve via
+    // `talos_trace::endpoint_from_env` (structural lint check 69).
     tracing::init_tracing(
         "talos-worker",
         Some("http://localhost:4317"), // Jaeger OTLP gRPC endpoint

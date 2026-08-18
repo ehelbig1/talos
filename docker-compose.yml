@@ -433,6 +433,36 @@ services:
       # back to FRONTEND_URL/BASE_URL. See talos-public-url.
       TALOS_NGROK_API_URL: http://ngrok:4040
       RUST_LOG: info,controller=debug,audit_ledger=info
+      # ── DO NOT ADD `JAEGER_ENDPOINT` HERE. Trace export is deliberately OFF. ──
+      #
+      # This is a prohibition, not a disabled setting. The stack runs a Jaeger
+      # (service `jaeger`, OTLP gRPC on 4317) and pointing the controller at it
+      # is a one-line change that WORKS — which is exactly why this comment
+      # exists. Enabling it today would newly route SECRETS into Jaeger:
+      #
+      #   `worker/src/main.rs:1165` and `:1493` stamp the raw WASM guest error
+      #   string onto the exported job span. `sanitize_error_message` strips
+      #   file paths, line numbers and internal IPs and then truncates — it does
+      #   NO secret redaction. The sibling sink at
+      #   `talos-worker-runtime/src/runtime.rs:4071` DLP-redacts the same text
+      #   and its comment names `sk-*` / `ghp_*` / Bearer tokens as the reason.
+      #   Two sinks, one redacted, one not; the span one is not.
+      #
+      # CLAUDE.md permits plaintext secrets off the controller host by exactly
+      # two audited paths, and span export is not one of them. Jaeger being
+      # loopback-bound narrows the blast radius; it does not make this an
+      # audited path, and its UI is unauthenticated.
+      #
+      # UNBLOCKS WHEN: those two sites route through `talos_dlp_provider::redact_str`
+      # (ideally pushed down into `ExecutionSpan::end_error` so no future caller
+      # can regress it). Only then add the variable — pointed at the in-network
+      # jaeger service on port 4317 — to BOTH this service and `worker`. The
+      # exact line is deliberately NOT written out here, even commented: a
+      # commented-out setting greps as configuration and gets uncommented by
+      # someone who never reads the paragraph above it. The wiring itself is
+      # already proven to deliver; the redaction is what is missing.
+      # Until then, both binaries take `talos_trace`'s disabled path and say so
+      # at startup ("Tracing DISABLED"). See #649 and structural lint check 69.
       # Template catalog source. UNSET by default => the controller disk-seeds
       # the ~60 templates baked into its image (module-templates/), so the
       # Catalog is populated out of the box. Setting this (e.g. to the bundled
@@ -759,6 +789,16 @@ services:
       # that the worker can only resolve against an actual Redis client.
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
       RUST_LOG: info,worker=debug
+      # ── DO NOT ADD `JAEGER_ENDPOINT` HERE. Trace export is deliberately OFF. ──
+      #
+      # A prohibition, not a disabled setting — and THIS is the binary that
+      # makes it one. `worker/src/main.rs:1165` (single-node) and `:1493`
+      # (pipeline) set the raw WASM guest error string as an exported span
+      # attribute AND as the span's error status. `sanitize_error_message`
+      # strips paths/line numbers/internal IPs and truncates; it performs no
+      # secret redaction, so a module echoing an upstream 401 puts that
+      # provider's token into the trace backend. See the controller service's
+      # copy of this block for the full reasoning and the unblock condition.
       WORKER_SHARED_KEY: ${WORKER_SHARED_KEY:?WORKER_SHARED_KEY required in .env}
       # Disable the pooling allocator to avoid large PROT_NONE mmap slab failures
       # under Docker Desktop's VM memory overcommit limits.  The on-demand allocator
@@ -1256,8 +1296,26 @@ services:
   jaeger:
     image: jaegertracing/all-in-one:1.50@sha256:d589499a01e1e2f9d302db8e210af09688076fd8a93278fa024824a755c1a0f1
     container_name: talos-jaeger
+    # Storage is bounded AHEAD of use, not because of it. Nothing in this stack
+    # sends traces here today (see the `JAEGER_ENDPOINT` prohibition on the
+    # controller and worker services), and until #649 nothing could — each
+    # binary aimed its exporter at its OWN container's localhost. The default
+    # all-in-one posture is in-memory storage with `MEMORY_MAX_TRACES` unset
+    # (= unlimited) and no container memory limit, which was harmless only
+    # because the tap was shut. Capping it now means whoever opens the tap does
+    # not also have to remember the tank. 10 000 traces matches
+    # docker-compose.observability.yml; at this stack's ~20 workflow
+    # executions/hour that is days of retention, and traces are in RAM only
+    # (they do not survive a restart, by design).
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
+      SPAN_STORAGE_TYPE: memory
+      MEMORY_MAX_TRACES: "10000"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
     ports:
       - "127.0.0.1:16686:16686"  # Jaeger UI
       - "127.0.0.1:4317:4317"    # OTLP gRPC

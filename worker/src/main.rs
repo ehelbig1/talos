@@ -1897,17 +1897,32 @@ async fn main() -> anyhow::Result<()> {
     // (+ the W3C propagator used by `extract_trace_context`). The otel bridge
     // layer in the subscriber below pulls a tracer from that provider, so the
     // provider must exist before the subscriber is built.
-    let jaeger_endpoint = std::env::var("JAEGER_ENDPOINT")
-        .ok()
-        .or_else(|| Some("http://localhost:4317".to_string()));
+    //
+    // UNCONFIGURED MUST MEAN DISABLED — the controller carried the byte-identical
+    // defect and both are fixed together; repairing one of two sites is how a
+    // uniform bug becomes a per-binary one that survives far longer. This used to
+    // be `env::var("JAEGER_ENDPOINT").ok().or_else(|| Some("http://localhost:4317"))`,
+    // whose `or_else` made `init_tracing`'s `None` ⇒ disabled path unreachable, so
+    // an unconfigured worker exported spans to itself and logged an export ERROR
+    // per flush forever. `endpoint_from_env` is the shared chokepoint.
+    let trace_endpoint = worker::tracing::endpoint_from_env();
 
-    if let Some(endpoint) = jaeger_endpoint.as_ref() {
-        match worker::tracing::init_tracing("talos-worker", Some(endpoint)) {
-            Ok(_) => println!("      Tracing initialized (endpoint: {})", endpoint),
-            Err(e) => {
-                eprintln!("Warning: Failed to initialize tracing: {}", e);
-                eprintln!("    Continuing without tracing...");
-            }
+    // Called UNCONDITIONALLY, including with `None`, so "tracing is off" is
+    // stated in the log rather than being indistinguishable from silence.
+    match worker::tracing::init_tracing("talos-worker", trace_endpoint.as_deref()) {
+        Ok(()) => match trace_endpoint.as_deref() {
+            Some(endpoint) => println!(
+                "      Tracing enabled (endpoint: {})",
+                worker::tracing::redact_endpoint(endpoint)
+            ),
+            None => println!(
+                "      Tracing DISABLED (no endpoint configured; set one of {})",
+                worker::tracing::TRACE_ENDPOINT_ENV_VARS.join(", ")
+            ),
+        },
+        Err(e) => {
+            eprintln!("Warning: Failed to initialize tracing: {}", e);
+            eprintln!("    Continuing without tracing...");
         }
     }
 

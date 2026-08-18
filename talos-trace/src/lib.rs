@@ -93,12 +93,119 @@ fn parse_sampler(kind: Option<&str>, arg: Option<&str>) -> opentelemetry_sdk::tr
     }
 }
 
+/// Environment variables consulted for the OTLP trace endpoint, in precedence
+/// order (first non-empty wins). See [`endpoint_from_env`].
+///
+/// `JAEGER_ENDPOINT` is deliberately FIRST and is not going away: it is the name
+/// this codebase has always used and an operator may have it set out-of-band.
+/// The two `OTEL_EXPORTER_OTLP_*` names are the OpenTelemetry spec's, added
+/// because every collector/sidecar chart sets them by default and because this
+/// crate already reads the spec's `OTEL_TRACES_SAMPLER*` — the configuration
+/// surface was half-standard already.
+pub const TRACE_ENDPOINT_ENV_VARS: [&str; 3] = [
+    "JAEGER_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+];
+
+/// Resolve the OTLP trace endpoint from the environment, or `None` when the
+/// operator has configured no endpoint at all.
+///
+/// **`None` means DISABLED, and that is the whole point of this function.**
+/// Both binaries previously did
+/// `env::var("JAEGER_ENDPOINT").ok().or_else(|| Some("http://localhost:4317"))`,
+/// which substituted a default for the unset case and so made [`init_tracing`]'s
+/// documented "no endpoint ⇒ tracing disabled" path *unreachable*. Inside a
+/// container `localhost:4317` is the process itself, so every unconfigured
+/// deployment — the dev stack and every Helm install, neither of which sets the
+/// variable — built a batch span processor that failed every export and logged
+/// an ERROR per flush, indefinitely.
+///
+/// This is also why the endpoint is resolved HERE rather than by letting
+/// `opentelemetry-otlp` read the env itself: that crate's own chain
+/// (`exporter/tonic/mod.rs::resolve_endpoint`) ends in
+/// `OTEL_EXPORTER_OTLP_GRPC_ENDPOINT_DEFAULT` — the identical
+/// `http://localhost:4317` — so "just let the SDK read the standard vars" would
+/// reproduce this exact bug one layer down, where the `None` path can no longer
+/// see it.
+#[must_use]
+pub fn endpoint_from_env() -> Option<String> {
+    let values: Vec<Option<String>> = TRACE_ENDPOINT_ENV_VARS
+        .iter()
+        .map(|k| std::env::var(k).ok())
+        .collect();
+    first_configured(values.iter().map(Option::as_deref))
+}
+
+/// Pure core of [`endpoint_from_env`]: the first candidate that is present and
+/// non-empty after trimming, else `None`. Factored out so the precedence and the
+/// "unset ⇒ `None`" invariant are unit-testable without touching process env
+/// (the same pattern as `parse_sampler` above).
+///
+/// An explicitly EMPTY variable (`JAEGER_ENDPOINT=`) is treated as unset and
+/// falls through: a blank value is how compose/Helm spell "not configured", and
+/// handing `""` to the exporter builder is an invalid-URI error, not a disable.
+fn first_configured<'a>(candidates: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
+    candidates
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+/// Render an OTLP endpoint for logging with anything credential-bearing removed:
+/// keeps scheme + host + port, drops URL userinfo, path, query and fragment
+/// (replacing them with `/…` when present, so the reader can see that something
+/// was elided rather than that the endpoint had no path).
+///
+/// Hosted OTLP collectors routinely carry an ingest key in the userinfo or the
+/// query string, and this endpoint is printed at startup by both binaries — so
+/// printing it verbatim is a credential-into-logs path the moment anyone points
+/// Talos at a SaaS backend. Deliberately hand-rolled: `talos-trace` has no URL
+/// dependency and this does not warrant adding one.
+#[must_use]
+pub fn redact_endpoint(endpoint: &str) -> String {
+    let raw = endpoint.trim();
+    let (scheme, rest) = match raw.split_once("://") {
+        Some((s, r)) => (Some(s), r),
+        None => (None, raw),
+    };
+    // Everything from the first `/`, `?` or `#` onward is path/query/fragment.
+    let (authority, tail) = match rest.find(['/', '?', '#']) {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    // Drop userinfo (`user:password@host`) entirely, flagging that it was there.
+    // `rsplit_once` so a `:` or `@` inside the userinfo can't shift the split.
+    let (had_userinfo, host) = match authority.rsplit_once('@') {
+        Some((_, h)) => (true, h),
+        None => (false, authority),
+    };
+    let mut out = String::new();
+    if let Some(s) = scheme {
+        out.push_str(s);
+        out.push_str("://");
+    }
+    if had_userinfo {
+        out.push_str("<redacted>@");
+    }
+    out.push_str(host);
+    if !tail.is_empty() {
+        out.push_str("/…");
+    }
+    out
+}
+
 /// Initialize OpenTelemetry tracing
 /// Sets up the global tracer provider with OTLP exporter (for Jaeger)
 ///
 /// # Arguments
 /// * `service_name` - Name of the service (e.g., "talos-worker")
-/// * `endpoint` - OTLP gRPC endpoint (e.g., "http://jaeger:4317")
+/// * `endpoint` - OTLP gRPC endpoint (e.g., "http://jaeger:4317"). `None`
+///   disables tracing entirely: no exporter is built, no span is ever queued and
+///   no export is ever attempted. Callers MUST obtain this from
+///   [`endpoint_from_env`] rather than substituting a default of their own.
 ///
 /// # Example
 /// ```rust
@@ -122,11 +229,15 @@ pub fn init_tracing(
         }
     };
 
+    // Redacted: the endpoint can carry an ingest credential (see
+    // `redact_endpoint`). Logged once, not twice — the old code printed it at
+    // init AND again on success.
+    let shown = redact_endpoint(endpoint);
     println!(
         "[TRACING] Initializing OpenTelemetry for service: {}",
         service_name
     );
-    println!("[TRACING] OTLP endpoint: {}", endpoint);
+    println!("[TRACING] OTLP endpoint: {}", shown);
 
     // Build tracer provider with OTLP exporter
     use opentelemetry_otlp::SpanExporter;
@@ -173,8 +284,13 @@ pub fn init_tracing(
     // tracing stack is live in one place.
     global::set_text_map_propagator(opentelemetry_sdk::propagation::TraceContextPropagator::new());
 
-    println!("[TRACING] ✅ OpenTelemetry tracing initialized successfully");
-    println!("[TRACING] Traces will be exported to: {}", endpoint);
+    // NOTE the wording: the exporter is BUILT, and `connect_lazy` means nothing
+    // has been dialled yet. This line asserts that the pipeline was constructed,
+    // NOT that a single span has ever arrived — the pre-fix stack printed this
+    // exact ✅ for thirty-six hours while delivering nothing. Whether spans land
+    // is answerable only at the backend.
+    println!("[TRACING] ✅ OpenTelemetry span exporter built (delivery unverified)");
+    println!("[TRACING] Traces will be exported to: {}", shown);
 
     Ok(())
 }
@@ -699,5 +815,114 @@ mod tests {
             unk.contains("ParentBased") && unk.contains("AlwaysOn"),
             "{unk}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Endpoint resolution — the invariant this whole change exists to restore.
+    // ---------------------------------------------------------------------
+
+    /// THE regression test. Nothing configured must resolve to `None`, because
+    /// `None` is what makes `init_tracing` take its disabled path and build no
+    /// exporter at all. The pre-fix call sites answered `Some("http://localhost:4317")`
+    /// here, which is why both binaries exported to nowhere, loudly, forever.
+    #[test]
+    fn nothing_configured_resolves_to_none_not_a_default() {
+        assert_eq!(first_configured([None, None, None]), None);
+        // An explicitly empty value is "not configured", not an endpoint.
+        assert_eq!(first_configured([Some(""), Some("   "), None]), None);
+    }
+
+    #[test]
+    fn jaeger_endpoint_wins_and_standard_vars_are_honoured() {
+        // 1. JAEGER_ENDPOINT first — an operator who set it out-of-band is
+        //    unaffected by the addition of the standard names.
+        assert_eq!(
+            first_configured([
+                Some("http://jaeger:4317"),
+                Some("http://traces:4317"),
+                Some("http://generic:4317")
+            ])
+            .as_deref(),
+            Some("http://jaeger:4317")
+        );
+        // 2. signal-specific next.
+        assert_eq!(
+            first_configured([
+                None,
+                Some("http://traces:4317"),
+                Some("http://generic:4317")
+            ])
+            .as_deref(),
+            Some("http://traces:4317")
+        );
+        // 3. generic last.
+        assert_eq!(
+            first_configured([None, None, Some("http://generic:4317")]).as_deref(),
+            Some("http://generic:4317")
+        );
+        // An empty higher-precedence var falls THROUGH rather than disabling a
+        // lower one that is genuinely set.
+        assert_eq!(
+            first_configured([Some(""), None, Some("http://generic:4317")]).as_deref(),
+            Some("http://generic:4317")
+        );
+        // Surrounding whitespace is trimmed (compose/Helm YAML folding).
+        assert_eq!(
+            first_configured([Some("  http://jaeger:4317 ")]).as_deref(),
+            Some("http://jaeger:4317")
+        );
+    }
+
+    /// The env-reading wrapper must agree with the pure core on the case that
+    /// matters. Asserted only for the "nothing set" direction and only after
+    /// removing the vars, because process env is global and other tests in the
+    /// binary could otherwise race a `set_var`.
+    #[test]
+    fn endpoint_from_env_lists_exactly_the_documented_vars() {
+        assert_eq!(
+            TRACE_ENDPOINT_ENV_VARS,
+            [
+                "JAEGER_ENDPOINT",
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+            ]
+        );
+    }
+
+    #[test]
+    fn redact_endpoint_keeps_host_and_drops_credentials() {
+        // The ordinary case is unchanged and still readable.
+        assert_eq!(redact_endpoint("http://jaeger:4317"), "http://jaeger:4317");
+        assert_eq!(
+            redact_endpoint("http://localhost:4317"),
+            "http://localhost:4317"
+        );
+        // Userinfo — the hosted-collector credential form — is removed, and the
+        // fact that it was there is preserved.
+        assert_eq!(
+            redact_endpoint("https://ingestkey:s3cret@otlp.example.com:443"),
+            "https://<redacted>@otlp.example.com:443"
+        );
+        // Query string and path are elided but flagged.
+        assert_eq!(
+            redact_endpoint("https://otlp.example.com/v1/traces?api-key=abc123"),
+            "https://otlp.example.com/…"
+        );
+        assert_eq!(
+            redact_endpoint("https://otlp.example.com?token=abc"),
+            "https://otlp.example.com/…"
+        );
+        // No secret substring survives, which is the property that matters.
+        for raw in [
+            "https://user:s3cret@otlp.example.com/v1/traces?api-key=abc123#frag",
+            "https://otlp.example.com/v1/traces/abc123",
+        ] {
+            let out = redact_endpoint(raw);
+            assert!(!out.contains("s3cret"), "{out}");
+            assert!(!out.contains("abc123"), "{out}");
+        }
+        // Schemeless and empty inputs must not panic.
+        assert_eq!(redact_endpoint("jaeger:4317"), "jaeger:4317");
+        assert_eq!(redact_endpoint(""), "");
     }
 }

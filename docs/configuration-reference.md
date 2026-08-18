@@ -282,11 +282,55 @@ Script-level publish knobs (`scripts/publish-images.sh`, not Rust reads):
 
 | Variable | Default | Component | Purpose | Sensitive |
 |---|---|---|---|---|
-| `JAEGER_ENDPOINT` | none (optional) | both | OTLP/Jaeger trace export endpoint | |
+| `JAEGER_ENDPOINT` | none — tracing DISABLED | both | OTLP/gRPC trace export endpoint. Highest precedence of the three. | 🔒 (may carry an ingest key; logged redacted) |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | none | both | Standard OTel signal-specific endpoint. Used when `JAEGER_ENDPOINT` is unset/empty. | 🔒 (same) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | none | both | Standard OTel generic endpoint. Lowest precedence of the three. | 🔒 (same) |
 | `OTEL_TRACES_SAMPLER` | none (optional) | both | OTel trace sampler selection | |
 | `OTEL_TRACES_SAMPLER_ARG` | none (optional) | both | OTel sampler argument | |
 | `OTEL_METRICS_ENABLED` | bool default | both | Enable OTel metrics export | |
 | `TALOS_SELF_ALERTS` | flag | talos-ops-alerts-repository | Enable self-monitoring ops alerts | |
+
+**Trace export is OFF unless one of the three endpoint variables above holds a
+non-empty value.** Resolution is a single chokepoint —
+`talos_trace::endpoint_from_env`, shared by the controller and the worker — and
+an empty value counts as unset. With none set, both binaries print
+`Tracing DISABLED (no endpoint configured; …)` at startup, build no exporter and
+attempt no export.
+
+That is worth stating explicitly because until #649 it was false: both binaries
+substituted `http://localhost:4317` for the unset case, which inside a container
+is the process itself. Neither the dev stack nor the Helm chart sets any of
+these variables, so every unconfigured deployment built a span exporter aimed at
+itself and logged a `BatchSpanProcessor.ExportError` on every flush while the
+trace backend stayed empty. If you see that error, the endpoint you configured is
+unreachable *from inside the container* — check that you used the
+compose/Kubernetes service name (`http://jaeger:4317`), not `localhost`.
+
+The Helm chart sets none of these and needs no new key for them: pass one via
+`controller.env` / `worker.env` in `values.yaml`, which are rendered verbatim
+into both deployments.
+
+> **⚠ Do not enable trace export yet — there is an unclosed redaction gap.**
+> `worker/src/main.rs:1165` (single-node) and `:1493` (pipeline) stamp the RAW
+> WASM guest error string onto the exported job span, as both an `error`
+> attribute and the span's error status. `sanitize_error_message` strips file
+> paths, line numbers and internal IPs and then truncates — it performs **no
+> secret redaction**. The sibling sink at
+> `talos-worker-runtime/src/runtime.rs:4071` DLP-redacts the same text, and its
+> comment names `sk-*` / `ghp_*` / Bearer tokens as the reason. So a module that
+> echoes an upstream 401 writes that provider's token into whatever trace
+> backend you point these variables at.
+>
+> This repo's rule is that plaintext secrets leave the controller host by
+> exactly two audited paths (outbound `vault://` headers, and opt-in Tier-2
+> `expose_secret`). Span export is not one of them. Setting one of these
+> variables today opts you into a third, unaudited one.
+>
+> **Unblocks when** those two sites route through
+> `talos_dlp_provider::redact_str` — ideally pushed down into
+> `ExecutionSpan::end_error` so a future caller cannot regress it. The transport
+> itself is known-good: it was verified end-to-end (span delivered to Jaeger and
+> read back via `/api/traces`) with a scratch probe during #649.
 
 ## 9. Public URL / tunnel
 
