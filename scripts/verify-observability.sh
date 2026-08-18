@@ -213,10 +213,10 @@ bold "  B/C. loaded config and rules match this checkout"
 #    ended the block on the first entry, so it found zero rule files and
 #    reported "no alert definitions on disk" — a check that fails for the
 #    wrong reason is barely better than one that skips).
-MOUNTS="$MOUNTS" PROM_URL="$PROM_URL" ROOT="$ROOT" \
+MOUNTS="$MOUNTS" PROM_URL="$PROM_URL" ROOT="$ROOT" PROM_CONTAINER="$PROM_CONTAINER" \
 PROM_CMD="$(docker inspect "$PROM_CONTAINER" --format '{{json .Config.Cmd}}')" \
 python3 - <<'PYEOF'
-import json, os, sys, urllib.request
+import json, os, re, subprocess, sys, urllib.request
 import yaml
 
 FAIL = 0
@@ -319,47 +319,171 @@ else:
     green("  \u2713 every setting in %s is in effect (%d scrape job(s))"
           % (cfg_host, len(loaded.get("scrape_configs") or [])))
 
-# ── C. every alert defined on disk is loaded ──────────────────────────────
+# ── C. every alert on disk is loaded, AND ITS DEFINITION MATCHES ──────────
+#
+# WHY THIS COMPARES DEFINITIONS AND NOT JUST NAMES.
+# The first cut of this leg compared alert NAME SETS. That is blind to the
+# case that actually shipped: #644 did not only ADD three alerts, it also
+# REWROTE the expr of the existing `TalosWorkerFleetBuildSkew` from
+# `talos_worker_fleet_build_skew_workers > 0` (a series that had been
+# deleted, so the alert could never fire) to `..._build_skew_builds > 0`.
+# The name was in both sets, so a name-set gate reported ✓ while the running
+# process kept evaluating the un-fireable expr. A gate that cannot see the
+# repair of a broken detector is this repo's own defect class applied to its
+# own tooling — so the comparison is over the whole rule: expr, `for`,
+# labels and annotations.
+#
+# EXPR COMPARISON IS TWO-STAGE, and the second stage is the authority.
+# `/api/v1/rules` returns Prometheus's own re-rendered PromQL, not the repo
+# text. Measured differences on this stack, all pure formatting: newlines
+# collapsed, `on()` → `on ()`, `1.0` → `1`, `[50h]` → `[2d2h]`, and label
+# matchers re-sorted alphabetically. A textual compare is therefore a
+# permanently-red gate, which is the failure mode this script's header warns
+# about. Stage 1 is a cheap textual normalisation that agrees on 52 of 54
+# live rules; stage 2 hands every remaining disagreement to
+# `promtool promql format`, i.e. Prometheus's OWN parser and printer, which
+# canonicalises all five classes above. Typical cost is 0–2 `docker exec`s.
+#
+# STATED LIMITS:
+#   * If `promtool promql format --experimental` is unavailable (older
+#     Prometheus, or the flag withdrawn), stage 2 cannot run. The leg then
+#     reports the stage-1 verdict and SAYS it is unadjudicated, rather than
+#     silently downgrading to a name-set comparison.
+#   * Stage 1 can only produce false MISMATCHES, never false matches, for
+#     formatting differences — and stage 2 resolves those. The one direction
+#     it can miss is a difference confined to whitespace INSIDE a quoted
+#     label value (`{job="a b"}` vs `{job="ab"}`); stage 2 catches that too
+#     whenever it runs.
+#   * A recording rule is not compared; only alerting rules.
 entries = loaded.get("rule_files") or []
 if not entries:
-    red("  \u2717 the running Prometheus has NO rule_files at all — no alert can fire")
+    red("  ✗ the running Prometheus has NO rule_files at all — no alert can fire")
     FAIL = 1
 
-on_disk = set()
+on_disk = {}
 for entry in entries:
     hf = to_host(entry)
     if hf is None or not os.path.isfile(hf):
-        red("  \u2717 rule_files entry %r resolves to no file through the container's mounts" % entry)
-        yellow("    \u2192 Prometheus GLOBS rule_files, so this loads ZERO groups silently.")
+        red("  ✗ rule_files entry %r resolves to no file through the container's mounts" % entry)
+        yellow("    → Prometheus GLOBS rule_files, so this loads ZERO groups silently.")
         FAIL = 1
         continue
     doc = yaml.safe_load(open(hf).read()) or {}
     for g in doc.get("groups") or []:
         for r in g.get("rules") or []:
             if r.get("alert"):
-                on_disk.add(r["alert"])
+                on_disk[r["alert"]] = r
 
-live = {r["name"] for g in api("/rules")["groups"] for r in g["rules"]
-        if r.get("type") == "alerting"}
+def _canon_num(m):
+    f = float(m.group(0))
+    return str(int(f)) if f == int(f) and abs(f) < 1e15 else repr(f)
 
-missing = sorted(on_disk - live)
-extra   = sorted(live - on_disk)
+def norm_expr(e):
+    """Cheap stage-1 canonicalisation. Applied IDENTICALLY to both sides, so
+    it need only be deterministic — not semantically faithful."""
+    e = re.sub(r"\s+", " ", e or "").strip()
+    e = re.sub(r"\s*([^\w\s])\s*", r"\1", e)
+    return re.sub(r"\d+\.\d+(?:[eE][+-]?\d+)?", _canon_num, e)
+
+_UNIT = {"ms": 0, "s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800, "y": 31536000}
+
+def norm_for(v):
+    """`for:` is `30m` on disk and 1800 (seconds) from the API."""
+    if v is None:
+        return 0
+    if isinstance(v, (int, float)):
+        return int(v)
+    return sum(int(n) * _UNIT[u] for n, u in re.findall(r"(\d+)(ms|[smhdwy])", str(v)))
+
+PROM_CONTAINER = os.environ.get("PROM_CONTAINER", "talos-prometheus")
+
+def _promtool(expr):
+    try:
+        p = subprocess.run(
+            ["docker", "exec", PROM_CONTAINER, "promtool", "promql", "format",
+             "--experimental", expr],
+            capture_output=True, text=True, timeout=30)
+        return p.stdout.strip() if p.returncode == 0 else None
+    except Exception:
+        return None
+
+PROMTOOL_OK = _promtool("up") == "up"
+_fmt_cache = {}
+
+def canon(expr):
+    """Stage 2: Prometheus's own formatter, memoised."""
+    if expr not in _fmt_cache:
+        _fmt_cache[expr] = _promtool(expr)
+    return _fmt_cache[expr]
+
+live_rules = {r["name"]: r for g in api("/rules")["groups"] for r in g["rules"]
+              if r.get("type") == "alerting"}
+
+missing = sorted(set(on_disk) - set(live_rules))
+extra   = sorted(set(live_rules) - set(on_disk))
+
+drifted = []
+unadjudicated = 0
+for name in sorted(set(on_disk) & set(live_rules)):
+    d, l = on_disk[name], live_rules[name]
+    facets = []
+    if norm_expr(d.get("expr")) != norm_expr(l.get("query")):
+        # stage 2: let Prometheus's own parser adjudicate before reporting.
+        agreed = False
+        if PROMTOOL_OK:
+            cd, cl = canon(d.get("expr") or ""), canon(l.get("query") or "")
+            if cd is not None and cl is not None:
+                agreed = (cd == cl)
+            else:
+                unadjudicated += 1
+        else:
+            unadjudicated += 1
+        if not agreed:
+            facets.append(("expr", d.get("expr"), l.get("query")))
+    if norm_for(d.get("for")) != norm_for(l.get("duration")):
+        facets.append(("for", d.get("for"), l.get("duration")))
+    if (d.get("labels") or {}) != (l.get("labels") or {}):
+        facets.append(("labels", d.get("labels"), l.get("labels")))
+    if (d.get("annotations") or {}) != (l.get("annotations") or {}):
+        facets.append(("annotations", "<differs>", "<differs>"))
+    if facets:
+        drifted.append((name, facets))
+
 if missing:
-    red("  \u2717 defined on disk but NOT loaded by the running Prometheus:")
+    red("  ✗ defined on disk but NOT loaded by the running Prometheus:")
     for a in missing:
         yellow("      " + a)
-    yellow("    \u2192 this is the '#625 merged and never took effect' symptom exactly.")
+    yellow("    → this is the '#625 merged and never took effect' symptom exactly.")
     FAIL = 1
 if extra:
-    red("  \u2717 loaded by Prometheus but NOT defined on disk:")
+    red("  ✗ loaded by Prometheus but NOT defined on disk:")
     for a in extra:
         yellow("      " + a)
-    yellow("    \u2192 the process is running rules this checkout does not contain.")
+    yellow("    → the process is running rules this checkout does not contain.")
     FAIL = 1
-if on_disk and not missing and not extra:
-    green("  \u2713 all %d alert(s) on disk are loaded" % len(on_disk))
+if drifted:
+    red("  ✗ loaded under the right NAME but with a DIFFERENT definition:")
+    for name, facets in drifted:
+        yellow("      %s — %s differs" % (name, ", ".join(f[0] for f in facets)))
+        for facet, want, got in facets:
+            if facet == "annotations":
+                continue
+            yellow("        %s: repo=%r running=%r" % (facet, want, got))
+    yellow("    → the process is evaluating a STALE definition of an alert that")
+    yellow("      still exists by name — a name-only check cannot see this.")
+    yellow("      Apply with 'make observability-reload'.")
+    FAIL = 1
+if not PROMTOOL_OK and any(f[0] == "expr" for _, fs in drifted for f in fs):
+    yellow("    ⚠ 'promtool promql format --experimental' is unavailable in %s, so"
+           % PROM_CONTAINER)
+    yellow("      the expr differences above are UNADJUDICATED — they may be pure")
+    yellow("      formatting. Compare by hand before treating them as drift.")
+
+if on_disk and not missing and not extra and not drifted:
+    green("  ✓ all %d alert(s) on disk are loaded with matching definitions%s"
+          % (len(on_disk), "" if PROMTOOL_OK else " (expr compared textually only)"))
 elif not on_disk:
-    red("  \u2717 found no alert definitions on disk \u2014 cannot verify anything")
+    red("  ✗ found no alert definitions on disk — cannot verify anything")
     FAIL = 1
 
 sys.exit(1 if FAIL else 0)

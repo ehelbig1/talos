@@ -660,11 +660,19 @@ pub struct TalosMetrics {
     // `pa-read-later-digest/digest` sat at 96.9% of its budget for 16 days,
     // ACROSS A SUCCESSFUL RUN, and then failed two of its four scheduled
     // runs. Every fuel surface the platform had was structurally unable to
-    // see it: `get_fuel_usage_report` aggregates per MODULE against the
-    // shared `modules.max_fuel` (so a node-scoped override reads against the
-    // wrong denominator) behind a `min_executions` default of 3, and the
-    // adaptive-fuel learner needs `MIN_SAMPLES = 5`. The node had two
-    // samples.
+    // see it: `get_fuel_usage_report` aggregates per MODULE, behind a
+    // `min_executions` default of 3, and the adaptive-fuel learner needs
+    // `MIN_SAMPLES = 5`. The node had two samples.
+    //
+    // That report ALSO divided by the shared `modules.max_fuel` rather than
+    // the ceiling a worker enforced, so a node-scoped override read against
+    // the wrong denominator. **That half is fixed** (2026-08-18): both the
+    // per-module and per-node surfaces now measure against the enforced
+    // ceiling, so the report no longer contradicts this gauge. The reason
+    // THIS pair still has to exist is the OTHER half, which is unchanged and
+    // unfixable there — the per-module surface aggregates away the node, uses
+    // a percentile rather than a peak, and hides anything under
+    // `min_executions`. A node with two runs remains invisible to it.
     //
     // So the defining property of this pair is that it has **NO SAMPLE
     // FLOOR**. It fires at n=1. Adding one back — for smoothing, for

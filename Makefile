@@ -94,17 +94,6 @@ up: ## Build + start the full dev stack, wait for health
 	fi
 	@$(MAKE) _wait-healthy
 	@printf '\033[1;32m✓ stack healthy — http://localhost:8000/health\033[0m\n'
-	@# Prove the observability config the stack just came up with is the config
-	@# in this checkout. `docker compose up -d` does NOT recreate a container
-	@# whose spec is unchanged, so a rules/scrape edit can be merged, on disk,
-	@# and still not in effect — that is exactly how #625's alert stayed absent
-	@# from /api/v1/rules for a day while everything looked healthy. Advisory
-	@# here (a stale Prometheus must not block a dev stack); `make
-	@# observability-verify` is the same check as a hard gate.
-	@bash scripts/verify-observability.sh >/dev/null 2>&1 || { \
-	    printf '\033[1;33m⚠ Prometheus is NOT reading this checkout — merged config changes are not in effect.\033[0m\n'; \
-	    printf '\033[1;33m  Details: make observability-verify   Fix: make observability-reload\033[0m\n'; \
-	}
 	@if grep -Eq '^NGROK_AUTHTOKEN=.+' .env 2>/dev/null; then \
 	    sleep 2; \
 	    url="$$(curl -sf http://127.0.0.1:4040/api/tunnels 2>/dev/null | grep -o '"public_url":"https:[^"]*"' | head -1 | cut -d'"' -f4)"; \
@@ -113,6 +102,50 @@ up: ## Build + start the full dev stack, wait for health
 	    else \
 	        printf '\033[1;33m⚠ tunnel starting — check `docker logs talos-ngrok` / http://127.0.0.1:4040\033[0m\n'; \
 	    fi; \
+	fi
+
+	@# ── observability gate: SELF-HEAL, THEN FAIL HARD ──────────────────────
+	@# `docker compose up -d` does NOT recreate a container whose spec is
+	@# unchanged, so Prometheus keeps the rules it read at startup forever.
+	@# Measured 2026-08-18: the process had been up 31 h and was evaluating 47
+	@# rules against 54 on disk — seven alerts from #641/#643/#644 inert, plus
+	@# #644's rewritten `TalosWorkerFleetBuildSkew` expr still in its
+	@# un-fireable pre-#644 form. Every detector merged since the container
+	@# started was write-only.
+	@#
+	@# This was ADVISORY and got swallowed into one yellow line among many, on
+	@# the argument that a stale Prometheus must not block a dev stack. That
+	@# argument is kept and answered instead of overridden: on divergence we
+	@# APPLY THE REPO'S OWN COMMITTED CONFIG (`observability-reload` — POST
+	@# /-/reload, which also diagnoses the 403/no-lifecycle case) and re-verify.
+	@# The common case self-heals with no operator discipline; only a
+	@# divergence a reload CANNOT fix — a broken mount, a config Prometheus
+	@# rejects, a container predating --web.enable-lifecycle — is fatal, and
+	@# then the stack is already up so nothing is torn down by the non-zero
+	@# exit. It runs LAST so the failure is the final thing on screen.
+	@#
+	@# It cannot fire on a tree you did not deploy: it runs only inside an
+	@# explicit `make up`, never on a file save.
+	@#
+	@# STATED LIMIT: this gates `make up` ONLY. A bare `docker compose build &&
+	@# docker compose up -d` bypasses it and can still leave Prometheus stale.
+	@# A rules-checksum label on the service would not close that either (a
+	@# bare compose run evaluates the same default and skips the recreate), so
+	@# the raw path is documented, not covered.
+	@if bash scripts/verify-observability.sh >/dev/null 2>&1; then \
+	    printf '\033[1;32m✓ observability: Prometheus is evaluating this checkout\033[0m\n'; \
+	else \
+	    printf '\033[1;33m⚠ Prometheus is not evaluating this checkout — applying the repo config\033[0m\n'; \
+	    $(MAKE) --no-print-directory observability-reload || { \
+	        printf '\033[1;31m══════════════════════════════════════════════════════════════\033[0m\n'; \
+	        printf '\033[1;31m✗ OBSERVABILITY IS STALE AND A RELOAD DID NOT FIX IT\033[0m\n'; \
+	        printf '\033[1;31m  The stack is UP, but Prometheus is not evaluating the rules\033[0m\n'; \
+	        printf '\033[1;31m  in this checkout, so alerts merged since it started are inert.\033[0m\n'; \
+	        printf '\033[1;31m  Recreate it (prometheus_data is untouched):\033[0m\n'; \
+	        printf '\033[1;31m      docker compose up -d --force-recreate prometheus\033[0m\n'; \
+	        printf '\033[1;31m══════════════════════════════════════════════════════════════\033[0m\n'; \
+	        exit 1; \
+	    }; \
 	fi
 
 down: ## Stop the stack (preserves data volumes)
