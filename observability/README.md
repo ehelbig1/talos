@@ -14,6 +14,11 @@ observability/
 ├── README.md                           # This file
 ├── prometheus/
 │   └── prometheus.yml                  # Prometheus configuration
+├── alertmanager/
+│   └── alertmanager.yml                # Alert DELIVERY: routes + receivers.
+│                                       #   Own directory because compose
+│                                       #   mounts it, and a directory mount
+│                                       #   exposes every file in it.
 ├── rules/
 │   └── alerts.yml                      # WASM/worker alert rules (dev stack)
 ├── alerts_test.yml                     # promtool fixture — deliberately NOT
@@ -486,6 +491,77 @@ docker logs talos-prometheus | grep -i alert
 
 ---
 
+## Alert delivery — what the operator must supply
+
+Until 2026-08-18 every alert rule here was **write-only**: 54 rules evaluated
+and reached nobody, because `alerting:` in `prometheus.yml` was commented out
+and no Alertmanager existed. Prometheus has no native webhook output —
+Alertmanager is its only alert sink — so nothing else could have carried them.
+
+The transport now ships, and it ships **INERT**. It activates on **one file**.
+
+### The one thing you must supply
+
+```bash
+mkdir -p ~/.talos/alert-secrets
+printf '%s' 'https://hooks.slack.com/services/XXX/YYY/ZZZ' \
+    > ~/.talos/alert-secrets/infra-webhook-url
+chmod 600 ~/.talos/alert-secrets/infra-webhook-url
+make observability-reload        # POST /-/reload; no restart, no rebuild
+make observability-verify        # leg D checks containment, mode and binding
+```
+
+That is it. Alertmanager reads `api_url_file` at **notify** time, so the
+container starts and loads cleanly with the file absent and only fails when it
+tries to send — which is why `TalosAlertDeliveryFailing` exists.
+
+* **The directory is `$HOME/.talos/alert-secrets`, never the repo.** Override
+  with `TALOS_ALERT_SECRETS_DIR`. Leg D of `scripts/verify-observability.sh`
+  **refuses** a credential mount that resolves inside any checkout, symlinks
+  resolved, checking both this worktree and the main clone.
+* **No credential value is ever logged**, by the verifier or by anything else.
+  Leg D checks existence and file mode only; it never reads the contents.
+* Choosing a channel other than Slack is a 3-line edit — `alertmanager.yml`
+  carries the exact replacement blocks for Discord, Telegram, email and a
+  generic webhook, clearly marked as options rather than as what ships.
+
+### What you will receive the moment you drop that file
+
+Two alerts are firing on the dev stack right now, and grouping is by
+`(alertname, severity)`, so this is **two messages, not a burst**:
+
+| alert | severity | what it means |
+|---|---|---|
+| `TalosWorkerBuildSkew` | warning | a registered worker id on a different build than the controller |
+| `TalosFuelHeadroomLow` | warning | a (workflow, node) pair at ≥80 % of its enforced fuel ceiling |
+
+Both carry long `action:` annotations. **Neither is silenced**, deliberately:
+they are true, and silencing a true warning to make an enablement look clean is
+the same defect as an alert nobody reads. `LowCacheHitRate` may also appear —
+it flaps in and out of its own vector on an idle worker and has not yet
+completed its 10 m `for`.
+
+### The honest limits
+
+* **`AlertmanagerDown` cannot be delivered by the transport it reports on.**
+  It is dashboard-and-log-only by construction: Alertmanager is Prometheus's
+  only sink, so an alert about Alertmanager has nowhere to go. Its own
+  annotation says so. Do not read its existence as coverage.
+* If **no** credential is configured anywhere, `TalosAlertDeliveryFailing`
+  fires and is itself undeliverable. One working credential is what breaks
+  that circle; there is no config that removes the dependency.
+* Alertmanager is bound to **127.0.0.1 only**. Its `/api/v2/silences` lets any
+  caller disable every detector in this system and it ships no authentication,
+  so that binding is the whole access control. It assumes every process that
+  can open a loopback socket here is trusted — true on a single-user dev Mac,
+  **false** on a shared host.
+* The `ops_alerts` triage brain is **not** wired to this. See the
+  `alertmanager.yml` header for the two blockers (an Alertmanager payload
+  cannot produce an `__ops_alert__` envelope, and its byte-identical repeats
+  would be swallowed by the webhook layer's body-hash dedup).
+
+---
+
 ## Resources
 
 - **Prometheus Documentation**: https://prometheus.io/docs
@@ -495,5 +571,5 @@ docker logs talos-prometheus | grep -i alert
 
 ---
 
-**Last Updated**: 2026-08-02
+**Last Updated**: 2026-08-18
 **Maintained By**: Talos Team

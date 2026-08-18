@@ -875,3 +875,138 @@ groups:
             non-empty; and the instrument name has not drifted from the one
             these rules select on (talos-worker-runtime's exported-name
             pinning test is the arbiter).
+
+  # =========================================================================
+  # ALERT DELIVERY — the transport itself
+  # =========================================================================
+  # These live in THIS dev-only file and not in deploy/helm/talos/files/alerts.yaml
+  # for a reason that is the arc's own thesis: the chart ships NO Alertmanager
+  # (it delivers rules as a PrometheusRule CR and assumes an operator-run
+  # stack), and an operator's Alertmanager is not called `alertmanager` under
+  # kube-prometheus-stack. A chart-side copy of these would select a job that
+  # cluster does not scrape and could therefore never fire — a detector that
+  # cannot detect, which is the exact class this arc is burning down. Also
+  # structural check 65(d): an alert name may not appear in both mounted rule
+  # files.
+  - name: alert_delivery
+    rules:
+      # =====================================================================
+      # ⚠ THIS ALERT CANNOT BE DELIVERED BY THE TRANSPORT IT REPORTS ON.
+      # =====================================================================
+      # It is dashboard-and-log-only BY CONSTRUCTION, and saying so plainly
+      # is the whole point of the change that introduced it. Prometheus's
+      # only alert sink is Alertmanager; when Alertmanager is the thing that
+      # is down, Prometheus has nowhere to send the news. There is no
+      # arrangement of this config that fixes that, and the honest response
+      # is to state it rather than let the alert's existence read as
+      # coverage.
+      #
+      # So: where this one is actually visible.
+      #   * Prometheus UI  → http://127.0.0.1:9090/alerts  (it will be red)
+      #   * `curl -s 127.0.0.1:9090/api/v1/alerts`
+      #   * `docker ps`/`docker logs talos-alertmanager`
+      # Nothing pushes it. If you are reading this in a chat message or an
+      # email, something is wrong with this comment, not with the alert.
+      #
+      # Absence: `up` is synthesised (as 0) for every DECLARED scrape job, so
+      # the `== 0` arm is live as long as prometheus.yml declares the job —
+      # which structural check 65(a) enforces, because this rule selects on
+      # it. The `absent()` arm is belt-and-braces for a tree where that lint
+      # was bypassed; it is not the primary guard, and it costs nothing
+      # because a series cannot be present and absent at once.
+      #
+      # On docker-compose.observability.yml this fires permanently and
+      # CORRECTLY: that stack defines no alertmanager service, so alerts on
+      # it really are undelivered. It also observes nothing of Talos by
+      # design (see that file's header). It is not a false positive.
+    - alert: AlertmanagerDown
+      expr: |
+        up{job="alertmanager"} == 0
+        or absent(up{job="alertmanager"})
+      for: 5m
+      labels:
+        severity: critical
+        category: observability-loss
+        component: monitoring
+      annotations:
+        summary: "Alertmanager is down — NO alert in this system can reach anyone"
+        description: >-
+          Prometheus is still evaluating all of its rules and every one of
+          them is now write-only, which is the state this stack was in before
+          alert delivery existed at all. Note the severity is honest about
+          IMPACT and silent about REACH: this alert is not paging you, because
+          it cannot. Alertmanager is Prometheus's only alert sink, so an alert
+          about Alertmanager has no transport. It is visible on the Prometheus
+          UI at /alerts and in `docker logs talos-alertmanager`, and nowhere
+          else.
+        action: >-
+          1. `docker ps -a --filter name=talos-alertmanager` and
+          `docker logs talos-alertmanager`. A config error keeps the process
+          up but stops it reloading; a bad mount stops it starting.
+          2. `docker compose up -d alertmanager`.
+          3. Confirm recovery by state, not by exit code:
+          `curl -s 127.0.0.1:9093/-/ready` and then check that
+          127.0.0.1:9090/api/v1/alerts no longer lists this alert.
+
+      # =====================================================================
+      # Delivery is CONFIGURED but FAILING — the credential case.
+      # =====================================================================
+      # This is the state the stack ships in: alertmanager.yml names
+      # credential files under /etc/alertmanager/secrets that the operator has
+      # not created yet. Alertmanager loads and runs happily, then fails every
+      # notification and retries. Without this rule that is completely silent.
+      #
+      # `sum by (integration)` is load-bearing, and it is the #625 fan-out
+      # lesson applied. The raw series is labelled {integration, reason} with
+      # five reasons, so one broken credential would otherwise produce five
+      # near-identical alerts differing only by a label that does not change
+      # what you must do. `integration` is KEPT because it names which
+      # receiver is broken; drop into the metric directly if you want `reason`.
+      #
+      # No `absent()` arm, deliberately: Alertmanager pre-seeds
+      # alertmanager_notifications_failed_total at 0 for all 13 integrations
+      # before any notification is attempted (verified against v0.28.1), so
+      # the series exists from a cold start and `rate() > 0` is live
+      # immediately. This is the producer-side half of `absent is not zero`,
+      # already done for us upstream. If a future Alertmanager stops seeding,
+      # this rule goes quiet rather than loud — that is the failure direction
+      # to know about, and it is why the statement above is a measurement and
+      # not an assumption.
+      #
+      # Structural check 65(c) does NOT cover this expression: it validates
+      # `talos_*` and `wasm_*` prefixes only, and `alertmanager_*` is neither.
+      # The series was therefore confirmed by hand against a running v0.28.1
+      # rather than by the lint. Anyone editing this expr must do the same.
+    - alert: TalosAlertDeliveryFailing
+      expr: sum by (integration) (rate(alertmanager_notifications_failed_total[15m])) > 0
+      for: 10m
+      labels:
+        severity: warning
+        category: observability-loss
+        component: monitoring
+      annotations:
+        summary: "Alertmanager is failing to deliver via {{ $labels.integration }}"
+        description: >-
+          Alertmanager is up and routing, and its notifications to
+          {{ $labels.integration }} are failing. Alerts sent through that
+          receiver are not reaching anyone. The overwhelmingly likely cause on
+          this stack is a MISSING CREDENTIAL FILE: the shipped config names
+          files under /etc/alertmanager/secrets (api_url_file / url_file) which
+          are read at notify time, so the process starts and loads perfectly
+          with them absent and only fails when it tries to send.
+        action: >-
+          1. `docker logs talos-alertmanager | tail -50` — the notify error
+          names the integration and the reason.
+          2. Break the failures down by cause in the Prometheus UI with
+          `sum by (integration, reason) (rate(alertmanager_notifications_failed_total[15m]))`.
+          A missing credential file shows as reason="other"; a rejected
+          webhook URL shows as clientError.
+          3. If the file is missing, create it in the host directory that
+          docker-compose.yml mounts (TALOS_ALERT_SECRETS_DIR, default
+          $HOME/.talos/alert-secrets), `chmod 600`, then
+          `make observability-reload`. Do NOT put it in the repo — leg D of
+          scripts/verify-observability.sh refuses a secrets mount that
+          resolves inside a checkout.
+          4. This alert cannot be delivered through the receiver it is
+          reporting on. It CAN reach you through a different one: only the
+          named integration is broken.

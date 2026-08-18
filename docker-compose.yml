@@ -1151,6 +1151,107 @@ services:
       - talos-network
     restart: unless-stopped
 
+  # Alertmanager - Alert DELIVERY
+  #
+  # Before this service existed, 54 alert rules evaluated on the Prometheus
+  # above and reached NOBODY: the `alerting:` block in prometheus.yml was
+  # commented out and there was no sink. Prometheus has no native webhook
+  # output — Alertmanager is its only alert sink — so every detector this arc
+  # built was write-only. Config, routing rule and the unclosed gaps are all
+  # documented in observability/alertmanager/alertmanager.yml.
+  alertmanager:
+    # v0.28.1, not v0.27.x, for ONE measured reason: `http_config.http_headers`
+    # does not exist in 0.27 (`field http_headers not found in type
+    # config.plain` from amtool) and does in 0.28. That field is the only way
+    # Alertmanager can present the `X-Verification-Token` header that
+    # `POST /webhooks/{id}` requires, reading it from a FILE rather than from
+    # config. Without it the Talos-bound route could never be authenticated.
+    image: quay.io/prometheus/alertmanager:v0.28.1@sha256:27c475db5fb156cab31d5c18a4251ac7ed567746a2483ff264516437a39b15ba
+    container_name: talos-alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/conf/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+      # Must match the `ports:` publication below, or the UI's own links and
+      # every `generatorURL`-adjacent redirect point at a host that is not
+      # reachable from the operator's browser.
+      - '--web.external-url=http://127.0.0.1:9093'
+      # NOTE — there is deliberately NO '--web.enable-lifecycle' here, and it
+      # is not an omission. That flag is PROMETHEUS-only; Alertmanager rejects
+      # it outright ("unknown long flag '--web.enable-lifecycle'") and the
+      # container exits 1 at startup. Caught by standing the stack up, not by
+      # reading — `amtool check-config` validates the CONFIG FILE and says
+      # nothing about the command line, so this would have shipped as a
+      # service that never starts. Alertmanager needs no flag: POST /-/reload
+      # is always available (and SIGHUP works), which is what
+      # `make observability-reload` uses to pick up a newly-dropped credential
+      # file without recreating the container.
+      # DISABLE CLUSTERING. Default-on, it opens a SECOND listener on 9094
+      # (TCP+UDP) for gossip. A single-node dev host has nothing to gossip
+      # with, and an unauthenticated cluster port that accepts silence and
+      # notification-log state from any peer that can reach it is a control
+      # surface, not a feature. Verified: with this flag `netstat -lntp` in
+      # the container shows 9093 alone and `alertmanager_cluster_enabled` is 0.
+      - '--cluster.listen-address='
+    ports:
+      # ── LOOPBACK ONLY, AND THIS IS A SECURITY BOUNDARY, NOT A PREFERENCE ──
+      #
+      # SILENCING IS AN AUTHORISATION SURFACE. Alertmanager's web UI and its
+      # /api/v2/silences endpoint let ANY caller create a silence, and a
+      # silence with a matcher like `severity=~".*"` disables EVERY detector
+      # in this system at once — the crypto-invariant alerts, the KEK-decrypt
+      # alerts, all of it. Alertmanager has NO authentication of its own: it
+      # ships none, and this stack adds none. The ONLY thing standing between
+      # that control surface and the network is this `127.0.0.1:` prefix.
+      #
+      # WHAT THAT ASSUMES, stated so it can be checked rather than believed:
+      #   * that every process able to open a loopback socket on this host is
+      #     already trusted. On a single-user dev Mac that is a reasonable
+      #     assumption; on a shared or multi-tenant host it is FALSE, and this
+      #     service must not be run there without a reverse proxy that
+      #     authenticates.
+      #   * that nothing republishes it. Docker's published-port rules bypass
+      #     the host firewall, so a later `9093:9093` here — or in the
+      #     gitignored docker-compose.override.yml, which no lint scans —
+      #     exposes it to the LAN with no other change and no warning.
+      #   * NOTE the neighbouring precedent that this does NOT follow:
+      #     docker-compose.observability.yml publishes Prometheus as
+      #     "9090:9090" on ALL interfaces together with --web.enable-lifecycle
+      #     (i.e. /-/reload and /-/quit reachable from the LAN). That is
+      #     pre-existing and out of scope, but it is exactly the drift this
+      #     comment exists to prevent here.
+      - "127.0.0.1:9093:9093"
+    volumes:
+      # DIRECTORY mount, never the single file — structural check 66. A
+      # single-file bind mount freezes the container's cached size once the
+      # host file is REPLACED (every `git checkout` of a changed file), after
+      # which reads return the current bytes TRUNCATED to the old length,
+      # silently. observability/alertmanager/ contains only alertmanager.yml,
+      # because a directory mount exposes every file in it.
+      - ./observability/alertmanager:/etc/alertmanager/conf:ro
+      # ── CREDENTIALS. Nothing here is in the repo, and nothing may be. ──
+      # An ABSOLUTE host path outside every checkout, defaulting under $HOME.
+      # `alertmanager.yml` names files inside it (`api_url_file`, `url_file`,
+      # `http_headers.files`) which Alertmanager reads at NOTIFY time — so
+      # this ships INERT and activates on a file drop plus a reload, with no
+      # repo change. If the directory does not exist Docker creates it empty,
+      # which is the correct inert state.
+      #
+      # The containment invariant (a secret source must never resolve inside a
+      # checkout, symlinks resolved) is ENFORCED at runtime by leg D of
+      # scripts/verify-observability.sh against the LIVE container's mounts —
+      # not by this comment, and not by a lint that cannot see an override
+      # file. Override with TALOS_ALERT_SECRETS_DIR.
+      - ${TALOS_ALERT_SECRETS_DIR:-$HOME/.talos/alert-secrets}:/etc/alertmanager/secrets:ro
+      - alertmanager_data:/alertmanager
+    networks:
+      - talos-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.2'
+
   # Jaeger - Distributed Tracing
   jaeger:
     image: jaegertracing/all-in-one:1.50@sha256:d589499a01e1e2f9d302db8e210af09688076fd8a93278fa024824a755c1a0f1
@@ -1356,6 +1457,8 @@ volumes:
   nats_data:
     driver: local
   prometheus_data:
+    driver: local
+  alertmanager_data:
     driver: local
   grafana_data:
     driver: local

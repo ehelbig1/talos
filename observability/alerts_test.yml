@@ -1127,3 +1127,171 @@ tests:
           )
         eval_time: 30m
         exp_samples: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # ALERT DELIVERY — the transport that carries everything above.
+  #
+  # These matter more than their size suggests. Every other test in this file
+  # asserts that a DETECTOR fires; these assert that anything at all can
+  # LEAVE. And two of the three assert a NEGATIVE that the whole design rests
+  # on and that a live stack cannot show you inside a review: that a healthy
+  # idle Alertmanager does not fire, and that ONE broken credential produces
+  # ONE alert rather than five.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: alertmanager healthy — neither delivery alert fires
+    input_series:
+      - series: 'up{job="alertmanager", instance="alertmanager:9093"}'
+        values: "1+0x30"
+      # The seeded-at-zero case. Alertmanager exports these counters flat at 0
+      # for all 13 integrations from a cold start, so this is the NORMAL state
+      # of a stack that has never sent a notification — and if `rate()==0` were
+      # written as anything looser it would fire on every idle stack forever.
+      - series: 'alertmanager_notifications_failed_total{integration="slack", reason="other"}'
+        values: "0+0x30"
+      - series: 'alertmanager_notifications_failed_total{integration="webhook", reason="other"}'
+        values: "0+0x30"
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: AlertmanagerDown
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: TalosAlertDeliveryFailing
+        exp_alerts: []
+
+  - interval: 1m
+    name: alertmanager down — fires after 5m (undeliverable by construction)
+    input_series:
+      - series: 'up{job="alertmanager", instance="alertmanager:9093"}'
+        values: "0+0x30"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: AlertmanagerDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: AlertmanagerDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              category: observability-loss
+              component: monitoring
+              job: alertmanager
+              instance: alertmanager:9093
+            exp_annotations:
+              summary: "Alertmanager is down — NO alert in this system can reach anyone"
+              description: >-
+                Prometheus is still evaluating all of its rules and every one
+                of them is now write-only, which is the state this stack was
+                in before alert delivery existed at all. Note the severity is
+                honest about IMPACT and silent about REACH: this alert is not
+                paging you, because it cannot. Alertmanager is Prometheus's
+                only alert sink, so an alert about Alertmanager has no
+                transport. It is visible on the Prometheus UI at /alerts and
+                in `docker logs talos-alertmanager`, and nowhere else.
+              action: >-
+                1. `docker ps -a --filter name=talos-alertmanager` and `docker
+                logs talos-alertmanager`. A config error keeps the process up
+                but stops it reloading; a bad mount stops it starting. 2.
+                `docker compose up -d alertmanager`. 3. Confirm recovery by
+                state, not by exit code: `curl -s 127.0.0.1:9093/-/ready` and
+                then check that 127.0.0.1:9090/api/v1/alerts no longer lists
+                this alert.
+
+  # The scrape job deleted / never declared. `up` is synthesised only for jobs
+  # that EXIST, so without the absent() arm this case — Prometheus not even
+  # looking at Alertmanager — would be the quietest of all. Structural check
+  # 65(a) is the primary guard; this proves the arm behind it works.
+  - interval: 1m
+    name: alertmanager job absent entirely — the absent() arm carries it
+    input_series:
+      - series: 'up{job="talos-worker", instance="worker:9090"}'
+        values: "1+0x30"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: AlertmanagerDown
+        exp_alerts:
+          # Note the label set differs from the `up == 0` case: absent()
+          # returns only the matcher's labels, so there is no `instance`.
+          # Anything routing or grouping on `instance` will not match this.
+          - exp_labels:
+              severity: critical
+              category: observability-loss
+              component: monitoring
+              job: alertmanager
+            exp_annotations:
+              summary: "Alertmanager is down — NO alert in this system can reach anyone"
+              description: >-
+                Prometheus is still evaluating all of its rules and every one
+                of them is now write-only, which is the state this stack was
+                in before alert delivery existed at all. Note the severity is
+                honest about IMPACT and silent about REACH: this alert is not
+                paging you, because it cannot. Alertmanager is Prometheus's
+                only alert sink, so an alert about Alertmanager has no
+                transport. It is visible on the Prometheus UI at /alerts and
+                in `docker logs talos-alertmanager`, and nowhere else.
+              action: >-
+                1. `docker ps -a --filter name=talos-alertmanager` and `docker
+                logs talos-alertmanager`. A config error keeps the process up
+                but stops it reloading; a bad mount stops it starting. 2.
+                `docker compose up -d alertmanager`. 3. Confirm recovery by
+                state, not by exit code: `curl -s 127.0.0.1:9093/-/ready` and
+                then check that 127.0.0.1:9090/api/v1/alerts no longer lists
+                this alert.
+
+  # THE FAN-OUT TEST. One broken Slack credential increments several `reason`
+  # label sets. Without `sum by (integration)` this produces one alert PER
+  # REASON — pages differing only by a label that does not change the fix.
+  # That is #625's fan-out defect, and this asserts it cannot come back: two
+  # failing reasons on one integration must yield exactly ONE alert, carrying
+  # `integration` and NOT `reason`.
+  - interval: 1m
+    name: one broken credential, several reasons — exactly one alert
+    input_series:
+      - series: 'up{job="alertmanager", instance="alertmanager:9093"}'
+        values: "1+0x30"
+      - series: 'alertmanager_notifications_failed_total{integration="slack", reason="other"}'
+        values: "0+1x30"
+      - series: 'alertmanager_notifications_failed_total{integration="slack", reason="clientError"}'
+        values: "0+2x30"
+      # A healthy second integration must NOT be dragged in.
+      - series: 'alertmanager_notifications_failed_total{integration="webhook", reason="other"}'
+        values: "0+0x30"
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: TalosAlertDeliveryFailing
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: TalosAlertDeliveryFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: observability-loss
+              component: monitoring
+              integration: slack
+            exp_annotations:
+              summary: "Alertmanager is failing to deliver via slack"
+              description: >-
+                Alertmanager is up and routing, and its notifications to slack
+                are failing. Alerts sent through that receiver are not
+                reaching anyone. The overwhelmingly likely cause on this stack
+                is a MISSING CREDENTIAL FILE: the shipped config names files
+                under /etc/alertmanager/secrets (api_url_file / url_file) which
+                are read at notify time, so the process starts and loads
+                perfectly with them absent and only fails when it tries to
+                send.
+              action: >-
+                1. `docker logs talos-alertmanager | tail -50` — the notify
+                error names the integration and the reason. 2. Break the
+                failures down by cause in the Prometheus UI with `sum by
+                (integration, reason)
+                (rate(alertmanager_notifications_failed_total[15m]))`. A
+                missing credential file shows as reason="other"; a rejected
+                webhook URL shows as clientError. 3. If the file is missing,
+                create it in the host directory that docker-compose.yml mounts
+                (TALOS_ALERT_SECRETS_DIR, default $HOME/.talos/alert-secrets),
+                `chmod 600`, then `make observability-reload`. Do NOT put it in
+                the repo — leg D of scripts/verify-observability.sh refuses a
+                secrets mount that resolves inside a checkout. 4. This alert
+                cannot be delivered through the receiver it is reporting on.
+                It CAN reach you through a different one: only the named
+                integration is broken.

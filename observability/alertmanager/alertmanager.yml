@@ -1,0 +1,250 @@
+# ===========================================================================
+# Alertmanager — the transport that makes a firing alert reach a human.
+# DEV STACK ONLY (see SCOPE at the bottom).
+# ===========================================================================
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# Before it, 54 alert rules evaluated on the dev Prometheus and reached
+# NOBODY. `alerting:` in observability/prometheus/prometheus.yml was commented
+# out and no alertmanager process existed, so every detector this arc built
+# (#618, #620, #623, #625, #628, #631, #643, #644) was write-only: its firing
+# was a number in a web UI nobody opens. Prometheus has NO native webhook
+# output — Alertmanager is its only alert sink — so this is not one option
+# among several, it is the mechanism.
+#
+# ⚠ BEFORE YOU GREP THIS FILE. It contains commented-out receiver blocks for
+#   Discord / Telegram / email / generic-webhook. They are DOCUMENTATION OF
+#   OPTIONS, NOT WHAT SHIPS. What ships is exactly the two uncommented
+#   `slack_configs` / `webhook_configs` blocks below. A commented line is
+#   found by every search you run and reads as the product's behaviour, and
+#   it is the opposite of it — the #644 lesson, applied to the file that
+#   most invites it.
+#
+# ===========================================================================
+# THE ROUTE SPLIT, AND THE RULE IT DERIVES FROM
+# ===========================================================================
+#
+# THE RULE, in one sentence:
+#
+#     An alert is delivered THROUGH Talos only when it has explicitly
+#     declared that Talos is not in its own failure path. Everything else
+#     goes to the Talos-independent receiver.
+#
+# The mechanism is ONE label on the alert rule: `delivery: talos`. There is
+# deliberately NO list of alert names, categories, components or severities
+# used to classify anywhere in this file. A hardcoded list is a snapshot, and
+# a snapshot rots — that is structural check 64's lesson and check 65's own
+# recorded failure, and it is why this is a property of the alert rather than
+# a property of this config.
+#
+# HOW A NEW ALERT GETS CLASSIFIED: the author does nothing.
+# An alert with no `delivery` label, with a misspelled one, or written next
+# year by someone who has never opened this file, matches no child route and
+# lands on the default receiver — the Talos-independent one. Moving an alert
+# onto the Talos triage path costs one label, and the label's name IS the
+# assertion its author is making.
+#
+# WHY OPT-IN AND NOT OPT-OUT — the two mistakes do not cost the same:
+#
+#   * Forget the label on a platform-quality alert → it is delivered by the
+#     independent channel. A slightly noisier phone. Nothing is lost.
+#   * Forget it under an opt-OUT scheme (default = Talos) → an alert saying
+#     "Postgres is down" is routed through a webhook that needs Postgres. It
+#     is dropped at exactly the moment it matters, and the drop is silent.
+#
+# That second shape is `absent is not zero` one level up: a delivery path
+# disabled by precisely the condition it was carrying news of. So the DEFAULT
+# must be the channel that does not depend on the subject of the alert, and
+# the exception must be the one you opt into deliberately.
+#
+# THIRD CLAUSE: `severity: critical` always takes the independent channel,
+# whatever else it is labelled. A critical alert is the worst possible case
+# in which to be clever about routing.
+#
+# ⚠ TODAY, ZERO ALERT RULES CARRY `delivery: talos`. That is deliberate and
+#   it is stated here so nobody reads the route below as a wired integration.
+#   All 54 alerts take the default path, so the split cannot currently lose
+#   anything. The reason is in the next block.
+#
+# ===========================================================================
+# WHY THE SECOND RECEIVER IS NOT `ops_alerts`, AND WHAT WOULD HAVE TO CHANGE
+# ===========================================================================
+# The plan's D3 wanted platform-quality alerts to land in `ops_alerts`, where
+# the triage brain and the corrections moat live. That is NOT reachable by
+# configuration. Investigated 2026-08-18 against this tree:
+#
+#   A. AUTH — solvable here, and it is solved by the version pin.
+#      `POST /webhooks/{id}` accepts only HMAC-SHA256 (Slack/GitHub/X-Signature
+#      header shapes) or a static `X-Verification-Token` header
+#      (talos-webhooks/src/router.rs:538-781). It reads no Bearer, no Basic,
+#      no Authorization. Alertmanager cannot compute an HMAC over its own
+#      body — but v0.28+ CAN set an arbitrary header from a FILE:
+#          http_config: { http_headers: { X-Verification-Token: { files: [ … ] } } }
+#      Verified empirically: that field does NOT exist in v0.27.0
+#      (`field http_headers not found in type config.plain`) and DOES in
+#      v0.28.1. That is the reason for the version pin in docker-compose.yml.
+#
+#   B. PAYLOAD → ROW — needs code, not config. An `ops_alerts` row is only
+#      ever written by `OpsAlertRepository::ingest`, reached exclusively via
+#      the `__ops_alert__` reserved key in a node/module OUTPUT
+#      (talos-ops-alerts-repository/src/envelope.rs:145-280;
+#      talos-mcp-handlers/src/ops_alerts.rs:2-3 states there is no other
+#      surface). Alertmanager's envelope has no `dedup_key`, no `title`, no
+#      `source`, and nothing in the catalog can mint them — JSON_Transform
+#      only navigates and wraps. This needs an "alertmanager-normalize"
+#      module mapping `alerts[].labels/annotations` → `__ops_alert__`.
+#
+#   C. REPEATS WOULD BE SILENTLY SWALLOWED — the worst of the three, because
+#      it fails while looking healthy. Alertmanager re-notifies on
+#      `repeat_interval` with a BYTE-IDENTICAL body, and the webhook layer
+#      dedups on a SHA-256 of the body when no delivery-id header is present
+#      (talos-webhooks/src/router.rs:827-841). Every repeat would return 200
+#      `duplicate_suppressed` and never bump `occurrence_count` — the field
+#      `ops_alerts` is built around. A wired-LOOKING path that discards every
+#      repeat is worse than no path.
+#
+# So the second receiver below is a plain second DESTINATION, named for what
+# it is. Wiring it to `ops_alerts` is its own cycle: close B and C, then stamp
+# `delivery: talos` on the alerts that qualify.
+
+global:
+  # NO credential of any kind in this file — every secret is read from a FILE
+  # at notify time. Nothing secret may enter the repo (plan D5).
+  resolve_timeout: 5m
+
+route:
+  # ── DEFAULT = Talos-INDEPENDENT. This line is the safety property. ──
+  # Do not "tidy" it into a catch-all pointing at the platform.
+  receiver: 'infra-independent'
+
+  # Grouped by alertname + severity, NOT by `instance`: several rules in this
+  # repo deliberately `sum()` away their source labels (see the fan-out note
+  # in observability/rules/alerts.yml), so grouping or matching on `instance`
+  # silently stops matching exactly those alerts.
+  group_by: ['alertname', 'severity']
+  group_wait: 30s
+  group_interval: 5m
+  # 4h rather than the 1h default. On a single-node dev host, re-notifying
+  # every hour about a warning that is understood and unfixed is how an
+  # operator is trained to ignore red — the same defect this arc is about.
+  repeat_interval: 4h
+
+  routes:
+    # 1. critical always takes the channel that does not depend on Talos.
+    - matchers:
+        - severity = "critical"
+      receiver: 'infra-independent'
+      group_wait: 10s
+      repeat_interval: 1h
+
+    # 2. the ONLY way onto the non-default path. Nothing carries this label
+    #    today — see the block above.
+    - matchers:
+        - delivery = "talos"
+      receiver: 'platform-quality'
+
+receivers:
+  # =========================================================================
+  # infra-independent — must survive Talos being broken.
+  # =========================================================================
+  # Reaches the operator without touching the controller, Postgres, NATS,
+  # Redis or the worker fleet: Alertmanager talks straight out.
+  #
+  # CREDENTIAL: `api_url_file` is read at NOTIFY time, not at config-load
+  # time. Verified against v0.28.1: `amtool check-config` returns SUCCESS and
+  # the process starts and loads cleanly with the referenced file ABSENT. So
+  # this ships INERT and activates on a single file drop plus
+  # `make observability-reload` — no repo change, no rebuild, no image.
+  #
+  # ⚠ INERT IS NOT SILENT — BUT IT IS NOT LOUD EITHER, AND THAT MATTERS.
+  #   With no credential file every notification fails and retries;
+  #   `alertmanager_notifications_failed_total` climbs (Alertmanager seeds it
+  #   at 0 for every integration from a cold start, so it is fireable — I
+  #   checked) and `TalosAlertDeliveryFailing` fires. But that alert is
+  #   delivered through these same receivers. If NO credential is configured
+  #   anywhere, its only visible form is a dashboard — which is the state
+  #   this whole change exists to leave. Configuring one working credential
+  #   is what converts this from a dashboard into a delivery system. There is
+  #   no arrangement of config that removes that dependency, and saying
+  #   otherwise would be the defect being fixed.
+  - name: 'infra-independent'
+    slack_configs:
+      - api_url_file: /etc/alertmanager/secrets/infra-webhook-url
+        channel: '#talos-alerts'
+        send_resolved: true
+        title: '[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}'
+        text: >-
+          {{ range .Alerts }}{{ .Annotations.summary }}
+          {{ .Annotations.description }}
+          {{ end }}
+
+    # ── OPTIONS, NOT SHIPPED (see the grep warning at the top). ──
+    # REPLACE the block above; do not add alongside it. Every config inside
+    # ONE receiver is notified, so two blocks means two pages per alert.
+    #
+    # Discord:
+    #   discord_configs:
+    #     - webhook_url_file: /etc/alertmanager/secrets/infra-webhook-url
+    #
+    # Telegram (also needs a numeric chat_id, which is not a secret):
+    #   telegram_configs:
+    #     - bot_token_file: /etc/alertmanager/secrets/infra-webhook-url
+    #       chat_id: 0
+    #
+    # Generic HTTP endpoint:
+    #   webhook_configs:
+    #     - url_file: /etc/alertmanager/secrets/infra-webhook-url
+    #
+    # Email — needs a `global.smtp_*` block AND an SMTP credential. There is
+    # no SMTP listener on this host (ports 25/587 closed, postfix installed
+    # but not loaded) and Talos itself sends mail through the Gmail OAuth
+    # API, not SMTP, so nothing in this repo is reusable. See D1(c).
+    #   email_configs:
+    #     - to: 'you@example.com'
+    #       auth_password_file: /etc/alertmanager/secrets/infra-webhook-url
+
+  # =========================================================================
+  # platform-quality — a SECOND destination, deliberately not named ops_alerts.
+  # =========================================================================
+  # For alerts whose author has asserted that Talos is healthy enough to carry
+  # them. It is a plain HTTP webhook: point it wherever you like.
+  #
+  # It is NOT wired to `ops_alerts` and must not be described as if it were —
+  # blockers B and C above are unclosed. If you later point this at
+  # `POST /webhooks/{id}`, that URL crosses a trust boundary INTO Talos: the
+  # receiving end authenticates by `X-Verification-Token` or HMAC and treats
+  # the body as untrusted (it does — per-IP 60/min, per-trigger and per-user
+  # buckets, and a circuit breaker that trips on 10 auth failures in 300 s
+  # before any DB work). Alertmanager's word is not evidence of anything.
+  #
+  # `url_file`, not `url`: a webhook URL with a token in it is a credential.
+  - name: 'platform-quality'
+    webhook_configs:
+      - url_file: /etc/alertmanager/secrets/platform-quality-url
+        send_resolved: true
+        # Alertmanager's default is 0 = UNLIMITED, which lets one broad group
+        # POST an arbitrarily large body at the receiver.
+        max_alerts: 20
+        # When this is eventually pointed at Talos, uncomment — v0.28+ only:
+        # http_config:
+        #   http_headers:
+        #     X-Verification-Token:
+        #       files: [ /etc/alertmanager/secrets/talos-webhook-token ]
+
+inhibit_rules:
+  # A critical suppresses the warning-level noise for the SAME alertname only.
+  # Suppressing across different alertnames would hide independent faults.
+  - source_matchers: [severity = "critical"]
+    target_matchers: [severity = "warning"]
+    equal: ['alertname']
+
+# ===========================================================================
+# SCOPE — dev-compose only, and deliberately so.
+# ===========================================================================
+# deploy/helm/talos/ templates NO Alertmanager. It ships alert RULES as a
+# PrometheusRule CR (templates/prometheusrule.yaml) and assumes an
+# operator-run Prometheus Operator stack; deploy/observability/alertmanager-route.yaml
+# is a documentation FRAGMENT ("drop this into your existing alertmanager.yaml"),
+# not a rendered template. There is therefore no chart-side mirror to keep in
+# sync and structural checks 2 / 5 / 13 have nothing to bite on here.

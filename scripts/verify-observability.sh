@@ -490,6 +490,178 @@ sys.exit(1 if FAIL else 0)
 PYEOF
 [ $? -ne 0 ] && FAIL=1
 
+# ══════════════════════════════════════════════════════════════════════════
+# LEG D — alert DELIVERY: the transport, and the credential containment.
+#
+# Legs A-C prove Prometheus is evaluating the right rules. They say nothing
+# about whether a firing alert reaches anyone, which until 2026-08-18 it did
+# not: 54 rules evaluated and the `alerting:` block was commented out.
+#
+# This leg checks the four things that are invisible statically:
+#   D1. the transport EXISTS and is ready;
+#   D2. the credential source does NOT resolve inside a checkout;
+#   D3. no config mount is read-write, and secrets are not world-readable;
+#   D4. the UI is bound to loopback ONLY.
+#
+# D4 is the one that matters most and the one a lint cannot do. Alertmanager's
+# /api/v2/silences lets any caller silence every detector in this system, and
+# Alertmanager ships no authentication. A published port bypasses the host
+# firewall, and docker-compose.override.yml is gitignored and scanned by no
+# lint — so the LIVE binding is the only trustworthy answer.
+#
+# STATED LIMITS:
+#   * Secrets are checked for EXISTENCE and PERMISSIONS only. Their contents
+#     are never read, hashed, printed or logged (CLAUDE.md: presence only).
+#     So this cannot tell you a credential is VALID — only
+#     TalosAlertDeliveryFailing can, and only once a send is attempted.
+#   * Containment resolves symlinks and checks BOTH checkout roots (this one
+#     and, via `git rev-parse --git-common-dir`, the main working tree). In
+#     this repo's layout a worktree's own root is NOT an ancestor of the main
+#     clone, so checking one root would accept a key file sitting in the
+#     other — the #641 two-root fix, reused here.
+#   * If the checkout FEEDING the running stack declares no alertmanager
+#     service, this leg reports and skips rather than failing: that is the
+#     worktree case (the stack mounts main), and failing there would be a red
+#     that says nothing about the tree being verified. It prints which
+#     checkout it looked at, exactly as leg B does — a check that redirects
+#     must SAY so.
+# ══════════════════════════════════════════════════════════════════════════
+bold "  D. alert delivery: transport, credential containment, and binding"
+
+AM_CONTAINER="${AM_CONTAINER:-talos-alertmanager}"
+
+# Which checkout feeds the RUNNING stack? Derived from the live Prometheus
+# config mount, never from this script's own location.
+STACK_ROOT=""
+while IFS='|' read -r src dst _rw; do
+    [ -n "${src:-}" ] || continue
+    hostsrc="${src#/host_mnt}"
+    [ -e "$hostsrc" ] || hostsrc="$src"
+    case "$hostsrc" in
+        */observability/prometheus) STACK_ROOT="${hostsrc%/observability/prometheus}" ;;
+    esac
+done <<< "$MOUNTS"
+[ -n "$STACK_ROOT" ] || STACK_ROOT="$ROOT"
+
+if ! grep -qE '^[[:space:]]{2}alertmanager:[[:space:]]*$' "$STACK_ROOT/docker-compose.yml" 2>/dev/null; then
+    yellow "  ⚠ $STACK_ROOT/docker-compose.yml declares no alertmanager service —"
+    yellow "    alert delivery is not configured in the checkout that feeds this stack."
+    if grep -qE '^[[:space:]]{2}alertmanager:[[:space:]]*$' "$ROOT/docker-compose.yml" 2>/dev/null; then
+        yellow "    (THIS checkout ($ROOT) does declare one. The running stack is fed by"
+        yellow "     another tree, so leg D cannot exercise your change — stand up a"
+        yellow "     throwaway stack from this checkout to verify it.)"
+    fi
+elif ! docker inspect "$AM_CONTAINER" >/dev/null 2>&1; then
+    red "  ✗ '$STACK_ROOT/docker-compose.yml' declares an alertmanager service but"
+    red "    container '$AM_CONTAINER' does not exist — every alert is undelivered."
+    yellow "    → docker compose up -d alertmanager"
+    FAIL=1
+elif [ "$(docker inspect -f '{{.State.Running}}' "$AM_CONTAINER")" != "true" ]; then
+    red "  ✗ '$AM_CONTAINER' exists but is not running — every alert is undelivered."
+    FAIL=1
+else
+    D_FAIL=0
+
+    # ── D1. ready ────────────────────────────────────────────────────────
+    if ! curl -fsS --max-time 10 "${AM_URL:-http://127.0.0.1:9093}/-/ready" >/dev/null 2>&1; then
+        red "  ✗ Alertmanager is running but ${AM_URL:-http://127.0.0.1:9093}/-/ready is unreachable"
+        D_FAIL=1
+    fi
+
+    # ── D4. loopback ONLY ────────────────────────────────────────────────
+    # `docker inspect` reports every published binding; an empty or 0.0.0.0
+    # HostIp means "all interfaces", which puts the silence API on the LAN.
+    while IFS= read -r hostip; do
+        [ -n "$hostip" ] || continue
+        case "$hostip" in
+            127.0.0.1|::1) ;;
+            *)  red "  ✗ Alertmanager is published on HostIp '$hostip', not loopback"
+                yellow "    → its /api/v2/silences can disable EVERY detector in this system and"
+                yellow "      it has no authentication of its own. Bind it 127.0.0.1:9093:9093."
+                yellow "      Check docker-compose.override.yml too — it is gitignored and no"
+                yellow "      lint scans it."
+                D_FAIL=1 ;;
+        esac
+    done <<< "$(docker inspect "$AM_CONTAINER" \
+        --format '{{range $p, $c := .NetworkSettings.Ports}}{{range $c}}{{.HostIp}}{{"\n"}}{{end}}{{end}}')"
+
+    # ── D2/D3. mounts: containment, mode, permissions ────────────────────
+    # Containment roots: this checkout AND the main working tree. A worktree
+    # root is not an ancestor of the main clone, so one root is not enough.
+    ROOTS="$(cd "$ROOT" && pwd -P)"
+    [ "$STACK_ROOT" != "$ROOT" ] && ROOTS="$ROOTS
+$(cd "$STACK_ROOT" && pwd -P 2>/dev/null || true)"
+    _common="$(cd "$ROOT" && git rev-parse --git-common-dir 2>/dev/null || true)"
+    if [ -n "$_common" ]; then
+        _main="$( (cd "$ROOT" && cd "$_common/.." && pwd -P) 2>/dev/null || true)"
+        [ -n "$_main" ] && ROOTS="$ROOTS
+$_main"
+    fi
+    # Dedupe: a worktree and the main clone can resolve to the same string,
+    # and reporting one violation twice reads as two problems.
+    ROOTS="$(printf '%s\n' "$ROOTS" | sort -u)"
+
+    while IFS='|' read -r src dst rw; do
+        [ -n "${src:-}" ] || continue
+        hostsrc="${src#/host_mnt}"
+        [ -e "$hostsrc" ] || hostsrc="$src"
+
+        if [ "$rw" = "true" ]; then
+            red "  ✗ Alertmanager mounts '$dst' READ-WRITE; config and secrets must be :ro"
+            D_FAIL=1
+        fi
+
+        case "$dst" in
+            */secrets*)
+                real="$( (cd "$hostsrc" 2>/dev/null && pwd -P) || printf '%s' "$hostsrc")"
+                while IFS= read -r r; do
+                    [ -n "$r" ] || continue
+                    if [ "$real" = "$r" ] || case "$real" in "$r"/*) true ;; *) false ;; esac; then
+                        red "  ✗ the credential mount resolves INSIDE a checkout: $real"
+                        yellow "    → (within $r). A secret must never live where git can commit it,"
+                        yellow "      and symlinks are resolved before this comparison. Move it out"
+                        yellow "      and point TALOS_ALERT_SECRETS_DIR at it."
+                        D_FAIL=1
+                    fi
+                done <<< "$ROOTS"
+                # Presence and permissions only — contents are never read.
+                if [ -d "$real" ]; then
+                    n=0
+                    bad_mode=0
+                    for f in "$real"/*; do
+                        [ -f "$f" ] || continue
+                        n=$((n + 1))
+                        mode="$(stat -f '%Lp' "$f" 2>/dev/null || stat -c '%a' "$f" 2>/dev/null || echo '')"
+                        case "$mode" in
+                            ''|600|400) ;;
+                            *) red "  ✗ credential file mode $mode (name only: $(basename "$f")) — chmod 600"
+                               bad_mode=1
+                               D_FAIL=1 ;;
+                        esac
+                    done
+                    if [ "$n" -eq 0 ]; then
+                        yellow "  ⚠ no credential files in $real — delivery is INERT."
+                        yellow "    Alertmanager reads api_url_file/url_file at NOTIFY time, so it"
+                        yellow "    starts and loads cleanly and then fails every send. Nothing"
+                        yellow "    reaches a human until one is dropped in. Not a failure: this is"
+                        yellow "    the documented shipping state, and it is what"
+                        yellow "    TalosAlertDeliveryFailing exists to make visible."
+                    elif [ "$bad_mode" -eq 0 ]; then
+                        green "  ✓ $n credential file(s) present, mode-checked (contents never read)"
+                    fi
+                fi
+                ;;
+        esac
+    done <<< "$(docker inspect "$AM_CONTAINER" \
+        --format '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}|{{.Destination}}|{{.RW}}{{"\n"}}{{end}}{{end}}')"
+
+    if [ "$D_FAIL" -eq 0 ]; then
+        green "  ✓ transport up, loopback-bound, credentials contained outside every checkout"
+    else
+        FAIL=1
+    fi
+fi
+
 echo
 if [ "$FAIL" -ne 0 ]; then
     red "✗ the running Prometheus and this repo DISAGREE."
