@@ -237,6 +237,51 @@ invisible locally. Run `cargo deny --all-features check advisories` by hand
 when adding a dependency — that is the only pre-CI signal for this class.
 """ },
 
+    { id = "RUSTSEC-2026-0258", reason = """
+h2 accepts and queues empty DATA frames without limit, so a peer that sends a
+flood of them can drive unbounded memory growth, or a panic if the length
+counter overflows. Low severity per the advisory.
+
+WHAT REMAINS IN THE TREE, and what was FIXED rather than suppressed. Two h2
+versions were affected. `h2` 0.4.14 (via aws-smithy-http-client -> aws-config /
+aws-sdk-s3, the off-host backup path) WAS PATCHED in this same change with
+`cargo update -p h2@0.4.14` -> 0.4.16. The bump was applied FIRST and
+deliberately, because a cargo-deny `ignore` is keyed on the ADVISORY ID and
+therefore silences EVERY instance of it in the tree. Suppressing before
+patching would have hidden a fix that was freely available.
+
+So this entry covers exactly ONE remaining path, which has no upstream fix:
+
+  h2 0.3.27 <- hyper 0.14.32 <- reqwest 0.11.27 <- oauth2 4.4.2
+             <- controller, talos-oauth, talos-google-calendar
+
+The 0.3 line is UNPATCHED — the advisory names 0.4.16 as the only fix, and
+`cargo update -p h2@0.3.27` resolves to no newer release. There is no version
+to move to inside the 0.3 series.
+
+REACHABILITY — stated honestly, NOT claimed to be nil. Unlike the other entries
+in this file, this vulnerable code path IS reachable in principle:
+  * `oauth2` uses reqwest 0.11 as an HTTP CLIENT against OAuth token endpoints
+    (Google, Atlassian). Those servers negotiate HTTP/2 via ALPN, so h2 0.3 is
+    genuinely on the wire.
+  * Exploiting it requires the OAUTH PROVIDER ITSELF to be malicious or
+    compromised (TLS rules out an off-path attacker), and the blast radius is
+    memory growth in the controller process.
+  * `talos_http_body::read_json_capped` does NOT mitigate this. The cap applies
+    to the decoded body; the flaw sits BELOW that layer, in frame queuing.
+Net: low severity, low likelihood, non-zero exposure. Writing "unreachable"
+here would be the same overstatement this repo keeps having to correct.
+
+Tracking: `oauth2` 5.x, which moves to reqwest 0.12 / hyper 1.x and drops the
+h2 0.3 chain entirely. That is the REAL fix and it is a major-version migration
+across `talos-oauth`, `talos-google-calendar`, `controller` and every OAuth
+consumer, in security-critical code — it needs its own change, not a drive-by.
+DELETE this entry the moment that lands; if h2 0.3 leaves the tree for any
+other reason, delete it then instead of letting it rot.
+
+Re-review 2026-Q4.
+""" },
+
 ]
 
 # ============================================================================

@@ -536,9 +536,31 @@ controller:
   #      the SINGLE current key, not the staged ring that job results get, so
   #      a worker still signing under the previous key is silent here while
   #      its results still verify.
-  # Only (1) is a transient you can wait out. Check
-  # talos_worker_fleet_live_workers against your actual replica count before
-  # setting this, and again after.
+  # Only (1) is a transient you can wait out.
+  #
+  # BEFORE SETTING THIS, CHECK talos_worker_fleet_live_workers — BUT KNOW
+  # WHICH NUMBER IT SHOULD EQUAL, because that depends on your posture. The
+  # fleet view is a map keyed on worker_id, so the gauge counts heartbeating
+  # IDENTITIES, and:
+  #   * DEFAULT INSTALL (this chart renders no TALOS_WORKER_ID anywhere — the
+  #     line offering it under worker.env is commented out inside the RFC-0010
+  #     block): each pod falls back to HOSTNAME, so every replica has its own
+  #     id and the gauge IS your replica count. Check it against
+  #     worker.replicaCount; a mismatch means some replica is not being
+  #     observed, which is exactly what this flag would then treat as
+  #     departure. This is the pre-flight the flag deserves.
+  #   * SHARED-ID INSTALL (you uncommented TALOS_WORKER_ID below, or set one
+  #     fleet-wide value via worker.extraEnv): every replica writes the same
+  #     entry, so the gauge reads 1 at any fleet size and comparing it to
+  #     replicaCount is meaningless. Compare it to your number of DISTINCT
+  #     worker_ids instead.
+  # An earlier version of this comment told you to check against replicaCount
+  # unconditionally (right for the default, wrong under a shared id); the
+  # version after that told you never to check at all (wrong for the default,
+  # and it talks you out of the only pre-flight this flag has). Read a drop to
+  # 0 as "nothing observed" under either posture.
+  # Under a shared id nothing here can tell you a single replica died; see
+  # talos-worker-fleet's module header.
   #
   # SCOPE: it changes ONE gauge's population. It grants nothing, writes
   # nothing, and cannot affect trust — a heartbeat never touches
