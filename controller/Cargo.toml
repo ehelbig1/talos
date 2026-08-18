@@ -197,8 +197,10 @@ totp-rs = "5.7"
 qrcode = "0.14"
 image = "0.25"
 
-# OAuth/OIDC – implemented with `oauth2` crate only (no `openidconnect`).
-oauth2 = { version = "4.4.2", default-features = false, features = ["reqwest"] }
+# HTTP client. The `oauth2` crate declaration that used to sit here was
+# removed 2026-08: it had ZERO references in `controller/src`, and it was the
+# sole reason reqwest 0.11 -> hyper 0.14 -> h2 0.3 (RUSTSEC-2026-0258) was in
+# the tree. OAuth lives in `talos-oauth`; see its Cargo.toml.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 
 # OCI registry client — used by registry::sync to pull template manifests from

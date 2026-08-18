@@ -16,7 +16,7 @@ dashmap = "6.1"
 futures = "0.3"
 hex = "0.4"
 redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
-oauth2 = { version = "4.4.2", default-features = false, features = ["reqwest"] }
+oauth2 = { version = "5.0.0", default-features = false, features = ["reqwest", "rustls-tls"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -31,6 +31,15 @@ talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+# Needed only by the oauth2-5.x migration guard tests (#647): a throwaway
+# loopback listener that answers 302, to prove `oauth_http_client()` does NOT
+# follow redirects. oauth2 4.x's built-in `async_http_client` set
+# `redirect(Policy::none())` itself; 5.x sets nothing and takes the caller's
+# client, so that property now lives in OUR code and needs its own test.
+base64 = "0.22"
+tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "time"] }
 
 [lints]
 workspace = true

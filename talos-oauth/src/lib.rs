@@ -236,7 +236,13 @@ pub(crate) async fn revoke_at_provider(provider: &str, token: &str) -> Result<bo
 // performed with constant‑time primitives from the `ring` crate via the custom
 // `OAuthService` implementation.
 use chrono::{DateTime, Utc};
-use oauth2::reqwest::async_http_client;
+// oauth2 5.x removed `oauth2::reqwest::async_http_client` — the caller now
+// supplies the HTTP client to `request_async`. 4.x's built-in client set
+// `redirect(Policy::none())` itself; 5.x sets NOTHING, so passing a default
+// `reqwest::Client` would SILENTLY DROP that protection. We pass
+// `oauth_http_client()`, which is `talos_http_utils::trusted_client` and sets
+// redirect-none (plus a connect timeout 4.x never had). Redirect posture is
+// therefore preserved, not improved — see `token_exchange_client_refuses_redirects`.
 use oauth2::{
     basic::BasicClient, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken,
     PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenResponse, TokenUrl,
@@ -849,23 +855,22 @@ impl OAuthService {
         &self,
         extra_scopes: Option<Vec<String>>,
     ) -> Result<(String, String, PkceCodeVerifier)> {
-        // `client` is not used after creation; rename to `_client` to avoid dead_code warning.
-        let _client = BasicClient::new(
-            ClientId::new(
-                self.google_client_id
-                    .clone()
-                    .ok_or_else(|| anyhow!("Google client ID not configured"))?,
-            ),
-            Some(ClientSecret::new(
-                self.google_client_secret
-                    .clone()
-                    .ok_or_else(|| anyhow!("Google client secret not configured"))?,
-            )),
-            AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".to_string())?,
-            Some(TokenUrl::new(
-                "https://oauth2.googleapis.com/token".to_string(),
-            )?),
-        )
+        let client = BasicClient::new(ClientId::new(
+            self.google_client_id
+                .clone()
+                .ok_or_else(|| anyhow!("Google client ID not configured"))?,
+        ))
+        .set_client_secret(ClientSecret::new(
+            self.google_client_secret
+                .clone()
+                .ok_or_else(|| anyhow!("Google client secret not configured"))?,
+        ))
+        .set_auth_uri(AuthUrl::new(
+            "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
+        )?)
+        .set_token_uri(TokenUrl::new(
+            "https://oauth2.googleapis.com/token".to_string(),
+        )?)
         // The redirect URI must match the one used in the auth request.
         .set_redirect_uri(RedirectUrl::new(
             self.google_redirect_uri
@@ -876,7 +881,7 @@ impl OAuthService {
         // PKCE: generate S256 challenge to prevent authorization code interception.
         let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
-        let mut req = _client
+        let mut req = client
             .authorize_url(CsrfToken::new_random)
             .add_scope(Scope::new("openid".to_string()))
             .add_scope(Scope::new("email".to_string()))
@@ -909,20 +914,18 @@ impl OAuthService {
         let auth_endpoint = format!("https://{domain}/oauth2/v1/authorize");
         let token_endpoint = format!("https://{domain}/oauth2/v1/token");
 
-        let _client = BasicClient::new(
-            ClientId::new(
-                self.okta_client_id
-                    .clone()
-                    .ok_or_else(|| anyhow!("Okta client ID not configured"))?,
-            ),
-            Some(ClientSecret::new(
-                self.okta_client_secret
-                    .clone()
-                    .ok_or_else(|| anyhow!("Okta client secret not configured"))?,
-            )),
-            AuthUrl::new(auth_endpoint)?,
-            Some(TokenUrl::new(token_endpoint)?),
-        )
+        let client = BasicClient::new(ClientId::new(
+            self.okta_client_id
+                .clone()
+                .ok_or_else(|| anyhow!("Okta client ID not configured"))?,
+        ))
+        .set_client_secret(ClientSecret::new(
+            self.okta_client_secret
+                .clone()
+                .ok_or_else(|| anyhow!("Okta client secret not configured"))?,
+        ))
+        .set_auth_uri(AuthUrl::new(auth_endpoint)?)
+        .set_token_uri(TokenUrl::new(token_endpoint)?)
         .set_redirect_uri(RedirectUrl::new(
             self.okta_redirect_uri
                 .clone()
@@ -932,7 +935,7 @@ impl OAuthService {
         // PKCE: generate S256 challenge to prevent authorization code interception.
         let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
-        let (auth_url, csrf_token) = _client
+        let (auth_url, csrf_token) = client
             .authorize_url(CsrfToken::new_random)
             .add_scope(Scope::new("openid".to_string()))
             .add_scope(Scope::new("email".to_string()))
@@ -949,22 +952,22 @@ impl OAuthService {
 
     /// Snyk OAuth authorization URL
     async fn get_snyk_auth_url(&self) -> Result<(String, String, PkceCodeVerifier)> {
-        let _client = BasicClient::new(
-            ClientId::new(
-                self.snyk_client_id
-                    .clone()
-                    .ok_or_else(|| anyhow!("Snyk client ID not configured"))?,
-            ),
-            Some(ClientSecret::new(
-                self.snyk_client_secret
-                    .clone()
-                    .ok_or_else(|| anyhow!("Snyk client secret not configured"))?,
-            )),
-            AuthUrl::new("https://app.snyk.io/oauth2/authorize".to_string())?,
-            Some(TokenUrl::new(
-                "https://api.snyk.io/oauth2/token".to_string(),
-            )?),
-        )
+        let client = BasicClient::new(ClientId::new(
+            self.snyk_client_id
+                .clone()
+                .ok_or_else(|| anyhow!("Snyk client ID not configured"))?,
+        ))
+        .set_client_secret(ClientSecret::new(
+            self.snyk_client_secret
+                .clone()
+                .ok_or_else(|| anyhow!("Snyk client secret not configured"))?,
+        ))
+        .set_auth_uri(AuthUrl::new(
+            "https://app.snyk.io/oauth2/authorize".to_string(),
+        )?)
+        .set_token_uri(TokenUrl::new(
+            "https://api.snyk.io/oauth2/token".to_string(),
+        )?)
         .set_redirect_uri(RedirectUrl::new(
             self.snyk_redirect_uri
                 .clone()
@@ -974,7 +977,7 @@ impl OAuthService {
         // PKCE: generate S256 challenge to prevent authorization code interception.
         let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
-        let (auth_url, csrf_token) = _client
+        let (auth_url, csrf_token) = client
             .authorize_url(CsrfToken::new_random)
             // Snyk scopes: offline.access for refresh tokens, plus API access scopes
             .add_scope(Scope::new("offline.access".to_string()))
@@ -1031,23 +1034,28 @@ impl OAuthService {
         code: String,
         pkce_verifier: Option<String>,
     ) -> Result<OAuthUserInfo> {
-        // Construct OAuth client; not used directly in this flow.
-        let _client = BasicClient::new(
-            ClientId::new(
-                self.google_client_id
-                    .clone()
-                    .ok_or_else(|| anyhow!("Google client ID not configured"))?,
-            ),
-            Some(ClientSecret::new(
-                self.google_client_secret
-                    .clone()
-                    .ok_or_else(|| anyhow!("Google client secret not configured"))?,
-            )),
-            AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".to_string())?,
-            Some(TokenUrl::new(
-                "https://oauth2.googleapis.com/token".to_string(),
-            )?),
-        )
+        // Constructed but deliberately NOT used to issue the request: Google wants
+        // client credentials in the request BODY, not HTTP Basic auth, so the
+        // exchange below is a hand-rolled form POST. Kept (rather than deleted as
+        // dead code) because these constructors are also the only place the
+        // configured `google_redirect_uri` is validated as a parseable URL —
+        // removing them would silently drop that check.
+        let _client = BasicClient::new(ClientId::new(
+            self.google_client_id
+                .clone()
+                .ok_or_else(|| anyhow!("Google client ID not configured"))?,
+        ))
+        .set_client_secret(ClientSecret::new(
+            self.google_client_secret
+                .clone()
+                .ok_or_else(|| anyhow!("Google client secret not configured"))?,
+        ))
+        .set_auth_uri(AuthUrl::new(
+            "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
+        )?)
+        .set_token_uri(TokenUrl::new(
+            "https://oauth2.googleapis.com/token".to_string(),
+        )?)
         .set_redirect_uri(RedirectUrl::new(
             self.google_redirect_uri
                 .clone()
@@ -1162,20 +1170,18 @@ impl OAuthService {
         let auth_endpoint = format!("https://{domain}/oauth2/v1/authorize");
         let token_endpoint = format!("https://{domain}/oauth2/v1/token");
 
-        let client = BasicClient::new(
-            ClientId::new(
-                self.okta_client_id
-                    .clone()
-                    .ok_or_else(|| anyhow!("Okta client ID not configured"))?,
-            ),
-            Some(ClientSecret::new(
-                self.okta_client_secret
-                    .clone()
-                    .ok_or_else(|| anyhow!("Okta client secret not configured"))?,
-            )),
-            AuthUrl::new(auth_endpoint)?,
-            Some(TokenUrl::new(token_endpoint)?),
-        )
+        let client = BasicClient::new(ClientId::new(
+            self.okta_client_id
+                .clone()
+                .ok_or_else(|| anyhow!("Okta client ID not configured"))?,
+        ))
+        .set_client_secret(ClientSecret::new(
+            self.okta_client_secret
+                .clone()
+                .ok_or_else(|| anyhow!("Okta client secret not configured"))?,
+        ))
+        .set_auth_uri(AuthUrl::new(auth_endpoint)?)
+        .set_token_uri(TokenUrl::new(token_endpoint)?)
         .set_redirect_uri(RedirectUrl::new(
             self.okta_redirect_uri
                 .clone()
@@ -1187,8 +1193,9 @@ impl OAuthService {
         if let Some(verifier) = pkce_verifier {
             exchange = exchange.set_pkce_verifier(PkceCodeVerifier::new(verifier));
         }
+        let http = oauth_http_client();
         let token_response = exchange
-            .request_async(async_http_client)
+            .request_async(&http)
             .await
             .context("Failed to exchange authorization code for token")?;
 
@@ -1229,22 +1236,22 @@ impl OAuthService {
         code: String,
         pkce_verifier: Option<String>,
     ) -> Result<OAuthUserInfo> {
-        let client = BasicClient::new(
-            ClientId::new(
-                self.snyk_client_id
-                    .clone()
-                    .ok_or_else(|| anyhow!("Snyk client ID not configured"))?,
-            ),
-            Some(ClientSecret::new(
-                self.snyk_client_secret
-                    .clone()
-                    .ok_or_else(|| anyhow!("Snyk client secret not configured"))?,
-            )),
-            AuthUrl::new("https://app.snyk.io/oauth2/authorize".to_string())?,
-            Some(TokenUrl::new(
-                "https://api.snyk.io/oauth2/token".to_string(),
-            )?),
-        )
+        let client = BasicClient::new(ClientId::new(
+            self.snyk_client_id
+                .clone()
+                .ok_or_else(|| anyhow!("Snyk client ID not configured"))?,
+        ))
+        .set_client_secret(ClientSecret::new(
+            self.snyk_client_secret
+                .clone()
+                .ok_or_else(|| anyhow!("Snyk client secret not configured"))?,
+        ))
+        .set_auth_uri(AuthUrl::new(
+            "https://app.snyk.io/oauth2/authorize".to_string(),
+        )?)
+        .set_token_uri(TokenUrl::new(
+            "https://api.snyk.io/oauth2/token".to_string(),
+        )?)
         .set_redirect_uri(RedirectUrl::new(
             self.snyk_redirect_uri
                 .clone()
@@ -1256,8 +1263,9 @@ impl OAuthService {
         if let Some(verifier) = pkce_verifier {
             exchange = exchange.set_pkce_verifier(PkceCodeVerifier::new(verifier));
         }
+        let http = oauth_http_client();
         let token_response = exchange
-            .request_async(async_http_client)
+            .request_async(&http)
             .await
             .context("Failed to exchange authorization code for Snyk token")?;
 
@@ -2004,5 +2012,315 @@ mod oauth_expires_at_tests {
         let exp = oauth_expires_at(Some(0));
         let delta = exp - now;
         assert!(delta.num_seconds() >= 55);
+    }
+}
+
+/// Migration guards for the `oauth2` 4.4.2 → 5.0.0 bump (#647).
+///
+/// Before this module, NOTHING in `talos-oauth` exercised the authorize-URL
+/// builders or the token-exchange client — the 41 existing tests cover the
+/// state-token format gate, the session-binding cookie compare, Okta domain
+/// validation, `expires_in` clamping and `Debug` redaction, none of which touch
+/// `BasicClient`. A type-only migration of security-critical code with zero
+/// coverage of that code is exactly the shape this repo keeps having to
+/// correct, so the properties the 5.x rewrite could have silently dropped are
+/// pinned here instead of asserted in a commit message.
+///
+/// These call the REAL production builders (`get_*_auth_url`) on a real
+/// `OAuthService`; they do not re-implement the construction. The service is
+/// built by struct literal rather than `OAuthService::new` so the tests neither
+/// touch Postgres nor mutate process-global env (which would race the other
+/// tests in this binary).
+///
+/// NOT covered here, stated rather than implied: `flow.rs::begin_oauth_authorization`
+/// (its INSERT needs a live Postgres) and the Okta/Snyk `exchange_code` round
+/// trip (needs a provider). See the findings note.
+#[cfg(test)]
+mod oauth2_v5_migration_guards {
+    use super::*;
+    use base64::Engine as _;
+    use oauth2::url::Url;
+    use sha2::{Digest, Sha256};
+
+    /// A lazy pool that is never connected — every builder under test returns
+    /// before touching the DB, and `connect_lazy` does no I/O at construction.
+    fn service() -> OAuthService {
+        OAuthService {
+            db_pool: sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+                .expect("lazy pool"),
+            google_client_id: Some("google-client-id".to_string()),
+            google_client_secret: Some("google-SECRET-must-not-leak".to_string()),
+            google_redirect_uri: Some("https://talos.example/auth/google/callback".to_string()),
+            okta_domain: Some("acme.okta.com".to_string()),
+            okta_client_id: Some("okta-client-id".to_string()),
+            okta_client_secret: Some("okta-SECRET-must-not-leak".to_string()),
+            okta_redirect_uri: Some("https://talos.example/auth/okta/callback".to_string()),
+            snyk_client_id: Some("snyk-client-id".to_string()),
+            snyk_client_secret: Some("snyk-SECRET-must-not-leak".to_string()),
+            snyk_redirect_uri: Some("https://talos.example/auth/snyk/callback".to_string()),
+            redis_client: None,
+        }
+    }
+
+    fn params(url: &str) -> std::collections::HashMap<String, String> {
+        Url::parse(url)
+            .expect("authorize URL parses")
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect()
+    }
+
+    /// RFC 7636 §4.2: `code_challenge = BASE64URL-ENCODE(SHA256(ASCII(verifier)))`.
+    /// Recomputing it here is what makes this a PKCE *binding* assertion rather
+    /// than a "some opaque string is present" assertion — a 5.x builder that
+    /// emitted a challenge unrelated to the verifier it handed back would pass
+    /// the latter and fail this.
+    fn assert_pkce_binding(p: &std::collections::HashMap<String, String>, verifier: &str) {
+        assert_eq!(
+            p.get("code_challenge_method").map(String::as_str),
+            Some("S256"),
+            "PKCE must be S256; `plain` is a downgrade"
+        );
+        let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(Sha256::digest(verifier.as_bytes()));
+        assert_eq!(
+            p.get("code_challenge").map(String::as_str),
+            Some(expected.as_str()),
+            "code_challenge must be S256(verifier) — the returned verifier is what \
+             the callback later sends, so an unbound challenge silently disables PKCE"
+        );
+        assert!(
+            verifier.len() >= 43,
+            "RFC 7636 requires a 43..128 char verifier, got {}",
+            verifier.len()
+        );
+    }
+
+    fn assert_state_is_usable_and_bound(
+        p: &std::collections::HashMap<String, String>,
+        state: &str,
+    ) {
+        assert_eq!(
+            p.get("state").map(String::as_str),
+            Some(state),
+            "the `state` in the URL must be the value the caller persists, or CSRF \
+             validation compares two different things"
+        );
+        // The returned state is stored in `oauth_state_tokens` and re-validated on
+        // callback by `validate_oauth_state_token_format`. A generator whose output
+        // that validator rejects would make every callback fail closed.
+        validate_oauth_state_token_format(state)
+            .expect("CsrfToken::new_random output must satisfy the callback format gate");
+        assert!(
+            state.len() >= 16,
+            "state too short to be unguessable: {}",
+            state.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn google_authorize_url_binds_pkce_state_and_redirect_uri() {
+        let svc = service();
+        let (url, state, verifier) = svc
+            .get_google_auth_url(Some(vec![
+                "https://www.googleapis.com/auth/calendar".to_string()
+            ]))
+            .await
+            .expect("google authorize URL builds");
+
+        assert!(
+            url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"),
+            "unexpected endpoint: {url}"
+        );
+        let p = params(&url);
+        assert_pkce_binding(&p, verifier.secret());
+        assert_state_is_usable_and_bound(&p, &state);
+        assert_eq!(p.get("response_type").map(String::as_str), Some("code"));
+        assert_eq!(
+            p.get("client_id").map(String::as_str),
+            Some("google-client-id")
+        );
+        assert_eq!(
+            p.get("redirect_uri").map(String::as_str),
+            Some("https://talos.example/auth/google/callback"),
+            "redirect_uri must be echoed exactly — the provider binds the code to it"
+        );
+
+        let scopes: Vec<&str> = p
+            .get("scope")
+            .map(|s| s.split(' ').collect())
+            .unwrap_or_default();
+        for want in [
+            "openid",
+            "email",
+            "profile",
+            "https://www.googleapis.com/auth/calendar",
+        ] {
+            assert!(scopes.contains(&want), "missing scope {want} in {scopes:?}");
+        }
+        // Extra scopes imply an integration grant, which needs a refresh token.
+        assert_eq!(p.get("access_type").map(String::as_str), Some("offline"));
+        assert_eq!(p.get("prompt").map(String::as_str), Some("consent"));
+
+        assert!(
+            !url.contains("google-SECRET-must-not-leak"),
+            "client_secret must never appear in a front-channel redirect URL"
+        );
+    }
+
+    #[tokio::test]
+    async fn google_authorize_url_omits_offline_grant_when_no_extra_scopes() {
+        let svc = service();
+        let (url, _, _) = svc.get_google_auth_url(None).await.expect("builds");
+        let p = params(&url);
+        assert!(
+            !p.contains_key("access_type") && !p.contains_key("prompt"),
+            "plain login must not silently request an offline refresh token: {url}"
+        );
+    }
+
+    #[tokio::test]
+    async fn okta_authorize_url_binds_pkce_state_and_redirect_uri() {
+        let svc = service();
+        let (url, state, verifier) = svc.get_okta_auth_url().await.expect("builds");
+
+        assert!(
+            url.starts_with("https://acme.okta.com/oauth2/v1/authorize?"),
+            "unexpected endpoint: {url}"
+        );
+        let p = params(&url);
+        assert_pkce_binding(&p, verifier.secret());
+        assert_state_is_usable_and_bound(&p, &state);
+        assert_eq!(
+            p.get("client_id").map(String::as_str),
+            Some("okta-client-id")
+        );
+        assert_eq!(
+            p.get("redirect_uri").map(String::as_str),
+            Some("https://talos.example/auth/okta/callback")
+        );
+        assert!(!url.contains("okta-SECRET-must-not-leak"));
+    }
+
+    #[tokio::test]
+    async fn snyk_authorize_url_binds_pkce_state_and_redirect_uri() {
+        let svc = service();
+        let (url, state, verifier) = svc.get_snyk_auth_url().await.expect("builds");
+
+        assert!(
+            url.starts_with("https://app.snyk.io/oauth2/authorize?"),
+            "unexpected endpoint: {url}"
+        );
+        let p = params(&url);
+        assert_pkce_binding(&p, verifier.secret());
+        assert_state_is_usable_and_bound(&p, &state);
+        assert_eq!(
+            p.get("client_id").map(String::as_str),
+            Some("snyk-client-id")
+        );
+        let scopes: Vec<&str> = p
+            .get("scope")
+            .map(|s| s.split(' ').collect())
+            .unwrap_or_default();
+        for want in [
+            "offline.access",
+            "org.read",
+            "org.project.read",
+            "org.report.read",
+        ] {
+            assert!(scopes.contains(&want), "missing scope {want} in {scopes:?}");
+        }
+        assert!(!url.contains("snyk-SECRET-must-not-leak"));
+    }
+
+    #[tokio::test]
+    async fn missing_config_still_fails_closed_rather_than_building_a_blank_url() {
+        // The 5.x type-state builder moved client_id into `new()` and the
+        // endpoints into setters; the `ok_or_else` guards had to be re-threaded
+        // through that. A builder that dropped one would emit an authorize URL
+        // with an empty client_id instead of erroring.
+        let mut svc = service();
+        svc.google_client_secret = None;
+        assert!(svc.get_google_auth_url(None).await.is_err());
+
+        let mut svc = service();
+        svc.google_redirect_uri = None;
+        assert!(svc.get_google_auth_url(None).await.is_err());
+
+        let mut svc = service();
+        svc.okta_client_id = None;
+        assert!(svc.get_okta_auth_url().await.is_err());
+
+        let mut svc = service();
+        svc.snyk_redirect_uri = None;
+        assert!(svc.get_snyk_auth_url().await.is_err());
+    }
+
+    /// **The property most at risk in this migration.**
+    ///
+    /// oauth2 4.x's `oauth2::reqwest::async_http_client` built its own client and
+    /// set `redirect(Policy::none())` internally, with a comment saying why.
+    /// 5.x deleted that function and takes the caller's client, setting no
+    /// redirect policy of its own — so a migration that passed
+    /// `reqwest::Client::new()` would follow redirects on the token endpoint
+    /// while looking correct. The token request carries `client_secret` (and the
+    /// authorization `code`), so a 3xx from a compromised or misconfigured
+    /// provider would hand them to the redirect target.
+    ///
+    /// This asserts the behaviour, not the config: reqwest exposes no getter for
+    /// the redirect policy, so we make a real request to a loopback server that
+    /// answers 302 and require the 302 to come back unfollowed.
+    #[tokio::test]
+    async fn token_exchange_client_refuses_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+
+        // Answers every request: 302 on the first, 200 on any follow-up. The
+        // listener stays alive for the whole test and the request count is
+        // reported back, so a redirect-FOLLOWING client fails with a legible
+        // "2 requests / got 200" rather than a connection error that could be
+        // mistaken for a flaky fixture.
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_hits = hits.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let n = server_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let body: &[u8] = if n == 0 {
+                    b"HTTP/1.1 302 Found\r\nLocation: /followed\r\nContent-Length: 0\r\n\r\n"
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+                };
+                let _ = sock.write_all(body).await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        let resp = oauth_http_client()
+            .get(format!("http://{addr}/token"))
+            .send()
+            .await
+            .expect("request completes");
+        let status = resp.status().as_u16();
+        let requests = hits.load(std::sync::atomic::Ordering::SeqCst);
+        server.abort();
+
+        assert_eq!(
+            (status, requests),
+            (302, 1),
+            "oauth_http_client MUST surface the 3xx rather than follow it (expected one \
+             request answered 302). oauth2 4.x set redirect-none inside its own built-in \
+             client; 5.x sets nothing and uses ours, so this is now OUR invariant — and a \
+             followed redirect would carry the token request to the redirect target."
+        );
     }
 }
