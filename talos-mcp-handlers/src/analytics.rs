@@ -5443,8 +5443,19 @@ async fn handle_get_fuel_usage_report(
 
     let mut modules: Vec<serde_json::Value> = Vec::with_capacity(stats.len());
     for s in &stats {
-        let ceiling = s.current_max_fuel.max(1);
-        let utilization_pct = (s.fuel_p95 as f64 / ceiling as f64) * 100.0;
+        // THE DENOMINATOR IS THE ENFORCED CEILING, NOT THE MODULE ROW.
+        //
+        // This used to be `fuel_p95 / modules.max_fuel`, which is not the
+        // limit a run is killed at whenever a node carries a `max_fuel`
+        // override — so it reported utilisation ABOVE 100% for runs that
+        // completed, and `at_risk` is a verdict about exhaustion, i.e. a claim
+        // about the ENFORCED limit. Measured on the live database 2026-08-18:
+        // 11 of 12 `at_risk` verdicts were false (cos_groundedness 566.5%,
+        // LLM Inference 425.5%), and `Gmail: Get Message` understated its
+        // utilisation 4× in the direction that HIDES risk. See
+        // `ModuleFuelStats` for the full derivation and why this is a p95 of
+        // per-row ratios rather than a ratio of aggregates.
+        let utilization_pct = s.utilisation_p95 * 100.0;
         let recommended = recommend_budget_from_p95(s.fuel_p95);
 
         // Classification thresholds:
@@ -5470,6 +5481,17 @@ async fn handle_get_fuel_usage_report(
             "kind": s.kind,
             "executions": s.executions,
             "current_max_fuel": s.current_max_fuel,
+            // Disambiguation rather than a rename: `current_max_fuel` keeps its
+            // meaning for back-compat, and the two numbers that were silently
+            // collapsed into it are now both named. `module_row_max_fuel` is
+            // what `hot_update_module(fuel_budget=…)` writes; the enforced
+            // range is what runs are actually measured against. A spread here
+            // means the module row governs only some of this module's nodes,
+            // so bumping it will not move the ones that override it.
+            "module_row_max_fuel": s.current_max_fuel,
+            "enforced_ceiling_min": s.enforced_ceiling_min,
+            "enforced_ceiling_max": s.enforced_ceiling_max,
+            "executions_with_enforced_ceiling": s.rows_with_enforced_ceiling,
             "fuel_p50": s.fuel_p50,
             "fuel_p95": s.fuel_p95,
             "fuel_max": s.fuel_max,
@@ -5572,7 +5594,18 @@ async fn handle_get_fuel_usage_report(
              `min_executions` above, and deliberately UNFLOORED on sample count — a node \
              with one or two runs is exactly the case the per-module section cannot see. \
              Backs the TalosFuelHeadroomLow alert.",
-        "note": "Apply recommendations via hot_update_module(name, fuel_budget=recommended_max_fuel) — bumps modules.max_fuel without recompiling source.",
+        "utilization_basis": "utilization_p95_pct is the p95 of the PER-EXECUTION ratio \
+             fuel_consumed / the ceiling that execution actually ran under \
+             (execution_cost_rollup.max_fuel — the worker's own __fuel_limit__ stamp — \
+             falling back to modules.max_fuel for rows written before that column \
+             existed). It is NOT fuel_p95 / module_row_max_fuel: a node-level max_fuel \
+             override means the module row is not the limit anything is killed at, and \
+             dividing by it produced impossible >100% figures. Because each execution \
+             consumed at most the ceiling enforced for it, this value cannot exceed \
+             100% for completed runs. The high_utilisation_nodes section below uses the \
+             same ENFORCED basis, per (workflow, node) and peak-not-percentile — so the \
+             two sections now agree on what the denominator means.",
+        "note": "Apply recommendations via hot_update_module(name, fuel_budget=recommended_max_fuel) — bumps modules.max_fuel without recompiling source. If enforced_ceiling_min/max differ from module_row_max_fuel, some nodes override the module budget and bumping the row will not change what they enforce.",
     });
 
     mcp_text(
