@@ -5772,6 +5772,96 @@ else
 fi
 echo
 
+# ── 69. Unconfigured tracing must mean DISABLED ───────────────────────
+# `talos_trace::init_tracing(name, None)` is documented to build no exporter
+# ("No endpoint configured, tracing disabled"). Both binaries made that path
+# UNREACHABLE by substituting a default for the unset case:
+#
+#     std::env::var("JAEGER_ENDPOINT").ok().or_else(|| Some("http://localhost:4317"))
+#
+# Nothing sets JAEGER_ENDPOINT — not docker-compose, not the Helm chart — so
+# every controller and worker built a batch span processor aimed at its own
+# container's localhost, failed every export, and logged an
+# ERROR `BatchSpanProcessor.ExportError` per flush while the Jaeger it could
+# have reached sat empty for 36 h. An ERROR that fires forever on a healthy
+# fleet trains operators to ignore ERROR, which is the harm.
+#
+# Two legs, because either alone is trivially evaded:
+#  (a) a file that CALLS init_tracing must resolve its endpoint through the
+#      shared chokepoint `endpoint_from_env` — this is the "chokepoint that
+#      misses a site" guard: the defect existed identically in TWO binaries
+#      and fixing one would have made it protocol-dependent;
+#  (b) the three endpoint env vars may only be READ inside talos-trace, so a
+#      new site cannot re-derive the endpoint (and re-add a default) in a file
+#      that never mentions init_tracing.
+#
+# STATED LIMITS, each demonstrated rather than asserted:
+#  * Both legs are TEXTUAL. A caller that receives an already-resolved
+#    `Option<String>` from a third crate satisfies (a) without (b) ever seeing
+#    an env read — invisible to both. So is an endpoint sourced from a config
+#    struct or a CLI flag rather than the environment.
+#  * (a) fires on the FILE, not the call. An opt-out therefore blinds the file
+#    to a FUTURE init_tracing added to it. One opt-out exists today
+#    (worker/src/bin/observability_test.rs, a developer-run demo where
+#    localhost genuinely IS the Jaeger).
+#  * (b) matches the literal variable names; a name assembled at runtime
+#    (`env::var(format!("JAEGER_{}", x))`) evades it.
+#  * Neither leg can prove the RESOLVED VALUE is right — only that resolution
+#    went through the one function whose "unset ⇒ None" behaviour is unit
+#    tested (`nothing_configured_resolves_to_none_not_a_default`).
+bold "▶ check 69: unconfigured tracing must mean disabled (no localhost default)"
+TRACE_FAIL=0
+TRACE_HOME="talos-trace/src/lib.rs"
+
+# (a) init_tracing callers must go through the chokepoint.
+while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    [ "$file" = "$TRACE_HOME" ] && continue
+    case "$file" in */tests/*|*_tests.rs|*/test_support.rs) continue ;; esac
+    grep -q 'allow-hardcoded-trace-endpoint' "$ROOT/$file" && continue
+    grep -q 'endpoint_from_env' "$ROOT/$file" && continue
+    red "✗ $file calls init_tracing() without resolving via endpoint_from_env()"
+    yellow "  → use talos_trace::endpoint_from_env(); an unset variable must yield None,"
+    yellow "    which is what makes init_tracing build no exporter. Substituting a"
+    yellow "    default (e.g. http://localhost:4317) points the exporter at the process"
+    yellow "    itself and logs BatchSpanProcessor.ExportError on every flush, forever."
+    yellow "  → a demo/manual binary may mark itself \`// allow-hardcoded-trace-endpoint: <reason>\`."
+    TRACE_FAIL=1
+done < <(cd "$ROOT" && grep -rlE '\binit_tracing\s*\(' --include='*.rs' --exclude-dir=target . 2>/dev/null \
+         | sed 's|^\./||' | grep -v '^target/' || true)
+
+# (b) endpoint env vars are read in exactly one place.
+while IFS= read -r hit; do
+    [ -z "$hit" ] && continue
+    file="${hit%%:*}"
+    [ "$file" = "$TRACE_HOME" ] && continue
+    case "$file" in */tests/*|*_tests.rs|*/test_support.rs) continue ;; esac
+    case "$hit" in *allow-hardcoded-trace-endpoint*) continue ;; esac
+    red "✗ trace-endpoint env var read outside $TRACE_HOME: $hit"
+    yellow "  → resolution lives in talos_trace::endpoint_from_env (JAEGER_ENDPOINT >"
+    yellow "    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT > OTEL_EXPORTER_OTLP_ENDPOINT, first"
+    yellow "    non-empty wins, else None). A second reader is a second chance to"
+    yellow "    re-introduce the default that made 'disabled' unreachable."
+    TRACE_FAIL=1
+done < <(cd "$ROOT" && grep -rnE 'env::var\s*\(\s*"(JAEGER_ENDPOINT|OTEL_EXPORTER_OTLP_TRACES_ENDPOINT|OTEL_EXPORTER_OTLP_ENDPOINT)"' \
+         --include='*.rs' --exclude-dir=target . 2>/dev/null \
+         | sed 's|^\./||' | grep -v '^target/' \
+         | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
+# ^ comment lines are dropped: the fix's own comments QUOTE the removed
+#   expression verbatim so the next reader knows what not to write, and the
+#   first run of this check flagged exactly those two comments. A commented
+#   env read cannot resolve an endpoint, so this is a correctness fix, not a
+#   weakening — but it does mean a read hidden inside a `/* */` block or on a
+#   line-continuation after a comment is invisible (safe direction: it also
+#   cannot execute).
+
+if [ "$TRACE_FAIL" -eq 1 ]; then
+    EXIT_CODE=1
+else
+    green "✓ trace endpoint resolves through talos_trace::endpoint_from_env"
+fi
+echo
+
 # ── 54. Lint self-consistency (meta-check) ────────────────────────────
 # The system whose purpose is catching drift drifted from its own docs:
 # by 2026-07-01 the script had 49 checks while CLAUDE.md said 43 and the

@@ -810,18 +810,36 @@ async fn main() -> anyhow::Result<()> {
 /// Install the fmt/OTLP tracing subscriber. Extracted verbatim from the top
 /// of the pre-decomposition `main()`.
 fn init_tracing_and_logging() {
-    // Initialise logger
-    let jaeger_endpoint = std::env::var("JAEGER_ENDPOINT")
-        .ok()
-        .or_else(|| Some("http://localhost:4317".to_string()));
+    // Initialise logger.
+    //
+    // UNCONFIGURED MUST MEAN DISABLED. This used to be
+    // `env::var("JAEGER_ENDPOINT").ok().or_else(|| Some("http://localhost:4317"))`
+    // — the `or_else` substituted a default for the unset case, making
+    // `init_tracing`'s documented `None` ⇒ disabled path unreachable. Since
+    // nothing (not the dev stack, not the Helm chart) sets the variable, both
+    // this binary and the worker built a batch span processor aimed at
+    // themselves, failed every export, and logged an ERROR per flush.
+    // `endpoint_from_env` is the single chokepoint both binaries share —
+    // resolve here, never re-derive. See `talos_trace::endpoint_from_env`.
+    let trace_endpoint = crate::trace::endpoint_from_env();
 
-    if let Some(endpoint) = jaeger_endpoint.as_ref() {
-        match crate::trace::init_tracing("talos-controller", Some(endpoint)) {
-            Ok(_) => println!("      Tracing initialized (endpoint: {})", endpoint),
-            Err(e) => {
-                eprintln!("Warning: Failed to initialize tracing: {}", e);
-                eprintln!("    Continuing without tracing...");
-            }
+    // Called UNCONDITIONALLY, including with `None`, so the disabled case is
+    // announced rather than silent: an observer must be able to tell "tracing
+    // is off" from "tracing is on and broken".
+    match crate::trace::init_tracing("talos-controller", trace_endpoint.as_deref()) {
+        Ok(()) => match trace_endpoint.as_deref() {
+            Some(endpoint) => println!(
+                "      Tracing enabled (endpoint: {})",
+                crate::trace::redact_endpoint(endpoint)
+            ),
+            None => println!(
+                "      Tracing DISABLED (no endpoint configured; set one of {})",
+                crate::trace::TRACE_ENDPOINT_ENV_VARS.join(", ")
+            ),
+        },
+        Err(e) => {
+            eprintln!("Warning: Failed to initialize tracing: {}", e);
+            eprintln!("    Continuing without tracing...");
         }
     }
 
