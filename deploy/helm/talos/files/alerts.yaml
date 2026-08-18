@@ -2072,6 +2072,114 @@ groups:
             or zero. Check: `kubectl -n talos get pods -l app.kubernetes.io/component=worker`.
 
   # ────────────────────────────────────────────────────────────────────
+  # Fuel headroom.
+  #
+  # WHY THIS GROUP EXISTS. `pa-read-later-digest/digest` ran at 96.9% of its
+  # fuel budget for 16 days — across a SUCCESSFUL run — and then failed two
+  # of its four scheduled runs. The number that says so
+  # (peak `fuel_consumed` against the ceiling a worker actually enforced) was
+  # in `execution_cost_rollup` the whole time and was never compared to
+  # anything. Nothing here learns; it just reads a fact that already existed.
+  #
+  # AND WHY IT IS NOT GATED ON A SAMPLE COUNT. The node had TWO runs. The
+  # adaptive-fuel learner needs five, and `get_fuel_usage_report` defaults to
+  # three, so both were structurally blind to it. Every fuel surface this
+  # platform had was hidden behind a sample floor, which is exactly why the
+  # detector without one is worth adding.
+  - name: talos.fuel
+    interval: 30s
+    rules:
+      # DELIBERATELY NO `absent()` ARM. `talos_fuel_high_utilisation_nodes` is
+      # an unlabelled IntGauge SEEDED AT 0 at registration, so it exists from
+      # controller start and cannot go absent while the controller is up;
+      # while it is down, `TalosControllerDown` is the alert that fires and a
+      # second page adds nothing. The absence case that DOES matter here is
+      # different and is not absence at all — a gauge stuck at a stale 0
+      # because the sweep died — and that is what the second rule catches.
+      - alert: TalosFuelHeadroomLow
+        expr: talos_fuel_high_utilisation_nodes > 0
+        for: 30m
+        labels:
+          severity: warning
+          category: capacity
+        annotations:
+          summary: "{{ $value }} workflow node(s) running with no fuel headroom"
+          description: |
+            One or more (workflow, node) pairs consumed at least 80% of the
+            fuel ceiling last enforced for them, at peak, over the past 30
+            days. A node at that level fails on its next larger payload —
+            and it fails AFTER paying for the whole LLM call, because
+            WASM_MAX_INPUT_BYTES is ~100x looser than a typical LLM node's
+            fuel budget, so payload growth surfaces as fuel exhaustion in
+            post-processing rather than as a clean input rejection.
+
+            THE SAMPLE COUNT IS NOT A REASON TO DISCOUNT THIS. The node this
+            detector was built for had two runs.
+
+            Which node: the controller logs it at WARN
+            (target=talos_fuel, event_kind=fuel_headroom_low), and
+            `get_fuel_usage_report` returns it under high_utilisation_nodes.
+            The names are deliberately not metric labels — node labels are
+            author-supplied and unbounded.
+
+            Fix by SIZING FROM THE NODE'S CONFIGURED MAXIMUM (MAX_TOKENS,
+            item caps) per docs/fuel-budget-sizing.md — not from the last
+            observed run, and not from the number in the exhaustion error,
+            which equals the limit by construction. Prefer a node-scoped
+            `data.max_fuel` over `modules.max_fuel`, which is shared by every
+            override-less consumer of that module.
+
+            Raising the budget does NOT clear this immediately: the ceiling
+            read here is the limit a worker ENFORCED, so the change lands
+            only after the node next runs. For a weekly workflow that is up
+            to a week.
+
+      # The meta-detector. `talos_fuel_high_utilisation_nodes` reads 0 both
+      # on a healthy fleet and on a fleet whose sweep never ran, because an
+      # IntGauge exports 0 from registration — so a dead detector is
+      # indistinguishable from a clean bill of health. That is the exact
+      # defect the whole group exists to remove, one level up.
+      #
+      # The denominator resolves it: 0 observed pairs while workflows are
+      # demonstrably executing means the sweep, the query, or the rollup
+      # writer is broken. The execution arm is what keeps this off a
+      # permanently-red state — a dev stack or a fresh install that has run
+      # nothing has no rollup rows and legitimately observes 0, and
+      # `talos_workflow_executions_total` is a CounterVec that is absent
+      # until a terminal execution touches it, so `sum(increase(...)) > 0`
+      # is empty and this cannot match. A permanently-firing alert trains
+      # operators to ignore red.
+      #
+      # 6h, not the 30d detector window: rollup rows are written by
+      # `ControllerNodeHook::on_node_completed` within a run, so if anything
+      # completed in the last 6h the sweep had something to see. `sum()`
+      # collapses the status fan-out — a per-series `increase(...) > 0`
+      # would match once per status label.
+      - alert: TalosFuelHeadroomDetectorBlind
+        expr: |
+          talos_fuel_utilisation_observed_nodes == 0
+          and on() (sum(increase(talos_workflow_executions_total[6h])) > 0)
+        for: 1h
+        labels:
+          severity: warning
+          category: observability
+        annotations:
+          summary: "Fuel-headroom detector is observing no nodes despite live executions"
+          description: |
+            `talos_fuel_utilisation_observed_nodes` has been 0 for an hour
+            while workflow executions completed in the last 6h. The
+            fuel-headroom detector is therefore reporting a clean fleet it
+            has not measured, and `TalosFuelHeadroomLow` cannot fire.
+
+            Check, in order: the controller WARN log
+            (target=talos_fuel — a failed sweep logs and leaves both gauges
+            at their previous values rather than zeroing them); whether
+            `execution_cost_rollup` is receiving rows at all (its writer is
+            `ControllerNodeHook::on_node_completed`, and only COMPLETED runs
+            produce a row); and whether the executions that completed were
+            all test runs, which the detector excludes by design.
+
+  # ────────────────────────────────────────────────────────────────────
   # Infrastructure availability. These series come from kube-state-metrics
   # (bundled with kube-prometheus-stack — the same operator the
   # ServiceMonitors assume). If you don't run kube-state-metrics, these

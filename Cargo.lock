@@ -9894,6 +9894,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "talos-capability-world",
+ "talos-config",
  "talos-text-util",
  "talos-workflow-job-protocol",
  "talos-workflow-repository",

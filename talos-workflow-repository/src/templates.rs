@@ -181,7 +181,7 @@ impl WorkflowRepository {
         }
         let rows = sqlx::query(
             "SELECT id, name, config_schema, allowed_secrets, allowed_hosts, max_retries, \
-                    allowed_methods, capability_world \
+                    allowed_methods, capability_world, max_fuel \
              FROM modules \
              WHERE id = ANY($1)",
         )
@@ -207,6 +207,7 @@ impl WorkflowRepository {
                         .try_get::<Option<_>, _>("allowed_methods")?
                         .unwrap_or_default(),
                     capability_world: r.try_get::<Option<_>, _>("capability_world")?,
+                    max_fuel: r.try_get::<Option<_>, _>("max_fuel")?,
                 })
             })
             .collect()
@@ -254,6 +255,10 @@ impl WorkflowRepository {
                 max_retries: r.try_get::<Option<_>, _>("max_retries")?.unwrap_or(0),
                 allowed_methods: Vec::new(),
                 capability_world: None,
+                // Same reason as `allowed_hosts` above — not selected on this
+                // path. `None` is honest here ("unknown"), not a claim that
+                // the module has no ceiling.
+                max_fuel: None,
             })
         })
         .transpose()
@@ -746,8 +751,22 @@ pub struct NodeTemplateRow {
     pub max_retries: i32,
     /// HTTP method allowlist — input to the method-aware retry default.
     pub allowed_methods: Vec<String>,
-    /// Capability world — input to the method-aware retry default.
+    /// Capability world — input to the method-aware retry default, and the
+    /// gate on whether `__actor_context__` is injected into this module's
+    /// input by default (`talos_capability_world::world_defaults_no_memory`).
     pub capability_world: Option<String>,
+    /// Raw `modules.max_fuel` — the ceiling every override-less consumer of
+    /// this module inherits.
+    ///
+    /// SHARED, and that is the point of surfacing it here: the node that
+    /// motivated the authoring-time fuel check
+    /// (`pa-read-later-digest/digest`) had NO node-scoped `data.max_fuel` at
+    /// all, so a check that looked only at the node would have seen nothing
+    /// to judge and passed it. `None` means the column is NULL, i.e. the
+    /// module expresses no ceiling and the engine falls back to its own
+    /// default — a case the sizing check cannot evaluate and must not guess
+    /// at.
+    pub max_fuel: Option<i64>,
 }
 
 impl NodeTemplateRow {

@@ -2151,3 +2151,173 @@ tests:
       - eval_time: 6h30m
         alertname: TalosModuleExecutionsNeverFinalize
         exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # FUEL HEADROOM — the detector, driven in BOTH directions.
+  #
+  # The values are the real measurement off the live database on 2026-08-17
+  # (30-day window, test executions excluded, each node's ceiling taken from
+  # its most recent enforced limit): 6 pairs observed, 1 of them —
+  # `pa-read-later-digest/digest` at 96.9% on TWO samples — at or above the
+  # 80% threshold.
+  #
+  # WHAT THIS SUITE CAN AND CANNOT PROVE, stated because the last two cycles
+  # shipped a defect that a fixture exactly like this one could not see: these
+  # tests supply the GAUGE VALUES directly, so they prove the EXPRESSION reads
+  # them correctly and prove nothing about whether the sweep computes them
+  # correctly. The producer half is pinned separately, in
+  # `controller::bootstrap::background::fuel_headroom_tests`, whose fixtures
+  # are the same live numbers and which drives the real
+  # `publish_fuel_utilisation`. Neither half is sufficient alone.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: a node with no fuel headroom fires, and clears when the budget is raised
+    input_series:
+      # 1 high-utilisation pair out of 6 observed, then fixed at t=90m
+      # (`digest`'s ceiling moves 1,404,000 -> 8,000,000, dropping it to 17%).
+      - series: 'talos_fuel_high_utilisation_nodes{job="talos-controller",instance="controller:8080"}'
+        values: "1+0x90 0+0x90"
+      - series: 'talos_fuel_utilisation_observed_nodes{job="talos-controller",instance="controller:8080"}'
+        values: "6+0x180"
+    alert_rule_test:
+      # `for: 30m` — pending, not firing, before the hold elapses. This arm is
+      # what makes the suite non-vacuous in the negative direction: without it
+      # an expression that matched unconditionally would still pass the firing
+      # arm below.
+      - eval_time: 20m
+        alertname: TalosFuelHeadroomLow
+        exp_alerts: []
+      - eval_time: 31m
+        alertname: TalosFuelHeadroomLow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: capacity
+              job: talos-controller
+              instance: controller:8080
+            exp_annotations:
+              summary: "1 workflow node(s) running with no fuel headroom"
+              description: |
+                One or more (workflow, node) pairs consumed at least 80% of the
+                fuel ceiling last enforced for them, at peak, over the past 30
+                days. A node at that level fails on its next larger payload —
+                and it fails AFTER paying for the whole LLM call, because
+                WASM_MAX_INPUT_BYTES is ~100x looser than a typical LLM node's
+                fuel budget, so payload growth surfaces as fuel exhaustion in
+                post-processing rather than as a clean input rejection.
+
+                THE SAMPLE COUNT IS NOT A REASON TO DISCOUNT THIS. The node this
+                detector was built for had two runs.
+
+                Which node: the controller logs it at WARN
+                (target=talos_fuel, event_kind=fuel_headroom_low), and
+                `get_fuel_usage_report` returns it under high_utilisation_nodes.
+                The names are deliberately not metric labels — node labels are
+                author-supplied and unbounded.
+
+                Fix by SIZING FROM THE NODE'S CONFIGURED MAXIMUM (MAX_TOKENS,
+                item caps) per docs/fuel-budget-sizing.md — not from the last
+                observed run, and not from the number in the exhaustion error,
+                which equals the limit by construction. Prefer a node-scoped
+                `data.max_fuel` over `modules.max_fuel`, which is shared by every
+                override-less consumer of that module.
+
+                Raising the budget does NOT clear this immediately: the ceiling
+                read here is the limit a worker ENFORCED, so the change lands
+                only after the node next runs. For a weekly workflow that is up
+                to a week.
+      # THE CLEARING DIRECTION. The whole point of taking the ceiling from the
+      # node's most recent ENFORCED limit rather than maxing it over the window
+      # is that the alert can go quiet when the budget is fixed. A per-row max
+      # ratio would keep this firing for the full 30-day window after the fix —
+      # a permanently-red alert, which is a defect, not caution.
+      - eval_time: 95m
+        alertname: TalosFuelHeadroomLow
+        exp_alerts: []
+
+  - interval: 1m
+    name: the detector is silent on a healthy fleet it genuinely measured
+    input_series:
+      - series: 'talos_fuel_high_utilisation_nodes{job="talos-controller",instance="controller:8080"}'
+        values: "0+0x120"
+      - series: 'talos_fuel_utilisation_observed_nodes{job="talos-controller",instance="controller:8080"}'
+        values: "77+0x120"
+      - series: 'talos_workflow_executions_total{job="talos-controller",instance="controller:8080",status="success"}'
+        values: "0+5x120"
+    alert_rule_test:
+      - eval_time: 110m
+        alertname: TalosFuelHeadroomLow
+        exp_alerts: []
+      # And the meta-detector stays quiet too: 77 observed is a measurement.
+      - eval_time: 110m
+        alertname: TalosFuelHeadroomDetectorBlind
+        exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # THE META-DETECTOR: a gauge stuck at a stale 0 is indistinguishable from a
+  # clean bill of health, because an IntGauge exports 0 from registration.
+  # This is the #625 shape — a detector silenced by exactly the condition it
+  # detects — caught one level up.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: detector observing nothing while executions complete
+    input_series:
+      - series: 'talos_fuel_high_utilisation_nodes{job="talos-controller",instance="controller:8080"}'
+        values: "0+0x180"
+      - series: 'talos_fuel_utilisation_observed_nodes{job="talos-controller",instance="controller:8080"}'
+        values: "0+0x180"
+      - series: 'talos_workflow_executions_total{job="talos-controller",instance="controller:8080",status="success"}'
+        values: "0+3x180"
+    alert_rule_test:
+      # `for: 1h`.
+      - eval_time: 45m
+        alertname: TalosFuelHeadroomDetectorBlind
+        exp_alerts: []
+      - eval_time: 65m
+        alertname: TalosFuelHeadroomDetectorBlind
+        exp_alerts:
+          # `and on()` keeps the LEFT-hand series' labels, so the alert carries
+          # the controller target it was observed on — which is what you want
+          # on a multi-replica deploy: one replica's dead sweep stays
+          # attributable rather than pooled.
+          - exp_labels:
+              severity: warning
+              category: observability
+              job: talos-controller
+              instance: controller:8080
+            exp_annotations:
+              summary: "Fuel-headroom detector is observing no nodes despite live executions"
+              description: |
+                `talos_fuel_utilisation_observed_nodes` has been 0 for an hour
+                while workflow executions completed in the last 6h. The
+                fuel-headroom detector is therefore reporting a clean fleet it
+                has not measured, and `TalosFuelHeadroomLow` cannot fire.
+
+                Check, in order: the controller WARN log
+                (target=talos_fuel — a failed sweep logs and leaves both gauges
+                at their previous values rather than zeroing them); whether
+                `execution_cost_rollup` is receiving rows at all (its writer is
+                `ControllerNodeHook::on_node_completed`, and only COMPLETED runs
+                produce a row); and whether the executions that completed were
+                all test runs, which the detector excludes by design.
+
+  # THE ARM THAT KEEPS THE META-DETECTOR OFF A PERMANENTLY-RED STATE. A fresh
+  # install has no rollup rows and legitimately observes 0. Because
+  # `talos_workflow_executions_total` is a CounterVec — ABSENT until a terminal
+  # execution first touches a label set — `sum(increase(...))` over it is an
+  # EMPTY vector, `empty > 0` matches nothing, and the `and on()` yields
+  # nothing. No series is fed for it here, which is exactly that state.
+  - interval: 1m
+    name: a fleet that has executed nothing does not page
+    input_series:
+      - series: 'talos_fuel_high_utilisation_nodes{job="talos-controller",instance="controller:8080"}'
+        values: "0+0x180"
+      - series: 'talos_fuel_utilisation_observed_nodes{job="talos-controller",instance="controller:8080"}'
+        values: "0+0x180"
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: TalosFuelHeadroomDetectorBlind
+        exp_alerts: []
+      - eval_time: 170m
+        alertname: TalosFuelHeadroomDetectorBlind
+        exp_alerts: []
