@@ -918,14 +918,55 @@ tests:
   #     folding the unverifiable count into the skew count so the alert looks
   #     more sensitive.
   # ══════════════════════════════════════════════════════════════════════
+  # ══════════════════════════════════════════════════════════════════════
+  # THE FLAP (2026-08). The suite immediately below drives the shape a stuck
+  # rolling deploy produces on a fleet whose replicas share one worker_id —
+  # the posture the chart writes out inline. Under the OLD per-worker_id
+  # gauge, two replicas on different builds overwrote the same map entry, so
+  # the series alternated 1/0 every sweep. `for: 30m` needs the condition to
+  # hold CONTINUOUSLY, so it could never elapse.
+  #
+  # This fixture is what makes "the old shape could not fire" DEMONSTRATED
+  # rather than asserted. It is expressed against the CURRENT series name
+  # deliberately: promtool cannot evaluate a rule that no longer exists, so
+  # the honest way to pin the property is to feed the current rule the
+  # FLAPPING VALUES the old gauge produced and show it stays silent. That is
+  # also the regression guard — if anyone ever re-derives this gauge from a
+  # last-write-wins population, this fixture goes red.
+  - interval: 1m
+    name: "a flapping skew series can never satisfy the for: duration"
+    input_series:
+      # 1,0,1,0,… for two hours — the old gauge's behaviour on a mixed-build
+      # shared-id fleet. Skew is CONTINUOUSLY PRESENT in the fleet; only the
+      # gauge alternates.
+      - series: 'talos_worker_fleet_build_skew_builds{job="talos-controller"}'
+        values: "1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0"
+      - series: 'talos_worker_fleet_live_builds{job="talos-controller"}'
+        values: "2x120"
+    alert_rule_test:
+      # Silent throughout, at every horizon — 30m, 60m, 2h.
+      - eval_time: 35m
+        alertname: TalosWorkerFleetBuildSkew
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: TalosWorkerFleetBuildSkew
+        exp_alerts: []
+      - eval_time: 119m
+        alertname: TalosWorkerFleetBuildSkew
+        exp_alerts: []
+
   - interval: 1m
     name: a running worker on the wrong build fires, and clears when it rolls
     input_series:
       # Skewed for 60m, then the worker rolls onto the controller's build.
-      - series: 'talos_worker_fleet_build_skew_workers{job="talos-controller"}'
+      # STEADY, not flapping — which is exactly what the build-keyed
+      # population gives on the same mixed fleet that made the old gauge flap.
+      - series: 'talos_worker_fleet_build_skew_builds{job="talos-controller"}'
         values: "1x60 0x60"
+      - series: 'talos_worker_fleet_live_builds{job="talos-controller"}'
+        values: "2x60 1x60"
       - series: 'talos_worker_fleet_live_workers{job="talos-controller"}'
-        values: "3x120"
+        values: "1x120"
     alert_rule_test:
       # `for: 30m` — pending, not firing, before the half hour is up.
       - eval_time: 20m
@@ -939,29 +980,53 @@ tests:
               category: fleet-identity
               job: talos-controller
             exp_annotations:
-              summary: "1 RUNNING worker process(es) on a different build than the controller"
+              summary: "1 RUNNING build(s) differ from the controller's — NOT a count of workers"
               description: |
-                At least one worker process has published a fleet heartbeat
-                recently — up to ~150s ago, being 60s of staleness plus a 30s prune
-                tick plus one 60s gauge sweep — reporting a build that provably
-                differs from this controller's, and has done so for 30m. Unlike
-                TalosWorkerBuildSkew this cannot be a ghost registry row: a process
-                spoke. Signed wire formats are version-coupled, so a live skew
-                breaks jobs in ways that read as signature bugs.
-                Read it beside talos_worker_fleet_live_workers (the denominator)
-                and talos_worker_fleet_unverifiable_builds, which counts every
-                heartbeating worker whose build could not be compared — either it
-                reported no usable commit sha, or THIS CONTROLLER has none, in
-                which case nothing is comparable. Uncomparable workers are not
-                counted here, so a 0 is not "the fleet agrees".
+                At least one build that provably differs from this controller's has
+                published a fleet heartbeat recently — up to ~150s ago, being 60s
+                of staleness plus a 30s prune tick plus one 60s gauge sweep — and
+                has done so for 30m. Unlike TalosWorkerBuildSkew this cannot be a
+                ghost registry row: a process spoke. Signed wire formats are
+                version-coupled, so a live skew breaks jobs in ways that read as
+                signature bugs.
+
+                THE VALUE COUNTS BUILDS, NOT PROCESSES. Five workers stuck on one
+                old build report 1, not 5, so this number tells you a skew exists
+                and NOT how much of the fleet it covers. That magnitude is
+                genuinely unavailable here: the fleet view is keyed on worker_id
+                and the chart's single-key posture gives every replica the same
+                one, so a per-worker count would alternate on a mixed-build fleet
+                and no `for:` duration could ever elapse. Use
+                get_platform_info → `fleet` for per-worker detail.
+
+                The denominator is talos_worker_fleet_live_builds — NOT
+                talos_worker_fleet_live_workers, which counts heartbeating
+                IDENTITIES and is a different population. The three build series
+                decompose exactly: live == this + unverifiable + agreeing.
+
+                READ talos_worker_fleet_unverifiable_builds BEFORE CONCLUDING
+                ANYTHING FROM A LOW NUMBER HERE. It counts observed builds that
+                could not be compared at all — the worker reported no usable commit
+                sha, or THIS CONTROLLER has none, in which case nothing is
+                comparable and every observed build lands there. Those sit in the
+                denominator but are never counted as skew, so "1 skewed of 3 live
+                builds" over an unverifiable count of 1 means one build was never
+                checked. A 0 here is not "the fleet agrees"; it is "nothing was
+                proven to differ".
               action: |
                 1. Compare the controller and worker image digests — they must come
                    from the same published tree.
-                2. get_platform_info → `fleet` for the per-worker detail; the
-                   heartbeat gauges are counts only (worker_id is caller-supplied on
-                   the bus and is deliberately never a metric label).
-                3. Roll the worker onto the controller's build. Do NOT silence: this
-                   one names running processes, not stale rows.
+                2. get_platform_info → `fleet` for the per-worker detail, including
+                   HOW MANY workers are on the offending build; the heartbeat gauges
+                   are counts only (worker_id is caller-supplied on the bus and is
+                   deliberately never a metric label, and neither is build_version).
+                3. Roll the workers onto the controller's build. Do NOT silence:
+                   this one names running processes, not stale rows.
+                4. If talos_worker_fleet_capacity_dropped_builds is non-zero, the
+                   build view is saturated and these counts include fabricated
+                   values — only a holder of the fleet-shared WORKER_SHARED_KEY can
+                   produce that, so treat it as a key-handling question first and a
+                   build question second.
       # Rolled at t=61m: the gauge falls and the alert clears.
       - eval_time: 100m
         alertname: TalosWorkerFleetBuildSkew
@@ -973,11 +1038,11 @@ tests:
   - interval: 1m
     name: an all-unverifiable fleet does not fire
     input_series:
-      - series: 'talos_worker_fleet_build_skew_workers{job="talos-controller"}'
+      - series: 'talos_worker_fleet_build_skew_builds{job="talos-controller"}'
         values: "0x120"
       - series: 'talos_worker_fleet_unverifiable_builds{job="talos-controller"}'
         values: "3x120"
-      - series: 'talos_worker_fleet_live_workers{job="talos-controller"}'
+      - series: 'talos_worker_fleet_live_builds{job="talos-controller"}'
         values: "3x120"
     alert_rule_test:
       - eval_time: 90m

@@ -1129,13 +1129,15 @@ groups:
           action: |
             1. get_platform_info → `fleet`. Cross-check last_seen_at against
                the pods that actually exist.
-            1b. Faster: compare this gauge with talos_worker_fleet_live_workers
-               and talos_worker_fleet_build_skew_workers. The pair separates the
+            1b. Faster: compare this gauge with talos_worker_fleet_live_builds
+               and talos_worker_fleet_build_skew_builds. The pair separates the
                two causes — a REGISTERED row with no running process (ghost) vs
-               a PROCESS that just spoke and is on the wrong build. If the
+               a BUILD that just spoke and differs from the controller's. If the
                live-skew gauge is 0 while this one is not, you are looking at
                ghost rows. Read a 0 on the live gauge carefully though: it also
-               reads 0 when nothing publishes heartbeats at all.
+               reads 0 when nothing publishes heartbeats at all, and the live
+               pair counts BUILDS while this one counts ROWS — so their
+               magnitudes are not comparable, only their zero/non-zero.
             2. If the offending worker_id has no running pod, this is a GHOST
                ROW, not a live skew: the registry has no reaper, so a retired
                pod's identity stays ACTIVE forever. Find it with the controller
@@ -1180,8 +1182,31 @@ groups:
       # ambiguous — empty fleet, pre-heartbeat build, or broken subscription —
       # and an alert that cannot tell those apart would fire loudest on the
       # deployments where it means least. TalosWorkerDown owns "the worker is
-      # gone" (it selects on the worker scrape job); this gauge is the
-      # denominator you read beside the skew count, and the annotation says so.
+      # gone" (it selects on the worker scrape job). The same reasoning applies
+      # to talos_worker_fleet_live_builds == 0.
+      #
+      # WHY THE SKEW GAUGE COUNTS BUILDS AND NOT WORKERS (2026-08). It used to
+      # be talos_worker_fleet_build_skew_workers, derived per-worker_id from a
+      # last-write-wins map. Where replicas share one worker_id — the posture
+      # the chart writes out inline as TALOS_WORKER_ID: "fleet" — every replica
+      # overwrites the same map entry, so on a MIXED-build fleet the gauge
+      # alternated between 1 and 0 as first one replica and then the other
+      # wrote last. `for: 30m` needs its condition to hold CONTINUOUSLY, so the
+      # timer reset forever and a stuck rolling deploy could not raise this.
+      #
+      # BE PRECISE ABOUT THE OLD DEFECT, because the overstated version of it
+      # is wrong: a UNIFORMLY skewed fleet (every replica on one non-controller
+      # build) retained one steady entry and DID alert correctly. What could
+      # not fire was the mixed case — which is the one a version-coupled
+      # signing incident actually looks like, and the one that cost several
+      # turns of misdiagnosis on 2026-07-27.
+      #
+      # Smoothing the flap in PromQL was evaluated and rejected: the gauge is
+      # non-zero only on sweeps where a skewed replica happened to write last,
+      # so a max_over_time window would have to grow as the skewed fraction
+      # shrinks — least reliable on a single straggler pod, which is exactly
+      # the case worth catching. The fix is retention (a build-keyed map in the
+      # controller), not an expression.
       #
       # Structural check 65(a) scans this file TEXTUALLY, not just `expr:`
       # blocks, so spelling a job selector out in prose here would make that
@@ -1190,35 +1215,59 @@ groups:
       # name that does not exist and failed the lint, which is the check
       # working as documented.
       - alert: TalosWorkerFleetBuildSkew
-        expr: talos_worker_fleet_build_skew_workers > 0
+        expr: talos_worker_fleet_build_skew_builds > 0
         for: 30m
         labels:
           severity: warning
           category: fleet-identity
         annotations:
-          summary: "{{ $value }} RUNNING worker process(es) on a different build than the controller"
+          summary: "{{ $value }} RUNNING build(s) differ from the controller's — NOT a count of workers"
           description: |
-            At least one worker process has published a fleet heartbeat
-            recently — up to ~150s ago, being 60s of staleness plus a 30s prune
-            tick plus one 60s gauge sweep — reporting a build that provably
-            differs from this controller's, and has done so for 30m. Unlike
-            TalosWorkerBuildSkew this cannot be a ghost registry row: a process
-            spoke. Signed wire formats are version-coupled, so a live skew
-            breaks jobs in ways that read as signature bugs.
-            Read it beside talos_worker_fleet_live_workers (the denominator)
-            and talos_worker_fleet_unverifiable_builds, which counts every
-            heartbeating worker whose build could not be compared — either it
-            reported no usable commit sha, or THIS CONTROLLER has none, in
-            which case nothing is comparable. Uncomparable workers are not
-            counted here, so a 0 is not "the fleet agrees".
+            At least one build that provably differs from this controller's has
+            published a fleet heartbeat recently — up to ~150s ago, being 60s
+            of staleness plus a 30s prune tick plus one 60s gauge sweep — and
+            has done so for 30m. Unlike TalosWorkerBuildSkew this cannot be a
+            ghost registry row: a process spoke. Signed wire formats are
+            version-coupled, so a live skew breaks jobs in ways that read as
+            signature bugs.
+
+            THE VALUE COUNTS BUILDS, NOT PROCESSES. Five workers stuck on one
+            old build report 1, not 5, so this number tells you a skew exists
+            and NOT how much of the fleet it covers. That magnitude is
+            genuinely unavailable here: the fleet view is keyed on worker_id
+            and the chart's single-key posture gives every replica the same
+            one, so a per-worker count would alternate on a mixed-build fleet
+            and no `for:` duration could ever elapse. Use
+            get_platform_info → `fleet` for per-worker detail.
+
+            The denominator is talos_worker_fleet_live_builds — NOT
+            talos_worker_fleet_live_workers, which counts heartbeating
+            IDENTITIES and is a different population. The three build series
+            decompose exactly: live == this + unverifiable + agreeing.
+
+            READ talos_worker_fleet_unverifiable_builds BEFORE CONCLUDING
+            ANYTHING FROM A LOW NUMBER HERE. It counts observed builds that
+            could not be compared at all — the worker reported no usable commit
+            sha, or THIS CONTROLLER has none, in which case nothing is
+            comparable and every observed build lands there. Those sit in the
+            denominator but are never counted as skew, so "1 skewed of 3 live
+            builds" over an unverifiable count of 1 means one build was never
+            checked. A 0 here is not "the fleet agrees"; it is "nothing was
+            proven to differ".
           action: |
             1. Compare the controller and worker image digests — they must come
                from the same published tree.
-            2. get_platform_info → `fleet` for the per-worker detail; the
-               heartbeat gauges are counts only (worker_id is caller-supplied on
-               the bus and is deliberately never a metric label).
-            3. Roll the worker onto the controller's build. Do NOT silence: this
-               one names running processes, not stale rows.
+            2. get_platform_info → `fleet` for the per-worker detail, including
+               HOW MANY workers are on the offending build; the heartbeat gauges
+               are counts only (worker_id is caller-supplied on the bus and is
+               deliberately never a metric label, and neither is build_version).
+            3. Roll the workers onto the controller's build. Do NOT silence:
+               this one names running processes, not stale rows.
+            4. If talos_worker_fleet_capacity_dropped_builds is non-zero, the
+               build view is saturated and these counts include fabricated
+               values — only a holder of the fleet-shared WORKER_SHARED_KEY can
+               produce that, so treat it as a key-handling question first and a
+               build question second.
 
       # ══════════════════════════════════════════════════════════════════
       # THE DETECTOR THAT MAKES THE WORKER-IDENTITY REAPER SAFE TO ENABLE

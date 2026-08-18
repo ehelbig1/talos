@@ -536,9 +536,20 @@ controller:
   #      the SINGLE current key, not the staged ring that job results get, so
   #      a worker still signing under the previous key is silent here while
   #      its results still verify.
-  # Only (1) is a transient you can wait out. Check
-  # talos_worker_fleet_live_workers against your actual replica count before
-  # setting this, and again after.
+  # Only (1) is a transient you can wait out.
+  #
+  # DO NOT CHECK talos_worker_fleet_live_workers AGAINST YOUR REPLICA COUNT —
+  # an earlier version of this comment told you to, and that check is
+  # meaningless unless your replicas carry DISTINCT worker_ids. The fleet view
+  # is a map keyed on worker_id, and worker.env writes the single-key Ed25519
+  # posture out inline (`TALOS_WORKER_ID: "fleet"`, one id for every replica),
+  # under which the gauge reads 1 for a fleet of any size. It is a count of
+  # heartbeating IDENTITIES. Compare it against your number of distinct
+  # worker_ids instead — 1 on the single-key posture, N when you have given
+  # each worker its own registered identity — and read a drop to 0 as
+  # "nothing observed".
+  # Nothing here can tell you a single replica died; see
+  # talos-worker-fleet's module header.
   #
   # SCOPE: it changes ONE gauge's population. It grants nothing, writes
   # nothing, and cannot affect trust — a heartbeat never touches

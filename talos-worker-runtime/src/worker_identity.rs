@@ -33,6 +33,24 @@
 //! visibility (which pod produced which result, surfaced in the
 //! controller's audit log) plus the wire-format anchor that a future
 //! per-worker HKDF subkey scheme can dispatch on.
+//!
+//! **THE FORENSIC HALF OF THAT PROMISE IS NOT KEPT WHENEVER RESOLUTION
+//! STEP 1 WINS ACROSS REPLICAS**, which is a posture both shipped
+//! configurations write out: the chart's `values.yaml` gives
+//! `TALOS_WORKER_ID: "fleet"` inline for the single-key Ed25519 fleet,
+//! and the dev compose stack sets one `TALOS_WORKER_ID` for both
+//! replicas. Every `JobResult` and every
+//! signed audit event from every replica then carries the SAME
+//! `worker_id`, so "which pod produced which result" has no answer —
+//! a job, an audit event and a crash cannot be attributed to a replica.
+//! Only step 2 (`HOSTNAME` → pod name) delivers per-pod attribution.
+//!
+//! This is a stated cost, not a bug to fix here. Giving replicas
+//! distinct ids would break dispatch verification against the static
+//! `TALOS_WORKER_PUBLIC_KEYS` ring, which looks a worker's public key up
+//! BY `worker_id`. An operator who needs per-replica forensics must
+//! move to per-worker registered identities first (worker.extraEnv),
+//! not merely vary this value.
 
 use std::sync::OnceLock;
 

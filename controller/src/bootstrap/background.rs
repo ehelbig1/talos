@@ -542,7 +542,7 @@ pub(crate) fn departed_liveness_cutoff_hours() -> i64 {
 /// consumers it protects.
 pub(crate) const MAX_REAP_SILENCE_HOURS: i64 = 24 * 365 * 10;
 
-/// Recompute and publish the four `talos_worker_fleet_*` gauges from one
+/// Recompute and publish the six `talos_worker_fleet_*` gauges from one
 /// snapshot of the NATS heartbeat view.
 ///
 /// Purely ADDITIVE to the registry-backed gauges: it reports only positive
@@ -550,30 +550,69 @@ pub(crate) const MAX_REAP_SILENCE_HOURS: i64 = 24 * 365 * 10;
 /// needs no operator assertion and cannot silence anything. See
 /// [`heartbeat_silence_is_authoritative`] for the narrowing that does.
 ///
-/// `worker_id` never reaches a label here — the summary is computed from
-/// [`talos_worker_fleet::WorkerManager::live_build_versions`], which hands out
-/// builds WITHOUT the identities they belong to, precisely so a caller-supplied
-/// string cannot become unbounded series cardinality.
+/// **TWO POPULATIONS, and conflating them is a reporting defect rather than a
+/// rounding error.** `live_worker_ids` counts heartbeating IDENTITIES;
+/// `distinct_builds` counts distinct BUILDS observed. The three build gauges
+/// are computed over the SECOND, so the denominator to read them against is
+/// `talos_worker_fleet_live_builds` — never `..._live_workers`. A builds
+/// numerator over an ids denominator is how "1 skewed of 1 live worker" comes
+/// to read as a wholly skewed fleet that is really one pod in ten.
+///
+/// The build population is used because the ids one CANNOT support a skew
+/// alert where replicas share a `worker_id`: the fleet map is last-write-wins,
+/// so a per-worker skew count alternates on a mixed-build fleet and no `for:`
+/// duration elapses. (A UNIFORMLY skewed fleet was always steady and always
+/// alerted — that half was never broken.) See the `talos_worker_fleet` module
+/// header.
+///
+/// **The three build gauges decompose exactly**: `live == skew + unverifiable
+/// + agreeing`. `unverifiable` is published for that reason — it sits in the
+/// denominator, so a 0 skew over a population containing it is NOT a clean
+/// bill of health, and folding it away would render an absence as a negative
+/// result.
+///
+/// `worker_id` never reaches a label here — both accessors hand out their
+/// values WITHOUT the identities they belong to, precisely so a caller-supplied
+/// string cannot become unbounded series cardinality. Neither does the build
+/// string, which is caller-supplied too.
 pub(crate) fn publish_worker_fleet_gauges(
     controller_build: &str,
-    live_builds: &[Option<String>],
+    live_worker_ids: usize,
+    distinct_builds: &[Option<String>],
     capacity_drops: u64,
+    build_capacity_drops: u64,
 ) {
-    let (skewed, unverifiable) = count_heartbeat_build_skew(controller_build, live_builds);
+    let (skewed, unverifiable) = count_heartbeat_build_skew(controller_build, distinct_builds);
     if let Some(m) = metrics::global() {
         m.worker_fleet_live_workers
-            .set(i64::try_from(live_builds.len()).unwrap_or(i64::MAX));
-        m.worker_fleet_build_skew_workers
+            .set(i64::try_from(live_worker_ids).unwrap_or(i64::MAX));
+        m.worker_fleet_live_builds
+            .set(i64::try_from(distinct_builds.len()).unwrap_or(i64::MAX));
+        m.worker_fleet_build_skew_builds
             .set(i64::try_from(skewed).unwrap_or(i64::MAX));
         m.worker_fleet_unverifiable_builds
             .set(i64::try_from(unverifiable).unwrap_or(i64::MAX));
         m.worker_fleet_capacity_dropped_heartbeats
             .set(i64::try_from(capacity_drops).unwrap_or(i64::MAX));
+        m.worker_fleet_capacity_dropped_builds
+            .set(i64::try_from(build_capacity_drops).unwrap_or(i64::MAX));
     }
 }
 
 /// Pure half of [`publish_worker_fleet_gauges`]: `(provably skewed,
-/// unverifiable)` over the heartbeating workers' self-reported builds.
+/// unverifiable)` over a slice of self-reported builds.
+///
+/// **The FUNCTION did not change when the gauges moved to a build-keyed
+/// population in 2026-08; only its INPUT did** — from one element per
+/// heartbeating `worker_id` to one per distinct build. That is the whole of
+/// the fix, and it is why the classification rules below are untouched: what
+/// was wrong was never how a build was judged, it was that a last-write-wins
+/// map had already discarded the second build before anything got to judge it.
+///
+/// `None` — reported nothing, or something the fleet view refused to retain —
+/// counts as UNVERIFIABLE, never as skew, and is returned rather than
+/// discarded so the caller can publish it. A zero skew over a population
+/// holding an unverifiable element is not "the fleet agrees".
 ///
 /// Uses the SAME `builds_match` / `build_is_verifiable` pair as the
 /// registration WARN, `get_platform_info.fleet` and the registry-backed gauge,
@@ -657,8 +696,12 @@ pub(crate) fn spawn_worker_fleet_tasks(
             ticker.tick().await;
             publish_worker_fleet_gauges(
                 &controller_build,
-                &worker_manager.live_build_versions(),
+                worker_manager.worker_count(),
+                // NOT `live_build_versions()`, which is per-`worker_id` and so
+                // retains only the last writer's build on a shared-id fleet.
+                &worker_manager.live_distinct_builds(),
                 worker_manager.capacity_drops(),
+                worker_manager.build_capacity_drops(),
             );
         }
     });
@@ -4823,24 +4866,54 @@ mod detector_metric_tests {
         let _g = gauge_guard();
         let m = install_metrics();
 
+        // ONE worker_id (the shared-id posture) publishing three distinct
+        // builds — so the two populations differ, which is the case that
+        // makes reading one against the other a defect.
         publish_worker_fleet_gauges(
             "0.1.0+aaaaaaa",
+            1,
             &[
                 Some("0.1.0+aaaaaaa".to_string()),
                 Some("0.1.0+bbbbbbb".to_string()),
                 None,
             ],
             7,
+            2,
         );
-        assert_eq!(m.worker_fleet_live_workers.get(), 3);
-        assert_eq!(m.worker_fleet_build_skew_workers.get(), 1);
+        assert_eq!(m.worker_fleet_live_workers.get(), 1, "IDENTITIES");
+        assert_eq!(
+            m.worker_fleet_live_builds.get(),
+            3,
+            "BUILDS — a different population"
+        );
+        assert_eq!(m.worker_fleet_build_skew_builds.get(), 1);
         assert_eq!(m.worker_fleet_unverifiable_builds.get(), 1);
         assert_eq!(m.worker_fleet_capacity_dropped_heartbeats.get(), 7);
+        assert_eq!(m.worker_fleet_capacity_dropped_builds.get(), 2);
 
-        // Fleet converges and scales down.
-        publish_worker_fleet_gauges("0.1.0+aaaaaaa", &[Some("0.1.0+aaaaaaa".to_string())], 7);
+        // THE DECOMPOSITION IDENTITY the annotation and the HELP strings both
+        // promise: live == skew + unverifiable + agreeing. If it stopped
+        // holding, "0 skewed" would stop being readable against a denominator.
+        let agreeing = 1; // only 0.1.0+aaaaaaa matches the controller
+        assert_eq!(
+            m.worker_fleet_live_builds.get(),
+            m.worker_fleet_build_skew_builds.get()
+                + m.worker_fleet_unverifiable_builds.get()
+                + agreeing
+        );
+
+        // Fleet converges: the rolled-away build leaves the view.
+        publish_worker_fleet_gauges(
+            "0.1.0+aaaaaaa",
+            1,
+            &[Some("0.1.0+aaaaaaa".to_string())],
+            7,
+            2,
+        );
         assert_eq!(m.worker_fleet_live_workers.get(), 1);
-        assert_eq!(m.worker_fleet_build_skew_workers.get(), 0);
+        assert_eq!(m.worker_fleet_live_builds.get(), 1);
+        assert_eq!(m.worker_fleet_build_skew_builds.get(), 0);
+        assert_eq!(m.worker_fleet_unverifiable_builds.get(), 0);
 
         // `worker_id` is caller-supplied on the bus, so it must not appear in
         // the exposition at all — these are plain label-free IntGauges and the

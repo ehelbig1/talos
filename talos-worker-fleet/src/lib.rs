@@ -52,6 +52,71 @@
 //! Neither bound is LRU: entries leave only by going stale or by the process
 //! restarting. That is deliberate — an LRU keyed on caller-supplied ids lets a
 //! flood evict the real fleet, which is worse than refusing the flood.
+//!
+//! # Two maps, and why the second one exists (2026-08)
+//!
+//! [`WorkerManager`] keeps a SECOND, observability-only map keyed on the
+//! reported BUILD rather than on `worker_id`. It exists because the first map
+//! cannot answer "is some running process on a different build than the
+//! controller?" whenever replicas share one `worker_id` — the posture the
+//! chart writes out inline (`TALOS_WORKER_ID: "fleet"`) and the one the dev
+//! stack runs.
+//!
+//! The mechanism, stated exactly, because the imprecise version of it is
+//! wrong. `handle_heartbeat` ends in `workers.insert(worker_id, …)`, so on a
+//! shared id every replica overwrites the same entry: the map retains ONE
+//! build, whichever replica spoke last. A per-`worker_id` skew count over that
+//! map therefore ALTERNATES on a mixed-build fleet — 1 when the skewed replica
+//! wrote last, 0 when the matching one did — and an alert with a `for:`
+//! duration needs its condition to hold CONTINUOUSLY, so the timer resets
+//! forever. **Be precise about the scope of that defect**: a UNIFORMLY skewed
+//! fleet (every replica on one build that differs from the controller's) reads
+//! steadily 1 and alerts correctly. The unfireable case is the MIXED one — a
+//! roll that got stuck partway, which is exactly what a version-coupled
+//! signing incident looks like.
+//!
+//! No counting function can repair that, because the second build is destroyed
+//! at insert time, before anything gets to count it. Retention is the fix, so
+//! the build observations are retained separately. Keying the PRIMARY map on
+//! `(worker_id, build)` was rejected: it would move [`WorkerManager::worker_count`],
+//! which is the scheduler's dispatch barrier.
+//!
+//! The build map carries the same two bounds for the same reason — its key is
+//! also caller-supplied — with one addition. `WorkerHeartbeat.build_version`
+//! has NO charset or length validation of its own (unlike `worker_id`, which
+//! `validate_worker_id` gates before the MAC), so a value is normalised
+//! through [`well_formed_build_key`] before it can become a key. Signing bounds
+//! WHO can inflate this map to holders of the fleet-shared key; it does not
+//! bound HOW MUCH, which is what [`MAX_TRACKED_BUILDS`] is for. This is not a
+//! new trust boundary — the same holder already floods the `worker_id` map and
+//! already inflates the same gauges — it is a second key space with the same
+//! property, and it is bounded the same way.
+//!
+//! # The `None` bucket, and what a reader may NOT conclude from it
+//!
+//! [`WorkerManager::live_distinct_builds`] returns `Option<String>`, and the
+//! `None` element is a REAL observation: some process heartbeated and reported
+//! no build this crate could use. Its consumer splits the population three
+//! ways — provably skewed, unverifiable, and agreeing — and `None` always
+//! lands in UNVERIFIABLE, never in skewed. That direction is deliberate (#578:
+//! absence of evidence is not evidence of skew) and it creates a trap on the
+//! way out:
+//!
+//! **A zero skew count over a population containing an unverifiable bucket is
+//! not a clean bill of health.** "0 skewed of 2 live builds" describes a fleet
+//! in which one of the two builds was never checked. An absence rendered as a
+//! negative result is the failure this whole area of the repo exists to stop,
+//! so the unverifiable count is exported as its own series
+//! (`talos_worker_fleet_unverifiable_builds`) rather than being folded away —
+//! the denominator includes it, so it must be visible beside it. The three
+//! series decompose exactly: `live_builds == skew + unverifiable + agreeing`.
+//!
+//! Concretely, when the unverifiable count is non-zero a reader MAY conclude
+//! "at least that many distinct builds are running that I could not compare",
+//! and MAY NOT conclude anything about whether they match. When it EQUALS
+//! `live_builds`, no comparison was possible at all — which happens for every
+//! observed build at once if THIS CONTROLLER's own build has no usable sha, so
+//! it is as often a statement about the controller as about the fleet.
 
 use dashmap::DashMap;
 use futures::StreamExt;
@@ -79,6 +144,43 @@ pub const STALE_AFTER: Duration = Duration::from_secs(WORKER_HEARTBEAT_MAX_AGE_S
 /// `STALE_AFTER + PRUNE_INTERVAL`, not `STALE_AFTER` alone.
 pub const PRUNE_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Maximum distinct build values tracked at once in the build-keyed map.
+///
+/// Deliberately FAR smaller than [`MAX_TRACKED_WORKERS`], because the honest
+/// organic maximum is tiny: a healthy fleet has 1, a fleet mid-roll has 2, a
+/// pathological one that stacked three rollouts has 3. 64 leaves an order of
+/// magnitude of headroom over anything real while keeping the flood ceiling
+/// low — and unlike the worker map, a full build map does not hide a worker:
+/// its only consumer is a COUNT of builds, so saturation is visible in
+/// `talos_worker_fleet_capacity_dropped_builds` and nothing else degrades.
+pub const MAX_TRACKED_BUILDS: usize = 64;
+
+/// Longest build string that may become a key in the build map.
+///
+/// Matches the `validate_worker_id` bound (128) on purpose: the same argument
+/// applies to both, and picking a different number here would invite the
+/// question of which one is right.
+pub const MAX_BUILD_VERSION_LEN: usize = 128;
+
+/// Whether a reported build may be used verbatim as a key in the build map.
+///
+/// The charset is `validate_worker_id`'s plus `+`, which real build strings
+/// need (`{version}+{sha}[-dirty]`). A value failing this is NOT discarded —
+/// discarding would make the worker that sent it vanish from the builds view
+/// entirely — it is folded into the `None` ("no usable build reported")
+/// bucket, where it is counted as UNVERIFIABLE rather than as skew. That is
+/// the safe direction in both senses: a malformed build cannot fabricate skew,
+/// and it cannot hide a worker either. Every malformed value collapses onto
+/// that one key, so this is also what bounds the key LENGTH — no caller-
+/// supplied string longer than [`MAX_BUILD_VERSION_LEN`] is ever retained.
+pub fn well_formed_build_key(build: &str) -> bool {
+    !build.is_empty()
+        && build.len() <= MAX_BUILD_VERSION_LEN
+        && build
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'+'))
+}
+
 /// Tracks the state of a single worker in the fleet.
 #[derive(Debug, Clone)]
 pub struct WorkerState {
@@ -103,6 +205,24 @@ pub struct WorkerManager {
     /// Read by the fleet-gauge sweep so the condition is visible rather than
     /// only logged.
     capacity_drops: std::sync::atomic::AtomicU64,
+    /// Reported BUILD → when that build was last observed, over the same
+    /// staleness window as `workers`. See the module header: this map exists
+    /// because `workers` is last-write-wins on `worker_id`, so on a shared-id
+    /// fleet it retains only one of the builds actually running.
+    ///
+    /// `None` is a real key — "a worker heartbeated and reported no usable
+    /// build" — and every malformed value collapses onto it (see
+    /// [`well_formed_build_key`]). It is deliberately NOT an absence.
+    ///
+    /// The same absent-field note applies as for `workers`: no pool, no
+    /// repository, no HTTP client. Nothing here may write
+    /// `worker_identities.last_liveness_at`.
+    builds: DashMap<Option<String>, Instant>,
+    /// Build observations refused because the build map was at
+    /// [`MAX_TRACKED_BUILDS`]. Separate from `capacity_drops` on purpose —
+    /// conflating two different refusal causes into one number is the
+    /// misleading-report-field defect this whole area exists to remove.
+    build_capacity_drops: std::sync::atomic::AtomicU64,
 }
 
 impl WorkerManager {
@@ -112,6 +232,8 @@ impl WorkerManager {
             workers: DashMap::new(),
             shared_key,
             capacity_drops: std::sync::atomic::AtomicU64::new(0),
+            builds: DashMap::new(),
+            build_capacity_drops: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -171,15 +293,66 @@ impl WorkerManager {
         }
 
         // 3. Update the registry with the latest metrics and timestamp.
+        let now = Instant::now();
+        self.record_build_observation(hb.build_version.as_deref(), now);
         self.workers.insert(
             hb.worker_id.clone(),
             WorkerState {
                 heartbeat: hb,
-                last_seen: Instant::now(),
+                last_seen: now,
             },
         );
 
         Ok(())
+    }
+
+    /// Record that SOME process is running `build`, in the map that survives
+    /// the `worker_id` collision.
+    ///
+    /// Reached only after the heartbeat has verified AND passed the worker-map
+    /// capacity gate: a heartbeat refused there is refused entirely, so a
+    /// flood cannot spend the worker budget and the build budget at once.
+    ///
+    /// A malformed or over-long build is folded into the `None` bucket rather
+    /// than dropped — see [`well_formed_build_key`] for why that is the safe
+    /// direction — so the key space this map can ever hold is
+    /// `{None} ∪ {well-formed strings ≤ MAX_BUILD_VERSION_LEN}`, capped at
+    /// [`MAX_TRACKED_BUILDS`].
+    fn record_build_observation(&self, build: Option<&str>, now: Instant) {
+        let key: Option<String> = match build {
+            Some(b) if well_formed_build_key(b) => Some(b.to_string()),
+            // Reported nothing, reported "", or reported something that must
+            // not become a key: all are "no usable build", i.e. unverifiable.
+            _ => None,
+        };
+
+        // Same bound shape as the worker map: at the cap a NEW key is refused
+        // while tracked keys keep refreshing, so saturation degrades to "no
+        // new build is visible" rather than to eviction churn of the real
+        // ones. Not LRU, for the same reason.
+        if !self.builds.contains_key(&key) && self.builds.len() >= MAX_TRACKED_BUILDS {
+            let n = self
+                .build_capacity_drops
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n == 0 || n.is_multiple_of(1000) {
+                tracing::warn!(
+                    target: "talos_worker_fleet",
+                    event_kind = "fleet_build_view_at_capacity",
+                    cap = MAX_TRACKED_BUILDS,
+                    drops = n + 1,
+                    // The build string itself is NOT logged. It is
+                    // caller-supplied under the fleet-shared key, and a
+                    // rate-limited log line is still a log line.
+                    "worker fleet BUILD view is at capacity; observations of NEW build \
+                     values are being dropped. Tracked builds still refresh. A real \
+                     fleet has one build, or two mid-roll — this many distinct values \
+                     means the shared key is being used to publish fabricated ones."
+                );
+            }
+            return;
+        }
+
+        self.builds.insert(key, now);
     }
 
     /// Returns a list of all currently active workers.
@@ -264,6 +437,37 @@ impl WorkerManager {
             .collect()
     }
 
+    /// The DISTINCT builds observed within the staleness window — the
+    /// population every `talos_worker_fleet_*_builds` gauge is computed over.
+    ///
+    /// **Use this, not [`Self::live_build_versions`], for skew detection.**
+    /// That one is per-tracked-`worker_id` and so retains only the last
+    /// writer's build when replicas share an id; this one retains every build
+    /// that was actually observed. On a mixed-build shared-id fleet the former
+    /// alternates and the latter is steady, which is the whole reason this
+    /// method exists (module header).
+    ///
+    /// Anonymous for the same reason as its sibling: no `worker_id` comes out,
+    /// so a caller-supplied string cannot become a metric label. What DOES
+    /// come out is the caller-supplied BUILD string — also never a label, and
+    /// bounded on the way in by [`well_formed_build_key`].
+    ///
+    /// **This is a count of BUILDS, not of processes.** Five workers on one
+    /// skewed build are one element here. Detection is unaffected (the alert
+    /// asks `> 0`); the MAGNITUDE is not recoverable from it.
+    pub fn live_distinct_builds(&self) -> Vec<Option<String>> {
+        self.builds.iter().map(|kv| kv.key().clone()).collect()
+    }
+
+    /// Cumulative build observations refused because the build map was at
+    /// [`MAX_TRACKED_BUILDS`], since process start. Distinct from
+    /// [`Self::capacity_drops`], which counts heartbeats refused by the
+    /// WORKER map.
+    pub fn build_capacity_drops(&self) -> u64 {
+        self.build_capacity_drops
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Cumulative heartbeats refused because the map was at
     /// [`MAX_TRACKED_WORKERS`], since process start.
     pub fn capacity_drops(&self) -> u64 {
@@ -317,6 +521,12 @@ impl WorkerManager {
     }
 
     /// Removes workers that haven't sent a heartbeat within the specified duration.
+    ///
+    /// Prunes BOTH maps on the same tick and against the same `max_age`, so a
+    /// build cannot outlive the workers that reported it: were the build map
+    /// pruned more slowly, a rolled-away build would keep the skew alert
+    /// firing after the fleet was fixed, which is the failure the `for:`
+    /// duration is supposed to prevent.
     pub fn prune_stale(&self, max_age: Duration) {
         let now = Instant::now();
         let initial_count = self.workers.len();
@@ -332,6 +542,16 @@ impl WorkerManager {
         let pruned = initial_count - self.workers.len();
         if pruned > 0 {
             tracing::info!("Pruned {} stale workers from fleet", pruned);
+        }
+
+        // The build value is NOT logged (caller-supplied under a shared key);
+        // the count is.
+        let builds_before = self.builds.len();
+        self.builds
+            .retain(|_, last_seen| now.duration_since(*last_seen) < max_age);
+        let builds_pruned = builds_before - self.builds.len();
+        if builds_pruned > 0 {
+            tracing::info!("Pruned {} stale builds from fleet view", builds_pruned);
         }
     }
 }
@@ -625,6 +845,230 @@ mod tests {
     /// The build accessor hands out builds WITHOUT the identities they belong
     /// to. That is the anti-cardinality rule made structural: a caller that
     /// never receives `worker_id` cannot label a metric with it.
+    /// **THE ACCEPTANCE CASE: a simulated mixed-build shared-id fleet.**
+    ///
+    /// This is the honest substitute for a two-build deployment, which cannot
+    /// be observed on the dev stack because both replicas run the same build.
+    /// It drives the exact shape a stuck rolling deploy produces — two
+    /// processes, ONE `worker_id` (the posture the chart writes out inline),
+    /// two different builds — and asserts BOTH halves of the claim:
+    ///
+    ///   * the OLD per-`worker_id` population alternates, so a `> 0` alert
+    ///     with a `for:` duration on it can never hold; and
+    ///   * the NEW build-keyed population is steady across the same
+    ///     alternation, so the same alert can.
+    ///
+    /// Proving only the second half would leave "the old one could not fire"
+    /// asserted rather than demonstrated.
+    #[tokio::test]
+    async fn a_mixed_build_shared_id_fleet_flaps_per_id_but_is_steady_per_build() {
+        const ID: &str = "dev-worker-fleet";
+        const CONTROLLER: &str = "0.1.0+aaaaaaa";
+        const ROLLED: &str = "0.1.0+bbbbbbb";
+
+        let m = WorkerManager::new(KEY.to_vec());
+
+        // Ten publish rounds of two replicas sharing one id, alternating which
+        // one wrote last. A real fleet's ordering is arbitrary; alternating is
+        // the clearest way to show the per-id view changing under a fleet that
+        // is not changing.
+        let mut per_id_readings = Vec::new();
+        for round in 0..10 {
+            let (first, second) = if round % 2 == 0 {
+                (CONTROLLER, ROLLED)
+            } else {
+                (ROLLED, CONTROLLER)
+            };
+            m.handle_heartbeat(signed(ID, Some(first))).unwrap();
+            m.handle_heartbeat(signed(ID, Some(second))).unwrap();
+
+            // The worker map holds exactly one entry the whole time: the
+            // shared id collapses both replicas onto it.
+            assert_eq!(m.worker_count(), 1, "round {round}");
+
+            let per_id = m.live_build_versions();
+            assert_eq!(per_id.len(), 1, "round {round}: one id, one entry");
+            per_id_readings.push(per_id[0].clone());
+        }
+
+        // OLD SHAPE. The retained build is whichever replica spoke last, so a
+        // sweep sampling this population sees the skewed build only some of
+        // the time. A gauge derived from it is therefore not continuously
+        // non-zero, and `expr > 0` + `for: 30m` cannot be satisfied.
+        assert!(
+            per_id_readings.iter().any(|b| b.as_deref() == Some(ROLLED))
+                && per_id_readings
+                    .iter()
+                    .any(|b| b.as_deref() == Some(CONTROLLER)),
+            "the per-id population must be shown ALTERNATING, otherwise this \
+             test does not demonstrate why the old gauge could not hold a for:"
+        );
+
+        // NEW SHAPE. Both builds are retained regardless of write order, so
+        // the skewed build is present on EVERY sample, not some of them.
+        let mut distinct = m.live_distinct_builds();
+        distinct.sort();
+        assert_eq!(
+            distinct,
+            vec![Some(CONTROLLER.to_string()), Some(ROLLED.to_string())],
+            "the build-keyed population must retain BOTH builds"
+        );
+
+        // And it is steady: re-sampling after either replica writes again
+        // returns the same set. This is the property the `for:` needs.
+        for round in 0..4 {
+            let last = if round % 2 == 0 { CONTROLLER } else { ROLLED };
+            m.handle_heartbeat(signed(ID, Some(last))).unwrap();
+            let mut d = m.live_distinct_builds();
+            d.sort();
+            assert_eq!(
+                d,
+                vec![Some(CONTROLLER.to_string()), Some(ROLLED.to_string())],
+                "round {round}: the build population must not depend on write order"
+            );
+        }
+    }
+
+    /// A UNIFORMLY skewed shared-id fleet was never the broken case, and
+    /// saying so is the difference between an accurate defect report and an
+    /// overstated one. Every replica on one non-controller build retains ONE
+    /// build, steadily — the old gauge held its `for:` here and the new one
+    /// must too.
+    #[tokio::test]
+    async fn a_uniformly_skewed_fleet_was_already_steady_and_stays_steady() {
+        let m = WorkerManager::new(KEY.to_vec());
+        for _ in 0..6 {
+            m.handle_heartbeat(signed("dev-worker-fleet", Some("0.1.0+bbbbbbb")))
+                .unwrap();
+            assert_eq!(m.live_build_versions().len(), 1);
+            assert_eq!(
+                m.live_distinct_builds(),
+                vec![Some("0.1.0+bbbbbbb".to_string())]
+            );
+        }
+    }
+
+    /// The build map is bounded and reports its own drops, and its counter is
+    /// SEPARATE from the worker map's — one number covering two different
+    /// refusal causes is the misleading-report-field defect.
+    #[tokio::test]
+    async fn the_build_map_is_bounded_and_reports_its_drops_separately() {
+        let m = WorkerManager::new(KEY.to_vec());
+        // One id, many distinct builds: this is the flood shape the worker-map
+        // cap cannot see, because the worker map has exactly one entry.
+        for i in 0..MAX_TRACKED_BUILDS + 50 {
+            m.handle_heartbeat(signed("w", Some(&format!("9.9.9+bui{i:04}"))))
+                .unwrap();
+        }
+        assert_eq!(m.worker_count(), 1, "the worker cap never engages here");
+        assert_eq!(m.live_distinct_builds().len(), MAX_TRACKED_BUILDS);
+        assert_eq!(m.build_capacity_drops(), 50);
+        assert_eq!(
+            m.capacity_drops(),
+            0,
+            "a build-map refusal must not be reported as a worker-map refusal"
+        );
+    }
+
+    /// A malformed or over-long build is folded into the `None` bucket, never
+    /// retained verbatim. Two properties at once: the key space stays bounded
+    /// in LENGTH, and the worker does not VANISH from the builds view (it is
+    /// counted unverifiable, which is what "we saw a process and cannot
+    /// compare its build" means).
+    #[tokio::test]
+    async fn a_malformed_build_becomes_unverifiable_not_a_key() {
+        let m = WorkerManager::new(KEY.to_vec());
+        let huge = "0.1.0+".to_string() + &"a".repeat(MAX_BUILD_VERSION_LEN);
+        m.handle_heartbeat(signed("w1", Some(&huge))).unwrap();
+        m.handle_heartbeat(signed("w2", Some("has space and \n newline")))
+            .unwrap();
+        m.handle_heartbeat(signed("w3", Some(""))).unwrap();
+        m.handle_heartbeat(signed("w4", None)).unwrap();
+
+        assert_eq!(
+            m.live_distinct_builds(),
+            vec![None],
+            "every unusable value collapses onto the one unverifiable key"
+        );
+        assert!(well_formed_build_key("0.1.0+abc1234-dirty"));
+        assert!(!well_formed_build_key(&huge));
+        assert!(!well_formed_build_key(""));
+    }
+
+    /// Both maps prune on the same tick against the same window. A build that
+    /// outlived its workers would keep the skew alert firing after the fleet
+    /// was rolled — the exact failure a `for:` duration exists to prevent.
+    #[tokio::test]
+    async fn pruning_clears_the_build_view_too() {
+        let m = WorkerManager::new(KEY.to_vec());
+        m.handle_heartbeat(signed("w", Some("0.1.0+aaaaaaa")))
+            .unwrap();
+        m.handle_heartbeat(signed("w", Some("0.1.0+bbbbbbb")))
+            .unwrap();
+        assert_eq!(m.live_distinct_builds().len(), 2);
+
+        m.prune_stale(Duration::from_secs(3600));
+        assert_eq!(m.live_distinct_builds().len(), 2, "still fresh");
+
+        m.prune_stale(Duration::from_secs(0));
+        assert_eq!(m.worker_count(), 0);
+        assert!(
+            m.live_distinct_builds().is_empty(),
+            "a stale build must leave the view with its workers"
+        );
+    }
+
+    /// PINS THE ORDERING CLAIM, which a doc comment alone cannot hold: a
+    /// heartbeat refused by the WORKER-map capacity gate must not still spend
+    /// the BUILD budget. If `record_build_observation` were ever hoisted above
+    /// that gate's early return, one flood would consume both bounds at once.
+    #[tokio::test]
+    async fn a_heartbeat_refused_at_the_worker_cap_never_reaches_the_build_map() {
+        let m = WorkerManager::new(KEY.to_vec());
+        for i in 0..MAX_TRACKED_WORKERS {
+            m.handle_heartbeat(signed(&format!("w{i}"), Some("0.1.0+aaaaaaa")))
+                .unwrap();
+        }
+        assert_eq!(
+            m.live_distinct_builds(),
+            vec![Some("0.1.0+aaaaaaa".to_string())]
+        );
+
+        // A NEW id at the cap: refused, and its build must be refused with it.
+        m.handle_heartbeat(signed("overflow", Some("0.1.0+bbbbbbb")))
+            .unwrap();
+        assert_eq!(m.capacity_drops(), 1);
+        assert_eq!(
+            m.live_distinct_builds(),
+            vec![Some("0.1.0+aaaaaaa".to_string())],
+            "a heartbeat dropped at the worker cap must not register a build"
+        );
+        assert_eq!(m.build_capacity_drops(), 0, "that is not a build-cap drop");
+    }
+
+    /// The `None` bucket is a real element of the population, so a caller
+    /// splitting it three ways gets a total that adds up. This is the shape
+    /// the gauges rely on: an unverifiable build sits in the DENOMINATOR, so
+    /// it must also be visible in its own numerator or a 0 skew reads as a
+    /// clean bill of health over something never checked.
+    #[tokio::test]
+    async fn an_unverifiable_build_stays_in_the_population_as_its_own_bucket() {
+        let m = WorkerManager::new(KEY.to_vec());
+        m.handle_heartbeat(signed("w1", Some("0.1.0+aaaaaaa")))
+            .unwrap();
+        m.handle_heartbeat(signed("w2", Some("0.1.0+bbbbbbb")))
+            .unwrap();
+        m.handle_heartbeat(signed("w3", None)).unwrap();
+
+        let population = m.live_distinct_builds();
+        assert_eq!(population.len(), 3, "None is an element, not an absence");
+        assert!(
+            population.contains(&None),
+            "an unreported build must remain visible to the consumer that \
+             classifies it, rather than being silently dropped"
+        );
+    }
+
     #[tokio::test]
     async fn live_build_versions_are_anonymous() {
         let m = WorkerManager::new(KEY.to_vec());
