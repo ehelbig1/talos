@@ -58,9 +58,18 @@
 //! [`WorkerManager`] keeps a SECOND, observability-only map keyed on the
 //! reported BUILD rather than on `worker_id`. It exists because the first map
 //! cannot answer "is some running process on a different build than the
-//! controller?" whenever replicas share one `worker_id` — the posture the
-//! chart writes out inline (`TALOS_WORKER_ID: "fleet"`) and the one the dev
-//! stack runs.
+//! controller?" whenever replicas share one `worker_id`.
+//!
+//! **NAME THE POSTURE, because only one of the two shipped ones has that
+//! problem.** The chart's worker deployment template renders no
+//! `TALOS_WORKER_ID` at all — the `values.yaml` line offering it is COMMENTED
+//! OUT inside the opt-in RFC-0010 worker-trust block — so a default
+//! `helm install` falls through to `worker_identity()`'s step 2, `HOSTNAME` →
+//! the pod name, and every replica holds its OWN map entry. The shared-id
+//! posture is the dev compose stack (one `TALOS_WORKER_ID` for both replicas)
+//! and the RFC-0010 single-key Ed25519 fleet once an operator uncomments it.
+//! The build map is what makes the detector work in BOTH; under distinct ids
+//! the `worker_id`-keyed view was never broken.
 //!
 //! The mechanism, stated exactly, because the imprecise version of it is
 //! wrong. `handle_heartbeat` ends in `workers.insert(worker_id, …)`, so on a
@@ -69,11 +78,20 @@
 //! map therefore ALTERNATES on a mixed-build fleet — 1 when the skewed replica
 //! wrote last, 0 when the matching one did — and an alert with a `for:`
 //! duration needs its condition to hold CONTINUOUSLY, so the timer resets
-//! forever. **Be precise about the scope of that defect**: a UNIFORMLY skewed
-//! fleet (every replica on one build that differs from the controller's) reads
-//! steadily 1 and alerts correctly. The unfireable case is the MIXED one — a
+//! forever. **Be precise about the scope of that defect**: it is confined to
+//! MIXED-build SHARED-id fleets. A UNIFORMLY skewed shared-id fleet (every
+//! replica on one build that differs from the controller's) reads steadily 1
+//! and alerts correctly, and under DISTINCT ids the per-`worker_id` count is
+//! steady in every case. The unfireable case is the mixed shared-id one — a
 //! roll that got stuck partway, which is exactly what a version-coupled
 //! signing incident looks like.
+//!
+//! The per-`worker_id` view is therefore still published
+//! (`talos_worker_fleet_build_skew_workers`, from
+//! [`WorkerManager::live_build_versions`]) as an INFORMATIONAL magnitude — it
+//! answers "how many PODS", which the build-keyed count structurally cannot —
+//! with no alert on it. Alerting stays on the build-keyed count, which is the
+//! only one steady in both postures.
 //!
 //! No counting function can repair that, because the second build is destroyed
 //! at insert time, before anything gets to count it. Retention is the fix, so
@@ -116,7 +134,23 @@
 //! and MAY NOT conclude anything about whether they match. When it EQUALS
 //! `live_builds`, no comparison was possible at all — which happens for every
 //! observed build at once if THIS CONTROLLER's own build has no usable sha, so
-//! it is as often a statement about the controller as about the fleet.
+//! it is as often a statement about the controller as about the fleet. That
+//! state pins the skew count at 0 by construction, so it has its own alert
+//! (`TalosWorkerFleetBuildSkewUndetectable`): the advice to read the
+//! unverifiable count first otherwise lives only in the annotation of an
+//! alert that requires skew > 0, i.e. it is delivered in every state except
+//! this one.
+//!
+//! **`None` is not the whole of UNVERIFIABLE, and the two must not be
+//! conflated.** [`well_formed_build_key`] folds every MALFORMED value onto
+//! that one key, which is what bounds key length — but a build string can be
+//! perfectly well formed and still uncomparable (`1.2.3` with no `+sha`,
+//! `0.1.0+unknown`), in which case it becomes its OWN key and is classified
+//! unverifiable by the consumer's `build_is_verifiable` check rather than by
+//! this crate. So "malformed values fold into one key" is a statement about
+//! the KEY SPACE only; it does NOT mean the unverifiable count is at most 1,
+//! and a fleet publishing many distinct unstamped builds occupies many slots
+//! of [`MAX_TRACKED_BUILDS`].
 
 use dashmap::DashMap;
 use futures::StreamExt;
@@ -150,9 +184,25 @@ pub const PRUNE_INTERVAL: Duration = Duration::from_secs(30);
 /// organic maximum is tiny: a healthy fleet has 1, a fleet mid-roll has 2, a
 /// pathological one that stacked three rollouts has 3. 64 leaves an order of
 /// magnitude of headroom over anything real while keeping the flood ceiling
-/// low — and unlike the worker map, a full build map does not hide a worker:
-/// its only consumer is a COUNT of builds, so saturation is visible in
-/// `talos_worker_fleet_capacity_dropped_builds` and nothing else degrades.
+/// low.
+///
+/// **A FULL BUILD MAP SUPPRESSES THE SIGNAL — say that first.** An earlier
+/// version of this comment said only that a full map "does not hide a worker
+/// … and nothing else degrades". It does not hide a *worker*; it hides a
+/// *build*, which is the entire signal. At the cap a NEW key is refused
+/// (`WorkerManager::record_build_observation` returns early), and
+/// `builds_match` compares only the `+sha` suffix, so `v0+<sha>` …
+/// `v63+<sha>` are 64 distinct keys that ALL classify as agreeing. A holder of
+/// the fleet-shared key can therefore fill the map with agreeing-but-distinct
+/// builds; a genuinely straggling worker's build is then a new key, is
+/// refused, and never appears — `talos_worker_fleet_build_skew_builds` reads
+/// 0, `TalosWorkerFleetBuildSkew` stays silent, and every published number
+/// looks healthy. That is a FALSE NEGATIVE on the detector, and it is why
+/// `talos_worker_fleet_capacity_dropped_builds` carries its own alert
+/// (`TalosWorkerFleetBuildViewSaturated`) rather than being an unread gauge.
+///
+/// The inflation direction (fabricated builds counted as skew or unverifiable
+/// BEFORE the cap is reached) is real too, and milder: it is loud.
 pub const MAX_TRACKED_BUILDS: usize = 64;
 
 /// Longest build string that may become a key in the build map.
@@ -173,6 +223,15 @@ pub const MAX_BUILD_VERSION_LEN: usize = 128;
 /// and it cannot hide a worker either. Every malformed value collapses onto
 /// that one key, so this is also what bounds the key LENGTH — no caller-
 /// supplied string longer than [`MAX_BUILD_VERSION_LEN`] is ever retained.
+///
+/// **That is a statement about the KEY SPACE, not about the unverifiable
+/// COUNT.** Returning `false` here is one of two ways to end up unverifiable;
+/// the other is a perfectly well-formed build with no comparable sha
+/// (`1.2.3`, `0.1.0+unknown`), which passes this gate, becomes its OWN key,
+/// and is classified by the consumer's `build_is_verifiable` instead. So
+/// `talos_worker_fleet_unverifiable_builds` is not bounded at 1 by this
+/// function, and a fleet publishing many distinct unstamped builds occupies
+/// many slots of [`MAX_TRACKED_BUILDS`].
 pub fn well_formed_build_key(build: &str) -> bool {
     !build.is_empty()
         && build.len() <= MAX_BUILD_VERSION_LEN
@@ -327,9 +386,14 @@ impl WorkerManager {
         };
 
         // Same bound shape as the worker map: at the cap a NEW key is refused
-        // while tracked keys keep refreshing, so saturation degrades to "no
-        // new build is visible" rather than to eviction churn of the real
-        // ones. Not LRU, for the same reason.
+        // while tracked keys keep refreshing, rather than eviction churn of
+        // the real ones. Not LRU, for the same reason.
+        //
+        // "No NEW build is visible" is a SUPPRESSION of the skew detector,
+        // not a cosmetic degradation — a straggler arriving during a flood is
+        // exactly the build the alert exists to catch, and it is the one that
+        // gets refused. See MAX_TRACKED_BUILDS. The drop is counted so the
+        // condition is alertable rather than silent.
         if !self.builds.contains_key(&key) && self.builds.len() >= MAX_TRACKED_BUILDS {
             let n = self
                 .build_capacity_drops
@@ -430,6 +494,14 @@ impl WorkerManager {
     /// itself is done by the caller so this crate needs no dependency on the
     /// identity-registry crate (see
     /// [`tests::heartbeat_never_touches_the_trust_boundary`]).
+    ///
+    /// **This is the MAGNITUDE population** — one element per tracked
+    /// `worker_id`, so its length is [`Self::worker_count`]. It feeds
+    /// `talos_worker_fleet_build_skew_workers`, which answers "how many PODS
+    /// are on a wrong build" where [`Self::live_distinct_builds`] can only
+    /// answer "how many BUILDS". No ALERT may be built on it: where replicas
+    /// share one `worker_id` this slice has one element and the derived count
+    /// alternates on a mixed-build fleet (module header).
     pub fn live_build_versions(&self) -> Vec<Option<String>> {
         self.workers
             .iter()
@@ -440,12 +512,14 @@ impl WorkerManager {
     /// The DISTINCT builds observed within the staleness window — the
     /// population every `talos_worker_fleet_*_builds` gauge is computed over.
     ///
-    /// **Use this, not [`Self::live_build_versions`], for skew detection.**
-    /// That one is per-tracked-`worker_id` and so retains only the last
-    /// writer's build when replicas share an id; this one retains every build
-    /// that was actually observed. On a mixed-build shared-id fleet the former
-    /// alternates and the latter is steady, which is the whole reason this
-    /// method exists (module header).
+    /// **Use this, not [`Self::live_build_versions`], for the ALERTED skew
+    /// count.** That one is per-tracked-`worker_id` and so retains only the
+    /// last writer's build when replicas share an id; this one retains every
+    /// build that was actually observed. On a mixed-build shared-id fleet the
+    /// former alternates and the latter is steady, which is the whole reason
+    /// this method exists (module header). Under DISTINCT `worker_id`s — the
+    /// chart default — both are steady, and the other one additionally
+    /// carries the per-pod magnitude, which is why it still has a caller.
     ///
     /// Anonymous for the same reason as its sibling: no `worker_id` comes out,
     /// so a caller-supplied string cannot become a metric label. What DOES
@@ -850,16 +924,24 @@ mod tests {
     /// This is the honest substitute for a two-build deployment, which cannot
     /// be observed on the dev stack because both replicas run the same build.
     /// It drives the exact shape a stuck rolling deploy produces — two
-    /// processes, ONE `worker_id` (the posture the chart writes out inline),
-    /// two different builds — and asserts BOTH halves of the claim:
+    /// processes, ONE `worker_id` (the dev compose stack's posture, and a
+    /// chart install that has uncommented the RFC-0010 single-key block; the
+    /// chart DEFAULT renders no `TALOS_WORKER_ID`, so each pod is its own
+    /// identity and this shape does not arise there) — two different builds,
+    /// and asserts BOTH halves of the claim:
     ///
-    ///   * the OLD per-`worker_id` population alternates, so a `> 0` alert
+    ///   * the per-`worker_id` population alternates, so a `> 0` alert
     ///     with a `for:` duration on it can never hold; and
-    ///   * the NEW build-keyed population is steady across the same
+    ///   * the build-keyed population is steady across the same
     ///     alternation, so the same alert can.
     ///
-    /// Proving only the second half would leave "the old one could not fire"
-    /// asserted rather than demonstrated.
+    /// Proving only the second half would leave "the per-id one could not
+    /// fire here" asserted rather than demonstrated.
+    ///
+    /// **This is the derivation guard** that `observability/alerts_chart_test.yml`
+    /// points at: promtool feeds SYNTHETIC series, so no change here can turn
+    /// that fixture red. This test is where a re-derivation of the gauge from
+    /// a last-write-wins population is caught.
     #[tokio::test]
     async fn a_mixed_build_shared_id_fleet_flaps_per_id_but_is_steady_per_build() {
         const ID: &str = "dev-worker-fleet";

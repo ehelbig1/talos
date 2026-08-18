@@ -920,21 +920,50 @@ tests:
   # ══════════════════════════════════════════════════════════════════════
   # ══════════════════════════════════════════════════════════════════════
   # THE FLAP (2026-08). The suite immediately below drives the shape a stuck
-  # rolling deploy produces on a fleet whose replicas share one worker_id —
-  # the posture the chart writes out inline. Under the OLD per-worker_id
-  # gauge, two replicas on different builds overwrote the same map entry, so
-  # the series alternated 1/0 every sweep. `for: 30m` needs the condition to
-  # hold CONTINUOUSLY, so it could never elapse.
+  # rolling deploy produces on a fleet whose replicas SHARE one worker_id —
+  # the dev compose stack, or a chart install that has uncommented the
+  # RFC-0010 single-key block (the chart's default renders no TALOS_WORKER_ID
+  # at all, so each pod is its own identity and this shape does not arise).
+  # Under the per-worker_id gauge two replicas on different builds overwrite
+  # the same map entry, so the series alternates 1/0 every sweep. `for: 30m`
+  # needs the condition to hold CONTINUOUSLY, so it can never elapse — which
+  # is why talos_worker_fleet_build_skew_workers is exported without an alert
+  # and the alert lives on the build-keyed count.
   #
-  # This fixture is what makes "the old shape could not fire" DEMONSTRATED
-  # rather than asserted. It is expressed against the CURRENT series name
-  # deliberately: promtool cannot evaluate a rule that no longer exists, so
-  # the honest way to pin the property is to feed the current rule the
-  # FLAPPING VALUES the old gauge produced and show it stays silent. That is
-  # also the regression guard — if anyone ever re-derives this gauge from a
-  # last-write-wins population, this fixture goes red.
+  # This fixture is what makes "a flapping series cannot satisfy a for:"
+  # DEMONSTRATED rather than asserted. It is expressed against the CURRENT
+  # series name deliberately: promtool cannot evaluate a rule that no longer
+  # exists, so the honest way to pin the property is to feed the current rule
+  # the FLAPPING VALUES the per-worker_id gauge produces on a shared-id fleet
+  # and show it stays silent.
+  #
+  # STATE WHAT THIS FIXTURE GATES, AND WHAT IT DOES NOT. promtool feeds
+  # SYNTHETIC series; the derivation that produces them lives in Rust, so NO
+  # change to WorkerManager or to publish_worker_fleet_gauges can turn this
+  # red. It is not the derivation guard. What it does gate, measured rather
+  # than assumed:
+  #   * removing `for:` from TalosWorkerFleetBuildSkew entirely (it then fires
+  #     at the eval points where the series is 1) — note this catches only one
+  #     of the three eval points below, which is enough;
+  #   * adding any smoothing (max_over_time, avg_over_time, a `> 0` over a
+  #     range) that would make the flapping series satisfy the rule.
+  # It does NOT gate a SHORTENED `for:` — a 1m `for:` still fails on a series
+  # that is 0 every other minute, so this fixture stays green.
+  #
+  # THE DERIVATION GUARD IS THE RUST TEST
+  # talos_worker_fleet::tests::a_mixed_build_shared_id_fleet_flaps_per_id_but_
+  # is_steady_per_build, which drives two replicas on one worker_id through
+  # the real map and asserts both halves. If you are here because you changed
+  # how the gauge is derived, that is the test that should have caught it.
+  # NAME states the INVARIANT under test, not a verdict on your change. If you
+  # are reading this because it went red after adding smoothing to
+  # TalosWorkerFleetBuildSkew: the rationale for rejecting smoothing is the
+  # comment block immediately above, and the trade it makes is that the
+  # detector gets LEAST reliable as the skewed fraction shrinks — i.e. on a
+  # single straggler pod. Read that, then decide; this fixture is not the
+  # argument, it is the pin.
   - interval: 1m
-    name: "a flapping skew series can never satisfy the for: duration"
+    name: "smoothing or a missing for: would let a flapping series alert; neither is present"
     input_series:
       # 1,0,1,0,… for two hours — the old gauge's behaviour on a mixed-build
       # shared-id fleet. Skew is CONTINUOUSLY PRESENT in the fleet; only the
@@ -992,12 +1021,13 @@ tests:
 
                 THE VALUE COUNTS BUILDS, NOT PROCESSES. Five workers stuck on one
                 old build report 1, not 5, so this number tells you a skew exists
-                and NOT how much of the fleet it covers. That magnitude is
-                genuinely unavailable here: the fleet view is keyed on worker_id
-                and the chart's single-key posture gives every replica the same
-                one, so a per-worker count would alternate on a mixed-build fleet
-                and no `for:` duration could ever elapse. Use
-                get_platform_info → `fleet` for per-worker detail.
+                and NOT how much of the fleet it covers. For the magnitude read
+                talos_worker_fleet_build_skew_workers — which is correct on a
+                DEFAULT install (this chart renders no TALOS_WORKER_ID, so each pod
+                is its own identity) and is 0-or-1 and flapping only where you have
+                deliberately given every replica ONE id. The alert lives on the
+                build count because that one is steady in both postures. Use
+                get_platform_info → `fleet` for per-worker detail either way.
 
                 The denominator is talos_worker_fleet_live_builds — NOT
                 talos_worker_fleet_live_workers, which counts heartbeating
@@ -1035,18 +1065,272 @@ tests:
   # A fleet whose workers all report an unusable sha is UNVERIFIABLE, not
   # agreeing. The skew gauge is 0 and the alert must stay silent — reporting
   # skew we cannot prove would page on every dev build.
+  #
+  # AND THE SAME INPUT DRIVES THE META-DETECTOR THE OTHER WAY. This state is
+  # exactly TalosWorkerFleetBuildSkewUndetectable's firing condition: the skew
+  # alert is silent because nothing was comparable, which is indistinguishable
+  # on that series alone from "the fleet agrees". Asserting BOTH here is the
+  # point — a silence and the alert that explains the silence, from one input.
   - interval: 1m
-    name: an all-unverifiable fleet does not fire
+    name: an all-unverifiable fleet does not fire the skew alert, and DOES fire the meta-detector
     input_series:
+      # Wholly unverifiable for 90m, then the images are rebuilt with a sha:
+      # one comparable build, nothing unverifiable. The alert must CLEAR — a
+      # meta-detector that pinned on after one bad build would train the same
+      # ignore-the-red reflex it exists to prevent.
       - series: 'talos_worker_fleet_build_skew_builds{job="talos-controller"}'
-        values: "0x120"
+        values: "0x150"
       - series: 'talos_worker_fleet_unverifiable_builds{job="talos-controller"}'
-        values: "3x120"
+        values: "3x90 0x60"
       - series: 'talos_worker_fleet_live_builds{job="talos-controller"}'
-        values: "3x120"
+        values: "3x90 1x60"
     alert_rule_test:
       - eval_time: 90m
         alertname: TalosWorkerFleetBuildSkew
+        exp_alerts: []
+      # `for: 1h` — pending, not firing, at 30m.
+      - eval_time: 30m
+        alertname: TalosWorkerFleetBuildSkewUndetectable
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: TalosWorkerFleetBuildSkewUndetectable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: fleet-identity
+              job: talos-controller
+            exp_annotations:
+              summary: "no observed build can be compared with the controller's — TalosWorkerFleetBuildSkew cannot fire"
+              description: |
+                Every build observed in the fleet heartbeat is UNVERIFIABLE: it
+                carries no usable commit sha, or THIS CONTROLLER's build carries
+                none, in which case nothing is comparable regardless of what the
+                workers report.
+
+                So talos_worker_fleet_build_skew_builds is 0 because no comparison
+                was possible, NOT because the fleet agrees. Its alert is dark for
+                as long as this fires. A live build skew — which breaks signed,
+                version-coupled wire formats in ways that read as crypto bugs —
+                would produce no signal at all right now.
+
+                This is a build-provenance defect, not a fleet defect. The most
+                common cause by far is a controller image built outside the
+                publish path, where GIT_SHA is unavailable and the version string
+                is stamped `unknown`.
+              action: |
+                1. Establish WHICH side is unstamped: get_platform_info shows the
+                   controller's own build string and, under `fleet`, what the
+                   workers reported. If the controller's has no `+<sha>` suffix,
+                   it is the controller.
+                2. Controller unstamped: rebuild through the published path
+                   (main-publish.yml, or scripts/publish-images.sh) so build.rs
+                   stamps GIT_SHA. A hand `docker build` from a context without
+                   git metadata is the usual way to land here.
+                3. Workers unstamped: the same applies to the worker image; the
+                   two build.rs copies must stamp identically (structural check
+                   62), so a drift there presents as this.
+                4. Do NOT silence this to quieten a dev stack. Set the policy at
+                   the source instead — an unstamped build is exactly the state in
+                   which a fleet-wide version skew is undetectable.
+      # Rebuilt at t=91m: comparison is possible again and the alert clears.
+      - eval_time: 130m
+        alertname: TalosWorkerFleetBuildSkewUndetectable
+        exp_alerts: []
+
+  # THE TWO SILENT DIRECTIONS for the meta-detector, because an alert that
+  # fires on a healthy or a merely-partial fleet is worse than none. Both are
+  # driven PAST the `for: 1h`, which is not a detail: the first draft of the
+  # partial suite evaluated at 55m and therefore passed under a mutation that
+  # relaxed `>=` to `> 0` — the pending window hid the defect, so the fixture
+  # gated nothing. Any silent-direction leg here must outlast the `for:`.
+  - interval: 1m
+    name: a partially unverifiable fleet never fires, however long it lasts
+    input_series:
+      # One of two observed builds is unverifiable — an ordinary state (one
+      # worker on an unstamped image). 1 >= 2 is false, forever. This is the
+      # direction a future "tidy-up" is most likely to break, by relaxing
+      # `>=` to a bare `> 0`.
+      - series: 'talos_worker_fleet_unverifiable_builds{job="talos-controller"}'
+        values: "1x180"
+      - series: 'talos_worker_fleet_live_builds{job="talos-controller"}'
+        values: "2x180"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: TalosWorkerFleetBuildSkewUndetectable
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: TalosWorkerFleetBuildSkewUndetectable
+        exp_alerts: []
+      - eval_time: 170m
+        alertname: TalosWorkerFleetBuildSkewUndetectable
+        exp_alerts: []
+
+  - interval: 1m
+    name: a controller that has never seen a heartbeat does not alert on comparability
+    input_series:
+      # Both seeded at 0 from registration — the state a controller exports
+      # before any worker publishes. 0 >= 0 is TRUE, so the live_builds > 0
+      # arm is doing all the work here. Without it every controller alerts an
+      # hour after every restart, which is how an alert gets ignored.
+      - series: 'talos_worker_fleet_unverifiable_builds{job="talos-controller"}'
+        values: "0x180"
+      - series: 'talos_worker_fleet_live_builds{job="talos-controller"}'
+        values: "0x180"
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: TalosWorkerFleetBuildSkewUndetectable
+        exp_alerts: []
+      - eval_time: 170m
+        alertname: TalosWorkerFleetBuildSkewUndetectable
+        exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # THE SATURATION PAIR. Both fleet maps are capped, and a full map SUPPRESSES
+  # the skew detector rather than merely inflating it — a build (or a worker
+  # id) not already tracked cannot enter, so a genuine straggler is refused
+  # and talos_worker_fleet_build_skew_builds reads 0 while every published
+  # number looks healthy.
+  #
+  # Both counters have COUNTER SEMANTICS ON A GAUGE TYPE: they are republished
+  # from a running total each sweep and reset only on controller restart. The
+  # `restart` leg below is what pins that the alert is on the LEVEL — a
+  # rate()/increase() form would misread the reset to 0 as a drop and could
+  # also fire spuriously on the step up, and the level form does neither.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: a saturated build map alerts on the level, and clears only on restart
+    input_series:
+      # Healthy for 20m, then the map saturates and the total climbs, then a
+      # controller restart resets it to 0 at t=81m.
+      - series: 'talos_worker_fleet_capacity_dropped_builds{job="talos-controller"}'
+        values: "0x20 1+3x60 0x40"
+      - series: 'talos_worker_fleet_capacity_dropped_heartbeats{job="talos-controller"}'
+        values: "0x120"
+    alert_rule_test:
+      # Healthy: silent.
+      - eval_time: 15m
+        alertname: TalosWorkerFleetBuildViewSaturated
+        exp_alerts: []
+      # `for: 5m` — the first drop lands at t=21m, so still pending at 24m.
+      - eval_time: 24m
+        alertname: TalosWorkerFleetBuildViewSaturated
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: TalosWorkerFleetBuildViewSaturated
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: fleet-identity
+              job: talos-controller
+            exp_annotations:
+              summary: "fleet BUILD view hit its cap — 58 observation(s) refused; build-skew detection is SUPPRESSED"
+              description: |
+                The controller's NATS fleet view refused build observations
+                because its BUILD map was at the hard cap (MAX_TRACKED_BUILDS =
+                64). The bound held — this is not a memory incident — but while
+                this is non-zero the view is INCOMPLETE IN THE DIRECTION THAT
+                MATTERS: a build not already tracked cannot enter, so
+                TalosWorkerFleetBuildSkew can read 0 on a fleet that is genuinely
+                skewed.
+
+                Read this as a FALSE-NEGATIVE risk on that alert, not as noise.
+                The other direction — fabricated builds inflating the skew and
+                unverifiable counts before the cap is reached — is also possible
+                and is the milder one, because it is loud.
+
+                A real fleet publishes one build, or two mid-roll. Reaching 64
+                distinct build strings does not happen organically, and
+                build_version is carried on a signed heartbeat, so whatever
+                produced this holds WORKER_SHARED_KEY. Note builds_match compares
+                only the +sha suffix, so 64 mutually-distinct strings can all
+                classify as AGREEING while filling the map — the flood need not
+                look like skew to cause this.
+              action: |
+                1. Which map: talos_worker_fleet_capacity_dropped_builds is the
+                   BUILD map (64), talos_worker_fleet_capacity_dropped_heartbeats
+                   the worker-id map (4096). They are separate counters on purpose.
+                2. Treat it as a key-handling question FIRST. Only a holder of the
+                   fleet-shared WORKER_SHARED_KEY can publish a verifying
+                   heartbeat, so enumerate what holds that key today and rotate it
+                   if the list is longer than it should be.
+                3. get_platform_info → `fleet` for what is actually being reported.
+                   The build strings and worker ids are deliberately NOT metric
+                   labels (caller-supplied, unbounded cardinality), so the queried
+                   surface is the only place to see them.
+                4. Until this clears, do not read a 0 on
+                   talos_worker_fleet_build_skew_builds as "the fleet agrees".
+                   Compare controller and worker image digests by hand instead.
+                5. Restarting the controller clears both counters and both maps.
+                   That is a way to confirm a diagnosis, NOT a fix: if the source
+                   is still publishing, it refills.
+      # Restarted at t=81m: the level falls to 0 and the alert clears. The
+      # worker-map alert never fired at any point — its counter stayed 0, and
+      # the two are separate rules precisely so one cannot mask the other.
+      - eval_time: 110m
+        alertname: TalosWorkerFleetBuildViewSaturated
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: TalosWorkerFleetWorkerViewSaturated
+        exp_alerts: []
+
+  - interval: 1m
+    name: a saturated worker-id map alerts independently of the build map
+    input_series:
+      - series: 'talos_worker_fleet_capacity_dropped_heartbeats{job="talos-controller"}'
+        values: "0x20 4+7x100"
+      - series: 'talos_worker_fleet_capacity_dropped_builds{job="talos-controller"}'
+        values: "0x120"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: TalosWorkerFleetWorkerViewSaturated
+        exp_alerts: []
+      - eval_time: 24m
+        alertname: TalosWorkerFleetWorkerViewSaturated
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: TalosWorkerFleetWorkerViewSaturated
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: fleet-identity
+              job: talos-controller
+            exp_annotations:
+              summary: "fleet WORKER-ID view hit its cap — 137 heartbeat(s) refused; build-skew detection is SUPPRESSED"
+              description: |
+                The controller's NATS fleet view refused heartbeats from worker ids
+                it was not already tracking, because the worker-id map was at its
+                hard cap (MAX_TRACKED_WORKERS = 4096). The bound held — this is not
+                a memory incident — but the view is now INCOMPLETE in the direction
+                that matters.
+
+                A refused heartbeat is refused ENTIRELY: it never reaches the
+                build-keyed map either. So a worker that boots, is renamed or is
+                rescheduled while this is non-zero is invisible to
+                talos_worker_fleet_live_workers AND to
+                talos_worker_fleet_build_skew_builds. Already-tracked workers keep
+                refreshing, which is why a flood degrades to "no NEW worker is
+                visible" rather than to churn of the real fleet.
+
+                No real fleet has 4096 distinct worker ids. Heartbeats are signed,
+                so whatever produced this holds WORKER_SHARED_KEY.
+              action: |
+                1. Treat it as a key-handling question FIRST: enumerate what holds
+                   WORKER_SHARED_KEY today and rotate it if that list is longer
+                   than it should be.
+                2. get_platform_info → `fleet` for the ids actually being
+                   reported. worker_id is caller-supplied and is deliberately
+                   never a metric label, so the queried surface is the only place
+                   to see them.
+                3. If this is NOT an attack, something is generating a fresh
+                   worker_id per process far more often than the fleet rolls —
+                   check whether TALOS_WORKER_ID is being set from a value that
+                   changes every restart.
+                4. Until it clears, do not read a 0 on
+                   talos_worker_fleet_build_skew_builds as "the fleet agrees".
+                5. Restarting the controller clears the counter and the map. That
+                   confirms a diagnosis; it does not fix the source.
+      - eval_time: 40m
+        alertname: TalosWorkerFleetBuildViewSaturated
         exp_alerts: []
 
   # ══════════════════════════════════════════════════════════════════════

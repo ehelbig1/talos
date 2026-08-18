@@ -542,8 +542,20 @@ pub(crate) fn departed_liveness_cutoff_hours() -> i64 {
 /// consumers it protects.
 pub(crate) const MAX_REAP_SILENCE_HOURS: i64 = 24 * 365 * 10;
 
-/// Recompute and publish the six `talos_worker_fleet_*` gauges from one
-/// snapshot of the NATS heartbeat view.
+/// Recompute and publish the eight `talos_worker_fleet_*` gauges from one
+/// read of the NATS heartbeat view.
+///
+/// **"One read" is a statement about the SOURCE, not about the wire.** All
+/// eight values are derived from the same set of accessor calls on the same
+/// tick, so they are mutually consistent as computed. They are then `set` into
+/// eight independent `IntGauge`s in sequence, and `registry.gather()` runs on
+/// the scrape task — so a scrape that lands mid-sequence can observe a MIX of
+/// two sweeps and, transiently, an inconsistent decomposition (e.g.
+/// `live_builds < skew + unverifiable`). The window is the handful of atomic
+/// stores below, sub-microsecond against a 60s sweep, and every alert built on
+/// these carries a `for:` of 30m or more, which absorbs it. Do not read this
+/// as an atomic multi-series snapshot; there is no such thing in the
+/// `prometheus` crate's model.
 ///
 /// Purely ADDITIVE to the registry-backed gauges: it reports only positive
 /// observations (workers that just spoke), so unlike a population NARROWING it
@@ -551,27 +563,33 @@ pub(crate) const MAX_REAP_SILENCE_HOURS: i64 = 24 * 365 * 10;
 /// [`heartbeat_silence_is_authoritative`] for the narrowing that does.
 ///
 /// **TWO POPULATIONS, and conflating them is a reporting defect rather than a
-/// rounding error.** `live_worker_ids` counts heartbeating IDENTITIES;
-/// `distinct_builds` counts distinct BUILDS observed. The three build gauges
-/// are computed over the SECOND, so the denominator to read them against is
-/// `talos_worker_fleet_live_builds` — never `..._live_workers`. A builds
-/// numerator over an ids denominator is how "1 skewed of 1 live worker" comes
-/// to read as a wholly skewed fleet that is really one pod in ten.
+/// rounding error.** `live_worker_ids` / `per_worker_builds` describe
+/// heartbeating IDENTITIES; `distinct_builds` describes distinct BUILDS
+/// observed. Each population gets its own numerator pair over its own
+/// denominator, and each decomposes exactly:
 ///
-/// The build population is used because the ids one CANNOT support a skew
-/// alert where replicas share a `worker_id`: the fleet map is last-write-wins,
-/// so a per-worker skew count alternates on a mixed-build fleet and no `for:`
-/// duration elapses. (A UNIFORMLY skewed fleet was always steady and always
-/// alerted — that half was never broken.) See the `talos_worker_fleet` module
-/// header.
+/// * `live_builds   == build_skew_builds  + unverifiable_builds  + agreeing`
+/// * `live_workers  == build_skew_workers + unverifiable_workers + agreeing`
 ///
-/// **The three build gauges decompose exactly**: `live == skew + unverifiable
-/// + agreeing`. `unverifiable` is published for that reason — it sits in the
-/// denominator, so a 0 skew over a population containing it is NOT a clean
-/// bill of health, and folding it away would render an absence as a negative
-/// result.
+/// Reading a builds numerator against an ids denominator is how "1 skewed of 1
+/// live worker" comes to read as a wholly skewed fleet that is really one pod
+/// in ten. `unverifiable` is published in BOTH populations for the same
+/// reason: it sits in the denominator, so a 0 skew over a population
+/// containing it is NOT a clean bill of health, and folding it away would
+/// render an absence as a negative result.
 ///
-/// `worker_id` never reaches a label here — both accessors hand out their
+/// **THE ALERT IS ON THE BUILD POPULATION, and only that one.** The ids
+/// population cannot support a skew alert where replicas share a `worker_id`:
+/// the fleet map is last-write-wins, so a per-worker skew count alternates on
+/// a mixed-build fleet and no `for:` duration elapses. (A UNIFORMLY skewed
+/// shared-id fleet was always steady and always alerted — that half was never
+/// broken, and under DISTINCT ids, which is the chart default because nothing
+/// renders `TALOS_WORKER_ID`, the per-worker count is steady in every case.)
+/// The ids population is published anyway because it carries the MAGNITUDE —
+/// how many pods, not how many builds — which the build population structurally
+/// cannot. See the `talos_worker_fleet` module header.
+///
+/// `worker_id` never reaches a label here — every accessor hands out its
 /// values WITHOUT the identities they belong to, precisely so a caller-supplied
 /// string cannot become unbounded series cardinality. Neither does the build
 /// string, which is caller-supplied too.
@@ -579,10 +597,16 @@ pub(crate) fn publish_worker_fleet_gauges(
     controller_build: &str,
     live_worker_ids: usize,
     distinct_builds: &[Option<String>],
+    per_worker_builds: &[Option<String>],
     capacity_drops: u64,
     build_capacity_drops: u64,
 ) {
     let (skewed, unverifiable) = count_heartbeat_build_skew(controller_build, distinct_builds);
+    // Same classifier, second population. `per_worker_builds` has one element
+    // per tracked `worker_id`, so its length is `live_worker_ids` and the
+    // decomposition documented above holds by construction.
+    let (skewed_workers, unverifiable_workers) =
+        count_heartbeat_build_skew(controller_build, per_worker_builds);
     if let Some(m) = metrics::global() {
         m.worker_fleet_live_workers
             .set(i64::try_from(live_worker_ids).unwrap_or(i64::MAX));
@@ -592,6 +616,10 @@ pub(crate) fn publish_worker_fleet_gauges(
             .set(i64::try_from(skewed).unwrap_or(i64::MAX));
         m.worker_fleet_unverifiable_builds
             .set(i64::try_from(unverifiable).unwrap_or(i64::MAX));
+        m.worker_fleet_build_skew_workers
+            .set(i64::try_from(skewed_workers).unwrap_or(i64::MAX));
+        m.worker_fleet_unverifiable_workers
+            .set(i64::try_from(unverifiable_workers).unwrap_or(i64::MAX));
         m.worker_fleet_capacity_dropped_heartbeats
             .set(i64::try_from(capacity_drops).unwrap_or(i64::MAX));
         m.worker_fleet_capacity_dropped_builds
@@ -697,9 +725,17 @@ pub(crate) fn spawn_worker_fleet_tasks(
             publish_worker_fleet_gauges(
                 &controller_build,
                 worker_manager.worker_count(),
-                // NOT `live_build_versions()`, which is per-`worker_id` and so
-                // retains only the last writer's build on a shared-id fleet.
+                // The ALERTED population. `live_distinct_builds()` retains
+                // every build actually observed, so it is steady where
+                // `live_build_versions()` — per-`worker_id`, and therefore
+                // holding only the last writer's build on a shared-id fleet —
+                // alternates.
                 &worker_manager.live_distinct_builds(),
+                // The MAGNITUDE population, informational only. One element
+                // per tracked `worker_id`; meaningful where replicas carry
+                // distinct ids (the chart default), 0-or-1 where they share
+                // one. No alert is built on the gauges derived from it.
+                &worker_manager.live_build_versions(),
                 worker_manager.capacity_drops(),
                 worker_manager.build_capacity_drops(),
             );
@@ -4868,7 +4904,9 @@ mod detector_metric_tests {
 
         // ONE worker_id (the shared-id posture) publishing three distinct
         // builds — so the two populations differ, which is the case that
-        // makes reading one against the other a defect.
+        // makes reading one against the other a defect. The per-worker slice
+        // has ONE element because the map has one entry: this is precisely
+        // the magnitude loss the shared-id posture imposes.
         publish_worker_fleet_gauges(
             "0.1.0+aaaaaaa",
             1,
@@ -4877,6 +4915,7 @@ mod detector_metric_tests {
                 Some("0.1.0+bbbbbbb".to_string()),
                 None,
             ],
+            &[Some("0.1.0+bbbbbbb".to_string())],
             7,
             2,
         );
@@ -4888,12 +4927,21 @@ mod detector_metric_tests {
         );
         assert_eq!(m.worker_fleet_build_skew_builds.get(), 1);
         assert_eq!(m.worker_fleet_unverifiable_builds.get(), 1);
+        assert_eq!(
+            m.worker_fleet_build_skew_workers.get(),
+            1,
+            "the one retained map entry is on the skewed build"
+        );
+        assert_eq!(m.worker_fleet_unverifiable_workers.get(), 0);
         assert_eq!(m.worker_fleet_capacity_dropped_heartbeats.get(), 7);
         assert_eq!(m.worker_fleet_capacity_dropped_builds.get(), 2);
 
         // THE DECOMPOSITION IDENTITY the annotation and the HELP strings both
         // promise: live == skew + unverifiable + agreeing. If it stopped
         // holding, "0 skewed" would stop being readable against a denominator.
+        // It is asserted for BOTH populations — shipping the ids numerator
+        // without its own denominator decomposition would repeat the defect
+        // the builds trio exists to avoid, one population over.
         let agreeing = 1; // only 0.1.0+aaaaaaa matches the controller
         assert_eq!(
             m.worker_fleet_live_builds.get(),
@@ -4901,11 +4949,48 @@ mod detector_metric_tests {
                 + m.worker_fleet_unverifiable_builds.get()
                 + agreeing
         );
+        let agreeing_workers = 0; // the single entry is the skewed build
+        assert_eq!(
+            m.worker_fleet_live_workers.get(),
+            m.worker_fleet_build_skew_workers.get()
+                + m.worker_fleet_unverifiable_workers.get()
+                + agreeing_workers
+        );
+
+        // DISTINCT ids — the chart DEFAULT, where nothing renders
+        // TALOS_WORKER_ID and each pod is its own map entry. Here the ids
+        // population carries the MAGNITUDE the builds population cannot:
+        // three pods on one skewed build read 3 here and 1 there.
+        publish_worker_fleet_gauges(
+            "0.1.0+aaaaaaa",
+            4,
+            &[
+                Some("0.1.0+aaaaaaa".to_string()),
+                Some("0.1.0+bbbbbbb".to_string()),
+            ],
+            &[
+                Some("0.1.0+aaaaaaa".to_string()),
+                Some("0.1.0+bbbbbbb".to_string()),
+                Some("0.1.0+bbbbbbb".to_string()),
+                Some("0.1.0+bbbbbbb".to_string()),
+            ],
+            7,
+            2,
+        );
+        assert_eq!(m.worker_fleet_live_workers.get(), 4);
+        assert_eq!(m.worker_fleet_build_skew_builds.get(), 1, "ONE build");
+        assert_eq!(
+            m.worker_fleet_build_skew_workers.get(),
+            3,
+            "THREE pods — the magnitude the builds gauge structurally cannot \
+             carry, and the reason this gauge was restored"
+        );
 
         // Fleet converges: the rolled-away build leaves the view.
         publish_worker_fleet_gauges(
             "0.1.0+aaaaaaa",
             1,
+            &[Some("0.1.0+aaaaaaa".to_string())],
             &[Some("0.1.0+aaaaaaa".to_string())],
             7,
             2,
@@ -4914,6 +4999,8 @@ mod detector_metric_tests {
         assert_eq!(m.worker_fleet_live_builds.get(), 1);
         assert_eq!(m.worker_fleet_build_skew_builds.get(), 0);
         assert_eq!(m.worker_fleet_unverifiable_builds.get(), 0);
+        assert_eq!(m.worker_fleet_build_skew_workers.get(), 0);
+        assert_eq!(m.worker_fleet_unverifiable_workers.get(), 0);
 
         // `worker_id` is caller-supplied on the bus, so it must not appear in
         // the exposition at all — these are plain label-free IntGauges and the

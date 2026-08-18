@@ -390,26 +390,40 @@ pub struct TalosMetrics {
     /// (always `set`), so an id that stops heartbeating lowers it within
     /// `STALE_AFTER + PRUNE_INTERVAL`.
     ///
-    /// **IT IS NOT A REPLICA COUNT on any fleet whose replicas share a
-    /// `worker_id`** — which is the single-key Ed25519 posture the chart
-    /// writes out inline (`values.yaml` worker.env `TALOS_WORKER_ID: "fleet"`,
-    /// with per-worker identities offered via `extraEnv`) and the one the dev
-    /// compose stack runs. The fleet view is a map keyed on `worker_id`, so
-    /// every such replica writes the SAME entry: a 5-replica fleet reports 1,
-    /// and scaling 5→1 still reports 1. The earlier wording here ("so a
-    /// scaled-down worker lowers it") holds only where replicas carry DISTINCT
-    /// ids; it is corrected rather than renamed, per the
-    /// misleading-report-field rule (#579/#580). Do NOT "fix" a shared id to
-    /// make this gauge nicer: the static `TALOS_WORKER_PUBLIC_KEYS` ring looks
-    /// a worker's public key up BY `worker_id`, so varying it alone breaks
-    /// dispatch verification.
+    /// **WHETHER THIS IS A REPLICA COUNT DEPENDS ON THE POSTURE, so establish
+    /// the posture before reading the number.** The fleet view is a map keyed
+    /// on `worker_id`, and the two shipped postures differ:
     ///
-    /// So this answers "how many distinct heartbeating identities?", which is
-    /// the honest denominator for the two skew gauges below (they are derived
-    /// from the same map) and NOT an answer to "are all my replicas up?".
-    /// Nothing in this file can answer that second question — see the fleet
-    /// crate's module header for why replica-loss detection is a separate
-    /// problem.
+    /// * **DISTINCT ids — the chart DEFAULT.** Nothing in
+    ///   `deploy/helm/talos/templates/worker/deployment.yaml` renders
+    ///   `TALOS_WORKER_ID`; the `values.yaml` line offering it is COMMENTED
+    ///   OUT inside the opt-in RFC-0010 worker-trust block. So a default
+    ///   `helm install` falls through to `worker_identity()`'s step 2,
+    ///   `HOSTNAME` → the pod name, and every replica carries its own id.
+    ///   Here the gauge IS a replica count: five replicas report 5, and
+    ///   scaling 5→1 lowers it to 1.
+    /// * **ONE SHARED id.** The dev compose stack sets a single
+    ///   `TALOS_WORKER_ID` for every replica (`.env`), and the RFC-0010
+    ///   single-key Ed25519 block does the same once an operator uncomments
+    ///   it. Every replica then writes the SAME entry: a fleet of any size
+    ///   reports 1, and scaling 5→1 still reports 1.
+    ///
+    /// The earlier wording here ("so a scaled-down worker lowers it") was true
+    /// of the first posture and silently false of the second; it is corrected
+    /// rather than renamed, per the misleading-report-field rule (#579/#580).
+    /// Where a shared id is deliberate, do NOT "fix" it to make this gauge
+    /// nicer: the static `TALOS_WORKER_PUBLIC_KEYS` ring looks a worker's
+    /// public key up BY `worker_id`, so varying it alone breaks dispatch
+    /// verification.
+    ///
+    /// What it answers in EVERY posture is "how many distinct heartbeating
+    /// identities?", which is the honest denominator for
+    /// [`Self::worker_fleet_build_skew_workers`] and
+    /// [`Self::worker_fleet_unverifiable_workers`] (all three are derived from
+    /// this same map). It is an answer to "are all my replicas up?" only under
+    /// distinct ids, and under a shared id nothing in this file can answer
+    /// that — see the fleet crate's module header for why replica-loss
+    /// detection is a separate problem.
     ///
     /// 0 is AMBIGUOUS and must be read as "no heartbeat observed": it covers
     /// a genuinely empty fleet, a fleet on a build too old to publish, and a
@@ -437,20 +451,27 @@ pub struct TalosMetrics {
     /// Of [`Self::worker_fleet_live_builds`], those that PROVABLY differ from
     /// this controller's build.
     ///
-    /// **COUNTS BUILDS, NOT PROCESSES — the magnitude is deliberately gone.**
-    /// Five workers stuck on one old build report 1 here, not 5. That is a
-    /// real information loss over the `_workers`-suffixed gauge this replaced
-    /// (2026-08) and it is the price of the gauge being able to fire at all:
-    /// the fleet view is keyed on `worker_id`, so where replicas share an id —
-    /// the posture the chart writes out inline — a per-worker skew count
-    /// ALTERNATES on a mixed-build fleet and no `for:` duration can ever
-    /// elapse. Detection is unaffected (the alert asks `> 0`); only the
-    /// magnitude is. Read `get_platform_info.fleet` for per-worker detail.
+    /// **COUNTS BUILDS, NOT PROCESSES.** Five workers stuck on one old build
+    /// report 1 here, not 5. The magnitude is not lost from the export —
+    /// [`Self::worker_fleet_build_skew_workers`] carries it — but it is not
+    /// recoverable from THIS number, and it is this number the alert is built
+    /// on, because it is the only one that survives every posture.
     ///
-    /// **State the old defect precisely.** The replaced gauge could not fire on
-    /// a MIXED-build shared-id fleet — a roll stuck partway. It DID fire
-    /// correctly on a uniformly skewed one, where the single retained entry is
-    /// steady. "It could not fire" is the overstatement; this is the claim.
+    /// **Why the ALERT lives here and not on the `_workers` gauge.** The fleet
+    /// view is keyed on `worker_id`. Where replicas share one id — the dev
+    /// compose stack, and the RFC-0010 single-key block once uncommented — a
+    /// per-worker skew count ALTERNATES on a mixed-build fleet (the map is
+    /// last-write-wins, so the retained build is whichever replica spoke
+    /// last), and no `for:` duration can ever elapse. This build-keyed count
+    /// is steady in BOTH postures, so the detector holds in both.
+    ///
+    /// **State the old defect precisely.** The `_workers` gauge could not
+    /// hold a `for:` on a MIXED-build SHARED-id fleet — a roll stuck partway.
+    /// It was steady and alerted correctly on a uniformly skewed shared-id
+    /// fleet, and it is steady and correct in ALL cases under distinct ids
+    /// (the chart default), which is why it is exported again beside this one
+    /// rather than deleted. "It could not fire" is the overstatement; this is
+    /// the claim.
     ///
     /// Still the live-process twin of `worker_build_skew_workers`, which counts
     /// REGISTERED ROWS. Neither subsumes the other — a ghost row appears only
@@ -473,8 +494,67 @@ pub struct TalosMetrics {
     ///
     /// Its population moved from workers to builds in 2026-08 alongside the
     /// gauge above; the NAME did not have to change because it already said
-    /// `builds`, which is now accurate rather than merely plausible.
+    /// `builds`, which is now accurate rather than merely plausible. The
+    /// per-identity companion is [`Self::worker_fleet_unverifiable_workers`].
+    ///
+    /// **WHEN THIS EQUALS [`Self::worker_fleet_live_builds`] THE SKEW
+    /// DETECTOR CANNOT FIRE AT ALL** — nothing was comparable, so
+    /// `build_skew_builds` is pinned at 0 by construction rather than by
+    /// agreement. `TalosWorkerFleetBuildSkewUndetectable` is the alert that
+    /// says so, and it exists because the "read this gauge first" mitigation
+    /// otherwise lives only in the annotation of an alert that requires
+    /// `build_skew_builds > 0` — i.e. it would be delivered in every state
+    /// EXCEPT the one it warns about.
     pub worker_fleet_unverifiable_builds: IntGauge,
+    /// Of [`Self::worker_fleet_live_workers`], the heartbeating IDENTITIES
+    /// whose reported build PROVABLY differs from this controller's — the
+    /// MAGNITUDE that [`Self::worker_fleet_build_skew_builds`] cannot carry.
+    ///
+    /// **INFORMATIONAL. NO ALERT IS BUILT ON THIS, and one must not be**, for
+    /// the reason spelled out on the builds gauge: under a shared `worker_id`
+    /// the underlying map is last-write-wins, so on a MIXED-build fleet this
+    /// alternates 1/0 across sweeps and no `for:` duration can elapse.
+    ///
+    /// **The posture decides whether the number means anything:**
+    ///
+    /// * **DISTINCT ids (the chart DEFAULT — `HOSTNAME` → pod name, because
+    ///   nothing renders `TALOS_WORKER_ID`)**: every replica holds its own map
+    ///   entry, so this is exactly "how many running pods are on a build that
+    ///   differs from mine". Steady, and the honest magnitude.
+    /// * **ONE SHARED id (dev compose; the RFC-0010 single-key block once
+    ///   uncommented)**: the map holds ONE entry for the whole fleet, so this
+    ///   is 0 or 1 regardless of fleet size, and it FLAPS whenever the fleet
+    ///   is mid-roll. Read `talos_worker_fleet_build_skew_builds` there, and
+    ///   `get_platform_info.fleet` for per-worker detail.
+    ///
+    /// It was briefly dropped while the ALERT was moved to the build-keyed
+    /// population (#644 review) and kept on purpose: dropping it would have
+    /// lost the magnitude on the DEFAULT posture, where the per-identity view
+    /// was never broken, in order to fix a defect only shared-id installs
+    /// have. It is not a dead metric — `publish_worker_fleet_gauges` `set`s it
+    /// every sweep from `WorkerManager::live_build_versions`.
+    ///
+    /// Its denominator is [`Self::worker_fleet_live_workers`], NOT
+    /// `live_builds`, and the identity population decomposes exactly the same
+    /// way the build one does: `live_workers == build_skew_workers +
+    /// unverifiable_workers + agreeing`.
+    pub worker_fleet_build_skew_workers: IntGauge,
+    /// Of [`Self::worker_fleet_live_workers`], the heartbeating identities
+    /// whose build could not be compared with this controller's.
+    ///
+    /// Exists so that [`Self::worker_fleet_build_skew_workers`] has a
+    /// published denominator decomposition and a 0 on it is readable: 0 skewed
+    /// of 5 live identities means something quite different when 4 of them
+    /// were never comparable. Shipping the numerator without this would repeat,
+    /// one population over, the exact defect the builds trio was built to
+    /// avoid — an absence rendered as a negative result (#578).
+    ///
+    /// Same two causes as [`Self::worker_fleet_unverifiable_builds`]: the
+    /// WORKER reported no usable sha, or THIS CONTROLLER's own build has none,
+    /// in which case every identity lands here at once. Same posture caveat as
+    /// its sibling above: under a shared `worker_id` this counts map entries,
+    /// of which there is one.
+    pub worker_fleet_unverifiable_workers: IntGauge,
     /// Heartbeats refused because the fleet view was at its hard cap
     /// (`talos_worker_fleet::MAX_TRACKED_WORKERS`), cumulative since process
     /// start.
@@ -485,11 +565,20 @@ pub struct TalosMetrics {
     /// either a misconfigured fleet or someone using the shared key to flood
     /// distinct worker ids — the bound held, but say so out loud.
     ///
-    /// **TRAP FOR THE FIRST ALERT WRITTEN ON THIS.** It has COUNTER semantics
+    /// **TRAP FOR ANY ALERT WRITTEN ON THIS.** It has COUNTER semantics
     /// but a GAUGE type and no `_total` suffix, so `rate()` / `increase()`
     /// will not apply counter reset handling and will misread every
     /// controller restart. Alert on the level (`> 0`) or on
-    /// `delta(...[1h]) > 0`, not on a rate. No alert consumes it today.
+    /// `delta(...[1h]) > 0`, not on a rate.
+    ///
+    /// **IT SUPPRESSES THE BUILD-SKEW DETECTOR, not just the fleet census.**
+    /// `handle_heartbeat` refuses an untracked id at the cap and returns
+    /// BEFORE `record_build_observation`, so a heartbeat dropped here never
+    /// reaches the build map either — a straggling worker that boots during a
+    /// flood is invisible to `worker_fleet_build_skew_builds` as well as to
+    /// `worker_fleet_live_workers`. `TalosWorkerFleetWorkerViewSaturated` consumes
+    /// this counter, and `TalosWorkerFleetBuildViewSaturated` its build-map
+    /// sibling, for that reason.
     pub worker_fleet_capacity_dropped_heartbeats: IntGauge,
     /// Build observations refused because the BUILD map was at its hard cap
     /// (`talos_worker_fleet::MAX_TRACKED_BUILDS`), cumulative since process
@@ -505,11 +594,29 @@ pub struct TalosMetrics {
     /// Non-zero means the bound held while something published more distinct
     /// builds than a fleet can have. `build_version` is signed, so only a
     /// holder of the fleet-shared key can do it; signing bounds WHO, never HOW
-    /// MUCH, which is what the cap is for. While this is non-zero the skew and
-    /// unverifiable counts are inflated and the alert built on them may fire
-    /// on fabricated data — that is a warning-severity nuisance, not a trust
-    /// failure, and it is the same property the pre-existing worker-map flood
-    /// already had.
+    /// MUCH, which is what the cap is for.
+    ///
+    /// **NAME THE SUPPRESSION DIRECTION FIRST, because it is the one the skew
+    /// alert exists for and an earlier version of this comment gave only the
+    /// other one.** At the cap a NEW key is REFUSED (`record_build_observation`
+    /// returns early); tracked keys keep refreshing. `builds_match` compares
+    /// only the `+sha` suffix, so `v0+<sha>` … `v63+<sha>` are 64 distinct keys
+    /// that all classify as AGREEING. A shared-key holder can therefore fill
+    /// the map with agreeing-but-distinct builds, after which a genuinely
+    /// straggling worker's build is a new key, is refused, and is INVISIBLE:
+    /// `build_skew_builds` reads 0, `TalosWorkerFleetBuildSkew` stays silent,
+    /// and every published number looks healthy. That is a FALSE NEGATIVE on
+    /// the detector, not a nuisance. Inflation (fabricated builds landing in
+    /// the skew or unverifiable counts before the cap is reached) is the other
+    /// direction and is the milder one — it is loud.
+    ///
+    /// The same suppression reaches this map through the WORKER cap too:
+    /// `handle_heartbeat` returns early at
+    /// `talos_worker_fleet::MAX_TRACKED_WORKERS` BEFORE recording the build,
+    /// so a flood of distinct ids hides a straggler's build as effectively as
+    /// a flood of distinct builds does. `TalosWorkerFleetBuildViewSaturated` and
+    /// `TalosWorkerFleetWorkerViewSaturated` alert on the two counters for
+    /// exactly that reason.
     ///
     /// Same COUNTER-semantics-with-GAUGE-type trap as its sibling: alert on
     /// the level (`> 0`) or `delta(...[1h]) > 0`, never on a `rate()`.
@@ -1086,10 +1193,14 @@ impl TalosMetrics {
         let worker_fleet_live_workers = IntGauge::new(
             "talos_worker_fleet_live_workers",
             "Distinct worker_ids that published a NATS fleet heartbeat within \
-             the staleness window. Recomputed each sweep. NOT A REPLICA COUNT: \
-             under the single-key posture the chart writes out inline, every \
-             replica shares one TALOS_WORKER_ID, so a fleet of any size \
-             reports 1. 0 is AMBIGUOUS — it \
+             the staleness window. Recomputed each sweep. WHETHER IT IS A \
+             REPLICA COUNT DEPENDS ON THE POSTURE: with distinct ids (the \
+             chart DEFAULT — nothing renders TALOS_WORKER_ID, so the worker \
+             falls back to HOSTNAME/pod name) it IS one, and checking it \
+             against your replica count is valid; where every replica shares \
+             one TALOS_WORKER_ID (the dev compose stack, and the commented-out \
+             RFC-0010 single-key block once enabled) a fleet of any size \
+             reports 1. 0 is AMBIGUOUS in both — it \
              covers an empty fleet, a fleet on a build too old to publish \
              heartbeats, and a broken subscription alike, so it is not \
              evidence that workers are absent. Heartbeats are HMAC-signed \
@@ -1113,14 +1224,18 @@ impl TalosMetrics {
         let worker_fleet_build_skew_builds = IntGauge::new(
             "talos_worker_fleet_build_skew_builds",
             "DISTINCT observed builds that PROVABLY differ from this \
-             controller's. COUNTS BUILDS, NOT PROCESSES: five workers stuck on \
-             one old build report 1, not 5, so detection is intact but the \
-             magnitude is not — use get_platform_info.fleet for per-worker \
-             detail. It replaced talos_worker_fleet_build_skew_workers in \
-             2026-08, which could not hold an alert's for: duration on a \
-             MIXED-build fleet whose replicas share one worker_id (it did fire \
-             correctly on a uniformly skewed one). Still the live-process twin \
-             of talos_worker_build_skew_workers, which counts REGISTERED ROWS; \
+             controller's, over the denominator talos_worker_fleet_live_builds. \
+             THE ALERTABLE ONE, because it is steady in every posture. COUNTS \
+             BUILDS, NOT PROCESSES: five workers stuck on one old build report \
+             1, not 5 — for the magnitude read \
+             talos_worker_fleet_build_skew_workers (meaningful under distinct \
+             worker_ids, which is the chart default) or get_platform_info.fleet \
+             for per-worker detail. The alert is here rather than on that gauge \
+             because where replicas share one worker_id the fleet map is \
+             last-write-wins, so a per-worker count alternates on a MIXED-build \
+             fleet and no for: duration can elapse (a uniformly skewed shared-id \
+             fleet was always steady). Still the live-process twin of \
+             talos_worker_build_skew_workers, which counts REGISTERED ROWS; \
              neither subsumes the other.",
         )?;
         registry.register(Box::new(worker_fleet_build_skew_builds.clone()))?;
@@ -1137,13 +1252,47 @@ impl TalosMetrics {
         )?;
         registry.register(Box::new(worker_fleet_unverifiable_builds.clone()))?;
 
+        let worker_fleet_build_skew_workers = IntGauge::new(
+            "talos_worker_fleet_build_skew_workers",
+            "Heartbeating worker_ids whose reported build PROVABLY differs \
+             from this controller's, over the denominator \
+             talos_worker_fleet_live_workers. INFORMATIONAL MAGNITUDE — do NOT \
+             build an alert on it. Under distinct worker_ids (the chart \
+             DEFAULT: nothing renders TALOS_WORKER_ID, so each pod is its own \
+             id) it is steady and answers 'how many running pods are on the \
+             wrong build'. Where replicas share one worker_id the fleet map \
+             holds a single entry, so it is 0 or 1 at any fleet size and \
+             ALTERNATES while the fleet is mid-roll — which is why the alert \
+             is on talos_worker_fleet_build_skew_builds, whose population is \
+             steady in both postures.",
+        )?;
+        registry.register(Box::new(worker_fleet_build_skew_workers.clone()))?;
+
+        let worker_fleet_unverifiable_workers = IntGauge::new(
+            "talos_worker_fleet_unverifiable_workers",
+            "Heartbeating worker_ids whose build cannot be compared with the \
+             controller's — same two causes as \
+             talos_worker_fleet_unverifiable_builds (the worker reported no \
+             usable sha, or THIS CONTROLLER has none, in which case every \
+             identity lands here at once). Published so \
+             talos_worker_fleet_build_skew_workers has its decomposition \
+             beside it: live_workers == build_skew_workers + \
+             unverifiable_workers + agreeing. Same posture caveat as that \
+             gauge.",
+        )?;
+        registry.register(Box::new(worker_fleet_unverifiable_workers.clone()))?;
+
         let worker_fleet_capacity_dropped_heartbeats = IntGauge::new(
             "talos_worker_fleet_capacity_dropped_heartbeats",
             "Heartbeats refused because the controller's fleet view was at its \
              hard cap (MAX_TRACKED_WORKERS). Cumulative within a controller \
              process; resets on restart. Non-zero means the bound held but \
              something is publishing under more distinct worker ids than the \
-             fleet has.",
+             fleet has. IT ALSO SUPPRESSES THE SKEW DETECTOR: a heartbeat \
+             refused here never reaches the build map, so a straggling worker \
+             that boots during a flood is invisible to \
+             talos_worker_fleet_build_skew_builds too. Counter semantics on a \
+             gauge type: alert on the level, never on rate().",
         )?;
         registry.register(Box::new(worker_fleet_capacity_dropped_heartbeats.clone()))?;
 
@@ -1153,14 +1302,19 @@ impl TalosMetrics {
              was at its hard cap (MAX_TRACKED_BUILDS). Cumulative within a \
              controller process; resets on restart. Saturates on a shape the \
              worker cap cannot see — one worker_id publishing many distinct \
-             build strings. While non-zero the skew and unverifiable counts \
-             are inflated by fabricated builds; only a holder of the \
-             fleet-shared key can do that, and the cap is what bounds how \
-             much.",
+             build strings. THE SUPPRESSION DIRECTION MATTERS MOST: at the \
+             cap a NEW key is refused, and builds_match compares only the \
+             +sha suffix, so a shared-key holder can fill the map with 64 \
+             agreeing-but-distinct builds after which a genuinely straggling \
+             worker's build is refused and talos_worker_fleet_build_skew_builds \
+             reads 0 while looking healthy. Inflation by fabricated builds is \
+             the milder, louder direction. Only a holder of the fleet-shared \
+             key can do either, and the cap is what bounds how much. Counter \
+             semantics on a gauge type: alert on the level, never on rate().",
         )?;
         registry.register(Box::new(worker_fleet_capacity_dropped_builds.clone()))?;
 
-        // Seed all six at 0. A gauge that has never been `set` is ABSENT, not
+        // Seed all eight at 0. A gauge that has never been `set` is ABSENT, not
         // zero, and every common PromQL idiom reads absent as "no match" — so
         // an alert on a fleet that has never heartbeated could not fire on the
         // cold-dead case, which is the one that matters (#625). These are
@@ -1171,6 +1325,8 @@ impl TalosMetrics {
         worker_fleet_live_builds.set(0);
         worker_fleet_build_skew_builds.set(0);
         worker_fleet_unverifiable_builds.set(0);
+        worker_fleet_build_skew_workers.set(0);
+        worker_fleet_unverifiable_workers.set(0);
         worker_fleet_capacity_dropped_heartbeats.set(0);
         worker_fleet_capacity_dropped_builds.set(0);
 
@@ -1504,6 +1660,8 @@ impl TalosMetrics {
             worker_fleet_live_builds,
             worker_fleet_build_skew_builds,
             worker_fleet_unverifiable_builds,
+            worker_fleet_build_skew_workers,
+            worker_fleet_unverifiable_workers,
             worker_fleet_capacity_dropped_heartbeats,
             worker_fleet_capacity_dropped_builds,
             fuel_high_utilisation_nodes,
@@ -1689,6 +1847,8 @@ mod tests {
             "talos_worker_fleet_live_builds 0",
             "talos_worker_fleet_build_skew_builds 0",
             "talos_worker_fleet_unverifiable_builds 0",
+            "talos_worker_fleet_build_skew_workers 0",
+            "talos_worker_fleet_unverifiable_workers 0",
             "talos_worker_fleet_capacity_dropped_heartbeats 0",
             "talos_worker_fleet_capacity_dropped_builds 0",
             // The fuel-headroom pair. The numerator's healthy steady state is

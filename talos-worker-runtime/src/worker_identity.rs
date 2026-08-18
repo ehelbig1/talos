@@ -35,22 +35,35 @@
 //! per-worker HKDF subkey scheme can dispatch on.
 //!
 //! **THE FORENSIC HALF OF THAT PROMISE IS NOT KEPT WHENEVER RESOLUTION
-//! STEP 1 WINS ACROSS REPLICAS**, which is a posture both shipped
-//! configurations write out: the chart's `values.yaml` gives
-//! `TALOS_WORKER_ID: "fleet"` inline for the single-key Ed25519 fleet,
-//! and the dev compose stack sets one `TALOS_WORKER_ID` for both
-//! replicas. Every `JobResult` and every
-//! signed audit event from every replica then carries the SAME
-//! `worker_id`, so "which pod produced which result" has no answer —
-//! a job, an audit event and a crash cannot be attributed to a replica.
-//! Only step 2 (`HOSTNAME` → pod name) delivers per-pod attribution.
+//! STEP 1 WINS ACROSS REPLICAS.** Every `JobResult` and every signed
+//! audit event from every replica then carries the SAME `worker_id`, so
+//! "which pod produced which result" has no answer — a job, an audit
+//! event and a crash cannot be attributed to a replica. Only step 2
+//! (`HOSTNAME` → pod name) delivers per-pod attribution.
 //!
-//! This is a stated cost, not a bug to fix here. Giving replicas
-//! distinct ids would break dispatch verification against the static
-//! `TALOS_WORKER_PUBLIC_KEYS` ring, which looks a worker's public key up
-//! BY `worker_id`. An operator who needs per-replica forensics must
-//! move to per-worker registered identities first (worker.extraEnv),
-//! not merely vary this value.
+//! **WHICH SHIPPED CONFIGURATIONS ARE IN THAT STATE — the precise list,
+//! because an earlier version of this note named the chart and was
+//! wrong.** The Helm chart's worker deployment template renders
+//! `TALOS_WORKER_ID` ZERO times; the `values.yaml` line offering
+//! `TALOS_WORKER_ID: "fleet"` is COMMENTED OUT inside the opt-in
+//! RFC-0010 worker-trust block ("Uncomment together with the controller
+//! half"). So a DEFAULT `helm install` resolves at step 2 and DOES get
+//! per-pod attribution. The postures that lose it are:
+//!
+//!   * the dev compose stack, which sets one `TALOS_WORKER_ID` for both
+//!     worker replicas (`.env`);
+//!   * a chart install whose operator has uncommented that block to run
+//!     the single-key Ed25519 fleet;
+//!   * any deployment setting `TALOS_WORKER_ID` per-fleet rather than
+//!     per-pod through `worker.extraEnv`.
+//!
+//! Where it applies this is a stated cost, not a bug to fix here.
+//! Giving those replicas distinct ids would break dispatch verification
+//! against the static `TALOS_WORKER_PUBLIC_KEYS` ring, which looks a
+//! worker's public key up BY `worker_id`. An operator who needs
+//! per-replica forensics under that posture must move to per-worker
+//! registered identities first (worker.extraEnv), not merely vary this
+//! value.
 
 use std::sync::OnceLock;
 
