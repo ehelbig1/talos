@@ -2032,9 +2032,13 @@ mod oauth_expires_at_tests {
 /// touch Postgres nor mutate process-global env (which would race the other
 /// tests in this binary).
 ///
-/// NOT covered here, stated rather than implied: `flow.rs::begin_oauth_authorization`
-/// (its INSERT needs a live Postgres) and the Okta/Snyk `exchange_code` round
-/// trip (needs a provider). See the findings note.
+/// Coverage of the rest of the migrated surface, stated rather than implied:
+/// `flow.rs::begin_oauth_authorization` + `consume_oauth_state` are covered by
+/// `controller/tests/oauth_flow_tests.rs` (they need a live Postgres, so they
+/// live in an integration binary gated by `scripts/test-integration.sh`); the
+/// `exchange_code` wire contract is pinned by
+/// [`oauth2_v5_exchange_wire_contract`], whose own doc states exactly which
+/// production properties it does and does NOT reach.
 #[cfg(test)]
 mod oauth2_v5_migration_guards {
     use super::*;
@@ -2044,7 +2048,7 @@ mod oauth2_v5_migration_guards {
 
     /// A lazy pool that is never connected — every builder under test returns
     /// before touching the DB, and `connect_lazy` does no I/O at construction.
-    fn service() -> OAuthService {
+    pub(super) fn service() -> OAuthService {
         OAuthService {
             db_pool: sqlx::postgres::PgPoolOptions::new()
                 .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
@@ -2063,7 +2067,7 @@ mod oauth2_v5_migration_guards {
         }
     }
 
-    fn params(url: &str) -> std::collections::HashMap<String, String> {
+    pub(super) fn params(url: &str) -> std::collections::HashMap<String, String> {
         Url::parse(url)
             .expect("authorize URL parses")
             .query_pairs()
@@ -2321,6 +2325,420 @@ mod oauth2_v5_migration_guards {
              request answered 302). oauth2 4.x set redirect-none inside its own built-in \
              client; 5.x sets nothing and uses ours, so this is now OUR invariant — and a \
              followed redirect would carry the token request to the redirect target."
+        );
+    }
+}
+
+/// Wire-contract pin for the `oauth2` 5.x authorization-code token exchange —
+/// the half of the flow that carries the `client_secret` and the authorization
+/// `code`, and the half #647 migrated without exercising.
+///
+/// # What this reaches
+///
+/// It drives `oauth2`'s REAL `exchange_code(..).set_pkce_verifier(..)
+/// .request_async(&oauth_http_client())` — the identical call sequence
+/// [`OAuthService::handle_okta_callback`] and [`OAuthService::handle_snyk_callback`]
+/// make — through the REAL production HTTP client, against a loopback token
+/// endpoint that records the exact bytes it received. The PKCE verifier is not
+/// invented here: it comes from the REAL production authorize-URL builder
+/// (`get_okta_auth_url`), so the assertion closes the authorize→exchange loop
+/// across production's own generator.
+///
+/// # What this deliberately does NOT reach, and why
+///
+/// **It does not drive the `handle_*_callback` bodies.** All three token
+/// endpoints are hardcoded `https://` values with no injection seam (Google
+/// and Snyk are literals; Okta is `format!("https://{domain}/…")`). The
+/// hardcoding IS a security property — it is what makes an attacker-supplied
+/// token endpoint impossible — and `oauth_http_client()` is built on rustls
+/// with compiled-in webpki roots, so a loopback mock cannot terminate that TLS
+/// connection and no root can be added. Adding an override would weaken the
+/// property to test it, so the handlers stay unreached and this says so.
+///
+/// Concretely, a regression these tests would NOT catch:
+/// * a handler calling `.set_auth_type(AuthType::RequestBody)` (moving the
+///   secret into the body — still not the URL, but a posture change),
+/// * a handler passing a FRESH verifier instead of the one recovered from the
+///   consumed state row,
+/// * a wrong hardcoded provider host,
+/// * anything about how a real provider responds.
+///
+/// These are pins on a DEPENDENCY's contract. A future `oauth2` bump that moved
+/// client credentials into the query string, dropped `code_verifier`, or stopped
+/// binding the `code` would turn them red and name what changed.
+#[cfg(test)]
+mod oauth2_v5_exchange_wire_contract {
+    use super::oauth2_v5_migration_guards::{params, service};
+    use super::*;
+    use base64::Engine as _;
+    use oauth2::url::Url;
+    use sha2::{Digest, Sha256};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Everything the token endpoint actually received, captured verbatim.
+    struct Seen {
+        method: String,
+        /// The request-target as sent, e.g. `/oauth2/v1/token`. Kept raw
+        /// (never re-parsed into a URL) so a query string cannot be lost.
+        target: String,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    impl Seen {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        }
+
+        /// The form-encoded body decoded into pairs.
+        fn form(&self) -> std::collections::HashMap<String, String> {
+            Url::parse(&format!("http://form.invalid/?{}", self.body))
+                .expect("body is parseable as a query string")
+                .query_pairs()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect()
+        }
+
+        /// `(client_id, client_secret)` recovered from `Authorization: Basic …`
+        /// the way a provider recovers them: base64-decode, split on the first
+        /// `:`, percent-decode each half (RFC 6749 §2.3.1 requires the halves to
+        /// be url-encoded separately before Basic encoding).
+        fn basic_credentials(&self) -> (String, String) {
+            let raw = self
+                .header("authorization")
+                .expect("token request must carry an Authorization header");
+            let b64 = raw
+                .strip_prefix("Basic ")
+                .unwrap_or_else(|| panic!("expected Basic auth, got: {raw}"));
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .expect("Basic credential is valid base64");
+            let decoded = String::from_utf8(decoded).expect("credential is UTF-8");
+            let (id, secret) = decoded
+                .split_once(':')
+                .expect("Basic credential is `id:secret`");
+            let dec = |s: &str| percent_decode(s);
+            (dec(id), dec(secret))
+        }
+    }
+
+    /// Minimal `application/x-www-form-urlencoded` decode for one component.
+    fn percent_decode(s: &str) -> String {
+        Url::parse(&format!("http://x.invalid/?v={s}"))
+            .expect("component decodes")
+            .query_pairs()
+            .find(|(k, _)| k == "v")
+            .map(|(_, v)| v.into_owned())
+            .unwrap_or_default()
+    }
+
+    /// A one-shot loopback token endpoint. Answers exactly one request with
+    /// `status_line` + `json_body`, and yields what it saw.
+    ///
+    /// Loopback + ephemeral port + single connection + task join = nothing
+    /// leaks past the test.
+    async fn spawn_token_endpoint(
+        status_line: &'static str,
+        json_body: &'static str,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<Seen>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+
+        let handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept one connection");
+
+            let mut buf: Vec<u8> = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let head_end = loop {
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+                let n = sock.read(&mut tmp).await.expect("read request head");
+                assert!(
+                    n > 0,
+                    "client closed before sending a complete request head"
+                );
+                buf.extend_from_slice(&tmp[..n]);
+            };
+
+            let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+            let mut lines = head.split("\r\n");
+            let request_line = lines.next().unwrap_or_default().to_string();
+            let mut parts = request_line.split(' ');
+            let method = parts.next().unwrap_or_default().to_string();
+            let target = parts.next().unwrap_or_default().to_string();
+
+            let mut headers: Vec<(String, String)> = Vec::new();
+            for line in lines {
+                if line.is_empty() {
+                    continue;
+                }
+                if let Some((k, v)) = line.split_once(':') {
+                    headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+                }
+            }
+
+            let content_length: usize = headers
+                .iter()
+                .find(|(k, _)| k == "content-length")
+                .and_then(|(_, v)| v.parse().ok())
+                .unwrap_or(0);
+            while buf.len() < head_end + content_length {
+                let n = sock.read(&mut tmp).await.expect("read request body");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            let body = String::from_utf8_lossy(&buf[head_end..]).into_owned();
+
+            let response = format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{json_body}",
+                json_body.len()
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.flush().await;
+            // Let the client read the response before the socket drops.
+            let _ = sock.shutdown().await;
+
+            Seen {
+                method,
+                target,
+                headers,
+                body,
+            }
+        });
+
+        (addr, handle)
+    }
+
+    const TOKEN_JSON: &str = r#"{"access_token":"access-token-from-provider","token_type":"bearer","expires_in":3599,"refresh_token":"refresh-token-from-provider","scope":"openid email profile"}"#;
+
+    /// The authorization code the callback receives from the provider. A
+    /// distinctive literal so "the code on the wire is the code we were given"
+    /// is a real comparison, not a coincidence.
+    const CODE: &str = "authz-code-4f1c9";
+
+    /// Drives the exchange and returns `(what the endpoint saw, parsed token)`.
+    ///
+    /// Builds the client with the SAME builder chain and the SAME configured
+    /// values `handle_okta_callback` uses (read off the same `service()`
+    /// fixture); only the endpoint is redirected to loopback, which is the one
+    /// substitution the hardcoded `https://` endpoints force.
+    async fn exchange_against_mock(
+        code: &str,
+        verifier: Option<&str>,
+        status_line: &'static str,
+        json_body: &'static str,
+    ) -> (Seen, Result<oauth2::basic::BasicTokenResponse>) {
+        let svc = service();
+        let (addr, server) = spawn_token_endpoint(status_line, json_body).await;
+
+        let client = BasicClient::new(ClientId::new(
+            svc.okta_client_id.clone().expect("fixture client id"),
+        ))
+        .set_client_secret(ClientSecret::new(
+            svc.okta_client_secret
+                .clone()
+                .expect("fixture client secret"),
+        ))
+        .set_auth_uri(AuthUrl::new(format!("http://{addr}/oauth2/v1/authorize")).expect("auth url"))
+        .set_token_uri(TokenUrl::new(format!("http://{addr}/oauth2/v1/token")).expect("token url"))
+        .set_redirect_uri(
+            RedirectUrl::new(svc.okta_redirect_uri.clone().expect("fixture redirect"))
+                .expect("redirect url"),
+        );
+
+        let mut exchange = client.exchange_code(AuthorizationCode::new(code.to_string()));
+        if let Some(v) = verifier {
+            exchange = exchange.set_pkce_verifier(PkceCodeVerifier::new(v.to_string()));
+        }
+        let http = oauth_http_client();
+        let outcome = exchange
+            .request_async(&http)
+            .await
+            .map_err(|e| anyhow!("exchange failed: {e}"));
+
+        let seen = server.await.expect("token endpoint task joined");
+        (seen, outcome)
+    }
+
+    /// The core binding test. Every assertion here compares two values that a
+    /// broken exchange would make disagree — none of them is a "field exists"
+    /// check, which is what a green suite on a broken exchange looks like.
+    #[tokio::test]
+    async fn exchange_binds_code_and_pkce_verifier_and_keeps_the_secret_out_of_the_url() {
+        // The verifier/challenge pair comes from the REAL production authorize
+        // builder, so this test and production agree on what PKCE was started.
+        let svc = service();
+        let (auth_url, _state, verifier) = svc
+            .get_okta_auth_url()
+            .await
+            .expect("production authorize URL builds");
+        let challenge = params(&auth_url)
+            .get("code_challenge")
+            .cloned()
+            .expect("authorize URL carries a PKCE challenge");
+
+        let (seen, outcome) =
+            exchange_against_mock(CODE, Some(verifier.secret()), "HTTP/1.1 200 OK", TOKEN_JSON)
+                .await;
+        let token = outcome.expect("exchange succeeds against a well-formed 200");
+        let form = seen.form();
+
+        // ---- transport shape -------------------------------------------------
+        assert_eq!(seen.method, "POST", "the token request must be a POST");
+        assert_eq!(
+            seen.target, "/oauth2/v1/token",
+            "the request-target must be the token path with NO query string; \
+             credentials and the authorization code belong in the body"
+        );
+        assert_eq!(
+            seen.header("content-type"),
+            Some("application/x-www-form-urlencoded")
+        );
+        assert_eq!(seen.header("accept"), Some("application/json"));
+
+        // ---- the code on the wire is the code we were handed -----------------
+        assert_eq!(
+            form.get("grant_type").map(String::as_str),
+            Some("authorization_code")
+        );
+        assert_eq!(
+            form.get("code").map(String::as_str),
+            Some(CODE),
+            "the `code` sent to the provider must be the `code` the callback \
+             received — an exchange that sent anything else would redeem the \
+             wrong grant"
+        );
+
+        // ---- PKCE: the verifier on the wire hashes to the challenge we sent --
+        let sent_verifier = form.get("code_verifier").cloned().expect(
+            "code_verifier must be sent when PKCE was used — omitting it \
+                     silently disables the interception defence and most providers \
+                     accept the request anyway",
+        );
+        let recomputed = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(Sha256::digest(sent_verifier.as_bytes()));
+        assert_eq!(
+            recomputed, challenge,
+            "BASE64URL(SHA256(code_verifier on the wire)) must equal the \
+             code_challenge the authorize URL advertised (RFC 7636 §4.6). \
+             Comparing the two is what makes this a binding assertion — a \
+             `code_verifier` field that merely EXISTS proves nothing"
+        );
+
+        // ---- client credentials: Basic header, never the URL, never the body -
+        let (id, secret) = seen.basic_credentials();
+        assert_eq!(
+            id,
+            svc.okta_client_id.clone().unwrap(),
+            "the client_id recovered from Basic auth must be the configured one"
+        );
+        assert_eq!(
+            secret,
+            svc.okta_client_secret.clone().unwrap(),
+            "the client_secret recovered from Basic auth must be the configured \
+             one — oauth2 defaults to AuthType::BasicAuth and Talos never \
+             overrides it"
+        );
+        assert!(
+            !form.contains_key("client_secret"),
+            "with BasicAuth the secret must NOT be duplicated into the form body: {}",
+            seen.body
+        );
+        let leaked_secret = svc.okta_client_secret.clone().unwrap();
+        assert!(
+            !seen.target.contains(&leaked_secret),
+            "client_secret must never appear in the request-target (it lands in \
+             proxy and provider access logs): {}",
+            seen.target
+        );
+
+        // ---- redirect_uri is echoed; the provider binds the code to it --------
+        assert_eq!(
+            form.get("redirect_uri").cloned(),
+            svc.okta_redirect_uri.clone(),
+            "redirect_uri must be echoed exactly on the exchange"
+        );
+
+        // ---- the parsed response carries what the caller stores ---------------
+        assert_eq!(
+            token.access_token().secret(),
+            "access-token-from-provider",
+            "the parsed access_token is what the caller persists / bearers"
+        );
+        assert_eq!(
+            token.refresh_token().map(|t| t.secret().as_str()),
+            Some("refresh-token-from-provider"),
+            "a dropped refresh_token would silently make the grant expire in ~1h"
+        );
+        assert_eq!(
+            token.expires_in().map(|d| d.as_secs()),
+            Some(3599),
+            "expires_in drives every downstream expiry calculation"
+        );
+        assert_eq!(
+            token
+                .scopes()
+                .map(|s| s.iter().map(|s| s.as_str()).collect::<Vec<_>>()),
+            Some(vec!["openid", "email", "profile"]),
+            "granted scopes must survive parsing — they are what the caller \
+             records as the effective grant"
+        );
+    }
+
+    /// The no-PKCE branch: `handle_*_callback` only calls `set_pkce_verifier`
+    /// when the consumed state row carried a verifier, so the omission path is
+    /// real production behaviour and must not smuggle an empty parameter (a
+    /// present-but-empty `code_verifier` is rejected by strict providers).
+    #[tokio::test]
+    async fn exchange_without_pkce_omits_code_verifier_entirely() {
+        let (seen, outcome) =
+            exchange_against_mock(CODE, None, "HTTP/1.1 200 OK", TOKEN_JSON).await;
+        outcome.expect("exchange succeeds");
+        let form = seen.form();
+        assert!(
+            !form.contains_key("code_verifier"),
+            "no verifier means the parameter must be absent, not empty: {}",
+            seen.body
+        );
+        // The rest of the contract is unchanged by the PKCE branch.
+        assert_eq!(form.get("code").map(String::as_str), Some(CODE));
+        assert!(seen.header("authorization").is_some());
+    }
+
+    /// `endpoint_response` requires HTTP **200 exactly**. A provider error must
+    /// surface as an `Err`, never as a token — an exchange that accepted a
+    /// non-2xx would store a credential the provider never issued.
+    ///
+    /// The body here is a **fully valid token response**, deliberately. The
+    /// first version of this test used an `{"error":…}` body and SURVIVED the
+    /// mutation that changed the status to 200: the body was unparseable, so
+    /// the `Err` came from the parser and the status gate was never the reason.
+    /// A perfectly parseable body makes the status code the ONLY thing that can
+    /// produce an error, so flipping it to 200 now turns this test red.
+    #[tokio::test]
+    async fn non_200_from_the_token_endpoint_is_an_error_not_a_token() {
+        let (_seen, outcome) = exchange_against_mock(
+            CODE,
+            Some("verifier-that-should-never-be-redeemed-0123456789"),
+            "HTTP/1.1 400 Bad Request",
+            TOKEN_JSON,
+        )
+        .await;
+        let err = outcome.expect_err(
+            "a 400 carrying an otherwise-valid token body must still be rejected              on the status alone",
+        );
+        assert!(
+            !format!("{err:#}").contains("okta-SECRET-must-not-leak"),
+            "the error surfaced from a failed exchange must not echo the \
+             client_secret: {err:#}"
         );
     }
 }
