@@ -221,17 +221,64 @@ pub struct SlaWindowStats {
 
 /// Per-module fuel statistics aggregated from `execution_cost_rollup`.
 ///
-/// Source of truth for `get_fuel_usage_report`. Joined against
-/// `modules.max_fuel` so callers can compute utilization (p95 ÷ ceiling)
-/// and surface budget recommendations without a second query.
+/// Source of truth for `get_fuel_usage_report`.
+///
+/// ## Utilisation is measured against the ENFORCED ceiling, not the module row
+///
+/// `modules.max_fuel` is NOT the limit a run is killed at. The dispatch
+/// enforces `node config max_fuel override > module default, engine-clamped`
+/// (`engine_dispatch_single`), and the worker stamps what it actually enforced
+/// into `execution_cost_rollup.max_fuel` (migration
+/// `20260707190000_cost_rollup_max_fuel.sql`, added for exactly this reason).
+///
+/// Dividing `fuel_p95` by `modules.max_fuel` therefore produced utilisation
+/// figures above 100 % for completed runs — impossible against a real ceiling,
+/// since the run would have been killed. Measured on the live database
+/// 2026-08-18 over a 7-day window: `cos_groundedness` 566.5 %,
+/// `LLM Inference` 425.5 %, and **11 of 12 `at_risk` verdicts were false**
+/// (only `gmail-organize`, at 75.8 %, was genuinely at risk). The
+/// false-NEGATIVE direction is live too and is the one worth naming first:
+/// `Gmail: Get Message` carries a 24 460 000 module row against a 6 000 000
+/// enforced ceiling, understating its utilisation by 4×; a module row above
+/// the enforced ceiling hides risk without bound.
+///
+/// [`Self::utilisation_p95`] is therefore a p95 of the PER-ROW ratio
+/// `fuel_consumed / COALESCE(r.max_fuel, m.max_fuel)`, not a ratio of
+/// aggregates. Two reasons, and the second is the load-bearing one:
+///
+/// 1. A module runs across many nodes with DIFFERENT enforced ceilings
+///    (`LLM Inference`: 2 003 782 … 14 000 000 in one window), so any single
+///    per-module denominator is a mixture of unlike things.
+/// 2. It makes ">100 % is impossible for a completed run" true BY
+///    CONSTRUCTION rather than by documentation — each row's ratio is ≤ 1, so
+///    the percentile is ≤ 1. Taking the LATEST enforced ceiling as a single
+///    denominator does not have this property and would still print 286 % for
+///    `LLM Inference`.
+///
+/// `COALESCE` back to `modules.max_fuel` preserves the pre-migration
+/// behaviour for rows written by older workers (`r.max_fuel IS NULL`), which
+/// is correct for a module with no node-level override.
 #[derive(Debug)]
 pub struct ModuleFuelStats {
     pub module_id: Uuid,
     pub module_name: String,
     pub kind: String,
-    /// Current `modules.max_fuel` ceiling. Compared against `fuel_p95` to
-    /// produce the utilization recommendation in the handler.
+    /// The `modules.max_fuel` row value. **Not** the limit that is enforced
+    /// when a node overrides it, and deliberately NOT the utilisation
+    /// denominator — see the type docs. Retained because it is the number
+    /// `hot_update_module(fuel_budget=…)` actually writes.
     pub current_max_fuel: i64,
+    /// p95 of the per-execution ratio `fuel_consumed / enforced ceiling`,
+    /// as a fraction (0.0–1.0). The basis for the handler's verdict.
+    pub utilisation_p95: f64,
+    /// Range of ceilings actually enforced for this module in the window.
+    /// A wide spread means the module row governs only some of its nodes.
+    pub enforced_ceiling_min: i64,
+    pub enforced_ceiling_max: i64,
+    /// Executions whose enforced ceiling came from the worker's own
+    /// `__fuel_limit__` stamp rather than the `COALESCE` fallback. Provenance:
+    /// if this is 0, every ratio fell back to the module row.
+    pub rows_with_enforced_ceiling: i64,
     pub executions: i64,
     pub fuel_p50: i64,
     pub fuel_p95: i64,
@@ -4617,6 +4664,10 @@ impl AnalyticsRepository {
             Option<f64>,
             Option<f64>,
             Option<f64>,
+            Option<f64>,
+            Option<i64>,
+            Option<i64>,
+            i64,
         )>(
             // M-F (2026-05-06): cast `AVG(BIGINT)` to FLOAT8. Postgres
             // returns `numeric` for `avg(bigint)`, which sqlx decodes into
@@ -4638,7 +4689,14 @@ impl AnalyticsRepository {
                 MAX(r.fuel_consumed) AS fuel_max, \
                 AVG(r.fuel_consumed)::float8 AS fuel_avg, \
                 PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY r.wall_time_ms) AS wall_p50, \
-                PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY r.wall_time_ms) AS wall_p95 \
+                PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY r.wall_time_ms) AS wall_p95, \
+                PERCENTILE_CONT(0.95) WITHIN GROUP ( \
+                    ORDER BY r.fuel_consumed::float8 \
+                             / GREATEST(COALESCE(r.max_fuel, m.max_fuel), 1)::float8 \
+                ) AS util_p95, \
+                MIN(COALESCE(r.max_fuel, m.max_fuel)) AS ceil_min, \
+                MAX(COALESCE(r.max_fuel, m.max_fuel)) AS ceil_max, \
+                COUNT(*) FILTER (WHERE r.max_fuel IS NOT NULL) AS enforced_rows \
              FROM execution_cost_rollup r \
              JOIN modules m ON m.id = r.module_id \
              JOIN workflows w ON w.id = r.workflow_id \
@@ -4660,12 +4718,39 @@ impl AnalyticsRepository {
         Ok(rows
             .into_iter()
             .map(
-                |(id, name, kind, max_fuel, execs, p50, p95, fmax, favg, wp50, wp95)| {
+                |(
+                    id,
+                    name,
+                    kind,
+                    max_fuel,
+                    execs,
+                    p50,
+                    p95,
+                    fmax,
+                    favg,
+                    wp50,
+                    wp95,
+                    util,
+                    cmin,
+                    cmax,
+                    enforced_rows,
+                )| {
+                    let row_fuel = max_fuel.unwrap_or(0);
                     ModuleFuelStats {
                         module_id: id,
                         module_name: name,
                         kind,
-                        current_max_fuel: max_fuel.unwrap_or(0),
+                        current_max_fuel: row_fuel,
+                        // Clamped to [0, 1]: a completed run cannot consume more
+                        // than the ceiling enforced FOR IT, so a value above 1
+                        // means a NULL-ceiling row fell back to a module row
+                        // smaller than the limit actually enforced. Clamping
+                        // keeps the ">100% is impossible" invariant true at the
+                        // API boundary instead of leaking the old symptom back.
+                        utilisation_p95: util.unwrap_or(0.0).clamp(0.0, 1.0),
+                        enforced_ceiling_min: cmin.unwrap_or(row_fuel),
+                        enforced_ceiling_max: cmax.unwrap_or(row_fuel),
+                        rows_with_enforced_ceiling: enforced_rows,
                         executions: execs,
                         fuel_p50: p50.unwrap_or(0.0) as i64,
                         fuel_p95: p95.unwrap_or(0.0) as i64,
