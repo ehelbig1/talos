@@ -11,12 +11,32 @@ global:
     cluster: 'talos-dev'
     environment: 'development'
 
-# Alertmanager configuration (optional)
-# alerting:
-#   alertmanagers:
-#     - static_configs:
-#         - targets:
-#           - alertmanager:9093
+# ===========================================================================
+# ALERT DELIVERY  (uncommented 2026-08-18)
+# ===========================================================================
+# This block was commented out, and that single fact made all 54 alert rules
+# below write-only: they evaluated, they went `firing`, and their firing was a
+# number in a web UI nobody opens. Prometheus has NO native webhook output —
+# Alertmanager is its only alert sink — so nothing downstream of here could be
+# reached by any other means.
+#
+# `alertmanager:9093` is the compose SERVICE name on the talos-network bridge
+# (docker-compose.yml). It is NOT the published loopback port: the container's
+# UI is bound to 127.0.0.1 on the HOST because Alertmanager's /api/v2/silences
+# can disable every detector in this system and Alertmanager ships no
+# authentication of its own. Prometheus reaches it over the bridge, which is
+# not affected by that host-side binding.
+#
+# NOTE for docker-compose.observability.yml: that stack defines no
+# alertmanager service, so this target is unresolvable there and alerts are
+# undelivered on it. That is the same pre-existing, documented condition as
+# its `talos-controller` and `node-exporter` jobs (see that file's header) —
+# it observes nothing of Talos by design.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
 
 # Load alerting rules.
 #
@@ -207,6 +227,32 @@ scrape_configs:
         labels:
           service: 'node-exporter'
           component: 'textfile-collector'
+
+  # ========================================================================
+  # Alertmanager self-monitoring
+  # ========================================================================
+  # REQUIRED, not optional. `AlertmanagerDown` in observability/rules/alerts.yml
+  # selects `up{job="alertmanager"}`, and `up` only exists for jobs that are
+  # declared here — an alert selecting an undeclared job can never fire, which
+  # is precisely the class structural check 65(a) exists to catch. Deleting
+  # this job silently un-fires that alert; the lint will stop you.
+  #
+  # It also supplies `alertmanager_notifications_failed_total`, which
+  # `TalosAlertDeliveryFailing` needs. Alertmanager pre-seeds that counter at 0
+  # for all 13 integrations from a cold start (verified against v0.28.1), so
+  # that alert is fireable before any notification has ever been attempted —
+  # no `absent()` arm required on the failure side.
+  #
+  # No credential: Alertmanager's /metrics is unauthenticated and this port is
+  # only reachable on the compose bridge.
+  - job_name: 'alertmanager'
+    scrape_interval: 15s
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['alertmanager:9093']
+        labels:
+          service: 'alertmanager'
+          component: 'monitoring'
 
   # ========================================================================
   # Grafana self-monitoring (optional)
