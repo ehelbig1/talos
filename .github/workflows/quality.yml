@@ -114,7 +114,23 @@ jobs:
       - name: Install mold linker
         # .cargo/config.toml pins `-fuse-ld=mold` for x86_64-unknown-linux-gnu,
         # so a Linux host can't link the workspace without mold installed.
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
+        # 2026-08-19: apt stalls on the hosted runners cancelled four jobs
+        # across #646 and #658 — the integration job burned its FULL 40-minute
+        # cap twice in a row on this exact line, and the migration job its
+        # 15-minute cap twice on the pgdg install. A stall with no step timeout
+        # costs the whole job budget and reports as a code failure, so this
+        # retries and fails fast instead.
+        timeout-minutes: 6
+        run: |
+          for attempt in 1 2 3; do
+            if sudo apt-get update -qq && sudo apt-get install -y -qq mold; then
+              exit 0
+            fi
+            echo "apt attempt ${attempt}/3 failed; retrying in $((attempt * 15))s" >&2
+            sleep $((attempt * 15))
+          done
+          echo "::error::apt-get failed to install mold after 3 attempts" >&2
+          exit 1
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
@@ -315,7 +331,23 @@ jobs:
       - name: Install mold linker
         # .cargo/config.toml pins `-fuse-ld=mold` for x86_64-unknown-linux-gnu,
         # so a Linux host can't link the workspace without mold installed.
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
+        # 2026-08-19: apt stalls on the hosted runners cancelled four jobs
+        # across #646 and #658 — the integration job burned its FULL 40-minute
+        # cap twice in a row on this exact line, and the migration job its
+        # 15-minute cap twice on the pgdg install. A stall with no step timeout
+        # costs the whole job budget and reports as a code failure, so this
+        # retries and fails fast instead.
+        timeout-minutes: 6
+        run: |
+          for attempt in 1 2 3; do
+            if sudo apt-get update -qq && sudo apt-get install -y -qq mold; then
+              exit 0
+            fi
+            echo "apt attempt ${attempt}/3 failed; retrying in $((attempt * 15))s" >&2
+            sleep $((attempt * 15))
+          done
+          echo "::error::apt-get failed to install mold after 3 attempts" >&2
+          exit 1
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
@@ -431,10 +463,25 @@ jobs:
         # pg_dump refuses servers NEWER than itself; ubuntu-latest ships
         # client 16 vs the pg17 service. The scripts honor PG_DUMP_BIN /
         # PSQL_BIN overrides.
+        timeout-minutes: 6
         run: |
           sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
-          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client-17
+          # --batch --yes: without them `gpg --dearmor -o` PROMPTS when the
+          # target keyring already exists and blocks forever on stdin, which a
+          # runner-image change could trigger at any time.
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --batch --yes --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          for attempt in 1 2 3; do
+            if sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client-17; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "::error::apt-get failed to install postgresql-client-17 after 3 attempts" >&2
+              exit 1
+            fi
+            echo "apt attempt ${attempt}/3 failed; retrying in $((attempt * 15))s" >&2
+            sleep $((attempt * 15))
+          done
           echo "PG_DUMP_BIN=/usr/lib/postgresql/17/bin/pg_dump" >> "$GITHUB_ENV"
           echo "PSQL_BIN=/usr/lib/postgresql/17/bin/psql" >> "$GITHUB_ENV"
 
@@ -492,7 +539,23 @@ jobs:
 
       - name: Install mold linker
         # .cargo/config.toml pins `-fuse-ld=mold` for the Linux target.
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq mold
+        # 2026-08-19: apt stalls on the hosted runners cancelled four jobs
+        # across #646 and #658 — the integration job burned its FULL 40-minute
+        # cap twice in a row on this exact line, and the migration job its
+        # 15-minute cap twice on the pgdg install. A stall with no step timeout
+        # costs the whole job budget and reports as a code failure, so this
+        # retries and fails fast instead.
+        timeout-minutes: 6
+        run: |
+          for attempt in 1 2 3; do
+            if sudo apt-get update -qq && sudo apt-get install -y -qq mold; then
+              exit 0
+            fi
+            echo "apt attempt ${attempt}/3 failed; retrying in $((attempt * 15))s" >&2
+            sleep $((attempt * 15))
+          done
+          echo "::error::apt-get failed to install mold after 3 attempts" >&2
+          exit 1
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
