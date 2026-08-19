@@ -287,6 +287,22 @@ async fn run_rank_training_tick(pool: &PgPool, actor_repo: &ActorRepository) -> 
             }
         };
 
+        // Instrument for the order-free label rule: an execution whose scored
+        // judges disagreed contributes NO judge label (it falls through to the
+        // weaker status label). That withdrawal must be visible — a silently
+        // shrinking labeled set is the same defect one level up.
+        let disputed = examples.iter().filter(|e| e.judge_disputed).count();
+        if disputed > 0 {
+            tracing::info!(
+                target: "talos_memory_ranking",
+                %actor_id,
+                disputed_examples = disputed,
+                total_examples = examples.len(),
+                "provenance rows whose execution's judges disagreed — labeled by \
+                 execution status instead of a judge verdict"
+            );
+        }
+
         let train = model::build_training_set(&examples);
         match model::fit_rank_weights(&train) {
             Some(rw) => {
@@ -332,6 +348,7 @@ async fn run_rank_training_tick(pool: &PgPool, actor_repo: &ActorRepository) -> 
                 target: "talos_memory_ranking",
                 %actor_id,
                 usable_examples = train.len(),
+                disputed_examples = disputed,
                 "insufficient / single-class training data; keeping global defaults"
             ),
         }

@@ -44,8 +44,8 @@ drift between what was ranked and what was recorded.
 returns the training data Phase 2 will consume: each provenance row's feature
 snapshot LEFT-JOINed to its execution's OUTCOME label —
 
-- the newest SCORED `judge_scores` verdict for that execution (`judge_score`,
-  `judge_passed`), via a `LATERAL` "newest verdict" subquery; and
+- its execution's UNANIMOUS scored `judge_scores` verdict (`judge_score`,
+  `judge_passed`, `judge_disputed`), via the shared `JUDGE_LABEL_LATERAL`; and
 - the `workflow_executions.status` (`execution_status`).
 
 Both outcome sides are `Option` — a provenance row may have no judge verdict
@@ -104,15 +104,32 @@ only fires on the flag-ON smart path.
   **scheduler** (primary actor-bound path) + the manual trigger path; the
   sub-workflow resolver is a noted follow-up (its `execution_id` isn't in scope
   at that call site yet).
-- **Outcome label = newest SCORED judge verdict.** `fetch_rank_training_examples`
-  takes the most-recent `judge_scores` row per execution (`ORDER BY created_at
-  DESC LIMIT 1`), skipping rows the judge marked `not_applicable` — an
-  abstention says the run had nothing to judge, which is not an outcome label,
-  so the lateral falls through to the prior scored verdict (or `None`). A
-  workflow with more than one judge node collapses to whichever judge wrote
-  last — an arbitrary label. Phase 2's learner should treat the
-  label as execution-level, not judge-node-scoped, and may want to aggregate
-  (e.g. min/mean passed) if multi-judge workflows become common.
+- **Outcome label = the execution's UNANIMOUS scored judge verdict.** Rows the
+  judge marked `not_applicable` are excluded first — an abstention says the run
+  had nothing to judge, which is not an outcome label. Over what remains,
+  `judge_passed` is the value every judge agreed on and `judge_score` is the
+  MIN across them (the worst score among judges that agreed); when the judges
+  DISAGREE the label is withheld entirely and `judge_disputed` says so.
+
+  This replaced an `ORDER BY created_at DESC LIMIT 1` "newest verdict" rule
+  (2026-08-19). The concern this section previously raised — "a workflow with
+  more than one judge node collapses to whichever judge wrote last, an
+  arbitrary label" — was live: each verdict is recorded by its own
+  fire-and-forget `tokio::spawn`, so `created_at` ordered the DB round-trips,
+  not the graph. Measured on the live table: `pa-inbox-organizer` was labelled
+  159 times by its in-path shape `judge` and 35 times by its leaf
+  `coverage_judge`, and two runs of the identical `pa-chief-of-staff` graph
+  recorded their verdicts 10 µs apart in opposite orders. The measured impact
+  was nonetheless small — `passed` was unanimous on all 405 labelled
+  executions, so **no training label changed**; only 5 of 405 `judge_score`
+  values did. A correctness-of-record fix, not a model-quality one.
+
+  Being order-free is also the guard: a judge added later cannot become the
+  ranker's teacher by being written last, because nothing is selected by write
+  order. It can only agree, or disagree and withdraw the label — never
+  substitute its own. The withdrawal is instrumented
+  (`ObservationalReport.n_disputed`, `disputed_examples` on the training tick's
+  per-actor log) so it cannot shrink the labeled set silently.
 
 ## Phase 2 — the learned ranker
 
