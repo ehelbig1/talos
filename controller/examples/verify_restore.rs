@@ -438,15 +438,15 @@ async fn main() -> Result<()> {
     }
 
     // ── 5. Decrypt PRE-EXISTING secrets ──────────────────────────────────
+    // NOT NULL: the previous `.filter_map(... .ok())` could only drop an org on
+    // schema drift, and a dropped org is one whose secrets are never verified —
+    // a verifier that silently narrows its own scope.
     let org_ids: Vec<Uuid> = sqlx::query("SELECT id FROM organizations")
         .fetch_all(&pool)
-        .await
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|r| r.try_get::<Uuid, _>("id").ok())
-                .collect()
-        })
-        .unwrap_or_default();
+        .await?
+        .iter()
+        .map(|r| r.try_get::<Uuid, _>("id"))
+        .collect::<std::result::Result<Vec<Uuid>, _>>()?;
 
     // Grouped by (format, DEK), not by format alone. With per-ORG v4 DEKs a
     // format-only grouping exercises whichever org happens to sort first and

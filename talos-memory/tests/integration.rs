@@ -979,3 +979,142 @@ async fn forget_prefix_reports_invisible_tombstones_separately_from_live_rows() 
 
     cleanup_prefix(&pool, actor_id, &prefix).await;
 }
+
+/// #662: a SELECT that drops `value_enc` (or `value_key_id`) must ERROR, not
+/// resolve to an empty memory.
+///
+/// Pre-fix, `decrypt_row_value` read both ciphertext columns with
+/// `row.try_get(...).ok()`. Both are NOT NULL, so the only reachable `None` was
+/// projection drift — and `resolve_stored_value` answers a `None` ciphertext
+/// with `Ok(value_plain.unwrap_or(Value::Null))`. `value_plain` is itself always
+/// `None` since Phase B dropped the `value` column, so the drift arrived at the
+/// caller as **JSON `null` reported as success**: no decrypt attempted, no
+/// error, an empty memory that looks exactly like a memory that is empty.
+///
+/// This test drives the real production helper against a real row through three
+/// projections: the full one (must decrypt), one missing `value_enc`, and one
+/// missing `value_key_id`. The last two are the drift, and they must be `Err`.
+/// It is the read-side twin of `aad_binding_blocks_cross_row_ciphertext_swap`,
+/// which covers the case where the ciphertext IS present but wrong.
+#[tokio::test]
+async fn missing_ciphertext_projection_errors_instead_of_reading_as_an_empty_memory() {
+    let Some((pool, actor_id)) = test_pool_or_skip().await else {
+        return;
+    };
+    let prefix = format!("talos-memory-test/{}/", Uuid::new_v4());
+    cleanup_prefix(&pool, actor_id, &prefix).await;
+
+    let key = format!("{}projection-drift", prefix);
+    let value = serde_json::json!({ "text": "must not read as null" });
+    mem::persist_memory(&pool, actor_id, &key, &value, "episodic", Some(1.0))
+        .await
+        .expect("persist_memory");
+
+    // Control: the full projection decrypts.
+    let full = sqlx::query(
+        "SELECT actor_id, key, value_enc, value_key_id, value_format \
+         FROM actor_memory WHERE actor_id = $1 AND key = $2",
+    )
+    .bind(actor_id)
+    .bind(&key)
+    .fetch_one(&pool)
+    .await
+    .expect("full projection query");
+    let decrypted = mem::decrypt_row_value(&full)
+        .await
+        .expect("full projection must decrypt");
+    assert_eq!(
+        decrypted.get("text").and_then(|v| v.as_str()),
+        Some("must not read as null"),
+        "control: the full projection must round-trip the real value"
+    );
+
+    // Drift 1: `value_enc` not projected.
+    let no_enc = sqlx::query(
+        "SELECT actor_id, key, value_key_id, value_format \
+         FROM actor_memory WHERE actor_id = $1 AND key = $2",
+    )
+    .bind(actor_id)
+    .bind(&key)
+    .fetch_one(&pool)
+    .await
+    .expect("no-value_enc query");
+    let err = mem::decrypt_row_value(&no_enc)
+        .await
+        .expect_err("a SELECT without `value_enc` must ERROR, not resolve to JSON null");
+    assert!(
+        format!("{err:#}").contains("value_enc"),
+        "the error must name the missing column, got: {err:#}"
+    );
+
+    // Drift 2: `value_key_id` not projected.
+    let no_key_id = sqlx::query(
+        "SELECT actor_id, key, value_enc, value_format \
+         FROM actor_memory WHERE actor_id = $1 AND key = $2",
+    )
+    .bind(actor_id)
+    .bind(&key)
+    .fetch_one(&pool)
+    .await
+    .expect("no-value_key_id query");
+    let err = mem::decrypt_row_value(&no_key_id)
+        .await
+        .expect_err("a SELECT without `value_key_id` must ERROR, not resolve to JSON null");
+    assert!(
+        format!("{err:#}").contains("value_key_id"),
+        "the error must name the missing column, got: {err:#}"
+    );
+
+    cleanup_prefix(&pool, actor_id, &prefix).await;
+}
+
+/// #662: the few-shot retrieval queries must project everything
+/// `decrypt_row_value` requires.
+///
+/// Found live, not by inspection-only: `find_few_shot_examples_semantic` and
+/// `find_few_shot_examples_keyword` selected
+/// `key, value_enc, value_key_id, memory_type` and nothing else, so
+/// `decrypt_row_value`'s fail-loud `actor_id` / `value_format` guards fired on
+/// EVERY row — and both call sites converted that straight back into an absence
+/// with `.unwrap_or(serde_json::Value::Null)`. `get_few_shot_examples` returned
+/// correct keys and similarity scores with `"value": null` for every example.
+///
+/// The repository lives in `talos-actor-repository`, which this crate does not
+/// depend on, so the guard here is on the CONTRACT the two queries have to
+/// satisfy: the exact projection they use must decrypt.
+#[tokio::test]
+async fn few_shot_projection_carries_everything_the_decrypt_contract_needs() {
+    let Some((pool, actor_id)) = test_pool_or_skip().await else {
+        return;
+    };
+    let prefix = format!("talos-memory-test/{}/", Uuid::new_v4());
+    cleanup_prefix(&pool, actor_id, &prefix).await;
+
+    let key = format!("{}few-shot", prefix);
+    let value = serde_json::json!({ "text": "few-shot example body" });
+    mem::persist_memory(&pool, actor_id, &key, &value, "episodic", Some(1.0))
+        .await
+        .expect("persist_memory");
+
+    // Byte-for-byte the projection `find_few_shot_examples_{semantic,keyword}`
+    // build, minus the score expression (which decrypt_row_value never reads).
+    let row = sqlx::query(
+        "SELECT actor_id, key, value_enc, value_key_id, value_format, memory_type \
+         FROM actor_memory WHERE actor_id = $1 AND key = $2",
+    )
+    .bind(actor_id)
+    .bind(&key)
+    .fetch_one(&pool)
+    .await
+    .expect("few-shot projection query");
+    let decrypted = mem::decrypt_row_value(&row)
+        .await
+        .expect("the few-shot projection must satisfy the decrypt contract");
+    assert_eq!(
+        decrypted.get("text").and_then(|v| v.as_str()),
+        Some("few-shot example body"),
+        "few-shot examples must carry their VALUE, not just their key and score"
+    );
+
+    cleanup_prefix(&pool, actor_id, &prefix).await;
+}

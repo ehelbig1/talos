@@ -104,7 +104,8 @@ impl WorkflowRepository {
         let rows = if let Some(tag) = tag_filter {
             sqlx::query(
                 "SELECT w.id, w.name, w.description, w.graph_json, w.created_at, w.updated_at, \
-                        w.tags, latest.status AS last_status, latest.started_at AS last_exec_at \
+                        w.tags, w.status, w.workflow_type, \
+                        latest.status AS last_status, latest.started_at AS last_exec_at \
                  FROM workflows w \
                  LEFT JOIN LATERAL ( \
                      SELECT status, started_at FROM workflow_executions \
@@ -120,7 +121,8 @@ impl WorkflowRepository {
         } else {
             sqlx::query(
                 "SELECT w.id, w.name, w.description, w.graph_json, w.created_at, w.updated_at, \
-                        w.tags, latest.status AS last_status, latest.started_at AS last_exec_at \
+                        w.tags, w.status, w.workflow_type, \
+                        latest.status AS last_status, latest.started_at AS last_exec_at \
                  FROM workflows w \
                  LEFT JOIN LATERAL ( \
                      SELECT status, started_at FROM workflow_executions \
@@ -141,15 +143,15 @@ impl WorkflowRepository {
                 Ok(WorkflowSummary {
                     id: row.try_get("id")?,
                     name: row.try_get("name")?,
-                    description: row.try_get("description").ok().flatten(),
+                    description: row.try_get::<Option<_>, _>("description")?,
                     graph_json: row.try_get("graph_json")?,
-                    tags: row.try_get("tags").ok().unwrap_or_default(),
-                    last_status: row.try_get("last_status").ok().flatten(),
-                    last_exec_at: row.try_get("last_exec_at").ok().flatten(),
+                    tags: row.try_get::<Option<_>, _>("tags")?.unwrap_or_default(),
+                    last_status: row.try_get::<Option<_>, _>("last_status")?,
+                    last_exec_at: row.try_get::<Option<_>, _>("last_exec_at")?,
                     created_at: row.try_get("created_at")?,
                     updated_at: row.try_get("updated_at")?,
-                    status: row.try_get("status").ok().flatten(),
-                    workflow_type: row.try_get("workflow_type").ok().flatten(),
+                    status: row.try_get::<Option<_>, _>("status")?,
+                    workflow_type: row.try_get::<Option<_>, _>("workflow_type")?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -251,15 +253,15 @@ impl WorkflowRepository {
                 Ok(WorkflowSummary {
                     id: row.try_get("id")?,
                     name: row.try_get("name")?,
-                    description: row.try_get("description").ok().flatten(),
+                    description: row.try_get::<Option<_>, _>("description")?,
                     graph_json: row.try_get("graph_json")?,
-                    tags: row.try_get("tags").ok().unwrap_or_default(),
-                    last_status: row.try_get("last_status").ok().flatten(),
-                    last_exec_at: row.try_get("last_exec_at").ok().flatten(),
+                    tags: row.try_get::<Option<_>, _>("tags")?.unwrap_or_default(),
+                    last_status: row.try_get::<Option<_>, _>("last_status")?,
+                    last_exec_at: row.try_get::<Option<_>, _>("last_exec_at")?,
                     created_at: row.try_get("created_at")?,
                     updated_at: row.try_get("updated_at")?,
-                    status: row.try_get("status").ok().flatten(),
-                    workflow_type: row.try_get("workflow_type").ok().flatten(),
+                    status: row.try_get::<Option<_>, _>("status")?,
+                    workflow_type: row.try_get::<Option<_>, _>("workflow_type")?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;

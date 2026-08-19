@@ -749,9 +749,7 @@ impl WorkflowRepository {
                     intent: r.try_get::<Option<_>, _>("intent")?,
                     readiness_score: r.try_get::<Option<_>, _>("readiness_score")?,
                     match_score: r
-                        .try_get::<Option<f32>, _>("match_score")
-                        .ok()
-                        .flatten()
+                        .try_get::<Option<f32>, _>("match_score")?
                         .map(|f| f as f64),
                 })
             })

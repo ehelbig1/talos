@@ -428,9 +428,23 @@ pub async fn decrypt_row_value(row: &sqlx::postgres::PgRow) -> anyhow::Result<se
     let key: String = row
         .try_get("key")
         .context("decrypt_row_value: caller's SELECT must project `key`")?;
-    let value_plain: Option<serde_json::Value> = row.try_get("value").ok();
-    let value_enc: Option<Vec<u8>> = row.try_get("value_enc").ok();
-    let value_key_id: Option<Uuid> = row.try_get("value_key_id").ok();
+    // `value` was DROPPED in Phase B, so `row.try_get("value")` returned
+    // Err(ColumnNotFound) on EVERY call and the `.ok()` swallowing it was the
+    // only reason this path worked. Reading a column that cannot exist is not
+    // a fallback, so the read is gone: every other caller of
+    // resolve_stored_value already passes a literal None.
+    let value_plain: Option<serde_json::Value> = None;
+    // value_enc / value_key_id are NOT NULL. A None could therefore only ever
+    // be SELECT-projection drift — and resolve_stored_value answers that with
+    // `Ok(value_plain.unwrap_or(Null))`, i.e. an EMPTY MEMORY reported as
+    // success, no decrypt attempted, no error. Fail loud, exactly as the
+    // value_format read below and clone_memories already do.
+    let value_enc: Option<Vec<u8>> = Some(row.try_get("value_enc").context(
+        "decrypt_row_value: caller's SELECT must project `value_enc` (MCP-S2 ciphertext)",
+    )?);
+    let value_key_id: Option<Uuid> = Some(row.try_get("value_key_id").context(
+        "decrypt_row_value: caller's SELECT must project `value_key_id` (MCP-S2 ciphertext)",
+    )?);
     let value_format: i16 = row.try_get("value_format").context(
         "decrypt_row_value: caller's SELECT must project `value_format` (MCP-S2 dispatch)",
     )?;
@@ -1073,8 +1087,16 @@ pub async fn recall_exact(
 
     let Some(r) = row else { return Ok(None) };
     let row_key: String = r.try_get("key")?;
-    let value_enc: Option<Vec<u8>> = r.try_get("value_enc").ok();
-    let value_key_id: Option<Uuid> = r.try_get("value_key_id").ok();
+    let value_enc: Option<Vec<u8>> = Some(
+        r.try_get("value_enc")
+            .context("recall_exact: SELECT must project `value_enc` (MCP-S2 ciphertext)")?,
+    );
+    // NOT NULL: a None is projection drift, which resolve_stored_value would
+    // turn into an empty memory returned as success.
+    let value_key_id: Option<Uuid> = Some(
+        r.try_get("value_key_id")
+            .context("recall_exact: SELECT must project `value_key_id` (MCP-S2 ciphertext)")?,
+    );
     // Fail LOUD on a missing `value_format`, matching decrypt_row_value /
     // rows_to_memory_hits. value_format is NOT NULL in the schema, so `.ok()`
     // / `.unwrap_or(0)` here would only ever mask SELECT-projection drift —
@@ -1597,10 +1619,7 @@ pub async fn list_memories(
                 expires_at: r.try_get("expires_at")?,
                 updated_at: r.try_get("updated_at")?,
                 value_bytes: r.try_get("value_bytes")?,
-                metadata: r
-                    .try_get::<Option<serde_json::Value>, _>("metadata")
-                    .ok()
-                    .flatten(),
+                metadata: r.try_get::<Option<serde_json::Value>, _>("metadata")?,
             })
         })
         .collect()
@@ -1956,8 +1975,14 @@ pub async fn recall_semantic_filtered(
             let mut hits = Vec::with_capacity(rows.len());
             for r in rows {
                 let row_key: String = r.try_get("key")?;
-                let value_enc: Option<Vec<u8>> = r.try_get("value_enc").ok();
-                let value_key_id: Option<Uuid> = r.try_get("value_key_id").ok();
+                let value_enc: Option<Vec<u8>> = Some(r.try_get("value_enc").context(
+                    "recall_semantic_filtered: SELECT must project `value_enc` (MCP-S2 ciphertext)",
+                )?);
+                // NOT NULL: a None is projection drift, which
+                // resolve_stored_value would turn into an empty memory.
+                let value_key_id: Option<Uuid> = Some(r.try_get("value_key_id").context(
+                    "recall_semantic_filtered: SELECT must project `value_key_id` (MCP-S2 ciphertext)",
+                )?);
                 // Fail LOUD on a missing `value_format` (see recall_exact /
                 // decrypt_row_value): silently defaulting to 0 would mis-
                 // dispatch v1 ciphertexts to empty-AAD decryption on any
@@ -2230,8 +2255,15 @@ async fn rows_to_memory_hits(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<Mem
             .try_get("actor_id")
             .context("rows_to_memory_hits: caller's SELECT must project `actor_id` (MCP-S2 AAD)")?;
         let row_key: String = r.try_get("key")?;
-        let value_enc: Option<Vec<u8>> = r.try_get("value_enc").ok();
-        let value_key_id: Option<Uuid> = r.try_get("value_key_id").ok();
+        let value_enc: Option<Vec<u8>> = Some(r.try_get("value_enc").context(
+            "rows_to_memory_hits: caller's SELECT must project `value_enc` (MCP-S2 ciphertext)",
+        )?);
+        // NOT NULL columns: a None here can only be SELECT-projection drift,
+        // and resolve_stored_value would answer it with an empty memory
+        // reported as success. Same fail-loud rule as `value_format` below.
+        let value_key_id: Option<Uuid> = Some(r.try_get("value_key_id").context(
+            "rows_to_memory_hits: caller's SELECT must project `value_key_id` (MCP-S2 ciphertext)",
+        )?);
         let value_format: i16 = r.try_get("value_format").context(
             "rows_to_memory_hits: caller's SELECT must project `value_format` (MCP-S2 dispatch)",
         )?;
@@ -3177,7 +3209,7 @@ pub async fn clone_memories(
             let value_key_id: Uuid = r.try_get("value_key_id")?;
             let src_format: i16 = r.try_get("value_format")?;
             let memory_type: String = r.try_get("memory_type")?;
-            let metadata: Option<serde_json::Value> = r.try_get("metadata").ok();
+            let metadata: Option<serde_json::Value> = r.try_get::<Option<_>, _>("metadata")?;
             // Decrypt under SOURCE AAD, using the row's OWN format (v1/v3/v4 all
             // decrypt via the versioned dispatch).
             let source_aad = build_memory_aad(source_actor_id, &key);

@@ -6,7 +6,7 @@
 /// are methods on this struct (removing the free-function `&PgPool` parameter).
 /// Handlers in `mcp/agents.rs` should be thin wrappers that call these
 /// methods and format the JSON-RPC response.
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
@@ -3481,18 +3481,17 @@ impl ActorRepository {
             Ok(ActorBasicInfo {
                 id: r.try_get("id")?,
                 name: r.try_get("name")?,
-                description: r.try_get("description").ok().flatten(),
+                description: r.try_get::<Option<_>, _>("description")?,
+                // actors.status / max_capability_world are NOT NULL, so the
+                // Option can only be projection drift — propagate it and keep
+                // the documented default for the genuinely-absent case.
                 status: r
-                    .try_get::<Option<String>, _>("status")
-                    .ok()
-                    .flatten()
+                    .try_get::<Option<String>, _>("status")?
                     .unwrap_or_else(|| "active".to_string()),
                 max_capability_world: r
-                    .try_get::<Option<String>, _>("max_capability_world")
-                    .ok()
-                    .flatten()
+                    .try_get::<Option<String>, _>("max_capability_world")?
                     .unwrap_or_else(|| "minimal-node".to_string()),
-                updated_at: r.try_get("updated_at").ok().flatten(),
+                updated_at: r.try_get::<Option<_>, _>("updated_at")?,
             })
         })
         .transpose()
@@ -3630,7 +3629,7 @@ impl ActorRepository {
         exclude_kinds: &[String],
     ) -> Result<Vec<MemoryExample>> {
         let rows = sqlx::query(
-            "SELECT key, value_enc, value_key_id, memory_type, \
+            "SELECT actor_id, key, value_enc, value_key_id, value_format, memory_type, \
                     (1.0 - (embedding <=> $2::vector)) AS score \
              FROM actor_memory \
              WHERE actor_id = $1 \
@@ -3655,16 +3654,17 @@ impl ActorRepository {
         .await?;
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
+            // Was `.unwrap_or(serde_json::Value::Null)` — see the keyword twin.
             let value = talos_memory::decrypt_row_value(r)
                 .await
-                .unwrap_or(serde_json::Value::Null);
+                .context("find_few_shot_examples_semantic: decrypt memory row")?;
             out.push(MemoryExample {
                 key: r.try_get::<Option<_>, _>("key")?.unwrap_or_default(),
                 value,
                 memory_type: r
                     .try_get::<Option<_>, _>("memory_type")?
                     .unwrap_or_default(),
-                score: r.try_get("score").ok(),
+                score: r.try_get::<Option<_>, _>("score")?,
             });
         }
         Ok(out)
@@ -3684,7 +3684,8 @@ impl ActorRepository {
         exclude_kinds: &[String],
     ) -> Result<Vec<MemoryExample>> {
         let rows = sqlx::query(
-            "SELECT key, value_enc, value_key_id, memory_type, NULL::float8 AS score \
+            "SELECT actor_id, key, value_enc, value_key_id, value_format, memory_type, \
+                    NULL::float8 AS score \
              FROM actor_memory \
              WHERE actor_id = $1 \
                AND memory_type = $2 \
@@ -3706,9 +3707,12 @@ impl ActorRepository {
         .await?;
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
+            // Was `.unwrap_or(serde_json::Value::Null)`: decrypt_row_value
+            // fails LOUD on a missing projection, and swallowing that turned
+            // every example into `value: null`. Propagate.
             let value = talos_memory::decrypt_row_value(r)
                 .await
-                .unwrap_or(serde_json::Value::Null);
+                .context("find_few_shot_examples_keyword: decrypt memory row")?;
             out.push(MemoryExample {
                 key: r.try_get::<Option<_>, _>("key")?.unwrap_or_default(),
                 value,

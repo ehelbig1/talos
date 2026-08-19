@@ -90,11 +90,15 @@ async fn main() -> Result<()> {
     .bind(exec_id)
     .fetch_one(&pool)
     .await?;
-    let pt_input: Option<serde_json::Value> = row.try_get("input_data").ok();
-    let pt_trigger: Option<serde_json::Value> = row.try_get("trigger_metadata").ok();
-    let enc_input: Option<Vec<u8>> = row.try_get("input_data_enc").ok();
-    let enc_trigger: Option<Vec<u8>> = row.try_get("trigger_metadata_enc").ok();
-    let key_id: Option<Uuid> = row.try_get("payload_enc_key_id").ok();
+    // Every one of these five feeds an assert! below, including the
+    // "PLAINTEXT LEAK" one. Read through `.ok()`, a renamed or dropped column
+    // arrived as None and that assertion PASSED VACUOUSLY — a verifier that
+    // could not fail on the condition it exists to check.
+    let pt_input: Option<serde_json::Value> = row.try_get::<Option<_>, _>("input_data")?;
+    let pt_trigger: Option<serde_json::Value> = row.try_get::<Option<_>, _>("trigger_metadata")?;
+    let enc_input: Option<Vec<u8>> = row.try_get::<Option<_>, _>("input_data_enc")?;
+    let enc_trigger: Option<Vec<u8>> = row.try_get::<Option<_>, _>("trigger_metadata_enc")?;
+    let key_id: Option<Uuid> = row.try_get::<Option<_>, _>("payload_enc_key_id")?;
 
     assert!(pt_input.is_none(), "PLAINTEXT LEAK: input_data is non-NULL");
     assert!(

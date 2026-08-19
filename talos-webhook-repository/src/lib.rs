@@ -464,7 +464,7 @@ impl WebhookRepository {
             .map(|r| -> Result<WebhookSecurityStat> {
                 Ok(WebhookSecurityStat {
                     trigger_id: r.try_get("trigger_id")?,
-                    trigger_name: r.try_get("trigger_name").ok().flatten(),
+                    trigger_name: r.try_get::<Option<_>, _>("trigger_name")?,
                     // RFC check-52: fail loud on schema drift (read as Option so a
                     // genuinely-NULL count still yields 0, but a renamed/retyped
                     // column errors instead of silently reporting 0).

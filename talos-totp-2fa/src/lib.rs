@@ -851,7 +851,10 @@ impl TotpService {
                     return Ok(false);
                 }
                 Some(row) => {
-                    let codes: Option<Vec<String>> = row.try_get("backup_codes").ok().flatten();
+                    // Nullable column, so the Option is real — but the `.ok()`
+                    // also turned schema drift into "no backup codes", i.e. a
+                    // silent lockout that looks like a wrong code.
+                    let codes: Option<Vec<String>> = row.try_get::<Option<_>, _>("backup_codes")?;
                     match codes {
                         None => {
                             tx.rollback().await?;

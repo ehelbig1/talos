@@ -82,9 +82,13 @@ async fn main() -> Result<()> {
         let mut batch_count: u64 = 0;
         for row in &rows {
             let id: Uuid = row.try_get("id")?;
-            let input: Option<serde_json::Value> = row.try_get("input_data").ok();
-            let output: Option<serde_json::Value> = row.try_get("output_data").ok();
-            let trigger: Option<serde_json::Value> = row.try_get("trigger_metadata").ok();
+            // These three plaintext reads feed an UPDATE that sets all three
+            // columns to NULL. Swallowed drift => empty ciphertext written AND
+            // the plaintext nulled, irreversibly. Propagate.
+            let input: Option<serde_json::Value> = row.try_get::<Option<_>, _>("input_data")?;
+            let output: Option<serde_json::Value> = row.try_get::<Option<_>, _>("output_data")?;
+            let trigger: Option<serde_json::Value> =
+                row.try_get::<Option<_>, _>("trigger_metadata")?;
             // MCP-S2: backfill writes v1 with AAD = id, matching the
             // production write path. Resulting rows are decrypt-safe
             // under the AAD-bound read dispatcher.

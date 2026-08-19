@@ -361,12 +361,12 @@ impl ModuleExecutionService {
         let mut failed = 0u64;
         for r in &rows {
             let id: Uuid = r.try_get("id")?;
-            let wei: Option<Uuid> = r.try_get("workflow_execution_id").ok().flatten();
-            let key_id: Option<Uuid> = r.try_get("payload_enc_key_id").ok().flatten();
+            let wei: Option<Uuid> = r.try_get::<Option<_>, _>("workflow_execution_id")?;
+            let key_id: Option<Uuid> = r.try_get::<Option<_>, _>("payload_enc_key_id")?;
             let old_format: i16 = r.try_get("payload_format")?;
-            let input_enc: Option<Vec<u8>> = r.try_get("input_data_enc").ok().flatten();
-            let output_enc: Option<Vec<u8>> = r.try_get("output_data_enc").ok().flatten();
-            let trigger_enc: Option<Vec<u8>> = r.try_get("trigger_metadata_enc").ok().flatten();
+            let input_enc: Option<Vec<u8>> = r.try_get::<Option<_>, _>("input_data_enc")?;
+            let output_enc: Option<Vec<u8>> = r.try_get::<Option<_>, _>("output_data_enc")?;
+            let trigger_enc: Option<Vec<u8>> = r.try_get::<Option<_>, _>("trigger_metadata_enc")?;
 
             let res: Result<bool> = async {
                 // Decrypt each present slot under its current key/format.
@@ -985,13 +985,13 @@ impl ModuleExecutionService {
         let Some(r) = row else {
             return Ok(None);
         };
-        let pt_trigger: Option<JsonValue> = r.try_get("trigger_metadata").ok().flatten();
-        let pt_input: Option<JsonValue> = r.try_get("input_data").ok().flatten();
-        let pt_output: Option<JsonValue> = r.try_get("output_data").ok().flatten();
-        let enc_trigger: Option<Vec<u8>> = r.try_get("trigger_metadata_enc").ok().flatten();
-        let enc_input: Option<Vec<u8>> = r.try_get("input_data_enc").ok().flatten();
-        let enc_output: Option<Vec<u8>> = r.try_get("output_data_enc").ok().flatten();
-        let key_id: Option<Uuid> = r.try_get("payload_enc_key_id").ok().flatten();
+        let pt_trigger: Option<JsonValue> = r.try_get::<Option<_>, _>("trigger_metadata")?;
+        let pt_input: Option<JsonValue> = r.try_get::<Option<_>, _>("input_data")?;
+        let pt_output: Option<JsonValue> = r.try_get::<Option<_>, _>("output_data")?;
+        let enc_trigger: Option<Vec<u8>> = r.try_get::<Option<_>, _>("trigger_metadata_enc")?;
+        let enc_input: Option<Vec<u8>> = r.try_get::<Option<_>, _>("input_data_enc")?;
+        let enc_output: Option<Vec<u8>> = r.try_get::<Option<_>, _>("output_data_enc")?;
+        let key_id: Option<Uuid> = r.try_get::<Option<_>, _>("payload_enc_key_id")?;
         // Fail loud: payload_format drives AEAD dispatch. Defaulting to v0 is
         // only safe when the row carries NO encrypted payload; with ciphertext
         // present a silent v0 dispatches the wrong AAD and fails decryption on a
@@ -1098,13 +1098,13 @@ impl ModuleExecutionService {
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
             let exec_id: Uuid = r.try_get("id")?;
-            let pt_trigger: Option<JsonValue> = r.try_get("trigger_metadata").ok().flatten();
-            let pt_input: Option<JsonValue> = r.try_get("input_data").ok().flatten();
-            let pt_output: Option<JsonValue> = r.try_get("output_data").ok().flatten();
-            let enc_trigger: Option<Vec<u8>> = r.try_get("trigger_metadata_enc").ok().flatten();
-            let enc_input: Option<Vec<u8>> = r.try_get("input_data_enc").ok().flatten();
-            let enc_output: Option<Vec<u8>> = r.try_get("output_data_enc").ok().flatten();
-            let key_id: Option<Uuid> = r.try_get("payload_enc_key_id").ok().flatten();
+            let pt_trigger: Option<JsonValue> = r.try_get::<Option<_>, _>("trigger_metadata")?;
+            let pt_input: Option<JsonValue> = r.try_get::<Option<_>, _>("input_data")?;
+            let pt_output: Option<JsonValue> = r.try_get::<Option<_>, _>("output_data")?;
+            let enc_trigger: Option<Vec<u8>> = r.try_get::<Option<_>, _>("trigger_metadata_enc")?;
+            let enc_input: Option<Vec<u8>> = r.try_get::<Option<_>, _>("input_data_enc")?;
+            let enc_output: Option<Vec<u8>> = r.try_get::<Option<_>, _>("output_data_enc")?;
+            let key_id: Option<Uuid> = r.try_get::<Option<_>, _>("payload_enc_key_id")?;
             // Fail loud (same rule as the single-row path): payload_format is
             // load-bearing for AEAD dispatch when ciphertext is present.
             let payload_format: i16 = match r.try_get("payload_format") {

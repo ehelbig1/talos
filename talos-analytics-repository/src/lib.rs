@@ -2093,9 +2093,12 @@ impl AnalyticsRepository {
                     id: r.try_get("id")?,
                     cron_expression: r.try_get("cron_expression")?,
                     is_enabled: r.try_get::<Option<_>, _>("is_enabled")?.unwrap_or(false),
-                    timezone: r.try_get("timezone").ok(),
-                    last_triggered_at: r.try_get("last_triggered_at").ok(),
-                    next_trigger_at: r.try_get("next_trigger_at").ok(),
+                    // NOT NULL. A silent None was rendered as "UTC" by
+                    // handle_get_schedule_health (analytics.rs:4776) — #661's
+                    // exported-cron defect, one spelling over.
+                    timezone: r.try_get::<Option<_>, _>("timezone")?,
+                    last_triggered_at: r.try_get::<Option<_>, _>("last_triggered_at")?,
+                    next_trigger_at: r.try_get::<Option<_>, _>("next_trigger_at")?,
                 })
             })
             .collect::<Result<Vec<_>>>()
@@ -4329,8 +4332,22 @@ impl AnalyticsRepository {
             .await
             .unwrap_or_default()
             .iter()
-            .filter_map(|r| r.try_get::<String, _>("name").ok())
-            .collect();
+            // A `.filter_map(... .ok())` here silently DROPPED rows on schema
+            // drift, so the wildcard-secret hygiene check would report "none"
+            // for a reason unrelated to there being none. The enclosing future
+            // yields Vec<String> (no `?` available), so the drift is logged
+            // loudly instead of being absorbed row by row.
+            .map(|r| r.try_get::<String, _>("name"))
+            .collect::<std::result::Result<Vec<String>, _>>()
+            .unwrap_or_else(|e| {
+                tracing::error!(
+                    error = %e,
+                    "platform hygiene: wildcard-secret module scan could not read \
+                     `modules.name` — reporting an EMPTY list; this is schema drift, \
+                     not an absence of wildcard grants"
+                );
+                Vec::new()
+            });
             names
         };
 
