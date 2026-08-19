@@ -3738,9 +3738,11 @@ impl ActorRepository {
         row.map(|r| -> Result<ActorCardInfo> {
             Ok(ActorCardInfo {
                 name: r.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
-                description: r
-                    .try_get::<Option<String>, _>("description")
-                    .unwrap_or(None),
+                // #661: `?`, like the three sibling fields on this struct.
+                // Display-only, so the blast radius is small — it is here
+                // because it is the same swallow, and because it is what makes
+                // this the odd one out in a struct that otherwise propagates.
+                description: r.try_get::<Option<String>, _>("description")?,
                 status: r.try_get::<Option<_>, _>("status")?.unwrap_or_default(),
                 max_capability_world: r
                     .try_get::<Option<_>, _>("max_capability_world")?

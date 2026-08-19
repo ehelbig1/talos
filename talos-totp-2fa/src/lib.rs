@@ -136,8 +136,24 @@ impl TotpService {
 
         let key = format!("totp_rate_limit:{}", user_id);
 
-        // Check if user is currently locked out
-        let locked_until: Option<i64> = conn.hget(&key, "locked_until").await.ok().flatten();
+        // Check if user is currently locked out.
+        //
+        // #661 (error-as-absence): this read must propagate. `.ok()` made a
+        // failed HGET read as "not locked" — the identical state MCP-780's
+        // comment below describes as the degraded outcome of a failed HSET
+        // ("the next attempt's `hget locked_until` returns None and the gate
+        // falls through ... brute-force gate degraded"). Three Redis ops in
+        // this function (DEL, EXPIRE, HSET) log their failures with that
+        // impact spelled out; the one op that DECIDES whether the user is
+        // locked out was the only one that swallowed silently. The HINCRBY
+        // pre-charge below still backstops the counter, so this is a
+        // defense-in-depth gate rather than the sole one — but a lockout
+        // skipped because Redis hiccuped is indistinguishable from a user who
+        // was never locked, and that is exactly what this class costs.
+        let locked_until: Option<i64> = conn
+            .hget(&key, "locked_until")
+            .await
+            .context("Failed to read 2FA lockout state")?;
 
         if let Some(locked_ts) = locked_until {
             let now = chrono::Utc::now().timestamp();

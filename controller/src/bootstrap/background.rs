@@ -2219,17 +2219,44 @@ pub(crate) fn spawn_cleanup_tasks(
             // MCP-961 sibling: saturating i64→i32 conversion. Sibling
             // of the advanced.rs fix — operator-supplied DB value
             // could exceed i32::MAX and silently wrap pre-fix.
-            let db_days: Option<i32> = sqlx::query_scalar::<_, serde_json::Value>(
+            // #661 (error-as-absence): the retention setting must be READ, not
+            // guessed. `.unwrap_or(None)` made an unreadable `system_settings`
+            // row indistinguishable from an unset one, so a DB fault silently
+            // substituted the env default (30) for whatever the operator had
+            // configured. Everything the MCP-758 comment above is about — this
+            // number binding into `make_interval(days => $1::int)` on a
+            // statement that DELETEs from `workflow_executions` — applies just
+            // as much when the number is wrong because the read failed. An
+            // operator running 365-day retention would have had ~11 months of
+            // executions swept out of the live table on the next daily tick.
+            //
+            // The sweep is periodic and idempotent, so the correct response to
+            // "cannot tell what the retention is" is to skip THIS tick and
+            // re-read tomorrow, not to archive on a guess.
+            let db_days_read = sqlx::query_scalar::<_, serde_json::Value>(
                 "SELECT value FROM system_settings WHERE key = 'archive_after_days'",
             )
             .fetch_optional(&archive_pool)
-            .await
-            .unwrap_or(None)
-            .and_then(|v| {
-                v.as_i64()
-                    .map(|n| i32::try_from(n).unwrap_or(i32::MAX))
-                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-            });
+            .await;
+            let db_days: Option<i32> = match db_days_read {
+                Ok(v) => v.and_then(|v| {
+                    v.as_i64()
+                        .map(|n| i32::try_from(n).unwrap_or(i32::MAX))
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                }),
+                Err(e) => {
+                    tracing::error!(
+                        target: "talos_engine",
+                        event_kind = "archive_after_days_unreadable_skipped",
+                        error = %e,
+                        "could not READ system_settings.archive_after_days — skipping this \
+                         archival tick rather than sweeping workflow_executions on the \
+                         env-derived default, which may be far shorter than the configured \
+                         retention"
+                    );
+                    continue;
+                }
+            };
             let env_days = talos_config::positive_env_or_default::<i32>("ARCHIVE_AFTER_DAYS", 30);
             let days = match db_days {
                 Some(d) if d > 0 => d,

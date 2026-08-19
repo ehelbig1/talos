@@ -3520,10 +3520,18 @@ impl SecretsManager {
             Ok(SecretLookup {
                 id: r.try_get("id")?,
                 key_path: r.try_get("key_path")?,
+                // #661: propagate both. `namespace` silently defaulting to
+                // "default" on a read error puts a secret in the wrong
+                // namespace as far as every caller of this lookup is
+                // concerned — and namespace is half of the identity this
+                // struct exists to resolve. `description` is display-only, but
+                // `.try_get(...).ok()` is the same swallow in a spelling
+                // structural check 52 does not match at all (its regex only
+                // covers `.unwrap_or`).
                 namespace: r
-                    .try_get::<String, _>("namespace")
-                    .unwrap_or_else(|_| "default".to_string()),
-                description: r.try_get("description").ok(),
+                    .try_get::<Option<String>, _>("namespace")?
+                    .unwrap_or_else(|| "default".to_string()),
+                description: r.try_get("description")?,
             })
         })
         .transpose()

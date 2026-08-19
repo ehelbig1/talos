@@ -1877,9 +1877,17 @@ impl WorkflowRepository {
                     graph_json: r.try_get("graph_json")?,
                     is_enabled: r.try_get::<Option<_>, _>("is_enabled")?.unwrap_or(true),
                     cron_expression: r.try_get::<Option<_>, _>("cron_expression")?,
+                    // #661: `?` before the default, not `.unwrap_or(None)`.
+                    // Every sibling field on this struct already propagates.
+                    // This one loaded a workflow's SCHEDULE for export, so a
+                    // drifted or retyped `timezone` column read as "no
+                    // timezone" and silently became UTC — a 09:00
+                    // America/Toronto cron round-trips as 09:00 UTC, the wrong
+                    // hour, with no error raised anywhere. Structural check 52
+                    // could not see it: its regex needs `.try_get(...)` and
+                    // `.unwrap_or` on the SAME line.
                     timezone: r
-                        .try_get::<Option<String>, _>("timezone")
-                        .unwrap_or(None)
+                        .try_get::<Option<String>, _>("timezone")?
                         .unwrap_or_else(|| "UTC".to_string()),
                     schedule_enabled: r
                         .try_get::<Option<_>, _>("schedule_enabled")?

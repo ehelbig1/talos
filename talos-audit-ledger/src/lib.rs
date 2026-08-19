@@ -345,8 +345,33 @@ impl OTLPCache {
         )
         .bind(user_id)
         .fetch_optional(pool)
-        .await
-        .ok()??;
+        .await;
+
+        // #661 (error-as-absence): `.ok()??` collapsed three different
+        // outcomes into one `None` — "streaming is off for this user", "this
+        // user has no settings row", and "the settings row could not be READ".
+        // Only the first two are configuration. The third silently disables a
+        // user's audit streaming for the lifetime of the DB fault, and audit
+        // streaming going quiet is precisely the failure an audit trail must
+        // not be able to hide. This function returns `Option` and its callers
+        // treat `None` as "no exporter", so the fallback is unchanged — what
+        // changes is that the read failure is now distinguishable in the log
+        // rather than looking like a deliberate opt-out.
+        let settings = match settings {
+            Ok(row) => row?,
+            Err(e) => {
+                tracing::warn!(
+                    target: "talos_audit",
+                    user_id = %user_id,
+                    error = %e,
+                    event_kind = "audit_settings_read_failed",
+                    "could not READ user_audit_settings — audit streaming is being \
+                     skipped for this user because the row was unreadable, NOT because \
+                     streaming is disabled; batches are buffered, not sent"
+                );
+                return None;
+            }
+        };
 
         if !settings.streaming_enabled {
             return None;

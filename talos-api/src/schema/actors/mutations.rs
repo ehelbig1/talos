@@ -270,16 +270,34 @@ impl ActorsMutations {
         // through; unrecognised values (legacy data, direct SQL writes)
         // collapse to the conservative default rather than silently
         // granting tier-7 via `world_rank`'s unknown-world default.
+        // #661 (error-as-absence): the grant read must be distinguishable from
+        // "this user holds no grant". `.ok().flatten()` collapsed a DB error
+        // into the same `_` arm as an unrecognised value, so an unreadable
+        // `user_capability_grants` row yielded `http-node` — `world_rank` 1 —
+        // for a user whose actual grant is `minimal-node`, rank 0. That is one
+        // rank of escalation, on the left-hand side of the `ceiling_permits`
+        // lattice gate immediately below, and it is PERSISTED into the actor
+        // row that this mutation goes on to create, so it outlives the fault.
+        // Narrow but real: every grant of rank >= 1 fails closed to http-node,
+        // only a `minimal-node` grant escalates.
         let user_ceiling: String = {
             let repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
-            match repo
-                .get_user_max_capability_world(user_id)
-                .await
-                .ok()
-                .flatten()
-            {
-                Some(world) if talos_capability_world::is_actor_ceiling_world(&world) => world,
-                _ => "http-node".to_string(),
+            match repo.get_user_max_capability_world(user_id).await {
+                Ok(Some(world)) if talos_capability_world::is_actor_ceiling_world(&world) => world,
+                Ok(_) => "http-node".to_string(),
+                Err(e) => {
+                    tracing::error!(
+                        target: "talos_api",
+                        user_id = %user_id,
+                        error = %e,
+                        "could not read capability grant — refusing actor creation rather than \
+                         assuming the default ceiling"
+                    );
+                    return Err(async_graphql::Error::new(
+                        "Could not verify your capability ceiling — try again.",
+                    )
+                    .extend_safe());
+                }
             }
         };
         // Wasm-security review 2026-05-28 (HIGH): partial-order lattice gate
@@ -639,16 +657,31 @@ impl ActorsMutations {
         // MCP-648: same `is_actor_ceiling_world` consolidation as
         // create_actor above.
         if let Some(ref w) = max_capability_world {
+            // #661: see `create_actor` above — a DB error on the grant read
+            // must not be laundered into the default ceiling on the left side
+            // of the `ceiling_permits` gate. This path RAISES an existing
+            // actor's ceiling, so the escalation persists just as it does on
+            // create.
             let user_ceiling: String = {
                 let repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
-                match repo
-                    .get_user_max_capability_world(user_id)
-                    .await
-                    .ok()
-                    .flatten()
-                {
-                    Some(world) if talos_capability_world::is_actor_ceiling_world(&world) => world,
-                    _ => "http-node".to_string(),
+                match repo.get_user_max_capability_world(user_id).await {
+                    Ok(Some(world)) if talos_capability_world::is_actor_ceiling_world(&world) => {
+                        world
+                    }
+                    Ok(_) => "http-node".to_string(),
+                    Err(e) => {
+                        tracing::error!(
+                            target: "talos_api",
+                            user_id = %user_id,
+                            error = %e,
+                            "could not read capability grant — refusing ceiling change rather \
+                             than assuming the default ceiling"
+                        );
+                        return Err(async_graphql::Error::new(
+                            "Could not verify your capability ceiling — try again.",
+                        )
+                        .extend_safe());
+                    }
                 }
             };
             // Wasm-security review 2026-05-28 (HIGH): partial-order lattice gate.

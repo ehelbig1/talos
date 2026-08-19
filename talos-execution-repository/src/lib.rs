@@ -524,9 +524,14 @@ impl ExecutionRepository {
                     level: r.try_get::<Option<_>, _>("level")?.unwrap_or_default(),
                     message: r.try_get::<Option<_>, _>("message")?.unwrap_or_default(),
                     metadata: r.try_get::<Option<_>, _>("metadata")?,
-                    created_at: r
-                        .try_get("created_at")
-                        .unwrap_or_else(|_| chrono::Utc::now()),
+                    // #661: propagate. `unwrap_or_else(|_| Utc::now())` is an
+                    // error-as-absence with a particularly bad default: an
+                    // unreadable timestamp on a log row was reported as
+                    // "created this instant", so a drifted column made every
+                    // historical log line look brand new — and any age-based
+                    // reader (retention, staleness, ordering) would never reach
+                    // it. Every sibling field here already uses `?`.
+                    created_at: r.try_get("created_at")?,
                 })
             })
             .collect::<Result<Vec<_>>>()

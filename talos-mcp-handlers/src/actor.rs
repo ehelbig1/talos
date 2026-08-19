@@ -1160,15 +1160,21 @@ pub use talos_actor_repository::{spawn_log_action, spawn_log_admin_event};
 /// `max_capability_world = 'agent-node'` got over-restricted to
 /// `'http-node'` via the catch-all on MCP while the GraphQL path
 /// recognised it correctly. The strict helper closes the drift.
-async fn user_max_world(pool: &sqlx::PgPool, user_id: Uuid) -> String {
+///
+/// #661 (error-as-absence): returns `Err` when the grant could not be READ.
+/// Pre-fix this was `.ok().flatten()`, which routed a DB error into the same
+/// catch-all arm as an unrecognised grant value — and that arm's own comment
+/// (below) reasons only about the unrecognised case. The two are not
+/// interchangeable: an unrecognised value is bad data an operator can fix,
+/// while an unreadable one means the ceiling is simply unknown. Collapsed, they
+/// returned `http-node` (rank 1) for a user granted `minimal-node` (rank 0) —
+/// one rank of escalation on the left-hand side of every `ceiling_permits` gate
+/// this feeds. Callers refuse rather than guess.
+async fn user_max_world(pool: &sqlx::PgPool, user_id: Uuid) -> anyhow::Result<String> {
     let repo = talos_actor_repository::ActorRepository::new(pool.clone());
-    let row = repo
-        .get_user_max_capability_world(user_id)
-        .await
-        .ok()
-        .flatten();
+    let row = repo.get_user_max_capability_world(user_id).await?;
 
-    match row.as_deref() {
+    Ok(match row.as_deref() {
         Some(world) if talos_capability_world::is_actor_ceiling_world(world) => world.to_string(),
         // Unrecognised grant value (legacy migration drift, direct
         // SQL write) collapses to the conservative default. Fail-
@@ -1180,7 +1186,31 @@ async fn user_max_world(pool: &sqlx::PgPool, user_id: Uuid) -> String {
         // operator to investigate. Sibling pattern to MCP-461
         // (`actor_world_rank_strict`).
         _ => "http-node".to_string(),
-    }
+    })
+}
+
+/// Resolve `user_max_world` or produce the MCP error response. Keeps the three
+/// `ceiling_permits` gates from having to spell out the same refusal.
+macro_rules! user_ceiling_or_error {
+    ($req_id:expr, $pool:expr, $uid:expr) => {
+        match user_max_world($pool, $uid).await {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!(
+                    target: "talos_mcp",
+                    user_id = %$uid,
+                    error = %e,
+                    "could not read capability grant — refusing rather than assuming the \
+                     default ceiling"
+                );
+                return mcp_error(
+                    $req_id,
+                    -32603,
+                    "Could not verify your capability ceiling — try again.",
+                );
+            }
+        }
+    };
 }
 
 // `memory_expires_at` moved to `actor_memory_service::default_expires_at`.
@@ -1577,7 +1607,7 @@ async fn handle_create_actor(
     // Wasm-security review 2026-05-28 (HIGH): partial-order lattice gate — a
     // user may only create an actor whose ceiling is a SUBSET of their own.
     // `world_rank` comparison wrongly admitted incomparable siblings.
-    let user_ceiling = user_max_world(&state.db_pool, user_id).await;
+    let user_ceiling = user_ceiling_or_error!(req_id, &state.db_pool, user_id);
     if !talos_capability_world::ceiling_permits(&user_ceiling, max_world) {
         return mcp_error(
             req_id, -32603,
@@ -4400,11 +4430,31 @@ async fn handle_get_my_capability_ceiling(
     state: &McpState,
     user_id: Uuid,
 ) -> JsonRpcResponse {
-    let row = state
-        .actor_repo
-        .get_user_capability_grant(user_id)
-        .await
-        .unwrap_or(None);
+    // #661 (error-as-absence): this response has a dedicated `source` field
+    // whose entire job is to distinguish "you hold a grant" from "you hold
+    // none", and `.unwrap_or(None)` filled it in with `"default"` on a DB
+    // error — a positive claim that no grant exists, addressed to the one
+    // person who would act on it. A user holding `agent-node` was told to go
+    // ask an admin for a ceiling they already have; a user holding
+    // `minimal-node` was told they have `http-node`. Report the failure
+    // instead of asserting the negative.
+    let row = match state.actor_repo.get_user_capability_grant(user_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(
+                target: "talos_mcp",
+                user_id = %user_id,
+                error = %e,
+                "could not read capability grant for get_my_capability_ceiling"
+            );
+            return mcp_error(
+                req_id,
+                -32603,
+                "Could not read your capability grant — this is NOT the same as having no \
+                 grant; try again.",
+            );
+        }
+    };
 
     let result = match row {
         Some(g) => serde_json::json!({
@@ -4539,7 +4589,7 @@ async fn handle_grant_capability_ceiling(
     // Wasm-security review 2026-05-28 (HIGH): partial-order lattice gate — a
     // `cache-node` granter could previously grant `secrets-node`/`governance-node`
     // (lower rank, but lattice-incomparable) to another user.
-    let granter_ceiling = user_max_world(&state.db_pool, granter_id).await;
+    let granter_ceiling = user_ceiling_or_error!(req_id, &state.db_pool, granter_id);
     if !talos_capability_world::ceiling_permits(&granter_ceiling, grant_world) {
         return mcp_error(
             req_id,
@@ -5067,7 +5117,7 @@ async fn handle_clone_actor(
     // Wasm-security review 2026-05-28 (HIGH): partial-order lattice gate — a
     // user could previously clone an actor whose ceiling is a lattice-incomparable
     // sibling of (not a subset of) their own.
-    let user_ceiling = user_max_world(&state.db_pool, user_id).await;
+    let user_ceiling = user_ceiling_or_error!(req_id, &state.db_pool, user_id);
     if !talos_capability_world::ceiling_permits(&user_ceiling, &source_max_world) {
         return mcp_error(
             req_id,
