@@ -1341,7 +1341,21 @@ interface graph-memory {
     /// distance from the seed entities, plus a JSON blob summarising
     /// the edges between them.
     record graph-context {
-        /// Total entity count across all distances.
+        /// Entities RETURNED, which is a page size, not a population.
+        ///
+        /// NOT a total, despite what this comment said until 2026-08-19. The
+        /// host caps the seed set at 10 and the returned rows at
+        /// `min(max-nodes, 50)`, so a guest requesting the RPC maximum of 200
+        /// is silently floored to 50 and told `entity-count: 50`. Treat it as
+        /// a lower bound on how many entities relate to the query; a value
+        /// equal to your requested `max-nodes` (or to 50) means the graph
+        /// almost certainly holds more.
+        ///
+        /// A structured truncation flag belongs here, but adding a field to
+        /// this record is a component-model ABI change requiring every guest's
+        /// `bindings.rs` to be regenerated, so it is deferred to a coordinated
+        /// regen. The JSON surface (`get_graph_context`) carries the
+        /// disclosure today.
         entity-count: u32,
         /// Entity hits sorted by (distance asc, label asc).
         entities: list<graph-hit>,

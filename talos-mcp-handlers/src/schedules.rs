@@ -516,6 +516,40 @@ async fn handle_get_schedule_next_runs(
     }
 }
 
+/// Rows the success/failure streak is walked over.
+///
+/// The streak is `take_while` over this many most-recent scheduled executions,
+/// so it CANNOT report a run longer than the window — it saturates silently at
+/// exactly this value. Measured on the reference deployment 2026-08-19:
+/// `ops-critical-notifier` had 1116 consecutive `completed` runs and reported
+/// 20; the longest failure streak ever recorded was 49, also reported as 20.
+/// Raising this is an operator call (it widens a per-request query), so the fix
+/// is to report saturation rather than to guess a bigger number.
+pub(crate) const SCHEDULE_STREAK_WINDOW: i64 = 20;
+
+/// Walk the leading run of identical statuses.
+///
+/// Returns `(status, count, saturated)`. `saturated` is true when the run fills
+/// the entire window, meaning `count` is a LOWER BOUND rather than the streak.
+///
+/// Pure so the saturation contract is testable without Postgres — the property
+/// that matters (a 1000-run streak and a 20-run streak are indistinguishable in
+/// `count`) needs no database to demonstrate, only a long enough slice.
+pub(crate) fn compute_streak(statuses: &[String]) -> (String, usize, bool) {
+    let Some(first) = statuses.first() else {
+        // No executions at all: not a zero-length streak that "filled" an empty
+        // window. Saturation must be false here or an idle schedule would claim
+        // its streak is a lower bound.
+        return ("none".to_string(), 0, false);
+    };
+    let count = statuses.iter().take_while(|s| *s == first).count();
+    // `>=` for the same reason Coverage::truncated uses it: a run that exactly
+    // fills the window is indistinguishable from one that exceeds it, and the
+    // safe direction is to say so.
+    let saturated = count >= usize::try_from(SCHEDULE_STREAK_WINDOW).unwrap_or(usize::MAX);
+    (first.clone(), count, saturated)
+}
+
 async fn handle_get_schedule_health(
     req_id: Option<serde_json::Value>,
     args: &Value,
@@ -590,7 +624,7 @@ async fn handle_get_schedule_health(
     // Compute streak from recent executions (schedule-scoped only).
     let statuses = match state
         .workflow_repo
-        .list_recent_scheduled_execution_statuses(workflow_id, 20)
+        .list_recent_scheduled_execution_statuses(workflow_id, SCHEDULE_STREAK_WINDOW)
         .await
     {
         Ok(s) => s,
@@ -613,12 +647,7 @@ async fn handle_get_schedule_health(
         }
     };
 
-    let (streak_type, streak_count) = if let Some(first) = statuses.first() {
-        let count = statuses.iter().take_while(|s| *s == first).count();
-        (first.clone(), count)
-    } else {
-        ("none".to_string(), 0)
-    };
+    let (streak_type, streak_count, streak_saturated) = compute_streak(&statuses);
 
     // MCP-29 (2026-05-07): emit last_success_ago as a structured
     // {available, runs_ago, label} envelope rather than a magic string
@@ -697,6 +726,22 @@ async fn handle_get_schedule_health(
         "streak": {
             "type": streak_type,
             "count": streak_count,
+            // 2026-08-19: `count` alone cannot express "at least". The streak is
+            // walked over a window of SCHEDULE_STREAK_WINDOW rows, so a run that
+            // fills the window reports the window size and is indistinguishable
+            // from a run that happens to be exactly that long. Measured on the
+            // reference deployment: ops-critical-notifier had 1116 consecutive
+            // `completed` runs and reported 20; the longest FAILURE streak ever
+            // recorded was 49, also reported as 20.
+            "at_least": streak_saturated,
+            "window": SCHEDULE_STREAK_WINDOW,
+            "note": if streak_saturated {
+                "count is a LOWER BOUND: the streak fills the whole lookback window, so the true \
+                 run is at least this long and may be much longer. Widen the window or query \
+                 workflow_executions directly for the exact figure."
+            } else {
+                "count is exact: the streak ended inside the lookback window."
+            },
         },
         "last_success_ago": last_success_ago,
     });
@@ -809,5 +854,67 @@ mod tests {
     fn a_single_failure_never_renders_as_a_hundred_percent() {
         assert_eq!(super::rolling_success_rate_pct(1999, 2000), Some(99.9));
         assert_eq!(super::rolling_success_rate_pct(1, 2000), Some(0.1));
+    }
+}
+
+#[cfg(test)]
+mod streak_saturation_pins {
+    //! `streak.count` is walked over a bounded window, so it must be able to say
+    //! "at least". Before 2026-08-19 it could not: a 1116-run streak and a
+    //! 20-run streak both rendered as `count: 20` with nothing to tell them
+    //! apart.
+    use super::{compute_streak, SCHEDULE_STREAK_WINDOW};
+
+    fn runs(status: &str, n: usize) -> Vec<String> {
+        vec![status.to_string(); n]
+    }
+
+    #[test]
+    fn a_streak_that_fills_the_window_is_flagged_as_a_lower_bound() {
+        let w = usize::try_from(SCHEDULE_STREAK_WINDOW).unwrap();
+        let (kind, count, saturated) = compute_streak(&runs("failed", w));
+        assert_eq!(kind, "failed");
+        assert_eq!(count, w);
+        assert!(
+            saturated,
+            "a run filling the window must report at_least; otherwise a 49-run failure streak \
+             (the longest ever recorded on the reference deployment) is indistinguishable from \
+             an exactly-{w}-run one"
+        );
+    }
+
+    #[test]
+    fn the_query_cannot_return_more_than_the_window_so_saturation_is_the_only_signal() {
+        // The repository applies `LIMIT SCHEDULE_STREAK_WINDOW`, so a 1116-run
+        // streak arrives here already cut to the window. This models that: the
+        // caller can never see the true length, which is exactly why `count`
+        // alone is insufficient and `at_least` carries the information.
+        let w = usize::try_from(SCHEDULE_STREAK_WINDOW).unwrap();
+        let as_delivered = runs("completed", w); // 1116 real runs, cut by SQL
+        let (_, count, saturated) = compute_streak(&as_delivered);
+        assert_eq!(
+            count, w,
+            "the true 1116 is not recoverable from the delivered rows"
+        );
+        assert!(saturated, "so the response must say the number is a floor");
+    }
+
+    #[test]
+    fn a_streak_that_ends_inside_the_window_is_exact() {
+        let mut v = runs("failed", 3);
+        v.push("completed".to_string());
+        let (kind, count, saturated) = compute_streak(&v);
+        assert_eq!((kind.as_str(), count), ("failed", 3));
+        assert!(
+            !saturated,
+            "a streak broken inside the window is an exact figure"
+        );
+    }
+
+    #[test]
+    fn no_executions_is_not_a_saturated_streak() {
+        // An idle schedule must not claim its zero is a lower bound.
+        let (kind, count, saturated) = compute_streak(&[]);
+        assert_eq!((kind.as_str(), count, saturated), ("none", 0, false));
     }
 }

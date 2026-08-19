@@ -64,6 +64,159 @@ pub const JUDGE_SCORE_POPULATION_NOTE: &str =
 /// [`wilson_interval_95`] is bit-identical to the pre-move implementation.
 const Z_95: f64 = 1.959_963_984_540_054;
 
+/// Accounting for a COUNT that came out of a capped read.
+///
+/// The read-side sibling of [`Measurement`]. Where `Measurement` exists because
+/// a bare `f64` carries no sample size, this exists because a bare INTEGER COUNT
+/// carries no ceiling: `count: 20` renders identically whether the population
+/// was 20 or 1116, and every reader — human or model — supplies the difference
+/// from imagination. That is the whole defect class (`n_examples: 20000` on a
+/// 55 179-row window; `streak.count: 20` on a 1116-run streak;
+/// `total_secrets_checked: 200` on a vault whose oldest secrets were never
+/// fetched).
+///
+/// # Why a type and not a convention
+///
+/// [`Self::new`] REQUIRES the cap. You cannot describe a count's coverage
+/// without naming the limit it ran under, which is the one fact the reporting
+/// site usually does not have — the cap is typically a literal buried in SQL in
+/// another crate. Making it an argument forces it to travel. This is the same
+/// move as `EncryptedSecrets` losing its `Default` (structural lint check 17):
+/// a type beats a lint, because a lint has to find you.
+///
+/// Generalised from `talos_memory_ranking::model::FetchProvenance`, which proved
+/// the shape on one site.
+///
+/// # The two rules it encodes
+///
+/// * **Truncation is decided with `>=`, not `>`.** A read that returned exactly
+///   its cap reads as truncated. That over-reports by at most one boundary case
+///   and is the safe direction — the alternative is a report that silently saw
+///   a short window. Same rule as the fuel-headroom sweep's
+///   `rows.len() >= MAX_FUEL_HEADROOM_ROWS`.
+/// * **Unknown is unknown.** [`Self::available`] is `Option` and
+///   `skip_serializing_if`-omitted. `None` means the population was not
+///   measured; it NEVER means "nothing was omitted". A `0` there would be the
+///   original bug wearing the fix's clothes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Coverage {
+    /// Rows the read actually returned.
+    pub returned: i64,
+    /// The cap the read ran under. `0` means "no cap declared" — a read that is
+    /// genuinely unbounded should say so with [`Self::complete`] instead.
+    pub cap: i64,
+    /// Rows that EXISTED to be read.
+    ///
+    /// Equal to `returned` whenever the cap did not bind (an unbound read has
+    /// already seen everything, so no extra query is owed). `None` means the cap
+    /// DID bind and the population was not measured.
+    ///
+    /// When measured after the read it races with concurrent writes, so it is an
+    /// accurate order of magnitude, not an exact ledger — which is why
+    /// [`Self::omitted`] clamps at zero rather than going negative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available: Option<i64>,
+}
+
+impl Coverage {
+    /// Declare a read that ran under `cap` and returned `returned` rows, with
+    /// the population not (yet) measured.
+    #[must_use]
+    pub fn new(returned: i64, cap: i64) -> Self {
+        Self {
+            returned,
+            cap,
+            available: None,
+        }
+    }
+
+    /// Declare a read that was NOT capped — `returned` is the population.
+    ///
+    /// Use this rather than `new(n, 0)` when you mean it: it makes
+    /// [`Self::truncated`] false by construction and [`Self::omitted`] a
+    /// definite zero rather than an unknown.
+    #[must_use]
+    pub fn complete(returned: i64) -> Self {
+        Self {
+            returned,
+            cap: 0,
+            available: Some(returned),
+        }
+    }
+
+    /// Attach a measured population count.
+    #[must_use]
+    pub fn with_available(mut self, available: i64) -> Self {
+        self.available = Some(available);
+        self
+    }
+
+    /// True when the read returned at least its cap — i.e. rows may have been
+    /// left unread. See the `>=` rule in the type docs.
+    #[must_use]
+    pub fn truncated(&self) -> bool {
+        self.cap > 0 && self.returned >= self.cap
+    }
+
+    /// Rows that existed but were not read. `None` when the population is
+    /// unknown — an unmeasurable gap is not a zero gap.
+    #[must_use]
+    pub fn omitted(&self) -> Option<i64> {
+        self.available.map(|a| (a - self.returned).max(0))
+    }
+
+    /// One sentence a human or a model can act on, correct in all three states.
+    ///
+    /// Deliberately never claims completeness it cannot support: when the cap
+    /// bound and the population is unknown it says "at least", which is the
+    /// strongest true statement available.
+    #[must_use]
+    pub fn note(&self) -> String {
+        if !self.truncated() {
+            return match self.available {
+                Some(a) => format!("complete: all {a} row(s) were read"),
+                None => format!(
+                    "complete: the read was not capped ({} row(s))",
+                    self.returned
+                ),
+            };
+        }
+        match self.omitted() {
+            Some(0) => format!(
+                "at the cap of {}: the read returned exactly its limit and the population was                  measured at the same value, so nothing is known to be missing",
+                self.cap
+            ),
+            Some(n) => format!(
+                "TRUNCATED: read {} of {} row(s) under a cap of {}; {n} row(s) were not examined                  and are not reflected in any count derived from this read",
+                self.returned,
+                self.available.unwrap_or(self.returned),
+                self.cap
+            ),
+            None => format!(
+                "TRUNCATED: the read hit its cap of {}, so the true population was not measured                  and is AT LEAST {}. Counts derived from this read are lower bounds, not totals",
+                self.cap, self.returned
+            ),
+        }
+    }
+
+    /// The disclosure as a JSON object, for report surfaces.
+    ///
+    /// Emits the derived `truncated` / `omitted` alongside the raw fields:
+    /// consumers of these surfaces are frequently language models, which should
+    /// not be asked to do the comparison themselves.
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "returned": self.returned,
+            "cap": self.cap,
+            "available": self.available,
+            "truncated": self.truncated(),
+            "omitted": self.omitted(),
+            "note": self.note(),
+        })
+    }
+}
+
 /// A measured number plus everything a reader needs in order not to
 /// over-read it.
 ///
@@ -582,6 +735,97 @@ mod tests {
     }
 
     // ---- The consolidated population note --------------------------------
+
+    #[test]
+    // ── Coverage ──────────────────────────────────────────────────────────
+    //
+    // The failure these guard is not "the arithmetic is wrong" — it is
+    // "a truncated read was reported as a complete one". Every assertion
+    // below is written so it FAILS if the disclosure collapses back into a
+    // bare count.
+    #[test]
+    fn coverage_at_the_cap_is_truncated_even_without_a_population() {
+        // The exact shape of `streak.count: 20` under a 20-row cap: we do not
+        // know the true streak, and the one thing we must not do is imply we
+        // read all of it.
+        let c = Coverage::new(20, 20);
+        assert!(
+            c.truncated(),
+            "a read that returned exactly its cap must report truncated"
+        );
+        assert_eq!(
+            c.omitted(),
+            None,
+            "unknown population must stay unknown, never 0"
+        );
+        assert!(
+            c.note().contains("AT LEAST"),
+            "with an unknown population the strongest true claim is a lower bound: {}",
+            c.note()
+        );
+    }
+
+    #[test]
+    fn coverage_below_the_cap_is_complete() {
+        let c = Coverage::new(7, 50);
+        assert!(!c.truncated());
+        assert!(c.note().starts_with("complete"), "{}", c.note());
+    }
+
+    #[test]
+    fn coverage_omitted_is_never_negative_when_the_population_shrinks() {
+        // `available` is measured after the read, so a retention sweep in
+        // between can make it smaller than `returned`. That must read as
+        // "nothing known missing", not as a negative count.
+        let c = Coverage::new(500, 500).with_available(480);
+        assert_eq!(c.omitted(), Some(0));
+    }
+
+    #[test]
+    fn coverage_reports_the_gap_when_the_population_is_known() {
+        let c = Coverage::new(20_000, 20_000).with_available(55_179);
+        assert_eq!(c.omitted(), Some(35_179));
+        let note = c.note();
+        assert!(note.contains("TRUNCATED"), "{note}");
+        assert!(
+            note.contains("35179"),
+            "the note must name the omitted count: {note}"
+        );
+    }
+
+    #[test]
+    fn coverage_complete_is_not_truncated_and_omits_nothing() {
+        let c = Coverage::complete(30);
+        assert!(
+            !c.truncated(),
+            "an uncapped read must never read as truncated"
+        );
+        assert_eq!(c.omitted(), Some(0), "an uncapped read omits a KNOWN zero");
+    }
+
+    #[test]
+    fn coverage_json_carries_the_derived_verdict_not_just_the_raw_numbers() {
+        // The consumer is frequently an LLM. Making it compute
+        // `returned >= cap` itself is how the class recurs one layer up.
+        let v = Coverage::new(25, 25).to_json();
+        assert_eq!(v["truncated"], serde_json::json!(true));
+        assert_eq!(v["cap"], serde_json::json!(25));
+        assert!(v["note"].as_str().unwrap().contains("AT LEAST"));
+        assert_eq!(v["omitted"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn coverage_unknown_population_serialises_as_absent_not_as_zero() {
+        // The doctrine of this crate: a missing field renders as "not
+        // measured", NEVER as a defaulted 0.
+        let s = serde_json::to_string(&Coverage::new(10, 10)).unwrap();
+        assert!(
+            !s.contains("available"),
+            "unknown population must be omitted: {s}"
+        );
+        let round: Coverage = serde_json::from_str(&s).unwrap();
+        assert_eq!(round.available, None);
+    }
 
     #[test]
     fn judge_population_note_states_both_populations() {
