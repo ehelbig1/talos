@@ -122,12 +122,18 @@ jobs:
         # retries and fails fast instead.
         timeout-minutes: 6
         run: |
+          # 2026-08-19 (#659 follow-up): the retry alone did NOT help, because
+          # apt HANGS rather than failing — the first attempt consumed the whole
+          # 6-minute step budget and attempts 2/3 never ran. A retry only helps
+          # against a FAST failure; a hang needs a per-ATTEMPT timeout. Budget:
+          # 3 x 90s + 10s + 20s = 300s, inside the 6-minute step cap.
           for attempt in 1 2 3; do
-            if sudo apt-get update -qq && sudo apt-get install -y -qq mold; then
+            if sudo timeout 90 apt-get update -qq \
+               && sudo timeout 90 apt-get install -y -qq mold; then
               exit 0
             fi
-            echo "apt attempt ${attempt}/3 failed; retrying in $((attempt * 15))s" >&2
-            sleep $((attempt * 15))
+            echo "apt attempt ${attempt}/3 failed or timed out; retrying" >&2
+            sleep $((attempt * 10))
           done
           echo "::error::apt-get failed to install mold after 3 attempts" >&2
           exit 1
@@ -339,12 +345,18 @@ jobs:
         # retries and fails fast instead.
         timeout-minutes: 6
         run: |
+          # 2026-08-19 (#659 follow-up): the retry alone did NOT help, because
+          # apt HANGS rather than failing — the first attempt consumed the whole
+          # 6-minute step budget and attempts 2/3 never ran. A retry only helps
+          # against a FAST failure; a hang needs a per-ATTEMPT timeout. Budget:
+          # 3 x 90s + 10s + 20s = 300s, inside the 6-minute step cap.
           for attempt in 1 2 3; do
-            if sudo apt-get update -qq && sudo apt-get install -y -qq mold; then
+            if sudo timeout 90 apt-get update -qq \
+               && sudo timeout 90 apt-get install -y -qq mold; then
               exit 0
             fi
-            echo "apt attempt ${attempt}/3 failed; retrying in $((attempt * 15))s" >&2
-            sleep $((attempt * 15))
+            echo "apt attempt ${attempt}/3 failed or timed out; retrying" >&2
+            sleep $((attempt * 10))
           done
           echo "::error::apt-get failed to install mold after 3 attempts" >&2
           exit 1
@@ -472,15 +484,16 @@ jobs:
           curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
             | sudo gpg --batch --yes --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
           for attempt in 1 2 3; do
-            if sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client-17; then
+            if sudo timeout 90 apt-get update -qq \
+               && sudo timeout 90 apt-get install -y -qq postgresql-client-17; then
               break
             fi
             if [ "$attempt" = 3 ]; then
               echo "::error::apt-get failed to install postgresql-client-17 after 3 attempts" >&2
               exit 1
             fi
-            echo "apt attempt ${attempt}/3 failed; retrying in $((attempt * 15))s" >&2
-            sleep $((attempt * 15))
+            echo "apt attempt ${attempt}/3 failed or timed out; retrying" >&2
+            sleep $((attempt * 10))
           done
           echo "PG_DUMP_BIN=/usr/lib/postgresql/17/bin/pg_dump" >> "$GITHUB_ENV"
           echo "PSQL_BIN=/usr/lib/postgresql/17/bin/psql" >> "$GITHUB_ENV"
@@ -547,12 +560,18 @@ jobs:
         # retries and fails fast instead.
         timeout-minutes: 6
         run: |
+          # 2026-08-19 (#659 follow-up): the retry alone did NOT help, because
+          # apt HANGS rather than failing — the first attempt consumed the whole
+          # 6-minute step budget and attempts 2/3 never ran. A retry only helps
+          # against a FAST failure; a hang needs a per-ATTEMPT timeout. Budget:
+          # 3 x 90s + 10s + 20s = 300s, inside the 6-minute step cap.
           for attempt in 1 2 3; do
-            if sudo apt-get update -qq && sudo apt-get install -y -qq mold; then
+            if sudo timeout 90 apt-get update -qq \
+               && sudo timeout 90 apt-get install -y -qq mold; then
               exit 0
             fi
-            echo "apt attempt ${attempt}/3 failed; retrying in $((attempt * 15))s" >&2
-            sleep $((attempt * 15))
+            echo "apt attempt ${attempt}/3 failed or timed out; retrying" >&2
+            sleep $((attempt * 10))
           done
           echo "::error::apt-get failed to install mold after 3 attempts" >&2
           exit 1
