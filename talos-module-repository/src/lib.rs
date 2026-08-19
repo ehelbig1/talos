@@ -3310,14 +3310,13 @@ impl ModuleRepository {
             .bind(user_id)
             .fetch_all(&self.db_pool)
             .await?;
-        Ok(rows
-            .into_iter()
+        rows.into_iter()
             // `.ok()?` silently DROPPED a row on drift, shortening the
             // installed-template map so a catalog entry reads as
             // not-installed. Both columns are NOT NULL, so the only
             // reachable skip was drift.
             .map(|row| -> Result<(String, Uuid)> { Ok((row.try_get("name")?, row.try_get("id")?)) })
-            .collect::<Result<std::collections::HashMap<String, Uuid>>>()?)
+            .collect::<Result<std::collections::HashMap<String, Uuid>>>()
     }
 }
 

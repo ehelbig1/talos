@@ -163,8 +163,7 @@ impl WorkflowRepository {
         .fetch_all(&self.db_pool)
         .await?;
 
-        Ok(rows
-            .into_iter()
+        rows.into_iter()
             // `.ok()?` dropped a row on drift, so a template silently lost
             // its declared secret grants. `modules.id` is NOT NULL.
             .map(|r| -> Result<(Uuid, Vec<String>)> {
@@ -172,7 +171,7 @@ impl WorkflowRepository {
                 let secrets: Vec<String> = decode_allowed_secrets_row(&r, Some(tid));
                 Ok((tid, secrets))
             })
-            .collect::<Result<std::collections::HashMap<Uuid, Vec<String>>>>()?)
+            .collect::<Result<std::collections::HashMap<Uuid, Vec<String>>>>()
     }
 
     /// Batch-fetch node template metadata (name, config_schema, allowed_secrets).
