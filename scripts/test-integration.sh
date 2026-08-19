@@ -156,6 +156,20 @@ if ! cargo test -p talos-workflow-engine-nats --lib full_claim_loop; then
     rc=1
 fi
 
+# ── #661 error-as-absence :: the tier-2 expose_secret daily cap  [redis] ────
+# A Redis GET FAILURE used to read as "no counter yet today", which both allowed
+# the expose AND ran set_ex(key,1,86400), destroying the day's accumulated
+# count. The test induces a real per-command failure (the key is made a LIST, so
+# GET returns WRONGTYPE while the connection stays healthy) and asserts the call
+# returns Err AND leaves the key untouched. Named here, not merely gated on
+# TALOS_TEST_REDIS_URL, so it is real coverage rather than a green skip (the
+# workspace `--lib` run in quality.yml has no Redis and skips it).
+echo
+echo "▶ #661 expose-limit error-as-absence :: talos-worker-runtime  [redis]"
+if ! cargo test -p talos-worker-runtime --lib expose_limit_absence_tests; then
+    rc=1
+fi
+
 # ── Controller DB-harness binaries ──────────────────────────────────────────
 # These predate the TALOS_TEST_DATABASE_URL convention: they read DATABASE_URL
 # directly via controller::db::init_pool, need a non-zero TALOS_MASTER_KEY

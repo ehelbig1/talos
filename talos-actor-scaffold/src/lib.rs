@@ -292,7 +292,7 @@ pub async fn scaffold_actor(
     // Wasm-security review 2026-05-28 (HIGH): partial-order lattice gate via
     // the canonical `ceiling_permits` helper — the `world_rank` comparison
     // wrongly admitted lattice-incomparable siblings.
-    let user_ceiling = user_max_world_str(&deps.db_pool, user_id).await;
+    let user_ceiling = user_max_world_str(&deps.db_pool, user_id).await?;
     if !talos_capability_world::ceiling_permits(user_ceiling, &req.max_capability_world) {
         return Err(ScaffoldError::CapabilityCeilingExceeded {
             user_ceiling: user_ceiling.to_string(),
@@ -796,7 +796,17 @@ async fn build_and_create_starter_workflow(
 /// Same default-ceiling helper `handle_create_actor` uses, lifted out
 /// so the service doesn't reach into mcp/actor.rs internals beyond the
 /// already-public `world_rank` + `is_actor_ceiling_world`.
-async fn user_max_world_str(pool: &sqlx::PgPool, user_id: Uuid) -> &'static str {
+///
+/// #661 (error-as-absence): returns `Err` when the grant could not be READ.
+/// `.ok().flatten()` put a DB error into the same bucket as "no grant" and
+/// "unrecognised label", all three yielding `http-node` (rank 1) — an
+/// escalation for a user whose actual grant is `minimal-node` (rank 0), on the
+/// left-hand side of the `ceiling_permits` gate at the call site, and persisted
+/// into the actor row this function's caller then creates.
+async fn user_max_world_str(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+) -> Result<&'static str, ScaffoldError> {
     // MCP-816 (2026-05-14): delegate canonicalization to the
     // `talos_capability_world` crate instead of hand-rolling a match
     // arm per world. Pre-fix this match was missing `"agent-node"` and
@@ -824,13 +834,24 @@ async fn user_max_world_str(pool: &sqlx::PgPool, user_id: Uuid) -> &'static str 
     let row = repo
         .get_user_max_capability_world(user_id)
         .await
-        .ok()
-        .flatten();
-    row.as_deref()
+        .map_err(|e| {
+            tracing::error!(
+                target: "talos_actor_scaffold",
+                user_id = %user_id,
+                error = %e,
+                "could not read capability grant — refusing scaffold rather than assuming \
+                 the default ceiling"
+            );
+            ScaffoldError::DatabaseError(
+                "Could not verify your capability ceiling — try again.".to_string(),
+            )
+        })?;
+    Ok(row
+        .as_deref()
         .and_then(|s| CapabilityWorld::from_str(s).ok())
         .filter(|w| !matches!(w, CapabilityWorld::Unknown))
         .map(|w| w.as_node_str())
-        .unwrap_or("http-node")
+        .unwrap_or("http-node"))
 }
 
 #[cfg(test)]

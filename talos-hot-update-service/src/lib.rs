@@ -346,7 +346,7 @@ impl HotUpdateService {
                 ctx.template_id,
                 ctx.is_sandbox_only,
             )
-            .await;
+            .await?;
 
         // 6. Wrap source with `#[talos_module]` if needed.
         let wrapped_source = wrap_source_with_module_macro(&source_code, &effective_world);
@@ -419,9 +419,22 @@ impl HotUpdateService {
             Some(h) => h,
             None => self
                 .module_repo
+                // #661 (error-as-absence): a failed read of the previous
+                // history hash used to read as "there is no previous entry",
+                // and the chain then RESTARTED at "initial" — the module's
+                // update history silently forks and every earlier entry is
+                // orphaned from the chain that is supposed to prove
+                // continuity. Losing the history row entirely (the `Err`
+                // branch below already tolerates that) is honest; writing a
+                // false chain anchor is not.
                 .last_history_hash_for_module(module_id)
                 .await
-                .unwrap_or(None)
+                .map_err(|e| {
+                    HotUpdateError::DatabaseWrite(format!(
+                        "could not read the module's previous history hash — refusing to \
+                         restart the update-history chain at 'initial': {e}"
+                    ))
+                })?
                 .unwrap_or_else(|| "initial".to_string()),
         };
         if let Err(e) = self
@@ -469,15 +482,27 @@ impl HotUpdateService {
         })
     }
 
+    /// #661 (error-as-absence): both reads propagate.
+    ///
+    /// `talos.json`-style `dependencies` are the ONLY dependency declaration
+    /// the compiler sees, so `.unwrap_or(None)` on a DB blip did not degrade
+    /// gracefully — it recompiled the module WITHOUT its declared crates. The
+    /// user then gets an `E0433: failed to resolve` naming a crate they
+    /// correctly declared, with nothing anywhere saying the declaration failed
+    /// to load. Same class check 68 exists for, arriving by a different route.
+    ///
+    /// Note the MCP-883 comment in `write_sandbox_path` below: that pass fixed
+    /// exactly this shape for three PRE-COMPILE reads in the sibling function
+    /// and did not reach these two.
     async fn resolve_dependencies(
         &self,
         explicit: Option<JsonValue>,
         module_id: Uuid,
         template_id: Option<Uuid>,
         is_sandbox: bool,
-    ) -> Option<JsonValue> {
+    ) -> Result<Option<JsonValue>, HotUpdateError> {
         if let Some(d) = explicit {
-            return Some(d);
+            return Ok(Some(d));
         }
         let lookup_id = if is_sandbox {
             Some(module_id)
@@ -488,17 +513,25 @@ impl HotUpdateService {
             self.module_repo
                 .get_template_dependencies(tid)
                 .await
-                .unwrap_or(None)
+                .map_err(|e| {
+                    HotUpdateError::DatabaseWrite(format!(
+                        "could not read the template's declared dependencies: {e}"
+                    ))
+                })?
         } else {
             None
         };
         match from_template {
-            Some(d) => Some(d),
+            Some(d) => Ok(Some(d)),
             None => self
                 .module_repo
                 .get_wasm_module_dependencies(module_id)
                 .await
-                .unwrap_or(None),
+                .map_err(|e| {
+                    HotUpdateError::DatabaseWrite(format!(
+                        "could not read the module's declared dependencies: {e}"
+                    ))
+                }),
         }
     }
 

@@ -3936,13 +3936,56 @@ async fn handle_validate_workflow(
         state.analytics_repo.count_expiring_secrets(user_id),
         state.analytics_repo.get_workflow_full(wf_id, user_id),
     );
-    let exec_data = exec_data_res.unwrap_or(talos_analytics_repository::ReadinessExecData {
-        success_rate: None,
-        total_count: 0,
+    // #661 (error-as-absence): each of these four `unwrap_or` defaults is the
+    // value that an EMPTY result would produce, so a failed read is scored
+    // exactly like a workflow that has never run and has no description —
+    // `readiness_score` drops and the response recommends the operator go fix
+    // documentation that is already there. This is the recorded
+    // `get_schedule_health`-returns-zeros shape (a DB error rendered as "there
+    // is nothing to report"), and the prescribed fix from that write-up is
+    // followed here: keep the fail-soft default so the handler still answers,
+    // but stamp a structured event AND put a non-numeric hint in the response
+    // so the number is never read as a verdict on the workflow.
+    let mut degraded_inputs: Vec<&'static str> = Vec::new();
+    let exec_data = exec_data_res.unwrap_or_else(|e| {
+        tracing::error!(
+            target: "talos_mcp",
+            %wf_id, error = %e, event_kind = "readiness_input_read_failed",
+            "readiness: execution stats unreadable — scoring as if the workflow never ran"
+        );
+        degraded_inputs.push("execution_stats");
+        talos_analytics_repository::ReadinessExecData {
+            success_rate: None,
+            total_count: 0,
+        }
     });
-    let last_exec_at = last_exec_res.unwrap_or(None);
-    let expiring_secrets: i64 = expiring_res.unwrap_or(0);
-    let wf_meta = wf_meta_res.unwrap_or(None);
+    let last_exec_at = last_exec_res.unwrap_or_else(|e| {
+        tracing::error!(
+            target: "talos_mcp",
+            %wf_id, error = %e, event_kind = "readiness_input_read_failed",
+            "readiness: last-execution timestamp unreadable — scoring as if never run"
+        );
+        degraded_inputs.push("last_execution_at");
+        None
+    });
+    let expiring_secrets: i64 = expiring_res.unwrap_or_else(|e| {
+        tracing::error!(
+            target: "talos_mcp",
+            %wf_id, error = %e, event_kind = "readiness_input_read_failed",
+            "readiness: expiring-secret count unreadable — scoring as zero expiring"
+        );
+        degraded_inputs.push("expiring_secrets");
+        0
+    });
+    let wf_meta = wf_meta_res.unwrap_or_else(|e| {
+        tracing::error!(
+            target: "talos_mcp",
+            %wf_id, error = %e, event_kind = "readiness_input_read_failed",
+            "readiness: workflow metadata unreadable — scoring as undocumented"
+        );
+        degraded_inputs.push("workflow_metadata");
+        None
+    });
 
     // Documentation (20 pts): has_desc=10, has_node_desc=5, has_caps=5
     let has_desc = wf_meta
@@ -4165,7 +4208,7 @@ async fn handle_validate_workflow(
         .take(2)
         .collect();
 
-    let result = serde_json::json!({
+    let mut result = serde_json::json!({
         "valid": valid,
         "readiness_score": readiness_score,
         "node_count": nodes.len(),
@@ -4174,6 +4217,16 @@ async fn handle_validate_workflow(
         "warnings": warnings,
         "top_improvements": improvement_actions,
     });
+    // #661: say which happened. Absent this field the caller cannot tell a
+    // genuinely low score from a score computed on inputs that failed to load.
+    if !degraded_inputs.is_empty() {
+        result["readiness_score_degraded"] = serde_json::json!(true);
+        result["readiness_unreadable_inputs"] = serde_json::json!(degraded_inputs);
+        result["readiness_score_note"] = serde_json::json!(
+            "One or more inputs could NOT BE READ and were scored as empty. \
+             readiness_score is a lower bound, not a verdict on this workflow."
+        );
+    }
 
     Some(mcp_text(
         req_id.clone(),

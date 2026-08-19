@@ -543,11 +543,18 @@ impl WorkflowRepository {
             let id: Uuid = r.try_get("input_id")?;
             let is_compiled: bool = r.try_get::<Option<_>, _>("is_compiled")?.unwrap_or(false);
             let name: String = r.try_get("name")?;
-            let capability_world: Option<String> = r.try_get("capability_world").ok();
-            let category_persisted: Option<String> = r.try_get("category").ok();
+            // #661: all three propagate. This builds the module EXPORT
+            // manifest, so an unreadable column silently produced an export
+            // that omits the field — `source_code` absent reads as "this
+            // module has no source", which is what a re-import would then
+            // faithfully reproduce. `capability_world` absent is worse in kind:
+            // it is the privilege declaration. Both `.ok()` spellings are
+            // invisible to structural check 52, whose regex only covers
+            // `.unwrap_or`.
+            let capability_world: Option<String> = r.try_get("capability_world")?;
+            let category_persisted: Option<String> = r.try_get("category")?;
             let source_code: Option<String> = if include_source {
-                r.try_get::<Option<String>, _>("source_code")
-                    .unwrap_or(None)
+                r.try_get::<Option<String>, _>("source_code")?
             } else {
                 None
             };

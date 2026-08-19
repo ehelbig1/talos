@@ -371,3 +371,252 @@ Adjacent swallow shapes, deliberately out of scope — a floor, not a ceiling:
   reaches the caller as "Scratch session 'x' not found". Recorded, not fixed.
 * `let _ = tokio::spawn(async { … })` where the SPAWNED BODY swallows — the
   scanner sees the outer statement, not the inner one.
+
+---
+
+# Part 2 — error rendered as an ABSENCE (#661)
+
+Produced on `757cf45` (= `origin/main`, i.e. #660's merge) by
+`scripts/lint-absence-inventory.py`; verdicts in `scripts/absence-verdicts.py`.
+Re-derive with:
+
+```sh
+python3 scripts/lint-absence-inventory.py . > /tmp/sites.json
+python3 scripts/absence-verdicts.py                    # counts + per-site list
+```
+
+**A distinct class from Part 1.** Part 1 (#660) covered *failure rendered as
+SUCCESS* — `let _ = <expr>.await`, where a caller is told OK while the write
+failed. This part covers *failure rendered as ABSENCE*: a fallible operation
+whose `Err` becomes `None` or an empty collection, so the caller takes the
+not-found branch and behaves as though the row genuinely does not exist.
+Downstream that becomes "no such session", "no memories", "no schedule", "never
+ran", "no grant" — each of which some code path treats as a legitimate,
+actionable state.
+
+## Population, re-derived (production only; test files and `#[cfg(test)] mod`
+## regions excluded)
+
+| anchor | prod sites | of which the expression contains `.await` |
+|---|---|---|
+| `.unwrap_or(None)` | 53 | 47 |
+| `.unwrap_or_else(\|_\| None)` | 0 | 0 |
+| `.ok()` (value used) | 675 | 78 |
+| `.ok();` (pure discard — Part 1's class, not this one) | 54 | 17 |
+| `.unwrap_or(<empty literal>)` | 294 | 3 |
+
+783 of the 1076 anchors are multi-line statements.
+
+**`grep -c 'unwrap_or(None)'` gives 67; the truth is 53.** The 14-site gap is
+not multi-line chains (in Part 1 the gap ran the other way): **all 14 are
+comments inside code that has ALREADY been fixed for this class** — MCP-535 /
+MCP-551 / MCP-552 left explanatory comments behind, e.g.
+
+    // MCP-552: previously `.unwrap_or(None)` silently treated a DB read
+    // `.unwrap_or(None)` collapsed both into "owner = None" -> 404. The
+
+Any count that does not strip comments over-reports by ~26%, and over-reports
+*precisely in the files that were already fixed*.
+
+## Scope closed, and what "closed" means here
+
+1076 anchors is too many to read a caller for, and most are not this class at
+all (`header.to_str().ok()`, `Uuid::parse_str(..).ok()`). The **closed set** is
+every anchor whose swallowed expression is a fallible I/O read — the 128
+`.await`-bearing anchors — plus the 6 non-I/O `unwrap_or(None)` sites and the
+`try_get` schema-drift reads found alongside them. **129 sites, every one read
+at the caller, no residual "unclassified" bucket:**
+
+| class | count |
+|---|---|
+| **(a)** error-as-absence, ACTED ON | **94** |
+| **(b)** error-as-absence, INERT (reason stated per site) | **26** |
+| **(c)** not this class (an `Option`/parse the grep caught) | **9** |
+| total | **129** |
+
+Everything outside that set is stated in "Not covered" below rather than
+silently dropped.
+
+## (a) is emphatically NOT just the one instance #660 named
+
+#660 named `get_scratch_session(...).unwrap_or(None)` — a DB error reported as
+"scratch session not found". That site is real and is in the list
+(`talos-mcp-handlers/src/advanced.rs:1468`), and it is one of **94**.
+
+### Ranked first: the absence causes or skips a WRITE (20 sites)
+
+The plan's own ranking — creating a duplicate, re-running a job, or skipping a
+dedupe/uniqueness check because the DB blipped outranks rendering a wrong number.
+
+* `talos-worker-runtime/src/host/graphql.rs:1079` — **the sharpest.** A Redis
+  `GET` failure reads as "no counter yet today" on the **tier-2
+  `expose_secret` daily cap**, which both allows the call and runs
+  `set_ex(key, 1, 86400)` — overwriting the day's accumulated count with 1 and
+  restarting the 24 h window. The guard erases its own state. The caller
+  (`host/secrets.rs:387`) already routes `Err` to an in-memory fallback,
+  preserving MCP-722's "never-configured = the same fail-closed path as an
+  outage"; the `.ok()` inside the callee created a **third** path — *GET
+  failed* — reaching neither arm.
+* `talos-api/src/schema/actors/mutations.rs:278,647`,
+  `talos-mcp-handlers/src/actor.rs:1168`, `talos-actor-scaffold/src/lib.rs:827`
+  — the capability-grant read. A DB error lands in the same arm as an
+  *unrecognised* grant value and yields `http-node` (`world_rank` **1**) for a
+  user granted `minimal-node` (rank **0**) — one rank of escalation on the left
+  side of the `ceiling_permits` lattice gate, **persisted** into the actor row.
+* `controller/src/bootstrap/background.rs:2227` — `archive_after_days`
+  unreadable → the env default (30) binds into a CTE that DELETEs from
+  `workflow_executions`. On a 365-day deployment that is ~11 months of history
+  swept out on the next daily tick.
+* `talos-gmail/src/watch.rs:278` — `get_integration` error skips the whole
+  `if let Some(integration)` block, so `users.stop()` is never called;
+  `google_err` stays `None`, so the audit row records **`success = true`**, and
+  `delete_row` still removes the local row. An orphaned Gmail push channel keeps
+  delivering, audited as a clean stop.
+* `talos-mcp-handlers/src/sandbox.rs:1126` — skipped compile dedupe → a full
+  WASM recompile plus a duplicate persisted template row.
+* `talos-mcp-handlers/src/workflows.rs:2298` — node config-schema validation
+  skipped; the unvalidated node is written into `graph_json`.
+* `talos-mcp-handlers/src/workflows.rs:10390,10397` — `plan_and_execute`
+  publishes an **empty** passthrough subtask workflow (`{"nodes":[]}`) and runs
+  it as a silent no-op.
+* `talos-actor-lifecycle-service/src/handoff.rs:539` — the handed-off execution
+  row is created with a **NULL version**, so it runs against the live draft
+  graph and loses its replay pin.
+* `talos-atlassian/src/integration.rs:326` — the credential UPSERT writes
+  `account_id = NULL` and `EXCLUDED.account_id` **overwrites a previously-good
+  value**.
+* `talos-oauth/src/credentials.rs:843` — persists `scope = ""`, wiping the
+  recorded grant scope kept for 401/403 scope-drift auditing.
+* `talos-mcp-handlers/src/lib.rs:484,492` — `find_first_user_id` error → "no
+  users" → `ensure_dev_user()` creates a synthetic dev user; and if *that*
+  errors, `agent.user_id = None` for the whole session, which the code's own
+  comment says makes every write land NULL while tools report success.
+  (`/mcp/local` dev endpoint only.)
+* `controller/src/bootstrap/router.rs:2158` — the Google Calendar integration
+  is never created, with **no `else` and no log**, while the OAuth callback
+  completes and logs a successful login.
+
+### Then: authorisation and existence checks, with the direction stated
+
+**Fails OPEN** (the dangerous direction) — 7:
+`totp-2fa:140` (2FA lockout gate skipped on an HGET error; backstopped by the
+HINCRBY pre-charge, so narrow), the four capability-grant sites above,
+`analytics.rs:4626` (the high-severity `repeated_auth_failures` finding is
+silently omitted from the risk assessment), `analytics-repository:1955` (the
+background SLA loop's `_ => continue` **skips SLA-violation alerting**,
+indistinguishable from "fewer than 3 executions"), `analytics-repository:4329`
+(the hygiene report claims no module holds a `*` secret grant),
+`oauth/credentials.rs:550` (the provider-side revoke is skipped while the local
+rows are deleted, leaving a live OAuth grant the platform has forgotten),
+`actor.rs:2885` and `modules.rs:2492` (an actor is reported as having no budget
+policy; a module as unthrottled).
+
+**Fails CLOSED** — 21. Safe direction, and the defect is
+[[misleading-report-field-class]]: the response asserts a conclusion the code
+never reached. `executions.rs:5601` (approval ownership), `sandbox.rs:1813,3102`
+and `workflows.rs:2806` (actor ownership), `handoff.rs:312,336,436`,
+`platform.rs:1710`, `modules.rs:976,1139`, `graph.rs:4215`,
+`analytics.rs:1170,1913,2066,2230`, `versions.rs:731`, `webhooks.rs:613`,
+`schedules.rs:569`, `advanced.rs:1468`, `system-repo:218`, `actor.rs:6404`, and
+`google-calendar/admin.rs:250,288` (403 *"no audit record of this channel being
+created for this user"* / 404 *"no active gcal integration for this user"*).
+
+Note `schedules.rs:569`'s **honest twin in the same handler**: the stats read
+below it stamps a `data_warning` instead of collapsing to a 404.
+
+### Schema-drift reads that structural check 52 could not see
+
+Check 52 (`silent try_get().unwrap_or`) was burned 526 → 0 and **graduated to a
+hard rule**. Its regex needs `.try_get(...)` and `.unwrap_or` on one line; the
+script's own comment admitted a split-across-lines read "still slips past ...
+rare and caught in review". Measured: check 52's grep reports **0**, and there
+were **5**.
+
+| site | column | error/NULL read as | why it matters |
+|---|---|---|---|
+| `talos-workflow-repository/src/workflows.rs:1881` | `timezone` | `"UTC"` | the workflow-schedule EXPORT row — a 09:00 America/Toronto cron round-trips as 09:00 UTC |
+| `talos-execution-repository/src/lib.rs:528` | `created_at` | `Utc::now()` | an unreadable timestamp reads as "created this instant"; age-based readers never reach the row |
+| `talos-secrets-manager/src/manager.rs:3524` | `namespace` | `"default"` | namespace is half the identity this lookup exists to resolve |
+| `talos-actor-repository/src/lib.rs:3742` | `description` | `None` | display only; listed because it is the odd one out in a struct whose other three fields propagate |
+| `talos-workflow-repository/src/templates.rs:549` | `source_code` | `None` | the module EXPORT manifest says "this module has no source", which a re-import faithfully reproduces |
+
+`talos-registry/src/lib.rs:892` was a **false positive of my first detector** —
+a `.context(...)?` sits between the two lines, which is the *fixed* form. It is
+struck from the list and is what the shipped check correctly does not flag.
+
+**The bigger hole in the same check is `.ok()`, and it is NOT closed.**
+`.try_get(...).ok()` has identical semantics — drift reads as `None`, never as
+an error — and neither check-52 leg mentions `.ok` at all, so it is invisible on
+one line or many. Measured: **84** workspace-wide, including
+`talos-memory/src/lib.rs:431-433, 1076-1077, 1959-1960, 2233-2234` — `value`,
+`value_enc`, `value_key_id`, the **encryption-envelope columns** on the table
+whose sibling `value_format` read check 34 exists specifically to make fail
+loud. That is a burn-down cycle, not a lint change: gating it today means
+re-adding a baseline, which check 52's own rule forbids.
+
+## (b) — inert, 26 sites, each with its reason
+
+* **The node-label decoration group (12)** — `executions.rs:1137, 1593, 1830,
+  1980, 3067, 3288, 3431, 4159, 4293, 4717`, `analytics.rs:2530`,
+  `failure-analysis-service/lib.rs:579`. All are
+  `get_workflow_graph*(..).await.ok().flatten()` feeding `build_node_label_map`,
+  whose only consumer is `map.get(uuid).unwrap_or(uuid.to_string())`. An empty
+  map renders raw UUIDs — the honest "label unknown", identical to what a
+  genuinely graph-less workflow renders — and never removes a row, adds a row,
+  or changes a count. The substantive payload comes from separately-checked
+  queries that `return mcp_error` on their own `Err`.
+* `executions.rs:5893` — the empty-map fallback re-derives the UUID with the
+  same `SHA256(rf_id)[..16]` used to build the map. Byte-identical result.
+* `node-cache/lib.rs:145`, `workflow-repository/search.rs:25,82` — cache reads.
+  A read error and a genuine miss both mean "recompute", and the recompute is
+  the correct answer either way.
+* `actor.rs:1907,2179` — the terminal-state guard falls through, but the
+  `suspend_actor` / `update_actor_status` SQL re-gates terminal states and its
+  `Ok(0)` arm emits the same operator-facing error (MCP-645/646).
+* `actor.rs:2598,2811`, `search.rs:629`, `api/platform/queries.rs:103`,
+  `google-calendar/handlers.rs:186` — a decoration on an answer that stands
+  without it; nothing branches on the field and a genuine NULL renders the same.
+* `registry/sync.rs:122` — `which cosign` → falls back to a PATH walk;
+  verification still runs, only the PATH-pinning defence-in-depth is lost, and
+  the doc comment says a resolution failure deliberately does not cache a
+  sentinel so the next call retries.
+* **`talos-scheduler/src/lib.rs:2083` — the model shape, kept for contrast.**
+  The fence-epoch read is `.ok().flatten()` and is *immediately* followed by
+  `if fence_epoch.is_none() { warn!("… running unfenced") }`, with a comment
+  saying why unfenced is acceptable. The absence is observable and the
+  degradation is named. That is what a correct fallback looks like.
+* `secrets-manager/manager.rs:3495` — see the correction below.
+
+## A correction the inventory forced, recorded per [[inventory-before-naming-the-fix]]
+
+I ranked `SecretsManager::find_name_collision` the top (a) on sight. Its doc
+says *"Best-effort — DB errors return `None` so a transient hiccup doesn't break
+the upsert"*, four lines under a doc describing the harm it prevents (*"later
+calls `delete_secret(name="foo")` and watches the wrong secret disappear"*): a
+read whose absence causes a write, self-documented.
+
+It has **zero callers** — one occurrence workspace-wide, its own definition. The
+warning is never emitted for any reason. Inert for this class, and a
+signal-nobody-consumes item instead. Sample of one, wrong generalisation, caught
+only by closing the caller set.
+
+## Not covered — the floor, not the ceiling
+
+* **`unwrap_or_default()` as a class — 1127 sites, deliberately excluded.** It
+  is dominated by legitimate config and `Option` handling and sweeping it would
+  bury the signal. Individual `unwrap_or_default()` sites reached through an
+  adjacent finding ARE included (`analytics-repository:4329`,
+  `oauth/credentials.rs:843`), so the exclusion is of the *sweep*, not of the
+  shape.
+* **`.try_get(...).ok()` — 84 sites**, measured and reported above, not fixed
+  and not gated.
+* **`.ok()` on non-I/O expressions — ~597 sites.** A malformed input genuinely
+  is an absence of a valid value; that is a different (and usually correct)
+  judgement from a DB blip.
+* **`Err(_) => return Ok(())` and `Err(_) => None` match arms** are the same
+  class in a spelling no anchor here catches. One was found incidentally while
+  verifying another site: `talos-gmail/src/watch.rs:269` — `find_by_id` error →
+  `return Ok(())`, documented as "Idempotent: missing rows succeed silently".
+  Not enumerated; the population is unknown.
+* `unwrap_or_else`, `map_or`, and `?` on a call whose error type erases the
+  distinction — not enumerated.

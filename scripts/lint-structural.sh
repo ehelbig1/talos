@@ -3696,8 +3696,31 @@ echo
 # `.try_get::<Option<T>, _>("col").unwrap_or` form (the `(::<[^(]*>)?` group), but
 # NOT the fixed `?.unwrap_or` form — the `\)\.unwrap_or` requires `)` immediately
 # followed by `.unwrap_or`, so a `)?.unwrap_or` (error propagated) never matches.
-# (A silent read split across lines — `.try_get(...)` and `.unwrap_or` on separate
-# lines — still slips past this line-based grep; those are rare and caught in review.)
+# THE MULTI-LINE HOLE IS NOW CLOSED (#661, 2026-08-19). This comment used to
+# say a read split across lines "still slips past this line-based grep; those
+# are rare and caught in review." Measured: FIVE such reads existed while the
+# line-based grep reported 0 workspace-wide on a check that had been GRADUATED
+# to a hard rule — and the sharpest of them (`timezone` in the workflow-schedule
+# export row, `talos-workflow-repository/src/workflows.rs:1881`) silently ran
+# every exported cron in UTC. "Rare and caught in review" was an assumption, not
+# a measurement, and review had not caught them in the thirteen months the hole
+# was documented. The perl pass below is statement-aware: it matches a
+# `try_get(...)` whose `.unwrap_or` continues on the NEXT line with nothing but
+# whitespace between. An intervening `?` (or `.context(...)?`) breaks the match,
+# which is correct — that IS the fixed form, and it is what keeps
+# `talos-registry/src/lib.rs`'s `.context(...)?.unwrap_or_else(...)` out of the
+# results. Verified against the pre-fix tree: the pass reports exactly those 5
+# and nothing else.
+#
+# STATED LIMIT, because overstating a lint is the defect one level up: this
+# check covers `.unwrap_or` ONLY. `.try_get(...).ok()` has identical semantics
+# — a renamed/dropped/retyped column reads as `None`, never as an error — and
+# is invisible to BOTH passes, on one line or many, because neither regex
+# mentions `.ok`. Measured at the same time: **84 such reads workspace-wide**,
+# including the `value_enc` / `value_key_id` encryption-envelope columns in
+# `talos-memory` that check 34's sibling `value_format` read is specifically
+# hardened for. That is a burn-down cycle, not a lint change: gating it today
+# would mean re-adding a baseline, which this check's own rule above forbids.
 bold "▶ check 52: silent try_get().unwrap_or reads (workspace-wide, must be 0)"
 # `|| true`: now that the count is 0, `grep -c` finds no matches and exits 1,
 # which under this script's `set -euo pipefail` would abort here — the very
@@ -3718,7 +3741,23 @@ if [ "$REPO_SILENT_READ_COUNT" -ne 0 ]; then
     yellow "    or use a typed FromRow / query_as! mapping."
     EXIT_CODE=1
 else
-    green "✓ no silent try_get().unwrap_or reads workspace-wide"
+    green "✓ no silent try_get().unwrap_or reads workspace-wide (single-line)"
+fi
+# 52b: the same read split across two lines. Line-based grep cannot see it;
+# this per-file perl pass can. Must also be 0 — same rule, same fix.
+REPO_SILENT_READ_ML="$(find . -name '*.rs' \
+        -not -path './target/*' -not -path './.git/*' \
+        -not -path './.claude/*' -not -path './node_modules/*' -print0 2>/dev/null \
+    | xargs -0 perl -ne 'BEGIN{$/=undef} my @l=split/\n/,$_; for my $i (0..$#l-1){ next if $l[$i]=~/\?/; if ($l[$i]=~/\.try_get(?:::<[^(]*>)?\([^)]*\)\s*$/ && $l[$i+1]=~/^\s*\.unwrap_or/){ print "$ARGV:".($i+1)."\n" } }' 2>/dev/null)"
+REPO_SILENT_READ_ML_COUNT="$(printf '%s' "$REPO_SILENT_READ_ML" | grep -c . || true)"
+if [ "$REPO_SILENT_READ_ML_COUNT" -ne 0 ]; then
+    red "✗ ${REPO_SILENT_READ_ML_COUNT} MULTI-LINE silent try_get().unwrap_or read(s) (must be 0):"
+    printf '%s\n' "$REPO_SILENT_READ_ML" | sed 's/^/    /'
+    yellow "  → same class as check 52 above, split across lines so the grep misses it."
+    yellow "    Fix: .try_get::<Option<_>, _>(\"col\")?.unwrap_or(default)"
+    EXIT_CODE=1
+else
+    green "✓ no multi-line silent try_get().unwrap_or reads workspace-wide"
 fi
 echo
 

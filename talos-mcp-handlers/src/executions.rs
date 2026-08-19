@@ -5594,11 +5594,33 @@ async fn handle_submit_workflow_approval(
 
     // SECURITY: verify the authenticated user owns this execution before allowing
     // them to approve/reject it.
-    let owner = state
+    //
+    // #661 (error-as-absence): the response deliberately does NOT distinguish
+    // "not yours" from "no such execution" — that is correct, and unchanged.
+    // What was missing is the SERVER-side distinction: `.unwrap_or(None)` made
+    // a DB failure land in the `None` arm, which is the only arm that logs
+    // nothing, so during a Postgres fault every approval submission returned
+    // "not found or access denied" with zero operator signal. This is the twin
+    // of the `talos-webhooks::approval_handler` site fixed under MCP-535; that
+    // sweep did not reach the MCP handler.
+    let owner = match state
         .execution_repo
         .get_workflow_execution_owner(exec_id)
         .await
-        .unwrap_or(None);
+    {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::error!(
+                target: "talos_mcp",
+                %user_id,
+                %exec_id,
+                error = %e,
+                "submit_workflow_approval: could not read execution owner — denying, but \
+                 this is a READ FAILURE, not an ownership decision"
+            );
+            return mcp_error(req_id, -32000, "Execution not found or access denied");
+        }
+    };
 
     match owner {
         Some(owner_id) if owner_id == user_id => {} // authorised

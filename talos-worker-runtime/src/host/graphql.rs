@@ -1073,11 +1073,27 @@ impl TalosContext {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get Redis connection: {}", e))?;
 
-        // Get current count
+        // Get current count.
+        //
+        // #661 (error-as-absence): this GET must NOT swallow its error. `.ok()`
+        // turned a failed read into `None`, which is the SAME value as "no
+        // counter yet today" — and the `None` branch below runs
+        // `set_ex(key, 1, 86400)`. So a single failed GET both skipped the cap
+        // for that call AND overwrote the day's accumulated count with 1,
+        // restarting the 24 h window: a user at 99/100 went back to 1/100. The
+        // guard erased its own state on the way past.
+        //
+        // The caller already handles this correctly and was never given the
+        // chance: `host/secrets.rs` routes `Err(_)` to the in-memory
+        // `global_expose_fallback`, preserving MCP-722's invariant that
+        // "never-configured = the same fail-closed path as an outage". Because
+        // the connection acquisition above propagates but the command did not,
+        // a full Redis outage took that fallback while a PER-COMMAND failure
+        // (timeout, connection dropped mid-command, WRONGTYPE, response parse)
+        // was laundered into `Ok(true)` and reached neither arm.
         let count: Option<u64> = redis::AsyncCommands::get(&mut conn, key)
             .await
-            .ok()
-            .flatten();
+            .map_err(|e| anyhow::anyhow!("Redis GET for tier-2 expose counter failed: {}", e))?;
 
         if let Some(c) = count {
             if c >= MAX_TIER2_EXPOSES_PER_USER_PER_DAY {
@@ -1092,5 +1108,74 @@ impl TalosContext {
         }
 
         Ok(true) // Rate limit OK
+    }
+}
+
+#[cfg(test)]
+mod expose_limit_absence_tests {
+    use super::*;
+
+    /// #661 — a Redis GET **failure** must not be reported as "no counter yet
+    /// today".
+    ///
+    /// Reproduced against a real Redis with a real per-command failure: the key
+    /// is made a LIST, so `GET` returns `WRONGTYPE` while the connection itself
+    /// stays healthy. That is the exact shape the pre-fix `.ok()` swallowed —
+    /// connection acquisition already propagated, so only a per-command failure
+    /// could reach the bug.
+    ///
+    /// Asserts BOTH halves of the defect, because either alone would pass on a
+    /// half-fix:
+    ///   1. the call returns `Err`, so the caller's in-memory fallback in
+    ///      `host/secrets.rs` actually runs. Pre-fix it returned `Ok(true)` —
+    ///      the tier-2 `expose_secret` was ALLOWED.
+    ///   2. the key is UNCHANGED. Pre-fix the `None` branch ran
+    ///      `set_ex(key, 1, 86400)`, overwriting the day's accumulated count
+    ///      with 1 and restarting the 24 h window — the guard erasing its own
+    ///      state. A fix that returned `Err` *after* clobbering the key would
+    ///      satisfy (1) and still leak the budget.
+    ///
+    /// Gated on `TALOS_TEST_REDIS_URL` following the house idiom
+    /// (`talos-replay-guard`, `talos-idempotency`). It is NOT only gated: it is
+    /// named explicitly by `scripts/test-integration.sh`, which provisions the
+    /// Redis, so it is real coverage there rather than a green skip.
+    #[tokio::test]
+    async fn redis_get_failure_is_not_reported_as_an_absent_counter() {
+        let Ok(url) = std::env::var("TALOS_TEST_REDIS_URL") else {
+            eprintln!("skipping: TALOS_TEST_REDIS_URL unset");
+            return;
+        };
+        let client = std::sync::Arc::new(redis::Client::open(url).expect("redis client"));
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("redis connection");
+        let key = format!("talos:test:tier2_expose:{}", uuid::Uuid::new_v4());
+
+        // Make GET fail without breaking the connection.
+        let _: () = redis::AsyncCommands::del(&mut conn, &key).await.unwrap();
+        let _: i64 = redis::AsyncCommands::rpush(&mut conn, &key, "sentinel")
+            .await
+            .unwrap();
+
+        let verdict = TalosContext::check_global_expose_limit(&client, &key).await;
+        assert!(
+            verdict.is_err(),
+            "a failed Redis GET must not be laundered into an allow/deny verdict; got {:?}",
+            verdict.as_ref().ok()
+        );
+
+        let key_type: String = redis::cmd("TYPE")
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            key_type, "list",
+            "the counter key must be untouched — pre-fix the error path ran \
+             set_ex(key, 1, 86400) and destroyed the day's accumulated count"
+        );
+
+        let _: () = redis::AsyncCommands::del(&mut conn, &key).await.unwrap();
     }
 }
