@@ -43,6 +43,47 @@ use uuid::Uuid;
 /// not in this set (i.e. `manual`) is operator-initiated.
 const AUTONOMOUS_TRIGGERS: &[&str] = &["scheduled", "webhook", "actor_dispatch", "agent_dispatch"];
 
+/// Turn a rank fit's fetch accounting into `(rows_dropped, population_note)` for
+/// the digest's learned panel.
+///
+/// The rank-training fetch runs under a per-actor row cap
+/// (`talos_memory_ranking::TRAINING_FETCH_CAP`). When it binds, the stored
+/// `n_examples` equals that cap, so on its own it reads as "learned from
+/// everything available" while in fact measuring the limit — the misleading
+/// report-field class, and the reason this pair travels with it.
+///
+/// Exactly ONE derived quantity is emitted. A second boolean named "truncated"
+/// would have had to choose between the model's deliberately conservative
+/// `n_fetched >= cap` rule and the exact `available > fetched` one, and two
+/// same-named flags that disagree on the exactly-at-cap case would be this
+/// disclosure committing the very defect it exists to fix.
+///
+/// `None` for either input means UNKNOWN — a pre-disclosure artifact, or a fit
+/// whose window count could not be read. It is reported as unknown, never
+/// collapsed to "nothing was dropped".
+fn rank_fit_population(n_fetched: Option<i64>, n_available: Option<i64>) -> (Option<i64>, String) {
+    match (n_fetched, n_available) {
+        (Some(f), Some(a)) => {
+            let dropped = (a - f).max(0);
+            let note = if dropped > 0 {
+                format!(
+                    "fit saw the newest {f} of {a} rows in the training window \
+                     ({dropped} dropped); n_examples measures the fetch cap, not the window"
+                )
+            } else {
+                format!("fit saw the whole training window ({a} rows)")
+            };
+            (Some(dropped), note)
+        }
+        _ => (
+            None,
+            "fetch coverage unknown for this fit (model predates the disclosure, \
+             or the training-window count could not be read)"
+                .to_string(),
+        ),
+    }
+}
+
 fn is_autonomous(trigger_type: &str) -> bool {
     AUTONOMOUS_TRIGGERS.contains(&trigger_type)
 }
@@ -222,8 +263,23 @@ impl OperatorDigestService {
             .await
             .unwrap_or_default()
             .into_iter()
-            .map(|(actor, n_examples, fitted_at)| {
-                json!({ "actor": actor, "n_examples": n_examples, "fitted_at": fitted_at })
+            .map(|f| {
+                // `n_examples` is the LABELED subset of a CAPPED fetch. On a
+                // truncating actor it equals the cap, so presenting it alone
+                // reads as "learned from everything available" when it is a
+                // measurement of the limit. Ship the accounting beside it, and
+                // encode "we could not tell" as absent rather than as a
+                // reassuring number.
+                let (rows_dropped, note) = rank_fit_population(f.n_fetched, f.n_available);
+                json!({
+                    "actor": f.actor,
+                    "n_examples": f.n_examples,
+                    "n_fetched": f.n_fetched,
+                    "window_available": f.n_available,
+                    "window_rows_dropped": rows_dropped,
+                    "population_note": note,
+                    "fitted_at": f.fitted_at,
+                })
             })
             .collect::<Vec<_>>();
 
@@ -1198,6 +1254,65 @@ pub fn correction_loop_note(state: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── rank-fit population disclosure ────────────────────────────────────
+    //
+    // These pin the property the pre-disclosure digest could not express: a
+    // fit on 36 % of its window must not render identically to a fit on all of
+    // it. Before this, the panel emitted only `n_examples`, so every assertion
+    // below is unrepresentable on the old shape.
+
+    #[test]
+    fn truncated_fit_names_the_dropped_rows_and_warns_the_count_is_the_cap() {
+        // The live 2026-08-19 personal-assistant figures.
+        let (dropped, note) = rank_fit_population(Some(20_000), Some(55_179));
+        assert_eq!(dropped, Some(35_179));
+        assert!(note.contains("newest 20000 of 55179"), "note was: {note}");
+        assert!(
+            note.contains("35179 dropped"),
+            "the note must NAME the dropped rows, got: {note}"
+        );
+        assert!(
+            note.contains("measures the fetch cap"),
+            "the note must say what n_examples actually measures, got: {note}"
+        );
+    }
+
+    #[test]
+    fn complete_fit_says_so_and_drops_nothing() {
+        let (dropped, note) = rank_fit_population(Some(95), Some(95));
+        assert_eq!(dropped, Some(0));
+        assert!(note.contains("whole training window (95 rows)"), "{note}");
+        assert!(
+            !note.contains("dropped"),
+            "a complete fit must not imply loss, got: {note}"
+        );
+    }
+
+    #[test]
+    fn unknown_provenance_is_reported_as_unknown_never_as_complete() {
+        // A pre-disclosure artifact (no `fetch` key at all) and a fit whose
+        // window count failed must BOTH read as unknown. Rendering either as
+        // "saw the whole window" would be the same defect one layer up.
+        for (f, a) in [(None, None), (Some(20_000), None), (None, Some(55_179))] {
+            let (dropped, note) = rank_fit_population(f, a);
+            assert_eq!(dropped, None, "unknown coverage must not yield a count");
+            assert!(note.contains("unknown"), "{f:?}/{a:?} note was: {note}");
+            assert!(
+                !note.contains("whole training window"),
+                "unknown coverage must never claim completeness, got: {note}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shrinking_window_never_reports_negative_dropped_rows() {
+        // `n_available` is counted AFTER the fetch, so a concurrent retention
+        // sweep can make it smaller. Clamp at 0 rather than emit a negative.
+        let (dropped, note) = rank_fit_population(Some(20_000), Some(19_000));
+        assert_eq!(dropped, Some(0));
+        assert!(!note.contains('-'), "{note}");
+    }
 
     /// Build a `JudgeScoreStat` for signal tests.
     ///

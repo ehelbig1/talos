@@ -481,6 +481,29 @@ pub struct ActorRepository {
     secrets_manager: Option<Arc<talos_secrets_manager::SecretsManager>>,
 }
 
+/// One actor's most recent learned-rank fit, for the operator digest.
+///
+/// A NAMED struct rather than a tuple on purpose: `n_fetched` and `n_available`
+/// are adjacent `Option<i64>`s whose whole job is to be told apart, and a
+/// positional swap would silently render "saw the whole window" for a truncated
+/// fit — the exact defect this accounting exists to prevent.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct RankFitSummary {
+    /// Actor name, or `(unnamed)`.
+    pub actor: String,
+    /// Usable LABELED examples the fit consumed. **Not a population figure** —
+    /// read it against the two fields below.
+    pub n_examples: i64,
+    /// Rows the training fetch returned. `None` = pre-disclosure artifact.
+    pub n_fetched: Option<i64>,
+    /// Rows that existed in the training window. `None` = unknown (either a
+    /// pre-disclosure artifact or a window count that failed). Never "zero
+    /// dropped".
+    pub n_available: Option<i64>,
+    /// When the fit ran.
+    pub fitted_at: chrono::DateTime<chrono::Utc>,
+}
+
 impl ActorRepository {
     pub fn new(db_pool: PgPool) -> Self {
         Self {
@@ -2592,20 +2615,30 @@ impl ActorRepository {
     /// `days`, for the operator digest's "what the learning loops produced"
     /// panel. Reads `actors.metadata->'rank_weights'->>'fitted_at'` (stamped by
     /// the rank-training loop) — USER-SCOPED (`WHERE user_id = $1`), most-recent
-    /// fit first. Returns `(actor_name, n_examples, fitted_at)`; actors with no
-    /// fit or a fit outside the window are excluded. `n_examples` COALESCEs to 0
-    /// when the JSON lacks it. The `fitted_at` cast is safe: the value is written
-    /// by our own RFC-3339 serializer, never user input.
-    pub async fn recent_rank_fits(
-        &self,
-        user_id: Uuid,
-        days: i32,
-    ) -> Result<Vec<(String, i64, chrono::DateTime<chrono::Utc>)>> {
+    /// fit first. Returns
+    /// `(actor_name, n_examples, n_fetched, n_available, fitted_at)`; actors
+    /// with no fit or a fit outside the window are excluded. The `fitted_at`
+    /// cast is safe: the value is written by our own RFC-3339 serializer, never
+    /// user input.
+    ///
+    /// **`n_examples` alone is not a population figure**, which is why the two
+    /// `fetch` columns travel with it: the training fetch runs under a row cap,
+    /// and on a truncating actor `n_examples` equals that cap. `n_fetched` and
+    /// `n_available` are `NULL` for a pre-disclosure artifact (unknown
+    /// provenance) and for `n_available` also when the population count itself
+    /// failed — in both cases NULL means UNKNOWN, never "nothing was dropped",
+    /// so they are returned as `Option` rather than COALESCEd to 0.
+    pub async fn recent_rank_fits(&self, user_id: Uuid, days: i32) -> Result<Vec<RankFitSummary>> {
         let days = days.clamp(1, 31);
         Ok(sqlx::query_as(
-            "SELECT COALESCE(name, '(unnamed)'), \
-                    COALESCE((metadata->'rank_weights'->>'n_examples')::bigint, 0), \
-                    (metadata->'rank_weights'->>'fitted_at')::timestamptz \
+            "SELECT COALESCE(name, '(unnamed)') AS actor, \
+                    COALESCE((metadata->'rank_weights'->>'n_examples')::bigint, 0) \
+                        AS n_examples, \
+                    (metadata->'rank_weights'->'fetch'->>'n_fetched')::bigint \
+                        AS n_fetched, \
+                    (metadata->'rank_weights'->'fetch'->>'n_available')::bigint \
+                        AS n_available, \
+                    (metadata->'rank_weights'->>'fitted_at')::timestamptz AS fitted_at \
              FROM actors \
              WHERE user_id = $1 \
                AND metadata->'rank_weights'->>'fitted_at' IS NOT NULL \
