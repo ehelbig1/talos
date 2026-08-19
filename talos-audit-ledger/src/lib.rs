@@ -625,6 +625,31 @@ pub struct ChainSweepStats {
     pub failed: usize,
     /// Executions whose chain could not be read (S3/IO error) — unverified.
     pub errored: usize,
+    /// The row cap bound: there were AT LEAST `scanned` executions in the
+    /// window and the oldest of them were not verified.
+    ///
+    /// # Why this is not merely a disclosure
+    ///
+    /// The sweep takes `ORDER BY completed_at DESC ... LIMIT max_executions`
+    /// over a SLIDING `[now-lookback, now-settle]` window, and keeps NO cursor,
+    /// watermark or offset — `ChainSweepStats` is rebuilt from `default()` on
+    /// every pass. So the rows the cap drops are the OLDEST in the window; by
+    /// the next tick they are older still and fall out the back. **They are
+    /// never verified by any later pass.**
+    ///
+    /// Meanwhile `failed == 0 && errored == 0` is trivially satisfied by rows
+    /// nobody looked at, so before 2026-08-19 the controller logged
+    /// "audit chain verification sweep completed clean" as a bill of health over
+    /// a window it had not finished — on a SECURITY assurance. An attacker who
+    /// breaks a chain and then generates more than `max_executions` completions
+    /// inside one window would earn a permanent, unqualified "clean" for that
+    /// break.
+    ///
+    /// This flag does not fix the coverage gap — closing that needs a cursor, or
+    /// a lookback the operator has sized against their completion rate. It stops
+    /// the gap being reported as a clean bill of health, which is the difference
+    /// between an unverified window and a window falsely certified.
+    pub cap_hit: bool,
 }
 
 /// Periodic sweep that runs the offline chain verifier over recently-completed
@@ -683,6 +708,10 @@ pub async fn run_chain_verification_sweep(
     };
 
     stats.scanned = rows.len();
+    // `>=` for the safe direction: a window holding exactly the cap is
+    // indistinguishable from one holding more, and the alternative is a sweep
+    // that quietly certifies a short window.
+    stats.cap_hit = max_executions > 0 && rows.len() as i64 >= max_executions;
     for (exec_id, wf_id) in rows {
         let outcome =
             verify_execution_chain(s3_client, bucket, &wf_id.to_string(), &exec_id.to_string())
@@ -1886,5 +1915,81 @@ mod audit_verification_metric_tests {
     fn stage_label_values_are_the_ones_the_alerts_select() {
         assert_eq!(AUDIT_STAGE_EVENT, "event");
         assert_eq!(AUDIT_STAGE_CHAIN, "chain");
+    }
+}
+
+#[cfg(test)]
+mod sweep_coverage_pins {
+    //! A sweep that did not finish its window must not be reportable as clean.
+    //!
+    //! These pin the two halves separately: the FLAG (`cap_hit`, here) and the
+    //! LOG BRANCH that consumes it (`controller/src/bootstrap/background.rs`).
+    //! Pinning only the flag would leave the original defect — a truncated
+    //! sweep logging "completed clean" — perfectly reachable with the flag set
+    //! and ignored.
+    use super::ChainSweepStats;
+
+    /// Mirrors the assignment in `run_chain_verification_sweep`, which needs
+    /// Postgres and an S3/WORM endpoint to drive end-to-end.
+    fn cap_hit(rows: usize, max_executions: i64) -> bool {
+        max_executions > 0 && rows as i64 >= max_executions
+    }
+
+    #[test]
+    fn a_full_page_marks_the_sweep_incomplete() {
+        assert!(
+            cap_hit(500, 500),
+            "a window that filled the cap left older rows unverified"
+        );
+        assert!(cap_hit(501, 500));
+    }
+
+    #[test]
+    fn a_short_page_is_a_finished_window() {
+        // The reference deployment: max 77 terminal executions per rolling 2h
+        // window against a cap of 500, so this is the live case today.
+        assert!(!cap_hit(77, 500));
+        assert!(!cap_hit(0, 500));
+    }
+
+    #[test]
+    fn no_findings_does_not_by_itself_mean_clean() {
+        // The heart of it. `failed == 0 && errored == 0` is trivially satisfied
+        // by rows nobody read, so the clean-bill branch must ALSO require
+        // !cap_hit. If someone drops that condition this states why not.
+        let truncated_but_no_findings = ChainSweepStats {
+            scanned: 500,
+            verified_ok: 500,
+            failed: 0,
+            errored: 0,
+            cap_hit: true,
+        };
+        assert!(
+            truncated_but_no_findings.failed == 0 && truncated_but_no_findings.errored == 0,
+            "the pre-fix clean-bill predicate is satisfied here"
+        );
+        assert!(
+            truncated_but_no_findings.cap_hit,
+            "...and yet the window was not finished, which is why the predicate is insufficient"
+        );
+    }
+
+    /// The consumer half: the controller must branch on `cap_hit` BEFORE the
+    /// clean-bill branch, and must not describe a capped sweep as clean.
+    #[test]
+    fn the_controller_cannot_certify_a_truncated_sweep() {
+        let src = include_str!("../../controller/src/bootstrap/background.rs");
+        let clean = concat!("audit chain verification sweep ", "completed clean");
+        let guard = concat!("} else if stats.", "cap_hit {");
+        let (guard_at, clean_at) = (
+            src.find(guard)
+                .expect("the cap_hit branch is gone; a truncated sweep can be certified clean"),
+            src.find(clean).expect("the clean-bill log line moved"),
+        );
+        assert!(
+            guard_at < clean_at,
+            "the cap_hit branch must precede the clean-bill branch, or a truncated sweep still \
+             reports clean"
+        );
     }
 }

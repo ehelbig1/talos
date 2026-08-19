@@ -876,6 +876,30 @@ impl HygieneService {
                 "id": r.id.to_string(), "name": r.name,
             })).collect::<Vec<_>>(),
             "total_fixable": draft_ids.len() + stale_exec_ids.len() + orphaned_module_ids.len(),
+            // Every list above is a per-check finding vector capped at
+            // HYGIENE_FINDING_LIMIT by SQL, so `total_fixable` is a sum of
+            // capped counts and cannot exceed 3x that cap. Without this the
+            // number reads as "everything fixable", which is what an operator
+            // is being asked to confirm.
+            "coverage": {
+                "stale_draft_workflows": talos_measurement::Coverage::new(
+                    i64::try_from(auto_deletable_drafts.len() + substantive_drafts_skipped.len())
+                        .unwrap_or(i64::MAX),
+                    talos_analytics_repository::HYGIENE_FINDING_LIMIT,
+                ).to_json(),
+                "stale_executions": talos_measurement::Coverage::new(
+                    i64::try_from(stale_exec_ids.len()).unwrap_or(i64::MAX),
+                    talos_analytics_repository::HYGIENE_FINDING_LIMIT,
+                ).to_json(),
+                "orphaned_modules": talos_measurement::Coverage::new(
+                    i64::try_from(orphaned_module_ids.len()).unwrap_or(i64::MAX),
+                    talos_analytics_repository::HYGIENE_FINDING_LIMIT,
+                ).to_json(),
+                "note": "total_fixable counts only the findings LISTED here, and each list is \
+                         capped independently. A `truncated: true` above means fix_all will \
+                         address a bounded subset and leave the rest — re-run it after \
+                         confirming.",
+            },
         });
 
         Ok(HygieneReportOutcome {
@@ -925,13 +949,27 @@ impl HygieneService {
         }
 
         // 2. Cancel/fail stale executions (mark as failed after >120 min stuck)
+        //
+        // 2026-08-19: this passes `stale_exec_ids` because it once did NOT.
+        // The call was `cleanup_stale_executions(120, user_id)` — user-wide,
+        // with the id list used only as an `is_empty()` trigger — while the
+        // preview the operator confirmed was capped at 25 rows. Confirming a
+        // 25-row preview marked EVERY stale execution for the user as failed.
+        // Steps 1 and 3 below always passed their id lists; this one did not.
+        // The action is now a subset of the preview by construction.
         if !candidates.stale_exec_ids.is_empty() {
             let cancelled = self
                 .execution_repo
-                .cleanup_stale_executions(120, user_id)
+                .cleanup_stale_executions_by_ids(&candidates.stale_exec_ids, 120, user_id)
                 .await
                 .unwrap_or(0);
             fix_results["stale_executions_cancelled"] = serde_json::json!(cancelled);
+            // `cancelled` can legitimately be LOWER than the previewed count:
+            // the preview selects running/queued/resuming, the write touches
+            // only `running`, and a row may have finished in between. Saying so
+            // stops the gap reading as a partial failure.
+            fix_results["stale_executions_previewed"] =
+                serde_json::json!(candidates.stale_exec_ids.len());
         }
 
         // 3. Delete orphaned compiled modules (not referenced by any workflow)
@@ -1070,5 +1108,76 @@ mod share_pct_tests {
         assert!(n.contains("summary.total_workflows"), "{n}");
         assert!(n.contains("null when"), "{n}");
         assert!(n.contains("one decimal"), "{n}");
+    }
+}
+
+#[cfg(test)]
+mod destructive_preview_pins {
+    //! The `fix_all` confirmation prompt must never under-state what it runs.
+    //!
+    //! These are SOURCE pins rather than behavioural tests because
+    //! `execute_fixes` needs Postgres, an S3/WORM endpoint and a populated
+    //! hygiene report to drive, and the property at stake is structural: which
+    //! repository method the destructive step calls. A behavioural test would
+    //! need the very fixture that made the original bug invisible (a tenant with
+    //! more than HYGIENE_FINDING_LIMIT stale executions).
+
+    /// The bug, 2026-08-19: step 2 of `execute_fixes` called the USER-WIDE
+    /// `cleanup_stale_executions(120, user_id)` while the operator had confirmed
+    /// a preview capped at 25 rows — the id list was built, rendered, and then
+    /// used only as an `is_empty()` trigger. Confirming a 25-row preview marked
+    /// every stale execution for the user as `failed`.
+    ///
+    /// This test FAILS on that tree and passes on the fix.
+    #[test]
+    fn fix_all_cancels_only_the_executions_it_previewed() {
+        // Needles are `concat!`-assembled so this test's own source text is not
+        // a match — a self-scanning `include_str!` that matches itself is a
+        // test that can never fail.
+        let src = include_str!("lib.rs");
+
+        assert!(
+            src.contains(concat!(
+                "cleanup_stale_executions",
+                "_by_ids(&candidates.stale_exec_ids"
+            )),
+            "fix_all's stale-execution step must pass the previewed id list; without it the \
+             action is user-wide while the preview is capped, and the operator confirms a \
+             subset while a superset executes"
+        );
+
+        // And the user-wide sibling must not reappear here. Scoped to a `self.`
+        // receiver so the doc-comment prose naming the old method (which is
+        // deliberate — it explains the bug) does not satisfy or trip the pin.
+        assert!(
+            !src.contains(concat!(".", "cleanup_stale_executions(")),
+            "the user-wide cleanup_stale_executions is back in the hygiene path; it is correct \
+             for the cleanup_stale_executions MCP tool, which asks the operator for a time \
+             window, and wrong here, where a bounded preview was already shown"
+        );
+    }
+
+    /// Steps 1 and 3 always passed their id lists. Pinning them alongside step 2
+    /// states the invariant as a property of the whole `fix_all`, not as a
+    /// patch to the one step that broke it.
+    #[test]
+    fn every_destructive_fix_all_step_is_bounded_by_its_preview() {
+        let src = include_str!("lib.rs");
+        for needle in [
+            concat!("delete_workflows(&candidates.", "draft_ids"),
+            concat!(
+                "delete_orphaned_modules(&candidates.",
+                "orphaned_module_ids"
+            ),
+            concat!(
+                "cleanup_stale_executions_by_ids(&candidates.",
+                "stale_exec_ids"
+            ),
+        ] {
+            assert!(
+                src.contains(needle),
+                "a destructive fix_all step stopped passing its previewed id list: {needle}"
+            );
+        }
     }
 }

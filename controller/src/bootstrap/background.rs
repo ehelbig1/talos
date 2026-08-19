@@ -1838,6 +1838,24 @@ pub(crate) fn spawn_maintenance_sweeps(
                                     errored = stats.errored,
                                     "audit chain verification sweep completed WITH findings"
                                 );
+                            } else if stats.cap_hit {
+                                // 2026-08-19: this branch used to say "completed
+                                // clean". It cannot: the sweep takes the NEWEST
+                                // `MAX_EXECUTIONS_PER_SWEEP` of a sliding window
+                                // and keeps no cursor, so the executions it
+                                // dropped age out and are never verified by any
+                                // later pass. "No findings" over rows nobody read
+                                // is not a clean bill of health, and on a
+                                // security assurance the difference matters.
+                                tracing::warn!(
+                                    target: "talos_audit",
+                                    event_kind = "audit_chain_sweep_incomplete",
+                                    scanned = stats.scanned,
+                                    verified_ok = stats.verified_ok,
+                                    cap = MAX_EXECUTIONS_PER_SWEEP,
+                                    lookback_secs,
+                                    "audit chain verification sweep hit its row cap — the OLDEST                                      executions in this window were not verified and will not be                                      picked up by a later pass (the window slides and no cursor is                                      kept). No findings among the rows that WERE checked; this is                                      NOT a clean bill of health for the window. Lower                                      AUDIT_CHAIN_SWEEP_INTERVAL_SECS so fewer executions land in                                      each window, or raise the sweep cap."
+                                );
                             } else if stats.scanned > 0 {
                                 tracing::info!(
                                     target: "talos_audit",

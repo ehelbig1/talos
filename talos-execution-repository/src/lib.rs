@@ -2333,6 +2333,72 @@ impl ExecutionRepository {
         Ok(result.rows_affected())
     }
 
+    /// Stale-execution cleanup BOUNDED TO AN EXPLICIT ID LIST.
+    ///
+    /// The sibling [`Self::cleanup_stale_executions`] is user-wide by design —
+    /// the `cleanup_stale_executions` MCP tool asks the operator for a time
+    /// window and acts on everything matching it, which is what that tool
+    /// promises. This variant exists for the opposite contract: a caller that
+    /// has already SHOWN the operator a list and must not act beyond it.
+    ///
+    /// # The bug this closes (2026-08-19)
+    ///
+    /// `HygieneService`'s `fix_all` built `stale_exec_ids` from a preview query
+    /// capped at `LIMIT 25`, rendered those 25 to the operator as
+    /// `stale_executions_to_cancel`, and then called the USER-WIDE sibling —
+    /// passing the id list nowhere and using it only as an `is_empty()` trigger.
+    /// With 400 stale executions the operator confirmed a 25-row preview and all
+    /// 400 were marked `failed`. Steps 1 and 3 of the same `fix_all`
+    /// (`delete_workflows`, `delete_orphaned_modules`) both correctly pass their
+    /// id lists; step 2 was the only one that did not.
+    ///
+    /// The invariant this restores is one-directional and worth stating: the set
+    /// acted upon is a SUBSET of the set previewed, never a superset. A
+    /// confirmation prompt may under-promise; it may never under-state.
+    ///
+    /// Both the `status = 'running'` guard (structural check 39) and the age
+    /// predicate are retained rather than trusting the caller's ids — an id
+    /// resolved at preview time may have reached a terminal status, or been
+    /// resumed, in the seconds before the operator confirmed. Re-checking here
+    /// makes the write idempotent against that race instead of clobbering a row
+    /// another writer now owns.
+    pub async fn cleanup_stale_executions_by_ids(
+        &self,
+        ids: &[Uuid],
+        timeout_minutes: i64,
+        user_id: Uuid,
+    ) -> Result<u64> {
+        // Same refusal as the user-wide sibling: `make_interval(mins => -N)`
+        // flips the predicate to `started_at < NOW() + INTERVAL`, which would
+        // fail every listed execution regardless of age.
+        if timeout_minutes <= 0 {
+            tracing::warn!(
+                target: "talos_audit",
+                timeout_minutes,
+                %user_id,
+                "scoped stale-executions cleanup refused: timeout_minutes must be positive"
+            );
+            return Ok(0);
+        }
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query(
+            "UPDATE workflow_executions \
+             SET status = 'failed', \
+                 error_message = CONCAT('Cleaned up: execution was stale (running for over ', $1::text, ' minutes)'), \
+                 completed_at = NOW() \
+             WHERE id = ANY($3) AND status = 'running' AND user_id = $2 \
+               AND started_at < NOW() - make_interval(mins => $1::int)",
+        )
+        .bind(timeout_minutes)
+        .bind(user_id)
+        .bind(ids)
+        .execute(&self.db_pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Atomically CLAIM one orphaned `running` execution for crash recovery
     /// (RFC 0003 durable execution). Returns everything the resume needs, or
     /// `None` when nothing is claimable.

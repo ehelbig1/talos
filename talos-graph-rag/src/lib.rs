@@ -1349,9 +1349,27 @@ impl GraphRagService {
             }
         }
 
+        // 2026-08-19: `entity_count` is a PAGE SIZE, and this object is
+        // injected verbatim into an LLM system prompt inside an <agent_memory>
+        // block that the prompt itself declares "FIRST-PARTY trusted context ...
+        // authoritative ground-truth" (module-templates/llm-inference/
+        // template.rs:215). A number the model has been instructed to believe
+        // must not silently be a query limit. The seed set is capped at 10 and
+        // the rows at min(max_nodes, 50), so a caller asking for the RPC maximum
+        // of 200 gets 50 and is told 50.
+        //
+        // Disclosed here rather than on the WIT `graph-context` record because
+        // adding a field there is a component-model ABI change needing every
+        // guest's bindings regenerated; the JSON surface reaches the LLM path,
+        // which is the one that currently misleads.
+        let coverage = talos_measurement::Coverage::new(
+            i64::try_from(entities.len()).unwrap_or(i64::MAX),
+            limit,
+        );
         Ok(serde_json::json!({
             "entities": entities,
             "entity_count": entities.len(),
+            "entity_count_coverage": coverage.to_json(),
             "query": query,
         }))
     }

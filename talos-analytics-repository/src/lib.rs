@@ -804,6 +804,72 @@ pub struct TwinScanGraphRow {
 /// surfaces so an empty finding list is never read as "nothing diverged".
 pub const TWIN_SCAN_GRAPH_LIMIT: i64 = 100;
 
+/// Row cap on the per-check hygiene finding lists.
+///
+/// **This constant does not drive the SQL** — the queries below carry a literal
+/// `LIMIT 25`, and changing this value alone changes nothing. It exists so the
+/// cap can TRAVEL to the reporting layer, which is in a different crate
+/// (`talos-hygiene-service`) and previously had no way to know what bound the
+/// vectors it was counting. `hygiene_finding_limit_matches_the_sql_literals`
+/// pins the two together, in the style of
+/// `the_hygiene_cuts_have_a_unique_tiebreaker` above.
+///
+/// The defect it addresses: `HygieneService` sums eleven of these `.len()`s into
+/// a single `total_issues`, so an operator's headline "you have N issues" is a
+/// sum of eleven independent truncations that saturates near 270 — a platform
+/// with 5 000 real issues and one with 300 print an indistinguishable number.
+/// A count cannot disclose its own ceiling if the ceiling is a literal in
+/// another crate's SQL.
+pub const HYGIENE_FINDING_LIMIT: i64 = 25;
+
+/// Row cap on the `get_all_readiness_scores` page.
+///
+/// As with [`HYGIENE_FINDING_LIMIT`], this does NOT drive the SQL — the query
+/// carries a literal `LIMIT 50` — it exists so the cap can travel to the
+/// handler, which is in another crate and otherwise had no way to disclose the
+/// bound on the list it renders. `readiness_page_limit_matches_the_sql_literal`
+/// pins the two together.
+pub const READINESS_PAGE_LIMIT: i64 = 50;
+
+/// Population summary for `get_all_readiness_scores`, over the WHOLE filtered
+/// set rather than the capped page.
+///
+/// Exists because the four summary numbers were previously accumulated over the
+/// `LIMIT 50` page returned by [`AnalyticsRepository::list_readiness_scores`],
+/// whose `ORDER BY COALESCE(readiness_score, 0) ASC` selects the 50 LOWEST
+/// scorers. That is not a truncated population statistic — it is a BIASED SAMPLE
+/// presented as one, and it fails in the direction that matters:
+///
+/// * `avg_score` is pinned to the worst tail, so it is monotonically
+///   non-increasing in fleet quality once the cap binds. Adding good workflows
+///   cannot raise it (they never enter the window); adding bad ones lowers it.
+///   **A fleet that improves reports a falling average.**
+/// * `below_50_count` counts, among the 50 worst, how many are below 50 — it
+///   saturates at 50 and then never moves again.
+/// * unscored rows `COALESCE` to 0 and therefore sort FIRST, so at >=50 unscored
+///   workflows the page is entirely unscored and every scored workflow in the
+///   fleet becomes invisible.
+///
+/// No disclosure flag fixes an inverted statistic, so this is computed over the
+/// population instead. The capped list stays exactly as it is — an
+/// `ORDER BY ... ASC LIMIT 50` is a good "worst offenders, fix these first"
+/// list, and it is only the SUMMARY that was claiming to be about the fleet.
+#[derive(Debug, Clone, Copy)]
+pub struct ReadinessPopulation {
+    /// Workflows matching the filters, uncapped.
+    pub total: i64,
+    /// Mean of `COALESCE(readiness_score, 0)` over all of them. `None` when
+    /// there are no matching rows — a mean over zero rows has no value, and
+    /// emitting `0` there would render "no workflows" as "everything is broken".
+    pub avg_score: Option<f64>,
+    /// How many score below 50, over all of them.
+    pub below_50: i64,
+    /// How many have never been scored, over all of them. Anchored on
+    /// `readiness_scored_at IS NULL` to match `classify_readiness_state`'s
+    /// authoritative predicate — the two columns can drift.
+    pub unscored: i64,
+}
+
 /// Per-graph payload guard. Graphs above this are counted in
 /// `workflow_graphs_skipped` and their text is never transferred (the
 /// projection nulls it out server-side). Defensive: the largest graph
@@ -3056,6 +3122,52 @@ impl AnalyticsRepository {
         Ok(result.rows_affected())
     }
 
+    /// Population-wide readiness aggregate, over the SAME filter predicate as
+    /// [`Self::list_readiness_scores`] and deliberately WITHOUT its
+    /// `ORDER BY`/`LIMIT`.
+    ///
+    /// The predicate is duplicated rather than shared because the two queries
+    /// differ only in the clause that makes one of them a sample; keeping them
+    /// textually adjacent is what makes a future divergence visible in review.
+    /// `readiness_population_predicate_matches_the_list_query` pins them.
+    ///
+    /// Cost, measured on the reference deployment: 0.042 ms / 19 buffer hits,
+    /// all cache hits. This is an interactive MCP operator tool, not a
+    /// request-path query.
+    pub async fn readiness_population(
+        &self,
+        user_id: Uuid,
+        filter_ids: Option<&[Uuid]>,
+        max_score: Option<i32>,
+        include_archived: bool,
+    ) -> Result<ReadinessPopulation> {
+        let row = sqlx::query(
+            "SELECT COUNT(*)::bigint AS total, \
+                    AVG(COALESCE(readiness_score, 0))::float8 AS avg_score, \
+                    COUNT(*) FILTER (WHERE COALESCE(readiness_score, 0) < 50)::bigint AS below_50, \
+                    COUNT(*) FILTER (WHERE readiness_scored_at IS NULL)::bigint AS unscored \
+             FROM workflows \
+             WHERE user_id = $1 \
+               AND ($2::uuid[] IS NULL OR id = ANY($2::uuid[])) \
+               AND ($3::int IS NULL OR COALESCE(readiness_score, 0) <= $3) \
+               AND ($4 OR status != 'archived')",
+        )
+        .bind(user_id)
+        .bind(filter_ids)
+        .bind(max_score)
+        .bind(include_archived)
+        .fetch_one(&self.db_pool)
+        .await?;
+        Ok(ReadinessPopulation {
+            total: row.try_get::<Option<i64>, _>("total")?.unwrap_or(0),
+            // AVG() is NULL over zero rows — kept as None rather than
+            // COALESCEd, per this crate's "unknown is not zero" doctrine.
+            avg_score: row.try_get::<Option<f64>, _>("avg_score")?,
+            below_50: row.try_get::<Option<i64>, _>("below_50")?.unwrap_or(0),
+            unscored: row.try_get::<Option<i64>, _>("unscored")?.unwrap_or(0),
+        })
+    }
+
     /// List readiness scores for a user with optional filters: explicit
     /// workflow IDs, max score threshold, and include-archived flag.
     /// Capped at 50 rows; the handler doesn't currently expose limit
@@ -5010,6 +5122,8 @@ impl AnalyticsRepository {
 /// green while the row started claiming a denominator it does not have.
 #[cfg(test)]
 mod capability_query_pins {
+    use super::{HYGIENE_FINDING_LIMIT, READINESS_PAGE_LIMIT};
+
     /// The rate expression and the count must come from one subquery with one
     /// window predicate.
     #[test]
@@ -5044,6 +5158,45 @@ mod capability_query_pins {
             lateral.matches("FROM workflow_executions").count(),
             1,
             "one pass over workflow_executions, not two:\n{lateral}"
+        );
+    }
+
+    /// The readiness page cap must equal the literal its query runs under, for
+    /// the same reason as the hygiene one: a disclosure naming a ceiling that is
+    /// not in force is this bug class one level up.
+    #[test]
+    fn readiness_page_limit_matches_the_sql_literal() {
+        let src = include_str!("lib.rs");
+        let needle = format!(
+            "{} {}",
+            concat!("ORDER BY COALESCE(readiness_score, 0) ASC \\\n             LIMIT"),
+            READINESS_PAGE_LIMIT
+        );
+        assert!(
+            src.contains(&needle),
+            "the readiness page query no longer runs under \
+             READINESS_PAGE_LIMIT={READINESS_PAGE_LIMIT}"
+        );
+    }
+
+    /// The exported cap must equal the literal the hygiene queries actually
+    /// run under. A disclosure that names the wrong ceiling is worse than no
+    /// disclosure — it is this bug class one level up.
+    #[test]
+    fn hygiene_finding_limit_matches_the_sql_literals() {
+        // Needle is `concat!`-assembled so this test's own text is not a match.
+        let src = include_str!("lib.rs");
+        let needle = format!(
+            "{} {}",
+            concat!("ORDER BY we.started_at ASC", " LIMIT"),
+            HYGIENE_FINDING_LIMIT
+        );
+        assert!(
+            src.contains(&needle),
+            "the stale-executions hygiene query no longer runs under \
+             HYGIENE_FINDING_LIMIT={HYGIENE_FINDING_LIMIT}; the exported cap and the SQL \
+             literal have drifted, so every disclosure derived from the const now names a \
+             ceiling that is not in force"
         );
     }
 

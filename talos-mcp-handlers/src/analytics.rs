@@ -5930,6 +5930,42 @@ pub(crate) fn classify_readiness_state(
     (is_unscored, label)
 }
 
+/// Build the `summary` block for `get_all_readiness_scores` from the POPULATION
+/// aggregate — never from the returned page.
+///
+/// Pure so the contract is testable without Postgres. The contract has two
+/// halves and the second is the one that matters:
+///
+/// 1. When the population is known, the figures are population-wide and
+///    `avg_score` keeps one decimal (the pre-2026-08-19 code used integer
+///    division, rendering 75.59 as 75).
+/// 2. When the population query FAILED, every figure is `null` and the note says
+///    so. It deliberately does NOT fall back to accumulating over the page: the
+///    page is `ORDER BY readiness_score ASC LIMIT 50`, so its mean is a
+///    worst-50 mean, and emitting that under the name `avg_score` is the exact
+///    defect this function exists to remove. A null is a missing answer; a
+///    biased sample under a population name is a wrong one.
+pub(crate) fn readiness_summary_json(
+    population: Option<&talos_analytics_repository::ReadinessPopulation>,
+) -> serde_json::Value {
+    match population {
+        Some(p) => serde_json::json!({
+            "avg_score": p.avg_score.map(|a| (a * 10.0).round() / 10.0),
+            "below_50_count": p.below_50,
+            "unscored_count": p.unscored,
+            "population": "all workflows matching the request filters, uncapped",
+        }),
+        None => serde_json::json!({
+            "avg_score": serde_json::Value::Null,
+            "below_50_count": serde_json::Value::Null,
+            "unscored_count": serde_json::Value::Null,
+            "population": "unavailable: the population aggregate query failed. These are NULL \
+                           rather than computed over the returned page, because the page is the \
+                           lowest-scoring workflows and its mean is not a fleet average.",
+        }),
+    }
+}
+
 async fn handle_get_all_readiness_scores(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
@@ -6017,10 +6053,6 @@ async fn handle_get_all_readiness_scores(
         .await
         .unwrap_or_default();
 
-    let mut below_50_count: i64 = 0;
-    let mut unscored_count: i64 = 0;
-    let mut score_sum: i64 = 0;
-
     let workflows: Vec<serde_json::Value> = rows
         .iter()
         .map(|r| {
@@ -6035,14 +6067,6 @@ async fn handle_get_all_readiness_scores(
             // counter so they can never diverge again. See
             // `classify_readiness_state` for the full rationale.
             let (is_unscored, score_state) = classify_readiness_state(raw_score, scored_at);
-
-            score_sum += score as i64;
-            if score < 50 {
-                below_50_count += 1;
-            }
-            if is_unscored {
-                unscored_count += 1;
-            }
 
             let mut entry = serde_json::json!({
                 "workflow_id": r.id.to_string(),
@@ -6061,22 +6085,50 @@ async fn handle_get_all_readiness_scores(
         })
         .collect();
 
-    let total = workflows.len();
-    let avg_score = if total > 0 {
-        score_sum / total as i64
-    } else {
-        0
+    // 2026-08-19: `summary` now describes the POPULATION, not the page.
+    //
+    // Every one of these four numbers used to be accumulated over the rows
+    // returned by `list_readiness_scores`, which is `ORDER BY
+    // COALESCE(readiness_score, 0) ASC LIMIT 50` — the 50 LOWEST scorers. That
+    // is a biased sample sold as a fleet statistic, and no `truncated: true`
+    // flag repairs it: pinned to the worst tail, `avg_score` is monotonically
+    // non-increasing in fleet quality, so a fleet that IMPROVES reports a
+    // falling average, and `below_50_count` saturates at exactly 50 forever.
+    // The `workflows` array below is unchanged — a "worst 50, fix these first"
+    // list is what that query is genuinely good for.
+    let population = state
+        .analytics_repo
+        .readiness_population(user_id, filter_ids.as_deref(), max_score, include_archived)
+        .await
+        .ok();
+
+    let page_len = i64::try_from(workflows.len()).unwrap_or(i64::MAX);
+    // `total` keeps meaning what its name says. When the population query
+    // failed we fall back to the page length AND say so, rather than silently
+    // reporting a page size under a population name — which is the defect.
+    let coverage = match &population {
+        Some(p) => talos_measurement::Coverage::new(
+            page_len,
+            talos_analytics_repository::READINESS_PAGE_LIMIT,
+        )
+        .with_available(p.total),
+        None => talos_measurement::Coverage::new(
+            page_len,
+            talos_analytics_repository::READINESS_PAGE_LIMIT,
+        ),
     };
+
+    let summary = readiness_summary_json(population.as_ref());
 
     mcp_text(
         req_id,
         &serde_json::to_string_pretty(&serde_json::json!({
-            "total": total,
-            "summary": {
-                "avg_score": avg_score,
-                "below_50_count": below_50_count,
-                "unscored_count": unscored_count,
-            },
+            "total": population.map_or(page_len, |p| p.total),
+            "summary": summary,
+            "workflows_coverage": coverage.to_json(),
+            "workflows_note": "`workflows` is the LOWEST-scoring page (ORDER BY readiness_score \
+                               ASC), not a sample of the fleet. Read `summary` for fleet-wide \
+                               figures and this list for what to fix first.",
             "workflows": workflows,
         }))
         .unwrap_or_default(),
@@ -6683,5 +6735,62 @@ mod node_timing_shape_tests {
         // The fallback's error is swallowed (`if let Ok(..)`), so the note
         // must not promise that an empty list proves both sources were empty.
         assert!(n.contains("its query failed"), "{n}");
+    }
+}
+
+#[cfg(test)]
+mod readiness_population_pins {
+    //! `get_all_readiness_scores`' summary must describe the FLEET, not the page.
+    //!
+    //! The page is `ORDER BY COALESCE(readiness_score, 0) ASC LIMIT 50` — the 50
+    //! LOWEST scorers. Accumulating a mean over it and calling it `avg_score` is
+    //! not a truncation (which a `truncated: true` flag would answer); it is an
+    //! inverted statistic. Pinned rather than disclosed for that reason.
+    use super::readiness_summary_json;
+    use talos_analytics_repository::ReadinessPopulation;
+
+    fn pop(total: i64, avg: Option<f64>, below: i64, unscored: i64) -> ReadinessPopulation {
+        ReadinessPopulation {
+            total,
+            avg_score: avg,
+            below_50: below,
+            unscored,
+        }
+    }
+
+    #[test]
+    fn summary_reports_population_figures_not_page_figures() {
+        // The live reference deployment: 22 non-archived workflows, true mean
+        // 75.59. The pre-fix handler emitted 75 (integer division).
+        let v = readiness_summary_json(Some(&pop(22, Some(75.59), 3, 21)));
+        assert_eq!(v["avg_score"], serde_json::json!(75.6));
+        assert_eq!(v["below_50_count"], serde_json::json!(3));
+        assert_eq!(v["unscored_count"], serde_json::json!(21));
+        assert!(v["population"].as_str().unwrap().contains("uncapped"));
+    }
+
+    #[test]
+    fn a_failed_population_query_nulls_the_summary_rather_than_falling_back_to_the_page() {
+        // This is the whole point. A fallback to page-derived figures would be
+        // silently WRONG (a worst-50 mean under a fleet-average name); a null is
+        // merely absent. If someone "helpfully" restores a fallback, this fails.
+        let v = readiness_summary_json(None);
+        assert_eq!(v["avg_score"], serde_json::Value::Null);
+        assert_eq!(v["below_50_count"], serde_json::Value::Null);
+        assert_eq!(v["unscored_count"], serde_json::Value::Null);
+        assert!(
+            v["population"].as_str().unwrap().contains("unavailable"),
+            "the note must say the figures are missing, not imply they are zero"
+        );
+    }
+
+    #[test]
+    fn an_empty_fleet_yields_a_null_mean_not_a_zero_one() {
+        // AVG() over zero rows is SQL NULL. Rendering that as 0 would report an
+        // empty account as "every workflow scores zero" — the same
+        // absent-is-not-zero rule the alerting layer learned in #625.
+        let v = readiness_summary_json(Some(&pop(0, None, 0, 0)));
+        assert_eq!(v["avg_score"], serde_json::Value::Null);
+        assert_eq!(v["below_50_count"], serde_json::json!(0));
     }
 }
