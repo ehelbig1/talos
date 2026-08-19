@@ -146,46 +146,140 @@ mod job_span_redaction_tests {
         }
     }
 
-    /// **Documents an exposure this change does NOT close.**
+    /// The guest-log export surface, and the shared bridge layer that closes
+    /// it.
     ///
-    /// When trace export is enabled the worker installs
-    /// `tracing_opentelemetry::layer()` (`worker/src/main.rs`), and that layer
-    /// turns every `tracing` EVENT emitted inside a span into an exported OTel
-    /// span event whose NAME is the formatted message. Guest log lines go
-    /// through `tracing::{warn,error}!("[WASM] {msg}")`
-    /// (`crate::host::logging`) with no redaction — a deliberate, commented
-    /// decision resting on the three-tier secrets model, not an oversight.
+    /// `tracing_opentelemetry` promotes every `tracing` EVENT emitted inside a
+    /// span into an exported OTel span event **named with the formatted
+    /// message**. Guest log lines go through
+    /// `tracing::{warn,error}!("[WASM] {msg}")` (`crate::host::logging`) with
+    /// no redaction — a deliberate, commented decision resting on the
+    /// three-tier secrets model and on stdout being an operator surface. So a
+    /// bridge layer built inline shipped untrusted guest text to the trace
+    /// collector as span-event names, and guest logs were only the loudest of
+    /// ~418 event callsites in this crate that interpolate untrusted or
+    /// upstream-derived text.
     ///
-    /// Consequence: turning on `JAEGER_ENDPOINT` ships guest WARN/ERROR log
-    /// text to the collector verbatim. The span-status/attribute sinks are
-    /// redacted; this path is not. Asserted here with a harmless canary so the
-    /// fact is measured rather than assumed, and so a future reader evaluating
-    /// "can we enable tracing yet?" finds it.
+    /// `talos_trace::otel_bridge_layer_with_tracer` — the ONE constructor both
+    /// `worker/src/main.rs` and `controller/src/main.rs` call — filters
+    /// promoted events out and exports spans only.
+    ///
+    /// This test has three arms, and the first two are what make the third
+    /// meaningful:
+    ///
+    /// 1. **Control.** An inline `tracing_opentelemetry::layer()` DOES promote
+    ///    the event. Without this arm, arm 3 would pass just as happily if the
+    ///    event had never been emitted at all.
+    /// 2. **Span writes survive the filter.** `Layer::with_filter` wraps the
+    ///    bridge in `tracing_subscriber`'s `Filtered`, and every
+    ///    `OpenTelemetrySpanExt` call (`set_parent`, `set_attribute`,
+    ///    `add_event`, `set_status`) resolves the bridge by `downcast_raw`. If
+    ///    `Filtered` did not forward that downcast, all four would silently
+    ///    no-op and the entire redacted span surface would vanish — a far worse
+    ///    outcome than the leak being fixed. Asserted, not assumed.
+    /// 3. **The invariant.** The guest line is absent from the exported span.
+    ///
+    /// The fixture is AWS-shaped on purpose. `sk-…` is a bad canary for this
+    /// family of tests: its pattern needs only `sk-` plus six characters, so a
+    /// truncated or partially-processed stub still matches and a broken
+    /// implementation still passes. `\bA[KS]IA[0-9A-Z]{16}\b` needs the whole
+    /// token.
     #[test]
-    fn tracing_events_are_exported_as_span_events() {
-        const CANARY: &str = "[WASM] canary-line-from-a-guest-module";
+    fn guest_log_events_are_not_promoted_by_the_shared_bridge_layer() {
+        // AWS's own published documentation example key.
+        const CANARY: &str = "[WASM] upstream said AKIAIOSFODNN7EXAMPLE was rejected";
+
+        // Arm 1 — control: the unfiltered bridge DOES promote the event, so
+        // arm 3 below is testing a real difference rather than an event that
+        // was never emitted.
+        {
+            let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
+            let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                .with_simple_exporter(exporter.clone())
+                .build();
+            let raw = tracing_opentelemetry::layer().with_tracer(provider.tracer("control"));
+            let subscriber = tracing_subscriber::Registry::default().with(raw);
+            tracing::subscriber::with_default(subscriber, || {
+                let span = tracing::info_span!("wasm-job");
+                let _entered = span.enter();
+                tracing::error!("{CANARY}");
+            });
+            let spans = exporter
+                .get_finished_spans()
+                .expect("in-memory export failed");
+            assert!(
+                spans[0].events.events.iter().any(|e| e.name == CANARY),
+                "CONTROL ARM: an inline `tracing_opentelemetry::layer()` no longer \
+                 promotes `tracing` events to span events. That is the behaviour \
+                 `talos_trace::otel_bridge_layer_with_tracer` exists to neutralise \
+                 — re-read whether the filter is still needed before deleting it. \
+                 Events seen: {:?}",
+                spans[0].events
+            );
+        }
+
+        // Arms 2 and 3 — the shared constructor, built exactly as both
+        // `main.rs` files build it.
         let exporter = opentelemetry_sdk::trace::InMemorySpanExporterBuilder::new().build();
         let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
-        let layer = tracing_opentelemetry::layer().with_tracer(provider.tracer("probe"));
+        let layer = talos_trace::otel_bridge_layer_with_tracer(provider.tracer("shared"));
         let subscriber = tracing_subscriber::Registry::default().with(layer);
         tracing::subscriber::with_default(subscriber, || {
             let span = tracing::info_span!("wasm-job");
             let _entered = span.enter();
+            let mut job_span = JobSpan::current_with_parent(&opentelemetry::Context::new());
+            job_span.set_attribute("error", "deliberate-span-attribute");
+            job_span.add_event("deliberate-span-event");
+            // The guest log line, emitted exactly as `host::logging` emits it.
             tracing::error!("{CANARY}");
+            job_span.end_error("deliberate-span-status");
         });
 
         let spans = exporter
             .get_finished_spans()
             .expect("in-memory export failed");
-        assert_eq!(spans.len(), 1);
+        assert_eq!(spans.len(), 1, "expected exactly one exported span");
+        let span = &spans[0];
+        let events: Vec<String> = span
+            .events
+            .events
+            .iter()
+            .map(|e| e.name.to_string())
+            .collect();
+        let attrs = format!("{:?}", span.attributes);
+        let status = format!("{:?}", span.status);
+
+        // Arm 2 — the deliberate, already-redacted span surface still lands.
+        // If `Filtered` stopped forwarding `downcast_raw`, all three of these
+        // would silently become no-ops.
         assert!(
-            spans[0].events.events.iter().any(|e| e.name == CANARY),
-            "expected the tracing event to be exported as a span event; \
-             if this now fails, the guest-log export surface described above \
-             has changed and the tracing-enablement analysis needs revisiting: {:?}",
-            spans[0].events
+            attrs.contains("deliberate-span-attribute"),
+            "`OpenTelemetrySpanExt::set_attribute` stopped reaching the bridge \
+             through `Filtered` — every redacted span sink is now a silent \
+             no-op, which is worse than the leak this filter closes. \
+             Attributes: {attrs}"
+        );
+        assert!(
+            events.iter().any(|e| e == "deliberate-span-event"),
+            "`OpenTelemetrySpanExt::add_event` stopped reaching the bridge \
+             through `Filtered`: {events:?}"
+        );
+        assert!(
+            status.contains("deliberate-span-status"),
+            "`OpenTelemetrySpanExt::set_status` stopped reaching the bridge \
+             through `Filtered`: {status}"
+        );
+
+        // Arm 3 — the invariant this change exists for.
+        assert!(
+            !events.iter().any(|e| e.contains("AKIA")),
+            "a `tracing` event was promoted to a span event by the shared bridge \
+             layer. The event-drop filter in \
+             `talos_trace::otel_bridge_layer_with_tracer` has changed or been \
+             bypassed — re-read the tracing-enablement analysis before accepting \
+             this: {events:?}"
         );
     }
 }
