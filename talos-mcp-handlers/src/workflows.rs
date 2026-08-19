@@ -2428,8 +2428,8 @@ async fn handle_add_node_to_workflow(
     let updated_json = graph.to_string();
     // MCP-1228 (2026-05-18): mirror the MCP-1226 chokepoint on this
     // direct-repository write. `handle_add_node_to_workflow` calls
-    // `workflow_repo.update_workflow_graph_unchecked` rather than
-    // `save_graph_json_unchecked`, so the canonical
+    // `workflow_repo.update_workflow_graph` rather than the
+    // `save_graph_json` helper, so the canonical
     // `validate_graph_timeouts` cap check never fired on the
     // top-level `timeout_secs` / `retry_count` / `retry_backoff_ms`
     // fields that `build_add_node_payload` stamps onto the new
@@ -2440,10 +2440,34 @@ async fn handle_add_node_to_workflow(
     if let Err(resp) = crate::utils::ensure_graph_within_caps(&updated_json, &req_id) {
         return resp;
     }
-    let _ = state
+    // The write now carries `AND user_id = $3` (the `_unchecked` variant is
+    // gone). The prior `get_workflow_graph(wf_id, user_id)` above is still the
+    // primary gate; this is a second, independent one whose verdict is no
+    // longer discarded. Pre-fix this was `let _ = …await;` — a swallowed
+    // Result, so a failed save still answered "Node added". Lint check 10 does
+    // not see it: that check greps for a swallowed raw-SQL call, and this is a
+    // repository method. (Spelling the grep's literal here would trip check 6,
+    // which forbids raw SQL in this crate — found the hard way.)
+    match state
         .workflow_repo
-        .update_workflow_graph_unchecked(wf_id, &updated_json)
-        .await;
+        .update_workflow_graph(wf_id, user_id, &updated_json)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                target: "talos_audit",
+                workflow_id = %wf_id,
+                "add_node_to_workflow: UPDATE matched 0 rows — workflow missing or not owned at \
+                 write time; node NOT persisted"
+            );
+            return mcp_error(req_id, -32000, "Workflow not found or access denied");
+        }
+        Err(e) => {
+            tracing::error!(workflow_id = %wf_id, "add_node_to_workflow save failed: {}", e);
+            return mcp_error(req_id, -32000, "Failed to save workflow graph");
+        }
+    }
 
     // Keep a published workflow's active version in sync with the edited
     // draft (shared helper — see crate::graph::maybe_auto_publish). Since
@@ -8785,13 +8809,29 @@ async fn handle_add_edge_to_workflow(
     if let Err(resp) = crate::utils::ensure_graph_within_caps(&updated_json, &req_id) {
         return resp;
     }
-    if let Err(e) = state
+    // Ownership was already established by the `get_workflow_graph(wf_id,
+    // user_id)` read above; the write now re-states it as `AND user_id = $3`
+    // instead of relying on that read alone, and a 0-row result is surfaced
+    // rather than read as success.
+    match state
         .workflow_repo
-        .update_workflow_graph_unchecked(wf_id, &updated_json)
+        .update_workflow_graph(wf_id, user_id, &updated_json)
         .await
     {
-        tracing::error!(workflow_id = %wf_id, "add_edge_to_workflow save failed: {}", e);
-        return mcp_error(req_id, -32000, "Failed to save workflow graph");
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                target: "talos_audit",
+                workflow_id = %wf_id,
+                "add_edge_to_workflow: UPDATE matched 0 rows — workflow missing or not owned at \
+                 write time; edge NOT persisted"
+            );
+            return mcp_error(req_id, -32000, "Workflow not found or access denied");
+        }
+        Err(e) => {
+            tracing::error!(workflow_id = %wf_id, "add_edge_to_workflow save failed: {}", e);
+            return mcp_error(req_id, -32000, "Failed to save workflow graph");
+        }
     }
 
     // Keep a published workflow's active version in sync with the new edge

@@ -1058,8 +1058,8 @@ echo
 # ── 15. Graph_json write chokepoint (MCP-1226 / 1227 / 1228 / 1229) ───
 #
 # Every MCP handler that writes workflows.graph_json MUST route through
-# `crate::utils::ensure_graph_within_caps` (or the `save_graph_json` /
-# `save_graph_json_unchecked` helpers in graph.rs that wrap it) BEFORE
+# `crate::utils::ensure_graph_within_caps` (or the `save_graph_json`
+# helper in graph.rs that wraps it) BEFORE
 # the repository UPDATE. The canonical
 # `talos_workflow_types::validate_graph_timeouts` caps from MCP-1216 /
 # MCP-1218 / MCP-1219 / MCP-1220 / MCP-1221 only run at create /
@@ -1074,15 +1074,21 @@ echo
 #
 # The lint flags:
 #   * `.update_workflow_graph(`
-#   * `.update_workflow_graph_unchecked(`
+#   * `.update_workflow_graph_unchecked(`  (deleted in #658; the
+#     alternation is kept so a reintroduction is still caught)
 #   * `.update_workflow_graph_json(`
 # in `talos-mcp-handlers/` UNLESS the matched line is preceded within
 # 8 lines by either `ensure_graph_within_caps` (the canonical
 # chokepoint call) or `validate_graph_timeouts` (the underlying
-# canonical validator — same contract). The two declarations in
-# `graph.rs::save_graph_json` and `save_graph_json_unchecked` ARE
-# the chokepoint, so they self-opt-out via `ensure_graph_within_caps`
-# inside their own bodies.
+# canonical validator — same contract). The declaration in
+# `graph.rs::save_graph_json` IS the chokepoint, so it self-opts-out
+# via `ensure_graph_within_caps` inside its own body.
+#
+# NOTE (#658): this check is NOT a tenancy guard and never was — it
+# only requires the CAP validator near the write. Tenancy on the
+# graph_json write is now carried by the statement itself
+# (`AND user_id = $3`), after `update_workflow_graph_unchecked` was
+# deleted and its six handlers routed through the checked twin.
 #
 # Opt-out marker: `// allow-direct-graph-write: <reason>` for any
 # documented exception (none today).
@@ -1120,8 +1126,7 @@ if [ "$GRAPH_WRITE_VIOLATIONS" -gt 0 ]; then
     red "✗ found $GRAPH_WRITE_VIOLATIONS direct graph_json write(s) bypassing canonical caps"
     yellow "  → call crate::utils::ensure_graph_within_caps(&graph_json, &req_id)?"
     yellow "    before the repository write, OR route through the"
-    yellow "    save_graph_json / save_graph_json_unchecked helpers"
-    yellow "    in graph.rs that already wrap it."
+    yellow "    save_graph_json helper in graph.rs that already wraps it."
     yellow "  → opt-out comment // allow-direct-graph-write: <reason>"
     yellow "    within 8 lines above is for documented exceptions."
     EXIT_CODE=1

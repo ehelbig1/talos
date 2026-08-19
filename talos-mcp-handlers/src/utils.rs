@@ -318,7 +318,7 @@ pub use talos_mcp::{mcp_error, mcp_text};
 /// graph_json against the canonical
 /// `talos_workflow_types::validate_graph_timeouts` caps before any
 /// MCP write path persists it. Originally lived in `graph.rs` as a
-/// private helper used by `save_graph_json` / `save_graph_json_unchecked`;
+/// private helper used by `save_graph_json`;
 /// promoted here so `set_workflow_priority` (configuration.rs) and
 /// `rollback_workflow` (versions.rs) can call it without depending on
 /// `graph.rs`. Those two paths write graph_json through

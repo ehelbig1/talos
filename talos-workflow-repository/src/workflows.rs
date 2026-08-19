@@ -590,7 +590,18 @@ impl WorkflowRepository {
         Ok(wf_id)
     }
 
-    /// Update only graph_json (and bump updated_at). Returns true if a row was affected.
+    /// Update only graph_json (and bump updated_at). Returns `true` if a row
+    /// was affected — i.e. the workflow exists AND belongs to `user_id`.
+    ///
+    /// **This is the only graph_json write path.** The former
+    /// `update_workflow_graph_unchecked` (`… WHERE id = $2`, no tenancy
+    /// predicate) was deleted: an audit of its six handlers found every one
+    /// already held `user_id` and had already run an ownership-checked read,
+    /// so the unscoped variant bought one saved bind in exchange for a write
+    /// whose tenancy lived entirely in caller convention. `false` here is a
+    /// real signal (row missing, or owned by someone else) and callers MUST
+    /// surface it rather than discarding it — see
+    /// `talos_mcp_handlers::graph::save_graph_json`.
     pub async fn update_workflow_graph(
         &self,
         workflow_id: Uuid,
@@ -606,22 +617,6 @@ impl WorkflowRepository {
         .bind(user_id)
         .execute(&self.db_pool)
         .await?;
-        Ok(result.rows_affected() > 0)
-    }
-
-    /// Update graph_json without the user_id ownership check (used by graph mutation handlers
-    /// that have already verified ownership earlier in the call).
-    pub async fn update_workflow_graph_unchecked(
-        &self,
-        workflow_id: Uuid,
-        graph_json: &str,
-    ) -> Result<bool> {
-        let result =
-            sqlx::query("UPDATE workflows SET graph_json = $1, updated_at = NOW() WHERE id = $2")
-                .bind(graph_json)
-                .bind(workflow_id)
-                .execute(&self.db_pool)
-                .await?;
         Ok(result.rows_affected() > 0)
     }
 

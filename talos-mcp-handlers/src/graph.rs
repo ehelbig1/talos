@@ -270,7 +270,7 @@ async fn fetch_graph_json_unchecked(
 
 /// MCP-11: HTML-decode Rhai-expression fields in graph_json before
 /// persistence. Every node-config write path bottlenecks through
-/// `save_graph_json` / `save_graph_json_unchecked`, so applying the
+/// `save_graph_json`, so applying the
 /// decode here covers `update_node_config`, `add_node_to_workflow`,
 /// `add_skip_condition`, `add_synthesize_node`, and every other
 /// system-node setter in one shot. The runtime decode in
@@ -332,36 +332,28 @@ async fn save_graph_json(
         .update_workflow_graph(wf_id, user_id, canonical.as_ref())
         .await
     {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            tracing::error!("save_graph_json: {}", e);
+        // `false` = zero rows matched `id = $2 AND user_id = $3`. Every
+        // caller has already run an ownership-checked read, so this can only
+        // mean the workflow was deleted (or changed hands) between that read
+        // and this write. Reporting Ok here would be the MCP-737/738
+        // misleading-success shape one level down: the handler would answer
+        // "node added" over a graph that was never persisted. Surface it.
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            tracing::warn!(
+                target: "talos_audit",
+                workflow_id = %wf_id,
+                "save_graph_json: UPDATE matched 0 rows — workflow missing or not owned by the \
+                 caller at write time; graph NOT persisted"
+            );
             Err(mcp_error(
                 req_id.clone(),
                 -32000,
-                "Failed to save workflow graph",
+                "Workflow not found or access denied",
             ))
         }
-    }
-}
-
-/// Save updated graph_json without user_id ownership check (used by handlers
-/// that have already verified ownership earlier in the call).
-async fn save_graph_json_unchecked(
-    state: &McpState,
-    wf_id: Uuid,
-    graph_json: &str,
-    req_id: &Option<serde_json::Value>,
-) -> Result<(), JsonRpcResponse> {
-    let canonical = canonicalise_rhai_in_graph_json(graph_json);
-    crate::utils::ensure_graph_within_caps(canonical.as_ref(), req_id)?;
-    match state
-        .workflow_repo
-        .update_workflow_graph_unchecked(wf_id, canonical.as_ref())
-        .await
-    {
-        Ok(_) => Ok(()),
         Err(e) => {
-            tracing::error!("save_graph_json_unchecked: {}", e);
+            tracing::error!("save_graph_json: {}", e);
             Err(mcp_error(
                 req_id.clone(),
                 -32000,
@@ -1640,9 +1632,10 @@ async fn handle_set_speculative_prefetch(
         return mcp_error(req_id, -32000, "Node not found in workflow");
     }
 
-    if let Err(e) = save_graph_json_unchecked(
+    if let Err(e) = save_graph_json(
         state,
         wf_id,
+        user_id,
         &serde_json::to_string(&graph).unwrap_or_default(),
         &req_id,
     )
@@ -2496,18 +2489,18 @@ async fn handle_duplicate_node(
 
     let updated_json = graph.to_string();
     // MCP-737 (2026-05-13): propagate save errors instead of silently
-    // discarding. Pre-fix `let _ = save_graph_json_unchecked(...).await;`
+    // discarding. Pre-fix `let _ = save_graph_json(...).await;`
     // swallowed the Err(JsonRpcResponse) — the handler then returned
     // "Node 'X' duplicated" success even when the underlying graph
     // save failed (DB outage, encryption-key rotation in flight,
     // etc.). User reloaded, saw no change, and had no signal that
-    // their mutation was lost. The save_graph_json_unchecked
+    // their mutation was lost. The save_graph_json
     // signature is explicitly `Result<(), JsonRpcResponse>` so the
     // Err variant carries a fully-formed error response — propagating
     // it is the documented contract. Sibling siblings at lines 2098
     // (handle_remove_node) and 2151 (handle_update_node_config)
     // closed in the same commit.
-    if let Err(resp) = save_graph_json_unchecked(state, wf_id, &updated_json, &req_id).await {
+    if let Err(resp) = save_graph_json(state, wf_id, user_id, &updated_json, &req_id).await {
         return resp;
     }
 
@@ -2652,7 +2645,7 @@ async fn handle_add_edge(
 
     let updated_json = graph.to_string();
     // MCP-737: propagate save errors — see duplicate_node above for rationale.
-    if let Err(resp) = save_graph_json_unchecked(state, wf_id, &updated_json, &req_id).await {
+    if let Err(resp) = save_graph_json(state, wf_id, user_id, &updated_json, &req_id).await {
         return resp;
     }
 
@@ -2712,7 +2705,7 @@ async fn handle_remove_edge(
 
     let updated_json = graph.to_string();
     // MCP-737: propagate save errors — see duplicate_node above for rationale.
-    if let Err(resp) = save_graph_json_unchecked(state, wf_id, &updated_json, &req_id).await {
+    if let Err(resp) = save_graph_json(state, wf_id, user_id, &updated_json, &req_id).await {
         return resp;
     }
 
