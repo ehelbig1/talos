@@ -1422,10 +1422,32 @@ async fn handle_run_scratch_session(
                 return mcp_error(req_id, -32602, "code exceeds 100 KB limit")
             }
             Some(s) => {
-                let _ = state
+                // The run path below RE-READS the session from the DB
+                // (`get_scratch_session`) and compiles whatever it finds.
+                // Pre-fix this write was `let _ = ... .await`, so a failed
+                // persist meant the OLD code was compiled, executed, and its
+                // output returned as the result of the code the caller just
+                // submitted — reported success on a failed write, the same
+                // shape the wrong-type comment above this match documents
+                // fixing. Refuse the run instead of answering with the wrong
+                // program's output.
+                if let Err(e) = state
                     .advanced_repo
                     .update_scratch_code(s, user_id, session_name)
-                    .await;
+                    .await
+                {
+                    tracing::error!(
+                        %user_id,
+                        error = %e,
+                        "run_scratch_session: failed to persist submitted code"
+                    );
+                    return mcp_error(
+                        req_id,
+                        -32000,
+                        "Failed to save the submitted code; the session was NOT run \
+                         (running would have executed the previously saved code). Retry.",
+                    );
+                }
             }
             None => {
                 let kind = crate::utils::json_type_name(v);
@@ -1498,10 +1520,17 @@ async fn handle_run_scratch_session(
         Ok(r) => r,
         Err(_) => {
             let err_str = "Compilation timed out after 60 seconds";
-            let _ = state
+            if let Err(e) = state
                 .advanced_repo
                 .update_scratch_error(err_str, user_id, session_name)
-                .await;
+                .await
+            {
+                tracing::warn!(
+                    %user_id, session = %session_name,
+                    error = %e,
+                    "failed to record the scratch-session error; the stored session row is now stale"
+                );
+            }
             return mcp_error(req_id, -32000, err_str);
         }
     };
@@ -1510,14 +1539,21 @@ async fn handle_run_scratch_session(
         Ok(res) if res.success => match res.wasm_bytes {
             Some(b) => b,
             None => {
-                let _ = state
+                if let Err(e) = state
                     .advanced_repo
                     .update_scratch_no_wasm(
                         "Compilation succeeded but produced no WASM bytes",
                         user_id,
                         session_name,
                     )
-                    .await;
+                    .await
+                {
+                    tracing::warn!(
+                        %user_id, session = %session_name,
+                        error = %e,
+                        "failed to record the scratch-session no-WASM outcome; the stored session row is now stale"
+                    );
+                }
                 return mcp_text(req_id, "Compilation succeeded but produced no WASM bytes.");
             }
         },
@@ -1534,18 +1570,32 @@ async fn handle_run_scratch_session(
                 })
                 .collect();
             let err_str = format!("Compilation failed:\n{}", error_msgs.join("\n"));
-            let _ = state
+            if let Err(e) = state
                 .advanced_repo
                 .update_scratch_error(&err_str, user_id, session_name)
-                .await;
+                .await
+            {
+                tracing::warn!(
+                    %user_id, session = %session_name,
+                    error = %e,
+                    "failed to record the scratch-session error; the stored session row is now stale"
+                );
+            }
             return mcp_text(req_id, &err_str);
         }
         Err(e) => {
             let err_str = format!("Compilation error: {}", e);
-            let _ = state
+            if let Err(e) = state
                 .advanced_repo
                 .update_scratch_error(&err_str, user_id, session_name)
-                .await;
+                .await
+            {
+                tracing::warn!(
+                    %user_id, session = %session_name,
+                    error = %e,
+                    "failed to record the scratch-session error; the stored session row is now stale"
+                );
+            }
             return mcp_text(req_id, &err_str);
         }
     };
@@ -1596,18 +1646,32 @@ async fn handle_run_scratch_session(
     match execution_result {
         Ok(val) => {
             let output = talos_workflow_engine::ParallelWorkflowEngine::unwrap_output(&val);
-            let _ = state
+            if let Err(e) = state
                 .advanced_repo
                 .update_scratch_output(output, user_id, session_name)
-                .await;
+                .await
+            {
+                tracing::warn!(
+                    %user_id, session = %session_name,
+                    error = %e,
+                    "failed to record the scratch-session output; the stored session row is now stale"
+                );
+            }
             mcp_text(req_id, &output.to_string())
         }
         Err(e) => {
             let err_str = format!("Execution error: {}", e);
-            let _ = state
+            if let Err(e) = state
                 .advanced_repo
                 .update_scratch_error(&err_str, user_id, session_name)
-                .await;
+                .await
+            {
+                tracing::warn!(
+                    %user_id, session = %session_name,
+                    error = %e,
+                    "failed to record the scratch-session error; the stored session row is now stale"
+                );
+            }
             mcp_text(req_id, &err_str)
         }
     }
@@ -3393,10 +3457,17 @@ async fn handle_list_approval_gates(
     };
 
     // Expire stale pending gates before listing
-    let _ = state
+    if let Err(e) = state
         .advanced_repo
         .expire_stale_approval_gates(user_id)
-        .await;
+        .await
+    {
+        tracing::warn!(
+            %user_id,
+            error = %e,
+            "list_approval_gates: stale-gate expiry failed; the listing may over-report pending gates"
+        );
+    }
 
     match state
         .advanced_repo
@@ -4138,10 +4209,17 @@ async fn handle_promote_workflow(
         {
             Ok((v, _warnings)) => {
                 version_id_str = Some(v.id.to_string());
-                let _ = state
+                if let Err(e) = state
                     .advanced_repo
                     .activate_workflow(new_wf_id, user_id)
-                    .await;
+                    .await
+                {
+                    tracing::warn!(
+                        workflow_id = %new_wf_id,
+                        error = %e,
+                        "promote_workflow: activation failed; the promoted workflow was published but is NOT active"
+                    );
+                }
 
                 // Spawn background updates
                 let db1 = state.db_pool.clone();

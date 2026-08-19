@@ -1308,7 +1308,15 @@ async fn handle_set_policy(
     match ModelRegistry::set_policy(&mut tx, model_id, user_id, policy_raw).await {
         Ok(true) => match tx.commit().await {
             Ok(()) => {
-                let _ = state
+                // The policy change is already committed; the audit row is
+                // best-effort. But it is an AUDIT row for a privileged
+                // change, so its failure must be visible — matching every
+                // other admin_event_log caller (actor.rs:2628/2733/2838 and
+                // spawn_log_admin_event, which all WARN). Pre-fix this was
+                // `let _ = ... .await`, the only silent admin_event_log
+                // write in the workspace: a gap in the trail for an
+                // operator-initiated ML policy change left no signal at all.
+                if let Err(e) = state
                     .actor_repo
                     .insert_admin_event_log(
                         user_id,
@@ -1321,7 +1329,15 @@ async fn handle_set_policy(
                         ),
                         Some(policy_raw),
                     )
-                    .await;
+                    .await
+                {
+                    tracing::warn!(
+                        target: "talos_audit",
+                        %model_id,
+                        error = %e,
+                        "ml_set_policy: audit log write failed (policy change applied)"
+                    );
+                }
                 mcp_text(
                     req_id,
                     &serde_json::json!({
@@ -1399,7 +1415,9 @@ async fn handle_set_lifecycle(
         Ok(true) => match tx.commit().await {
             Ok(()) => {
                 talos_ml::invalidate_serving_cache(user_id, &model.name);
-                let _ = state
+                // Audit row for a privileged lifecycle move — see the
+                // rationale on the `ml_policy_set` write above.
+                if let Err(e) = state
                     .actor_repo
                     .insert_admin_event_log(
                         user_id,
@@ -1414,7 +1432,15 @@ async fn handle_set_lifecycle(
                         ),
                         None,
                     )
-                    .await;
+                    .await
+                {
+                    tracing::warn!(
+                        target: "talos_audit",
+                        %model_id,
+                        error = %e,
+                        "ml_set_lifecycle: audit log write failed (transition applied)"
+                    );
+                }
                 mcp_text(
                     req_id,
                     &serde_json::json!({
@@ -1556,7 +1582,9 @@ async fn handle_reset_shadow_window(
     };
     match tx.commit().await {
         Ok(()) => {
-            let _ = state
+            // Audit row for a privileged shadow-window rotation — see the
+            // rationale on the `ml_policy_set` write above.
+            if let Err(e) = state
                 .actor_repo
                 .insert_admin_event_log(
                     user_id,
@@ -1569,7 +1597,15 @@ async fn handle_reset_shadow_window(
                     ),
                     None,
                 )
-                .await;
+                .await
+            {
+                tracing::warn!(
+                    target: "talos_audit",
+                    model_id = %model.model_id,
+                    error = %e,
+                    "ml_reset_shadow_window: audit log write failed (epoch bumped)"
+                );
+            }
             mcp_text(
                 req_id,
                 &serde_json::json!({

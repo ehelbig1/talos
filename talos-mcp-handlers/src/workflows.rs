@@ -3079,9 +3079,16 @@ async fn handle_test_workflow_draft(
         Err(talos_engine::builder::BuildError::GraphLoad(engine_err)) => {
             tracing::error!(err = ?engine_err, exec_id = %exec_id, "test_workflow_draft: failed to load graph");
             let user_msg = talos_engine::user_errors::render_graph_load_error(&engine_err);
-            let _ = repo_for_draft
+            if let Err(e) = repo_for_draft
                 .mark_execution_failed(exec_id, &user_msg, None)
-                .await;
+                .await
+            {
+                tracing::warn!(
+                    target: "talos_audit", execution_id = %exec_id,
+                    error = %e,
+                    "failed to mark execution FAILED; the row keeps its non-terminal status until the stale-execution sweeper finalizes it"
+                );
+            }
             return mcp_error(req_id, -32000, "Failed to load graph");
         }
     };
@@ -3119,22 +3126,43 @@ async fn handle_test_workflow_draft(
                 // completed — persist status='waiting' (mirrors the
                 // handle_test_workflow branch) so the row stays resumable.
                 if ctx.waiting {
-                    let _ = repo_for_draft
+                    if let Err(e) = repo_for_draft
                         .mark_execution_waiting(exec_id, &output_json)
-                        .await;
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "talos_audit", execution_id = %exec_id,
+                            error = %e,
+                            "failed to mark execution WAITING; the paused run may not be resumable"
+                        );
+                    }
                 } else {
-                    let _ = repo_for_draft
+                    if let Err(e) = repo_for_draft
                         .mark_execution_completed(exec_id, &output_json)
-                        .await;
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "talos_audit", execution_id = %exec_id,
+                            error = %e,
+                            "failed to mark execution COMPLETED; the row keeps its non-terminal status until the stale-execution sweeper finalizes it"
+                        );
+                    }
                 }
             }
             Err(e) => {
                 let fail_output = talos_dlp_provider::redact_json(
                     &serde_json::json!({"__trigger_input__": input_payload_for_storage}),
                 );
-                let _ = repo_for_draft
+                if let Err(e) = repo_for_draft
                     .mark_execution_failed(exec_id, &e.to_string(), Some(&fail_output))
-                    .await;
+                    .await
+                {
+                    tracing::warn!(
+                        target: "talos_audit", execution_id = %exec_id,
+                        error = %e,
+                        "failed to mark execution FAILED; the row keeps its non-terminal status until the stale-execution sweeper finalizes it"
+                    );
+                }
             }
         }
     });
@@ -4316,7 +4344,13 @@ async fn handle_call_workflow(
         }
     }
 
-    let _ = state.workflow_repo.record_reuse_event(wf_id, "call").await;
+    if let Err(e) = state.workflow_repo.record_reuse_event(wf_id, "call").await {
+        tracing::warn!(
+            workflow_id = %wf_id,
+            error = %e,
+            "failed to record a workflow reuse event; get_workflow_reuse_stats will under-count"
+        );
+    }
 
     let registry = state.registry.clone();
     let nats = match &state.nats_client {
@@ -4380,10 +4414,17 @@ async fn handle_call_workflow(
     {
         Ok(e) => e,
         Err(talos_engine::builder::BuildError::GraphLoad(engine_err)) => {
-            let _ = state
+            if let Err(e) = state
                 .workflow_repo
                 .mark_execution_failed(exec_id, &engine_err.to_string(), None)
-                .await;
+                .await
+            {
+                tracing::warn!(
+                    target: "talos_audit", execution_id = %exec_id,
+                    error = %e,
+                    "failed to mark execution FAILED; the row keeps its non-terminal status until the stale-execution sweeper finalizes it"
+                );
+            }
             return Some(mcp_error(
                 req_id.clone(),
                 -32000,
@@ -4432,23 +4473,44 @@ async fn handle_call_workflow(
                 // completed — persist status='waiting' and surface "waiting"
                 // so the paused run isn't treated as terminal.
                 let is_waiting = ctx.waiting;
+                // Pre-fix both writes were `let _ = ... .await` while the
+                // tuple below asserted the terminal status UNCONDITIONALLY —
+                // so a failed write answered the caller "completed" while
+                // workflow_executions.status stayed 'running' and the
+                // caller's own get_execution_status disagreed. Carry the
+                // persist outcome so the response can say so.
                 if is_waiting {
-                    let _ = repo_for_spawn
-                        .mark_execution_waiting(exec_id, &output_json)
-                        .await;
-                    Ok::<_, String>(("waiting".to_string(), output_json))
+                    let persisted = log_status_persist(
+                        repo_for_spawn
+                            .mark_execution_waiting(exec_id, &output_json)
+                            .await,
+                        exec_id,
+                        "waiting",
+                    );
+                    Ok::<_, String>(("waiting".to_string(), output_json, persisted))
                 } else {
-                    let _ = repo_for_spawn
-                        .mark_execution_completed(exec_id, &output_json)
-                        .await;
-                    Ok::<_, String>(("completed".to_string(), output_json))
+                    let persisted = log_status_persist(
+                        repo_for_spawn
+                            .mark_execution_completed(exec_id, &output_json)
+                            .await,
+                        exec_id,
+                        "completed",
+                    );
+                    Ok::<_, String>(("completed".to_string(), output_json, persisted))
                 }
             }
             Err(e) => {
                 let err_str = e.to_string();
-                let _ = repo_for_spawn
+                if let Err(e) = repo_for_spawn
                     .mark_execution_failed(exec_id, &err_str, None)
-                    .await;
+                    .await
+                {
+                    tracing::warn!(
+                        target: "talos_audit", execution_id = %exec_id,
+                        error = %e,
+                        "failed to mark execution FAILED; the row keeps its non-terminal status until the stale-execution sweeper finalizes it"
+                    );
+                }
                 // Alert + webhook fire from INSIDE the detached task so they
                 // still run when the client has already disconnected — pre-fix
                 // an abandoned failure notified nobody.
@@ -4471,13 +4533,16 @@ async fn handle_call_workflow(
     match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), spawn_handle).await {
         // Within-deadline success — EXACT pre-fix response shape (output_mode
         // 'full' is byte-identical; the shaping only elides on opt-in).
-        Ok(Ok(Ok((status, output_json)))) => {
+        Ok(Ok(Ok((status, output_json, status_persisted)))) => {
             let shaped =
                 crate::utils::shape_response_output(&output_json, &terminal_nodes, &output_mode);
             Some(mcp_text(
                 req_id.clone(),
                 &serde_json::to_string_pretty(&call_workflow_terminal_body(
-                    exec_id, &status, &shaped,
+                    exec_id,
+                    &status,
+                    &shaped,
+                    status_persisted,
                 ))
                 .unwrap_or_default(),
             ))
@@ -4492,10 +4557,17 @@ async fn handle_call_workflow(
         // Task panicked or was cancelled out-of-band. Finalize defensively.
         Ok(Err(join_err)) => {
             let msg = format!("Engine task terminated unexpectedly: {}", join_err);
-            let _ = state
+            if let Err(e) = state
                 .workflow_repo
                 .mark_execution_failed(exec_id, &msg, None)
-                .await;
+                .await
+            {
+                tracing::warn!(
+                    target: "talos_audit", execution_id = %exec_id,
+                    error = %e,
+                    "failed to mark execution FAILED; the row keeps its non-terminal status until the stale-execution sweeper finalizes it"
+                );
+            }
             Some(mcp_error(req_id.clone(), -32000, &msg))
         }
         // Sync-wait window elapsed: the detached task keeps running and will
@@ -4514,16 +4586,61 @@ async fn handle_call_workflow(
 /// `call_workflow`. Pure so the exact shape is regression-locked by a unit
 /// test — the `{execution_id, status, output}` triple is a public contract
 /// used by sub-workflow-composition callers.
+///
+/// `status_persisted == false` means the run reached `status` but the
+/// terminal-status WRITE failed. The `{execution_id, status, output}` triple
+/// is unchanged in that case (the run really did finish); two ADDITIVE keys
+/// appear so the caller is not told a clean "completed" for a row that
+/// `get_execution_status` will still report as `running`. Additive rather
+/// than a renamed/overloaded `status` field, per the misleading-report-field
+/// rule — existing sub-workflow-composition callers keep working byte-for-byte
+/// on the success path.
 fn call_workflow_terminal_body(
     exec_id: uuid::Uuid,
     status: &str,
     output_json: &serde_json::Value,
+    status_persisted: bool,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "execution_id": exec_id.to_string(),
         "status": status,
         "output": output_json,
-    })
+    });
+    annotate_unpersisted_status(&mut body, status_persisted);
+    body
+}
+
+/// Stamp the two ADDITIVE keys that make a sync-wait response honest when the
+/// run's terminal status could not be written. Shared by `call_workflow` and
+/// `test_workflow` so the contract cannot drift between the two handlers, and
+/// pure so one unit test covers both. `status_persisted == true` is a NO-OP —
+/// the success path stays byte-identical to the pre-fix response.
+fn annotate_unpersisted_status(body: &mut serde_json::Value, status_persisted: bool) {
+    if status_persisted {
+        return;
+    }
+    body["status_persisted"] = serde_json::json!(false);
+    body["warning"] = serde_json::json!(
+        "The run finished but its terminal status could NOT be written to the database. get_execution_status may report this execution as still running until the stale-execution sweeper finalizes it. The result reported here is the real one."
+    );
+}
+
+/// Shared by the two sync-wait handlers (`call_workflow`, `test_workflow`):
+/// collapse a terminal-status write into a bool and WARN on failure, so the
+/// response builder can be honest about a status the platform did not record.
+fn log_status_persist(result: anyhow::Result<()>, exec_id: uuid::Uuid, status: &str) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(
+                execution_id = %exec_id,
+                status,
+                error = %e,
+                "failed to persist terminal execution status; response will flag it"
+            );
+            false
+        }
+    }
 }
 
 /// Body for the sync-wait-elapsed `running` response of `call_workflow`. Pure:
@@ -5317,9 +5434,16 @@ async fn handle_bulk_trigger_workflow(
                 Ok(e) => e,
                 Err(talos_engine::builder::BuildError::GraphLoad(engine_err)) => {
                     let user_msg = talos_engine::user_errors::render_graph_load_error(&engine_err);
-                    let _ = repo_for_bulk
+                    if let Err(e) = repo_for_bulk
                         .mark_execution_failed(exec_id, &user_msg, None)
-                        .await;
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "talos_audit", execution_id = %exec_id,
+                            error = %e,
+                            "failed to mark execution FAILED; the row keeps its non-terminal status until the stale-execution sweeper finalizes it"
+                        );
+                    }
                     return;
                 }
             };
@@ -5353,22 +5477,43 @@ async fn handle_bulk_trigger_workflow(
                     // completed — persist status='waiting' so the row stays
                     // resumable for the later approval/resume signal.
                     if ctx.waiting {
-                        let _ = repo_for_bulk
+                        if let Err(e) = repo_for_bulk
                             .mark_execution_waiting(exec_id, &output_json)
-                            .await;
+                            .await
+                        {
+                            tracing::warn!(
+                                target: "talos_audit", execution_id = %exec_id,
+                                error = %e,
+                                "failed to mark execution WAITING; the paused run may not be resumable"
+                            );
+                        }
                     } else {
-                        let _ = repo_for_bulk
+                        if let Err(e) = repo_for_bulk
                             .mark_execution_completed(exec_id, &output_json)
-                            .await;
+                            .await
+                        {
+                            tracing::warn!(
+                                target: "talos_audit", execution_id = %exec_id,
+                                error = %e,
+                                "failed to mark execution COMPLETED; the row keeps its non-terminal status until the stale-execution sweeper finalizes it"
+                            );
+                        }
                     }
                 }
                 Err(e) => {
                     let fail_output = talos_dlp_provider::redact_json(
                         &serde_json::json!({"__trigger_input__": input_payload_for_storage}),
                     );
-                    let _ = repo_for_bulk
+                    if let Err(e) = repo_for_bulk
                         .mark_execution_failed(exec_id, &e.to_string(), Some(&fail_output))
-                        .await;
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "talos_audit", execution_id = %exec_id,
+                            error = %e,
+                            "failed to mark execution FAILED; the row keeps its non-terminal status until the stale-execution sweeper finalizes it"
+                        );
+                    }
                 }
             }
         });
@@ -5757,9 +5902,16 @@ async fn handle_trigger_workflow_as_actors(
                 Ok(e) => e,
                 Err(talos_engine::builder::BuildError::GraphLoad(engine_err)) => {
                     let user_msg = talos_engine::user_errors::render_graph_load_error(&engine_err);
-                    let _ = repo_clone
+                    if let Err(e) = repo_clone
                         .mark_execution_failed(exec_id, &user_msg, None)
-                        .await;
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "talos_audit", execution_id = %exec_id,
+                            error = %e,
+                            "failed to mark execution FAILED; the row keeps its non-terminal status until the stale-execution sweeper finalizes it"
+                        );
+                    }
                     return;
                 }
             };
@@ -5793,22 +5945,43 @@ async fn handle_trigger_workflow_as_actors(
                     // completed — persist status='waiting' so the row stays
                     // resumable for the later approval/resume signal.
                     if ctx.waiting {
-                        let _ = repo_clone
+                        if let Err(e) = repo_clone
                             .mark_execution_waiting(exec_id, &output_json)
-                            .await;
+                            .await
+                        {
+                            tracing::warn!(
+                                target: "talos_audit", execution_id = %exec_id,
+                                error = %e,
+                                "failed to mark execution WAITING; the paused run may not be resumable"
+                            );
+                        }
                     } else {
-                        let _ = repo_clone
+                        if let Err(e) = repo_clone
                             .mark_execution_completed(exec_id, &output_json)
-                            .await;
+                            .await
+                        {
+                            tracing::warn!(
+                                target: "talos_audit", execution_id = %exec_id,
+                                error = %e,
+                                "failed to mark execution COMPLETED; the row keeps its non-terminal status until the stale-execution sweeper finalizes it"
+                            );
+                        }
                     }
                 }
                 Err(e) => {
                     let fail_output = talos_dlp_provider::redact_json(
                         &serde_json::json!({"__trigger_input__": per_actor_input_for_storage}),
                     );
-                    let _ = repo_clone
+                    if let Err(e) = repo_clone
                         .mark_execution_failed(exec_id, &e.to_string(), Some(&fail_output))
-                        .await;
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "talos_audit", execution_id = %exec_id,
+                            error = %e,
+                            "failed to mark execution FAILED; the row keeps its non-terminal status until the stale-execution sweeper finalizes it"
+                        );
+                    }
                 }
             }
         });
@@ -6513,9 +6686,16 @@ async fn handle_test_workflow(
     {
         Ok(e) => e,
         Err(talos_engine::builder::BuildError::GraphLoad(engine_err)) => {
-            let _ = repo_for_test
+            if let Err(e) = repo_for_test
                 .mark_execution_failed(exec_id, &engine_err.to_string(), None)
-                .await;
+                .await
+            {
+                tracing::warn!(
+                    target: "talos_audit", execution_id = %exec_id,
+                    error = %e,
+                    "failed to mark execution FAILED; the row keeps its non-terminal status until the stale-execution sweeper finalizes it"
+                );
+            }
             return Some(mcp_error(
                 req_id.clone(),
                 -32000,
@@ -6567,25 +6747,45 @@ async fn handle_test_workflow(
                 // scheduler.rs's branch: persist status='waiting' in the DB
                 // and surface "waiting" as the test result so assert_status:
                 // "waiting" can match.
+                // Same fix as call_workflow: pre-fix these writes were
+                // `let _ = ... .await` while the tuple asserted the terminal
+                // status regardless, so `assert_status: "completed"` could
+                // pass against a row still marked 'running'.
                 if is_waiting {
-                    let _ = repo_for_spawn
-                        .mark_execution_waiting(exec_id, &output_json)
-                        .await;
-                    Ok::<_, String>(("waiting".to_string(), output_json))
+                    let persisted = log_status_persist(
+                        repo_for_spawn
+                            .mark_execution_waiting(exec_id, &output_json)
+                            .await,
+                        exec_id,
+                        "waiting",
+                    );
+                    Ok::<_, String>(("waiting".to_string(), output_json, persisted))
                 } else {
-                    let _ = repo_for_spawn
-                        .mark_execution_completed(exec_id, &output_json)
-                        .await;
-                    Ok::<_, String>(("completed".to_string(), output_json))
+                    let persisted = log_status_persist(
+                        repo_for_spawn
+                            .mark_execution_completed(exec_id, &output_json)
+                            .await,
+                        exec_id,
+                        "completed",
+                    );
+                    Ok::<_, String>(("completed".to_string(), output_json, persisted))
                 }
             }
             Err(e) => {
-                let _ = repo_for_spawn
+                if let Err(e) = repo_for_spawn
                     .mark_execution_failed(exec_id, &e.to_string(), None)
-                    .await;
+                    .await
+                {
+                    tracing::warn!(
+                        target: "talos_audit", execution_id = %exec_id,
+                        error = %e,
+                        "failed to mark execution FAILED; the row keeps its non-terminal status until the stale-execution sweeper finalizes it"
+                    );
+                }
                 Ok((
                     "failed".to_string(),
                     serde_json::json!({"error": e.to_string()}),
+                    true,
                 ))
             }
         }
@@ -6596,16 +6796,27 @@ async fn handle_test_workflow(
 
     let duration_ms = start_time.elapsed().as_millis() as u64;
 
-    let (actual_status, output_json) = match wait_result {
-        Ok(Ok(Ok((status, output)))) => (status, output),
-        Ok(Ok(Err(e))) => ("failed".to_string(), serde_json::json!({"error": e})),
+    let (actual_status, output_json, status_persisted) = match wait_result {
+        Ok(Ok(Ok((status, output, persisted)))) => (status, output, persisted),
+        Ok(Ok(Err(e))) => ("failed".to_string(), serde_json::json!({"error": e}), true),
         Ok(Err(join_err)) => {
             // Task panicked or was cancelled out-of-band.
             let msg = format!("Engine task terminated unexpectedly: {}", join_err);
-            let _ = repo_for_test
+            if let Err(e) = repo_for_test
                 .mark_execution_failed(exec_id, &msg, None)
-                .await;
-            ("failed".to_string(), serde_json::json!({"error": msg}))
+                .await
+            {
+                tracing::warn!(
+                    target: "talos_audit", execution_id = %exec_id,
+                    error = %e,
+                    "failed to mark execution FAILED; the row keeps its non-terminal status until the stale-execution sweeper finalizes it"
+                );
+            }
+            (
+                "failed".to_string(),
+                serde_json::json!({"error": msg}),
+                true,
+            )
         }
         Err(_) => {
             // Sync-wait window elapsed; workflow is still running and
@@ -6645,13 +6856,18 @@ async fn handle_test_workflow(
     // full `output_json`). 'full' is byte-identical.
     let shaped_output =
         crate::utils::shape_response_output(&output_json, &terminal_nodes, &output_mode);
-    let test_result = serde_json::json!({
+    let mut test_result = serde_json::json!({
         "passed": all_passed,
         "execution_id": exec_id.to_string(),
         "assertions": assertions,
         "duration_ms": duration_ms,
         "output": shaped_output,
     });
+    // Additive keys only — `passed`/`assertions` still describe the RUN, which
+    // really did reach `actual_status`; what could not be recorded is the row.
+    // Same pure helper as call_workflow so the two sync-wait handlers cannot
+    // drift, and so one unit test covers both.
+    annotate_unpersisted_status(&mut test_result, status_persisted);
 
     Some(mcp_text(
         req_id.clone(),
@@ -7462,13 +7678,25 @@ fn spawn_llm_auto_fill_task(
                     "auto_fill_config: skipping write — existing graph_json violates caps"
                 );
             } else {
-                let _ = repo_fill
+                // Pre-fix the write was `let _ = ... .await` followed by an
+                // UNCONDITIONAL debug!("patched graph") — a log that asserted
+                // success on a failed write. No API response is involved here,
+                // so the fix is to make the log honest, not to change a caller.
+                match repo_fill
                     .update_workflow_graph(workflow_id, user_id, &updated_json)
-                    .await;
-                tracing::debug!(
-                    "auto_fill_config: patched graph for workflow {}",
-                    workflow_id
-                );
+                    .await
+                {
+                    Ok(_) => tracing::debug!(
+                        "auto_fill_config: patched graph for workflow {}",
+                        workflow_id
+                    ),
+                    Err(e) => tracing::warn!(
+                        workflow_id = %workflow_id,
+                        user_id = %user_id,
+                        error = %e,
+                        "auto_fill_config: graph patch write FAILED — config defaults not applied"
+                    ),
+                }
             }
         }
     });
@@ -11111,7 +11339,7 @@ mod tests {
         let exec = uuid::Uuid::nil();
         let out = serde_json::json!({"result": 42});
         for status in ["completed", "waiting"] {
-            let body = call_workflow_terminal_body(exec, status, &out);
+            let body = call_workflow_terminal_body(exec, status, &out, true);
             assert_eq!(
                 body["execution_id"],
                 serde_json::json!("00000000-0000-0000-0000-000000000000")
@@ -11122,7 +11350,63 @@ mod tests {
                 body.get("hint").is_none(),
                 "terminal body must not carry a `hint` — that key signals the still-running path"
             );
+            assert!(
+                body.get("status_persisted").is_none() && body.get("warning").is_none(),
+                "the success path must stay byte-identical to the pre-fix contract"
+            );
         }
+    }
+
+    /// `test_workflow` builds its body inline rather than through
+    /// `call_workflow_terminal_body`, so BOTH sync-wait handlers route through
+    /// the same pure annotator and it is locked here — otherwise the
+    /// honest-response contract drifts between them, which is the shape that
+    /// produced the divergence being fixed.
+    #[test]
+    fn annotate_unpersisted_status_is_a_noop_when_persisted() {
+        let mut body = serde_json::json!({"passed": true, "duration_ms": 12});
+        let before = body.clone();
+        super::annotate_unpersisted_status(&mut body, true);
+        assert_eq!(body, before, "the success path must not gain keys");
+    }
+
+    #[test]
+    fn annotate_unpersisted_status_flags_a_test_workflow_body() {
+        let mut body = serde_json::json!({"passed": true, "duration_ms": 12});
+        super::annotate_unpersisted_status(&mut body, false);
+        assert_eq!(body["status_persisted"], serde_json::json!(false));
+        assert!(body["warning"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("get_execution_status"));
+        // The run-level facts are untouched: the assertions really did run.
+        assert_eq!(body["passed"], serde_json::json!(true));
+    }
+
+    /// The point of the fix: when the terminal-status WRITE fails, the
+    /// caller must be TOLD — not merely have a log line emitted somewhere.
+    /// Pre-fix the write was `let _ = ...await` and this body was
+    /// indistinguishable from a clean completion, so a caller reading
+    /// `status: "completed"` and then polling `get_execution_status` saw
+    /// `running` with nothing to explain the disagreement.
+    #[test]
+    fn call_workflow_terminal_body_flags_unpersisted_status() {
+        let exec = uuid::Uuid::nil();
+        let out = serde_json::json!({"result": 42});
+        let body = call_workflow_terminal_body(exec, "completed", &out, false);
+        assert_eq!(
+            body["status_persisted"],
+            serde_json::json!(false),
+            "an unpersisted terminal status must be flagged in the RESPONSE"
+        );
+        let warning = body["warning"].as_str().unwrap_or_default();
+        assert!(
+            warning.contains("get_execution_status"),
+            "the warning must name the surface that will disagree, got: {warning:?}"
+        );
+        // The run really did finish, so the run-level facts are unchanged.
+        assert_eq!(body["status"], serde_json::json!("completed"));
+        assert_eq!(body["output"], out);
     }
 
     /// The sync-wait-elapsed response is the anti-orphan contract: callers

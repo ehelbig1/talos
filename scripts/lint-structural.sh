@@ -660,7 +660,7 @@ fi
 echo
 
 # ── 10. let _ = sqlx::query(...).execute(...) silent-swallow drift ────
-bold "▶ check 10: let _ = sqlx::query(...).await silent-swallow outside tests"
+bold "▶ check 10: discarded Result on an awaited call (raw sqlx everywhere; any callee in mcp-handlers)"
 
 # 2026-05-13/14: MCP-733 through MCP-804 closed 50+ sites of the
 # fire-and-forget swallow class — `let _ = sqlx::query(...).execute(&pool).await`
@@ -712,6 +712,103 @@ if [ "$SQLX_SWALLOW_VIOLATIONS" -gt 0 ]; then
     EXIT_CODE=1
 else
     green "✓ no let _ = sqlx::query(...) silent-swallow in production code"
+fi
+
+# Leg (b), 2026-08-19 (#660): the raw-SQL leg above covers 2 of the 109
+# non-test `let _ = <expr>.await` sites in the workspace. #658 found the
+# gap the hard way — `handle_add_node_to_workflow` swallowed a REPOSITORY
+# call, so a failed graph save still answered "Node added", and leg (a)
+# structurally cannot see a repository method.
+#
+# The obvious widening — grepping the `let _ =` LINE for `.await` — was
+# built and MEASURED, and it does not work: the house style for the calls
+# that matter is a broken method chain, so 80 of the 109 sites span
+# multiple lines. That widening sees 3 of the 42 problem sites (7.1%,
+# below the <8% recall bar that already rejected an earlier lint), 0 of
+# the 7 sites that report success on a failed write, and — reinstated by
+# line index into the fixed tree — it does NOT fire on #658's own defect.
+#
+# So this leg is STATEMENT-aware (gather forward to the terminating `;`
+# at depth 0) and SCOPED to `talos-mcp-handlers/src/`, where 40 of 41
+# sites were (a)/(b): a handler is by definition about to answer a
+# caller, so a Result it drops is one nobody will ever see. Same scoping
+# principle as check 6 (raw sqlx here) and check 50 (raw sqlx in
+# talos-api/src/schema). Ships at ZERO — every site was either converted
+# to `if let Err(e) = … { warn!(…) }` or given the marker — so this is a
+# hard rule from day one, not a ratchet.
+#
+# STATED LIMITS, each the safe (loud) direction:
+#   * brace/paren counting is TEXTUAL, so a `{` or `(` inside a string
+#     literal can end the statement early or late — early means `.await`
+#     is not seen (a miss), late means a neighbouring `.await` is (a
+#     false positive). Cross-validated against an independent Python
+#     implementation (`scripts/lint-swallow-inventory.py`): both return
+#     exactly the same 30 sites on the pre-fix tree, no disagreement.
+#   * the `#[cfg(test)] mod` strip ends a region at the first column-0
+#     `}`, so a raw string containing one leaves test code in the
+#     haystack — a false POSITIVE, never a silent miss.
+#   * it says nothing about `.ok()`, `unwrap_or_default()` on a write, or
+#     `let _ =` on a non-awaited Result. Those are adjacent shapes this
+#     check does not claim.
+SWALLOW_AWAIT_VIOLATIONS=0
+while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    printf '  %s\n' "$line"
+    SWALLOW_AWAIT_VIOLATIONS=$((SWALLOW_AWAIT_VIOLATIONS + 1))
+done < <(
+    find talos-mcp-handlers/src -name '*.rs' \
+        ! -name '*_tests.rs' ! -name 'tests.rs' ! -name 'test_support.rs' \
+        -print0 2>/dev/null \
+    | xargs -0 perl -0777 -n -e '
+        my @L = split /\n/, $_;
+        my $n = scalar @L;
+        # Strip #[cfg(test)] mod regions detected at column 0 (same conservative rule as
+        # check 58: a mis-detected end leaves test code in the haystack — a false
+        # POSITIVE here, which is loud, never a silent miss).
+        my @skip = (0) x ($n + 1);
+        for (my $i = 0; $i < $n; $i++) {
+            next unless $L[$i] =~ /^#\[cfg\(test\)\]/;
+            my $j = $i + 1;
+            $j++ while ($j < $n && $j < $i + 4 && $L[$j] !~ /^(pub\s+)?mod\s/);
+            next unless ($j < $n && $L[$j] =~ /^(pub\s+)?mod\s/);
+            my $k = $j + 1;
+            $k++ while ($k < $n && $L[$k] !~ /^\}/);
+            $skip[$_] = 1 for ($i .. ($k < $n ? $k : $n - 1));
+        }
+        for (my $i = 0; $i < $n; $i++) {
+            next if $skip[$i];
+            my $l = $L[$i];
+            next if $l =~ m{^\s*(//|\*)};
+            next unless $l =~ /(?:^|[^\w.])let\s+_\s*=/;
+            my ($depth, $stmt, $j) = (0, "", $i);
+            for (; $j < $n && $j < $i + 40; $j++) {
+                my $s = $L[$j];
+                $s =~ s{//.*$}{};
+                $depth += ($s =~ tr/([{//);
+                $depth -= ($s =~ tr/)]}//);
+                $stmt .= $L[$j] . "\n";
+                last if ($s =~ /;\s*$/ && $depth <= 0);
+            }
+            next unless $stmt =~ /\.await/;
+            my $ok = 0;
+            my $lo = $i - 8; $lo = 0 if $lo < 0;
+            for my $k ($lo .. $i) { $ok = 1 if $L[$k] =~ /allow-swallowed-result/; }
+            next if $ok;
+            printf("%s:%d:%s\n", $ARGV, $i + 1, $l);
+        }
+' 2>/dev/null || true
+)
+
+if [ "$SWALLOW_AWAIT_VIOLATIONS" -gt 0 ]; then
+    red "✗ found $SWALLOW_AWAIT_VIOLATIONS discarded Results on awaited calls in talos-mcp-handlers/src"
+    yellow "  → a handler is about to answer a caller: either propagate the error"
+    yellow "    into the RESPONSE, or \`if let Err(e) = ...\` + WARN and say in the"
+    yellow "    response what did not happen. A log alone is not a fix when the"
+    yellow "    caller is being told the operation succeeded."
+    yellow "  → or add // allow-swallowed-result: <reason> within 8 lines above"
+    EXIT_CODE=1
+else
+    green "✓ no discarded Result on an awaited call in talos-mcp-handlers/src"
 fi
 echo
 

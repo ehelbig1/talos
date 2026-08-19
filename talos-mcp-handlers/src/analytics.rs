@@ -141,9 +141,16 @@ pub(crate) async fn auto_suggest_capabilities(
         return;
     }
 
-    let _ = repo
+    if let Err(e) = repo
         .set_capabilities_if_empty(workflow_id, user_id, &suggestions)
-        .await;
+        .await
+    {
+        tracing::warn!(
+            %workflow_id,
+            error = %e,
+            "auto_suggest_capabilities: capability write failed; the workflow stays untagged for capability search"
+        );
+    }
 }
 
 pub fn tool_schemas() -> Vec<serde_json::Value> {
