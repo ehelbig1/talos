@@ -46,7 +46,11 @@ talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-http-utils = { path = "../talos-http-utils" }
-talos-text-util = { path = "../talos-text-util" }
+# `redact_span_text` — the single redact-then-bound-then-failsafe helper for
+# every string this crate writes to a span attribute. Replaced a local
+# truncate-then-redact block (see the `talos.payload` site in src/lib.rs), which
+# is why `talos-text-util` is no longer needed here.
+talos-trace = { path = "../talos-trace" }
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 tracing.workspace = true
 uuid.workspace = true

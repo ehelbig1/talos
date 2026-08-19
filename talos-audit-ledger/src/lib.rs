@@ -1223,10 +1223,15 @@ async fn process_batch(
                 // for consistency with the sibling `talos.payload` attribute
                 // below: defense-in-depth so a secret-shaped value that ever
                 // lands in the actor field (e.g. a misformatted "agent:sk-...")
-                // doesn't egress to the collector in the clear.
+                // doesn't egress to the collector in the clear. That stated
+                // consistency is why this one moved to `redact_span_text` at
+                // the same time as its sibling — leaving it on the bare,
+                // failsafe-less `redact_str` would have made the comment false
+                // the moment the sibling changed.
                 span.set_attribute(KeyValue::new(
                     "talos.actor",
-                    talos_dlp_provider::redact_str(event["actor"].as_str().unwrap_or("unknown")),
+                    talos_trace::redact_span_text(event["actor"].as_str().unwrap_or("unknown"))
+                        .into_owned(),
                 ));
                 span.set_attribute(KeyValue::new(
                     "talos.action",
@@ -1241,39 +1246,38 @@ async fn process_batch(
                         prev.to_string(),
                     ));
                 }
-                // MCP-1207 (2026-05-17): truncate-then-redact for the
-                // OTLP span attribute. Pre-fix `redact_str` walked the
-                // full `event["payload"]` (up to ~1 MB — NATS message
-                // size cap) and the unbounded result was bound to the
-                // span attribute. Two costs: (a) regex pass cost on
-                // multi-KB payload runs on every audit event with a
-                // configured tracer; (b) OTLP exporters truncate
-                // attribute strings inconsistently (the default
-                // opentelemetry-sdk per-attribute cap is 32 KiB but
-                // varies by exporter), so an over-cap payload silently
-                // gets clipped downstream — better to clip it
-                // deterministically up front. Cap at 4 KiB: bounds the
-                // regex pass cost AND fits comfortably inside every
-                // known OTLP exporter's per-attribute limit, while
-                // preserving enough payload context for human triage
-                // through the trace UI. Same truncate-first-before-
-                // redact discipline as MCP-1160/1161/1165/1167 on the
-                // DB persistence sites; here it's the telemetry
-                // boundary.
-                const MAX_OTLP_PAYLOAD_PREVIEW_BYTES: usize = 4096;
+                // ORDERING FIX (supersedes MCP-1207's truncate-then-redact).
+                //
+                // MCP-1207 clipped `event["payload"]` to 4 KiB and redacted the
+                // clip, to bound the regex pass over what can be a ~1 MB NATS
+                // message. That ordering leaks: the AWS pattern is
+                // `\bA[KS]IA[0-9A-Z]{16}\b`, so a key straddling byte 4096 is
+                // cut, stops matching entirely, and its surviving prefix is
+                // exported unredacted. `redact_str` also has no failsafe — a
+                // panic inside the redactor propagates instead of yielding
+                // `REDACTION_UNAVAILABLE`.
+                //
+                // `talos_trace::redact_span_text` is the single span-text sink
+                // helper introduced by #650: redact FIRST, bound SECOND, panic
+                // ⇒ placeholder. Delegating removes the ordering decision from
+                // this site rather than re-deciding it correctly here — there
+                // is no second redactor to drift.
+                //
+                // Two consequences, stated rather than buried. (1) The preview
+                // bound becomes `MAX_SPAN_TEXT_CHARS` (2000 Unicode scalars,
+                // the platform-wide span-text bound) instead of 4096 bytes;
+                // still far inside every known OTLP per-attribute limit, which
+                // was MCP-1207's other stated reason for clipping. (2) The
+                // redaction pass now covers the whole payload, which is what
+                // MCP-1207 was avoiding. That is a single linear
+                // finite-automaton pass (the `regex` crate does not backtrack),
+                // paid only on an audit append with a tracer configured — i.e.
+                // never on a deployment with trace export off. Correctness over
+                // the micro-optimisation.
                 let payload_str = event["payload"].as_str().unwrap_or("");
-                let truncated_preview: &str = if payload_str.len() > MAX_OTLP_PAYLOAD_PREVIEW_BYTES
-                {
-                    talos_text_util::truncate_at_char_boundary(
-                        payload_str,
-                        MAX_OTLP_PAYLOAD_PREVIEW_BYTES,
-                    )
-                } else {
-                    payload_str
-                };
                 span.set_attribute(KeyValue::new(
                     "talos.payload",
-                    talos_dlp_provider::redact_str(truncated_preview),
+                    talos_trace::redact_span_text(payload_str).into_owned(),
                 ));
                 span.set_status(Status::Ok);
                 span.end();

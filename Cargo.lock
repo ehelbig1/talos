@@ -7686,7 +7686,7 @@ dependencies = [
  "talos-http-utils",
  "talos-metrics",
  "talos-secrets-manager",
- "talos-text-util",
+ "talos-trace",
  "talos-workflow-job-protocol",
  "tokio",
  "tonic",

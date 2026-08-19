@@ -309,6 +309,94 @@ pub fn sdk_tracer(scope: &'static str) -> Option<opentelemetry_sdk::trace::Trace
     TRACER_PROVIDER.get().map(|provider| provider.tracer(scope))
 }
 
+/// The predicate that decides whether a `tracing` callsite is handed to the
+/// OTel bridge layer: **spans yes, events no**.
+///
+/// Exposed (rather than inlined into [`otel_bridge_layer_with_tracer`]) so a
+/// test can assert the predicate itself, and so a reader grepping for the rule
+/// finds one definition.
+#[must_use]
+pub fn export_to_otel(metadata: &tracing::Metadata<'_>) -> bool {
+    !metadata.is_event()
+}
+
+/// Build the `tracing`→OTLP bridge layer that both binaries install.
+///
+/// # Why this is a function and not two inline `tracing_opentelemetry::layer()`
+/// calls
+///
+/// `tracing_opentelemetry` promotes every `tracing` EVENT emitted inside a span
+/// into an exported OTel span event **whose name is the formatted message** and
+/// whose fields become attributes. Neither is routed through
+/// [`redact_span_text`] — that runs inside [`ExecutionSpan`]/`JobSpan` methods,
+/// which the bridge does not use. So with a tracer configured, the OTLP event
+/// stream is exactly the subset of the process's stdout log stream that was
+/// emitted inside a span, verbatim.
+///
+/// In this workspace that stream carries untrusted text. The loudest source is
+/// guest WASM log lines — `tracing::{warn,error}!("[WASM] {msg}")` in
+/// `talos_worker_runtime::host::logging`, deliberately un-redacted on the
+/// stated grounds that stdout is an operator surface — but it is one of roughly
+/// 418 event callsites in that crate alone, many of which interpolate upstream
+/// error text (`error = %e`) that has historically echoed a rejected `Bearer`
+/// token. Redacting the guest-log line alone would fix the loudest site and
+/// leave the class open while looking closed.
+///
+/// This layer therefore **drops promoted events entirely** and exports spans
+/// only. What survives is exactly the deliberately-authored trace surface:
+/// span names, span attributes, span status, and span events added through
+/// `OpenTelemetrySpanExt` (`JobSpan::add_event`, [`ExecutionSpan::add_event`]),
+/// **all** of which already pass through [`redact_span_text`]. Those writes go
+/// straight onto the span's otel data and are NOT `tracing` events, so this
+/// filter does not touch them — pinned by
+/// `otel_bridge_layer_keeps_span_writes_and_drops_promoted_events`.
+///
+/// # What is given up
+///
+/// Arbitrary worker log lines do not appear inline on a trace timeline. They
+/// remain in stdout in full; guest logs additionally remain in
+/// `module_execution_logs`, DLP-redacted at the persistence boundary and
+/// already stamped with `trace_id`/`span_id`, so trace↔log correlation
+/// survives. This declines to add an inline-log view rather than removing one:
+/// no deployment exports traces today.
+///
+/// # Cost
+///
+/// One [`tracing::Metadata::is_event`] check per callsite on this layer only,
+/// and only when a tracer exists. No allocation, no regex.
+/// `Layer::with_filter` (rather than the crate's own
+/// `with_counting_event_filter`) is the upstream-sanctioned way to drop events
+/// — its docs say so explicitly; the counting variant exists only to also
+/// record how many were dropped, which we do not need.
+/// `tracing_subscriber`'s `Filtered` forwards `downcast_raw` to the wrapped
+/// layer, so `OpenTelemetrySpanExt` (`set_parent` / `set_attribute` /
+/// `add_event` / `set_status`) keeps working through it. That forwarding is
+/// load-bearing — if it did not hold, every span sink would silently no-op —
+/// so it is asserted, not assumed.
+pub fn otel_bridge_layer_with_tracer<S>(
+    tracer: opentelemetry_sdk::trace::Tracer,
+) -> impl tracing_subscriber::Layer<S>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    use tracing_subscriber::Layer as _;
+    tracing_opentelemetry::layer()
+        .with_tracer(tracer)
+        .with_filter(tracing_subscriber::filter::filter_fn(export_to_otel))
+}
+
+/// [`otel_bridge_layer_with_tracer`] wired to the globally-installed provider.
+///
+/// `None` when [`init_tracing`] installed no provider (no OTLP endpoint
+/// configured), which is the "tracing disabled" case.
+#[must_use]
+pub fn otel_bridge_layer<S>(scope: &'static str) -> Option<impl tracing_subscriber::Layer<S>>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    sdk_tracer(scope).map(otel_bridge_layer_with_tracer)
+}
+
 /// Shutdown tracing gracefully
 /// Call this before application exit to flush remaining traces
 pub fn shutdown_tracing() {

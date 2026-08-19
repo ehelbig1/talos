@@ -854,8 +854,14 @@ fn init_tracing_and_logging() {
     {
         use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
         let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-        let otel_layer = crate::trace::sdk_tracer("talos-controller")
-            .map(|tracer| tracing_opentelemetry::layer().with_tracer(tracer));
+        // SECURITY CHOKEPOINT — same shared constructor the worker uses; see
+        // `talos_trace::otel_bridge_layer_with_tracer`. This binary is NOT
+        // exempt: `talos-worker-runtime` is compiled into the controller for
+        // in-process `run_sandbox`/`test_module`, so guest WASM log lines reach
+        // this layer too — and this filter defaults to `info` (all targets)
+        // rather than the worker's `worker=info,warn`, so it would promote
+        // guest INFO lines as well.
+        let otel_layer = crate::trace::otel_bridge_layer("talos-controller");
         tracing_subscriber::registry()
             .with(filter)
             .with(fmt::layer())

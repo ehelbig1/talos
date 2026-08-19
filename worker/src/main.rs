@@ -1945,8 +1945,17 @@ async fn main() -> anyhow::Result<()> {
         use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
         let filter = EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new("worker=info,warn"));
-        let otel_layer = worker::tracing::sdk_tracer("talos-worker")
-            .map(|tracer| tracing_opentelemetry::layer().with_tracer(tracer));
+        // SECURITY CHOKEPOINT — `otel_bridge_layer` is the ONE constructor for
+        // this layer in the workspace; the controller builds its own from the
+        // same function. Built inline, `tracing_opentelemetry::layer()`
+        // promotes every in-span `tracing` EVENT into an exported span event
+        // named with the formatted message — which in this binary includes
+        // un-redacted guest WASM log lines (`[WASM] {msg}`) plus ~418 other
+        // event callsites that interpolate upstream error text. The shared
+        // constructor filters promoted events out; deliberate span writes
+        // (`JobSpan`, `ExecutionSpan`) are unaffected and stay redacted. See
+        // `talos_trace::otel_bridge_layer_with_tracer`.
+        let otel_layer = worker::tracing::otel_bridge_layer("talos-worker");
         tracing_subscriber::registry()
             .with(filter)
             .with(fmt::layer().with_target(true).with_thread_ids(false))
