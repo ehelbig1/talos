@@ -5862,6 +5862,148 @@ else
 fi
 echo
 
+# ── 70. tenant-scoped natural keys: a write keyed on the non-tenant half
+#        of a composite UNIQUE (tenant_col, X) must also constrain tenant_col ─
+# #656: `restore_pinned_modules` read under `begin_user_scoped` + `pm.user_id
+# = $1`, then wrote `UPDATE modules … SET wasm_bytes = $1 WHERE name = $2`
+# with NO owner predicate. The severity turned entirely on a SCHEMA fact —
+# `modules.name` is unique only PER USER (`modules_user_name_uniq (user_id,
+# name) WHERE user_id IS NOT NULL`) — so "3 of YOUR pins restored" wrote
+# 3 × every tenant holding those names. A `WHERE <natural key> = $N` looks
+# perfectly ordinary; only the index definition says it addresses more than
+# one tenant's row. This check reads that index definition FOR you.
+#
+# The table→(tenant_col, natural_col) map is DERIVED from migrations/, never
+# hardcoded (hardcoded lists rot — #624): CREATE UNIQUE INDEX, inline
+# UNIQUE(...) and composite PRIMARY KEY(...) in CREATE TABLE, ADD CONSTRAINT
+# … UNIQUE, with ALTER TABLE … RENAME TO / RENAME COLUMN applied.
+#
+# STATED LIMITS, each confirmed by running the check rather than inferred:
+#  (a) TEXTUAL. The statement window is the enclosing string literal,
+#      truncated heuristically; SQL assembled with format!() is invisible.
+#  (b) An alias-qualified column IS handled (`WHERE m.name = $2` fires) but
+#      only for a single-segment alias.
+#  (c) It proves a tenant column is CONSTRAINED, never that it is constrained
+#      to the RIGHT tenant — `WHERE name = $1 AND user_id = $2` passes
+#      whatever $2 is. Cross-org injection is checks 25/42's business.
+#  (d) Test files are excluded: `talos-advanced-repository/tests/scratch_rls.rs`
+#      and `talos-db/tests/rls_org_isolation.rs` deliberately issue unscoped
+#      deletes to PROVE RLS blocks them; firing there would be backwards.
+#  (e) A partial-index conflict arbiter (`ON CONFLICT (name) WHERE user_id IS
+#      NULL`) counts as constrained — that is the catalog idiom in
+#      talos-registry and it is correct.
+# Opt-out: `// allow-untenanted-natural-key: <reason>` on or within 8 lines
+# above the write.
+bold "▶ check 70: writes keyed on a per-tenant-unique natural key must constrain the tenant column"
+
+NATKEY_VIOLATIONS=0
+NATKEY_MAP="$(perl -0777 -e '
+my %uniq; my %tbl_rename; my %col_rename;
+my @files = glob("migrations/*.sql");
+for my $f (@files) {
+    open(my $fh, "<", $f) or next; local $/; my $s = <$fh>; close $fh;
+    $s =~ s/--[^\n]*//g; $s = lc $s;
+    while ($s =~ /alter\s+table\s+(?:if\s+exists\s+)?([a-z0-9_]+)\s+rename\s+to\s+([a-z0-9_]+)/g) { $tbl_rename{$1} = $2; }
+    while ($s =~ /alter\s+table\s+(?:if\s+exists\s+)?([a-z0-9_]+)[^;]{0,200}?rename\s+column\s+([a-z0-9_]+)\s+to\s+([a-z0-9_]+)/g) { $col_rename{"$1.$2"} = $3; }
+    while ($s =~ /create\s+unique\s+index\s+(?:concurrently\s+)?(?:if\s+not\s+exists\s+)?[a-z0-9_]+\s+on\s+([a-z0-9_.]+)\s*(?:using\s+\w+\s*)?\(([^)]*)\)/g) {
+        my ($t,$c)=($1,$2); $t =~ s/.*\.//; push @{$uniq{$t}}, [map { my $x=$_; $x =~ s/^\s+|\s+$//g; $x =~ s/\s.*//; $x } split(/,/,$c)];
+    }
+    while ($s =~ /alter\s+table\s+(?:if\s+exists\s+)?([a-z0-9_.]+)[^;]{0,300}?add\s+constraint\s+[a-z0-9_]+\s+unique\s*\(([^)]*)\)/gs) {
+        my ($t,$c)=($1,$2); $t =~ s/.*\.//; push @{$uniq{$t}}, [map { my $x=$_; $x =~ s/^\s+|\s+$//g; $x } split(/,/,$c)];
+    }
+    while ($s =~ /create\s+table\s+(?:if\s+not\s+exists\s+)?([a-z0-9_.]+)\s*\(/g) {
+        my $t = $1; $t =~ s/.*\.//; my $start = pos($s) - 1; my $d = 0; my $end = -1;
+        for (my $i=$start; $i < length($s); $i++) {
+            my $ch = substr($s,$i,1);
+            if ($ch eq "(") { $d++ } elsif ($ch eq ")") { $d--; if ($d==0) { $end=$i; last } }
+        }
+        next if $end < 0;
+        my $body = substr($s, $start+1, $end-$start-1);
+        while ($body =~ /\b(?:unique|primary\s+key)\s*\(([^)]*)\)/g) {
+            my @c = map { my $x=$_; $x =~ s/^\s+|\s+$//g; $x } split(/,/,$1);
+            push @{$uniq{$t}}, \@c if @c > 1;
+        }
+    }
+}
+my %TEN = map { $_ => 1 } qw(user_id org_id actor_id created_by owner_user_id owner_id tenant_id);
+my %seen;
+for my $t (sort keys %uniq) {
+    my $tn = $tbl_rename{$t} // $t;
+    for my $combo (@{$uniq{$t}}) {
+        my @cols = map { $col_rename{"$t.$_"} // $col_rename{"$tn.$_"} // $_ } @$combo;
+        next if @cols < 2;
+        my @ten = grep { $TEN{$_} } @cols;
+        my @nat = grep { !$TEN{$_} } @cols;
+        next unless @ten && @nat;
+        my $k = "$tn|" . join(",",@ten) . "|" . join(",",@nat);
+        next if $seen{$k}++;
+        print "$k\n";
+    }
+}
+')"
+
+natkey_tables="$(echo "$NATKEY_MAP" | cut -d'|' -f1 | sort -u)"
+for tbl in $natkey_tables; do
+    [ -n "$tbl" ] || continue
+    files=$(grep -rlE "(UPDATE[[:space:]]+${tbl}\b|DELETE[[:space:]]+FROM[[:space:]]+${tbl}\b|INTO[[:space:]]+${tbl}\b)" \
+        --include='*.rs' talos-* controller worker 2>/dev/null \
+        | grep -vE '/tests/|_tests\.rs|/test_support\.rs' || true)
+    for file in $files; do
+        [ -f "$file" ] || continue
+        while IFS='|' read -r maptbl tencols natcols; do
+            [ "$maptbl" = "$tbl" ] || continue
+            OFFENDERS=$(TBL="$tbl" TEN="$tencols" NAT="$natcols" perl -0777 -ne '
+                my $tbl = $ENV{TBL};
+                $_ =~ s{//[^\n]*}{}g;   # a doc comment quoting SQL is prose, not a statement
+                my @ten = split(/,/, $ENV{TEN});
+                my @nat = split(/,/, $ENV{NAT});
+                sub constrained {
+                    my ($scope, $col) = @_;
+                    return $scope =~ /(?:^|[^a-zA-Z0-9_.])(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?\Q$col\E\s*(?:=|<>|!=|\bIN\b|\bLIKE\b|\bILIKE\b|\bIS\s+(?:NOT\s+)?NULL\b)/i;
+                }
+                while (/((?:UPDATE\s+|DELETE\s+FROM\s+|INTO\s+)\Q$tbl\E\b)/gi) {
+                    my $at = $-[0];
+                    my $win = substr($_, $at, 1400);
+                    if ($win =~ /("\#|",|"\)|"\s*\n)/) { $win = substr($win, 0, $-[0]); }
+                    my $scope = "";
+                    if ($win =~ /\bWHERE\b/i) { $scope = substr($win, $-[0]); }
+                    my $conflict = "";
+                    if ($win =~ /ON\s+CONFLICT\s*\(([^)]*)\)([^(]{0,80}?)DO\s/is) { $conflict = "$1 $2"; }
+                    for my $region ($scope, $conflict) {
+                        next unless length $region;
+                        my $hits_nat = 0; my $hits_ten = 0;
+                        for my $c (@nat) { $hits_nat = 1 if constrained($region, $c); }
+                        for my $c (@ten) { $hits_ten = 1 if constrained($region, $c); }
+                        if ($hits_nat && !$hits_ten) {
+                            my $ln = 1 + (substr($_, 0, $at) =~ tr/\n//);
+                            print "$ln\n"; last;
+                        }
+                    }
+                }
+            ' "$file" || true)
+            for lineno in $OFFENDERS; do
+                start=$((lineno > 8 ? lineno - 8 : 1))
+                if sed -n "${start},$((lineno + 2))p" "$file" | grep -q '// allow-untenanted-natural-key:'; then
+                    continue
+                fi
+                red "✗ ${file}:${lineno}: write on '${tbl}' keyed on '${natcols}' without constraining '${tencols}'"
+                yellow "    UNIQUE (${tencols}, ${natcols}) — this key addresses one row PER TENANT, so the write spans tenants"
+                NATKEY_VIOLATIONS=$((NATKEY_VIOLATIONS + 1))
+            done
+        done <<< "$NATKEY_MAP"
+    done
+done
+
+if [ "$NATKEY_VIOLATIONS" -gt 0 ]; then
+    red "✗ ${NATKEY_VIOLATIONS} write(s) key on a per-tenant-unique natural key with no tenant predicate"
+    yellow "  → add the tenant column to the WHERE (or to the ON CONFLICT arbiter)"
+    yellow "  → or mark '// allow-untenanted-natural-key: <reason>' for a deliberate system-wide write"
+    EXIT_CODE=1
+else
+    green "✓ every write on a per-tenant-unique natural key constrains its tenant column"
+fi
+echo
+
 # ── 54. Lint self-consistency (meta-check) ────────────────────────────
 # The system whose purpose is catching drift drifted from its own docs:
 # by 2026-07-01 the script had 49 checks while CLAUDE.md said 43 and the
