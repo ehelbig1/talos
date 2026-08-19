@@ -627,7 +627,7 @@ pub const JUDGE_PASS_RATE_POPULATION: &str =
 /// `weekly_judge_scores` clamps no narrower), never the caller's raw request.
 #[must_use]
 fn judge_score_row(s: &talos_execution_repository::JudgeScoreStat, days: i32) -> JsonValue {
-    let signal = judge_signal(s.runs, s.avg_score, s.worst_score);
+    let signal = judge_signal(s);
     json!({
         "name": s.workflow_name,
         // 2026-07-29: the row's grain is now (workflow, judge NODE), so
@@ -676,6 +676,32 @@ fn judge_score_row(s: &talos_execution_repository::JudgeScoreStat, days: i32) ->
             })
         }),
         "worst_score": s.worst_score,
+        "best_score": s.best_score(),
+        // 2026-08-19 — the evidence BEHIND `signal`, not a replacement for
+        // any field. `avg_score` and `worst_score` are deliberately still
+        // reported unchanged even when the signal says they carry no
+        // information: silently dropping a number an operator has been
+        // reading is its own misleading-report defect, and a reader who
+        // cannot see why the verdict was reached cannot check it. These four
+        // are the whole basis of `mirrors_pass` / `constant_score` — a
+        // per-verdict-group MIN and MAX. When both groups are non-empty and
+        // each collapses to a single value, the score is a function of
+        // `passed` and nothing more.
+        "scored_passed": s.scored_passed,
+        "scored_failed": s.scored_failed(),
+        "pass_score_range": [s.pass_score_min, s.pass_score_max],
+        "fail_score_range": [s.fail_score_min, s.fail_score_max],
+        // The one-field answer to "should I read `avg_score` as quality?".
+        // False whenever the score is a re-encoding of, or independent of,
+        // the verdict — the two cases where `avg_score` is arithmetic over a
+        // column that never measured anything. `null` (not `true`) while the
+        // sample is too small to tell: an unproven claim of informativeness
+        // is the same defect as an unproven claim of saturation.
+        "score_carries_information": match signal {
+            "mirrors_pass" | "constant_score" | "score_out_of_domain" => Some(false),
+            "discriminating" => Some(true),
+            _ => None,
+        },
         // D5 (2026-07-28): one constant, shared with
         // `talos-engine::assistant_report_reader`, which carried a
         // byte-identical hand-copy. Two copies of a population disclosure is
@@ -706,22 +732,60 @@ fn judge_score_row(s: &talos_execution_repository::JudgeScoreStat, days: i32) ->
 /// `insufficient_runs` can be reported for a judge that fired many times,
 /// which is why [`judge_signal_note`] takes the abstention count and states
 /// it — the number alone would be misread as "this judge barely ran".
-pub fn judge_signal(runs: i64, avg_score: Option<f64>, worst_score: Option<f64>) -> &'static str {
-    if runs < JUDGE_MIN_RUNS_FOR_SIGNAL {
+/// Takes the WHOLE stat, not `(runs, avg, worst)`, and that is the point
+/// (2026-08-19). `avg`/`worst` are a projection of the score distribution,
+/// and the projection destroys exactly what separates a meaningful trend
+/// from `pass_rate` written twice. Passing the struct makes it structurally
+/// impossible for a caller to compute a signal from the narrower view — the
+/// same reason the row's grain moved to `(workflow, node)` in #606.
+pub fn judge_signal(s: &talos_execution_repository::JudgeScoreStat) -> &'static str {
+    if s.runs < JUDGE_MIN_RUNS_FOR_SIGNAL {
         return "insufficient_runs";
     }
     // Absent scores are not zero — report unknown rather than inventing a
     // verdict from a missing aggregate.
-    let (Some(avg_score), Some(worst_score)) = (avg_score, worst_score) else {
+    let (Some(avg_score), Some(worst_score)) = (s.avg_score, s.worst_score) else {
         return "unknown";
     };
     if !avg_score.is_finite() || !worst_score.is_finite() {
         return "unknown";
     }
+    // BEFORE any spread verdict: is the SCALE itself valid? Nothing clamps a
+    // judge score on the way in — `extract_judge_score` reads
+    // `__judge_score__` verbatim and `judge_scores.score` is a bare
+    // `double precision` — so a `matched / count` expression emits > 1.0 the
+    // moment it matches more items than it counted (reproduced against the
+    // LIVE `coverage_judge` with `probe_inline_judge`: 4 classifications for
+    // 3 messages ⇒ score 1.3333). Every verdict below assumes a 0.0–1.0
+    // scale, and `avg_score >= 1.0` would read such a judge as *saturated at
+    // the maximum* when it is off the end of the ruler entirely. Report the
+    // ruler before reporting the reading.
+    if worst_score < 0.0 || s.best_score().is_some_and(|b| b > 1.0) {
+        return "score_out_of_domain";
+    }
     if (avg_score - worst_score).abs() > f64::EPSILON {
+        // Spread exists — but spread is not INFORMATION. A judge whose
+        // expression is `if <cond> {1.0} else {0.2}` produces spread the
+        // moment it fails once, and that spread is entirely `passed`
+        // flipping between two constants: `avg_score` is then an exact
+        // affine transform of the `pass_rate` printed beside it (measured
+        // live to 5 dp on four fleet judges, `avg = 0.2 + 0.8*pass_rate`).
+        // Calling that "discriminating — the trend is meaningful" is a false
+        // claim about a number, i.e. this module committing the defect it
+        // exists to prevent.
+        if s.score_mirrors_passed() {
+            return "mirrors_pass";
+        }
         return "discriminating";
     }
-    // Zero spread across enough runs: the verdict never varied.
+    // Zero spread across enough runs: the score never varied. That is NOT
+    // the same as "never failed". If the judge both passed and failed while
+    // emitting ONE score, the score is independent of the verdict —
+    // reporting `saturated_pass` ("has not been observed to fail anything")
+    // would be flatly contradicted by the `pass_rate` on the same row.
+    if s.scored_passed > 0 && s.scored_failed() > 0 {
+        return "constant_score";
+    }
     if avg_score >= 1.0 - f64::EPSILON {
         "saturated_pass"
     } else if avg_score <= f64::EPSILON {
@@ -777,10 +841,19 @@ pub fn judge_signal_note(
     )
 }
 
-/// The copy-pasteable follow-up for a saturated-pass judge, or `""`.
+/// The copy-pasteable follow-up for a judge whose note asks for action, or `""`.
 ///
-/// Only `saturated_pass` gets it: that is the signal whose base wording asks
-/// the operator to do something, and this is the something.
+/// Three signals get it, and they ask for two different things:
+/// * `saturated_pass` — "prove it CAN fail", answered by a case that should
+///   fail;
+/// * `mirrors_pass` / `constant_score` — the diagnosis is already complete
+///   (we know the score is a function of, or independent of, the verdict), so
+///   the follow-up is to TRY a graded replacement. `probe_inline_judge` takes
+///   a `verdict_expr` override that evaluates a candidate expression without
+///   writing it to the graph, which is exactly that loop.
+///
+/// Every other signal gets `""` — an instruction with no matching question is
+/// noise, and noise in an operator surface is what trains people to skip it.
 ///
 /// The command names BOTH tools because `judge_scores` does not record which
 /// KIND of judge wrote the row — an inline-expression judge and an
@@ -791,14 +864,22 @@ fn judge_probe_pointer(signal: &str, probe: Option<(Uuid, Uuid)>) -> String {
     let Some((workflow_id, node_id)) = probe else {
         return String::new();
     };
-    if signal != "saturated_pass" {
-        return String::new();
+    match signal {
+        "saturated_pass" => format!(
+            " — to verify: run probe_inline_judge(workflow_id=\"{workflow_id}\", \
+             node_id=\"{node_id}\") with a case that SHOULD fail; if that node is a \
+             sub-workflow judge instead, use test_subworkflow_contract(contract=\"judge\")"
+        ),
+        "mirrors_pass" | "constant_score" => format!(
+            " — to fix: run probe_inline_judge(workflow_id=\"{workflow_id}\", \
+             node_id=\"{node_id}\") with a verdict_expr override that GRADES the \
+             result (e.g. matched/total) and confirm `passed` is unchanged on every \
+             case before persisting it — the score is telemetry, `passed` is routing, \
+             and only the score should move; if that node is a sub-workflow judge \
+             instead, use test_subworkflow_contract(contract=\"judge\")"
+        ),
+        _ => String::new(),
     }
-    format!(
-        " — to verify: run probe_inline_judge(workflow_id=\"{workflow_id}\", \
-         node_id=\"{node_id}\") with a case that SHOULD fail; if that node is a \
-         sub-workflow judge instead, use test_subworkflow_contract(contract=\"judge\")"
-    )
 }
 
 /// The signal-only half of [`judge_signal_note`]. Split out so the wording of
@@ -818,8 +899,33 @@ fn judge_signal_note_base(signal: &str) -> &'static str {
             "every run returned the same non-extreme score — the verdict is probably \
              constant-valued and carries no signal"
         }
+        "constant_score" => {
+            "the score was IDENTICAL on every run — including runs this judge \
+             FAILED — so it is independent of the verdict and carries no quality \
+             signal at all; read `pass_rate` on this row, not `avg_score`, and fix \
+             the expression's score arm (`passed` is already discriminating, so \
+             routing is unaffected either way)"
+        }
+        "mirrors_pass" => {
+            "the score took one fixed value on every PASS and another on every \
+             FAIL, so it is a re-encoding of `passed` and `avg_score` is an exact \
+             affine transform of the `pass_rate` beside it — it adds nothing. This \
+             is NOT a broken gate: routing is correct. It means the score column is \
+             not a quality trend; grade it (e.g. covered/total) if you want one"
+        }
+        "score_out_of_domain" => {
+            "at least one recorded score fell outside the documented 0.0–1.0 range, \
+             so every aggregate on this row is off its own scale — `avg_score` can \
+             exceed the maximum and the saturation verdicts below it are meaningless. \
+             Nothing clamps a judge score on the way in, so this is an expression \
+             defect (a ratio whose numerator can exceed its denominator is the usual \
+             cause); fix it before reading any other number here"
+        }
         "insufficient_runs" => "too few runs to interpret the spread yet",
-        "discriminating" => "scores vary across runs — the trend is meaningful",
+        "discriminating" => {
+            "scores vary across runs, and the variation is not merely `passed` \
+             flipping between two constants — the trend is meaningful"
+        }
         _ => "score distribution could not be interpreted",
     }
 }
@@ -1093,13 +1199,64 @@ pub fn correction_loop_note(state: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    /// Build a `JudgeScoreStat` for signal tests.
+    ///
+    /// `pass` and `fail` are `(count, min_score, max_score)` for each verdict
+    /// group, and `runs` is DERIVED from them so a test cannot accidentally
+    /// describe a population that does not add up. `avg`/`worst` stay explicit
+    /// because several tests pin the exact aggregate the pre-2026-08-19
+    /// three-argument signature took.
+    fn stat(
+        avg: Option<f64>,
+        worst: Option<f64>,
+        pass: (i64, Option<f64>, Option<f64>),
+        fail: (i64, Option<f64>, Option<f64>),
+    ) -> talos_execution_repository::JudgeScoreStat {
+        talos_execution_repository::JudgeScoreStat {
+            workflow_id: Uuid::nil(),
+            node_id: Uuid::nil(),
+            workflow_name: "wf".into(),
+            runs: pass.0 + fail.0,
+            na_runs: 0,
+            avg_score: avg,
+            pass_rate: None,
+            worst_score: worst,
+            scored_passed: pass.0,
+            pass_score_min: pass.1,
+            pass_score_max: pass.2,
+            fail_score_min: fail.1,
+            fail_score_max: fail.2,
+        }
+    }
+
+    /// Fixed ids so pointer assertions can match exact text. Deliberately a
+    /// second pair rather than a `use` of the identical helpers in
+    /// `measurement_pr3_tests`: a test module reaching into a sibling test
+    /// module couples two suites that have no reason to move together.
+    fn probe_wf() -> Uuid {
+        Uuid::parse_str("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa").unwrap()
+    }
+    fn probe_node() -> Uuid {
+        Uuid::parse_str("bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb").unwrap()
+    }
+
+    /// Every run passed, all at one score — the pre-existing saturation shape.
+    fn all_pass(runs: i64, score: f64) -> talos_execution_repository::JudgeScoreStat {
+        stat(
+            Some(score),
+            Some(score),
+            (runs, Some(score), Some(score)),
+            (0, None, None),
+        )
+    }
+
     /// The motivating case: `pa-chief-of-staff` scored 1.0 on all 11 runs and
     /// `pa-inbox-organizer` on all 9. Both read as "perfect quality"; both were
     /// judges that had never been observed to fail anything.
     #[test]
     fn judge_pinned_at_max_is_flagged_saturated_not_perfect() {
-        assert_eq!(judge_signal(11, Some(1.0), Some(1.0)), "saturated_pass");
-        assert_eq!(judge_signal(9, Some(1.0), Some(1.0)), "saturated_pass");
+        assert_eq!(judge_signal(&all_pass(11, 1.0)), "saturated_pass");
+        assert_eq!(judge_signal(&all_pass(9, 1.0)), "saturated_pass");
         assert!(judge_signal_note("saturated_pass", 11, 0, None).contains("FAILURE direction"));
     }
 
@@ -1110,7 +1267,7 @@ mod tests {
     #[test]
     fn heavily_abstaining_judge_states_its_abstentions() {
         // 3 scored runs, 9 abstentions: 12 invocations, not 3.
-        assert_eq!(judge_signal(3, Some(1.0), Some(1.0)), "insufficient_runs");
+        assert_eq!(judge_signal(&all_pass(3, 1.0)), "insufficient_runs");
         let note = judge_signal_note("insufficient_runs", 3, 9, None);
         assert!(note.contains("3 scored runs"), "{note}");
         assert!(note.contains("9 abstained"), "{note}");
@@ -1127,6 +1284,9 @@ mod tests {
             "saturated_pass",
             "saturated_fail",
             "saturated_constant",
+            "constant_score",
+            "mirrors_pass",
+            "score_out_of_domain",
             "insufficient_runs",
             "discriminating",
             "bogus",
@@ -1144,7 +1304,7 @@ mod tests {
     /// how often it abstained; `runs` is already the scored population.
     #[test]
     fn abstentions_do_not_change_the_signal() {
-        assert_eq!(judge_signal(9, Some(1.0), Some(1.0)), "saturated_pass");
+        assert_eq!(judge_signal(&all_pass(9, 1.0)), "saturated_pass");
         let note = judge_signal_note("saturated_pass", 9, 40, None);
         assert!(note.contains("FAILURE direction"), "{note}");
         assert!(note.contains("40 abstained"), "{note}");
@@ -1166,7 +1326,12 @@ mod tests {
     #[test]
     fn varying_judge_is_discriminating() {
         assert_eq!(
-            judge_signal(9, Some(0.5555555555555557), Some(0.2)),
+            judge_signal(&stat(
+                Some(0.5555555555555557),
+                Some(0.2),
+                (9, Some(0.2), Some(1.0)),
+                (0, None, None)
+            )),
             "discriminating"
         );
     }
@@ -1175,26 +1340,221 @@ mod tests {
     /// that a judge cannot fail.
     #[test]
     fn small_sample_is_not_saturation() {
-        assert_eq!(judge_signal(1, Some(1.0), Some(1.0)), "insufficient_runs");
-        assert_eq!(judge_signal(4, Some(1.0), Some(1.0)), "insufficient_runs");
-        assert_eq!(judge_signal(5, Some(1.0), Some(1.0)), "saturated_pass");
+        assert_eq!(judge_signal(&all_pass(1, 1.0)), "insufficient_runs");
+        assert_eq!(judge_signal(&all_pass(4, 1.0)), "insufficient_runs");
+        assert_eq!(judge_signal(&all_pass(5, 1.0)), "saturated_pass");
     }
 
     /// A judge stuck at zero is broken, not "strict" — distinguish it from a
     /// judge stuck at max, since the operator actions differ.
     #[test]
     fn stuck_at_zero_is_distinct_from_stuck_at_max() {
-        assert_eq!(judge_signal(10, Some(0.0), Some(0.0)), "saturated_fail");
-        assert_eq!(judge_signal(10, Some(0.5), Some(0.5)), "saturated_constant");
+        assert_eq!(judge_signal(&all_pass(10, 0.0)), "saturated_fail");
+        assert_eq!(judge_signal(&all_pass(10, 0.5)), "saturated_constant");
     }
 
     /// NaN/inf must not be reported as a verdict.
     #[test]
     fn non_finite_scores_are_unknown() {
-        assert_eq!(judge_signal(10, Some(f64::NAN), Some(0.0)), "unknown");
-        assert_eq!(judge_signal(10, Some(1.0), Some(f64::INFINITY)), "unknown");
-        assert_eq!(judge_signal(10, None, Some(1.0)), "unknown");
-        assert_eq!(judge_signal(10, Some(1.0), None), "unknown");
+        assert_eq!(
+            judge_signal(&stat(
+                Some(f64::NAN),
+                Some(0.0),
+                (10, Some(0.0), Some(0.0)),
+                (0, None, None)
+            )),
+            "unknown"
+        );
+        assert_eq!(
+            judge_signal(&stat(
+                Some(1.0),
+                Some(f64::INFINITY),
+                (10, Some(1.0), Some(1.0)),
+                (0, None, None)
+            )),
+            "unknown"
+        );
+        assert_eq!(
+            judge_signal(&stat(
+                None,
+                Some(1.0),
+                (10, Some(1.0), Some(1.0)),
+                (0, None, None)
+            )),
+            "unknown"
+        );
+        assert_eq!(
+            judge_signal(&stat(
+                Some(1.0),
+                None,
+                (10, Some(1.0), Some(1.0)),
+                (0, None, None)
+            )),
+            "unknown"
+        );
+    }
+
+    // ── 2026-08-19: spread is not the same as INFORMATION ─────────────────
+    //
+    // Measured on the live `judge_scores` table before any of this was
+    // written, so each case below is a real fleet shape, not an invention.
+
+    /// **The false claim this change exists to retire.** `pa-inbox-organizer`
+    /// `judge` is `if type_of(classifications)=="array" {1.0} else {0.2}` — a
+    /// pure re-encoding of `passed`. Live, all-time: 189 passes ALL at 1.0,
+    /// 4 failures ALL at 0.2, avg 0.98342, worst 0.2.
+    ///
+    /// The old `(runs, avg, worst)` signature saw only `avg != worst` and
+    /// returned `discriminating`, whose note reads "the trend is meaningful".
+    /// It is not: `avg_score` there is exactly `0.2 + 0.8 * pass_rate`
+    /// (verified live to 5 dp), so the column is `pass_rate` printed twice.
+    /// This test FAILS on the pre-change behaviour.
+    #[test]
+    fn two_constants_one_per_verdict_is_not_a_meaningful_trend() {
+        let live = stat(
+            Some(0.983_419_689_119_170_9),
+            Some(0.2),
+            (189, Some(1.0), Some(1.0)),
+            (4, Some(0.2), Some(0.2)),
+        );
+        assert_eq!(judge_signal(&live), "mirrors_pass");
+        let note = judge_signal_note("mirrors_pass", live.runs, 0, None);
+        assert!(note.contains("re-encoding of `passed`"), "{note}");
+        assert!(note.contains("pass_rate"), "{note}");
+        // It must NOT read as a broken gate: routing is correct, and telling
+        // an operator otherwise would send them to fix a working guard.
+        assert!(note.contains("NOT a broken gate"), "{note}");
+    }
+
+    /// A judge that emits ONE score while both passing and failing. The score
+    /// is independent of the verdict — the literal case the plan asked about.
+    ///
+    /// The old code called this `saturated_pass`, whose note says the judge
+    /// "has not been observed to fail anything" — flatly contradicted by the
+    /// `pass_rate` on the same row. This test FAILS on the pre-change
+    /// behaviour.
+    #[test]
+    fn one_score_across_passes_and_failures_is_not_saturated_pass() {
+        let s = stat(
+            Some(1.0),
+            Some(1.0),
+            (40, Some(1.0), Some(1.0)),
+            (2, Some(1.0), Some(1.0)),
+        );
+        assert_eq!(judge_signal(&s), "constant_score");
+        let note = judge_signal_note("constant_score", s.runs, 0, None);
+        assert!(note.contains("FAILED"), "{note}");
+        assert!(
+            !note.contains("has not been observed to fail"),
+            "the retired claim must not survive: {note}"
+        );
+    }
+
+    /// A score outside 0.0–1.0 invalidates every aggregate above it, so it is
+    /// reported BEFORE any saturation verdict. Reachable today: nothing
+    /// clamps `__judge_score__`, and the live `coverage_judge` returns
+    /// 1.3333 for 4 classifications over 3 messages (reproduced with
+    /// `probe_inline_judge`).
+    #[test]
+    fn out_of_domain_score_is_reported_before_any_saturation_verdict() {
+        let over = stat(
+            Some(1.2),
+            Some(1.0),
+            (10, Some(1.0), Some(1.333_333_333_333_333_3)),
+            (0, None, None),
+        );
+        assert_eq!(judge_signal(&over), "score_out_of_domain");
+        let under = stat(
+            Some(-0.5),
+            Some(-1.0),
+            (10, Some(-1.0), Some(0.0)),
+            (0, None, None),
+        );
+        assert_eq!(judge_signal(&under), "score_out_of_domain");
+        let note = judge_signal_note("score_out_of_domain", 10, 0, None);
+        assert!(note.contains("0.0–1.0"), "{note}");
+    }
+
+    /// NEGATIVE CONTROL — the detector must not eat the judges it is not for.
+    /// `pa-daily-brief`'s LLM rubric judge, live: passes spread 0.85–1.0, one
+    /// failure at 0.65. The passing group VARIES, so this is a real trend and
+    /// must stay `discriminating`. A flag that fires on everything is noise.
+    #[test]
+    fn genuinely_graded_judge_stays_discriminating() {
+        let live = stat(
+            Some(0.928_947_368_421_052_6),
+            Some(0.65),
+            (18, Some(0.85), Some(1.0)),
+            (1, Some(0.65), Some(0.65)),
+        );
+        assert_eq!(judge_signal(&live), "discriminating");
+    }
+
+    /// NEGATIVE CONTROL — a judge that has only ever PASSED cannot be shown
+    /// to mirror its verdict: the failure branch was never exercised, so the
+    /// score could still be graded. Claiming `mirrors_pass` there would be
+    /// the same over-reading this module exists to prevent. It stays
+    /// `saturated_pass`, whose remedy (probe the FAILURE direction) is right.
+    /// Live shape: `pa-inbox-organizer` `coverage_judge`, 163 passes at 1.0.
+    #[test]
+    fn all_passing_judge_is_saturated_not_claimed_to_mirror() {
+        let live = all_pass(163, 1.0);
+        assert_eq!(judge_signal(&live), "saturated_pass");
+        assert!(!live.score_mirrors_passed());
+    }
+
+    /// The two new signals ask the operator to CHANGE an expression, not to
+    /// go looking — so they carry the `verdict_expr` override loop, and they
+    /// must restate the invariant that only the score may move.
+    #[test]
+    fn expression_signals_point_at_the_override_loop_and_guard_routing() {
+        for signal in ["mirrors_pass", "constant_score"] {
+            let note = judge_signal_note(signal, 9, 0, Some((probe_wf(), probe_node())));
+            assert!(note.contains("verdict_expr"), "{signal}: {note}");
+            assert!(note.contains(&probe_wf().to_string()), "{signal}: {note}");
+            assert!(note.contains(&probe_node().to_string()), "{signal}: {note}");
+            assert!(
+                note.contains("`passed` is unchanged"),
+                "the routing invariant must be restated where the fix is proposed: {note}"
+            );
+        }
+        // And a healthy judge is still given no busywork.
+        assert_eq!(
+            judge_signal_note("discriminating", 9, 0, Some((probe_wf(), probe_node()))),
+            judge_signal_note_base("discriminating"),
+        );
+    }
+
+    /// `score_carries_information` is the one-field answer, and it must be
+    /// `null` — never `true` — while the sample cannot support either claim.
+    #[test]
+    fn score_carries_information_is_null_when_undetermined() {
+        let mirror = judge_score_row(
+            &stat(
+                Some(0.84),
+                Some(0.2),
+                (8, Some(1.0), Some(1.0)),
+                (2, Some(0.2), Some(0.2)),
+            ),
+            7,
+        );
+        assert_eq!(mirror["signal"], "mirrors_pass");
+        assert_eq!(mirror["score_carries_information"], json!(false));
+        // ... and the numbers it annotates are still there. Dropping a field
+        // an operator reads is this arc's own defect one level up.
+        assert_eq!(mirror["avg_score"], json!(0.84));
+        assert_eq!(mirror["worst_score"], json!(0.2));
+        assert_eq!(mirror["scored_passed"], json!(8));
+        assert_eq!(mirror["scored_failed"], json!(2));
+
+        let thin = judge_score_row(&all_pass(2, 1.0), 7);
+        assert_eq!(thin["signal"], "insufficient_runs");
+        assert_eq!(
+            thin["score_carries_information"],
+            JsonValue::Null,
+            "an unproven claim of informativeness is the same defect as an \
+             unproven claim of saturation"
+        );
     }
 
     /// The `inbox-classifier-personal` case: 108 corrections banked, gold
@@ -1820,6 +2180,11 @@ mod measurement_pr3_tests {
                 avg_score: Some(1.0),
                 pass_rate: Some(1.0),
                 worst_score: Some(1.0),
+                scored_passed: 11,
+                pass_score_min: Some(1.0),
+                pass_score_max: Some(1.0),
+                fail_score_min: None,
+                fail_score_max: None,
             },
             7,
         )
@@ -1921,6 +2286,15 @@ mod measurement_pr3_tests {
                 avg_score: Some(0.8),
                 pass_rate,
                 worst_score: Some(0.5),
+                // Spread within the PASSING group, so this row stays
+                // `discriminating` — these tests are about the pass-rate
+                // envelope, not the score signal, and must not silently
+                // start exercising a different verdict.
+                scored_passed: runs,
+                pass_score_min: Some(0.5),
+                pass_score_max: Some(1.0),
+                fail_score_min: None,
+                fail_score_max: None,
             },
             days,
         );
