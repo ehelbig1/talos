@@ -245,7 +245,11 @@ pub(crate) fn render_grounding_report(
                  executions in the window are read — a busier actor gets a silently partial \
                  window. n_labeled counts those executions that ALSO carry a judge verdict; \
                  abstentions are not verdicts and are excluded at the source \
-                 (judge_scores NOT not_applicable). Every statistic below is over n_labeled, \
+                 (judge_scores NOT not_applicable). An execution whose scored judges DISAGREED \
+                 on 'passed' is also excluded — a disputed outcome is not an outcome, so the \
+                 label is withheld rather than picked; n_disputed is how many were withheld that \
+                 way, and is the only way to tell a withdrawn label from an absent judge. \
+                 Every statistic below is over n_labeled, \
                  never over all executions, and overall_pass_rate is NULL when \
                  n_labeled = 0 — a rate over a zero denominator has no value, so it is not \
                  reported rather than reported as 0.0; read n_labeled first. mean_judge_score is over \
@@ -279,6 +283,7 @@ mod grounding_report_window_tests {
                 mem_count: i as i64,
                 judge_passed: Some(i % 3 != 0),
                 judge_score: Some(0.5),
+                judge_disputed: false,
             })
             .collect();
         analyze_observational(&rows)
@@ -314,6 +319,7 @@ mod grounding_report_window_tests {
             "n_low",
             "mean_judge_score",
             "n_scored",
+            "n_disputed",
         ] {
             assert!(
                 v.as_object().unwrap().contains_key(k),

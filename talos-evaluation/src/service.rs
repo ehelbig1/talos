@@ -452,6 +452,7 @@ impl EvaluationService {
                 mem_count: r.mem_count,
                 judge_passed: r.judge_passed,
                 judge_score: r.judge_score,
+                judge_disputed: r.judge_disputed,
             })
             .collect();
         Ok(analyze_observational(&obs))

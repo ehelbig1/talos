@@ -107,6 +107,16 @@ pub fn example_to_features(ex: &RankTrainingExample) -> [f64; N_FEATURES] {
 /// * `execution_status` maps `completed → 1.0`, `failed`/`cancelled → 0.0` at
 ///   the weaker [`STATUS_SAMPLE_WEIGHT`]; any other status (e.g. `running`,
 ///   `pending`, `resuming`, or `None`) is unlabeled → skipped.
+///
+/// **The ranker trains on the judge's BOOLEAN, never on `judge_score`.**
+/// [`RankTrainingExample::judge_score`] has no reader anywhere; do not add one
+/// without first deciding what a score means across the several judges one
+/// execution can carry (`talos_memory`'s `JUDGE_LABEL_LATERAL` reduces them to
+/// the worst score among judges that AGREED — a floor, not a rating).
+///
+/// A DISPUTED execution (`judge_disputed`) arrives with `judge_passed: None`
+/// and so falls through to the weaker status label. Deliberate: a disagreement
+/// between judges should weaken the evidence, not assert half of it.
 pub fn example_label(ex: &RankTrainingExample) -> Option<(f64, f64)> {
     if let Some(passed) = ex.judge_passed {
         return Some((if passed { 1.0 } else { 0.0 }, JUDGE_SAMPLE_WEIGHT));
@@ -319,6 +329,7 @@ mod tests {
             rank: 0,
             judge_score: None,
             judge_passed,
+            judge_disputed: false,
             execution_status: status.map(|s| s.to_string()),
             created_at: Utc::now(),
         }

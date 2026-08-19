@@ -646,3 +646,210 @@ async fn execution_memory_outcomes_leave_all_abstaining_executions_unlabeled() {
     );
     assert_eq!(rows[0].judge_score, None);
 }
+
+// ── Multi-judge outcome labels: unanimity, not write order ──────────────
+//
+// A workflow can run several judges (the organizers pair an in-path shape
+// `judge` with a leaf `coverage_judge`; pa-chief-of-staff pairs an inline
+// `judge` with an LLM `quality_judge`). The label lateral used to take the
+// NEWEST verdict, and each verdict is recorded by its own fire-and-forget
+// `tokio::spawn`, so `created_at` ordered the DB round-trips rather than the
+// graph — measured on the live table, two runs of the identical
+// pa-chief-of-staff graph landed their two verdicts 10 µs apart in OPPOSITE
+// orders. These tests pin the replacement rule: unanimity, order-free.
+//
+// Every one of them FAILS under `ORDER BY created_at DESC LIMIT 1`.
+
+/// Two judges DISAGREE on `passed` → no label at all, and `judge_disputed`
+/// says why. Under the old rule the label was whichever verdict was written
+/// last; here the second insert passes, so the old rule produced
+/// `Some(true)` — asserting the half of a contradiction that happened to
+/// win a race.
+#[tokio::test]
+async fn disputed_verdicts_yield_no_label_and_are_flagged() {
+    let (pool, _db) = common::isolated_db_pool().await;
+
+    let user = Uuid::new_v4();
+    let wf = Uuid::new_v4();
+    let actor = Uuid::new_v4();
+    let exec = Uuid::new_v4();
+    seed_user(&pool, user, "disputed@quality.test").await;
+    seed_workflow(&pool, wf, user, "disputed-wf").await;
+    seed_memory_provenance(&pool, exec, actor, "mem/dispute").await;
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    // Shape judge fails the run; the leaf coverage judge passes it.
+    ExecutionRepository::record_judge_score(&mut conn, wf, Uuid::new_v4(), exec, 0.2, false, false)
+        .await
+        .expect("shape verdict");
+    ExecutionRepository::record_judge_score(&mut conn, wf, Uuid::new_v4(), exec, 1.0, true, false)
+        .await
+        .expect("coverage verdict");
+
+    let since = chrono::Utc::now() - chrono::Duration::days(1);
+    let rows = talos_memory::fetch_rank_training_examples(&pool, actor, since, 50)
+        .await
+        .expect("training examples");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].judge_passed, None,
+        "the judges contradicted each other — asserting either half would be \
+         a label the data does not support"
+    );
+    assert_eq!(rows[0].judge_score, None);
+    assert!(
+        rows[0].judge_disputed,
+        "a withdrawn label must be distinguishable from an absent judge"
+    );
+
+    let outcomes = talos_memory::fetch_execution_memory_outcomes(&pool, actor, since, 50)
+        .await
+        .expect("outcomes");
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].judge_passed, None);
+    assert!(outcomes[0].judge_disputed);
+}
+
+/// Judges AGREE on `passed` but score differently → the label survives and
+/// carries the WORST score. This is the live pa-chief-of-staff shape: an
+/// inline `judge` at 1.0 beside an LLM `quality_judge` at 0.85. Under the old
+/// rule the answer was whichever landed last (measured: the optimistic 1.0 in
+/// 5 of the 6 live cases).
+#[tokio::test]
+async fn agreeing_judges_label_with_the_worst_score_not_the_newest() {
+    let (pool, _db) = common::isolated_db_pool().await;
+
+    let user = Uuid::new_v4();
+    let wf = Uuid::new_v4();
+    let actor = Uuid::new_v4();
+    let exec = Uuid::new_v4();
+    seed_user(&pool, user, "agree@quality.test").await;
+    seed_workflow(&pool, wf, user, "agree-wf").await;
+    seed_memory_provenance(&pool, exec, actor, "mem/agree").await;
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    ExecutionRepository::record_judge_score(&mut conn, wf, Uuid::new_v4(), exec, 0.85, true, false)
+        .await
+        .expect("rubric verdict");
+    // Written LAST, and the optimistic one — the old rule would return 1.0.
+    ExecutionRepository::record_judge_score(&mut conn, wf, Uuid::new_v4(), exec, 1.0, true, false)
+        .await
+        .expect("shape verdict");
+
+    let since = chrono::Utc::now() - chrono::Duration::days(1);
+    let rows = talos_memory::fetch_rank_training_examples(&pool, actor, since, 50)
+        .await
+        .expect("training examples");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].judge_passed, Some(true));
+    assert_eq!(
+        rows[0].judge_score,
+        Some(0.85),
+        "the label is the worst score among judges that agreed, not the one \
+         whose insert happened to land last"
+    );
+    assert!(!rows[0].judge_disputed);
+}
+
+/// The rule must be ORDER-FREE: the same two verdicts written in the opposite
+/// order must produce the identical label. This is the property that makes a
+/// judge added tomorrow unable to become the teacher by being written last.
+#[tokio::test]
+async fn the_label_does_not_depend_on_which_verdict_was_written_first() {
+    let (pool, _db) = common::isolated_db_pool().await;
+
+    let user = Uuid::new_v4();
+    let wf = Uuid::new_v4();
+    let actor = Uuid::new_v4();
+    let exec_a = Uuid::new_v4();
+    let exec_b = Uuid::new_v4();
+    seed_user(&pool, user, "orderfree@quality.test").await;
+    seed_workflow(&pool, wf, user, "orderfree-wf").await;
+    seed_memory_provenance(&pool, exec_a, actor, "mem/order-a").await;
+    seed_memory_provenance(&pool, exec_b, actor, "mem/order-b").await;
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    // exec_a: 0.9 then 0.4.  exec_b: 0.4 then 0.9.  Same multiset.
+    for (exec, first, second) in [(exec_a, 0.9_f64, 0.4_f64), (exec_b, 0.4, 0.9)] {
+        ExecutionRepository::record_judge_score(
+            &mut conn,
+            wf,
+            Uuid::new_v4(),
+            exec,
+            first,
+            true,
+            false,
+        )
+        .await
+        .expect("first verdict");
+        ExecutionRepository::record_judge_score(
+            &mut conn,
+            wf,
+            Uuid::new_v4(),
+            exec,
+            second,
+            true,
+            false,
+        )
+        .await
+        .expect("second verdict");
+    }
+
+    let since = chrono::Utc::now() - chrono::Duration::days(1);
+    let outcomes = talos_memory::fetch_execution_memory_outcomes(&pool, actor, since, 50)
+        .await
+        .expect("outcomes");
+    assert_eq!(outcomes.len(), 2);
+    let a = outcomes
+        .iter()
+        .find(|o| o.execution_id == exec_a)
+        .expect("exec_a");
+    let b = outcomes
+        .iter()
+        .find(|o| o.execution_id == exec_b)
+        .expect("exec_b");
+    assert_eq!(
+        a.judge_score, b.judge_score,
+        "two executions carrying the same verdicts in opposite write order \
+         must receive the same label"
+    );
+    assert_eq!(a.judge_score, Some(0.4));
+}
+
+/// An ABSTENTION alongside a real verdict must neither dispute it nor drag
+/// the score: abstentions are excluded before unanimity is evaluated, so a
+/// judge saying "nothing to judge" cannot withdraw another judge's label.
+/// (The organizers' `coverage_judge` abstains on an empty inbox 36 times in
+/// the live table while the in-path `judge` still scores — this is that case.)
+#[tokio::test]
+async fn an_abstention_neither_disputes_nor_drags_a_real_verdict() {
+    let (pool, _db) = common::isolated_db_pool().await;
+
+    let user = Uuid::new_v4();
+    let wf = Uuid::new_v4();
+    let actor = Uuid::new_v4();
+    let exec = Uuid::new_v4();
+    seed_user(&pool, user, "abstain-mix@quality.test").await;
+    seed_workflow(&pool, wf, user, "abstain-mix-wf").await;
+    seed_memory_provenance(&pool, exec, actor, "mem/abstain-mix").await;
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    ExecutionRepository::record_judge_score(&mut conn, wf, Uuid::new_v4(), exec, 0.7, true, false)
+        .await
+        .expect("scored verdict");
+    // An abstention authored with the opposite `passed` and a lower score:
+    // if abstentions were not excluded first, this would both dispute the
+    // label and drop the score to 0.0.
+    ExecutionRepository::record_judge_score(&mut conn, wf, Uuid::new_v4(), exec, 0.0, false, true)
+        .await
+        .expect("abstention");
+
+    let since = chrono::Utc::now() - chrono::Duration::days(1);
+    let rows = talos_memory::fetch_rank_training_examples(&pool, actor, since, 50)
+        .await
+        .expect("training examples");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].judge_passed, Some(true));
+    assert_eq!(rows[0].judge_score, Some(0.7));
+    assert!(!rows[0].judge_disputed);
+}

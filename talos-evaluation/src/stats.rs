@@ -210,7 +210,15 @@ pub struct ObservationalRow {
     /// arrives with `judge_passed = None` and is dropped from the analyzable
     /// set below — an abstention is not an outcome label.
     pub judge_passed: Option<bool>,
+    /// The WORST score among the judges that agreed on the outcome — an
+    /// execution can carry several judges, so this is not "the judge score".
+    /// `None` whenever `judge_passed` is `None`.
     pub judge_score: Option<f64>,
+    /// `true` when the execution's scored judges DISAGREED on `passed`, which
+    /// is why it arrives unlabeled. Counted into
+    /// [`ObservationalReport::n_disputed`] so a withdrawn label is visible
+    /// rather than silently shrinking `n_labeled`.
+    pub judge_disputed: bool,
 }
 
 /// Correlational report: does higher memory relevance track a better outcome?
@@ -270,6 +278,16 @@ pub struct ObservationalReport {
     /// `n_labeled - n_scored` is the number of labeled executions with no
     /// score.
     pub n_scored: usize,
+    /// Executions dropped from `n_labeled` because their scored judges
+    /// DISAGREED on `passed`.
+    ///
+    /// A disputed outcome is not an outcome, so the label is withheld rather
+    /// than picked (see `talos_memory`'s `JUDGE_LABEL_LATERAL`). Reported
+    /// because an absence that reads as a negative result is the sharper form
+    /// of a misleading field: without this, a workflow whose judges started
+    /// contradicting each other would show only a quietly shrinking
+    /// `n_labeled`. `0` on every deployment measured to date.
+    pub n_disputed: usize,
 }
 
 /// Analyze observational rows. Only rows carrying a judge verdict
@@ -294,6 +312,7 @@ pub fn analyze_observational(rows: &[ObservationalRow]) -> ObservationalReport {
             n_low: None,
             mean_judge_score: None,
             n_scored: 0,
+            n_disputed: rows.iter().filter(|r| r.judge_disputed).count(),
         };
     }
     let nf = n as f64;
@@ -346,6 +365,7 @@ pub fn analyze_observational(rows: &[ObservationalRow]) -> ObservationalReport {
         n_low: split.n_low,
         mean_judge_score,
         n_scored,
+        n_disputed: rows.iter().filter(|r| r.judge_disputed).count(),
     }
 }
 
@@ -521,6 +541,7 @@ mod tests {
             mem_count: count,
             judge_passed: passed,
             judge_score: score,
+            judge_disputed: false,
         }
     }
 
@@ -579,6 +600,35 @@ mod tests {
         assert!((r.overall_pass_rate.expect("n_labeled > 0") - 0.5).abs() < 1e-9);
         // Mean score is over the two scored rows only.
         assert!((r.mean_judge_score.unwrap() - 0.55).abs() < 1e-9);
+    }
+
+    /// A DISPUTED execution arrives unlabeled (the source lateral withholds
+    /// the label when an execution's scored judges disagree on `passed`), so
+    /// it must not enter the correlation — and the withdrawal must be
+    /// COUNTED, or a workflow whose judges started contradicting each other
+    /// would show nothing but a quietly shrinking `n_labeled`.
+    #[test]
+    fn observational_counts_disputed_executions_it_dropped() {
+        let mut disputed = obs(0.95, 9, None, None);
+        disputed.judge_disputed = true;
+        let rows = vec![obs(0.9, 5, Some(true), Some(0.9)), disputed];
+        let r = analyze_observational(&rows);
+        assert_eq!(r.n_labeled, 1, "a disputed execution is not analyzable");
+        assert_eq!(r.n_disputed, 1, "and its exclusion must be visible");
+    }
+
+    /// The zero-labeled report must still report disputes — that is exactly
+    /// the case where `n_labeled = 0` would otherwise read as "no judges ran"
+    /// when the truth is "every judge contradicted another".
+    #[test]
+    fn disputes_are_reported_even_when_nothing_is_analyzable() {
+        let mut d1 = obs(0.9, 5, None, None);
+        d1.judge_disputed = true;
+        let mut d2 = obs(0.2, 1, None, None);
+        d2.judge_disputed = true;
+        let r = analyze_observational(&[d1, d2]);
+        assert_eq!(r.n_labeled, 0);
+        assert_eq!(r.n_disputed, 2);
     }
 
     #[test]

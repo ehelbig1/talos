@@ -2378,9 +2378,10 @@ pub async fn record_execution_memory_context(
 
 /// A labeled training example for the Phase-2 learned ranker: one memory's
 /// pack-time feature snapshot joined to its execution's OUTCOME label
-/// (`judge_score` / `judge_passed` — the newest SCORED judge verdict for that
-/// execution — and `execution_status`). Outcome fields are `Option` because a
-/// provenance row may have no judge verdict and/or an orphaned execution.
+/// (`judge_score` / `judge_passed` — the execution's UNANIMOUS scored judge
+/// verdict, see [`JUDGE_LABEL_LATERAL`] — and `execution_status`). Outcome
+/// fields are `Option` because a provenance row may have no judge verdict, a
+/// DISPUTED one, and/or an orphaned execution.
 #[derive(Clone, Debug)]
 pub struct RankTrainingExample {
     pub memory_key: String,
@@ -2390,8 +2391,21 @@ pub struct RankTrainingExample {
     pub access_boost: Option<f64>,
     pub fused_score: f64,
     pub rank: i32,
+    /// The WORST score among the judges that agreed on the outcome — not "the
+    /// judge score", because an execution can carry several. `None` whenever
+    /// `judge_passed` is `None`.
+    ///
+    /// Read by nothing today: [`crate::RankTrainingExample`]'s only consumer,
+    /// `talos_memory_ranking::model::example_label`, labels on `judge_passed`
+    /// alone. Kept because it is the natural companion of the label and is
+    /// free to carry; do not infer from its presence that the ranker trains
+    /// on scores.
     pub judge_score: Option<f64>,
     pub judge_passed: Option<bool>,
+    /// `true` when the execution's scored judges DISAGREED on `passed`, which
+    /// is why `judge_passed` is `None` — distinguishing "the judges could not
+    /// agree" from "there was no judge", which are the same `None` otherwise.
+    pub judge_disputed: bool,
     pub execution_status: Option<String>,
     pub created_at: DateTime<Utc>,
 }
@@ -2400,11 +2414,69 @@ pub struct RankTrainingExample {
 /// can't ask for an unbounded scan.
 const RANK_TRAINING_EXAMPLE_MAX: i64 = 50_000;
 
+/// THE outcome-label rule, in one place — the lateral both label consumers
+/// splice in. It must stay a single constant: the two queries below previously
+/// carried byte-identical copies of a DIFFERENT rule, and a rule duplicated is
+/// a rule that can diverge.
+///
+/// **Unanimity, order-free.** Over the execution's SCORED verdicts
+/// (abstentions are excluded — a verdict about nothing is not an outcome):
+/// * `judge_passed` is the value every judge agreed on, or `NULL` when they
+///   disagreed;
+/// * `judge_score` is the MIN across those verdicts — the WORST score among
+///   judges that agreed on the outcome. Safe precisely *because* the label
+///   only exists under unanimity, so no dissenting judge can drag it;
+/// * `judge_disputed` distinguishes "the judges disagreed" from "there was no
+///   judge", which are otherwise the same `NULL`.
+///
+/// **Why not `ORDER BY created_at DESC LIMIT 1`** (what this replaced): a
+/// workflow can run several judges, and the recorder is a fire-and-forget
+/// `tokio::spawn` per verdict, so `created_at` orders the DB round-trips, not
+/// the graph. Measured on the live table: two runs of the identical
+/// `pa-chief-of-staff` graph recorded their two verdicts 10 µs apart in
+/// OPPOSITE orders, and `pa-inbox-organizer` was labelled 159 times by its
+/// in-path shape judge and 35 times by its leaf coverage judge. The winner was
+/// a race. One execution even carries an exact `created_at` tie, where the old
+/// lateral had no tiebreaker at all (check 28 / check 60's class).
+///
+/// Being order-free is also what makes a mislabelled future impossible: a judge
+/// added tomorrow cannot become the ranker's teacher by being written last,
+/// because nothing is selected by write order. It can only agree, or disagree
+/// and WITHDRAW the label — never substitute its own.
+///
+/// A disagreement deliberately yields NO label rather than a picked one. The
+/// consumers degrade gracefully: the ranker's `example_label` falls through to
+/// `execution_status` at the weaker `STATUS_SAMPLE_WEIGHT`, and
+/// `analyze_observational` drops the row from `n_labeled`. Asserting half of a
+/// disputed verdict would be worse than declining to label it.
+///
+/// Index note: `idx_judge_scores_execution (execution_id, created_at DESC)`
+/// still serves the seek; the aggregate reads the (one or two) matching rows
+/// instead of stopping at the first. No new index.
+///
+/// Splice-in contract: the fragment correlates on the outer alias **`emc`**
+/// (`execution_memory_context`) and exposes `js.passed` / `js.score` /
+/// `js.disputed`. A future query using a different alias fails loudly at
+/// query time rather than silently labelling from the wrong execution.
+const JUDGE_LABEL_LATERAL: &str = "\
+    LEFT JOIN LATERAL ( \
+        SELECT CASE WHEN bool_and(j.passed) = bool_or(j.passed) \
+                    THEN bool_and(j.passed) END AS passed, \
+               CASE WHEN bool_and(j.passed) = bool_or(j.passed) \
+                    THEN min(j.score) END AS score, \
+               COALESCE(bool_and(j.passed) <> bool_or(j.passed), false) \
+                    AS disputed \
+        FROM judge_scores j \
+        WHERE j.execution_id = emc.execution_id \
+          AND NOT j.not_applicable \
+    ) js ON true ";
+
 /// Fetch labeled training examples for one actor since `since`, newest first.
-/// Left-joins each provenance row to (a) the newest SCORED judge verdict for its
-/// execution and (b) the execution status — the labeled-data source Phase 2
-/// consumes. Actor-scoped (`WHERE emc.actor_id = $1`). `limit` is clamped to
-/// `[0, RANK_TRAINING_EXAMPLE_MAX]`. Reads are fail-loud (`try_get`).
+/// Left-joins each provenance row to (a) its execution's outcome label per
+/// [`JUDGE_LABEL_LATERAL`] and (b) the execution status — the labeled-data
+/// source Phase 2 consumes. Actor-scoped (`WHERE emc.actor_id = $1`). `limit`
+/// is clamped to `[0, RANK_TRAINING_EXAMPLE_MAX]`. Reads are fail-loud
+/// (`try_get`).
 pub async fn fetch_rank_training_examples(
     pool: &Pool<Postgres>,
     actor_id: Uuid,
@@ -2415,23 +2487,19 @@ pub async fn fetch_rank_training_examples(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let rows = sqlx::query(
+    let rows = sqlx::query(&format!(
         "SELECT emc.memory_key, emc.relevance, emc.recency, emc.importance, \
                 emc.access_boost, emc.fused_score, emc.rank, emc.created_at, \
                 js.score AS judge_score, js.passed AS judge_passed, \
+                js.disputed AS judge_disputed, \
                 we.status AS execution_status \
          FROM execution_memory_context emc \
-         LEFT JOIN LATERAL ( \
-             SELECT score, passed FROM judge_scores j \
-             WHERE j.execution_id = emc.execution_id \
-               AND NOT j.not_applicable \
-             ORDER BY j.created_at DESC LIMIT 1 \
-         ) js ON true \
+         {JUDGE_LABEL_LATERAL}\
          LEFT JOIN workflow_executions we ON we.id = emc.execution_id \
          WHERE emc.actor_id = $1 AND emc.created_at >= $2 \
          ORDER BY emc.created_at DESC \
-         LIMIT $3",
-    )
+         LIMIT $3"
+    ))
     .bind(actor_id)
     .bind(since)
     .bind(limit)
@@ -2462,6 +2530,9 @@ pub async fn fetch_rank_training_examples(
             rank,
             judge_score: row.try_get::<Option<f64>, _>("judge_score")?,
             judge_passed: row.try_get::<Option<bool>, _>("judge_passed")?,
+            judge_disputed: row
+                .try_get::<Option<bool>, _>("judge_disputed")?
+                .unwrap_or(false),
             execution_status: row.try_get::<Option<String>, _>("execution_status")?,
             created_at: row
                 .try_get::<Option<DateTime<Utc>>, _>("created_at")?
@@ -2484,17 +2555,21 @@ pub struct ExecutionMemoryOutcome {
     pub max_fused: f64,
     /// Number of memories injected.
     pub mem_count: i64,
-    /// Newest SCORED judge verdict for the execution, if any. Verdicts where
-    /// the judge abstained (`not_applicable`) are skipped by the lateral —
-    /// an abstention is not an outcome label, so a run whose last verdict was
-    /// an abstention falls back to its prior scored verdict (or `None`).
+    /// The WORST score among the judges that agreed on the outcome — see
+    /// [`JUDGE_LABEL_LATERAL`]. `None` whenever `judge_passed` is `None`
+    /// (no scored verdict, or a disputed one). Abstentions
+    /// (`not_applicable`) never contribute: a verdict about nothing is not
+    /// an outcome, so an all-abstaining execution arrives unlabeled.
     pub judge_score: Option<f64>,
     pub judge_passed: Option<bool>,
+    /// `true` when the execution's scored judges DISAGREED on `passed` — the
+    /// reason `judge_passed` is `None`, as opposed to there being no judge.
+    pub judge_disputed: bool,
     pub execution_status: Option<String>,
 }
 
 /// Per-execution aggregate of `execution_memory_context` joined to each
-/// execution's newest SCORED judge verdict and status. Actor-scoped
+/// execution's outcome label ([`JUDGE_LABEL_LATERAL`]) and status. Actor-scoped
 /// (`WHERE emc.actor_id = $1`). `limit` is clamped to
 /// `[0, RANK_TRAINING_EXAMPLE_MAX]`. Reads are fail-loud. Only executions that
 /// actually carried memory context appear (memory-OFF runs write no provenance
@@ -2510,26 +2585,22 @@ pub async fn fetch_execution_memory_outcomes(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let rows = sqlx::query(
+    let rows = sqlx::query(&format!(
         "SELECT emc.execution_id, \
                 AVG(emc.fused_score)::float8 AS mean_fused, \
                 MAX(emc.fused_score)::float8 AS max_fused, \
                 COUNT(*)::int8 AS mem_count, \
                 js.score AS judge_score, js.passed AS judge_passed, \
+                js.disputed AS judge_disputed, \
                 we.status AS execution_status \
          FROM execution_memory_context emc \
-         LEFT JOIN LATERAL ( \
-             SELECT score, passed FROM judge_scores j \
-             WHERE j.execution_id = emc.execution_id \
-               AND NOT j.not_applicable \
-             ORDER BY j.created_at DESC LIMIT 1 \
-         ) js ON true \
+         {JUDGE_LABEL_LATERAL}\
          LEFT JOIN workflow_executions we ON we.id = emc.execution_id \
          WHERE emc.actor_id = $1 AND emc.created_at >= $2 \
-         GROUP BY emc.execution_id, js.score, js.passed, we.status \
+         GROUP BY emc.execution_id, js.score, js.passed, js.disputed, we.status \
          ORDER BY MAX(emc.created_at) DESC \
-         LIMIT $3",
-    )
+         LIMIT $3"
+    ))
     .bind(actor_id)
     .bind(since)
     .bind(limit)
@@ -2548,6 +2619,9 @@ pub async fn fetch_execution_memory_outcomes(
             mem_count: row.try_get::<Option<i64>, _>("mem_count")?.unwrap_or(0),
             judge_score: row.try_get::<Option<f64>, _>("judge_score")?,
             judge_passed: row.try_get::<Option<bool>, _>("judge_passed")?,
+            judge_disputed: row
+                .try_get::<Option<bool>, _>("judge_disputed")?
+                .unwrap_or(false),
             execution_status: row.try_get::<Option<String>, _>("execution_status")?,
         });
     }
