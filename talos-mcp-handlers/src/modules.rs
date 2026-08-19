@@ -73,12 +73,13 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "cleanup_modules",
-            "description": "Delete compiled modules NOT referenced by any workflow, optionally scoped by name prefix. Returns count of deleted modules. WARNING: omitting prefix deletes ALL of your unreferenced modules and requires confirm: true.",
+            "description": "Delete compiled modules NOT referenced by any workflow AND compiled more than `days` days ago, optionally scoped by name prefix. Returns count of deleted modules. WARNING: omitting prefix deletes ALL of your unreferenced modules older than `days` and requires confirm: true.\n\nThe age filter matches `find_unreferenced_modules` — survey with that tool using the SAME `days` value and this deletes what it showed you. Without the age filter this tool used to destroy modules you had just compiled and not yet wired into a workflow, which no survey could have shown you.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "prefix": { "type": "string", "description": "Only delete unreferenced modules whose name starts with this prefix (minimum 2 characters). Omit to delete ALL unreferenced modules (requires confirm: true)." },
-                    "confirm": { "type": "boolean", "description": "Must be explicitly set to true when prefix is omitted, to confirm deletion of ALL unreferenced modules. Ignored when prefix is provided." }
+                    "days": { "type": "number", "description": "Only delete modules compiled more than this many days ago (default: 30). Same meaning and same default as find_unreferenced_modules' `days` — pass the value you surveyed with." },
+                    "confirm": { "type": "boolean", "description": "Must be explicitly set to true when prefix is omitted, to confirm deletion of ALL unreferenced modules older than `days`. Ignored when prefix is provided." }
                 }
             }
         }),
@@ -785,10 +786,19 @@ async fn handle_cleanup_modules(
             );
         }
     }
+    // The age filter is the same one `find_unreferenced_modules` surveys with —
+    // same validator, same bounds, same default — so an operator who surveys and
+    // then cleans up at one `days` value acts on the set they were shown. The
+    // DELETE previously had no age predicate at all, so it also destroyed
+    // modules compiled minutes ago that no survey could have listed.
+    let days: i32 = match crate::utils::validate_range_i64(args, "days", 1, 365, 30, &req_id) {
+        Ok(v) => v as i32,
+        Err(resp) => return resp,
+    };
     // Only delete modules NOT referenced by any workflow
     match state
         .module_repo
-        .cleanup_unreferenced_modules(user_id, prefix)
+        .cleanup_unreferenced_modules(user_id, prefix, days)
         .await
     {
         Ok(deleted) => {
@@ -814,10 +824,17 @@ async fn handle_cleanup_modules(
                     Some(serde_json::json!({
                         "deleted_count": deleted,
                         "prefix": prefix,
+                        "older_than_days": days,
                     })),
                 );
             }
-            mcp_text(req_id, &format!("Deleted {} module(s).", deleted))
+            mcp_text(
+                req_id,
+                &format!(
+                    "Deleted {} unreferenced module(s) compiled more than {} day(s) ago.",
+                    deleted, days
+                ),
+            )
         }
         Err(e) => {
             tracing::error!(err = ?e, user_id = %user_id, "cleanup_unused_modules failed");
@@ -1666,10 +1683,26 @@ async fn handle_find_unreferenced_modules(
                     })
                 })
                 .collect();
+            // This listing is the ONLY preview an operator has for
+            // `cleanup_modules`, whose DELETE is unbounded. A bare `count: 50`
+            // over a capped query reads as the whole population, and the
+            // operator then authorises a delete against it. Disclose the cap so
+            // the number can be read as the lower bound it is.
+            let coverage = talos_measurement::Coverage::new(
+                i64::try_from(modules.len()).unwrap_or(i64::MAX),
+                talos_module_repository::UNREFERENCED_MODULES_LIMIT,
+            );
             let result = serde_json::json!({
                 "unreferenced_modules": modules,
                 "count": modules.len(),
                 "filter_days": days,
+                "coverage": coverage.to_json(),
+                "cleanup_note": format!(
+                    "cleanup_modules(days: {days}) deletes unreferenced modules older than {days} \
+                     day(s) — pass the SAME days value you surveyed with. It is not bounded by \
+                     this listing's cap, so a truncated listing means cleanup_modules will remove \
+                     more than is shown here.",
+                ),
             });
             mcp_text(
                 req_id,
@@ -3511,11 +3544,28 @@ async fn handle_restore_pinned_modules(
         match compilation {
             Ok(res) if res.success => {
                 if let Some(wasm_bytes) = res.wasm_bytes {
+                    // The write is scoped to THIS user's install row. It used to
+                    // be `WHERE name = $2` with no owner predicate, which
+                    // overwrote every tenant's module of that name plus the
+                    // shared catalog row — a user-scoped read reporting a
+                    // cross-tenant write. See
+                    // `ModuleRepository::update_template_precompiled_wasm`.
                     match state
                         .module_repo
-                        .update_template_precompiled_wasm(&module_name, &wasm_bytes)
+                        .update_template_precompiled_wasm(&module_name, &wasm_bytes, user_id)
                         .await
                     {
+                        // `rows_affected == 0` means the compile succeeded but
+                        // landed on no row: this user has a pin but no install
+                        // row under that name. Reporting it as `restored` would
+                        // tell the operator a module is usable when the write
+                        // went nowhere — the same class this whole path is being
+                        // audited for, one level down.
+                        Ok(0) => failed.push(serde_json::json!({
+                            "module": module_name,
+                            "reason": "compiled, but no module row is installed under this name for your account — \
+                                       run install_module_from_catalog first, then re-run restore_pinned_modules"
+                        })),
                         Ok(_) => restored.push(module_name.clone()),
                         Err(e) => {
                             tracing::error!(module = %module_name, "restore_pinned_modules upsert failed: {:#}", e);

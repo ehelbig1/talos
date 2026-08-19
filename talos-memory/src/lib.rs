@@ -3284,7 +3284,47 @@ pub async fn clone_memories(
     Ok(v0_count + v1_count)
 }
 
-pub async fn forget_prefix(pool: &Pool<Postgres>, actor_id: Uuid, prefix: &str) -> Result<u64> {
+/// What a [`forget_prefix`] call actually removed, split along the one axis the
+/// preview cannot show.
+///
+/// `list_memories` — the tool `actor_forget_prefix` names in its own error text
+/// as the way to preview a delete — excludes `expires_at <= now()`. Tombstones
+/// written by [`forget`] (a soft `UPDATE … SET expires_at = now() - 1s`) are
+/// therefore invisible in the preview and removed by the delete. Purging them is
+/// correct; reporting them inside one undifferentiated `deleted_count` is not,
+/// because it makes the total exceed the previewed set for a reason the operator
+/// has no way to attribute. Splitting the count is the honest form: the action
+/// still removes both, and now says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ForgetPrefixOutcome {
+    /// Total rows deleted — `live + expired`.
+    pub deleted: u64,
+    /// Rows that were visible to `list_memories` (not expired). This is the
+    /// subset a preview could have shown.
+    pub live: u64,
+    /// Already-expired tombstones, invisible to every preview.
+    pub expired: u64,
+}
+
+/// Hard-delete every memory under `prefix` for one actor.
+///
+/// **`memory_type` mirrors `list_memories`' own
+/// `($3::text IS NULL OR memory_type = $3)` filter and exists so the delete can
+/// be a SUBSET of the preview.** Without it, an operator who previewed
+/// `prefix='project/', memory_type='working'`, saw three rows and confirmed also
+/// destroyed every `semantic` row under that prefix — and semantic is the
+/// no-TTL, permanent tier. `None` keeps the historical all-types behaviour.
+///
+/// The invariant, stated for this crate in the words
+/// `talos_execution_repository` uses for the same class: the set acted upon is a
+/// SUBSET of the set previewed, never a superset. A confirmation prompt may
+/// under-promise; it may never under-state.
+pub async fn forget_prefix(
+    pool: &Pool<Postgres>,
+    actor_id: Uuid,
+    prefix: &str,
+    memory_type: Option<&str>,
+) -> Result<ForgetPrefixOutcome> {
     if prefix.is_empty() {
         anyhow::bail!("forget_prefix requires a non-empty prefix");
     }
@@ -3292,16 +3332,34 @@ pub async fn forget_prefix(pool: &Pool<Postgres>, actor_id: Uuid, prefix: &str) 
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_");
-    let result = sqlx::query(
+    // `RETURNING` the liveness of each removed row makes the reported split a
+    // property of the DELETE itself rather than of a second query that could
+    // describe a different set — the same discipline as
+    // `compress_actor_context`'s measure-and-delete CTE.
+    let rows = sqlx::query(
         "DELETE FROM actor_memory \
-         WHERE actor_id = $1 AND key LIKE $2 || '%' ESCAPE '\\'",
+         WHERE actor_id = $1 \
+           AND key LIKE $2 || '%' ESCAPE '\\' \
+           AND ($3::text IS NULL OR memory_type = $3) \
+         RETURNING (expires_at IS NULL OR expires_at > now()) AS was_live",
     )
     .bind(actor_id)
     .bind(escaped)
-    .execute(pool)
+    .bind(memory_type)
+    .fetch_all(pool)
     .await
     .context("forget_prefix")?;
-    Ok(result.rows_affected())
+
+    let mut outcome = ForgetPrefixOutcome::default();
+    for r in &rows {
+        outcome.deleted += 1;
+        if r.try_get::<Option<bool>, _>("was_live")?.unwrap_or(false) {
+            outcome.live += 1;
+        } else {
+            outcome.expired += 1;
+        }
+    }
+    Ok(outcome)
 }
 
 pub async fn refresh_ttl(
@@ -5580,5 +5638,52 @@ mod rpc_verify_classification_specs {
         }
         let unique: std::collections::HashSet<_> = all.iter().map(|f| f.as_str()).collect();
         assert_eq!(unique.len(), all.len(), "tokens must be distinct");
+    }
+}
+
+/// Structural pin: `forget_prefix`'s DELETE must be able to restrict to the
+/// same `memory_type` `list_memories` filters on.
+///
+/// `actor_forget_prefix`'s own error text tells the operator to preview with
+/// `list_actor_memories`. That preview takes a `memory_type` filter; the DELETE
+/// did not, so previewing `memory_type='working'` and confirming also destroyed
+/// every `semantic` row under the prefix — the no-TTL permanent tier.
+///
+/// Behavioural proof is `tests/integration.rs`, which needs a live Postgres and
+/// SKIPS without `TALOS_TEST_DATABASE_URL`. This is the always-running backstop.
+#[cfg(test)]
+mod forget_prefix_scope_pins {
+    // `concat!`-assembled so this module's own text is not a self-match.
+    fn src() -> &'static str {
+        include_str!("lib.rs")
+    }
+
+    #[test]
+    fn forget_prefix_delete_can_restrict_to_the_previewed_memory_type() {
+        assert!(
+            src().contains(concat!(
+                "AND ($3::text IS NULL OR memory_type = $3) \\\n         ",
+                "RETURNING"
+            )),
+            "forget_prefix's DELETE lost the memory_type predicate that mirrors \
+             list_memories' own filter; the delete is then wider than any \
+             type-filtered preview and reaches semantic (permanent, no-TTL) rows"
+        );
+    }
+
+    /// The tombstone split must be a property of the DELETE itself, via
+    /// `RETURNING`, not of a second query that could describe a different set —
+    /// the same discipline `compress_actor_context`'s measure-and-delete CTE uses.
+    #[test]
+    fn the_live_versus_tombstone_split_comes_from_the_delete_itself() {
+        assert!(
+            src().contains(concat!(
+                "RETURNING (expires_at IS NULL OR expires_at > now()) ",
+                "AS was_live"
+            )),
+            "forget_prefix stopped reporting which removed rows were visible to a \
+             preview; purged tombstones then inflate deleted_count past the \
+             previewed set for a reason the operator cannot attribute"
+        );
     }
 }

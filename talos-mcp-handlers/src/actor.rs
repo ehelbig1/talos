@@ -607,8 +607,15 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             "name": "actor_forget_prefix",
             "description": "Hard-delete all memory entries for an actor whose key starts with the \
                 given prefix. Use to bulk-clear auto-written execution traces (prefix: 'execution/'), \
-                scratchpad entries, or other namespaced keys. Returns deleted_count. \
-                Call list_actor_memories(prefix: '...') first to preview what will be deleted. \
+                scratchpad entries, or other namespaced keys. \
+                Call list_actor_memories(prefix: '...') first to preview what will be deleted, and \
+                pass the SAME memory_type to both calls — otherwise the delete is wider than the \
+                preview and will also remove semantic (permanent, no-TTL) entries under the prefix. \
+                Two further ways the delete can exceed what the preview showed you, both reported \
+                back rather than hidden: list_actor_memories is capped at 200 rows and says so in \
+                its `coverage` field (this delete is NOT capped), and it hides already-expired \
+                tombstones, which this delete removes and reports separately as \
+                deleted_expired_tombstones. Returns deleted_count plus that live/tombstone split. \
                 Unlike actor_forget (which soft-deletes for tombstone tracking), this hard-deletes — \
                 subsequent actor_recall returns reason: 'never_set'. \
                 Safety: prefix must be at least 3 characters to prevent accidental mass deletion.",
@@ -619,6 +626,10 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "prefix": {
                         "type": "string",
                         "description": "Key prefix to match (e.g. 'execution/' or 'cache/'). Minimum 3 characters."
+                    },
+                    "memory_type": {
+                        "type": "string",
+                        "description": "Restrict the delete to one memory type, matching list_actor_memories' filter of the same name. Omit to delete every type under the prefix — including semantic, which has no TTL and is never reclaimed automatically."
                     }
                 },
                 "required": ["actor_id", "prefix"]
@@ -1982,13 +1993,32 @@ async fn handle_terminate_actor(
         Err(resp) => return resp,
     };
 
-    // Count workflows that would be archived (used for both dry_run and actual run)
+    // Count workflows that would be archived (used for both dry_run and actual run).
+    //
+    // This must NOT be `.unwrap_or(0)`. A swallowed DB error rendered
+    // `"would_archive_workflows": 0`, which is byte-identical to "this actor
+    // owns nothing" — so an operator probing an IRREVERSIBLE terminate reads 0,
+    // concludes there is nothing to lose, and confirms. The preview understated
+    // on exactly the path where it had no information. Fail the preview loudly
+    // instead; a confirmation prompt that cannot count must not report a count.
     let would_archive_count: i64 = if cleanup {
-        state
+        match state
             .actor_repo
             .count_active_workflows_for_actor(actor_id)
             .await
-            .unwrap_or(0)
+        {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!("terminate_actor: count_active_workflows_for_actor: {}", e);
+                return mcp_error(
+                    req_id,
+                    -32000,
+                    "Could not count the workflows this actor owns, so the number that would be \
+                     archived cannot be reported. Terminate is irreversible — retry rather than \
+                     proceeding without it.",
+                );
+            }
+        }
     } else {
         0
     };
@@ -3847,17 +3877,67 @@ async fn handle_actor_forget_prefix(
         Err(e) => return e,
     };
 
-    match talos_actor_memory_service::forget_prefix(&state.db_pool, actor_id, prefix).await {
-        Ok(deleted_count) => mcp_text(
+    // `memory_type` mirrors `list_actor_memories`' filter of the same name so
+    // the delete can be scoped to exactly what was previewed. Without it, an
+    // operator who previewed `memory_type: "working"`, saw three rows and
+    // confirmed also destroyed every `semantic` row under the prefix — and
+    // semantic is the no-TTL permanent tier. Same validation as the listing
+    // handler, so the two surfaces cannot disagree about what a valid type is.
+    let memory_type_filter: Option<&str> = match args.get("memory_type") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => match v.as_str() {
+            Some(s) if talos_memory::is_valid_memory_type(s) => Some(s),
+            Some(s) => {
+                return mcp_error(
+                    req_id,
+                    -32602,
+                    &format!(
+                        "Invalid memory_type filter '{s}'. Valid values: {}",
+                        talos_memory::memory_types_csv()
+                    ),
+                )
+            }
+            None => {
+                let kind = crate::utils::json_type_name(v);
+                return mcp_error(
+                    req_id,
+                    -32602,
+                    &format!("memory_type must be a string, got {kind}"),
+                );
+            }
+        },
+    };
+
+    match talos_actor_memory_service::forget_prefix(
+        &state.db_pool,
+        actor_id,
+        prefix,
+        memory_type_filter,
+    )
+    .await
+    {
+        Ok(outcome) => mcp_text(
             req_id,
             &serde_json::to_string_pretty(&serde_json::json!({
-                "deleted_count": deleted_count,
+                "deleted_count": outcome.deleted,
+                // Split because `list_actor_memories` — the preview this tool's
+                // own error messages tell you to run first — hides expired rows.
+                // Undifferentiated, purged tombstones push `deleted_count` past
+                // the previewed set for a reason the reader cannot attribute.
+                "deleted_live": outcome.live,
+                "deleted_expired_tombstones": outcome.expired,
                 "prefix": prefix,
+                "memory_type": memory_type_filter,
                 "actor_id": actor_id,
-                "note": if deleted_count == 0 {
+                "note": if outcome.deleted == 0 {
                     "No matching keys found.".to_string()
                 } else {
-                    format!("{} key(s) permanently deleted. Subsequent actor_recall will return reason: 'never_set'.", deleted_count)
+                    format!(
+                        "{} key(s) permanently deleted ({} live, {} already-expired tombstone(s), \
+                         which list_actor_memories does not show). Subsequent actor_recall will \
+                         return reason: 'never_set'.",
+                        outcome.deleted, outcome.live, outcome.expired
+                    )
                 }
             }))
             .unwrap_or_default(),
@@ -3981,14 +4061,34 @@ async fn handle_list_actor_memories(
                     entry
                 })
                 .collect();
+            // This listing is the preview `actor_forget_prefix` names in its own
+            // error text, and that delete is NOT capped. A bare `count: 200`
+            // over a query clamped to MAX_LIST_LIMIT reads as the whole
+            // population (an actor may hold up to MAX_MEMORIES_PER_ACTOR =
+            // 10_000), so the operator confirms against a number 50x short of
+            // what the delete will remove. Disclose the cap so it reads as the
+            // lower bound it is.
+            let coverage = talos_measurement::Coverage::new(
+                i64::try_from(memories.len()).unwrap_or(i64::MAX),
+                talos_memory::MAX_LIST_LIMIT,
+            );
+            let truncated = coverage.truncated();
+            let mut result = serde_json::json!({
+                "actor_id": actor_id,
+                "memories": memories,
+                "count": memories.len(),
+                "coverage": coverage.to_json(),
+            });
+            if truncated {
+                result["forget_prefix_warning"] = serde_json::json!(
+                    "This listing is truncated. actor_forget_prefix is NOT capped — confirming \
+                     against this list would delete more than is shown. Narrow the prefix (or \
+                     memory_type) until `coverage.truncated` is false before deleting."
+                );
+            }
             mcp_text(
                 req_id,
-                &serde_json::to_string_pretty(&serde_json::json!({
-                    "actor_id": actor_id,
-                    "memories": memories,
-                    "count": memories.len(),
-                }))
-                .unwrap_or_default(),
+                &serde_json::to_string_pretty(&result).unwrap_or_default(),
             )
         }
         Err(e) => {

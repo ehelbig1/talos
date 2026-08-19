@@ -7,6 +7,17 @@ use anyhow::Result;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+/// Row cap on [`ModuleRepository::find_unreferenced_modules`].
+///
+/// Exported because that query is the ONLY preview an operator has for
+/// `cleanup_modules`, whose DELETE is unbounded. A cap that stays a literal
+/// buried in SQL cannot travel to the reporting site, so the response says
+/// "50" where it means "at least 50" — and the reader authorises a delete
+/// against a number they believe is the whole population. Same reason
+/// `talos_measurement::Coverage::new` takes the cap as an argument rather
+/// than defaulting it.
+pub const UNREFERENCED_MODULES_LIMIT: i64 = 50;
+
 pub struct ModuleRepository {
     db_pool: PgPool,
     /// Optional SecretsManager for transparent decryption of
@@ -934,10 +945,27 @@ impl ModuleRepository {
     /// The 3-shape alias NOT-IN check stays until the alias columns are
     /// dropped in the follow-up migration — a workflow still carrying a
     /// legacy UUID must not get its module deleted out from under it.
+    ///
+    /// **`older_than_days` exists so this DELETE matches the survey the
+    /// operator ran before authorising it.** `find_unreferenced_modules` — the
+    /// tool whose own description says "useful for cleanup", and the only
+    /// preview an operator has for this delete — selects
+    /// `compiled_at IS NOT NULL AND compiled_at < NOW() - N days … LIMIT 50`.
+    /// This statement carried NEITHER age predicate, so a module compiled
+    /// minutes ago and not yet wired into a workflow (exactly what
+    /// `compile_custom_sandbox` produces) was invisible in the survey and
+    /// destroyed by the cleanup. The operator read predicate A's output and
+    /// authorised predicate B — the `fix_all` shape, on an irreversible delete.
+    ///
+    /// The `LIMIT 50` gap is closed on the preview side instead: a `LIMIT`
+    /// belongs on a survey, not on a DELETE, so `find_unreferenced_modules`
+    /// now discloses its own truncation rather than this statement pretending
+    /// to a bound it should not have.
     pub async fn cleanup_unreferenced_modules(
         &self,
         user_id: Uuid,
         prefix_filter: Option<&str>,
+        older_than_days: i32,
     ) -> Result<u64> {
         // Single statement with optional name filter via boolean parameter so
         // there's no dynamic SQL — the `$2::bool` arm short-circuits when no
@@ -947,6 +975,8 @@ impl ModuleRepository {
             "DELETE FROM modules \
              WHERE user_id = $1 \
                AND ($2::bool IS FALSE OR name LIKE $3) \
+               AND compiled_at IS NOT NULL \
+               AND compiled_at < NOW() - make_interval(days => $4::int) \
                AND id NOT IN ( \
                  SELECT DISTINCT unnest(regexp_matches( \
                    graph_json, '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', 'g' \
@@ -957,6 +987,7 @@ impl ModuleRepository {
         .bind(user_id)
         .bind(prefix_filter.is_some())
         .bind(pattern.as_deref())
+        .bind(older_than_days)
         .execute(&self.db_pool)
         .await?;
         Ok(result.rows_affected())
@@ -1256,8 +1287,10 @@ impl ModuleRepository {
     }
 
     /// Find user-owned modules that haven't been referenced by any
-    /// workflow in the past `days` days. Capped at 50 rows. Phase 5:
-    /// queries the unified `modules` table.
+    /// workflow in the past `days` days. Capped at
+    /// [`UNREFERENCED_MODULES_LIMIT`] rows — the caller MUST disclose that cap,
+    /// because this is the preview leg of an irreversible `cleanup_modules`
+    /// delete. Phase 5: queries the unified `modules` table.
     pub async fn find_unreferenced_modules(
         &self,
         user_id: Uuid,
@@ -1273,10 +1306,11 @@ impl ModuleRepository {
                    SELECT 1 FROM workflows w \
                    WHERE w.user_id = $1 AND w.graph_json LIKE '%' || m.id::text || '%' \
                ) \
-             ORDER BY m.compiled_at ASC LIMIT 50",
+             ORDER BY m.compiled_at ASC LIMIT $3",
         )
         .bind(user_id)
         .bind(days)
+        .bind(UNREFERENCED_MODULES_LIMIT)
         .fetch_all(&self.db_pool)
         .await?;
         rows.iter()
@@ -1598,13 +1632,22 @@ impl ModuleRepository {
     /// resolves against the unified `modules` table; "has_wasm" becomes
     /// `wasm_bytes IS NOT NULL AND length > 0`. Used by
     /// `restore_pinned_modules` to decide which entries need a recompile.
+    ///
+    /// The join carries `AND m.user_id = pm.user_id` because `modules.name` is
+    /// unique only PER USER (see `update_template_precompiled_wasm` below for
+    /// the index definitions). Without it the LEFT JOIN fans out one row per
+    /// tenant holding the name — over-counting the pin list and recompiling the
+    /// same module repeatedly — and `has_wasm` reads true when ANY tenant's row
+    /// has bytes, so a user whose own copy is empty is reported
+    /// `already_present` and never restored. That is this tool failing silently
+    /// in precisely the case it exists for.
     pub async fn list_user_pinned_modules(&self, user_id: Uuid) -> Result<Vec<PinnedModuleStatus>> {
         let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let rows = sqlx::query(
             "SELECT pm.module_name, \
                     (m.wasm_bytes IS NOT NULL AND octet_length(m.wasm_bytes) > 0) AS has_wasm \
              FROM user_module_pins pm \
-             LEFT JOIN modules m ON m.name = pm.module_name \
+             LEFT JOIN modules m ON m.name = pm.module_name AND m.user_id = pm.user_id \
              WHERE pm.user_id = $1 \
              ORDER BY pm.pinned_at ASC",
         )
@@ -1626,20 +1669,48 @@ impl ModuleRepository {
 
     /// Phase 5: update a module's precompiled wasm bytes by name (modules
     /// table; `wasm_bytes` replaces the legacy `precompiled_wasm` column).
+    ///
+    /// **Scoped to `owner_user_id`.** This write used to be `WHERE name = $2`
+    /// with no owner predicate, which is safe only if `modules.name` is
+    /// globally unique. It is not:
+    /// `migrations/20260423000000_modules_table_phase1.sql:74-81` declares TWO
+    /// uniqueness scopes —
+    /// `modules_user_name_uniq (user_id, name) WHERE user_id IS NOT NULL` and
+    /// `modules_catalog_name_uniq (name) WHERE user_id IS NULL`. One
+    /// catalog-template name therefore names one row PER TENANT plus the shared
+    /// catalog row, and the unscoped UPDATE overwrote all of them:
+    /// `restore_pinned_modules` reported "N of YOUR pinned modules restored"
+    /// while writing N x (tenants holding those names). A tenant who had
+    /// `hot_update_module`'d their copy lost it to a stock catalog rebuild with
+    /// no history row and no audit event, and `compiled_at = NOW()` stamped on
+    /// every tenant's row corrupts the `ORDER BY compiled_at DESC` keeper
+    /// choice that `cleanup_module_versions` depends on.
+    ///
+    /// The correctly-scoped shape already existed one crate over:
+    /// `talos_advanced_repository::list_pinned_modules_with_user_install_status`
+    /// resolves a pin with `EXISTS(… WHERE m.user_id = $1 AND m.name = …)` and
+    /// documents `modules.user_id + name` as "the new per-user install signal".
+    /// This is that predicate applied to the write side.
+    ///
+    /// Returns `rows_affected` so the caller can distinguish a real restore (1)
+    /// from "this user has no install row under that name" (0), instead of
+    /// reporting success for a write that landed nowhere.
     pub async fn update_template_precompiled_wasm(
         &self,
         module_name: &str,
         wasm_bytes: &[u8],
+        owner_user_id: Uuid,
     ) -> Result<u64> {
         let result = sqlx::query(
             "UPDATE modules \
              SET wasm_bytes = $1, \
                  size_bytes = length($1)::INTEGER, \
                  compiled_at = NOW() \
-             WHERE name = $2",
+             WHERE name = $2 AND user_id = $3",
         )
         .bind(wasm_bytes)
         .bind(module_name)
+        .bind(owner_user_id)
         .execute(&self.db_pool)
         .await?;
         Ok(result.rows_affected())
@@ -3306,5 +3377,108 @@ mod tests {
         ] {
             assert!(sql.contains(needle), "lost `{needle}`: {sql}");
         }
+    }
+}
+
+/// Structural pins for the two preview→action scope defects fixed alongside
+/// #655's `fix_all` instance of the same class.
+///
+/// These are source-text assertions, not behavioural ones, on purpose: the
+/// behavioural proofs live in `tests/preview_action_scope.rs`, which needs a
+/// live Postgres and SKIPS without `TALOS_TEST_DATABASE_URL`. A gate that can
+/// only skip is not a gate, so the always-running backstop is here. Both were
+/// run against the pre-fix tree and fail on it.
+#[cfg(test)]
+mod preview_action_scope_pins {
+    /// Needles are `concat!`-assembled so this module's own source text is not
+    /// a match. A self-scanning `include_str!` that matches itself is a test
+    /// that can never fail — #655's lesson, kept.
+    fn src() -> &'static str {
+        include_str!("lib.rs")
+    }
+
+    /// The restore write must name an owner. `modules.name` is unique only
+    /// per-user (`modules_user_name_uniq (user_id, name) WHERE user_id IS NOT
+    /// NULL`), so an unscoped `WHERE name = $2` reaches every tenant's row of
+    /// that name plus the shared catalog row — a user-scoped read driving a
+    /// cross-tenant write.
+    #[test]
+    fn pinned_wasm_write_is_scoped_to_one_owner() {
+        assert!(
+            src().contains(concat!("WHERE name = $2 AND ", "user_id = $3")),
+            "update_template_precompiled_wasm lost its owner predicate; without it \
+             restore_pinned_modules reports a user-scoped restore while overwriting \
+             every tenant's module of that name and the shared catalog row"
+        );
+        // There is deliberately NO paired negative assertion ("the unscoped form
+        // is not back"). The doc comments in this crate quote `WHERE name = $2`
+        // to explain the bug, so a negative over that substring would either
+        // self-trip or have to be spelled with exact surrounding whitespace —
+        // brittle to rustfmt and, worse, quietly satisfiable. The positive
+        // assertion above is the load-bearing one and was mutation-proved: with
+        // the owner predicate removed it fails and no other pin does.
+    }
+
+    /// The read leg. Without `AND m.user_id = pm.user_id` the LEFT JOIN fans out
+    /// one row per tenant holding the name, and `has_wasm` reads true when ANY
+    /// tenant's row has bytes — so a user whose own copy is empty is reported
+    /// `already_present` and silently never restored.
+    #[test]
+    fn pinned_listing_join_is_scoped_to_the_pin_owner() {
+        assert!(
+            src().contains(concat!(
+                "LEFT JOIN modules m ON m.name = pm.module_name AND ",
+                "m.user_id = pm.user_id"
+            )),
+            "list_user_pinned_modules' join lost its owner predicate; it now fans out \
+             across tenants and reports another tenant's compiled bytes as this \
+             user's install state"
+        );
+    }
+
+    /// `cleanup_modules` must carry the age predicate its only survey has.
+    /// `find_unreferenced_modules` selects `compiled_at < NOW() - N days`; the
+    /// DELETE had no age predicate at all, so a module compiled minutes ago —
+    /// exactly what `compile_custom_sandbox` produces — could not appear in the
+    /// survey and was destroyed by the cleanup the survey invited.
+    #[test]
+    fn cleanup_delete_carries_the_age_filter_the_survey_previews_with() {
+        assert!(
+            src().contains(concat!(
+                "AND compiled_at < NOW() - make_interval(days => ",
+                "$4::int)"
+            )),
+            "cleanup_unreferenced_modules lost its age predicate; the operator then \
+             surveys with find_unreferenced_modules(days) and authorises a DELETE \
+             that ignores `days` entirely"
+        );
+        assert!(
+            src().contains(concat!(
+                "AND compiled_at ",
+                "IS NOT NULL \\\n               AND"
+            )),
+            "cleanup_unreferenced_modules lost the `compiled_at IS NOT NULL` guard \
+             the survey also applies"
+        );
+    }
+
+    /// The survey's own cap must stay reachable by its caller. A cap that is a
+    /// literal buried in SQL cannot travel to the reporting site, so the
+    /// response says "50" where it means "at least 50" — and the reader
+    /// authorises an UNBOUNDED delete against it.
+    #[test]
+    fn the_survey_cap_is_exported_and_bound_not_a_literal() {
+        assert!(
+            src().contains(concat!("ORDER BY m.compiled_at ASC ", "LIMIT $3")),
+            "find_unreferenced_modules' row cap went back to a SQL literal; the \
+             handler can then no longer disclose it, and a truncated survey reads \
+             as the whole population"
+        );
+        assert_eq!(
+            super::UNREFERENCED_MODULES_LIMIT,
+            50,
+            "the exported cap must match the query's actual bound — a disclosure \
+             derived from the wrong number is worse than none"
+        );
     }
 }

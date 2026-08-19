@@ -24,9 +24,9 @@ pub use talos_memory::{
     measure_and_forget_keys_in_tx, measure_value_bytes_in_tx, persist_memory, persist_memory_in_tx,
     persist_memory_with_metadata, persist_memory_with_metadata_typed, recall_exact, recall_hyde,
     recall_keyword, recall_semantic, refresh_ttl, sweep_expired, validate_memory_type,
-    ForgetOutcome, MemoryHit, MemoryMeta, MemoryRow, MemoryWriteError, PersistOutcome,
-    SearchMethod, SearchOutcome, MAX_LIST_LIMIT, MAX_MEMORIES_PER_ACTOR, MAX_VALUE_BYTES,
-    MEMORY_TYPES,
+    ForgetOutcome, ForgetPrefixOutcome, MemoryHit, MemoryMeta, MemoryRow, MemoryWriteError,
+    PersistOutcome, SearchMethod, SearchOutcome, MAX_LIST_LIMIT, MAX_MEMORIES_PER_ACTOR,
+    MAX_VALUE_BYTES, MEMORY_TYPES,
 };
 
 /// Re-export the canonical graph-service singleton from `talos-graph-rag`.
