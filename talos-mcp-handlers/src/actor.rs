@@ -5846,6 +5846,7 @@ async fn handle_compress_actor_context(
         .await
         {
             tracing::error!("compress_actor_context write key '{}': {}", key, e);
+            // allow-swallowed-result: rollback on a path that is already returning an error; a failed rollback is followed by the tx being dropped, which rolls back anyway.
             let _ = tx.rollback().await;
             return mcp_error(req_id, -32000, "Failed to write replacement memory entry");
         }

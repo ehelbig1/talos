@@ -627,8 +627,18 @@ pub async fn idempotency_middleware(
                 }
                 Err(_) => {
                     // Body exceeded the cache cap and is now consumed; release so
-                    // a retry can proceed, and surface a clear error.
-                    let _ = service.release(&scoped_key, &request_hash).await;
+                    // a retry can proceed, and surface a clear error. Its two
+                    // siblings above both WARN on a failed release; this one
+                    // was the outlier `let _ = ... .await`, and a silent
+                    // failure here keeps the key in-flight so the caller's
+                    // legitimate retry is refused until the lease expires.
+                    if let Err(e) = service.release(&scoped_key, &request_hash).await {
+                        tracing::warn!(
+                            error = %e,
+                            "idempotency release failed (oversized response); \
+                             key stays in-flight until lease expiry"
+                        );
+                    }
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "Response too large for idempotent handling",

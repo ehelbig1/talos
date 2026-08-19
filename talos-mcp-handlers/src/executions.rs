@@ -2761,7 +2761,13 @@ async fn handle_enqueue_workflow(
                     // MCP-450: DLP-redact engine build error before
                     // persistence. Same secret-leak class as MCP-447.
                     let redacted = talos_dlp_provider::redact_str(&e.to_string());
-                    let _ = repo.mark_execution_failed(exec_id, &redacted, None).await;
+                    if let Err(e) = repo.mark_execution_failed(exec_id, &redacted, None).await {
+                        tracing::warn!(
+                            target: "talos_audit", execution_id = %exec_id,
+                            error = %e,
+                            "failed to mark execution FAILED; the row keeps its non-terminal status until the stale-execution sweeper finalizes it"
+                        );
+                    }
                     if idx + 1 < inputs.len() {
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     }

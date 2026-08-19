@@ -191,7 +191,12 @@ async fn handle_publish_version(
 
     // Update intent and capabilities if provided
     if intent.is_some() || capabilities.is_some() {
-        let _ = state
+        // Pre-fix `let _ = ... .await` discarded BOTH the Err and the
+        // rows_affected==0 case, so a caller who supplied intent/capabilities
+        // as part of publish_version was told the version published while
+        // neither was recorded. This write happens BEFORE the publish, so
+        // refusing here leaves nothing half-done.
+        match state
             .workflow_repo
             .update_workflow_intent_and_capabilities(
                 workflow_id,
@@ -199,7 +204,30 @@ async fn handle_publish_version(
                 intent.as_ref(),
                 capabilities.as_deref(),
             )
-            .await;
+            .await
+        {
+            Ok(0) => {
+                return mcp_error(
+                    req_id,
+                    -32000,
+                    "Workflow not found or access denied; intent/capabilities were not \
+                     recorded and no version was published.",
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!(
+                    workflow_id = %workflow_id,
+                    error = %e,
+                    "publish_version: intent/capabilities write failed"
+                );
+                return mcp_error(
+                    req_id,
+                    -32000,
+                    "Failed to record intent/capabilities; no version was published. Retry.",
+                );
+            }
+        }
     }
 
     // Build a narrow policy hook so the version service can evaluate
@@ -247,11 +275,34 @@ async fn handle_publish_version(
             version,
             warnings: validation_warnings,
         }) => {
-            // Move workflow to 'active' status now that it has a published version
-            let _ = state
+            // Move workflow to 'active' status now that it has a published
+            // version. The publish already committed, so this cannot be
+            // rolled back — but pre-fix `let _ = ... .await` meant a failure
+            // left the workflow in draft while the response reported a
+            // published version and a "deploy_workflow" next step. Report it
+            // instead: `activated` is echoed in the body below.
+            let activated = match state
                 .workflow_repo
                 .set_workflow_status(workflow_id, user_id, "active")
-                .await;
+                .await
+            {
+                Ok(n) if n > 0 => true,
+                Ok(_) => {
+                    tracing::warn!(
+                        workflow_id = %workflow_id,
+                        "publish_version: activation matched no row (version WAS published)"
+                    );
+                    false
+                }
+                Err(e) => {
+                    tracing::error!(
+                        workflow_id = %workflow_id,
+                        error = %e,
+                        "publish_version: activation failed (version WAS published)"
+                    );
+                    false
+                }
+            };
             // Spawn best-effort search text update
             let db_pool = state.db_pool.clone();
             tokio::spawn(async move {
@@ -267,13 +318,12 @@ async fn handle_publish_version(
                 .iter()
                 .map(|w: &talos_workflow_validation::ValidationIssue| w.message.clone())
                 .collect();
-            mcp_text(
-                req_id,
-                &serde_json::to_string_pretty(&serde_json::json!({
+            let mut body = serde_json::json!({
                     "version_id": version.id,
                     "version_number": version.version_number,
                     "published_at": version.published_at.to_rfc3339(),
                     "is_active": version.is_active,
+                    "workflow_activated": activated,
                     "validation_warnings": warn_messages,
                     "next_steps_checklist": [
                         {
@@ -291,8 +341,11 @@ async fn handle_publish_version(
                             "note": "Runs synchronously against this version and validates output before going live.",
                         },
                     ],
-                }))
-                .unwrap_or_default(),
+            });
+            annotate_unactivated_workflow(&mut body, activated);
+            mcp_text(
+                req_id,
+                &serde_json::to_string_pretty(&body).unwrap_or_default(),
             )
         }
         Err(e) => {
@@ -786,5 +839,48 @@ async fn handle_list_workflow_versions_with_diff(
             tracing::error!(err = ?e, workflow_id = %workflow_id, "list_workflow_versions_with_diff failed");
             mcp_error(req_id, -32000, "Failed to list versions")
         }
+    }
+}
+
+/// A published version whose workflow could NOT be moved to `active` is not a
+/// clean publish, and the caller has to be told so — `publish_version`'s
+/// pre-fix `let _ = set_workflow_status(...).await` left the workflow in
+/// `draft` while the response returned the version plus a "deploy_workflow"
+/// next step, i.e. reported success on a failed write. `activated == true` is
+/// a NO-OP so the success path is byte-identical.
+fn annotate_unactivated_workflow(body: &mut serde_json::Value, activated: bool) {
+    if activated {
+        return;
+    }
+    body["warning"] = serde_json::json!(
+        "The version WAS published, but the workflow could not be moved to `active` — it is still in its previous status. Re-run publish_version or set the status directly before relying on a scheduled trigger."
+    );
+}
+
+#[cfg(test)]
+mod publish_activation_tests {
+    use super::annotate_unactivated_workflow;
+
+    #[test]
+    fn activated_publish_gains_no_extra_keys() {
+        let mut body = serde_json::json!({"version_id": 1, "workflow_activated": true});
+        let before = body.clone();
+        annotate_unactivated_workflow(&mut body, true);
+        assert_eq!(body, before, "the success path must stay byte-identical");
+    }
+
+    /// The bar for this fix is that the CALLER is told, not that a log line
+    /// exists somewhere: the response itself must say the workflow is not
+    /// active.
+    #[test]
+    fn unactivated_publish_warns_in_the_response() {
+        let mut body = serde_json::json!({"version_id": 1, "workflow_activated": false});
+        annotate_unactivated_workflow(&mut body, false);
+        let w = body["warning"].as_str().unwrap_or_default();
+        assert!(
+            w.contains("published") && w.contains("active"),
+            "the warning must distinguish 'published' from 'active', got: {w:?}"
+        );
+        assert_eq!(body["workflow_activated"], serde_json::json!(false));
     }
 }
