@@ -18,5 +18,11 @@ talos-secrets-manager = { path = "../talos-secrets-manager" }
 tracing.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+# `preview_action_scope` is an async integration binary against a live Postgres —
+# the predicates it pins (per-user scoping on the wasm write, the age filter on
+# the cleanup DELETE) are properties of SQL, so only the database can evaluate them.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
 [lints]
 workspace = true

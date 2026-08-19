@@ -198,7 +198,7 @@ async fn test_pool_or_skip() -> Option<(Pool<Postgres>, Uuid)> {
 }
 
 async fn cleanup_prefix(pool: &Pool<Postgres>, actor_id: Uuid, prefix: &str) {
-    let _ = mem::forget_prefix(pool, actor_id, prefix).await;
+    let _ = mem::forget_prefix(pool, actor_id, prefix, None).await;
 }
 
 #[tokio::test]
@@ -254,10 +254,10 @@ async fn persist_recall_forget_roundtrip() {
         .is_none());
 
     // Hard delete via prefix
-    let n = mem::forget_prefix(&pool, actor_id, &prefix)
+    let n = mem::forget_prefix(&pool, actor_id, &prefix, None)
         .await
         .expect("forget_prefix");
-    assert!(n >= 1);
+    assert!(n.deleted >= 1);
     assert!(!mem::key_exists_at_all(&pool, actor_id, &key)
         .await
         .expect("key_exists_at_all post-prefix-forget"));
@@ -483,7 +483,7 @@ async fn recall_semantic_filtered_excludes_by_metadata_kind() {
         "NULL-metadata row passes even when multiple kinds excluded"
     );
 
-    let _ = mem::forget_prefix(&pool, actor_id, &prefix).await;
+    let _ = mem::forget_prefix(&pool, actor_id, &prefix, None).await;
 }
 
 #[tokio::test]
@@ -562,7 +562,7 @@ async fn recall_recent_by_types_filters_and_orders() {
         );
     }
 
-    let _ = mem::forget_prefix(&pool, actor_id, &prefix).await;
+    let _ = mem::forget_prefix(&pool, actor_id, &prefix, None).await;
 }
 
 #[tokio::test]
@@ -620,7 +620,7 @@ async fn recall_recent_excluding_types_drops_match_keeps_rest() {
         "scratchpad included when exclude is empty"
     );
 
-    let _ = mem::forget_prefix(&pool, actor_id, &prefix).await;
+    let _ = mem::forget_prefix(&pool, actor_id, &prefix, None).await;
 }
 
 #[tokio::test]
@@ -662,7 +662,7 @@ async fn semantic_recall_returns_keyword_fallback_when_no_embedding() {
     );
     assert!(outcome.hits.iter().any(|h| h.key == key));
 
-    let _ = mem::forget_prefix(&pool, actor_id, &prefix).await;
+    let _ = mem::forget_prefix(&pool, actor_id, &prefix, None).await;
 }
 
 /// The user_id `test_pool_or_skip` seeds its actor under. Re-derived here so
@@ -707,8 +707,8 @@ async fn batched_listing_groups_caps_and_decrypts_across_actors() {
     let actor_unknown = Uuid::new_v4(); // not owned / does not exist
 
     let prefix = format!("talos-memory-test/{}/", Uuid::new_v4());
-    mem::forget_prefix(&pool, actor_a, &prefix).await.ok();
-    mem::forget_prefix(&pool, actor_b, &prefix).await.ok();
+    mem::forget_prefix(&pool, actor_a, &prefix, None).await.ok();
+    mem::forget_prefix(&pool, actor_b, &prefix, None).await.ok();
 
     // actor_a: 3 rows created in a known order (distinct created_at — each
     // persist is its own tx, so now() strictly increases). With a per-actor
@@ -819,6 +819,163 @@ async fn batched_listing_groups_caps_and_decrypts_across_actors() {
     assert!(empty.is_empty(), "empty actor_ids → no rows");
     drop(conn);
 
-    mem::forget_prefix(&pool, actor_a, &prefix).await.ok();
-    mem::forget_prefix(&pool, actor_b, &prefix).await.ok();
+    mem::forget_prefix(&pool, actor_a, &prefix, None).await.ok();
+    mem::forget_prefix(&pool, actor_b, &prefix, None).await.ok();
+}
+
+// ── forget_prefix: the delete must be a SUBSET of what list_memories shows ───
+//
+// `actor_forget_prefix`'s own error messages tell the operator to run
+// `list_actor_memories` first "to preview what will be affected". Three
+// predicates the preview has and the DELETE did not:
+//   1. `LIMIT` (MAX_LIST_LIMIT = 200 vs MAX_MEMORIES_PER_ACTOR = 10_000) —
+//      closed on the PREVIEW side, which now discloses its cap via `coverage`.
+//   2. `expires_at > now()` — the DELETE correctly purges tombstones, but must
+//      report them separately or the total exceeds the previewed set for a
+//      reason the reader cannot attribute.
+//   3. `memory_type` — the preview filters, the DELETE did not. Covered below.
+
+/// The sharpest of the three. An operator previews
+/// `prefix='p/', memory_type='working'`, sees the working rows, confirms — and
+/// pre-fix also destroyed every `semantic` row under that prefix. Semantic is
+/// the no-TTL permanent tier: nothing reclaims it, and nothing brings it back.
+///
+/// This test cannot even be expressed against the pre-fix signature, which took
+/// no `memory_type`; behaviourally, the pre-fix DELETE removed both rows.
+#[tokio::test]
+async fn forget_prefix_honours_the_memory_type_the_preview_filtered_on() {
+    let Some((pool, actor_id)) = test_pool_or_skip().await else {
+        return;
+    };
+    let prefix = format!("pa-scope-type-{}/", Uuid::new_v4().simple());
+    cleanup_prefix(&pool, actor_id, &prefix).await;
+
+    let working_key = format!("{prefix}working");
+    let semantic_key = format!("{prefix}semantic");
+    mem::persist_memory_with_metadata_typed(
+        &pool,
+        actor_id,
+        &working_key,
+        &serde_json::json!({"v": "working"}),
+        None,
+        "working",
+        None,
+    )
+    .await
+    .expect("persist working");
+    mem::persist_memory_with_metadata_typed(
+        &pool,
+        actor_id,
+        &semantic_key,
+        &serde_json::json!({"v": "semantic"}),
+        None,
+        "semantic",
+        None,
+    )
+    .await
+    .expect("persist semantic");
+
+    // The preview the operator would run, filtered to one type.
+    let previewed = mem::list_memories(&pool, actor_id, Some(&prefix), Some("working"), None)
+        .await
+        .expect("list_memories");
+    let previewed_keys: Vec<String> = previewed.iter().map(|m| m.key.clone()).collect();
+    assert_eq!(
+        previewed_keys,
+        vec![working_key.clone()],
+        "precondition: the type-filtered preview shows only the working row"
+    );
+
+    let outcome = mem::forget_prefix(&pool, actor_id, &prefix, Some("working"))
+        .await
+        .expect("forget_prefix");
+
+    assert_eq!(
+        outcome.deleted, 1,
+        "the delete must touch exactly the previewed set — pre-fix it removed \
+         both rows because the DELETE had no memory_type predicate"
+    );
+    assert!(
+        mem::recall_exact(&pool, actor_id, &semantic_key)
+            .await
+            .expect("recall semantic")
+            .is_some(),
+        "the semantic row was never previewed and must survive; semantic is the \
+         permanent, no-TTL tier and nothing reclaims or restores it"
+    );
+    assert!(
+        mem::recall_exact(&pool, actor_id, &working_key)
+            .await
+            .expect("recall working")
+            .is_none(),
+        "the previewed working row is gone"
+    );
+
+    cleanup_prefix(&pool, actor_id, &prefix).await;
+}
+
+/// `list_memories` hides `expires_at <= now()`, so tombstones written by
+/// `forget` are invisible to every preview and removed by this delete. Purging
+/// them is right; folding them into one undifferentiated `deleted_count` is not
+/// — the total then exceeds the previewed set for a reason the operator has no
+/// way to attribute. The split makes the action honest about its own scope.
+///
+/// Pre-fix `forget_prefix` returned a bare `u64` and this distinction did not exist.
+#[tokio::test]
+async fn forget_prefix_reports_invisible_tombstones_separately_from_live_rows() {
+    let Some((pool, actor_id)) = test_pool_or_skip().await else {
+        return;
+    };
+    let prefix = format!("pa-scope-tomb-{}/", Uuid::new_v4().simple());
+    cleanup_prefix(&pool, actor_id, &prefix).await;
+
+    let live_key = format!("{prefix}live");
+    let dead_key = format!("{prefix}dead");
+    for k in [&live_key, &dead_key] {
+        mem::persist_memory(
+            &pool,
+            actor_id,
+            k,
+            &serde_json::json!({"v": 1}),
+            "episodic",
+            None,
+        )
+        .await
+        .expect("persist");
+    }
+    // Soft-delete one: `forget` writes a tombstone the preview cannot show.
+    mem::forget(&pool, actor_id, &dead_key)
+        .await
+        .expect("forget");
+
+    let previewed = mem::list_memories(&pool, actor_id, Some(&prefix), None, None)
+        .await
+        .expect("list_memories");
+    assert_eq!(
+        previewed.len(),
+        1,
+        "precondition: the preview shows only the live row — the tombstone is hidden"
+    );
+
+    let outcome = mem::forget_prefix(&pool, actor_id, &prefix, None)
+        .await
+        .expect("forget_prefix");
+
+    assert_eq!(outcome.deleted, 2, "both rows are removed");
+    assert_eq!(
+        outcome.live, 1,
+        "exactly one removed row was visible to the preview"
+    );
+    assert_eq!(
+        outcome.expired, 1,
+        "the tombstone is counted separately, so the operator can see WHY the \
+         delete total exceeds the row count they were shown"
+    );
+    assert_eq!(
+        outcome.deleted,
+        outcome.live + outcome.expired,
+        "the split must account for the whole total"
+    );
+
+    cleanup_prefix(&pool, actor_id, &prefix).await;
 }

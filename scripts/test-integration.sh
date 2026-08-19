@@ -109,6 +109,12 @@ TESTS=(
     "talos-organizations:personal_org_resolution:migrated"
     "talos-advanced-repository:scratch_rls:migrated"
     "talos-execution-repository:crash_recovery:migrated"
+    # Preview-vs-action scope pins: the per-user predicate on the pinned-module
+    # wasm write (a user-scoped read used to drive a cross-tenant UPDATE) and the
+    # age filter on the cleanup DELETE (which the find_unreferenced_modules
+    # survey has and the DELETE had lost). Both are SQL properties — a live
+    # database is the only thing that can evaluate a WHERE clause.
+    "talos-module-repository:preview_action_scope:migrated"
     "talos-memory:integration:migrated"
     "talos-system-repo:revocation_query:migrated"
 )

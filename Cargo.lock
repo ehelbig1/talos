@@ -8818,6 +8818,7 @@ dependencies = [
  "talos-db",
  "talos-module-payload-encryption",
  "talos-secrets-manager",
+ "tokio",
  "tracing",
  "uuid",
 ]
