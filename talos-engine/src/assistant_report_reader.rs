@@ -150,6 +150,24 @@ impl talos_workflow_engine_core::AssistantReportReader for PostgresAssistantRepo
                     "avg_score": s.avg_score,
                     "pass_rate": s.pass_rate,
                     "worst_score": s.worst_score,
+                    // 2026-08-19: this surface printed `avg_score` with NO
+                    // interpretation at all, while the operator digest —
+                    // reading the SAME `JudgeScoreStat` rows — shipped
+                    // `signal`/`signal_note` beside them since #580. So the
+                    // weekly email was the one place a saturated or
+                    // verdict-mirroring score arrived unqualified, which is
+                    // the surface an operator actually reads unprompted.
+                    // Same function, not a second wording: a hand-copy here
+                    // is what `JUDGE_SCORE_POPULATION_NOTE` was created to
+                    // stop, and a divergent SIGNAL would be worse than a
+                    // divergent note.
+                    "signal": talos_operator_digest::judge_signal(s),
+                    "signal_note": talos_operator_digest::judge_signal_note(
+                        talos_operator_digest::judge_signal(s),
+                        s.runs,
+                        s.na_runs,
+                        Some((s.workflow_id, s.node_id)),
+                    ),
                 })).collect::<Vec<_>>(),
             },
         }))

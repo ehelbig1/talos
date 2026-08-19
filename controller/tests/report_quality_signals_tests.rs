@@ -342,6 +342,54 @@ async fn weekly_judge_scores_are_per_judge_not_per_workflow() {
         rubric.avg_score, rubric.worst_score,
         "the rubric judge genuinely varies"
     );
+
+    // ── 2026-08-19: the per-verdict-group spread, straight from SQL ──────
+    //
+    // These five columns are the ONLY basis for the `mirrors_pass` /
+    // `constant_score` / `score_out_of_domain` signals, and the unit tests
+    // in `talos-operator-digest` build the struct by hand — so nothing else
+    // in the suite would notice a mistyped `FILTER` clause or a renamed
+    // column. `try_get` makes drift loud rather than silent (check 52), but
+    // a WRONG-BUT-VALID predicate reads as perfectly healthy data, which is
+    // exactly the class this change exists to close. Assert the values.
+    assert_eq!(rubric.scored_passed, 1, "one scored pass (0.9)");
+    assert_eq!(rubric.scored_failed(), 1, "one scored fail (0.3)");
+    assert_eq!(rubric.pass_score_min, Some(0.9));
+    assert_eq!(rubric.pass_score_max, Some(0.9));
+    assert_eq!(rubric.fail_score_min, Some(0.3));
+    assert_eq!(rubric.fail_score_max, Some(0.3));
+    assert_eq!(rubric.best_score(), Some(0.9));
+    // The ABSTENTION (score 1.0, passed=true) must not leak into the passing
+    // group — if it did, `pass_score_max` would read 1.0 and the mirror test
+    // would silently stop holding. This is the `FILTER (WHERE NOT
+    // not_applicable)` guarantee asserted at the group grain for the first
+    // time.
+    assert_ne!(
+        rubric.pass_score_max,
+        Some(1.0),
+        "the abstention must be excluded from the passing group too"
+    );
+    // Two constants, one per verdict ⇒ this judge's score is a re-encoding
+    // of `passed`, and the digest must say so instead of calling its spread
+    // a meaningful trend.
+    assert!(
+        rubric.score_mirrors_passed(),
+        "0.9 on every pass and 0.3 on every fail is a verdict mirror"
+    );
+
+    // The all-passing judge has an EMPTY failing group, so no mirror can be
+    // claimed: the failure branch was never exercised. It stays saturated.
+    assert_eq!(coverage.scored_passed, 2);
+    assert_eq!(coverage.scored_failed(), 0);
+    assert_eq!(
+        coverage.fail_score_min, None,
+        "no failing verdicts to bound"
+    );
+    assert_eq!(coverage.fail_score_max, None);
+    assert!(
+        !coverage.score_mirrors_passed(),
+        "an unexercised failure branch is not evidence of a mirror"
+    );
 }
 
 /// Two DIFFERENT workflows that share a name are also no longer pooled —

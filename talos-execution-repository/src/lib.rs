@@ -146,6 +146,100 @@ pub struct JudgeScoreStat {
     pub pass_rate: Option<f64>,
     /// Minimum score over the `runs` scored verdicts.
     pub worst_score: Option<f64>,
+
+    // ── Per-verdict-group score spread ───────────────────────────────────
+    //
+    // (2026-08-19) `avg_score` and `worst_score` are a PROJECTION of the
+    // score distribution, and the projection destroys the one thing the
+    // digest's signal actually needs to know: whether the score carries
+    // information the `passed` boolean beside it does not.
+    //
+    // Two judges are indistinguishable from `(avg, worst)` alone:
+    //   * a graded judge that happens to score 0.2 on its bad runs, and
+    //   * a judge whose expression is `if <cond> {1.0} else {0.2}` — a pure
+    //     re-encoding of `passed`, for which `avg_score` is an exact affine
+    //     transform of `pass_rate` (measured live to 5 dp on four fleet
+    //     judges: `avg = 0.2 + 0.8 * pass_rate`).
+    // The first is a meaningful trend; the second is `pass_rate` printed
+    // twice. Splitting MIN/MAX by verdict group separates them, and it is
+    // the smallest statistic that does — a bare `COUNT(DISTINCT score)`
+    // cannot tell "two values, one per verdict" from "two values, sprinkled".
+    //
+    // Same lesson as [[dimension-collapsed-by-aggregation]]: the dimension
+    // you want to alert on must survive the aggregation you alert over. No
+    // amount of downstream arithmetic recovers it from `(avg, worst)`.
+    /// Scored verdicts in the window where the judge PASSED.
+    /// `runs - scored_passed` is the failing count.
+    pub scored_passed: i64,
+    /// MIN score among scored verdicts that PASSED. `None` when none did.
+    pub pass_score_min: Option<f64>,
+    /// MAX score among scored verdicts that PASSED. `None` when none did.
+    pub pass_score_max: Option<f64>,
+    /// MIN score among scored verdicts that FAILED. `None` when none did.
+    pub fail_score_min: Option<f64>,
+    /// MAX score among scored verdicts that FAILED. `None` when none did.
+    pub fail_score_max: Option<f64>,
+}
+
+impl JudgeScoreStat {
+    /// Scored verdicts in the window where the judge FAILED.
+    #[must_use]
+    pub const fn scored_failed(&self) -> i64 {
+        self.runs - self.scored_passed
+    }
+
+    /// Largest score over the scored verdicts, or `None` when nothing scored.
+    ///
+    /// Derived rather than stored: it is exactly `MAX` over the two group
+    /// maxima, and a sixth SQL aggregate that must agree with them is one
+    /// more thing that can silently disagree.
+    #[must_use]
+    pub fn best_score(&self) -> Option<f64> {
+        match (self.pass_score_max, self.fail_score_max) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        }
+    }
+
+    /// `true` when the score took ONE value on passing runs and ONE (other)
+    /// value on failing runs — i.e. the score is a deterministic function of
+    /// `passed` and therefore carries no information beyond `pass_rate`.
+    ///
+    /// Requires BOTH groups to be non-empty: with only passes observed the
+    /// score could still be graded and simply never have been exercised in
+    /// the failure direction, and claiming otherwise would be the same
+    /// over-reading this module exists to prevent. A judge that has only
+    /// passed is `saturated_pass`, whose remedy (probe it in the FAILURE
+    /// direction) is the correct one.
+    ///
+    /// Non-finite scores answer `false` — a NaN compares unequal to itself,
+    /// so it would otherwise read as "spread" and mask the domain problem
+    /// that a separate check reports.
+    #[must_use]
+    pub fn score_mirrors_passed(&self) -> bool {
+        let (Some(pmin), Some(pmax), Some(fmin), Some(fmax)) = (
+            self.pass_score_min,
+            self.pass_score_max,
+            self.fail_score_min,
+            self.fail_score_max,
+        ) else {
+            return false;
+        };
+        if self.scored_passed <= 0 || self.scored_failed() <= 0 {
+            return false;
+        }
+        if ![pmin, pmax, fmin, fmax].iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        // Exact equality, deliberately: these are the SAME f64 values read
+        // back from the same column, not the result of arithmetic, so a
+        // tolerance would only widen the claim without making it truer.
+        #[allow(clippy::float_cmp)]
+        {
+            pmin == pmax && fmin == fmax
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1411,7 +1505,17 @@ impl ExecutionRepository {
                         / NULLIF(COUNT(*) FILTER (WHERE NOT js.not_applicable), 0) \
                         AS pass_rate, \
                     (MIN(js.score) FILTER (WHERE NOT js.not_applicable))::float8 \
-                        AS worst_score \
+                        AS worst_score, \
+                    (COUNT(*) FILTER (WHERE js.passed AND NOT js.not_applicable))::bigint \
+                        AS scored_passed, \
+                    (MIN(js.score) FILTER (WHERE js.passed AND NOT js.not_applicable))::float8 \
+                        AS pass_score_min, \
+                    (MAX(js.score) FILTER (WHERE js.passed AND NOT js.not_applicable))::float8 \
+                        AS pass_score_max, \
+                    (MIN(js.score) FILTER (WHERE NOT js.passed AND NOT js.not_applicable))::float8 \
+                        AS fail_score_min, \
+                    (MAX(js.score) FILTER (WHERE NOT js.passed AND NOT js.not_applicable))::float8 \
+                        AS fail_score_max \
              FROM judge_scores js \
              JOIN workflows w ON w.id = js.workflow_id \
              WHERE w.user_id = $1 \
@@ -1442,6 +1546,15 @@ impl ExecutionRepository {
                     avg_score: r.try_get::<Option<f64>, _>("avg_score")?,
                     pass_rate: r.try_get::<Option<f64>, _>("pass_rate")?,
                     worst_score: r.try_get::<Option<f64>, _>("worst_score")?,
+                    // Read as `Option` per check 52 — NULL still yields the
+                    // default, but a renamed/retyped column errors instead
+                    // of silently reading as "no passing runs", which would
+                    // turn every judge into `saturated_*` without a word.
+                    scored_passed: r.try_get::<Option<i64>, _>("scored_passed")?.unwrap_or(0),
+                    pass_score_min: r.try_get::<Option<f64>, _>("pass_score_min")?,
+                    pass_score_max: r.try_get::<Option<f64>, _>("pass_score_max")?,
+                    fail_score_min: r.try_get::<Option<f64>, _>("fail_score_min")?,
+                    fail_score_max: r.try_get::<Option<f64>, _>("fail_score_max")?,
                 })
             })
             .collect()
