@@ -620,3 +620,251 @@ only by closing the caller set.
   Not enumerated; the population is unknown.
 * `unwrap_or_else`, `map_or`, and `?` on a call whose error type erases the
   distinction — not enumerated.
+
+
+# Part 3 — `.try_get(...).ok()`: check 52's forbidden shape in a spelling it cannot see (#662)
+
+Produced on `248d690` (= `origin/main`) by `scripts/lint-tryget-ok-inventory.py`;
+verdicts in `scripts/tryget-ok-verdicts.py`. Re-derive and cross-check with:
+
+```sh
+python3 scripts/lint-tryget-ok-inventory.py . > /tmp/sites.json
+python3 scripts/tryget-ok-verdicts.py --check /tmp/sites.json
+```
+
+`row.try_get("col").ok()` is **identical in effect** to the
+`row.try_get("col").unwrap_or(default)` that structural check 52 forbids
+workspace-wide: a renamed / dropped / retyped column produces `Err`, `.ok()`
+turns it into `None`, and the caller cannot tell that from a legitimate SQL
+NULL. Check 52's regex names `.unwrap_or` and nothing else, and 52b's perl pass
+names it too, so this spelling is invisible to both on one line or many. #661
+measured it at 84 and deliberately did **not** gate it, because check 52's own
+header says *"Do NOT re-add a baseline."* This part is the burn-down; the check
+follows at zero.
+
+**90 sites**, closed and classified: **49 (a)**, **41 (b)**, **0 (c)**.
+
+* **(a) drift-hiding that changes behaviour or defeats a check** — encryption,
+  tenancy, security-report and assertion columns, plus the three sites where the
+  `.ok()` is masking something other than NULL.
+* **(b) genuinely NULLable** — `None` is a real value; the correct form is
+  `.try_get::<Option<_>, _>("col")?`, which still errors on drift while allowing
+  NULL. Mechanical, and the whole risk is silently changing NULL handling.
+* **(c) not a DB column read** — none. Every site in this population is a real
+  `sqlx::Row` read.
+
+Nullability was resolved against `information_schema.columns` on the live
+`talos` database, which is **fully migrated** (308 `_sqlx_migrations` rows == 308
+files in `migrations/`), not against the surrounding code's assumptions. Three
+sites read a column the code assumed was there and it is not; two read a NOT
+NULL column the code treats as optional.
+
+## Reconciling the count — 84 vs 85 vs 90
+
+| view | count |
+|---|---|
+| `scripts/lint-tryget-ok-inventory.py` (balanced parens + balanced angle brackets) | **90** |
+| check-52-shaped line grep `\.try_get(::<[^(]*>)?\([^)]*\)\.ok\(\)` | 84 |
+| #661's stated figure | 84 |
+| a line sweep for `try_get` co-occurring with `.ok()` | 85 |
+
+Both directions are closed, and the first attempt at each was wrong in a way
+worth recording, since it is this class one level up.
+
+* **The line grep misses 7 sites, and it is not the nested generics.** All 7 are
+  the house style breaking the chain *after* the argument list:
+  `.try_get::<Option<String>, _>("status")` then `.ok()` on the next line. A
+  line-based regex cannot see them — the same multi-line hole #661 measured for
+  check 52 and closed with 52b, still open in this spelling.
+  (`talos-actor-repository` 3486, 3491; `talos-advanced-repository` 2667, 2672;
+  `talos-memory` 1601; `talos-module-repository` 609;
+  `talos-workflow-repository/src/search.rs` 752.)
+* **The grep also falsely counts 1**: prose inside a `#661` comment in
+  `talos-secrets-manager/src/manager.rs:3528`. 84 − 1 + 7 = 90.
+* **The first version of the script above missed 8 of the 90** — every
+  `::<Option<i64>, _>` turbofish, because a non-nesting `[^>]*>` stops at the
+  inner `>`. Seven of those eight were also the multi-line ones, so a first
+  reconciliation attributed the grep's gap to nested generics. It is not: the
+  two blind spots are independent, and
+  `talos-advanced-repository/src/lib.rs:2745` is the single-line nested-generic
+  site that the grep sees and the broken script did not.
+
+**7 of the 90 span two lines.** The `multiline` field in the first run of the
+inventory reported 0, because it compared the line of the try_get's *closing
+paren* rather than the line of the `.ok` token — and every one of these breaks
+after `("col")`, not inside it. The number the check must be built against is 7,
+not 0; a single-line leg alone would ship at "zero" while leaving them in place.
+All 90 name their column with a string literal.
+
+**Nothing is in a `tests/` directory or a `#[cfg(test)] mod`.** Nine sites are in
+`controller/examples/` — operator backfill and verification binaries, excluded
+from the "production crate" count of 81 but **in scope for the check**, whose
+grep excludes only `target/`, `.git/`, `.claude/` and `node_modules/`.
+
+## (a) — 49 sites
+
+### `talos-memory`: `value_enc` / `value_key_id` — 8 sites
+
+`talos-memory/src/lib.rs` 432, 433 (`decrypt_row_value`), 1076, 1077
+(`recall_exact`), 1959, 1960 (`recall_semantic_filtered`), 2233, 2234
+(`rows_to_memory_hits`).
+
+Both columns are **NOT NULL** in the live schema, so a `None` can only mean
+SELECT-projection drift or a decode change. `resolve_stored_value` (l.383) falls
+through `if let (Some(enc), Some(key_id)) = …` to
+`Ok(value_plain.unwrap_or(Value::Null))` — and `value_plain` is **always** `None`
+because Phase B dropped the `value` column. So the drift resolves to **an empty
+memory, returned as success, with no decrypt attempted and no error**. Not a
+wrong-format branch — a silent empty read (the `encrypted_output_select_blindness`
+class, MCP-680).
+
+The sharp part: in each of those four functions the *next* line reads
+`value_format` with `.context(...)?` under a five-to-eight-line comment
+explaining that a silent default there would mask SELECT-projection drift. The
+identical argument applies to the two lines above it and was not applied.
+`clone_memories` l.3176-3177 already does it right —
+`let value_enc: Vec<u8> = r.try_get("value_enc")?;`.
+
+**Honest severity: latent, not live.** Every in-repo SELECT feeding those four
+functions projects both columns today.
+
+### `talos-memory:431` — a read of a DROPPED column whose `.ok()` is load-bearing
+
+`try_get("value")` returns `Err(ColumnNotFound)` on **every** call, and `.ok()`
+is what lets every memory decrypt proceed; the doc comment at l.411-413 says so
+in as many words. Converting this one site to `?` would break the entire memory
+read path. It is the one site in the population where the mechanical conversion
+is actively wrong, and it is in the highest-ranked file. Fixed by **deleting**
+the read: `resolve_stored_value` is already called with a literal `None` at all
+five other call sites.
+
+### `controller/examples/verify_module_payload_encryption.rs` 93-97 — 5 sites
+
+Every one feeds an `assert!`, including
+`assert!(pt_input.is_none(), "PLAINTEXT LEAK: input_data is non-NULL")`. A
+drifted or renamed column reads as `None`, so **the plaintext-leak assertion
+passes vacuously** — a gate that cannot fail on the condition it checks (#624's
+class), inside the tool that certifies payload encryption.
+
+### `controller/examples/backfill_module_payload_encryption.rs` 85-87 — 3 sites
+
+The three plaintext columns are read with `.ok()`, encrypted, and then the row is
+`UPDATE`d with `input_data = NULL, output_data = NULL, trigger_metadata = NULL`
+alongside the ciphertext. A silent `None` writes empty ciphertext **and** nulls
+the plaintext — irreversible loss. A one-shot operator migration, but the
+shape — swallowed read feeding a destructive update — is the sharpest in the set.
+
+### `talos-module-executions` — 19 sites
+
+`364, 365, 367, 368, 369` (`re_encrypt_module_payloads_to_org`), `988-994`
+(`get_execution`), `1101-1107` (`list_module_executions`). The `*_enc`,
+`payload_enc_key_id` and `workflow_execution_id` columns are all genuinely
+NULLable, so the `Option` is right and the fix is purely `.ok().flatten()` → `?`.
+Ranked (a) because they are the payload-encryption path and because the same
+functions harden `payload_format` with an explicit match-and-fail arm three lines
+below — the identical asymmetry to `talos-memory`.
+
+### `talos-analytics-repository:2096` — `workflow_schedules.timezone`
+
+**NOT NULL.** #661 fixed this exact column at
+`talos-workflow-repository/src/workflows.rs:1881`, where a silent default ran
+every exported cron in UTC. Here the `None` surfaces at
+`talos-mcp-handlers/src/analytics.rs:4776` as
+`r.timezone.as_deref().unwrap_or("UTC")` — a schedule in `America/Vancouver`
+would be *reported* as UTC. Display path, not the executor, so it misinforms
+rather than misfires: #661's defect, one spelling over, and its fix could not see
+it.
+
+### `talos-analytics-repository:4332` — the wildcard-secret hygiene check
+
+`filter_map(|r| r.try_get::<String, _>("name").ok())` over
+`SELECT DISTINCT name FROM modules WHERE '*' = ANY(allowed_secrets)`. Drift drops
+rows silently, so the platform-hygiene report says "no wildcard modules" for a
+reason unrelated to there being none.
+
+### `talos-totp-2fa:854` — `users.backup_codes`
+
+Nullable, so the `Option` is right. Drift ⇒ `None` ⇒ rollback +
+`record_2fa_failure` + `Ok(false)`: **fail-closed**, so not an auth bypass, but
+every backup code is rejected and the operator sees a wrong-code error rather
+than a schema error.
+
+### Silent row-SKIPs — 8 sites
+
+`talos-module-repository` 458, 1445, 1448, 3318, 3319;
+`talos-workflow-repository/src/templates.rs:169`;
+`talos-registry/src/reconcile.rs:391`;
+`controller/examples/verify_restore.rs:446`.
+
+`filter_map(|r| r.try_get(…).ok())` and
+`let Some(id) = r.try_get::<Uuid, _>("id").ok() else { continue };`. The columns
+are NOT NULL projections, so the only reachable skip **is** drift, and the batch
+silently shortens. The in-place comment at l.1443-1444 says *"skip a malformed
+row rather than abort the batch (preserves the prior filter_map behaviour)"* —
+i.e. **this shape was introduced by the check-52 burn-down itself**: the swallow
+moved into the spelling the check cannot see. `reconcile.rs:391` and
+`verify_restore.rs:446` matter most: an under-reported stale-module warning, and
+an org whose secrets the restore verifier never checked.
+
+### `talos-workflow-repository/src/workflows.rs` 151, 152 — the `.ok()` masks a missing projection
+
+`list_workflows`' two SELECT branches (l.104, l.122) **do not project
+`w.status` or `w.workflow_type` at all**, so both reads return `None` on every
+call. Its sibling `list_workflows_paginated` (l.170) does project them. Fixed by
+adding the two columns to both branches, then `?`. **Latent**:
+`WorkflowRepository::list_workflows` has zero callers workspace-wide — the MCP
+handler uses the paginated twin.
+
+## (b) — 41 sites
+
+Genuinely NULLable (or NOT NULL feeding an `Option`-typed field), converted to
+`.try_get::<Option<_>, _>("col")?` with the existing default kept verbatim:
+
+| file | lines | columns |
+|---|---|---|
+| `talos-actor-repository/src/lib.rs` | 3484, 3486, 3491, 3495, 3667 | `actors.description`, `status`, `max_capability_world`, `updated_at`, computed `score` |
+| `talos-advanced-repository/src/lib.rs` | 1476, 2667, 2672, 2743, 2744, 2745 | `next_trigger_at`, `status`, `max_capability_world`, `started_at`, `completed_at`, computed `duration_ms` |
+| `talos-analytics-repository/src/lib.rs` | 2097, 2098 | `last_triggered_at`, `next_trigger_at` |
+| `talos-execution-repository/src/lib.rs` | 2965, 2967, 2968, 2969 | LEFT JOIN `workflow_name`, `started_at`, `completed_at`, `error_message` |
+| `talos-memory/src/lib.rs` | 1601, 3180 | `actor_memory.metadata` |
+| `talos-module-repository/src/lib.rs` | 283, 284, 609, 626, 785, 787, 936 | computed `score`/`same_category`, `config`, `max_fuel`, `capability_world`, `usage_count`, `template_id` |
+| `talos-webhook-repository/src/lib.rs` | 467 | LEFT JOIN `trigger_name` |
+| `talos-webhooks/src/dlq.rs` | 214, 223, 224 | LEFT JOIN `workflow_id`, `user_id`, `org_id` |
+| `talos-workflow-repository/src/search.rs` | 752 | computed `match_score` |
+| `talos-workflow-repository/src/workflows.rs` | 144, 146, 147, 148, 254, 256, 257, 258, 261, 262 | `description`, `tags`, LATERAL `last_status`/`last_exec_at`, `status`, `workflow_type` |
+
+`dlq.rs` is the one (b) that cannot use `?`: the enclosing `flush_batch` returns
+`()`. Converted to an explicit `match` that logs the drift at `error!` and keeps
+the fire-and-forget event flowing — loud, not silent.
+
+## Not covered by the new check leg — the floor, not the ceiling
+
+Stated so the next cycle does not have to re-measure it, and because overstating
+a lint is the defect one level up.
+
+* **`.ok()` on a `try_get` reached through a variable** — `let r =
+  row.try_get(…); … r.ok()` is invisible to any chain-shaped matcher, including
+  the new leg. **0 sites today** (no `let … = <recv>.try_get` binding a `Result`
+  exists workspace-wide), so this is the next spelling, not a current gap.
+* **`.map_or` on a `try_get`** — **0 sites**, single-line and multi-line. NOT
+  matched by check 52's regex either, so it is the cheapest escape available and
+  is deliberately left ungated rather than gated on an empty population.
+* **`.unwrap_or_else` / `.unwrap_or_default` on a `try_get`** — 0 in the
+  swallowing form; 85 sites exist in the fixed `?.unwrap_or_default(…)` form.
+  Already covered by check 52 regardless: its `\.unwrap_or` has no trailing word
+  boundary, so it matches both as a prefix.
+* **`if let Ok(v) = row.try_get(…)` and `match row.try_get(…) { Err(_) => … }`** —
+  the same swallow as a control-flow shape, and NOT covered. **14 sites**
+  (`talos-mcp-handlers/src/advanced.rs` ×7, `talos-module-executions` ×2,
+  `talos-execution-repository` ×2, `talos-registry/src/lib.rs`,
+  `talos-workflow-repository/src/templates.rs`,
+  `controller/examples/verify_restore.rs`). Not classified here, because the
+  correct verdict is per-site and several are the shape used *correctly*:
+  `advanced.rs` probes an unknown column's type by trying each one in turn, and
+  `talos-module-executions`' `payload_format` arms deliberately fail loud only
+  when ciphertext is present. A blanket gate would be wrong; an inventory is the
+  next cycle's work.
+* **`?` on a `try_get` whose error type erases which column failed** — every
+  fixed site propagates `sqlx::Error::ColumnNotFound`, which names the column, so
+  this is not a live loss here; it would be if a caller mapped it into a bare
+  `anyhow!("db error")`.
