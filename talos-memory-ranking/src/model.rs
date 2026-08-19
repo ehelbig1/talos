@@ -62,6 +62,69 @@ pub const STATUS_SAMPLE_WEIGHT: f64 = 0.3;
 /// logistic coefficients (logit scale — CAN be negative). The non-negative,
 /// clamped fused weights are derived at serve time by [`rank_weights_to_fused`];
 /// storing the raw coefficients keeps this a faithful model record.
+/// Accounting for the FETCH that produced a fit's examples — the disclosure that
+/// makes [`RankWeights::n_examples`] legible.
+///
+/// `n_examples` counts the usable LABELED rows the fit consumed, which is a
+/// subset of what the fetch returned, which is in turn a subset of what the
+/// lookback window HELD once the per-actor row cap binds. Reporting only
+/// `n_examples` makes a fit on 36 % of the window read exactly like a fit on all
+/// of it — a measurement of the limit presented as a measurement of the
+/// population. Carrying this struct alongside the model is what closes that gap,
+/// and it is a required argument of [`fit_rank_weights`] so a fit cannot be
+/// produced without declaring where its rows came from.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FetchProvenance {
+    /// Rows the training fetch returned, BEFORE labeling. Always
+    /// `>= RankWeights::n_examples`.
+    pub n_fetched: i64,
+    /// The per-actor row cap the fetch ran under (`0` = no cap declared).
+    pub fetch_cap: i64,
+    /// Rows that EXISTED in the lookback window.
+    ///
+    /// Equals `n_fetched` whenever the cap did not bind — an unbound fetch has
+    /// already seen the whole window, so the caller issues no extra count.
+    /// `None` means **unknown**: the cap DID bind and the population count could
+    /// not be measured. It never means "nothing was dropped".
+    ///
+    /// Measured AFTER the fetch, so it races with concurrent writes: rows added
+    /// in between inflate `n_dropped()` slightly, and a retention sweep can make
+    /// it smaller than `n_fetched` (which is why `n_dropped()` clamps at 0). It
+    /// is an accurate order of magnitude, not an exact ledger — and saying so is
+    /// cheaper than a transaction the fit does not otherwise need.
+    pub n_available: Option<i64>,
+}
+
+impl FetchProvenance {
+    /// Declare a fetch that ran under `cap` and returned `n_fetched` rows, with
+    /// `n_available` measured only when it had to be.
+    pub fn new(n_fetched: i64, fetch_cap: i64, n_available: Option<i64>) -> Self {
+        Self {
+            n_fetched,
+            fetch_cap,
+            n_available,
+        }
+    }
+
+    /// True when the fetch returned at least its cap — i.e. rows inside the
+    /// lookback window were left unread.
+    ///
+    /// Deliberately `>=` rather than `>`: a window holding EXACTLY `cap` rows
+    /// reads as truncated. That over-reports by at most one boundary case and is
+    /// the safe direction (same rule as the fuel-headroom sweep's
+    /// `rows.len() >= MAX_FUEL_HEADROOM_ROWS`), because the alternative is a fit
+    /// that silently saw a short window.
+    pub fn truncated(&self) -> bool {
+        self.fetch_cap > 0 && self.n_fetched >= self.fetch_cap
+    }
+
+    /// Rows inside the lookback window the fit never saw. `None` when
+    /// `n_available` is unknown — an unmeasurable gap is not a zero gap.
+    pub fn n_dropped(&self) -> Option<i64> {
+        self.n_available.map(|a| (a - self.n_fetched).max(0))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RankWeights {
     /// Raw logistic coefficient for the relevance feature.
@@ -81,7 +144,17 @@ pub struct RankWeights {
     /// serve time).
     pub feature_std: [f64; N_FEATURES],
     /// Number of usable labeled examples the fit consumed.
+    ///
+    /// **This is not the size of the available population.** It counts the rows
+    /// that survived [`build_training_set`] out of what the FETCH returned, and
+    /// the fetch is capped. Read it next to [`Self::fetch`], never instead of it.
     pub n_examples: i64,
+    /// Where `n_examples` came from: rows fetched, the cap in force, and the
+    /// window population. `None` on models written before this field existed —
+    /// **unknown provenance, not "the whole window"**. Such rows are replaced by
+    /// the next training tick.
+    #[serde(default)]
+    pub fetch: Option<FetchProvenance>,
     /// When the fit ran.
     pub fitted_at: DateTime<Utc>,
 }
@@ -165,8 +238,13 @@ fn sigmoid(z: f64) -> f64 {
 /// * the fit produced a non-finite coefficient/bias (degenerate).
 ///
 /// `examples` are the `(features, label, sample_weight)` triples from
-/// [`build_training_set`].
-pub fn fit_rank_weights(examples: &[(Vec<f64>, f64, f64)]) -> Option<RankWeights> {
+/// [`build_training_set`]. `fetch` is the caller's declaration of where those
+/// rows came from (see [`FetchProvenance`]); it is REQUIRED rather than optional
+/// so a model cannot be persisted whose example count is unaccountable.
+pub fn fit_rank_weights(
+    examples: &[(Vec<f64>, f64, f64)],
+    fetch: FetchProvenance,
+) -> Option<RankWeights> {
     let min_examples = talos_config::adaptive_rank_min_examples().max(0) as usize;
     if examples.len() < min_examples {
         return None;
@@ -253,6 +331,7 @@ pub fn fit_rank_weights(examples: &[(Vec<f64>, f64, f64)]) -> Option<RankWeights
         feature_mean,
         feature_std,
         n_examples: n_examples as i64,
+        fetch: Some(fetch),
         fitted_at: Utc::now(),
     })
 }
@@ -310,6 +389,10 @@ pub fn rank_weights_to_fused(rw: &RankWeights) -> (talos_memory::actor_context::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prov(n_fetched: i64, fetch_cap: i64, n_available: Option<i64>) -> FetchProvenance {
+        FetchProvenance::new(n_fetched, fetch_cap, n_available)
+    }
 
     fn ex(
         relevance: f64,
@@ -393,7 +476,7 @@ mod tests {
         let train: Vec<(Vec<f64>, f64, f64)> = (0..10)
             .map(|i| (vec![0.5, 0.5, 0.5, 0.0], (i % 2) as f64, 1.0))
             .collect();
-        assert!(fit_rank_weights(&train).is_none());
+        assert!(fit_rank_weights(&train, prov(10, 20_000, Some(10))).is_none());
     }
 
     #[test]
@@ -402,7 +485,7 @@ mod tests {
         let train: Vec<(Vec<f64>, f64, f64)> = (0..80)
             .map(|_| (vec![0.9, 0.5, 0.8, 0.1], 1.0, 1.0))
             .collect();
-        assert!(fit_rank_weights(&train).is_none());
+        assert!(fit_rank_weights(&train, prov(80, 20_000, Some(80))).is_none());
     }
 
     #[test]
@@ -425,7 +508,8 @@ mod tests {
                 train.push((vec![0.1, noise_a, 0.15, noise_b], 0.0, 1.0));
             }
         }
-        let rw = fit_rank_weights(&train).expect("separable data must fit");
+        let rw = fit_rank_weights(&train, prov(120, 20_000, Some(120)))
+            .expect("separable data must fit");
         assert_eq!(rw.n_examples, 120);
         // The predictive features moved positive.
         assert!(
@@ -468,6 +552,7 @@ mod tests {
             feature_mean: [0.0; N_FEATURES],
             feature_std: [0.0; N_FEATURES],
             n_examples: 100,
+            fetch: Some(prov(100, 20_000, Some(100))),
             fitted_at: Utc::now(),
         };
         let (weights, access_weight) = rank_weights_to_fused(&rw);
@@ -488,6 +573,7 @@ mod tests {
             feature_mean: [0.0; N_FEATURES],
             feature_std: [0.0; N_FEATURES],
             n_examples: 100,
+            fetch: Some(prov(100, 20_000, Some(100))),
             fitted_at: Utc::now(),
         };
         let (weights, access_weight) = rank_weights_to_fused(&rw);
@@ -511,6 +597,7 @@ mod tests {
             feature_mean: [0.5, 0.4, 0.6, 0.1],
             feature_std: [0.2, 0.1, 0.3, 0.05],
             n_examples: 73,
+            fetch: Some(prov(20_000, 20_000, Some(55_179))),
             fitted_at: Utc::now(),
         };
         let json = serde_json::to_value(&rw).unwrap();
@@ -519,5 +606,99 @@ mod tests {
         assert!((back.w_recency + 0.4).abs() < 1e-12);
         assert_eq!(back.n_examples, 73);
         assert_eq!(back.feature_mean, [0.5, 0.4, 0.6, 0.1]);
+    }
+
+    // ── Fetch-provenance disclosure ────────────────────────────────────────
+    //
+    // These pin the property the pre-disclosure artifact could not express: a
+    // fit whose example count IS the cap must be distinguishable from a fit
+    // that saw the whole window. Before `RankWeights::fetch` existed both
+    // produced byte-identical JSON, so every assertion below fails on the old
+    // shape (it does not compile there at all — the field is the fix).
+
+    fn separable(n: usize) -> Vec<(Vec<f64>, f64, f64)> {
+        (0..n)
+            .map(|i| {
+                if i % 2 == 0 {
+                    (vec![0.9, 0.5, 0.85, 0.1], 1.0, 1.0)
+                } else {
+                    (vec![0.1, 0.5, 0.15, 0.1], 0.0, 1.0)
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn truncated_fit_is_distinguishable_from_a_complete_one() {
+        // The live personal-assistant shape: 55 179 rows in the window, the
+        // 20 000-row cap binds, and every fetched row happened to be labeled —
+        // so `n_examples` alone reads exactly like a complete fit.
+        let train = separable(120);
+        let capped = fit_rank_weights(&train, prov(20_000, 20_000, Some(55_179)))
+            .expect("separable data must fit");
+        let complete = fit_rank_weights(&train, prov(120, 20_000, Some(120)))
+            .expect("separable data must fit");
+
+        // The number that WAS the whole report cannot tell them apart …
+        assert_eq!(capped.n_examples, complete.n_examples);
+        // … and the disclosure can.
+        let cf = capped.fetch.expect("fit must declare its fetch");
+        let nf = complete.fetch.expect("fit must declare its fetch");
+        assert!(cf.truncated(), "a fetch at its cap is truncated");
+        assert!(!nf.truncated(), "a fetch under its cap is not truncated");
+        assert_eq!(cf.n_dropped(), Some(35_179));
+        assert_eq!(nf.n_dropped(), Some(0));
+    }
+
+    #[test]
+    fn unmeasured_population_reads_as_unknown_not_as_zero_dropped() {
+        // `n_available: None` is the "cap bound but the count failed" state.
+        // It must NOT collapse to "nothing was dropped" — that is the very
+        // class this disclosure exists to prevent.
+        let p = prov(20_000, 20_000, None);
+        assert!(p.truncated());
+        assert_eq!(p.n_dropped(), None);
+    }
+
+    #[test]
+    fn legacy_artifact_without_fetch_reads_as_unknown_provenance() {
+        // Rows written before the disclosure existed have no `fetch` key. They
+        // must deserialize (back-compat) as UNKNOWN, never as untruncated.
+        let legacy = serde_json::json!({
+            "w_relevance": 1.0, "w_recency": 0.5, "w_importance": 0.25, "w_access": 0.1,
+            "bias": 0.0,
+            "feature_mean": [0.5, 0.5, 0.5, 0.5],
+            "feature_std": [0.1, 0.1, 0.1, 0.1],
+            "n_examples": 20_000,
+            "fitted_at": "2026-08-19T11:09:04.118441303Z"
+        });
+        let rw: RankWeights = serde_json::from_value(legacy).unwrap();
+        assert_eq!(rw.n_examples, 20_000);
+        assert!(
+            rw.fetch.is_none(),
+            "a pre-disclosure artifact must read as unknown provenance"
+        );
+    }
+
+    #[test]
+    fn fetch_provenance_survives_the_json_round_trip() {
+        let train = separable(120);
+        let rw = fit_rank_weights(&train, prov(20_000, 20_000, Some(55_179)))
+            .expect("separable data must fit");
+        let back: RankWeights = serde_json::from_value(serde_json::to_value(&rw).unwrap()).unwrap();
+        let f = back.fetch.expect("fetch must round-trip");
+        assert_eq!(f.n_fetched, 20_000);
+        assert_eq!(f.fetch_cap, 20_000);
+        assert_eq!(f.n_available, Some(55_179));
+        assert!(f.truncated());
+    }
+
+    #[test]
+    fn a_zero_cap_is_never_reported_as_truncation() {
+        // `fetch_cap: 0` means "no cap declared". `n_fetched >= 0` is trivially
+        // true, so without the `fetch_cap > 0` guard every such fit would claim
+        // truncation.
+        assert!(!prov(0, 0, Some(0)).truncated());
+        assert!(!prov(500, 0, Some(500)).truncated());
     }
 }

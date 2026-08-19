@@ -2542,6 +2542,37 @@ pub async fn fetch_rank_training_examples(
     Ok(out)
 }
 
+/// How many provenance rows EXIST for one actor in the same window
+/// [`fetch_rank_training_examples`] reads — its population, with no `LIMIT`.
+///
+/// This is the denominator that makes a capped fetch legible: without it, a fit
+/// that consumed the newest `LIMIT` rows is indistinguishable from one that
+/// consumed the whole window. The predicate is deliberately IDENTICAL to the
+/// fetch's `WHERE` (`actor_id` + `created_at >= since`) — a drifted predicate
+/// would produce a denominator that does not belong to its numerator.
+///
+/// Cost: an index-only scan of `idx_emc_actor_created` (measured 5 ms / 1 349
+/// buffer hits at 55 k rows on the reference deployment). It is still a scan
+/// proportional to the window, so callers should issue it ONLY when the fetch
+/// actually hit its cap — an unbound fetch has already seen every row and its
+/// own length IS the population.
+pub async fn count_rank_training_examples(
+    pool: &Pool<Postgres>,
+    actor_id: Uuid,
+    since: DateTime<Utc>,
+) -> Result<i64> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM execution_memory_context emc \
+         WHERE emc.actor_id = $1 AND emc.created_at >= $2",
+    )
+    .bind(actor_id)
+    .bind(since)
+    .fetch_one(pool)
+    .await
+    .context("count_rank_training_examples")?;
+    Ok(n)
+}
+
 /// One execution's memory footprint joined to its outcome, aggregated per
 /// execution (contrast [`RankTrainingExample`], which is per-memory-row). Used
 /// by the OBSERVATIONAL evaluation: within executions that carried memory, does

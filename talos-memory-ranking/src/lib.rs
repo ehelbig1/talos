@@ -41,7 +41,7 @@ pub mod recall;
 
 pub use model::{
     build_training_set, example_label, example_to_features, fit_rank_weights,
-    rank_weights_to_fused, RankWeights, FUSED_WEIGHT_MAX, N_FEATURES,
+    rank_weights_to_fused, FetchProvenance, RankWeights, FUSED_WEIGHT_MAX, N_FEATURES,
 };
 pub use recall::recall_semantic_ranked;
 
@@ -55,7 +55,20 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 /// Upper bound on the per-actor training fetch, so one degenerate actor can't
-/// pull an unbounded scan. The Phase-1 query additionally clamps its own limit.
+/// pull an unbounded scan. The Phase-1 query additionally clamps its own limit
+/// (`talos_memory::RANK_TRAINING_EXAMPLE_MAX`, 50 000 — a second, higher ceiling
+/// on the same path).
+///
+/// The fetch orders `created_at DESC`, so when this binds the fit sees the
+/// NEWEST rows of the lookback window and the older remainder is never read.
+/// That is defensible as recency bias for a ranker — but it is NOT defensible
+/// for the fit to then report `n_examples` as if it were the population, so the
+/// training tick measures the window and records a
+/// [`model::FetchProvenance`] with every model. It binds today:
+/// `personal-assistant` had 55 179 rows in a 30-day window on 2026-08-19.
+///
+/// Changing this value is a PERFORMANCE decision (it bounds per-tick work as
+/// `max_actors × TRAINING_FETCH_CAP`), and belongs to the operator.
 const TRAINING_FETCH_CAP: i64 = 20_000;
 
 // ── Serving-weights cache (F3) ──────────────────────────────────────────────
@@ -303,8 +316,67 @@ async fn run_rank_training_tick(pool: &PgPool, actor_repo: &ActorRepository) -> 
             );
         }
 
+        // ── Fetch accounting (the disclosure) ──────────────────────────────
+        //
+        // `TRAINING_FETCH_CAP` takes the NEWEST rows in the lookback window and
+        // drops the rest. The fit then reports `n_examples`, which without this
+        // block equals the cap and reads as "trained on everything available" —
+        // a measurement of the limit presented as a measurement of the
+        // population. Observed live 2026-08-19: `personal-assistant` had 55 179
+        // rows in its 30-day window, the fetch returned 20 000, and the stored
+        // artifact said `n_examples: 20000` and nothing else.
+        //
+        // The population count is issued ONLY when the cap actually bound. An
+        // unbound fetch has already read every row in the window, so its own
+        // length IS the denominator and the extra scan would buy nothing. A
+        // fleet with no truncating actor therefore pays zero additional queries.
+        let n_fetched = examples.len() as i64;
+        let fetch_bound = n_fetched >= TRAINING_FETCH_CAP;
+        let n_available = if fetch_bound {
+            match talos_memory::count_rank_training_examples(pool, actor_id, since).await {
+                Ok(n) => Some(n),
+                // A failed count leaves the population UNKNOWN. It must not
+                // degrade to `Some(n_fetched)` — that would assert "nothing was
+                // dropped" about the one case where something certainly was.
+                Err(e) => {
+                    tracing::warn!(
+                        target: "talos_memory_ranking",
+                        %actor_id,
+                        error = %e,
+                        "training-window population count failed; the fit will \
+                         record its fetch as truncated with an unknown denominator"
+                    );
+                    None
+                }
+            }
+        } else {
+            Some(n_fetched)
+        };
+        let fetch = model::FetchProvenance::new(n_fetched, TRAINING_FETCH_CAP, n_available);
+
+        if fetch.truncated() {
+            // WARN, and say which direction the truncation runs. Unlike the
+            // fuel-headroom sweep — whose `ORDER BY utilisation DESC` keeps the
+            // numerator complete so only a denominator under-reports — this
+            // fetch orders by `created_at DESC`, so what is dropped is the OLDER
+            // half of the window. That is a recency bias, not a missing tail.
+            tracing::warn!(
+                target: "talos_memory_ranking",
+                %actor_id,
+                event_kind = "rank_training_truncated",
+                cap = TRAINING_FETCH_CAP,
+                n_fetched,
+                n_available = n_available.unwrap_or(-1),
+                n_dropped = fetch.n_dropped().unwrap_or(-1),
+                lookback_days,
+                "rank-training fetch hit its row cap; the fit sees only the \
+                 NEWEST rows of the lookback window and the model's n_examples \
+                 measures the cap, not the window (-1 = population unmeasured)"
+            );
+        }
+
         let train = model::build_training_set(&examples);
-        match model::fit_rank_weights(&train) {
+        match model::fit_rank_weights(&train, fetch) {
             Some(rw) => {
                 let json = match serde_json::to_value(&rw) {
                     Ok(v) => v,
@@ -326,6 +398,9 @@ async fn run_rank_training_tick(pool: &PgPool, actor_repo: &ActorRepository) -> 
                             %actor_id,
                             updated,
                             n_examples = rw.n_examples,
+                            n_fetched,
+                            fetch_truncated = fetch.truncated(),
+                            n_available = n_available.unwrap_or(-1),
                             w_relevance = rw.w_relevance,
                             w_recency = rw.w_recency,
                             w_importance = rw.w_importance,
@@ -348,6 +423,8 @@ async fn run_rank_training_tick(pool: &PgPool, actor_repo: &ActorRepository) -> 
                 target: "talos_memory_ranking",
                 %actor_id,
                 usable_examples = train.len(),
+                n_fetched,
+                fetch_truncated = fetch.truncated(),
                 disputed_examples = disputed,
                 "insufficient / single-class training data; keeping global defaults"
             ),
