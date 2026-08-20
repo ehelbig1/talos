@@ -1473,7 +1473,7 @@ impl AdvancedRepository {
                 timezone: r
                     .try_get::<Option<String>, _>("timezone")?
                     .unwrap_or_else(|| "UTC".to_string()),
-                next_trigger_at: r.try_get("next_trigger_at").ok(),
+                next_trigger_at: r.try_get::<Option<_>, _>("next_trigger_at")?,
                 workflow_name: r.try_get::<Option<String>, _>("name")?.unwrap_or_default(),
             })
         })
@@ -2664,14 +2664,10 @@ impl AdvancedRepository {
                     name: r.try_get("name")?,
                     description: r.try_get::<Option<String>, _>("description")?,
                     status: r
-                        .try_get::<Option<String>, _>("status")
-                        .ok()
-                        .flatten()
+                        .try_get::<Option<String>, _>("status")?
                         .unwrap_or_else(|| "active".to_string()),
                     max_capability_world: r
-                        .try_get::<Option<String>, _>("max_capability_world")
-                        .ok()
-                        .flatten()
+                        .try_get::<Option<String>, _>("max_capability_world")?
                         .unwrap_or_else(|| "minimal-node".to_string()),
                     memory_count: r.try_get::<Option<i64>, _>("memory_count")?.unwrap_or(0),
                 })
@@ -2740,9 +2736,9 @@ impl AdvancedRepository {
                         .try_get::<Option<String>, _>("workflow_name")?
                         .unwrap_or_default(),
                     status: r.try_get("status")?,
-                    started_at: r.try_get("started_at").ok(),
-                    completed_at: r.try_get("completed_at").ok(),
-                    duration_ms: r.try_get::<Option<i64>, _>("duration_ms").ok().flatten(),
+                    started_at: r.try_get::<Option<_>, _>("started_at")?,
+                    completed_at: r.try_get::<Option<_>, _>("completed_at")?,
+                    duration_ms: r.try_get::<Option<i64>, _>("duration_ms")?,
                 })
             })
             .collect::<Result<Vec<_>>>()

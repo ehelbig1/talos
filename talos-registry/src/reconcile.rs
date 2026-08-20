@@ -388,8 +388,11 @@ pub async fn reconcile_duplicate_catalog_modules(pool: &Pool<Postgres>) -> Resul
                 Ok(refs) if !refs.is_empty() => {
                     let wf_list: Vec<String> = refs
                         .iter()
-                        .filter_map(|r| r.try_get::<Uuid, _>("id").ok().map(|id| id.to_string()))
-                        .collect();
+                        // NOT NULL projection: `.ok()` could only drop rows on
+                        // drift, and under-reporting IS this warning's failure
+                        // mode. reconcile_* returns Result, so propagate.
+                        .map(|r| r.try_get::<Uuid, _>("id").map(|id| id.to_string()))
+                        .collect::<std::result::Result<Vec<String>, _>>()?;
                     tracing::warn!(
                         target: "talos_registry",
                         event_kind = "workflows_referencing_stale_module",

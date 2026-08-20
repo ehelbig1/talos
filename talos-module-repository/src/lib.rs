@@ -280,8 +280,8 @@ fn template_alternative_row_from_pg(row: sqlx::postgres::PgRow) -> Result<Templa
             .try_get::<Option<serde_json::Value>, _>("config_schema")?
             .unwrap_or(serde_json::Value::Null),
         // similarity() returns PostgreSQL real (f32); cast to f64. Missing column → None.
-        score: row.try_get::<f32, _>("score").ok().map(|s| s as f64),
-        same_category: row.try_get("same_category").ok(),
+        score: row.try_get::<Option<f32>, _>("score")?.map(|s| s as f64),
+        same_category: row.try_get::<Option<_>, _>("same_category")?,
     })
 }
 
@@ -455,8 +455,10 @@ impl ModuleRepository {
             .fetch_all(&self.db_pool)
             .await?
             .iter()
-            .filter_map(|r| r.try_get::<String, _>("id").ok())
-            .collect()
+            // NOT NULL projection: `.ok()` could only drop rows on drift,
+            // under-reporting which webhooks block a module delete.
+            .map(|r| r.try_get::<String, _>("id"))
+            .collect::<std::result::Result<Vec<String>, _>>()?
         } else {
             Vec::new()
         };
@@ -606,9 +608,7 @@ impl ModuleRepository {
             let name: String = row.try_get::<Option<_>, _>("name")?.unwrap_or_default();
             let source: Option<String> = row.try_get::<Option<String>, _>("source_code")?;
             let config: serde_json::Value = row
-                .try_get::<Option<serde_json::Value>, _>("config")
-                .ok()
-                .flatten()
+                .try_get::<Option<serde_json::Value>, _>("config")?
                 .unwrap_or_else(|| serde_json::json!({}));
             let old_hash: Option<String> = row.try_get::<Option<String>, _>("content_hash")?;
             let world: String = row
@@ -622,8 +622,9 @@ impl ModuleRepository {
             // Treat <= 0 as None too — the CHECK constraint disallows it but
             // a stray 0 would silently mean "use baseline" without surprising
             // the caller.
-            let existing_fuel: Option<i64> =
-                row.try_get::<i64, _>("max_fuel").ok().filter(|v| *v > 0);
+            let existing_fuel: Option<i64> = row
+                .try_get::<Option<i64>, _>("max_fuel")?
+                .filter(|v| *v > 0);
 
             return Ok(Some(HotUpdateContext {
                 effective_wm_id: wm_id,
@@ -782,9 +783,9 @@ impl ModuleRepository {
                     name: r.try_get("name")?,
                     // capability_world is NOT NULL on modules; surface as
                     // Some(_) so the type matches the dual-row contract.
-                    capability_world: r.try_get::<String, _>("capability_world").ok(),
+                    capability_world: r.try_get::<Option<String>, _>("capability_world")?,
                     max_fuel: r.try_get("max_fuel")?,
-                    usage_count: r.try_get::<i64, _>("usage_count").ok(),
+                    usage_count: r.try_get::<Option<i64>, _>("usage_count")?,
                     updated_at: r.try_get("updated_at")?,
                 })
             })
@@ -933,7 +934,7 @@ impl ModuleRepository {
                     name: r.try_get("name")?,
                     capability_world: r.try_get("capability_world")?,
                     source: r.try_get("source")?,
-                    template_id: r.try_get("template_id").ok().flatten(),
+                    template_id: r.try_get::<Option<_>, _>("template_id")?,
                 })
             })
             .collect::<Result<Vec<_>>>()
@@ -1440,14 +1441,11 @@ impl ModuleRepository {
         .await?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
-            // id/source are NOT NULL projections; skip a malformed row rather
-            // than abort the batch (preserves the prior filter_map behaviour).
-            let Some(id) = r.try_get::<Uuid, _>("id").ok() else {
-                continue;
-            };
-            let Some(source) = r.try_get::<String, _>("source").ok() else {
-                continue;
-            };
+            // id/source are NOT NULL projections, so the `.ok()` + `continue`
+            // that used to guard them could only ever skip on schema drift —
+            // silently shortening the batch. Propagate instead.
+            let id: Uuid = r.try_get("id")?;
+            let source: String = r.try_get("source")?;
             // user_id is nullable (catalog rows) — Option decode maps NULL → None,
             // but a missing column fails loud instead of silently defaulting.
             let owner: Option<Uuid> = r.try_get::<Option<_>, _>("user_id")?;
@@ -3312,14 +3310,13 @@ impl ModuleRepository {
             .bind(user_id)
             .fetch_all(&self.db_pool)
             .await?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|row| {
-                let name: String = row.try_get("name").ok()?;
-                let id: Uuid = row.try_get("id").ok()?;
-                Some((name, id))
-            })
-            .collect())
+        rows.into_iter()
+            // `.ok()?` silently DROPPED a row on drift, shortening the
+            // installed-template map so a catalog entry reads as
+            // not-installed. Both columns are NOT NULL, so the only
+            // reachable skip was drift.
+            .map(|row| -> Result<(String, Uuid)> { Ok((row.try_get("name")?, row.try_get("id")?)) })
+            .collect::<Result<std::collections::HashMap<String, Uuid>>>()
     }
 }
 

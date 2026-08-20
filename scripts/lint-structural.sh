@@ -3759,6 +3759,79 @@ if [ "$REPO_SILENT_READ_ML_COUNT" -ne 0 ]; then
 else
     green "✓ no multi-line silent try_get().unwrap_or reads workspace-wide"
 fi
+
+# 52c/52d: the SAME read spelled `.try_get(...).ok()`. Identical in effect to
+# the `.unwrap_or` form above — a renamed / dropped / retyped column produces
+# Err, `.ok()` turns it into None, and the caller cannot tell that from a
+# legitimate SQL NULL — and invisible to BOTH passes above, on one line or many,
+# because neither regex mentions `.ok`. #661 measured it at 84 and deliberately
+# did NOT gate it, because gating above zero would have meant re-adding the
+# baseline this check's own header forbids. #662 burned the population down and
+# the gate follows AT ZERO.
+#
+# The population as found was 90, not 84: the line grep #661 used misses the 7
+# sites where the house style breaks the chain after `("col")` and puts `.ok()`
+# on the next line, and falsely counts 1 that is prose inside a #661 comment.
+# So this leg is a single statement-aware perl pass rather than a grep + a
+# multi-line sibling:
+#   * line comments are stripped first (only where the `//` is OUTSIDE a string
+#     literal), which is what keeps talos-secrets-manager/src/manager.rs's #661
+#     note — a comment that QUOTES the forbidden pattern — out of the results;
+#   * the turbofish allows ONE level of nested angle brackets, because a flat
+#     `[^>]*>` stops at the inner `>` of `::<Option<i64>, _>` and silently misses
+#     every such site (the inventory script's own first version did exactly that
+#     and under-counted by 8);
+#   * `\s*` between the argument list and `.ok()` spans newlines, so 52c and 52d
+#     are one pass, not two.
+# VERIFIED AGAINST THE ORIGINAL TREE (the #624 rule): run over the pre-fix
+# copies of the 17 touched files it reports exactly 90 sites, and that set is
+# byte-for-byte the inventory in docs/swallowed-results-inventory.md Part 3.
+#
+# STATED LIMIT: this is still a CHAIN matcher. `let r = row.try_get("c"); …
+# r.ok()` through a variable, `.map_or(…)`, and the control-flow
+# `match row.try_get(…) { Err(_) => … }` shape are all invisible to it. Measured
+# at the same time: 0, 0 and 14 respectively (the 14 are per-site judgements —
+# several are the shape used CORRECTLY, e.g. probing an unknown column's type —
+# so a blanket gate there would be wrong). Fix a hit by reading as
+# `.try_get::<Option<_>, _>("col")?` (NULL still yields None, drift errors), or
+# for a NOT NULL column the plain `.try_get("col")?`. Do NOT re-add a baseline.
+TRYGET_OK_PERL='BEGIN{$/=undef}
+my @lines = split /\n/, $_, -1;
+for my $l (@lines) {
+    my $q = 0; my $i = 0; my $cut = -1;
+    while ($i < length($l)) {
+        my $c = substr($l,$i,1);
+        if ($c eq "\\\\") { $i += 2; next }
+        if ($c eq "\"") { $q = 1 - $q }
+        elsif ($c eq "/" && $q == 0 && substr($l,$i+1,1) eq "/") { $cut = $i; last }
+        $i++;
+    }
+    $l = substr($l,0,$cut) if $cut >= 0;
+}
+my $code = join("\n", @lines);
+my @nl = (0);
+while ($code =~ /\n/g) { push @nl, pos($code) }
+while ($code =~ /\.try_get(?:::<(?:[^<>()]|<[^<>()]*>)*>)?\s*\((?:[^()]|\([^()]*\))*\)\s*\.\s*ok\s*\(\s*\)/gs) {
+    my $p = $-[0];
+    my ($lo,$hi) = (0, $#nl);
+    while ($lo < $hi) { my $m = int(($lo+$hi+1)/2); if ($nl[$m] <= $p) { $lo = $m } else { $hi = $m-1 } }
+    print "$ARGV:" . ($lo+1) . "\n";
+}'
+TRYGET_OK_HITS="$(find . -name '*.rs' \
+        -not -path './target/*' -not -path './.git/*' \
+        -not -path './.claude/*' -not -path './node_modules/*' -print0 2>/dev/null \
+    | xargs -0 perl -ne "$TRYGET_OK_PERL" 2>/dev/null || true)"
+TRYGET_OK_COUNT="$(printf '%s' "$TRYGET_OK_HITS" | grep -c . || true)"
+if [ "$TRYGET_OK_COUNT" -ne 0 ]; then
+    red "✗ ${TRYGET_OK_COUNT} silent try_get().ok() read(s) workspace-wide (must be 0):"
+    printf '%s\n' "$TRYGET_OK_HITS" | sed 's/^/    /'
+    yellow "  → same class as check 52: a renamed/dropped column reads as None,"
+    yellow "    indistinguishable from a SQL NULL, never as an error."
+    yellow "    Fix: .try_get::<Option<_>, _>(\"col\")?  (NOT NULL column: .try_get(\"col\")?)"
+    EXIT_CODE=1
+else
+    green "✓ no silent try_get().ok() reads workspace-wide (single- and multi-line)"
+fi
 echo
 
 # ── 53. Unguarded wasmtime Component::new in the worker runtime ───────

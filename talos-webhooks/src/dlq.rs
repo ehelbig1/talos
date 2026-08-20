@@ -208,10 +208,34 @@ impl DlqService {
 
             match result {
                 Ok(row) => {
+                    // These three are LEFT JOIN columns, so None is a real
+                    // value — but `.ok()` also erased schema drift, and
+                    // flush_batch returns () so there is no `?` to reach for.
+                    // Read them once, loudly: drift is logged and the
+                    // fire-and-forget event still goes out.
+                    let ownership: std::result::Result<
+                        (Option<Uuid>, Option<Uuid>, Option<Uuid>),
+                        sqlx::Error,
+                    > = (|| {
+                        Ok((
+                            row.try_get::<Option<Uuid>, _>("workflow_id")?,
+                            row.try_get::<Option<Uuid>, _>("user_id")?,
+                            row.try_get::<Option<Uuid>, _>("org_id")?,
+                        ))
+                    })();
+                    if let Err(ref e) = ownership {
+                        tracing::error!(
+                            error = %e,
+                            "dlq: could not read workflow/user/org ownership columns — \
+                             emitting the event UNSCOPED; this is schema drift, not an \
+                             unowned webhook"
+                        );
+                    }
+                    let (wf_id, ev_user_id, ev_org_id) = ownership.unwrap_or((None, None, None));
                     // Broadcast event for real-time UI updates
                     let _ = dlq_tx.send(talos_engine::events::DlqEvent {
                         id: row.get("id"),
-                        workflow_id: row.try_get("workflow_id").ok(),
+                        workflow_id: wf_id,
                         execution_id: None,
                         node_id: None,
                         error_message: Some(entry.drop_reason.clone()),
@@ -220,8 +244,8 @@ impl DlqService {
                             .get::<chrono::DateTime<chrono::Utc>, _>("created_at")
                             .to_rfc3339(),
                         replayed_at: None,
-                        user_id: row.try_get("user_id").ok(),
-                        org_id: row.try_get("org_id").ok(),
+                        user_id: ev_user_id,
+                        org_id: ev_org_id,
                     });
                 }
                 Err(e) => {

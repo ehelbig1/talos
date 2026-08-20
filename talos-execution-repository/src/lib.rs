@@ -2962,11 +2962,11 @@ impl ExecutionRepository {
                 Ok(ChildExecutionRow {
                     execution_id: r.try_get("id")?,
                     workflow_id: r.try_get("workflow_id")?,
-                    workflow_name: r.try_get("workflow_name").ok(),
+                    workflow_name: r.try_get::<Option<_>, _>("workflow_name")?,
                     status: r.try_get::<Option<_>, _>("status")?.unwrap_or_default(),
-                    started_at: r.try_get("started_at").ok(),
-                    completed_at: r.try_get("completed_at").ok(),
-                    error_message: r.try_get("error_message").ok(),
+                    started_at: r.try_get::<Option<_>, _>("started_at")?,
+                    completed_at: r.try_get::<Option<_>, _>("completed_at")?,
+                    error_message: r.try_get::<Option<_>, _>("error_message")?,
                 })
             })
             .collect::<Result<Vec<_>>>()
