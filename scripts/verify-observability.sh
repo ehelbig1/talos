@@ -501,7 +501,18 @@ PYEOF
 #   D1. the transport EXISTS and is ready;
 #   D2. the credential source does NOT resolve inside a checkout;
 #   D3. no config mount is read-write, and secrets are not world-readable;
-#   D4. the UI is bound to loopback ONLY.
+#   D4. the UI is bound to loopback ONLY;
+#   D5. every credential file the RUNNING config names is PRESENT and
+#       WELL-FORMED (and nothing is sitting there under a name it will
+#       never read);
+#   D6. the credential is ACCEPTED — passively from Alertmanager's own
+#       delivery counters, and on request by sending one real alert.
+#
+# D5 and D6 exist because enabling delivery is "drop a file and reload", and
+# until 2026-08-19 the only way to find out you had done it wrong was the
+# first incident. Counting files in a directory is not checking them: this
+# leg reported `1 credential file present, mode-checked` for a directory
+# containing a file Alertmanager would never open.
 #
 # D4 is the one that matters most and the one a lint cannot do. Alertmanager's
 # /api/v2/silences lets any caller silence every detector in this system, and
@@ -510,10 +521,34 @@ PYEOF
 # lint — so the LIVE binding is the only trustworthy answer.
 #
 # STATED LIMITS:
-#   * Secrets are checked for EXISTENCE and PERMISSIONS only. Their contents
-#     are never read, hashed, printed or logged (CLAUDE.md: presence only).
-#     So this cannot tell you a credential is VALID — only
-#     TalosAlertDeliveryFailing can, and only once a send is attempted.
+#   * CONTENTS: D5 reads the FIRST LINE of a URL-typed credential far enough
+#     to classify it into one of five fixed verdicts (ok / empty / insecure /
+#     notaurl / dirty). No byte of a credential is ever printed, logged,
+#     hashed, or included in any message — only the verdict word and the
+#     file's basename. This is a deliberate, narrow widening of the older
+#     "contents are never read" rule, stated here rather than done quietly;
+#     everything else (mode, existence) is still metadata only.
+#   * WELL-FORMED IS NOT VALID. A revoked Slack webhook is a perfectly-shaped
+#     https:// URL. D5 cannot distinguish them; only a send can, which is
+#     what D6 is for.
+#   * D6's PASSIVE half reports on notifications ALREADY attempted since this
+#     Alertmanager started. On a freshly-enabled stack that count is 0, and 0
+#     failures out of 0 attempts is not evidence — it says so, and points at
+#     the active probe rather than printing a green.
+#   * D5 fails an `http://` credential URL with NO opt-out. A webhook URL with
+#     a token in it IS the credential (alertmanager.yml says so), so plaintext
+#     leaks it to anything on the path. An operator who deliberately points the
+#     generic `url_file` receiver at an internal plaintext endpoint will fail
+#     this leg and there is no flag to silence it — stated here so it is a
+#     known cost rather than a surprise.
+#   * D5 classifies only the FIRST LINE. A credential file with a valid first
+#     line and junk on line two passes; Alertmanager itself trims only trailing
+#     whitespace, so such a file would also break at notify time. Rare enough to
+#     leave, loud enough to name.
+#   * D6's ACTIVE half (TALOS_ALERT_SEND_TEST=1) proves the ENDPOINT ACCEPTED
+#     the POST. It does not prove a human saw it: a valid webhook for an
+#     archived channel, or one nobody has muted-checked, accepts happily.
+#     That last link is not testable from here — see B4 in the change notes.
 #   * Containment resolves symlinks and checks BOTH checkout roots (this one
 #     and, via `git rev-parse --git-common-dir`, the main working tree). In
 #     this repo's layout a worktree's own root is NOT an ancestor of the main
@@ -526,9 +561,45 @@ PYEOF
 #     checkout it looked at, exactly as leg B does — a check that redirects
 #     must SAY so.
 # ══════════════════════════════════════════════════════════════════════════
-bold "  D. alert delivery: transport, credential containment, and binding"
+bold "  D. alert delivery: transport, binding, credential containment + acceptance"
 
 AM_CONTAINER="${AM_CONTAINER:-talos-alertmanager}"
+AM_URL="${AM_URL:-http://127.0.0.1:9093}"
+
+# Classify one credential file's first line. Echoes exactly ONE fixed word and
+# nothing derived from the content. Callers must never echo $line — it does not
+# leave this function.
+_cred_shape() {
+    local f="$1" key="$2" line
+    line="$(head -c 4096 "$f" 2>/dev/null | head -n 1)"
+    [ -n "$line" ] || { printf 'empty'; return; }
+    case "$key" in
+        *url*_file)
+            case "$line" in
+                https://*) ;;
+                http://*)  printf 'insecure'; return ;;
+                *)         printf 'notaurl';  return ;;
+            esac
+            # A pasted `curl -X POST <url>`, a quoted value, or a stray CR.
+            case "$line" in
+                *[[:space:]]*|*'"'*|*"'"*|*'<'*) printf 'dirty'; return ;;
+            esac
+            printf 'ok' ;;
+        *)
+            # Opaque credential (token, routing key). Shape unknown by design;
+            # only whitespace/quote contamination is checkable.
+            case "$line" in
+                *[[:space:]]*|*'"'*|*"'"*) printf 'opaque_dirty'; return ;;
+            esac
+            printf 'opaque_ok' ;;
+    esac
+}
+
+# Sum every sample of a Prometheus metric family in $AM_METRICS.
+_amsum() {
+    printf '%s' "$AM_METRICS" | awk -v m="$1" '
+        $0 !~ /^#/ && index($0, m) == 1 { s += $NF } END { printf "%d", s + 0 }'
+}
 
 # Which checkout feeds the RUNNING stack? Derived from the live Prometheus
 # config mount, never from this script's own location.
@@ -563,8 +634,8 @@ else
     D_FAIL=0
 
     # ── D1. ready ────────────────────────────────────────────────────────
-    if ! curl -fsS --max-time 10 "${AM_URL:-http://127.0.0.1:9093}/-/ready" >/dev/null 2>&1; then
-        red "  ✗ Alertmanager is running but ${AM_URL:-http://127.0.0.1:9093}/-/ready is unreachable"
+    if ! curl -fsS --max-time 10 "$AM_URL/-/ready" >/dev/null 2>&1; then
+        red "  ✗ Alertmanager is running but $AM_URL/-/ready is unreachable"
         D_FAIL=1
     fi
 
@@ -614,6 +685,10 @@ $_main"
         case "$dst" in
             */secrets*)
                 real="$( (cd "$hostsrc" 2>/dev/null && pwd -P) || printf '%s' "$hostsrc")"
+                # Handed to D5, which needs both ends of the mapping to turn a
+                # container path from the running config into a host path.
+                SECRETS_REAL="$real"
+                SECRETS_DST="$dst"
                 while IFS= read -r r; do
                     [ -n "$r" ] || continue
                     if [ "$real" = "$r" ] || case "$real" in "$r"/*) true ;; *) false ;; esac; then
@@ -639,15 +714,17 @@ $_main"
                                D_FAIL=1 ;;
                         esac
                     done
-                    if [ "$n" -eq 0 ]; then
-                        yellow "  ⚠ no credential files in $real — delivery is INERT."
-                        yellow "    Alertmanager reads api_url_file/url_file at NOTIFY time, so it"
-                        yellow "    starts and loads cleanly and then fails every send. Nothing"
-                        yellow "    reaches a human until one is dropped in. Not a failure: this is"
-                        yellow "    the documented shipping state, and it is what"
-                        yellow "    TalosAlertDeliveryFailing exists to make visible."
-                    elif [ "$bad_mode" -eq 0 ]; then
-                        green "  ✓ $n credential file(s) present, mode-checked (contents never read)"
+                    # NO presence verdict here, deliberately. `$n` is a COUNT
+                    # of whatever happens to be in the directory, and a count
+                    # cannot tell a credential Alertmanager will read from one
+                    # it will not — this line used to print
+                    # "1 credential file present, mode-checked" over a
+                    # directory holding a file named from
+                    # deploy/observability/alertmanager-route.yaml that the dev
+                    # config never opens. D5 owns presence, because D5 asks the
+                    # running process which files it actually wants.
+                    if [ "$n" -gt 0 ] && [ "$bad_mode" -eq 0 ]; then
+                        green "  ✓ $n file(s) in the credential dir, all mode 600/400"
                     fi
                 fi
                 ;;
@@ -655,8 +732,303 @@ $_main"
     done <<< "$(docker inspect "$AM_CONTAINER" \
         --format '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}|{{.Destination}}|{{.RW}}{{"\n"}}{{end}}{{end}}')"
 
-    if [ "$D_FAIL" -eq 0 ]; then
-        green "  ✓ transport up, loopback-bound, credentials contained outside every checkout"
+    # ── D5. is the credential PRESENT, and WELL-FORMED, for the files this
+    #        Alertmanager will ACTUALLY open? ──────────────────────────────
+    #
+    # THE REQUIRED LIST IS DERIVED FROM THE RUNNING PROCESS, NEVER FROM
+    # alertmanager.yml ON DISK. That file documents four receiver OPTIONS in
+    # COMMENTS — webhook_url_file, bot_token_file, auth_password_file, a
+    # commented http_headers.files — and grep cannot tell an option from a
+    # requirement. A check built on grep would demand credential files for
+    # receivers that do not ship: the #644 defect (a commented line read as
+    # what the product does) reproduced inside a gate written to prevent that
+    # class. `/api/v2/status` returns the config as Alertmanager PARSED it,
+    # comments stripped — measured 2357 bytes against ~11 KB on disk, with only
+    # the two live `*_file` entries present.
+    #
+    # It also catches the opposite error, which the old file-count could not:
+    # a credential dropped under a name nothing reads. That is not exotic —
+    # deploy/observability/alertmanager-route.yaml, the fragment an operator is
+    # most likely to copy from, names FOUR different filenames
+    # (slack-webhook-default, slack-webhook-oncall, pagerduty-routing-key,
+    # jira-ops-hygiene-webhook), none of which the dev config opens.
+    # -1 = D5 could not determine it. 0 = nothing configured (the INERT
+    # shipping state). >0 = the operator has enabled at least one receiver.
+    # D6 needs this to tell "inert by design" from "believed working, broken":
+    # the failure counter looks identical in both, and calling the first one RED
+    # would leave `make observability-verify` permanently red on a stack that is
+    # in exactly the state #646 shipped — which trains an operator to ignore
+    # red, the defect this whole arc is about.
+    _cred_present=-1
+    if [ -n "${SECRETS_DST:-}" ]; then
+        _named="$(curl -fsS --max-time 10 "$AM_URL/api/v2/status" 2>/dev/null | python3 -c '
+import json, re, sys
+try:
+    cfg = json.load(sys.stdin)["config"]["original"]
+except Exception:
+    sys.exit(0)
+seen = set()
+for k, v in re.findall(r"^\s*([A-Za-z0-9_]+_file):\s*\"?([^\"\s#]+)\"?\s*$", cfg, re.M):
+    if (k, v) not in seen:
+        seen.add((k, v))
+        print(k + "\t" + v)
+' 2>/dev/null || true)"
+
+        if [ -z "$_named" ]; then
+            yellow "  ⚠ could not read the running config from $AM_URL/api/v2/status —"
+            yellow "    D5 (credential present + well-formed) did NOT run. This is a gap,"
+            yellow "    not a pass: nothing below has checked your credential."
+        else
+            _want=0
+            _cred_present=0
+            _wanted_names=""
+            while IFS="$(printf '\t')" read -r _key _cpath; do
+                [ -n "${_cpath:-}" ] || continue
+                case "$_cpath" in "$SECRETS_DST"/*) ;; *) continue ;; esac
+                _want=$((_want + 1))
+                _base="${_cpath##*/}"
+                _wanted_names="$_wanted_names $_base"
+                _hpath="$SECRETS_REAL/$_base"
+
+                if [ ! -f "$_hpath" ]; then
+                    yellow "  ⚠ $_key names $_base — NOT PRESENT. Delivery through that"
+                    yellow "    receiver is INERT: Alertmanager reads it at NOTIFY time, so it"
+                    yellow "    started and loaded cleanly and will fail every send silently."
+                    yellow "    → printf '%s' \"\$URL\" > $SECRETS_REAL/$_base && chmod 600 \"\$_\""
+                    yellow "      then: make observability-reload"
+                    continue
+                fi
+
+                _cred_present=$((_cred_present + 1))
+                case "$(_cred_shape "$_hpath" "$_key")" in
+                    ok|opaque_ok)
+                        green "  ✓ $_base present and well-formed for $_key" ;;
+                    empty)
+                        red   "  ✗ $_base is EMPTY (0 bytes of content). A touch/redirect that"
+                        red   "    lost its input looks identical to a configured credential."
+                        D_FAIL=1 ;;
+                    insecure)
+                        red   "  ✗ $_base is an http:// URL — a credential-bearing webhook must"
+                        red   "    be https://. (Value not shown.)"
+                        D_FAIL=1 ;;
+                    notaurl)
+                        red   "  ✗ $_base does not begin with a URL scheme, but $_key is a"
+                        red   "    URL-typed field. (Value not shown.)"
+                        D_FAIL=1 ;;
+                    dirty|opaque_dirty)
+                        red   "  ✗ $_base contains whitespace or quote characters on its first"
+                        red   "    line — the usual cause is pasting a whole curl command, or"
+                        red   "    \"quoting\" the value. Alertmanager trims only trailing"
+                        red   "    whitespace. (Value not shown.)"
+                        D_FAIL=1 ;;
+                esac
+            done <<< "$_named"
+
+            if [ "$_want" -eq 0 ]; then
+                yellow "  ⚠ the running config names no credential file under $SECRETS_DST —"
+                yellow "    no receiver reads a secret, so nothing here can be checked."
+            fi
+
+            # Files present that nothing will ever open. Basenames only.
+            if [ -d "$SECRETS_REAL" ]; then
+                for _f in "$SECRETS_REAL"/*; do
+                    [ -f "$_f" ] || continue
+                    _b="${_f##*/}"
+                    case " $_wanted_names " in
+                        *" $_b "*) ;;
+                        *) yellow "  ⚠ $_b is in the credential dir but the running config never"
+                           yellow "    names it — Alertmanager will not open it. Check the filename"
+                           yellow "    against api_url_file/url_file in the config; note that"
+                           yellow "    deploy/observability/alertmanager-route.yaml is a"
+                           yellow "    DOCUMENTATION FRAGMENT using different names." ;;
+                    esac
+                done
+            fi
+        fi
+    fi
+
+    # ── D6. is the credential ACCEPTED? ───────────────────────────────────
+    # Present and well-formed is not delivered. A revoked Slack webhook is a
+    # perfectly-shaped https:// URL, and D5 passes it.
+    AM_METRICS="$(curl -fsS --max-time 10 "$AM_URL/metrics" 2>/dev/null || true)"
+    if [ -z "$AM_METRICS" ]; then
+        yellow "  ⚠ could not scrape $AM_URL/metrics — D6 (acceptance) did NOT run."
+    else
+        _reload="$(printf '%s' "$AM_METRICS" \
+            | awk '$1 == "alertmanager_config_last_reload_successful" { print $2 }')"
+        if [ "${_reload:-1}" = "0" ]; then
+            red "  ✗ Alertmanager's LAST CONFIG RELOAD FAILED — it is still serving the"
+            red "    previous config, so an edit you believe is live is not."
+            yellow "    → docker logs $AM_CONTAINER | tail -30"
+            D_FAIL=1
+        fi
+
+        _sent="$(_amsum alertmanager_notifications_total)"
+        _failed="$(_amsum alertmanager_notifications_failed_total)"
+        _req="$(_amsum alertmanager_notification_requests_total)"
+        _reqfail="$(_amsum alertmanager_notification_requests_failed_total)"
+        _reqok=$(( _req - _reqfail ))
+
+        # "0 failed" IS NOT "delivered". alertmanager_notifications_failed_total
+        # counts only a notification Alertmanager has GIVEN UP on. While it is
+        # still retrying an endpoint that rejects every request, that counter
+        # reads 0 and notifications_total reads 1 — so the obvious pair prints a
+        # green over a dead endpoint. MEASURED against an unresolvable host:
+        # requests_total=6, requests_FAILED_total=6, notifications_failed_total=0,
+        # notifications_total=1. The first version of this block printed
+        # "✓ 1 notification(s) attempted, 0 failed" for exactly that.
+        #
+        # So the delivered question is answered by SUCCESSFUL REQUESTS
+        # (requests_total - requests_failed_total), and the given-up counter is
+        # reported beside it rather than used as the verdict.
+        _broken=0
+        [ "$_failed" -gt 0 ] && _broken=1
+        [ "$_req" -gt 0 ] && [ "$_reqok" -eq 0 ] && _broken=1
+
+        if [ "$_broken" -eq 1 ] && [ "$_cred_present" -eq 0 ]; then
+            # INERT BY DESIGN, not broken. Every send fails because no
+            # credential is configured, which is the state #646 shipped
+            # deliberately. Reporting it RED would make this target
+            # permanently red out of the box.
+            yellow "  ⚠ $_reqfail notification request(s) have failed ($_failed given up on),"
+            yellow "    and NO credential is configured"
+            yellow "    — so this is the documented INERT state, not a fault. Every alert"
+            yellow "    since this Alertmanager started has reached nobody. Enable delivery"
+            yellow "    by creating the file(s) named above; TalosAlertDeliveryFailing is"
+            yellow "    firing about exactly this, through the channel that does not work."
+        elif [ "$_broken" -eq 1 ]; then
+            red "  ✗ delivery is FAILING and a credential IS configured:"
+            red "    $_req notification request(s) attempted, $_reqok succeeded,"
+            red "    $_reqfail failed, $_failed notification(s) given up on."
+            red "    Alerts routed through that receiver are reaching NOBODY while"
+            red "    the configuration looks enabled."
+            printf '%s' "$AM_METRICS" \
+                | awk '$0 !~ /^#/ && index($0,"alertmanager_notifications_failed_total")==1 && $NF+0 > 0 { print "      " $0 }'
+            yellow "    reason=\"other\" is typically a missing/unreadable credential FILE;"
+            yellow "    clientError is an endpoint rejecting the URL (revoked/wrong/archived)."
+            yellow "    → docker logs $AM_CONTAINER | grep -i notify | tail -5   (URL is redacted)"
+            if [ "$_cred_present" -lt 0 ]; then
+                yellow "    (D5 could not run, so I cannot tell inert-by-design from broken.)"
+            fi
+            D_FAIL=1
+        elif [ "$_req" -eq 0 ]; then
+            yellow "  ⚠ NO notification has been attempted since this Alertmanager started."
+            yellow "    0 failures out of 0 attempts is not evidence of anything, and this"
+            yellow "    line deliberately is not a green tick. The credential is UNPROVEN"
+            yellow "    until something is actually sent."
+            yellow "    → prove it now with ONE real alert:"
+            yellow "        TALOS_ALERT_SEND_TEST=1 make observability-verify"
+        else
+            green "  ✓ $_reqok notification request(s) DELIVERED ($_sent notification(s)"
+            green "    attempted, $_failed given up on)"
+            if [ "$_reqfail" -gt 0 ]; then
+                yellow "    ($_reqfail HTTP request(s) failed and were RETRIED successfully."
+                yellow "     alertmanager_notifications_failed_total only counts a notification"
+                yellow "     that never got through, which is the right basis for"
+                yellow "     TalosAlertDeliveryFailing — but it means transient trouble is"
+                yellow "     invisible to that alert. Worth a look if it keeps climbing.)"
+            fi
+        fi
+
+        # ── D6b. ACTIVE probe. Opt-in, because it DELIVERS. ───────────────
+        if [ "${TALOS_ALERT_SEND_TEST:-0}" = "1" ]; then
+            yellow "  … TALOS_ALERT_SEND_TEST=1 — injecting ONE real alert."
+            yellow "    This SENDS to whatever your credential points at. Expect a real"
+            yellow "    message now and a second one when it resolves in ~2 minutes"
+            yellow "    (send_resolved: true). It is labelled TalosAlertDeliveryProbe."
+            # THE COUNTER TO WATCH IS SUCCESSES, NOT ATTEMPTS. The first
+            # version of this probe waited for
+            # alertmanager_notification_requests_total to increase and called
+            # that DELIVERED. Driven against an unresolvable host it printed
+            # "✓ probe DELIVERED — the endpoint accepted it" while the live
+            # counters read requests_total=6, requests_FAILED_total=6 — six
+            # consecutive failures — and the log read `Notify attempt failed,
+            # will retry later ... no such host`. notifications_failed_total
+            # was still 0 because Alertmanager had not yet given up retrying,
+            # so watching THAT would have been just as wrong.
+            # successes = requests_total - requests_failed_total.
+            _b_req="$(_amsum alertmanager_notification_requests_total)"
+            _b_reqfail="$(_amsum alertmanager_notification_requests_failed_total)"
+            _b_ok=$(( _b_req - _b_reqfail ))
+            _b_fail="$(_amsum alertmanager_notifications_failed_total)"
+            _t0="$(python3 -c 'import time; print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))')"
+            _t1="$(python3 -c 'import time; print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time()+120)))')"
+            if curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' \
+                 --data "[{\"labels\":{\"alertname\":\"TalosAlertDeliveryProbe\",\"severity\":\"warning\",\"probe\":\"verify-observability\"},\"annotations\":{\"summary\":\"deliberate delivery probe from scripts/verify-observability.sh\",\"description\":\"If this reached your alert channel, delivery works. It resolves itself in two minutes; nothing is wrong.\"},\"startsAt\":\"$_t0\",\"endsAt\":\"$_t1\"}]" \
+                 "$AM_URL/api/v2/alerts" >/dev/null 2>&1; then
+                _seen=0
+                _ok=0
+                _deadline=$(( $(date +%s) + ${TALOS_ALERT_SEND_TEST_TIMEOUT:-90} ))
+                while [ "$(date +%s)" -lt "$_deadline" ]; do
+                    sleep 5
+                    AM_METRICS="$(curl -fsS --max-time 10 "$AM_URL/metrics" 2>/dev/null || true)"
+                    [ -n "$AM_METRICS" ] || continue
+                    _n_req="$(_amsum alertmanager_notification_requests_total)"
+                    _n_ok=$(( _n_req - $(_amsum alertmanager_notification_requests_failed_total) ))
+                    [ "$_n_req" -gt "$_b_req" ] && _seen=1
+                    # Keep waiting after a failed attempt: Alertmanager retries,
+                    # and a retry that lands inside the window IS a delivery.
+                    if [ "$_n_ok" -gt "$_b_ok" ]; then _ok=1; break; fi
+                done
+                _a_fail="$(_amsum alertmanager_notifications_failed_total)"
+                _a_reqfail="$(_amsum alertmanager_notification_requests_failed_total)"
+                if [ "$_seen" -eq 0 ]; then
+                    yellow "  ⚠ INCONCLUSIVE: no notification request left Alertmanager within"
+                    yellow "    ${TALOS_ALERT_SEND_TEST_TIMEOUT:-90}s. group_wait is 30s, so that is"
+                    yellow "    normally ample. The known way to hit this is a probe from an"
+                    yellow "    earlier run still being ACTIVE: the group is then inside its 5m"
+                    yellow "    group_interval and a second notification is deferred. Probes"
+                    yellow "    self-resolve after 2 minutes, and a re-run AFTER that was measured"
+                    yellow "    to deliver normally — so wait two minutes and try again, or raise"
+                    yellow "    TALOS_ALERT_SEND_TEST_TIMEOUT."
+                elif [ "$_ok" -eq 0 ]; then
+                    red "  ✗ the probe was SENT and NOT DELIVERED. Every notification request"
+                    red "    Alertmanager made in the window failed"
+                    red "    ($((_a_reqfail - _b_reqfail)) failed request(s),"
+                    red "    $((_a_fail - _b_fail)) notification(s) given up on). The credential"
+                    red "    is present and well-formed but NOT accepted — unreachable host,"
+                    red "    revoked URL, wrong workspace, or the wrong receiver type."
+                    yellow "    → docker logs $AM_CONTAINER | grep -i notify | tail -5"
+                    yellow "      (Alertmanager redacts the URL in that log line.)"
+                    D_FAIL=1
+                else
+                    green "  ✓ probe DELIVERED — a notification request completed successfully."
+                    green "    (This proves the ENDPOINT ACCEPTED THE POST, not that a human"
+                    green "    saw it: a valid webhook for an archived or muted channel accepts"
+                    green "    just as happily. Go and confirm the message appeared where you"
+                    green "    expect it — that last link is not testable from here.)"
+                fi
+            else
+                red "  ✗ could not POST the probe alert to $AM_URL/api/v2/alerts"
+                D_FAIL=1
+            fi
+        fi
+    fi
+
+    if [ "$D_FAIL" -eq 0 ] && [ "$_cred_present" -eq 0 ]; then
+        # The summary must not claim more than the legs proved. Its first
+        # version read "...every credential the running config names is present,
+        # well-formed and not failing" and printed that verbatim over a stack
+        # with ZERO credentials -- a green whose words denied the two yellow
+        # lines directly above it. Same class as everything else in this arc:
+        # a field whose name implies a verdict the measurement does not carry.
+        green "  ✓ transport up, loopback-bound, credential dir contained outside"
+        green "    every checkout — but DELIVERY IS INERT: no credential is"
+        green "    configured, so no alert reaches anyone. Not a failure; it is the"
+        green "    shipping state. See the file names above to enable it."
+    elif [ "$D_FAIL" -eq 0 ] && [ "${_req:-0}" -eq 0 ]; then
+        # Credentials configured and well-formed, but nothing has been sent.
+        # "not failing" would be literally true and read as "working" — the
+        # same overstatement the inert branch above was written to avoid.
+        green "  ✓ transport up, loopback-bound, credentials contained outside every"
+        green "    checkout, and every credential the running config names is present"
+        green "    and well-formed — but NOTHING HAS BEEN SENT YET, so delivery is"
+        green "    still unproven. TALOS_ALERT_SEND_TEST=1 proves it."
+    elif [ "$D_FAIL" -eq 0 ]; then
+        green "  ✓ transport up, loopback-bound, credentials contained outside every"
+        green "    checkout, every credential the running config names is present and"
+        green "    well-formed, and ${_reqok:-?} notification request(s) have been"
+        green "    delivered with none outstanding."
     else
         FAIL=1
     fi

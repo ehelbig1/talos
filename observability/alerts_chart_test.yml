@@ -2575,12 +2575,59 @@ tests:
                 read here is the limit a worker ENFORCED, so the change lands
                 only after the node next runs. For a weekly workflow that is up
                 to a week.
+      # keep_firing_for: 10m — the expr stops matching at t=91m, and the alert
+      # must STILL be firing four minutes later. This arm is the one that
+      # proves the anti-flap hold is actually in effect: without
+      # keep_firing_for it was `exp_alerts: []` here, and that is exactly how
+      # a controller restart used to resolve this alert and re-arm its 30m
+      # `for:` from scratch (19 and 11 firing episodes in 24h for the two
+      # affected alerts, against continuously-true conditions).
+      - eval_time: 95m
+        alertname: TalosFuelHeadroomLow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: capacity
+              job: talos-controller
+              instance: controller:8080
+            exp_annotations:
+              summary: "1 workflow node(s) running with no fuel headroom"
+              description: |
+                One or more (workflow, node) pairs consumed at least 80% of the
+                fuel ceiling last enforced for them, at peak, over the past 30
+                days. A node at that level fails on its next larger payload —
+                and it fails AFTER paying for the whole LLM call, because
+                WASM_MAX_INPUT_BYTES is ~100x looser than a typical LLM node's
+                fuel budget, so payload growth surfaces as fuel exhaustion in
+                post-processing rather than as a clean input rejection.
+
+                THE SAMPLE COUNT IS NOT A REASON TO DISCOUNT THIS. The node this
+                detector was built for had two runs.
+
+                Which node: the controller logs it at WARN
+                (target=talos_fuel, event_kind=fuel_headroom_low), and
+                `get_fuel_usage_report` returns it under high_utilisation_nodes.
+                The names are deliberately not metric labels — node labels are
+                author-supplied and unbounded.
+
+                Fix by SIZING FROM THE NODE'S CONFIGURED MAXIMUM (MAX_TOKENS,
+                item caps) per docs/fuel-budget-sizing.md — not from the last
+                observed run, and not from the number in the exhaustion error,
+                which equals the limit by construction. Prefer a node-scoped
+                `data.max_fuel` over `modules.max_fuel`, which is shared by every
+                override-less consumer of that module.
+
+                Raising the budget does NOT clear this immediately: the ceiling
+                read here is the limit a worker ENFORCED, so the change lands
+                only after the node next runs. For a weekly workflow that is up
+                to a week.
       # THE CLEARING DIRECTION. The whole point of taking the ceiling from the
       # node's most recent ENFORCED limit rather than maxing it over the window
       # is that the alert can go quiet when the budget is fixed. A per-row max
       # ratio would keep this firing for the full 30-day window after the fix —
-      # a permanently-red alert, which is a defect, not caution.
-      - eval_time: 95m
+      # a permanently-red alert, which is a defect, not caution. keep_firing_for
+      # delays this by TEN MINUTES, not by a month: 91m + 10m = 101m.
+      - eval_time: 102m
         alertname: TalosFuelHeadroomLow
         exp_alerts: []
 
@@ -2670,3 +2717,328 @@ tests:
       - eval_time: 170m
         alertname: TalosFuelHeadroomDetectorBlind
         exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # THE CONTROLLER-RESTART DIP — the case keep_firing_for was added for.
+  #
+  # Every talos_* gauge is republished by a background task in
+  # controller/src/bootstrap/background.rs whose FIRST tick is deliberately
+  # skipped. So for one refresh interval after every controller start the
+  # gauge is either ABSENT (never yet set) or sitting at its registration-time
+  # `.set(0)` pre-seed — an unmeasured zero indistinguishable from a measured
+  # healthy one. A bare `> 0` matches neither, so the alert RESOLVES on every
+  # restart and then has to serve its full `for: 30m` again before it can
+  # re-fire.
+  #
+  # This is not theoretical and it is not small. MEASURED on the dev stack
+  # 2026-08-19 over 24h of ALERTS{alertstate="firing"} at 60s resolution:
+  # TalosWorkerBuildSkew produced 19 separate firing episodes and
+  # TalosFuelHeadroomLow 11, against conditions that were CONTINUOUSLY TRUE —
+  # 36 episodes across all alerts, ~72 notifications a day with
+  # send_resolved: true, on an idle laptop with nothing wrong. The mechanism
+  # was forced rather than inferred: the dips coincide with drops in
+  # talos_workflow_executions_total (a COUNTER — it can only fall on a process
+  # restart), and their LENGTH matches each task's interval exactly (1 min for
+  # the 60s skew task, 5 min for the 300s fuel task).
+  #
+  # The consequence is worse than noise: a controller restarting more often
+  # than the `for:` duration can NEVER fire these alerts. A crash-looping
+  # controller is precisely when a fleet alert matters most.
+  #
+  # Both tests below are `exp_alerts: []` WITHOUT keep_firing_for — that is
+  # how the fix was proven to have landed (removing the two keep_firing_for
+  # lines makes both of these fail, and the pre-existing fuel clearing test at
+  # 102m pass at 95m instead).
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: a controller restart must not resolve TalosFuelHeadroomLow (pre-seeded 0 for 5m)
+    input_series:
+      # firing by t=30m; controller restarts at t=45m and the 300s task leaves
+      # the gauge at its `.set(0)` pre-seed for five minutes; then it returns.
+      - series: 'talos_fuel_high_utilisation_nodes{job="talos-controller",instance="controller:8080"}'
+        values: "1+0x44 0 0 0 0 0 1+0x60"
+      - series: 'talos_fuel_utilisation_observed_nodes{job="talos-controller",instance="controller:8080"}'
+        values: "6+0x120"
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: TalosFuelHeadroomLow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: capacity
+              job: talos-controller
+              instance: controller:8080
+            exp_annotations:
+              summary: "1 workflow node(s) running with no fuel headroom"
+              description: |
+                One or more (workflow, node) pairs consumed at least 80% of the
+                fuel ceiling last enforced for them, at peak, over the past 30
+                days. A node at that level fails on its next larger payload —
+                and it fails AFTER paying for the whole LLM call, because
+                WASM_MAX_INPUT_BYTES is ~100x looser than a typical LLM node's
+                fuel budget, so payload growth surfaces as fuel exhaustion in
+                post-processing rather than as a clean input rejection.
+
+                THE SAMPLE COUNT IS NOT A REASON TO DISCOUNT THIS. The node this
+                detector was built for had two runs.
+
+                Which node: the controller logs it at WARN
+                (target=talos_fuel, event_kind=fuel_headroom_low), and
+                `get_fuel_usage_report` returns it under high_utilisation_nodes.
+                The names are deliberately not metric labels — node labels are
+                author-supplied and unbounded.
+
+                Fix by SIZING FROM THE NODE'S CONFIGURED MAXIMUM (MAX_TOKENS,
+                item caps) per docs/fuel-budget-sizing.md — not from the last
+                observed run, and not from the number in the exhaustion error,
+                which equals the limit by construction. Prefer a node-scoped
+                `data.max_fuel` over `modules.max_fuel`, which is shared by every
+                override-less consumer of that module.
+
+                Raising the budget does NOT clear this immediately: the ceiling
+                read here is the limit a worker ENFORCED, so the change lands
+                only after the node next runs. For a weekly workflow that is up
+                to a week.
+      # MID-DIP. The expression does not match here at all. Without
+      # keep_firing_for this is [] — the alert has resolved, the operator has
+      # been told the problem went away, and the 30m clock has restarted.
+      - eval_time: 47m
+        alertname: TalosFuelHeadroomLow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: capacity
+              job: talos-controller
+              instance: controller:8080
+            exp_annotations:
+              summary: "1 workflow node(s) running with no fuel headroom"
+              description: |
+                One or more (workflow, node) pairs consumed at least 80% of the
+                fuel ceiling last enforced for them, at peak, over the past 30
+                days. A node at that level fails on its next larger payload —
+                and it fails AFTER paying for the whole LLM call, because
+                WASM_MAX_INPUT_BYTES is ~100x looser than a typical LLM node's
+                fuel budget, so payload growth surfaces as fuel exhaustion in
+                post-processing rather than as a clean input rejection.
+
+                THE SAMPLE COUNT IS NOT A REASON TO DISCOUNT THIS. The node this
+                detector was built for had two runs.
+
+                Which node: the controller logs it at WARN
+                (target=talos_fuel, event_kind=fuel_headroom_low), and
+                `get_fuel_usage_report` returns it under high_utilisation_nodes.
+                The names are deliberately not metric labels — node labels are
+                author-supplied and unbounded.
+
+                Fix by SIZING FROM THE NODE'S CONFIGURED MAXIMUM (MAX_TOKENS,
+                item caps) per docs/fuel-budget-sizing.md — not from the last
+                observed run, and not from the number in the exhaustion error,
+                which equals the limit by construction. Prefer a node-scoped
+                `data.max_fuel` over `modules.max_fuel`, which is shared by every
+                override-less consumer of that module.
+
+                Raising the budget does NOT clear this immediately: the ceiling
+                read here is the limit a worker ENFORCED, so the change lands
+                only after the node next runs. For a weekly workflow that is up
+                to a week.
+      # AFTER the gauge returns. Without the hold this would still be `pending`
+      # (30m of re-arming from t=50m, i.e. not firing again until t=80m); with
+      # it, the alert never stopped firing.
+      - eval_time: 55m
+        alertname: TalosFuelHeadroomLow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: capacity
+              job: talos-controller
+              instance: controller:8080
+            exp_annotations:
+              summary: "1 workflow node(s) running with no fuel headroom"
+              description: |
+                One or more (workflow, node) pairs consumed at least 80% of the
+                fuel ceiling last enforced for them, at peak, over the past 30
+                days. A node at that level fails on its next larger payload —
+                and it fails AFTER paying for the whole LLM call, because
+                WASM_MAX_INPUT_BYTES is ~100x looser than a typical LLM node's
+                fuel budget, so payload growth surfaces as fuel exhaustion in
+                post-processing rather than as a clean input rejection.
+
+                THE SAMPLE COUNT IS NOT A REASON TO DISCOUNT THIS. The node this
+                detector was built for had two runs.
+
+                Which node: the controller logs it at WARN
+                (target=talos_fuel, event_kind=fuel_headroom_low), and
+                `get_fuel_usage_report` returns it under high_utilisation_nodes.
+                The names are deliberately not metric labels — node labels are
+                author-supplied and unbounded.
+
+                Fix by SIZING FROM THE NODE'S CONFIGURED MAXIMUM (MAX_TOKENS,
+                item caps) per docs/fuel-budget-sizing.md — not from the last
+                observed run, and not from the number in the exhaustion error,
+                which equals the limit by construction. Prefer a node-scoped
+                `data.max_fuel` over `modules.max_fuel`, which is shared by every
+                override-less consumer of that module.
+
+                Raising the budget does NOT clear this immediately: the ceiling
+                read here is the limit a worker ENFORCED, so the change lands
+                only after the node next runs. For a weekly workflow that is up
+                to a week.
+
+  - interval: 1m
+    name: a controller restart must not resolve TalosWorkerBuildSkew (unmeasured 0 for 1m)
+    input_series:
+      # A registered prometheus IntGauge serves its initial value from the
+      # first scrape, so a restart yields an EXPORTED 0, not an absent series.
+      # The first draft of this test used a `_ _` gap instead and was VACUOUS:
+      # it passed with and without keep_firing_for, because Prometheus's 5m
+      # lookback carries the previous sample across a two-minute hole. Caught
+      # only by running the mutation — a test that cannot fail is not a test.
+      # Verified live at 30s resolution across the 01:26:15Z restart of
+      # 2026-08-19: 1.0, 1.0, 0.0, 0.0, 1.0, 1.0.
+      - series: 'talos_worker_build_skew_workers{job="talos-controller",instance="controller:8080"}'
+        values: "1+0x44 0 0 1+0x60"
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: TalosWorkerBuildSkew
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: fleet-identity
+              job: talos-controller
+              instance: controller:8080
+            exp_annotations:
+              summary: 1 registered worker id(s) on a different build than the controller
+              description: |
+                At least one worker_id with an ACTIVE worker_identities row has
+                reported a provably different build than this controller for 30m —
+                longer than any rolling deploy should take. Signed wire formats (job
+                dispatch, memory RPC, envelope sealing) are version-coupled, so this
+                breaks jobs in ways that look like signature bugs; it cost several
+                turns of misdiagnosis during the 2026-07-27 signing outage.
+                Run get_platform_info and read the `fleet` section for the
+                per-worker build_status and last_seen_at, or grep the controller log
+                for event_kind="worker_build_skew". Then verify the controller and
+                worker images were published from the same tree.
+              action: |
+                1. get_platform_info → `fleet`. Cross-check last_seen_at against
+                   the pods that actually exist.
+                1b. Faster: compare this gauge with talos_worker_fleet_live_builds
+                   and talos_worker_fleet_build_skew_builds. The pair separates the
+                   two causes — a REGISTERED row with no running process (ghost) vs
+                   a BUILD that just spoke and differs from the controller's. If the
+                   live-skew gauge is 0 while this one is not, you are looking at
+                   ghost rows. Read a 0 on the live gauge carefully though: it also
+                   reads 0 when nothing publishes heartbeats at all, and the live
+                   pair counts BUILDS while this one counts ROWS — so their
+                   magnitudes are not comparable, only their zero/non-zero.
+                2. If the offending worker_id has no running pod, this is a GHOST
+                   ROW, not a live skew: the registry has no reaper, so a retired
+                   pod's identity stays ACTIVE forever. Find it with the controller
+                   CLI `list-worker-identities` and clear it with
+                   `deactivate-worker-identity --worker-id <id> --public-key <hex>`;
+                   the gauge drops on the next 60s sweep. Once the WHOLE fleet runs
+                   a heartbeat-publishing build you may instead set
+                   TALOS_WORKER_FLEET_HEARTBEAT_AUTHORITATIVE=1 so silent rows drop
+                   out automatically — but read the caveat above first: that flag
+                   also silences a live worker on a pre-heartbeat build.
+                3. If the pod IS running, it is genuinely on another image — roll it
+                   onto the controller's build. Do NOT silence this one: a skewed
+                   live worker fails signature verification in ways that read as
+                   crypto bugs.
+      # MID-DIP: the gauge reads 0 because nothing has measured it yet. That
+      # is an unmeasured value published as a measured healthy one — the same
+      # family as `absent is not zero`, one step further in.
+      - eval_time: 46m
+        alertname: TalosWorkerBuildSkew
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: fleet-identity
+              job: talos-controller
+              instance: controller:8080
+            exp_annotations:
+              summary: 1 registered worker id(s) on a different build than the controller
+              description: |
+                At least one worker_id with an ACTIVE worker_identities row has
+                reported a provably different build than this controller for 30m —
+                longer than any rolling deploy should take. Signed wire formats (job
+                dispatch, memory RPC, envelope sealing) are version-coupled, so this
+                breaks jobs in ways that look like signature bugs; it cost several
+                turns of misdiagnosis during the 2026-07-27 signing outage.
+                Run get_platform_info and read the `fleet` section for the
+                per-worker build_status and last_seen_at, or grep the controller log
+                for event_kind="worker_build_skew". Then verify the controller and
+                worker images were published from the same tree.
+              action: |
+                1. get_platform_info → `fleet`. Cross-check last_seen_at against
+                   the pods that actually exist.
+                1b. Faster: compare this gauge with talos_worker_fleet_live_builds
+                   and talos_worker_fleet_build_skew_builds. The pair separates the
+                   two causes — a REGISTERED row with no running process (ghost) vs
+                   a BUILD that just spoke and differs from the controller's. If the
+                   live-skew gauge is 0 while this one is not, you are looking at
+                   ghost rows. Read a 0 on the live gauge carefully though: it also
+                   reads 0 when nothing publishes heartbeats at all, and the live
+                   pair counts BUILDS while this one counts ROWS — so their
+                   magnitudes are not comparable, only their zero/non-zero.
+                2. If the offending worker_id has no running pod, this is a GHOST
+                   ROW, not a live skew: the registry has no reaper, so a retired
+                   pod's identity stays ACTIVE forever. Find it with the controller
+                   CLI `list-worker-identities` and clear it with
+                   `deactivate-worker-identity --worker-id <id> --public-key <hex>`;
+                   the gauge drops on the next 60s sweep. Once the WHOLE fleet runs
+                   a heartbeat-publishing build you may instead set
+                   TALOS_WORKER_FLEET_HEARTBEAT_AUTHORITATIVE=1 so silent rows drop
+                   out automatically — but read the caveat above first: that flag
+                   also silences a live worker on a pre-heartbeat build.
+                3. If the pod IS running, it is genuinely on another image — roll it
+                   onto the controller's build. Do NOT silence this one: a skewed
+                   live worker fails signature verification in ways that read as
+                   crypto bugs.
+      - eval_time: 55m
+        alertname: TalosWorkerBuildSkew
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: fleet-identity
+              job: talos-controller
+              instance: controller:8080
+            exp_annotations:
+              summary: 1 registered worker id(s) on a different build than the controller
+              description: |
+                At least one worker_id with an ACTIVE worker_identities row has
+                reported a provably different build than this controller for 30m —
+                longer than any rolling deploy should take. Signed wire formats (job
+                dispatch, memory RPC, envelope sealing) are version-coupled, so this
+                breaks jobs in ways that look like signature bugs; it cost several
+                turns of misdiagnosis during the 2026-07-27 signing outage.
+                Run get_platform_info and read the `fleet` section for the
+                per-worker build_status and last_seen_at, or grep the controller log
+                for event_kind="worker_build_skew". Then verify the controller and
+                worker images were published from the same tree.
+              action: |
+                1. get_platform_info → `fleet`. Cross-check last_seen_at against
+                   the pods that actually exist.
+                1b. Faster: compare this gauge with talos_worker_fleet_live_builds
+                   and talos_worker_fleet_build_skew_builds. The pair separates the
+                   two causes — a REGISTERED row with no running process (ghost) vs
+                   a BUILD that just spoke and differs from the controller's. If the
+                   live-skew gauge is 0 while this one is not, you are looking at
+                   ghost rows. Read a 0 on the live gauge carefully though: it also
+                   reads 0 when nothing publishes heartbeats at all, and the live
+                   pair counts BUILDS while this one counts ROWS — so their
+                   magnitudes are not comparable, only their zero/non-zero.
+                2. If the offending worker_id has no running pod, this is a GHOST
+                   ROW, not a live skew: the registry has no reaper, so a retired
+                   pod's identity stays ACTIVE forever. Find it with the controller
+                   CLI `list-worker-identities` and clear it with
+                   `deactivate-worker-identity --worker-id <id> --public-key <hex>`;
+                   the gauge drops on the next 60s sweep. Once the WHOLE fleet runs
+                   a heartbeat-publishing build you may instead set
+                   TALOS_WORKER_FLEET_HEARTBEAT_AUTHORITATIVE=1 so silent rows drop
+                   out automatically — but read the caveat above first: that flag
+                   also silences a live worker on a pre-heartbeat build.
+                3. If the pod IS running, it is genuinely on another image — roll it
+                   onto the controller's build. Do NOT silence this one: a skewed
+                   live worker fails signature verification in ways that read as
+                   crypto bugs.
