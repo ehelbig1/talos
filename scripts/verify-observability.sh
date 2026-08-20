@@ -306,6 +306,41 @@ def subset(want, got, path=""):
             bad.append((path, want, got))
     return bad
 
+# `subset` is ONE-DIRECTIONAL by construction, and it has to be: Prometheus
+# marshals its config with every unset field filled in, so `loaded` is a proper
+# superset of `disk` on a healthy stack and a symmetric diff would be
+# permanently red. The cost is a real blind spot, MEASURED on a throwaway rig:
+# add a scrape job, reload, then DELETE it from disk without reloading — the
+# process keeps scraping a job this checkout no longer declares and leg B
+# reports "every setting is in effect", printing its own count of 2 jobs
+# against a file declaring 1. Leg A is green too, because the mounted bytes do
+# match.
+#
+# Closed for the two lists Prometheus never adds to on its own — scrape job
+# NAMES and `rule_files` entries. Both are wholly repo-authored, so an entry
+# present in the process and absent from disk is unambiguous drift and cannot
+# be a filled-in default. Everything else in the config stays one-directional
+# and is named as a limit rather than left implied.
+extra_cfg = []
+for label, dl, ll in (
+        ("scrape job",
+         [j.get("job_name") for j in (disk.get("scrape_configs") or [])],
+         [j.get("job_name") for j in (loaded.get("scrape_configs") or [])]),
+        ("rule_files entry",
+         list(disk.get("rule_files") or []),
+         list(loaded.get("rule_files") or []))):
+    for name in sorted(set(ll) - set(dl)):
+        extra_cfg.append((label, name))
+if extra_cfg:
+    red("  \u2717 the running config has %d entr(y/ies) this checkout does not declare:"
+        % len(extra_cfg))
+    for label, name in extra_cfg:
+        yellow("      %s %r" % (label, name))
+    yellow("    \u2192 the process is still running a deleted setting. Prometheus never")
+    yellow("      invents a scrape job or a rule_files entry, so this is drift, not a")
+    yellow("      default. Apply with 'make observability-reload'.")
+    FAIL = 1
+
 diffs = subset(disk, loaded)
 if diffs:
     red("  \u2717 settings in %s are NOT in effect:" % cfg_host)
@@ -315,64 +350,86 @@ if diffs:
         yellow("      ... and %d more" % (len(diffs) - 12))
     yellow("    \u2192 the process has not re-read %s. Apply with 'make observability-reload'." % cfg_host)
     FAIL = 1
-else:
-    green("  \u2713 every setting in %s is in effect (%d scrape job(s))"
+elif not extra_cfg:
+    green("  \u2713 every setting in %s is in effect, and nothing extra is loaded (%d scrape job(s))"
           % (cfg_host, len(loaded.get("scrape_configs") or [])))
 
-# ── C. every alert on disk is loaded, AND ITS DEFINITION MATCHES ──────────
+# ── C. every rule GROUP and every RULE on disk is loaded, AND ITS WHOLE
+#      DEFINITION MATCHES ────────────────────────────────────────────────
 #
-# WHY THIS COMPARES DEFINITIONS AND NOT JUST NAMES.
-# The first cut of this leg compared alert NAME SETS. That is blind to the
-# case that actually shipped: #644 did not only ADD three alerts, it also
-# REWROTE the expr of the existing `TalosWorkerFleetBuildSkew` from
-# `talos_worker_fleet_build_skew_workers > 0` (a series that had been
-# deleted, so the alert could never fire) to `..._build_skew_builds > 0`.
-# The name was in both sets, so a name-set gate reported ✓ while the running
-# process kept evaluating the un-fireable expr. A gate that cannot see the
-# repair of a broken detector is this repo's own defect class applied to its
-# own tooling — so the comparison is over the whole rule: expr, `for`,
-# labels and annotations.
+# WHY THIS DIFFS THE WHOLE OBJECT INSTEAD OF AN ENUMERATED SUBSET.
 #
-# EXPR COMPARISON IS TWO-STAGE, and the second stage is the authority.
+# This leg has now been wrong three times in one direction — each time by
+# comparing LESS than the whole thing, and each time reporting green over the
+# exact condition it was built to detect:
+#
+#   1. #625 — it did not exist. A merged rules file was never read at all;
+#      the container served a truncated prefix and nothing noticed.
+#   2. #645 — it compared alert NAME SETS. #644 had REWRITTEN
+#      `TalosWorkerFleetBuildSkew`'s expr from a deleted series to a live one;
+#      the name was in both sets, so the gate ticked while the process kept
+#      evaluating the un-fireable expr. Fixed by comparing four named facets:
+#      expr, `for`, labels, annotations.
+#   3. #665 — it compared exactly those four, and #665's whole fix was a
+#      FIFTH field, `keep_firing_for`. MEASURED an hour after that merge:
+#      2 rules carrying it on disk, 0 in the running process, and this script
+#      exited 0 saying "the running Prometheus is reading exactly what its
+#      source checkout contains". `POST /-/reload` took it 0 -> 2.
+#
+# An allow-list of what to COMPARE fails SILENT: every field invented after
+# the list was written is invisible, and this leg's green becomes
+# indistinguishable from a real one. An allow-list of what to IGNORE fails
+# LOUD: a field invented tomorrow is unrecognised, and unrecognised is
+# reported rather than skipped.
+#
+# So: diff the whole group object and the whole rule object, subtract only the
+# named runtime-state fields in VOLATILE_* (each justified where it is
+# declared), and treat a field that is neither mapped nor named as a FINDING.
+# Specifically —
+#   * a field the REPO SETS that this leg cannot compare is a hard FAIL. That
+#     is the #665 shape exactly, and it fires even for a field nobody has
+#     taught this script about, which is the property the last two fixes
+#     lacked.
+#   * a field only the API reports is a hard FAIL when it holds a truthy value
+#     (the process is running a setting nothing verified) and a WARNING when
+#     it is empty/zero (a default the repo does not set, which cannot hide a
+#     divergence). Stated so a Prometheus upgrade that adds a defaulted field
+#     does not make this gate permanently red — a permanently-red gate trains
+#     you to ignore it, which is this script's own header warning.
+#
+# EXPR COMPARISON REMAINS TWO-STAGE, and the second stage is the authority.
 # `/api/v1/rules` returns Prometheus's own re-rendered PromQL, not the repo
 # text. Measured differences on this stack, all pure formatting: newlines
-# collapsed, `on()` → `on ()`, `1.0` → `1`, `[50h]` → `[2d2h]`, and label
-# matchers re-sorted alphabetically. A textual compare is therefore a
-# permanently-red gate, which is the failure mode this script's header warns
-# about. Stage 1 is a cheap textual normalisation that agrees on 52 of 54
-# live rules; stage 2 hands every remaining disagreement to
-# `promtool promql format`, i.e. Prometheus's OWN parser and printer, which
-# canonicalises all five classes above. Typical cost is 0–2 `docker exec`s.
+# collapsed, `on()` -> `on ()`, `1.0` -> `1`, `[50h]` -> `[2d2h]`, and label
+# matchers re-sorted alphabetically. A textual compare would be permanently
+# red. Stage 1 is a cheap textual normalisation that agrees on 52 of 54 live
+# rules; stage 2 hands every residual to `promtool promql format`, i.e.
+# Prometheus's OWN parser and printer. Typical cost 0-2 `docker exec`s.
+#
+# WHAT IS NOW COMPARED THAT WAS NOT: `keep_firing_for`; rule GROUPS (their
+# existence, their file assignment, `interval` — resolved against the global
+# `evaluation_interval` when a group omits it — and `limit`); and RECORDING
+# rules, which were filtered out entirely and which alerting exprs depend on.
 #
 # STATED LIMITS:
 #   * If `promtool promql format --experimental` is unavailable (older
-#     Prometheus, or the flag withdrawn), stage 2 cannot run. The leg then
-#     reports the stage-1 verdict and SAYS it is unadjudicated, rather than
-#     silently downgrading to a name-set comparison.
+#     Prometheus, or the flag withdrawn), stage 2 cannot run. The leg reports
+#     the stage-1 verdict and SAYS it is unadjudicated rather than silently
+#     downgrading.
 #   * Stage 1 can only produce false MISMATCHES, never false matches, for
 #     formatting differences — and stage 2 resolves those. The one direction
-#     it can miss is a difference confined to whitespace INSIDE a quoted
-#     label value (`{job="a b"}` vs `{job="ab"}`); stage 2 catches that too
-#     whenever it runs.
-#   * A recording rule is not compared; only alerting rules.
+#     it can miss alone is whitespace INSIDE a quoted label value
+#     (`{job="a b"}` vs `{job="ab"}`); stage 2 catches that whenever it runs.
+#   * Rules are keyed by (rule_files entry, group, kind, name). Prometheus
+#     GLOBS rule_files, so a glob entry resolves to no host file and is
+#     reported unresolvable — a false positive in the loud direction, the same
+#     limit as structural check 65(b).
+#   * This compares the rule DEFINITIONS. It cannot tell you an expr is
+#     correct, only that the process is evaluating the one on disk.
 entries = loaded.get("rule_files") or []
 if not entries:
     red("  ✗ the running Prometheus has NO rule_files at all — no alert can fire")
     FAIL = 1
-
-on_disk = {}
-for entry in entries:
-    hf = to_host(entry)
-    if hf is None or not os.path.isfile(hf):
-        red("  ✗ rule_files entry %r resolves to no file through the container's mounts" % entry)
-        yellow("    → Prometheus GLOBS rule_files, so this loads ZERO groups silently.")
-        FAIL = 1
-        continue
-    doc = yaml.safe_load(open(hf).read()) or {}
-    for g in doc.get("groups") or []:
-        for r in g.get("rules") or []:
-            if r.get("alert"):
-                on_disk[r["alert"]] = r
 
 def _canon_num(m):
     f = float(m.group(0))
@@ -388,7 +445,7 @@ def norm_expr(e):
 _UNIT = {"ms": 0, "s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800, "y": 31536000}
 
 def norm_for(v):
-    """`for:` is `30m` on disk and 1800 (seconds) from the API."""
+    """A duration is `30m` on disk and 1800 (seconds) from the API."""
     if v is None:
         return 0
     if isinstance(v, (int, float)):
@@ -416,74 +473,220 @@ def canon(expr):
         _fmt_cache[expr] = _promtool(expr)
     return _fmt_cache[expr]
 
-live_rules = {r["name"]: r for g in api("/rules")["groups"] for r in g["rules"]
-              if r.get("type") == "alerting"}
+# ── the ignore-list: the ONLY subtraction from a whole-object diff ────────
+# Every entry is a RUNTIME-STATE field — it describes what the evaluator has
+# most recently DONE, not what the rule IS, so it can never carry a drift
+# between disk and process. Anything not listed here is compared or reported.
+VOLATILE_RULE_FIELDS = {
+    "state":          "pending/firing/inactive; changes on its own every evaluation",
+    "alerts":         "the currently-firing instances (2.x spelling)",
+    "activeAlerts":   "the same list under the spelling other versions/clients use",
+    "health":         "ok/err/unknown — the outcome of the last evaluation",
+    "lastEvaluation": "wall-clock timestamp of the last evaluation",
+    "evaluationTime": "duration of the last evaluation, in seconds",
+}
+VOLATILE_GROUP_FIELDS = {
+    "lastEvaluation": "wall-clock timestamp of the group's last evaluation",
+    "evaluationTime": "duration of the group's last evaluation, in seconds",
+}
 
-missing = sorted(set(on_disk) - set(live_rules))
-extra   = sorted(set(live_rules) - set(on_disk))
+# rule-file key -> /api/v1/rules key. Everything here IS compared.
+RULE_FILE_TO_API = {
+    "expr":            "query",
+    "for":             "duration",
+    "keep_firing_for": "keepFiringFor",
+    "labels":          "labels",
+    "annotations":     "annotations",
+}
+GROUP_FILE_TO_API = {"interval": "interval", "limit": "limit"}
+# Identity: carried in the comparison KEY, so compared by the missing/extra sets.
+RULE_FILE_IDENTITY  = {"alert", "record"}
+RULE_API_IDENTITY   = {"name", "type"}
+GROUP_FILE_IDENTITY = {"name", "rules"}
+GROUP_API_IDENTITY  = {"name", "file", "rules"}
 
-drifted = []
-unadjudicated = 0
-for name in sorted(set(on_disk) & set(live_rules)):
-    d, l = on_disk[name], live_rules[name]
+# A group that omits `interval` inherits the global evaluation_interval, so
+# "absent on disk" is NOT zero here — resolve it rather than skipping it.
+GLOBAL_EVAL = norm_for((loaded.get("global") or {}).get("evaluation_interval")) or 60
+
+disk_groups, disk_rules = {}, {}
+for entry in entries:
+    hf = to_host(entry)
+    if hf is None or not os.path.isfile(hf):
+        red("  ✗ rule_files entry %r resolves to no file through the container's mounts" % entry)
+        yellow("    → Prometheus GLOBS rule_files, so this loads ZERO groups silently.")
+        FAIL = 1
+        continue
+    doc = yaml.safe_load(open(hf).read()) or {}
+    for g in doc.get("groups") or []:
+        gname = g.get("name")
+        disk_groups[(entry, gname)] = g
+        for r in g.get("rules") or []:
+            kind = "alerting" if r.get("alert") else "recording"
+            k = (entry, gname, kind, r.get("alert") or r.get("record"))
+            # Prometheus permits two rules with the same name in one group, and
+            # a dict would silently keep only the last — comparing one of them
+            # and reporting green over the other. Same shape as the bug this
+            # leg exists for, so it is reported rather than collapsed.
+            if k in disk_rules:
+                red("  ✗ %r is defined twice in group %r of %s — this leg compares"
+                    % (k[3], gname, entry))
+                yellow("    only one of them. Give them distinct names.")
+                FAIL = 1
+            disk_rules[k] = r
+
+live_groups, live_rules = {}, {}
+for g in api("/rules")["groups"]:
+    live_groups[(g.get("file"), g.get("name"))] = g
+    for r in g.get("rules") or []:
+        live_rules[(g.get("file"), g.get("name"), r.get("type"), r.get("name"))] = r
+
+# API fields present but empty, hence unverifiable and merely reported.
+unknown_empty = {}
+# expr differences promtool could not adjudicate (stage 2 unavailable/failed).
+UNADJ = []
+
+def _diff(disk, live, f2a, disk_ident, api_ident, volatile, what):
+    """Whole-object diff, minus the named volatile fields. Returns facets."""
     facets = []
-    if norm_expr(d.get("expr")) != norm_expr(l.get("query")):
-        # stage 2: let Prometheus's own parser adjudicate before reporting.
-        agreed = False
-        if PROMTOOL_OK:
-            cd, cl = canon(d.get("expr") or ""), canon(l.get("query") or "")
-            if cd is not None and cl is not None:
-                agreed = (cd == cl)
-            else:
-                unadjudicated += 1
+    for k in sorted(set(disk) - set(f2a) - disk_ident):
+        facets.append(("repo sets %r" % k, disk[k],
+                       "<leg C has no comparator for this %s field>" % what))
+    for fk, ak in f2a.items():
+        dv, lv = disk.get(fk), live.get(ak)
+        if fk == "expr":
+            if norm_expr(dv) != norm_expr(lv):
+                agreed = False
+                if PROMTOOL_OK:
+                    cd, cl = canon(dv or ""), canon(lv or "")
+                    if cd is not None and cl is not None:
+                        agreed = (cd == cl)
+                    else:
+                        UNADJ.append(1)
+                else:
+                    UNADJ.append(1)
+                if not agreed:
+                    facets.append(("expr", dv, lv))
+        elif fk in ("for", "keep_firing_for", "interval"):
+            want = norm_for(dv)
+            if fk == "interval" and dv is None:
+                want = GLOBAL_EVAL
+            if want != norm_for(lv):
+                facets.append((fk, dv if dv is not None else
+                               ("<global %ds>" % GLOBAL_EVAL if fk == "interval" else None), lv))
+        elif fk == "limit":
+            if int(dv or 0) != int(lv or 0):
+                facets.append((fk, dv, lv))
+        elif fk == "annotations":
+            d0, l0 = (dv or {}), (lv or {})
+            if d0 != l0:
+                ks = sorted(set(d0) ^ set(l0)) + sorted(k for k in set(d0) & set(l0) if d0[k] != l0[k])
+                facets.append(("annotations", "differing key(s): " + ", ".join(ks), "<not printed>"))
         else:
-            unadjudicated += 1
-        if not agreed:
-            facets.append(("expr", d.get("expr"), l.get("query")))
-    if norm_for(d.get("for")) != norm_for(l.get("duration")):
-        facets.append(("for", d.get("for"), l.get("duration")))
-    if (d.get("labels") or {}) != (l.get("labels") or {}):
-        facets.append(("labels", d.get("labels"), l.get("labels")))
-    if (d.get("annotations") or {}) != (l.get("annotations") or {}):
-        facets.append(("annotations", "<differs>", "<differs>"))
-    if facets:
-        drifted.append((name, facets))
+            if (dv or {}) != (lv or {}):
+                facets.append((fk, dv, lv))
+    known = set(f2a.values()) | api_ident | set(volatile)
+    for k in sorted(set(live) - known):
+        if live[k]:
+            facets.append(("running has %r" % k, "<nothing in this checkout maps to it>", live[k]))
+        else:
+            unknown_empty.setdefault(k, what)
+    return facets
+
+gmissing = sorted(set(disk_groups) - set(live_groups))
+gextra   = sorted(set(live_groups) - set(disk_groups))
+gdrifted = []
+for key in sorted(set(disk_groups) & set(live_groups)):
+    f = _diff(disk_groups[key], live_groups[key], GROUP_FILE_TO_API,
+              GROUP_FILE_IDENTITY, GROUP_API_IDENTITY, VOLATILE_GROUP_FIELDS, "rule-group")
+    if f:
+        gdrifted.append((key, f))
+
+missing = sorted(set(disk_rules) - set(live_rules))
+extra   = sorted(set(live_rules) - set(disk_rules))
+drifted = []
+for key in sorted(set(disk_rules) & set(live_rules)):
+    f = _diff(disk_rules[key], live_rules[key], RULE_FILE_TO_API,
+              RULE_FILE_IDENTITY, RULE_API_IDENTITY, VOLATILE_RULE_FIELDS, "rule")
+    if f:
+        drifted.append((key, f))
+
+def _rk(k):
+    return "%s [%s in %s of %s]" % (k[3], k[2], k[1], k[0])
+
+if gmissing:
+    red("  ✗ rule GROUPS on disk that the running Prometheus has not loaded:")
+    for e, n in gmissing:
+        yellow("      %s (in %s)" % (n, e))
+    FAIL = 1
+if gextra:
+    red("  ✗ rule GROUPS the process is running that are not on disk:")
+    for e, n in gextra:
+        yellow("      %s (claiming %s)" % (n, e))
+    FAIL = 1
+if gdrifted:
+    red("  ✗ rule GROUPS loaded under the right name with a DIFFERENT definition:")
+    for (e, n), facets in gdrifted:
+        for facet, want, got in facets:
+            yellow("      %s (%s) — %s: repo=%r running=%r" % (n, e, facet, want, got))
+    FAIL = 1
 
 if missing:
     red("  ✗ defined on disk but NOT loaded by the running Prometheus:")
-    for a in missing:
-        yellow("      " + a)
+    for k in missing:
+        yellow("      " + _rk(k))
     yellow("    → this is the '#625 merged and never took effect' symptom exactly.")
     FAIL = 1
 if extra:
     red("  ✗ loaded by Prometheus but NOT defined on disk:")
-    for a in extra:
-        yellow("      " + a)
+    for k in extra:
+        yellow("      " + _rk(k))
     yellow("    → the process is running rules this checkout does not contain.")
     FAIL = 1
 if drifted:
     red("  ✗ loaded under the right NAME but with a DIFFERENT definition:")
-    for name, facets in drifted:
-        yellow("      %s — %s differs" % (name, ", ".join(f[0] for f in facets)))
+    for k, facets in drifted:
+        yellow("      %s — %s differs" % (_rk(k), ", ".join(f[0] for f in facets)))
         for facet, want, got in facets:
-            if facet == "annotations":
-                continue
             yellow("        %s: repo=%r running=%r" % (facet, want, got))
-    yellow("    → the process is evaluating a STALE definition of an alert that")
-    yellow("      still exists by name — a name-only check cannot see this.")
+    yellow("    → the process is evaluating a STALE definition of a rule that")
+    yellow("      still exists by name — a name-only check cannot see this, and")
+    yellow("      neither could the four-facet check this replaced.")
     yellow("      Apply with 'make observability-reload'.")
+    if any(f[0].startswith(("repo sets ", "running has "))
+           for _, fs in drifted for f in fs):
+        yellow("    → a \'repo sets\'/\'running has\' line means the FIELD ITSELF is")
+        yellow("      unknown to this leg. Teach it a comparator in RULE_FILE_TO_API,")
+        yellow("      or name it in VOLATILE_RULE_FIELDS with the reason it cannot")
+        yellow("      carry a drift. It is reported rather than skipped precisely so")
+        yellow("      that the next field added to these files cannot repeat #665.")
     FAIL = 1
-if not PROMTOOL_OK and any(f[0] == "expr" for _, fs in drifted for f in fs):
-    yellow("    ⚠ 'promtool promql format --experimental' is unavailable in %s, so"
-           % PROM_CONTAINER)
-    yellow("      the expr differences above are UNADJUDICATED — they may be pure")
-    yellow("      formatting. Compare by hand before treating them as drift.")
+if UNADJ:
+    yellow("    ⚠ %d expr difference(s) above are UNADJUDICATED: 'promtool promql"
+           % len(UNADJ))
+    yellow("      format --experimental' %s in %s, so stage 2 could not run."
+           % ("is unavailable" if not PROMTOOL_OK else "failed on one side",
+              PROM_CONTAINER))
+    yellow("      They may be pure formatting — compare by hand before treating")
+    yellow("      them as drift.")
+if unknown_empty:
+    yellow("    ⚠ the API reports %d field(s) this leg does not map, all empty on"
+           % len(unknown_empty))
+    yellow("      every object, so none can be hiding a divergence today:")
+    for k, what in sorted(unknown_empty.items()):
+        yellow("        %s (%s)" % (k, what))
+    yellow("      Map or ignore-list them before this checkout starts setting them;")
+    yellow("      a non-empty one FAILS this leg rather than being skipped.")
 
-if on_disk and not missing and not extra and not drifted:
-    green("  ✓ all %d alert(s) on disk are loaded with matching definitions%s"
-          % (len(on_disk), "" if PROMTOOL_OK else " (expr compared textually only)"))
-elif not on_disk:
-    red("  ✗ found no alert definitions on disk — cannot verify anything")
+if disk_rules and not (missing or extra or drifted or gmissing or gextra or gdrifted):
+    green("  ✓ %d group(s) and %d rule(s) on disk are loaded with matching whole-object"
+          % (len(disk_groups), len(disk_rules)))
+    green("    definitions (%d rule field(s) + %d group field(s) compared; %d named"
+          % (len(RULE_FILE_TO_API), len(GROUP_FILE_TO_API), len(VOLATILE_RULE_FIELDS)))
+    green("    runtime-state field(s) ignored)%s"
+          % ("" if PROMTOOL_OK else " — expr compared textually only"))
+elif not disk_rules:
+    red("  ✗ found no rule definitions on disk — cannot verify anything")
     FAIL = 1
 
 sys.exit(1 if FAIL else 0)

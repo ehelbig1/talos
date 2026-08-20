@@ -585,7 +585,17 @@ tests:
             value: 0
     alert_rule_test:
       # ...and the alert itself is gone, not merely below threshold.
-      - eval_time: 245m
+      #
+      # 247m, not 245m: this alert now carries `keep_firing_for: 5m` (the
+      # anti-flap block at the end of this file), so from the expr's last
+      # matching sample at t=240m it is HELD firing through t=245m and
+      # resolves at t=246m. This arm therefore still tests exactly what it
+      # tested before — that the alert CLEARS rather than latching — and the
+      # five extra minutes are the hold, not a latch. The held-firing half is
+      # asserted in that anti-flap group, which owns the annotation blob; a
+      # YAML alias cannot be used here because an anchor must be defined
+      # earlier in the document than its alias.
+      - eval_time: 247m
         alertname: TalosWorkerLivenessParticipationDropped
         exp_alerts: []
 
@@ -3042,3 +3052,719 @@ tests:
                    onto the controller's build. Do NOT silence this one: a skewed
                    live worker fails signature verification in ways that read as
                    crypto bugs.
+
+  # ══════════════════════════════════════════════════════════════════════
+  # ANTI-FLAP: the nine alerts #665 left unprotected in the
+  # "a registered gauge exports its initial 0 before anything measures it"
+  # class. #665 fixed two of seventeen and named the rest; these are the ones
+  # whose producer is a periodic task that SKIPS its first tick, so the window
+  # is real and its length is known from the source rather than guessed:
+  #
+  #   60s  publish_worker_fleet_gauges          background.rs:596 / :721-725
+  #   60s  publish_worker_build_skew +
+  #        publish_worker_liveness_participation background.rs:122/:390 / :1077
+  #   60s  the crypto-invariant orphan scan      background.rs:913-963
+  #
+  # Six of the seventeen are deliberately NOT here and the reason is recorded
+  # per alert in the findings for this change: the db-pool pair (their sampler
+  # does NOT skip its first tick, so the window is ~0), TalosDEKCacheOverflow
+  # and TalosSchedulerReadinessDegraded (their post-restart 0 is a TRUE
+  # reading, not an unmeasured one), TalosCatalogTemplateNeverCompiled (its
+  # gauge is published at BOOT ONLY, so no keep_firing_for can be sized), and
+  # TalosFuelHeadroomDetectorBlind (its `== 0` reads the unmeasured zero in the
+  # OPPOSITE direction — a hold there would EXTEND a false positive).
+  #
+  # WHAT THESE TESTS CAN AND CANNOT PROVE, in the same terms the fuel suite
+  # above states it: they supply the GAUGE VALUES directly, so they prove the
+  # alert's firing/holding/clearing transitions and prove nothing about
+  # whether the producer computes those values correctly. The producer half is
+  # pinned in the Rust unit tests beside each publisher.
+  #
+  # The expected labels and annotations are anchored once per alert and
+  # aliased into the two later firing arms. The alias is deliberate: the
+  # annotation is not what these cases test, and three hand-maintained copies
+  # of a 40-line blob is how they drift.
+  # ══════════════════════════════════════════════════════════════════════
+  # ── TalosActorMemoryDEKOrphaned ─────────────────────────────
+  # The four arms below are ordered so that THREE of them go red without
+  # `keep_firing_for`, and one goes red if it is too long:
+  #   * the first is PENDING, not firing — without it a rule that matched
+  #     unconditionally would still pass the firing arms;
+  #   * the second is the ordinary firing state;
+  #   * the third sits ON the single 0 sample that models the ~60s window
+  #     after a controller restart in which the gauge serves its
+  #     registration-time 0. Without keep_firing_for this is `[]`;
+  #   * the fourth is five minutes AFTER the gauge repopulates. Without
+  #     keep_firing_for the alert had already resolved and re-armed its
+  #     whole `for:` from scratch, so it would still be pending here —
+  #     this is the arm that measures the DAMAGE, not just the dip;
+  #   * the last is after the condition genuinely ends. It must CLEAR.
+  #     keep_firing_for that outlived the condition would be a
+  #     permanently-red alert, which is a defect and not caution.
+  - interval: 1m
+    name: TalosActorMemoryDEKOrphaned — held across a controller-restart zero window, and still clears
+    input_series:
+    - series: talos_actor_memory_orphaned_rows{job="talos-controller",instance="controller:8080"}
+      values: 3x14 0x0 3x9 0x19
+    alert_rule_test:
+    - eval_time: 4m
+      alertname: TalosActorMemoryDEKOrphaned
+      exp_alerts: []
+    - eval_time: 6m
+      alertname: TalosActorMemoryDEKOrphaned
+      exp_alerts: &talos_actor_memory_d_e_k_orphaned_firing
+      - exp_labels:
+          severity: critical
+          category: data-loss
+          runbook: https://github.com/OWNER/talos/blob/main/docs/security/operational-runbook.md#dek-orphan
+          job: talos-controller
+          instance: controller:8080
+        exp_annotations:
+          summary: 3 actor_memory row(s) reference a missing DEK
+          description: |
+            actor_memory.value_key_id points at an encryption_keys row that
+            no longer exists. This should be structurally impossible under
+            the ON DELETE RESTRICT FK — investigate for:
+              - partial DB restore (pg_restore without encryption_keys)
+              - manual DEK deletion with FK triggers disabled
+              - Vault master-key rotation without DEK rewrap
+            Affected rows are UNRECOVERABLE. Do not delete them without
+            a decision to abandon their payloads.
+          action: |
+            1. kubectl -n talos exec deploy/talos-controller -- \
+                 psql $DATABASE_URL -c "SELECT id, actor_id, key, created_at \
+                   FROM actor_memory am \
+                   WHERE NOT EXISTS ( \
+                     SELECT 1 FROM encryption_keys ek WHERE ek.id = am.value_key_id \
+                   );"
+            2. Decide: delete orphans, or hold for forensic dump before delete.
+            3. Follow docs/security/operational-runbook.md § DEK orphan.
+    - eval_time: 15m
+      alertname: TalosActorMemoryDEKOrphaned
+      exp_alerts: *talos_actor_memory_d_e_k_orphaned_firing
+    - eval_time: 20m
+      alertname: TalosActorMemoryDEKOrphaned
+      exp_alerts: *talos_actor_memory_d_e_k_orphaned_firing
+    - eval_time: 32m
+      alertname: TalosActorMemoryDEKOrphaned
+      exp_alerts: []
+  # ── TalosModuleExecutionPayloadOrphaned ─────────────────────────────
+  # The four arms below are ordered so that THREE of them go red without
+  # `keep_firing_for`, and one goes red if it is too long:
+  #   * the first is PENDING, not firing — without it a rule that matched
+  #     unconditionally would still pass the firing arms;
+  #   * the second is the ordinary firing state;
+  #   * the third sits ON the single 0 sample that models the ~60s window
+  #     after a controller restart in which the gauge serves its
+  #     registration-time 0. Without keep_firing_for this is `[]`;
+  #   * the fourth is five minutes AFTER the gauge repopulates. Without
+  #     keep_firing_for the alert had already resolved and re-armed its
+  #     whole `for:` from scratch, so it would still be pending here —
+  #     this is the arm that measures the DAMAGE, not just the dip;
+  #   * the last is after the condition genuinely ends. It must CLEAR.
+  #     keep_firing_for that outlived the condition would be a
+  #     permanently-red alert, which is a defect and not caution.
+  - interval: 1m
+    name: TalosModuleExecutionPayloadOrphaned — held across a controller-restart zero window, and still clears
+    input_series:
+    - series: talos_module_execution_orphaned_rows{job="talos-controller",instance="controller:8080"}
+      values: 3x14 0x0 3x9 0x19
+    alert_rule_test:
+    - eval_time: 4m
+      alertname: TalosModuleExecutionPayloadOrphaned
+      exp_alerts: []
+    - eval_time: 6m
+      alertname: TalosModuleExecutionPayloadOrphaned
+      exp_alerts: &talos_module_execution_payload_orphaned_firing
+      - exp_labels:
+          severity: critical
+          category: data-loss
+          job: talos-controller
+          instance: controller:8080
+        exp_annotations:
+          summary: 3 module_executions row(s) reference a missing DEK
+          description: |
+            module_executions.payload_enc_key_id FK broken. Execution
+            metadata survives; input/output/trigger_metadata_enc are
+            unrecoverable. NULL the _enc columns once a decision is
+            made — see 2026-04-24 cleanup precedent.
+    - eval_time: 15m
+      alertname: TalosModuleExecutionPayloadOrphaned
+      exp_alerts: *talos_module_execution_payload_orphaned_firing
+    - eval_time: 20m
+      alertname: TalosModuleExecutionPayloadOrphaned
+      exp_alerts: *talos_module_execution_payload_orphaned_firing
+    - eval_time: 32m
+      alertname: TalosModuleExecutionPayloadOrphaned
+      exp_alerts: []
+  # ── TalosWorkflowOutputPayloadOrphaned ─────────────────────────────
+  # The four arms below are ordered so that THREE of them go red without
+  # `keep_firing_for`, and one goes red if it is too long:
+  #   * the first is PENDING, not firing — without it a rule that matched
+  #     unconditionally would still pass the firing arms;
+  #   * the second is the ordinary firing state;
+  #   * the third sits ON the single 0 sample that models the ~60s window
+  #     after a controller restart in which the gauge serves its
+  #     registration-time 0. Without keep_firing_for this is `[]`;
+  #   * the fourth is five minutes AFTER the gauge repopulates. Without
+  #     keep_firing_for the alert had already resolved and re-armed its
+  #     whole `for:` from scratch, so it would still be pending here —
+  #     this is the arm that measures the DAMAGE, not just the dip;
+  #   * the last is after the condition genuinely ends. It must CLEAR.
+  #     keep_firing_for that outlived the condition would be a
+  #     permanently-red alert, which is a defect and not caution.
+  - interval: 1m
+    name: TalosWorkflowOutputPayloadOrphaned — held across a controller-restart zero window, and still clears
+    input_series:
+    - series: talos_workflow_execution_orphaned_rows{job="talos-controller",instance="controller:8080"}
+      values: 3x14 0x0 3x9 0x19
+    alert_rule_test:
+    - eval_time: 4m
+      alertname: TalosWorkflowOutputPayloadOrphaned
+      exp_alerts: []
+    - eval_time: 6m
+      alertname: TalosWorkflowOutputPayloadOrphaned
+      exp_alerts: &talos_workflow_output_payload_orphaned_firing
+      - exp_labels:
+          severity: critical
+          category: data-loss
+          job: talos-controller
+          instance: controller:8080
+        exp_annotations:
+          summary: 3 workflow_executions row(s) reference a missing DEK
+          description: |
+            workflow_executions.output_enc_key_id FK broken. Output data
+            unrecoverable.
+    - eval_time: 15m
+      alertname: TalosWorkflowOutputPayloadOrphaned
+      exp_alerts: *talos_workflow_output_payload_orphaned_firing
+    - eval_time: 20m
+      alertname: TalosWorkflowOutputPayloadOrphaned
+      exp_alerts: *talos_workflow_output_payload_orphaned_firing
+    - eval_time: 32m
+      alertname: TalosWorkflowOutputPayloadOrphaned
+      exp_alerts: []
+  # ── TalosWorkerFleetBuildSkew ─────────────────────────────
+  # The four arms below are ordered so that THREE of them go red without
+  # `keep_firing_for`, and one goes red if it is too long:
+  #   * the first is PENDING, not firing — without it a rule that matched
+  #     unconditionally would still pass the firing arms;
+  #   * the second is the ordinary firing state;
+  #   * the third sits ON the single 0 sample that models the ~60s window
+  #     after a controller restart in which the gauge serves its
+  #     registration-time 0. Without keep_firing_for this is `[]`;
+  #   * the fourth is five minutes AFTER the gauge repopulates. Without
+  #     keep_firing_for the alert had already resolved and re-armed its
+  #     whole `for:` from scratch, so it would still be pending here —
+  #     this is the arm that measures the DAMAGE, not just the dip;
+  #   * the last is after the condition genuinely ends. It must CLEAR.
+  #     keep_firing_for that outlived the condition would be a
+  #     permanently-red alert, which is a defect and not caution.
+  - interval: 1m
+    name: TalosWorkerFleetBuildSkew — held across a controller-restart zero window, and still clears
+    input_series:
+    - series: talos_worker_fleet_build_skew_builds{job="talos-controller",instance="controller:8080"}
+      values: 3x39 0x0 3x9 0x19
+    alert_rule_test:
+    - eval_time: 29m
+      alertname: TalosWorkerFleetBuildSkew
+      exp_alerts: []
+    - eval_time: 31m
+      alertname: TalosWorkerFleetBuildSkew
+      exp_alerts: &talos_worker_fleet_build_skew_firing
+      - exp_labels:
+          severity: warning
+          category: fleet-identity
+          job: talos-controller
+          instance: controller:8080
+        exp_annotations:
+          summary: 3 RUNNING build(s) differ from the controller's — NOT a count of workers
+          description: |
+            At least one build that provably differs from this controller's has
+            published a fleet heartbeat recently — up to ~150s ago, being 60s
+            of staleness plus a 30s prune tick plus one 60s gauge sweep — and
+            has done so for 30m. Unlike TalosWorkerBuildSkew this cannot be a
+            ghost registry row: a process spoke. Signed wire formats are
+            version-coupled, so a live skew breaks jobs in ways that read as
+            signature bugs.
+
+            THE VALUE COUNTS BUILDS, NOT PROCESSES. Five workers stuck on one
+            old build report 1, not 5, so this number tells you a skew exists
+            and NOT how much of the fleet it covers. For the magnitude read
+            talos_worker_fleet_build_skew_workers — which is correct on a
+            DEFAULT install (this chart renders no TALOS_WORKER_ID, so each pod
+            is its own identity) and is 0-or-1 and flapping only where you have
+            deliberately given every replica ONE id. The alert lives on the
+            build count because that one is steady in both postures. Use
+            get_platform_info → `fleet` for per-worker detail either way.
+
+            The denominator is talos_worker_fleet_live_builds — NOT
+            talos_worker_fleet_live_workers, which counts heartbeating
+            IDENTITIES and is a different population. The three build series
+            decompose exactly: live == this + unverifiable + agreeing.
+
+            READ talos_worker_fleet_unverifiable_builds BEFORE CONCLUDING
+            ANYTHING FROM A LOW NUMBER HERE. It counts observed builds that
+            could not be compared at all — the worker reported no usable commit
+            sha, or THIS CONTROLLER has none, in which case nothing is
+            comparable and every observed build lands there. Those sit in the
+            denominator but are never counted as skew, so "1 skewed of 3 live
+            builds" over an unverifiable count of 1 means one build was never
+            checked. A 0 here is not "the fleet agrees"; it is "nothing was
+            proven to differ".
+          action: |
+            1. Compare the controller and worker image digests — they must come
+               from the same published tree.
+            2. get_platform_info → `fleet` for the per-worker detail, including
+               HOW MANY workers are on the offending build; the heartbeat gauges
+               are counts only (worker_id is caller-supplied on the bus and is
+               deliberately never a metric label, and neither is build_version).
+            3. Roll the workers onto the controller's build. Do NOT silence:
+               this one names running processes, not stale rows.
+            4. If talos_worker_fleet_capacity_dropped_builds is non-zero, the
+               build view is saturated and these counts include fabricated
+               values — only a holder of the fleet-shared WORKER_SHARED_KEY can
+               produce that, so treat it as a key-handling question first and a
+               build question second.
+    - eval_time: 40m
+      alertname: TalosWorkerFleetBuildSkew
+      exp_alerts: *talos_worker_fleet_build_skew_firing
+    - eval_time: 45m
+      alertname: TalosWorkerFleetBuildSkew
+      exp_alerts: *talos_worker_fleet_build_skew_firing
+    - eval_time: 57m
+      alertname: TalosWorkerFleetBuildSkew
+      exp_alerts: []
+  # ── TalosWorkerFleetBuildViewSaturated ─────────────────────────────
+  # The four arms below are ordered so that THREE of them go red without
+  # `keep_firing_for`, and one goes red if it is too long:
+  #   * the first is PENDING, not firing — without it a rule that matched
+  #     unconditionally would still pass the firing arms;
+  #   * the second is the ordinary firing state;
+  #   * the third sits ON the single 0 sample that models the ~60s window
+  #     after a controller restart in which the gauge serves its
+  #     registration-time 0. Without keep_firing_for this is `[]`;
+  #   * the fourth is five minutes AFTER the gauge repopulates. Without
+  #     keep_firing_for the alert had already resolved and re-armed its
+  #     whole `for:` from scratch, so it would still be pending here —
+  #     this is the arm that measures the DAMAGE, not just the dip;
+  #   * the last is after the condition genuinely ends. It must CLEAR.
+  #     keep_firing_for that outlived the condition would be a
+  #     permanently-red alert, which is a defect and not caution.
+  - interval: 1m
+    name: TalosWorkerFleetBuildViewSaturated — held across a controller-restart zero window, and still clears
+    input_series:
+    - series: talos_worker_fleet_capacity_dropped_builds{job="talos-controller",instance="controller:8080"}
+      values: 3x14 0x0 3x9 0x19
+    alert_rule_test:
+    - eval_time: 4m
+      alertname: TalosWorkerFleetBuildViewSaturated
+      exp_alerts: []
+    - eval_time: 6m
+      alertname: TalosWorkerFleetBuildViewSaturated
+      exp_alerts: &talos_worker_fleet_build_view_saturated_firing
+      - exp_labels:
+          severity: warning
+          category: fleet-identity
+          job: talos-controller
+          instance: controller:8080
+        exp_annotations:
+          summary: fleet BUILD view hit its cap — 3 observation(s) refused; build-skew detection is SUPPRESSED
+          description: |
+            The controller's NATS fleet view refused build observations
+            because its BUILD map was at the hard cap (MAX_TRACKED_BUILDS =
+            64). The bound held — this is not a memory incident — but while
+            this is non-zero the view is INCOMPLETE IN THE DIRECTION THAT
+            MATTERS: a build not already tracked cannot enter, so
+            TalosWorkerFleetBuildSkew can read 0 on a fleet that is genuinely
+            skewed.
+
+            Read this as a FALSE-NEGATIVE risk on that alert, not as noise.
+            The other direction — fabricated builds inflating the skew and
+            unverifiable counts before the cap is reached — is also possible
+            and is the milder one, because it is loud.
+
+            A real fleet publishes one build, or two mid-roll. Reaching 64
+            distinct build strings does not happen organically, and
+            build_version is carried on a signed heartbeat, so whatever
+            produced this holds WORKER_SHARED_KEY. Note builds_match compares
+            only the +sha suffix, so 64 mutually-distinct strings can all
+            classify as AGREEING while filling the map — the flood need not
+            look like skew to cause this.
+          action: |
+            1. Which map: talos_worker_fleet_capacity_dropped_builds is the
+               BUILD map (64), talos_worker_fleet_capacity_dropped_heartbeats
+               the worker-id map (4096). They are separate counters on purpose.
+            2. Treat it as a key-handling question FIRST. Only a holder of the
+               fleet-shared WORKER_SHARED_KEY can publish a verifying
+               heartbeat, so enumerate what holds that key today and rotate it
+               if the list is longer than it should be.
+            3. get_platform_info → `fleet` for what is actually being reported.
+               The build strings and worker ids are deliberately NOT metric
+               labels (caller-supplied, unbounded cardinality), so the queried
+               surface is the only place to see them.
+            4. Until this clears, do not read a 0 on
+               talos_worker_fleet_build_skew_builds as "the fleet agrees".
+               Compare controller and worker image digests by hand instead.
+            5. Restarting the controller clears both counters and both maps.
+               That is a way to confirm a diagnosis, NOT a fix: if the source
+               is still publishing, it refills.
+    - eval_time: 15m
+      alertname: TalosWorkerFleetBuildViewSaturated
+      exp_alerts: *talos_worker_fleet_build_view_saturated_firing
+    - eval_time: 20m
+      alertname: TalosWorkerFleetBuildViewSaturated
+      exp_alerts: *talos_worker_fleet_build_view_saturated_firing
+    - eval_time: 32m
+      alertname: TalosWorkerFleetBuildViewSaturated
+      exp_alerts: []
+  # ── TalosWorkerFleetWorkerViewSaturated ─────────────────────────────
+  # The four arms below are ordered so that THREE of them go red without
+  # `keep_firing_for`, and one goes red if it is too long:
+  #   * the first is PENDING, not firing — without it a rule that matched
+  #     unconditionally would still pass the firing arms;
+  #   * the second is the ordinary firing state;
+  #   * the third sits ON the single 0 sample that models the ~60s window
+  #     after a controller restart in which the gauge serves its
+  #     registration-time 0. Without keep_firing_for this is `[]`;
+  #   * the fourth is five minutes AFTER the gauge repopulates. Without
+  #     keep_firing_for the alert had already resolved and re-armed its
+  #     whole `for:` from scratch, so it would still be pending here —
+  #     this is the arm that measures the DAMAGE, not just the dip;
+  #   * the last is after the condition genuinely ends. It must CLEAR.
+  #     keep_firing_for that outlived the condition would be a
+  #     permanently-red alert, which is a defect and not caution.
+  - interval: 1m
+    name: TalosWorkerFleetWorkerViewSaturated — held across a controller-restart zero window, and still clears
+    input_series:
+    - series: talos_worker_fleet_capacity_dropped_heartbeats{job="talos-controller",instance="controller:8080"}
+      values: 3x14 0x0 3x9 0x19
+    alert_rule_test:
+    - eval_time: 4m
+      alertname: TalosWorkerFleetWorkerViewSaturated
+      exp_alerts: []
+    - eval_time: 6m
+      alertname: TalosWorkerFleetWorkerViewSaturated
+      exp_alerts: &talos_worker_fleet_worker_view_saturated_firing
+      - exp_labels:
+          severity: warning
+          category: fleet-identity
+          job: talos-controller
+          instance: controller:8080
+        exp_annotations:
+          summary: fleet WORKER-ID view hit its cap — 3 heartbeat(s) refused; build-skew detection is SUPPRESSED
+          description: |
+            The controller's NATS fleet view refused heartbeats from worker ids
+            it was not already tracking, because the worker-id map was at its
+            hard cap (MAX_TRACKED_WORKERS = 4096). The bound held — this is not
+            a memory incident — but the view is now INCOMPLETE in the direction
+            that matters.
+
+            A refused heartbeat is refused ENTIRELY: it never reaches the
+            build-keyed map either. So a worker that boots, is renamed or is
+            rescheduled while this is non-zero is invisible to
+            talos_worker_fleet_live_workers AND to
+            talos_worker_fleet_build_skew_builds. Already-tracked workers keep
+            refreshing, which is why a flood degrades to "no NEW worker is
+            visible" rather than to churn of the real fleet.
+
+            No real fleet has 4096 distinct worker ids. Heartbeats are signed,
+            so whatever produced this holds WORKER_SHARED_KEY.
+          action: |
+            1. Treat it as a key-handling question FIRST: enumerate what holds
+               WORKER_SHARED_KEY today and rotate it if that list is longer
+               than it should be.
+            2. get_platform_info → `fleet` for the ids actually being
+               reported. worker_id is caller-supplied and is deliberately
+               never a metric label, so the queried surface is the only place
+               to see them.
+            3. If this is NOT an attack, something is generating a fresh
+               worker_id per process far more often than the fleet rolls —
+               check whether TALOS_WORKER_ID is being set from a value that
+               changes every restart.
+            4. Until it clears, do not read a 0 on
+               talos_worker_fleet_build_skew_builds as "the fleet agrees".
+            5. Restarting the controller clears the counter and the map. That
+               confirms a diagnosis; it does not fix the source.
+    - eval_time: 15m
+      alertname: TalosWorkerFleetWorkerViewSaturated
+      exp_alerts: *talos_worker_fleet_worker_view_saturated_firing
+    - eval_time: 20m
+      alertname: TalosWorkerFleetWorkerViewSaturated
+      exp_alerts: *talos_worker_fleet_worker_view_saturated_firing
+    - eval_time: 32m
+      alertname: TalosWorkerFleetWorkerViewSaturated
+      exp_alerts: []
+  # ── TalosWorkerFleetBuildSkewUndetectable ─────────────────────────────
+  # The four arms below are ordered so that THREE of them go red without
+  # `keep_firing_for`, and one goes red if it is too long:
+  #   * the first is PENDING, not firing — without it a rule that matched
+  #     unconditionally would still pass the firing arms;
+  #   * the second is the ordinary firing state;
+  #   * the third sits ON the single 0 sample that models the ~60s window
+  #     after a controller restart in which the gauge serves its
+  #     registration-time 0. Without keep_firing_for this is `[]`;
+  #   * the fourth is five minutes AFTER the gauge repopulates. Without
+  #     keep_firing_for the alert had already resolved and re-armed its
+  #     whole `for:` from scratch, so it would still be pending here —
+  #     this is the arm that measures the DAMAGE, not just the dip;
+  #   * the last is after the condition genuinely ends. It must CLEAR.
+  #     keep_firing_for that outlived the condition would be a
+  #     permanently-red alert, which is a defect and not caution.
+  - interval: 1m
+    name: TalosWorkerFleetBuildSkewUndetectable — held across a controller-restart zero window, and still clears
+    input_series:
+    - series: talos_worker_fleet_unverifiable_builds{job="talos-controller",instance="controller:8080"}
+      values: 2x69 0x0 2x9 0x19
+    - series: talos_worker_fleet_live_builds{job="talos-controller",instance="controller:8080"}
+      values: 2x69 0x0 2x9 0x19
+    alert_rule_test:
+    - eval_time: 59m
+      alertname: TalosWorkerFleetBuildSkewUndetectable
+      exp_alerts: []
+    - eval_time: 61m
+      alertname: TalosWorkerFleetBuildSkewUndetectable
+      exp_alerts: &talos_worker_fleet_build_skew_undetectable_firing
+      - exp_labels:
+          severity: warning
+          category: fleet-identity
+          job: talos-controller
+          instance: controller:8080
+        exp_annotations:
+          summary: no observed build can be compared with the controller's — TalosWorkerFleetBuildSkew cannot fire
+          description: |
+            Every build observed in the fleet heartbeat is UNVERIFIABLE: it
+            carries no usable commit sha, or THIS CONTROLLER's build carries
+            none, in which case nothing is comparable regardless of what the
+            workers report.
+
+            So talos_worker_fleet_build_skew_builds is 0 because no comparison
+            was possible, NOT because the fleet agrees. Its alert is dark for
+            as long as this fires. A live build skew — which breaks signed,
+            version-coupled wire formats in ways that read as crypto bugs —
+            would produce no signal at all right now.
+
+            This is a build-provenance defect, not a fleet defect. The most
+            common cause by far is a controller image built outside the
+            publish path, where GIT_SHA is unavailable and the version string
+            is stamped `unknown`.
+          action: |
+            1. Establish WHICH side is unstamped: get_platform_info shows the
+               controller's own build string and, under `fleet`, what the
+               workers reported. If the controller's has no `+<sha>` suffix,
+               it is the controller.
+            2. Controller unstamped: rebuild through the published path
+               (main-publish.yml, or scripts/publish-images.sh) so build.rs
+               stamps GIT_SHA. A hand `docker build` from a context without
+               git metadata is the usual way to land here.
+            3. Workers unstamped: the same applies to the worker image; the
+               two build.rs copies must stamp identically (structural check
+               62), so a drift there presents as this.
+            4. Do NOT silence this to quieten a dev stack. Set the policy at
+               the source instead — an unstamped build is exactly the state in
+               which a fleet-wide version skew is undetectable.
+    - eval_time: 70m
+      alertname: TalosWorkerFleetBuildSkewUndetectable
+      exp_alerts: *talos_worker_fleet_build_skew_undetectable_firing
+    - eval_time: 75m
+      alertname: TalosWorkerFleetBuildSkewUndetectable
+      exp_alerts: *talos_worker_fleet_build_skew_undetectable_firing
+    - eval_time: 87m
+      alertname: TalosWorkerFleetBuildSkewUndetectable
+      exp_alerts: []
+  # ── TalosWorkerLivenessParticipationDropped ─────────────────────────────
+  # The four arms below are ordered so that THREE of them go red without
+  # `keep_firing_for`, and one goes red if it is too long:
+  #   * the first is PENDING, not firing — without it a rule that matched
+  #     unconditionally would still pass the firing arms;
+  #   * the second is the ordinary firing state;
+  #   * the third sits ON the single 0 sample that models the ~60s window
+  #     after a controller restart in which the gauge serves its
+  #     registration-time 0. Without keep_firing_for this is `[]`;
+  #   * the fourth is five minutes AFTER the gauge repopulates. Without
+  #     keep_firing_for the alert had already resolved and re-armed its
+  #     whole `for:` from scratch, so it would still be pending here —
+  #     this is the arm that measures the DAMAGE, not just the dip;
+  #   * the last is after the condition genuinely ends. It must CLEAR.
+  #     keep_firing_for that outlived the condition would be a
+  #     permanently-red alert, which is a defect and not caution.
+  - interval: 1m
+    name: TalosWorkerLivenessParticipationDropped — held across a controller-restart zero window, and still clears
+    input_series:
+    - series: talos_worker_liveness_participants{job="talos-controller",instance="controller:8080"}
+      values: 5x69 0x0 5x9 0x19
+    - series: talos_worker_liveness_recent_participants{job="talos-controller",instance="controller:8080"}
+      values: 2x69 0x0 2x9 0x19
+    alert_rule_test:
+    - eval_time: 59m
+      alertname: TalosWorkerLivenessParticipationDropped
+      exp_alerts: []
+    - eval_time: 61m
+      alertname: TalosWorkerLivenessParticipationDropped
+      exp_alerts: &talos_worker_liveness_participation_dropped_firing
+      - exp_labels:
+          severity: warning
+          category: fleet-identity
+        exp_annotations:
+          summary: 3 worker signing key(s) stopped proving liveness and are heading for a reap
+          description: |
+            3 worker_id(s) with an ACTIVE worker_identities row have
+            proved liveness in the past and have not pinged for over 2 hours.
+            Read the denominator alongside this number:
+            talos_worker_liveness_participants is the total population that has
+            ever pinged, talos_worker_liveness_recent_participants the subset
+            still pinging. If the two have converged to (N, 0) the WHOLE fleet
+            stopped, which is a configuration change, not N simultaneous
+            departures.
+
+            This is a WARNING and not yet damage. Nothing has been deactivated:
+            with TALOS_WORKER_IDENTITY_REAP_ENABLED set, the first key is
+            reaped one full TALOS_WORKER_IDENTITY_REAP_HOURS (default 24h)
+            after its last ping. You have roughly that window minus 3 hours to
+            act. With the reaper unset (the default) nothing will ever be
+            deactivated and this is purely informational — but it still means
+            the liveness signal you would need before enabling it is broken.
+
+            Two causes, and they need opposite responses:
+              * THE WORKERS ARE GONE (scale-down, retired pods). Expected —
+                but whether it CLEARS depends on the reaper, see action 1.
+              * THE WORKERS ARE ALIVE AND STOPPED PINGING. This is the
+                dangerous one and it is a configuration fault every time —
+                see the action below.
+          action: |
+            1. Are the workers running? `kubectl get pods -l
+               app.kubernetes.io/component=worker`. If the pods are gone this
+               is an expected scale-down, and what happens next depends on the
+               reaper: WITH it enabled the rows are deactivated one window
+               later and this alert clears itself, no action. With it DISABLED
+               — the default, and the state throughout every step of the
+               enablement runbook before the last one — nothing ever clears
+               them and this alert STAYS FIRING. That is a true finding, not a
+               false positive: it is reading "N signing keys are still trusted
+               by workers that no longer exist". Drain them
+               (`deactivate-worker-identity` per key) or enable the reaper. Do
+               not silence the rule, and do not wait for a self-resolution
+               that is not coming. See docs/security/operational-runbook.md
+               § 2.8.
+            2. If they ARE running, DISABLE THE REAPER FIRST
+               (TALOS_WORKER_IDENTITY_REAP_ENABLED unset, restart controller)
+               and only then diagnose. Disabling costs nothing — it restores
+               the pre-feature behaviour of keys never expiring. Not disabling
+               costs a fleet-wide, non-self-recoverable outage in ~21h.
+            3. Then find why they stopped. In order of observed likelihood:
+               a rollback to a pre-liveness worker image; TALOS_CONTROLLER_URL
+               missing from the worker env; TALOS_WORKER_LIVENESS_INTERVAL_SECS
+               set to 0; a NetworkPolicy or ingress change that broke
+               worker→controller HTTP one-way; or WORKER CLOCK SKEW, the only
+               cause with no configuration change behind it — a worker drifting
+               more than 60s AHEAD of the controller fails the freshness check
+               on every ping while running perfectly, so auditing recent
+               changes will never find it.
+            4. Read talos_worker_liveness_pings_total on the controller. All
+               five outcomes matter and they separate the causes above:
+                 * every outcome flat, including accepted → nothing reached the
+                   handler. Either the pings are not ARRIVING (network path, or
+                   the worker is not pinging) or they are arriving and being
+                   refused by the extractor before the handler — wrong body
+                   shape, oversized body, wrong content-type — which this label
+                   set does not cover and which looks identical from here.
+                 * error climbing → they ARE arriving and the controller is
+                   failing to record them (a database fault). The workers are
+                   innocent and MUST NOT be reaped — disable the reaper.
+                 * rejected_request climbing → arriving and refused before the
+                   database: freshness (clock skew, in both directions) or a
+                   malformed field. This is the clock-skew fingerprint.
+                 * rejected_proof climbing → arriving with a signature that
+                   does not verify: a key rotated outside the registration
+                   path, or a worker signing with a key it never registered.
+                 * inactive_identity climbing → the key is already deactivated
+                   (revoked or previously reaped). Re-register it; the damage
+                   has already happened for that worker.
+            5. Grep the worker logs for event_kind="worker_liveness_rejected",
+               "worker_liveness_not_found" or
+               "worker_liveness_interval_unparseable".
+    - eval_time: 70m
+      alertname: TalosWorkerLivenessParticipationDropped
+      exp_alerts: *talos_worker_liveness_participation_dropped_firing
+    - eval_time: 75m
+      alertname: TalosWorkerLivenessParticipationDropped
+      exp_alerts: *talos_worker_liveness_participation_dropped_firing
+    - eval_time: 87m
+      alertname: TalosWorkerLivenessParticipationDropped
+      exp_alerts: []
+  # ── TalosWorkerIdentityReapBlinded ─────────────────────────────
+  # The four arms below are ordered so that THREE of them go red without
+  # `keep_firing_for`, and one goes red if it is too long:
+  #   * the first is PENDING, not firing — without it a rule that matched
+  #     unconditionally would still pass the firing arms;
+  #   * the second is the ordinary firing state;
+  #   * the third sits ON the single 0 sample that models the ~60s window
+  #     after a controller restart in which the gauge serves its
+  #     registration-time 0. Without keep_firing_for this is `[]`;
+  #   * the fourth is five minutes AFTER the gauge repopulates. Without
+  #     keep_firing_for the alert had already resolved and re-armed its
+  #     whole `for:` from scratch, so it would still be pending here —
+  #     this is the arm that measures the DAMAGE, not just the dip;
+  #   * the last is after the condition genuinely ends. It must CLEAR.
+  #     keep_firing_for that outlived the condition would be a
+  #     permanently-red alert, which is a defect and not caution.
+  - interval: 1m
+    name: TalosWorkerIdentityReapBlinded — held across a controller-restart zero window, and still clears
+    input_series:
+    - series: talos_worker_liveness_population_truncated{job="talos-controller",instance="controller:8080"}
+      values: 1x24 0x0 1x9 0x19
+    alert_rule_test:
+    - eval_time: 14m
+      alertname: TalosWorkerIdentityReapBlinded
+      exp_alerts: []
+    - eval_time: 16m
+      alertname: TalosWorkerIdentityReapBlinded
+      exp_alerts: &talos_worker_identity_reap_blinded_firing
+      - exp_labels:
+          severity: warning
+          category: fleet-identity
+        exp_annotations:
+          summary: worker-identity liveness detector is truncated; the reaper has stopped acting
+          description: |
+            The ACTIVE worker_identities population is at or past the bound on
+            the query the liveness participation gauges are computed from (200
+            rows). Above that bound the detector and the reaper no longer
+            describe the same set of rows, so
+            TalosWorkerLivenessParticipationDropped can no longer promise to
+            warn before a key is deactivated.
+
+            The controller has therefore STOPPED REAPING — nothing is being
+            deactivated while this fires. The trust-bounding property is off,
+            which is the pre-#631 status quo, not a regression in progress.
+
+            talos_worker_liveness_participants and
+            talos_worker_liveness_recent_participants are both UNDERSTATED
+            while this fires. Do not read them as a fleet census, and do not
+            use them for the runbook's step-4 gate until this clears.
+          action: |
+            1. `list-worker-identities` and count ACTIVE rows. The overwhelming
+               likely cause is accumulated ghosts — every retired pod that ever
+               registered leaves an active row behind, which is the backlog the
+               reaper exists to drain and cannot drain while blinded.
+            2. Drain them: `deactivate-worker-identity` for every worker_id
+               with no corresponding running pod. This is safe for a departed
+               worker and recoverable (`register-worker-identity`) if you
+               retire one by mistake.
+            3. Confirm talos_worker_liveness_population_truncated returns to 0
+               and that talos_worker_liveness_participants now matches your
+               real worker count before relying on either gauge again.
+            4. If your fleet is LEGITIMATELY larger than 200 active identities,
+               this is not drainable and the cap must be raised in code
+               (MAX_FLEET_BUILD_ROWS in talos-worker-identity-repository, which
+               bounds the gauge query) — do not work around it by removing the
+               reaper's precondition, which is the only thing keeping the
+               detector and the reaper honest with each other.
+    - eval_time: 25m
+      alertname: TalosWorkerIdentityReapBlinded
+      exp_alerts: *talos_worker_identity_reap_blinded_firing
+    - eval_time: 30m
+      alertname: TalosWorkerIdentityReapBlinded
+      exp_alerts: *talos_worker_identity_reap_blinded_firing
+    - eval_time: 42m
+      alertname: TalosWorkerIdentityReapBlinded
+      exp_alerts: []
