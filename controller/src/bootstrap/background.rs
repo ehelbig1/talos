@@ -3478,6 +3478,82 @@ pub(crate) fn spawn_integration_renewal_tasks(
     }
 }
 
+/// Record a `talos.results.*` message that would not deserialize into a
+/// `JobResult`: bump `talos_job_results_dropped_unparseable_total` and say so
+/// at WARN.
+///
+/// This was a bare `tracing::debug!` until 2026-08. Debug is not enabled by
+/// default, so the drop left NO operator-visible trace — while the engine
+/// dispatcher, handling the SAME condition on the SAME signed message type,
+/// fails the node outright (`talos-workflow-engine-nats::dispatcher`,
+/// `map_err(…)?`). Two handlers of one message, opposite treatment.
+///
+/// Debug WOULD have been defensible if the subscription were broad enough to
+/// carry other traffic. It is not: `talos.results.*` is a single-token
+/// wildcard, its only publisher is the worker's no-reply-topic branch,
+/// pipeline results use `talos.pipeline.results.*`, and guest WASM is denied
+/// the entire `talos.` prefix (`RESERVED_PUBLISH_PREFIXES`). An unparseable
+/// message there is an anomaly by construction.
+///
+/// And the drop is expensive. This subscriber is the ONLY finalizer for the
+/// FOUR fire-and-forget dispatch paths that publish with no reply inbox
+/// (`reply_topic: None` and no wire `msg.reply`, so the worker's
+/// `pick_trusted_reply_topic` takes its `(None, None)` arm and
+/// `publish_result_with_retry` falls through to `talos.results.<job_id>`):
+/// Gmail push, Google-Calendar push, GCP Monitoring Pub/Sub, and the webhook
+/// **DLQ replay** (`talos_webhooks::router::dispatch_replay`, a bare
+/// `nats.publish`, whose own comment names this subscriber by
+/// `RESULTS_WILDCARD`). The LIVE webhook path is NOT one of them — it uses
+/// `nats.request()`, so a wire reply exists and the result goes to that inbox.
+/// Count the set from the publish call, not from the `reply_topic: None`
+/// literal: two other comments in this repo enumerate "three" and name two
+/// different threes. Losing one message loses that execution's
+/// terminal status write, its `output_data`, and the `__ops_alert__` ingest
+/// that hangs off `complete_execution_from_worker`; the stale sweep then
+/// rewrites the row to `'timeout'`. That is the #638 shape.
+///
+/// **The serde error text is NOT logged.** It is derived from the message
+/// payload, which on this path is worker output — the same secret-bearing
+/// class the sibling failure log DLP-redacts. `serde_json` error text quotes
+/// input around the failure point for several error kinds. Presence and count
+/// only; `classify` is a closed set of `&'static str` and never a label.
+///
+/// Not routed through a shared warn-and-count helper — see the detector block
+/// in `talos_metrics::TalosMetrics` for why a macro would re-blind check 58.
+pub(crate) fn record_unparseable_job_result(err: &serde_json::Error) {
+    if let Some(m) = metrics::global() {
+        m.job_results_dropped_unparseable_total.inc();
+    }
+    tracing::warn!(
+        target: "talos_controller",
+        event_kind = "job_result_unparseable",
+        classify = classify_job_result_parse_error(err),
+        "Job result on talos.results.* discarded: payload did not deserialize \
+         into a JobResult. This subscriber is the only finalizer for \
+         fire-and-forget module-bound dispatches, so the execution's terminal \
+         status, output and ops-alert ingest are lost and the stale sweep will \
+         mark it 'timeout'. Error text withheld (it can quote worker output)."
+    );
+}
+
+/// Closed-set shape hint for a `JobResult` parse failure, safe to log because
+/// it is derived only from `serde_json::Error::classify()` — a four-valued
+/// enum — and never from the payload bytes.
+///
+/// `Eof` is the one worth naming: an EMPTY payload classifies `Eof`, and an
+/// empty payload is what a NATS `503 no-responders` control message carries.
+/// Nothing should ever send one to `talos.results.*` (it is a reply-inbox
+/// mechanism), so seeing `Eof` here means something is publishing an empty
+/// body to a subject only the worker should touch.
+pub(crate) fn classify_job_result_parse_error(err: &serde_json::Error) -> &'static str {
+    match err.classify() {
+        serde_json::error::Category::Eof => "eof_empty_or_truncated",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "schema_mismatch",
+        serde_json::error::Category::Io => "io",
+    }
+}
+
 /// `kind` label values for `talos_wasm_log_orphaned_total`. A closed set of
 /// `&'static str`, and it must stay closed: `/metrics/prometheus` is
 /// scrapeable, and the thing being counted is a log line whose body is
@@ -4066,7 +4142,7 @@ pub(crate) fn spawn_nats_log_subscribers(
                             }
                         }
                         Err(e) => {
-                            tracing::debug!("Failed to parse job result message: {}", e);
+                            record_unparseable_job_result(&e);
                         }
                     }
                 }
@@ -4541,6 +4617,72 @@ mod detector_metric_tests {
             status: None,
             description: None,
             length: payload.len(),
+        }
+    }
+
+    fn dropped_results() -> f64 {
+        talos_metrics::global()
+            .expect("global installed")
+            .job_results_dropped_unparseable_total
+            .get()
+    }
+
+    /// Drives the PRODUCTION `Err`-arm handler of the `talos.results.*`
+    /// subscriber and reads the counter back.
+    ///
+    /// Asserts the COUNTER, not a log line, deliberately: the log was there
+    /// before this change (at `debug!`) and proved nothing, because nothing
+    /// consumes controller logs. The counter is what an alert can read.
+    ///
+    /// The empty payload is not an arbitrary bad input — it is the exact
+    /// production symptom (`EOF while parsing a value at line 1 column 0`,
+    /// twice), and the classifier must name it distinctly so an operator
+    /// reading the WARN can tell an empty body from a schema drift.
+    #[test]
+    fn unparseable_job_result_is_counted_on_the_production_path() {
+        install_metrics();
+
+        // 1. The observed shape: an EMPTY payload.
+        let before = dropped_results();
+        let empty = serde_json::from_slice::<talos_workflow_job_protocol::JobResult>(b"")
+            .expect_err("empty payload cannot parse");
+        assert_eq!(
+            classify_job_result_parse_error(&empty),
+            "eof_empty_or_truncated"
+        );
+        record_unparseable_job_result(&empty);
+        assert_eq!(
+            dropped_results() - before,
+            1.0,
+            "an empty JobResult payload must be COUNTED, not discarded at debug"
+        );
+
+        // 2. A well-formed JSON object that is not a JobResult — the other
+        //    realistic anomaly (a producer/consumer schema drift). It must be
+        //    counted too, and classified differently.
+        let before = dropped_results();
+        let wrong_shape =
+            serde_json::from_slice::<talos_workflow_job_protocol::JobResult>(b"{\"a\":1}")
+                .expect_err("wrong shape cannot parse into JobResult");
+        assert_eq!(
+            classify_job_result_parse_error(&wrong_shape),
+            "schema_mismatch"
+        );
+        record_unparseable_job_result(&wrong_shape);
+        assert_eq!(dropped_results() - before, 1.0);
+    }
+
+    /// The classifier is the only payload-derived thing that reaches a log
+    /// line or a metric, so pin that it can only ever be one of four fixed
+    /// strings — never the serde message, which quotes input.
+    #[test]
+    fn parse_error_classification_is_a_closed_set() {
+        const CLOSED: [&str; 4] = ["eof_empty_or_truncated", "syntax", "schema_mismatch", "io"];
+        for bytes in [b"".as_slice(), b"{", b"{\"a\":1}", b"not json"] {
+            let err = serde_json::from_slice::<talos_workflow_job_protocol::JobResult>(bytes)
+                .expect_err("must fail");
+            let c = classify_job_result_parse_error(&err);
+            assert!(CLOSED.contains(&c), "unexpected classification {c}");
         }
     }
 
