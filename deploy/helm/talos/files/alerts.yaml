@@ -70,6 +70,19 @@ groups:
       - alert: TalosActorMemoryDEKOrphaned
         expr: talos_actor_memory_orphaned_rows > 0
         for: 5m
+        # ANTI-FLAP (a registered gauge exports its initial 0 before anything
+        # measures it) — see TalosWorkerBuildSkew for the full mechanism, the
+        # 24h episode measurements, the keep_firing_for-vs-max_over_time
+        # reasoning and the Prometheus/CRD version floor.
+        # The three crypto-invariant gauges are republished by the 60s orphan scan at
+        # background.rs:913-963, whose first tick is skipped, so for ~60s after every
+        # controller start they serve their registration-time 0. `for: 5m` means a
+        # restart RESOLVES this critical data-loss alert and re-arms the full five
+        # minutes; a controller restarting faster than that can never fire it. 5m
+        # comfortably exceeds the 60s window. The cost is that genuinely-repaired
+        # orphans keep this firing for up to 5 extra minutes, which for a data-loss
+        # alert is the right side to err on.
+        keep_firing_for: 5m
         labels:
           severity: critical
           category: data-loss
@@ -98,6 +111,13 @@ groups:
       - alert: TalosModuleExecutionPayloadOrphaned
         expr: talos_module_execution_orphaned_rows > 0
         for: 5m
+        # ANTI-FLAP (a registered gauge exports its initial 0 before anything
+        # measures it) — see TalosWorkerBuildSkew for the full mechanism, the
+        # 24h episode measurements, the keep_firing_for-vs-max_over_time
+        # reasoning and the Prometheus/CRD version floor.
+        # Same 60s scan, same 60s unmeasured-zero window as
+        # TalosActorMemoryDEKOrphaned above.
+        keep_firing_for: 5m
         labels:
           severity: critical
           category: data-loss
@@ -112,6 +132,13 @@ groups:
       - alert: TalosWorkflowOutputPayloadOrphaned
         expr: talos_workflow_execution_orphaned_rows > 0
         for: 5m
+        # ANTI-FLAP (a registered gauge exports its initial 0 before anything
+        # measures it) — see TalosWorkerBuildSkew for the full mechanism, the
+        # 24h episode measurements, the keep_firing_for-vs-max_over_time
+        # reasoning and the Prometheus/CRD version floor.
+        # Same 60s scan, same 60s unmeasured-zero window as
+        # TalosActorMemoryDEKOrphaned above.
+        keep_firing_for: 5m
         labels:
           severity: critical
           category: data-loss
@@ -1279,6 +1306,15 @@ groups:
       - alert: TalosWorkerFleetBuildSkew
         expr: talos_worker_fleet_build_skew_builds > 0
         for: 30m
+        # ANTI-FLAP (a registered gauge exports its initial 0 before anything
+        # measures it) — see TalosWorkerBuildSkew for the full mechanism, the
+        # 24h episode measurements, the keep_firing_for-vs-max_over_time
+        # reasoning and the Prometheus/CRD version floor.
+        # The exact twin of TalosWorkerBuildSkew: the same 60s task
+        # (background.rs:721-725 -> publish_worker_fleet_gauges) with its first tick
+        # skipped, so a restart serves an unmeasured 0 for ~60s, resolves this and
+        # re-arms the whole 30m `for:`.
+        keep_firing_for: 5m
         labels:
           severity: warning
           category: fleet-identity
@@ -1382,6 +1418,14 @@ groups:
       - alert: TalosWorkerFleetBuildViewSaturated
         expr: talos_worker_fleet_capacity_dropped_builds > 0
         for: 5m
+        # ANTI-FLAP (a registered gauge exports its initial 0 before anything
+        # measures it) — see TalosWorkerBuildSkew for the full mechanism, the
+        # 24h episode measurements, the keep_firing_for-vs-max_over_time
+        # reasoning and the Prometheus/CRD version floor.
+        # publish_worker_fleet_gauges, 60s, first tick skipped. Note this one is a
+        # DETECTOR-BLIND alert: resolving it on a restart says the build view is no
+        # longer saturated when nothing has looked.
+        keep_firing_for: 5m
         labels:
           severity: warning
           category: fleet-identity
@@ -1438,6 +1482,13 @@ groups:
       - alert: TalosWorkerFleetWorkerViewSaturated
         expr: talos_worker_fleet_capacity_dropped_heartbeats > 0
         for: 5m
+        # ANTI-FLAP (a registered gauge exports its initial 0 before anything
+        # measures it) — see TalosWorkerBuildSkew for the full mechanism, the
+        # 24h episode measurements, the keep_firing_for-vs-max_over_time
+        # reasoning and the Prometheus/CRD version floor.
+        # publish_worker_fleet_gauges, 60s, first tick skipped. Same detector-blind
+        # argument as TalosWorkerFleetBuildViewSaturated above.
+        keep_firing_for: 5m
         labels:
           severity: warning
           category: fleet-identity
@@ -1506,6 +1557,15 @@ groups:
       - alert: TalosWorkerFleetBuildSkewUndetectable
         expr: talos_worker_fleet_unverifiable_builds >= talos_worker_fleet_live_builds and talos_worker_fleet_live_builds > 0
         for: 1h
+        # ANTI-FLAP (a registered gauge exports its initial 0 before anything
+        # measures it) — see TalosWorkerBuildSkew for the full mechanism, the
+        # 24h episode measurements, the keep_firing_for-vs-max_over_time
+        # reasoning and the Prometheus/CRD version floor.
+        # Both operands come from publish_worker_fleet_gauges (60s, first tick
+        # skipped). On a restart they are 0 and 0, so `0 >= 0 and 0 > 0` matches
+        # nothing and the alert resolves — then re-arms a full HOUR, the worst
+        # window-to-`for:` ratio of the set.
+        keep_firing_for: 5m
         labels:
           severity: warning
           category: fleet-identity
@@ -1650,6 +1710,14 @@ groups:
             - talos_worker_liveness_recent_participants
           ) > 0
         for: 1h
+        # ANTI-FLAP (a registered gauge exports its initial 0 before anything
+        # measures it) — see TalosWorkerBuildSkew for the full mechanism, the
+        # 24h episode measurements, the keep_firing_for-vs-max_over_time
+        # reasoning and the Prometheus/CRD version floor.
+        # Both operands come from publish_worker_liveness_participation (60s, first
+        # tick skipped, background.rs:1077-1117). On a restart both read 0, their
+        # difference is 0, and a 1h `for:` re-arms from scratch.
+        keep_firing_for: 5m
         labels:
           severity: warning
           category: fleet-identity
@@ -1828,6 +1896,14 @@ groups:
       - alert: TalosWorkerIdentityReapBlinded
         expr: max(talos_worker_liveness_population_truncated) > 0
         for: 15m
+        # ANTI-FLAP (a registered gauge exports its initial 0 before anything
+        # measures it) — see TalosWorkerBuildSkew for the full mechanism, the
+        # 24h episode measurements, the keep_firing_for-vs-max_over_time
+        # reasoning and the Prometheus/CRD version floor.
+        # publish_worker_liveness_participation, 60s, first tick skipped. Resolving
+        # this on a restart asserts the reaper can see the population again when
+        # nothing has measured it.
+        keep_firing_for: 5m
         labels:
           severity: warning
           category: fleet-identity
