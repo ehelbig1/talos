@@ -287,6 +287,19 @@ impl SecretsResolver for ControllerSecretsResolver {
             .refresh_oauth_tokens_in_batch(paths)
             .await;
     }
+
+    async fn force_refresh_vault_paths(&self, paths: &[String]) -> bool {
+        if paths.is_empty() {
+            return false;
+        }
+        // Routed through the SAME `OAuthCredentialService` as the predictive
+        // path, so a reactive repair is still a vault write on the audited
+        // credential path — it does not get its own token-endpoint call site
+        // or its own way into the secrets table.
+        self.oauth_service()
+            .force_refresh_oauth_tokens_in_batch(paths)
+            .await
+    }
 }
 
 #[cfg(test)]

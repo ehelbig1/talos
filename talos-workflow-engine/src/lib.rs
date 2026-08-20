@@ -57,6 +57,7 @@ mod execution_progress;
 pub mod graph_builder;
 pub mod graph_json;
 mod graph_parser;
+mod oauth_reauth;
 mod sandbox;
 mod scheduler_handlers;
 mod secrets_pipeline;

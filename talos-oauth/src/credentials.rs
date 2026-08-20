@@ -599,12 +599,143 @@ impl OAuthCredentialService {
             .await;
     }
 
+    /// Force-refresh every OAuth credential in a batch of vault paths, after
+    /// a job carrying them has already failed with an authentication error.
+    ///
+    /// Returns `true` **only if at least one path now holds a NEW access
+    /// token**. That is the caller's sole authorisation to retry, and it is
+    /// what keeps the two dangerous shapes out of reach:
+    ///
+    /// * **Never re-send a credential already known bad.** `true` is returned
+    ///   only after `store_credentials` has written a new token to the vault,
+    ///   so a caller that re-resolves the same paths reads the NEW value. A
+    ///   retry can therefore never replay the token that just 401'd.
+    /// * **A revoked grant can never loop.** A revoked/expired grant makes the
+    ///   token endpoint return `HTTP 400 invalid_grant`, which surfaces here
+    ///   as `Err` → `refresh_failed` → `false` → no retry. Zero extra
+    ///   provider calls, no bound to tune.
+    ///
+    /// Non-`oauth/` paths are filtered out, so a node mixing an OAuth token
+    /// with static secrets only ever triggers a refresh of the former.
+    ///
+    /// Errors are absorbed (logged + counted) rather than propagated: the
+    /// caller's decision is binary and already encoded in the return value.
+    pub async fn force_refresh_oauth_tokens_in_batch(&self, vault_paths: &[String]) -> bool {
+        // Same cap as the predictive batch: distinct credentials parallelize
+        // safely behind their per-credential mutexes, and 8 bounds the burst
+        // we can aim at a provider's token endpoint.
+        const REFRESH_CONCURRENCY: usize = 8;
+        use futures::stream::{self, StreamExt};
+
+        // Materialised before the stream rather than filtered inside it: an
+        // inline `.filter(|vp| vp.starts_with(...))` over `&&String` trips
+        // rustc's higher-ranked-lifetime check on the resulting future.
+        let targets: Vec<String> = vault_paths
+            .iter()
+            .filter(|vp| vp.starts_with("oauth/"))
+            .cloned()
+            .collect();
+
+        let outcomes: Vec<bool> = stream::iter(targets)
+        .map(|vp| async move {
+            let redacted = crate::refresh_task::redact_oauth_path_for_log(&vp);
+            match self.refresh_oauth_token_forced(&vp).await {
+                Ok(true) => {
+                    record_reactive_refresh("repaired");
+                    tracing::info!(
+                        target: "talos_oauth_refresh",
+                        vault_path = %redacted,
+                        outcome = "repaired",
+                        "OAuth credential re-refreshed after an auth failure — retrying the node once"
+                    );
+                    true
+                }
+                Ok(false) => {
+                    record_reactive_refresh("not_refreshed");
+                    tracing::warn!(
+                        target: "talos_oauth_refresh",
+                        vault_path = %redacted,
+                        outcome = "not_refreshed",
+                        "Auth failure on an OAuth credential that has no refresh path — \
+                         not retrying (the 401 is not a token-staleness problem)"
+                    );
+                    false
+                }
+                Err(e) => {
+                    record_reactive_refresh("refresh_failed");
+                    // SECURITY: `e` is a status-shaped message from the
+                    // refresh path (`Token refresh failed (HTTP 400)`), never
+                    // a token, a refresh token, or a response body — the body
+                    // is length-logged only at its own call site above.
+                    tracing::error!(
+                        target: "talos_oauth_refresh",
+                        vault_path = %redacted,
+                        outcome = "refresh_failed",
+                        error = %e,
+                        "OAuth credential refresh REFUSED by the provider after an auth \
+                         failure — the grant is most likely revoked or expired and the \
+                         integration must be re-authorised by a human. Not retrying."
+                    );
+                    false
+                }
+            }
+        })
+        .buffer_unordered(REFRESH_CONCURRENCY)
+        .collect()
+        .await;
+
+        outcomes.into_iter().any(|refreshed| refreshed)
+    }
+
     /// Given a vault:// path like `oauth/{provider}/{user_id}/{provider_key}/access_token`,
     /// check if the token is expiring soon and refresh it proactively.
     ///
     /// Returns `Ok(true)` if refreshed, `Ok(false)` if still valid, `Err` on failure.
     /// This is called by the engine's vault pre-fetch path before dispatching jobs.
     pub async fn refresh_oauth_token_if_needed(&self, vault_path: &str) -> Result<bool> {
+        self.refresh_oauth_token_inner(vault_path, false).await
+    }
+
+    /// Refresh this credential **unconditionally**, ignoring the recorded
+    /// expiry.
+    ///
+    /// This is the reactive counterpart to
+    /// [`refresh_oauth_token_if_needed`](Self::refresh_oauth_token_if_needed),
+    /// and exists because the recorded expiry is not evidence about what the
+    /// PROVIDER currently accepts. A token can be rejected with a 401 while
+    /// `token_expires_at` is still comfortably in the future — the predictive
+    /// refresh that should have run may have failed transiently, or the
+    /// provider may have invalidated the token early. In both cases
+    /// `refresh_oauth_token_if_needed` returns `Ok(false)` ("still valid") and
+    /// the dead token is handed out again.
+    ///
+    /// Call this ONLY after an actual authentication failure. It performs a
+    /// token-endpoint round trip every time it is called, so using it on the
+    /// pre-dispatch path would turn one HTTP request per credential per
+    /// workflow dispatch into the steady state.
+    ///
+    /// Same return contract as the predictive variant: `Ok(true)` means a NEW
+    /// access token is now stored in the vault, `Ok(false)` means nothing was
+    /// refreshed (not a refreshable path, or provider has no refresh
+    /// endpoint), `Err` means the refresh was attempted and failed — which for
+    /// Google/Atlassian is what a REVOKED grant looks like (`HTTP 400
+    /// invalid_grant`). Callers must treat anything other than `Ok(true)` as
+    /// "do not retry".
+    pub async fn refresh_oauth_token_forced(&self, vault_path: &str) -> Result<bool> {
+        self.refresh_oauth_token_inner(vault_path, true).await
+    }
+
+    /// Shared body of the predictive and forced refresh paths.
+    ///
+    /// `force = false` keeps the historical behaviour exactly: refresh only
+    /// when the recorded expiry is within `REFRESH_THRESHOLD_MINUTES` (or is
+    /// NULL). `force = true` skips both expiry predicates but keeps every
+    /// other property — the same per-credential mutex, the same
+    /// `store_credentials` write, the same audit/log surface. There is
+    /// deliberately only ONE token-endpoint call site in this crate so a
+    /// reactive refresh cannot become a second, unaudited way to write the
+    /// vault.
+    async fn refresh_oauth_token_inner(&self, vault_path: &str, force: bool) -> Result<bool> {
         // Parse the vault path: oauth/{provider}/{user_id}/{provider_key}/access_token
         let parts: Vec<&str> = vault_path.split('/').collect();
         if parts.len() != 5 || parts[0] != "oauth" || parts[4] != "access_token" {
@@ -650,32 +781,87 @@ impl OAuthCredentialService {
             None => true, // No expiry tracked — optimistically refresh to populate it
         };
 
-        if !needs_refresh {
+        // `force` skips the predicate, never the lock. The recorded expiry is
+        // evidence about our own bookkeeping, not about what the provider will
+        // accept — and the forced path is only ever reached because the
+        // provider has ALREADY rejected this token.
+        if !force && !needs_refresh {
             return Ok(false);
         }
+
+        // On the forced path, remember when this credential was last written
+        // BEFORE we queue for the lock, so that after acquiring it we can tell
+        // "nobody has touched this" from "another 401 on the same credential
+        // already repaired it". Without this, a node fan-out where five nodes
+        // share one credential and all 401 in the same instant would fire five
+        // sequential token-endpoint round trips, four of them pointless — and
+        // Google caps the number of live access tokens per client+user, so a
+        // refresh storm is not merely wasteful.
+        let updated_before: Option<DateTime<Utc>> = if force {
+            sqlx::query_scalar(
+                "SELECT updated_at FROM integration_credentials \
+                 WHERE user_id = $1 AND provider = $2 AND provider_key = $3 AND is_active = TRUE",
+            )
+            .bind(user_id)
+            .bind(provider)
+            .bind(provider_key)
+            .fetch_optional(&self.db_pool)
+            .await?
+        } else {
+            None
+        };
 
         // Acquire per-credential lock to prevent concurrent refresh storms
         let lock = self.get_refresh_lock(provider, user_id, provider_key);
         let _guard = lock.lock().await;
 
-        // Re-check after acquiring lock (another task may have refreshed)
-        let expiry_recheck: Option<DateTime<Utc>> = sqlx::query_scalar(
-            "SELECT token_expires_at FROM integration_credentials \
-             WHERE user_id = $1 AND provider = $2 AND provider_key = $3 AND is_active = TRUE",
-        )
-        .bind(user_id)
-        .bind(provider)
-        .bind(provider_key)
-        .fetch_optional(&self.db_pool)
-        .await?
-        .flatten();
+        if force {
+            // Forced re-check: did somebody else refresh while we waited? The
+            // expiry predicate cannot answer that here (we are forcing
+            // precisely because it says "fine"), so compare the write
+            // timestamp instead. An advance means a NEW token is already in
+            // the vault — report success WITHOUT burning a second refresh.
+            let updated_now: Option<DateTime<Utc>> = sqlx::query_scalar(
+                "SELECT updated_at FROM integration_credentials \
+                 WHERE user_id = $1 AND provider = $2 AND provider_key = $3 AND is_active = TRUE",
+            )
+            .bind(user_id)
+            .bind(provider)
+            .bind(provider_key)
+            .fetch_optional(&self.db_pool)
+            .await?;
+            if let (Some(before), Some(now)) = (updated_before, updated_now) {
+                if now > before {
+                    tracing::debug!(
+                        target: "talos_oauth_refresh",
+                        provider,
+                        outcome = "coalesced",
+                        "forced refresh coalesced — another caller already refreshed this credential"
+                    );
+                    return Ok(true);
+                }
+            }
+        } else {
+            // Re-check after acquiring lock (another task may have refreshed)
+            let expiry_recheck: Option<DateTime<Utc>> = sqlx::query_scalar(
+                "SELECT token_expires_at FROM integration_credentials \
+                 WHERE user_id = $1 AND provider = $2 AND provider_key = $3 AND is_active = TRUE",
+            )
+            .bind(user_id)
+            .bind(provider)
+            .bind(provider_key)
+            .fetch_optional(&self.db_pool)
+            .await?
+            .flatten();
 
-        // Only short-circuit if the expiry was BOTH populated AND pushed
-        // safely past the threshold by another task. A NULL expiry here
-        // still warrants a refresh — matches the optimistic path above.
-        if let Some(exp) = expiry_recheck {
-            if exp - chrono::Utc::now() >= chrono::Duration::minutes(REFRESH_THRESHOLD_MINUTES) {
-                return Ok(false); // Another task refreshed while we waited
+            // Only short-circuit if the expiry was BOTH populated AND pushed
+            // safely past the threshold by another task. A NULL expiry here
+            // still warrants a refresh — matches the optimistic path above.
+            if let Some(exp) = expiry_recheck {
+                if exp - chrono::Utc::now() >= chrono::Duration::minutes(REFRESH_THRESHOLD_MINUTES)
+                {
+                    return Ok(false); // Another task refreshed while we waited
+                }
             }
         }
 
@@ -1005,6 +1191,22 @@ fn is_pg_unique_violation(err: &anyhow::Error) -> bool {
                 .to_string()
                 .contains("name or key path already exists")
         })
+}
+
+/// Bump `talos_oauth_reactive_refresh_total{outcome=…}`.
+///
+/// A free function rather than an inline `if let` at each of the three arms so
+/// the metric moves from exactly one place; `outcome` is `&'static str` from a
+/// closed three-value set at its call sites, which is what keeps the label
+/// cardinality bounded (nothing caller-derived may become a label — the vault
+/// path segments are a workflow-authored provider name, a user id, and, for
+/// gmail/google_calendar, the user's e-mail address).
+fn record_reactive_refresh(outcome: &'static str) {
+    if let Some(m) = talos_metrics::global() {
+        m.oauth_reactive_refresh_total
+            .with_label_values(&[outcome])
+            .inc();
+    }
 }
 
 #[cfg(test)]

@@ -24,6 +24,10 @@ sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-http-body = { path = "../talos-http-body" }
+# Reactive-repair outcome counter (talos_oauth_reactive_refresh_total). The
+# repair happens here, on the audited credential path, so the counter is
+# emitted here too rather than from the engine.
+talos-metrics = { path = "../talos-metrics" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 # MCP-1028: truncate-then-redact discipline on audit log error_message.
 talos-text-util = { path = "../talos-text-util" }
