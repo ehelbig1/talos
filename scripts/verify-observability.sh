@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 #
-# Verify that the RUNNING dev Prometheus is actually reading the files in this
-# repo — i.e. that a merged, deployed config change is in effect.
+# Verify that the RUNNING dev Prometheus and Alertmanager are actually reading
+# the files in this repo — i.e. that a merged, deployed config change is in
+# effect. (Alertmanager joined in leg E; before that its LOADED config was
+# compared by zero legs, which #666 named as its own largest residual.)
 #
 # WHY THIS EXISTS
 # ---------------
@@ -64,6 +66,11 @@
 #   * Leg B cannot verify a changed CREDENTIAL took effect (Prometheus
 #     redacts/restructures those when it marshals its config — see
 #     SECRET_KEYS below). Leg A still compares the raw file bytes.
+#   * Leg E has the same limit for Alertmanager and closes it differently: an
+#     inline credential is redacted identically on both sides, so instead of
+#     comparing it, leg E FAILS on it — a credential literal in a tracked
+#     config file is a containment violation in its own right. No byte of any
+#     credential is read, hashed or printed anywhere in this script.
 #
 # Usage:
 #   scripts/verify-observability.sh              # against 127.0.0.1:9090
@@ -87,7 +94,7 @@ green()  { printf '\033[32m%s\033[0m\n' "$*"; }
 yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
 bold()   { printf '\033[1m%s\033[0m\n' "$*"; }
 
-bold "▶ observability liveness: is the running Prometheus reading THIS repo?"
+bold "▶ observability liveness: is the running stack reading THIS repo?"
 
 # ── preflight: fail loudly, never skip ────────────────────────────────────
 if ! command -v docker >/dev/null 2>&1; then
@@ -1237,13 +1244,464 @@ for k, v in re.findall(r"^\s*([A-Za-z0-9_]+_file):\s*\"?([^\"\s#]+)\"?\s*$", cfg
     fi
 fi
 
+# ══════════════════════════════════════════════════════════════════════════
+# LEG E — the running Alertmanager is using the alertmanager.yml in the
+#         checkout that feeds it.
+#
+# WHY THIS EXISTS
+# ---------------
+# #666 named this as its own largest residual and left it: leg A byte-compares
+# the PROMETHEUS container's mounted files, legs B/C compare PROMETHEUS's
+# loaded config and rules — and NOTHING compared Alertmanager's. So the exact
+# #625/#645/#666 failure, in the one component whose whole job is reaching a
+# human: edit alertmanager.yml, forget the reload, delivery keeps using the old
+# routing, and every existing leg reports green. That matters most immediately
+# after a credential is added, because that is the edit an operator makes.
+#
+# WHAT #666 MEASURED, AND WHY IT IS NOT THE OBSTACLE IT LOOKED LIKE
+# -----------------------------------------------------------------
+# `/api/v2/status` returns 2357 bytes against a 13267-byte file, which reads
+# like most of the file is unrepresented. It is not. Re-measured here:
+#   * 213 of the file's 250 lines are COMMENT or BLANK (it documents four
+#     receiver options that do not ship). 37 lines are configuration.
+#   * The file declares 26 leaf fields. The API reports 58. Leaf paths the file
+#     declares and the API does NOT report: ZERO.
+#   * The 32 extra API leaves are Alertmanager's filled-in defaults.
+#   * 4 shared paths differ in value, all ONE class: Alertmanager re-prints
+#     each matcher canonically (`severity = "critical"` -> `severity="critical"`).
+# The re-marshal drops nothing. The size gap is commentary.
+#
+# NOTE the field name: the JSON key is `config.original`, which reads as "the
+# file as given". It is not — it is `Config.String()`, i.e. yaml.Marshal of the
+# parsed struct, which is why the defaults are there and the comments are not.
+#
+# TWO STAGES, AND STAGE 2 IS THE AUTHORITY — the same shape leg C uses for
+# exprs, for the same reason.
+#
+#   STAGE 1 (always; no container): recursive subset — everything this checkout
+#   DECLARES is in effect. Catches every ADD and CHANGE drift, which is the
+#   whole "edited and never reloaded" failure. It is ONE-DIRECTIONAL, and that
+#   is a real blind spot: delete `max_alerts: 20` from disk without reloading
+#   and the process keeps applying it while a subset check reports green. Leg B
+#   has the identical hole and names it. Closed here only for the collections
+#   Alertmanager never invents on its own — receiver NAMES, the child-route
+#   tree, and inhibit_rules — where an entry in the process and not on disk is
+#   unambiguous drift rather than a filled-in default.
+#
+#   STAGE 2 (default on): run THIS CHECKOUT's alertmanager.yml through the SAME
+#   BINARY — the image ID of the running container, so it cannot drift with a
+#   version bump — and diff the two marshals BIDIRECTIONALLY. Both sides are
+#   filled in by the same code, so the defaults cancel exactly: measured
+#   BYTE-IDENTICAL, 2357 B against 2357 B, on a healthy stack. That removes the
+#   need for a defaults list, a SECRET_KEYS list and the matcher normalisation
+#   all at once, and it closes the deletion hole. #666's leg C rejected an
+#   allow-list of what to COMPARE because it fails SILENT; a one-directional
+#   subset is that same failure in a different dimension, so it is the fallback
+#   here and not the verdict.
+#
+# THE TWO FAIL-SAFE ARMS (leg C's, and they are why this cannot rot):
+#   * a key the REPO SETS that this leg cannot compare is a hard FAIL. Here that
+#     is exactly the redaction case: an inline credential marshals to `<secret>`
+#     on BOTH sides, so two DIFFERENT inline credentials compare equal. It is
+#     reported rather than skipped — and it is a finding in its own right,
+#     because a credential literal in a tracked config file is the containment
+#     violation leg D exists to prevent. The `*_file` house pattern has no such
+#     gap: paths are not redacted.
+#   * a key only the RUNNING process has is a hard FAIL when its value is
+#     truthy and a named WARNING when it is empty/zero — so an Alertmanager
+#     upgrade that adds a defaulted field cannot make this gate permanently red.
+#     A permanently-red gate trains you to ignore it, which is this script's own
+#     header warning.
+#
+# SECRETS. No credential is read, hashed, compared or printed by this leg.
+#   * Alertmanager redacts every secret-TYPED field to the literal `<secret>`
+#     (measured across smtp_auth_password, slack_api_url, api_url, webhook url,
+#     basic_auth.password and routing_key with dummy values). The redaction set
+#     is therefore DERIVED from the data — value == "<secret>" — never from a
+#     key list that a version bump could outdate.
+#   * The disk side of a redacted field is never read. The leg reports the PATH.
+#   * The stage-2 reference container is fed the CONFIG directory only, never
+#     the secrets mount. It can do this because Alertmanager opens `*_file`
+#     credentials at NOTIFY time, not load time — the same fact leg D5 relies
+#     on. It publishes no port (it is queried through `docker exec`), joins no
+#     network, and gossips nowhere (`--cluster.listen-address=`).
+#
+# STATED LIMITS:
+#   * Stage 2 spawns and removes one throwaway container per run (~4 s). If
+#     docker refuses, or the reference never becomes ready, the leg reports
+#     stage 1's verdict and SAYS the result is one-directional. Set
+#     TALOS_AM_REF_CHECK=0 to skip it deliberately — that also prints the
+#     degradation rather than hiding it.
+#   * If the reference container EXITS, this checkout's alertmanager.yml does
+#     not load at all. That is a hard FAIL and is reported as such: it is a
+#     stronger finding than any drift.
+#   * Stage 2's diff is REPORTED ONLY WHEN STAGE 1 IS CLEAN. When the process
+#     has not reloaded, every drifted field would otherwise be printed twice —
+#     once in the repo's own terms and once again amid default-level noise,
+#     burying the actionable lines. Stage 1's findings are a strict subset of
+#     stage 2's in that state, so nothing is lost: fix them, re-run, and stage
+#     2 reports whatever remains. Named here rather than left implied.
+#   * This compares the CONFIG. It cannot tell you the routing is correct, only
+#     that the process is running the routing on disk. Whether a message
+#     reaches a human is leg D6.
+#   * The reference container has a FIXED name (AM_REF_NAME). Two concurrent
+#     runs of this script fight over it: the second's cleanup removes the
+#     first's reference mid-query, and the first then reports "stage 2 did not
+#     run" — the loud, one-directional direction, never a false green.
+#   * `templates:` is compared as a LIST OF PATHS, not as content. If this
+#     config ever names notification-template files, an edited template would
+#     be invisible to both stages — the path is unchanged. It is `[]` today,
+#     which is why this is a note rather than a second comparison; add one
+#     before the first template file lands.
+#   * The remedy this leg prints, `make observability-reload`, reloads
+#     Alertmanager as well as Prometheus — it was Prometheus-only until this
+#     change, which would have made every leg-E failure quote a target that
+#     could not clear it.
+#   * Leg A byte-compares the PROMETHEUS container's mounts and is deliberately
+#     NOT extended to Alertmanager's. Two reasons: (a) it would have to hash the
+#     credential mount, and no byte of a credential is hashed anywhere in this
+#     script; (b) the truncation defect leg A exists for is SUBSUMED here —
+#     stage 2 marshals the HOST file and compares it to what the process serves,
+#     so a container reading a truncated prefix diverges and is caught by
+#     EFFECT. A truncation that parses identically is, by definition, not a
+#     divergence.
+#   * Like leg B, the file compared is the one the RUNNING CONTAINER reads,
+#     resolved through its own mount table — not a path relative to this
+#     script. In a worktree the stack is fed by the main clone, and the leg says
+#     so rather than reporting a false divergence against a checkout that feeds
+#     nothing.
+# ══════════════════════════════════════════════════════════════════════════
+bold "  E. Alertmanager's LOADED config matches alertmanager.yml on disk"
+
+AM_REF_NAME="${AM_REF_NAME:-talos-am-refcheck}"
+AM_REF_OUT="$(mktemp -t am-ref-XXXXXX)"
+AM_REF_STATE="skipped"
+AM_REF_WHY=""
+
+_am_ref_cleanup() { docker rm -fv "$AM_REF_NAME" >/dev/null 2>&1 || true; }
+trap _am_ref_cleanup EXIT
+
+if ! docker inspect "$AM_CONTAINER" >/dev/null 2>&1 \
+   || [ "$(docker inspect -f '{{.State.Running}}' "$AM_CONTAINER" 2>/dev/null)" != "true" ]; then
+    yellow "  ⚠ '$AM_CONTAINER' is not running — leg E did NOT run. Nothing below has"
+    yellow "    compared the loaded Alertmanager config. (Leg D reports the absence.)"
+else
+    # Resolve the config file the CONTAINER actually reads, through its OWN
+    # mounts — the same discipline leg B uses, and for the same reason: a
+    # worktree has its own copy that no container mounts, and comparing the
+    # running process against a checkout that does not feed it is a category
+    # error that manufactures a divergence.
+    AM_MOUNTS="$(docker inspect "$AM_CONTAINER" \
+        --format '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}|{{.Destination}}|{{.RW}}{{"\n"}}{{end}}{{end}}')"
+    AM_CFG_ARG="$(docker inspect "$AM_CONTAINER" --format '{{json .Config.Cmd}}' \
+        | python3 -c 'import json,sys
+try: a=json.load(sys.stdin) or []
+except Exception: a=[]
+print(next((x.split("=",1)[1] for x in a if x.startswith("--config.file=")),
+           "/etc/alertmanager/alertmanager.yml"))')"
+    AM_CFG_HOST=""
+    while IFS='|' read -r src dst _rw; do
+        [ -n "${src:-}" ] || continue
+        hostsrc="${src#/host_mnt}"
+        [ -e "$hostsrc" ] || hostsrc="$src"
+        case "$AM_CFG_ARG" in
+            "$dst")   AM_CFG_HOST="$hostsrc" ;;
+            "$dst"/*) AM_CFG_HOST="$hostsrc/${AM_CFG_ARG#"$dst"/}" ;;
+        esac
+    done <<< "$AM_MOUNTS"
+
+    if [ -z "$AM_CFG_HOST" ] || [ ! -f "$AM_CFG_HOST" ]; then
+        red "  ✗ the container's --config.file ($AM_CFG_ARG) resolves to no host file"
+        yellow "    → Alertmanager is reading a config no checkout on this host provides,"
+        yellow "      so nothing can verify what it is routing. Mount it, or set"
+        yellow "      AM_CONTAINER to the one you meant."
+        FAIL=1
+    else
+        _amdir="$( (cd "$(dirname "$AM_CFG_HOST")" && pwd -P) 2>/dev/null || true)"
+        _root="$(cd "$ROOT" && pwd -P)"
+        # `case`, not `grep` — ROOT contains '.claude' for a worktree and a
+        # regex '.' would match any character.
+        case "$_amdir" in "$_root"|"$_root"/*) _amdir_in_root=1 ;; *) _amdir_in_root=0 ;; esac
+        if [ "$_amdir_in_root" -eq 0 ]; then
+            yellow "  ⚠ the running Alertmanager is fed by $AM_CFG_HOST, not $ROOT"
+            yellow "    (checking the stack against ITS OWN source; a worktree's copy is"
+            yellow "     not mounted, so this says nothing about your branch)"
+        fi
+
+        # ── STAGE 2 reference marshal: the same binary, this checkout's file ──
+        if [ "${TALOS_AM_REF_CHECK:-1}" != "1" ]; then
+            AM_REF_WHY="TALOS_AM_REF_CHECK=0 — skipped deliberately"
+        else
+            AM_IMAGE="$(docker inspect -f '{{.Image}}' "$AM_CONTAINER" 2>/dev/null || true)"
+            if [ -z "$AM_IMAGE" ]; then
+                AM_REF_WHY="could not read the running container's image ID"
+            else
+                _am_ref_cleanup
+                if docker run -d --name "$AM_REF_NAME" --network none \
+                       -v "$(dirname "$AM_CFG_HOST")":/etc/alertmanager/conf:ro \
+                       "$AM_IMAGE" \
+                       "--config.file=/etc/alertmanager/conf/$(basename "$AM_CFG_HOST")" \
+                       "--storage.path=/tmp/am-ref" \
+                       "--cluster.listen-address=" >/dev/null 2>&1; then
+                    _deadline=$(( $(date +%s) + ${TALOS_AM_REF_TIMEOUT:-30} ))
+                    while [ "$(date +%s)" -lt "$_deadline" ]; do
+                        if [ "$(docker inspect -f '{{.State.Running}}' "$AM_REF_NAME" 2>/dev/null)" != "true" ]; then
+                            AM_REF_STATE="exited"
+                            break
+                        fi
+                        if docker exec "$AM_REF_NAME" wget -q -O - \
+                               'http://127.0.0.1:9093/api/v2/status' > "$AM_REF_OUT" 2>/dev/null \
+                           && [ -s "$AM_REF_OUT" ]; then
+                            AM_REF_STATE="ok"
+                            break
+                        fi
+                        sleep 1
+                    done
+                    [ "$AM_REF_STATE" = "skipped" ] && \
+                        AM_REF_WHY="the reference container never became ready in ${TALOS_AM_REF_TIMEOUT:-30}s"
+                else
+                    AM_REF_WHY="'docker run' of $AM_IMAGE was refused"
+                fi
+            fi
+        fi
+
+        if [ "$AM_REF_STATE" = "exited" ]; then
+            red "  ✗ $AM_CFG_HOST DOES NOT LOAD. A fresh Alertmanager on the same image"
+            red "    exited rather than serving it, so this checkout could not be applied"
+            red "    even with a reload — whatever the running process is serving, it is"
+            red "    not this file."
+            docker logs "$AM_REF_NAME" 2>&1 | grep -i 'level=ERROR' | tail -2 | sed 's/^/      /' \
+                || docker logs "$AM_REF_NAME" 2>&1 | tail -2 | sed 's/^/      /'
+            AM_REF_WHY="$AM_CFG_HOST does not load — see the error above"
+            FAIL=1
+        fi
+        _am_ref_cleanup
+
+        AM_URL="$AM_URL" AM_CFG_HOST="$AM_CFG_HOST" \
+        AM_REF_OUT="$([ "$AM_REF_STATE" = "ok" ] && printf '%s' "$AM_REF_OUT")" \
+        AM_REF_WHY="$AM_REF_WHY" \
+        python3 - <<'AMEOF'
+import json, os, re, sys, urllib.request
+import yaml
+
+FAIL = 0
+def red(m):    print("\033[31m%s\033[0m" % m)
+def yellow(m): print("\033[33m%s\033[0m" % m)
+def green(m):  print("\033[32m%s\033[0m" % m)
+
+am  = os.environ["AM_URL"]
+cfg = os.environ["AM_CFG_HOST"]
+REDACTED = "<secret>"
+
+def status_config(fetch):
+    """Parse an /api/v2/status body into (yaml_text, parsed). `config.original`
+    is Config.String(), i.e. the MARSHALLED config — not the file text."""
+    try:
+        d = json.loads(fetch)
+        txt = d["config"]["original"]
+        return txt, (yaml.safe_load(txt) or {})
+    except Exception as e:
+        return None, e
+
+try:
+    with urllib.request.urlopen(am + "/api/v2/status", timeout=10) as r:
+        body = r.read().decode()
+except Exception as e:
+    red("  ✗ cannot read %s/api/v2/status: %s" % (am, e))
+    yellow("    → leg E cannot compare anything. This is a GAP, not a pass.")
+    sys.exit(1)
+
+live_txt, live = status_config(body)
+if live_txt is None:
+    red("  ✗ %s/api/v2/status did not carry a parseable config: %s" % (am, live))
+    sys.exit(1)
+
+try:
+    disk = yaml.safe_load(open(cfg).read()) or {}
+except Exception as e:
+    red("  ✗ %s does not parse as YAML: %s" % (cfg, e))
+    sys.exit(1)
+
+# ── shared helpers ────────────────────────────────────────────────────────
+def leaves(o, p=""):
+    out = {}
+    if isinstance(o, dict):
+        for k, v in o.items():
+            out.update(leaves(v, p + "/" + str(k)))
+    elif isinstance(o, list):
+        for i, v in enumerate(o):
+            out.update(leaves(v, "%s[%d]" % (p, i)))
+    else:
+        out[p] = o
+    return out
+
+# Alertmanager parses each matcher into labels.Matcher and re-prints it
+# canonically: `severity = "critical"` on disk, `severity="critical"` from the
+# API. MEASURED as the only value-level difference on a healthy stack (4 of 4).
+# Applied to BOTH sides, so it need only be deterministic.
+_MATCH = re.compile(r'^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(=~|!~|!=|=)\s*(.*?)\s*$')
+def norm_matcher(v):
+    if not isinstance(v, str):
+        return v
+    m = _MATCH.match(v)
+    if not m:
+        return v
+    name, op, val = m.groups()
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+        val = val[1:-1]
+    return '%s%s"%s"' % (name, op, val)
+
+def norm(path, v):
+    return norm_matcher(v) if re.search(r"matchers\[\d+\]$", path) else v
+
+# ── STAGE 1: everything this checkout DECLARES is in effect ───────────────
+dl = {p: norm(p, v) for p, v in leaves(disk).items()}
+ll = {p: norm(p, v) for p, v in leaves(live).items()}
+
+redacted_repo = sorted(p for p in dl if p in ll and ll[p] == REDACTED)
+missing, changed = [], []
+for p in sorted(dl):
+    if p in redacted_repo:
+        continue
+    if p not in ll:
+        missing.append(p)
+    elif dl[p] != ll[p]:
+        changed.append(p)
+
+# ARM 1 — a key the REPO SETS that this leg cannot compare is a hard FAIL.
+if redacted_repo:
+    red("  ✗ %d setting(s) this checkout declares are CREDENTIAL LITERALS, which"
+        % len(redacted_repo))
+    red("    Alertmanager redacts to <secret> on both sides — so this leg cannot")
+    red("    tell whether the running value is the one in the file:")
+    for p in redacted_repo:
+        yellow("      %s   (path only; no value read from either side)" % p)
+    yellow("    → a credential in a TRACKED config file is also the containment")
+    yellow("      violation leg D exists to prevent. Move it to the *_file form")
+    yellow("      (api_url_file / url_file), which is a PATH and compares exactly.")
+    FAIL = 1
+
+if missing or changed:
+    red("  ✗ %d setting(s) in %s are NOT in effect:" % (len(missing) + len(changed), cfg))
+    for p in missing:
+        yellow("      %s: repo=%r running=<absent>" % (p, dl[p]))
+    for p in changed:
+        yellow("      %s: repo=%r running=%r" % (p, dl[p], ll[p]))
+    yellow("    → the process has not re-read %s." % cfg)
+    yellow("      Apply with 'make observability-reload'.")
+    FAIL = 1
+
+# Closure on the collections Alertmanager NEVER invents. Stage 1 is otherwise
+# one-directional; these three are wholly repo-authored, so an entry the process
+# has and the file does not is drift, never a filled-in default.
+extra = []
+for label, dv, lv in (
+        ("receiver", [r.get("name") for r in (disk.get("receivers") or [])],
+                     [r.get("name") for r in (live.get("receivers") or [])]),):
+    for n in sorted(set(lv) - set(dv)):
+        extra.append((label, n))
+d_routes = len(((disk.get("route") or {}).get("routes")) or [])
+l_routes = len(((live.get("route") or {}).get("routes")) or [])
+if l_routes > d_routes:
+    extra.append(("child route", "%d loaded vs %d on disk" % (l_routes, d_routes)))
+d_inh, l_inh = len(disk.get("inhibit_rules") or []), len(live.get("inhibit_rules") or [])
+if l_inh > d_inh:
+    extra.append(("inhibit rule", "%d loaded vs %d on disk" % (l_inh, d_inh)))
+if extra:
+    red("  ✗ the running config has %d entr(y/ies) this checkout does not declare:"
+        % len(extra))
+    for label, n in extra:
+        yellow("      %s %s" % (label, n))
+    yellow("    → Alertmanager never invents a receiver, a child route or an inhibit")
+    yellow("      rule, so this is a DELETED setting the process is still applying.")
+    FAIL = 1
+
+# ── STAGE 2: the reference marshal — the authority ────────────────────────
+ref_path = os.environ.get("AM_REF_OUT") or ""
+ref = None
+if ref_path and os.path.isfile(ref_path):
+    ref_txt, ref = status_config(open(ref_path).read())
+    if ref_txt is None:
+        ref = None
+
+if ref is None:
+    yellow("    ⚠ STAGE 2 DID NOT RUN (%s)." % (os.environ.get("AM_REF_WHY")
+           or "no reference marshal was produced"))
+    yellow("      The verdict above is ONE-DIRECTIONAL: it proves everything this")
+    yellow("      checkout declares is in effect, and CANNOT see a setting DELETED")
+    yellow("      from disk that the process is still applying (outside the three")
+    yellow("      collections closed above). Not a pass for that case — a gap.")
+elif not (missing or changed or redacted_repo or extra):
+    rl = leaves(ref)
+    both = set(rl) | set(ll)
+    hard, soft = [], []
+    for p in sorted(both):
+        rv, lv = rl.get(p, "\0absent"), ll.get(p, "\0absent")
+        if rv == lv:
+            continue
+        if rv == REDACTED and lv == REDACTED:
+            continue          # already reported by ARM 1
+        # ARM 2 — a key only the RUNNING process has: hard FAIL when truthy,
+        # named WARNING when empty/zero. Both marshals come from the SAME
+        # binary, so an extra key cannot be a filled-in default.
+        if rv == "\0absent" and not lv:
+            soft.append(p)
+        else:
+            hard.append((p, rv, lv))
+    if hard:
+        red("  ✗ STAGE 2: the running config differs from what %s marshals to," % cfg)
+        red("    through the SAME Alertmanager binary — %d difference(s):" % len(hard))
+        for p, rv, lv in hard[:12]:
+            yellow("      %s: repo=%r running=%r"
+                   % (p, "<absent>" if rv == "\0absent" else rv,
+                      "<absent>" if lv == "\0absent" else lv))
+        if len(hard) > 12:
+            yellow("      ... and %d more" % (len(hard) - 12))
+        yellow("    → defaults cancel exactly on both sides, so every line above is a")
+        yellow("      REAL divergence — including a setting deleted from disk that the")
+        yellow("      process still applies, which stage 1 cannot see.")
+        yellow("      Apply with 'make observability-reload'.")
+        FAIL = 1
+    if soft:
+        yellow("    ⚠ %d field(s) present only in the running config and EMPTY/zero on"
+               % len(soft))
+        yellow("      every object, so none can be hiding a divergence today:")
+        for p in soft[:8]:
+            yellow("        %s" % p)
+        if len(soft) > 8:
+            yellow("        ... and %d more" % (len(soft) - 8))
+        yellow("      A non-empty one FAILS this leg rather than being skipped.")
+    if not hard:
+        green("  ✓ %s" % cfg)
+        green("    is loaded EXACTLY: all %d declared leaf field(s) are in effect, and"
+              % len(dl))
+        green("    the running config is identical to what the same binary marshals")
+        green("    from this file (%d leaf field(s) compared BIDIRECTIONALLY, defaults"
+              % len(both))
+        green("    included) — nothing extra, nothing deleted-but-still-applied.")
+
+if (missing or changed or redacted_repo or extra):
+    pass
+elif ref is None:
+    green("  ✓ all %d setting(s) declared by" % len(dl))
+    green("    %s" % cfg)
+    green("    are in effect (ONE-DIRECTIONAL — see the gap named just above)")
+
+sys.exit(1 if FAIL else 0)
+AMEOF
+        [ $? -ne 0 ] && FAIL=1
+    fi
+fi
+rm -f "$AM_REF_OUT" 2>/dev/null || true
+
 echo
 if [ "$FAIL" -ne 0 ]; then
-    red "✗ the running Prometheus and this repo DISAGREE."
+    red "✗ the running observability stack and this repo DISAGREE."
     yellow "  Recover with: make observability-reload"
     yellow "  (if that does not clear it, the container predates the directory-mount"
     yellow "   fix — 'docker compose up -d --force-recreate prometheus' recreates it"
     yellow "   without touching the prometheus_data volume.)"
     exit 1
 fi
-green "✓ the running Prometheus is reading exactly what its source checkout contains."
+green "✓ the running Prometheus AND Alertmanager are reading exactly what their"
+green "  source checkout contains."

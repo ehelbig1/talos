@@ -3116,7 +3116,6 @@ tests:
       - exp_labels:
           severity: critical
           category: data-loss
-          runbook: https://github.com/OWNER/talos/blob/main/docs/security/operational-runbook.md#dek-orphan
           job: talos-controller
           instance: controller:8080
         exp_annotations:
@@ -3138,7 +3137,11 @@ tests:
                      SELECT 1 FROM encryption_keys ek WHERE ek.id = am.value_key_id \
                    );"
             2. Decide: delete orphans, or hold for forensic dump before delete.
-            3. Follow docs/security/operational-runbook.md § DEK orphan.
+            3. There is deliberately no further pointer here. This step used to
+               read "Follow docs/security/operational-runbook.md § DEK orphan"
+               and that section has never existed, so the two steps above ARE
+               the procedure. Nothing recovers the rows; the only decision is
+               whether to dump them first.
     - eval_time: 15m
       alertname: TalosActorMemoryDEKOrphaned
       exp_alerts: *talos_actor_memory_d_e_k_orphaned_firing

@@ -328,7 +328,8 @@ groups:
 
 Reload Prometheus — and then prove the reload actually took effect:
 ```bash
-make observability-reload   # POST /-/reload, then runs observability-verify
+make observability-reload   # POST /-/reload to Prometheus AND Alertmanager,
+                            # then runs observability-verify
 ```
 
 (`docker exec talos-prometheus kill -HUP 1` also reloads, but tells you
@@ -508,7 +509,8 @@ printf '%s' 'https://hooks.slack.com/services/XXX/YYY/ZZZ' \
     > ~/.talos/alert-secrets/infra-webhook-url
 chmod 600 ~/.talos/alert-secrets/infra-webhook-url
 make observability-reload        # POST /-/reload; no restart, no rebuild
-make observability-verify        # leg D checks containment, mode and binding
+make observability-verify        # leg D: containment, mode, binding, acceptance
+                                 # leg E: the LOADED config matches the file
 ```
 
 That is it. Alertmanager reads `api_url_file` at **notify** time, so the
@@ -519,8 +521,15 @@ tries to send — which is why `TalosAlertDeliveryFailing` exists.
   with `TALOS_ALERT_SECRETS_DIR`. Leg D of `scripts/verify-observability.sh`
   **refuses** a credential mount that resolves inside any checkout, symlinks
   resolved, checking both this worktree and the main clone.
-* **No credential value is ever logged**, by the verifier or by anything else.
-  Leg D checks existence and file mode only; it never reads the contents.
+* **No credential value is ever logged, printed or hashed**, by the verifier or
+  by anything else — but state the guarantee precisely, because "it never reads
+  the contents" has not been true since D5 landed. D5 reads the FIRST LINE of a
+  URL-typed credential far enough to classify it into one of five fixed verdicts
+  (ok / empty / insecure / notaurl / dirty) and emits only the verdict word and
+  the file's basename. Everything else is metadata. Leg E never reads a
+  credential at all: Alertmanager redacts secret-typed fields to the literal
+  `<secret>`, and rather than defeating that by reading the file's side, leg E
+  FAILS on any credential literal in a tracked config and reports the PATH.
 * Choosing a channel other than Slack is a 3-line edit — `alertmanager.yml`
   carries the exact replacement blocks for Discord, Telegram, email and a
   generic webhook, clearly marked as options rather than as what ships.
