@@ -3768,3 +3768,132 @@ tests:
     - eval_time: 42m
       alertname: TalosWorkerIdentityReapBlinded
       exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # TalosCryptoOrphanDetectorBlind — the meta-detector for the three
+  # `critical` DEK-orphan alerts.
+  #
+  # Read the FIRST test as a pair: the orphan gauge sits at 0 for the whole
+  # timeline and TalosActorMemoryDEKOrphaned is silent for the whole
+  # timeline — which is correct on a clean database and catastrophic on a
+  # database nobody measured. Before 2026-08-20 those two situations were
+  # the same series at the same value with no second signal, and the
+  # producer (`if let Ok(row) = …`) logged nothing on the failing path. The
+  # blind alert is the entire difference.
+  #
+  # As the file header notes, promtool's clock starts at 0, so `time()` at
+  # eval_time T is T seconds and a "fresh" stamp is a series that tracks
+  # the clock (`0+60x…` at a 1m interval).
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: TalosCryptoOrphanDetectorBlind — the sweep has NEVER completed
+    input_series:
+      # 0 is what a registered Gauge exports before anything sets it. That
+      # is the "sweep task never spawned / every probe has always failed"
+      # state, and it must be LOUD.
+      - series: 'talos_crypto_orphan_scan_last_success_timestamp_seconds{job="talos-controller",instance="controller:8080"}'
+        values: "0x60"
+      # The gauge the operator would otherwise read as a clean bill of health.
+      - series: 'talos_actor_memory_orphaned_rows{job="talos-controller",instance="controller:8080"}'
+        values: "0x60"
+    alert_rule_test:
+      # The 600s threshold has not been crossed yet (time() - 0 == 600).
+      - eval_time: 10m
+        alertname: TalosCryptoOrphanDetectorBlind
+        exp_alerts: []
+      # Crossed at 10m01s, but `for: 15m` has not elapsed — pending, not firing.
+      - eval_time: 20m
+        alertname: TalosCryptoOrphanDetectorBlind
+        exp_alerts: []
+      - eval_time: 26m
+        alertname: TalosCryptoOrphanDetectorBlind
+        exp_alerts: &talos_crypto_orphan_detector_blind_firing
+          - exp_labels:
+              severity: warning
+              category: observability
+              job: talos-controller
+              instance: controller:8080
+            exp_annotations:
+              summary: Crypto-orphan detector has not completed a sweep in 10+ minutes
+              description: |
+                No crypto-orphan sweep has measured all three tables for over ten
+                minutes, so `talos_actor_memory_orphaned_rows`,
+                `talos_module_execution_orphaned_rows` and
+                `talos_workflow_execution_orphaned_rows` are holding values
+                nothing measured — and their three `critical` data-loss alerts
+                cannot fire. If unrecoverable ciphertext appears while this is
+                firing, you will not be told.
+
+                A value of 0 for the stamp means the sweep has NEVER completed on
+                this controller: either it has just started (it clears within
+                ~60s) or the sweep task is not running at all.
+              action: |
+                1. Controller log, target=talos_crypto,
+                   event_kind=crypto_orphan_probe_failed — it names the failing
+                   table and carries the driver error. No line at all means the
+                   sweep task itself is not running.
+                2. Run the three counts by hand; the actor_memory one is in
+                   TalosActorMemoryDEKOrphaned's action block above. If they
+                   return, the fault is in the controller, not the data.
+                3. Until this clears, treat the three orphan gauges as unknown,
+                   not as zero.
+      - eval_time: 55m
+        alertname: TalosCryptoOrphanDetectorBlind
+        exp_alerts: *talos_crypto_orphan_detector_blind_firing
+      # THE PAIRING. Same timeline, same data: the data-loss alert is silent
+      # throughout. That silence is what the blind alert qualifies.
+      - eval_time: 26m
+        alertname: TalosActorMemoryDEKOrphaned
+        exp_alerts: []
+      - eval_time: 55m
+        alertname: TalosActorMemoryDEKOrphaned
+        exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # A HEALTHY sweep is quiet for the whole timeline. Without this, a rule
+  # that fired unconditionally would pass the test above.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: TalosCryptoOrphanDetectorBlind — a sweep that keeps up is silent
+    input_series:
+      - series: 'talos_crypto_orphan_scan_last_success_timestamp_seconds{job="talos-controller",instance="controller:8080"}'
+        values: "0+60x90"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: TalosCryptoOrphanDetectorBlind
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: TalosCryptoOrphanDetectorBlind
+        exp_alerts: []
+      - eval_time: 89m
+        alertname: TalosCryptoOrphanDetectorBlind
+        exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # A TRANSIENT stall must not page, and the alert must CLEAR when the
+  # sweep recovers. The stamp stops advancing for 20 minutes — long enough
+  # to cross the 600s threshold for ten of them — and `for: 15m` absorbs
+  # it. A detector-health alert that pages on every DB blip is one
+  # operators learn to ignore, which is the same defect one level up.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: TalosCryptoOrphanDetectorBlind — a 20-minute stall that recovers never fires
+    input_series:
+      # t=0..30m tracking the clock; t=31..50m frozen at 1800; t=51m+ caught up.
+      - series: 'talos_crypto_orphan_scan_last_success_timestamp_seconds{job="talos-controller",instance="controller:8080"}'
+        values: "0+60x30 1800x19 3060+60x30"
+    alert_rule_test:
+      # Threshold crossed at ~41m, so this is PENDING, not firing.
+      - eval_time: 45m
+        alertname: TalosCryptoOrphanDetectorBlind
+        exp_alerts: []
+      - eval_time: 50m
+        alertname: TalosCryptoOrphanDetectorBlind
+        exp_alerts: []
+      # Recovered; the pending state is discarded.
+      - eval_time: 60m
+        alertname: TalosCryptoOrphanDetectorBlind
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: TalosCryptoOrphanDetectorBlind
+        exp_alerts: []

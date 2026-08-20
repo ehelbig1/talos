@@ -148,6 +148,116 @@ groups:
             workflow_executions.output_enc_key_id FK broken. Output data
             unrecoverable.
 
+      # ── THE META-DETECTOR for the three alerts above.
+      #
+      # All three read `> 0`, and a registered prometheus IntGauge exports
+      # its initial 0 the moment /metrics is scraped. So `== 0` covers two
+      # states that are the same number and opposite in meaning: "measured,
+      # no orphans" and "the SELECT errored, nothing was ever measured".
+      # Until 2026-08-20 the producer was three
+      # `if let Ok(row) = …{ gauge.set(row) }` blocks with no `else` and no
+      # log, so a failing query — a permissions change, a column rename, a
+      # `statement_timeout`, a partial restore that dropped a table — turned
+      # all three CRITICAL data-loss detectors off silently and left them
+      # reading "all clear". These alerts are the only automated notice that
+      # at-rest ciphertext has become unrecoverable; nothing else in the
+      # platform reports that condition.
+      #
+      # `talos_crypto_orphan_scan_last_success_timestamp_seconds` advances
+      # only on a sweep in which ALL THREE probes returned. A held gauge is
+      # then distinguishable from a measured one, which is the whole point —
+      # the counts themselves were deliberately NOT changed (they hold their
+      # last value rather than zeroing, and no sentinel is folded into them,
+      # because every other consumer reads them as row counts).
+      #
+      # WHY A FRESHNESS STAMP AND NOT A `blind == 1` GAUGE. A boolean blind
+      # flag is itself an unmeasured zero: a sweep task that never spawns or
+      # panics leaves it at 0 forever, reading "not blind" — this defect one
+      # level up, which is precisely the mistake this rule exists to stop
+      # repeating. A timestamp degrades correctly in all four cases: query
+      # error, task death, task never spawned, and a controller build that
+      # predates the sweep (0 from registration = maximally stale). Same
+      # form as TalosBackupRestoreDrillFailed below.
+      #
+      # NO absent() ARM, same reasoning as TalosWorkerBuildSkew and
+      # TalosWorkerIdentityReapBlinded: this is a plain registered Gauge,
+      # exported from registration on every controller carrying this build,
+      # so absence means the controller is down (TalosControllerDown owns
+      # that) or is running a build older than 2026-08-20. An absent() arm
+      # would page permanently through any staged rollout of an older
+      # controller image, and a permanently-red alert trains operators to
+      # ignore red.
+      #
+      # THRESHOLDS. The sweep runs every 60s, so 600s is ten consecutive
+      # missed sweeps and `for: 15m` requires the condition to hold across
+      # another fifteen — a total of ~25 minutes of continuous blindness
+      # before this fires. That is deliberately far outside any single DB
+      # blip, a rolling controller restart, or the ~60s post-boot window in
+      # which the stamp still reads 0 because the first tick is skipped.
+      # Chosen over a tighter bound because this is a detector-health alert,
+      # not the data-loss alert itself: the cost of being 25 minutes late is
+      # 25 minutes, and the cost of flapping is that the next real one is
+      # ignored.
+      #
+      # PER-INSTANCE, NOT `max()`. The subtraction keeps the source series'
+      # labels, so a two-replica controller deployment produces one alert per
+      # replica. That is deliberate and differs from
+      # TalosWorkerIdentityReapBlinded: each controller runs its OWN sweep
+      # against its OWN pool, so one blind replica is a real fault on that
+      # replica, and collapsing with max() would fire without saying which
+      # one to look at. Alertmanager groups them (group_by is
+      # [alertname, category]), so this is one notification either way.
+      #
+      # SEVERITY IS `warning`, MATCHING THE OTHER TWO BLIND DETECTORS
+      # (TalosFuelHeadroomDetectorBlind, TalosWorkerIdentityReapBlinded) —
+      # stated rather than implied, because the alerts it guards are
+      # `critical`. Being unable to measure is not the same event as data
+      # loss, and routing this at `critical` would page on a DB hiccup with
+      # the same urgency as unrecoverable ciphertext. An operator who wants
+      # it louder should raise it here rather than assume it is already.
+      - alert: TalosCryptoOrphanDetectorBlind
+        expr: |
+          time() - talos_crypto_orphan_scan_last_success_timestamp_seconds > 600
+        for: 15m
+        # ANTI-FLAP, same convention as the rest of this file but for a
+        # DIFFERENT mechanism, stated rather than implied. The neighbours
+        # carry keep_firing_for because a restart makes their gauge read an
+        # unmeasured 0, which RESOLVES them. A restart cannot resolve this one
+        # by value — it resets the stamp to 0, which is maximally stale, i.e.
+        # more firing, not less. What a restart does do is break the SERIES
+        # (the instance disappears and returns), and a gap drops the alert
+        # back to inactive and re-arms the full 15m. keep_firing_for holds it
+        # across that gap so a controller that is both blind AND restarting
+        # cannot ride out the detector indefinitely.
+        keep_firing_for: 5m
+        labels:
+          severity: warning
+          category: observability
+        annotations:
+          summary: "Crypto-orphan detector has not completed a sweep in 10+ minutes"
+          description: |
+            No crypto-orphan sweep has measured all three tables for over ten
+            minutes, so `talos_actor_memory_orphaned_rows`,
+            `talos_module_execution_orphaned_rows` and
+            `talos_workflow_execution_orphaned_rows` are holding values
+            nothing measured — and their three `critical` data-loss alerts
+            cannot fire. If unrecoverable ciphertext appears while this is
+            firing, you will not be told.
+
+            A value of 0 for the stamp means the sweep has NEVER completed on
+            this controller: either it has just started (it clears within
+            ~60s) or the sweep task is not running at all.
+          action: |
+            1. Controller log, target=talos_crypto,
+               event_kind=crypto_orphan_probe_failed — it names the failing
+               table and carries the driver error. No line at all means the
+               sweep task itself is not running.
+            2. Run the three counts by hand; the actor_memory one is in
+               TalosActorMemoryDEKOrphaned's action block above. If they
+               return, the fault is in the controller, not the data.
+            3. Until this clears, treat the three orphan gauges as unknown,
+               not as zero.
+
       # ── KEK decrypt failures — rate > 0 means current write path is
       # broken. "both" means EVERY CONFIGURED provider failed, so the read
       # is terminally broken; it is emitted when active+legacy both fail AND

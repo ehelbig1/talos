@@ -882,6 +882,153 @@ pub(crate) fn publish_fuel_utilisation(
     );
 }
 
+/// `actor_memory` rows whose `value_key_id` names a DEK that is gone.
+pub(crate) const ACTOR_MEMORY_ORPHAN_SQL: &str = "SELECT COUNT(*) FROM actor_memory am \
+     WHERE NOT EXISTS ( \
+         SELECT 1 FROM encryption_keys ek WHERE ek.id = am.value_key_id \
+     )";
+
+/// `module_executions` rows whose `payload_enc_key_id` names a DEK that is
+/// gone. The column is NULLABLE — a row with no encrypted payload is not an
+/// orphan, so the `IS NOT NULL` predicate is load-bearing, not defensive.
+pub(crate) const MODULE_EXECUTION_ORPHAN_SQL: &str = "SELECT COUNT(*) FROM module_executions me \
+     WHERE me.payload_enc_key_id IS NOT NULL \
+       AND NOT EXISTS ( \
+         SELECT 1 FROM encryption_keys ek WHERE ek.id = me.payload_enc_key_id \
+     )";
+
+/// `workflow_executions` rows whose `output_enc_key_id` names a DEK that is
+/// gone. Same nullable-column reasoning as [`MODULE_EXECUTION_ORPHAN_SQL`].
+pub(crate) const WORKFLOW_EXECUTION_ORPHAN_SQL: &str =
+    "SELECT COUNT(*) FROM workflow_executions we \
+     WHERE we.output_enc_key_id IS NOT NULL \
+       AND NOT EXISTS ( \
+         SELECT 1 FROM encryption_keys ek WHERE ek.id = we.output_enc_key_id \
+     )";
+
+/// One sweep's worth of crypto-orphan probes: per-table counts, each of which
+/// may have failed independently.
+///
+/// The error is carried as a `String` rather than a `sqlx::Error` for one
+/// reason only: [`publish_crypto_orphan_scan`] is the PRODUCTION publisher and
+/// a unit test has to be able to hand it a failed probe without a database.
+/// `sqlx::Error` is not constructible from outside sqlx for the variants that
+/// matter here.
+#[derive(Debug, Default)]
+pub(crate) struct CryptoOrphanScan {
+    pub actor_memory: Option<Result<i64, String>>,
+    pub module_executions: Option<Result<i64, String>>,
+    pub workflow_executions: Option<Result<i64, String>>,
+}
+
+impl CryptoOrphanScan {
+    /// True only when every probe returned a count.
+    ///
+    /// `None` (probe not attempted) counts as NOT complete, which is why the
+    /// fields are `Option<Result<..>>` and not `Result<..>`: a future refactor
+    /// that skips a probe must not be able to advance the freshness stamp.
+    fn is_complete(&self) -> bool {
+        matches!(self.actor_memory, Some(Ok(_)))
+            && matches!(self.module_executions, Some(Ok(_)))
+            && matches!(self.workflow_executions, Some(Ok(_)))
+    }
+}
+
+/// Run the three orphan probes. Each is independent — one failure does not
+/// skip the others, because two measured gauges are strictly better than none
+/// and the freshness stamp records that the sweep was incomplete either way.
+async fn run_crypto_orphan_scan(pool: &sqlx::PgPool) -> CryptoOrphanScan {
+    async fn probe(pool: &sqlx::PgPool, sql: &'static str) -> Option<Result<i64, String>> {
+        Some(
+            sqlx::query_scalar::<_, i64>(sql)
+                .fetch_one(pool)
+                .await
+                .map_err(|e| e.to_string()),
+        )
+    }
+    CryptoOrphanScan {
+        actor_memory: probe(pool, ACTOR_MEMORY_ORPHAN_SQL).await,
+        module_executions: probe(pool, MODULE_EXECUTION_ORPHAN_SQL).await,
+        workflow_executions: probe(pool, WORKFLOW_EXECUTION_ORPHAN_SQL).await,
+    }
+}
+
+/// Publish one sweep. Split out from the spawned task so a unit test can drive
+/// the PRODUCTION path and assert what a FAILED probe does to the exported
+/// state — CLAUDE.md's check-58 guidance, and the same split as
+/// `publish_catalog_missing_wasm`.
+///
+/// **What changed on 2026-08-20 and why.** This was three
+/// `if let Ok(row) = …fetch_one(&pool).await { gauge.set(row) }` blocks. On
+/// `Err` nothing was set and nothing was logged, so the gauge held its
+/// registration-time 0 and all three `critical` / data-loss alerts
+/// (`TalosActorMemoryDEKOrphaned`, `TalosModuleExecutionPayloadOrphaned`,
+/// `TalosWorkflowOutputPayloadOrphaned`) were permanently unfireable while
+/// looking exactly like a clean bill of health. An orphaned row is ciphertext
+/// whose DEK no longer exists — unrecoverable data — so the silent 0 was the
+/// worst form of the class: a monitor that cannot fire, on the one condition
+/// nothing else in the platform reports.
+///
+/// **The gauges still HOLD their last value on failure; that part was right.**
+/// Zeroing a count nobody measured would read as "the orphans were repaired",
+/// and publishing a sentinel would make the counts untrustworthy to every
+/// other consumer. What was missing was a way to tell a held value from a
+/// measured one, and that is a SEPARATE series —
+/// `talos_crypto_orphan_scan_last_success_timestamp_seconds`, stamped only
+/// when all three probes returned.
+///
+/// Takes the collector explicitly rather than reading `metrics::global()` so a
+/// test does not have to win a race for a process-wide `OnceLock`.
+pub(crate) fn publish_crypto_orphan_scan(
+    metrics: Option<&talos_metrics::TalosMetrics>,
+    scan: &CryptoOrphanScan,
+) {
+    // No key id, no row content, no tenant identifier reaches a log line or a
+    // label — the table name is a compile-time constant and the error text is
+    // the driver's, which carries the failing statement, not its data.
+    for (table, probe) in [
+        ("actor_memory", &scan.actor_memory),
+        ("module_executions", &scan.module_executions),
+        ("workflow_executions", &scan.workflow_executions),
+    ] {
+        if let Some(Err(e)) = probe {
+            tracing::warn!(
+                target: "talos_crypto",
+                event_kind = "crypto_orphan_probe_failed",
+                table,
+                error = %e,
+                "crypto-orphan probe failed; talos_{}_orphaned_rows is holding a value \
+                 it did not measure and its critical data-loss alert cannot fire until \
+                 talos_crypto_orphan_scan_last_success_timestamp_seconds advances again",
+                table
+            );
+        }
+    }
+
+    let Some(m) = metrics else {
+        return;
+    };
+    if let Some(Ok(row)) = &scan.actor_memory {
+        m.actor_memory_orphaned_rows.set(*row);
+    }
+    if let Some(Ok(row)) = &scan.module_executions {
+        m.module_execution_orphaned_rows.set(*row);
+    }
+    if let Some(Ok(row)) = &scan.workflow_executions {
+        m.workflow_execution_orphaned_rows.set(*row);
+    }
+    if scan.is_complete() {
+        // `unwrap_or(0.0)` on a pre-epoch clock stamps 0, which the alert
+        // reads as maximally stale — the fail-SAFE direction. A clock that
+        // cannot produce a unix time is not evidence that the sweep ran.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        m.crypto_orphan_scan_last_success_timestamp_seconds.set(now);
+    }
+}
+
 /// Embedding-provider re-probe loop + crypto-invariant orphan gauges +
 /// worker build-skew gauge + DB-pool saturation gauges. Extracted verbatim from
 /// `main()`; spawn order preserved.
@@ -910,6 +1057,10 @@ pub(crate) fn spawn_metrics_gauge_tasks(
     // them means at-rest encrypted data is unrecoverable — the same
     // failure mode that silently bit us on 2026-04-24 before Vault
     // persistence was wired up. See docs/security/operational-runbook.md.
+    //
+    // COST, stated: three `SELECT COUNT(*)` with a `NOT EXISTS` anti-join
+    // against `encryption_keys(id)` (primary key), once a minute — unchanged
+    // by the 2026-08-20 blindness fix, which adds no query and no round trip.
     {
         let pool = db_pool.clone();
         tokio::spawn(async move {
@@ -918,46 +1069,8 @@ pub(crate) fn spawn_metrics_gauge_tasks(
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                if let Some(m) = metrics::global() {
-                    // actor_memory
-                    if let Ok(row) = sqlx::query_scalar::<_, i64>(
-                        "SELECT COUNT(*) FROM actor_memory am \
-                         WHERE NOT EXISTS ( \
-                             SELECT 1 FROM encryption_keys ek WHERE ek.id = am.value_key_id \
-                         )",
-                    )
-                    .fetch_one(&pool)
-                    .await
-                    {
-                        m.actor_memory_orphaned_rows.set(row);
-                    }
-                    // module_executions (payload_enc_key_id is nullable)
-                    if let Ok(row) = sqlx::query_scalar::<_, i64>(
-                        "SELECT COUNT(*) FROM module_executions me \
-                         WHERE me.payload_enc_key_id IS NOT NULL \
-                           AND NOT EXISTS ( \
-                             SELECT 1 FROM encryption_keys ek WHERE ek.id = me.payload_enc_key_id \
-                         )",
-                    )
-                    .fetch_one(&pool)
-                    .await
-                    {
-                        m.module_execution_orphaned_rows.set(row);
-                    }
-                    // workflow_executions
-                    if let Ok(row) = sqlx::query_scalar::<_, i64>(
-                        "SELECT COUNT(*) FROM workflow_executions we \
-                         WHERE we.output_enc_key_id IS NOT NULL \
-                           AND NOT EXISTS ( \
-                             SELECT 1 FROM encryption_keys ek WHERE ek.id = we.output_enc_key_id \
-                         )",
-                    )
-                    .fetch_one(&pool)
-                    .await
-                    {
-                        m.workflow_execution_orphaned_rows.set(row);
-                    }
-                }
+                let scan = run_crypto_orphan_scan(&pool).await;
+                publish_crypto_orphan_scan(metrics::global().map(|m| m.as_ref()), &scan);
             }
         });
     }
@@ -5659,5 +5772,160 @@ mod fuel_headroom_tests {
              the new ceiling — the denominator does NOT change, because the \
              node is still observed"
         );
+    }
+}
+
+/// The crypto-orphan sweep's blindness guarantee.
+///
+/// These drive the PRODUCTION publisher (`publish_crypto_orphan_scan`), not a
+/// re-implementation, and each builds its OWN `TalosMetrics` registry — the
+/// publisher takes the collector explicitly precisely so these do not have to
+/// win a race for the process-wide `OnceLock` (the reason the fuel tests above
+/// had to be collapsed into one).
+#[cfg(test)]
+mod crypto_orphan_blindness_tests {
+    use super::{publish_crypto_orphan_scan, CryptoOrphanScan};
+
+    fn metrics() -> std::sync::Arc<talos_metrics::TalosMetrics> {
+        talos_metrics::TalosMetrics::new().expect("fresh registry")
+    }
+
+    fn ok_scan() -> CryptoOrphanScan {
+        CryptoOrphanScan {
+            actor_memory: Some(Ok(0)),
+            module_executions: Some(Ok(0)),
+            workflow_executions: Some(Ok(0)),
+        }
+    }
+
+    /// A cold registry exports the stamp as 0, and 0 is the MAXIMALLY STALE
+    /// reading — `time() - 0` is ~1.8e9, far over the alert's 600s threshold.
+    ///
+    /// This is the property that makes the alert cover "the sweep task never
+    /// spawned", which a `blind == 1` boolean could not: nothing would set the
+    /// boolean either, and it would read "not blind" forever.
+    #[test]
+    fn a_sweep_that_never_ran_reads_as_maximally_stale() {
+        let m = metrics();
+        assert_eq!(
+            m.crypto_orphan_scan_last_success_timestamp_seconds.get(),
+            0.0,
+            "the stamp must start at 0 so the never-ran case is loud"
+        );
+        let rendered = m.render_prometheus().expect("render");
+        assert!(
+            rendered.contains("talos_crypto_orphan_scan_last_success_timestamp_seconds 0"),
+            "a registered Gauge must be EXPORTED before anything sets it, or the \
+             alert is silenced by absence instead of firing on staleness\n{rendered}"
+        );
+    }
+
+    /// THE CORE CLAIM. A failing probe must produce a state distinguishable
+    /// from "zero orphans" — which, before 2026-08-20, it did not: the gauge
+    /// held 0 and there was no second series to contradict it.
+    #[test]
+    fn a_failing_probe_is_distinguishable_from_zero_orphans() {
+        let m = metrics();
+
+        // A healthy sweep over a clean database: every count is 0.
+        publish_crypto_orphan_scan(Some(&m), &ok_scan());
+        let healthy_stamp = m.crypto_orphan_scan_last_success_timestamp_seconds.get();
+        assert_eq!(m.actor_memory_orphaned_rows.get(), 0);
+        assert!(
+            healthy_stamp > 1_700_000_000.0,
+            "a completed sweep must stamp a real unix time, got {healthy_stamp}"
+        );
+
+        // Now the actor_memory probe fails. The COUNT is identical — 0, held
+        // from the previous sweep — which is exactly why the old code was
+        // silent. The stamp is what differs.
+        let failed = CryptoOrphanScan {
+            actor_memory: Some(Err("relation \"actor_memory\" does not exist".into())),
+            ..ok_scan()
+        };
+        publish_crypto_orphan_scan(Some(&m), &failed);
+        assert_eq!(
+            m.actor_memory_orphaned_rows.get(),
+            0,
+            "the count must HOLD its last value, not zero and not a sentinel — \
+             every other consumer reads it as a row count"
+        );
+        assert_eq!(
+            m.crypto_orphan_scan_last_success_timestamp_seconds.get(),
+            healthy_stamp,
+            "an incomplete sweep must NOT advance the stamp; if it does, the \
+             blind alert can never fire"
+        );
+    }
+
+    /// Two measured tables plus one broken one is still blind. Partial data is
+    /// not a completed sweep, and for a data-loss detector over-reporting
+    /// blindness is the right side to err on.
+    #[test]
+    fn partial_success_does_not_advance_the_stamp() {
+        for failed in [
+            CryptoOrphanScan {
+                module_executions: Some(Err("timeout".into())),
+                ..ok_scan()
+            },
+            CryptoOrphanScan {
+                workflow_executions: Some(Err("permission denied".into())),
+                ..ok_scan()
+            },
+        ] {
+            let m = metrics();
+            publish_crypto_orphan_scan(Some(&m), &failed);
+            assert_eq!(
+                m.crypto_orphan_scan_last_success_timestamp_seconds.get(),
+                0.0,
+                "partial success must leave the stamp untouched"
+            );
+        }
+    }
+
+    /// A probe that was never ATTEMPTED is not a success either. This pins the
+    /// `Option<Result<..>>` shape: a future refactor that conditionally skips a
+    /// table must not be able to certify the sweep complete.
+    #[test]
+    fn a_skipped_probe_does_not_advance_the_stamp() {
+        let m = metrics();
+        publish_crypto_orphan_scan(
+            Some(&m),
+            &CryptoOrphanScan {
+                workflow_executions: None,
+                ..ok_scan()
+            },
+        );
+        assert_eq!(
+            m.crypto_orphan_scan_last_success_timestamp_seconds.get(),
+            0.0
+        );
+    }
+
+    /// Measured counts still reach their gauges — the fix must not break the
+    /// thing it is protecting.
+    #[test]
+    fn measured_counts_are_published() {
+        let m = metrics();
+        publish_crypto_orphan_scan(
+            Some(&m),
+            &CryptoOrphanScan {
+                actor_memory: Some(Ok(7)),
+                module_executions: Some(Ok(1)),
+                workflow_executions: Some(Ok(2)),
+            },
+        );
+        assert_eq!(m.actor_memory_orphaned_rows.get(), 7);
+        assert_eq!(m.module_execution_orphaned_rows.get(), 1);
+        assert_eq!(m.workflow_execution_orphaned_rows.get(), 2);
+        assert!(m.crypto_orphan_scan_last_success_timestamp_seconds.get() > 0.0);
+    }
+
+    /// The publisher must not panic when metrics are not installed — the
+    /// sweep loop calls it unconditionally now, where the old code skipped
+    /// the whole block (and therefore the queries too).
+    #[test]
+    fn no_collector_is_not_a_panic() {
+        publish_crypto_orphan_scan(None, &ok_scan());
     }
 }
