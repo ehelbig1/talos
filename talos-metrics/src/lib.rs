@@ -196,6 +196,37 @@ pub struct TalosMetrics {
     /// label set is touched), so an alert on it is never silenced by the
     /// absent-is-not-zero trap.
     pub module_executions_swept_stuck_total: Counter,
+    /// Job results discarded by the fire-and-forget `talos.results.*`
+    /// subscriber because the payload would not deserialize into a
+    /// `JobResult`.
+    ///
+    /// That subject is single-producer and single-type — only the worker
+    /// publishes there (`worker/src/main.rs::publish_result_with_retry`, the
+    /// no-reply-topic branch), pipeline results go to a different subject,
+    /// and guest WASM is denied the whole `talos.` prefix. So a message that
+    /// does not parse is an anomaly, never routine traffic, and the drop is
+    /// not free: that subscriber is the ONLY finalizer for the four
+    /// fire-and-forget dispatch paths that publish with no reply inbox (Gmail
+    /// push, Google-Calendar push, GCP Monitoring Pub/Sub, and the webhook
+    /// DLQ replay `talos_webhooks::router::dispatch_replay`). The live
+    /// webhook path uses `nats.request()` and is NOT one of them. One dropped
+    /// message loses the
+    /// terminal `module_executions` status write, the `output_data` payload,
+    /// and the `__ops_alert__` ingest that hangs off
+    /// `complete_execution_from_worker` — after which the 30-minute sweep
+    /// rewrites the row to `'timeout'`. Pre-metric this was a
+    /// `tracing::debug!`, a level not enabled by default, so the loss left no
+    /// operator-visible trace at all.
+    ///
+    /// UNLABELLED on purpose, for two independent reasons. The serde error
+    /// text is derived from an attacker-influenceable payload, so it is an
+    /// unbounded-cardinality surface on a scrapeable endpoint; and `job_id`
+    /// is unavailable by construction (the parse that would have produced it
+    /// is the thing that failed). Registration alone exports an unlabelled
+    /// `Counter` at 0 from process start, so `> 0` cannot be silenced by the
+    /// series being absent (a `CounterVec` emits nothing until a label set is
+    /// first touched).
+    pub job_results_dropped_unparseable_total: Counter,
     /// WORM audit-ledger verification failures. Labels:
     /// `stage=event|chain` — `event` is the inline per-message
     /// authenticity/integrity check at ingest (the message is quarantined,
@@ -1118,6 +1149,18 @@ impl TalosMetrics {
         )?;
         registry.register(Box::new(module_executions_swept_stuck_total.clone()))?;
 
+        let job_results_dropped_unparseable_total = Counter::new(
+            "talos_job_results_dropped_unparseable_total",
+            "Job results discarded by the talos.results.* subscriber because \
+             the payload would not deserialize into a JobResult. That \
+             subscriber is the only finalizer for the fire-and-forget \
+             module-bound dispatch paths, so each drop loses a terminal \
+             module_executions status write, its output_data, and its \
+             __ops_alert__ ingest. Registration alone exports it at 0, so an \
+             alert on it cannot be silenced by the series being absent.",
+        )?;
+        registry.register(Box::new(job_results_dropped_unparseable_total.clone()))?;
+
         let audit_verification_failures_total = CounterVec::new(
             prometheus::Opts::new(
                 "talos_audit_verification_failures_total",
@@ -1766,6 +1809,7 @@ impl TalosMetrics {
             wasm_log_orphaned_total,
             module_execution_record_started_failures_total,
             module_executions_swept_stuck_total,
+            job_results_dropped_unparseable_total,
             audit_verification_failures_total,
             worker_key_tofu_conflicts_total,
             worker_build_skew_workers,

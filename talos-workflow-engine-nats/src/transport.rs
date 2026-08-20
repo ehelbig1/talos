@@ -122,8 +122,165 @@ impl JobTransport for NatsTransport {
         // — `next()` will simply time out if the broker disconnects.
         let _ = self.client.flush().await;
         match sub.next().await {
-            Some(msg) => Ok(msg.payload.to_vec()),
+            Some(msg) => {
+                // A NATS `503 No Responders` control message is a REPLY with
+                // an EMPTY body, not an error — see
+                // `no_responders_error_for` for why this check has to be
+                // here and what it cost to be missing.
+                if let Some(e) = no_responders_error_for(msg.status, topic) {
+                    return Err(e);
+                }
+                Ok(msg.payload.to_vec())
+            }
             None => Err("inbox subscription closed before reply arrived".into()),
         }
+    }
+}
+
+/// Translate a NATS reply `status` into a delivery error when it is
+/// `503 No Responders`, i.e. the server had ZERO subscribers on the job
+/// subject at publish time and synthesised a reply so the requester would not
+/// hang.
+///
+/// # Why this is not free plumbing
+///
+/// `async_nats::Client::request()` performs exactly this check internally
+/// (`client.rs`, `if message.status == Some(StatusCode::NO_RESPONDERS)` →
+/// `RequestErrorKind::NoResponders`), and every other NATS request/reply in
+/// this workspace goes through it. This module is the one place that
+/// hand-rolls request/reply — H-1 requires the reply inbox to be allocated
+/// BEFORE the payload is signed, so the inbox can be HMAC-bound — and in
+/// doing so it dropped the status check.
+///
+/// The 503 body is empty, so without this the empty payload flowed into
+/// `serde_json::from_slice::<JobResult>` and surfaced as
+/// **"Failed to parse job result: EOF while parsing a value at line 1
+/// column 0"** — a message that blames the worker's output when in fact no
+/// worker existed. It cost two production workflow failures (2026-07-29,
+/// 2026-08-19), each an isolated dispatch with healthy neighbours either
+/// side: the signature of a sub-second reconnect window, not a fleet outage.
+///
+/// Returning `Err` also re-arms machinery that already exists:
+/// `dispatch_with_retry` retries delivery errors with backoff, but a 503
+/// arrived as `Ok(Ok(response))` and returned immediately. A 503 is the
+/// safest thing in the system to retry — zero subscribers means the message
+/// reached nobody, so a retry cannot double-execute a non-idempotent module.
+/// (The retry is still gated by the caller's `max_retries`; this does not
+/// widen it.)
+///
+/// Pure so the branch is testable without a broker.
+pub(crate) fn no_responders_error_for(
+    status: Option<async_nats::StatusCode>,
+    topic: &str,
+) -> Option<BoxError> {
+    if status == Some(async_nats::StatusCode::NO_RESPONDERS) {
+        return Some(
+            format!(
+                "no responders on '{topic}': no worker was subscribed when the \
+                 job was published (NATS 503). The job was delivered to nobody, \
+                 so it is safe to retry."
+            )
+            .into(),
+        );
+    }
+    None
+}
+
+#[cfg(test)]
+mod no_responders_tests {
+    use super::*;
+
+    #[test]
+    fn no_responders_status_becomes_a_delivery_error() {
+        let e = no_responders_error_for(Some(async_nats::StatusCode::NO_RESPONDERS), "talos.jobs")
+            .expect("503 must map to an error, not an empty payload");
+        let msg = e.to_string();
+        // The operator-visible attribution is the whole point of the fix: it
+        // must name the fleet, not the payload.
+        assert!(msg.contains("no responders"), "got: {msg}");
+        assert!(msg.contains("talos.jobs"), "subject must be named: {msg}");
+        assert!(
+            !msg.contains("parse"),
+            "must not blame the result payload: {msg}"
+        );
+    }
+
+    #[test]
+    fn ordinary_replies_pass_through() {
+        assert!(no_responders_error_for(None, "talos.jobs").is_none());
+        assert!(no_responders_error_for(Some(async_nats::StatusCode::OK), "talos.jobs").is_none());
+    }
+
+    /// Drives the CALL SITE, not just the pure helper above.
+    ///
+    /// This test exists because the pure-function test cannot fail if someone
+    /// deletes the `no_responders_error_for(...)` call from
+    /// `request_with_reply_inbox` — the "wrapper is wired but nothing calls
+    /// it" gap that structural check 58's own documentation names as the hole
+    /// a grep cannot close. Here the assertion runs through the real
+    /// `JobTransport` impl against a real broker.
+    ///
+    /// GATED, and honestly so: without `TALOS_TEST_NATS_URL` it returns
+    /// without asserting anything, exactly like the two live-NATS tests in
+    /// `dispatcher.rs`. A skip is not a pass; the guard for that is running it
+    /// against the dev stack, which is how this fix was validated.
+    #[tokio::test]
+    async fn call_site_converts_a_real_503_into_an_error() {
+        let Ok(url) = std::env::var("TALOS_TEST_NATS_URL") else {
+            eprintln!("skipping: set TALOS_TEST_NATS_URL to run");
+            return;
+        };
+        if url.is_empty() {
+            eprintln!("skipping: TALOS_TEST_NATS_URL is empty");
+            return;
+        }
+        // Credentials may be supplied out-of-band for brokers that require
+        // auth (the dev stack does); a bare URL is still the common case.
+        let client = Arc::new(
+            match (
+                std::env::var("TALOS_TEST_NATS_USER"),
+                std::env::var("TALOS_TEST_NATS_PASSWORD"),
+            ) {
+                (Ok(u), Ok(pw)) if !u.is_empty() => {
+                    async_nats::ConnectOptions::with_user_and_password(u, pw)
+                        .connect(&url)
+                        .await
+                        .expect("connect nats (user/password)")
+                }
+                _ => async_nats::connect(&url).await.expect("connect nats"),
+            },
+        );
+        let transport = NatsTransport::new(client.clone());
+        let inbox = client.new_inbox();
+
+        // A subject with ZERO subscribers — the production condition.
+        let err = transport
+            .request_with_reply_inbox(
+                "talos.jobs.nobody.is.listening.here",
+                &inbox,
+                b"{}".to_vec(),
+            )
+            .await
+            .expect_err("a 503 must surface as an error, not an empty payload");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no responders"),
+            "the call site must attribute this to the fleet, got: {msg}"
+        );
+    }
+
+    /// The exact production symptom, pinned: an EMPTY body — which is what a
+    /// 503 carries — parses as `Eof`. This is the byte-for-byte string that
+    /// appeared in `workflow_executions.error_message` on both occurrences,
+    /// and it is what the status check above now prevents anyone from seeing.
+    #[test]
+    fn empty_payload_is_the_eof_parse_error_we_observed() {
+        let err = serde_json::from_slice::<serde_json::Value>(b"")
+            .expect_err("an empty payload cannot parse");
+        assert_eq!(
+            err.to_string(),
+            "EOF while parsing a value at line 1 column 0"
+        );
     }
 }

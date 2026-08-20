@@ -1071,6 +1071,77 @@ groups:
             duration_ms is fabricated (it measures the sweep, not the module),
             so latency archaeology over this table is invalid for the window.
 
+      # ────────────────────────────────────────────────────────────────
+      # A job result that arrives on `talos.results.*` and does not
+      # deserialize is DISCARDED — and that subscriber is the only finalizer
+      # for the FOUR dispatch paths that publish with no reply inbox: Gmail
+      # push, Google Calendar push, GCP Monitoring Pub/Sub, and the webhook
+      # DLQ replay. (The LIVE webhook path uses `nats.request()`, so its
+      # result goes to a wire reply inbox and never reaches this subscriber —
+      # count the set from the publish call, not from `reply_topic: None`.)
+      # So one dropped message loses that execution's
+      # terminal status write, its `output_data`, and the `__ops_alert__`
+      # ingest — after which TalosModuleExecutionsNeverFinalize above will
+      # eventually fire on the SYMPTOM (a swept row) while this alert names
+      # the CAUSE.
+      #
+      # Until 2026-08 the drop was a `tracing::debug!` — a level not enabled
+      # by default — so it produced no signal of any kind. The engine
+      # dispatcher, handling the identical condition on the identical signed
+      # message type, fails the node outright. Two handlers, opposite
+      # treatment; this alert closes the observability half.
+      #
+      # THRESHOLD: `> 0`, not a rate. There is no benign background rate to
+      # tolerate. That subject is single-producer (only the worker's
+      # no-reply-topic branch publishes there), single-type (pipeline results
+      # use `talos.pipeline.results.*`, which this wildcard cannot match —
+      # NATS `*` is one token) and guest WASM is denied the entire `talos.`
+      # prefix. An unparseable message there is an anomaly by construction,
+      # and each one is a lost ledger row.
+      #
+      # `for: 15m` only so a single drop during a rolling deploy does not page
+      # instantly; the `increase(...[1h])` window means the alert still fires
+      # on ONE event and stays up for an hour after it.
+      #
+      # ABSENT vs ZERO: `talos_job_results_dropped_unparseable_total` is an
+      # UNLABELLED Counter, so registration alone exports it at 0 from
+      # controller start — this expression can never be silenced by the series
+      # not existing (a CounterVec would emit nothing until a label set were
+      # touched, which is why this one has no labels). Note the counter is
+      # deliberately unlabelled for a second reason too: the only available
+      # discriminator is the serde error text, which is derived from the
+      # payload and therefore both unbounded-cardinality and secret-bearing.
+      - alert: TalosJobResultsDropped
+        expr: increase(talos_job_results_dropped_unparseable_total[1h]) > 0
+        for: 15m
+        labels:
+          severity: warning
+          category: observability-loss
+        annotations:
+          summary: "Job results are being discarded before they can finalize an execution"
+          description: |
+            {{ $value | printf "%.0f" }} job result message(s) on talos.results.*
+            in the last hour could not be deserialized into a JobResult and were
+            discarded. That subscriber is the ONLY finalizer for the four
+            no-reply-inbox dispatch paths (Gmail push, Google Calendar push,
+            GCP Monitoring Pub/Sub, webhook DLQ replay), so each drop loses a
+            terminal
+            module_executions status write, its output_data, and its
+            __ops_alert__ ingest; the stuck-execution sweep will convert the row
+            to status='timeout' 30 minutes later.
+            Find the cause in the controller log: `event_kind=job_result_unparseable`
+            carries a `classify` field. `classify="eof_empty_or_truncated"` means
+            an EMPTY body — nothing should ever publish one to this subject, so
+            suspect a rogue publisher or a truncated NATS message. `classify=
+            "schema_mismatch"` means a worker is emitting a JobResult shape this
+            controller does not understand — check TalosWorkerBuildSkew, this is
+            what a half-rolled deploy looks like on the result path.
+            The error text is deliberately NOT logged: it is derived from worker
+            output and can quote secrets.
+            Blast radius: any execution whose result was dropped is
+            indistinguishable, in the database, from one whose worker never
+            answered.
+
   # ────────────────────────────────────────────────────────────────────
   # WORM audit-ledger integrity. Two independent verification layers, one
   # series: `stage=event` is the inline per-message check at ingest (the
