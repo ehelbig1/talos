@@ -101,6 +101,42 @@ pub trait SecretsResolver: Send + Sync {
     /// had a chance to return the last-known-good value. Impls should
     /// log internally.
     async fn refresh_vault_paths(&self, _paths: &[String]) {}
+
+    /// Optional **reactive** repair hook, invoked only after a dispatched job
+    /// has already failed with what looks like an authentication failure on a
+    /// credential this resolver owns.
+    ///
+    /// This is a different axis from
+    /// [`refresh_vault_paths`](Self::refresh_vault_paths). That one is
+    /// PREDICTIVE — it asks "is this credential near its recorded expiry?" and
+    /// is a no-op when the recorded expiry says the token is fine. A token can
+    /// nevertheless be rejected by the provider while the recorded expiry is
+    /// still in the future (the refresh that should have run failed
+    /// transiently, or the provider invalidated the token early). Only an
+    /// error-driven refresh recovers those, so this hook deliberately skips
+    /// the expiry predicate.
+    ///
+    /// Returns `true` **only when at least one path now holds a NEW
+    /// credential**. That return value is the caller's whole retry
+    /// authorisation:
+    ///
+    /// * `true`  — a fresh credential was stored; retrying can succeed, and
+    ///   re-resolving the paths is guaranteed to read the new value rather
+    ///   than replay the one that just failed.
+    /// * `false` — nothing was refreshed (the grant is revoked, the refresh
+    ///   itself failed, or there was nothing refreshable here). The caller
+    ///   **must not** retry: re-sending the same rejected credential is a
+    ///   guaranteed second failure and doubles load on the provider.
+    ///
+    /// Because a revoked grant can only ever produce `false`, a caller that
+    /// honours this contract cannot loop on one.
+    ///
+    /// The default implementation refreshes nothing and returns `false`,
+    /// which is the correct fail-safe for any resolver whose backing store
+    /// holds only long-lived secrets.
+    async fn force_refresh_vault_paths(&self, _paths: &[String]) -> bool {
+        false
+    }
 }
 
 /// Resolves a GitHub App installation token for a repo owner (RFC 0008 B4).

@@ -1821,6 +1821,78 @@ groups:
                detector and the reaper honest with each other.
 
   # ────────────────────────────────────────────────────────────────────
+  - name: talos.integrations
+    interval: 30s
+    rules:
+
+      # An OAuth integration's grant is dead: the token endpoint REFUSED a
+      # refresh that was attempted only because a running job had already been
+      # rejected by the provider with a 401. For Google and Atlassian that
+      # response is `HTTP 400 invalid_grant`, i.e. the refresh token was
+      # revoked or has expired.
+      #
+      # THIS ARM IS THE ONE THAT NEEDS A PERSON, which is why it is alerted and
+      # its siblings are not. `outcome="repaired"` means the platform healed
+      # itself and the node was retried; `outcome="not_refreshed"` means the
+      # provider has no refresh endpoint at all. Only `refresh_failed` is a
+      # state that persists until a human re-consents — every scheduled run of
+      # every workflow bound to that credential will keep failing until then,
+      # and nothing else in the system will say so.
+      #
+      # All three arms are pre-seeded at 0 in talos-metrics, so `increase()`
+      # has a series to reference before the first occurrence. Without that
+      # seed the counter would be ABSENT in the healthy steady state and this
+      # alert could not fire on the very first revocation — the one it exists
+      # for. (Absent is not zero: `increase(absent[6h]) > 0` matches nothing.)
+      #
+      # UNLABELLED BY PROVIDER OR ACCOUNT ON PURPOSE. The vault path's
+      # provider_key segment IS the user's e-mail address for gmail and
+      # google_calendar, and the provider segment is workflow-authored. The
+      # identifying detail lives in the controller's `talos_oauth_refresh`
+      # log target, with the provider_key hashed.
+      - alert: TalosOAuthCredentialNeedsReauth
+        expr: increase(talos_oauth_reactive_refresh_total{outcome="refresh_failed"}[6h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          category: integrations
+        annotations:
+          summary: "An OAuth integration's grant was refused on refresh — re-authorisation required"
+          description: |
+            A workflow node failed with an authentication error on a
+            Talos-held OAuth credential. The platform forced a token refresh
+            in response, and the provider REFUSED it — which is what a revoked
+            or expired grant looks like.
+
+            The node was NOT retried (retrying a dead grant is worse than
+            failing once), and it will keep failing on every scheduled run
+            until the integration is re-authorised by a human. Nothing in the
+            platform can fix this on its own: Talos can refresh a token, it
+            cannot re-consent on a user's behalf.
+          action: |
+            1. Find the credential: grep the controller log for
+               `target=talos_oauth_refresh outcome=refresh_failed`. The
+               vault_path field names the provider and a sha256 prefix of the
+               account (the raw provider_key is the user's e-mail and is
+               deliberately not logged).
+            2. Confirm it is the grant and not the client config —
+               `refresh_oauth_token` on that path reproduces the failure. An
+               `invalid_client` response means the CLIENT_ID/SECRET env vars
+               are wrong (a deploy problem, all accounts of that provider
+               affected); `invalid_grant` means the grant itself is dead (one
+               account affected).
+            3. For `invalid_grant` the only fix is re-consent in the frontend
+               Integrations page. Check the OAuth app's publishing status
+               first: a Google app left in "Testing" expires every refresh
+               token after 7 days, which is what caused the 2026-07-16 estate
+               outage.
+            4. Expect `talos_oauth_reactive_refresh_total{outcome="repaired"}`
+               to be the arm that moves in normal operation. If THAT one is
+               climbing, the predictive refresh is losing races and each
+               occurrence costs a doubled dispatch — worth investigating even
+               though nothing is failing.
+
+  # ────────────────────────────────────────────────────────────────────
   - name: talos.vault
     interval: 30s
     rules:

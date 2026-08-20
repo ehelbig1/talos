@@ -314,6 +314,36 @@ pub struct TalosMetrics {
     /// same cardinality rule as above, and the reaper's own WARN already
     /// carries the count.
     pub worker_identity_reaps_total: CounterVec,
+    /// Reactive OAuth credential repairs — one increment per credential per
+    /// repair attempt, fired only after a dispatched job has ALREADY failed
+    /// with an authentication error on a Talos-held OAuth credential.
+    ///
+    /// Labels: `outcome=repaired|not_refreshed|refresh_failed`, a closed set
+    /// of three `&'static str`. **Deliberately not labelled by provider,
+    /// user, or vault path**: the provider segment comes from a
+    /// workflow-authored `vault://oauth/<provider>/…` string (unbounded
+    /// cardinality from caller data), and the remaining segments are the
+    /// user id and — for gmail/google_calendar — the user's e-mail address.
+    ///
+    /// This counter is what makes the two failure MODES distinguishable,
+    /// which is the whole operator-facing point of the reactive path:
+    ///
+    /// * `repaired` — the credential was dead, a new token was obtained, and
+    ///   the node was re-dispatched. Self-healed; no action. A rising rate
+    ///   means the PREDICTIVE refresh is losing races and is worth a look,
+    ///   because each one costs a doubled dispatch.
+    /// * `refresh_failed` — the token endpoint refused. For Google and
+    ///   Atlassian that is what a REVOKED or expired grant looks like
+    ///   (`HTTP 400 invalid_grant`). The node failed and **will keep failing
+    ///   until a human re-consents** — this is the arm that needs a person.
+    /// * `not_refreshed` — nothing to refresh (no refresh endpoint for the
+    ///   provider, e.g. non-expiring Slack bot tokens). The 401 was not a
+    ///   staleness problem and the node was NOT retried.
+    ///
+    /// All three are pre-seeded at 0: the healthy steady state is that none
+    /// of them ever moves, which is exactly the case where an absent series
+    /// silently unfires an `increase(...) > 0` alert.
+    pub oauth_reactive_refresh_total: CounterVec,
     /// Distinct `worker_id`s with an ACTIVE `worker_identities` row that have
     /// proved liveness at least once — i.e. **the automatic reaper's
     /// population**. A row enters it on its first ping and never leaves
@@ -1166,6 +1196,32 @@ impl TalosMetrics {
                 .inc_by(0.0);
         }
 
+        let oauth_reactive_refresh_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_oauth_reactive_refresh_total",
+                "Reactive OAuth credential repairs attempted after a job \
+                 failed with an authentication error on a Talos-held OAuth \
+                 credential. Labels: \
+                 outcome=repaired|not_refreshed|refresh_failed. \
+                 `refresh_failed` is the arm that needs a human — the token \
+                 endpoint refused, which for Google/Atlassian means the grant \
+                 is revoked or expired and the integration must be \
+                 re-consented.",
+            ),
+            &["outcome"],
+        )?;
+        registry.register(Box::new(oauth_reactive_refresh_total.clone()))?;
+        // Seed all three: the healthy steady state is that NONE of them ever
+        // moves, so without seeding the whole family is absent and
+        // `increase(...) > 0` — the shape the re-auth alert uses — matches
+        // nothing. Every one of the three has a live emitting site in
+        // `OAuthCredentialService::force_refresh_oauth_tokens_in_batch`.
+        for outcome in ["repaired", "not_refreshed", "refresh_failed"] {
+            oauth_reactive_refresh_total
+                .with_label_values(&[outcome])
+                .inc_by(0.0);
+        }
+
         let worker_liveness_participants = IntGauge::new(
             "talos_worker_liveness_participants",
             "Distinct worker_ids with an ACTIVE worker_identities row that \
@@ -1661,6 +1717,7 @@ impl TalosMetrics {
             catalog_templates_missing_wasm,
             worker_liveness_pings_total,
             worker_identity_reaps_total,
+            oauth_reactive_refresh_total,
             worker_liveness_participants,
             worker_liveness_recent_participants,
             worker_liveness_population_truncated,
@@ -1835,6 +1892,12 @@ mod tests {
             r#"talos_worker_liveness_pings_total{outcome="error"} 0"#,
             r#"talos_worker_identity_reaps_total{arm="departed"} 0"#,
             r#"talos_worker_identity_reaps_total{arm="pre_protocol"} 0"#,
+            // Reactive OAuth repair. Same absent-is-not-zero reasoning: the
+            // healthy steady state is that no arm ever moves, and the re-auth
+            // alert is an `increase(...) > 0`.
+            r#"talos_oauth_reactive_refresh_total{outcome="repaired"} 0"#,
+            r#"talos_oauth_reactive_refresh_total{outcome="not_refreshed"} 0"#,
+            r#"talos_oauth_reactive_refresh_total{outcome="refresh_failed"} 0"#,
             // The D2 pair. Plain IntGauges, so they are exported from
             // registration — asserted anyway because the alert subtracts one
             // from the other and a vector match against a missing series

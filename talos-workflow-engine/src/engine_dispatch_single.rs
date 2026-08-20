@@ -370,9 +370,12 @@ impl ParallelWorkflowEngine {
         // claim; NO plaintext on the wire), otherwise the legacy inline WSK
         // envelope. The SAME helper backs the loop-body path so sealing applies
         // uniformly. L-1: AAD = execution_id binds the legacy AES-GCM tag.
+        // Hoisted out of the match arm below: the SAME path list is needed a
+        // second time if this dispatch comes back with the provider rejecting
+        // one of these credentials (the one-shot repair after `dispatch`).
+        let vault_paths = extract_vault_paths(&module_config);
         let secrets = match (self.secrets_resolver.as_ref(), &worker_shared_key) {
             (Some(resolver), Some(key)) => {
-                let vault_paths = extract_vault_paths(&module_config);
                 crate::secrets_pipeline::build_dispatch_secrets_for(
                     resolver.as_ref(),
                     self.secret_envelope.as_ref(),
@@ -399,7 +402,7 @@ impl ParallelWorkflowEngine {
             .copied()
             .unwrap_or(*DEFAULT_NODE_TIMEOUT_SECS);
 
-        let job = DispatchJob {
+        let mut job = DispatchJob {
             execution_id,
             node_id,
             module_id: module_id_resolved,
@@ -460,6 +463,32 @@ impl ParallelWorkflowEngine {
             emit_retry_events: true,
         };
 
+        // ── One-shot reactive OAuth credential repair ────────────────────
+        //
+        // Snapshot the job ONLY when a repair could actually happen: the node
+        // carries at least one `vault://oauth/…` credential AND a resolver and
+        // shared key are wired. On this deployment that is 35 nodes across 20
+        // enabled workflows; every other dispatch pays nothing.
+        //
+        // The WASM bytes are moved out before the clone and moved straight
+        // back, so the snapshot never copies them — inline components run to
+        // the NATS payload cap and cloning one per dispatch to insure against
+        // a once-a-month 401 would be the wrong trade. They are re-attached
+        // from `wasm_module` (still in scope) if the repair fires.
+        let repair_oauth_paths = if self.secrets_resolver.is_some() && worker_shared_key.is_some() {
+            crate::oauth_reauth::refreshable_oauth_paths(&vault_paths)
+        } else {
+            Vec::new()
+        };
+        let repair_seed: Option<DispatchJob> = if repair_oauth_paths.is_empty() {
+            None
+        } else {
+            let inline_bytes = job.wasm_bytes.take();
+            let seed = job.clone();
+            job.wasm_bytes = inline_bytes;
+            Some(seed)
+        };
+
         // Wall clock for the ledger row's `duration_ms`. Started immediately
         // before the dispatch so it measures the same span the pipeline path
         // reports as `execution_time_ms` and the loop path measures with its
@@ -481,8 +510,138 @@ impl ParallelWorkflowEngine {
         // into the fabricated 1,800,301 ms minimum this change exists to
         // stop, and the pipeline path's `execution_time_ms` has always been
         // discarded the same way.
+        //
+        // The span also covers the one-shot OAuth credential repair below when
+        // it fires — a forced token refresh plus a second dispatch. That is
+        // deliberate: the node really did take that long, and a repaired node
+        // showing its true (roughly doubled) latency is the honest reading.
         let dispatch_started = std::time::Instant::now();
-        let outcome = dispatcher.dispatch(job).await;
+        let mut outcome = dispatcher.dispatch(job).await;
+
+        // A dispatched job carries a credential the CONTROLLER resolved and
+        // sealed; the worker holds no refresh token and no database handle, so
+        // it cannot repair one — this is the only layer that can, and it is
+        // the layer that owns the resolver.
+        //
+        // Placed here rather than inside the dispatcher's retry loop for two
+        // reasons, both load-bearing:
+        //
+        //   1. `NodeDispatcher::dispatch` builds the wire `JobRequest` ONCE and
+        //      its retry loop re-publishes those same bytes. A retry there
+        //      would replay the credential that was just rejected — a
+        //      guaranteed second failure and doubled provider load. Here the
+        //      secrets are resolved from scratch, so the second attempt
+        //      carries the NEW token by construction.
+        //   2. The retry loop is gated by the node's author-written
+        //      `retry_condition`. Of the 35 OAuth-bearing nodes on this
+        //      deployment, 14 carry one restricted to network errors and the
+        //      other 21 carry `retry_count: 0` — so NEITHER route reaches the
+        //      retry classifier, and a 401 got zero attempts on all 35. A
+        //      credential repair is a different axis from the application
+        //      retry the author was reasoning about, and belongs above it.
+        //
+        // There is NO loop here: a single `if`, one re-dispatch. The bound is
+        // structural, not a counter that could be miscounted.
+        // Read the rejection out FIRST so no borrow of `outcome` is alive while
+        // the repair below reassigns it.
+        let credential_rejection: Option<String> = match &outcome {
+            Err(e) => {
+                let message = e.to_string();
+                crate::oauth_reauth::looks_like_credential_rejection(&message).then_some(message)
+            }
+            Ok(_) => None,
+        };
+        if let (Some(original_message), Some(seed)) = (credential_rejection, repair_seed) {
+            // Unwrap-free: `repair_oauth_paths` is only non-empty when both of
+            // these are `Some` (see the guard above).
+            if let (Some(resolver), Some(key)) =
+                (self.secrets_resolver.as_ref(), &worker_shared_key)
+            {
+                tracing::warn!(
+                    %node_id,
+                    %execution_id,
+                    credentials = repair_oauth_paths.len(),
+                    "Node failed with an authentication error on a Talos-held OAuth \
+                     credential — forcing a refresh and retrying once"
+                );
+
+                // The retry is authorised ONLY by a refresh that actually
+                // stored a NEW token. `false` covers every non-recoverable
+                // case at once — a revoked grant (the token endpoint
+                // answers 400 invalid_grant), a provider with no refresh
+                // endpoint, a refresh that failed — so a dead grant retries
+                // zero times rather than "retries with a bound".
+                let refreshed = resolver
+                    .force_refresh_vault_paths(&repair_oauth_paths)
+                    .await;
+
+                if !refreshed {
+                    // Enrich the failure the operator will read in
+                    // `get_execution_status`, naming re-authorisation as
+                    // the likely remedy. The provider/account is NOT named
+                    // here: for gmail / google_calendar the vault path's
+                    // provider_key IS the user's e-mail address, and this
+                    // string is persisted to `workflow_executions`.
+                    outcome = Err(format!(
+                        "{original_message} (OAuth credential refresh was refused — the \
+                             integration most likely needs to be re-authorised; not retried)"
+                    )
+                    .into());
+                } else {
+                    // Re-resolve from scratch. This read happens strictly
+                    // after the refresh wrote the vault, so it cannot
+                    // return the token that was just rejected.
+                    let fresh = crate::secrets_pipeline::build_dispatch_secrets_for(
+                        resolver.as_ref(),
+                        self.secret_envelope.as_ref(),
+                        module_id_resolved,
+                        self.user_id,
+                        &vault_paths,
+                        &wasm_module.allowed_secrets,
+                        key.as_bytes(),
+                        self.max_llm_tier,
+                        execution_id.as_bytes(),
+                    )
+                    .await;
+
+                    let mut retry_job = seed;
+                    // Re-attach the bytes the snapshot deliberately left
+                    // behind (identical decision to the first dispatch).
+                    retry_job.wasm_bytes =
+                        if crate::dispatch_bytes::embeds_inline(&wasm_module.wasm_bytes) {
+                            Some(wasm_module.wasm_bytes.clone())
+                        } else {
+                            None
+                        };
+                    retry_job.encrypted_secrets_ciphertext = fresh.encrypted.ciphertext;
+                    retry_job.encrypted_secrets_nonce = fresh.encrypted.nonce;
+                    retry_job.plaintext_secrets = fresh.plaintext;
+                    retry_job.secret_paths = fresh.secret_paths;
+
+                    match dispatcher.dispatch(retry_job).await {
+                        Ok(result) => {
+                            tracing::info!(
+                                %node_id,
+                                %execution_id,
+                                "Node recovered after an OAuth credential refresh"
+                            );
+                            outcome = Ok(result);
+                        }
+                        Err(retry_err) => {
+                            // One attempt, then stop. A second 401 after a
+                            // provably-new token is not staleness — it is a
+                            // scope or account problem a human must look at.
+                            outcome = Err(format!(
+                                "{retry_err} (retried once after refreshing the OAuth \
+                                     credential; the fresh token was rejected too)"
+                            )
+                            .into());
+                        }
+                    }
+                }
+            }
+        }
+
         let duration_ms = i32::try_from(dispatch_started.elapsed().as_millis()).unwrap_or(i32::MAX);
 
         // THE 2026-08-12 finding: this arm used to return without ever closing
@@ -840,5 +999,351 @@ mod single_node_ledger_finalize_tests {
             "failed"
         );
         assert_eq!(classify("Missing AUTH_HEADER config"), "failed");
+    }
+}
+
+#[cfg(test)]
+mod oauth_repair_tests {
+    //! Tests for the one-shot reactive OAuth credential repair.
+    //!
+    //! These drive the REAL `run_single_node_dispatch` — not a
+    //! re-implementation of its tail — through in-memory adapters, and every
+    //! one of them FAILS on the pre-fix tree: before the change a 401 on an
+    //! OAuth-bearing node produced exactly one dispatch, zero refreshes, and
+    //! the raw provider error.
+    //!
+    //! The property that matters most is not "it retried" but **"it could not
+    //! have replayed the credential that was just rejected"**. A retry that
+    //! re-sends a known-dead token is a guaranteed second failure and doubles
+    //! load on the provider. That is asserted structurally, by the ORDER of
+    //! the resolver's calls: the second `resolve_by_paths` must come strictly
+    //! after the `force_refresh_vault_paths`, so the value it reads cannot be
+    //! the one the first dispatch carried.
+
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use petgraph::graph::NodeIndex;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use talos_workflow_engine_core::{
+        BoxError, DispatchJob, DispatchResult, NodeDispatcher, SecretsResolver, WasmModuleArtifact,
+        WorkerSharedKey,
+    };
+    use talos_workflow_engine_test_utils::capture::CaptureModuleExecutionStore;
+    use talos_workflow_engine_test_utils::memory::InMemoryModuleFetcher;
+    use uuid::Uuid;
+
+    use crate::engine::ParallelWorkflowEngine;
+
+    const OAUTH_PATH: &str =
+        "oauth/gmail/56a7eea7-d1e0-4a53-b8ca-6ca4e19bb2f4/user@example.com/access_token";
+    /// Verbatim from `workflow_executions.error_message` on 2026-08-19.
+    const LIVE_401: &str = "execution failure: Component returned error: \
+         Gmail 401: access_token invalid or expired. Call refresh_oauth_token to force a refresh.";
+
+    // ── A dispatcher that answers a SCRIPTED SEQUENCE ────────────────────
+    //
+    // `ScriptedDispatcher` keys one response per module, which cannot express
+    // "fails, then succeeds" — the exact shape a repair produces.
+    struct SequencedDispatcher {
+        script: Mutex<std::collections::VecDeque<Result<serde_json::Value, String>>>,
+        calls: Mutex<usize>,
+    }
+
+    impl SequencedDispatcher {
+        fn new(script: Vec<Result<serde_json::Value, String>>) -> Arc<Self> {
+            Arc::new(Self {
+                script: Mutex::new(script.into()),
+                calls: Mutex::new(0),
+            })
+        }
+        fn calls(&self) -> usize {
+            *self.calls.lock().expect("calls mutex")
+        }
+    }
+
+    #[async_trait]
+    impl NodeDispatcher for SequencedDispatcher {
+        async fn dispatch(&self, _job: DispatchJob) -> Result<DispatchResult, BoxError> {
+            *self.calls.lock().expect("calls mutex") += 1;
+            match self
+                .script
+                .lock()
+                .expect("script mutex")
+                .pop_front()
+                .expect("dispatched more times than the script allows")
+            {
+                Ok(v) => Ok(DispatchResult { output: v }),
+                Err(e) => Err(e.into()),
+            }
+        }
+    }
+
+    // ── A resolver that RECORDS THE ORDER of its calls ───────────────────
+    struct RepairResolver {
+        /// `"resolve"` / `"force_refresh"`, in call order.
+        log: Mutex<Vec<&'static str>>,
+        /// What `force_refresh_vault_paths` reports. `false` models a revoked
+        /// grant (the token endpoint answered 400 `invalid_grant`).
+        refresh_succeeds: bool,
+        /// Paths the forced refresh was asked to repair.
+        refresh_targets: Mutex<Vec<String>>,
+    }
+
+    impl RepairResolver {
+        fn new(refresh_succeeds: bool) -> Arc<Self> {
+            Arc::new(Self {
+                log: Mutex::new(Vec::new()),
+                refresh_succeeds,
+                refresh_targets: Mutex::new(Vec::new()),
+            })
+        }
+        fn log(&self) -> Vec<&'static str> {
+            self.log.lock().expect("log mutex").clone()
+        }
+        fn refresh_calls(&self) -> usize {
+            self.log().iter().filter(|e| **e == "force_refresh").count()
+        }
+        fn refresh_targets(&self) -> Vec<String> {
+            self.refresh_targets.lock().expect("targets mutex").clone()
+        }
+    }
+
+    #[async_trait]
+    impl SecretsResolver for RepairResolver {
+        async fn resolve_module_secrets(
+            &self,
+            _node_id: Uuid,
+        ) -> Result<HashMap<String, String>, BoxError> {
+            Ok(HashMap::new())
+        }
+
+        async fn resolve_by_paths(
+            &self,
+            paths: &[String],
+            _user_id: Option<Uuid>,
+        ) -> Result<HashMap<String, String>, BoxError> {
+            self.log.lock().expect("log mutex").push("resolve");
+            Ok(paths
+                .iter()
+                .map(|p| (p.clone(), "token-bytes".to_string()))
+                .collect())
+        }
+
+        async fn force_refresh_vault_paths(&self, paths: &[String]) -> bool {
+            self.log.lock().expect("log mutex").push("force_refresh");
+            self.refresh_targets
+                .lock()
+                .expect("targets mutex")
+                .extend(paths.iter().cloned());
+            self.refresh_succeeds
+        }
+    }
+
+    fn artifact(module_id: Uuid) -> WasmModuleArtifact {
+        WasmModuleArtifact {
+            module_id,
+            content_hash: "stub".into(),
+            wasm_bytes: vec![1, 2, 3],
+            oci_url: None,
+            max_fuel: 1_000_000,
+            capability_world: "network-node".into(),
+            allowed_hosts: vec![],
+            allowed_methods: vec![],
+            allowed_secrets: vec![],
+            requires_approval_for: vec![],
+            integration_name: None,
+            config: None,
+        }
+    }
+
+    /// Run one node through the real dispatch path.
+    ///
+    /// `auth_header` is the node's `data.AUTH_HEADER` — the `Bearer
+    /// vault://…` shape every OAuth node on this deployment uses. Pass `None`
+    /// for a node holding no OAuth credential.
+    async fn run(
+        script: Vec<Result<serde_json::Value, String>>,
+        refresh_succeeds: bool,
+        auth_header: Option<&str>,
+    ) -> (
+        Result<serde_json::Value, String>,
+        Arc<SequencedDispatcher>,
+        Arc<RepairResolver>,
+    ) {
+        let node_id = Uuid::new_v4();
+        let module_id = Uuid::new_v4();
+        let dispatcher = SequencedDispatcher::new(script);
+        let resolver = RepairResolver::new(refresh_succeeds);
+
+        let mut engine = ParallelWorkflowEngine::new();
+        engine.set_user_id(Uuid::new_v4());
+        engine.set_module_execution_store(Arc::new(CaptureModuleExecutionStore::new()));
+        engine.set_module_fetcher(Arc::new(
+            InMemoryModuleFetcher::new().with_module(module_id, artifact(module_id)),
+        ));
+        engine.set_secrets_resolver(resolver.clone());
+        engine.add_node(node_id, Some(module_id), None, None);
+        if let Some(header) = auth_header {
+            engine
+                .node_configs
+                .insert(node_id, json!({ "AUTH_HEADER": header }));
+        }
+
+        let out = engine
+            .run_single_node_dispatch(
+                NodeIndex::new(0),
+                node_id,
+                Uuid::new_v4(),
+                dispatcher.clone(),
+                // A shared key must be present or no secrets are resolved at
+                // all — the same precondition production dispatch has.
+                Some(WorkerSharedKey::new(vec![7u8; 32])),
+                json!({ "seed": 1 }),
+                None,
+                None,
+                None,
+            )
+            .await
+            .1;
+        (out, dispatcher, resolver)
+    }
+
+    fn bearer() -> String {
+        format!("Bearer vault://{OAUTH_PATH}")
+    }
+
+    /// THE regression, and the ordering property that makes the retry safe.
+    #[tokio::test]
+    async fn a_401_refreshes_once_and_retries_once() {
+        let (out, dispatcher, resolver) = run(
+            vec![Err(LIVE_401.to_string()), Ok(json!({ "messages": [] }))],
+            true,
+            Some(&bearer()),
+        )
+        .await;
+
+        assert!(out.is_ok(), "node should have recovered, got {out:?}");
+        assert_eq!(dispatcher.calls(), 2, "exactly one retry, never more");
+        assert_eq!(resolver.refresh_calls(), 1, "exactly one forced refresh");
+        assert_eq!(
+            resolver.refresh_targets(),
+            vec![OAUTH_PATH.to_string()],
+            "the forced refresh targets the node's OAuth path and nothing else"
+        );
+        // The credential cannot have been replayed: the second resolve is
+        // strictly after the refresh that wrote the new token.
+        assert_eq!(
+            resolver.log(),
+            vec!["resolve", "force_refresh", "resolve"],
+            "secrets must be RE-RESOLVED after the refresh, not reused"
+        );
+    }
+
+    /// A revoked grant retries ZERO times — the bound is structural, not a
+    /// counter, so there is nothing to tune and nothing that can loop.
+    #[tokio::test]
+    async fn a_revoked_grant_does_not_retry_and_does_not_loop() {
+        let (out, dispatcher, resolver) =
+            run(vec![Err(LIVE_401.to_string())], false, Some(&bearer())).await;
+
+        let err = out.expect_err("a revoked grant must fail the node");
+        assert_eq!(
+            dispatcher.calls(),
+            1,
+            "a refused refresh must NOT re-send the dead credential"
+        );
+        assert_eq!(resolver.refresh_calls(), 1, "one attempt, then stop");
+        assert!(
+            err.contains("re-authorised"),
+            "operator must be told a human is needed; got: {err}"
+        );
+        // The original provider error survives — the enrichment adds context,
+        // it does not replace the diagnosis.
+        assert!(err.contains("401"), "original error preserved; got: {err}");
+    }
+
+    /// A second 401 after a provably-new token is not staleness. Stop, and say
+    /// so distinctly — otherwise the operator reads it as the same failure.
+    #[tokio::test]
+    async fn a_second_401_after_a_successful_refresh_stops_with_a_distinct_message() {
+        let (out, dispatcher, resolver) = run(
+            vec![Err(LIVE_401.to_string()), Err(LIVE_401.to_string())],
+            true,
+            Some(&bearer()),
+        )
+        .await;
+
+        let err = out.expect_err("two 401s must fail the node");
+        assert_eq!(dispatcher.calls(), 2, "must not attempt a third dispatch");
+        assert_eq!(
+            resolver.refresh_calls(),
+            1,
+            "the second failure must not trigger another refresh"
+        );
+        assert!(
+            err.contains("retried once after refreshing"),
+            "distinct from the refused-refresh message; got: {err}"
+        );
+    }
+
+    /// The narrow gate, exercised at its sharpest point: the node DOES carry
+    /// a `vault://` credential, it just isn't one this platform holds a
+    /// refresh token for. A static API key cannot be refreshed, so retrying
+    /// its 401 achieves nothing — and widening the repair to cover it would
+    /// put a retry on an unbounded population of caller-controlled endpoints.
+    #[tokio::test]
+    async fn a_401_on_a_node_with_a_non_oauth_credential_is_not_repaired() {
+        let (out, dispatcher, resolver) = run(
+            vec![Err(LIVE_401.to_string())],
+            true,
+            Some("Bearer vault://stripe/secret_key"),
+        )
+        .await;
+
+        assert!(out.is_err());
+        assert_eq!(dispatcher.calls(), 1);
+        assert_eq!(
+            resolver.refresh_calls(),
+            0,
+            "a vault path that is not oauth/ is not refreshable ⇒ no refresh, no retry"
+        );
+    }
+
+    /// Every OTHER way an OAuth node can fail must be untouched — a timeout is
+    /// not a credential problem and must not cost a token-endpoint round trip.
+    #[tokio::test]
+    async fn a_non_auth_failure_on_an_oauth_node_is_untouched() {
+        let (out, dispatcher, resolver) = run(
+            vec![Err("Job failed: node timed out after 120s".to_string())],
+            true,
+            Some(&bearer()),
+        )
+        .await;
+
+        let err = out.expect_err("timeout still fails");
+        assert_eq!(dispatcher.calls(), 1);
+        assert_eq!(resolver.refresh_calls(), 0);
+        assert_eq!(
+            err, "Job failed: node timed out after 120s",
+            "error text must pass through verbatim"
+        );
+    }
+
+    /// The happy path pays nothing: no refresh, no second dispatch.
+    #[tokio::test]
+    async fn a_successful_oauth_node_triggers_no_repair() {
+        let (out, dispatcher, resolver) =
+            run(vec![Ok(json!({ "ok": true }))], true, Some(&bearer())).await;
+
+        assert!(out.is_ok());
+        assert_eq!(dispatcher.calls(), 1);
+        assert_eq!(resolver.refresh_calls(), 0);
+        assert_eq!(
+            resolver.log(),
+            vec!["resolve"],
+            "one resolve, no forced refresh"
+        );
     }
 }
