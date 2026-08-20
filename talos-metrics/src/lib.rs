@@ -8,7 +8,9 @@
 //! - Cache hit/miss rates
 //! - DLQ metrics
 
-use prometheus::{exponential_buckets, Counter, CounterVec, HistogramVec, IntGauge, Registry};
+use prometheus::{
+    exponential_buckets, Counter, CounterVec, Gauge, HistogramVec, IntGauge, Registry,
+};
 use std::sync::{Arc, OnceLock};
 
 /// The complete, closed set of `phase` label values on
@@ -837,6 +839,45 @@ pub struct TalosMetrics {
     pub actor_memory_orphaned_rows: IntGauge,
     pub module_execution_orphaned_rows: IntGauge,
     pub workflow_execution_orphaned_rows: IntGauge,
+    /// Unix time of the last crypto-orphan sweep in which **all three** of the
+    /// gauges above were successfully measured.
+    ///
+    /// **This is the companion "the detector could not measure" signal for the
+    /// three `critical` / data-loss orphan alerts**, and it exists for exactly
+    /// the reason `fuel_utilisation_observed_nodes` exists for
+    /// `fuel_high_utilisation_nodes`: an `IntGauge` exports 0 from
+    /// registration, so `talos_actor_memory_orphaned_rows == 0` covers BOTH
+    /// "measured, and there are no orphans" and "the `SELECT COUNT(*)` errored
+    /// and nothing was ever measured". Those two readings are the same number,
+    /// and one of them means the only automated notice that at-rest ciphertext
+    /// has become unrecoverable is switched off.
+    ///
+    /// **Deliberately NOT folded into the orphan counts.** Publishing a
+    /// sentinel (`-1`, or a synthetic large value) on failure would make the
+    /// counts untrustworthy to every other consumer — `get_health_dashboard`,
+    /// the runbook's psql cross-check, and the `{{ $value }}` in the alert
+    /// summary all read them as row counts. The blind signal is a separate
+    /// series; the counts keep their meaning and simply stop advancing.
+    ///
+    /// **Why a freshness timestamp rather than a `blind`/`failed` counter.**
+    /// A `blind == 0` gauge is itself an unmeasured zero: if the sweep task
+    /// never spawns, panics, or is removed in a refactor, nothing sets it and
+    /// it reads "not blind" forever — the same defect one level up, which is
+    /// the failure mode this whole change exists to remove. A timestamp that
+    /// only ever advances on a fully successful sweep degrades the right way
+    /// in all four cases: query error, task death, task never spawned, and
+    /// controller build predating the sweep (0 from registration, which reads
+    /// as maximally stale). The form is the same one
+    /// `talos_backup_drill_last_success_timestamp_seconds` already uses.
+    ///
+    /// **PARTIAL failure counts as blind, on purpose.** Only a sweep in which
+    /// all three probes returned advances this. One broken probe leaves two
+    /// trustworthy gauges and still raises the alert; for a data-loss detector
+    /// that is the right side to err on, and the WARN log
+    /// (`target: "talos_crypto"`) names which table failed.
+    ///
+    /// `TalosCryptoOrphanDetectorBlind` is the alert that consumes it.
+    pub crypto_orphan_scan_last_success_timestamp_seconds: Gauge,
     pub dek_cache_size: IntGauge,
     /// Total connections currently held by the controller's sqlx
     /// Postgres pool (idle + in-use). Sampled periodically by a
@@ -1662,6 +1703,20 @@ impl TalosMetrics {
         )?;
         registry.register(Box::new(workflow_execution_orphaned_rows.clone()))?;
 
+        let crypto_orphan_scan_last_success_timestamp_seconds = Gauge::new(
+            "talos_crypto_orphan_scan_last_success_timestamp_seconds",
+            "Unix time of the last crypto-orphan sweep in which ALL THREE \
+             talos_*_orphaned_rows gauges were measured. Not seeded and not \
+             reset: it reads 0 until the first fully successful sweep, which \
+             is maximally stale, so a controller that never ran the sweep is \
+             loud rather than silent. The three orphan gauges read 0 both when \
+             clean and when unmeasured; this is how those cases are told \
+             apart. TalosCryptoOrphanDetectorBlind alerts on it.",
+        )?;
+        registry.register(Box::new(
+            crypto_orphan_scan_last_success_timestamp_seconds.clone(),
+        ))?;
+
         let dek_cache_size = IntGauge::new(
             "talos_dek_cache_size",
             "Current number of DEKs held in the in-memory decryption cache. \
@@ -1749,6 +1804,7 @@ impl TalosMetrics {
             actor_memory_orphaned_rows,
             module_execution_orphaned_rows,
             workflow_execution_orphaned_rows,
+            crypto_orphan_scan_last_success_timestamp_seconds,
             dek_cache_size,
             db_pool_connections,
             db_pool_idle_connections,
@@ -1833,6 +1889,12 @@ mod tests {
             "talos_actor_memory_orphaned_rows",
             "talos_module_execution_orphaned_rows",
             "talos_workflow_execution_orphaned_rows",
+            // The meta-detector's series. It is registered but deliberately
+            // NOT set above: the assertion below is that it renders as 0 on a
+            // registry nothing has stamped, because `time() - 0` is what makes
+            // TalosCryptoOrphanDetectorBlind fire for a controller whose sweep
+            // never completed.
+            "talos_crypto_orphan_scan_last_success_timestamp_seconds",
             "talos_dek_cache_size",
         ] {
             assert!(
@@ -1845,6 +1907,12 @@ mod tests {
         assert!(rendered.contains(r#"talos_kek_decrypt_failures_total{provider="both"} 2"#));
         assert!(rendered.contains("talos_actor_memory_orphaned_rows 3"));
         assert!(rendered.contains("talos_dek_cache_size 42"));
+        assert!(
+            rendered.contains("talos_crypto_orphan_scan_last_success_timestamp_seconds 0"),
+            "an unstamped freshness gauge must EXPORT 0, not be absent — an \
+             absent series makes `time() - x > 600` an empty vector, which is \
+             the detector silenced by its own condition (#625)"
+        );
     }
 
     /// Absence is not zero. A `CounterVec` emits NOTHING until some label set
