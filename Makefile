@@ -159,7 +159,7 @@ rebuild: ## Hot-rebuild one service (SERVICE=controller|worker|frontend|...)
 restart: ## Restart one service without rebuilding (SERVICE=...)
 	@docker compose restart -- "$(SERVICE)"
 
-observability-reload: ## Apply edited Prometheus rules/config to the running stack (no recreate)
+observability-reload: ## Apply edited Prometheus AND Alertmanager config to the running stack (no recreate)
 	@# POST /-/reload, not a restart: it keeps the in-memory TSDB head, so the
 	@# user's local metric history survives. Enabled by --web.enable-lifecycle
 	@# on the dev stack only (port is bound to 127.0.0.1; prod ships no
@@ -178,9 +178,30 @@ observability-reload: ## Apply edited Prometheus rules/config to the running sta
 	  000) printf 'no response from http://127.0.0.1:9090 — is the stack up? (make up)\n'; exit 1 ;; \
 	  *)   printf 'reload failed with HTTP %s\n' "$$code"; exit 1 ;; \
 	esac
+	@# ALERTMANAGER TOO, and it is not optional. Leg E of
+	@# scripts/verify-observability.sh compares Alertmanager's LOADED config
+	@# against alertmanager.yml on disk, and its remedy line names this target
+	@# — a target that reloaded only Prometheus would be a WRONG REMEDY in an
+	@# error message, which this file's 403 comment above already argues costs
+	@# more than no message at all. Alertmanager needs no --web.enable-lifecycle
+	@# (that flag is Prometheus-only and Alertmanager rejects it outright, see
+	@# docker-compose.yml); POST /-/reload is always served.
+	@if [ "$$(docker inspect -f '{{.State.Running}}' talos-alertmanager 2>/dev/null)" = "true" ]; then \
+	  amcode="$$(curl -s -o /dev/null -w '%{http_code}' -XPOST http://127.0.0.1:9093/-/reload 2>/dev/null)"; \
+	  case "$$amcode" in \
+	    200) printf 'alertmanager reloaded\n' ;; \
+	    000) printf 'alertmanager is running but http://127.0.0.1:9093 did not answer.\n'; \
+	         printf '  -> its config was NOT reloaded; delivery is still using the old one.\n'; \
+	         exit 1 ;; \
+	    *)   printf 'alertmanager reload failed with HTTP %s - config NOT applied\n' "$$amcode"; \
+	         exit 1 ;; \
+	  esac; \
+	else \
+	  printf 'alertmanager is not running - nothing to reload there (leg D reports it)\n'; \
+	fi
 	@$(MAKE) --no-print-directory observability-verify
 
-observability-verify: ## Prove the running Prometheus reads THIS repo (rules + config parity)
+observability-verify: ## Prove the running Prometheus AND Alertmanager read THIS repo (rules + config parity)
 	@bash scripts/verify-observability.sh
 
 logs: ## Tail logs for one service (SERVICE=..., empty for all: `make logs SERVICE=`)

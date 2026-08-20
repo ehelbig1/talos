@@ -86,7 +86,26 @@ groups:
         labels:
           severity: critical
           category: data-loss
-          runbook: https://github.com/OWNER/talos/blob/main/docs/security/operational-runbook.md#dek-orphan
+        # NO `runbook:` LABEL, AND ITS ABSENCE IS THE FIX. This alert carried
+        # the only one in the file — 1 of 45 — and it was broken twice over:
+        # a literal unsubstituted `OWNER` in the URL (this repo is `ehelbig1`),
+        # and a `#dek-orphan` anchor that has never existed in
+        # docs/security/operational-runbook.md. So it pointed nowhere, on the
+        # one alert whose payloads are UNRECOVERABLE.
+        #
+        # Fixing the URL would have left a worse problem than it solved: an
+        # operator who learns "read the runbook label" gets nothing on the
+        # other 44, which is a coverage claim the file cannot honour. Those 44
+        # put remediation in an `action:` ANNOTATION, which is also the correct
+        # home — a label is part of an alert's IDENTITY (it participates in
+        # grouping, inhibition and dedup in alertmanager.yml), not a place for
+        # a human-readable pointer. This alert's own `action:` below already
+        # carries the full procedure, so nothing was lost with the label.
+        #
+        # observability/alerts_chart_test.yml PINNED the broken URL as an
+        # expected label, so the promtool suite was green the whole time it
+        # pointed nowhere — a pin over a wrong value certifies nothing. That
+        # expectation is removed in the same commit.
         annotations:
           summary: "{{ $value }} actor_memory row(s) reference a missing DEK"
           description: |
@@ -106,7 +125,11 @@ groups:
                      SELECT 1 FROM encryption_keys ek WHERE ek.id = am.value_key_id \
                    );"
             2. Decide: delete orphans, or hold for forensic dump before delete.
-            3. Follow docs/security/operational-runbook.md § DEK orphan.
+            3. There is deliberately no further pointer here. This step used to
+               read "Follow docs/security/operational-runbook.md § DEK orphan"
+               and that section has never existed, so the two steps above ARE
+               the procedure. Nothing recovers the rows; the only decision is
+               whether to dump them first.
 
       - alert: TalosModuleExecutionPayloadOrphaned
         expr: talos_module_execution_orphaned_rows > 0
@@ -288,7 +311,10 @@ groups:
           action: |
             1. Check Vault transit key version: `vault read transit/keys/talos-kek`
             2. Check controller KEK_PROVIDER env: matches Vault or env?
-            3. Review `docs/security/kek-to-kms-plan.md` § recovery.
+            3. Review `docs/security/operational-runbook.md` § 1.4 (Lost-KEK
+               disaster). This step used to name `docs/security/kek-to-kms-plan.md`,
+               which has never existed in this repo — retargeted, not invented:
+               § 1.4 is the recovery content it was reaching for.
             4. If Vault is unreachable, failing over to KEK_PROVIDER=env
                works iff TALOS_MASTER_KEY is the key the DEKs were
                originally wrapped with.
