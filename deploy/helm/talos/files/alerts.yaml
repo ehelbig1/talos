@@ -1110,6 +1110,54 @@ groups:
       - alert: TalosWorkerBuildSkew
         expr: talos_worker_build_skew_workers > 0
         for: 30m
+        # A CONTROLLER RESTART MUST NOT RESOLVE THIS. The gauge is republished
+        # by a 60s background task in controller/src/bootstrap/background.rs
+        # whose FIRST tick is deliberately skipped, so for ~60s after every
+        # controller start this gauge reads 0 — and that 0 is EXPORTED, not
+        # absent: a registered prometheus IntGauge serves its initial value the
+        # moment /metrics is scraped, before anything has measured it. (The
+        # explicit `.set(0)` pre-seeds elsewhere in talos-metrics are
+        # belt-and-braces for the same reason; the CounterVec caveat in
+        # CLAUDE.md is about VECs, which really do export nothing until a label
+        # set is touched.) Verified on the live stack at 30s resolution across
+        # the 01:26:15Z restart of 2026-08-19: 1.0, 1.0, 0.0, 0.0, 1.0, 1.0 —
+        # present throughout, never a gap.
+        #
+        # An unmeasured 0 is indistinguishable from a measured healthy one, so
+        # `> 0` stops matching, the alert RESOLVES, and when the gauge
+        # repopulates it must serve the full `for: 30m` again before re-firing.
+        #
+        # MEASURED on the dev stack 2026-08-19, 24h of ALERTS{alertstate="firing"}
+        # at 60s resolution: 19 separate firing EPISODES of this one alert,
+        # against a condition that was continuously true. With
+        # send_resolved: true that is 38 notifications for one unchanging fact.
+        # The mechanism was forced, not inferred: the zero windows line up with
+        # drops in talos_workflow_executions_total (a COUNTER, so it can only
+        # fall on a process restart) and with talos_worker_fleet_live_workers
+        # going 1->0->1, and their LENGTH matches the task interval exactly
+        # (1 min here, 5 min for the 300s fuel task).
+        #
+        # A restarting controller therefore cannot fire a fleet alert — which
+        # is the case you most want it to. Same family as `absent is not zero`:
+        # the detector is disabled by a condition adjacent to the one it
+        # reports on.
+        #
+        # keep_firing_for, not max_over_time(): it leaves the expression and
+        # `{{ $value }}` meaning exactly what they meant (the CURRENT count,
+        # not a window peak), so no annotation becomes a number that no longer
+        # says what its name says. Cost: a genuinely-fixed skew stays firing
+        # for up to 5 extra minutes.
+        #
+        # VERSION FLOOR, stated with what was and was not checked: verified
+        # working on Prometheus 2.48.0, which is what the dev stack runs and
+        # what promtool drove these tests with. `keep_firing_for` is a
+        # relatively recent addition, so a Prometheus older than the dev stack's
+        # would reject this file at load — and for the chart path, the
+        # PrometheusRule CRD must be new enough to carry the field through to
+        # the operator's Prometheus. NEITHER of those floors was tested here
+        # (there is no cluster to test them on); if you run this chart against
+        # an older stack, check that first.
+        keep_firing_for: 5m
         labels:
           severity: warning
           category: fleet-identity
@@ -2446,6 +2494,22 @@ groups:
       - alert: TalosFuelHeadroomLow
         expr: talos_fuel_high_utilisation_nodes > 0
         for: 30m
+        # Same defect as TalosWorkerBuildSkew above, read that comment first.
+        # This gauge's task ticks every 300s and skips its first tick, so a
+        # controller restart leaves it at its registration-time `.set(0)`
+        # pre-seed for a full FIVE minutes — an unmeasured 0 published as a
+        # measured healthy one, which resolves this alert every time.
+        # MEASURED: 11 firing episodes in 24h against a continuously-true
+        # condition (22 notifications for one unchanging fact).
+        #
+        # 10m rather than the 5m above because the window must exceed the
+        # refresh interval with margin. It does NOT reintroduce the
+        # permanently-red behaviour the clearing test guards against: that test
+        # is about maxing the UTILISATION RATIO over a 30-day window, which
+        # would hold the alert up for a month after a budget fix. This holds it
+        # for ten minutes, and the clearing test still drives the alert to
+        # inactive after the budget is raised.
+        keep_firing_for: 10m
         labels:
           severity: warning
           category: capacity
