@@ -2124,8 +2124,7 @@ pub(crate) async fn seed_templates(
         // guess. Parsing lives next to the column it feeds; see
         // `parse_manifest_allowed_methods` for why an unknown verb is dropped
         // rather than skipping the whole template.
-        let allowed_methods =
-            talos_registry::reconcile::parse_manifest_allowed_methods(&manifest);
+        let allowed_methods = talos_registry::reconcile::parse_manifest_allowed_methods(manifest);
 
         let code_template = template.source();
 
