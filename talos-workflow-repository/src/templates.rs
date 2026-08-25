@@ -758,6 +758,9 @@ pub struct NodeTemplateRow {
     /// operator override and is honored verbatim.
     pub max_retries: i32,
     /// HTTP method allowlist — input to the method-aware retry default.
+    /// An EMPTY list means "allow every verb" at the worker's enforcement
+    /// point, so the retry default reads it as UNKNOWN and stamps 0.
+    /// Read-only retries require a declared `["GET"]`/`["GET","HEAD"]`.
     pub allowed_methods: Vec<String>,
     /// Capability world — input to the method-aware retry default, and the
     /// gate on whether `__actor_context__` is injected into this module's

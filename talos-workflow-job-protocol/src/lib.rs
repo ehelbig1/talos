@@ -3225,6 +3225,14 @@ pub struct JobRequest {
 
     pub allowed_hosts: Vec<String>,
     /// HTTP method allowlist. Empty = allow all methods. Non-empty = restrict to listed methods.
+    ///
+    /// Note the asymmetry with the two neighbouring lists: an empty
+    /// `allowed_hosts` DENIES all hosts and an empty `allowed_secrets`
+    /// DENIES all secrets, but an empty `allowed_methods` ALLOWS every
+    /// verb. Because of that, the retry classifier
+    /// (`talos_workflow_engine_core::default_max_retries_for_module`)
+    /// treats an empty list as UNKNOWN rather than read-only and grants
+    /// no default retries — read-only has to be declared.
     #[serde(default)]
     pub allowed_methods: Vec<String>,
     /// Secret allowlist. Empty = deny all. `["*"]` = allow all. Otherwise explicit secret names.

@@ -56,14 +56,36 @@ pub const DEFAULT_TRANSIENT_RETRIES: u32 = 2;
 ///
 /// * `minimal` / `secrets` worlds have no HTTP or side-effect surface
 ///   (pure compute + host-mediated LLM calls) — retrying is safe.
-/// * `http` / `agent` worlds are safe only when every allowed method
-///   is `GET`/`HEAD` (an empty list means the module cannot make any
-///   outbound call at all, which is also safe).
+/// * `http` / `agent` worlds are safe only when the module DECLARES a
+///   method allowlist and every entry in it is `GET`/`HEAD`.
 /// * Everything else — `governance` (approval gates must not re-fire
 ///   on rejection), `messaging`, `database`, `network`, `filesystem`,
 ///   `cache`, `automation`, `trusted`, and any world this function
 ///   does not recognise — fails closed to 0 retries. Per-node
 ///   `retry_count` remains the explicit override for those.
+///
+/// # An EMPTY method list is UNKNOWN, not read-only
+///
+/// This function used to read an empty `allowed_methods` as read-only,
+/// because `[].iter().all(..)` is vacuously true. That made the platform
+/// disagree with itself: at the ENFORCEMENT point an empty list means
+/// "allow every method" (`talos-worker-runtime/src/host/http.rs` on both
+/// `fetch` and `fetch_all`, and `host/graphql.rs` for the always-POST
+/// GraphQL call), so an undeclared module may `POST`/`PUT`/`DELETE`/
+/// `PATCH` freely — and was nonetheless handed blind transient retries,
+/// which is exactly the non-idempotent re-fire this function exists to
+/// prevent. An absent declaration is an absence of evidence, so it now
+/// resolves to 0.
+///
+/// Note that `allowed_methods` is the ODD ONE OUT among the per-module
+/// declaration lists: an empty `allowed_hosts` and an empty
+/// `allowed_secrets` both DENY ALL (`host/http.rs`, `host/webhook.rs`,
+/// `job_protocol::vault_path_permitted`). Do not generalise "empty
+/// means unrestricted" from this one field.
+///
+/// A module author who wants transient retries declares `["GET"]` (or
+/// `["GET", "HEAD"]`); a node author who wants them regardless sets an
+/// explicit `retry_count`. Both are explicit, which is the point.
 ///
 /// Accepts both bare (`"http"`) and node-suffixed (`"http-node"`)
 /// world spellings; `None`/empty world fails closed to 0.
@@ -81,9 +103,13 @@ pub fn default_max_retries_for_module(
         .trim()
         .trim_end_matches("-node")
         .to_ascii_lowercase();
-    let methods_read_only = allowed_methods
-        .iter()
-        .all(|m| matches!(m.trim().to_ascii_uppercase().as_str(), "GET" | "HEAD"));
+    // `!is_empty()` is load-bearing, not defensive: `.all()` over an empty
+    // slice is vacuously true, and empty means "allow every method" at the
+    // worker's enforcement point. Read-only must be DECLARED.
+    let methods_read_only = !allowed_methods.is_empty()
+        && allowed_methods
+            .iter()
+            .all(|m| matches!(m.trim().to_ascii_uppercase().as_str(), "GET" | "HEAD"));
     match world.as_str() {
         "minimal" | "secrets" => DEFAULT_TRANSIENT_RETRIES,
         "http" | "agent" if methods_read_only => DEFAULT_TRANSIENT_RETRIES,
@@ -241,11 +267,41 @@ mod default_for_module_tests {
     }
 
     #[test]
-    fn http_world_with_empty_methods_is_read_only() {
-        // No allowed methods = no egress at all; retrying is safe.
+    fn undeclared_method_list_is_unknown_and_fails_closed() {
+        // An EMPTY `allowed_methods` is an ABSENT declaration, not a
+        // read-only one. `[].iter().all(..)` is vacuously true, and the
+        // worker's enforcement point reads empty as "allow every method"
+        // (`host/http.rs` fetch + fetch_all, `host/graphql.rs`), so an
+        // undeclared module can POST. Resolve it to 0.
+        //
+        // If this assertion fails: the classifier has started granting
+        // retries on the strength of an absent declaration again — check
+        // the `!allowed_methods.is_empty()` conjunct in
+        // `default_max_retries_for_module`, and re-read whether the
+        // worker still treats an empty list as unrestricted.
+        for world in ["http", "http-node", "agent", "agent-node"] {
+            assert_eq!(
+                default_max_retries_for_module(&[], Some(world)),
+                0,
+                "{world}: an undeclared method list must not earn retries"
+            );
+        }
+        // A declared read-only list still does, so the fix narrows only
+        // the undeclared case.
         assert_eq!(
-            default_max_retries_for_module(&[], Some("http-node")),
+            default_max_retries_for_module(&methods(&["GET"]), Some("http-node")),
             DEFAULT_TRANSIENT_RETRIES
+        );
+        assert_eq!(
+            default_max_retries_for_module(&methods(&["GET", "HEAD"]), Some("agent-node")),
+            DEFAULT_TRANSIENT_RETRIES
+        );
+        // A list of blank entries is a declaration of nothing recognisable
+        // and must fail closed the same way (it is non-empty, so the
+        // `is_empty` conjunct does not carry it — the GET/HEAD match does).
+        assert_eq!(
+            default_max_retries_for_module(&methods(&["", "   "]), Some("http-node")),
+            0
         );
     }
 
