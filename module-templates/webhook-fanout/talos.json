@@ -8,6 +8,9 @@
   "allowed_hosts": [
     "*"
   ],
+  "allowed_methods": [
+    "POST"
+  ],
   "requires_secrets": [],
   "config_schema": {
     "type": "object",

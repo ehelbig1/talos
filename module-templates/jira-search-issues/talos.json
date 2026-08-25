@@ -8,6 +8,9 @@
   "allowed_hosts": [
     "api.atlassian.com"
   ],
+  "allowed_methods": [
+    "GET"
+  ],
   "requires_secrets": [
     "oauth/atlassian/*"
   ],

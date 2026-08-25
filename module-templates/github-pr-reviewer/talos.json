@@ -6,6 +6,10 @@
   "category": "Development",
   "capability_world": "secrets-node",
   "allowed_hosts": ["api.github.com"],
+  "allowed_methods": [
+    "GET",
+    "POST"
+  ],
   "requires_secrets": ["github/token"],
   "requires_approval_for": [],
   "config_schema": {

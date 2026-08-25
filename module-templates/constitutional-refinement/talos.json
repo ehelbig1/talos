@@ -6,6 +6,9 @@
   "category": "AI",
   "capability_world": "secrets-node",
   "allowed_hosts": ["api.openai.com", "api.anthropic.com"],
+  "allowed_methods": [
+    "POST"
+  ],
   "allowed_secrets": ["*"],
   "config_schema": {
     "type": "object",

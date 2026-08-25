@@ -6,6 +6,9 @@
   "category": "Payments",
   "capability_world": "secrets-node",
   "allowed_hosts": ["api.stripe.com"],
+  "allowed_methods": [
+    "POST"
+  ],
   "requires_secrets": ["stripe/secret_key"],
   "config_schema": {
     "type": "object",

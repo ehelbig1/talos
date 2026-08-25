@@ -4,6 +4,9 @@
   "capability_world": "network-node",
   "description": "Trigger, acknowledge, or resolve a PagerDuty incident via the Events API v2.",
   "allowed_hosts": ["events.pagerduty.com"],
+  "allowed_methods": [
+    "POST"
+  ],
   "requires_secrets": ["pagerduty/integration_key"],
   "config_schema": {
     "type": "object",

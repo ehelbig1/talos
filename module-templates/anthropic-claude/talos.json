@@ -6,6 +6,9 @@
   "category": "AI",
   "capability_world": "secrets-node",
   "allowed_hosts": ["api.anthropic.com"],
+  "allowed_methods": [
+    "POST"
+  ],
   "requires_secrets": ["anthropic/api_key"],
   "setup_instructions": [
     "1. Store your Anthropic API key: create_secret {name: 'anthropic/api_key', value: 'sk-ant-...', namespace: 'ai'}",

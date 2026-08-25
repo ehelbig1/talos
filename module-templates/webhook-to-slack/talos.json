@@ -6,6 +6,9 @@
   "category": "Communication",
   "capability_world": "http-node",
   "allowed_hosts": ["hooks.slack.com"],
+  "allowed_methods": [
+    "POST"
+  ],
   "requires_secrets": [],
   "requires_approval_for": [],
   "config_schema": {

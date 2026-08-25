@@ -6,6 +6,9 @@
   "category": "Data",
   "capability_world": "database-node",
   "allowed_hosts": ["*"],
+  "allowed_methods": [
+    "GET"
+  ],
   "requires_secrets": [],
   "requires_approval_for": [],
   "config_schema": {
