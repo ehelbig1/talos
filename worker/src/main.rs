@@ -401,6 +401,146 @@ fn failed_result(job_id: uuid::Uuid, start: &std::time::Instant, msg: &str) -> J
     }
 }
 
+/// Build the operator-facing message for the per-job execution timeout.
+///
+/// **Takes the same `Duration` that armed `tokio::time::timeout`**, so the
+/// reported number cannot disagree with the number that was enforced. That is
+/// the point of the function: until 2026-08-25 the timeout arm built the string
+/// `"execution timed out after 30 seconds"` as a HARDCODED literal while
+/// `job_timeout` was per-node and variable (`req.timeout_ms`, else
+/// `WASM_EXECUTION_TIMEOUT_SECS`, default **120**). No node on the reference
+/// deployment had ever been given 30 s: fourteen recorded timeouts ran with an
+/// enforced 110 s (×4) or 120 s (×10), so the message understated the real
+/// budget by ~4× in 14 of 14 cases and led an operator to propose raising a
+/// "30 s default" that does not exist.
+///
+/// `source` names WHERE the limit came from so the operator knows which knob to
+/// turn; it is one of two fixed strings, never a request field. The message
+/// carries no payload, secret, host or worker id — it reaches
+/// `workflow_executions.error_message`.
+///
+/// **The attribution is deliberately hedged, and that is not sloppiness.** The
+/// controller resolves `node_timeouts[node].unwrap_or(*DEFAULT_NODE_TIMEOUT_SECS)`
+/// (`engine_dispatch_single.rs`) and sends only the RESULT, so a non-zero
+/// `req.timeout_ms` is indistinguishable here between "the node declared
+/// `timeout_secs`" and "the node declared nothing and the controller applied its
+/// own default". Asserting the former would be a fresh instance of the very
+/// defect this function exists to fix: right number, wrong attribution, operator
+/// sent to edit a field that is not set.
+///
+/// Keeps the substring `timed out`, which
+/// `talos_retry_intelligence::classify_error` matches to produce the `timeout`
+/// class.
+fn timeout_error_message(job_timeout: std::time::Duration, request_supplied: bool) -> String {
+    let ms = job_timeout.as_millis();
+    let source = if request_supplied {
+        "enforced limit from job timeout_ms: node timeout_secs, else controller default"
+    } else {
+        "enforced limit from worker default WASM_EXECUTION_TIMEOUT_SECS"
+    };
+    if ms.is_multiple_of(1000) {
+        format!(
+            "execution timed out after {} seconds ({})",
+            ms / 1000,
+            source
+        )
+    } else {
+        format!("execution timed out after {ms} ms ({source})")
+    }
+}
+
+#[cfg(test)]
+mod timeout_message_tests {
+    use super::timeout_error_message;
+    use std::time::Duration;
+
+    /// The headline regression: a node with a NON-30s budget must report its
+    /// OWN number. 110 s is not a hypothetical — it is the live
+    /// budget of an extract node on the reference deployment, which produced
+    /// four of the fourteen recorded timeouts while the message said
+    /// "30 seconds".
+    #[test]
+    fn node_supplied_timeout_reports_its_own_value() {
+        let msg = timeout_error_message(Duration::from_secs(110), true);
+        assert!(
+            msg.contains("110 seconds"),
+            "must report the enforced 110s, got: {msg}"
+        );
+        assert!(
+            !msg.contains("30 seconds"),
+            "must not report the retired hardcoded literal, got: {msg}"
+        );
+        assert!(
+            msg.contains("job timeout_ms"),
+            "must name where the limit arrived from, got: {msg}"
+        );
+        // Hedged on purpose — see `timeout_error_message`. The worker cannot
+        // distinguish a node-declared `timeout_secs` from the controller's own
+        // default, so it must not claim either one.
+        assert!(
+            msg.contains("else controller default"),
+            "attribution must stay hedged, got: {msg}"
+        );
+    }
+
+    /// The worker fallback is 120 s (`WASM_EXECUTION_TIMEOUT_SECS`), which is
+    /// what ten of the fourteen recorded timeouts actually enforced.
+    #[test]
+    fn worker_fallback_timeout_reports_120_and_names_the_env_var() {
+        let msg = timeout_error_message(Duration::from_secs(120), false);
+        assert!(msg.contains("120 seconds"), "got: {msg}");
+        assert!(
+            msg.contains("WASM_EXECUTION_TIMEOUT_SECS"),
+            "must name the env var an operator would change, got: {msg}"
+        );
+        assert!(!msg.contains("job timeout_ms"), "got: {msg}");
+    }
+
+    /// A 30 s budget still says 30 — the fix is not "never print 30", it is
+    /// "print what was enforced". This is the case the old literal got right
+    /// by accident, and it must keep working.
+    #[test]
+    fn thirty_second_budget_still_reports_thirty() {
+        let msg = timeout_error_message(Duration::from_secs(30), true);
+        assert!(msg.contains("30 seconds"), "got: {msg}");
+    }
+
+    /// `req.timeout_ms` is milliseconds, so a sub-second-precision budget must
+    /// not be silently truncated to a wrong whole number of seconds (1 500 ms
+    /// reported as "1 seconds" would be a smaller instance of the same class).
+    #[test]
+    fn sub_second_precision_is_reported_in_ms_not_truncated() {
+        let msg = timeout_error_message(Duration::from_millis(1_500), true);
+        assert!(msg.contains("1500 ms"), "got: {msg}");
+        assert!(!msg.contains("1 seconds"), "got: {msg}");
+    }
+
+    /// Retry-classification coupling. `talos_retry_intelligence::classify_error`
+    /// buckets this message by the substring `timed out` (it matches BOTH
+    /// "timed out" and "timeout"; see CLAUDE.md) and `timeout` is transient, so
+    /// a node with `retry_count > 0` retries. Rewording the message without
+    /// this substring would silently reclassify every node timeout as
+    /// `unknown` (non-transient) — the exact "classification derived from
+    /// prose" hazard `classify_verify_failure` was rewritten to escape.
+    /// Asserted here rather than in the classifier crate because `worker` does
+    /// not depend on `talos-retry-intelligence`; this guards the token, not the
+    /// classifier's own behaviour.
+    #[test]
+    fn message_keeps_the_token_the_retry_classifier_matches() {
+        for (d, node) in [
+            (Duration::from_secs(110), true),
+            (Duration::from_secs(120), false),
+            (Duration::from_millis(1_500), true),
+        ] {
+            let msg = timeout_error_message(d, node);
+            assert!(
+                msg.to_lowercase().contains("timed out"),
+                "classifier token missing, got: {msg}"
+            );
+        }
+    }
+}
+
 /// Worker-side gate for the MCP-1212 signature-failure diagnostic (the
 /// enriched `output_payload` built in `signature_failure_payload`). OFF by
 /// default — the rich payload echoes UNAUTHENTICATED attacker-controllable
@@ -1180,8 +1320,14 @@ async fn execute_job(
     // Honor the controller-supplied `timeout_ms` from the job request. The
     // controller has already sourced it from the node's `timeout_secs` (or the
     // per-env `WASM_EXECUTION_TIMEOUT_SECS` default). Fallback: use the same
-    // `WASM_EXECUTION_TIMEOUT_SECS` env var (60s default) when the request
-    // didn't specify. Previously both timeouts were hardcoded 30s, which
+    // `WASM_EXECUTION_TIMEOUT_SECS` env var (120s default) when the request
+    // didn't specify. That figure read "60s default" until 2026-08-25, while
+    // the lockstep note four lines below this one said 120 and the code says
+    // 120 — one comment block contradicting itself. Same
+    // stale-literal-beside-a-variable shape as the hardcoded "30 seconds"
+    // message that `timeout_error_message` exists to fix, which is why it was
+    // corrected in the same change rather than left as a sibling instance.
+    // Previously both timeouts were hardcoded 30s, which
     // silently capped agent-node modules calling `llm::complete` even when
     // the author set `timeout_secs: 120` on the node.
     // MCP-642 (2026-05-13): if WASM_EXECUTION_TIMEOUT_SECS=0 AND the
@@ -1286,7 +1432,10 @@ async fn execute_job(
         }
         Err(_) => {
             let duration_ms = start.elapsed().as_millis() as u64;
-            let error_msg = "execution timed out after 30 seconds".to_string();
+            // Report the timeout that was ACTUALLY enforced. `job_timeout` is
+            // the exact binding passed to `tokio::time::timeout` above, so the
+            // message cannot drift from the enforcement.
+            let error_msg = timeout_error_message(job_timeout, req.timeout_ms > 0);
             _span.set_attribute("error", &error_msg);
             _span.set_attribute_int("duration_ms", duration_ms as i64);
             _span.end_error(&error_msg);
