@@ -6,6 +6,9 @@
   "capability_world": "secrets-node",
   "description": "Analyzes private and public GitHub repositories using a Personal Access Token. Requires a GitHub PAT stored in the vault (canonical path: 'github/pat'). For public-only repos without secrets, use github-analyzer-public (http-node) instead.",
   "allowed_hosts": ["api.github.com"],
+  "allowed_methods": [
+    "GET"
+  ],
   "requires_secrets": ["github/pat"],
   "setup_instructions": [
     "1. Create a GitHub Personal Access Token (PAT) at https://github.com/settings/tokens with repo scope",

@@ -6,6 +6,9 @@
   "category": "Governance",
   "capability_world": "governance-node",
   "allowed_hosts": ["*"],
+  "allowed_methods": [
+    "POST"
+  ],
   "requires_secrets": [],
   "requires_approval_for": [],
   "config_schema": {

@@ -6,6 +6,9 @@
     "capability_world": "http-node",
     "description": "Analyzes public GitHub repositories without authentication. Suitable for agents with an http-node or lower capability ceiling. For private repos use github-analyzer (secrets-node).",
     "allowed_hosts": ["api.github.com"],
+    "allowed_methods": [
+      "GET"
+    ],
     "requires_secrets": [],
     "config_schema": {
         "type": "object",

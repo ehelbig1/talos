@@ -138,6 +138,48 @@ pub fn find_duplicate_catalog_sets(rows: Vec<CatalogRowSummary>) -> Vec<Duplicat
     sets
 }
 
+/// HTTP verbs accepted in a template manifest's `allowed_methods`.
+///
+/// Kept in lockstep with the MCP `update_module_methods` validator
+/// (`talos-mcp-handlers/src/sandbox.rs`) so a verb an operator can set on a user
+/// module is also one a template manifest can declare. `HEAD` / `OPTIONS` are
+/// accepted for parity even though `wit_http::Method` cannot express them —
+/// listing an inexpressible verb is inert, whereas rejecting one an operator
+/// legitimately writes would fail the seed.
+const HTTP_VERBS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+
+/// Read + normalise a template manifest's `allowed_methods` into the value bound
+/// to [`CatalogUpsert::allowed_methods`].
+///
+/// Returns an EMPTY vec when the field is absent, is not an array, or contains
+/// nothing recognisable — which reproduces the pre-2026-08-25 behaviour exactly,
+/// because the column is then written as `{}` (the worker's "allow every verb").
+///
+/// **Unknown verbs are dropped, not fatal.** This is the opposite of the
+/// `allowed_hosts` / `allowed_secrets` manifest handling, which skips the whole
+/// template on a validation failure, and the asymmetry is deliberate: a
+/// malformed host/secret entry WIDENS what a module may reach, so failing the
+/// seed closed is right. A junk verb here can only ever fail to match at the
+/// enforcement point, so dropping it is the conservative direction — and keeping
+/// the template seeded means one typo cannot silently remove a module the fleet
+/// depends on.
+#[must_use]
+pub fn parse_manifest_allowed_methods(manifest: &serde_json::Value) -> Vec<String> {
+    manifest
+        .get("allowed_methods")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .filter_map(|s| {
+                    let upper = s.trim().to_ascii_uppercase();
+                    HTTP_VERBS.contains(&upper.as_str()).then_some(upper)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Parameters for [`upsert_catalog_template_by_slug`]. Mirrors the columns
 /// the disk seed writes.
 pub struct CatalogUpsert<'a> {
@@ -147,6 +189,25 @@ pub struct CatalogUpsert<'a> {
     pub config_schema: &'a serde_json::Value,
     pub source_code: &'a str,
     pub allowed_hosts: &'a [String],
+    /// HTTP verb allowlist, straight from the template manifest's
+    /// `allowed_methods`.
+    ///
+    /// Before 2026-08-25 this struct had no such field, so the disk/OCI seed
+    /// never wrote `modules.allowed_methods` for a shared catalog row — every
+    /// catalog row sat permanently at the column default `{}`. At the worker's
+    /// three enforcement points (`host/http.rs` `fetch` / `fetch_all`,
+    /// `host/graphql.rs`) an EMPTY list means **allow every verb**, so a catalog
+    /// row could issue any method regardless of what its template does. Catalog
+    /// rows ARE dispatched directly by workflow nodes, not only via user copies:
+    /// the shipped HTML-email sender is referenced by six enabled workflows and
+    /// has no user copy at all. The sibling user-copy path
+    /// (`install_catalog_module_to_modules`) already bound the column, which is
+    /// why a user copy of a slug carried a correct list while the shared row for
+    /// the SAME slug did not.
+    ///
+    /// An empty slice keeps the pre-fix behaviour byte-for-byte — the column is
+    /// written as `{}`, exactly what it already held.
+    pub allowed_methods: &'a [String],
     pub allowed_secrets: &'a [String],
     pub requires_approval_for: &'a [String],
     pub capability_world_long: &'a str,
@@ -205,7 +266,7 @@ pub async fn upsert_catalog_template_by_slug(
                  name = $2, category = $3, description = $4, config_schema = $5, \
                  source_code = $6, allowed_hosts = $7, allowed_secrets = $8, \
                  requires_approval_for = $9, capability_world = $10, \
-                 dependencies = $11, updated_at = NOW() \
+                 dependencies = $11, allowed_methods = $12, updated_at = NOW() \
              WHERE id = $1",
         )
         .bind(id)
@@ -219,6 +280,7 @@ pub async fn upsert_catalog_template_by_slug(
         .bind(params.requires_approval_for)
         .bind(params.capability_world_long)
         .bind(params.dependencies)
+        .bind(params.allowed_methods)
         .execute(pool)
         .await?;
 
@@ -241,11 +303,12 @@ pub async fn upsert_catalog_template_by_slug(
              INSERT INTO modules ( \
                  user_id, name, kind, category, description, config_schema, \
                  source_code, allowed_hosts, allowed_secrets, requires_approval_for, \
-                 capability_world, catalog_slug, dependencies, language, created_at, updated_at \
+                 capability_world, catalog_slug, dependencies, allowed_methods, \
+                 language, created_at, updated_at \
              ) VALUES ( \
                  NULL, $1, 'catalog', $2, $3, $4, \
                  $5, $6, $7, $8, \
-                 $9, $10, $11, 'rust', NOW(), NOW() \
+                 $9, $10, $11, $12, 'rust', NOW(), NOW() \
              ) \
              ON CONFLICT (name) WHERE user_id IS NULL DO UPDATE SET \
                  category = EXCLUDED.category, \
@@ -258,6 +321,7 @@ pub async fn upsert_catalog_template_by_slug(
                  requires_approval_for = EXCLUDED.requires_approval_for, \
                  capability_world = EXCLUDED.capability_world, \
                  dependencies = EXCLUDED.dependencies, \
+                 allowed_methods = EXCLUDED.allowed_methods, \
                  updated_at = NOW() \
              RETURNING id, \
                  (wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0) AS has_wasm \
@@ -278,6 +342,7 @@ pub async fn upsert_catalog_template_by_slug(
     .bind(params.capability_world_long)
     .bind(params.catalog_slug)
     .bind(params.dependencies)
+    .bind(params.allowed_methods)
     .fetch_one(pool)
     .await?;
 
@@ -416,6 +481,69 @@ pub async fn reconcile_duplicate_catalog_modules(pool: &Pool<Postgres>) -> Resul
     }
 
     Ok(dupe_sets.len())
+}
+
+#[cfg(test)]
+mod allowed_methods_manifest_tests {
+    use super::*;
+
+    /// The load-bearing default. An absent field must produce an EMPTY list,
+    /// because that is byte-identical to what every catalog row already holds —
+    /// adding the column to the seed must not change a single existing row's
+    /// effective policy on the first boot after deploy.
+    #[test]
+    fn absent_field_yields_empty_which_is_the_pre_fix_value() {
+        let m = serde_json::json!({ "name": "x", "allowed_hosts": ["example.com"] });
+        assert!(parse_manifest_allowed_methods(&m).is_empty());
+    }
+
+    #[test]
+    fn non_array_value_yields_empty_rather_than_panicking() {
+        for v in [
+            serde_json::json!({ "allowed_methods": "GET" }),
+            serde_json::json!({ "allowed_methods": 7 }),
+            serde_json::json!({ "allowed_methods": null }),
+            serde_json::json!({ "allowed_methods": { "GET": true } }),
+        ] {
+            assert!(parse_manifest_allowed_methods(&v).is_empty(), "{v}");
+        }
+    }
+
+    #[test]
+    fn verbs_are_normalised_to_upper_case_and_trimmed() {
+        let m = serde_json::json!({ "allowed_methods": ["get", " Post ", "pAtCh"] });
+        assert_eq!(parse_manifest_allowed_methods(&m), ["GET", "POST", "PATCH"]);
+    }
+
+    /// An unrecognised entry is DROPPED and its siblings survive. The opposite
+    /// choice — skipping the template — would let one typo remove a module the
+    /// fleet depends on, and a junk verb can only ever fail to match at the
+    /// enforcement point, so it cannot widen anything.
+    #[test]
+    fn unknown_verb_is_dropped_without_discarding_the_valid_siblings() {
+        let m = serde_json::json!({ "allowed_methods": ["GET", "TRACE", "", "POST", 42] });
+        assert_eq!(parse_manifest_allowed_methods(&m), ["GET", "POST"]);
+    }
+
+    /// A list of ONLY junk collapses to empty — i.e. back to "allow all", not to
+    /// an accidental deny-all. Stated as a test because the alternative reading
+    /// (empty == deny) is the one every sibling field uses, and this field is
+    /// the odd one out.
+    #[test]
+    fn all_entries_unknown_collapses_to_empty_not_to_deny_all() {
+        let m = serde_json::json!({ "allowed_methods": ["TRACE", "CONNECT"] });
+        assert!(parse_manifest_allowed_methods(&m).is_empty());
+    }
+
+    /// Parity with the MCP `update_module_methods` validator's verb set: a verb
+    /// an operator may set on a user module must also be declarable in a
+    /// template manifest, or the two surfaces disagree about the same column.
+    #[test]
+    fn accepts_every_verb_the_mcp_validator_accepts() {
+        let all = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+        let m = serde_json::json!({ "allowed_methods": all });
+        assert_eq!(parse_manifest_allowed_methods(&m), all);
+    }
 }
 
 #[cfg(test)]

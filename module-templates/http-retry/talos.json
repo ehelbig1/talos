@@ -6,6 +6,13 @@
   "category": "Network",
   "capability_world": "http-node",
   "allowed_hosts": ["*"],
+  "allowed_methods": [
+    "GET",
+    "POST",
+    "PUT",
+    "PATCH",
+    "DELETE"
+  ],
   "requires_secrets": [],
   "config_schema": {
     "type": "object",
