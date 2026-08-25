@@ -8939,6 +8939,7 @@ dependencies = [
  "talos-text-util",
  "talos-workflow-authorization",
  "talos-workflow-engine-core",
+ "talos-workflow-job-protocol",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

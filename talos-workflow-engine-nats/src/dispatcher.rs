@@ -270,7 +270,20 @@ fn resign_pipeline_payload_for_retry(payload: &[u8], key: &[u8]) -> Option<Vec<u
 ///
 /// Does NOT retry:
 /// - Timeouts (job ran but took too long)
-/// - Signature verification failures (security issue)
+/// - Result-verification failures — BOTH kinds, and the reason differs:
+///   * a bad signature / replay / malformed nonce is a security event, and
+///     retrying it would just re-admit the same forgery attempt;
+///   * a STALE result (`VerifyFailureKind::Stale`) is a liveness failure, and
+///     retry still must not happen, for a different and stronger reason: the
+///     worker ALREADY EXECUTED the module. Re-dispatching re-runs a possibly
+///     non-idempotent side effect (a sent email, a posted webhook). Worse, the
+///     worker's own idempotency cache (`worker::job_idempotency`) re-publishes
+///     the *same already-signed* result for a re-seen `job_id` — so a retry
+///     would return a result whose nonce is now even older and fail again,
+///     having risked the duplicate side effect for nothing.
+///     A safe retry here would have to be gated on a declared
+///     `__idempotency_key__` (see `effective_retries_with_idempotency`), which
+///     this path does not carry. Not added.
 /// - Serialization errors (deterministic failures)
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_job_with_retry(
@@ -363,7 +376,22 @@ pub(crate) async fn execute_job_with_retry(
                         300,
                         talos_workflow_job_protocol::result_accept_legacy_hmac(),
                     ) {
-                        return Err(format!("Job result signature verification failed: {}", e));
+                        // A result that aged out is a LIVENESS failure, not
+                        // tampering — see `describe_verify_failure`. Still
+                        // rejected either way (fail-closed is unchanged); only
+                        // the operator-facing attribution differs.
+                        tracing::warn!(
+                            target: "talos_security",
+                            job_id = %job_result.job_id,
+                            failure_kind = e.kind().label(),
+                            liveness = e.is_liveness(),
+                            age_secs = e.age_secs(),
+                            "job result rejected at the primary verifier"
+                        );
+                        return Err(talos_workflow_job_protocol::describe_verify_failure(
+                            "Job result",
+                            &e,
+                        ));
                     }
                     // L-11 (2026-05-22): record the worker_id committed to
                     // by the signed result. `worker_id` is the
@@ -1452,7 +1480,15 @@ impl NodeDispatcher for NatsNodeDispatcher {
                     talos_workflow_job_protocol::result_accept_legacy_hmac(),
                 )
                 .map_err(|e| -> BoxError {
-                    format!("Pipeline result signature verification failed: {e}").into()
+                    tracing::warn!(
+                        target: "talos_security",
+                        failure_kind = e.kind().label(),
+                        liveness = e.is_liveness(),
+                        age_secs = e.age_secs(),
+                        "pipeline result rejected at the primary verifier"
+                    );
+                    talos_workflow_job_protocol::describe_verify_failure("Pipeline result", &e)
+                        .into()
                 })?;
             // L-11: forensic attribution — see the matching block in
             // `dispatch_single` above for the security rationale.

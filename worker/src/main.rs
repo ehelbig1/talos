@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use talos_workflow_job_protocol::{
     load_worker_key_ring, JobRequest, JobResult, JobStatus, PipelineJobRequest, PipelineJobResult,
-    PipelineStepResult,
+    PipelineStepResult, VerifyError, VerifyFailureKind,
 };
 use worker::error_sanitize::sanitize_error_message;
 use worker::job_span::JobSpan;
@@ -417,26 +417,31 @@ static WORKER_SIGNATURE_DIAG_ENABLED: std::sync::LazyLock<bool> = std::sync::Laz
 
 /// Coarse, non-sensitive classification of a verify failure.
 ///
-/// Matches on the verifier's own error text (job-protocol) and returns a
-/// stable token. Deliberately NOT the raw error and NOT any request field:
-/// safe to publish on an unverified request, which is exactly when it is
-/// needed. Distinct classes because the operator action differs —
-/// `key_config` is a deploy/env problem, `scheme_mismatch` is version skew
-/// between controller and worker, `replay` is a nonce-cache interaction, and
-/// `mismatch` is a genuine signing-payload divergence.
-fn classify_verify_failure(verify_error: &str) -> &'static str {
-    let e = verify_error.to_ascii_lowercase();
-    if e.contains("already seen") || e.contains("replay") {
-        "replay"
-    } else if e.contains("crypto_scheme") {
-        "scheme_mismatch"
-    } else if e.contains("verifying key") || e.contains("key configured") || e.contains("key ring")
-    {
-        "key_config"
-    } else if e.contains("too old") || e.contains("future") || e.contains("freshness") {
-        "stale_timestamp"
-    } else {
-        "mismatch"
+/// Returns a stable token. Deliberately NOT the raw error and NOT any request
+/// field: safe to publish on an unverified request, which is exactly when it is
+/// needed. Distinct classes because the operator action differs — `key_config`
+/// is a deploy/env problem, `scheme_mismatch` is version skew between controller
+/// and worker, `replay` is a nonce-cache interaction, `stale_timestamp` is a
+/// LIVENESS failure (a stall or clock skew, not tampering), and `mismatch` is a
+/// genuine signing-payload divergence.
+///
+/// 2026-08-25: was a `contains()` scan over the verifier's own error TEXT. It is
+/// now a total match over the verifier's TYPED reason
+/// ([`VerifyFailureKind`]) — the tokens are unchanged, but a reworded protocol
+/// message can no longer silently reclassify a failure. Same defect class as the
+/// headline this PR fixes: a classification derived from prose rather than from
+/// the thing that produced it.
+fn classify_verify_failure(kind: VerifyFailureKind) -> &'static str {
+    match kind {
+        VerifyFailureKind::Replay => "replay",
+        VerifyFailureKind::SchemeRefused => "scheme_mismatch",
+        VerifyFailureKind::KeyError => "key_config",
+        VerifyFailureKind::Stale | VerifyFailureKind::ClockSkewAhead => "stale_timestamp",
+        VerifyFailureKind::BadSignature | VerifyFailureKind::MalformedNonce => "mismatch",
+        // `VerifyFailureKind` is `#[non_exhaustive]`: a new variant must be
+        // given an explicit token here rather than silently becoming
+        // "mismatch" (which would read as tampering).
+        _ => "mismatch",
     }
 }
 
@@ -450,8 +455,19 @@ fn classify_verify_failure(verify_error: &str) -> &'static str {
 fn signature_failure_payload(
     diag_enabled: bool,
     req: &JobRequest,
-    verify_error: &str,
+    verify_error: &VerifyError,
 ) -> serde_json::Value {
+    // The headline is the operator's ONLY signal when the diagnostic is off, so
+    // it must not say "signature verification failed" for a message that was
+    // rejected on AGE before its signature was ever evaluated.
+    //
+    // `verify_failure_headline`, NOT `describe_verify_failure`: the gated-OFF
+    // arm must contain no byte derived from the UNAUTHENTICATED request, and
+    // the protocol detail can echo one (the `crypto_scheme` byte, the age the
+    // sender chose). The class token carries the actionable part; the full
+    // detail is in the worker's own log, which is never signed or republished.
+    let headline =
+        talos_workflow_job_protocol::verify_failure_headline("Job dispatch", verify_error.kind());
     if !diag_enabled {
         // Always carry the coarse CLASS of failure. Pre-2026-07-27 this arm
         // returned the bare string, which left a live incident with no signal
@@ -465,15 +481,19 @@ fn signature_failure_payload(
         // controllable on an UNVERIFIED request and get echoed into a result
         // the worker then signs.
         return json!({
-            "error": "signature verification failed",
-            "reason_class": classify_verify_failure(verify_error),
+            "error": headline,
+            "reason_class": classify_verify_failure(verify_error.kind()),
         });
     }
     let (worker_input_hash, worker_secrets_hash, worker_input_byte_len) = req.diag_hashes();
     json!({
-        "error": "signature verification failed",
+        // Operator opted in: the detail and the observed age are useful here and
+        // the echo risk is explicitly accepted (see the gate's doc comment).
+        "error": talos_workflow_job_protocol::describe_verify_failure("Job dispatch", verify_error),
+        "reason_class": classify_verify_failure(verify_error.kind()),
+        "age_secs": verify_error.age_secs(),
         "diag": {
-            "verify_error": verify_error,
+            "verify_error": verify_error.to_string(),
             "worker_input_hash": worker_input_hash,
             "worker_secrets_hash": worker_secrets_hash,
             "worker_input_byte_len": worker_input_byte_len,
@@ -501,32 +521,64 @@ mod signature_failure_payload_tests {
     use talos_workflow_job_protocol::{EncryptedSecrets, LlmTier};
     use uuid::Uuid;
 
+    fn err(kind: VerifyFailureKind) -> VerifyError {
+        VerifyError::from_parts(kind, "hmac mismatch", None)
+    }
+
     /// Each class implies a DIFFERENT operator action, so they must not
     /// collapse: key_config is a deploy/env fault, scheme_mismatch is
     /// controller/worker version skew, replay is a nonce-cache interaction,
-    /// and mismatch is a genuine signing-payload divergence.
+    /// stale_timestamp is a LIVENESS failure, and mismatch is a genuine
+    /// signing-payload divergence.
     #[test]
     fn verify_failures_classify_into_distinct_actionable_classes() {
+        assert_eq!(classify_verify_failure(VerifyFailureKind::Replay), "replay");
         assert_eq!(
-            classify_verify_failure("job_nonce already seen (replay attempt within 300s)"),
-            "replay"
-        );
-        assert_eq!(
-            classify_verify_failure("unknown dispatch crypto_scheme: ed25519"),
+            classify_verify_failure(VerifyFailureKind::SchemeRefused),
             "scheme_mismatch"
         );
         assert_eq!(
-            classify_verify_failure("no controller Ed25519 verifying key configured"),
+            classify_verify_failure(VerifyFailureKind::KeyError),
             "key_config"
         );
         assert_eq!(
-            classify_verify_failure("timestamp too old (max_age 60s)"),
+            classify_verify_failure(VerifyFailureKind::Stale),
             "stale_timestamp"
         );
-        assert_eq!(classify_verify_failure("HMAC mismatch"), "mismatch");
-        // Unrecognised text must still yield a usable class, never panic or
-        // echo the input.
-        assert_eq!(classify_verify_failure(""), "mismatch");
+        assert_eq!(
+            classify_verify_failure(VerifyFailureKind::ClockSkewAhead),
+            "stale_timestamp"
+        );
+        assert_eq!(
+            classify_verify_failure(VerifyFailureKind::BadSignature),
+            "mismatch"
+        );
+        assert_eq!(
+            classify_verify_failure(VerifyFailureKind::MalformedNonce),
+            "mismatch"
+        );
+    }
+
+    /// The token set and the headline must AGREE: anything the worker labels
+    /// `stale_timestamp` must also be reported as a liveness failure, and
+    /// nothing else may be. Guards against the two paths drifting apart — the
+    /// exact way this bug class returns.
+    #[test]
+    fn stale_timestamp_class_and_liveness_headline_never_disagree() {
+        for &kind in VerifyFailureKind::ALL {
+            let e = VerifyError::from_parts(kind, "x", None);
+            let headline = talos_workflow_job_protocol::describe_verify_failure("Job dispatch", &e);
+            let says_signature_failed = headline.contains("signature verification failed");
+            assert_eq!(
+                classify_verify_failure(kind) == "stale_timestamp",
+                kind.is_liveness(),
+                "class/liveness disagreement for {kind:?}"
+            );
+            assert!(
+                !(kind.is_liveness() && says_signature_failed),
+                "a liveness failure must never be headlined as a signature failure: {headline}"
+            );
+        }
     }
 
     /// The gated-OFF payload must carry the class but NOTHING derived from the
@@ -535,10 +587,18 @@ mod signature_failure_payload_tests {
     #[test]
     fn ungated_payload_carries_class_but_no_request_fields() {
         let req = unauthenticated_req();
-        let v = signature_failure_payload(false, &req, "HMAC mismatch");
-        assert_eq!(v["error"], "signature verification failed");
+        let v = signature_failure_payload(false, &req, &err(VerifyFailureKind::BadSignature));
+        assert_eq!(v["error"], "Job dispatch signature verification failed");
         assert_eq!(v["reason_class"], "mismatch");
         assert!(v.get("diag").is_none(), "no rich dump when gated off");
+        // The gated-OFF payload gets SIGNED and published in reply to an
+        // UNAUTHENTICATED request, so it must carry no byte derived from that
+        // request — not even the verifier's own detail string, which can echo
+        // the sender-chosen `crypto_scheme` byte or age.
+        assert!(
+            !v.to_string().contains("hmac mismatch"),
+            "protocol detail must not reach the signed ungated payload: {v}"
+        );
         let rendered = v.to_string();
         assert!(
             !rendered.contains("worker_input_hash") && !rendered.contains("module_uri"),
@@ -592,8 +652,15 @@ mod signature_failure_payload_tests {
     /// nothing extra about the leak this test actually guards.
     #[test]
     fn diag_disabled_emits_generic_error_only() {
-        let payload = signature_failure_payload(false, &unauthenticated_req(), "hmac mismatch");
-        assert_eq!(payload["error"], "signature verification failed");
+        let payload = signature_failure_payload(
+            false,
+            &unauthenticated_req(),
+            &err(VerifyFailureKind::BadSignature),
+        );
+        assert_eq!(
+            payload["error"],
+            "Job dispatch signature verification failed"
+        );
         // The class is one of OUR tokens, never the verifier's raw text.
         assert!(
             [
@@ -620,10 +687,30 @@ mod signature_failure_payload_tests {
         }
     }
 
+    /// A dispatch that aged out must not tell the operator its signature failed
+    /// — the worker leg of the same 2026-08-20/24 misattribution.
+    #[test]
+    fn an_aged_out_dispatch_is_not_reported_as_a_signature_failure() {
+        for kind in [VerifyFailureKind::Stale, VerifyFailureKind::ClockSkewAhead] {
+            let v = signature_failure_payload(false, &unauthenticated_req(), &err(kind));
+            let msg = v["error"].as_str().expect("error is a string");
+            assert!(
+                !msg.contains("signature verification failed"),
+                "{kind:?} headlined as tampering: {msg}"
+            );
+            assert!(msg.contains(talos_workflow_job_protocol::LIVENESS_REJECTION_MARKER));
+            assert_eq!(v["reason_class"], "stale_timestamp");
+        }
+    }
+
     /// Diag ON (explicit operator opt-in): full MCP-1212 field dump.
     #[test]
     fn diag_enabled_carries_divergence_fields() {
-        let payload = signature_failure_payload(true, &unauthenticated_req(), "hmac mismatch");
+        let payload = signature_failure_payload(
+            true,
+            &unauthenticated_req(),
+            &err(VerifyFailureKind::BadSignature),
+        );
         let diag = payload.get("diag").expect("diag block present");
         assert_eq!(diag["verify_error"], "hmac mismatch");
         assert_eq!(diag["module_uri"], "wasm://attacker-chosen/v1");
@@ -799,9 +886,27 @@ async fn execute_job(
     // jobs.
     let dvc = dispatch_verify_config();
     if let Err(e) = req.verify_dispatch(&shared_key, &dvc.ed_keys, 300, dvc.accept_legacy_hmac) {
-        ::tracing::error!(job_id = %req.job_id, error = %e, "Job signature verification failed");
-        _span.set_attribute("error", "signature_verification_failed");
-        _span.end_error("Signature verification failed");
+        // The stall is symmetric: the SAME host suspend that ages out a result
+        // on the controller ages out a dispatch here. Report which it was.
+        let headline = talos_workflow_job_protocol::describe_verify_failure("Job dispatch", &e);
+        if e.is_liveness() {
+            ::tracing::warn!(
+                target: "talos_security",
+                job_id = %req.job_id,
+                failure_kind = e.kind().label(),
+                age_secs = e.age_secs(),
+                "{headline}"
+            );
+        } else {
+            ::tracing::error!(
+                target: "talos_security",
+                job_id = %req.job_id,
+                failure_kind = e.kind().label(),
+                "{headline}"
+            );
+        }
+        _span.set_attribute("error", e.kind().label());
+        _span.end_error(&headline);
 
         // MCP-1212 (2026-05-18): diagnostic enrichment for signature
         // verification failures — recompute the per-field hashes that
@@ -1235,17 +1340,45 @@ async fn execute_pipeline_job(
     // HMAC side for rolling WORKER_SHARED_KEY rotation. See `execute_job`.
     let dvc = dispatch_verify_config();
     if let Err(e) = req.verify_dispatch(&shared_key, &dvc.ed_keys, 300, dvc.accept_legacy_hmac) {
-        ::tracing::error!(job_id = %req.job_id, error = %e, "Pipeline job signature verification failed");
-        _span.set_attribute("error", "signature_verification_failed");
-        _span.end_error("Signature verification failed");
+        // Detailed form for the LOG (never signed); the published payload below
+        // uses the constant-only headline, same rule as `signature_failure_payload`.
+        let headline =
+            talos_workflow_job_protocol::describe_verify_failure("Pipeline job dispatch", &e);
+        if e.is_liveness() {
+            ::tracing::warn!(
+                target: "talos_security",
+                job_id = %req.job_id,
+                failure_kind = e.kind().label(),
+                age_secs = e.age_secs(),
+                "{headline}"
+            );
+        } else {
+            ::tracing::error!(
+                target: "talos_security",
+                job_id = %req.job_id,
+                failure_kind = e.kind().label(),
+                "{headline}"
+            );
+        }
+        _span.set_attribute("error", e.kind().label());
+        _span.end_error(&headline);
         return PipelineJobResult {
             llm_usage: vec![],
             crypto_scheme: 0,
             job_id: req.job_id,
             overall_status: JobStatus::Failed,
             step_results: vec![],
-            final_output: serde_json::json!({"error": "pipeline signature verification failed"})
-                .into(),
+            // The operator-visible reason for the whole pipeline. Previously a
+            // bare literal with no class at all, so a fleet stall here was
+            // indistinguishable from tampering AND from a key problem.
+            final_output: serde_json::json!({
+                "error": talos_workflow_job_protocol::verify_failure_headline(
+                    "Pipeline job dispatch",
+                    e.kind(),
+                ),
+                "reason_class": classify_verify_failure(e.kind()),
+            })
+            .into(),
             total_time_ms: start.elapsed().as_millis() as u64,
             signature: vec![],
             result_nonce: String::new(),

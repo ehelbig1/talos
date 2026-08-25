@@ -1015,6 +1015,233 @@ pub fn result_accept_legacy_hmac() -> bool {
     })
 }
 
+/// **Why** a signed message failed verification — the axis an operator needs.
+///
+/// A signature that verifies cryptographically but arrived outside its freshness
+/// window is a **liveness** failure (the sender stalled, or the two hosts'
+/// clocks disagree). A signature that does not verify is a **security** failure.
+/// Before this split, both surfaced as "signature verification failed", which
+/// sent operators hunting an attacker after a host suspend froze the fleet
+/// (2026-08-20/24: six executions, two clusters, ages 902–919 s, every one a
+/// valid signature).
+///
+/// Fail-closed is unchanged: every variant is still a REJECTION. This type only
+/// says which kind of rejection it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum VerifyFailureKind {
+    /// Nonce parsed, timestamp older than `max_age_secs`. The signature itself
+    /// was never reached — but a message this old is *usually* a stall, not an
+    /// attack, because a forger has no reason to send a stale nonce.
+    /// **LIVENESS.**
+    Stale,
+    /// Nonce timestamp is ahead of this host's clock by more than
+    /// [`MAX_FUTURE_SKEW_SECS`]. **LIVENESS** (clock skew), though it is also
+    /// what a naive replay-forward would look like.
+    ClockSkewAhead,
+    /// Nonce is not `"<unix_secs>:<hex>"`. **SECURITY** — a stalled sender still
+    /// emits a well-formed nonce.
+    MalformedNonce,
+    /// MAC / Ed25519 mismatch, no key in the ring matched, or the message's
+    /// crypto scheme is refused/unknown. **SECURITY.**
+    BadSignature,
+    /// The nonce was already recorded inside the replay window. **SECURITY.**
+    Replay,
+    /// Local key material could not be loaded. **OPERATIONAL** — neither the
+    /// peer's liveness nor its honesty is in question.
+    KeyError,
+    /// The message's `crypto_scheme` is unknown, or is legacy HMAC while
+    /// Ed25519-only enforcement is on. **OPERATIONAL/version skew** — kept
+    /// separate from [`Self::BadSignature`] because the operator action is a
+    /// controller/worker version or flag reconciliation, not an investigation.
+    SchemeRefused,
+}
+
+impl VerifyFailureKind {
+    /// `true` when the message was well-formed and the failure is about WHEN it
+    /// arrived rather than WHO sent it. Operators should read a `true` here as
+    /// "the fleet or a clock is unhealthy", never as "someone tampered".
+    #[must_use]
+    pub fn is_liveness(self) -> bool {
+        matches!(self, Self::Stale | Self::ClockSkewAhead)
+    }
+
+    /// Closed, bounded label set for metrics / structured logs. Never contains
+    /// a nonce, a signature, a key, or any payload — only the class.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stale => "stale",
+            Self::ClockSkewAhead => "clock_skew_ahead",
+            Self::MalformedNonce => "malformed_nonce",
+            Self::BadSignature => "bad_signature",
+            Self::Replay => "replay",
+            Self::KeyError => "key_error",
+            Self::SchemeRefused => "scheme_refused",
+        }
+    }
+
+    /// Every label this enum can ever emit. Use it to pre-seed a metric's label
+    /// set so an absent series is distinguishable from a zero one
+    /// (`absent-is-not-zero`).
+    pub const ALL: &'static [Self] = &[
+        Self::Stale,
+        Self::ClockSkewAhead,
+        Self::MalformedNonce,
+        Self::BadSignature,
+        Self::Replay,
+        Self::KeyError,
+        Self::SchemeRefused,
+    ];
+}
+
+/// A verification rejection: the byte-stable operator message PLUS the typed
+/// reason it was produced for.
+///
+/// `Display` renders exactly the string the pre-split code returned, so every
+/// existing `format!("…: {e}")` call site and every test that matches on the
+/// message text is byte-identical. New call sites read [`Self::kind`] instead of
+/// parsing the text — deriving a classification by string-sniffing is the defect
+/// this type exists to avoid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyError {
+    kind: VerifyFailureKind,
+    message: String,
+    age_secs: Option<u64>,
+}
+
+impl VerifyError {
+    /// Build a rejection with an explicit reason. Exposed so downstream crates
+    /// (and their tests) can synthesise a rejection whose class is known,
+    /// instead of matching on prose.
+    #[must_use]
+    pub fn from_parts(
+        kind: VerifyFailureKind,
+        message: impl Into<String>,
+        age_secs: Option<u64>,
+    ) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            age_secs,
+        }
+    }
+
+    pub(crate) fn new(kind: VerifyFailureKind, message: String) -> Self {
+        Self {
+            kind,
+            message,
+            age_secs: None,
+        }
+    }
+
+    pub(crate) fn with_age(kind: VerifyFailureKind, message: String, age_secs: u64) -> Self {
+        Self {
+            kind,
+            message,
+            age_secs: Some(age_secs),
+        }
+    }
+
+    /// The typed reason. Branch on this, never on the message text.
+    #[must_use]
+    pub fn kind(&self) -> VerifyFailureKind {
+        self.kind
+    }
+
+    /// `true` for a well-formed message that arrived at the wrong TIME.
+    #[must_use]
+    pub fn is_liveness(&self) -> bool {
+        self.kind.is_liveness()
+    }
+
+    /// How far outside the window the message was, in seconds, when that is the
+    /// reason it was rejected. An age is not a secret and is the one number that
+    /// tells an operator how long the stall was.
+    #[must_use]
+    pub fn age_secs(&self) -> Option<u64> {
+        self.age_secs
+    }
+}
+
+impl std::fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for VerifyError {}
+
+impl From<VerifyError> for String {
+    fn from(e: VerifyError) -> Self {
+        e.message
+    }
+}
+
+/// The phrase every LIVENESS rejection headline contains, and no other headline
+/// does.
+///
+/// Downstream classifiers (notably the ops-alert `classify_execution_error`)
+/// only ever see the rendered `error_message` string from the database, so they
+/// cannot read [`VerifyFailureKind`]. Sharing this constant makes that coupling
+/// explicit and compile-checked at both ends instead of leaving two
+/// independently-maintained literals to drift.
+pub const LIVENESS_REJECTION_MARKER: &str = "rejected on AGE, before its signature was evaluated";
+
+/// Operator-facing headline for a rejected signed message, split so that a
+/// LIVENESS failure never reads as tampering. **Constant strings only** — this
+/// carries no bytes derived from the rejected message, so it is safe to place
+/// in a payload the receiver will sign and publish after refusing an
+/// UNAUTHENTICATED request. Use [`describe_verify_failure`] wherever the
+/// protocol detail is also wanted (logs, controller-side error messages).
+///
+/// `noun` names the thing that was rejected ("Job result", "Pipeline result",
+/// "Job dispatch").
+///
+/// **Deliberately does NOT claim the signature was valid.** The freshness check
+/// runs BEFORE the signature check ([`SignedMessage::verify_no_replay_core`]),
+/// so on a `Stale` rejection the signature was never evaluated. Saying "valid
+/// but stale" would be a new instance of exactly the defect this split fixes:
+/// a message asserting something it did not measure.
+#[must_use]
+pub fn verify_failure_headline(noun: &str, kind: VerifyFailureKind) -> String {
+    match kind {
+        VerifyFailureKind::Stale => format!(
+            "{noun} arrived outside its freshness window and was \
+             {LIVENESS_REJECTION_MARKER} — this is a liveness failure \
+             (sender/receiver stall, paused host, or clock skew), not tampering"
+        ),
+        VerifyFailureKind::ClockSkewAhead => format!(
+            "{noun} carries a timestamp ahead of this host's clock and was \
+             {LIVENESS_REJECTION_MARKER} — check clock sync between controller \
+             and workers"
+        ),
+        VerifyFailureKind::KeyError => {
+            format!("{noun} could not be verified — local key material problem")
+        }
+        VerifyFailureKind::SchemeRefused => format!(
+            "{noun} was refused on its crypto scheme, not on its signature — \
+             reconcile controller/worker versions and the Ed25519 enforcement flag"
+        ),
+        VerifyFailureKind::Replay
+        | VerifyFailureKind::BadSignature
+        | VerifyFailureKind::MalformedNonce => {
+            format!("{noun} signature verification failed")
+        }
+    }
+}
+
+/// [`verify_failure_headline`] plus the byte-stable protocol detail.
+///
+/// The detail can contain a value taken from the rejected message (the
+/// `crypto_scheme` byte, the observed age), so this belongs in logs and in
+/// controller-side error messages — NOT in a payload that gets signed and
+/// republished in response to an unauthenticated request.
+#[must_use]
+pub fn describe_verify_failure(noun: &str, e: &VerifyError) -> String {
+    format!("{}: {e}", verify_failure_headline(noun, e.kind()))
+}
+
 /// Crate-private core shared by every signed NATS message type.
 ///
 /// Implementors provide the canonical signing payload plus nonce/signature
@@ -1073,35 +1300,56 @@ trait SignedMessage {
     /// `PipelineJobResult` alone checked hex first — accidental drift; the
     /// orders are otherwise equivalent, differing only in WHICH error
     /// string is returned for a nonce malformed in both ways at once.)
-    fn check_freshness_window(&self, max_age_secs: u64) -> Result<u64, String> {
+    fn check_freshness_window(&self, max_age_secs: u64) -> Result<u64, VerifyError> {
         let parts: Vec<&str> = self.nonce().splitn(2, ':').collect();
         if parts.len() != 2 {
-            return Err(format!("malformed {}", Self::NONCE_LABEL));
+            return Err(VerifyError::new(
+                VerifyFailureKind::MalformedNonce,
+                format!("malformed {}", Self::NONCE_LABEL),
+            ));
         }
-        let ts: u64 = parts[0]
-            .parse()
-            .map_err(|_| format!("invalid timestamp in {}", Self::NONCE_LABEL))?;
+        let ts: u64 = parts[0].parse().map_err(|_| {
+            VerifyError::new(
+                VerifyFailureKind::MalformedNonce,
+                format!("invalid timestamp in {}", Self::NONCE_LABEL),
+            )
+        })?;
         if hex::decode(parts[1]).is_err() {
-            return Err(format!("invalid hex in {}", Self::NONCE_LABEL));
+            return Err(VerifyError::new(
+                VerifyFailureKind::MalformedNonce,
+                format!("invalid hex in {}", Self::NONCE_LABEL),
+            ));
         }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         if now.saturating_sub(ts) > max_age_secs {
-            return Err(format!(
-                "{} is too old ({} s, max {})",
-                Self::NONCE_LABEL,
-                now.saturating_sub(ts),
-                max_age_secs
+            let age = now.saturating_sub(ts);
+            // LIVENESS, not tampering: the signature has not even been checked
+            // yet. See `VerifyFailureKind::Stale`.
+            return Err(VerifyError::with_age(
+                VerifyFailureKind::Stale,
+                format!(
+                    "{} is too old ({} s, max {})",
+                    Self::NONCE_LABEL,
+                    age,
+                    max_age_secs
+                ),
+                age,
             ));
         }
         if ts.saturating_sub(now) > MAX_FUTURE_SKEW_SECS {
-            return Err(format!(
-                "{} is in the future ({} s ahead, max {})",
-                Self::NONCE_LABEL,
-                ts.saturating_sub(now),
-                MAX_FUTURE_SKEW_SECS
+            let ahead = ts.saturating_sub(now);
+            return Err(VerifyError::with_age(
+                VerifyFailureKind::ClockSkewAhead,
+                format!(
+                    "{} is in the future ({} s ahead, max {})",
+                    Self::NONCE_LABEL,
+                    ahead,
+                    MAX_FUTURE_SKEW_SECS
+                ),
+                ahead,
             ));
         }
         Ok(ts)
@@ -1111,15 +1359,20 @@ trait SignedMessage {
     /// constant-time HMAC. **Never touches the replay cache** — this is the
     /// observer half of the verify-once split. Returns the parsed nonce
     /// timestamp on success.
-    fn verify_no_replay_core(&self, key: &[u8], max_age_secs: u64) -> Result<u64, String> {
+    fn verify_no_replay_core(&self, key: &[u8], max_age_secs: u64) -> Result<u64, VerifyError> {
         let ts = self.check_freshness_window(max_age_secs)?;
 
         // Constant-time HMAC verification.
-        let mut mac =
-            <HmacSha256 as Mac>::new_from_slice(key).map_err(|e| format!("HMAC key error: {e}"))?;
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(key).map_err(|e| {
+            VerifyError::new(VerifyFailureKind::KeyError, format!("HMAC key error: {e}"))
+        })?;
         mac.update(&self.payload_bytes());
-        mac.verify_slice(self.signature())
-            .map_err(|_| "HMAC signature verification failed".to_string())?;
+        mac.verify_slice(self.signature()).map_err(|_| {
+            VerifyError::new(
+                VerifyFailureKind::BadSignature,
+                "HMAC signature verification failed".to_string(),
+            )
+        })?;
 
         Ok(ts)
     }
@@ -1161,20 +1414,30 @@ trait SignedMessage {
         &self,
         keys: &[DispatchVerifyingKey],
         max_age_secs: u64,
-    ) -> Result<u64, String> {
+    ) -> Result<u64, VerifyError> {
         let ts = self.check_freshness_window(max_age_secs)?;
         if keys.is_empty() {
-            return Err("no controller Ed25519 verifying key configured".to_string());
+            return Err(VerifyError::new(
+                VerifyFailureKind::KeyError,
+                "no controller Ed25519 verifying key configured".to_string(),
+            ));
         }
-        let sig = ed25519_dalek::Signature::from_slice(self.signature())
-            .map_err(|_| "malformed Ed25519 signature".to_string())?;
+        let sig = ed25519_dalek::Signature::from_slice(self.signature()).map_err(|_| {
+            VerifyError::new(
+                VerifyFailureKind::BadSignature,
+                "malformed Ed25519 signature".to_string(),
+            )
+        })?;
         let input = self.ed25519_signing_input();
         for k in keys {
             if k.verify_strict(&input, &sig).is_ok() {
                 return Ok(ts);
             }
         }
-        Err("Ed25519 signature verification failed".to_string())
+        Err(VerifyError::new(
+            VerifyFailureKind::BadSignature,
+            "Ed25519 signature verification failed".to_string(),
+        ))
     }
 
     /// Ed25519 primary-verifier core: [`Self::verify_no_replay_ed25519_core`]
@@ -1184,7 +1447,7 @@ trait SignedMessage {
         &self,
         keys: &[DispatchVerifyingKey],
         max_age_secs: u64,
-    ) -> Result<(), String> {
+    ) -> Result<(), VerifyError> {
         let ts = self.verify_no_replay_ed25519_core(keys, max_age_secs)?;
         self.record_nonce_or_replay_err(ts, max_age_secs)
     }
@@ -1193,17 +1456,20 @@ trait SignedMessage {
     /// process-local replay cache, or fail with the byte-stable
     /// `"<nonce> already seen"` replay error. This is the ONLY place the
     /// shared core inserts into `JOB_NONCE_CACHE`.
-    fn record_nonce_or_replay_err(&self, ts: u64, max_age_secs: u64) -> Result<(), String> {
+    fn record_nonce_or_replay_err(&self, ts: u64, max_age_secs: u64) -> Result<(), VerifyError> {
         // Replay protection: refuse a nonce we have seen before within
         // the freshness window. HMAC alone catches forgery; without
         // this check, anyone with NATS-publish access can capture a
         // signed message and re-fire it any number of times until
         // ts + max_age_secs expires.
         if !check_and_record_job_nonce(self.nonce(), ts, max_age_secs) {
-            return Err(format!(
-                "{} already seen (replay attempt within {}-second window)",
-                Self::NONCE_LABEL,
-                max_age_secs
+            return Err(VerifyError::new(
+                VerifyFailureKind::Replay,
+                format!(
+                    "{} already seen (replay attempt within {}-second window)",
+                    Self::NONCE_LABEL,
+                    max_age_secs
+                ),
             ));
         }
         Ok(())
@@ -1212,7 +1478,7 @@ trait SignedMessage {
     /// Shared primary-verifier core: [`Self::verify_no_replay_core`] plus
     /// replay-cache recording. Exactly one primary caller per signed
     /// message per process (verify-once rule).
-    fn verify_core(&self, key: &[u8], max_age_secs: u64) -> Result<(), String> {
+    fn verify_core(&self, key: &[u8], max_age_secs: u64) -> Result<(), VerifyError> {
         let ts = self.verify_no_replay_core(key, max_age_secs)?;
         self.record_nonce_or_replay_err(ts, max_age_secs)
     }
@@ -1227,7 +1493,7 @@ trait SignedMessage {
         &self,
         ring: &talos_workflow_engine_core::WorkerKeyRing,
         max_age_secs: u64,
-    ) -> Result<u64, String> {
+    ) -> Result<u64, VerifyError> {
         let mut keys = ring.verify_keys().iter();
         let signing = keys.next().expect("WorkerKeyRing is never empty");
         let signing_err = match self.verify_no_replay_core(signing.as_bytes(), max_age_secs) {
@@ -1242,13 +1508,37 @@ trait SignedMessage {
         Err(signing_err)
     }
 
+    /// Sign with a nonce timestamp `age_secs` in the PAST, producing a message
+    /// whose HMAC is genuinely valid over that back-dated nonce.
+    ///
+    /// This is the only way to build the real-world shape — a correctly signed
+    /// message that has since aged out — because the nonce is part of the
+    /// signed payload, so merely rewriting the timestamp of an already-signed
+    /// message breaks the MAC and no longer proves anything about staleness.
+    /// Test-only: production signing always mints a nonce at `now`.
+    #[cfg(test)]
+    fn sign_backdated_for_test(&mut self, key: &[u8], age_secs: u64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_secs();
+        self.set_nonce(format!(
+            "{}:{}",
+            now.saturating_sub(age_secs),
+            hex::encode([7u8; 16])
+        ));
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC key");
+        mac.update(&self.payload_bytes());
+        self.set_signature(mac.finalize().into_bytes().to_vec());
+    }
+
     /// Ring variant of [`Self::verify_core`]: the nonce is recorded exactly
     /// once, only after a ring member matches.
     fn verify_with_ring_core(
         &self,
         ring: &talos_workflow_engine_core::WorkerKeyRing,
         max_age_secs: u64,
-    ) -> Result<(), String> {
+    ) -> Result<(), VerifyError> {
         let ts = self.verify_no_replay_with_ring_core(ring, max_age_secs)?;
         self.record_nonce_or_replay_err(ts, max_age_secs)
     }
@@ -3462,6 +3752,7 @@ impl JobRequest {
     /// `max_age_secs` (default recommendation: 300 s / 5 minutes).
     pub fn verify(&self, key: &[u8], max_age_secs: u64) -> Result<(), String> {
         self.verify_core(key, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     /// Verify against a [`WorkerKeyRing`] (decrypt/verify-ring), recording the
@@ -3479,6 +3770,7 @@ impl JobRequest {
         max_age_secs: u64,
     ) -> Result<(), String> {
         self.verify_with_ring_core(ring, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     /// Ring variant of [`Self::verify_no_replay`]: HMAC+freshness against the
@@ -3490,6 +3782,7 @@ impl JobRequest {
         max_age_secs: u64,
     ) -> Result<u64, String> {
         self.verify_no_replay_with_ring_core(ring, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     /// Verify HMAC signature and nonce freshness **without** recording
@@ -3511,6 +3804,7 @@ impl JobRequest {
     /// replay protection is the responsibility of the primary verifier.
     pub fn verify_no_replay(&self, key: &[u8], max_age_secs: u64) -> Result<u64, String> {
         self.verify_no_replay_core(key, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     // ── RFC 0010 P1: Ed25519 dispatch scheme ──────────────────────────────
@@ -3532,6 +3826,7 @@ impl JobRequest {
         max_age_secs: u64,
     ) -> Result<(), String> {
         self.verify_ed25519_core(keys, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     /// Observer Ed25519 verify: freshness + signature only, no replay-cache
@@ -3542,6 +3837,7 @@ impl JobRequest {
         max_age_secs: u64,
     ) -> Result<u64, String> {
         self.verify_no_replay_ed25519_core(keys, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     /// Scheme-dispatching **primary** verify for the worker. Routes on
@@ -3561,19 +3857,23 @@ impl JobRequest {
         ed_keys: &[DispatchVerifyingKey],
         max_age_secs: u64,
         accept_legacy_hmac: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), VerifyError> {
         match self.crypto_scheme {
-            CRYPTO_SCHEME_ED25519 => self.verify_ed25519(ed_keys, max_age_secs),
+            CRYPTO_SCHEME_ED25519 => self.verify_ed25519_core(ed_keys, max_age_secs),
             CRYPTO_SCHEME_HMAC => {
                 if !accept_legacy_hmac {
-                    return Err(
+                    return Err(VerifyError::new(
+                        VerifyFailureKind::SchemeRefused,
                         "legacy HMAC dispatch refused (Ed25519-only enforcement enabled)"
                             .to_string(),
-                    );
+                    ));
                 }
-                self.verify_with_ring(hmac_ring, max_age_secs)
+                self.verify_with_ring_core(hmac_ring, max_age_secs)
             }
-            other => Err(format!("unknown dispatch crypto_scheme: {other}")),
+            other => Err(VerifyError::new(
+                VerifyFailureKind::SchemeRefused,
+                format!("unknown dispatch crypto_scheme: {other}"),
+            )),
         }
     }
 }
@@ -3855,6 +4155,7 @@ impl JobResult {
     /// the second one to fail with a spurious replay error.
     pub fn verify(&self, key: &[u8], max_age_secs: u64) -> Result<(), String> {
         self.verify_core(key, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     /// L-4 typed verifier: dispatches to [`Self::verify`] for
@@ -3898,6 +4199,7 @@ impl JobResult {
         max_age_secs: u64,
     ) -> Result<(), String> {
         self.verify_with_ring_core(ring, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     /// Ring variant of [`Self::verify_no_replay`]: signing key first, then
@@ -3909,6 +4211,7 @@ impl JobResult {
         max_age_secs: u64,
     ) -> Result<u64, String> {
         self.verify_no_replay_with_ring_core(ring, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     /// Verify HMAC signature and nonce freshness **without** recording
@@ -3930,6 +4233,7 @@ impl JobResult {
     /// chain, use `verify()` (not this method).
     pub fn verify_no_replay(&self, key: &[u8], max_age_secs: u64) -> Result<u64, String> {
         self.verify_no_replay_core(key, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     // ── RFC 0010 P2: per-worker Ed25519 result signing ────────────────────
@@ -3962,6 +4266,7 @@ impl JobResult {
         max_age_secs: u64,
     ) -> Result<(), String> {
         self.verify_ed25519_core(keys, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     /// Observer Ed25519 result verify: freshness + signature only, no replay
@@ -3972,6 +4277,7 @@ impl JobResult {
         max_age_secs: u64,
     ) -> Result<u64, String> {
         self.verify_no_replay_ed25519_core(keys, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     /// Scheme-dispatching **primary** verify for the controller. Routes on
@@ -3986,18 +4292,22 @@ impl JobResult {
         worker_ed_keys: &[DispatchVerifyingKey],
         max_age_secs: u64,
         accept_legacy_hmac: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), VerifyError> {
         match self.crypto_scheme {
-            CRYPTO_SCHEME_ED25519 => self.verify_ed25519(worker_ed_keys, max_age_secs),
+            CRYPTO_SCHEME_ED25519 => self.verify_ed25519_core(worker_ed_keys, max_age_secs),
             CRYPTO_SCHEME_HMAC => {
                 if !accept_legacy_hmac {
-                    return Err(
+                    return Err(VerifyError::new(
+                        VerifyFailureKind::SchemeRefused,
                         "legacy HMAC result refused (Ed25519-only enforcement enabled)".to_string(),
-                    );
+                    ));
                 }
-                self.verify_with_ring(hmac_ring, max_age_secs)
+                self.verify_with_ring_core(hmac_ring, max_age_secs)
             }
-            other => Err(format!("unknown result crypto_scheme: {other}")),
+            other => Err(VerifyError::new(
+                VerifyFailureKind::SchemeRefused,
+                format!("unknown result crypto_scheme: {other}"),
+            )),
         }
     }
 
@@ -4014,20 +4324,25 @@ impl JobResult {
         worker_ed_keys: &[DispatchVerifyingKey],
         max_age_secs: u64,
         accept_legacy_hmac: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), VerifyError> {
         match self.crypto_scheme {
             CRYPTO_SCHEME_ED25519 => self
-                .verify_no_replay_ed25519(worker_ed_keys, max_age_secs)
+                .verify_no_replay_ed25519_core(worker_ed_keys, max_age_secs)
                 .map(|_| ()),
             CRYPTO_SCHEME_HMAC => {
                 if !accept_legacy_hmac {
-                    return Err(
+                    return Err(VerifyError::new(
+                        VerifyFailureKind::SchemeRefused,
                         "legacy HMAC result refused (Ed25519-only enforcement enabled)".to_string(),
-                    );
+                    ));
                 }
-                self.verify_as_with_ring(hmac_ring, max_age_secs, Verifier::Observer)
+                self.verify_no_replay_with_ring_core(hmac_ring, max_age_secs)
+                    .map(|_| ())
             }
-            other => Err(format!("unknown result crypto_scheme: {other}")),
+            other => Err(VerifyError::new(
+                VerifyFailureKind::SchemeRefused,
+                format!("unknown result crypto_scheme: {other}"),
+            )),
         }
     }
 }
@@ -4528,6 +4843,7 @@ impl PipelineJobRequest {
     /// for passive observers.
     pub fn verify(&self, key: &[u8], max_age_secs: u64) -> Result<(), String> {
         self.verify_core(key, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     /// Ring variant of [`Self::verify`]: HMAC+freshness per ring member,
@@ -4539,6 +4855,7 @@ impl PipelineJobRequest {
         max_age_secs: u64,
     ) -> Result<(), String> {
         self.verify_with_ring_core(ring, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     /// Ring variant of [`Self::verify_no_replay`]: signing key first, then
@@ -4549,6 +4866,7 @@ impl PipelineJobRequest {
         max_age_secs: u64,
     ) -> Result<u64, String> {
         self.verify_no_replay_with_ring_core(ring, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     /// Verify HMAC + freshness WITHOUT touching the replay cache.
@@ -4557,6 +4875,7 @@ impl PipelineJobRequest {
     /// to avoid dual-cache-insert deadlocks.
     pub fn verify_no_replay(&self, key: &[u8], max_age_secs: u64) -> Result<u64, String> {
         self.verify_no_replay_core(key, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     // ── RFC 0010 P1: Ed25519 dispatch scheme (mirror of JobRequest) ────────
@@ -4574,6 +4893,7 @@ impl PipelineJobRequest {
         max_age_secs: u64,
     ) -> Result<(), String> {
         self.verify_ed25519_core(keys, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     /// Observer Ed25519 verify. See [`JobRequest::verify_no_replay_ed25519`].
@@ -4583,6 +4903,7 @@ impl PipelineJobRequest {
         max_age_secs: u64,
     ) -> Result<u64, String> {
         self.verify_no_replay_ed25519_core(keys, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     /// Scheme-dispatching primary verify. See [`JobRequest::verify_dispatch`].
@@ -4592,19 +4913,23 @@ impl PipelineJobRequest {
         ed_keys: &[DispatchVerifyingKey],
         max_age_secs: u64,
         accept_legacy_hmac: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), VerifyError> {
         match self.crypto_scheme {
-            CRYPTO_SCHEME_ED25519 => self.verify_ed25519(ed_keys, max_age_secs),
+            CRYPTO_SCHEME_ED25519 => self.verify_ed25519_core(ed_keys, max_age_secs),
             CRYPTO_SCHEME_HMAC => {
                 if !accept_legacy_hmac {
-                    return Err(
+                    return Err(VerifyError::new(
+                        VerifyFailureKind::SchemeRefused,
                         "legacy HMAC dispatch refused (Ed25519-only enforcement enabled)"
                             .to_string(),
-                    );
+                    ));
                 }
-                self.verify_with_ring(hmac_ring, max_age_secs)
+                self.verify_with_ring_core(hmac_ring, max_age_secs)
             }
-            other => Err(format!("unknown dispatch crypto_scheme: {other}")),
+            other => Err(VerifyError::new(
+                VerifyFailureKind::SchemeRefused,
+                format!("unknown dispatch crypto_scheme: {other}"),
+            )),
         }
     }
 }
@@ -4798,6 +5123,7 @@ impl PipelineJobResult {
     /// added, not after the same regression hits production.
     pub fn verify(&self, key: &[u8], max_age_secs: u64) -> Result<(), String> {
         self.verify_core(key, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     /// L-4 typed verifier — same dispatch as
@@ -4834,6 +5160,7 @@ impl PipelineJobResult {
         max_age_secs: u64,
     ) -> Result<(), String> {
         self.verify_with_ring_core(ring, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     /// Ring variant of [`Self::verify_no_replay`]: signing key first, then
@@ -4844,6 +5171,7 @@ impl PipelineJobResult {
         max_age_secs: u64,
     ) -> Result<u64, String> {
         self.verify_no_replay_with_ring_core(ring, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     /// Verify HMAC signature and nonce freshness without recording the
@@ -4862,6 +5190,7 @@ impl PipelineJobResult {
     /// ways at once differs — every accept/reject outcome is identical.)
     pub fn verify_no_replay(&self, key: &[u8], max_age_secs: u64) -> Result<u64, String> {
         self.verify_no_replay_core(key, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     // ── RFC 0010 P2: per-worker Ed25519 result signing (mirror of JobResult) ──
@@ -4889,6 +5218,7 @@ impl PipelineJobResult {
         max_age_secs: u64,
     ) -> Result<(), String> {
         self.verify_ed25519_core(keys, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     /// Observer Ed25519 result verify. See [`JobResult::verify_no_replay_ed25519`].
@@ -4898,6 +5228,7 @@ impl PipelineJobResult {
         max_age_secs: u64,
     ) -> Result<u64, String> {
         self.verify_no_replay_ed25519_core(keys, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     /// Scheme-dispatching primary verify. See [`JobResult::verify_dispatch`].
@@ -4907,18 +5238,22 @@ impl PipelineJobResult {
         worker_ed_keys: &[DispatchVerifyingKey],
         max_age_secs: u64,
         accept_legacy_hmac: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), VerifyError> {
         match self.crypto_scheme {
-            CRYPTO_SCHEME_ED25519 => self.verify_ed25519(worker_ed_keys, max_age_secs),
+            CRYPTO_SCHEME_ED25519 => self.verify_ed25519_core(worker_ed_keys, max_age_secs),
             CRYPTO_SCHEME_HMAC => {
                 if !accept_legacy_hmac {
-                    return Err(
+                    return Err(VerifyError::new(
+                        VerifyFailureKind::SchemeRefused,
                         "legacy HMAC result refused (Ed25519-only enforcement enabled)".to_string(),
-                    );
+                    ));
                 }
-                self.verify_with_ring(hmac_ring, max_age_secs)
+                self.verify_with_ring_core(hmac_ring, max_age_secs)
             }
-            other => Err(format!("unknown result crypto_scheme: {other}")),
+            other => Err(VerifyError::new(
+                VerifyFailureKind::SchemeRefused,
+                format!("unknown result crypto_scheme: {other}"),
+            )),
         }
     }
 }
@@ -5131,6 +5466,7 @@ impl WorkerHeartbeat {
     pub fn verify(&self, key: &[u8], max_age_secs: u64) -> Result<(), String> {
         validate_worker_id(&self.worker_id)?;
         self.verify_core(key, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     /// Verify HMAC + freshness WITHOUT touching the replay cache.
@@ -5138,6 +5474,7 @@ impl WorkerHeartbeat {
     pub fn verify_no_replay(&self, key: &[u8], max_age_secs: u64) -> Result<u64, String> {
         validate_worker_id(&self.worker_id)?;
         self.verify_no_replay_core(key, max_age_secs)
+            .map_err(|e| e.to_string())
     }
 
     /// MAC the current fields WITHOUT minting a fresh nonce, so a test can
@@ -6887,6 +7224,101 @@ mod tests {
         r.sign_ed25519_with_worker_id(&sk, "worker-a").unwrap();
         r.output_payload = serde_json::json!({"ok": false}).into();
         assert!(r.verify_no_replay_ed25519(&[pk], 300).is_err());
+    }
+
+    /// **The regression this PR exists to prevent.**
+    ///
+    /// A `JobResult` that is correctly signed but arrived after its freshness
+    /// window must be distinguishable from one whose signature does not verify
+    /// — at the type level, not by reading prose — and it must still be
+    /// REJECTED. Drives the real `verify_dispatch` path, not a re-implementation.
+    #[test]
+    fn a_stale_result_is_typed_as_liveness_and_a_forged_one_is_not() {
+        // Serialized against the tests that wipe/bulk-fill the process-global
+        // nonce cache — see NONCE_CACHE_TEST_SERIAL.
+        let _serial = crate::NONCE_CACHE_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let key = test_key();
+        let ring = hmac_ring(&key);
+        let sk = ed_keypair();
+        let pk = sk.verifying_key();
+
+        // (1) Correctly signed 715 s ago — the measured shape of the 2026-08-24
+        //     cluster (host suspend froze the controller for 718.6 s).
+        let mut stale = make_test_result();
+        stale.worker_id = "worker-a".to_string();
+        stale.sign_backdated_for_test(&key, 715);
+
+        let e = stale
+            .verify_dispatch(&ring, &[pk], 300, true)
+            .expect_err("fail-closed: a stale result is STILL rejected");
+        assert_eq!(e.kind(), VerifyFailureKind::Stale);
+        assert!(e.is_liveness());
+        assert_eq!(e.age_secs(), Some(715));
+        // The byte-stable protocol text is preserved verbatim inside the error.
+        assert_eq!(e.to_string(), "result_nonce is too old (715 s, max 300)");
+
+        // (2) The signature on those exact bytes IS valid — verified by
+        //     re-checking under a window wide enough to admit it. Without this
+        //     leg, "stale, not forged" would be an assertion rather than a
+        //     measurement, which is the very defect class being fixed.
+        stale
+            .verify_dispatch(&ring, &[pk], 10_000, true)
+            .expect("the same bytes verify once the window admits them");
+
+        // (3) A FRESH result with a corrupted signature is a security failure.
+        let mut forged = make_test_result();
+        forged.worker_id = "worker-a".to_string();
+        forged.sign_with_worker_id(&key, "worker-a").unwrap();
+        forged.signature[0] ^= 0xff;
+        let f = forged
+            .verify_dispatch(&ring, &[pk], 300, true)
+            .expect_err("a corrupted signature is rejected");
+        assert_eq!(f.kind(), VerifyFailureKind::BadSignature);
+        assert!(!f.is_liveness());
+        assert_eq!(f.age_secs(), None);
+
+        // (4) The operator-facing headlines must not be confusable.
+        let stale_headline = describe_verify_failure("Job result", &e);
+        let forged_headline = describe_verify_failure("Job result", &f);
+        assert!(
+            !stale_headline.contains("signature verification failed"),
+            "a liveness failure must never be headlined as tampering: {stale_headline}"
+        );
+        assert!(stale_headline.contains(LIVENESS_REJECTION_MARKER));
+        assert!(stale_headline.contains("715 s"));
+        assert!(forged_headline.contains("signature verification failed"));
+        assert!(!forged_headline.contains(LIVENESS_REJECTION_MARKER));
+    }
+
+    /// The headline/kind mapping must be total and self-consistent: exactly the
+    /// liveness kinds carry the shared marker, and no liveness kind is ever
+    /// headlined as a signature failure. Iterates `ALL`, so a new variant that
+    /// forgets its arm fails here rather than silently reading as tampering.
+    #[test]
+    fn every_failure_kind_headlines_consistently_with_its_liveness_flag() {
+        for &kind in VerifyFailureKind::ALL {
+            let e = VerifyError::from_parts(kind, "detail", None);
+            let h = describe_verify_failure("Job result", &e);
+            assert_eq!(
+                h.contains(LIVENESS_REJECTION_MARKER),
+                kind.is_liveness(),
+                "marker/liveness disagreement for {kind:?}: {h}"
+            );
+            assert!(
+                !(kind.is_liveness() && h.contains("signature verification failed")),
+                "{kind:?} headlined as tampering: {h}"
+            );
+            assert!(h.contains("detail"), "{kind:?} dropped the protocol detail");
+        }
+        // Labels are a closed, unique set — a metric or log field built on them
+        // cannot silently collapse two classes into one series.
+        let mut labels: Vec<&str> = VerifyFailureKind::ALL.iter().map(|k| k.label()).collect();
+        let n = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), n, "VerifyFailureKind labels must be unique");
     }
 
     #[test]
