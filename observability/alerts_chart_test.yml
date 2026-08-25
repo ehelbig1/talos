@@ -146,6 +146,122 @@ tests:
         exp_alerts: []
 
   # ══════════════════════════════════════════════════════════════════════
+  # THE DRILL RAN AND FAILED — the fault the staleness alert above cannot
+  # express, and which had NO consumer at all until 2026-08-25 (the gauge
+  # sat at 0 on this deployment for eight days while nothing read it).
+  #
+  # Driven in BOTH directions, and the negative cases are the load-bearing
+  # ones: a rule that fired unconditionally would pass the firing test.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: last drill run FAILED — pending, then fires, then clears on a green re-run
+    input_series:
+      # 0 = failure, held for 40 intervals, then a successful re-run.
+      - series: 'talos_backup_drill_last_status{job="node-exporter"}'
+        values: "0+0x40 1+0x60"
+    alert_rule_test:
+      # `for: 15m` — pending, not firing, before the window is up. This is
+      # the whole point of the 15m: a remediation drill already in flight
+      # must not notify, because the file on disk is still the old failure.
+      - eval_time: 10m
+        alertname: TalosBackupRestoreDrillLastRunFailed
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: TalosBackupRestoreDrillLastRunFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: data-loss
+              job: node-exporter
+            exp_annotations:
+              summary: "The last backup→restore drill RAN AND FAILED"
+              description: |
+                scripts/drills/backup-restore.sh completed and reported
+                failure — this is not "the drill is overdue", it is "the drill
+                ran and the backups did not come back". Until it passes, the
+                readability of every artifact in $BACKUP_DIR is unproven.
+                The metric records only the outcome, never which step failed,
+                so read the run's own output: ~/.talos/logs/backup-drill.log
+                for a scheduled run, or re-run it by hand with `make drill`.
+                Common causes, in the order they are checked: no escrowed KEK
+                source (TALOS_DRILL_ESCROW_KEY_CMD / _FILE — the drill refuses
+                to read the key from the live stack, by design), a missing or
+                stale artifact in $BACKUP_DIR, and a restore or decrypt that
+                failed on real rows. Clears on the next successful run.
+      # A green run flips the gauge to 1 and the alert clears. Without this
+      # the alert would be unclearable by the only action that fixes it —
+      # the exact defect TalosBackupRestoreDrillFailed shipped with for ten
+      # weeks (nothing collected its metric, so no drill could clear it).
+      - eval_time: 60m
+        alertname: TalosBackupRestoreDrillLastRunFailed
+        exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # A drill that keeps passing is silent for the whole timeline.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: last drill run SUCCEEDED — no alert at any point
+    input_series:
+      - series: 'talos_backup_drill_last_status{job="node-exporter"}'
+        values: "1+0x180"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: TalosBackupRestoreDrillLastRunFailed
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: TalosBackupRestoreDrillLastRunFailed
+        exp_alerts: []
+      - eval_time: 180m
+        alertname: TalosBackupRestoreDrillLastRunFailed
+        exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # THE SERIES IS ABSENT — a host that has never drilled. This alert is
+  # SILENT here, deliberately: `== 0` over an absent series matches
+  # nothing, and "never ran" is already the absent() arm of
+  # TalosBackupRestoreDrillFailed. This test is not decoration — it PINS
+  # that decision, so anyone who later adds `or absent(...)` here goes red
+  # and has to re-make the argument rather than quietly shipping a second
+  # permanently-firing alert for a condition already covered one rule up.
+  #
+  # `_x180` = a hundred and eighty intervals with no sample at all. The
+  # companion series keeps the test from degenerating to an empty input.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: drill has never run — the status alert stays silent by design
+    input_series:
+      - series: 'talos_backup_drill_last_status{job="node-exporter"}'
+        values: "_x180"
+      - series: 'talos_backup_drill_last_success_timestamp_seconds{job="node-exporter"}'
+        values: "_x180"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: TalosBackupRestoreDrillLastRunFailed
+        exp_alerts: []
+      - eval_time: 180m
+        alertname: TalosBackupRestoreDrillLastRunFailed
+        exp_alerts: []
+      # …while the SIBLING alert does fire on exactly this input. That is
+      # what makes "silent by design" a division of labour rather than a
+      # hole: the two together cover never-ran, stopped-running and
+      # ran-and-failed.
+      - eval_time: 70m
+        alertname: TalosBackupRestoreDrillFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: ops-hygiene
+            exp_annotations:
+              summary: "No successful backup→restore drill in 14+ days"
+              description: |
+                scripts/drills/backup-restore.sh has either not run or is
+                failing. A backup you have not restored is a hypothesis —
+                run the drill now. If this fired via the absent() arm the
+                series has NEVER been published: check that the drill script
+                is scheduled at all and that its node_exporter textfile
+                directory is being collected.
+
+  # ══════════════════════════════════════════════════════════════════════
   # OFF-HOST BACKUP EGRESS (Tier 2).
   #
   # The upload deliberately does not fail the local dump, which is correct
