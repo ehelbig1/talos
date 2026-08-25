@@ -50,23 +50,26 @@ impl ParallelWorkflowEngine {
             Err(e) => return (node_idx, Err(e)),
         };
 
-        // Absent-policy fallback is METHOD-AWARE, not a blanket count:
-        // a node with no explicit retry config retries transient
+        // Absent-count fallback is METHOD-AWARE, not a blanket count:
+        // a node that did not declare `retry_count` retries transient
         // failures only when its module is read-only / pure compute
         // (worlds minimal/secrets, or http/agent with GET/HEAD-only
         // methods). Side-effect-capable modules fail closed to 0 so a
         // retry can never double-fire a send. Explicit per-node
         // `retry_count` (including 0) always wins.
-        let mut retry = self
+        //
+        // "No retry keys at all" and "retry keys but no count" resolve
+        // through the SAME call, which is the point: they used to differ,
+        // and the second silently got 2 for every world.
+        let retry = self
             .node_meta
             .get(&node_id)
             .and_then(|(_, rp, _)| rp.clone())
-            .unwrap_or_else(|| {
-                talos_workflow_engine_core::RetryPolicy::default_for_module(
-                    &wasm_module.allowed_methods,
-                    Some(&wasm_module.capability_world),
-                )
-            });
+            .unwrap_or_default();
+        let mut max_retries = retry.resolved_max_retries(
+            &wasm_module.allowed_methods,
+            Some(&wasm_module.capability_world),
+        );
 
         // Approval gate: verify an approved record exists when the
         // module declares `requires_approval_for`.
@@ -191,8 +194,8 @@ impl ParallelWorkflowEngine {
         // lower an explicit count, NEVER touch a non-declaring node) lives in
         // `effective_retries_with_idempotency` so its safety property is unit
         // tested there.
-        retry.max_retries = talos_workflow_engine_core::effective_retries_with_idempotency(
-            retry.max_retries,
+        max_retries = talos_workflow_engine_core::effective_retries_with_idempotency(
+            max_retries,
             &wasm_module.capability_world,
             idempotency_key.is_some(),
         );
@@ -456,7 +459,7 @@ impl ParallelWorkflowEngine {
             max_write_ceiling: self.max_write_ceiling,
             egress_scope: self.egress_scope,
             idempotency_key,
-            max_retries: retry.max_retries,
+            max_retries,
             backoff_ms: retry.backoff_ms,
             retry_condition: retry.retry_condition.clone(),
             retry_delay_expr: retry.retry_delay_expression.clone(),
