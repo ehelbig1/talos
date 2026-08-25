@@ -1694,6 +1694,414 @@ AMEOF
 fi
 rm -f "$AM_REF_OUT" 2>/dev/null || true
 
+# ══════════════════════════════════════════════════════════════════════════
+# LEG F — off-host backup egress (Tier 2): producer → collector → Prometheus
+#
+# WHY THIS EXISTS. `scripts/offhost-backup/upload.sh` is the only thing
+# standing between losing this disk and losing 1,544 ml_examples + 384
+# ml_disagreements — a month of human labelling that no re-clone recovers.
+# Its two alerts (TalosOffhostBackupUploadFailing / TalosOffhostBackupStale)
+# are BOTH gated on series the uploader itself publishes into node_exporter's
+# textfile directory. So the alerts cannot see any failure that happens
+# UPSTREAM of the textfile: an uploader writing to a directory node_exporter
+# does not read produces no series, and `increase(absent[50h])` matches
+# nothing. The producer and the collector agreeing with EACH OTHER is not the
+# property that matters; the property that matters is that PROMETHEUS has the
+# series, and that is what this leg checks.
+#
+# WHY IT IS NOT AN ALERT. The alerts deliberately cannot fire before the
+# uploader's first run (an absent() arm would go permanently red on every
+# deployment that does not use Tier 2, and permanent red trains operators to
+# ignore red — see the comment above TalosOffhostBackupStale). That leaves
+# "never wired up at all" with no live detector. This leg is that detector,
+# and it runs where a human is watching.
+#
+# IT MUST BE HONEST WHEN THE ANSWER IS "NOT ENABLED". A leg that printed a
+# green tick because nothing is configured would be a worse defect than the
+# one it is checking for. Three states, and only one of them is a tick:
+#   BROKEN     — configured (or scheduled) but the chain cannot deliver. FAILS.
+#   NOT PROVEN — nothing is wired up. Does NOT fail, is NOT green, and says
+#                out loud that neither alert can fire.
+#   wired      — Prometheus is actually serving the series the loaded alerts
+#                reference, and every kind has a recent success.
+#
+# EVERYTHING IS DERIVED, NOTHING IS HARDCODED. node_exporter's textfile
+# directory comes from the LIVE container's argv plus its LIVE bind mounts;
+# the series to look for and the staleness threshold come from the alert rules
+# Prometheus has actually LOADED (/api/v1/rules), not from a file on disk and
+# not from a list in this script. A hardcoded list is the next stale snapshot
+# (check 65's own lesson).
+#
+# STATED LIMITS — every one of these can produce a `wired` tick over a chain
+# that would fail in practice, and each was reasoned about rather than
+# discovered later:
+#   * It cannot tell an OFF-HOST destination from a local one. `enabled == 1`
+#     means three env vars were set; a bucket served from this same disk would
+#     tick green. Only the operator choosing the destination closes that, and
+#     the key must live in a different trust domain from the ciphertext.
+#   * It never opens an archive. That an object in the bucket DECRYPTS to a
+#     restorable dump is `make drill ARGS="--source b2"`, and nothing else.
+#   * The metric it reads is written by the uploader, so an uploader that
+#     stamped a success it did not perform would pass. (`last_success` is only
+#     stamped after a PUT returns success, which bounds this.)
+#   * It checks the LaunchAgent's textfile directory but cannot check that
+#     `cargo` and `aws` resolve on the plist's fixed PATH, or that the
+#     passphrase helper is non-interactive under launchd. Those surface as a
+#     failing scheduled run, i.e. as reason="config" in the counter.
+#   * macOS/launchd only for the schedule half; on Linux the plist is absent
+#     and that half reports as "not scheduled" rather than inspecting systemd.
+#   * PLACEMENT: `make up` runs this whole script with `>/dev/null 2>&1` and
+#     reacts only to its exit status, so a NOT-PROVEN verdict (which
+#     deliberately exits 0) is INVISIBLE there. An operator sees leg F only via
+#     `make observability-verify`. Making NOT PROVEN exit non-zero would fix
+#     the visibility and break something worse — `make up` would then run
+#     `observability-reload` and eventually declare the stack stale, on a host
+#     whose Prometheus config is perfectly current. The narrow line `make up`
+#     prints ("Prometheus is evaluating this checkout") is true and is not a
+#     claim about backups; the line this script itself prints at the end WAS
+#     the one that read green over an unproven chain, and that is the one
+#     F_NOTPROVEN corrects.
+# ══════════════════════════════════════════════════════════════════════════
+bold "  F. off-host backup egress: producer → collector → Prometheus"
+
+NE_CONTAINER="${NE_CONTAINER:-talos-node-exporter}"
+# Tri-state, because two-state is what would have made this leg a liar. The
+# script's closing line is an unqualified green tick, and "nothing is wired up"
+# must not be allowed to reach it — an operator who reads a green summary over
+# an unproven off-host chain has been told the opposite of the truth. 0 = wired
+# or irrelevant, 1 = NOT PROVEN (does not fail the run, but the summary says so).
+F_NOTPROVEN=0
+
+if ! grep -qE '^[[:space:]]{2}node-exporter:[[:space:]]*$' "$STACK_ROOT/docker-compose.yml" 2>/dev/null; then
+    yellow "  ⚠ $STACK_ROOT/docker-compose.yml declares no node-exporter service — this"
+    yellow "    stack collects no textfile metrics at all, so neither the off-host"
+    yellow "    alerts nor the restore-drill alert can ever have data. NOT PROVEN."
+    F_NOTPROVEN=1
+elif ! docker inspect "$NE_CONTAINER" >/dev/null 2>&1; then
+    red "  ✗ compose declares a node-exporter service but container '$NE_CONTAINER'"
+    red "    does not exist — every textfile metric is unscraped."
+    yellow "    → docker compose up -d node-exporter"
+    FAIL=1
+elif [ "$(docker inspect -f '{{.State.Running}}' "$NE_CONTAINER")" != "true" ]; then
+    red "  ✗ '$NE_CONTAINER' exists but is not running — every textfile metric is unscraped."
+    FAIL=1
+else
+    NE_ARGV="$(docker inspect "$NE_CONTAINER" --format '{{json .Config.Cmd}}{{json .Args}}')"
+    NE_MOUNTS="$(docker inspect "$NE_CONTAINER" \
+        --format '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}|{{.Destination}}{{"\n"}}{{end}}{{end}}')"
+
+    NE_ARGV="$NE_ARGV" NE_MOUNTS="$NE_MOUNTS" NE_CONTAINER="$NE_CONTAINER" \
+    PROM_URL="$PROM_URL" STACK_ROOT="$STACK_ROOT" \
+    python3 - <<'FEOF'
+import json, os, plistlib, re, time, urllib.parse, urllib.request
+
+FAIL = 0
+NOTPROVEN = 0
+def red(m):    print("\033[31m%s\033[0m" % m)
+def yellow(m): print("\033[33m%s\033[0m" % m)
+def green(m):  print("\033[32m%s\033[0m" % m)
+
+prom = os.environ["PROM_URL"]
+home = os.path.expanduser("~")
+TEXTFILE_NAME = "talos_offhost_backup.prom"   # talos-offhost-backup/src/metrics.rs
+PLIST = os.path.join(home, "Library", "LaunchAgents", "com.talos.offhost-backup.plist")
+
+def promq(expr):
+    """Return the list of samples, or None if Prometheus could not answer."""
+    try:
+        url = prom + "/api/v1/query?query=" + urllib.parse.quote(expr)
+        with urllib.request.urlopen(url, timeout=10) as r:
+            d = json.load(r)
+        if d.get("status") != "success":
+            return None
+        return d["data"]["result"]
+    except Exception:
+        return None
+
+# ── F1. Where does node_exporter actually read textfiles from, on the HOST?
+#        argv gives the CONTAINER path; the bind mounts translate it back.
+argv = []
+for blob in re.findall(r'\[[^\]]*\]', os.environ.get("NE_ARGV", "")):
+    try:
+        argv += [a for a in json.loads(blob) if isinstance(a, str)]
+    except Exception:
+        pass
+
+cdir = None
+for i, a in enumerate(argv):
+    if a.startswith("--collector.textfile.directory="):
+        cdir = a.split("=", 1)[1]
+    elif a == "--collector.textfile.directory" and i + 1 < len(argv):
+        cdir = argv[i + 1]
+if cdir is None:
+    # node_exporter's own default when the flag is omitted.
+    cdir = ""
+
+if not any(a == "--collector.textfile" or a.startswith("--collector.textfile.")
+           for a in argv):
+    red("  ✗ '%s' does not enable --collector.textfile — the uploader's metric is"
+        % os.environ["NE_CONTAINER"])
+    red("    written to disk and read by nobody. Neither off-host alert can fire.")
+    FAIL = 1
+    cdir = None
+
+ne_dir = None
+if cdir:
+    for line in os.environ.get("NE_MOUNTS", "").splitlines():
+        if "|" not in line:
+            continue
+        src, dst = line.split("|", 1)
+        # Docker Desktop reports macOS bind sources under /host_mnt.
+        hostsrc = src[len("/host_mnt"):] if src.startswith("/host_mnt") else src
+        if not os.path.exists(hostsrc):
+            hostsrc = src
+        if cdir == dst:
+            ne_dir = hostsrc
+        elif cdir.startswith(dst.rstrip("/") + "/"):
+            ne_dir = os.path.join(hostsrc, cdir[len(dst.rstrip("/")) + 1:])
+    if ne_dir is None:
+        red("  ✗ '%s' reads textfiles from '%s', which NO bind mount maps to this host."
+            % (os.environ["NE_CONTAINER"], cdir))
+        red("    Nothing any host-side producer writes can ever be scraped.")
+        FAIL = 1
+
+# ── F2. Where would the uploader WRITE? Same precedence as the binary
+#        (talos-offhost-backup/src/main.rs: TALOS_OFFHOST_TEXTFILE_DIR →
+#        TALOS_TEXTFILE_DIR → $HOME/.talos/metrics/textfile_collector).
+#        Resolved twice: for THIS shell, and for the scheduled job's plist.
+def resolve_textfile_dir(env):
+    for k in ("TALOS_OFFHOST_TEXTFILE_DIR", "TALOS_TEXTFILE_DIR"):
+        v = (env.get(k) or "").strip()
+        if v:
+            return v, k
+    return os.path.join(home, ".talos", "metrics", "textfile_collector"), "default"
+
+def same(a, b):
+    try:
+        return os.path.realpath(a) == os.path.realpath(b)
+    except Exception:
+        return a == b
+
+env_dir, env_src = resolve_textfile_dir(os.environ)
+
+plist_env, plist_dir, plist_src = None, None, None
+if os.path.isfile(PLIST):
+    try:
+        with open(PLIST, "rb") as f:
+            plist_env = plistlib.load(f).get("EnvironmentVariables", {}) or {}
+        plist_dir, plist_src = resolve_textfile_dir(plist_env)
+    except Exception as e:
+        yellow("  ⚠ %s exists but could not be parsed (%s) — the scheduled job's"
+               % (PLIST, type(e).__name__))
+        yellow("    textfile directory could not be checked.")
+
+if ne_dir:
+    if not same(env_dir, ne_dir):
+        red("  ✗ TEXTFILE PATH MISMATCH. An uploader run from this environment writes to")
+        red("      %s   (from %s)" % (env_dir, env_src))
+        red("    but %s reads" % os.environ["NE_CONTAINER"])
+        red("      %s" % ne_dir)
+        red("    Prometheus would never see the series, so TalosOffhostBackupUploadFailing")
+        red("    and TalosOffhostBackupStale could BOTH never fire — while")
+        red("    'make offhost-status' reads the same override and reports green.")
+        yellow("    → set TALOS_TEXTFILE_DIR (which docker-compose.yml also interpolates)")
+        yellow("      rather than TALOS_OFFHOST_TEXTFILE_DIR, which no collector-side")
+        yellow("      config reads.")
+        FAIL = 1
+    if plist_dir is not None and not same(plist_dir, ne_dir):
+        red("  ✗ The SCHEDULED job writes its metric somewhere unscraped.")
+        red("      plist: %s  (from %s)" % (plist_dir, plist_src))
+        red("      %s reads: %s" % (os.environ["NE_CONTAINER"], ne_dir))
+        FAIL = 1
+    if plist_dir is not None and not same(plist_dir, env_dir):
+        yellow("  ⚠ this shell and the scheduled job resolve DIFFERENT textfile")
+        yellow("    directories (%s vs %s) — 'make offhost-status' and the daily run"
+               % (env_dir, plist_dir))
+        yellow("    are looking at different files.")
+
+# ── F3. Which series do the LOADED alerts actually reference, and at what
+#        staleness threshold? Read from Prometheus, not from a file on disk:
+#        the rules that matter are the ones it has loaded.
+alert_series, stale_secs, n_alerts = set(), None, 0
+try:
+    with urllib.request.urlopen(prom + "/api/v1/rules", timeout=10) as r:
+        for grp in json.load(r)["data"]["groups"]:
+            for rule in grp.get("rules", []):
+                expr = rule.get("query", "") or ""
+                if "talos_offhost_backup" not in expr:
+                    continue
+                n_alerts += 1
+                alert_series.update(re.findall(r"talos_offhost_backup_[a-z_]+", expr))
+                m = re.search(r"(\d+)\s*\*\s*3600", expr)
+                if m:
+                    v = int(m.group(1)) * 3600
+                    stale_secs = v if stale_secs is None else min(stale_secs, v)
+except Exception:
+    yellow("  ⚠ could not read /api/v1/rules — the series list and the staleness")
+    yellow("    threshold fall back to the shipped defaults.")
+
+if n_alerts == 0:
+    yellow("  ⚠ the running Prometheus has loaded NO alert rule referencing")
+    yellow("    talos_offhost_backup_* — this stack has no off-host detector at all.")
+if not alert_series:
+    alert_series = {"talos_offhost_backup_enabled",
+                    "talos_offhost_backup_failures_total",
+                    "talos_offhost_backup_last_success_timestamp_seconds"}
+if stale_secs is None:
+    stale_secs = 168 * 3600
+
+# ── F4. Is there a metric, and does Prometheus have it?
+metric_path = os.path.join(ne_dir, TEXTFILE_NAME) if ne_dir else None
+have_metric = bool(metric_path and os.path.isfile(metric_path))
+scheduled = os.path.isfile(PLIST)
+
+def parse_metric(path):
+    enabled, last = 0, {}
+    with open(path, "r", errors="replace") as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            if line.startswith("talos_offhost_backup_enabled "):
+                enabled = int(float(line.split()[-1]))
+            elif line.startswith("talos_offhost_backup_last_success_timestamp_seconds{"):
+                m = re.search(r'kind="([^"]+)"\}\s+(\S+)', line)
+                if m:
+                    last[m.group(1)] = float(m.group(2))
+    return enabled, last
+
+if FAIL:
+    pass                      # a path defect is already reported; do not also
+                              # editorialise about freshness on top of it.
+elif not have_metric:
+    if scheduled:
+        red("  ✗ the off-host upload IS scheduled (%s) but has never written a" % PLIST)
+        red("    metric into %s — the daily job is failing before it reaches" % ne_dir)
+        red("    its own reporting, so no alert can see it. Check ~/.talos/logs/offhost-backup.log.")
+        FAIL = 1
+    else:
+        NOTPROVEN = 1
+        yellow("  ⚠ NOT PROVEN — the off-host backup chain is NOT WIRED UP on this host.")
+        yellow("    No %s in %s, and no LaunchAgent." % (TEXTFILE_NAME, ne_dir))
+        yellow("    Consequences, stated rather than implied:")
+        yellow("      * Every backup exists ONLY on the disk it insures. Disk loss,")
+        yellow("        theft or fire is total loss of the ml_examples labelling.")
+        yellow("      * NEITHER off-host alert can fire: no .prom file means no series,")
+        yellow("        and increase(absent[50h]) / (… and enabled == 1) both match")
+        yellow("        nothing. This is by design, and it is why THIS leg exists.")
+        yellow("      * The drill is not a substitute. Its metric carries NO source")
+        yellow("        label, so a green talos_backup_drill_last_success cannot")
+        yellow("        distinguish a --source b2 run from a local-copy restore.")
+        yellow("    → docs/offhost-backup.md § Operator setup, then 'make offhost-schedule'.")
+else:
+    enabled, last = parse_metric(metric_path)
+    if enabled != 1:
+        NOTPROVEN = 1
+        yellow("  ⚠ NOT PROVEN — the uploader has run, but no destination is configured")
+        yellow("    (talos_offhost_backup_enabled = 0 in %s)." % metric_path)
+        yellow("    All three of TALOS_OFFHOST_B2_{BUCKET,ENDPOINT,REGION} must be set;")
+        yellow("    every run is failing with reason=\"config\". Nothing is off-host.")
+    else:
+        # The consumer is the authority. A metric file the collector reads but
+        # Prometheus does not serve is the failure this leg exists to name.
+        missing = []
+        for s in sorted(alert_series):
+            res = promq(s)
+            if res is None:
+                yellow("  ⚠ could not query Prometheus for %s" % s)
+            elif not res:
+                missing.append(s)
+        if missing:
+            red("  ✗ %s exists and says enabled=1, but Prometheus serves NO samples for:"
+                % metric_path)
+            for s in missing:
+                red("      %s" % s)
+            red("    The alerts reference these series, so they cannot fire. The file is")
+            red("    written where node_exporter reads it, so the break is downstream:")
+            yellow("    → check the 'node-exporter' scrape job in observability/prometheus/")
+            yellow("      prometheus.yml and node_textfile_scrape_error on that target.")
+            FAIL = 1
+        else:
+            now = time.time()
+            stale = [(k, v) for k, v in sorted(last.items())
+                     if v <= 0 or (now - v) > stale_secs]
+            if stale:
+                red("  ✗ a destination is configured but the off-host copy is not current:")
+                for k, v in stale:
+                    if v <= 0:
+                        red("      kind=%s: NEVER succeeded" % k)
+                    else:
+                        red("      kind=%s: last success %.1f h ago (limit %.0f h)"
+                            % (k, (now - v) / 3600.0, stale_secs / 3600.0))
+                red("    Everything since then exists only on the disk it insures.")
+                FAIL = 1
+            else:
+                oldest = min(last.values()) if last else now
+                green("  ✓ off-host egress wired: %d kind(s), newest success %.1f h ago,"
+                      % (len(last), (now - oldest) / 3600.0))
+                green("    metric at %s, and Prometheus is serving all %d series the loaded"
+                      % (metric_path, len(alert_series)))
+                green("    alert rules reference.")
+                if not scheduled:
+                    yellow("  ⚠ …but it is NOT SCHEDULED (%s absent), so it will go stale."
+                           % PLIST)
+                    yellow("    TalosOffhostBackupStale will catch that in %.0f h."
+                           % (stale_secs / 3600.0))
+                yellow("    NOT proven by this leg: that the destination is genuinely")
+                yellow("    off-host, or that any object there decrypts to a restorable")
+                yellow("    dump. That is 'make drill ARGS=\"--source b2\"'.")
+
+# ── F5. The restore drill, because leg F keeps CITING it.
+#
+# Everything above points at `make drill ARGS="--source b2"` as the thing
+# that proves an archive is readable. Citing a guard without saying whether
+# it is passing is how the docs ended up naming a backstop that was not
+# armed, so leg F states the drill's last outcome instead of assuming it.
+#
+# ADVISORY, NOT A FAILURE, and deliberately so on both counts:
+#   * it does not set FAIL — a failing drill must not make `make up` decide
+#     Prometheus is stale and start reloading it (see the placement limit in
+#     this leg's header). The DETECTOR for this is the alert rule
+#     TalosBackupRestoreDrillLastRunFailed; this line is a courtesy for the
+#     operator already looking at a terminal, not a substitute for it.
+#   * it reads PROMETHEUS, not the .prom file, for the same reason the rest
+#     of this leg does: the consumer is the authority, and a file the
+#     collector never served is not a signal.
+last_status = promq("talos_backup_drill_last_status")
+if last_status:
+    v = float(last_status[0]["value"][1])
+    succ = promq("talos_backup_drill_last_success_timestamp_seconds")
+    age = None
+    if succ:
+        t = float(succ[0]["value"][1])
+        age = (time.time() - t) / 86400.0 if t > 0 else None
+    when = ("last SUCCESS %.1f days ago" % age) if age is not None else "NO success ever recorded"
+    if v == 0:
+        yellow("  ⚠ the LAST restore drill RAN AND FAILED (%s)." % when)
+        yellow("    The drill is what certifies these backups are readable at all, and it")
+        yellow("    is the guard the off-host docs name for 'the uploader was never")
+        yellow("    scheduled'. Re-run it: make drill   (the alert on this is")
+        yellow("    TalosBackupRestoreDrillLastRunFailed; this line does not replace it)")
+    else:
+        green("  ✓ the last restore drill passed (%s)." % when)
+elif last_status is None:
+    # NOT the same as "no series", and conflating them would be this file's
+    # own misleading-report class: one says the guard is unarmed, the other
+    # says the check could not run.
+    yellow("  ⚠ could not query Prometheus for talos_backup_drill_last_status — the")
+    yellow("    restore drill's state is UNKNOWN, not known-good.")
+else:
+    yellow("  ⚠ Prometheus serves no talos_backup_drill_last_status — the restore drill")
+    yellow("    has never reported here, so the guard leg F cites above is UNARMED.")
+
+raise SystemExit(1 if FAIL else (2 if NOTPROVEN else 0))
+FEOF
+    case $? in
+        0) ;;
+        2) F_NOTPROVEN=1 ;;
+        *) FAIL=1 ;;
+    esac
+fi
+
 echo
 if [ "$FAIL" -ne 0 ]; then
     red "✗ the running observability stack and this repo DISAGREE."
@@ -1705,3 +2113,12 @@ if [ "$FAIL" -ne 0 ]; then
 fi
 green "✓ the running Prometheus AND Alertmanager are reading exactly what their"
 green "  source checkout contains."
+if [ "$F_NOTPROVEN" -ne 0 ]; then
+    # Deliberately AFTER the green line and deliberately not an exit 1. The
+    # green above is true and narrow — it is about config liveness. Letting it
+    # stand alone as the last word over an off-host chain that has never run
+    # would be this script telling an operator the opposite of the truth.
+    yellow "…but see leg F: the off-host backup chain is NOT PROVEN. Every backup"
+    yellow "  still exists only on the disk it insures, and neither off-host alert"
+    yellow "  can fire until the uploader has run once."
+fi

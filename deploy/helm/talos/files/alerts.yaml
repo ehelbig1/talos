@@ -2544,6 +2544,103 @@ groups:
             is scheduled at all and that its node_exporter textfile
             directory is being collected.
 
+      # ──────────────────────────────────────────────────────────────
+      # THE OTHER FAULT. The alert above answers "has a drill SUCCEEDED
+      # recently?". It cannot answer "did the last drill RUN AND FAIL?",
+      # and those are different faults with different fixes: staleness
+      # means the drill stopped happening (schedule it), failure means it
+      # happened and the backups did not come back (fix the cause, which
+      # is a different investigation entirely).
+      #
+      # THIS GAP WAS LIVE AND MEASURED, 2026-08-25. The producer has
+      # written `talos_backup_drill_last_status` since 2026-08-03 and NO
+      # rule anywhere read it. On this host the gauge had been sitting at
+      # 0 — the last drill RAN AND FAILED — for EIGHT DAYS, visible in
+      # Prometheus the whole time, and the only notice was the 14-day
+      # staleness timer above, which had not yet tripped (last success was
+      # 12.2 days old). A correctly-written metric with no consumer is
+      # structural check 58's shape, and it was sitting on the safeguard
+      # that underwrites every other backup claim in this file.
+      #
+      # NO absent() ARM, DELIBERATELY, and this is the one design decision
+      # worth arguing. `x == 0` over an absent series matches NOTHING, so
+      # on a host that has never run the drill this alert is silent. That
+      # is correct here and it is NOT the absent-is-not-zero defect:
+      #   * "never ran" is ALREADY covered, by the absent() arm of
+      #     TalosBackupRestoreDrillFailed above, whose own comment says it
+      #     fires permanently on a cluster that has never drilled.
+      #   * a second permanently-firing alert for that same condition adds
+      #     no information and dilutes both — the exact "permanently-red
+      #     trains you to ignore red" failure this file argues against
+      #     elsewhere.
+      #   * and there is no honest producer-side pre-seed. This gauge has
+      #     two values and both are claims: seeding 0 would assert a
+      #     failure that never happened, seeding 1 a success. Absence is
+      #     the truthful encoding of "no drill has reported yet".
+      # So: absence means NOT APPLICABLE here, it is covered one rule up,
+      # and it is stated rather than left for a reader to wonder about.
+      #
+      # BOTH CAN FIRE AT ONCE and that is not double-reporting: a drill
+      # that failed today AND has not succeeded in three weeks is two true
+      # statements. They differ in alertname, so Alertmanager's
+      # `group_by: [alertname, category]` keeps them separate.
+      #
+      # `for: 15m` — the gauge is DURABLE, not sampled: it is whatever the
+      # last run wrote and it does not flap, so a `for:` buys no debouncing
+      # of a real signal and only delays it. Its single job is to not
+      # notify while a remediation run is already in flight — during a
+      # drill the PREVIOUS (failed) metric is still the one on disk, and
+      # 15m comfortably covers a full restore of this deployment's ~236 MB
+      # dump. It is deliberately NOT the 1h used above, which is long
+      # enough that an operator drilling twice in a morning would never see
+      # this transition at all.
+      #
+      # LABELS, AND WHAT THEY ACTUALLY DO. `severity: warning` because a
+      # failed drill does not mean data IS lost — it means readability is
+      # now UNPROVEN — and because every other rule in this backup family
+      # is a warning.
+      #
+      # READ THE ROUTE BEFORE READING `warning` AS "quiet". Routing in
+      # deploy/observability/alertmanager-route.yaml keys on CATEGORY, not
+      # severity: `category =~ "data-loss|crypto-broken"` matches
+      # UNCONDITIONALLY into talos-pagerduty-critical (`continue: true`,
+      # repeat_interval 1h) and falls through to talos-slack-oncall. So
+      # this alert PAGES, exactly as TalosOffhostBackupStale and
+      # TalosOffhostBackupUploadFailing — same severity, same category —
+      # already do. A `severity: warning` label in this file does not mean
+      # "will not page", and an earlier draft of this comment claimed it
+      # did.
+      #
+      # THAT ROUTING SPLIT IS THE POINT, not an oversight. The staleness
+      # alert above is `category: ops-hygiene`, which routes to the Jira
+      # lane at group_wait 10m / repeat 168h — the right lane for "we have
+      # not checked lately". A drill that RAN AND FAILED is not overdue
+      # housekeeping: the recovery path is broken right now, and 168h is
+      # how this deployment's failure went eight days unnoticed. Same
+      # subject, different fault, different lane, deliberately.
+      - alert: TalosBackupRestoreDrillLastRunFailed
+        expr: |
+          talos_backup_drill_last_status == 0
+        for: 15m
+        labels:
+          severity: warning
+          category: data-loss
+        annotations:
+          summary: "The last backup→restore drill RAN AND FAILED"
+          description: |
+            scripts/drills/backup-restore.sh completed and reported
+            failure — this is not "the drill is overdue", it is "the drill
+            ran and the backups did not come back". Until it passes, the
+            readability of every artifact in $BACKUP_DIR is unproven.
+            The metric records only the outcome, never which step failed,
+            so read the run's own output: ~/.talos/logs/backup-drill.log
+            for a scheduled run, or re-run it by hand with `make drill`.
+            Common causes, in the order they are checked: no escrowed KEK
+            source (TALOS_DRILL_ESCROW_KEY_CMD / _FILE — the drill refuses
+            to read the key from the live stack, by design), a missing or
+            stale artifact in $BACKUP_DIR, and a restore or decrypt that
+            failed on real rows. Clears on the next successful run.
+
       # ══════════════════════════════════════════════════════════════
       # OFF-HOST EGRESS (Tier 2). Producer: the `talos-offhost-backup`
       # binary, driven by scripts/offhost-backup/upload.sh. Unlike the
