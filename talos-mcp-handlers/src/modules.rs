@@ -307,7 +307,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "allowed_methods": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "HTTP method allowlist (e.g. ['GET', 'POST']). Empty = allow all methods."
+                        "description": "HTTP method allowlist (e.g. ['GET', 'POST']). Empty = allow all methods AND classifies the module UNKNOWN (not read-only) for the method-aware retry default, so nodes created from it get retry_count 0. Declare ['GET'] on a read-only module to enforce read-only egress AND earn transient retries."
                     },
                     "pin_module": { "type": "boolean", "description": "Mark module as pinned so restore_pinned_modules reinstalls it on session start. Useful for modules you always want available (e.g. llm-inference, http-request). Default: false." },
                     "fuel_budget": {

@@ -172,7 +172,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "allowed_methods": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "HTTP method allowlist (e.g. ['GET', 'POST']). Empty = allow all methods."
+                        "description": "HTTP method allowlist (e.g. ['GET', 'POST']). Empty = allow all methods AND classifies the module UNKNOWN (not read-only) for the method-aware retry default, so nodes created from it get retry_count 0. Declare ['GET'] on a read-only module to enforce read-only egress AND earn transient retries."
                     },
                     "fuel_budget": {
                         "type": "object",
@@ -409,7 +409,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "update_module_methods",
-            "description": "Update the allowed_methods list for a compiled module. Controls which HTTP verbs the module may issue (e.g. GET / POST / PATCH). Empty list = allow all methods. Companion to update_module_hosts.",
+            "description": "Update the allowed_methods list for a compiled module. Controls which HTTP verbs the module may issue (e.g. GET / POST / PATCH). Empty list = allow all methods AND forfeits the automatic transient-retry default (an undeclared list is treated as UNKNOWN, so nodes created from the module default to retry_count 0); declare [\"GET\"] to get read-only retries. Companion to update_module_hosts.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -420,7 +420,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "allowed_methods": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "New allowed_methods list. Each item is an HTTP verb (GET, POST, PUT, PATCH, DELETE, HEAD). Empty list = allow all methods."
+                        "description": "New allowed_methods list. Each item is an HTTP verb (GET, POST, PUT, PATCH, DELETE, HEAD). Empty list = allow all methods, and the module is then classed UNKNOWN (not read-only) by the retry default, so new nodes get retry_count 0."
                     }
                 },
                 "required": ["module_id", "allowed_methods"]
