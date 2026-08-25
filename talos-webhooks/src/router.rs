@@ -1327,12 +1327,27 @@ impl WebhookRouter {
                             300,
                             talos_workflow_job_protocol::result_accept_legacy_hmac(),
                         ) {
+                            // Split liveness from tampering: a stale result means
+                            // the fleet or a clock stalled, NOT that someone forged
+                            // a reply. Rejected either way.
                             tracing::warn!(
+                                target: "talos_security",
                                 trigger_id = %trigger_id,
-                                "Webhook job result signature verification failed: {}",
-                                e
+                                failure_kind = e.kind().label(),
+                                liveness = e.is_liveness(),
+                                age_secs = e.age_secs(),
+                                "{}",
+                                talos_workflow_job_protocol::describe_verify_failure(
+                                    "Webhook job result",
+                                    &e,
+                                )
                             );
-                            return Err(anyhow::anyhow!("Job result verification failed"));
+                            return Err(anyhow::anyhow!(
+                                talos_workflow_job_protocol::describe_verify_failure(
+                                    "Job result",
+                                    &e,
+                                )
+                            ));
                         }
                     }
 

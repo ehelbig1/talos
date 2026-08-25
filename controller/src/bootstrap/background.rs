@@ -4043,10 +4043,17 @@ pub(crate) fn spawn_nats_log_subscribers(
                                     talos_workflow_job_protocol::result_accept_legacy_hmac(),
                                 ) {
                                     tracing::warn!(
-                                    "Rejected job result {}: signature verification failed — {}",
-                                    job_id,
-                                    e
-                                );
+                                        target: "talos_security",
+                                        job_id = %job_id,
+                                        failure_kind = e.kind().label(),
+                                        liveness = e.is_liveness(),
+                                        age_secs = e.age_secs(),
+                                        "{}",
+                                        talos_workflow_job_protocol::describe_verify_failure(
+                                            "Job result",
+                                            &e,
+                                        )
+                                    );
                                     continue;
                                 }
                             }

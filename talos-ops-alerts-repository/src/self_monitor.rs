@@ -188,6 +188,23 @@ pub fn classify_execution_error(msg: &str) -> ErrorClass {
             label: "HTTP egress denied (host not allowed)",
             severity_hint: "high",
         }
+    } else if has(&LIVENESS_MARKER_LC) {
+        // BEFORE the signature branch, and it must stay there. A signed job or
+        // result that aged out of its 300 s freshness window was rejected on
+        // AGE — the signature was never evaluated — so it is a LIVENESS fault
+        // (a controller/worker stall, a paused host, clock skew), NOT tampering.
+        // Live instance: 2026-08-20/24, six executions across two clusters, all
+        // caused by the host machine suspending. Classing those as `signature`
+        // /`high` sent the operator hunting an attacker; the actionable
+        // response is to look at fleet liveness and clock sync.
+        //
+        // The needle is a SHARED CONSTANT with the crate that renders the
+        // message, so the two ends cannot drift apart silently.
+        ErrorClass {
+            class: "result_stale",
+            label: "signed message aged out before verification (stall or clock skew)",
+            severity_hint: "medium",
+        }
     } else if has("signature verification failed") {
         ErrorClass {
             class: "signature",
@@ -253,6 +270,16 @@ pub fn classify_execution_error(msg: &str) -> ErrorClass {
 /// on a confidence-gate / approval pause). Kept as a list (mirroring
 /// `UNATTENDED_TRIGGER_TYPES`) so future expected outcomes are a
 /// one-line, self-documenting addition.
+/// [`talos_workflow_job_protocol::LIVENESS_REJECTION_MARKER`], pre-lowercased.
+///
+/// `classify_execution_error` lowercases the message before matching, so the
+/// needle must be lowercase too — matching the mixed-case constant directly
+/// would never fire, and a needle that can never match is the silent-monitor
+/// failure this whole change exists to remove.
+static LIVENESS_MARKER_LC: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    talos_workflow_job_protocol::LIVENESS_REJECTION_MARKER.to_lowercase()
+});
+
 const NON_ALERTING_CLASSES: [&str; 1] = ["approval_denied"];
 
 impl ErrorClass {
@@ -699,6 +726,61 @@ fn bump_failure_metric(reason: &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Cross-crate drift guard.** This classifier only ever sees a rendered
+    /// string, so it matches on a marker it cannot type-check. Feed it the
+    /// REAL output of the crate that produces those strings, for every failure
+    /// kind, and require the split to hold. If the headline is reworded, or a
+    /// new `VerifyFailureKind` is added without an arm, this fails here rather
+    /// than silently re-merging a fleet stall into the `signature` class.
+    #[test]
+    fn a_liveness_rejection_never_classifies_as_a_signature_failure() {
+        use talos_workflow_job_protocol::{
+            describe_verify_failure, VerifyError, VerifyFailureKind,
+        };
+        for &kind in VerifyFailureKind::ALL {
+            // The shape the engine actually writes to
+            // `workflow_executions.error_message`.
+            let inner = describe_verify_failure(
+                "Job result",
+                &VerifyError::from_parts(
+                    kind,
+                    "result_nonce is too old (715 s, max 300)",
+                    Some(715),
+                ),
+            );
+            let row = format!(
+                "Scheduled workflow failed: workflow execution failed: \
+                 node 'critical_notify_compose' failed: {inner}"
+            );
+            let ec = classify_execution_error(&row);
+            if kind.is_liveness() {
+                assert_eq!(
+                    ec.class, "result_stale",
+                    "{kind:?} must not be classed as tampering; got {ec:?} for: {row}"
+                );
+                assert_eq!(ec.severity_hint, "medium");
+            } else {
+                assert_ne!(
+                    ec.class, "result_stale",
+                    "{kind:?} is not a liveness failure but classed as one"
+                );
+            }
+            // Fail-closed either way: every kind still raises an ops alert.
+            assert!(ec.is_alerting(), "{kind:?} must still alert");
+        }
+    }
+
+    /// The PRE-2026-08 wording must keep classifying as `signature` — this
+    /// classifier reads historical rows forever.
+    #[test]
+    fn the_legacy_signature_wording_still_classifies_as_signature() {
+        let ec = classify_execution_error(
+            "workflow execution failed: node 'compose' failed: \
+             Job result signature verification failed: result_nonce is too old (907 s, max 300)",
+        );
+        assert_eq!(ec.class, "signature");
+    }
 
     #[test]
     fn classifies_the_observed_corpus() {
