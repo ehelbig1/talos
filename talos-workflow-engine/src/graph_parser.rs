@@ -20,7 +20,27 @@ use uuid::Uuid;
 /// `retry_condition`, `retry_delay_expression`) or the same keys nested
 /// under `data` — the RF frontend emits both shapes depending on node
 /// type. Returns `None` when the node has no retry config at all; the
-/// engine treats that as "use the workflow-level default."
+/// engine treats that as "use the method-aware default."
+///
+/// # The presence test is wider than the count, deliberately
+///
+/// Any one of the four keys produces a policy, because a declared
+/// backoff / condition / delay expression must be preserved and honoured
+/// — dropping a `retry_condition` (a gate that only ever *narrows* which
+/// failures retry) would make the node retry on failures its author
+/// wrote that expression to exclude.
+///
+/// But only `retry_count` supplies [`RetryPolicy::max_retries`]; the
+/// other three answer "how far apart" or "when", never "how many". When
+/// it is absent the count stays `None` and the world-aware classifier
+/// answers at dispatch, exactly as it does for a node with no retry keys
+/// at all. This function used to synthesise `2` there, which suppressed
+/// the classifier entirely and handed blind retries to governance /
+/// messaging / database nodes that fail closed to 0 by design — a node
+/// declaring nothing but `retry_backoff_ms` got two re-fires of a
+/// non-idempotent send. Nothing here may invent a count: this parser is
+/// pure JSON decoding and does not have the module's `capability_world`
+/// / `allowed_methods` in scope, so it cannot answer the question.
 pub(crate) fn read_node_retry_policy(node: &JsonValue) -> Option<RetryPolicy> {
     // MCP-962 sibling: saturating u64→u32 conversion. Pre-fix `as u32`
     // silently wrapped a caller-supplied `retry_count: 5_000_000_000`
@@ -63,8 +83,11 @@ pub(crate) fn read_node_retry_policy(node: &JsonValue) -> Option<RetryPolicy> {
         return None;
     }
     Some(RetryPolicy {
-        max_retries: retry_count.unwrap_or(2),
-        backoff_ms: retry_backoff.unwrap_or(500),
+        // Verbatim, INCLUDING `None`. `None` is not "zero" and not "two" —
+        // it is "the author did not say", resolved against the module at
+        // dispatch by `RetryPolicy::resolved_max_retries`.
+        max_retries: retry_count,
+        backoff_ms: retry_backoff.unwrap_or(talos_workflow_engine_core::DEFAULT_BACKOFF_MS),
         retry_condition,
         retry_delay_expression,
     })
@@ -92,7 +115,14 @@ pub(crate) fn read_node_retry_policy_with_actor_cap(
 
     let mut policy = read_node_retry_policy(node)?;
     if actor_id.is_none() {
-        policy.max_retries = policy.max_retries.min(MAX_RETRIES_UNBUDGETED);
+        // Clamp only a DECLARED count. The cap exists to bound an absurd
+        // author-supplied value; there is nothing to bound when the author
+        // supplied nothing, and clamping `None` into a number here would
+        // reintroduce exactly the invented count this parser must not
+        // produce. The classifier's own answers (0 or
+        // `DEFAULT_TRANSIENT_RETRIES` = 2) are already below this cap, so
+        // leaving `None` alone changes no resolved value.
+        policy.max_retries = policy.max_retries.map(|n| n.min(MAX_RETRIES_UNBUDGETED));
     }
     Some(policy)
 }
@@ -516,7 +546,7 @@ mod read_node_retry_policy_tests {
     fn retry_count_within_u32_passes_through() {
         let node = json!({ "retry_count": 5 });
         let p = read_node_retry_policy(&node).unwrap();
-        assert_eq!(p.max_retries, 5);
+        assert_eq!(p.max_retries, Some(5));
     }
 
     #[test]
@@ -526,21 +556,21 @@ mod read_node_retry_policy_tests {
         // an operator-recognisably absurd value (~4.3B) instead.
         let node = json!({ "retry_count": 5_000_000_000_u64 });
         let p = read_node_retry_policy(&node).unwrap();
-        assert_eq!(p.max_retries, u32::MAX);
+        assert_eq!(p.max_retries, Some(u32::MAX));
     }
 
     #[test]
     fn retry_count_u64_max_saturates_to_u32_max() {
         let node = json!({ "retry_count": u64::MAX });
         let p = read_node_retry_policy(&node).unwrap();
-        assert_eq!(p.max_retries, u32::MAX);
+        assert_eq!(p.max_retries, Some(u32::MAX));
     }
 
     #[test]
     fn retry_count_at_u32_max_passes_through() {
         let node = json!({ "retry_count": u64::from(u32::MAX) });
         let p = read_node_retry_policy(&node).unwrap();
-        assert_eq!(p.max_retries, u32::MAX);
+        assert_eq!(p.max_retries, Some(u32::MAX));
     }
 
     #[test]
@@ -549,7 +579,7 @@ mod read_node_retry_policy_tests {
         // — silently disabling all retries.
         let node = json!({ "retry_count": u64::from(u32::MAX) + 1 });
         let p = read_node_retry_policy(&node).unwrap();
-        assert_eq!(p.max_retries, u32::MAX);
+        assert_eq!(p.max_retries, Some(u32::MAX));
     }
 
     #[test]
@@ -559,6 +589,148 @@ mod read_node_retry_policy_tests {
             "data": { "retry_count": 10_000_000_000_u64 }
         });
         let p = read_node_retry_policy(&node).unwrap();
-        assert_eq!(p.max_retries, u32::MAX);
+        assert_eq!(p.max_retries, Some(u32::MAX));
+    }
+
+    /// Read-only module: a DECLARED GET-only allowlist on an `http` world.
+    fn read_only() -> (Vec<String>, Option<&'static str>) {
+        (vec!["GET".to_string()], Some("http-node"))
+    }
+
+    /// Side-effect world that `default_max_retries_for_module` fails closed
+    /// on — a blind retry here re-fires an approval / publish / DML.
+    fn fail_closed() -> (Vec<String>, Option<&'static str>) {
+        (Vec::new(), Some("governance-node"))
+    }
+
+    #[test]
+    fn a_declaration_without_a_count_leaves_the_count_undeclared() {
+        // Each of these three keys answers a question OTHER than "how many":
+        // spacing (`retry_backoff_ms`, `retry_delay_expression`) or a
+        // restricting gate (`retry_condition`). None of them may synthesise a
+        // count — the parser has no module in scope and cannot answer.
+        for node in [
+            json!({ "retry_backoff_ms": 3_000 }),
+            json!({ "retry_condition": "error_code == 429" }),
+            json!({ "retry_delay_expression": "retry_after * 1000" }),
+            json!({ "data": { "retry_backoff_ms": 3_000 } }),
+        ] {
+            let p = read_node_retry_policy(&node)
+                .expect("a declared backoff/condition/delay must still produce a policy");
+            assert_eq!(
+                p.max_retries, None,
+                "{node}: only retry_count may supply a count"
+            );
+        }
+    }
+
+    #[test]
+    fn a_countless_declaration_resolves_world_aware_not_to_a_literal() {
+        // THE REGRESSION. Pre-fix every one of these resolved to a hardcoded
+        // 2 for EVERY capability world, because a non-empty presence test
+        // suppressed the method-aware fallback entirely. A governance /
+        // messaging / database node declaring nothing but a backoff got two
+        // blind re-fires of a non-idempotent side effect.
+        for node in [
+            json!({ "retry_backoff_ms": 3_000 }),
+            json!({ "retry_condition": "error_code == 429" }),
+            json!({ "retry_delay_expression": "retry_after * 1000" }),
+        ] {
+            let p = read_node_retry_policy(&node).unwrap();
+
+            let (methods, world) = fail_closed();
+            assert_eq!(
+                p.resolved_max_retries(&methods, world),
+                0,
+                "{node}: a side-effect world must still fail closed to 0"
+            );
+
+            let (methods, world) = read_only();
+            assert_eq!(
+                p.resolved_max_retries(&methods, world),
+                talos_workflow_engine_core::DEFAULT_TRANSIENT_RETRIES,
+                "{node}: a declared read-only module still earns transient retries"
+            );
+        }
+    }
+
+    #[test]
+    fn a_countless_declaration_keeps_its_spacing_and_gate() {
+        // The presence test stays four keys wide on purpose: dropping a
+        // `retry_condition` would make the node retry on failures the author
+        // wrote that expression to EXCLUDE, and dropping the backoff would
+        // silently re-space the retries. Fixing a fail-open default must not
+        // introduce a different fail-open.
+        let p = read_node_retry_policy(&json!({
+            "retry_backoff_ms": 3_000,
+            "retry_condition": "error_code == 429",
+            "retry_delay_expression": "retry_after * 1000"
+        }))
+        .unwrap();
+        assert_eq!(p.max_retries, None);
+        assert_eq!(p.backoff_ms, 3_000);
+        assert_eq!(p.retry_condition.as_deref(), Some("error_code == 429"));
+        assert_eq!(
+            p.retry_delay_expression.as_deref(),
+            Some("retry_after * 1000")
+        );
+    }
+
+    #[test]
+    fn an_explicit_count_still_always_wins_including_zero() {
+        // Documented platform rule: the classifier never overrides an author,
+        // in either direction.
+        let zero = read_node_retry_policy(&json!({ "retry_count": 0, "retry_backoff_ms": 3_000 }))
+            .unwrap();
+        let (methods, world) = read_only();
+        assert_eq!(
+            zero.resolved_max_retries(&methods, world),
+            0,
+            "a read-only module must not upgrade an author's explicit 0"
+        );
+
+        let five = read_node_retry_policy(&json!({ "retry_count": 5 })).unwrap();
+        let (methods, world) = fail_closed();
+        assert_eq!(
+            five.resolved_max_retries(&methods, world),
+            5,
+            "a fail-closed world must not downgrade an author's explicit count"
+        );
+    }
+
+    #[test]
+    fn a_node_with_no_retry_keys_at_all_still_yields_no_policy() {
+        // Unchanged: `None` here means the dispatch site builds a fully
+        // undeclared policy and resolves it the same way. The two paths are
+        // deliberately identical now — that is what stopped them diverging.
+        assert!(read_node_retry_policy(&json!({ "id": "n1" })).is_none());
+        assert!(read_node_retry_policy(&json!({ "data": { "timeout_secs": 30 } })).is_none());
+    }
+
+    #[test]
+    fn the_actor_cap_clamps_a_declared_count_but_never_invents_one() {
+        use super::read_node_retry_policy_with_actor_cap;
+
+        // Unbudgeted (no owning actor) clamps a declared count to 3 …
+        let clamped =
+            read_node_retry_policy_with_actor_cap(&json!({ "retry_count": 50 }), None).unwrap();
+        assert_eq!(clamped.max_retries, Some(3));
+
+        // … and an actor-owned execution passes the declared value through.
+        let uncapped = read_node_retry_policy_with_actor_cap(
+            &json!({ "retry_count": 50 }),
+            Some(uuid::Uuid::nil()),
+        )
+        .unwrap();
+        assert_eq!(uncapped.max_retries, Some(50));
+
+        // But an UNDECLARED count is not clamped into existence — clamping
+        // `None` to a number would reintroduce the invented count.
+        let undeclared =
+            read_node_retry_policy_with_actor_cap(&json!({ "retry_backoff_ms": 3_000 }), None)
+                .unwrap();
+        assert_eq!(undeclared.max_retries, None);
+        let (methods, world) = fail_closed();
+        assert_eq!(undeclared.resolved_max_retries(&methods, world), 0);
     }
 }

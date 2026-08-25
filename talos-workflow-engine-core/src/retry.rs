@@ -4,14 +4,38 @@ use serde::{Deserialize, Serialize};
 
 /// How the executor should retry a node when its dispatch fails.
 ///
-/// Defaults to 2 retries with 500ms backoff, no conditional gate, and no
-/// custom delay expression — a reasonable starting point that callers can
-/// override per-node. Both Rhai-style expression fields are opaque here:
-/// evaluation is the executor's job.
+/// This is a *declaration*, not a resolved plan: `max_retries` is
+/// `Option<u32>` precisely because the graph parser that builds this
+/// value cannot answer "how many". See the field docs.
+///
+/// The default is "nothing declared": no count, 500 ms base backoff, no
+/// conditional gate, no custom delay expression. Both Rhai-style
+/// expression fields are opaque here — evaluation is the executor's job.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct RetryPolicy {
-    /// Maximum number of retry attempts after the first failure.
-    pub max_retries: u32,
+    /// Maximum number of retry attempts after the first failure, when the
+    /// node author declared one (graph key `retry_count`).
+    ///
+    /// `None` means **the author did not say how many** — resolve it with
+    /// [`RetryPolicy::resolved_max_retries`], which asks
+    /// [`default_max_retries_for_module`] using the module's own
+    /// `capability_world` / `allowed_methods`.
+    ///
+    /// This field is deliberately NOT a `u32` with a default. The four
+    /// graph retry keys do not answer the same question: `retry_count`
+    /// answers *how many*, `retry_backoff_ms` / `retry_delay_expression`
+    /// answer *how far apart*, and `retry_condition` answers *when* (it
+    /// is a restricting gate — it can only ever shrink the retry set).
+    /// A parser that saw only a spacing or gating key used to synthesise
+    /// `max_retries: 2` here, which suppressed the world-aware fallback
+    /// entirely and handed blind retries to governance / messaging /
+    /// database nodes that fail closed to 0 by design. Keeping the count
+    /// optional makes that state unrepresentable rather than merely
+    /// corrected.
+    ///
+    /// An explicitly declared `Some(0)` still always wins — the
+    /// classifier must never override an author.
+    pub max_retries: Option<u32>,
     /// Base backoff between attempts in milliseconds. The executor may
     /// apply exponential growth and jitter on top of this value.
     pub backoff_ms: u64,
@@ -27,15 +51,25 @@ pub struct RetryPolicy {
 }
 
 impl Default for RetryPolicy {
+    /// "Nothing was declared." `max_retries: None` routes to the
+    /// method-aware classifier at resolve time; it is NOT a synonym for
+    /// [`DEFAULT_TRANSIENT_RETRIES`].
     fn default() -> Self {
         Self {
-            max_retries: 2,
-            backoff_ms: 500,
+            max_retries: None,
+            backoff_ms: DEFAULT_BACKOFF_MS,
             retry_condition: None,
             retry_delay_expression: None,
         }
     }
 }
+
+/// Base backoff applied when a node declares retries but no
+/// `retry_backoff_ms`. Unlike the retry COUNT, spacing has no
+/// safety-relevant classifier — 500 ms is safe for every world because it
+/// only affects *when* an already-authorised retry fires, never whether
+/// one fires at all.
+pub const DEFAULT_BACKOFF_MS: u64 = 500;
 
 /// Retry count applied to a module with no explicit retry configuration
 /// when the module is classified safe-to-retry (read-only / pure
@@ -180,19 +214,32 @@ pub fn effective_retries_with_idempotency(
 }
 
 impl RetryPolicy {
-    /// Full [`RetryPolicy`] for a module with no explicit retry
-    /// configuration — [`default_max_retries_for_module`] for the
-    /// count, the standard 500 ms base backoff otherwise.
-    pub fn default_for_module(allowed_methods: &[String], capability_world: Option<&str>) -> Self {
-        Self {
-            max_retries: default_max_retries_for_module(allowed_methods, capability_world),
-            ..Self::default()
-        }
+    /// The node's effective retry count: the author's declared
+    /// `retry_count` when there is one, otherwise
+    /// [`default_max_retries_for_module`] for the module actually being
+    /// dispatched.
+    ///
+    /// This is the ONLY place a missing count acquires a value, which is
+    /// what keeps "author said nothing at all" and "author declared a
+    /// backoff but no count" from diverging — before, the first went
+    /// through the classifier and the second was silently stamped 2 for
+    /// every world.
+    ///
+    /// The declared value is returned verbatim, including `Some(0)`: the
+    /// classifier never overrides an author.
+    #[must_use]
+    pub fn resolved_max_retries(
+        &self,
+        allowed_methods: &[String],
+        capability_world: Option<&str>,
+    ) -> u32 {
+        self.max_retries
+            .unwrap_or_else(|| default_max_retries_for_module(allowed_methods, capability_world))
     }
 }
 
 #[cfg(test)]
-mod default_for_module_tests {
+mod retry_resolution_tests {
     use super::*;
 
     fn methods(list: &[&str]) -> Vec<String> {
@@ -390,10 +437,75 @@ mod default_for_module_tests {
     }
 
     #[test]
-    fn default_for_module_keeps_standard_backoff() {
-        let p = RetryPolicy::default_for_module(&methods(&["GET"]), Some("http-node"));
-        assert_eq!(p.max_retries, DEFAULT_TRANSIENT_RETRIES);
-        assert_eq!(p.backoff_ms, 500);
-        assert!(p.retry_condition.is_none());
+    fn an_undeclared_count_resolves_through_the_classifier_not_a_literal() {
+        // The invariant this module exists to hold: a policy whose count
+        // was never declared asks the module, and gets DIFFERENT answers
+        // for a read-only module and a side-effecting one. A literal
+        // default cannot do that, which is why `max_retries` is optional.
+        let undeclared = RetryPolicy::default();
+        assert_eq!(
+            undeclared.resolved_max_retries(&methods(&["GET"]), Some("http-node")),
+            DEFAULT_TRANSIENT_RETRIES,
+        );
+        for world in ["governance", "messaging", "database", "network"] {
+            assert_eq!(
+                undeclared.resolved_max_retries(&[], Some(world)),
+                0,
+                "{world}: an undeclared count must fail closed, not inherit a literal"
+            );
+        }
+    }
+
+    #[test]
+    fn a_declared_count_always_wins_including_zero() {
+        // Documented platform rule: the classifier never overrides an author.
+        let explicit_zero = RetryPolicy {
+            max_retries: Some(0),
+            ..RetryPolicy::default()
+        };
+        assert_eq!(
+            explicit_zero.resolved_max_retries(&methods(&["GET"]), Some("minimal-node")),
+            0,
+            "a read-only world must not upgrade an author's explicit 0"
+        );
+        let explicit_seven = RetryPolicy {
+            max_retries: Some(7),
+            ..RetryPolicy::default()
+        };
+        assert_eq!(
+            explicit_seven.resolved_max_retries(&[], Some("governance-node")),
+            7,
+            "a fail-closed world must not downgrade an author's explicit count"
+        );
+    }
+
+    #[test]
+    fn spacing_and_gating_fields_do_not_supply_a_count() {
+        // `retry_backoff_ms` / `retry_delay_expression` answer "how far
+        // apart"; `retry_condition` is a RESTRICTING gate ("skip the retry
+        // unless this holds"). None of the three can decide "how many", so
+        // each must still resolve through the classifier — and on a
+        // fail-closed world that means 0, not a synthesised 2.
+        for policy in [
+            RetryPolicy {
+                backoff_ms: 3_000,
+                ..RetryPolicy::default()
+            },
+            RetryPolicy {
+                retry_condition: Some("error_code == 429".to_string()),
+                ..RetryPolicy::default()
+            },
+            RetryPolicy {
+                retry_delay_expression: Some("retry_after * 1000".to_string()),
+                ..RetryPolicy::default()
+            },
+        ] {
+            assert_eq!(policy.max_retries, None);
+            assert_eq!(policy.resolved_max_retries(&[], Some("messaging-node")), 0);
+            assert_eq!(
+                policy.resolved_max_retries(&methods(&["GET"]), Some("http-node")),
+                DEFAULT_TRANSIENT_RETRIES,
+            );
+        }
     }
 }

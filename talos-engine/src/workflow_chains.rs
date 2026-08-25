@@ -527,19 +527,41 @@ async fn run_single_workflow_chain(
                         || retry_condition.is_some()
                         || retry_delay_expression.is_some();
                     if has_any {
-                        let mut max_retries = retry_count.unwrap_or(2);
-                        if workflow_actor_id.is_none() {
-                            max_retries = max_retries.min(MAX_RETRIES_UNBUDGETED);
-                        } else {
-                            // MCP-1174: even with an owning actor, cap
-                            // the absolute count to prevent the
-                            // 4-billion-retry foot-gun the MCP-962
-                            // saturation alone left exposed.
-                            max_retries = max_retries.min(MAX_RETRIES_BUDGETED);
-                        }
+                        // Only `retry_count` answers "how many". The other
+                        // three keys answer "how far apart" or "when", so
+                        // a node declaring only those leaves the count
+                        // UNDECLARED (`None`) and the method-aware
+                        // classifier answers it at dispatch, exactly as it
+                        // does for a node with no retry keys at all.
+                        // Pre-fix this synthesised 2 for ANY capability
+                        // world — including governance / messaging /
+                        // database, which fail closed to 0 precisely so a
+                        // retry cannot double-fire a non-idempotent send.
+                        // Sibling of the same defect in
+                        // `talos-workflow-engine::graph_parser`.
+                        //
+                        // Both caps below clamp a DECLARED value only:
+                        // they exist to bound an absurd author-supplied
+                        // count, and there is nothing to bound when the
+                        // author supplied nothing. Clamping `None` into a
+                        // number here would reintroduce the invented
+                        // count. The classifier's own answers (0 or 2) sit
+                        // under both caps, so no resolved value moves.
+                        let max_retries = retry_count.map(|n| {
+                            if workflow_actor_id.is_none() {
+                                n.min(MAX_RETRIES_UNBUDGETED)
+                            } else {
+                                // MCP-1174: even with an owning actor, cap
+                                // the absolute count to prevent the
+                                // 4-billion-retry foot-gun the MCP-962
+                                // saturation alone left exposed.
+                                n.min(MAX_RETRIES_BUDGETED)
+                            }
+                        });
                         Some(RetryPolicy {
                             max_retries,
-                            backoff_ms: retry_backoff.unwrap_or(500),
+                            backoff_ms: retry_backoff
+                                .unwrap_or(talos_workflow_engine_core::DEFAULT_BACKOFF_MS),
                             retry_condition,
                             retry_delay_expression,
                         })

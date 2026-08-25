@@ -63,6 +63,11 @@ impl ParallelWorkflowEngine {
             .get(&chain_head_id)
             .and_then(|(_, rp, _)| rp.clone())
             .unwrap_or_default();
+        // Filled in by the per-step loop below: `min` of the method-aware
+        // classifier answer over EVERY step in the chain. Used only when the
+        // chain head declared no `retry_count`. `None` (a chain that somehow
+        // ran no steps) resolves to 0 — fail closed.
+        let mut chain_undeclared_retries: Option<u32> = None;
 
         // Resolve user_id early — required for all module-fetcher calls.
         let uid_for_chain: Option<Uuid> = if self.module_fetcher.is_some() {
@@ -254,6 +259,17 @@ impl ParallelWorkflowEngine {
                 obj.remove(talos_workflow_engine_core::reserved_keys::IDEMPOTENCY_KEY);
             }
 
+            // The classifier's answer for THIS step's module, computed once:
+            // it feeds both the per-step base below and the chain-level
+            // minimum accumulated after the match.
+            let step_world_default = talos_workflow_engine_core::default_max_retries_for_module(
+                artifact
+                    .as_ref()
+                    .map(|a| a.allowed_methods.as_slice())
+                    .unwrap_or(&[]),
+                artifact.as_ref().map(|a| a.capability_world.as_str()),
+            );
+
             // Base per-step retry count (same precedence as before: explicit
             // node policy → method-aware default; expression-gated policies
             // fall back to 0 because the worker can't evaluate Rhai).
@@ -274,16 +290,27 @@ impl ParallelWorkflowEngine {
                         );
                         0
                     }
-                    Some(p) => p.max_retries,
-                    None => talos_workflow_engine_core::default_max_retries_for_module(
-                        artifact
-                            .as_ref()
-                            .map(|a| a.allowed_methods.as_slice())
-                            .unwrap_or(&[]),
-                        artifact.as_ref().map(|a| a.capability_world.as_str()),
-                    ),
+                    // One resolution for both "no policy" and "policy with
+                    // no declared count" — a step declaring only
+                    // `retry_backoff_ms` must not skip the method-aware
+                    // classifier and inherit a literal.
+                    other => other
+                        .and_then(|p| p.max_retries)
+                        .unwrap_or(step_world_default),
                 }
             };
+            // A chain-level retry re-publishes the WHOLE pipeline payload
+            // (`dispatch_with_retry` resends the same bytes), so every step
+            // re-runs — including any step that already succeeded. The chain
+            // head's own world therefore does not bound the pipeline's side
+            // effects, and the only safe undeclared answer is the MOST
+            // RESTRICTIVE classifier answer across every step: one messaging /
+            // database / governance / state-changing step in the chain drags
+            // the whole chain to 0.
+            chain_undeclared_retries = Some(
+                chain_undeclared_retries
+                    .map_or(step_world_default, |cur: u32| cur.min(step_world_default)),
+            );
             // When idempotency IS declared, a declared Idempotency-Key header
             // makes an otherwise-non-idempotent send step safe to retry at the
             // HTTP boundary — upgrade 0→transient only for HTTP-egress worlds,
@@ -614,7 +641,15 @@ impl ParallelWorkflowEngine {
             max_write_ceiling: self.max_write_ceiling,
             egress_scope: self.egress_scope,
             total_timeout: std::time::Duration::from_secs(timeout_secs),
-            max_retries: chain_retry.max_retries,
+            // An explicit head `retry_count` (including 0) wins, as everywhere
+            // else. Otherwise the chain takes the most restrictive step's
+            // classifier answer — NOT a literal. Pre-fix this was
+            // `RetryPolicy::default()`, i.e. a hardcoded 2, so a pipeline
+            // whose head declared no retry keys re-fired the entire chain
+            // twice on a transport failure whatever any step's world was.
+            max_retries: chain_retry
+                .max_retries
+                .unwrap_or(chain_undeclared_retries.unwrap_or(0)),
             backoff_ms: chain_retry.backoff_ms,
             retry_condition: chain_retry.retry_condition.clone(),
             retry_delay_expr: chain_retry.retry_delay_expression.clone(),
