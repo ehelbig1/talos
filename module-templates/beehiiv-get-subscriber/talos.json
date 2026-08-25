@@ -6,6 +6,9 @@
   "category": "Marketing",
   "capability_world": "secrets-node",
   "allowed_hosts": ["api.beehiiv.com"],
+  "allowed_methods": [
+    "GET"
+  ],
   "requires_secrets": ["beehiiv/api_key"],
   "config_schema": {
     "type": "object",

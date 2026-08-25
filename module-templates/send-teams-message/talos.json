@@ -4,6 +4,9 @@
   "capability_world": "network-node",
   "description": "Send a message card to a Microsoft Teams channel via an Incoming Webhook URL.",
   "allowed_hosts": ["outlook.office.com", "outlook.office365.com"],
+  "allowed_methods": [
+    "POST"
+  ],
   "requires_secrets": ["teams/webhook_url"],
   "config_schema": {
     "type": "object",

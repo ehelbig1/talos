@@ -6,6 +6,9 @@
   "category": "Communication",
   "capability_world": "network-node",
   "allowed_hosts": ["gmail.googleapis.com", "www.googleapis.com", "oauth2.googleapis.com"],
+  "allowed_methods": [
+    "POST"
+  ],
   "requires_secrets": ["google/gmail_oauth_token"],
   "requires_approval_for": [],
   "config_schema": {

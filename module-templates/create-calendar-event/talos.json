@@ -7,6 +7,9 @@
   "capability_world": "network-node",
   "dependencies": { "urlencoding": "2.1.3" },
   "allowed_hosts": ["www.googleapis.com", "calendar.googleapis.com"],
+  "allowed_methods": [
+    "POST"
+  ],
   "requires_secrets": ["google/calendar_oauth_token"],
   "requires_approval_for": [],
   "config_schema": {

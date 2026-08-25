@@ -1879,6 +1879,29 @@ mod shipped_template_manifests_pass_seed_validation {
             if let Err(msg) = validate_allowed_hosts(&str_array(&manifest, "allowed_hosts")) {
                 failures.push(format!("{name}: allowed_hosts: {msg}"));
             }
+            // `allowed_methods` is fail-OPEN at seed time on purpose: an
+            // unrecognised verb is dropped rather than skipping the template
+            // (see `reconcile::parse_manifest_allowed_methods`). That is the
+            // right RUNTIME behaviour and the wrong BUILD behaviour — a typo'd
+            // verb silently yields a NARROWER list than the author wrote, and a
+            // too-narrow list is a runtime denial at the worker's enforcement
+            // point, not a permissive no-op. So assert here that nothing a
+            // SHIPPED manifest declares gets dropped: kept count == declared
+            // count. The message names the dropped entries so the failure says
+            // what to fix, not merely that something is wrong.
+            let declared = str_array(&manifest, "allowed_methods");
+            if !declared.is_empty() {
+                let kept = crate::reconcile::parse_manifest_allowed_methods(&manifest);
+                if kept.len() != declared.len() {
+                    failures.push(format!(
+                        "{name}: allowed_methods: {} of {} entries are not recognised HTTP \
+                         verbs and would be silently dropped, NARROWING the enforced \
+                         allowlist (declared: {declared:?}, kept: {kept:?})",
+                        declared.len() - kept.len(),
+                        declared.len()
+                    ));
+                }
+            }
             // capability_world must be a REAL compile target, i.e. one the
             // dispatcher's `CapabilityWorld` parser recognises. `llm-node` is
             // the trap: it exists as a WIT world AND as an actor-ceiling rank

@@ -8,6 +8,13 @@
   "allowed_hosts": [
     "*"
   ],
+  "allowed_methods": [
+    "GET",
+    "POST",
+    "PUT",
+    "PATCH",
+    "DELETE"
+  ],
   "requires_secrets": [],
   "recommended_fuel": {
     "expected_items": 1,

@@ -6,6 +6,9 @@
   "category": "Communication",
   "capability_world": "network-node",
   "allowed_hosts": ["slack.com", "api.slack.com"],
+  "allowed_methods": [
+    "POST"
+  ],
   "requires_secrets": ["slack/bot_token"],
   "requires_approval_for": [],
   "config_schema": {
