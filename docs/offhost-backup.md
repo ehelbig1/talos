@@ -52,9 +52,25 @@ Design decisions, made rather than left implicit:
   hand with no Rust toolchain involved. That property is pinned by a unit test
   (`output_is_a_standard_age_v1_file`) because recovery must not depend on
   this workspace compiling.
-* **Postgres and Vault are uploaded; Neo4j is not.** The graph is
-  reconstructible from `actor_memory` via `graph_backfill`. Adding it means
-  adding a `Neo4j` arm to `ArtifactKind`.
+* **Postgres, Vault and Neo4j are all uploaded.** Neo4j was excluded until
+  2026-08-26 because the graph was "reconstructible from `actor_memory` via
+  `graph_backfill`". That justification was measured against both live stores
+  and had decayed: of the graph's 16 distinct (`actor_id`, `source_key`)
+  pairs, **6 — 191 of 1,283 nodes — no longer have a row to rebuild from**,
+  and 90 of those never did (`reflection_synthesis` is a sentinel written by
+  the reflection loop, not an `actor_memory` key, so no backfill can emit it).
+  Nodes also accumulate over every value a mutable `latest` key has held while
+  `actor_memory` keeps only the current one, so even the recoverable remainder
+  would come back as a *different* graph. Cost is 1.2 MB/day against ~240 MB
+  for the Postgres dump. **No second secret**: it rides the same `age`
+  passphrase. Full derivation: `ArtifactKind`'s doc comment in
+  `talos-offhost-backup/src/key.rs`.
+* **Uploading Neo4j is not the same as restoring it.** `make drill
+  ARGS="--source b2"` fetches and restores `--kind postgres` and `--kind
+  vault` only; it does **not** touch the neo4j archive. `fetch --kind neo4j`
+  works and proves the object is present and decryptable, but nothing
+  automated proves the tarball is a loadable Neo4j store. See
+  [What none of this proves](#what-none-of-this-proves) below.
 * **First upload = "newest onward", not a backfill.** `upload` sends only the
   newest local artifact of each kind, *including the one already on disk*, so
   enabling this puts a real archive off-host within minutes rather than
@@ -246,7 +262,7 @@ scripts/offhost-backup/upload.sh plan --offline
 #    absent).
 scripts/offhost-backup/upload.sh probe-append-only
 
-# 2. First real upload: newest postgres dump + newest vault tarball.
+# 2. First real upload: newest postgres dump + newest vault and neo4j tarballs.
 scripts/offhost-backup/upload.sh
 
 # 3. PROVE IT IS RESTORABLE FROM THE BUCKET. Fetch → age-decrypt →
@@ -267,8 +283,8 @@ the thing on the other end is a backup.
 scripts/offhost-backup/upload.sh --backfill
 ```
 
-Pushes every retained local artifact the bucket lacks (currently ~12 dumps
-plus ~14 vault tarballs). Only worth the egress if you want point-in-time
+Pushes every retained local artifact the bucket lacks (as of 2026-08-26:
+13 dumps, 13 vault tarballs, 13 neo4j tarballs). Only worth the egress if you want point-in-time
 recovery to a specific day inside the retention window; the newest dump alone
 already contains all the data.
 
@@ -327,6 +343,26 @@ docker run --rm -v "$PWD:/repo:ro" --entrypoint promtool \
 
 ## What none of this proves
 
+* **That the Neo4j archive is restorable.** This is the newest and largest gap,
+  and it is stated first because it is the shape this whole arc keeps finding.
+  As of 2026-08-26 `scripts/drills/backup-restore.sh` knows exactly two
+  artifacts, `PG_ARTIFACT` and `VAULT_ARTIFACT`. `--kind neo4j` uploads and
+  fetches — so the object's presence, freshness and decryptability ARE proven
+  by `fetch` — but no automated step has ever loaded one back into a Neo4j
+  server. What a real restore leg would need, in order:
+  1. a scratch `neo4j:5.26-community` container with an empty data volume;
+  2. `tar -xzf` the archive into it (the tarball is a raw store-file copy of
+     `/neo4j-data` — `databases/`, `transactions/`, `dbms/auth.ini` — **not**
+     a `neo4j-admin database dump`, so there is no load command; the restore
+     is "stop, replace the directory, start");
+  3. start the server and let it recover `transactions/`;
+  4. a **content** probe, not an exit code: `MATCH (n) RETURN count(n)` and
+     `MATCH ()-[r]->() RETURN count(r)` compared against the `neo4j_nodes=` /
+     `neo4j_relationships=` lines the sidecar already writes into the local
+     `.tar.gz.manifest`. A `pg_restore`-shaped "it exited 0" check would
+     certify an empty database.
+  Not built here on purpose — it is a drill change, not a key change, and
+  bundling it would have hidden that the two are separable.
 * That the bucket cannot be emptied by someone who steals your **master**
   Backblaze credential. Nothing here defends against that.
 * That the age passphrase source is genuinely off-box (see the stated limits
