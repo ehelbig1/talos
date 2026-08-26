@@ -388,3 +388,175 @@ async fn enforce_cache_limits_size_cap_sheds_bytes_when_keys_tie() {
         remaining_bytes
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Cache-eviction ORDER guards.
+//
+// #681 scoped WHAT this sweep may delete. These two guard WHICH. The sort key
+// is now derived from `module_executions` (the engine writes a row per
+// dispatch) because `modules.last_used_at` has no writer — see
+// `evictable_candidates!` / `eviction_order!`.
+//
+// As in the scoping guards above, every row is left with
+// `last_used_at IS NULL`, faithfully reproducing production. Do NOT "fix"
+// these by stamping that column.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Insert a user-owned sandbox row with an explicit `created_at`, so a test can
+/// make creation order DISAGREE with usage order — which is the whole point.
+async fn insert_user_row_created_at(
+    db: &Pool<Postgres>,
+    user_id: Uuid,
+    name: &str,
+    size_bytes: i32,
+    created_days_ago: i32,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO modules (id, user_id, name, kind, config_schema, source_code, wasm_bytes, size_bytes, created_at)
+         VALUES ($1, $2, $3, 'sandbox', $4, $5, $6, $7, NOW() - make_interval(days => $8::int))",
+    )
+    .bind(id)
+    .bind(user_id)
+    .bind(name)
+    .bind(json!({}))
+    .bind("user source")
+    .bind(vec![0u8; 8])
+    .bind(size_bytes)
+    .bind(created_days_ago)
+    .execute(db)
+    .await
+    .unwrap();
+    id
+}
+
+/// A user plus the default actor `module_executions.actor_id` requires.
+///
+/// `actor_id` is NOT NULL and is filled by the `trg_set_default_actor` BEFORE
+/// INSERT trigger, which resolves `actors WHERE user_id = … AND is_default`.
+/// Without the actor the INSERT fails on the NOT NULL constraint — which makes
+/// the guard below red for the wrong reason, i.e. proves nothing.
+async fn create_test_user_with_default_actor(db: &Pool<Postgres>) -> Uuid {
+    let user_id = create_test_user(db).await;
+    sqlx::query("INSERT INTO actors (id, user_id, name, is_default) VALUES ($1, $2, $3, true)")
+        .bind(Uuid::new_v4())
+        .bind(user_id)
+        .bind("Default Test Actor")
+        .execute(db)
+        .await
+        .unwrap();
+    user_id
+}
+
+/// Record one module execution `days_ago` in the past — the same fact
+/// `PostgresModuleExecutionStore::record_started` writes on every dispatch.
+async fn record_execution_days_ago(
+    db: &Pool<Postgres>,
+    module_id: Uuid,
+    user_id: Uuid,
+    days_ago: i32,
+) {
+    sqlx::query(
+        "INSERT INTO module_executions (id, module_id, user_id, status, trigger_type, started_at)
+         VALUES ($1, $2, $3, 'completed', 'manual', NOW() - make_interval(days => $4::int))",
+    )
+    .bind(Uuid::new_v4())
+    .bind(module_id)
+    .bind(user_id)
+    .bind(days_ago)
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+/// ORDER GUARD. Creation order is the exact REVERSE of usage order, so the two
+/// candidate keys disagree on every row and the assertion cannot pass by luck.
+///
+/// This reproduces the live shape rather than inventing one: over the 29
+/// evictable rows on the deployment, `created_at ASC` put the three busiest
+/// modules on the platform at the front of the delete queue, because the
+/// modules built earliest are the ones in production longest.
+#[tokio::test]
+async fn enforce_cache_limits_evicts_the_least_recently_executed() {
+    let (registry, db) = setup_isolated_registry().await;
+    sqlx::query("DELETE FROM modules")
+        .execute(&db)
+        .await
+        .unwrap();
+    let user_id = create_test_user_with_default_actor(&db).await;
+
+    // created OLDEST, used TODAY  -> must survive
+    let hot = insert_user_row_created_at(&db, user_id, "Hot", 1024, 90).await;
+    let mid = insert_user_row_created_at(&db, user_id, "Mid", 1024, 60).await;
+    // created NEWEST, unused for 45 days -> must be the first to go
+    let cold = insert_user_row_created_at(&db, user_id, "Cold", 1024, 30).await;
+
+    record_execution_days_ago(&db, hot, user_id, 0).await;
+    record_execution_days_ago(&db, hot, user_id, 40).await; // MAX, not MIN, is the key
+    record_execution_days_ago(&db, mid, user_id, 10).await;
+    record_execution_days_ago(&db, cold, user_id, 45).await;
+
+    let outcome = registry.enforce_cache_limits(2, 500).await.unwrap();
+    assert_eq!(outcome.modules_deleted, 1);
+    assert_eq!(outcome.unevictable_count_overage, 0);
+
+    let survivors: Vec<String> = sqlx::query_scalar("SELECT name FROM modules ORDER BY name")
+        .fetch_all(&db)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        survivors,
+        vec!["Hot".to_string(), "Mid".to_string()],
+        "eviction deleted the wrong row: ordering on creation time rather than \
+         on last execution deletes the module that ran today and keeps the one \
+         idle for 45 days"
+    );
+}
+
+/// INVERSION GUARD (the retention trap).
+///
+/// `module_executions` has no retention sweep today, but it is unbounded and
+/// growing, and the sweep next door on `workflow_executions` deletes at 30
+/// days. If a COUNT- or bulk-based prune is ever added there, a module in
+/// active use can lose every execution row and present as never used.
+///
+/// A row with NO execution evidence must fall back to `created_at` — the
+/// position it held before this key existed — NOT to the front of the delete
+/// queue. Rewriting the order as a bare `last_exec ASC NULLS FIRST` fails here,
+/// and so does deleting a module compiled seconds ago that has not had a chance
+/// to run yet.
+#[tokio::test]
+async fn enforce_cache_limits_does_not_treat_missing_execution_rows_as_coldest() {
+    let (registry, db) = setup_isolated_registry().await;
+    sqlx::query("DELETE FROM modules")
+        .execute(&db)
+        .await
+        .unwrap();
+    let user_id = create_test_user_with_default_actor(&db).await;
+
+    // Genuinely idle for 50 days, and its evidence survives.
+    let stale = insert_user_row_created_at(&db, user_id, "Stale", 1024, 90).await;
+    record_execution_days_ago(&db, stale, user_id, 50).await;
+
+    // In active use, but its execution rows are gone (pruned) — or it was
+    // compiled a moment ago and has not run yet. Both look identical here, and
+    // both must be protected.
+    insert_user_row_created_at(&db, user_id, "EvidenceLost", 1024, 0).await;
+
+    let outcome = registry.enforce_cache_limits(1, 500).await.unwrap();
+    assert_eq!(outcome.modules_deleted, 1);
+
+    let survivors: Vec<String> = sqlx::query_scalar("SELECT name FROM modules ORDER BY name")
+        .fetch_all(&db)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        survivors,
+        vec!["EvidenceLost".to_string()],
+        "a module with no surviving execution rows sorted as coldest; absence of \
+         evidence is not evidence of disuse, and this sweep's deletions are \
+         irreversible"
+    );
+}

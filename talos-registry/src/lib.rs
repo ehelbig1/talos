@@ -1517,18 +1517,69 @@ macro_rules! evictable_module_predicate {
     };
 }
 
-/// SQL fragment: a TOTAL eviction order.
+/// SQL fragment: the evictable candidate relation, carrying a REAL recency key.
 ///
-/// `last_used_at` preserves the LRU intent, but note that **nothing in this
-/// workspace writes that column** — `ModuleRegistry::increment_usage` has zero
-/// callers, and live `count(*) FILTER (WHERE last_used_at IS NOT NULL)` is 0
-/// across all 112 rows. Without a tiebreaker every row ties, and both `LIMIT`
-/// and the window frame below then select an ARBITRARY subset. `created_at, id`
-/// make the order total and reproducible whether or not the LRU key is ever
-/// populated; `id` alone is enough to guarantee uniqueness.
+/// `modules.last_used_at` is not that key and cannot be: nothing in this
+/// workspace writes it (`increment_usage` has zero callers) and live
+/// `count(*) FILTER (WHERE last_used_at IS NOT NULL)` is 0 across all 112 rows.
+/// Ordering on it ties every row, and `LIMIT` over a total tie deletes an
+/// ARBITRARY subset.
+///
+/// The signal lives in `module_executions` instead, so recency is DERIVED here
+/// rather than maintained on the hot path — `increment_usage` would add a write
+/// per execution (35,793 in this corpus) contending on one row per module, to
+/// populate a column nothing else reads.
+///
+/// **Shape matters more than the usual "no correlated subquery" rule.** Measured
+/// on the live DB with `EXPLAIN (ANALYZE, BUFFERS)`:
+///
+/// | shape | time | buffers | scaling |
+/// |---|---|---|---|
+/// | `GROUP BY module_id` derived table | 8.04 ms | 2,751 | Seq Scan, grows forever |
+/// | same + `module_id IN (candidates)` | 134.58 ms | 5,116 | reads all matching entries |
+/// | this LATERAL | **0.25 ms** | **146** | 29 index-only probes, O(log n) each |
+///
+/// The LATERAL *is* a correlated subquery, and it is the shape that satisfies
+/// the constraint's substance: cost bounded by the CANDIDATE count, never by the
+/// history table. `module_executions` grows ~730 rows/day with no retention, so
+/// the `GROUP BY` form degrades without bound while this one does not.
+///
+/// `e` exposes only `last_exec`, so every unqualified column in the predicate
+/// still resolves unambiguously to `m`.
+macro_rules! evictable_candidates {
+    () => {
+        concat!(
+            "FROM modules m \
+             LEFT JOIN LATERAL ( \
+               SELECT x.started_at AS last_exec FROM module_executions x \
+               WHERE x.module_id = m.id ORDER BY x.started_at DESC LIMIT 1 \
+             ) e ON true \
+             WHERE ",
+            evictable_module_predicate!()
+        )
+    };
+}
+
+/// SQL fragment: a TOTAL eviction order over [`evictable_candidates`].
+///
+/// **`COALESCE(e.last_exec, m.created_at)`, not `last_exec ASC NULLS FIRST`.**
+/// Absence of execution rows is not evidence of coldness: a just-compiled module
+/// has none yet, and `module_executions` is CASCADE-deleted with its module and
+/// has no retention policy *today* — if one is added, a hot module could present
+/// as never-used. Falling back to `created_at` keeps such a row in its creation
+/// position instead of sending it to the front of the delete queue.
+///
+/// `m.created_at, m.id` keep the order TOTAL so both `LIMIT` (pass 1) and
+/// `ROWS UNBOUNDED PRECEDING` (pass 2) are reproducible.
+///
+/// What this replaced was worse than a neutral tiebreaker. Over the live
+/// evictable set, `created_at ASC` is close to an ANTI-LRU — the modules built
+/// earliest are the ones longest in production — and its first five deletions
+/// were modules last executed the same day with 101, 767 and 819 executions,
+/// against a true-recency order whose first five were last used five weeks ago.
 macro_rules! eviction_order {
     () => {
-        "ORDER BY last_used_at ASC NULLS FIRST, created_at ASC, id ASC"
+        "ORDER BY COALESCE(e.last_exec, m.created_at) ASC, m.created_at ASC, m.id ASC"
     };
 }
 
@@ -1637,8 +1688,8 @@ impl ModuleRegistry {
             // than a row count mislabelled as bytes.
             let freed = sqlx::query_as::<_, (i32,)>(concat!(
                 "DELETE FROM modules WHERE id IN ( \
-                   SELECT id FROM modules WHERE ",
-                evictable_module_predicate!(),
+                   SELECT m.id ",
+                evictable_candidates!(),
                 " ",
                 eviction_order!(),
                 " LIMIT $1 \
@@ -1678,13 +1729,12 @@ impl ModuleRegistry {
             //    excess is smaller than the first candidate row.
             let freed = sqlx::query_as::<_, (i32,)>(concat!(
                 "WITH candidates AS ( \
-                   SELECT id, \
-                          COALESCE(size_bytes, 0) AS size_bytes, \
-                          SUM(COALESCE(size_bytes, 0)) OVER ( ",
+                   SELECT m.id, \
+                          COALESCE(m.size_bytes, 0) AS size_bytes, \
+                          SUM(COALESCE(m.size_bytes, 0)) OVER ( ",
                 eviction_order!(),
-                " ROWS UNBOUNDED PRECEDING ) AS running_total \
-                   FROM modules WHERE ",
-                evictable_module_predicate!(),
+                " ROWS UNBOUNDED PRECEDING ) AS running_total ",
+                evictable_candidates!(),
                 " ) \
                  DELETE FROM modules WHERE id IN ( \
                    SELECT id FROM candidates WHERE running_total - size_bytes < $1 \
