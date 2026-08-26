@@ -1,5 +1,6 @@
-use sqlx::postgres::PgPoolOptions;
-use sqlx::{Pool, Postgres};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::{ConnectOptions, Connection, PgConnection, Pool, Postgres};
+use std::str::FromStr;
 use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres as PostgresImage;
 use tokio::sync::OnceCell;
@@ -72,4 +73,94 @@ pub async fn get_test_db_pool() -> Pool<Postgres> {
         .connect(&connection_string)
         .await
         .expect("Failed to connect to test database")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Per-test database isolation.
+//
+// `get_test_db_pool` hands every test the SAME `postgres` database on the
+// shared container, so tests that `DELETE FROM modules` and then assert on a
+// GLOBAL aggregate (cache size, cache row count) race each other. That is not
+// hypothetical: the cache-eviction guards below measure exactly such an
+// aggregate, and a peer test wiping the table mid-run can flip them either way
+// — including to a vacuous GREEN, which is the worst outcome for a guard.
+//
+// This gives such a test its own throwaway database, cloned from a migrated
+// template that nothing else ever connects to (Postgres refuses to use a
+// template that has live connections, which is why the shared `postgres`
+// database cannot serve as one). Everything stays inside the ephemeral
+// testcontainer, so no cleanup is needed and no non-container database is ever
+// touched.
+// ─────────────────────────────────────────────────────────────────────────
+
+const TEMPLATE_DB: &str = "talos_isolated_template";
+
+static TEMPLATE_READY: OnceCell<()> = OnceCell::const_new();
+
+/// Create + migrate the clone template exactly once per test binary.
+async fn ensure_template(base: &PgConnectOptions) {
+    TEMPLATE_READY
+        .get_or_init(|| async {
+            let mut admin = PgConnection::connect_with(base)
+                .await
+                .expect("connect to container maintenance db");
+            // Idempotent: a re-run inside the same container is fine.
+            let _ = sqlx::query(&format!("CREATE DATABASE \"{}\"", TEMPLATE_DB))
+                .execute(&mut admin)
+                .await;
+            let _ = admin.close().await;
+
+            let pool = PgPoolOptions::new()
+                .max_connections(2)
+                .connect_with(base.clone().database(TEMPLATE_DB))
+                .await
+                .expect("connect to clone template");
+            sqlx::migrate!("../migrations")
+                .run(&pool)
+                .await
+                .expect("migrate clone template");
+            // Must be connection-free before it can be used as a TEMPLATE.
+            pool.close().await;
+        })
+        .await;
+}
+
+/// A pool on a database of this test's own, cloned from the migrated template.
+#[allow(dead_code)]
+pub async fn get_isolated_db_pool() -> Pool<Postgres> {
+    let base = PgConnectOptions::from_str(&shared_conn_string().await)
+        .expect("container connection string is valid")
+        .disable_statement_logging();
+    ensure_template(&base).await;
+
+    let db_name = format!("t_{}", uuid::Uuid::new_v4().simple());
+    let mut admin = PgConnection::connect_with(&base)
+        .await
+        .expect("connect to container maintenance db");
+
+    // Two tests cloning the same template at the same instant can collide on
+    // the "being accessed by other users" window; retry rather than flake.
+    let create_sql = format!(
+        "CREATE DATABASE \"{}\" TEMPLATE \"{}\"",
+        db_name, TEMPLATE_DB
+    );
+    let mut attempt = 0;
+    loop {
+        match sqlx::query(&create_sql).execute(&mut admin).await {
+            Ok(_) => break,
+            Err(e) if attempt < 10 && e.to_string().contains("being accessed by other users") => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(100 * attempt)).await;
+            }
+            Err(e) => panic!("failed to clone test database: {e}"),
+        }
+    }
+    let _ = admin.close().await;
+
+    PgPoolOptions::new()
+        .max_connections(5)
+        .acquire_timeout(std::time::Duration::from_secs(30))
+        .connect_with(base.database(&db_name))
+        .await
+        .expect("connect to isolated test database")
 }

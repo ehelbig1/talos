@@ -1483,6 +1483,73 @@ impl From<NodeTemplateRow> for NodeTemplate {
     }
 }
 
+/// SQL fragment: the rows this cache sweep is permitted to delete.
+///
+/// `modules` is a module REGISTRY that a cache sweep happens to run over, not a
+/// cache. Every row carries `source_code`, and rows with `user_id IS NULL` are
+/// the shared catalog every tenant installs from. A sweep driven by AGGREGATE
+/// footprint — pressure that ANY tenant can create — must never delete a row
+/// that no tenant owns; doing so is a cross-tenant data-loss event, not a
+/// tuning artefact.
+///
+/// `kind = 'catalog'` rows that DO carry a `user_id` are excluded for a second
+/// reason: they are a user's INSTALL of a shared template, and re-installing
+/// mints a NEW id while workflows bind modules by raw UUID inside `graph_json`
+/// with no foreign key. Deleting one leaves a dangling reference that
+/// re-installing does not repair. They are definitions, not artifacts.
+///
+/// Sibling precedent on this same table: all three `DELETE FROM modules`
+/// statements in `talos-module-repository` carry a `user_id` predicate. This
+/// sweep was the only one in the workspace that did not.
+///
+/// **Measured on the live deployment 2026-08-26:** 112 of 112 cached rows carry
+/// `source_code`; **0 of 112 carry an `oci_url`**; 29 are evictable under this
+/// predicate. **The condition that would reverse the exclusion:** if a row class
+/// is introduced whose bytes are re-fetchable from a durable source (a populated
+/// `oci_url`), that class genuinely IS a cache entry and belongs here.
+/// Re-measure `count(*) FILTER (WHERE oci_url IS NOT NULL)` before assuming it
+/// is still 0 — the predicate this one replaced (`wasm_bytes IS NOT NULL`, on
+/// the reasoning that catalog rows are OCI-served and hold no bytes) was true
+/// when written and excluded nothing by the time it mattered.
+macro_rules! evictable_module_predicate {
+    () => {
+        "wasm_bytes IS NOT NULL AND user_id IS NOT NULL AND kind <> 'catalog'"
+    };
+}
+
+/// SQL fragment: a TOTAL eviction order.
+///
+/// `last_used_at` preserves the LRU intent, but note that **nothing in this
+/// workspace writes that column** — `ModuleRegistry::increment_usage` has zero
+/// callers, and live `count(*) FILTER (WHERE last_used_at IS NOT NULL)` is 0
+/// across all 112 rows. Without a tiebreaker every row ties, and both `LIMIT`
+/// and the window frame below then select an ARBITRARY subset. `created_at, id`
+/// make the order total and reproducible whether or not the LRU key is ever
+/// populated; `id` alone is enough to guarantee uniqueness.
+macro_rules! eviction_order {
+    () => {
+        "ORDER BY last_used_at ASC NULLS FIRST, created_at ASC, id ASC"
+    };
+}
+
+/// Outcome of one cache-limit sweep.
+///
+/// `unevictable_*_overage` is the part of the cap that could NOT be met without
+/// deleting rows this sweep does not own. It is a returned value rather than
+/// only a log line so it is unit-testable: a registry whose excess is entirely
+/// shared catalog must SURFACE that, not silently do nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CacheEvictionOutcome {
+    /// Rows actually deleted, across both passes.
+    pub modules_deleted: u64,
+    /// Bytes actually reclaimed — real `size_bytes`, not a row count.
+    pub bytes_freed: i64,
+    /// Rows still over the count cap that this sweep is not allowed to delete.
+    pub unevictable_count_overage: i64,
+    /// Bytes still over the size cap that this sweep is not allowed to delete.
+    pub unevictable_size_overage_bytes: i64,
+}
+
 impl ModuleRegistry {
     /// Clean up old unused WASM modules (default: 30 days).
     ///
@@ -1522,79 +1589,118 @@ impl ModuleRegistry {
         Ok(result.rows_affected())
     }
 
-    /// Enforce cache size limit by removing least recently used modules.
+    /// Enforce the cache caps by deleting the least recently used **evictable**
+    /// modules.
     ///
-    /// Phase 5: operates on the unified `modules` table. Only counts rows
-    /// with a stored compile artifact (`wasm_bytes IS NOT NULL`) so the
-    /// cap reflects actual on-disk footprint, not catalog metadata rows.
+    /// Stats are taken over the FULL cached set, because the caps are about real
+    /// footprint; only the DELETEs are restricted to
+    /// [`evictable_module_predicate!`]. Restricting the STATS instead would be
+    /// the silent failure — an over-cap registry whose excess is all catalog
+    /// would simply report itself as under cap. Whatever overage cannot be met
+    /// is returned in [`CacheEvictionOutcome`] for the caller to surface.
     pub async fn enforce_cache_limits(
         &self,
         max_modules: i64,
         max_size_mb: i64,
-    ) -> anyhow::Result<(u64, u64)> {
-        let max_size_bytes = max_size_mb * 1_048_576; // Convert MB to bytes
+    ) -> anyhow::Result<CacheEvictionOutcome> {
+        // Defense-in-depth at the function boundary, mirroring
+        // `cleanup_old_modules` (MCP-643): a non-positive cap makes
+        // `current > max` trivially true with an unbounded `to_delete`, purging
+        // every evictable row. No caller can reach this today — the sweep reads
+        // both caps through `talos_config::positive_env_or_default` — but this
+        // is a `pub` API and the sibling guards the identical shape.
+        if max_modules <= 0 || max_size_mb <= 0 {
+            tracing::warn!(
+                target: "talos_audit",
+                max_modules,
+                max_size_mb,
+                "wasm-cache eviction refused: caps must be positive (would purge every evictable row)"
+            );
+            return Ok(CacheEvictionOutcome::default());
+        }
+        let max_size_bytes = max_size_mb.saturating_mul(1_048_576);
 
-        // Get current cache stats — restricted to rows that actually
-        // store compiled bytes (catalog rows served via OCI pull hold no
-        // bytes and should not count toward the byte cap).
-        let stats = sqlx::query_as::<_, (i64, i64)>(
-            "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0) \
+        let (current_count, current_size) = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0)::bigint \
              FROM modules WHERE wasm_bytes IS NOT NULL",
         )
         .fetch_one(&self.db_pool)
         .await?;
 
-        let (current_count, current_size) = stats;
-        let mut modules_deleted = 0u64;
-        let mut bytes_freed = 0u64;
+        let mut outcome = CacheEvictionOutcome::default();
 
-        // Evict by count if over limit
+        // ── Pass 1: count cap ────────────────────────────────────────────
         if current_count > max_modules {
-            let to_delete = current_count - max_modules;
-            let result = sqlx::query(
-                r#"
-                DELETE FROM modules
-                WHERE id IN (
-                    SELECT id FROM modules
-                    WHERE wasm_bytes IS NOT NULL
-                    ORDER BY last_used_at ASC NULLS FIRST
-                    LIMIT $1
-                )
-                "#,
-            )
-            .bind(to_delete)
-            .execute(&self.db_pool)
+            let wanted = current_count - max_modules;
+            // RETURNING the real sizes: pass 2 needs to know what this pass
+            // actually freed (see below), and the caller needs bytes rather
+            // than a row count mislabelled as bytes.
+            let freed = sqlx::query_as::<_, (i32,)>(concat!(
+                "DELETE FROM modules WHERE id IN ( \
+                   SELECT id FROM modules WHERE ",
+                evictable_module_predicate!(),
+                " ",
+                eviction_order!(),
+                " LIMIT $1 \
+                 ) RETURNING COALESCE(size_bytes, 0)"
+            ))
+            .bind(wanted)
+            .fetch_all(&self.db_pool)
             .await?;
 
-            modules_deleted += result.rows_affected();
+            let deleted = freed.len() as i64;
+            outcome.modules_deleted += deleted as u64;
+            outcome.bytes_freed += freed.iter().map(|r| i64::from(r.0)).sum::<i64>();
+            outcome.unevictable_count_overage = wanted - deleted;
         }
 
-        // Evict by size if over limit
-        if current_size > max_size_bytes {
-            // Keep deleting oldest modules until under size limit
-            let result = sqlx::query(
-                r#"
-                WITH to_delete AS (
-                    SELECT id,
-                           SUM(size_bytes) OVER (ORDER BY last_used_at ASC NULLS FIRST) as running_total
-                    FROM modules
-                    WHERE wasm_bytes IS NOT NULL
-                )
-                DELETE FROM modules
-                WHERE id IN (
-                    SELECT id FROM to_delete
-                    WHERE running_total <= $1
-                )
-                "#
-            )
-            .bind(current_size - max_size_bytes)
-            .execute(&self.db_pool)
+        // ── Pass 2: size cap ─────────────────────────────────────────────
+        // `current_size` was read BEFORE pass 1 ran, and pass 1 mutates the very
+        // set this pass measures — so reusing it over-states the live footprint
+        // by whatever pass 1 freed and over-deletes by that amount. This needs
+        // no concurrent writer to go wrong. Subtract what was actually freed.
+        // (A concurrent writer can still move the set between the stats read and
+        // either DELETE; that residual window is narrowed, not closed.)
+        let live_size = current_size - outcome.bytes_freed;
+        if live_size > max_size_bytes {
+            let excess = live_size - max_size_bytes;
+            // Two corrections against the previous form:
+            //  * `ROWS UNBOUNDED PRECEDING` — the default `RANGE` frame gives
+            //    every row that TIES on the ordering key the sum of the whole
+            //    peer group, not a prefix sum. With `last_used_at` never
+            //    written, ALL rows tie, every `running_total` equals the entire
+            //    cache size, and `running_total <= excess` is false for every
+            //    row: the size cap shed nothing at all.
+            //  * `running_total - size_bytes < excess` — selects the SMALLEST
+            //    prefix that COVERS the excess. The old `running_total <=
+            //    excess` selects the largest prefix that fits WITHIN it, which
+            //    always frees less than needed, and frees nothing whenever the
+            //    excess is smaller than the first candidate row.
+            let freed = sqlx::query_as::<_, (i32,)>(concat!(
+                "WITH candidates AS ( \
+                   SELECT id, \
+                          COALESCE(size_bytes, 0) AS size_bytes, \
+                          SUM(COALESCE(size_bytes, 0)) OVER ( ",
+                eviction_order!(),
+                " ROWS UNBOUNDED PRECEDING ) AS running_total \
+                   FROM modules WHERE ",
+                evictable_module_predicate!(),
+                " ) \
+                 DELETE FROM modules WHERE id IN ( \
+                   SELECT id FROM candidates WHERE running_total - size_bytes < $1 \
+                 ) RETURNING COALESCE(size_bytes, 0)"
+            ))
+            .bind(excess)
+            .fetch_all(&self.db_pool)
             .await?;
 
-            bytes_freed = result.rows_affected();
+            let bytes = freed.iter().map(|r| i64::from(r.0)).sum::<i64>();
+            outcome.modules_deleted += freed.len() as u64;
+            outcome.bytes_freed += bytes;
+            outcome.unevictable_size_overage_bytes = (excess - bytes).max(0);
         }
 
-        Ok((modules_deleted, bytes_freed))
+        Ok(outcome)
     }
 
     /// Get cache statistics.

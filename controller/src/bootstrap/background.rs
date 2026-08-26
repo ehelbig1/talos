@@ -2643,13 +2643,30 @@ pub(crate) fn spawn_cleanup_tasks(
                 .enforce_cache_limits(max_modules, max_size_mb)
                 .await
             {
-                Ok((modules_deleted, bytes_freed)) => {
-                    if modules_deleted > 0 || bytes_freed > 0 {
+                Ok(outcome) => {
+                    if outcome.modules_deleted > 0 {
                         tracing::info!(
-                            "Evicted {} WASM modules (freed {} modules, {} MB)",
-                            modules_deleted,
-                            modules_deleted,
-                            bytes_freed
+                            modules_deleted = outcome.modules_deleted,
+                            bytes_freed = outcome.bytes_freed,
+                            "Evicted WASM cache modules"
+                        );
+                    }
+                    // A cap that cannot be met without deleting rows this sweep
+                    // does not own (the shared catalog) is a real operational
+                    // condition, not a no-op. Surface it — counts only, never a
+                    // module name, tenant id, or per-row size.
+                    if outcome.unevictable_count_overage > 0
+                        || outcome.unevictable_size_overage_bytes > 0
+                    {
+                        tracing::warn!(
+                            target: "talos_audit",
+                            unevictable_count_overage = outcome.unevictable_count_overage,
+                            unevictable_size_overage_bytes = outcome.unevictable_size_overage_bytes,
+                            max_modules,
+                            max_size_mb,
+                            "WASM cache is over cap but the excess is not evictable \
+                             (shared catalog rows are not cache entries); raise the cap \
+                             or prune the catalog"
                         );
                     }
                 }
