@@ -52,6 +52,16 @@
 # wrong. A drill that silently restored the local artifact after failing to
 # reach the bucket would certify an off-host copy that does not exist.
 #
+# EVERY RUN RECORDS WHICH COPY IT RESTORED. The three Prometheus gauges this
+# script writes carry a `source` label (`artifact` | `b2` | `live`) as of
+# 2026-08-26. Before that they said only "a drill passed", and since the
+# LaunchAgent passed no arguments every scheduled run was `artifact` — so a
+# green `talos_backup_drill_last_status` read as "the backups are verified"
+# while proving strictly less: that a file on the disk we are insuring
+# against round-trips. The label is what makes the metric able to say what it
+# actually certified. See emit_metric for which series are per-run and which
+# are retained per copy.
+#
 # See scripts/drills/README.md for scheduling and for what this does NOT cover.
 
 set -euo pipefail
@@ -184,6 +194,24 @@ die()  { printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2; emit_metric failure; exit 
 # directory so the rename is same-filesystem and therefore actually atomic —
 # `mktemp` in $TMPDIR can land on a different device, where `mv` degrades to
 # copy+unlink and a collector can read a half-written file.
+# ── The CLOSED label set for the drill's series. ──────────────────
+# `source` is the ONLY label these three gauges carry, and these are the
+# only values it may take — the same set the `--source` validation above
+# enforces on the WRITE side, restated here because the READ side below
+# parses a file that anything on the host could have written. Nine series
+# is the hard ceiling (3 names x 3 sources), so this cannot become a
+# cardinality bomb and /metrics stays scrapeable.
+#
+# WHY THE LABEL EXISTS AT ALL. Until 2026-08-26 these gauges said only
+# "a drill passed". They could not say WHICH COPY was restored, and the
+# scheduled run has always been `artifact` — the dump on the very disk
+# the backups insure against. So a green `talos_backup_drill_last_status`
+# read as "the backups are verified" while proving strictly less: that a
+# local file round-trips. The off-host copy, which is the whole point of
+# Tier 2, was uncertified and nothing in the metrics could tell the
+# difference. The label is the difference.
+DRILL_SOURCES_RE='(artifact|b2|live)'
+
 METRIC_EMITTED=0
 emit_metric() {
     local status="$1"; local ts; ts=$(date +%s)
@@ -198,8 +226,10 @@ emit_metric() {
         warn "textfile dir $TEXTFILE_DIR not writable — metric NOT emitted ($status)"
         return 0
     fi
-    # Resolve the carried-forward success timestamp BEFORE the temp file
-    # exists, and never let it fail the shell.
+    local sl="{source=\"$SOURCE_MODE\"}"
+
+    # Resolve everything read out of the PREVIOUS file before the temp file
+    # exists, and never let any of it fail the shell.
     #
     # This lookup used to live inside the here-block below, unguarded. With
     # `set -e -o pipefail`, an existing $TEXTFILE that does NOT contain a
@@ -208,12 +238,60 @@ emit_metric() {
     # emit_metric. Measured: the failure metric was never written, `die`'s
     # `exit 1` never ran, and the temp file was orphaned in the collector's
     # directory. A fail-open in the failure-REPORTING path is the same defect
-    # class as the sentinel it sits next to, so it is `|| true` plus a default.
-    local prev="0"
-    if [[ "$status" != "success" && -f "$TEXTFILE" ]]; then
-        prev=$(grep -E '^talos_backup_drill_last_success_timestamp_seconds ' "$TEXTFILE" 2>/dev/null \
+    # class as the sentinel it sits next to, so every read is `|| true` plus a
+    # default, and every value is re-validated as digits before use.
+    #
+    # ADDING THE LABEL RE-ARMED THAT EXACT TRAP, which is why the greps below
+    # are not the ones they replaced. The old pattern was an ANCHORED,
+    # LABEL-FREE prefix — `'^talos_backup_drill_last_success_timestamp_seconds '`
+    # with a trailing space — and it stops matching the instant the line
+    # becomes `…_seconds{source="artifact"} 123`. It would not have errored;
+    # it would have quietly returned nothing, `prev` would have defaulted, and
+    # every failed run after the format change would have ERASED the real
+    # last-success timestamp. Silent, in the failure-reporting path, one
+    # function below the comment warning about it.
+    local prev="" legacy="" carried=""
+    if [[ -f "$TEXTFILE" ]]; then
+        # (a) this source's own last success, in the labelled form.
+        prev=$(grep -E "^talos_backup_drill_last_success_timestamp_seconds\{source=\"$SOURCE_MODE\"\} " "$TEXTFILE" 2>/dev/null \
             | awk '{print $2}' | head -1 || true)
-        [[ -z "$prev" ]] && prev="0"
+        # (b) the LEGACY unlabelled line, written by every run before this
+        #     change. Read so the format transition does not throw away a
+        #     real proven-restore timestamp.
+        legacy=$(grep -E '^talos_backup_drill_last_success_timestamp_seconds [0-9]' "$TEXTFILE" 2>/dev/null \
+            | awk '{print $2}' | head -1 || true)
+        # (c) every OTHER source's last success, carried forward verbatim.
+        #     The regex admits only the closed label set, so a hand-edited or
+        #     corrupted file cannot inject a label value this producer would
+        #     never write.
+        carried=$(grep -E "^talos_backup_drill_last_success_timestamp_seconds\{source=\"$DRILL_SOURCES_RE\"\} [0-9]" "$TEXTFILE" 2>/dev/null \
+            | grep -vF "{source=\"$SOURCE_MODE\"}" || true)
+    fi
+    [[ "$prev"   =~ ^[0-9]+$ ]] || prev=""
+    [[ "$legacy" =~ ^[0-9]+$ ]] || legacy=""
+
+    # ATTRIBUTING THE LEGACY LINE. An unlabelled timestamp records a run whose
+    # source was not written down, so adopting it is a judgement, not a read —
+    # and it is made once, in the one direction the evidence supports: the
+    # LaunchAgent has never passed `--source`, so every unattended run this
+    # host has ever made was `artifact`. `b2` and `live` only ever happen when
+    # an operator types them. Adopting it as `artifact` can therefore only be
+    # wrong for a host whose last MANUAL run was `live` — and it is wrong in a
+    # bounded way that one subsequent run corrects. Dropping the line instead
+    # would fabricate an absence and fire the staleness alert on a host that
+    # genuinely had a green drill. A labelled line always wins over it.
+    if [[ -n "$legacy" ]]; then
+        if [[ "$SOURCE_MODE" == "artifact" ]]; then
+            [[ -z "$prev" ]] && prev="$legacy"
+        elif ! printf '%s\n' "$carried" | grep -qF '{source="artifact"}'; then
+            local adopted="talos_backup_drill_last_success_timestamp_seconds{source=\"artifact\"} $legacy"
+            if [[ -n "$carried" ]]; then
+                carried="$adopted
+$carried"
+            else
+                carried="$adopted"
+            fi
+        fi
     fi
 
     # Sweep temp files orphaned by an earlier aborted emit. node_exporter's
@@ -224,25 +302,51 @@ emit_metric() {
 
     local tmp; tmp=$(mktemp "$TEXTFILE_DIR/.talos_backup_drill.XXXXXX")
     {
-        echo "# HELP talos_backup_drill_last_run_timestamp_seconds Unix timestamp of the most recent drill attempt."
+        # WHICH SERIES ARE PER-RUN AND WHICH ARE PER-SOURCE, and why they
+        # differ. `last_run` and `last_status` are SINGULAR by name — "the
+        # most recent attempt", "the most recent drill" — so exactly one of
+        # each is written, labelled with the source that run exercised.
+        # Retaining a stale `last_status{source="live"} 0` from an abandoned
+        # one-off would manufacture a permanently-firing alert, which is the
+        # shape this alert family explicitly rejects.
+        #
+        # `last_success` is different: "has THIS copy ever been restored" is a
+        # durable per-copy fact and it is the question Tier 2 exists to ask,
+        # so every source's value is carried forward. It is also required for
+        # CORRECTNESS — without it a failed `--source live` run would erase
+        # the artifact copy's proven-restore timestamp, which is worse than
+        # what this file did before the label existed.
+        echo "# HELP talos_backup_drill_last_run_timestamp_seconds Unix timestamp of the most recent drill attempt, labelled with the copy it restored."
         echo "# TYPE talos_backup_drill_last_run_timestamp_seconds gauge"
-        echo "talos_backup_drill_last_run_timestamp_seconds $ts"
-        echo "# HELP talos_backup_drill_last_success_timestamp_seconds Unix timestamp of the most recent SUCCESSFUL drill."
+        echo "talos_backup_drill_last_run_timestamp_seconds$sl $ts"
+        echo "# HELP talos_backup_drill_last_success_timestamp_seconds Unix timestamp of the most recent SUCCESSFUL drill, per restored copy."
         echo "# TYPE talos_backup_drill_last_success_timestamp_seconds gauge"
         if [[ "$status" == "success" ]]; then
-            echo "talos_backup_drill_last_success_timestamp_seconds $ts"
-        else
+            echo "talos_backup_drill_last_success_timestamp_seconds$sl $ts"
+        elif [[ -n "$prev" ]]; then
             # Preserve previous success timestamp when available so the
             # alert threshold compares against the last actually-green run.
-            echo "talos_backup_drill_last_success_timestamp_seconds $prev"
+            echo "talos_backup_drill_last_success_timestamp_seconds$sl $prev"
         fi
-        echo "# HELP talos_backup_drill_last_status Status of the most recent drill (1=success, 0=failure)."
+        # NO LINE AT ALL when this source has failed and has never succeeded.
+        # The old code wrote 0 here. With a label that is no longer harmless:
+        # `0 < time() - 14d` is true forever, so a first-ever failing `b2`
+        # drill on a host whose `artifact` drill is green would fire an alert
+        # whose summary — "No successful backup→restore drill in 14+ days" —
+        # is FALSE. Absence is the honest encoding of "this copy has never
+        # been proven", it is what leg F5 of verify-observability.sh reads to
+        # say so, and the all-sources case is still covered by the alert's
+        # own absent() arm. Same argument as the deliberate no-absent()-arm
+        # carve-out on TalosBackupRestoreDrillLastRunFailed: a gauge with two
+        # values and no honest third has no honest pre-seed.
+        [[ -n "$carried" ]] && echo "$carried"
+        echo "# HELP talos_backup_drill_last_status Status of the most recent drill (1=success, 0=failure), labelled with the copy it restored."
         echo "# TYPE talos_backup_drill_last_status gauge"
-        [[ "$status" == "success" ]] && echo "talos_backup_drill_last_status 1" || echo "talos_backup_drill_last_status 0"
+        [[ "$status" == "success" ]] && echo "talos_backup_drill_last_status$sl 1" || echo "talos_backup_drill_last_status$sl 0"
     } > "$tmp"
     chmod 644 "$tmp"
     mv "$tmp" "$TEXTFILE"
-    ok "emitted metric → $TEXTFILE ($status)"
+    ok "emitted metric → $TEXTFILE ($status, source=$SOURCE_MODE)"
 }
 
 # ── Cleanup. Runs on EVERY exit path: success, failure, and signal. ──
@@ -1258,6 +1362,10 @@ printf '  Checkout schema: %s (newest migration in this working tree)\n' "$EXPEC
 printf '  KEK source:      %s\n' "$KEK_SOURCE"
 printf '                   (as configured; provenance is NOT verified — see step 0b STATED LIMITS)\n'
 printf '  Metric:          %s\n' "$TEXTFILE"
+# WHICH COPY THE METRIC NOW CLAIMS. Printed next to the file path because the
+# whole point of the label is that a reader of the gauge can tell what was
+# certified; a summary that omitted it would be the same gap one report out.
+printf '                   (all three gauges labelled source="%s")\n' "$SOURCE_MODE"
 printf '  Next drill:      within 7 days (alert fires at 14)\n'
 
 # WHAT A PASS NOW MEANS, AND WHAT IT STILL DOES NOT. Printed inside the banner

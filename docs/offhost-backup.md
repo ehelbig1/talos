@@ -281,7 +281,8 @@ already contains all the data.
 | Laptop closed / no network on **two** nights | `reason="network"` — one offline night is deliberately NOT an alert (the threshold is "at least two failures in 50 h"), because a daily job that alerts on every unrouted night trains you to ignore it |
 | Upload silently stopped for a week | `TalosOffhostBackupStale` |
 | Uploader was never scheduled at all | **Neither alert.** See below. |
-| Bucket holds nothing, or only stale archives | `make drill ARGS="--source b2"` FAILS → `TalosBackupRestoreDrillFailed` |
+| Bucket holds nothing, or only stale archives | `make drill ARGS="--source b2"` FAILS → `TalosBackupRestoreDrillLastRunFailed`, naming the `b2` copy |
+| Off-host copy has never been restored at all | **No alert, deliberately.** `make drill-schedule-status` and leg F of `make observability-verify` both say so; a rule for it could never clear on a host that cannot run `--source b2` yet |
 | Wrong age passphrase | the drill's b2 leg fails with `reason="encrypt"` and says the download succeeded, so it is the key and not the network |
 
 **The gap, stated rather than implied.** Both new alerts are gated on

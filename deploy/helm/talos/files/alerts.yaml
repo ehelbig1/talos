@@ -2525,17 +2525,42 @@ groups:
       # page. Silence it by running the drill (or by removing this rule if
       # the deployment's backups are verified some other way), not by
       # reverting to an expression that cannot see its own condition.
+      # `max without(source)` — the ONE aggregation in this rule, and it is
+      # there to PRESERVE the pre-label meaning exactly, not to change it.
+      #
+      # As of 2026-08-26 the producer labels these gauges with the copy the
+      # run restored (`artifact` = the local dump, `b2` = the off-host
+      # archive, `live` = a fresh dump), and it RETAINS one
+      # last_success sample per copy — otherwise a failed `--source live`
+      # run would erase the artifact copy's proven-restore timestamp.
+      # Retention means a bare `x < time() - 14d` would fire, forever, on any
+      # copy an operator drilled once and then stopped drilling: a
+      # permanently-red alert about an abandoned one-off, which is the
+      # failure mode this file argues against everywhere else.
+      # `max without(source)` asks the question the summary line actually
+      # asks — "has ANY copy been successfully restored in the last 14 days?"
+      # — which is bit-for-bit what this rule meant when there was only one
+      # series. `without(source)` rather than a bare `max()` so `job` and
+      # `instance` survive for anything that groups on them.
+      #
+      # PER-COPY DETAIL DELIBERATELY DOES NOT LIVE HERE. "The off-host copy
+      # has never been drilled" is a real and important fact, but on a host
+      # that cannot yet run `--source b2` an alert for it would fire forever
+      # and never clear — see the argument against exactly that shape in the
+      # rule below. It is reported instead by `make drill-schedule-status`
+      # and by leg F of scripts/verify-observability.sh, both of which name
+      # the unproven copy explicitly.
       - alert: TalosBackupRestoreDrillFailed
         expr: |
           absent(talos_backup_drill_last_success_timestamp_seconds)
           or
-          talos_backup_drill_last_success_timestamp_seconds < (time() - 14*86400)
+          max without(source) (talos_backup_drill_last_success_timestamp_seconds) < (time() - 14*86400)
         for: 1h
         labels:
           severity: warning
           category: ops-hygiene
         annotations:
-          summary: "No successful backup→restore drill in 14+ days"
+          summary: "No successful backup→restore drill of ANY copy in 14+ days"
           description: |
             scripts/drills/backup-restore.sh has either not run or is
             failing. A backup you have not restored is a hypothesis —
@@ -2543,6 +2568,9 @@ groups:
             series has NEVER been published: check that the drill script
             is scheduled at all and that its node_exporter textfile
             directory is being collected.
+            This alert aggregates over the `source` label, so it carries
+            none: `make drill-schedule-status` says which copy (artifact /
+            b2 / live) was last proven and which has never been.
 
       # ──────────────────────────────────────────────────────────────
       # THE OTHER FAULT. The alert above answers "has a drill SUCCEEDED
@@ -2618,6 +2646,22 @@ groups:
       # housekeeping: the recovery path is broken right now, and 168h is
       # how this deployment's failure went eight days unnoticed. Same
       # subject, different fault, different lane, deliberately.
+      # THE `source` LABEL DOES NOT FAN THIS OUT, and that is a producer
+      # property, not luck. `last_status` is SINGULAR by name — "the status
+      # of the most recent drill" — so emit_metric writes exactly ONE of it
+      # per run, labelled with the copy that run restored, and drops the
+      # previous one. Contrast `last_success`, which is retained per copy and
+      # therefore had to be aggregated in the rule above. Seeding or
+      # retaining a `last_status{source="live"} 0` from an abandoned one-off
+      # would be the seeded-fan-out trap: N alerts differing only by a label
+      # that carries no information about the fault.
+      #
+      # The flip side, stated because it is real and this PR did not change
+      # it: a green `--source live` run CLEARS this alert even if the
+      # `artifact` restore is still broken, because the failing series is
+      # replaced rather than kept. That was equally true before the label
+      # existed (there was one unlabelled series); what the label buys is
+      # that the alert, and the metric, now NAME the copy that cleared it.
       - alert: TalosBackupRestoreDrillLastRunFailed
         expr: |
           talos_backup_drill_last_status == 0
@@ -2626,12 +2670,15 @@ groups:
           severity: warning
           category: data-loss
         annotations:
-          summary: "The last backup→restore drill RAN AND FAILED"
+          summary: "The last backup→restore drill RAN AND FAILED ({{ $labels.source }} copy)"
           description: |
             scripts/drills/backup-restore.sh completed and reported
-            failure — this is not "the drill is overdue", it is "the drill
-            ran and the backups did not come back". Until it passes, the
-            readability of every artifact in $BACKUP_DIR is unproven.
+            failure while restoring the {{ $labels.source }} copy —
+            this is not "the drill is overdue", it is "the drill
+            ran and the backups did not come back". `artifact` is the local
+            dump in $BACKUP_DIR, `b2` the off-host archive, `live` a fresh
+            dump taken by the drill itself. Until it passes, the
+            readability of that copy is unproven.
             The metric records only the outcome, never which step failed,
             so read the run's own output: ~/.talos/logs/backup-drill.log
             for a scheduled run, or re-run it by hand with `make drill`.

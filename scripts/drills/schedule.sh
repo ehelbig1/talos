@@ -44,6 +44,26 @@ WEEKDAY=0
 HOUR=3
 MINUTE=0
 
+# WHICH COPY THE UNATTENDED RUN RESTORES, stated rather than defaulted.
+# Until 2026-08-26 ProgramArguments passed NO arguments, so every scheduled
+# run silently took backup-restore.sh's `artifact` default — the dump on the
+# very disk the backups insure against — and the metric it published could not
+# say so. The value is now written into the plist explicitly: `launchctl` and
+# `plutil -p` show what is actually being certified, and `status` below reads
+# it back out of the installed plist rather than assuming.
+#
+# `artifact` remains the DEFAULT because it is the only mode that runs with no
+# operator secrets. `TALOS_DRILL_SCHEDULE_SOURCE=b2 make drill-schedule` is
+# the upgrade path once the off-host chain and its age passphrase are wired:
+# that is the strictly harder question, and scheduling it is what turns
+# "the off-host copy is uncertified" into a continuously answered one.
+DRILL_SOURCE="${TALOS_DRILL_SCHEDULE_SOURCE:-artifact}"
+case "$DRILL_SOURCE" in
+    artifact|b2|live) ;;
+    *) printf 'TALOS_DRILL_SCHEDULE_SOURCE must be artifact, b2 or live, got %s\n' \
+        "$DRILL_SOURCE" >&2; exit 1 ;;
+esac
+
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
 yellow(){ printf '\033[33m%s\033[0m\n' "$*"; }
@@ -120,6 +140,8 @@ render_plist() {
   <array>
     <string>/bin/bash</string>
     <string>$REPO_ROOT/scripts/drills/backup-restore.sh</string>
+    <string>--source</string>
+    <string>$DRILL_SOURCE</string>
   </array>
   <key>WorkingDirectory</key><string>$REPO_ROOT</string>
   <key>StartCalendarInterval</key>
@@ -188,14 +210,57 @@ status)
     # The metric file is the authority on when the drill last actually
     # succeeded — the same file Prometheus scrapes, so this cannot disagree
     # with the alert.
+    #
+    # ONE LINE PER COPY, and the parse reads BOTH formats. The old pattern
+    # here was `/^talos_backup_drill_last_success_timestamp_seconds /` — an
+    # anchored, label-free prefix with a trailing space, which stops matching
+    # the instant the producer writes `…_seconds{source="artifact"} 123`. It
+    # would not have errored; it would have printed "no successful drill
+    # recorded yet" in red on a host that had one. The legacy unlabelled line
+    # is attributed to `artifact` for the same reason emit_metric adopts it
+    # there: the LaunchAgent has never passed `--source`.
+    if [[ -f "$PLIST" ]]; then
+        # `sed -nE`, not `sed -n`: BSD sed's BASIC regex has no `\|`
+        # alternation, so the obvious `\(artifact\|b2\|live\)` matches
+        # NOTHING on macOS — the platform this script refuses to run on
+        # anything but. It printed "the installed plist passes no --source"
+        # for a plist that passed one, which is this PR's own subject
+        # (a report that cannot see what it describes) committed inside the
+        # PR that fixes it. Caught by rendering a plist and reading it back.
+        installed_src=$(sed -nE 's/.*<string>(artifact|b2|live)<\/string>.*/\1/p' "$PLIST" | head -1)
+        if [[ -n "$installed_src" ]]; then
+            green "  scheduled run restores the ${installed_src} copy (--source $installed_src)"
+        else
+            yellow "  the installed plist passes no --source, so its runs take the"
+            yellow "  'artifact' default and certify only the LOCAL dump. Re-run"
+            yellow "  'make drill-schedule' to record the source explicitly."
+        fi
+    fi
     tf="${TALOS_DRILL_TEXTFILE_DIR:-${TALOS_TEXTFILE_DIR:-$HOME/.talos/metrics/textfile_collector}}/talos_backup_drill.prom"
     if [[ -f "$tf" ]]; then
-        ts=$(awk '/^talos_backup_drill_last_success_timestamp_seconds /{print $2}' "$tf" | head -1)
-        if [[ -n "$ts" && "$ts" != "0" ]]; then
-            green "  last SUCCESSFUL drill: $(date -r "$ts" '+%F %T %Z')"
-        else
-            red "  no successful drill recorded yet"
-        fi
+        proven=""
+        while IFS='|' read -r src ts; do
+            [[ -z "$src" || -z "$ts" || "$ts" == "0" ]] && continue
+            proven="$proven $src"
+            green "  last SUCCESSFUL drill of the $src copy: $(date -r "$ts" '+%F %T %Z')"
+        done < <(awk '
+            /^talos_backup_drill_last_success_timestamp_seconds\{source="[a-z0-9]+"\} / {
+                s = $1; sub(/.*source="/, "", s); sub(/".*/, "", s); print s "|" $2; next }
+            /^talos_backup_drill_last_success_timestamp_seconds [0-9]/ { print "artifact|" $2 }
+        ' "$tf")
+        [[ -z "$proven" ]] && red "  no successful drill recorded yet"
+        # NAME THE COPY THAT HAS NEVER BEEN PROVEN. A green artifact drill is
+        # the easy question — it restores a file from the disk whose loss the
+        # backups insure against. The absence of a b2 line IS the finding, and
+        # an absence is invisible unless something says it out loud.
+        case "$proven" in
+            *b2*) ;;
+            *)  yellow "  the OFF-HOST copy has never been restored on this host."
+                yellow "    Nothing here certifies that losing this disk is survivable."
+                yellow "    'make drill ARGS=\"--source b2\"' answers that; it needs the"
+                yellow "    escrowed age passphrase and the bucket config, see"
+                yellow "    docs/offhost-backup.md." ;;
+        esac
     else
         red "  no drill metric at $tf — the drill has never emitted one"
     fi

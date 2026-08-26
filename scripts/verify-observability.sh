@@ -1988,9 +1988,12 @@ elif not have_metric:
         yellow("      * NEITHER off-host alert can fire: no .prom file means no series,")
         yellow("        and increase(absent[50h]) / (… and enabled == 1) both match")
         yellow("        nothing. This is by design, and it is why THIS leg exists.")
-        yellow("      * The drill is not a substitute. Its metric carries NO source")
-        yellow("        label, so a green talos_backup_drill_last_success cannot")
-        yellow("        distinguish a --source b2 run from a local-copy restore.")
+        yellow("      * The drill does not substitute for it either. As of")
+        yellow("        2026-08-26 its metric DOES carry a `source` label, so a")
+        yellow("        green run names the copy it restored — and on this host")
+        yellow("        no {source=\"b2\"} sample exists, which is the same finding")
+        yellow("        stated from the other side: nothing has ever read an")
+        yellow("        off-host archive back.")
         yellow("    → docs/offhost-backup.md § Operator setup, then 'make offhost-schedule'.")
 else:
     enabled, last = parse_metric(metric_path)
@@ -2066,32 +2069,79 @@ else:
 #   * it reads PROMETHEUS, not the .prom file, for the same reason the rest
 #     of this leg does: the consumer is the authority, and a file the
 #     collector never served is not a signal.
+#
+# READ THE `source` LABEL, added 2026-08-26. Before it, this leg took
+# promq(...)[0] — an ARBITRARY element of the result vector. With one
+# series that was correct by accident; with a labelled family it would
+# report whichever copy Prometheus happened to return first as "the"
+# drill outcome, which is a subtler version of the very defect the label
+# was added to remove. Every sample is read, and the copy is named.
 last_status = promq("talos_backup_drill_last_status")
-if last_status:
-    v = float(last_status[0]["value"][1])
-    succ = promq("talos_backup_drill_last_success_timestamp_seconds")
-    age = None
-    if succ:
-        t = float(succ[0]["value"][1])
-        age = (time.time() - t) / 86400.0 if t > 0 else None
-    when = ("last SUCCESS %.1f days ago" % age) if age is not None else "NO success ever recorded"
-    if v == 0:
-        yellow("  ⚠ the LAST restore drill RAN AND FAILED (%s)." % when)
-        yellow("    The drill is what certifies these backups are readable at all, and it")
-        yellow("    is the guard the off-host docs name for 'the uploader was never")
-        yellow("    scheduled'. Re-run it: make drill   (the alert on this is")
-        yellow("    TalosBackupRestoreDrillLastRunFailed; this line does not replace it)")
-    else:
-        green("  ✓ the last restore drill passed (%s)." % when)
-elif last_status is None:
+succ = promq("talos_backup_drill_last_success_timestamp_seconds")
+
+def drill_source(sample):
+    # A producer older than the label emits no `source`. Report that as
+    # "unlabelled" rather than defaulting it to "artifact": a guess here
+    # would re-introduce exactly the false attribution this label exists
+    # to remove, and the honest answer lasts one drill run.
+    return sample.get("metric", {}).get("source") or "unlabelled"
+
+proven = {}
+for smp in (succ or []):
+    try:
+        t = float(smp["value"][1])
+    except (KeyError, IndexError, ValueError):
+        continue
+    if t > 0:
+        proven[drill_source(smp)] = t
+
+if last_status is None:
     # NOT the same as "no series", and conflating them would be this file's
     # own misleading-report class: one says the guard is unarmed, the other
     # says the check could not run.
     yellow("  ⚠ could not query Prometheus for talos_backup_drill_last_status — the")
     yellow("    restore drill's state is UNKNOWN, not known-good.")
-else:
+elif not last_status:
     yellow("  ⚠ Prometheus serves no talos_backup_drill_last_status — the restore drill")
     yellow("    has never reported here, so the guard leg F cites above is UNARMED.")
+else:
+    for smp in last_status:
+        try:
+            v = float(smp["value"][1])
+        except (KeyError, IndexError, ValueError):
+            continue
+        src = drill_source(smp)
+        t = proven.get(src)
+        when = ("last SUCCESS of that copy %.1f days ago" % ((time.time() - t) / 86400.0)) \
+            if t else "that copy has NEVER been restored successfully"
+        if v == 0:
+            yellow("  ⚠ the LAST restore drill RAN AND FAILED — %s copy (%s)." % (src, when))
+            yellow("    The drill is what certifies these backups are readable at all, and it")
+            yellow("    is the guard the off-host docs name for 'the uploader was never")
+            yellow("    scheduled'. Re-run it: make drill   (the alert on this is")
+            yellow("    TalosBackupRestoreDrillLastRunFailed; this line does not replace it)")
+        else:
+            green("  ✓ the last restore drill passed — %s copy (%s)." % (src, when))
+
+    # WHICH COPY WAS NEVER PROVEN. This is the finding the whole leg exists
+    # for, and it is an ABSENCE — no {source="b2"} sample — so it is stated
+    # explicitly. There is deliberately NO ALERT RULE for it: on a host that
+    # cannot yet run `--source b2` a rule would fire on install and never
+    # clear, which is the permanently-red shape the alert file argues against
+    # (and refuses, one rule up, for the same reason). Once the off-host
+    # chain IS wired and drilled, a FAILING b2 restore fires
+    # TalosBackupRestoreDrillLastRunFailed naming b2 — so the only gap a rule
+    # would cover is "never attempted", which is a setup task, not an
+    # incident, and this line is where it is reported.
+    if succ is None:
+        yellow("  ⚠ could not query the per-copy success timestamps, so which copies")
+        yellow("    have been proven is UNKNOWN on this run.")
+    elif "b2" not in proven:
+        yellow("  ⚠ NO off-host restore has ever succeeded here: Prometheus serves no")
+        yellow("    talos_backup_drill_last_success_timestamp_seconds{source=\"b2\"}.")
+        yellow("    Everything green above certifies only the copy on the disk these")
+        yellow("    backups insure against. 'make drill ARGS=\"--source b2\"' is the")
+        yellow("    strictly harder question; docs/offhost-backup.md § Operator setup.")
 
 raise SystemExit(1 if FAIL else (2 if NOTPROVEN else 0))
 FEOF
