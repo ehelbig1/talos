@@ -248,11 +248,15 @@ pub struct TalosMetrics {
     /// would be wrong at both ends: it would fire on every rolling deploy AND go
     /// quiet while a fleet stayed skewed.
     ///
-    /// ACTIVE means "row not deactivated", NOT "process running": nothing reaps
-    /// the row of a pod that is gone, and `last_seen_at` is boot-only so no age
-    /// filter can tell the two apart. On a fleet whose `worker_id` is the pod
-    /// name (the chart default), retired pods keep this above zero after a
-    /// controller upgrade until an operator deactivates their keys. See
+    /// ACTIVE means "row not deactivated", NOT "process running", and
+    /// `last_seen_at` is boot-only so no age filter can tell the two apart. A
+    /// reaper DOES exist (`reap_departed_identities`, added #631/#632) but it
+    /// is OFF by default, and its automatic arm only matches rows with a
+    /// non-NULL `last_liveness_at`; a worker that never ran the liveness
+    /// pinger needs the separately-gated `reap_pre_protocol_identities`. So on
+    /// a fleet whose `worker_id` is the pod name (the chart default), retired
+    /// pods keep this above zero after a controller upgrade until an operator
+    /// deactivates their keys or enables BOTH reaper arms. See
     /// `controller::bootstrap::background::publish_worker_build_skew`.
     ///
     /// "Unverifiable" workers are NOT counted here (absence of evidence is
@@ -1197,7 +1201,10 @@ impl TalosMetrics {
              sha, or -dirty on one side only). Recomputed each sweep, so it \
              falls back to 0 once the fleet converges OR the stale rows are \
              deactivated — ACTIVE means 'row not deactivated', not 'process \
-             running', and nothing reaps the row of a departed pod. Workers \
+             running'. A departed pod's row is reaped only if the identity \
+             reaper is enabled (OFF by default), and a row that never sent a \
+             liveness ping needs its second, separately-gated arm; otherwise \
+             it must be deactivated by an operator. Workers \
              that report no usable sha are 'unverifiable' and are NOT counted.",
         )?;
         registry.register(Box::new(worker_build_skew_workers.clone()))?;

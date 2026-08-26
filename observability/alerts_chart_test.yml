@@ -3264,8 +3264,17 @@ tests:
                    pair counts BUILDS while this one counts ROWS — so their
                    magnitudes are not comparable, only their zero/non-zero.
                 2. If the offending worker_id has no running pod, this is a GHOST
-                   ROW, not a live skew: the registry has no reaper, so a retired
-                   pod's identity stays ACTIVE forever. Find it with the controller
+                   ROW, not a live skew: a retired pod's identity stays ACTIVE
+                   until something deactivates it, and on stock settings nothing
+                   does. A reaper DOES exist (values.yaml workerIdentityReap) but
+                   it is `enabled: false` by default, AND its automatic arm only
+                   matches rows with a non-NULL last_liveness_at — a worker that
+                   never ran the liveness pinger needs the SECOND, separately
+                   gated arm (preProtocolHours, default 0). Observed 2026-08-26 on
+                   the dev stack: a 22-day-old row from a worktree-launched worker
+                   with last_liveness_at NULL held this gauge at 1 while the
+                   heartbeat-derived view reported zero skew.
+                   Find it with the controller
                    CLI `list-worker-identities` and clear it with
                    `deactivate-worker-identity --worker-id <id> --public-key <hex>`;
                    the gauge drops on the next 60s sweep. Once the WHOLE fleet runs
@@ -3314,8 +3323,17 @@ tests:
                    pair counts BUILDS while this one counts ROWS — so their
                    magnitudes are not comparable, only their zero/non-zero.
                 2. If the offending worker_id has no running pod, this is a GHOST
-                   ROW, not a live skew: the registry has no reaper, so a retired
-                   pod's identity stays ACTIVE forever. Find it with the controller
+                   ROW, not a live skew: a retired pod's identity stays ACTIVE
+                   until something deactivates it, and on stock settings nothing
+                   does. A reaper DOES exist (values.yaml workerIdentityReap) but
+                   it is `enabled: false` by default, AND its automatic arm only
+                   matches rows with a non-NULL last_liveness_at — a worker that
+                   never ran the liveness pinger needs the SECOND, separately
+                   gated arm (preProtocolHours, default 0). Observed 2026-08-26 on
+                   the dev stack: a 22-day-old row from a worktree-launched worker
+                   with last_liveness_at NULL held this gauge at 1 while the
+                   heartbeat-derived view reported zero skew.
+                   Find it with the controller
                    CLI `list-worker-identities` and clear it with
                    `deactivate-worker-identity --worker-id <id> --public-key <hex>`;
                    the gauge drops on the next 60s sweep. Once the WHOLE fleet runs
@@ -3361,8 +3379,17 @@ tests:
                    pair counts BUILDS while this one counts ROWS — so their
                    magnitudes are not comparable, only their zero/non-zero.
                 2. If the offending worker_id has no running pod, this is a GHOST
-                   ROW, not a live skew: the registry has no reaper, so a retired
-                   pod's identity stays ACTIVE forever. Find it with the controller
+                   ROW, not a live skew: a retired pod's identity stays ACTIVE
+                   until something deactivates it, and on stock settings nothing
+                   does. A reaper DOES exist (values.yaml workerIdentityReap) but
+                   it is `enabled: false` by default, AND its automatic arm only
+                   matches rows with a non-NULL last_liveness_at — a worker that
+                   never ran the liveness pinger needs the SECOND, separately
+                   gated arm (preProtocolHours, default 0). Observed 2026-08-26 on
+                   the dev stack: a 22-day-old row from a worktree-launched worker
+                   with last_liveness_at NULL held this gauge at 1 while the
+                   heartbeat-derived view reported zero skew.
+                   Find it with the controller
                    CLI `list-worker-identities` and clear it with
                    `deactivate-worker-identity --worker-id <id> --public-key <hex>`;
                    the gauge drops on the next 60s sweep. Once the WHOLE fleet runs

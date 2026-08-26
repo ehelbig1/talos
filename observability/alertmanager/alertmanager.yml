@@ -116,7 +116,13 @@ global:
 route:
   # ── DEFAULT = Talos-INDEPENDENT. This line is the safety property. ──
   # Do not "tidy" it into a catch-all pointing at the platform.
-  receiver: 'infra-independent'
+  #
+  # ⚠ THIS LINE IS ALSO THE DELIVERY SWITCH — see the ENABLING DELIVERY block
+  #   below. `delivery-not-configured` is a real receiver that declares no
+  #   integration, so alerts are grouped, deduped and DROPPED, with zero
+  #   notification attempts. Change it to 'infra-independent' when a credential
+  #   exists. Leg D of scripts/verify-observability.sh checks the two agree.
+  receiver: 'delivery-not-configured'
 
   # Grouped by alertname + severity, NOT by `instance`: several rules in this
   # repo deliberately `sum()` away their source labels (see the fan-out note
@@ -132,42 +138,106 @@ route:
 
   routes:
     # 1. critical always takes the channel that does not depend on Talos.
+    #    Flip this to 'infra-independent' together with the default above —
+    #    they are one decision, not two, and leg D reports a split.
     - matchers:
         - severity = "critical"
-      receiver: 'infra-independent'
+      receiver: 'delivery-not-configured'
       group_wait: 10s
       repeat_interval: 1h
 
     # 2. the ONLY way onto the non-default path. Nothing carries this label
-    #    today — see the block above.
+    #    today — see the block above. Flip to 'platform-quality' when
+    #    platform-quality-url exists.
     - matchers:
         - delivery = "talos"
-      receiver: 'platform-quality'
+      receiver: 'delivery-not-configured'
 
 receivers:
+  # =========================================================================
+  # delivery-not-configured — the SHIPPING DEFAULT. Accepts and DROPS.
+  # =========================================================================
+  # A receiver with no integrations. Alertmanager still groups, dedupes and
+  # inhibits normally; it simply has nothing to notify, so it makes ZERO
+  # notification attempts. Verified against v0.28.1 on a throwaway container:
+  # `amtool check-config` SUCCESS, and after posting an alert and waiting
+  # 36 s at a 5 s group_interval, every `alertmanager_notification*` counter
+  # was still 0 and the log carried no notify line.
+  #
+  # ── WHY THIS IS THE DEFAULT, i.e. what went wrong when it was not ────────
+  # Until this change the default route pointed straight at
+  # `infra-independent`, whose credential is read at NOTIFY time. With no
+  # credential file that is not "inert": Alertmanager ATTEMPTS every send,
+  # every send fails with ENOENT, and it re-attempts the group every
+  # `group_interval` forever. Measured on the dev stack 2026-08-26:
+  # `alertmanager_notifications_total{integration="slack"}` = 3271, and
+  # `..._failed_total{...,reason="other"}` = 3271. Every attempt ever made by
+  # that process failed; none ever succeeded.
+  #
+  # That is a permanent, self-sustaining alert, which is strictly worse than
+  # no alert. `TalosAlertDeliveryFailing` fires on
+  # `rate(alertmanager_notifications_failed_total[15m]) > 0`; it is itself
+  # routed here; its own notification fails; the failure keeps the rate above
+  # zero. Measured: in the windows where it was the ONLY firing alert, the log
+  # shows exactly one notify failure per 5 minutes — one alert sustaining
+  # itself, needing no other. It had been firing for 8 days.
+  # **A permanently-firing alert trains an operator to ignore red**, which is
+  # the defect this whole arc exists to remove.
+  #
+  # ── ENABLING DELIVERY — TWO STEPS, AND BOTH ARE CHECKED ──────────────────
+  # This costs one line more than the old "drop a file and reload", and that
+  # is the whole trade: Alertmanager decides whether to ATTEMPT a send from
+  # the config alone, so "no repo change to activate" and "no attempts when
+  # unconfigured" cannot both hold. The second is worth more.
+  #
+  #   1. printf '%s' "$URL" > $HOME/.talos/alert-secrets/infra-webhook-url
+  #      chmod 600 "$_"
+  #   2. in THIS file, change the two `receiver: 'delivery-not-configured'`
+  #      lines under `route:` to `receiver: 'infra-independent'`
+  #   3. make observability-reload
+  #
+  # Leg D of scripts/verify-observability.sh enforces the PAIRING in both
+  # directions, because each half alone fails in a different way and one of
+  # them is silent:
+  #   * route flipped, credential absent  → every send FAILS. Loud, and it
+  #     must stay loud: that is a real delivery failure, not a shipping state.
+  #   * credential present, route not flipped → total silence, zero attempts,
+  #     nothing in any metric. Verified on the same probe: 0 attempts, 0
+  #     arrivals at the sink. Only leg D can see this one.
+  # Step 2 is not a comment to uncomment: it is a live line whose VALUE is the
+  # operator's assertion that a credential exists — the same opt-in shape as
+  # the `delivery: talos` label above, for the same reason.
+  - name: 'delivery-not-configured'
+
   # =========================================================================
   # infra-independent — must survive Talos being broken.
   # =========================================================================
   # Reaches the operator without touching the controller, Postgres, NATS,
   # Redis or the worker fleet: Alertmanager talks straight out.
   #
+  # ⚠ NOT ON ANY ROUTE AS SHIPPED. Reaching it is step 2 of ENABLING DELIVERY
+  #   above. An unreferenced receiver is valid config (amtool: SUCCESS) and is
+  #   never opened, so naming a credential here costs nothing until routed.
+  #
   # CREDENTIAL: `api_url_file` is read at NOTIFY time, not at config-load
   # time. Verified against v0.28.1: `amtool check-config` returns SUCCESS and
-  # the process starts and loads cleanly with the referenced file ABSENT. So
-  # this ships INERT and activates on a single file drop plus
-  # `make observability-reload` — no repo change, no rebuild, no image.
+  # the process starts and loads cleanly with the referenced file ABSENT.
+  # That is why the file's absence cannot be detected at load and why the
+  # route, not the file, has to be the switch.
   #
-  # ⚠ INERT IS NOT SILENT — BUT IT IS NOT LOUD EITHER, AND THAT MATTERS.
-  #   With no credential file every notification fails and retries;
-  #   `alertmanager_notifications_failed_total` climbs (Alertmanager seeds it
-  #   at 0 for every integration from a cold start, so it is fireable — I
-  #   checked) and `TalosAlertDeliveryFailing` fires. But that alert is
-  #   delivered through these same receivers. If NO credential is configured
-  #   anywhere, its only visible form is a dashboard — which is the state
-  #   this whole change exists to leave. Configuring one working credential
-  #   is what converts this from a dashboard into a delivery system. There is
-  #   no arrangement of config that removes that dependency, and saying
-  #   otherwise would be the defect being fixed.
+  # ⚠ ONCE ROUTED, THIS RECEIVER IS LOUD ON FAILURE, AND IT MUST STAY THAT
+  #   WAY. A missing/revoked/rejected credential climbs
+  #   `alertmanager_notifications_failed_total` and fires
+  #   `TalosAlertDeliveryFailing` — a real fault, correctly reported. Making
+  #   THAT quiet would be the same defect one level up as the state this
+  #   change fixed. The only thing suppressed by the default above is the
+  #   never-configured case, which is not a fault.
+  #
+  #   And the standing caveat, unchanged: this alert is delivered through the
+  #   very receivers it reports on. If exactly one is configured and it is the
+  #   broken one, the alert's only visible form is a dashboard. There is no
+  #   arrangement of config that removes that dependency, and saying otherwise
+  #   would be the defect being fixed.
   - name: 'infra-independent'
     slack_configs:
       - api_url_file: /etc/alertmanager/secrets/infra-webhook-url
@@ -209,6 +279,13 @@ receivers:
   # =========================================================================
   # For alerts whose author has asserted that Talos is healthy enough to carry
   # them. It is a plain HTTP webhook: point it wherever you like.
+  #
+  # ⚠ NOT ON ANY ROUTE AS SHIPPED, for the same reason as infra-independent —
+  #   route sub-route 2 points at `delivery-not-configured` until
+  #   platform-quality-url exists. Nothing carries `delivery: talos` today, so
+  #   this receiver was never REACHED and therefore never exhibited the
+  #   attempt-and-fail loop; it carried the identical latent defect and is
+  #   closed the same way rather than left for whoever stamps the first label.
   #
   # It is NOT wired to `ops_alerts` and must not be described as if it were —
   # blockers B and C above are unclosed. If you later point this at

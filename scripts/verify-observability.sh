@@ -716,7 +716,11 @@ PYEOF
 #       WELL-FORMED (and nothing is sitting there under a name it will
 #       never read);
 #   D6. the credential is ACCEPTED — passively from Alertmanager's own
-#       delivery counters, and on request by sending one real alert.
+#       delivery counters, and on request by sending one real alert;
+#   D7. the ROUTE and the credential AGREE. Enabling delivery is two steps
+#       (drop the file, point the route at the receiver that reads it) and
+#       doing one of them fails in two different ways — one loud, one
+#       completely silent. D7 is the only thing that can see the silent one.
 #
 # D5 and D6 exist because enabling delivery is "drop a file and reload", and
 # until 2026-08-19 the only way to find out you had done it wrong was the
@@ -962,50 +966,186 @@ $_main"
     # most likely to copy from, names FOUR different filenames
     # (slack-webhook-default, slack-webhook-oncall, pagerduty-routing-key,
     # jira-ops-hygiene-webhook), none of which the dev config opens.
-    # -1 = D5 could not determine it. 0 = nothing configured (the INERT
-    # shipping state). >0 = the operator has enabled at least one receiver.
-    # D6 needs this to tell "inert by design" from "believed working, broken":
-    # the failure counter looks identical in both, and calling the first one RED
-    # would leave `make observability-verify` permanently red on a stack that is
-    # in exactly the state #646 shipped — which trains an operator to ignore
-    # red, the defect this whole arc is about.
+    # -1 = D5 could not determine it. 0 = nothing configured (the shipping
+    # not-configured state). >0 = the operator has enabled at least one
+    # receiver. D6 needs this to tell "not configured" from "believed working,
+    # broken": the failure counter looks identical in both, and calling the
+    # first one RED would leave `make observability-verify` permanently red on
+    # a stack that is in exactly the state #646 shipped — which trains an
+    # operator to ignore red, the defect this whole arc is about.
+    #
+    # ── D7 (new). ROUTING IS THE OTHER HALF, AND D5 ALONE CANNOT SEE IT ─────
+    # Until 2026-08-26 the default route pointed straight at the
+    # credential-bearing receiver, so "no credential" meant Alertmanager
+    # ATTEMPTED every send and every send failed with ENOENT, forever, one
+    # retry per group_interval — 3271 attempts, 3271 failures, zero deliveries
+    # on this stack, and `TalosAlertDeliveryFailing` firing for 8 days,
+    # sustained by its OWN undelivered notification. The default route now
+    # points at a receiver with no integrations, so the never-configured state
+    # makes ZERO attempts, and enabling delivery is TWO steps (drop the file,
+    # flip the route).
+    #
+    # Two steps means two ways to do half of it, and they fail differently:
+    #   * route flipped, credential absent → every send FAILS. LOUD, and it
+    #     must stay loud — that is a real fault, not a shipping state. This is
+    #     the case D5's old ⚠ under-reported, and it is now a hard FAIL.
+    #   * credential present, route not flipped → TOTAL SILENCE. Zero
+    #     attempts, zero failures, nothing in any metric, no log line.
+    #     Measured on a throwaway v0.28.1 probe: 0 attempts, 0 arrivals at a
+    #     local sink. NOTHING ELSE IN THIS SYSTEM CAN SEE IT — which is the
+    #     entire reason this check exists rather than being left implied.
+    #
+    # So D5's "is the credential present" question is now scoped to receivers
+    # the ROUTE ACTUALLY REACHES, and the unreached ones are reported as a
+    # separate, opposite finding instead of as a missing credential.
+    #
+    # The route tree comes from the RUNNING process (`/api/v2/status`), parsed
+    # as YAML rather than grepped, for the same reason the old regex read the
+    # process and not the disk file: the disk file documents four receiver
+    # OPTIONS in comments, and grep cannot tell an option from a requirement
+    # (the #644 defect reproduced inside a gate written to prevent that class).
+    # A YAML parse additionally knows which receiver each credential belongs
+    # to, which a flat regex over the whole config never could.
     _cred_present=-1
+    _routed_integrations=-1
     if [ -n "${SECRETS_DST:-}" ]; then
-        _named="$(curl -fsS --max-time 10 "$AM_URL/api/v2/status" 2>/dev/null | python3 -c '
-import json, re, sys
+        _amcfg="$(curl -fsS --max-time 10 "$AM_URL/api/v2/status" 2>/dev/null | python3 -c '
+import json, sys
 try:
-    cfg = json.load(sys.stdin)["config"]["original"]
+    import yaml
+except Exception:
+    print("NOYAML"); sys.exit(0)
+try:
+    cfg = yaml.safe_load(json.load(sys.stdin)["config"]["original"])
 except Exception:
     sys.exit(0)
-seen = set()
-for k, v in re.findall(r"^\s*([A-Za-z0-9_]+_file):\s*\"?([^\"\s#]+)\"?\s*$", cfg, re.M):
-    if (k, v) not in seen:
+if not isinstance(cfg, dict):
+    sys.exit(0)
+
+routed = set()
+def walk(node):
+    if not isinstance(node, dict):
+        return
+    r = node.get("receiver")
+    if r:
+        routed.add(r)
+    for child in node.get("routes") or []:
+        walk(child)
+walk(cfg.get("route") or {})
+
+def creds(obj, out):
+    # Every `*_file` string and every `files: [...]` list, at any depth —
+    # http_config.http_headers.<H>.files nests three levels down.
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, str) and k.endswith("_file"):
+                out.append((k, v))
+            elif k == "files" and isinstance(v, list):
+                for item in v:
+                    if isinstance(item, str):
+                        out.append((k, item))
+            else:
+                creds(v, out)
+    elif isinstance(obj, list):
+        for item in obj:
+            creds(item, out)
+
+for rcv in cfg.get("receivers") or []:
+    if not isinstance(rcv, dict):
+        continue
+    name = rcv.get("name")
+    if not isinstance(name, str):
+        continue
+    integ = 0
+    found = []
+    for k, v in rcv.items():
+        if k.endswith("_configs") and isinstance(v, list):
+            integ += len(v)
+            creds(v, found)
+    print("RCV\t%s\t%d\t%d" % (name, integ, 1 if name in routed else 0))
+    seen = set()
+    for k, v in found:
+        if (k, v) in seen:
+            continue
         seen.add((k, v))
-        print(k + "\t" + v)
+        print("CRED\t%s\t%s\t%s" % (name, k, v))
 ' 2>/dev/null || true)"
 
-        if [ -z "$_named" ]; then
+        if [ "$_amcfg" = "NOYAML" ]; then
+            yellow "  ⚠ python3 has no yaml module here, so the route tree could not be"
+            yellow "    parsed — D5 (credential present) and D7 (route/credential pairing)"
+            yellow "    did NOT run. This is a gap, not a pass: nothing below has checked"
+            yellow "    whether your alerts are deliverable."
+            yellow "    → python3 -m pip install pyyaml"
+        elif [ -z "$_amcfg" ]; then
             yellow "  ⚠ could not read the running config from $AM_URL/api/v2/status —"
             yellow "    D5 (credential present + well-formed) did NOT run. This is a gap,"
             yellow "    not a pass: nothing below has checked your credential."
         else
+            # Receivers the ROUTE reaches, and how many integrations they carry.
+            _routed_names=" "
+            _routed_integrations=0
+            while IFS="$(printf '\t')" read -r _kind _rname _rinteg _rrouted; do
+                [ "${_kind:-}" = "RCV" ] || continue
+                [ "${_rrouted:-0}" = "1" ] || continue
+                _routed_names="$_routed_names$_rname "
+                _routed_integrations=$((_routed_integrations + ${_rinteg:-0}))
+            done <<< "$_amcfg"
+
+            _named="$(printf '%s\n' "$_amcfg" | awk -F"$(printf '\t')" '$1=="CRED"{print $2 "\t" $3 "\t" $4}')"
             _want=0
             _cred_present=0
             _wanted_names=""
-            while IFS="$(printf '\t')" read -r _key _cpath; do
+            _stranded=0
+            while IFS="$(printf '\t')" read -r _rcv _key _cpath; do
                 [ -n "${_cpath:-}" ] || continue
                 case "$_cpath" in "$SECRETS_DST"/*) ;; *) continue ;; esac
-                _want=$((_want + 1))
                 _base="${_cpath##*/}"
                 _wanted_names="$_wanted_names $_base"
                 _hpath="$SECRETS_REAL/$_base"
 
+                # ── D7. Is this receiver ON THE ROUTE? ────────────────────
+                # A credential on a receiver no route reaches is not a
+                # missing credential and must not be reported as one — but a
+                # credential that IS present there is the silent half of the
+                # pairing, and nothing else in this system can see it.
+                case "$_routed_names" in
+                    *" $_rcv "*) ;;
+                    *)
+                        if [ -f "$_hpath" ]; then
+                            red   "  ✗ $_base is PRESENT, but receiver '$_rcv' is on NO ROUTE."
+                            red   "    Alertmanager will never open it and will never attempt a"
+                            red   "    send through it. This state is SILENT — zero attempts,"
+                            red   "    zero failures, nothing in any metric or log — so this"
+                            red   "    line is the only thing that can tell you."
+                            yellow "    → you did step 1 (the credential) and not step 2 (the"
+                            yellow "      route). In observability/alertmanager/alertmanager.yml"
+                            yellow "      point the route's receiver at '$_rcv', then:"
+                            yellow "      make observability-reload"
+                            D_FAIL=1
+                            _stranded=$((_stranded + 1))
+                        fi
+                        continue ;;
+                esac
+
+                _want=$((_want + 1))
+
                 if [ ! -f "$_hpath" ]; then
-                    yellow "  ⚠ $_key names $_base — NOT PRESENT. Delivery through that"
-                    yellow "    receiver is INERT: Alertmanager reads it at NOTIFY time, so it"
-                    yellow "    started and loaded cleanly and will fail every send silently."
+                    # ROUTED and absent. Every send through this receiver will
+                    # FAIL, not be skipped, and the alert about it is delivered
+                    # through the same receiver. Hard FAIL, deliberately not a
+                    # warning: an operator who flipped the route has asserted
+                    # the credential exists.
+                    red   "  ✗ receiver '$_rcv' IS ROUTED but $_key names $_base — NOT PRESENT."
+                    red   "    Alertmanager reads it at NOTIFY time, so it loaded cleanly and"
+                    red   "    will FAIL every send (not skip it), retrying each group every"
+                    red   "    group_interval indefinitely. TalosAlertDeliveryFailing will fire"
+                    red   "    and be delivered through this same broken receiver."
                     yellow "    → printf '%s' \"\$URL\" > $SECRETS_REAL/$_base && chmod 600 \"\$_\""
                     yellow "      then: make observability-reload"
+                    yellow "    → or, if you did not mean to enable delivery, point the route"
+                    yellow "      back at 'delivery-not-configured'."
+                    D_FAIL=1
                     continue
                 fi
 
@@ -1034,9 +1174,28 @@ for k, v in re.findall(r"^\s*([A-Za-z0-9_]+_file):\s*\"?([^\"\s#]+)\"?\s*$", cfg
                 esac
             done <<< "$_named"
 
-            if [ "$_want" -eq 0 ]; then
-                yellow "  ⚠ the running config names no credential file under $SECRETS_DST —"
-                yellow "    no receiver reads a secret, so nothing here can be checked."
+            # ── D7 verdict: is delivery WIRED AT ALL? ─────────────────────
+            # `_routed_integrations` counts integration blocks (slack_configs
+            # entries, webhook_configs entries, …) on receivers the route
+            # tree reaches. Zero means every alert is grouped, deduped and
+            # DROPPED: no attempt, no failure, nobody notified. That is the
+            # shipping state and it is NOT a fault — but it is also not a
+            # green tick, because nothing is being delivered.
+            if [ "$_routed_integrations" -eq 0 ]; then
+                yellow "  ⚠ DELIVERY IS NOT CONFIGURED. Every routed receiver declares zero"
+                yellow "    integrations, so alerts are accepted and DROPPED: 0 send attempts,"
+                yellow "    0 failures, nobody notified. This is the shipping state, not a"
+                yellow "    fault — and it is the ONLY place it is visible, because a"
+                yellow "    correctly-not-configured stack emits no metric and no log line."
+                if [ "$_stranded" -eq 0 ]; then
+                    yellow "    → enable it: observability/README.md § Alert delivery (two steps —"
+                    yellow "      the credential file AND the route's receiver name)."
+                fi
+            elif [ "$_want" -eq 0 ]; then
+                yellow "  ⚠ the routed receiver(s) name no credential file under $SECRETS_DST —"
+                yellow "    they carry $_routed_integrations integration(s) but read no secret,"
+                yellow "    so nothing here can be checked. That is legitimate for an endpoint"
+                yellow "    that needs no credential; it is a surprise for Slack/PagerDuty."
             fi
 
             # Files present that nothing will ever open. Basenames only.
@@ -1096,16 +1255,22 @@ for k, v in re.findall(r"^\s*([A-Za-z0-9_]+_file):\s*\"?([^\"\s#]+)\"?\s*$", cfg
         [ "$_req" -gt 0 ] && [ "$_reqok" -eq 0 ] && _broken=1
 
         if [ "$_broken" -eq 1 ] && [ "$_cred_present" -eq 0 ]; then
-            # INERT BY DESIGN, not broken. Every send fails because no
-            # credential is configured, which is the state #646 shipped
-            # deliberately. Reporting it RED would make this target
-            # permanently red out of the box.
+            # Failures with no credential on any ROUTED receiver. Since the
+            # route default became `delivery-not-configured` this can no
+            # longer be produced by a fresh not-configured stack — that state
+            # makes zero attempts — so it means one of two things, and the
+            # counters cannot tell them apart: either the process predates the
+            # route fix and is still carrying its old failure total, or the
+            # route was flipped and the credential is missing (D5 has already
+            # FAILED loudly above in that case).
             yellow "  ⚠ $_reqfail notification request(s) have failed ($_failed given up on),"
-            yellow "    and NO credential is configured"
-            yellow "    — so this is the documented INERT state, not a fault. Every alert"
-            yellow "    since this Alertmanager started has reached nobody. Enable delivery"
-            yellow "    by creating the file(s) named above; TalosAlertDeliveryFailing is"
-            yellow "    firing about exactly this, through the channel that does not work."
+            yellow "    and NO credential is configured on any ROUTED receiver."
+            yellow "    Alertmanager counters are cumulative per PROCESS, so if the D7 line"
+            yellow "    above says delivery is not configured, these are historical: a"
+            yellow "    container started before the default route stopped pointing at a"
+            yellow "    credential-bearing receiver. They will not grow, and they will clear"
+            yellow "    on: docker compose up -d --force-recreate alertmanager"
+            yellow "    (If D5 FAILED above instead, that is the live fault — fix that.)"
         elif [ "$_broken" -eq 1 ]; then
             red "  ✗ delivery is FAILING and a credential IS configured:"
             red "    $_req notification request(s) attempted, $_reqok succeeded,"
@@ -1223,13 +1388,23 @@ for k, v in re.findall(r"^\s*([A-Za-z0-9_]+_file):\s*\"?([^\"\s#]+)\"?\s*$", cfg
         # lines directly above it. Same class as everything else in this arc:
         # a field whose name implies a verdict the measurement does not carry.
         green "  ✓ transport up, loopback-bound, credential dir contained outside"
-        green "    every checkout — but DELIVERY IS INERT: no credential is"
-        green "    configured, so no alert reaches anyone. Not a failure; it is the"
-        green "    shipping state. See the file names above to enable it."
+        green "    every checkout — but DELIVERY IS NOT CONFIGURED: no alert reaches"
+        green "    anyone, and none is attempted. Not a failure; it is the shipping"
+        green "    state. Enabling it is two steps, both named above."
+    elif [ "$D_FAIL" -eq 0 ] && [ "$_cred_present" -lt 0 ]; then
+        # D5/D7 could not run at all (status endpoint unreadable, or no yaml
+        # module). The two branches below both assert "every credential the
+        # running config names is present and well-formed" — which nothing
+        # checked. Saying it anyway would be the exact class this summary was
+        # rewritten to avoid: a verdict whose words outrun the measurement.
+        yellow "  ⚠ transport up and loopback-bound, but the credential and routing"
+        yellow "    checks DID NOT RUN (see the line above). This is NOT a pass:"
+        yellow "    nothing has established that any alert is deliverable."
     elif [ "$D_FAIL" -eq 0 ] && [ "${_req:-0}" -eq 0 ]; then
         # Credentials configured and well-formed, but nothing has been sent.
         # "not failing" would be literally true and read as "working" — the
-        # same overstatement the inert branch above was written to avoid.
+        # same overstatement the not-configured branch above was written to
+        # avoid.
         green "  ✓ transport up, loopback-bound, credentials contained outside every"
         green "    checkout, and every credential the running config names is present"
         green "    and well-formed — but NOTHING HAS BEEN SENT YET, so delivery is"

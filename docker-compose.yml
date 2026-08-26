@@ -1315,10 +1315,18 @@ services:
       # ── CREDENTIALS. Nothing here is in the repo, and nothing may be. ──
       # An ABSOLUTE host path outside every checkout, defaulting under $HOME.
       # `alertmanager.yml` names files inside it (`api_url_file`, `url_file`,
-      # `http_headers.files`) which Alertmanager reads at NOTIFY time — so
-      # this ships INERT and activates on a file drop plus a reload, with no
-      # repo change. If the directory does not exist Docker creates it empty,
-      # which is the correct inert state.
+      # `http_headers.files`) which Alertmanager reads at NOTIFY time — NOT at
+      # config-load time. That is why a missing credential cannot be detected
+      # by the process at startup, and why the DEFAULT ROUTE (not the file) is
+      # the delivery switch: as shipped it points at `delivery-not-configured`,
+      # a receiver with no integrations, so an absent credential produces ZERO
+      # send attempts instead of one failing attempt per group_interval
+      # forever. Enabling delivery is two steps — drop the file AND flip the
+      # route — and leg D of scripts/verify-observability.sh fails if only one
+      # was done, in either direction. See the ENABLING DELIVERY block in
+      # observability/alertmanager/alertmanager.yml.
+      # If the directory does not exist Docker creates it empty, which is the
+      # correct not-configured state.
       #
       # The containment invariant (a secret source must never resolve inside a
       # checkout, symlinks resolved) is ENFORCED at runtime by leg D of
