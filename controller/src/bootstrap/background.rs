@@ -1162,9 +1162,13 @@ pub(crate) fn spawn_metrics_gauge_tasks(
     // level-triggered: it stays up while the condition holds and falls back to
     // 0 once the fleet converges or the stale rows are deactivated. "Retiring"
     // a worker POD is not enough — see the population caveat on
-    // `publish_worker_build_skew` above; nothing reaps rows for pods that are
-    // gone, so on a pod-name-keyed fleet this gauge needs an operator to drain
-    // it after the first controller upgrade.
+    // `publish_worker_build_skew` above. The identity reaper below CAN drain
+    // rows for departed pods, but it is off unless
+    // TALOS_WORKER_IDENTITY_REAP_ENABLED is set, and its automatic arm only
+    // matches rows with a non-NULL last_liveness_at — a row that never sent a
+    // liveness ping needs TALOS_WORKER_IDENTITY_REAP_PRE_PROTOCOL_HOURS on top.
+    // So on a stock pod-name-keyed fleet this gauge still needs an operator to
+    // drain it after the first controller upgrade.
     //
     // Unconditional: no config gate, no feature flag. The query is one bounded
     // SELECT over a fleet-sized table (MAX_FLEET_BUILD_ROWS = 200).

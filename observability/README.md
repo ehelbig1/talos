@@ -499,23 +499,57 @@ and reached nobody, because `alerting:` in `prometheus.yml` was commented out
 and no Alertmanager existed. Prometheus has no native webhook output —
 Alertmanager is its only alert sink — so nothing else could have carried them.
 
-The transport now ships, and it ships **INERT**. It activates on **one file**.
+The transport now ships, and as shipped it **accepts every alert and drops it**:
+the default route points at `delivery-not-configured`, a receiver that declares
+no integration. Alerts are grouped, deduped and inhibited normally, and **zero
+notification attempts are made**.
 
-### The one thing you must supply
+**This replaces an earlier "ships INERT, activates on one file" claim that was
+not what the deployment did.** The route used to point straight at the
+credential-bearing receiver, and Alertmanager reads `api_url_file` at *notify*
+time — so with no credential every send was ATTEMPTED and every send FAILED,
+forever, at one retry per `group_interval`. Measured on this stack 2026-08-26:
+3271 notifications attempted, **3271 failed, zero ever delivered**, and
+`TalosAlertDeliveryFailing` firing continuously for 8 days — sustained by its
+own undelivered notification. A permanently-firing alert trains you to ignore
+red, which is the defect this section exists to remove.
+
+### The two things you must supply
 
 ```bash
+# 1. the credential — never in the repo
 mkdir -p ~/.talos/alert-secrets
 printf '%s' 'https://hooks.slack.com/services/XXX/YYY/ZZZ' \
     > ~/.talos/alert-secrets/infra-webhook-url
 chmod 600 ~/.talos/alert-secrets/infra-webhook-url
+
+# 2. the route — assert that it exists.
+#    In observability/alertmanager/alertmanager.yml change BOTH
+#    `receiver: 'delivery-not-configured'` lines under `route:`
+#    to `receiver: 'infra-independent'`.
+
 make observability-reload        # POST /-/reload; no restart, no rebuild
-make observability-verify        # leg D: containment, mode, binding, acceptance
+make observability-verify        # leg D: containment, mode, binding, PAIRING,
+                                 #        acceptance
                                  # leg E: the LOADED config matches the file
 ```
 
-That is it. Alertmanager reads `api_url_file` at **notify** time, so the
-container starts and loads cleanly with the file absent and only fails when it
-tries to send — which is why `TalosAlertDeliveryFailing` exists.
+Step 2 is one line's value, not a comment to uncomment, and it is the operator
+ASSERTING that a credential exists — the same opt-in shape as the
+`delivery: talos` label. Two steps rather than one is the whole cost of the
+change, and it is unavoidable: Alertmanager decides whether to ATTEMPT a send
+from the config alone, so "no repo edit to activate" and "no attempts when
+unconfigured" cannot both hold.
+
+**Leg D checks the two agree, in both directions**, because each half alone
+fails differently and one of them is silent:
+
+| state | what happens | who tells you |
+|---|---|---|
+| neither | zero attempts, zero failures | leg D: "delivery NOT CONFIGURED" (not a failure) |
+| route flipped, no credential | **every send fails** — a real fault, still loud | `TalosAlertDeliveryFailing` **and** leg D (FAIL) |
+| credential, route not flipped | **total silence** — nothing in any metric | leg D only (FAIL) |
+| both | delivered | leg D6 (passive counters, or an active send) |
 
 * **The directory is `$HOME/.talos/alert-secrets`, never the repo.** Override
   with `TALOS_ALERT_SECRETS_DIR`. Leg D of `scripts/verify-observability.sh`
