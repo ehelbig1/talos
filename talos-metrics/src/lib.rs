@@ -291,18 +291,49 @@ pub struct TalosMetrics {
     /// surface; the names live in `get_catalog_status` → `never_compiled`,
     /// which is a queried surface rather than a scraped one.
     ///
-    /// Recomputed at BOOT ONLY, on every exit of the seeding pass (disk seed,
-    /// OCI early return, and missing-`module-templates/` early return) so the
-    /// alert is fireable in every supported mode.
+    /// Published at boot on every exit of the seeding pass (disk seed, OCI
+    /// early return, missing-`module-templates/` early return) so the alert is
+    /// fireable in every supported mode, AND re-measured every 300 s by
+    /// `spawn_metrics_gauge_tasks` so it tracks current state rather than the
+    /// state at the last restart.
     ///
-    /// How stale that makes it DEPENDS ON THE MODE, and the difference is not
-    /// cosmetic. In DISK mode nothing but the seeder writes these rows, so a
-    /// long-lived controller's value stays correct. In OCI mode the registry
-    /// sync loop rewrites catalog rows every 5 minutes, so the value can lag
-    /// reality by an entire controller lifetime — a firing alert is real,
-    /// a quiet one is weak evidence. Either way this is not a continuously
-    /// refreshed gauge and must not be read as one.
+    /// **Until 2026-08-26 the boot publish was the ONLY writer**, which broke
+    /// the gauge in both directions: a row that lost its bytes after boot left
+    /// it at 0 and the alert could never fire, and a row repaired after boot
+    /// left it above 0 and the alert fired until the next restart. The
+    /// periodic sweep is what makes `> 0` mean "right now".
+    ///
+    /// **Holds its last value when the query fails; it is NOT zeroed and no
+    /// sentinel is folded in** — `get_catalog_status` and the alert's
+    /// `{{ $value }}` both read this as a row count, and a synthetic value
+    /// would make it untrustworthy to them. Telling a held value from a
+    /// measured one is the job of the SEPARATE series below.
     pub catalog_templates_missing_wasm: IntGauge,
+
+    /// Unix time of the last sweep in which `talos_catalog_templates_missing_wasm`
+    /// was successfully measured.
+    ///
+    /// **This is the companion "the detector could not measure" signal**, in
+    /// the same form and for the same reason as
+    /// `crypto_orphan_scan_last_success_timestamp_seconds` (#667). An
+    /// `IntGauge` exports 0 from registration, so
+    /// `talos_catalog_templates_missing_wasm == 0` covers BOTH "measured, every
+    /// catalog template can run" and "the `SELECT COUNT(*)` errored and nothing
+    /// was ever measured". Before the periodic sweep those two readings were
+    /// not merely ambiguous but PERMANENTLY so: the boot publish never retried,
+    /// so one failed query at boot switched the detector off for the life of
+    /// the process while it read as a clean bill of health.
+    ///
+    /// **Why a freshness timestamp rather than a `blind`/`failed` gauge.** A
+    /// `blind == 0` gauge is itself an unmeasured zero: if the sweep task never
+    /// spawns, panics, or is dropped in a refactor, nothing sets it and it
+    /// reads "not blind" forever — this exact defect one level up. A timestamp
+    /// degrades the right way in all four cases: query error, task death, task
+    /// never spawned, and a controller build predating the sweep (0 from
+    /// registration, which reads as maximally stale).
+    ///
+    /// `TalosCatalogMissingWasmDetectorBlind` is the alert that consumes it.
+    pub catalog_missing_wasm_scan_last_success_timestamp_seconds: Gauge,
 
     // ---- Worker-identity liveness + reaper (2026-08) ----
     //
@@ -1213,14 +1244,30 @@ impl TalosMetrics {
             "talos_catalog_templates_missing_wasm",
             "Catalog templates whose wasm_bytes is NULL/empty AND which carry no \
              oci_url — they have neither local bytes nor a registry reference and \
-             cannot run at all. Recomputed at boot only, after that boot's \
-             background compiles settle, so it falls back to 0 once the templates \
-             build; in OCI mode the sync loop rewrites rows between boots, so the \
-             value can lag. Names are in get_catalog_status → never_compiled \
-             (deliberately not a label: template names are registry-supplied in \
-             OCI mode).",
+             cannot run at all. Published at boot after that boot's background \
+             compiles settle, then re-measured every 300s, so it falls back to 0 \
+             once the templates build and rises again if a row loses its bytes \
+             mid-life. HOLDS its last value if the query fails rather than \
+             zeroing; talos_catalog_missing_wasm_scan_last_success_timestamp_seconds \
+             is how a held value is told from a measured one. Names are in \
+             get_catalog_status → never_compiled (deliberately not a label: \
+             template names are registry-supplied in OCI mode).",
         )?;
         registry.register(Box::new(catalog_templates_missing_wasm.clone()))?;
+
+        let catalog_missing_wasm_scan_last_success_timestamp_seconds = Gauge::new(
+            "talos_catalog_missing_wasm_scan_last_success_timestamp_seconds",
+            "Unix time of the last sweep that successfully measured \
+             talos_catalog_templates_missing_wasm. Not seeded and not reset: it \
+             reads 0 until the first successful measurement, which is maximally \
+             stale, so a controller that never ran the sweep is loud rather than \
+             silent. The missing-wasm gauge reads 0 both when every template can \
+             run and when the query never returned; this is how those cases are \
+             told apart. TalosCatalogMissingWasmDetectorBlind alerts on it.",
+        )?;
+        registry.register(Box::new(
+            catalog_missing_wasm_scan_last_success_timestamp_seconds.clone(),
+        ))?;
 
         // ---- Worker-identity liveness + reaper ----
         let worker_liveness_pings_total = CounterVec::new(
@@ -1821,6 +1868,7 @@ impl TalosMetrics {
             worker_key_tofu_conflicts_total,
             worker_build_skew_workers,
             catalog_templates_missing_wasm,
+            catalog_missing_wasm_scan_last_success_timestamp_seconds,
             worker_liveness_pings_total,
             worker_identity_reaps_total,
             oauth_reactive_refresh_total,

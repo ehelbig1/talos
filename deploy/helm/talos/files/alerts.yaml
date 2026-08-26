@@ -2458,17 +2458,131 @@ groups:
                template's own Cargo.toml does not count; `make check-catalog`
                fails on exactly that divergence.
             4. Fix the manifest, rebuild the controller image, restart. The
-               gauge is recomputed after each boot's compiles settle, so it
-               drops to 0 on the next healthy start — it is NOT continuously
-               refreshed, so do not expect it to clear without a restart.
+               gauge is measured after each boot's compiles settle AND
+               re-measured every 5 minutes, so it drops to 0 within one sweep
+               of the fix landing — a restart is needed to pick up a new
+               image, not to clear the alert.
             5. In OCI mode (`TALOS_REGISTRY_URL` set) steps 2-4 do not apply:
                there is no disk seeder and no local compile. A counted row is
-               one the registry sync wrote WITHOUT an `oci_url`, so start at
-               the sync loop's logs and the published `_index` artifact.
-               Because the sync loop rewrites catalog rows every 5 minutes
-               while this gauge is only recomputed at boot, an OCI cluster's
-               value can lag reality by a whole controller lifetime — treat a
-               firing alert as real and a quiet one as weaker evidence there.
+               one written WITHOUT an `oci_url`, so start at the sync loop's
+               logs and the published `_index` artifact — and at
+               `POST /api/registry/publish`, which accepts an empty `oci_url`
+               and is the one runtime path that can move a row into this
+               count in either mode.
+            6. If this is QUIET, check
+               `TalosCatalogMissingWasmDetectorBlind` before concluding the
+               catalog is healthy: a zero here means "measured, nothing
+               broken" only while that alert is inactive.
+
+      # The companion detector-health alert for the rule above.
+      #
+      # WHY IT EXISTS. Until 2026-08-26 `talos_catalog_templates_missing_wasm`
+      # was published from exactly one place — `seed_templates`, a BOOT-TIME
+      # function — and the rule above reads it forever. Two consequences, and
+      # the first is the worse:
+      #   * a template that lost its WASM AFTER boot left the gauge at 0, so
+      #     the alert could never fire;
+      #   * one missing at boot and later repaired left it above 0, so the
+      #     alert fired until the next restart.
+      # Note the shape had already bitten THIS SAME ALERT once: an earlier fix
+      # added publish calls at `seed_templates`' two early returns because the
+      # alert was structurally unfireable in OCI mode. That fix added publish
+      # SITES; it did not make the value REFRESH. A 300s sweep now does.
+      #
+      # AND THE PART A SWEEP ALONE DOES NOT FIX. The boot publish only called
+      # the setter on `Ok`; on a query error it logged a WARN and returned, so
+      # the gauge held its registration-time 0. `talos_catalog_templates_missing_wasm 0`
+      # therefore meant BOTH "measured, every catalog template can run" AND
+      # "the SELECT errored and nothing was ever measured" — and with no loop
+      # to retry, the second reading was PERMANENT for the life of the process.
+      # A single failed query during boot switched the detector off for days
+      # while it read as a clean bill of health.
+      #
+      # WHY A FRESHNESS STAMP AND NOT A `blind == 1` GAUGE — same reasoning as
+      # TalosCryptoOrphanDetectorBlind above, restated rather than
+      # cross-referenced because an operator reads one rule, not the file. A
+      # boolean blind flag is itself an unmeasured zero: a sweep task that
+      # never spawns or panics leaves it at 0 forever, reading "not blind",
+      # which is this defect one level up. A timestamp degrades correctly in
+      # all four cases: query error, task death, task never spawned, and a
+      # controller build predating the sweep (0 from registration = maximally
+      # stale).
+      #
+      # THE COUNT ITSELF WAS DELIBERATELY NOT CHANGED. It holds its last value
+      # on failure rather than zeroing (zeroing reads as "the templates were
+      # repaired") and no sentinel is folded into it — get_catalog_status and
+      # the `{{ $value }}` above both read it as a row count.
+      #
+      # NO absent() ARM, same reasoning as TalosCryptoOrphanDetectorBlind: this
+      # is a plain registered Gauge, exported from registration by every
+      # controller carrying this build, so absence means the controller is down
+      # (TalosControllerDown owns that) or is running a build older than
+      # 2026-08-26. An absent() arm would page permanently through a staged
+      # rollout of an older controller image, and a permanently-red alert
+      # trains operators to ignore red.
+      #
+      # THRESHOLDS. The sweep runs every 300s, so 1800s is six consecutive
+      # missed sweeps and `for: 15m` requires that to hold across another
+      # fifteen — ~45 minutes of continuous blindness before this fires. Far
+      # outside any single DB blip or rolling controller restart, and outside
+      # the ~300s post-boot window in which the stamp could still read 0 if the
+      # boot publish's own query failed. Chosen loose because this is
+      # detector-health, not the fault itself: being 45 minutes late costs 45
+      # minutes, and flapping costs the next real one being ignored.
+      #
+      # PER-INSTANCE, NOT max(), same as TalosCryptoOrphanDetectorBlind: the
+      # subtraction keeps the source labels, and each controller replica runs
+      # its OWN sweep against its OWN pool, so one blind replica is a real
+      # fault on that replica. Alertmanager groups on [alertname, category], so
+      # it is one notification either way.
+      #
+      # SEVERITY `warning` / CATEGORY `observability`, matching the other three
+      # blind detectors (TalosCryptoOrphanDetectorBlind,
+      # TalosFuelHeadroomDetectorBlind, TalosWorkerIdentityReapBlinded). Stated
+      # rather than implied because severity is NOT what routes here —
+      # alertmanager-route.yaml matches on `category`, so `observability` is
+      # the field that decides where this lands.
+      - alert: TalosCatalogMissingWasmDetectorBlind
+        expr: |
+          time() - talos_catalog_missing_wasm_scan_last_success_timestamp_seconds > 1800
+        for: 15m
+        # ANTI-FLAP, same mechanism as TalosCryptoOrphanDetectorBlind: a
+        # restart cannot resolve this one by VALUE (it resets the stamp to 0,
+        # which is maximally stale, i.e. more firing), but it does break the
+        # SERIES, and a gap drops the alert to inactive and re-arms the full
+        # 15m. keep_firing_for holds it across that gap so a controller that is
+        # both blind AND restarting cannot ride out the detector indefinitely.
+        keep_firing_for: 5m
+        labels:
+          severity: warning
+          category: observability
+        annotations:
+          summary: "Catalog missing-WASM detector has not measured in 30+ minutes"
+          description: |
+            `talos_catalog_templates_missing_wasm` has not been successfully
+            measured for over thirty minutes, so it is holding a value nothing
+            measured and `TalosCatalogTemplateNeverCompiled` cannot fire. While
+            this is firing, a catalog template that becomes unrunnable will not
+            be reported.
+
+            A value of 0 for the stamp means the sweep has NEVER succeeded on
+            this controller — either every attempt has errored since boot, or
+            the controller is running a build that predates the sweep.
+          action: |
+            1. Controller logs, `event_kind=catalog_missing_wasm_probe_failed`
+               (target `talos_catalog`), carry the driver error for each failed
+               attempt. No row content or template name is logged.
+            2. The probe is a single `SELECT COUNT(*)` over `modules`. A
+               failure is almost always the pool, a `statement_timeout`, or a
+               schema change to `modules.wasm_bytes` / `oci_url` / `kind`.
+               Check `TalosDBPoolSaturated` / `TalosDBPoolExhausted` first.
+            3. Cross-check by hand — this is the same query the sweep runs:
+               `SELECT COUNT(*) FROM modules WHERE kind='catalog'
+                AND user_id IS NULL
+                AND (wasm_bytes IS NULL OR octet_length(wasm_bytes)=0)
+                AND (oci_url IS NULL OR oci_url='');`
+            4. `get_catalog_status` → `never_compiled` names any templates the
+               gauge would have counted, and does not depend on this sweep.
 
   # ────────────────────────────────────────────────────────────────────
   - name: talos.backups
