@@ -12,6 +12,17 @@ async fn setup_registry() -> (ModuleRegistry, Pool<Postgres>) {
     (registry, db_pool)
 }
 
+/// Registry on a database of this test's own. `enforce_cache_limits` asserts
+/// on GLOBAL aggregates (total cached rows / total cached bytes), so a peer
+/// test mutating `modules` concurrently can flip the verdict either way —
+/// including to a vacuous pass. Isolation is what makes those guards mean
+/// something.
+async fn setup_isolated_registry() -> (ModuleRegistry, Pool<Postgres>) {
+    let db_pool = test_helpers::get_isolated_db_pool().await;
+    let registry = ModuleRegistry::new(db_pool.clone(), None);
+    (registry, db_pool)
+}
+
 /// Helper to create a real user to satisfy foreign key constraints
 async fn create_test_user(db: &Pool<Postgres>) -> Uuid {
     let user_id = Uuid::new_v4();
@@ -171,7 +182,12 @@ async fn test_get_execution_info() {
 
 #[tokio::test]
 async fn test_cache_limits_eviction() {
-    let (registry, db) = setup_registry().await;
+    // Isolated: this asserts on GLOBAL cache aggregates (rows deleted, total
+    // cached rows), so any peer test holding rows in `modules` changes the
+    // answer. Observed: with peers' rows present the sweep correctly sheds 5
+    // rows instead of 1 and the assertion below fails — a pre-existing
+    // shared-state race, not an eviction defect.
+    let (registry, db) = setup_isolated_registry().await;
 
     // Clean up (Phase 5: unified `modules` table replaces `wasm_modules`).
     sqlx::query("DELETE FROM modules")
@@ -220,8 +236,9 @@ async fn test_cache_limits_eviction() {
     }
 
     // Enforce limit of 2 modules. Should delete the oldest one (i=0).
-    let (deleted, _) = registry.enforce_cache_limits(2, 500).await.unwrap();
-    assert_eq!(deleted, 1);
+    let outcome = registry.enforce_cache_limits(2, 500).await.unwrap();
+    assert_eq!(outcome.modules_deleted, 1);
+    assert_eq!(outcome.unevictable_count_overage, 0);
 
     let stats = registry.get_cache_stats().await.unwrap();
     assert_eq!(stats.module_count, 2);
@@ -232,4 +249,142 @@ async fn test_cache_limits_eviction() {
         .await
         .unwrap();
     assert_eq!(remaining, vec!["M1", "M2"]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Cache-eviction scoping guards.
+//
+// `enforce_cache_limits` is a CACHE sweep over a REGISTRY table. Every row in
+// `modules` carries `source_code`, and rows with `user_id IS NULL` are the
+// shared catalog every tenant installs from — they are not cache entries and
+// no tenant owns them, so aggregate cache pressure must never delete one.
+//
+// Both guards below reproduce the PRODUCTION state faithfully: every row is
+// left with `last_used_at IS NULL`, because nothing in the workspace ever
+// writes that column (`ModuleRegistry::increment_usage` has zero callers).
+// Do NOT "fix" these tests by stamping `last_used_at` — that manufactures a
+// precondition production never supplies and is exactly what hid this defect.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Insert a shared catalog row: `user_id IS NULL`, `kind = 'catalog'`,
+/// carrying compiled bytes (this deployment disk-seeds and compiles, so its
+/// catalog rows DO hold `wasm_bytes` — 112 of 112 live rows do).
+async fn insert_catalog_row(db: &Pool<Postgres>, name: &str, size_bytes: i32) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO modules (id, name, kind, config_schema, source_code, wasm_bytes, size_bytes)
+         VALUES ($1, $2, 'catalog', $3, $4, $5, $6)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(json!({}))
+    .bind("catalog source")
+    .bind(vec![0u8; 8])
+    .bind(size_bytes)
+    .execute(db)
+    .await
+    .unwrap();
+    id
+}
+
+/// Insert a user-owned sandbox row — the only class this sweep owns.
+async fn insert_user_row(db: &Pool<Postgres>, user_id: Uuid, name: &str, size_bytes: i32) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO modules (id, user_id, name, kind, config_schema, source_code, wasm_bytes, size_bytes)
+         VALUES ($1, $2, $3, 'sandbox', $4, $5, $6, $7)",
+    )
+    .bind(id)
+    .bind(user_id)
+    .bind(name)
+    .bind(json!({}))
+    .bind("user source")
+    .bind(vec![0u8; 8])
+    .bind(size_bytes)
+    .execute(db)
+    .await
+    .unwrap();
+    id
+}
+
+/// COUNT-CAP GUARD. 6 shared catalog rows + 2 user rows, cap 2 ⇒ the sweep
+/// must shed 6. Only 2 rows are evictable, so by pigeonhole the pre-fix code
+/// has to reach into the catalog for at least 4 of them — the assertion is
+/// decisive regardless of which arbitrary tie order Postgres picks.
+#[tokio::test]
+async fn enforce_cache_limits_never_evicts_shared_catalog_rows() {
+    let (registry, db) = setup_isolated_registry().await;
+    sqlx::query("DELETE FROM modules")
+        .execute(&db)
+        .await
+        .unwrap();
+    let user_id = create_test_user(&db).await;
+
+    let mut catalog_ids = Vec::new();
+    for i in 0..6 {
+        catalog_ids.push(insert_catalog_row(&db, &format!("Shared Template {}", i), 1024).await);
+    }
+    for i in 0..2 {
+        insert_user_row(&db, user_id, &format!("User Module {}", i), 1024).await;
+    }
+
+    let outcome = registry.enforce_cache_limits(2, 500).await.unwrap();
+
+    // The cap asked for 6 rows to go; only the 2 user rows are evictable. The
+    // shortfall must SURFACE as a value rather than vanish — an over-cap
+    // registry whose excess is all shared catalog is a real operational
+    // condition, and silently doing nothing about it is how the pre-fix code
+    // would have "passed" a naive check.
+    assert_eq!(outcome.modules_deleted, 2);
+    assert_eq!(outcome.unevictable_count_overage, 4);
+
+    let surviving: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM modules WHERE id = ANY($1) AND user_id IS NULL")
+            .bind(&catalog_ids)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+
+    assert_eq!(
+        surviving,
+        6,
+        "cache eviction deleted {} shared catalog row(s); a sweep driven by \
+         aggregate cache pressure must never delete a row no tenant owns",
+        6 - surviving
+    );
+}
+
+/// SIZE-CAP GUARD. Every row ties on `last_used_at`, so the pre-fix window
+/// `SUM(size_bytes) OVER (ORDER BY last_used_at ASC NULLS FIRST)` uses its
+/// DEFAULT `RANGE` frame and assigns EVERY peer row the FULL sum rather than a
+/// prefix sum. `running_total <= current_size - max_size_bytes` is then false
+/// for every row, so the size cap sheds nothing and stays over cap forever.
+#[tokio::test]
+async fn enforce_cache_limits_size_cap_sheds_bytes_when_keys_tie() {
+    let (registry, db) = setup_isolated_registry().await;
+    sqlx::query("DELETE FROM modules")
+        .execute(&db)
+        .await
+        .unwrap();
+    let user_id = create_test_user(&db).await;
+
+    // 4 evictable rows of 1 MiB each = 4 MiB against a 2 MiB cap.
+    for i in 0..4 {
+        insert_user_row(&db, user_id, &format!("Bulky {}", i), 1_048_576).await;
+    }
+
+    registry.enforce_cache_limits(1000, 2).await.unwrap();
+
+    let remaining_bytes: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(size_bytes), 0)::bigint FROM modules WHERE wasm_bytes IS NOT NULL",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+
+    assert!(
+        remaining_bytes <= 2 * 1_048_576,
+        "size cap not enforced: {} bytes remain against a 2 MiB cap",
+        remaining_bytes
+    );
 }
