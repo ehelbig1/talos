@@ -1120,10 +1120,10 @@ fn parse_args(args: &[String]) -> Result<Cmd, String> {
         }),
         "probe-append-only" => Ok(Cmd::Probe),
         "fetch" => {
-            let kind =
-                value("--kind").ok_or_else(|| "fetch needs --kind postgres|vault".to_string())?;
+            let kind = value("--kind")
+                .ok_or_else(|| "fetch needs --kind postgres|vault|neo4j".to_string())?;
             let kind = ArtifactKind::parse(&kind)
-                .ok_or_else(|| format!("unknown --kind '{kind}' (postgres|vault)"))?;
+                .ok_or_else(|| format!("unknown --kind '{kind}' (postgres|vault|neo4j)"))?;
             let dest = value("--dest").ok_or_else(|| "fetch needs --dest <path>".to_string())?;
             Ok(Cmd::Fetch {
                 kind,
@@ -1148,7 +1148,7 @@ talos-offhost-backup — encrypted off-host egress for Talos backups (Tier 2)
       --backfill is the one-time opt-in that pushes the whole retained
       history. Always writes the textfile metric, including on failure.
 
-  fetch --kind postgres|vault --dest <path> [--key <object-key>]
+  fetch --kind postgres|vault|neo4j --dest <path> [--key <object-key>]
         [--no-freshness-check]
       GET the newest archive of that kind and age-decrypt it. Fails if the
       bucket is unreachable, if it holds no such archive, if that archive is
@@ -1235,7 +1235,26 @@ mod tests {
         assert!(parse_args(&a(&["fetch"])).is_err());
         assert!(parse_args(&a(&["fetch", "--kind", "postgres"])).is_err());
         assert!(parse_args(&a(&["fetch", "--dest", "/tmp/x"])).is_err());
-        assert!(parse_args(&a(&["fetch", "--kind", "neo4j", "--dest", "/tmp/x"])).is_err());
+        // `neo4j` was the unknown-kind case here until 2026-08-26; it is a
+        // real kind now, so the assertion moved to a family that does not
+        // exist rather than being dropped.
+        assert!(parse_args(&a(&["fetch", "--kind", "redis", "--dest", "/tmp/x"])).is_err());
+        assert!(parse_args(&a(&["fetch", "--kind", "", "--dest", "/tmp/x"])).is_err());
+        // …and every kind that DOES exist is accepted, so the flag surface
+        // can never drift behind `ArtifactKind::ALL`.
+        for kind in ArtifactKind::ALL {
+            let parsed = parse_args(&a(&["fetch", "--kind", kind.as_str(), "--dest", "/tmp/x"]))
+                .unwrap_or_else(|e| panic!("--kind {kind} rejected: {e}"));
+            assert_eq!(
+                parsed,
+                Cmd::Fetch {
+                    kind,
+                    dest: PathBuf::from("/tmp/x"),
+                    assert_fresh: true,
+                    key: None,
+                }
+            );
+        }
     }
 
     #[test]
@@ -1386,6 +1405,7 @@ fi
     fn discover_local_ignores_partials_and_foreign_files() {
         let d = std::env::temp_dir().join(format!("talos-offhost-disc-{}", std::process::id()));
         std::fs::create_dir_all(d.join("vault")).unwrap();
+        std::fs::create_dir_all(d.join("neo4j")).unwrap();
         for f in [
             "talos-20260817-101757.dump",
             "talos-20260816-101757.dump.partial",
@@ -1394,17 +1414,43 @@ fi
         ] {
             std::fs::write(d.join(f), b"x").unwrap();
         }
+        // Every tarball on disk has a `.tar.gz.manifest` beside it — 13 of
+        // each for vault AND neo4j on the dev host. Neither may be shipped.
         std::fs::write(d.join("vault/vault-20260817-221124.tar.gz"), b"x").unwrap();
         std::fs::write(d.join("vault/vault-20260817-221124.tar.gz.manifest"), b"x").unwrap();
+        std::fs::write(d.join("neo4j/neo4j-20260825-145720.tar.gz"), b"x").unwrap();
+        std::fs::write(d.join("neo4j/neo4j-20260825-145720.tar.gz.manifest"), b"x").unwrap();
+        // MISPLACED files: `local_suffix` is `.tar.gz` for BOTH kinds, so if
+        // the directory partition were the only guard these would be picked
+        // up under the wrong kind and filed under the wrong object-key
+        // namespace. The prefix guard is what refuses them.
+        std::fs::write(d.join("vault/neo4j-20260825-145721.tar.gz"), b"x").unwrap();
+        std::fs::write(d.join("neo4j/vault-20260817-221125.tar.gz"), b"x").unwrap();
 
         let mut found: Vec<String> = discover_local(&d).into_iter().map(|a| a.filename).collect();
         found.sort();
         assert_eq!(
             found,
             vec![
+                "neo4j-20260825-145720.tar.gz".to_string(),
                 "talos-20260817-101757.dump".to_string(),
                 "vault-20260817-221124.tar.gz".to_string()
             ]
+        );
+        // And each survivor is filed under the kind whose directory it was
+        // in — "three artifacts were found" would pass even if two of them
+        // had swapped families.
+        let by_name: std::collections::BTreeMap<String, ArtifactKind> = discover_local(&d)
+            .into_iter()
+            .map(|a| (a.filename, a.kind))
+            .collect();
+        assert_eq!(
+            by_name.get("vault-20260817-221124.tar.gz"),
+            Some(&ArtifactKind::Vault)
+        );
+        assert_eq!(
+            by_name.get("neo4j-20260825-145720.tar.gz"),
+            Some(&ArtifactKind::Neo4j)
         );
         std::fs::remove_dir_all(&d).ok();
     }

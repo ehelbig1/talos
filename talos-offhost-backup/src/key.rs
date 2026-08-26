@@ -19,29 +19,84 @@ use std::fmt;
 
 /// Which backup family an artifact belongs to.
 ///
-/// `neo4j` is deliberately ABSENT. The graph is reconstructible from
-/// `actor_memory` via `graph_backfill`, so paying egress and a second fatal
-/// secret's blast radius for it is not worth it. That is a judgement, not an
-/// oversight — if the graph ever stops being reconstructible, add it here.
+/// # `neo4j` used to be absent on purpose. Its own stated trigger fired.
+///
+/// The comment here read: *"the graph is reconstructible from `actor_memory`
+/// via `graph_backfill`, so paying egress and a second fatal secret's blast
+/// radius for it is not worth it — if the graph ever stops being
+/// reconstructible, add it here."* It is REPLACED rather than deleted, because
+/// the reasoning was sound when written and decayed afterwards, and that shape
+/// is the thing worth remembering.
+///
+/// **Measured 2026-08-26 against both live stores.** Neo4j held 1,283 nodes /
+/// 1,939 relationships under 13 distinct `source_key`s spanning 16 distinct
+/// (`actor_id`, `source_key`) pairs; `actor_memory` held 18 rows / 15 keys.
+/// **6 of those 16 pairs — 191 nodes, 14.9 % — had no surviving row to rebuild
+/// from.** 90 of the 191 never had one: `reflection_synthesis` is a sentinel
+/// stamped by the reflection loop (`talos_graph_rag`'s `SYNTHESIS_SOURCE_KEY`),
+/// not an `actor_memory` key, and `graph_backfill` iterates `actor_memory`
+/// rows — so no retention policy and no re-run can re-emit it.
+///
+/// The survivors are weaker than a key-level count suggests. Graph nodes
+/// ACCUMULATE over every value a mutable `latest` key has ever held
+/// (`daily_brief/latest`: 323 nodes spanning 40 days) while `actor_memory`
+/// keeps only the current one, and extraction falls back to an LLM — so a
+/// re-run is a fresh generation, not a replay.
+///
+/// A graph is rebuildable; *that* graph is not recoverable. The second fatal
+/// secret never materialised either: this artifact rides the SAME `age`
+/// passphrase as the other two.
+///
+/// **This claim is a dated measurement, exactly like the one it replaces.**
+/// Re-derive it before relying on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ArtifactKind {
     /// `pg_dump --format=custom` of the whole database.
     Postgres,
     /// Opaque tar of Vault's file backend (`/vault/file`).
     Vault,
+    /// Opaque tar of Neo4j's data directory (`/neo4j-data` — `databases/`,
+    /// `transactions/`, `dbms/auth.ini`). A raw store-file copy, NOT a
+    /// `neo4j-admin database dump`, so a restore is "stop the server, replace
+    /// the data directory, start" rather than a load command.
+    ///
+    /// **Appended, never inserted.** [`ArtifactKind::ALL`] order is the order
+    /// the metric exposition is rendered in; putting a new kind in the middle
+    /// would reorder existing lines for no benefit.
+    ///
+    /// Uploadable and fetchable as of 2026-08-26. **NOT restored by
+    /// `scripts/drills/backup-restore.sh`** — that drill knows two artifacts,
+    /// `PG_ARTIFACT` and `VAULT_ARTIFACT`. See `docs/offhost-backup.md`.
+    Neo4j,
 }
 
 impl ArtifactKind {
     /// Every kind, in a stable order. Closed set — the metric label values
     /// are pre-seeded from this, so `increase(...) > 0` is well-defined
     /// before the first upload ever happens.
-    pub const ALL: [ArtifactKind; 2] = [ArtifactKind::Postgres, ArtifactKind::Vault];
+    ///
+    /// **Adding a variant does NOT break this array.** The length is a
+    /// literal, so a 2-element `ALL` compiles cleanly against a 3-variant
+    /// enum — and the three `for kind in ArtifactKind::ALL` loops
+    /// (`discover_local`, `plan_uploads`, `metrics::render`) would then skip
+    /// the new kind in silence: never discovered, never planned, never
+    /// pre-seeded, with a green metric throughout. Nothing in the compiler
+    /// catches that, which is why the unit test
+    /// `all_is_pinned_and_exhaustive` pins the length and the label list by
+    /// hand instead of deriving them from `ALL`. (Named, not linked — it is
+    /// `#[cfg(test)]`, so an intra-doc link to it would not resolve.)
+    pub const ALL: [ArtifactKind; 3] = [
+        ArtifactKind::Postgres,
+        ArtifactKind::Vault,
+        ArtifactKind::Neo4j,
+    ];
 
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             ArtifactKind::Postgres => "postgres",
             ArtifactKind::Vault => "vault",
+            ArtifactKind::Neo4j => "neo4j",
         }
     }
 
@@ -50,6 +105,7 @@ impl ArtifactKind {
         match s {
             "postgres" => Some(ArtifactKind::Postgres),
             "vault" => Some(ArtifactKind::Vault),
+            "neo4j" => Some(ArtifactKind::Neo4j),
             _ => None,
         }
     }
@@ -61,6 +117,7 @@ impl ArtifactKind {
         match self {
             ArtifactKind::Postgres => "",
             ArtifactKind::Vault => "vault",
+            ArtifactKind::Neo4j => "neo4j",
         }
     }
 
@@ -70,6 +127,7 @@ impl ArtifactKind {
         match self {
             ArtifactKind::Postgres => "talos-",
             ArtifactKind::Vault => "vault-",
+            ArtifactKind::Neo4j => "neo4j-",
         }
     }
 
@@ -79,6 +137,11 @@ impl ArtifactKind {
         match self {
             ArtifactKind::Postgres => ".dump",
             ArtifactKind::Vault => ".tar.gz",
+            // NOT unique to this kind — vault ends `.tar.gz` too. The
+            // discriminators are `local_prefix` and `backup_subdir`; see the
+            // module tests `two_targz_kinds_are_never_confused` and
+            // `a_manifest_sibling_is_not_an_artifact`.
+            ArtifactKind::Neo4j => ".tar.gz",
         }
     }
 }
@@ -295,7 +358,13 @@ mod tests {
     fn kinds_never_collide_with_each_other() {
         let p = object_key(ArtifactKind::Postgres, "talos-20260817-101757.dump").unwrap();
         let v = object_key(ArtifactKind::Vault, "vault-20260817-101757.tar.gz").unwrap();
+        let n = object_key(ArtifactKind::Neo4j, "neo4j-20260817-101757.tar.gz").unwrap();
+        // Same second, same suffix for two of the three. The kind segment is
+        // what keeps them apart, so a same-stamp vault and neo4j archive can
+        // never PUT over one another.
         assert_ne!(p, v);
+        assert_ne!(v, n);
+        assert_ne!(p, n);
     }
 
     #[test]
@@ -362,6 +431,7 @@ mod tests {
         for (kind, name) in [
             (ArtifactKind::Postgres, "talos-20260817-101757.dump"),
             (ArtifactKind::Vault, "vault-20260802-221124.tar.gz"),
+            (ArtifactKind::Neo4j, "neo4j-20260825-145720.tar.gz"),
         ] {
             let k = object_key(kind, name).unwrap();
             let (got_kind, got_stamp) = parse_object_key(&k).expect("round trip");
@@ -375,12 +445,111 @@ mod tests {
         for bad in [
             "talos/v1/postgres/2026/08/nope.age",
             "talos/v2/postgres/2026/08/20260817T101757Z-postgres.age",
-            "talos/v1/neo4j/2026/08/20260817T101757Z-neo4j.age",
+            // `neo4j` used to be the unknown-kind case here. It is a real
+            // kind as of 2026-08-26, so the unknown-kind case moved to a
+            // family that genuinely does not exist. If THIS one ever starts
+            // parsing, the same review question applies: was a kind added
+            // without walking `ArtifactKind::ALL`'s consumers?
+            "talos/v1/redis/2026/08/20260817T101757Z-redis.age",
             "talos/v1/postgres/2026/08/20260817T101757Z-postgres.age/extra",
             "20260817T101757Z-postgres.age",
         ] {
             assert!(parse_object_key(bad).is_none(), "'{bad}' should not parse");
         }
+    }
+
+    #[test]
+    fn all_is_pinned_and_exhaustive() {
+        // Deliberately HAND-WRITTEN, not derived from `ALL`. Every other
+        // assertion about kinds in this crate iterates `ArtifactKind::ALL`
+        // on both sides, which makes them self-adjusting and therefore
+        // useless as a guard on `ALL` itself: a variant added to the enum
+        // but forgotten in `ALL` would leave all of them green while the
+        // artifact was never discovered, never planned and never pre-seeded.
+        // This is the one place that would go red.
+        assert_eq!(ArtifactKind::ALL.len(), 3);
+        let got: Vec<&str> = ArtifactKind::ALL.iter().map(|k| k.as_str()).collect();
+        assert_eq!(got, ["postgres", "vault", "neo4j"]);
+
+        // These &strs are Prometheus label VALUES and object-key path
+        // segments. Renaming one splits a counter in two, orphans every
+        // dashboard on the old name, AND makes every already-uploaded object
+        // of that kind unreachable by `parse_object_key`.
+        let mut sorted = got.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), got.len(), "label values must be unique");
+    }
+
+    #[test]
+    fn every_kind_round_trips_through_its_label() {
+        // Closes the `parse`/`as_str` pair: `parse` matches on `&str` with a
+        // `_ => None` arm, so a missing arm compiles. A kind that does not
+        // round-trip would be dropped by `MetricState::carried_forward`,
+        // silently resetting its counters on every run.
+        for k in ArtifactKind::ALL {
+            assert_eq!(ArtifactKind::parse(k.as_str()), Some(k), "{k}");
+        }
+        assert_eq!(ArtifactKind::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn a_manifest_sibling_is_not_an_artifact() {
+        // Every tarball on disk has a `<name>.tar.gz.manifest` beside it
+        // (13 of each for vault AND neo4j on the dev host). A `contains`
+        // style suffix test would classify the 500-byte manifest as an
+        // archive and ship it under the tarball's own key shape.
+        // `strip_suffix` is an exact tail match, so it does not.
+        for (kind, name) in [
+            (ArtifactKind::Vault, "vault-20260825-145654.tar.gz.manifest"),
+            (ArtifactKind::Neo4j, "neo4j-20260825-145720.tar.gz.manifest"),
+        ] {
+            assert!(
+                object_key(kind, name).is_err(),
+                "{name} must not become an object key"
+            );
+            assert!(stamp_of_local(kind, name).is_err());
+        }
+    }
+
+    #[test]
+    fn two_targz_kinds_are_never_confused() {
+        // `local_suffix` is `.tar.gz` for BOTH vault and neo4j, so it cannot
+        // be the discriminator. Two independent guards keep them apart, and
+        // this asserts the second one — the prefix — in isolation, because
+        // the first (one directory per `backup_subdir`) lives in
+        // `discover_local` and would not protect a misplaced file.
+        assert!(object_key(ArtifactKind::Vault, "neo4j-20260825-145720.tar.gz").is_err());
+        assert!(object_key(ArtifactKind::Neo4j, "vault-20260825-145654.tar.gz").is_err());
+        // And the directories really are disjoint, so guard 1 is not a
+        // no-op either.
+        assert_ne!(
+            ArtifactKind::Vault.backup_subdir(),
+            ArtifactKind::Neo4j.backup_subdir()
+        );
+        assert_ne!(
+            ArtifactKind::Vault.local_prefix(),
+            ArtifactKind::Neo4j.local_prefix()
+        );
+
+        // A same-second pair filed under the right kinds lands in different
+        // key namespaces, so neither can overwrite the other.
+        let v = object_key(ArtifactKind::Vault, "vault-20260825-145720.tar.gz").unwrap();
+        let n = object_key(ArtifactKind::Neo4j, "neo4j-20260825-145720.tar.gz").unwrap();
+        assert_eq!(v, "talos/v1/vault/2026/08/20260825T145720Z-vault.age");
+        assert_eq!(n, "talos/v1/neo4j/2026/08/20260825T145720Z-neo4j.age");
+
+        // Round-tripping a key must recover the kind it was filed under, not
+        // merely "some .tar.gz kind".
+        assert_eq!(parse_object_key(&v).unwrap().0, ArtifactKind::Vault);
+        assert_eq!(parse_object_key(&n).unwrap().0, ArtifactKind::Neo4j);
+    }
+
+    #[test]
+    fn a_neo4j_partial_is_refused_like_every_other_kind() {
+        assert!(object_key(ArtifactKind::Neo4j, "neo4j-20260825-145720.tar.gz.partial").is_err());
+        assert!(object_key(ArtifactKind::Neo4j, "neo4j-20260825-145720.tar").is_err());
+        assert!(object_key(ArtifactKind::Neo4j, "neo4j-.tar.gz").is_err());
     }
 
     #[test]

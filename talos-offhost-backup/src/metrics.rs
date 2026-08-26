@@ -327,13 +327,30 @@ mod tests {
         // Seeding a combination NOTHING can write implies a wired signal
         // that does not exist. Pin the count so a future label addition is
         // a deliberate act.
+        //
+        // The arithmetic is spelled out with LITERALS on purpose. Deriving
+        // it from `ArtifactKind::ALL.len()` would make this test agree with
+        // whatever `ALL` happens to say, which is precisely the failure mode
+        // it exists to catch — `ALL` is a fixed-length array, so a variant
+        // added to the enum and forgotten in `ALL` compiles cleanly and
+        // silently stops being discovered, planned and pre-seeded.
+        //
+        // Went 15 → 18 on 2026-08-26 when `neo4j` was added (3rd kind:
+        // +2 upload series, +1 last_success). If it changes again, check
+        // that the new kind reached ALL THREE `for kind in ArtifactKind::ALL`
+        // loops — `discover_local`, `plan_uploads`, `render` — not just
+        // this one.
         let text = render(&MetricState::default());
         let samples = text
             .lines()
             .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
             .count();
-        // 1 enabled + 1 last_run + (2 kinds × 2 outcomes) + 7 reasons + 2 last_success
-        assert_eq!(samples, 1 + 1 + 4 + 7 + 2);
+        // 1 enabled + 1 last_run + (3 kinds × 2 outcomes) + 7 reasons + 3 last_success
+        assert_eq!(
+            samples,
+            1 + 1 + 6 + 7 + 3,
+            "pre-seeded series count changed; see the comment above:\n{text}"
+        );
     }
 
     #[test]
