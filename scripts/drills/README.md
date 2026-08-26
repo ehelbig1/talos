@@ -281,9 +281,24 @@ ignore red. Wire the escrow or unschedule; do not leave it half-way.
 # Propagates TALOS_DRILL_ESCROW_KEY_CMD / _FILE into the plist if set.
 TALOS_DRILL_ESCROW_KEY_CMD='op read "op://Private/Talos KEK/password"' \
   make drill-schedule       # install + load (Sunday 03:00 local)
-make drill-schedule-status  # is it scheduled, and when did it last pass?
+make drill-schedule-status  # is it scheduled, which copy, when did it last pass?
 make drill-unschedule
 ```
+
+**Which copy the unattended run restores is written into the plist.** Until
+2026-08-26 `ProgramArguments` passed no arguments at all, so every scheduled
+run silently took the `artifact` default — and the metric it published could
+not say which copy it had certified. The plist now carries `--source
+artifact` explicitly, `make drill-schedule-status` reads it back, and
+
+```bash
+TALOS_DRILL_SCHEDULE_SOURCE=b2 make drill-schedule
+```
+
+is the upgrade once the off-host chain and its escrowed age passphrase are
+wired. That is the strictly harder question, and scheduling it is what turns
+"the off-host copy is uncertified" into one that is continuously answered.
+An out-of-set value is refused at install time rather than reaching the plist.
 
 `StartCalendarInterval` runs missed jobs once the machine wakes, which
 is what makes a weekly cadence workable on a laptop — the same
@@ -361,14 +376,34 @@ when Phase 2 onboards — file an RFC before reaching for it.
 
 ### Wiring the metric into Prometheus
 
-`backup-restore.sh` writes `talos_backup_drill.prom` with three series:
+`backup-restore.sh` writes `talos_backup_drill.prom` with three series,
+every one of them labelled `source="artifact"|"b2"|"live"` — **the copy the
+run restored**. That label was added 2026-08-26 and it is the difference
+between "a drill passed" and "the backups are verified": the scheduled run
+has always been `artifact`, a dump on the very disk the backups insure
+against, and until the label existed nothing in the metrics could say so.
 
-- `talos_backup_drill_last_run_timestamp_seconds` — every run (success
-  or failure).
-- `talos_backup_drill_last_success_timestamp_seconds` — only green runs.
-  Preserves previous value on failure so the alert compares to the
-  last actually-green run, not the most recent failed run.
-- `talos_backup_drill_last_status` — `1` on success, `0` on failure.
+- `talos_backup_drill_last_run_timestamp_seconds{source}` — every run
+  (success or failure). **One series**, labelled with the source of the
+  most recent run.
+- `talos_backup_drill_last_success_timestamp_seconds{source}` — only green
+  runs, and **retained per copy**: an `artifact` success is not erased by a
+  later failed `b2` or `live` run. Preserves the previous value on failure
+  so the alert compares to the last actually-green run, not the most recent
+  failed run. **No line at all** for a copy that has never succeeded —
+  writing `0` there would make `TalosBackupRestoreDrillFailed` fire with a
+  summary that is false on a host whose other copy is green.
+- `talos_backup_drill_last_status{source}` — `1` on success, `0` on
+  failure. **One series**, same as `last_run`.
+
+The label set is closed (three values), enforced on both the write side
+(`--source` validation) and the read side (the carry-forward regex), so the
+family can never exceed nine series.
+
+`make drill-schedule-status` prints which copy the scheduled run restores,
+when each copy was last proven, and says outright when the **off-host** copy
+has never been restored. Leg F of `make observability-verify` reports the
+same absence from Prometheus's side.
 
 **Until 2026-08-03 there was no collector for any of them.** The script
 wrote to `/var/lib/node_exporter/textfile_collector`, a path that
@@ -392,9 +427,14 @@ skipping when it cannot publish.
 
 The alert itself is in `deploy/helm/talos/files/alerts.yaml` (symlinked
 as `deploy/observability/alerts.yaml`) and compares
-`talos_backup_drill_last_success_timestamp_seconds` against
-`time() - 14*86400`, with an `absent()` arm so a series that was never
-published fires rather than silently matching nothing.
+`max without(source) (talos_backup_drill_last_success_timestamp_seconds)`
+against `time() - 14*86400`, with an `absent()` arm so a series that was
+never published fires rather than silently matching nothing. The
+aggregation is what keeps a copy drilled once and then abandoned from
+firing that alert forever; it asks exactly what the summary asks, "has ANY
+copy been restored in the last 14 days?". The sibling
+`TalosBackupRestoreDrillLastRunFailed` reads `last_status == 0` and names
+the failing copy in its summary.
 
 There is deliberately **no separate alert on the collector itself**.
 The `absent()` arm already covers it: if node-exporter stops, its

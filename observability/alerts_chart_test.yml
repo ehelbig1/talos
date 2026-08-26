@@ -47,7 +47,7 @@ tests:
   - interval: 1m
     name: drill never ran, then runs — absent() fires, publication clears it
     input_series:
-      - series: 'talos_backup_drill_last_success_timestamp_seconds{job="node-exporter"}'
+      - series: 'talos_backup_drill_last_success_timestamp_seconds{job="node-exporter",source="artifact"}'
         values: "_x90 0+0x60"
     alert_rule_test:
       # `for: 1h` — pending, not firing, before the hour is up.
@@ -64,7 +64,7 @@ tests:
               severity: warning
               category: ops-hygiene
             exp_annotations:
-              summary: "No successful backup→restore drill in 14+ days"
+              summary: "No successful backup→restore drill of ANY copy in 14+ days"
               description: |
                 scripts/drills/backup-restore.sh has either not run or is
                 failing. A backup you have not restored is a hypothesis —
@@ -72,6 +72,9 @@ tests:
                 series has NEVER been published: check that the drill script
                 is scheduled at all and that its node_exporter textfile
                 directory is being collected.
+                This alert aggregates over the `source` label, so it carries
+                none: `make drill-schedule-status` says which copy (artifact /
+                b2 / live) was last proven and which has never been.
       # INACTIVE the moment the drill publishes a fresh success timestamp.
       # This is the deliverable: the alert is clearable by running the drill.
       - eval_time: 95m
@@ -87,7 +90,7 @@ tests:
     input_series:
       # See the note in the header: with promtool's clock at ~0, "older than
       # 14 days ago" is a large negative number.
-      - series: 'talos_backup_drill_last_success_timestamp_seconds{job="node-exporter"}'
+      - series: 'talos_backup_drill_last_success_timestamp_seconds{job="node-exporter",source="artifact"}'
         values: "-2000000+0x120"
     alert_rule_test:
       - eval_time: 30m
@@ -116,7 +119,7 @@ tests:
               category: ops-hygiene
               job: node-exporter
             exp_annotations:
-              summary: "No successful backup→restore drill in 14+ days"
+              summary: "No successful backup→restore drill of ANY copy in 14+ days"
               description: |
                 scripts/drills/backup-restore.sh has either not run or is
                 failing. A backup you have not restored is a hypothesis —
@@ -124,6 +127,9 @@ tests:
                 series has NEVER been published: check that the drill script
                 is scheduled at all and that its node_exporter textfile
                 directory is being collected.
+                This alert aggregates over the `source` label, so it carries
+                none: `make drill-schedule-status` says which copy (artifact /
+                b2 / live) was last proven and which has never been.
 
   # ══════════════════════════════════════════════════════════════════════
   # A recent green drill is quiet, for the whole timeline. Without this, a
@@ -132,7 +138,7 @@ tests:
   - interval: 1m
     name: recent successful drill — no alert at any point
     input_series:
-      - series: 'talos_backup_drill_last_success_timestamp_seconds{job="node-exporter"}'
+      - series: 'talos_backup_drill_last_success_timestamp_seconds{job="node-exporter",source="artifact"}'
         values: "0+0x180"
     alert_rule_test:
       - eval_time: 30m
@@ -157,7 +163,7 @@ tests:
     name: last drill run FAILED — pending, then fires, then clears on a green re-run
     input_series:
       # 0 = failure, held for 40 intervals, then a successful re-run.
-      - series: 'talos_backup_drill_last_status{job="node-exporter"}'
+      - series: 'talos_backup_drill_last_status{job="node-exporter",source="artifact"}'
         values: "0+0x40 1+0x60"
     alert_rule_test:
       # `for: 15m` — pending, not firing, before the window is up. This is
@@ -173,13 +179,23 @@ tests:
               severity: warning
               category: data-loss
               job: node-exporter
+              # THE ATTRIBUTION, PINNED. Without `source` on the series the
+              # rule's `{{ $labels.source }}` renders EMPTY and the summary
+              # reads "… RAN AND FAILED ( copy)" — a label silently absent is
+              # this PR's own subject, so it is asserted here rather than
+              # assumed. Observed exactly that way on the first run of this
+              # suite, before the fixtures were relabelled.
+              source: artifact
             exp_annotations:
-              summary: "The last backup→restore drill RAN AND FAILED"
+              summary: "The last backup→restore drill RAN AND FAILED (artifact copy)"
               description: |
                 scripts/drills/backup-restore.sh completed and reported
-                failure — this is not "the drill is overdue", it is "the drill
-                ran and the backups did not come back". Until it passes, the
-                readability of every artifact in $BACKUP_DIR is unproven.
+                failure while restoring the artifact copy —
+                this is not "the drill is overdue", it is "the drill
+                ran and the backups did not come back". `artifact` is the local
+                dump in $BACKUP_DIR, `b2` the off-host archive, `live` a fresh
+                dump taken by the drill itself. Until it passes, the
+                readability of that copy is unproven.
                 The metric records only the outcome, never which step failed,
                 so read the run's own output: ~/.talos/logs/backup-drill.log
                 for a scheduled run, or re-run it by hand with `make drill`.
@@ -202,7 +218,7 @@ tests:
   - interval: 1m
     name: last drill run SUCCEEDED — no alert at any point
     input_series:
-      - series: 'talos_backup_drill_last_status{job="node-exporter"}'
+      - series: 'talos_backup_drill_last_status{job="node-exporter",source="artifact"}'
         values: "1+0x180"
     alert_rule_test:
       - eval_time: 20m
@@ -230,9 +246,9 @@ tests:
   - interval: 1m
     name: drill has never run — the status alert stays silent by design
     input_series:
-      - series: 'talos_backup_drill_last_status{job="node-exporter"}'
+      - series: 'talos_backup_drill_last_status{job="node-exporter",source="artifact"}'
         values: "_x180"
-      - series: 'talos_backup_drill_last_success_timestamp_seconds{job="node-exporter"}'
+      - series: 'talos_backup_drill_last_success_timestamp_seconds{job="node-exporter",source="artifact"}'
         values: "_x180"
     alert_rule_test:
       - eval_time: 20m
@@ -252,7 +268,7 @@ tests:
               severity: warning
               category: ops-hygiene
             exp_annotations:
-              summary: "No successful backup→restore drill in 14+ days"
+              summary: "No successful backup→restore drill of ANY copy in 14+ days"
               description: |
                 scripts/drills/backup-restore.sh has either not run or is
                 failing. A backup you have not restored is a hypothesis —
@@ -260,6 +276,196 @@ tests:
                 series has NEVER been published: check that the drill script
                 is scheduled at all and that its node_exporter textfile
                 directory is being collected.
+                This alert aggregates over the `source` label, so it carries
+                none: `make drill-schedule-status` says which copy (artifact /
+                b2 / live) was last proven and which has never been.
+
+  # ══════════════════════════════════════════════════════════════════════
+  # WHICH COPY. Added 2026-08-26 with the `source` label.
+  #
+  # The failure this label exists to prevent: a green
+  # `talos_backup_drill_last_status` reading as "the backups are verified"
+  # when the scheduled run has only ever restored `artifact` — the dump on
+  # the very disk the backups insure against. These cases pin that the
+  # attribution survives all the way into the notification, and that the two
+  # rules keep their division of labour once more than one copy exists.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: the OFF-HOST copy fails while the LOCAL copy is green
+    input_series:
+      # The b2 restore ran and failed…
+      - series: 'talos_backup_drill_last_status{job="node-exporter",source="b2"}'
+        values: "0+0x180"
+      # …while the artifact copy has a recent proven restore. Both facts are
+      # true at once and each needs its own answer.
+      - series: 'talos_backup_drill_last_success_timestamp_seconds{job="node-exporter",source="artifact"}'
+        values: "0+0x180"
+    alert_rule_test:
+      # The status alert fires AND NAMES THE COPY. Before the label this
+      # notification was indistinguishable from a failed local restore.
+      - eval_time: 30m
+        alertname: TalosBackupRestoreDrillLastRunFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: data-loss
+              job: node-exporter
+              source: b2
+            exp_annotations:
+              summary: "The last backup→restore drill RAN AND FAILED (b2 copy)"
+              description: |
+                scripts/drills/backup-restore.sh completed and reported
+                failure while restoring the b2 copy —
+                this is not "the drill is overdue", it is "the drill
+                ran and the backups did not come back". `artifact` is the local
+                dump in $BACKUP_DIR, `b2` the off-host archive, `live` a fresh
+                dump taken by the drill itself. Until it passes, the
+                readability of that copy is unproven.
+                The metric records only the outcome, never which step failed,
+                so read the run's own output: ~/.talos/logs/backup-drill.log
+                for a scheduled run, or re-run it by hand with `make drill`.
+                Common causes, in the order they are checked: no escrowed KEK
+                source (TALOS_DRILL_ESCROW_KEY_CMD / _FILE — the drill refuses
+                to read the key from the live stack, by design), a missing or
+                stale artifact in $BACKUP_DIR, and a restore or decrypt that
+                failed on real rows. Clears on the next successful run.
+      # …and the STALENESS alert stays silent, because a successful drill of
+      # some copy did happen recently. If the producer had written
+      # `last_success{source="b2"} 0` for the never-succeeded b2 copy — the
+      # obvious pre-seed, and what the pre-label code did — this would fire
+      # with a summary that is FLATLY FALSE. That is why emit_metric writes
+      # NO last_success line for a copy that has never been proven.
+      - eval_time: 70m
+        alertname: TalosBackupRestoreDrillFailed
+        exp_alerts: []
+      - eval_time: 180m
+        alertname: TalosBackupRestoreDrillFailed
+        exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # RETENTION MUST NOT MANUFACTURE AN ALERT. `last_success` is kept per
+  # copy, so an operator who drilled `b2` once a year ago leaves that sample
+  # on disk forever. A bare `x < time() - 14d` would then fire permanently
+  # about an abandoned one-off — the "permanently-red trains you to ignore
+  # red" failure this file argues against elsewhere. `max without(source)`
+  # is what stops it, and this is the test that would go red if someone
+  # simplified the aggregation away.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: one copy ancient, one copy fresh — the aggregate stays silent
+    input_series:
+      - series: 'talos_backup_drill_last_success_timestamp_seconds{job="node-exporter",source="artifact"}'
+        values: "0+0x180"
+      - series: 'talos_backup_drill_last_success_timestamp_seconds{job="node-exporter",source="b2"}'
+        values: "-2000000+0x180"
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: TalosBackupRestoreDrillFailed
+        exp_alerts: []
+      - eval_time: 180m
+        alertname: TalosBackupRestoreDrillFailed
+        exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # …and when EVERY copy is stale it fires exactly ONCE, not once per copy.
+  # Seeding/retaining a label dimension under a `<` comparison is how a
+  # single fault became three identical pages in #625; the aggregation
+  # closes that here by construction, and `without(source)` keeps `job` so
+  # anything grouping or silencing on it still matches.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: every copy ancient — one alert, not one per copy
+    input_series:
+      - series: 'talos_backup_drill_last_success_timestamp_seconds{job="node-exporter",source="artifact"}'
+        values: "-2000000+0x180"
+      - series: 'talos_backup_drill_last_success_timestamp_seconds{job="node-exporter",source="b2"}'
+        values: "-3000000+0x180"
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: TalosBackupRestoreDrillFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: ops-hygiene
+              job: node-exporter
+            exp_annotations:
+              summary: "No successful backup→restore drill of ANY copy in 14+ days"
+              description: |
+                scripts/drills/backup-restore.sh has either not run or is
+                failing. A backup you have not restored is a hypothesis —
+                run the drill now. If this fired via the absent() arm the
+                series has NEVER been published: check that the drill script
+                is scheduled at all and that its node_exporter textfile
+                directory is being collected.
+                This alert aggregates over the `source` label, so it carries
+                none: `make drill-schedule-status` says which copy (artifact /
+                b2 / live) was last proven and which has never been.
+
+  # ══════════════════════════════════════════════════════════════════════
+  # THE DEPLOY WINDOW. Between this change landing and the next drill run,
+  # Prometheus is still scraping the UNLABELLED series the old producer
+  # wrote. Both rules must keep working on it — a metric change that only
+  # works after the producer catches up is a gap, not a migration.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: pre-label unlabelled series — both rules still behave
+    input_series:
+      - series: 'talos_backup_drill_last_success_timestamp_seconds{job="node-exporter"}'
+        values: "-2000000+0x180"
+      - series: 'talos_backup_drill_last_status{job="node-exporter"}'
+        values: "0+0x180"
+    alert_rule_test:
+      # `max without(source)` over a series that never had a `source` label
+      # is a no-op that keeps `job`, so the stale arm is unchanged.
+      - eval_time: 70m
+        alertname: TalosBackupRestoreDrillFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: ops-hygiene
+              job: node-exporter
+            exp_annotations:
+              summary: "No successful backup→restore drill of ANY copy in 14+ days"
+              description: |
+                scripts/drills/backup-restore.sh has either not run or is
+                failing. A backup you have not restored is a hypothesis —
+                run the drill now. If this fired via the absent() arm the
+                series has NEVER been published: check that the drill script
+                is scheduled at all and that its node_exporter textfile
+                directory is being collected.
+                This alert aggregates over the `source` label, so it carries
+                none: `make drill-schedule-status` says which copy (artifact /
+                b2 / live) was last proven and which has never been.
+      # The status alert still fires — and its summary shows the cost of a
+      # missing label plainly: "( copy)". That is ugly on purpose rather
+      # than hidden behind a default, because a `source` that silently reads
+      # as "artifact" would be exactly the false attribution this whole
+      # change exists to remove. It lasts one drill run.
+      - eval_time: 30m
+        alertname: TalosBackupRestoreDrillLastRunFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: data-loss
+              job: node-exporter
+            exp_annotations:
+              summary: "The last backup→restore drill RAN AND FAILED ( copy)"
+              description: |
+                scripts/drills/backup-restore.sh completed and reported
+                failure while restoring the  copy —
+                this is not "the drill is overdue", it is "the drill
+                ran and the backups did not come back". `artifact` is the local
+                dump in $BACKUP_DIR, `b2` the off-host archive, `live` a fresh
+                dump taken by the drill itself. Until it passes, the
+                readability of that copy is unproven.
+                The metric records only the outcome, never which step failed,
+                so read the run's own output: ~/.talos/logs/backup-drill.log
+                for a scheduled run, or re-run it by hand with `make drill`.
+                Common causes, in the order they are checked: no escrowed KEK
+                source (TALOS_DRILL_ESCROW_KEY_CMD / _FILE — the drill refuses
+                to read the key from the live stack, by design), a missing or
+                stale artifact in $BACKUP_DIR, and a restore or decrypt that
+                failed on real rows. Clears on the next successful run.
 
   # ══════════════════════════════════════════════════════════════════════
   # OFF-HOST BACKUP EGRESS (Tier 2).
