@@ -140,11 +140,14 @@ Tunables (all env vars):
 | `TALOS_DRILL_ESCROW_KEY_CMD` | unset | Command whose stdout is the escrowed `TALOS_MASTER_KEY`. Preferred: the key never lands on disk (it is captured through a pipe, never spooled to a file). Its stderr really does stay attached — it carried a `2>/dev/null` until 2026-08-13, which contradicted the line above it and swallowed both a password-manager prompt and a failing helper's diagnostic. Refused if it names `docker exec`/`docker inspect`/`printenv TALOS_MASTER_KEY`, or if a path-shaped argument resolves inside a checkout or `$BACKUP_DIR`. Setting this **and** `_FILE` is refused. |
 | `TALOS_DRILL_ESCROW_KEY_FILE` | unset | File whose first line is the escrowed `TALOS_MASTER_KEY`. **Refused if it resolves inside a checkout (this one *or* the main clone when you are in a worktree) or inside `$TALOS_DRILL_BACKUP_DIR`** — a key stored beside the ciphertext it unlocks is not encryption. Symlinks are resolved before the check; hard links are not, and cannot be. Setting this **and** `_CMD` is refused rather than resolved by precedence. |
 | `TALOS_DRILL_ESCROW_TIMEOUT_SECS` | `120` | Wall-clock bound on `_CMD`. On expiry the whole process tree is killed and the drill fails naming this knob. Without it a helper that prompts (Touch ID) hangs forever under launchd, which also stops launchd starting the *next* weekly run — the drill silently stops running with only the 14-day alert as signal. |
-| `TALOS_DRILL_MAX_ARTIFACT_AGE_HOURS` | `168` | Maximum age of the newest Postgres dump **and** the newest Vault archive. Older ⇒ the drill fails. Without this the age was computed, printed, and never compared, so a sidecar that died left the drill green for as long as its last artifact survived retention. `0` disables (use only to drill an archived artifact deliberately). Default is deliberately loose: the sidecars tick only while the laptop is awake, and a real two-day gap exists in the artifact history. |
+| `TALOS_DRILL_MAX_ARTIFACT_AGE_HOURS` | `168` | Maximum age of the newest Postgres dump, the newest Vault archive **and** the newest Neo4j archive. Older ⇒ the drill fails. Without this the age was computed, printed, and never compared, so a sidecar that died left the drill green for as long as its last artifact survived retention. `0` disables (use only to drill an archived artifact deliberately). Default is deliberately loose: the sidecars tick only while the laptop is awake, and a real two-day gap exists in the artifact history. |
 | `TALOS_DRILL_KEK_PROVIDER` | `env` | Which provider wrapped the DEKs. Was read from the live container; now stated, because in a real recovery there is no live container. Matches `docker-compose.yml`'s `KEK_PROVIDER` default. Being wrong fails loudly at the first decrypt. |
 | `TALOS_DRILL_ALLOW_NO_CIPHERTEXT` | unset | Read by `verify_restore`, not the script. Waives the "something, anywhere, must have decrypted" floor. Only correct for a genuinely fresh deployment, and it means the run certifies nothing about readability. |
 | `TALOS_DRILL_PG_IMAGE` | digest-pinned pgvector:pg16 | Scratch Postgres image. **Must be ≥ the major version the dump came from.** The compose stack is pg16 so the default matches; the Helm chart deploys `pgvector/pgvector:pg17`, and a pg17 dump will not restore into pg16. On a pg17 deployment set this to a pg17 image. The failure is loud (`pg_restore` aborts under `--exit-on-error`), not silent. |
 | `TALOS_DRILL_VAULT_IMAGE` | digest-pinned hashicorp/vault:1.18 | Scratch Vault image. |
+| `TALOS_DRILL_NEO4J_IMAGE` | digest-pinned neo4j:5.26-community | Scratch Neo4j image. **Must match the version that WROTE the store** — the artifact is a raw store copy, not a `neo4j-admin database dump`. Pinned to the same digest `docker-compose.yml` uses for both the `neo4j` service and the `neo4j-backup` sidecar; keep the three in lockstep. The bare tag is not enough: measured 2026-08-26, `neo4j:5.26-community` on this host already resolves to a different image than the live container runs. A mismatch is loud but terse — Neo4j exits in ~2 s with code 3 and an empty `debug.log` — so the drill re-checks liveness every second and dumps both logs the moment it stops. |
+| `TALOS_DRILL_NEO4J_COUNT_TOLERANCE` | `50` | How far the restored graph may fall SHORT of the count its own manifest recorded. Not 0, because the sidecar's probe runs 26-55 s *after* the tar, so writes in that window are in the probe and not in the archive — and a flaky assertion here pages (`last_status == 0` carries `category: data-loss`). Exceeding the manifest is never tolerated: the graph is MERGE-only. |
+| `TALOS_DRILL_ALLOW_NO_NEO4J` | unset | Required on a host with **no** `~/.talos/backups/neo4j/` artifacts; without it their absence is fatal. Deliberate: a silent skip would let a dead `neo4j-backup` sidecar produce a green drill that certified two kinds of three. A waived run reports neo4j as NOT VERIFIED and emits no `talos_backup_drill_kind_verified{kind="neo4j"}` series. |
 | `TALOS_DRILL_ALLOW_PRODUCTION` | unset | Required to run when a production environment is detected. Don't. |
 | `TALOS_DRILL_ALLOW_NO_METRIC` | unset | Waive the "metric must be publishable" precondition. Accepts a permanently-firing alert. |
 | `TALOS_OFFHOST_AGE_PASSPHRASE_CMD` | unset | **`--source b2` only.** Command whose stdout is the escrowed `age` passphrase. Same containment as the KEK's `_CMD`: a path-shaped argument resolving inside a checkout or `$BACKUP_DIR` is refused, and setting this **and** `_FILE` is refused rather than resolved by precedence. Bounded by `TALOS_OFFHOST_ESCROW_TIMEOUT_SECS` (default 120), whose expiry kills the whole process group. |
@@ -376,8 +379,8 @@ when Phase 2 onboards — file an RFC before reaching for it.
 
 ### Wiring the metric into Prometheus
 
-`backup-restore.sh` writes `talos_backup_drill.prom` with three series,
-every one of them labelled `source="artifact"|"b2"|"live"` — **the copy the
+`backup-restore.sh` writes `talos_backup_drill.prom` with four series. The
+first three are labelled `source="artifact"|"b2"|"live"` — **the copy the
 run restored**. That label was added 2026-08-26 and it is the difference
 between "a drill passed" and "the backups are verified": the scheduled run
 has always been `artifact`, a dump on the very disk the backups insure
@@ -397,8 +400,43 @@ against, and until the label existed nothing in the metrics could say so.
   failure. **One series**, same as `last_run`.
 
 The label set is closed (three values), enforced on both the write side
-(`--source` validation) and the read side (the carry-forward regex), so the
-family can never exceed nine series.
+(`--source` validation) and the read side (the carry-forward regex), so those
+three can never exceed nine series.
+
+The fourth is a **separate metric name**, added 2026-08-26 with the Neo4j leg:
+
+- `talos_backup_drill_kind_verified{source,kind}` — **which artifact kinds
+  the most recent run actually verified.** `kind` is `postgres|vault|neo4j`,
+  the same closed set `talos_offhost_backup_*` uses. Three values, and the
+  third one is an absence:
+  - `1` — restored **and** its content assertion passed.
+  - `0` — **present but NOT verified**: either the leg failed, or there was
+    nothing to check it against (a manifest recording `neo4j_nodes=unknown`,
+    or no manifest at all).
+  - **no line** — the kind is **not present** on this host, or not attempted
+    for that copy (`--source b2` and `--source live` do not fetch neo4j).
+
+  Per-run, like `last_run`/`last_status` — nothing is carried forward, so it
+  always describes one drill. Ceiling 3 kinds x 3 sources = nine more series.
+
+  **Why a new name rather than a `kind` label on the three above.** The
+  readers were inventoried first: `schedule.sh`'s awk matches
+  `\{source="[a-z0-9]+"\} ` and breaks with `kind` in *any* position;
+  `emit_metric`'s own carry-forward greps need `source` to be the last label;
+  `talos_backup_drill_last_status == 0` would match one series per kind and
+  that alert routes to PagerDuty; and the staleness rule's
+  `max without(source)` would retain `kind` and fire once per kind. Adding
+  the label would have broken four readers, two of them silently, in the
+  failure-reporting path. See the comment above `record_kind` in the script.
+
+  **There is deliberately no alert rule on it.** A "neo4j has never been
+  verified" rule would fire on install and never clear on a host that
+  legitimately runs no graph — the permanently-red shape this alert family
+  has already refused twice. A neo4j leg that *fails* sets
+  `last_status = 0`, which does alert. The never-attempted case is reported
+  by `make observability-verify` (leg F5) and in the drill's own banner,
+  whose headline now reads `PASSED - N/3 kinds verified` and turns amber
+  below 3.
 
 `make drill-schedule-status` prints which copy the scheduled run restores,
 when each copy was last proven, and says outright when the **off-host** copy
@@ -452,17 +490,44 @@ repo has learned not to take on trust.
 
 Honest list so future-you doesn't develop false confidence:
 
-1. **Neo4j graph data.** The drill tests Postgres + Vault only. This is
-   not a hypothetical gap: the `neo4j-backup` compose sidecar has been
-   writing `~/.talos/backups/neo4j/neo4j-*.tar.gz` daily since July, and
-   those artifacts get tar-integrity + expected-paths verification and
-   nothing else — they are, today, exactly the "backup nobody has ever
-   restored" that this drill was rewritten to eliminate for Postgres and
-   Vault. Community Edition can't host a scratch database, so a restore
-   drill means standing up a throwaway Neo4j on the tarball and counting
-   nodes/relationships against the manifest. Mitigating factor, not an
-   excuse: the graph is reconstructible from `actor_memory` via
-   `graph_backfill`.
+1. **~~Neo4j graph data~~ — CLOSED 2026-08-26 for `--source artifact`.
+   What the counts prove is narrow, and `--source b2` still does not fetch
+   it.** The drill now extracts the newest `neo4j-*.tar.gz` into a scratch
+   volume, starts a digest-pinned `neo4j:5.26-community` on it (the store is
+   a RAW COPY, so the server must match the one that wrote it — on this host
+   the bare tag has *already* drifted to a different image than the live
+   container runs), waits for the `neo4j` database to reach `online` so
+   transaction recovery has completed, and compares the restored node and
+   relationship counts against the `neo4j_nodes=` / `neo4j_relationships=`
+   the sidecar recorded in the artifact's own manifest — numbers that had sat
+   in every manifest since July with no reader.
+
+   **What a green neo4j leg does NOT prove.** A count is a weak content
+   check: 1,283 nodes of the right shape and 1,283 nodes of garbage both
+   count 1,283. It establishes cardinality, that the store opens, and that
+   the database recovers — not that any node holds the right properties.
+   Nothing stronger is available *from the manifest*, which records exactly
+   two integers.
+
+   **The assertion is `manifest - 50 <= restored <= manifest`, not
+   equality**, because the sidecar's probe runs *after* the tar (its only
+   call site is the manifest here-block), leaving a 26-55 s window in which
+   writes land in the probe but not the archive. The upper bound is exact
+   because the graph is MERGE-only with no production DELETE path, so
+   exceeding it means the manifest does not belong to the archive. Tolerance
+   knob: `TALOS_DRILL_NEO4J_COUNT_TOLERANCE` (default 50 — more than a peak
+   day's entire write volume, and ~25x smaller than the smallest real
+   failure). Measured: all 13 archives on this host restore to *exactly*
+   their manifest counts, 7 of them taken on days the graph grew.
+
+   **Absence is fatal by default.** A host with no neo4j backups must set
+   `TALOS_DRILL_ALLOW_NO_NEO4J=1`; otherwise a dead sidecar would let the
+   drill go green having certified two kinds. The waived run reports neo4j
+   as NOT VERIFIED and emits no `kind_verified{kind="neo4j"}` series.
+
+   **Still open:** `--source b2` restores postgres and vault only, so an
+   off-host drill certifies 2 of 3 even though #677 made the graph
+   uploadable. `--source live` likewise does not dump the graph.
 2. **MinIO object storage.** Audit logs and artifacts live there.
    Not in scope today because the blast radius of a MinIO loss is
    smaller than DEK loss — but worth adding.

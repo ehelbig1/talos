@@ -64,9 +64,26 @@ pub enum ArtifactKind {
     /// the metric exposition is rendered in; putting a new kind in the middle
     /// would reorder existing lines for no benefit.
     ///
-    /// Uploadable and fetchable as of 2026-08-26. **NOT restored by
-    /// `scripts/drills/backup-restore.sh`** — that drill knows two artifacts,
-    /// `PG_ARTIFACT` and `VAULT_ARTIFACT`. See `docs/offhost-backup.md`.
+    /// Uploadable and fetchable as of 2026-08-26.
+    ///
+    /// **Restore-drilled as of 2026-08-26, for `--source artifact` only.**
+    /// The sentence here previously read "NOT restored by
+    /// `scripts/drills/backup-restore.sh`", which was true when written and
+    /// is the reason the leg exists; it is replaced rather than deleted
+    /// because the shape — an omission recorded honestly, then closed — is
+    /// the thing worth remembering. The drill now extracts the archive into
+    /// a scratch volume, starts a version-pinned Neo4j on it, waits for the
+    /// database to reach `online` (transaction recovery), and compares the
+    /// restored node/relationship counts against the `neo4j_nodes=` /
+    /// `neo4j_relationships=` the sidecar wrote into the artifact's own
+    /// manifest.
+    ///
+    /// **Still NOT restored by `--source b2`.** The off-host branch fetches
+    /// postgres and vault only, so a green `--source b2` drill certifies 2 of
+    /// these 3 kinds. It says so: the drill emits
+    /// `talos_backup_drill_kind_verified{source,kind}` and writes no line for
+    /// a kind it did not attempt. See `docs/offhost-backup.md` and
+    /// `scripts/drills/README.md`.
     Neo4j,
 }
 
