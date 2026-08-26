@@ -1075,6 +1075,62 @@ pub(crate) fn spawn_metrics_gauge_tasks(
         });
     }
 
+    // Background task: catalog missing-WASM detector. Runs every 5 min and
+    // re-measures `talos_catalog_templates_missing_wasm`.
+    //
+    // WHY THIS EXISTS (2026-08-26). The gauge was published from ONE place —
+    // `seed_templates`, a boot-time function — and `TalosCatalogTemplateNeverCompiled`
+    // reads it forever. That broke it in both directions: a catalog row that
+    // lost its bytes after boot left the gauge at 0 and the alert could never
+    // fire, and a row repaired after boot left it above 0 and the alert fired
+    // until the next restart. Note the shape had already bitten this same alert
+    // once — an earlier fix added publish calls at `seed_templates`' two early
+    // returns so the alert was fireable in OCI mode, but adding publish SITES
+    // does not make a value REFRESH.
+    //
+    // WHY 5 MINUTES. Sized against how fast the population can actually move,
+    // which is: not fast. Every writer that can add or remove a member was
+    // enumerated. Everything that creates a missing row and then repairs it
+    // (`talos_registry::reconcile::{upsert_catalog_template_by_slug,
+    // refresh_catalog_wasm_by_slug}`) runs only inside `seed_templates`, i.e.
+    // at boot. The OCI sync loop cannot add a member at all — it always binds a
+    // non-empty `oci_url`. The one runtime mover, in both directions, is
+    // `POST /api/registry/publish`, a discrete operator action. 300s also
+    // matches the OCI sync cadence, the fastest periodic writer that touches
+    // these rows at all; sampling faster than the fastest writer buys nothing.
+    // The consumer alert's `for: 15m` dominates this interval either way.
+    //
+    // COST, stated: one `SELECT COUNT(*)` over the `modules` heap. Measured
+    // 0.3 ms / 32 shared buffer hits / zero TOAST reads on the reference
+    // deployment (112 rows, 256 kB heap, 11 MB with TOAST) —
+    // `octet_length(bytea)` reads the length from the TOAST pointer header and
+    // never detoasts the blob. Bounded by the catalog plus per-user sandbox
+    // modules; it does not scan executions, memory, or anything that grows with
+    // traffic. See `services::measure_catalog_missing_wasm`.
+    //
+    // FIRST TICK SKIPPED, so the first sweep lands at T+300s — long after the
+    // boot publish has awaited the background compiles (which take well under a
+    // minute). A sweep cannot report a pre-compile count.
+    //
+    // Unconditional: no config gate. A detector behind a flag that defaults off
+    // is a detector that is off.
+    {
+        let pool = db_pool.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let measured =
+                    crate::bootstrap::services::measure_catalog_missing_wasm(&pool).await;
+                crate::bootstrap::services::publish_catalog_missing_wasm(
+                    metrics::global().map(|m| m.as_ref()),
+                    &measured,
+                );
+            }
+        });
+    }
+
     // Background task: fuel-headroom detector. Runs every 5 min and republishes
     // `talos_fuel_high_utilisation_nodes` + its denominator from
     // `execution_cost_rollup`.

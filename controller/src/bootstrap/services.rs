@@ -2341,19 +2341,66 @@ pub(crate) const CATALOG_MISSING_WASM_SQL: &str = "SELECT COUNT(*) FROM modules 
        AND (wasm_bytes IS NULL OR octet_length(wasm_bytes) = 0) \
        AND (oci_url IS NULL OR oci_url = '')";
 
-/// Set the gauge (and warn when non-zero). Split out from the spawned task so
-/// a unit test can drive the PRODUCTION path and assert the gauge actually
-/// moved — CLAUDE.md's check-58 guidance: a wrapper that nothing calls, or
-/// calls with the wrong value, is invisible to the textual dead-metric lint.
+/// Publish one measurement. Split out from the spawned task so a unit test can
+/// drive the PRODUCTION path and assert the gauge actually moved — CLAUDE.md's
+/// check-58 guidance: a wrapper that nothing calls, or calls with the wrong
+/// value, is invisible to the textual dead-metric lint.
+///
+/// **Takes a `Result`, not an `i64`, and that is the point of the 2026-08-26
+/// change.** The caller used to `match` the query and only call this on `Ok`;
+/// on `Err` it logged a WARN and returned, so the gauge was never `.set()` and
+/// held its registration-time 0. `talos_catalog_templates_missing_wasm 0` then
+/// meant BOTH "measured, every catalog template can run" and "the query failed
+/// and nothing was ever measured" — and because the publish happened once per
+/// process with no retry, the second reading was PERMANENT. One failed
+/// `SELECT` during boot switched `TalosCatalogTemplateNeverCompiled` off for
+/// the life of the controller while it read as a clean bill of health. Routing
+/// the error through here makes the failure path a first-class, tested case.
+///
+/// **On failure the count HOLDS its last value.** It is not zeroed (that would
+/// read as "the templates were repaired") and no sentinel is folded into it
+/// (`get_catalog_status` and the alert's `{{ $value }}` both read it as a row
+/// count). What changes is that
+/// `talos_catalog_missing_wasm_scan_last_success_timestamp_seconds` stops
+/// advancing, which `TalosCatalogMissingWasmDetectorBlind` consumes.
+///
+/// No row content, template name, or tenant identifier reaches a log line or a
+/// label: the count is a count, and the error text is the driver's, which
+/// carries the failing statement rather than its data.
 ///
 /// Takes the collector explicitly rather than reading `metrics::global()` so
 /// the test does not have to win a race for a process-wide `OnceLock`.
 pub(crate) fn publish_catalog_missing_wasm(
     metrics: Option<&talos_metrics::TalosMetrics>,
-    missing: i64,
+    measured: &Result<i64, String>,
 ) {
+    let missing = match measured {
+        Ok(missing) => *missing,
+        Err(e) => {
+            tracing::warn!(
+                target: "talos_catalog",
+                event_kind = "catalog_missing_wasm_probe_failed",
+                error = %e,
+                "could not measure talos_catalog_templates_missing_wasm; the gauge is \
+                 holding a value it did not measure and TalosCatalogTemplateNeverCompiled \
+                 cannot fire until \
+                 talos_catalog_missing_wasm_scan_last_success_timestamp_seconds advances again"
+            );
+            return;
+        }
+    };
+
     if let Some(m) = metrics {
         m.catalog_templates_missing_wasm.set(missing);
+        // `unwrap_or(0.0)` on a pre-epoch clock stamps 0, which the alert reads
+        // as maximally stale — the fail-SAFE direction. A clock that cannot
+        // produce a unix time is not evidence that the sweep ran.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        m.catalog_missing_wasm_scan_last_success_timestamp_seconds
+            .set(now);
     }
     if missing > 0 {
         tracing::warn!(
@@ -2362,6 +2409,24 @@ pub(crate) fn publish_catalog_missing_wasm(
              call get_catalog_status for the names"
         );
     }
+}
+
+/// Measure the missing-WASM population once, collapsing the driver error to a
+/// `String` so the publish path can be unit-tested without a live pool.
+///
+/// COST, stated (measured 2026-08-26 against the reference deployment, 112
+/// `modules` rows / 256 kB heap / 11 MB with TOAST): one sequential scan,
+/// **0.3 ms, 32 shared buffer hits, zero TOAST reads**. `octet_length(bytea)`
+/// resolves the length from the varlena/TOAST pointer header
+/// (`toast_raw_datum_size`) and never detoasts the blob, which is why a count
+/// over multi-megabyte WASM columns is cheap. The scan is over the `modules`
+/// heap only — bounded by the catalog plus per-user sandbox modules, not by
+/// executions or memory — so this is not an unbounded scan on a periodic task.
+pub(crate) async fn measure_catalog_missing_wasm(pool: &sqlx::PgPool) -> Result<i64, String> {
+    sqlx::query_scalar::<_, i64>(CATALOG_MISSING_WASM_SQL)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// D3 (2026-08-11): a template that cannot compile must not be visible only
@@ -2377,16 +2442,30 @@ pub(crate) fn publish_catalog_missing_wasm(
 /// no-`module-templates/` paths do exactly that, because a gauge published on
 /// only one of three exits is an alert that cannot fire in the other two.
 ///
-/// Stated limits: (a) recomputed at BOOT ONLY, so on a controller that runs
-/// for days the value is as old as the last restart. In DISK mode that is
-/// benign — only the seeder writes these rows. In OCI mode it is NOT: the
-/// registry sync loop rewrites catalog rows every 5 minutes, so a row that
-/// becomes unrunnable mid-life (sync drops its `oci_url`) is not reflected
-/// until the next boot. (b) It is per-process, so each replica publishes its
-/// own (they agree — the rows are shared). (c) The named detail lives in
-/// `get_catalog_status` → `never_compiled`, because a per-template label here
-/// would be an unbounded-cardinality surface in OCI mode where template names
-/// are registry-supplied.
+/// **This is the BOOT publish and it is deliberately kept** alongside the
+/// 300 s sweep in `spawn_metrics_gauge_tasks`. It exists so the value is
+/// correct the moment the compiles settle rather than up to five minutes
+/// later, and so the three seeding exits each leave a measured value behind.
+/// The sweep is what keeps it correct afterwards.
+///
+/// Stated limits, corrected 2026-08-26:
+/// (a) **CORRECTION.** This comment previously claimed the value goes stale in
+/// OCI mode because "the registry sync loop rewrites catalog rows every 5
+/// minutes, so a row that becomes unrunnable mid-life (sync drops its
+/// `oci_url`)". **That mechanism does not exist.** `talos_registry::sync`'s
+/// upsert binds an `oci_url` it constructs itself
+/// (`format!("oci://{host}/{ns}/{name}:{tag}")`), which is never empty, and no
+/// statement in the workspace sets `modules.oci_url` to NULL or `''`. The real
+/// runtime mover of this population is `POST /api/registry/publish`
+/// (`talos_registry::api`), which inserts a catalog row with no `wasm_bytes`
+/// and a caller-supplied `oci_url` that is not rejected when empty — and which
+/// moves rows in BOTH directions, in either mode. That is why the sweep is not
+/// gated on OCI mode.
+/// (b) It is per-process, so each replica publishes its own (they agree — the
+/// rows are shared).
+/// (c) The named detail lives in `get_catalog_status` → `never_compiled`,
+/// because a per-template label here would be an unbounded-cardinality surface
+/// in OCI mode where template names are registry-supplied.
 pub(crate) fn spawn_catalog_missing_wasm_gauge(
     pool: sqlx::PgPool,
     compile_tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -2395,18 +2474,8 @@ pub(crate) fn spawn_catalog_missing_wasm_gauge(
         for h in compile_tasks {
             let _ = h.await;
         }
-        match sqlx::query_scalar::<_, i64>(CATALOG_MISSING_WASM_SQL)
-            .fetch_one(&pool)
-            .await
-        {
-            Ok(missing) => {
-                publish_catalog_missing_wasm(metrics::global().map(|m| m.as_ref()), missing)
-            }
-            Err(e) => tracing::warn!(
-                error = %e,
-                "could not publish talos_catalog_templates_missing_wasm"
-            ),
-        }
+        let measured = measure_catalog_missing_wasm(&pool).await;
+        publish_catalog_missing_wasm(metrics::global().map(|m| m.as_ref()), &measured);
     });
 }
 
@@ -2551,18 +2620,130 @@ mod catalog_seed_tests {
              zero differently)"
         );
 
-        publish_catalog_missing_wasm(Some(&m), 3);
+        publish_catalog_missing_wasm(Some(&m), &Ok(3));
         assert_eq!(m.catalog_templates_missing_wasm.get(), 3);
 
         // The healthy case must be PUBLISHED, not skipped. This is what makes
         // `TalosCatalogTemplateNeverCompiled`'s deliberate lack of an
         // `absent()` arm defensible: a zero is a real observation.
-        publish_catalog_missing_wasm(Some(&m), 0);
+        publish_catalog_missing_wasm(Some(&m), &Ok(0));
         assert_eq!(m.catalog_templates_missing_wasm.get(), 0);
 
         // No collector (metrics not initialised yet) must not panic — the
         // seeder runs during boot and can race global metrics init.
-        publish_catalog_missing_wasm(None, 7);
+        publish_catalog_missing_wasm(None, &Ok(7));
+    }
+
+    /// A FAILING query must produce a state distinguishable from "zero
+    /// missing". This is the defect the 2026-08-26 change exists to remove,
+    /// pinned in the failure direction: pre-change the caller `match`ed the
+    /// query and simply did not publish on `Err`, so the gauge held its
+    /// registration-time 0 and read as a clean bill of health — permanently,
+    /// because there was no loop to retry.
+    ///
+    /// Drives the real producer, not a re-implementation.
+    #[test]
+    fn a_failed_measurement_is_distinguishable_from_zero_missing() {
+        let m = talos_metrics::TalosMetrics::new().expect("build metrics");
+
+        // Registration state: count 0 AND stamp 0. An operator reading only
+        // the count here would conclude "no catalog template is broken"; the
+        // stamp says nothing has ever been measured.
+        assert_eq!(m.catalog_templates_missing_wasm.get(), 0);
+        assert_eq!(
+            m.catalog_missing_wasm_scan_last_success_timestamp_seconds
+                .get(),
+            0.0,
+            "the freshness stamp must NOT be seeded — 0 reads as maximally \
+             stale, so a controller whose sweep never ran is loud"
+        );
+
+        // A failure at this point must not advance the stamp. Count and stamp
+        // are byte-identical to the registration state, which is correct: the
+        // detector has still never measured anything.
+        publish_catalog_missing_wasm(Some(&m), &Err("connection closed".to_string()));
+        assert_eq!(
+            m.catalog_missing_wasm_scan_last_success_timestamp_seconds
+                .get(),
+            0.0,
+            "a failed measurement must not advance the freshness stamp"
+        );
+
+        // A real measurement of ZERO advances the stamp. THIS is what makes
+        // the healthy case distinguishable from the blind one: same count,
+        // different stamp.
+        publish_catalog_missing_wasm(Some(&m), &Ok(0));
+        let measured_clean = m
+            .catalog_missing_wasm_scan_last_success_timestamp_seconds
+            .get();
+        assert!(
+            measured_clean > 0.0,
+            "a successful measurement — including a measurement of 0 — must \
+             stamp the freshness gauge, or 'clean' and 'blind' stay identical"
+        );
+        assert_eq!(m.catalog_templates_missing_wasm.get(), 0);
+
+        // Now the case the alert exists for: 4 broken templates, measured.
+        publish_catalog_missing_wasm(Some(&m), &Ok(4));
+        assert_eq!(m.catalog_templates_missing_wasm.get(), 4);
+
+        // And a failure AFTER a real reading HOLDS the count rather than
+        // zeroing it or folding in a sentinel. Zeroing would read as "the
+        // templates were repaired"; a sentinel would corrupt the row count
+        // that `get_catalog_status` and the alert's `{{ $value }}` display.
+        let stamp_before = m
+            .catalog_missing_wasm_scan_last_success_timestamp_seconds
+            .get();
+        publish_catalog_missing_wasm(Some(&m), &Err("statement timeout".to_string()));
+        assert_eq!(
+            m.catalog_templates_missing_wasm.get(),
+            4,
+            "the count must HOLD on failure, not zero and not a sentinel"
+        );
+        assert_eq!(
+            m.catalog_missing_wasm_scan_last_success_timestamp_seconds
+                .get(),
+            stamp_before,
+            "the stamp must freeze on failure — that freeze is the only signal \
+             that the held 4 is not a fresh reading"
+        );
+
+        // No collector must not panic on the failure path either.
+        publish_catalog_missing_wasm(None, &Err("no pool".to_string()));
+    }
+
+    /// The blind signal must ship with its consumer — a gauge no alert reads
+    /// is structural check 58's dead metric, and this PR would then be
+    /// shipping its own thesis as a defect.
+    ///
+    /// Pins BOTH halves: the alert exists, and it reads the series this file
+    /// stamps. Also pins the deliberate ABSENCE of an `absent()` arm, for the
+    /// reason stated in alerts.yaml — a plain registered `Gauge` is exported
+    /// from registration by every controller carrying this build, so absence
+    /// means the controller is down or is running an older image, and an
+    /// `absent()` arm would page permanently through a staged rollout.
+    #[test]
+    fn the_blind_signal_has_a_consumer() {
+        const ALERTS: &str = include_str!("../../../deploy/helm/talos/files/alerts.yaml");
+        assert!(
+            ALERTS.contains("alert: TalosCatalogMissingWasmDetectorBlind"),
+            "the freshness stamp has no alert — a metric nothing reads is a \
+             dead metric (structural check 58)"
+        );
+        assert!(
+            ALERTS.contains(
+                "time() - talos_catalog_missing_wasm_scan_last_success_timestamp_seconds"
+            ),
+            "TalosCatalogMissingWasmDetectorBlind must read the series this \
+             module stamps"
+        );
+        assert!(
+            !ALERTS
+                .contains("absent(talos_catalog_missing_wasm_scan_last_success_timestamp_seconds"),
+            "no absent() arm on the blind detector — see the reasoning in \
+             alerts.yaml; adding one pages permanently through a staged \
+             rollout of an older controller image"
+        );
     }
 
     /// The gauge COUNTS a population; `get_catalog_status` → `never_compiled`

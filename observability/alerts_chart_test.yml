@@ -2106,10 +2106,13 @@ tests:
   #      published on every boot in every mode, including at 0);
   #   2. a non-zero value is still PENDING inside `for: 15m` — a cold start
   #      whose background compiles have not settled must not page;
-  #   3. it fires past 15m, and clears the moment the count returns to 0
-  #      (which in practice needs a controller restart, since the gauge is
-  #      recomputed at boot only — the alert clears, the operator's work is
-  #      what makes the underlying count drop).
+  #   3. it fires past 15m, and clears the moment the count returns to 0.
+  #      Until 2026-08-26 "the count returns to 0" required a controller
+  #      RESTART, because the gauge was published from `seed_templates` and
+  #      nothing else — so this third transition was demonstrable here at
+  #      synthetic time and unreachable in production without a bounce. A
+  #      300s sweep now re-measures it, and the blind-detector tests at the
+  #      bottom of this file cover the case the sweep alone does not fix.
   # ══════════════════════════════════════════════════════════════════════
   - interval: 1m
     name: catalog gauge at 0 is silent — the healthy published-zero case
@@ -2166,17 +2169,21 @@ tests:
                    template's own Cargo.toml does not count; `make check-catalog`
                    fails on exactly that divergence.
                 4. Fix the manifest, rebuild the controller image, restart. The
-                   gauge is recomputed after each boot's compiles settle, so it
-                   drops to 0 on the next healthy start — it is NOT continuously
-                   refreshed, so do not expect it to clear without a restart.
+                   gauge is measured after each boot's compiles settle AND
+                   re-measured every 5 minutes, so it drops to 0 within one sweep
+                   of the fix landing — a restart is needed to pick up a new
+                   image, not to clear the alert.
                 5. In OCI mode (`TALOS_REGISTRY_URL` set) steps 2-4 do not apply:
                    there is no disk seeder and no local compile. A counted row is
-                   one the registry sync wrote WITHOUT an `oci_url`, so start at
-                   the sync loop's logs and the published `_index` artifact.
-                   Because the sync loop rewrites catalog rows every 5 minutes
-                   while this gauge is only recomputed at boot, an OCI cluster's
-                   value can lag reality by a whole controller lifetime — treat a
-                   firing alert as real and a quiet one as weaker evidence there.
+                   one written WITHOUT an `oci_url`, so start at the sync loop's
+                   logs and the published `_index` artifact — and at
+                   `POST /api/registry/publish`, which accepts an empty `oci_url`
+                   and is the one runtime path that can move a row into this
+                   count in either mode.
+                6. If this is QUIET, check
+                   `TalosCatalogMissingWasmDetectorBlind` before concluding the
+                   catalog is healthy: a zero here means "measured, nothing
+                   broken" only while that alert is inactive.
       # Republished at 0 from t=40m — clears immediately, no `for:` on recovery.
       - eval_time: 45m
         alertname: TalosCatalogTemplateNeverCompiled
@@ -4248,4 +4255,180 @@ tests:
         exp_alerts: []
       - eval_time: 80m
         alertname: TalosCryptoOrphanDetectorBlind
+        exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # TalosCatalogMissingWasmDetectorBlind — the companion detector-health
+  # alert for TalosCatalogTemplateNeverCompiled, added 2026-08-26.
+  #
+  # WHY IT NEEDED ONE. `talos_catalog_templates_missing_wasm` was published
+  # from `seed_templates` — a BOOT-TIME function — and the alert above reads
+  # it forever, so a template that lost its WASM after boot left the gauge at
+  # 0 and the alert could never fire. Worse, the boot publish only called the
+  # setter on `Ok`: a failed query left the gauge at its registration-time 0
+  # with no retry, so "the detector is off" and "everything is healthy" were
+  # the same number, permanently.
+  #
+  # These tests drive the freshness stamp in BOTH directions. Run against the
+  # PRE-CHANGE alerts.yaml the two firing assertions fail with `got:[]` —
+  # they cannot pass without the rule. (The two silence assertions pass
+  # vacuously there, as any silence assertion does against a missing alert;
+  # the firing ones are what make this suite non-vacuous.)
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: TalosCatalogMissingWasmDetectorBlind — a sweep that keeps up is silent
+    input_series:
+      # The stamp tracks the clock exactly: every 300s sweep succeeded.
+      - series: 'talos_catalog_missing_wasm_scan_last_success_timestamp_seconds{job="talos-controller",instance="controller:8000"}'
+        values: "0+60x120"
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: TalosCatalogMissingWasmDetectorBlind
+        exp_alerts: []
+      - eval_time: 120m
+        alertname: TalosCatalogMissingWasmDetectorBlind
+        exp_alerts: []
+
+  - interval: 1m
+    name: TalosCatalogMissingWasmDetectorBlind — a stamp pinned at 0 (never measured) fires
+    input_series:
+      # 0 from registration and never advanced: either every attempt has
+      # errored since boot, or the sweep task never ran. This is the case the
+      # pre-change code could not distinguish from a healthy catalog.
+      - series: 'talos_catalog_missing_wasm_scan_last_success_timestamp_seconds{job="talos-controller",instance="controller:8000"}'
+        values: "0x120"
+    alert_rule_test:
+      # Threshold crossed at 31m, so this is PENDING inside `for: 15m`.
+      - eval_time: 40m
+        alertname: TalosCatalogMissingWasmDetectorBlind
+        exp_alerts: []
+      - eval_time: 50m
+        alertname: TalosCatalogMissingWasmDetectorBlind
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: observability
+              job: talos-controller
+              instance: controller:8000
+            exp_annotations:
+              summary: "Catalog missing-WASM detector has not measured in 30+ minutes"
+              description: |
+                `talos_catalog_templates_missing_wasm` has not been successfully
+                measured for over thirty minutes, so it is holding a value nothing
+                measured and `TalosCatalogTemplateNeverCompiled` cannot fire. While
+                this is firing, a catalog template that becomes unrunnable will not
+                be reported.
+
+                A value of 0 for the stamp means the sweep has NEVER succeeded on
+                this controller — either every attempt has errored since boot, or
+                the controller is running a build that predates the sweep.
+              action: |
+                1. Controller logs, `event_kind=catalog_missing_wasm_probe_failed`
+                   (target `talos_catalog`), carry the driver error for each failed
+                   attempt. No row content or template name is logged.
+                2. The probe is a single `SELECT COUNT(*)` over `modules`. A
+                   failure is almost always the pool, a `statement_timeout`, or a
+                   schema change to `modules.wasm_bytes` / `oci_url` / `kind`.
+                   Check `TalosDBPoolSaturated` / `TalosDBPoolExhausted` first.
+                3. Cross-check by hand — this is the same query the sweep runs:
+                   `SELECT COUNT(*) FROM modules WHERE kind='catalog'
+                    AND user_id IS NULL
+                    AND (wasm_bytes IS NULL OR octet_length(wasm_bytes)=0)
+                    AND (oci_url IS NULL OR oci_url='');`
+                4. `get_catalog_status` → `never_compiled` names any templates the
+                   gauge would have counted, and does not depend on this sweep.
+
+  - interval: 1m
+    name: TalosCatalogMissingWasmDetectorBlind — fires while blind, clears when the sweep recovers
+    input_series:
+      # Stamp frozen at 1800 for 90m (the sweep stopped succeeding), then it
+      # catches back up to the clock from t=91m.
+      - series: 'talos_catalog_missing_wasm_scan_last_success_timestamp_seconds{job="talos-controller",instance="controller:8000"}'
+        values: "1800x90 5400+60x40"
+    alert_rule_test:
+      # 3600 - 1800 == 1800 exactly: NOT `> 1800`. Pins the boundary.
+      - eval_time: 60m
+        alertname: TalosCatalogMissingWasmDetectorBlind
+        exp_alerts: []
+      # Crossed at 61m — pending, not firing. A DB blip must not page.
+      - eval_time: 70m
+        alertname: TalosCatalogMissingWasmDetectorBlind
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: TalosCatalogMissingWasmDetectorBlind
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: observability
+              job: talos-controller
+              instance: controller:8000
+            exp_annotations:
+              summary: "Catalog missing-WASM detector has not measured in 30+ minutes"
+              description: |
+                `talos_catalog_templates_missing_wasm` has not been successfully
+                measured for over thirty minutes, so it is holding a value nothing
+                measured and `TalosCatalogTemplateNeverCompiled` cannot fire. While
+                this is firing, a catalog template that becomes unrunnable will not
+                be reported.
+
+                A value of 0 for the stamp means the sweep has NEVER succeeded on
+                this controller — either every attempt has errored since boot, or
+                the controller is running a build that predates the sweep.
+              action: |
+                1. Controller logs, `event_kind=catalog_missing_wasm_probe_failed`
+                   (target `talos_catalog`), carry the driver error for each failed
+                   attempt. No row content or template name is logged.
+                2. The probe is a single `SELECT COUNT(*)` over `modules`. A
+                   failure is almost always the pool, a `statement_timeout`, or a
+                   schema change to `modules.wasm_bytes` / `oci_url` / `kind`.
+                   Check `TalosDBPoolSaturated` / `TalosDBPoolExhausted` first.
+                3. Cross-check by hand — this is the same query the sweep runs:
+                   `SELECT COUNT(*) FROM modules WHERE kind='catalog'
+                    AND user_id IS NULL
+                    AND (wasm_bytes IS NULL OR octet_length(wasm_bytes)=0)
+                    AND (oci_url IS NULL OR oci_url='');`
+                4. `get_catalog_status` → `never_compiled` names any templates the
+                   gauge would have counted, and does not depend on this sweep.
+      # The expression stopped matching at 91m, but `keep_firing_for: 5m`
+      # holds it. Asserting this is what makes the anti-flap knob a tested
+      # property rather than a comment — a `keep_firing_for` nobody drives is
+      # indistinguishable from one that was dropped in a refactor.
+      - eval_time: 95m
+        alertname: TalosCatalogMissingWasmDetectorBlind
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: observability
+              job: talos-controller
+              instance: controller:8000
+            exp_annotations:
+              summary: "Catalog missing-WASM detector has not measured in 30+ minutes"
+              description: |
+                `talos_catalog_templates_missing_wasm` has not been successfully
+                measured for over thirty minutes, so it is holding a value nothing
+                measured and `TalosCatalogTemplateNeverCompiled` cannot fire. While
+                this is firing, a catalog template that becomes unrunnable will not
+                be reported.
+
+                A value of 0 for the stamp means the sweep has NEVER succeeded on
+                this controller — either every attempt has errored since boot, or
+                the controller is running a build that predates the sweep.
+              action: |
+                1. Controller logs, `event_kind=catalog_missing_wasm_probe_failed`
+                   (target `talos_catalog`), carry the driver error for each failed
+                   attempt. No row content or template name is logged.
+                2. The probe is a single `SELECT COUNT(*)` over `modules`. A
+                   failure is almost always the pool, a `statement_timeout`, or a
+                   schema change to `modules.wasm_bytes` / `oci_url` / `kind`.
+                   Check `TalosDBPoolSaturated` / `TalosDBPoolExhausted` first.
+                3. Cross-check by hand — this is the same query the sweep runs:
+                   `SELECT COUNT(*) FROM modules WHERE kind='catalog'
+                    AND user_id IS NULL
+                    AND (wasm_bytes IS NULL OR octet_length(wasm_bytes)=0)
+                    AND (oci_url IS NULL OR oci_url='');`
+                4. `get_catalog_status` → `never_compiled` names any templates the
+                   gauge would have counted, and does not depend on this sweep.
+      # keep_firing_for elapsed: resolved.
+      - eval_time: 100m
+        alertname: TalosCatalogMissingWasmDetectorBlind
         exp_alerts: []
