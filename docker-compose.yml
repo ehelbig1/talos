@@ -1025,14 +1025,26 @@ services:
   #
   # AUDITED, not assumed — the full exposed set with these flags is:
   #   * talos_backup_drill_{last_run,last_success}_timestamp_seconds and
-  #     talos_backup_drill_last_status — the three gauges the drill writes
+  #     talos_backup_drill_last_status — three gauges the drill writes
   #     (two unix timestamps and a 1/0). Each carries exactly ONE label,
   #     `source`, from a CLOSED three-value set (artifact | b2 | live) —
   #     which COPY the run restored, added 2026-08-26 so a green drill can
-  #     say what it certified. Nine series is the ceiling. No secret, no
-  #     path, no hostname, and in particular nothing about the KEK: the
-  #     drill logs the NAME of the key source (KEK_SOURCE) and that never
-  #     reaches a label or this file.
+  #     say what it certified. Nine series is the ceiling for these three.
+  #     No secret, no path, no hostname, and in particular nothing about the
+  #     KEK: the drill logs the NAME of the key source (KEK_SOURCE) and that
+  #     never reaches a label or this file.
+  #   * talos_backup_drill_kind_verified{source,kind} — a FOURTH gauge, added
+  #     2026-08-26 with the neo4j restore leg. `kind` is the same closed
+  #     three-value set talos_offhost_backup_* already uses
+  #     (postgres | vault | neo4j; talos-offhost-backup/src/key.rs::as_str),
+  #     so 3 sources x 3 kinds = 9 more series and 18 for the family. It is a
+  #     SEPARATE NAME rather than a `kind` label on the three above, because
+  #     four existing readers parse those by anchored text or aggregate them
+  #     with `without(source)` and would have broken silently — see the
+  #     emit_metric comment in scripts/drills/backup-restore.sh. It says which
+  #     artifact KINDS the last run verified (1), which were present but
+  #     unverifiable (0), and — by writing no line — which were not present.
+  #     Still no secret, path or hostname: the values are three literals.
   #   * talos_offhost_backup_* — the SECOND textfile producer, added with the
   #     Tier-2 off-host egress: talos_offhost_backup_enabled (1/0),
   #     _last_run_timestamp_seconds, _last_success_timestamp_seconds{kind},
@@ -1067,7 +1079,9 @@ services:
   # samples across 5 families and is pinned by a unit test) rather than from a
   # live scrape, because the bucket it needs does not exist yet — stated
   # rather than implied, since that is a weaker form of evidence than the 2026-08-03
-  # audit above.
+  # audit above. talos_backup_drill_kind_verified is likewise enumerated from
+  # its producer (the closed `record_kind` call sites in the drill) rather than
+  # from a re-scrape — same weaker evidence, same reason for saying so.
   #
   # The directory is mounted READ-ONLY: the exporter can never write there,
   # and a compromised exporter cannot forge a green drill on disk.

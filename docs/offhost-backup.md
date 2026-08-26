@@ -343,26 +343,40 @@ docker run --rm -v "$PWD:/repo:ro" --entrypoint promtool \
 
 ## What none of this proves
 
-* **That the Neo4j archive is restorable.** This is the newest and largest gap,
-  and it is stated first because it is the shape this whole arc keeps finding.
-  As of 2026-08-26 `scripts/drills/backup-restore.sh` knows exactly two
-  artifacts, `PG_ARTIFACT` and `VAULT_ARTIFACT`. `--kind neo4j` uploads and
-  fetches — so the object's presence, freshness and decryptability ARE proven
-  by `fetch` — but no automated step has ever loaded one back into a Neo4j
-  server. What a real restore leg would need, in order:
-  1. a scratch `neo4j:5.26-community` container with an empty data volume;
-  2. `tar -xzf` the archive into it (the tarball is a raw store-file copy of
-     `/neo4j-data` — `databases/`, `transactions/`, `dbms/auth.ini` — **not**
-     a `neo4j-admin database dump`, so there is no load command; the restore
-     is "stop, replace the directory, start");
-  3. start the server and let it recover `transactions/`;
-  4. a **content** probe, not an exit code: `MATCH (n) RETURN count(n)` and
-     `MATCH ()-[r]->() RETURN count(r)` compared against the `neo4j_nodes=` /
-     `neo4j_relationships=` lines the sidecar already writes into the local
-     `.tar.gz.manifest`. A `pg_restore`-shaped "it exited 0" check would
-     certify an empty database.
-  Not built here on purpose — it is a drill change, not a key change, and
-  bundling it would have hidden that the two are separable.
+* **That the OFF-HOST Neo4j archive is restorable.** The gap narrowed on
+  2026-08-26 but did not close, and the remainder is stated first because it is
+  the shape this whole arc keeps finding.
+
+  `scripts/drills/backup-restore.sh` now has a Neo4j leg, built to the
+  four-step shape this section previously specified: a scratch
+  `neo4j:5.26-community` container (**digest-pinned** — the store is a raw
+  store-file copy of `/neo4j-data`, not a `neo4j-admin database dump`, so the
+  server must match the one that wrote it, and on the dev host the bare tag has
+  already drifted to a different image), `tar -xzf` into its volume, start and
+  let it recover `transactions/`, then a **content** probe — `MATCH (n) RETURN
+  count(n)` / `MATCH ()-[r]->() RETURN count(r)` compared against the
+  `neo4j_nodes=` / `neo4j_relationships=` the sidecar writes into the
+  `.tar.gz.manifest`. It also asserts the database reaches `online` rather than
+  trusting that the server replied, because a `pg_restore`-shaped "it exited 0"
+  check would certify an empty database.
+
+  **But that leg runs for `--source artifact` only.** `--source b2` still
+  fetches `PG_ARTIFACT` and `VAULT_ARTIFACT` and nothing else, so a green
+  off-host drill certifies 2 of the 3 kinds `--kind neo4j` uploads. `fetch`
+  proves the object's presence, freshness and decryptability; nothing has ever
+  loaded an off-host neo4j object back into a server. The drill no longer
+  *implies* otherwise — it writes
+  `talos_backup_drill_kind_verified{source="b2",kind=…}` for the kinds it
+  attempted and **no line** for neo4j, and its banner headline reads
+  `PASSED - 2/3 kinds verified` in amber. Extending the b2 branch to fetch the
+  third kind is the remaining work.
+
+* **That a count is a content check.** The Neo4j leg compares cardinality:
+  1,283 nodes of the right shape and 1,283 nodes of garbage both count 1,283.
+  It establishes that the store opens, that the database recovers, and that
+  nothing is missing in bulk — not that any node carries the right properties.
+  The manifest records two integers, so two integers is the strongest claim
+  available from it.
 * That the bucket cannot be emptied by someone who steals your **master**
   Backblaze credential. Nothing here defends against that.
 * That the age passphrase source is genuinely off-box (see the stated limits

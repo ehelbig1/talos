@@ -2133,6 +2133,61 @@ else:
     # TalosBackupRestoreDrillLastRunFailed naming b2 — so the only gap a rule
     # would cover is "never attempted", which is a setup task, not an
     # incident, and this line is where it is reported.
+    # WHICH ARTIFACT KINDS THE LAST RUN VERIFIED. Same shape as the b2
+    # finding above, one axis over: a green drill can restore fewer kinds
+    # than the host backs up and, until 2026-08-26, could not say so — the
+    # script contained zero occurrences of "neo4j" while the sidecar had
+    # been writing graph archives daily since July. The drill now publishes
+    # talos_backup_drill_kind_verified{source,kind}; this is its consumer,
+    # because a series nothing reads is the failure mode this whole leg was
+    # written to catch (the drill's own failure gauge sat unread for 8 days).
+    #
+    # ABSENCE IS MEANINGFUL AND IS NOT ZERO. The producer writes 1 for
+    # verified, 0 for present-but-unverified, and NO LINE for a kind that is
+    # not present / not attempted — so a missing kind is reported from the
+    # gap between what was returned and the closed kind set, never from a
+    # `== 0` that an empty vector would silently satisfy.
+    kinds = promq("talos_backup_drill_kind_verified")
+    ALL_KINDS = ("postgres", "vault", "neo4j")   # ArtifactKind::ALL
+    if kinds is None:
+        yellow("  ⚠ could not query talos_backup_drill_kind_verified — which artifact")
+        yellow("    KINDS the last drill verified is UNKNOWN on this run.")
+    elif not kinds:
+        yellow("  ⚠ Prometheus serves no talos_backup_drill_kind_verified. Either no drill")
+        yellow("    has run since the per-kind series was added, or the producer is older")
+        yellow("    than it — so a green drill above may have certified only some of the")
+        yellow("    kinds this host backs up.")
+    else:
+        by_source = {}
+        for smp in kinds:
+            m = smp.get("metric", {})
+            src, kind = drill_source(smp), m.get("kind")
+            if not kind:
+                continue
+            try:
+                by_source.setdefault(src, {})[kind] = float(smp["value"][1])
+            except (KeyError, IndexError, ValueError):
+                continue
+        for src in sorted(by_source):
+            seen = by_source[src]
+            ok_kinds = sorted(k for k, v in seen.items() if v == 1)
+            unver    = sorted(k for k, v in seen.items() if v != 1)
+            missing  = [k for k in ALL_KINDS if k not in seen]
+            if len(ok_kinds) == len(ALL_KINDS):
+                green("  ✓ last %s drill verified all %d artifact kinds (%s)."
+                      % (src, len(ALL_KINDS), ", ".join(ok_kinds)))
+            else:
+                yellow("  ⚠ last %s drill verified %d of %d artifact kinds (%s)."
+                       % (src, len(ok_kinds), len(ALL_KINDS), ", ".join(ok_kinds) or "none"))
+                if unver:
+                    yellow("    present but NOT verified: %s — restored, nothing to check it"
+                           % ", ".join(unver))
+                    yellow("    against (e.g. the manifest recorded neo4j_nodes=unknown).")
+                if missing:
+                    yellow("    not present / not attempted: %s. A green drill above does NOT"
+                           % ", ".join(missing))
+                    yellow("    cover these; see scripts/drills/README.md § What this doesn't cover.")
+
     if succ is None:
         yellow("  ⚠ could not query the per-copy success timestamps, so which copies")
         yellow("    have been proven is UNKNOWN on this run.")

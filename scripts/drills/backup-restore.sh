@@ -12,9 +12,11 @@
 #   3. Spin up scratch Postgres + Vault         (throwaway net, creds, volumes)
 #   4. Restore the Postgres dump into scratch   (pg_restore --exit-on-error)
 #   5. Restore the Vault tarball into scratch   (untar into a scratch volume)
-#   6. Verify against the restored pair         (verify_restore + verify_phase_b)
-#   7. Clean up every scratch container/volume/network
-#   8. Emit the Prometheus textfile metric
+#   6. Restore Neo4j into scratch + probe it     (counts vs the manifest's own
+#                                                neo4j_nodes/neo4j_relationships)
+#   7. Verify against the restored stack         (verify_restore + verify_phase_b)
+#   8. Clean up every scratch container/volume/network
+#   9. Emit the Prometheus textfile metric
 #
 # THE KEK COMES FROM ESCROW AND ONLY FROM ESCROW. Set exactly one of
 # (setting both is refused, not silently resolved by precedence):
@@ -152,6 +154,9 @@ SCRATCH_VAULT_NAME="talos-drill-vault-$$"
 SCRATCH_PG_VOLUME="talos-drill-pgdata-$$"
 SCRATCH_VAULT_VOLUME="talos-drill-vault-data-$$"
 SCRATCH_VAULT_LOGS="talos-drill-vault-logs-$$"
+SCRATCH_NEO4J_NAME="talos-drill-neo4j-$$"
+SCRATCH_NEO4J_VOLUME="talos-drill-neo4j-data-$$"
+SCRATCH_NEO4J_LOGS="talos-drill-neo4j-logs-$$"
 SCRATCH_NETWORK="talos-drill-net-$$"
 SCRATCH_PG_PORT=""   # assigned by docker; see step 3
 
@@ -167,6 +172,45 @@ LIVE_VAULT_CONTAINER="${TALOS_DRILL_LIVE_VAULT:-talos-vault}"
 LIVE_CONTROLLER="${TALOS_DRILL_LIVE_CONTROLLER:-talos-controller}"
 PG_IMAGE="${TALOS_DRILL_PG_IMAGE:-pgvector/pgvector:pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff}"
 VAULT_IMAGE="${TALOS_DRILL_VAULT_IMAGE:-hashicorp/vault:1.18@sha256:750bb37c1638fa194ab37053a81618c61bb0491ddec6fccac87c07a8e6cd8166}"
+
+# THE NEO4J IMAGE MUST MATCH THE ONE THAT WROTE THE STORE, and the tag alone
+# does not give you that. The neo4j artifact is a RAW STORE COPY — `databases/`,
+# `transactions/`, `dbms/auth.ini` — not a `neo4j-admin database dump`, so the
+# server that opens it has to understand that on-disk format. Measured on this
+# host 2026-08-26:
+#
+#   neo4j:5.26-community@sha256:b357872d…  →  image 610dfe7b…  (what talos-neo4j RUNS)
+#   neo4j:5.26-community          (bare tag) →  image 846cea23…  (a DIFFERENT build)
+#
+# `docker images -a` shows the older image now carries the tag `neo4j:<none>`:
+# the tag has ALREADY drifted away from the build that wrote every artifact in
+# ~/.talos/backups/neo4j. So the digest here is load-bearing, not decoration. It
+# is the same digest docker-compose.yml pins for BOTH the `neo4j` service and
+# the `neo4j-backup` sidecar — keep the three in lockstep when bumping Neo4j.
+#
+# It is deliberately NOT read off the live container. Step 0b's whole thesis is
+# that the drill has to work when the live host is gone; a drill that asks the
+# live stack which image to use cannot run in the disaster it rehearses.
+#
+# ON MISMATCH the failure is SILENT, which is why step 6's readiness loop is
+# not a bare poll. Measured: a Neo4j 5.26 container that cannot start exits with
+# code 3 in ~2 s having logged only "Neo4j Server shutdown initiated by request"
+# / "Stopped.", with an EMPTY debug.log. Step 6 therefore re-checks
+# `.State.Running` on every iteration and dumps both the container log and the
+# /logs volume the moment it stops, so a version mismatch is diagnosed in
+# seconds instead of read as a 90-second timeout.
+NEO4J_IMAGE="${TALOS_DRILL_NEO4J_IMAGE:-neo4j:5.26-community@sha256:b357872da95a164c5243ca8d9060601130717ff43cee3c829402fab46209a412}"
+
+# How far the RESTORED graph may fall short of the count its own manifest
+# recorded. See step 6 for the full derivation; the short version is that the
+# manifest's cypher probe runs AFTER the tar (sole call site: the manifest
+# here-block in scripts/dev-backup/dev-volume-backup-loop.sh), so anything
+# committed in the 26-55 s gap between them is in the probe and not in the
+# archive.
+NEO4J_COUNT_TOLERANCE="${TALOS_DRILL_NEO4J_COUNT_TOLERANCE:-50}"
+case "$NEO4J_COUNT_TOLERANCE" in
+    ''|*[!0-9]*) echo "TALOS_DRILL_NEO4J_COUNT_TOLERANCE must be a non-negative integer, got '$NEO4J_COUNT_TOLERANCE'" >&2; exit 1 ;;
+esac
 
 # Parse args.
 while [[ $# -gt 0 ]]; do
@@ -211,6 +255,80 @@ die()  { printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2; emit_metric failure; exit 
 # Tier 2, was uncertified and nothing in the metrics could tell the
 # difference. The label is the difference.
 DRILL_SOURCES_RE='(artifact|b2|live)'
+
+# ── WHICH KINDS THIS RUN ACTUALLY VERIFIED. ──────────────────────
+# A fourth series, on its OWN metric name, added 2026-08-26 with the neo4j leg.
+#
+# WHY A NEW NAME AND NOT A `kind` LABEL ON THE THREE ABOVE. That was the
+# obvious move and it is wrong. The readers of those three were inventoried
+# (65 lines / 11 files) before choosing, and four of them break:
+#
+#   * schedule.sh's awk matches `\{source="[a-z0-9]+"\} ` — a `}` and a space
+#     immediately after the source value. It breaks with `kind` in ANY
+#     position, and it breaks SILENTLY, printing "no successful drill recorded
+#     yet" on a host that has one.
+#   * emit_metric's own `prev`/`carried` greps anchor `\{source="` directly
+#     after the metric name, and the `grep -vF '{source="…"}'` exclusion needs
+#     `source` to be the LAST label. Same silent failure, in the
+#     failure-REPORTING path — the exact trap the comment above this one
+#     documents, re-armed.
+#   * `talos_backup_drill_last_status == 0` would match one series PER KIND.
+#     That alert is `category: data-loss`, which alertmanager-route.yaml sends
+#     to PagerDuty at repeat_interval 1h — so one failure would become N pages
+#     differing only by a label.
+#   * the staleness rule's `max without(source)` would RETAIN `kind`, giving
+#     one alert per kind and re-opening the per-abandoned-copy permanent red
+#     that `without(source)` exists to close.
+#
+# A separate name touches none of them, and `postgres`/`vault`/`neo4j` are the
+# label values talos_offhost_backup_*{kind=…} already uses (see
+# talos-offhost-backup/src/key.rs::as_str), so the vocabulary is not new either.
+#
+# THREE STATES, ALL DISTINGUISHABLE, which is the entire point:
+#   1  the kind was restored AND its content assertion passed
+#   0  the kind was PRESENT but could NOT be verified (e.g. the manifest says
+#      `neo4j_nodes=unknown` because the sidecar's probe could not reach the
+#      graph, or there is no manifest at all)
+#   (no line)  the kind was NOT PRESENT / not attempted for this source
+#
+# ABSENCE IS THE HONEST ENCODING OF "not present", and it is deliberate rather
+# than an oversight: 0 asserts "present but unverified", which is false for a
+# host that has no such artifact. Same argument, same file, as the
+# no-line-for-a-never-successful-copy rule on last_success below. Nothing
+# alerts on this series — a "neo4j has never been verified" rule would be
+# permanently red on a host that legitimately has no graph, the shape #675 and
+# #676 each rejected once already.
+#
+# THIS SERIES IS PER-RUN, NOT PER-COPY. It describes the most recent attempt,
+# like last_run and last_status, so only the current source's kinds are written
+# and nothing is carried forward. Ceiling: 3 names x 3 sources = 9 series, on
+# top of the 9 above.
+#
+# LAST WRITE WINS, AND EVERY KIND IS RECORDED 0 BEFORE IT IS ATTEMPTED.
+# The first cut appended, and only on success — so a leg that DIED left no line
+# at all, which is byte-identical to "this host has no such artifact". Two
+# different facts with the same encoding is the defect this series exists to
+# remove, reintroduced one level in; it showed up the first time the
+# deficit-assertion test was driven for real. Now each kind is stamped 0
+# ("present, NOT verified") the moment the drill commits to restoring it and
+# upgraded to 1 only once every assertion for it has passed, so an abort
+# anywhere leaves a 0. No line means, and only means, not present / not
+# attempted.
+KIND_VERIFIED_LINES=""
+record_kind() {
+    # $1 = kind (postgres|vault|neo4j), $2 = 1|0
+    local line="talos_backup_drill_kind_verified{source=\"$SOURCE_MODE\",kind=\"$1\"} $2"
+    local kept=""
+    if [[ -n "$KIND_VERIFIED_LINES" ]]; then
+        kept=$(printf '%s\n' "$KIND_VERIFIED_LINES" | grep -vF "kind=\"$1\"}" | grep -v '^$' || true)
+    fi
+    if [[ -n "$kept" ]]; then
+        KIND_VERIFIED_LINES="$kept
+$line"
+    else
+        KIND_VERIFIED_LINES="$line"
+    fi
+}
 
 METRIC_EMITTED=0
 emit_metric() {
@@ -343,6 +461,16 @@ $carried"
         echo "# HELP talos_backup_drill_last_status Status of the most recent drill (1=success, 0=failure), labelled with the copy it restored."
         echo "# TYPE talos_backup_drill_last_status gauge"
         [[ "$status" == "success" ]] && echo "talos_backup_drill_last_status$sl 1" || echo "talos_backup_drill_last_status$sl 0"
+        # Per-kind coverage of THIS run. Written even on the failure path: a
+        # drill that died at the neo4j leg still verified postgres and vault,
+        # and saying so is more useful than saying nothing. Emitted only when
+        # at least one kind was reached, so an early abort (before step 1
+        # selected anything) writes no lines rather than an empty HELP block.
+        if [[ -n "$KIND_VERIFIED_LINES" ]]; then
+            echo "# HELP talos_backup_drill_kind_verified Whether the most recent drill restore-verified this artifact kind (1=verified, 0=present but NOT verified). No line at all means the kind was not present / not attempted for that copy."
+            echo "# TYPE talos_backup_drill_kind_verified gauge"
+            echo "$KIND_VERIFIED_LINES"
+        fi
     } > "$tmp"
     chmod 644 "$tmp"
     mv "$tmp" "$TEXTFILE"
@@ -365,7 +493,7 @@ $carried"
 # `$?` is 0. Anything reading only the exit code (cron, launchd, systemd, a
 # CI step) would record a drill that stopped at step 5 as a success. The
 # `DRILL_COMPLETE` sentinel closes that generally rather than one bug at a
-# time: unless step 7 is reached, the trap forces a non-zero exit and a
+# time: unless step 8 is reached, the trap forces a non-zero exit and a
 # failure metric, whatever aborted the run.
 DRILL_COMPLETE=0
 CLEANED=0
@@ -381,27 +509,29 @@ cleanup_scratch() {
     # single path out of this function.
     if (( KEEP_SCRATCH == 1 )) && (( code == 0 )); then
         warn "--keep-scratch: leaving scratch stack UP. It holds REAL restored data."
-        warn "  containers: $SCRATCH_PG_NAME $SCRATCH_VAULT_NAME"
-        warn "  volumes:    $SCRATCH_PG_VOLUME $SCRATCH_VAULT_VOLUME $SCRATCH_VAULT_LOGS"
-        warn "  remove with: docker rm -fv $SCRATCH_PG_NAME $SCRATCH_VAULT_NAME &&"
-        warn "               docker volume rm $SCRATCH_PG_VOLUME $SCRATCH_VAULT_VOLUME $SCRATCH_VAULT_LOGS &&"
+        warn "  containers: $SCRATCH_PG_NAME $SCRATCH_VAULT_NAME $SCRATCH_NEO4J_NAME"
+        warn "  volumes:    $SCRATCH_PG_VOLUME $SCRATCH_VAULT_VOLUME $SCRATCH_VAULT_LOGS $SCRATCH_NEO4J_VOLUME $SCRATCH_NEO4J_LOGS"
+        warn "  remove with: docker rm -fv $SCRATCH_PG_NAME $SCRATCH_VAULT_NAME $SCRATCH_NEO4J_NAME &&"
+        warn "               docker volume rm $SCRATCH_PG_VOLUME $SCRATCH_VAULT_VOLUME $SCRATCH_VAULT_LOGS $SCRATCH_NEO4J_VOLUME $SCRATCH_NEO4J_LOGS &&"
         warn "               docker network rm $SCRATCH_NETWORK && rm -rf ${WORK_DIR:-<workdir>}"
     else
         # `-v` is load-bearing: without it the container's ANONYMOUS volumes
         # survive, and for the Postgres image that anonymous volume IS the
         # restored database (421 MB of real user data on the 2026-08-03 run).
-        docker rm -fv "$SCRATCH_PG_NAME" "$SCRATCH_VAULT_NAME" >/dev/null 2>&1 || true
-        docker volume rm "$SCRATCH_PG_VOLUME" "$SCRATCH_VAULT_VOLUME" "$SCRATCH_VAULT_LOGS" >/dev/null 2>&1 || true
+        docker rm -fv "$SCRATCH_PG_NAME" "$SCRATCH_VAULT_NAME" "$SCRATCH_NEO4J_NAME" >/dev/null 2>&1 || true
+        docker volume rm "$SCRATCH_PG_VOLUME" "$SCRATCH_VAULT_VOLUME" "$SCRATCH_VAULT_LOGS" \
+            "$SCRATCH_NEO4J_VOLUME" "$SCRATCH_NEO4J_LOGS" >/dev/null 2>&1 || true
         docker network rm "$SCRATCH_NETWORK" >/dev/null 2>&1 || true
         [[ -n "${WORK_DIR:-}" && -d "${WORK_DIR:-}" ]] && rm -rf "$WORK_DIR"
 
         # Assert, don't assume. A cleanup that silently failed is how note 2
         # above survived from May to August.
         local leaked=""
-        for c in "$SCRATCH_PG_NAME" "$SCRATCH_VAULT_NAME"; do
+        for c in "$SCRATCH_PG_NAME" "$SCRATCH_VAULT_NAME" "$SCRATCH_NEO4J_NAME"; do
             docker inspect "$c" >/dev/null 2>&1 && leaked="$leaked container:$c"
         done
-        for v in "$SCRATCH_PG_VOLUME" "$SCRATCH_VAULT_VOLUME" "$SCRATCH_VAULT_LOGS"; do
+        for v in "$SCRATCH_PG_VOLUME" "$SCRATCH_VAULT_VOLUME" "$SCRATCH_VAULT_LOGS" \
+                 "$SCRATCH_NEO4J_VOLUME" "$SCRATCH_NEO4J_LOGS"; do
             docker volume inspect "$v" >/dev/null 2>&1 && leaked="$leaked volume:$v"
         done
         [[ -n "${WORK_DIR:-}" && -d "${WORK_DIR:-}" ]] && leaked="$leaked workdir:$WORK_DIR"
@@ -410,7 +540,7 @@ cleanup_scratch() {
         fi
     fi
 
-    # Did not reach step 7 ⇒ this run is a FAILURE, whatever the shell says
+    # Did not reach step 8 ⇒ this run is a FAILURE, whatever the shell says
     # and whatever aborted it. Publish that: an abort under `set -e`/`set -u`
     # never reaches `die`, so without this the metric would keep whatever the
     # previous run left behind and `last_run`/`last_status` would describe a
@@ -481,10 +611,11 @@ fi
 
 # Never reuse a live name. A collision here would mean the cleanup trap
 # deletes something that is not ours.
-for n in "$SCRATCH_PG_NAME" "$SCRATCH_VAULT_NAME"; do
+for n in "$SCRATCH_PG_NAME" "$SCRATCH_VAULT_NAME" "$SCRATCH_NEO4J_NAME"; do
     docker inspect "$n" >/dev/null 2>&1 && die "scratch name '$n' already exists — refusing to clobber it"
 done
-for v in "$SCRATCH_PG_VOLUME" "$SCRATCH_VAULT_VOLUME" "$SCRATCH_VAULT_LOGS"; do
+for v in "$SCRATCH_PG_VOLUME" "$SCRATCH_VAULT_VOLUME" "$SCRATCH_VAULT_LOGS" \
+         "$SCRATCH_NEO4J_VOLUME" "$SCRATCH_NEO4J_LOGS"; do
     docker volume inspect "$v" >/dev/null 2>&1 && die "scratch volume '$v' already exists — refusing to clobber it"
 done
 
@@ -889,9 +1020,27 @@ case "$MAX_ARTIFACT_AGE_HOURS" in
     ''|*[!0-9]*) die "TALOS_DRILL_MAX_ARTIFACT_AGE_HOURS must be a non-negative integer, got '$MAX_ARTIFACT_AGE_HOURS'" ;;
 esac
 
+# NEO4J LEG STATE, declared here so `set -u` is safe on every branch and so the
+# four states are enumerable in one place. Exactly one of:
+#   verified      restored AND the count assertion passed
+#   unverifiable  restored (or restorable) but there is nothing to assert against
+#   absent        no artifact on this host, and the operator waived it
+#   not-attempted this --source cannot reach the neo4j copy (b2 / live) — see D4
+# `not-attempted` and `absent` both emit NO kind_verified series; they are kept
+# apart because the banner has to say WHICH, and they have different fixes.
+NEO4J_STATE="not-attempted"
+NEO4J_ARTIFACT=""
+NEO4J_ARTIFACT_AGE="?"
+NEO4J_MANIFEST_NODES=""
+NEO4J_MANIFEST_RELS=""
+NEO4J_EXPECTED_PATHS="./databases ./transactions"
+NEO4J_RESTORED_NODES=""
+NEO4J_RESTORED_RELS=""
+NEO4J_DETAIL=""
+
 # ── 1. Select the artifacts to restore ────────────────────────────
 if [[ "$SOURCE_MODE" == "artifact" ]]; then
-    log "[1/7] selecting backup artifacts from $BACKUP_DIR"
+    log "[1/8] selecting backup artifacts from $BACKUP_DIR"
     [[ -d "$BACKUP_DIR" ]] || die "backup dir '$BACKUP_DIR' does not exist — is the backup sidecar running?"
 
     PG_ARTIFACT=$(ls -1t "$BACKUP_DIR"/talos-*.dump 2>/dev/null | head -1 || true)
@@ -980,6 +1129,73 @@ if [[ "$SOURCE_MODE" == "artifact" ]]; then
     }
     assert_artifact_fresh "$PG_ARTIFACT_MTIME"    "postgres artifact" "$PG_ARTIFACT"
     assert_artifact_fresh "$VAULT_ARTIFACT_MTIME" "vault artifact"    "$VAULT_ARTIFACT"
+
+    # ── The THIRD artifact kind. ──────────────────────────────────
+    #
+    # ABSENCE IS FATAL BY DEFAULT, and that is the whole design of this leg.
+    # A host with no neo4j backups is legitimate — but a silent skip would
+    # rebuild, inside the safeguard, the exact hole this leg exists to close:
+    # a green run that certified two kinds and reported "PASSED". Making it
+    # fatal means "not present" can only be reached by an operator who typed
+    # the waiver, never by a sidecar that quietly died. The waiver has two
+    # precedents in this same file (TALOS_DRILL_ALLOW_PRODUCTION,
+    # TALOS_DRILL_ALLOW_NO_METRIC), so the shape is not new.
+    NEO4J_ARTIFACT=$(ls -1t "$BACKUP_DIR"/neo4j/neo4j-*.tar.gz 2>/dev/null | head -1 || true)
+    if [[ -z "$NEO4J_ARTIFACT" ]]; then
+        if [[ "${TALOS_DRILL_ALLOW_NO_NEO4J:-0}" == "1" ]]; then
+            NEO4J_STATE="absent"
+            warn "no neo4j-*.tar.gz in $BACKUP_DIR/neo4j — neo4j NOT verified on this run (waived)"
+        else
+            die "no neo4j-*.tar.gz in $BACKUP_DIR/neo4j — nothing to restore.
+   The neo4j-backup sidecar writes these daily (docker-compose.yml § neo4j-backup);
+   check 'docker logs talos-neo4j-backup'. If this host genuinely runs no graph,
+   set TALOS_DRILL_ALLOW_NO_NEO4J=1 — the run then reports neo4j as NOT VERIFIED
+   in the banner and emits NO talos_backup_drill_kind_verified{kind=\"neo4j\"}
+   series, rather than passing silently for two kinds out of three."
+        fi
+    else
+        # Integrity FIRST, exactly as the vault leg does. A corrupt archive must
+        # fail here, on a cheap sha256 of a ~1.2 MB file, and not 90 seconds
+        # later inside a container start that cannot say why it died.
+        if [[ -f "$NEO4J_ARTIFACT.manifest" ]]; then
+            want=$(grep -E '^sha256=' "$NEO4J_ARTIFACT.manifest" | cut -d= -f2)
+            got=$(shasum -a 256 "$NEO4J_ARTIFACT" 2>/dev/null | awk '{print $1}')
+            [[ -z "$got" ]] && got=$(sha256sum "$NEO4J_ARTIFACT" | awk '{print $1}')
+            [[ -n "$want" && "$want" == "$got" ]] || die "neo4j artifact sha256 mismatch — $NEO4J_ARTIFACT is corrupt
+   manifest declares: ${want:-<none>}
+   file hashes to:    $got"
+            ok "neo4j artifact sha256 matches its manifest"
+
+            # The counts the sidecar recorded at dump time. Anchor on
+            # `^neo4j_nodes=`: content_probe calls log() INSIDE the manifest
+            # here-block, so every manifest ALSO contains a prose line
+            # ("… live graph has 1283 nodes / 1939 relationships") that a
+            # looser scan would happily match.
+            NEO4J_MANIFEST_NODES=$(grep -E '^neo4j_nodes=' "$NEO4J_ARTIFACT.manifest" | head -1 | cut -d= -f2)
+            NEO4J_MANIFEST_RELS=$(grep -E '^neo4j_relationships=' "$NEO4J_ARTIFACT.manifest" | head -1 | cut -d= -f2)
+            # `unknown` is a REAL value the sidecar writes when its cypher probe
+            # could not reach the graph (the probe is non-fatal there). Blanking
+            # it here is what stops it coercing to a pass — see step 6.
+            [[ "$NEO4J_MANIFEST_NODES" =~ ^[0-9]+$ ]] || NEO4J_MANIFEST_NODES=""
+            [[ "$NEO4J_MANIFEST_RELS"  =~ ^[0-9]+$ ]] || NEO4J_MANIFEST_RELS=""
+            # Which top-level paths the sidecar asserted INTO the archive. Read
+            # from the manifest rather than hardcoded so it tracks the sidecar's
+            # EXPECTED_PATHS; the fallback is that env var's compose default.
+            NEO4J_EXPECTED_PATHS=$(grep -E '^expected_paths=' "$NEO4J_ARTIFACT.manifest" | head -1 | cut -d= -f2-)
+            [[ -n "$NEO4J_EXPECTED_PATHS" ]] || NEO4J_EXPECTED_PATHS="./databases ./transactions"
+        else
+            # No manifest ⇒ no sha256 to check AND no counts to assert against.
+            # That is precisely "present but unverifiable", and step 6 records it
+            # as such rather than restoring it and calling that a pass.
+            warn "no manifest beside $NEO4J_ARTIFACT — integrity unverified AND no counts to assert"
+        fi
+        NEO4J_ARTIFACT_MTIME="$(stat -f %m "$NEO4J_ARTIFACT" 2>/dev/null || stat -c %Y "$NEO4J_ARTIFACT" 2>/dev/null || echo '')"
+        NEO4J_ARTIFACT_AGE="$([[ -n "$NEO4J_ARTIFACT_MTIME" ]] && date -u -r "$NEO4J_ARTIFACT_MTIME" +%FT%TZ 2>/dev/null || echo '?')"
+        ok "neo4j artifact:    $(basename "$NEO4J_ARTIFACT") ($(wc -c < "$NEO4J_ARTIFACT" | tr -d ' ') bytes, taken $NEO4J_ARTIFACT_AGE)"
+        # Same gate, same knob, same reason as the other two: an artifact that
+        # stopped being written must not keep going green off the last good file.
+        assert_artifact_fresh "$NEO4J_ARTIFACT_MTIME" "neo4j artifact" "$NEO4J_ARTIFACT"
+    fi
 elif [[ "$SOURCE_MODE" == "b2" ]]; then
     # ── TIER 2: restore the OFF-HOST copy ─────────────────────────
     #
@@ -995,7 +1211,7 @@ elif [[ "$SOURCE_MODE" == "b2" ]]; then
     # quietly succeed the easy way leaves the defect in place while looking
     # fixed. Unreachable bucket, empty bucket, stale archive and wrong
     # passphrase are all FATAL here.
-    log "[1/7] fetching backup artifacts from OFF-HOST object storage (--source b2)"
+    log "[1/8] fetching backup artifacts from OFF-HOST object storage (--source b2)"
 
     # The age passphrase is a SECOND fatal secret — losing it makes every
     # uploaded archive unreadable, exactly as losing the KEK does. Same
@@ -1090,7 +1306,7 @@ elif [[ "$SOURCE_MODE" == "b2" ]]; then
         ok "off-host archives are within ${MAX_ARTIFACT_AGE_HOURS}h"
     fi
 else
-    log "[1/7] dumping LIVE postgres + vault (--source live)"
+    log "[1/8] dumping LIVE postgres + vault (--source live)"
     docker inspect "$LIVE_PG_CONTAINER" >/dev/null 2>&1 || die "live postgres container '$LIVE_PG_CONTAINER' not running"
     docker inspect "$LIVE_VAULT_CONTAINER" >/dev/null 2>&1 || die "live vault container '$LIVE_VAULT_CONTAINER' not running"
     LIVE_PG_USER=$(docker exec "$LIVE_PG_CONTAINER" printenv POSTGRES_USER 2>/dev/null || true)
@@ -1109,6 +1325,13 @@ else
     ok "live pg.dump ($(wc -c < "$WORK_DIR/pg.dump") bytes) + vault.tgz ($(wc -c < "$WORK_DIR/vault.tgz") bytes)"
 fi
 
+# Both other kinds are now PRESENT (step 1 hard-fails if either is missing on
+# any source). Stamp them 0 — "present, not yet verified" — so that if the drill
+# dies in step 4 or step 5 the metric says which kind it died on, instead of
+# omitting the line and reading like the artifact was never there.
+record_kind postgres 0
+record_kind vault 0
+
 # ── 2. Build the verifiers BEFORE anything holds real data ────────
 # `cargo run` at verify time was the original shape and it is a trap: the
 # drill exports DATABASE_URL, which is part of the sqlx macro fingerprint, so
@@ -1116,7 +1339,7 @@ fi
 # 2026-08-03 run — with a scratch Postgres full of restored user data
 # listening on a loopback port for every second of it. Build first, with
 # DATABASE_URL scrubbed, then execute the binaries directly.
-log "[2/7] building verifiers (this is the slow step; nothing is staged yet)"
+log "[2/8] building verifiers (this is the slow step; nothing is staged yet)"
 cd "$REPO_ROOT"
 env -u DATABASE_URL cargo build --quiet --example verify_restore --example verify_phase_b -p controller \
     || die "could not build the verifiers — fix the build before trusting a drill result"
@@ -1132,7 +1355,7 @@ ok "verifiers built"
 # ── 3. Spin up scratch Postgres ───────────────────────────────────
 # A dedicated bridge network: the scratch stack must never be able to reach
 # the live one, and vice versa.
-log "[3/7] starting scratch postgres (throwaway net + creds + volume)"
+log "[3/8] starting scratch postgres (throwaway net + creds + volume)"
 docker network create "$SCRATCH_NETWORK" >/dev/null || die "could not create scratch network"
 docker volume create "$SCRATCH_PG_VOLUME" >/dev/null || die "could not create scratch pg volume"
 
@@ -1166,7 +1389,7 @@ for i in $(seq 1 60); do
 done
 
 # ── 4. Restore the dump into scratch ──────────────────────────────
-log "[4/7] restoring dump into scratch postgres"
+log "[4/8] restoring dump into scratch postgres"
 docker cp "$WORK_DIR/pg.dump" "$SCRATCH_PG_NAME:/tmp/pg.dump" || die "could not copy dump into scratch"
 # --exit-on-error is the difference between "restored" and "attempted".
 # pg_restore's default is to log an error, carry on, and exit 0 — so without
@@ -1182,9 +1405,10 @@ if ! docker exec -e PGPASSWORD="$SCRATCH_PG_PASSWORD" "$SCRATCH_PG_NAME" \
 fi
 docker exec "$SCRATCH_PG_NAME" rm -f /tmp/pg.dump >/dev/null 2>&1 || true
 ok "restore complete with --exit-on-error (no object failed)"
+record_kind postgres 1
 
 # ── 5. Restore Vault into scratch and unseal it ───────────────────
-log "[5/7] restoring vault + unsealing"
+log "[5/8] restoring vault + unsealing"
 docker volume create "$SCRATCH_VAULT_VOLUME" >/dev/null
 docker volume create "$SCRATCH_VAULT_LOGS" >/dev/null
 
@@ -1285,6 +1509,7 @@ MOUNTS=$(docker exec -e VAULT_TOKEN="$VAULT_TOKEN" "$SCRATCH_VAULT_NAME" \
     'import json,sys; print(" ".join(sorted(json.load(sys.stdin).keys())))' 2>/dev/null || true)
 [[ -n "$MOUNTS" ]] || die "restored vault exposes no secret engines — the logical backend is empty"
 ok "scratch vault unsealed; token accepted; mounts: $MOUNTS"
+record_kind vault 1
 
 if [[ "$KEK_PROVIDER_MODE" == "vault" ]]; then
     TK="${VAULT_TRANSIT_KEY_NAME:-talos-kek}"
@@ -1305,8 +1530,262 @@ else
     warn "KEK_PROVIDER=$KEK_PROVIDER_MODE — the restored Vault is not on the KEK path here"
 fi
 
-# ── 6. Verify against the restored stack ──────────────────────────
-log "[6/7] verifying the restored stack"
+# ── 6. Restore Neo4j into scratch and probe the RESTORED graph ────
+#
+# WHY THIS LEG EXISTS. Until 2026-08-26 this script contained ZERO occurrences
+# of the string "neo4j" (measured on 037b96d3: 0 in 1421 lines). It knew two
+# artifacts, hard-failed if either was missing, and printed an unqualified
+# "Drill … PASSED" — so a green run certified TWO of the THREE kinds the host
+# backs up, and nothing in its output or its metrics could tell you that. #677
+# had just added neo4j to the off-host UPLOADER and said, in the PR, that the
+# restore path did not follow. This is that follow.
+#
+# WHAT IS BEING ASSERTED, AND WHY IT IS NOT EQUALITY.
+#
+# The manifest carries `neo4j_nodes=` / `neo4j_relationships=` written by the
+# sidecar's cypher probe. Those numbers have been sitting in every manifest
+# since July with NO reader. The ordering matters and is easy to get backwards:
+# `content_probe` is DEFINED near the top of dev-volume-backup-loop.sh but its
+# sole CALL SITE is the manifest here-block at the very END of take_backup —
+# after `tar -czf`, after the integrity check, after the `.partial` → final
+# rename. So the probe reads the LIVE graph *after* the archive's content is
+# already fixed. Measured across all 13 manifests on this host: archive stamp →
+# probe is 26-55 s (median 32).
+#
+# That gives a ONE-SIDED relation, because the graph never shrinks. Every
+# Cypher write in the workspace lives in exactly one file
+# (talos-graph-rag/src/lib.rs) and its node writer is
+# `MERGE (n:{label} {actor_id, name})`; there is no production DELETE, no
+# DETACH DELETE, and no graph pruning/retention job anywhere. So:
+#
+#     restored <= manifest        (structural: counts are monotonic)
+#     restored >= manifest - TOL  (the actual verification)
+#
+# The UPPER bound is exact and deliberately has no tolerance. It cannot be
+# exceeded while the MERGE-only property holds, so a violation means either the
+# manifest does not belong to this archive or that property has expired — both
+# worth a red drill. This is #677's own lesson applied to this assertion: the
+# condition that would reverse it is named, and dated 2026-08-26.
+#
+# The LOWER bound does the work. TOL defaults to 50 rather than 0 for a reason
+# that is about the ROUTING TABLE, not about statistics: all 13 archives on this
+# host restore to EXACTLY their manifest counts (7 of them taken on days the
+# graph actually grew, by +37/+16/+28/+1/+30/+39 nodes), so equality would
+# usually hold — but `talos_backup_drill_last_status == 0` carries
+# `category: data-loss`, and alertmanager-route.yaml sends that category to
+# PagerDuty at repeat_interval 1h. A count assertion that is flaky PAGES, and a
+# pager that cries wolf trains an operator to ignore red, which is the same
+# defect one level up. 50 is more than an entire peak DAY's write volume
+# (39 nodes / 64 rels), therefore more than any 55 s window can contain.
+#
+# AND 50 MASKS NOTHING, because no real failure is that small:
+#   * wrong extraction root      → 0 nodes restored, a 1283-node deficit
+#   * truncated/corrupt archive  → caught by the sha256 in step 1, then by tar
+#   * `transactions/` missing    → store opens at the last checkpoint, which
+#                                  CAN be a small deficit — so that one is
+#                                  closed STRUCTURALLY below (expected-paths
+#                                  assertion on the extracted tree), not by the
+#                                  number
+#   * store opens but the DB is broken → `SHOW DATABASES` currentStatus check
+#
+# ISOLATION. `--network none` was the obvious choice and it does not work:
+# measured, Neo4j 5.26 refuses to start without a network namespace (exit 3 in
+# 2 s, empty debug.log) — confirmed with a 2x2 control against an EMPTY volume,
+# so the cause is the namespace and not the restored store. Instead: the same
+# per-run bridge the rest of the drill uses, NO published ports at all, and
+# every query issued through `docker exec` against a LITERAL
+# `bolt://localhost:7687` — the container's own loopback, not an address
+# derived from anything.
+#
+# AND THE ISOLATION IS PROVEN, not asserted. The scratch server runs
+# NEO4J_AUTH=none; the live talos-neo4j runs with auth ENABLED and answers an
+# anonymous connection with "The client is unauthorized due to authentication
+# failure" (verified against the live stack). So an ANONYMOUS query that
+# SUCCEEDS cannot have reached the live instance. A useful side effect: this
+# leg needs no Neo4j credential at all — there is nothing here to log, leak, or
+# bake into a fixture.
+if [[ "$SOURCE_MODE" != "artifact" ]]; then
+    # b2 and live are out of this leg's reach and MUST NOT read as verified.
+    # See the banner and docs/offhost-backup.md — #677 made neo4j uploadable
+    # and fetchable, so `--source b2` under-certifies in exactly the way this
+    # leg exists to stop being silent about.
+    NEO4J_STATE="not-attempted"
+    log "[6/8] neo4j: NOT ATTEMPTED for --source $SOURCE_MODE"
+    warn "neo4j is restored only by --source artifact; this run certifies 2 of 3 kinds"
+elif [[ "$NEO4J_STATE" == "absent" ]]; then
+    log "[6/8] neo4j: NOT PRESENT on this host (waived with TALOS_DRILL_ALLOW_NO_NEO4J=1)"
+else
+    log "[6/8] restoring neo4j into scratch and probing the RESTORED graph"
+    # Present ⇒ stamped 0 up front; only the successful path below upgrades it.
+    record_kind neo4j 0
+    docker volume create "$SCRATCH_NEO4J_VOLUME" >/dev/null || die "could not create scratch neo4j volume"
+    docker volume create "$SCRATCH_NEO4J_LOGS"   >/dev/null || die "could not create scratch neo4j log volume"
+
+    cp "$NEO4J_ARTIFACT" "$WORK_DIR/neo4j.tgz" || die "could not stage the neo4j artifact"
+    # The sidecar tars `-C "$SRC_DIR" .`, so members are root-relative
+    # (./databases, ./transactions, ./dbms, ./server_id) and the extraction
+    # root is /data itself. Getting this wrong is the highest-probability bug
+    # in the whole leg and it fails LOUDLY rather than subtly: Neo4j would come
+    # up on an empty store and answer 0, which the count assertion rejects by a
+    # factor of ~25 over the tolerance.
+    docker run --rm \
+        --network "$SCRATCH_NETWORK" \
+        -v "$SCRATCH_NEO4J_VOLUME:/data" \
+        -v "$WORK_DIR:/in:ro" \
+        --entrypoint sh \
+        "$NEO4J_IMAGE" \
+        -c 'tar -xzf /in/neo4j.tgz -C /data' \
+        >/dev/null || die "neo4j extract FAILED — $NEO4J_ARTIFACT is not a readable tar.gz"
+
+    # EXPECTED PATHS, ASSERTED ON THE EXTRACTED TREE. The sidecar checks these
+    # against the archive LISTING when it writes; this checks them against what
+    # actually landed on disk. It is what closes the "transactions/ went
+    # missing" case — a store without its transaction logs opens cleanly at the
+    # last checkpoint and loses only the txns since, which is exactly the size
+    # of deficit a 50-node tolerance would swallow.
+    for p in $NEO4J_EXPECTED_PATHS; do
+        docker run --rm --network "$SCRATCH_NETWORK" -v "$SCRATCH_NEO4J_VOLUME:/data" \
+            --entrypoint sh "$NEO4J_IMAGE" -c "test -e '/data/${p#./}'" \
+            || die "restored neo4j store is missing '$p' (the manifest's expected_paths).
+   A store without ./transactions opens at its last checkpoint and silently
+   drops every transaction since — a deficit small enough to pass a count
+   tolerance, which is why it is checked structurally here."
+    done
+    ok "restored neo4j store has every expected path: $NEO4J_EXPECTED_PATHS"
+
+    # NEO4J_AUTH=none is the isolation discriminator described above, AND it
+    # keeps every credential out of this script. The restored dbms/auth.ini is
+    # left untouched on disk; the config setting simply makes it irrelevant.
+    docker run -d \
+        --name "$SCRATCH_NEO4J_NAME" \
+        --network "$SCRATCH_NETWORK" \
+        -v "$SCRATCH_NEO4J_VOLUME:/data" \
+        -v "$SCRATCH_NEO4J_LOGS:/logs" \
+        -e NEO4J_AUTH=none \
+        -e NEO4J_server_memory_heap_initial__size=256m \
+        -e NEO4J_server_memory_heap_max__size=512m \
+        "$NEO4J_IMAGE" >/dev/null \
+        || die "scratch neo4j failed to start"
+
+    # THE READINESS LOOP RE-CHECKS LIVENESS EVERY ITERATION. A bare poll would
+    # turn the version-mismatch case — the single most likely reason a raw
+    # store copy will not open — into a 90-second timeout whose message names
+    # the wrong cause. Measured: a Neo4j that cannot start exits in ~2 s with
+    # code 3 and an EMPTY debug.log, so the container log and the /logs volume
+    # are both dumped the moment `.State.Running` goes false. This is also what
+    # makes the negative test fail AT the failure rather than at a deadline.
+    neo4j_ready=0
+    for i in $(seq 1 90); do
+        if [[ "$(docker inspect -f '{{.State.Running}}' "$SCRATCH_NEO4J_NAME" 2>/dev/null)" != "true" ]]; then
+            warn "scratch neo4j container log:"
+            docker logs --tail 40 "$SCRATCH_NEO4J_NAME" 2>&1 | tail -40 >&2 || true
+            warn "scratch neo4j /logs/neo4j.log:"
+            docker run --rm -v "$SCRATCH_NEO4J_LOGS:/logs" --entrypoint sh "$NEO4J_IMAGE" \
+                -c 'tail -40 /logs/neo4j.log 2>/dev/null; tail -40 /logs/debug.log 2>/dev/null' >&2 || true
+            die "scratch neo4j EXITED after ${i}s (code $(docker inspect -f '{{.State.ExitCode}}' "$SCRATCH_NEO4J_NAME" 2>/dev/null)).
+   The store is a RAW COPY, so the commonest cause is an image that does not
+   match the one that wrote it — this drill pins
+   ${NEO4J_IMAGE}
+   and docker-compose.yml must pin the same digest for both the neo4j service
+   and the neo4j-backup sidecar. Override with TALOS_DRILL_NEO4J_IMAGE."
+        fi
+        if docker exec "$SCRATCH_NEO4J_NAME" cypher-shell -a bolt://localhost:7687 \
+                --format plain "RETURN 1;" >/dev/null 2>&1; then
+            neo4j_ready=1
+            ok "scratch neo4j accepted an ANONYMOUS query after ${i}s"
+            ok "  ⇒ this is NOT the live graph: talos-neo4j runs with auth enabled and refuses anonymous connections"
+            break
+        fi
+        sleep 1
+    done
+    (( neo4j_ready == 1 )) || die "scratch neo4j never became queryable within 90s — see 'docker logs $SCRATCH_NEO4J_NAME'"
+
+    # A SERVER THAT ANSWERS `RETURN 1` IS NOT A DATABASE THAT RECOVERED.
+    # Neo4j will happily serve the system database while the `neo4j` database
+    # sits in `failed` after a botched recovery, so ask it directly rather than
+    # inferring liveness from the fact that something replied.
+    NEO4J_DB_STATUS=$(docker exec "$SCRATCH_NEO4J_NAME" cypher-shell -a bolt://localhost:7687 \
+        --format plain "SHOW DATABASES YIELD name, currentStatus WHERE name = 'neo4j' RETURN currentStatus;" \
+        2>/dev/null | tail -1 | tr -d '"' | tr -d ' ' || true)
+    [[ "$NEO4J_DB_STATUS" == "online" ]] \
+        || die "restored neo4j database is '${NEO4J_DB_STATUS:-<unreadable>}', not 'online' — transaction recovery did not complete"
+    ok "restored neo4j database is online (transaction recovery completed)"
+
+    NEO4J_RESTORED_NODES=$(docker exec "$SCRATCH_NEO4J_NAME" cypher-shell -a bolt://localhost:7687 \
+        --format plain "MATCH (n) RETURN count(n);" 2>/dev/null | tail -1 | tr -d ' ' || true)
+    NEO4J_RESTORED_RELS=$(docker exec "$SCRATCH_NEO4J_NAME" cypher-shell -a bolt://localhost:7687 \
+        --format plain "MATCH ()-[r]->() RETURN count(r);" 2>/dev/null | tail -1 | tr -d ' ' || true)
+    [[ "$NEO4J_RESTORED_NODES" =~ ^[0-9]+$ ]] \
+        || die "could not read a node count from the restored graph (got '${NEO4J_RESTORED_NODES:-<empty>}')"
+    [[ "$NEO4J_RESTORED_RELS" =~ ^[0-9]+$ ]] \
+        || die "could not read a relationship count from the restored graph (got '${NEO4J_RESTORED_RELS:-<empty>}')"
+
+    # BOTH counts, not just nodes. The sidecar's probe runs the node query and
+    # the relationship query SEPARATELY and prints
+    # `neo4j_relationships=${rels:-unknown}` on the branch where the NODE query
+    # succeeded — so `neo4j_nodes=1283` beside `neo4j_relationships=unknown` is
+    # a manifest this host can really produce. Guarding on nodes alone reached
+    # `assert_neo4j_count relationships 1939 ""`, and bash coerces the empty
+    # string to 0 inside `(( ))` — so it evaluated `1939 > 0` and died with
+    # "restored neo4j relationships (1939) EXCEEDS the manifest's ()". A false
+    # RED on a shape the producer emits by design, and one that PAGES
+    # (last_status=0 carries category: data-loss). Found by auditing this leg
+    # against the standing question "can it pass without having verified
+    # anything"; the exact failure mode was then MEASURED, not predicted — the
+    # first guess written here was "arithmetic syntax error", which bash does
+    # not do for an empty operand.
+    if [[ -z "$NEO4J_MANIFEST_NODES" || -z "$NEO4J_MANIFEST_RELS" ]]; then
+        # `neo4j_nodes=unknown`, or no manifest at all. THE RESTORE STILL RAN
+        # and still proved something real — the archive opens, the store is a
+        # valid Neo4j store, the database recovers to `online` — but there is
+        # no recorded truth to compare the content against, so this is NOT a
+        # verification and must not be reported as one. It is recorded as
+        # kind_verified=0 ("present but NOT verified"), which is a different
+        # value from 1 and a different thing from no line at all.
+        NEO4J_STATE="unverifiable"
+        NEO4J_DETAIL="restored $NEO4J_RESTORED_NODES nodes / $NEO4J_RESTORED_RELS rels; manifest nodes=${NEO4J_MANIFEST_NODES:-unknown} rels=${NEO4J_MANIFEST_RELS:-unknown}"
+        record_kind neo4j 0
+        warn "neo4j manifest has no usable node AND relationship count (the sidecar writes"
+        warn "  'unknown' for whichever query could not reach the graph; both are required"
+        warn "  because a half-known manifest verifies half a graph). The store restored"
+        warn "  and the database came up"
+        warn "  online with $NEO4J_RESTORED_NODES nodes / $NEO4J_RESTORED_RELS relationships,"
+        warn "  but NOTHING was verified against it — this is 'present but unverifiable',"
+        warn "  not a pass. Fix the sidecar's probe (docker logs talos-neo4j-backup) so the"
+        warn "  NEXT artifact carries a count."
+    else
+        assert_neo4j_count() {
+            local label="$1" restored="$2" expected="$3"
+            if (( restored > expected )); then
+                die "restored neo4j $label ($restored) EXCEEDS the manifest's ($expected).
+   That is supposed to be impossible: the graph is MERGE-only with no production
+   DELETE path, so an archive can never hold MORE than the probe taken after it.
+   Either this manifest does not belong to this archive, or the MERGE-only
+   property has expired (measured 2026-08-26; re-derive with
+   grep -rn --include='*.rs' 'DETACH DELETE' talos-graph-rag/src)."
+            fi
+            local deficit=$(( expected - restored ))
+            if (( deficit > NEO4J_COUNT_TOLERANCE )); then
+                die "restored neo4j $label ($restored) is $deficit short of the manifest's ($expected),
+   over the ${NEO4J_COUNT_TOLERANCE} tolerance. THIS BACKUP DID NOT RESTORE ITS CONTENT.
+   A deficit this size is not the 26-55 s probe-after-tar window: check that the
+   archive contains ./databases AND ./transactions, and compare
+   '$NEO4J_ARTIFACT' against its .manifest. Raise
+   TALOS_DRILL_NEO4J_COUNT_TOLERANCE only if you can show the graph legitimately
+   grew that much inside one backup's probe window."
+            fi
+            ok "neo4j $label: restored $restored vs manifest $expected (deficit $deficit, tolerance $NEO4J_COUNT_TOLERANCE)"
+        }
+        assert_neo4j_count "nodes"         "$NEO4J_RESTORED_NODES" "$NEO4J_MANIFEST_NODES"
+        assert_neo4j_count "relationships" "$NEO4J_RESTORED_RELS"  "$NEO4J_MANIFEST_RELS"
+        NEO4J_STATE="verified"
+        NEO4J_DETAIL="restored $NEO4J_RESTORED_NODES/$NEO4J_RESTORED_RELS vs manifest $NEO4J_MANIFEST_NODES/$NEO4J_MANIFEST_RELS"
+        record_kind neo4j 1
+    fi
+fi
+
+# ── 7. Verify against the restored stack ──────────────────────────
+log "[7/8] verifying the restored stack"
 DATABASE_URL="postgres://${SCRATCH_PG_USER}:${SCRATCH_PG_PASSWORD}@127.0.0.1:${SCRATCH_PG_PORT}/${SCRATCH_PG_DB}"
 # EVERY migration version this checkout ships, not just the newest. The
 # verifier used to be handed only the newest and required equality, which
@@ -1335,17 +1814,54 @@ run_verifier() {
 run_verifier "$VERIFY_RESTORE_BIN" "verify_restore"
 run_verifier "$VERIFY_PHASE_B_BIN" "verify_phase_b"
 
-# ── 7. Done ───────────────────────────────────────────────────────
-log "[7/7] drill passed"
+# ── 8. Done ───────────────────────────────────────────────────────
+log "[8/8] drill passed"
 DRILL_COMPLETE=1
 emit_metric success
 
-printf '\n\033[1;32m╔══════════════════════════════════════════════════════════════╗\033[0m\n'
-printf '\033[1;32m║ Drill %-38s PASSED ║\033[0m\n' "$DRILL_ID"
-printf '\033[1;32m╚══════════════════════════════════════════════════════════════╝\033[0m\n'
+# THE HEADLINE CARRIES THE COVERAGE, because the headline is the only part of
+# this that gets read on a good day. A green "PASSED" box with a "Neo4j: NOT
+# VERIFIED" line four rows below it is the same shape as the defect this whole
+# leg exists to remove — a green signal certifying less than it appears to. So
+# the count of kinds actually verified goes IN the box, and the box turns amber
+# the moment it is not 3 of 3. Denominator is 3 because that is how many
+# artifact kinds this platform backs up (talos-offhost-backup/src/key.rs's
+# ArtifactKind), NOT how many this run attempted: a host that legitimately has
+# no graph still reads 2/3, and the line below says why. Reporting "2/2" for
+# that host would be exactly the aggregation that hides the shortfall.
+BANNER_KINDS_OK=0
+if [[ -n "$KIND_VERIFIED_LINES" ]]; then
+    BANNER_KINDS_OK=$(printf '%s\n' "$KIND_VERIFIED_LINES" | grep -c '} 1$' || true)
+fi
+BANNER_COLOUR='1;32'
+(( BANNER_KINDS_OK < 3 )) && BANNER_COLOUR='1;33'
+printf '\n\033[%sm╔══════════════════════════════════════════════════════════════╗\033[0m\n' "$BANNER_COLOUR"
+# ASCII only inside the padded field: printf's %-60s pads by BYTES, and an
+# em dash is 3 bytes to 1 display column, which knocks the box border out of
+# alignment by 2. The border characters themselves are literals, so they are
+# unaffected.
+printf '\033[%sm║ %-60s ║\033[0m\n' "$BANNER_COLOUR" \
+    "Drill $DRILL_ID PASSED - $BANNER_KINDS_OK/3 kinds verified"
+printf '\033[%sm╚══════════════════════════════════════════════════════════════╝\033[0m\n' "$BANNER_COLOUR"
 printf '  Source:          %s\n' "$SOURCE_MODE"
 [[ "$SOURCE_MODE" == "artifact" ]] && printf '  Postgres backup: %s\n' "$(basename "${PG_ARTIFACT:-?}")"
 [[ "$SOURCE_MODE" == "artifact" ]] && printf '  Vault backup:    %s\n' "$(basename "${VAULT_ARTIFACT:-?}")"
+# THE THIRD KIND, ALWAYS NAMED. The banner is where an operator decides whether
+# to stop reading, so the state that used to be invisible is printed here rather
+# than only in the caveat block: "verified", "not present" and "present but
+# unverifiable" are three different lines, and none of them is silence.
+case "$NEO4J_STATE" in
+    verified)
+        printf '  Neo4j backup:    %s\n' "$(basename "${NEO4J_ARTIFACT:-?}")"
+        printf '  Neo4j content:   VERIFIED — %s\n' "$NEO4J_DETAIL" ;;
+    unverifiable)
+        printf '  Neo4j backup:    %s\n' "$(basename "${NEO4J_ARTIFACT:-?}")"
+        printf '  Neo4j content:   NOT VERIFIED (present but unverifiable) — %s\n' "$NEO4J_DETAIL" ;;
+    absent)
+        printf '  Neo4j content:   NOT VERIFIED — no artifact on this host (TALOS_DRILL_ALLOW_NO_NEO4J=1)\n' ;;
+    *)
+        printf '  Neo4j content:   NOT VERIFIED — not attempted for --source %s\n' "$SOURCE_MODE" ;;
+esac
 [[ "$SOURCE_MODE" == "b2" ]] && printf '  Postgres object: %s\n' "${PG_OBJECT:-?}"
 [[ "$SOURCE_MODE" == "b2" ]] && printf '  Vault object:    %s\n' "${VAULT_OBJECT:-?}"
 # The RESTORED schema version is reported by verify_restore (which is the only
@@ -1418,4 +1934,18 @@ fi
 printf '\033[1;33m    Column families: only actor_memory, secrets and ml_examples ciphertext\033[0m\n'
 printf '\033[1;33m      was decrypted and content-checked. workflow_executions output, module\033[0m\n'
 printf '\033[1;33m      payloads, TOTP/webhook secrets and integration_state were not.\033[0m\n'
+# WHAT THE NEO4J COUNTS DO AND DO NOT PROVE. Said plainly, because a count is a
+# weak content check and a banner that implied otherwise would be this arc's
+# own defect: 1,283 nodes of the right shape and 1,283 nodes of garbage both
+# count 1,283.
+if [[ "$NEO4J_STATE" == "verified" ]]; then
+    printf '\033[1;33m    Neo4j content: the CARDINALITY of the restored graph matches the count\033[0m\n'
+    printf '\033[1;33m      the sidecar recorded, and its labels/relationship types are readable.\033[0m\n'
+    printf '\033[1;33m      NOT proven: that any individual node holds the right PROPERTIES. Nothing\033[0m\n'
+    printf '\033[1;33m      here compares a node to a known value — the manifest records only two\033[0m\n'
+    printf '\033[1;33m      integers, so two integers is the strongest claim available from it.\033[0m\n'
+else
+    printf '\033[1;33m    Neo4j: NOT verified on this run (%s). This drill certified 2 of the 3\033[0m\n' "$NEO4J_STATE"
+    printf '\033[1;33m      artifact kinds this host backs up. See the Neo4j line above.\033[0m\n'
+fi
 printf '\n'
