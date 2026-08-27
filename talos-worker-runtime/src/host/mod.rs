@@ -34,6 +34,9 @@ pub(crate) use sha2::{Digest, Sha256};
 #[path = "../host_impl_tests.rs"]
 mod host_impl_tests;
 
+#[cfg(test)]
+mod cancellation_tests;
+
 mod cache;
 mod crypto;
 mod data;

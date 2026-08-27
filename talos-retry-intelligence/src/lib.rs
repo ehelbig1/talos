@@ -464,6 +464,55 @@ mod tests {
         assert!(!is_transient_error_type("circuit_open"));
     }
 
+    /// The controller half of the cancellation receiver contract, asserted in
+    /// BOTH directions.
+    ///
+    /// A cancelled egress guard reaches this classifier as the bare WIT
+    /// `networkerror` token PLUS the host-stamped `[reason_class=cancelled]`
+    /// marker. Without the marker the string lands in the `network_transient`
+    /// bucket, the dispatcher re-dispatches, and the retry runs on a FRESH
+    /// worker context whose `cancelled` flag is false — i.e. the operator's
+    /// cancel silently does not stick. `http::fetch_all` and `graphql::execute`
+    /// were emitting exactly the unmarked form until the worker-side parity fix.
+    #[test]
+    fn a_cancelled_egress_is_non_transient_only_because_of_the_marker() {
+        const GUEST: &str = "Component returned error: list fetch: Error { code: 2, \
+name: \"networkerror\", message: \"\" }";
+
+        let marked = format!("{GUEST} [reason_class=cancelled]");
+        assert_eq!(classify_error(&marked), "cancelled");
+        assert!(
+            !is_transient_error_type("cancelled"),
+            "a cancelled execution must never be re-dispatched"
+        );
+
+        // FALSIFICATION DIRECTION. If this ever stops being transient the test
+        // above proves nothing, because the marker would no longer be what
+        // makes the difference.
+        assert_eq!(
+            classify_error(GUEST),
+            "network_transient",
+            "the unmarked form is the pre-fix behaviour and must stay transient \
+             for the marked assertion above to be meaningful"
+        );
+        assert!(is_transient_error_type("network_transient"));
+    }
+
+    /// The marker must beat the `networkerror` token regardless of ordering
+    /// inside the message — the two are matched by different `if` blocks and
+    /// only the HOIST keeps `cancelled` winning.
+    #[test]
+    fn the_cancelled_arm_outranks_the_networkerror_arm() {
+        assert_eq!(
+            classify_error("[reason_class=cancelled] networkerror"),
+            "cancelled"
+        );
+        assert_eq!(
+            classify_error("networkerror [reason_class=cancelled]"),
+            "cancelled"
+        );
+    }
+
     #[test]
     fn circuit_open_classified_non_transient() {
         // The worker's `circuit_open_error` message shape.

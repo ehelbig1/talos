@@ -964,6 +964,20 @@ impl TalosContext {
             if let Some(ref m) = self.metrics {
                 m.record_execution_cancelled();
             }
+            // `wit_graphql::Error::Networkerror` renders the same bare
+            // `networkerror` token as its HTTP namesake, so without a
+            // `[reason_class=cancelled]` marker both transient gates classify a
+            // cancelled GraphQL query `network_transient` and the controller
+            // RE-DISPATCHES it onto a fresh, uncancelled `TalosContext`. The
+            // latch `last_network_reason_suffix` reads is per-CONTEXT, not
+            // per-interface, and its only precondition is that the guest error
+            // carries the `networkerror` token — which this one does. Same
+            // parity fix as `http::fetch_all`.
+            self.emit_network_failure(
+                crate::reason_class::CANCELLED,
+                "the execution was cancelled before the GraphQL query was sent",
+            )
+            .await;
             return Err(wit_graphql::Error::Networkerror);
         }
 
