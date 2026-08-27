@@ -112,6 +112,166 @@ pub fn node_receives_actor_context(capability_world: Option<&str>, explicit: Opt
     }
 }
 
+// ── Retry envelope vs the workflow budget containing it ─────────────────────
+//
+// Every timeout / retry allowance in the platform is already capped against an
+// ABSOLUTE constant by `talos_workflow_types::validate_graph_timeouts` — the
+// workflow budget against 3600 s, per-node `timeout_secs` against 600 s,
+// `retry_count` against 100, `retry_backoff_ms` against its own ceiling. Eight
+// independent ceilings, and not one of them compares an allowance against the
+// container it has to fit inside.
+//
+// So a node can be configured with a retry envelope larger than the entire
+// workflow budget. The engine will honour it literally: the retry loop
+// (`talos-workflow-engine-nats::execute_job_with_retry`) terminates only on
+// `attempts > max_retries` and has no deadline parameter at all, while the
+// workflow budget is an OUTER `tokio::time::timeout` that DROPS the whole
+// reactor future when it fires. Nothing connects the two. An attempt that
+// cannot possibly finish is started anyway, runs until the budget expires, and
+// takes every already-completed sibling node's result down with it — those
+// results live only in the dropped future (per-node checkpointing is opt-in and
+// off).
+//
+// Observed live 2026-08-27: a node with a 120 s per-attempt timeout and
+// `retry_count: 2` inside a 300 s budget started its third attempt at t=252 s
+// with 48 s left. It could not have completed under any outcome. Two completed
+// sibling nodes were discarded.
+//
+// WHAT THIS CHECK CLAIMS, narrowly: at least one CONFIGURED attempt of this
+// node can never complete, whatever else the graph does. That is provable from
+// the single node — it needs no assumption about what runs in parallel.
+//
+// It deliberately does NOT flag the (larger) population where the SUM of
+// envelopes along the critical path exceeds the budget. That shape assumes
+// every node on the path burns its full envelope simultaneously; it is a real
+// worst case but it is not reachable in any observed run, and on the live fleet
+// it would fire on a clear majority of workflows that all work today. A warning
+// that fires on the majority is a warning nobody reads.
+
+/// Worst-case wall-clock seconds a node's configured retry envelope can occupy:
+/// every attempt running to its full per-attempt timeout, plus the exponential
+/// backoff slept between them.
+///
+/// `retries` is the ALREADY-RESOLVED count (an author's declared `retry_count`,
+/// or `default_max_retries_for_module` when the author declared none) — this
+/// function never invents one, matching `RetryPolicy::resolved_max_retries`.
+///
+/// Backoff mirrors the dispatcher's `base_backoff_ms * 2^(n-1)` per retry,
+/// summing to `base * (2^retries - 1)`. Jitter (up to +25 % per sleep) and the
+/// dispatcher's 5 s per-attempt Tokio grace are BOTH excluded, so the result is
+/// a lower bound on the true envelope: this check under-reports rather than
+/// false-positives.
+///
+/// **Every step saturates.** `retry_count` is capped at 100, and `2^100` does
+/// not fit in a `u64` — an envelope calculator that overflowed while computing
+/// whether an allowance fits its container would be an exceptionally poor joke.
+#[must_use]
+pub fn node_retry_envelope_secs(
+    per_attempt_timeout_secs: u64,
+    retries: u32,
+    base_backoff_ms: u64,
+) -> u64 {
+    let attempts = u64::from(retries).saturating_add(1);
+    let attempt_secs = per_attempt_timeout_secs.saturating_mul(attempts);
+    // sum(base * 2^(i-1)) for i in 1..=retries  ==  base * (2^retries - 1)
+    let growth = if retries >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << retries) - 1
+    };
+    let backoff_secs = base_backoff_ms.saturating_mul(growth) / 1_000;
+    attempt_secs.saturating_add(backoff_secs)
+}
+
+/// Read a node's per-attempt timeout the way the engine does:
+/// `data.timeout_secs` first, then top-level, then
+/// `DEFAULT_NODE_TIMEOUT_SECS`.
+///
+/// The precedence is `data`-first and that is NOT a typo — it is the OPPOSITE
+/// of `retry_count`, which the engine reads top-level-first. Mirroring each
+/// key's own order is the whole point; a checker that guessed one order for
+/// both would silently disagree with the engine on any node that sets both
+/// shapes.
+fn node_per_attempt_timeout_secs(node: &serde_json::Value, default_secs: u64) -> u64 {
+    node.get("data")
+        .and_then(|d| d.get("timeout_secs"))
+        .or_else(|| node.get("timeout_secs"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(default_secs)
+}
+
+/// Read a node's declared `retry_count` / `retry_backoff_ms` the way
+/// `read_node_retry_policy` does: top-level first, then under `data`.
+fn node_declared_u64(node: &serde_json::Value, key: &str) -> Option<u64> {
+    node.get(key)
+        .or_else(|| node.get("data").and_then(|d| d.get(key)))
+        .and_then(serde_json::Value::as_u64)
+}
+
+/// A node whose configured retry envelope cannot fit its workflow's budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryEnvelopeOverrun {
+    /// Worst-case seconds the node's attempts + backoff can occupy.
+    pub envelope_secs: u64,
+    /// Total attempts the engine is configured to make (`retries + 1`).
+    pub attempts: u64,
+    /// Per-attempt timeout the engine will enforce.
+    pub per_attempt_secs: u64,
+    /// Resolved retry count — declared, clamped, or classifier-supplied.
+    pub resolved_retries: u32,
+    /// `true` when the count came from the node's own `retry_count`;
+    /// `false` when the method-aware module default supplied it.
+    pub retries_declared: bool,
+}
+
+/// Decide whether one node's retry envelope exceeds the workflow budget that
+/// contains it. `None` means it fits (or there is no budget to fit inside).
+///
+/// Pure, so the fire / don't-fire decision is unit-tested against the real
+/// shapes rather than shadowed by a test-local reimplementation. `validate`
+/// calls this and only formats the message.
+///
+/// `budget_secs == 0` means the workflow-level wall-clock cap is DISABLED —
+/// there is no container, so nothing can exceed it.
+#[must_use]
+pub fn retry_envelope_overrun(
+    node: &serde_json::Value,
+    budget_secs: u64,
+    has_actor: bool,
+    module_methods: &[String],
+    module_world: Option<&str>,
+    default_node_timeout_secs: u64,
+) -> Option<RetryEnvelopeOverrun> {
+    if budget_secs == 0 {
+        return None;
+    }
+    let declared =
+        node_declared_u64(node, "retry_count").map(|v| u32::try_from(v).unwrap_or(u32::MAX));
+    let resolved_retries = match declared {
+        Some(n) if has_actor => n,
+        // An actor-less execution has its DECLARED count clamped at graph load;
+        // predicting the unclamped one would report an envelope that cannot run.
+        Some(n) => n.min(talos_workflow_engine_core::MAX_RETRIES_UNBUDGETED),
+        None => {
+            talos_workflow_engine_core::default_max_retries_for_module(module_methods, module_world)
+        }
+    };
+    let per_attempt_secs = node_per_attempt_timeout_secs(node, default_node_timeout_secs);
+    let backoff_ms = node_declared_u64(node, "retry_backoff_ms")
+        .unwrap_or(talos_workflow_engine_core::DEFAULT_BACKOFF_MS);
+    let envelope_secs = node_retry_envelope_secs(per_attempt_secs, resolved_retries, backoff_ms);
+    if envelope_secs <= budget_secs {
+        return None;
+    }
+    Some(RetryEnvelopeOverrun {
+        envelope_secs,
+        attempts: u64::from(resolved_retries).saturating_add(1),
+        per_attempt_secs,
+        resolved_retries,
+        retries_declared: declared.is_some(),
+    })
+}
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 /// Severity of a validation issue.
@@ -417,6 +577,22 @@ impl WorkflowValidationService {
                 .map(|r| (r.id, (r.max_fuel, r.capability_world.clone())))
                 .collect();
 
+            // Retry-envelope inputs, captured from the same rows for the same
+            // reason. A node that declares no `retry_count` still gets one at
+            // dispatch — `default_max_retries_for_module(allowed_methods,
+            // capability_world)` — so the envelope is NOT computable from the
+            // graph alone. That is why this check lives here and not in the
+            // pure `validate_graph_timeouts` walker.
+            let template_retry: HashMap<Uuid, (Vec<String>, Option<String>)> = template_rows
+                .iter()
+                .map(|r| {
+                    (
+                        r.id,
+                        (r.allowed_methods.clone(), r.capability_world.clone()),
+                    )
+                })
+                .collect();
+
             let template_schemas: HashMap<Uuid, (String, serde_json::Value, Vec<String>)> =
                 template_rows
                     .into_iter()
@@ -520,6 +696,117 @@ impl WorkflowValidationService {
                     node_id: Some(node_label.to_string()),
                     category: "fuel-sizing".into(),
                 });
+            }
+
+            // ── Retry envelope vs the workflow budget (Warning) ──────────────
+            //
+            // See the module-level rationale above `node_retry_envelope_secs`
+            // for what this claims and what it deliberately does not.
+            {
+                // The ENFORCED budget is the graph's `execution_timeout_secs`,
+                // read by the engine during `load_graph_from_json`, falling
+                // back to its 300 s default. It is NOT `workflows.timeout_seconds`
+                // — that column is read into `WorkflowRow` and never reaches an
+                // engine, and on the live fleet one workflow's column disagrees
+                // with its enforced budget by 240 s. Compare against what runs.
+                let budget = graph
+                    .get("execution_timeout_secs")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(talos_workflow_engine_core::DEFAULT_WORKFLOW_EXECUTION_TIMEOUT_SECS);
+
+                // `0` disables the wall-clock cap entirely (per-node timeouts
+                // become the only bound), so there is no container to exceed.
+                if budget > 0 {
+                    // An execution with no bound actor has its DECLARED count
+                    // clamped to `MAX_RETRIES_UNBUDGETED` at graph load. Using
+                    // the unclamped value would over-report an envelope that
+                    // cannot occur — the one direction a warning must not err in.
+                    //
+                    // On a DB failure we assume NO actor, which clamps the
+                    // predicted count and can only SUPPRESS warnings — never
+                    // invent one. Logged rather than swallowed: a silently
+                    // failing query that degrades a check into always-quiet is
+                    // its own class of bug.
+                    let has_actor = match workflow_repo
+                        .get_workflow_actor_id(workflow_id, user_id)
+                        .await
+                    {
+                        Ok(a) => a.is_some(),
+                        Err(e) => {
+                            tracing::warn!(
+                                %workflow_id,
+                                error = %e,
+                                "retry-envelope check: actor lookup failed; assuming unbound \
+                                 (clamps predicted retries, so this can only under-report)"
+                            );
+                            false
+                        }
+                    };
+
+                    for node in &nodes {
+                        let node_label =
+                            node.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        let Some(tid) = node
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<Uuid>().ok())
+                        else {
+                            // System node (`system:*`) — its cost is the
+                            // sub-workflow / judge it drives, not a dispatched
+                            // module envelope. Saying nothing is correct.
+                            continue;
+                        };
+                        let Some((methods, world)) = template_retry.get(&tid) else {
+                            // Module row missing — already reported as a
+                            // `missing_module` Error above; don't pile on.
+                            continue;
+                        };
+
+                        let Some(overrun) = retry_envelope_overrun(
+                            node,
+                            budget,
+                            has_actor,
+                            methods,
+                            world.as_deref(),
+                            talos_workflow_engine_core::default_node_timeout_secs(),
+                        ) else {
+                            continue;
+                        };
+
+                        let RetryEnvelopeOverrun {
+                            envelope_secs,
+                            attempts,
+                            per_attempt_secs,
+                            resolved_retries,
+                            retries_declared,
+                        } = overrun;
+                        let retry_note = if retries_declared {
+                            format!("its declared retry_count of {resolved_retries}")
+                        } else {
+                            format!(
+                                "the {resolved_retries} method-aware default retries its module \
+                                 resolves to (it declares no retry_count)"
+                            )
+                        };
+                        issues.push(ValidationIssue {
+                            severity: ValidationSeverity::Warning,
+                            message: format!(
+                                "Node '{node_label}' has a retry envelope of ~{envelope_secs}s \
+                                 ({attempts} attempts x {per_attempt_secs}s, plus backoff, from \
+                                 {retry_note}) inside a workflow budget of {budget}s. At least \
+                                 one configured attempt can never complete: the retry loop has no \
+                                 view of the workflow deadline, so it starts the attempt anyway, \
+                                 and when the budget expires the whole execution is dropped — \
+                                 discarding every sibling node that had already finished. Lower \
+                                 retry_count or raise execution_timeout_secs. Do NOT raise this \
+                                 node's timeout_secs: that multiplies the envelope by the attempt \
+                                 count and makes the failure arrive sooner."
+                            ),
+                            node_id: Some(node_label.to_string()),
+                            category: "retry-envelope".into(),
+                        });
+                    }
+                }
             }
 
             for node in &nodes {
@@ -2529,5 +2816,177 @@ mod fuel_sizing_tests {
     fn an_absurd_max_tokens_saturates_rather_than_wrapping() {
         assert_eq!(required_fuel_floor(u64::MAX, CTX), u64::MAX);
         assert_eq!(required_fuel_floor(u64::MAX, u64::MAX), u64::MAX);
+    }
+}
+
+// ── Retry-envelope containment tests ─────────────────────────────────────────
+//
+// These drive `retry_envelope_overrun` — the SAME function `validate` calls to
+// decide whether to emit the warning. `validate` itself only formats the
+// message, so there is no second copy of the decision to drift.
+#[cfg(test)]
+mod retry_envelope_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The observed live budget on the deployment that motivated this check.
+    const BUDGET: u64 = 300;
+    /// `DEFAULT_NODE_TIMEOUT_SECS` with no operator override.
+    const NODE_DEFAULT: u64 = talos_workflow_engine_core::DEFAULT_NODE_TIMEOUT_SECS_FALLBACK;
+
+    fn check(node: &serde_json::Value, budget: u64) -> Option<RetryEnvelopeOverrun> {
+        // Actor-bound, and a world that resolves to ZERO default retries, so
+        // any count in these cases came from the node itself unless a test
+        // deliberately says otherwise.
+        retry_envelope_overrun(node, budget, true, &[], Some("http-node"), NODE_DEFAULT)
+    }
+
+    /// The exact live shape, 2026-08-27: no declared `timeout_secs` (so the
+    /// 120 s default applies), `retry_count: 2`, 3 s backoff, 300 s budget.
+    /// 3 x 120 + (3 + 6) = 369 s. The third attempt cannot complete.
+    #[test]
+    fn live_shape_fires() {
+        let node = json!({ "retry_count": 2, "retry_backoff_ms": 3000 });
+        let o = check(&node, BUDGET).expect("369s envelope must not fit a 300s budget");
+        assert_eq!(o.attempts, 3);
+        assert_eq!(o.per_attempt_secs, 120);
+        assert_eq!(o.resolved_retries, 2);
+        assert!(o.retries_declared);
+        assert_eq!(o.envelope_secs, 369);
+    }
+
+    /// The same node WITHOUT the backoff — 360 s, the figure the incident
+    /// report quoted. Still over 300; the check must not depend on backoff to
+    /// find it.
+    #[test]
+    fn plan_shape_without_declared_backoff_fires() {
+        let node = json!({ "retry_count": 2 });
+        let o = check(&node, BUDGET).expect("360s + default backoff must not fit 300s");
+        assert_eq!(o.envelope_secs, 361); // 360 + 1.5s of default backoff, floored
+    }
+
+    /// One retry at the same timeout fits with 60 s to spare — the check must
+    /// stay quiet. This is the "does not fire on a fitting one" half.
+    #[test]
+    fn fitting_shape_does_not_fire() {
+        let node = json!({ "retry_count": 1 });
+        assert!(check(&node, BUDGET).is_none());
+    }
+
+    /// Exactly filling the budget is not an overrun: the attempt CAN complete
+    /// if it starts immediately. It is a hazard (nothing else may run) but not
+    /// a structural impossibility, and this check only claims the latter.
+    #[test]
+    fn exactly_filling_the_budget_does_not_fire() {
+        let node = json!({ "retry_count": 0, "timeout_secs": 300 });
+        assert!(check(&node, BUDGET).is_none());
+    }
+
+    /// `execution_timeout_secs: 0` disables the workflow wall-clock cap, so
+    /// there is no container for the envelope to exceed.
+    #[test]
+    fn disabled_budget_never_fires() {
+        let node = json!({ "retry_count": 9, "timeout_secs": 600 });
+        assert!(check(&node, 0).is_none());
+    }
+
+    /// A single attempt longer than the whole budget is the degenerate case of
+    /// the same defect, with no retry involved at all.
+    #[test]
+    fn single_attempt_over_budget_fires() {
+        let node = json!({ "retry_count": 0, "timeout_secs": 400 });
+        let o = check(&node, BUDGET).expect("one 400s attempt cannot fit 300s");
+        assert_eq!(o.attempts, 1);
+        assert_eq!(o.envelope_secs, 400);
+    }
+
+    /// Per-attempt timeout precedence is `data` FIRST, matching
+    /// `engine_graph_load`. A checker that read top-level first would compute
+    /// 300 s here and stay silent on a node the engine runs for 60 s.
+    #[test]
+    fn per_attempt_timeout_reads_data_before_top_level() {
+        let node = json!({ "timeout_secs": 300, "data": { "timeout_secs": 60 } });
+        assert_eq!(node_per_attempt_timeout_secs(&node, NODE_DEFAULT), 60);
+    }
+
+    /// `retry_count` precedence is the OPPOSITE — top level first, matching
+    /// `read_node_retry_policy`. An explicit 0 wins over a nested 5.
+    #[test]
+    fn retry_count_reads_top_level_before_data() {
+        let node = json!({ "retry_count": 0, "data": { "retry_count": 5 } });
+        assert_eq!(node_declared_u64(&node, "retry_count"), Some(0));
+        assert!(check(&node, BUDGET).is_none());
+    }
+
+    /// An actor-less execution has its DECLARED count clamped to
+    /// `MAX_RETRIES_UNBUDGETED` at graph load. Predicting the unclamped count
+    /// would warn about an envelope the engine will never run.
+    #[test]
+    fn actorless_declared_count_is_clamped_before_measuring() {
+        let node = json!({ "retry_count": 10, "timeout_secs": 60, "retry_backoff_ms": 0 });
+        // Bound actor: 11 x 60 = 660 > 500.
+        let bound = retry_envelope_overrun(&node, 500, true, &[], Some("http-node"), NODE_DEFAULT)
+            .expect("11 attempts of 60s must not fit 500s");
+        assert_eq!(bound.attempts, 11);
+        // No actor: clamped to 3 retries ⇒ 4 x 60 = 240 ≤ 500, no warning.
+        assert!(
+            retry_envelope_overrun(&node, 500, false, &[], Some("http-node"), NODE_DEFAULT)
+                .is_none()
+        );
+    }
+
+    /// A node that declares NO retry keys still gets a count at dispatch from
+    /// the method-aware classifier, so the envelope must include it — and the
+    /// message must not claim the author declared it.
+    #[test]
+    fn absent_retry_count_uses_the_module_default() {
+        let node = json!({ "id": "fetch" });
+        // Read-only HTTP ⇒ DEFAULT_TRANSIENT_RETRIES (2) ⇒ 3 x 120 + 1 = 361.
+        let o = retry_envelope_overrun(
+            &node,
+            BUDGET,
+            true,
+            &["GET".to_string()],
+            Some("http-node"),
+            NODE_DEFAULT,
+        )
+        .expect("classifier-supplied retries must count toward the envelope");
+        assert_eq!(
+            o.resolved_retries,
+            talos_workflow_engine_core::DEFAULT_TRANSIENT_RETRIES
+        );
+        assert!(!o.retries_declared);
+
+        // A side-effect world fails closed to 0 retries ⇒ one 120s attempt fits.
+        assert!(retry_envelope_overrun(
+            &node,
+            BUDGET,
+            true,
+            &["POST".to_string()],
+            Some("messaging-node"),
+            NODE_DEFAULT,
+        )
+        .is_none());
+    }
+
+    /// The standing mandate applied to this change: an envelope calculator
+    /// must not itself overflow the container it computes in. `retry_count` is
+    /// capped at 100 and `2^100` does not fit in a `u64`.
+    #[test]
+    fn envelope_saturates_at_the_retry_cap() {
+        let e = node_retry_envelope_secs(
+            talos_workflow_types::MAX_NODE_TIMEOUT_SECS,
+            talos_workflow_types::MAX_NODE_RETRY_COUNT,
+            60_000,
+        );
+        // Saturated, not wrapped: the backoff term alone pins at u64::MAX ms,
+        // which is u64::MAX/1000 seconds. A wrapping `<<` or `pow` would land
+        // somewhere small and the check would silently pass the node.
+        assert!(e >= u64::MAX / 1_000, "must saturate, not wrap (got {e})");
+        // The 63/64 shift boundary must not panic in a debug build either.
+        assert!(node_retry_envelope_secs(600, 63, 60_000) > 0);
+        assert!(node_retry_envelope_secs(600, 64, 60_000) > 0);
+        // And a small case is still exact: 4 attempts x 1s + (1+2+4)s backoff.
+        assert_eq!(node_retry_envelope_secs(1, 3, 1_000), 4 + 7);
     }
 }

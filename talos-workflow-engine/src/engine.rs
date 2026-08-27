@@ -161,12 +161,13 @@ pub fn global_rate_limit_entry_count() -> usize {
 /// Respects `WASM_EXECUTION_TIMEOUT_SECS` env var for operator override —
 /// matches `get_wasm_config`'s default so the tool output and actual
 /// runtime behavior agree.
-pub static DEFAULT_NODE_TIMEOUT_SECS: LazyLock<u64> = LazyLock::new(|| {
-    std::env::var("WASM_EXECUTION_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(120)
-});
+///
+/// The resolution itself lives in
+/// [`talos_workflow_engine_core::default_node_timeout_secs`] so the
+/// authoring-time retry-envelope check reads the value this enforces rather
+/// than a second copy of the same literal.
+pub static DEFAULT_NODE_TIMEOUT_SECS: LazyLock<u64> =
+    LazyLock::new(talos_workflow_engine_core::default_node_timeout_secs);
 
 /// M5 (2026-05-28 review): maximum number of node-dispatch futures the reactor
 /// keeps in flight at once (the `executing` pool: regular module nodes +
@@ -997,7 +998,8 @@ impl ParallelWorkflowEngine {
             secrets_resolver: None,
             user_id: None,
             node_meta: HashMap::new(),
-            execution_timeout_secs: 300,
+            execution_timeout_secs:
+                talos_workflow_engine_core::DEFAULT_WORKFLOW_EXECUTION_TIMEOUT_SECS,
             rate_limits: HashMap::new(),
             node_timeouts: HashMap::new(),
             actor_id: None,

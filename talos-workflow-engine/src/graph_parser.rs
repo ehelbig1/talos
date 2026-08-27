@@ -110,8 +110,10 @@ pub(crate) fn read_node_retry_policy_with_actor_cap(
 ) -> Option<RetryPolicy> {
     /// Max retries for workflows without an actor budget. A near-fuel-
     /// exhausting module with `retry_count=10` can otherwise saturate a
-    /// worker for 15+ seconds per trigger.
-    const MAX_RETRIES_UNBUDGETED: u32 = 3;
+    /// worker for 15+ seconds per trigger. Defined in core so an
+    /// authoring-time checker predicting the resolved count reads the same
+    /// clamp this applies.
+    use talos_workflow_engine_core::MAX_RETRIES_UNBUDGETED;
 
     let mut policy = read_node_retry_policy(node)?;
     if actor_id.is_none() {
