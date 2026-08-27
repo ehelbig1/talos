@@ -77,6 +77,46 @@ pub const DEFAULT_BACKOFF_MS: u64 = 500;
 /// the node-creation stamping path, and any future hygiene sweep agree.
 pub const DEFAULT_TRANSIENT_RETRIES: u32 = 2;
 
+/// Max retries honoured for a workflow with **no bound actor**.
+///
+/// An actor-less execution cannot amortize retry cost against a per-actor
+/// budget, so a DECLARED count is clamped here at graph load. Only a declared
+/// count is clamped — the classifier's own answers are already below this.
+///
+/// Lives in core so the graph parser that APPLIES the clamp and any
+/// authoring-time checker that must PREDICT the resolved count read the same
+/// number. A checker using an unclamped count would report an envelope the
+/// engine will never run.
+pub const MAX_RETRIES_UNBUDGETED: u32 = 3;
+
+/// Workflow-level wall-clock budget applied when a graph declares no
+/// `execution_timeout_secs`.
+///
+/// This is the number a node's retry envelope actually has to fit inside on
+/// the overwhelming majority of workflows, so it is defined once here rather
+/// than as a literal in the engine's constructor.
+pub const DEFAULT_WORKFLOW_EXECUTION_TIMEOUT_SECS: u64 = 300;
+
+/// Per-attempt node timeout applied when a node declares no `timeout_secs`
+/// and the operator sets no override. Matches the worker's single-op ceiling.
+pub const DEFAULT_NODE_TIMEOUT_SECS_FALLBACK: u64 = 120;
+
+/// Resolve the per-attempt node timeout the engine will actually enforce:
+/// `WASM_EXECUTION_TIMEOUT_SECS` when the operator sets it, else
+/// [`DEFAULT_NODE_TIMEOUT_SECS_FALLBACK`].
+///
+/// **Exists so the reported and the enforced value cannot drift.** The engine
+/// caches this in a `LazyLock`; an authoring-time checker that hardcoded 120
+/// would silently disagree with any deployment that sets the override, and a
+/// checker that disagrees with the enforcer is worse than no checker.
+#[must_use]
+pub fn default_node_timeout_secs() -> u64 {
+    std::env::var("WASM_EXECUTION_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_NODE_TIMEOUT_SECS_FALLBACK)
+}
+
 /// Method-aware default retry count for a module with no explicit
 /// retry configuration.
 ///

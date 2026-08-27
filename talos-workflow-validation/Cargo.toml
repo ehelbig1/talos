@@ -21,11 +21,18 @@ sqlx = { version = "0.8", default-features = false, features = ["postgres", "run
 talos-capability-world = { path = "../talos-capability-world" }
 talos-config = { path = "../talos-config" }
 talos-text-util = { path = "../talos-text-util" }
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 tokio = { version = "1", features = ["sync", "rt", "macros"] }
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+# Retry-envelope saturation test binds to the REAL per-node caps rather than
+# re-typing 600 / 100 — a saturation proof against a literal proves nothing
+# once the cap moves.
+talos-workflow-types = { path = "../talos-workflow-types" }
 
 [lints]
 workspace = true
