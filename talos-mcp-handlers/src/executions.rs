@@ -990,12 +990,30 @@ async fn handle_cancel_execution(
         .mark_execution_cancelled(exec_id, user_id)
         .await
     {
+        // TRUTHFULNESS: this marks the execution row cancelled and nothing
+        // more. There is no signal to the worker — `cancel_execution` performs a
+        // single `UPDATE workflow_executions SET status='cancelled'`, publishes
+        // nothing to NATS, and `TalosContext::cancel()` (which would flip the
+        // flag the 22 `is_cancelled()` guards read) has ZERO production callers.
+        // A WASM module already in flight keeps running to its own budget.
+        //
+        // It is still bounded: fuel metering, epoch interruption and the #686
+        // budget clamp all remain live, so a runaway module IS stopped — the
+        // exposure is the in-flight node's remaining budget, not unbounded.
+        // What does not exist is OPERATOR-INITIATED abort.
+        //
+        // Saying "cancelled successfully" asserted an in-flight abort that never
+        // happened. Naming what was actually done is the whole fix here; wiring
+        // the abort needs an in-flight cancellation design and is not this.
         Ok(true) => mcp_text(
             req_id,
             &serde_json::to_string_pretty(&serde_json::json!({
                 "execution_id": exec_id.to_string(),
                 "status": "cancelled",
-                "message": "Execution cancelled successfully"
+                "message": "Execution marked cancelled. No further nodes will be \
+                            dispatched; a node already in flight runs to its own \
+                            timeout or fuel limit.",
+                "in_flight_node_aborted": false
             }))
             .unwrap_or_default(),
         ),
