@@ -116,7 +116,24 @@ pub fn worker_heartbeat_for(worker_id: impl std::fmt::Display) -> String {
 }
 
 /// Fleet-wide graceful-shutdown command subject.
+///
+/// **Inert:** zero publishers, zero subscribers workspace-wide. Recorded here
+/// rather than quietly left ambiguous — see `docs/inert-mechanisms.md`.
 pub const WORKERS_CMD_SHUTDOWN: &str = "talos.workers.cmd.shutdown";
+
+/// Fleet-wide execution-cancel command subject.
+///
+/// **PLAIN subscribe, never a queue subscribe.** The controller does not know
+/// which worker holds a given execution's in-flight job, so the command has to
+/// reach EVERY worker; a queue group would deliver it to one arbitrary member
+/// and silently drop it for the rest. Workers for which the execution id is
+/// unknown treat the command as a no-op.
+///
+/// Carries a [`crate::CancelCommand`], signed. Nothing secret appears in the
+/// subject itself — it is fleet-wide and constant, so the execution id is in
+/// the (signed) BODY and never in the subject, which is visible in NATS
+/// `/subsz`.
+pub const WORKERS_CMD_CANCEL: &str = "talos.workers.cmd.cancel";
 
 // ── Agent orchestration ────────────────────────────────────────────────────
 
@@ -191,6 +208,7 @@ mod tests {
             APPROVALS_PENDING,
             WORKERS_HEARTBEAT_WILDCARD,
             WORKERS_CMD_SHUTDOWN,
+            WORKERS_CMD_CANCEL,
             ALERTS_EXECUTION_FAILED,
         ] {
             assert!(s.starts_with(NAMESPACE_PREFIX), "{s} escapes the namespace");

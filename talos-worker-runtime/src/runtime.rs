@@ -2154,6 +2154,15 @@ pub struct TalosRuntime {
     /// `Arc<ExposeFallback>` — see [`crate::expose_fallback`] for the
     /// M-2 tenant-isolation rationale.
     global_expose_fallback: Arc<crate::expose_fallback::ExposeFallback>,
+    /// Jobs currently executing in THIS process, so an operator-initiated
+    /// cancel can reach their job-scoped cancellation flag.
+    ///
+    /// Without this the flag every `is_cancelled()` guard reads is owned by a
+    /// stack local in `execute_job_with_full_features` and is addressable from
+    /// nowhere — which is why 20 enforcement points sat in front of a
+    /// mechanism with zero producers. Entries are RAII-scoped; see
+    /// [`crate::cancel_registry`].
+    cancel_registry: Arc<crate::cancel_registry::CancelRegistry>,
 }
 
 // ── Linker builders ──────────────────────────────────────────────────────────
@@ -3075,6 +3084,7 @@ impl TalosRuntime {
                 .and_then(|v| v.parse::<u64>().ok())
                 .filter(|n| *n > 0),
             global_expose_fallback: Arc::new(crate::expose_fallback::ExposeFallback::new()),
+            cancel_registry: Arc::new(crate::cancel_registry::CancelRegistry::new()),
         })
     }
 
@@ -3296,6 +3306,26 @@ impl TalosRuntime {
         // cancellation observed on attempt 1 is silently forgotten on attempt
         // 2 — the cancel would not stick even inside one worker process.
         let job_cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // ADDRESSING: publish the flag so an operator cancel can reach it.
+        //
+        // `execution_context.0` is the `workflow_executions.id` this job was
+        // dispatched under (`worker/src/main.rs` builds the tuple as
+        // `(workflow_execution_id, job_id, module_uri)`), which is exactly what
+        // `cancel_execution` names. Callers with no execution row — `run_sandbox`
+        // / `test_module` pass `None`, and any caller passing a non-uuid — are
+        // simply not registered: there is nothing an operator could address.
+        //
+        // The guard lives for the whole call. Every exit path drops it: return,
+        // `?`, panic-unwind, and the outer `tokio::time::timeout` dropping this
+        // future.
+        let _cancel_guard = crate::cancel_registry::addressable_execution_id(
+            execution_context.as_ref(),
+        )
+        .map(|exec_id| {
+            self.cancel_registry
+                .register(exec_id, job_cancel_flag.clone())
+        });
 
         // Compute module SHA256 ONCE — reused for result cache key, logging, and component cache.
         let module_hash_bytes: [u8; 32] = {
@@ -4469,6 +4499,29 @@ impl TalosRuntime {
         let shared_state: Arc<std::sync::Mutex<HashMap<String, String>>> =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
 
+        // PIPELINE-scoped cancellation flag, adopted by every step's context
+        // below (see `execute_pipeline_step_attempt`) and registered so an
+        // operator cancel can reach it.
+        //
+        // The single-node path does the same thing one function up. Doing only
+        // that one would have made cancellation PROTOCOL-DEPENDENT — working
+        // for a workflow whose nodes dispatch individually and silently
+        // no-oping for one the engine chained into a pipeline, with nothing in
+        // the operator's response distinguishing the two. That asymmetry is a
+        // worse defect than the uniform gap it replaced.
+        //
+        // Pipeline-scoped rather than step-scoped, for the same reason the job
+        // flag is job-scoped rather than attempt-scoped (#689): a cancel
+        // observed during step 2 must still be observed by step 3.
+        let pipeline_cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _pipeline_cancel_guard = crate::cancel_registry::addressable_execution_id_str(
+            workflow_execution_id,
+        )
+        .map(|exec_id| {
+            self.cancel_registry
+                .register(exec_id, pipeline_cancel_flag.clone())
+        });
+
         // R2 token ledger: ONE usage accumulator shared by every step's
         // context — pipeline usage is reported whole-pipeline in the signed
         // PipelineJobResult, mirroring the single-claim secrets model. Use
@@ -4569,6 +4622,7 @@ impl TalosRuntime {
                         &shared_state,
                         &shared_llm_usage,
                         shared_sandbox_dir.as_ref(),
+                        &pipeline_cancel_flag,
                     )
                     .await;
 
@@ -4677,6 +4731,11 @@ impl TalosRuntime {
         shared_state: &Arc<std::sync::Mutex<HashMap<String, String>>>,
         shared_llm_usage: &crate::context::LlmUsageAcc,
         shared_sandbox_dir: Option<&tempfile::TempDir>,
+        // Cancellation flag whose lifetime is the PIPELINE, not the step.
+        // Owned by `execute_pipeline` and adopted by every step's context, so
+        // an operator cancel observed during one step is still observed by the
+        // next. Mirrors the job-scoped flag on the single-node path.
+        pipeline_cancel_flag: &Arc<std::sync::atomic::AtomicBool>,
     ) -> anyhow::Result<(JsonValue, Option<u64>)> {
         {
             // Create a TalosContext for this step (fresh WASM memory / WASI sandbox).
@@ -4696,6 +4755,11 @@ impl TalosRuntime {
                 max_llm_tier,
                 egress_scope,
             )?;
+            // Adopt the PIPELINE-scoped cancellation flag in place of the
+            // private per-step one `TalosContext::new` minted. Done FIRST,
+            // before any host wiring, so the very first egress guard in this
+            // step reads the pipeline's flag rather than a fresh `false`.
+            context.cancelled = pipeline_cancel_flag.clone();
             // Attach OpenTelemetry metrics so host functions can record events.
             if let Some(ref m) = self.metrics {
                 context.set_metrics(m.clone());
@@ -4906,6 +4970,35 @@ impl TalosRuntime {
     /// Get total number of executions since startup
     pub fn total_executions(&self) -> u64 {
         self.total_executions.load(Ordering::SeqCst)
+    }
+
+    /// Flag every job of `execution_id` currently in flight in this process as
+    /// cancelled, and return how many were flagged.
+    ///
+    /// This is the production caller `TalosContext::cancel()` never had. It
+    /// sets the same `Arc<AtomicBool>` the 20 `is_cancelled()` egress guards
+    /// read, so the next off-host call the module attempts fails with
+    /// `reason_class=cancelled` — non-transient, so the controller does not
+    /// re-dispatch it.
+    ///
+    /// **0 is a normal answer**, not an error: the cancel is broadcast to the
+    /// whole fleet because the controller cannot know which worker holds the
+    /// job, so every other worker returns 0, as does a worker whose copy of
+    /// the execution has already finished.
+    ///
+    /// It does NOT abort the module mid-instruction. Fuel metering, epoch
+    /// interruption and the per-job timeout remain the bounds on a module that
+    /// makes no further host calls. And it does not bypass audit: the job
+    /// fails through the ordinary path, so its `node_failed` row and DLQ entry
+    /// are still written.
+    pub fn cancel_execution(&self, execution_id: uuid::Uuid) -> usize {
+        self.cancel_registry.cancel_execution(execution_id)
+    }
+
+    /// Number of jobs currently registered as in flight. Exposed so the
+    /// registry's bound is observable rather than merely asserted.
+    pub fn in_flight_cancellable_jobs(&self) -> usize {
+        self.cancel_registry.len()
     }
 
     /// Get total InstancePre cache entries across all 8 tiers.

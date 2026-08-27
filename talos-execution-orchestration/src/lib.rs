@@ -26,6 +26,7 @@
 #![forbid(unsafe_code)]
 
 mod approval_resume;
+mod cancel;
 mod count_memory_write_nodes;
 pub mod crash_recovery;
 mod deep_merge;
@@ -40,6 +41,7 @@ mod terminal_event;
 mod trigger;
 
 pub use approval_resume::{ApprovalDecisionOutcome, WaitingResumeOutcome};
+pub use cancel::{CancelBroadcast, CancelOutcome};
 pub use count_memory_write_nodes::count_memory_write_nodes;
 pub use crash_recovery::{recover_stuck_executions, RecoveryDeps};
 pub use deep_merge::deep_merge;

@@ -985,39 +985,66 @@ async fn handle_cancel_execution(
         Err(resp) => return resp,
     };
 
+    // The mark and the fleet broadcast are ONE service call on purpose: the
+    // publish is gated on the UPDATE having matched a row owned by `user_id`,
+    // and that gate is the entire authorization story (the worker is
+    // credential-free and cannot evaluate ownership). See
+    // `talos_execution_orchestration::cancel`.
     match state
-        .execution_repo
-        .mark_execution_cancelled(exec_id, user_id)
+        .execution_orchestration_service
+        .cancel_execution(exec_id, user_id)
         .await
     {
-        // TRUTHFULNESS: this marks the execution row cancelled and nothing
-        // more. There is no signal to the worker — `cancel_execution` performs a
-        // single `UPDATE workflow_executions SET status='cancelled'`, publishes
-        // nothing to NATS, and `TalosContext::cancel()` (which would flip the
-        // flag the 22 `is_cancelled()` guards read) has ZERO production callers.
-        // A WASM module already in flight keeps running to its own budget.
+        // TRUTHFULNESS, second pass (#687 wrote the first).
         //
-        // It is still bounded: fuel metering, epoch interruption and the #686
-        // budget clamp all remain live, so a runaway module IS stopped — the
-        // exposure is the in-flight node's remaining budget, not unbounded.
-        // What does not exist is OPERATOR-INITIATED abort.
+        // #687 removed a claim of an in-flight abort that never happened and
+        // left an explicit `"in_flight_node_aborted": false`. A producer now
+        // exists, so that literal `false` would have become the next
+        // misleading field — but its REPLACEMENT is deliberately not
+        // `"in_flight_node_aborted": true`, because the controller cannot
+        // observe that either. The cancel is a fire-and-forget fleet
+        // broadcast with no reply, so what is knowable here is exactly:
+        // whether a SIGNED command reached the bus. That is
+        // `in_flight_abort_requested`, and `cancel_broadcast` says which of
+        // the five outcomes produced it.
         //
-        // Saying "cancelled successfully" asserted an in-flight abort that never
-        // happened. Naming what was actually done is the whole fix here; wiring
-        // the abort needs an in-flight cancellation design and is not this.
-        Ok(true) => mcp_text(
-            req_id,
-            &serde_json::to_string_pretty(&serde_json::json!({
-                "execution_id": exec_id.to_string(),
-                "status": "cancelled",
-                "message": "Execution marked cancelled. No further nodes will be \
-                            dispatched; a node already in flight runs to its own \
-                            timeout or fuel limit.",
-                "in_flight_node_aborted": false
-            }))
-            .unwrap_or_default(),
-        ),
-        Ok(false) => {
+        // What the request buys, stated without inflation: a worker holding an
+        // in-flight job for this execution flips that job's cancellation flag,
+        // so its NEXT off-host call fails non-transiently and is not
+        // re-dispatched. A module making no further host calls still runs to
+        // its fuel limit or timeout. Fuel metering, epoch interruption and the
+        // #686 clamp remain the bound on a runaway module. Audit is not
+        // bypassed — the job fails through the ordinary path and still writes
+        // its terminal row and DLQ entry.
+        Ok(outcome) if outcome.marked => {
+            let requested = outcome.broadcast.reached_the_fleet();
+            let message = if requested {
+                "Execution marked cancelled and a signed cancel was broadcast to the \
+                 worker fleet. No further nodes will be dispatched. A worker holding an \
+                 in-flight job stops it at its next off-host call; a module making no \
+                 further host calls still runs to its own timeout or fuel limit. The \
+                 platform receives no acknowledgement, so the abort is requested, never \
+                 confirmed."
+            } else {
+                "Execution marked cancelled, but NO cancel reached the worker fleet \
+                 (see cancel_broadcast). No further nodes will be dispatched; a node \
+                 already in flight runs to its own timeout or fuel limit."
+            };
+            mcp_text(
+                req_id,
+                &serde_json::to_string_pretty(&serde_json::json!({
+                    "execution_id": exec_id.to_string(),
+                    "status": "cancelled",
+                    "message": message,
+                    // Observable: a signed command was published and flushed.
+                    "in_flight_abort_requested": requested,
+                    // Which of the five broadcast outcomes occurred.
+                    "cancel_broadcast": outcome.broadcast.as_str(),
+                }))
+                .unwrap_or_default(),
+            )
+        }
+        Ok(_) => {
             // rows_affected = 0: either the ID doesn't exist or already in terminal state.
             // Do a follow-up read so we can give an actionable message.
             match state.execution_repo.get_execution(exec_id, user_id).await {
