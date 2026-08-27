@@ -1049,6 +1049,20 @@ pub struct ModuleExecution {
     pub fuel_consumed: Option<i64>,
     pub memory_used_mb: Option<i32>,
     pub created_at: String,
+    /// RFC-3339 instant at which the payload-retention sweep cleared this
+    /// execution's stored input/output, or `null` if it never did.
+    ///
+    /// Read this before concluding anything from an empty `inputData` /
+    /// `outputData`. `null` here means the payload was never recorded;
+    /// non-null means it was recorded and has since been removed by policy.
+    /// The removal is irreversible — the stored form was AEAD ciphertext.
+    pub payload_pruned_at: Option<String>,
+    /// Size in bytes of the input payload at the moment it was pruned, or
+    /// `null` if this row was never pruned or held no input.
+    pub pruned_input_bytes: Option<i32>,
+    /// Size in bytes of the output payload at the moment it was pruned, or
+    /// `null` if this row was never pruned or held no output.
+    pub pruned_output_bytes: Option<i32>,
 }
 #[ComplexObject]
 impl ModuleExecution {
@@ -1083,6 +1097,9 @@ impl From<module_executions::ModuleExecution> for ModuleExecution {
             fuel_consumed: exec.fuel_consumed,
             memory_used_mb: exec.memory_used_mb,
             created_at: exec.created_at.to_rfc3339(),
+            payload_pruned_at: exec.payload_pruned_at.map(|d| d.to_rfc3339()),
+            pruned_input_bytes: exec.pruned_input_bytes,
+            pruned_output_bytes: exec.pruned_output_bytes,
         }
     }
 }

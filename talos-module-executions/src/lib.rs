@@ -178,6 +178,39 @@ pub struct ModuleExecution {
     pub memory_used_mb: Option<i32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// When the payload-retention sweep cleared this row's AEAD payloads.
+    ///
+    /// `None` means this row was NEVER pruned — so a `None` `input_data` /
+    /// `output_data` on it means the payload was never written, not that it
+    /// was taken away. That distinction is the whole reason the column
+    /// exists: 22,370 of 36,065 live rows have never had an output (the
+    /// ledger-finalizer outage relabelled by migration `20260812120000`), and
+    /// without a tombstone a pruned row and one of those is indistinguishable.
+    pub payload_pruned_at: Option<DateTime<Utc>>,
+    /// `octet_length(input_data_enc)` at prune time. `None` when never pruned
+    /// OR when the slot was empty at prune time.
+    pub pruned_input_bytes: Option<i32>,
+    /// `octet_length(output_data_enc)` at prune time. `None` when never pruned
+    /// OR when the slot was empty — the common case, since no `timeout` row
+    /// ever carried an output.
+    pub pruned_output_bytes: Option<i32>,
+}
+
+/// Outcome of [`ModuleExecutionService::prune_terminal_payloads`].
+///
+/// Counts and byte totals only. No execution id, module name, tenant
+/// identifier or payload content — the caller logs this verbatim.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PayloadRetentionStats {
+    /// Rows whose payloads were cleared.
+    pub pruned_rows: u64,
+    /// Sum of `octet_length(input_data_enc)` over the pruned rows.
+    pub input_bytes_freed: i64,
+    /// Sum of `octet_length(output_data_enc)` over the pruned rows.
+    pub output_bytes_freed: i64,
+    /// Batches executed. A sweep that stops on the batch cap rather than on
+    /// an empty batch will resume from where it left off on the next tick.
+    pub batches: u32,
 }
 
 /// Module execution log entry
@@ -973,7 +1006,8 @@ impl ModuleExecutionService {
                 started_at, completed_at, duration_ms,
                 error_message, error_type,
                 fuel_consumed, memory_used_mb,
-                created_at, updated_at
+                created_at, updated_at,
+                payload_pruned_at, pruned_input_bytes, pruned_output_bytes
             FROM module_executions
             WHERE id = $1 AND user_id = $2",
         )
@@ -1055,6 +1089,9 @@ impl ModuleExecutionService {
             memory_used_mb: r.try_get("memory_used_mb")?,
             created_at: r.try_get("created_at")?,
             updated_at: r.try_get("updated_at")?,
+            payload_pruned_at: r.try_get("payload_pruned_at")?,
+            pruned_input_bytes: r.try_get("pruned_input_bytes")?,
+            pruned_output_bytes: r.try_get("pruned_output_bytes")?,
         }))
     }
 
@@ -1082,7 +1119,8 @@ impl ModuleExecutionService {
                 started_at, completed_at, duration_ms,
                 error_message, error_type,
                 fuel_consumed, memory_used_mb,
-                created_at, updated_at
+                created_at, updated_at,
+                payload_pruned_at, pruned_input_bytes, pruned_output_bytes
             FROM module_executions
             WHERE module_id = $1 AND user_id = $2
             ORDER BY started_at DESC, id DESC
@@ -1166,6 +1204,9 @@ impl ModuleExecutionService {
                 memory_used_mb: r.try_get("memory_used_mb")?,
                 created_at: r.try_get("created_at")?,
                 updated_at: r.try_get("updated_at")?,
+                payload_pruned_at: r.try_get("payload_pruned_at")?,
+                pruned_input_bytes: r.try_get("pruned_input_bytes")?,
+                pruned_output_bytes: r.try_get("pruned_output_bytes")?,
             });
         }
         Ok(out)
@@ -1498,6 +1539,172 @@ impl ModuleExecutionService {
             error_message.chars().take(100).collect::<String>()
         );
         Ok(())
+    }
+
+    /// The furthest rank any payload reader reaches into a module's completed
+    /// history, and therefore the floor under `corpus_keep`.
+    ///
+    /// Two readers decrypt `module_executions` payloads from arbitrarily-old
+    /// rows, and both are rank-bounded rather than age-bounded:
+    ///
+    /// * `ModuleRepository::list_completed_module_executions` — backs the MCP
+    ///   tool `replay_module_regression`, whose handler clamps the caller's
+    ///   `limit` to `[1, 20]`.
+    /// * `ModuleRepository::find_latest_completed_execution_io` — backs
+    ///   `generate_typed_scaffold`, a hard `LIMIT 1`.
+    ///
+    /// Both order by exactly `completed_at DESC NULLS LAST, started_at DESC`,
+    /// which is why the sweep's `corpus` CTE can use the identical key and be
+    /// provably disjoint from their reach. **If the `[1, 20]` clamp is ever
+    /// widened, this constant must move with it** — the two are the same fact
+    /// stated in two crates.
+    pub const REPLAY_REACH: i64 = 20;
+
+    /// Terminal statuses. The `module_executions` CHECK constraint admits six
+    /// values; these are the four the sweep may touch, and `pending` /
+    /// `running` are the two it must never touch (a running row's
+    /// `input_data_enc` is the live dispatch payload). Kept as a constant so
+    /// the candidate filter and the under-lock re-check cannot drift apart.
+    const TERMINAL_STATUSES: [&'static str; 4] = ["completed", "failed", "cancelled", "timeout"];
+
+    /// Clear the AEAD payloads of old terminal module executions, leaving a
+    /// tombstone behind.
+    ///
+    /// **This is irreversible.** `input_data_enc` / `output_data_enc` are
+    /// AES-GCM ciphertexts; there is no decrypt-and-restore and the only
+    /// recovery is a backup restore. The caller is expected to gate this
+    /// behind an explicitly-enabled operator flag.
+    ///
+    /// # Why the predicate has the shape it does
+    ///
+    /// A plain "older than N days" policy is NOT safe here, and building one
+    /// was the trap this method exists to avoid. No payload read in the
+    /// workspace is bounded by age; the two replay/scaffold readers are
+    /// bounded by RANK within a module. For a module that ran a handful of
+    /// times and then went quiet, its most recent completed rows are also its
+    /// oldest — an age policy nulls exactly those and the replay corpus goes
+    /// silently empty, which is how `ReplayService` shipped as a no-op once
+    /// already.
+    ///
+    /// So the predicate is conjunctive:
+    ///
+    /// 1. terminal status only — never `pending` / `running`;
+    /// 2. `created_at` older than `retention_days` — the age BELT, whose
+    ///    natural value is `EXECUTION_RETENTION_DAYS`, because that is when
+    ///    this platform already DELETES the whole parent `workflow_executions`
+    ///    row (and CASCADEs `execution_events` with it). Retention parity;
+    /// 3. not among the `corpus_keep` most recent `completed` rows for its
+    ///    `(module_id, user_id)`, ranked by the readers' own ORDER BY;
+    /// 4. it still has a payload — which makes the sweep idempotent and keeps
+    ///    it off the rows that never had one.
+    ///
+    /// `corpus_keep` is clamped up to [`Self::REPLAY_REACH`]: a caller asking
+    /// to keep fewer than the readers can reach would be asking for the
+    /// silent-empty-corpus failure by configuration.
+    ///
+    /// # Side effect worth knowing
+    ///
+    /// `trigger_module_execution_updated_at` is an unconditional
+    /// `BEFORE UPDATE FOR EACH ROW` trigger, so `updated_at` moves on every
+    /// pruned row and no value set here can prevent it. Nothing in the
+    /// workspace filters or orders on `module_executions.updated_at` (it is
+    /// projected for display only), and `payload_pruned_at` sits beside it to
+    /// explain the movement. `duration_ms` is NOT recomputed: the duration
+    /// trigger fires only when `completed_at` transitions from NULL, which
+    /// this statement never does.
+    pub async fn prune_terminal_payloads(
+        &self,
+        retention_days: i32,
+        corpus_keep: i64,
+        batch_size: i64,
+    ) -> Result<PayloadRetentionStats> {
+        // Fail closed on a destructive misconfiguration rather than
+        // substituting a default and pruning something. Same `=0`/negative
+        // footgun family as MCP-1063 — with `retention_days = 0` the age belt
+        // becomes `created_at < NOW()`, i.e. every terminal row on the first
+        // sweep.
+        if retention_days <= 0 {
+            tracing::error!(
+                target: "talos_module_executions",
+                event_kind = "payload_retention_refused_nonpositive_days",
+                retention_days,
+                "module-payload retention refused: retention_days must be positive \
+                 (would prune every terminal row on the first sweep)"
+            );
+            return Ok(PayloadRetentionStats::default());
+        }
+        if batch_size <= 0 {
+            return Ok(PayloadRetentionStats::default());
+        }
+        let corpus_keep = corpus_keep.max(Self::REPLAY_REACH);
+
+        let mut stats = PayloadRetentionStats::default();
+        // Bound the whole sweep, not just each batch: a first run against a
+        // long-unswept table should not hold the pool for an unbounded number
+        // of rounds. Whatever is left is picked up on the next tick, because
+        // the predicate is self-excluding once a row is tombstoned.
+        const MAX_BATCHES_PER_SWEEP: u32 = 20;
+
+        while stats.batches < MAX_BATCHES_PER_SWEEP {
+            let rows: Vec<(Option<i32>, Option<i32>)> = sqlx::query_as(
+                r#"
+                WITH corpus AS (
+                    SELECT id FROM (
+                        SELECT id,
+                               row_number() OVER (
+                                   PARTITION BY module_id, user_id
+                                   ORDER BY completed_at DESC NULLS LAST, started_at DESC
+                               ) AS rn
+                        FROM module_executions
+                        WHERE status = 'completed'
+                    ) ranked
+                    WHERE rn <= $2
+                ),
+                candidates AS (
+                    SELECT me.id,
+                           octet_length(me.input_data_enc)  AS ib,
+                           octet_length(me.output_data_enc) AS ob
+                    FROM module_executions me
+                    WHERE me.status = ANY($4)
+                      AND me.created_at < NOW() - make_interval(days => $1::int)
+                      AND (me.input_data_enc IS NOT NULL OR me.output_data_enc IS NOT NULL)
+                      AND me.payload_pruned_at IS NULL
+                      AND NOT EXISTS (SELECT 1 FROM corpus c WHERE c.id = me.id)
+                    ORDER BY me.created_at
+                    LIMIT $3
+                )
+                UPDATE module_executions m
+                SET input_data_enc     = NULL,
+                    output_data_enc    = NULL,
+                    payload_pruned_at  = NOW(),
+                    pruned_input_bytes = c.ib,
+                    pruned_output_bytes = c.ob
+                FROM candidates c
+                WHERE m.id = c.id
+                  AND m.status = ANY($4)
+                RETURNING c.ib, c.ob
+                "#,
+            )
+            .bind(retention_days)
+            .bind(corpus_keep)
+            .bind(batch_size)
+            .bind(&Self::TERMINAL_STATUSES[..])
+            .fetch_all(&self.db_pool)
+            .await
+            .context("module-payload retention sweep failed")?;
+
+            let batch_len = rows.len() as u64;
+            stats.batches += 1;
+            stats.pruned_rows += batch_len;
+            for (ib, ob) in &rows {
+                stats.input_bytes_freed += i64::from(ib.unwrap_or(0));
+                stats.output_bytes_freed += i64::from(ob.unwrap_or(0));
+            }
+            if batch_len < batch_size as u64 {
+                break; // last batch
+            }
+        }
+        Ok(stats)
     }
 
     /// Mark executions stuck in `pending` or `running` state as `timeout`.

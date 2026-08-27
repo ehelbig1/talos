@@ -2813,6 +2813,94 @@ pub(crate) fn spawn_cleanup_tasks(
     });
     tracing::info!("Stuck execution cleanup task started (runs every 5 minutes, timeout after 30 min by default)");
 
+    // ---------- Start module-payload retention sweep (OPT-IN, default OFF) ----------
+    // NULLs `module_executions.input_data_enc` / `output_data_enc` on OLD
+    // TERMINAL rows, leaving a `payload_pruned_at` tombstone.
+    //
+    // WHY THIS EXISTS: `module_executions` is the only execution-history table
+    // in the schema with no retention bound. The sweep 60 lines above already
+    // DELETEs the whole PARENT `workflow_executions` row after
+    // EXECUTION_RETENTION_DAYS (default 30) and CASCADEs `execution_events`
+    // with it, but `module_executions.workflow_execution_id` has no foreign
+    // key, so the child orphans and is kept forever. Measured 2026-08-27:
+    // 130 MB, 82 MB of it TOAST, 7,656 rows already outliving a parent that no
+    // longer exists.
+    //
+    // WHY IT IS OFF BY DEFAULT, AND WHAT WOULD TURN IT ON: the payloads are
+    // AEAD ciphertext, so nulling is IRREVERSIBLE — the only recovery is a
+    // backup restore. The stated precondition is on
+    // `talos_config::module_payload_retention_enabled`: the off-host backup
+    // chain must be proven end-to-end first. Turning this on before then means
+    // deleting the only copy of data whose backup has never been shown to
+    // restore without the host it protects.
+    //
+    // The flag is read ONCE here rather than per tick, matching the
+    // EXECUTION_RETENTION_DAYS precedent directly above: a mid-process env
+    // mutation must not make a destructive sweep blink on and off. Operators
+    // re-deploy to change it.
+    if talos_config::module_payload_retention_enabled() {
+        let payload_retention_service = module_execution_service.clone();
+        let payload_retention_days = talos_config::module_payload_retention_days();
+        let payload_corpus_keep = talos_config::module_payload_retention_corpus_keep();
+        let payload_batch = talos_config::module_payload_retention_batch();
+        let payload_retention_shutdown = bg_shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut shutdown = payload_retention_shutdown;
+            // Same 6-hour cadence as the parent-row retention DELETE it is
+            // parity with. Nothing about payload nulling is urgent; a slower
+            // tick just means the next one does more.
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        match payload_retention_service
+                            .prune_terminal_payloads(
+                                payload_retention_days,
+                                payload_corpus_keep,
+                                payload_batch,
+                            )
+                            .await
+                        {
+                            Ok(stats) if stats.pruned_rows > 0 => tracing::info!(
+                                pruned_rows = stats.pruned_rows,
+                                input_bytes_freed = stats.input_bytes_freed,
+                                output_bytes_freed = stats.output_bytes_freed,
+                                batches = stats.batches,
+                                retention_days = payload_retention_days,
+                                corpus_keep = payload_corpus_keep,
+                                "module-payload retention: cleared payloads on old terminal executions"
+                            ),
+                            Ok(_) => {}
+                            Err(e) => tracing::error!(
+                                "module-payload retention sweep failed: {}", e
+                            ),
+                        }
+                    }
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            tracing::info!(
+                                "Module-payload retention loop received shutdown signal"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        tracing::warn!(
+            retention_days = payload_retention_days,
+            corpus_keep = payload_corpus_keep,
+            batch = payload_batch,
+            "Module-payload retention sweep ENABLED (every 6 hours). Clearing an AEAD payload \
+             is IRREVERSIBLE — confirm the off-host backup chain is proven before leaving this on."
+        );
+    } else {
+        tracing::info!(
+            "Module-payload retention sweep disabled (MODULE_PAYLOAD_RETENTION_ENABLED unset). \
+             module_executions payloads are retained indefinitely."
+        );
+    }
+
     // ---------- Crash recovery: resume checkpointed executions ----------
     // RFC 0003 (durable execution). On a controller restart, executions that
     // were mid-flight are wedged in `running` — their in-process engine task

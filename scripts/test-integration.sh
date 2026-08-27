@@ -297,6 +297,12 @@ TC_TESTS=(
     "actor_memory_sweep_dek_tests"
     "module_payload_dek_tests"
     "workflow_output_dek_tests"
+    # ── Module-payload retention sweep (added 2026-08-27) ───────────────────
+    # Proves what the sweep REFUSES to touch: non-terminal rows, and the whole
+    # completed corpus of a rarely-run module (the case an age-only policy
+    # would silently empty). Nulling an AEAD payload is irreversible, so these
+    # are the only guards there are.
+    "module_payload_retention_tests"
 )
 for tctest in "${TC_TESTS[@]}"; do
     echo
