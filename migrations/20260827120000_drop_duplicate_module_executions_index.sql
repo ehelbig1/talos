@@ -1,0 +1,61 @@
+-- Drop one of two byte-identical indexes on module_executions.
+--
+-- idx_module_executions_module_recent   btree (module_id, started_at DESC)
+-- idx_module_executions_module_created  btree (module_id, started_at DESC)
+--
+-- Identical is meant literally, and was checked in pg_index rather than in the
+-- pg_indexes text (which hides opclass, collation and sort options):
+--
+--   field          _module_recent   _module_created
+--   indkey         2 9              2 9
+--   indclass       10065 3127       10065 3127
+--   indoption      0 3              0 3
+--   indcollation   0 0              0 0
+--   indpred        none             none
+--   indexprs       none             none
+--
+-- Two structurally interchangeable btrees. The planner uses exactly one; the
+-- other is maintained on every INSERT and never read. This is redundancy by
+-- DEFINITION, not by observed scan counts -- see the note on statistics below.
+--
+-- How it happened, because the guard that should have caught it was present:
+--   * idx_node_executions_module_recent shipped in the original schema and was
+--     renamed to idx_module_executions_module_recent by 015_rename_tables.sql.
+--   * 20260310001200_add_missing_indexes.sql then created
+--     idx_module_executions_module_created on the same columns, using
+--     CREATE INDEX IF NOT EXISTS.
+-- IF NOT EXISTS guards the NAME, not the DEFINITION. The guard fired on a name
+-- that did not collide and the duplicate was created anyway. Any future
+-- "add missing indexes" pass must compare column lists, not index names.
+--
+-- WHY _module_recent IS THE ONE DROPPED. The live planner demonstrably chooses
+-- _module_created for the only hot path on these columns (the module-eviction
+-- LATERAL from #682, talos-registry/src/lib.rs::evictable_candidates):
+--
+--   ->  Index Only Scan using idx_module_executions_module_created
+--         Index Cond: (module_id = m.id)
+--
+-- so dropping _module_recent changes no query plan at all. Dropping the other
+-- member would also be correct -- the planner would fall back to this one --
+-- but it would force a plan re-selection on that path for no gain.
+--
+-- ON STATISTICS, AND WHY NO OTHER INDEX IS DROPPED HERE. Eight indexes on this
+-- table report idx_scan = 0, ~15 MB in total. That is NOT evidence they are
+-- unused. pg_stat counters cover only the window since the stats were last
+-- reset, and PostgreSQL 15+ silently DISCARDS cumulative stats when the stats
+-- file is absent or rejected at startup -- leaving pg_stat_database.stats_reset
+-- NULL, which reads as "never reset". On this deployment the counters have seen
+-- 7,726 inserts against 36,030 rows present and zero deletes ever, so they span
+-- roughly 14% of the table's life. A weekly, monthly or operator-only query
+-- would show idx_scan = 0 and still be load-bearing. Those eight stay.
+--
+-- LOCK. DROP INDEX (non-CONCURRENTLY -- sqlx wraps every migration in a
+-- transaction, so CONCURRENTLY is not available; structural lint check 30)
+-- takes ACCESS EXCLUSIVE on module_executions for the remainder of the
+-- migration transaction. The drop itself is catalog-only -- it does not read
+-- the 21 MB heap or the 2.8 MB index, and file unlink happens at commit -- so
+-- the work is sub-millisecond and independent of table size. The exposure is
+-- the WAIT for the lock behind any in-flight query on module_executions, during
+-- which new queries queue behind it. Apply when the execution path is quiet.
+
+DROP INDEX IF EXISTS idx_module_executions_module_recent;
