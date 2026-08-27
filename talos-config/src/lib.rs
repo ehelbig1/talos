@@ -1026,6 +1026,89 @@ pub fn execution_retention_days() -> i32 {
     positive_env_or_default::<i32>("EXECUTION_RETENTION_DAYS", 30)
 }
 
+/// Is the opt-in `module_executions` payload-retention sweep enabled?
+/// Default: **false**, and it must stay false until the stated
+/// precondition below is met.
+///
+/// The sweep NULLs `input_data_enc` / `output_data_enc` on terminal rows.
+/// Those are AEAD ciphertexts: nulling is IRREVERSIBLE — there is no
+/// decrypt-and-restore, and the only recovery is a backup restore.
+///
+/// **Stated precondition for turning this on** (an off-by-default flag with
+/// no condition attached is a decision nobody ever gets to make): the
+/// off-host backup chain must be proven end-to-end first. As of 2026-08-13
+/// the daily `pg_dump`s live on the same disk they insure, and the restore
+/// drill sources the KEK from the live container rather than from escrow —
+/// so today a disk loss is still total loss, and this sweep would be
+/// removing the only copy of data whose backup has never been shown to
+/// restore without the host it protects. Enable it after that is closed,
+/// not before.
+pub fn module_payload_retention_enabled() -> bool {
+    bool_env_or_default("MODULE_PAYLOAD_RETENTION_ENABLED", false)
+}
+
+/// Age floor (DAYS) for the `module_executions` payload-retention sweep.
+/// Default: the same value as [`execution_retention_days`] (30), because
+/// that is the age at which this platform ALREADY deletes the whole parent
+/// `workflow_executions` row. Retention parity, not an independent judgement.
+///
+/// Routed through `positive_env_or_default` for the same reason
+/// `execution_retention_days` is: `=0` would make the predicate
+/// `created_at < NOW()`, i.e. prune every terminal row on the first sweep,
+/// and a negative value would prune every row including future-dated ones.
+/// Same `=0`/negative footgun family as MCP-1063.
+pub fn module_payload_retention_days() -> i32 {
+    positive_env_or_default::<i32>("MODULE_PAYLOAD_RETENTION_DAYS", execution_retention_days())
+}
+
+/// How many of the most recent `status='completed'` executions to keep
+/// payloads for, per `(module_id, user_id)`. Default: 50.
+///
+/// This is the clause that makes the sweep safe, and its floor is not a
+/// preference. `replay_module_regression` clamps its caller-supplied limit to
+/// `[1, 20]` (`talos-mcp-handlers/src/sandbox.rs`, `validate_range_i64(args,
+/// "limit", 1, 20, 5, ..)`) and `find_latest_completed_execution_io` is a hard
+/// `LIMIT 1`; both order by exactly `completed_at DESC NULLS LAST, started_at
+/// DESC`. So no replay or scaffold path can reach past rank 20, and anything
+/// at or above 20 is provably outside their reach. 50 is that bound with a
+/// 2.5x margin.
+///
+/// **Clamped to a floor of [`MODULE_PAYLOAD_REPLAY_REACH`], not merely
+/// defaulted to it** — an operator who sets this to 5 to reclaim more space
+/// would silently empty the replay corpus for every module with more than 5
+/// completed runs, which is precisely how r303's ReplayService shipped as a
+/// no-op. Configuring it below the reach is refused, loudly, in favour of the
+/// floor.
+pub fn module_payload_retention_corpus_keep() -> i64 {
+    let configured = positive_env_or_default::<i64>("MODULE_PAYLOAD_RETENTION_CORPUS_KEEP", 50);
+    if configured < MODULE_PAYLOAD_REPLAY_REACH {
+        tracing::warn!(
+            target: "talos_config",
+            event_kind = "module_payload_corpus_keep_below_replay_reach",
+            configured,
+            floor = MODULE_PAYLOAD_REPLAY_REACH,
+            "MODULE_PAYLOAD_RETENTION_CORPUS_KEEP={configured} is below the replay reach \
+             ({MODULE_PAYLOAD_REPLAY_REACH}); using the floor so replay_module_regression \
+             and generate_typed_scaffold keep a corpus"
+        );
+        return MODULE_PAYLOAD_REPLAY_REACH;
+    }
+    configured
+}
+
+/// The furthest rank any payload reader can reach into a module's completed
+/// history. Mirrors the `[1, 20]` clamp on `replay_module_regression`'s
+/// `limit`. If that clamp is ever widened, this constant must move with it —
+/// they are the same fact stated in two crates.
+pub const MODULE_PAYLOAD_REPLAY_REACH: i64 = 20;
+
+/// Maximum rows one payload-retention batch may touch. Default: 5000,
+/// matching the existing `workflow_executions` retention DELETE's chunk size
+/// so the two sweeps have the same lock-hold profile.
+pub fn module_payload_retention_batch() -> i64 {
+    positive_env_or_default::<i64>("MODULE_PAYLOAD_RETENTION_BATCH", 5000).clamp(1, 20_000)
+}
+
 /// Maximum number of workflow execution rows to keep. Default: 100000.
 ///
 /// MCP-1063 (2026-05-15): same `positive_env_or_default` routing as
