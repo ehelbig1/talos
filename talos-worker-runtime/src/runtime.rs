@@ -1884,7 +1884,7 @@ pub(crate) fn pipeline_log_execution_id(workflow_execution_id: &str) -> String {
 
 /// String-shape core of [`is_transient_error`], shared with the
 /// pipeline step-retry gate.
-fn is_transient_error_text(error_str: &str) -> bool {
+pub(crate) fn is_transient_error_text(error_str: &str) -> bool {
     let error_str = error_str.to_lowercase();
 
     // ── Non-transient FIRST, before any transient token can match ────────
@@ -3290,6 +3290,13 @@ impl TalosRuntime {
         let mut metrics = PerformanceMetrics::default();
         let overall_start = std::time::Instant::now();
 
+        // JOB-scoped cancellation flag, minted ONCE here and adopted by every
+        // attempt's `TalosContext` below. Deliberately outside the retry loop:
+        // each attempt builds a fresh context, and a per-attempt flag means a
+        // cancellation observed on attempt 1 is silently forgotten on attempt
+        // 2 — the cancel would not stick even inside one worker process.
+        let job_cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         // Compute module SHA256 ONCE — reused for result cache key, logging, and component cache.
         let module_hash_bytes: [u8; 32] = {
             let mut hasher = Sha256::new();
@@ -3419,6 +3426,7 @@ impl TalosRuntime {
                     egress_scope,
                     llm_usage_out.clone(),
                     host_diag_out.clone(),
+                    job_cancel_flag.clone(),
                 )
                 .await
             {
@@ -3606,6 +3614,14 @@ impl TalosRuntime {
         // In-process host-diagnostic collector (see
         // `execute_job_with_full_features`).
         host_diag_out: Option<crate::context::HostDiagSink>,
+        // Cancellation flag whose lifetime is the JOB, not the ATTEMPT. Owned
+        // by `execute_job_with_full_features` above its retry loop and adopted
+        // by every attempt's `TalosContext`, so a cancellation observed on
+        // attempt 1 is still observed on attempt 2. `TalosContext::new` mints a
+        // private `AtomicBool::new(false)`; without this hand-off the flag reset
+        // on every in-worker retry and the 20 `is_cancelled()` egress guards
+        // would let a cancelled job keep re-running inside one worker process.
+        job_cancel_flag: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<JsonValue> {
         // DISTRIBUTED TRACING: Create execution span
         let execution_id = execution_context
@@ -3673,6 +3689,14 @@ impl TalosRuntime {
             max_llm_tier,
             egress_scope,
         )?;
+
+        // Adopt the JOB-scoped cancellation flag in place of the private
+        // per-attempt one `TalosContext::new` minted. Done FIRST — before any
+        // host wiring and long before the module runs — so the very first
+        // egress guard on this attempt reads the job's flag, not a fresh
+        // `false`. Cancellation is a property of the execution; an attempt
+        // boundary must not clear it.
+        context.cancelled = job_cancel_flag;
 
         // Attach OpenTelemetry metrics so host functions can record events.
         if let Some(ref m) = self.metrics {

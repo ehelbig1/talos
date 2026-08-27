@@ -938,7 +938,27 @@ impl wit_http::Host for TalosContext {
         }
 
         // ── Global pre-flight checks (require &mut self) ─────────────────────
+        // Sibling parity with `fetch`'s cancel guard ~650 lines above, and the
+        // parity is LOAD-BEARING, not cosmetic. A bare `networkerror` carrying
+        // no `[reason_class=…]` marker is classified `network_transient` by
+        // BOTH transient gates — `runtime::is_transient_error_text` in-worker
+        // and `talos_retry_intelligence::classify_error` on the controller — so
+        // a cancelled BATCH fetch was RE-DISPATCHED, onto a fresh
+        // `TalosContext` whose `cancelled` flag is false. The cancel did not
+        // stick. Both gates already carry a `reason_class=cancelled` arm
+        // hoisted ABOVE their `networkerror` arm for exactly this reason (see
+        // `crate::reason_class::NON_TRANSIENT`); this site simply never
+        // stamped the marker while its single-request sibling did.
         if self.is_cancelled() {
+            tracing::info!(module_id = ?self.module_id, "Execution cancelled");
+            if let Some(ref m) = self.metrics {
+                m.record_execution_cancelled();
+            }
+            self.emit_network_failure(
+                reason_class::CANCELLED,
+                "the execution was cancelled before the batch request was sent",
+            )
+            .await;
             return reqs
                 .iter()
                 .map(|_| Err(wit_http::Error::Networkerror))
