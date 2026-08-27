@@ -2367,6 +2367,14 @@ impl ParallelWorkflowEngine {
                 integration_name: wasm_module.integration_name.clone(),
                 input_payload: job_input,
                 timeout: std::time::Duration::from_secs(body_timeout_secs),
+                // Same workflow wall-clock deadline the single-node path
+                // stamps: a loop body dispatches through the SAME
+                // `NodeDispatcher::dispatch` / `execute_job_with_retry`
+                // loop, so it clamps identically. Re-read per iteration
+                // (this literal is inside the iteration loop), which is
+                // what makes iteration N see less budget than iteration
+                // 0 rather than the run-start value.
+                deadline: self.progress.deadline(),
                 // Per-node fuel precedence: the loop-body node's graph-JSON
                 // `data.max_fuel` override (if set) > module-row default, then
                 // the adaptive learned ceiling as a floor, clamped to the

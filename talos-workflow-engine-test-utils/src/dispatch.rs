@@ -147,6 +147,9 @@ mod tests {
             input_payload: JsonValue::Null,
             timeout: Duration::from_secs(30),
             max_fuel: 1_000_000,
+            // No workflow wall-clock budget in this stub — the
+            // reference dispatcher's clamp is then a no-op.
+            deadline: None,
             allowed_hosts: vec![],
             allowed_methods: vec![],
             allowed_secrets: vec![],

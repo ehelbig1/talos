@@ -376,6 +376,16 @@ impl ParallelWorkflowEngine {
                 // `PipelineStep` calls this `config`; the adapter maps
                 // `input_payload` to it.
                 input_payload: module_config,
+                // Chain-level concern, deliberately not populated per
+                // step — same class as `max_retries` / `retry_condition`
+                // (see `DispatchJob`'s per-step-vs-chain-level note).
+                // `dispatch_chain` retries the WHOLE pipeline through
+                // `dispatch_with_retry`, a different function from the
+                // single-node `execute_job_with_retry` that consumes
+                // this field, and reads no per-step deadline. Setting a
+                // value here would be silently ignored, which is worse
+                // than an explicit `None`.
+                deadline: None,
                 timeout: std::time::Duration::from_secs(
                     self.node_timeouts.get(&step_node_id).copied().unwrap_or(30),
                 ),

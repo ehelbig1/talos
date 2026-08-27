@@ -108,6 +108,39 @@ struct ProgressInner {
     in_flight: dashmap::DashMap<Uuid, (String, Instant)>,
     /// Count of nodes that reached completion (success or failure).
     completed: AtomicUsize,
+    /// Absolute instant this run's wall-clock budget expires, or `None`
+    /// when the run has no cap (`execution_timeout_secs == 0`).
+    ///
+    /// Written exactly once per run, by
+    /// [`crate::engine::run_with_workflow_timeout`], immediately after
+    /// it derives the `tokio::time::timeout` duration and immediately
+    /// before it arms the timer — from the SAME `secs`, so the value a
+    /// dispatch clamps against and the value the reactor is actually
+    /// killed on are derived from one input. They are not bit-identical:
+    /// the `Instant::now()` here is sampled a few statements before the
+    /// timer arms, making this deadline marginally EARLIER (the
+    /// conservative direction). It is
+    /// deliberately NOT cleared by [`ExecutionProgress::reset`]: reset
+    /// runs at the top of `run_inner`, i.e. INSIDE the future the
+    /// timeout wraps, so clearing there would erase the deadline that
+    /// was just armed. Every reactor entry point funnels through
+    /// `run_with_workflow_timeout`, so a reused engine handle is always
+    /// re-stamped (with `None` when the new run has no cap) before the
+    /// reactor starts.
+    ///
+    /// A sub-workflow engine gets its OWN handle
+    /// (`AdapterSet::into_engine` starts from
+    /// `ParallelWorkflowEngine::new()` and copies named adapter fields
+    /// only — never `progress`), so a nested run cannot overwrite its
+    /// parent's deadline. Two CONCURRENT runs on one engine handle would
+    /// clobber each other here, but that was already true of
+    /// `reset()`/`in_flight` and is not a constraint this field adds.
+    ///
+    /// `Mutex` rather than an atomic because `Instant` has no integer
+    /// representation. Contention is nil: one write per run, one
+    /// uncontended read per node dispatch, no `.await` held across the
+    /// guard.
+    deadline: std::sync::Mutex<Option<Instant>>,
 }
 
 impl ExecutionProgress {
@@ -116,6 +149,27 @@ impl ExecutionProgress {
     pub(crate) fn reset(&self) {
         self.inner.in_flight.clear();
         self.inner.completed.store(0, Ordering::Relaxed);
+    }
+
+    /// Stamp (or clear) this run's absolute wall-clock deadline.
+    ///
+    /// Called only from [`crate::engine::run_with_workflow_timeout`].
+    /// A poisoned lock is swallowed: the deadline simply stays unset and
+    /// dispatches clamp nothing, which is the pre-feature behaviour.
+    pub(crate) fn set_deadline(&self, deadline: Option<Instant>) {
+        if let Ok(mut slot) = self.inner.deadline.lock() {
+            *slot = deadline;
+        }
+    }
+
+    /// This run's absolute wall-clock deadline, if it has one.
+    ///
+    /// `None` on: no configured cap, a poisoned lock, or a dispatch that
+    /// never went through `run_with_workflow_timeout`. Every one of
+    /// those is a fail-OPEN to "do not clamp" — a clamp derived from a
+    /// wrong deadline would be worse than no clamp.
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.inner.deadline.lock().ok().and_then(|slot| *slot)
     }
 
     /// Record that `node_id` (rendered as `label`) has been dispatched.
