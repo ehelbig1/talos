@@ -444,6 +444,13 @@ impl ParallelWorkflowEngine {
             input_payload: wrapped_input,
             timeout: std::time::Duration::from_secs(node_timeout_secs),
             max_fuel: node_max_fuel,
+            // Workflow-level wall-clock deadline, stamped on the shared
+            // progress handle by `run_with_workflow_timeout` before the
+            // reactor started. `None` when this run has no cap. The
+            // dispatcher clamps each retry attempt's outer wait to what
+            // is left of it — it never shortens the WIRE budget
+            // (`timeout` above) and never grants an extra attempt.
+            deadline: self.progress.deadline(),
             allowed_hosts: wasm_module.allowed_hosts.clone(),
             allowed_methods: wasm_module.allowed_methods.clone(),
             allowed_secrets: wasm_module.allowed_secrets.clone(),

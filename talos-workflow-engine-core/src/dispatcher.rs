@@ -157,6 +157,34 @@ pub struct DispatchJob {
     pub timeout: Duration,
     /// Wasmtime fuel budget for the dispatch.
     pub max_fuel: u64,
+    /// Absolute instant at which the WORKFLOW's wall-clock budget
+    /// expires — not this node's. `None` means the run has no
+    /// wall-clock cap (`execution_timeout_secs == 0`) or the caller
+    /// does not track one.
+    ///
+    /// **Process-internal only.** `DispatchJob` is a trait-boundary
+    /// type, not a wire type: `std::time::Instant` has no absolute
+    /// representation and is neither serialized nor signed. An impl
+    /// wanting a wire deadline must convert to its own representation
+    /// (see `JobRequest::deadline_unix_secs`, which no caller
+    /// currently populates).
+    ///
+    /// **What an impl should do with it.** Treat it as a CEILING on
+    /// how long the impl keeps waiting, re-evaluated per retry
+    /// attempt — never as a reason to skip an attempt that might still
+    /// succeed, and never as a source of ADDITIONAL attempts. A
+    /// per-attempt timeout is a ceiling, not a duration: most attempts
+    /// finish far inside it, so refusing to start one because its full
+    /// allowance does not fit would remove successes. The reference
+    /// NATS dispatcher clamps each attempt's outer cancellation wrap
+    /// to `min(node_allowance, remaining - reserve)`; see
+    /// `talos_workflow_engine_nats::dispatcher::clamp_attempt_timeout`.
+    ///
+    /// **Chain steps ignore it.** Like `max_retries` and
+    /// `retry_condition` (see the type-level note above), the deadline
+    /// is a chain-LEVEL concern; the reference impl's `dispatch_chain`
+    /// reads neither this nor any per-step equivalent.
+    pub deadline: Option<std::time::Instant>,
 
     // ── Capability grants ────────────────────────────────────────────
     /// Hostnames the worker permits outbound HTTP to.
@@ -291,6 +319,8 @@ impl Default for DispatchJob {
     ///   to set a budget.
     /// * `max_fuel` → 0 — impls that enforce fuel read this as "no
     ///   budget configured"
+    /// * `deadline` → `None` — no workflow wall-clock budget known,
+    ///   so impls clamp nothing (the pre-field behaviour)
     /// * `priority` → 100 (documented default)
     /// * `emit_retry_events` → `true` (documented default)
     /// * Everything else → `false` / 0 / `None`
@@ -310,6 +340,10 @@ impl Default for DispatchJob {
             input_payload: JsonValue::Null,
             timeout: Duration::from_secs(DEFAULT_DISPATCH_TIMEOUT_SECS),
             max_fuel: 0,
+            // `None` = no workflow wall-clock budget known for this
+            // dispatch, which is byte-identical to the pre-field
+            // behaviour: impls clamp nothing.
+            deadline: None,
             allowed_hosts: Vec::new(),
             allowed_methods: Vec::new(),
             allowed_secrets: Vec::new(),
@@ -520,6 +554,15 @@ impl DispatchJobBuilder {
         self
     }
 
+    /// Absolute instant at which the WORKFLOW's wall-clock budget
+    /// expires. See [`DispatchJob::deadline`] — impls treat it as a
+    /// ceiling on how long they keep waiting, never as a source of
+    /// extra attempts.
+    pub fn deadline(mut self, deadline: std::time::Instant) -> Self {
+        self.inner.deadline = Some(deadline);
+        self
+    }
+
     /// Hostnames the worker permits outbound HTTP to.
     pub fn allowed_hosts(mut self, hosts: Vec<String>) -> Self {
         self.inner.allowed_hosts = hosts;
@@ -674,6 +717,7 @@ impl fmt::Debug for DispatchJob {
             )
             .field("timeout", &self.timeout)
             .field("max_fuel", &self.max_fuel)
+            .field("deadline", &self.deadline)
             .field("allowed_hosts", &self.allowed_hosts)
             .field("allowed_methods", &self.allowed_methods)
             .field("allowed_secrets", &self.allowed_secrets)

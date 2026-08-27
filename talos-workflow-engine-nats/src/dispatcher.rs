@@ -103,6 +103,205 @@ pub(crate) fn get_pipeline_job_topic(user_id: Option<Uuid>, priority: u8) -> Str
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Retry backoff — one implementation, four call sites
+// ─────────────────────────────────────────────────────────────────────
+
+/// Ceiling on a single computed retry delay, in milliseconds.
+///
+/// Mirrors the platform's per-node `retry_backoff_ms` write cap
+/// (`talos_workflow_types::MAX_NODE_RETRY_BACKOFF_MS`, 600_000). It is
+/// duplicated as a local constant rather than imported because this
+/// crate is a standalone, publishable engine adapter and must not depend
+/// on the Talos-internal workflow-types crate; [`backoff_delay_tests`]
+/// pins the value.
+///
+/// **This is not a new policy — it is the policy the platform already
+/// documents.** The `MAX_NODE_RETRY_BACKOFF_MS` doc comment states the
+/// worst-case dwell as `100 × (600 s timeout + 600 s backoff)`, a model
+/// that only holds if the EFFECTIVE per-retry delay is capped here too.
+/// Before this constant existed the code violated that model in both
+/// directions: it produced `u64::MAX` (an effectively permanent sleep)
+/// around attempt 55 and, once `2u64.pow` overflowed at attempt 65, a
+/// delay of exactly ZERO.
+pub(crate) const MAX_BACKOFF_DELAY_MS: u64 = 600_000;
+
+/// Exponential backoff for retry attempt `attempts` (1-based), with no
+/// jitter — the deterministic half of [`backoff_delay_ms`], split out so
+/// the arithmetic is unit-testable without a clock.
+///
+/// **Total over `u32`.** The previous form,
+/// `base.saturating_mul(2u64.pow(attempts - 1))`, was not:
+///
+/// * `2u64.pow(n)` overflows for `n >= 64`. `saturating_mul` on the
+///   OUTSIDE cannot rescue that — the saturation happens after `pow` has
+///   already produced its wrapped value.
+/// * Under `[profile.release]` / `[profile.docker]` (no
+///   `overflow-checks`) the wrap is silent, and `2^64 mod 2^64 == 0`, so
+///   from attempt 65 onward the delay became **0**: a hot retry loop with
+///   no spacing at all. Under `dev`/`test` the same expression panics
+///   inside the dispatcher task instead.
+/// * Reachable with a legal configuration: the platform's per-node retry
+///   ceiling is 100.
+///
+/// The shift is guarded against `u64::BITS` and the product saturates,
+/// so no `attempts` value — up to and including `u32::MAX` — can
+/// overflow or produce a shorter-than-previous delay at any attempt
+/// where the old code was correct.
+pub(crate) fn exponential_backoff_ms(base_backoff_ms: u64, attempts: u32) -> u64 {
+    let shift = attempts.saturating_sub(1);
+    let grown = if base_backoff_ms == 0 {
+        // A zero base means "no backoff configured" (it is
+        // `DispatchJob::default().backoff_ms`, and the engine passes it
+        // through for any node whose policy omits one). It must stay
+        // zero at EVERY attempt: the cap below is a ceiling, never a
+        // floor, and saturating to `u64::MAX` first would turn a
+        // no-backoff node into a 10-minute dwell past the shift
+        // boundary — a behaviour regression the old code did not have.
+        0
+    } else if shift >= u64::BITS {
+        u64::MAX
+    } else {
+        base_backoff_ms.saturating_mul(1_u64 << shift)
+    };
+    grown.min(MAX_BACKOFF_DELAY_MS)
+}
+
+/// Exponential backoff plus up to 25 % jitter, in milliseconds.
+///
+/// Jitter is derived from the system clock's sub-second nanos rather
+/// than an RNG so the crate takes no extra dependency; it is a spread,
+/// not a security primitive.
+pub(crate) fn backoff_delay_ms(base_backoff_ms: u64, attempts: u32) -> u64 {
+    let backoff = exponential_backoff_ms(base_backoff_ms, attempts);
+    let jitter_span = (backoff / 4).max(1);
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64
+        % jitter_span;
+    backoff.saturating_add(jitter)
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Budget-aware attempt clamp
+// ─────────────────────────────────────────────────────────────────────
+
+/// Seconds of the workflow's remaining wall-clock budget held back from
+/// a clamped attempt so the engine can still RECORD the failure.
+///
+/// A node failure is only worth more than a reactor drop because
+/// `handle_node_failure` gets to run: it `await`s a `node_failed` INSERT,
+/// fires the DLQ write, reaps sibling `module_executions` rows, and — for
+/// a node with an error edge or `__continue_on_error` — lets the workflow
+/// carry on. Clamping to exactly the remaining budget would race all of
+/// that against the wall-clock timeout and usually lose, converting the
+/// fix back into the bug.
+pub(crate) const BUDGET_RESERVE_SECS: u64 = 2;
+
+/// Below this much remaining budget an attempt is not started at all.
+///
+/// One second is the smallest attempt window this clamp will ever hand
+/// out; anything less cannot complete a NATS round-trip plus worker
+/// admission, so starting it removes no success that would otherwise
+/// have happened — while consuming the reserve the failure path needs.
+pub(crate) const MIN_REMAINING_FOR_ATTEMPT_SECS: u64 = BUDGET_RESERVE_SECS + 1;
+
+/// How long the retry loop may wait on one attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttemptWindow {
+    /// Wait up to `secs`. `clamped` is true when the WORKFLOW budget —
+    /// not the node's own allowance — set the ceiling, which is what
+    /// makes a resulting timeout attributable to "out of budget" rather
+    /// than "too slow".
+    Wait { secs: u64, clamped: bool },
+    /// Too little budget remains to run an attempt AND still record the
+    /// failure. `remaining_secs` is what was left.
+    BudgetExhausted { remaining_secs: u64 },
+}
+
+/// Clamp one attempt's outer cancellation window to
+/// `min(node_allowance, remaining_budget - reserve)`.
+///
+/// Called once per attempt (not once per dispatch) so attempt 3 sees the
+/// budget attempts 1 and 2 consumed — computing it once before the loop
+/// is the bug this exists to fix, one level up.
+///
+/// # Invariants
+///
+/// * The returned `secs` is **never greater than `node_allowance_secs`**.
+///   The clamp can only shorten a wait, never lengthen one.
+/// * It never changes the number of attempts upward. `BudgetExhausted`
+///   ends the loop; `Wait` neither adds nor removes an attempt.
+/// * `deadline == None` returns `Wait { node_allowance_secs, false }` —
+///   byte-identical to the pre-clamp behaviour, which is what every
+///   caller that does not track a workflow budget gets.
+/// * `Duration::as_secs` truncates toward zero, so the remaining budget
+///   is understated by up to a second. That is the conservative
+///   direction (a slightly tighter clamp), deliberately not rounded up.
+pub(crate) fn clamp_attempt_timeout(
+    node_allowance_secs: u64,
+    deadline: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> AttemptWindow {
+    let Some(deadline) = deadline else {
+        return AttemptWindow::Wait {
+            secs: node_allowance_secs,
+            clamped: false,
+        };
+    };
+    let remaining_secs = deadline.saturating_duration_since(now).as_secs();
+    if remaining_secs < MIN_REMAINING_FOR_ATTEMPT_SECS {
+        return AttemptWindow::BudgetExhausted { remaining_secs };
+    }
+    let budgeted = remaining_secs - BUDGET_RESERVE_SECS;
+    if budgeted >= node_allowance_secs {
+        AttemptWindow::Wait {
+            secs: node_allowance_secs,
+            clamped: false,
+        }
+    } else {
+        AttemptWindow::Wait {
+            secs: budgeted,
+            clamped: true,
+        }
+    }
+}
+
+/// Operator-facing error for an attempt the workflow budget cut short.
+///
+/// Deliberately distinct from the bare `"Job execution timed out"` a
+/// node's own allowance produces: the two invite opposite responses
+/// (raise `timeout_secs` vs. raise the workflow budget / shorten the
+/// node), and #685 shipped precisely because the old message pointed at
+/// the wrong lever. Numbers only — no workflow name, tenant, node label
+/// or payload, since this string reaches `dead_letter_queue`,
+/// `execution_events.log_message` and the failure webhook.
+pub(crate) fn budget_clamped_timeout_message(waited_secs: u64, node_allowance_secs: u64) -> String {
+    format!(
+        "Job execution timed out after {waited_secs}s — the attempt was clamped to the \
+         workflow's remaining wall-clock budget, not to this node's {node_allowance_secs}s \
+         allowance. Raise the workflow execution timeout or reduce upstream time; raising \
+         the node timeout will not help."
+    )
+}
+
+/// Operator-facing error for an attempt that was never started because
+/// too little of the workflow budget remained. Same DLP contract as
+/// [`budget_clamped_timeout_message`].
+pub(crate) fn budget_exhausted_message(
+    attempt_number: u32,
+    remaining_secs: u64,
+    node_allowance_secs: u64,
+) -> String {
+    format!(
+        "Job not dispatched (attempt {attempt_number}): {remaining_secs}s of the workflow's \
+         wall-clock budget remain, below the {MIN_REMAINING_FOR_ATTEMPT_SECS}s needed to run \
+         an attempt and record its outcome (node allowance {node_allowance_secs}s). Raise the \
+         workflow execution timeout or reduce upstream time."
+    )
+}
+
 /// H-1: route the outbound request through the inbox-aware
 /// transport method when an inbox was pre-allocated, falling back
 /// to the legacy `request` path otherwise. Keeps the retry-loop
@@ -186,16 +385,7 @@ pub(crate) async fn dispatch_with_retry(
                         attempts, e
                     ));
                 }
-                let backoff = base_backoff_ms.saturating_mul(2u64.pow(attempts - 1));
-                // Add jitter (up to 25% of backoff) using system time nanos to
-                // avoid pulling in an extra RNG dependency.
-                let jitter = backoff / 4;
-                let jitter_val = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .subsec_nanos() as u64
-                    % jitter.max(1);
-                let delay = backoff + jitter_val;
+                let delay = backoff_delay_ms(base_backoff_ms, attempts);
                 tracing::warn!(
                     attempt = attempts,
                     max_retries,
@@ -327,16 +517,65 @@ pub(crate) async fn execute_job_with_retry(
     // `llm_usage`. The hook owner attaches identity from the
     // controller-side dispatch context.
     on_llm_usage: Option<&(dyn Fn(Vec<talos_workflow_job_protocol::LlmUsageEntry>) + Send + Sync)>,
+    // Absolute instant the WORKFLOW's wall-clock budget expires, from
+    // `DispatchJob::deadline`. `None` disables the clamp entirely and
+    // reproduces the pre-clamp behaviour exactly. See
+    // `clamp_attempt_timeout` for the invariants this must preserve.
+    deadline: Option<std::time::Instant>,
 ) -> Result<serde_json::Value, String> {
     let mut attempts: u32 = 0;
     let mut current_payload = payload;
     loop {
+        // Budget-aware clamp, recomputed on EVERY attempt.
+        //
+        // `timeout_secs` is this node's own allowance (its wire budget
+        // plus TOKIO_WRAP_GRACE_SECS). It says nothing about how much of
+        // the WORKFLOW's wall-clock budget is left, so before this the
+        // loop would happily start a 120 s attempt with 48 s of a 300 s
+        // budget remaining, blow the budget, and get the whole reactor
+        // future DROPPED — no `node_failed` row, no DLQ row, no
+        // error-edge routing, no sibling reap. Clamping converts that
+        // into an ordinary node failure the engine can actually handle.
+        //
+        // Computing this once before the loop would be the same bug one
+        // level up: attempt 3 must see the budget attempts 1 and 2 spent.
+        let (attempt_secs, budget_clamped) =
+            match clamp_attempt_timeout(timeout_secs, deadline, std::time::Instant::now()) {
+                AttemptWindow::Wait { secs, clamped } => (secs, clamped),
+                AttemptWindow::BudgetExhausted { remaining_secs } => {
+                    // Fail NOW rather than dispatch into a budget that
+                    // cannot hold the round-trip: this both avoids work
+                    // that cannot land and preserves the reserve the
+                    // engine's failure path needs. Strictly fewer
+                    // attempts than before, never more. No send happened,
+                    // so no nonce was minted and no seal was re-armed.
+                    tracing::warn!(
+                        attempt = attempts + 1,
+                        remaining_secs,
+                        node_allowance_secs = timeout_secs,
+                        "workflow budget exhausted — not starting another attempt"
+                    );
+                    return Err(budget_exhausted_message(
+                        attempts + 1,
+                        remaining_secs,
+                        timeout_secs,
+                    ));
+                }
+            };
+        if budget_clamped {
+            tracing::warn!(
+                attempt = attempts + 1,
+                attempt_timeout_secs = attempt_secs,
+                node_allowance_secs = timeout_secs,
+                "attempt window clamped to the workflow's remaining wall-clock budget"
+            );
+        }
         // Re-arm the seal before every attempt (see `dispatch_with_retry`).
         if let Some(rearm) = on_before_send {
             rearm();
         }
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
+            std::time::Duration::from_secs(attempt_secs),
             send_with_optional_inbox(
                 transport,
                 &topic,
@@ -546,28 +785,10 @@ pub(crate) async fn execute_job_with_retry(
                         match expression_evaluator.eval_i64(expr, job_result.output_payload.value())
                         {
                             Some(ms) if ms > 0 => (ms as u64).min(60_000),
-                            _ => {
-                                let backoff =
-                                    base_backoff_ms.saturating_mul(2u64.pow(attempts - 1));
-                                let jitter = backoff / 4;
-                                let jitter_val = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .subsec_nanos()
-                                    as u64
-                                    % jitter.max(1);
-                                backoff + jitter_val
-                            }
+                            _ => backoff_delay_ms(base_backoff_ms, attempts),
                         }
                     } else {
-                        let backoff = base_backoff_ms.saturating_mul(2u64.pow(attempts - 1));
-                        let jitter = backoff / 4;
-                        let jitter_val = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .subsec_nanos() as u64
-                            % jitter.max(1);
-                        backoff + jitter_val
+                        backoff_delay_ms(base_backoff_ms, attempts)
                     };
 
                     let err_msg = job_result
@@ -638,13 +859,7 @@ pub(crate) async fn execute_job_with_retry(
                         attempts, e
                     ));
                 }
-                let backoff = base_backoff_ms.saturating_mul(2u64.pow(attempts - 1));
-                let jitter_val = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .subsec_nanos() as u64
-                    % (backoff / 4).max(1);
-                let delay = backoff + jitter_val;
+                let delay = backoff_delay_ms(base_backoff_ms, attempts);
                 tracing::warn!(
                     attempt = attempts,
                     max_retries,
@@ -666,6 +881,14 @@ pub(crate) async fn execute_job_with_retry(
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
             Err(_timeout) => {
+                // Distinguish "this node is too slow for its own
+                // allowance" from "this node ran out of the workflow's
+                // budget". They invite OPPOSITE operator responses, and
+                // #685 shipped precisely because the previous message
+                // pointed at the wrong lever.
+                if budget_clamped {
+                    return Err(budget_clamped_timeout_message(attempt_secs, timeout_secs));
+                }
                 return Err("Job execution timed out".to_string());
             }
         }
@@ -1240,6 +1463,11 @@ impl NodeDispatcher for NatsNodeDispatcher {
             seal_rearm.as_deref(),
             // R2 token ledger: record verified per-attempt usage.
             usage_hook.as_deref(),
+            // Workflow wall-clock deadline (engine-stamped; `None` when
+            // the run has no cap). Clamps each attempt's outer wait —
+            // NOT the wire `timeout_ms` above, which the worker still
+            // enforces at its own full value.
+            job.deadline,
         )
         .await;
 
@@ -2049,6 +2277,557 @@ mod p3_full_loop_tests {
         assert!(
             msg.contains("envelope") && msg.contains("fail-closed"),
             "expected a fail-closed envelope error, got: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod backoff_delay_tests {
+    use super::{backoff_delay_ms, exponential_backoff_ms, MAX_BACKOFF_DELAY_MS};
+
+    /// The local mirror must not drift from the platform's documented
+    /// per-node `retry_backoff_ms` ceiling
+    /// (`talos_workflow_types::MAX_NODE_RETRY_BACKOFF_MS`). That crate is
+    /// `publish = false` and this one is a standalone publishable engine
+    /// adapter, so the value is pinned here rather than imported.
+    #[test]
+    fn cap_mirrors_the_platform_backoff_ceiling() {
+        assert_eq!(MAX_BACKOFF_DELAY_MS, 600_000);
+    }
+
+    /// Below the cap and below the overflow boundary, the new helper
+    /// reproduces the old `base * 2^(attempts-1)` exactly. This is the
+    /// "no behaviour change where the old code was correct" half.
+    #[test]
+    fn reproduces_legacy_growth_where_legacy_was_correct() {
+        let base = 100_u64;
+        for attempts in 1_u32..=13 {
+            let legacy = base * 2_u64.pow(attempts - 1);
+            assert!(
+                legacy <= MAX_BACKOFF_DELAY_MS,
+                "sanity: still under the cap"
+            );
+            assert_eq!(
+                exponential_backoff_ms(base, attempts),
+                legacy,
+                "attempt {attempts} must match the pre-fix value"
+            );
+        }
+    }
+
+    /// RED-PROOF of the defect, runnable without invoking the overflow:
+    /// `checked_pow` reports exactly where `2u64.pow(attempts - 1)` stopped
+    /// being defined. Bound to `u64::BITS`, never to a literal.
+    ///
+    /// At and past that boundary the old expression panicked under
+    /// `dev`/`test` and wrapped to **0** under `release`/`docker` — a
+    /// zero-delay hot retry loop. The helper must produce a positive,
+    /// capped delay instead.
+    #[test]
+    fn old_expression_was_undefined_past_the_shift_boundary() {
+        let first_bad_shift = u64::BITS; // 64
+        assert!(
+            2_u64.checked_pow(first_bad_shift - 1).is_some(),
+            "shift {} must still be representable",
+            first_bad_shift - 1
+        );
+        assert!(
+            2_u64.checked_pow(first_bad_shift).is_none(),
+            "the pre-fix expression overflowed at shift {first_bad_shift}"
+        );
+
+        // `attempts - 1 == first_bad_shift` is the first attempt the old
+        // code got wrong.
+        let first_bad_attempt = first_bad_shift + 1;
+        let delay = exponential_backoff_ms(1_000, first_bad_attempt);
+        assert_eq!(
+            delay, MAX_BACKOFF_DELAY_MS,
+            "attempt {first_bad_attempt} must saturate to the cap, not wrap to 0"
+        );
+        assert!(delay > 0, "a wrapped 2^64 == 0 would make this a hot loop");
+    }
+
+    /// The helper is TOTAL over `u32` — no configured retry ceiling can
+    /// push it out of range. This binds to the actual bound of the
+    /// `attempts` parameter's type rather than to any platform constant,
+    /// so raising the platform's retry cap cannot make the coverage stale
+    /// (the failure mode a literal `100` would have had).
+    #[test]
+    fn total_over_every_u32_attempt() {
+        for attempts in [
+            0_u32,
+            1,
+            2,
+            u64::BITS - 1,
+            u64::BITS,
+            u64::BITS + 1,
+            1_000,
+            u32::MAX - 1,
+            u32::MAX,
+        ] {
+            let d = exponential_backoff_ms(1_000, attempts);
+            assert!(
+                d <= MAX_BACKOFF_DELAY_MS,
+                "attempts={attempts} produced {d}, above the cap"
+            );
+            assert!(d > 0, "attempts={attempts} produced a zero delay");
+        }
+        // `attempts == 0` is not reachable from the loop (it increments
+        // before computing) but must not underflow.
+        assert_eq!(exponential_backoff_ms(1_000, 0), 1_000);
+    }
+
+    /// A zero base means "no backoff configured" and must stay zero —
+    /// the cap is a ceiling, never a floor.
+    #[test]
+    fn zero_base_stays_zero() {
+        for attempts in [1_u32, 10, u64::BITS + 1, u32::MAX] {
+            assert_eq!(exponential_backoff_ms(0, attempts), 0);
+        }
+    }
+
+    /// Jitter is additive and bounded at 25 %, matching the pre-fix
+    /// contract at every site.
+    #[test]
+    fn jitter_stays_within_a_quarter() {
+        let base = 4_000_u64;
+        for _ in 0..64 {
+            let d = backoff_delay_ms(base, 3); // 4000 * 4 = 16_000
+            assert!(
+                (16_000..16_000 + 16_000 / 4).contains(&d),
+                "delay {d} outside [16000, 20000)"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod clamp_attempt_tests {
+    use super::{
+        budget_clamped_timeout_message, budget_exhausted_message, clamp_attempt_timeout,
+        AttemptWindow, BUDGET_RESERVE_SECS, MIN_REMAINING_FOR_ATTEMPT_SECS,
+    };
+    use std::time::{Duration, Instant};
+
+    fn at(now: Instant, secs: u64) -> Option<Instant> {
+        Some(now + Duration::from_secs(secs))
+    }
+
+    /// No workflow budget → the clamp is the identity function. This is
+    /// the byte-equivalent of the pre-clamp tree and is what every
+    /// caller that does not track a budget gets.
+    #[test]
+    fn no_deadline_is_the_identity() {
+        let now = Instant::now();
+        assert_eq!(
+            clamp_attempt_timeout(120, None, now),
+            AttemptWindow::Wait {
+                secs: 120,
+                clamped: false
+            }
+        );
+    }
+
+    /// Ample budget → also the identity, and NOT flagged as clamped, so
+    /// a timeout here still reports as "too slow".
+    #[test]
+    fn ample_budget_does_not_clamp_or_flag() {
+        let now = Instant::now();
+        assert_eq!(
+            clamp_attempt_timeout(30, at(now, 600), now),
+            AttemptWindow::Wait {
+                secs: 30,
+                clamped: false
+            }
+        );
+    }
+
+    /// The live #685 shape: 120 s node allowance, 48 s of budget left.
+    /// Pre-fix the loop waited 120 s and blew the workflow budget.
+    #[test]
+    fn tight_budget_clamps_and_flags() {
+        let now = Instant::now();
+        assert_eq!(
+            clamp_attempt_timeout(120, at(now, 48), now),
+            AttemptWindow::Wait {
+                secs: 48 - BUDGET_RESERVE_SECS,
+                clamped: true
+            }
+        );
+    }
+
+    /// The load-bearing safety invariant (#673 / #669): the clamp may
+    /// only ever SHORTEN a wait. Swept across the whole interesting
+    /// range rather than spot-checked.
+    #[test]
+    fn never_exceeds_the_node_allowance() {
+        let now = Instant::now();
+        for allowance in [0_u64, 1, 5, 30, 120, 600, 3_600] {
+            for remaining in 0_u64..400 {
+                if let AttemptWindow::Wait { secs, .. } =
+                    clamp_attempt_timeout(allowance, at(now, remaining), now)
+                {
+                    assert!(
+                        secs <= allowance,
+                        "allowance={allowance} remaining={remaining} produced {secs}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A clamped window is only ever flagged when the WORKFLOW budget,
+    /// not the node allowance, set the ceiling — otherwise the
+    /// distinguishable error message would misattribute an ordinary
+    /// node timeout.
+    #[test]
+    fn clamped_flag_implies_a_shortened_window() {
+        let now = Instant::now();
+        for allowance in [1_u64, 5, 30, 120] {
+            for remaining in 0_u64..200 {
+                if let AttemptWindow::Wait { secs, clamped } =
+                    clamp_attempt_timeout(allowance, at(now, remaining), now)
+                {
+                    assert_eq!(
+                        clamped,
+                        secs < allowance,
+                        "allowance={allowance} remaining={remaining}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Below the floor no attempt is started — fewer attempts, never
+    /// more, and the reserve the engine's failure path needs survives.
+    #[test]
+    fn below_the_floor_is_budget_exhausted() {
+        let now = Instant::now();
+        for remaining in 0..MIN_REMAINING_FOR_ATTEMPT_SECS {
+            assert_eq!(
+                clamp_attempt_timeout(120, at(now, remaining), now),
+                AttemptWindow::BudgetExhausted {
+                    remaining_secs: remaining
+                },
+                "remaining={remaining}"
+            );
+        }
+    }
+
+    /// Exactly at the floor the smallest window this clamp hands out is
+    /// one second — never zero, which would be indistinguishable from
+    /// "do not dispatch" while still burning an attempt.
+    #[test]
+    fn at_the_floor_the_window_is_one_second() {
+        let now = Instant::now();
+        assert_eq!(
+            clamp_attempt_timeout(120, at(now, MIN_REMAINING_FOR_ATTEMPT_SECS), now),
+            AttemptWindow::Wait {
+                secs: 1,
+                clamped: true
+            }
+        );
+    }
+
+    /// An already-expired deadline must saturate to zero remaining, not
+    /// underflow into a huge window. (`Instant` subtraction panics on
+    /// overflow; `saturating_duration_since` is why it does not here.)
+    #[test]
+    fn expired_deadline_saturates_instead_of_underflowing() {
+        // Observed an hour AFTER the deadline. Expressed as "later
+        // observation" rather than "earlier deadline" so the test itself
+        // does no `Instant` subtraction — which panics on overflow and is
+        // exactly the hazard `saturating_duration_since` exists to avoid
+        // inside the clamp.
+        let deadline = Instant::now();
+        let later = deadline + Duration::from_secs(3_600);
+        assert_eq!(
+            clamp_attempt_timeout(120, Some(deadline), later),
+            AttemptWindow::BudgetExhausted { remaining_secs: 0 }
+        );
+    }
+
+    /// The two failure messages must be distinguishable from the node's
+    /// own timeout, or the operator cannot tell "too slow" from "out of
+    /// budget" — the exact defect #685 shipped a warning for.
+    #[test]
+    fn budget_messages_are_distinguishable_and_dlp_clean() {
+        let clamped = budget_clamped_timeout_message(46, 120);
+        let exhausted = budget_exhausted_message(3, 1, 120);
+        assert_ne!(clamped, "Job execution timed out");
+        assert_ne!(exhausted, "Job execution timed out");
+        assert_ne!(clamped, exhausted);
+        for msg in [&clamped, &exhausted] {
+            assert!(
+                msg.contains("workflow"),
+                "message must name the budget that actually ran out: {msg}"
+            );
+            // Numbers and prose only: these strings reach
+            // `dead_letter_queue`, `execution_events.log_message` and the
+            // failure webhook.
+            assert!(!msg.contains('{') && !msg.contains('}'), "no JSON: {msg}");
+        }
+        assert!(clamped.contains("120s"), "names the node allowance");
+        assert!(exhausted.contains("attempt 3"), "names the attempt");
+    }
+}
+
+#[cfg(test)]
+mod budget_clamp_loop_tests {
+    //! Tests that drive the REAL `execute_job_with_retry` loop.
+    //!
+    //! **On running these red against the original tree.** The `deadline`
+    //! parameter does not exist there, so a test that passes one cannot
+    //! be compiled against it — the same honest limit recorded for the
+    //! `RetryPolicy` type change. What IS expressible is the equivalence:
+    //! `deadline: None` is byte-identical to the pre-clamp loop (proved
+    //! by `no_deadline_is_the_identity` above), so
+    //! `without_a_deadline_the_loop_waits_the_full_allowance` is the
+    //! original tree's behaviour asserted in place, and
+    //! `with_a_tight_budget_the_loop_gives_up_early` is the same
+    //! transport and the same allowance with only the deadline changed.
+    //! The pair is the pre/post comparison, run in one binary.
+
+    use super::execute_job_with_retry;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use talos_workflow_engine_core::{
+        BoxError, ExpressionEvaluator, JobTransport, RetryClassifier,
+    };
+    use talos_workflow_job_protocol::{JobResult, JobStatus};
+
+    /// Transport that sleeps `delay`, counts calls, then replies with a
+    /// `JobResult` of the configured status.
+    struct SlowTransport {
+        delay: Duration,
+        calls: Arc<AtomicUsize>,
+        succeed: bool,
+    }
+
+    #[async_trait]
+    impl JobTransport for SlowTransport {
+        async fn request(&self, _topic: &str, _payload: Vec<u8>) -> Result<Vec<u8>, BoxError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            let jr = JobResult {
+                llm_usage: vec![],
+                job_id: uuid::Uuid::nil(),
+                status: if self.succeed {
+                    JobStatus::Success
+                } else {
+                    JobStatus::Failed
+                },
+                output_payload: if self.succeed {
+                    serde_json::json!({"ok": true})
+                } else {
+                    serde_json::json!({"error": "connection reset"})
+                }
+                .into(),
+                logs: vec![],
+                execution_time_ms: 1,
+                signature: vec![],
+                result_nonce: String::new(),
+                worker_id: String::new(),
+                crypto_scheme: 0,
+            };
+            Ok(serde_json::to_vec(&jr).unwrap())
+        }
+    }
+
+    struct AlwaysTransient;
+    impl RetryClassifier for AlwaysTransient {
+        fn classify(&self, _error: &str) -> String {
+            "transient".to_string()
+        }
+        fn is_transient(&self, _class: &str) -> bool {
+            true
+        }
+    }
+
+    struct NoExpr;
+    impl ExpressionEvaluator for NoExpr {
+        fn eval_bool(&self, _e: &str, _c: &serde_json::Value) -> bool {
+            true
+        }
+        fn try_eval_bool(&self, _e: &str, _c: &serde_json::Value) -> Result<bool, BoxError> {
+            Ok(true)
+        }
+        fn eval_i64(&self, _e: &str, _c: &serde_json::Value) -> Option<i64> {
+            None
+        }
+        fn eval_json(
+            &self,
+            _e: &str,
+            _c: &serde_json::Value,
+        ) -> Result<serde_json::Value, BoxError> {
+            Ok(serde_json::Value::Null)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_loop(
+        transport: &dyn JobTransport,
+        timeout_secs: u64,
+        max_retries: u32,
+        deadline: Option<Instant>,
+    ) -> Result<serde_json::Value, String> {
+        let classifier = AlwaysTransient;
+        let evaluator = NoExpr;
+        execute_job_with_retry(
+            transport,
+            "test.topic".to_string(),
+            b"{}".to_vec(),
+            timeout_secs,
+            max_retries,
+            1, // base backoff ms — keep the test fast
+            None,
+            None,
+            None,
+            None,
+            None,
+            uuid::Uuid::nil(),
+            uuid::Uuid::nil(),
+            &classifier,
+            &evaluator,
+            None,
+            None,
+            None,
+            deadline,
+        )
+        .await
+    }
+
+    /// PRE-FIX BEHAVIOUR, asserted in place. A 30 s allowance against a
+    /// worker that takes 3 s: the loop waits the full 3 s and succeeds,
+    /// with no regard for any workflow budget.
+    #[tokio::test]
+    async fn without_a_deadline_the_loop_waits_the_full_allowance() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let t = SlowTransport {
+            delay: Duration::from_secs(3),
+            calls: calls.clone(),
+            succeed: true,
+        };
+        let started = Instant::now();
+        let out = run_loop(&t, 30, 0, None).await.expect("succeeds");
+        assert_eq!(out, serde_json::json!({"ok": true}));
+        assert!(
+            started.elapsed() >= Duration::from_secs(3),
+            "it really waited for the slow worker"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// POST-FIX. Same transport, same 30 s allowance — only a workflow
+    /// deadline added. The loop must give up at the clamped window
+    /// (5 s remaining - 2 s reserve = 3 s... so use a tighter budget)
+    /// and the error must name the BUDGET, not the node.
+    #[tokio::test]
+    async fn with_a_tight_budget_the_loop_gives_up_early() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let t = SlowTransport {
+            // Far longer than the clamped window, so the only way the
+            // loop can return early is the clamp.
+            delay: Duration::from_secs(30),
+            calls: calls.clone(),
+            succeed: true,
+        };
+        // 4 s of budget - 2 s reserve = a 2 s attempt window.
+        let deadline = Some(Instant::now() + Duration::from_secs(4));
+        let started = Instant::now();
+        let err = run_loop(&t, 30, 0, deadline)
+            .await
+            .expect_err("clamped out");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "must return at the clamped window, not the 30 s allowance (took {elapsed:?})"
+        );
+        assert!(
+            err.contains("workflow's remaining wall-clock budget"),
+            "must be attributable to the budget, not read as a node timeout: {err}"
+        );
+        assert_ne!(err, "Job execution timed out");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one attempt");
+    }
+
+    /// Below the floor the loop must not dispatch AT ALL — the transport
+    /// is never called. Fewer attempts than before, never more.
+    #[tokio::test]
+    async fn below_the_floor_no_attempt_is_dispatched() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let t = SlowTransport {
+            delay: Duration::from_secs(30),
+            calls: calls.clone(),
+            succeed: true,
+        };
+        let deadline = Some(Instant::now() + Duration::from_secs(1));
+        let err = run_loop(&t, 30, 3, deadline)
+            .await
+            .expect_err("budget exhausted");
+        assert!(err.contains("Job not dispatched"), "{err}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no send, so no nonce minted and no seal re-armed"
+        );
+    }
+
+    /// The clamp must never increase the attempt count. With an ample
+    /// deadline the loop makes exactly `max_retries + 1` attempts —
+    /// identical to the no-deadline case — and a tight deadline can only
+    /// reduce that.
+    #[tokio::test]
+    async fn clamp_never_increases_the_attempt_count() {
+        let max_retries = 2_u32;
+
+        let calls_none = Arc::new(AtomicUsize::new(0));
+        let t_none = SlowTransport {
+            delay: Duration::from_millis(1),
+            calls: calls_none.clone(),
+            succeed: false,
+        };
+        let _ = run_loop(&t_none, 30, max_retries, None).await;
+        let baseline = calls_none.load(Ordering::SeqCst);
+        assert_eq!(baseline, max_retries as usize + 1);
+
+        let calls_ample = Arc::new(AtomicUsize::new(0));
+        let t_ample = SlowTransport {
+            delay: Duration::from_millis(1),
+            calls: calls_ample.clone(),
+            succeed: false,
+        };
+        let _ = run_loop(
+            &t_ample,
+            30,
+            max_retries,
+            Some(Instant::now() + Duration::from_secs(600)),
+        )
+        .await;
+        assert_eq!(
+            calls_ample.load(Ordering::SeqCst),
+            baseline,
+            "an ample budget must not change the attempt count"
+        );
+
+        let calls_tight = Arc::new(AtomicUsize::new(0));
+        let t_tight = SlowTransport {
+            delay: Duration::from_millis(1),
+            calls: calls_tight.clone(),
+            succeed: false,
+        };
+        let _ = run_loop(
+            &t_tight,
+            30,
+            max_retries,
+            Some(Instant::now() + Duration::from_secs(4)),
+        )
+        .await;
+        assert!(
+            calls_tight.load(Ordering::SeqCst) <= baseline,
+            "a tight budget may only reduce attempts"
         );
     }
 }

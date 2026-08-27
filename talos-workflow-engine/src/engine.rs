@@ -48,6 +48,23 @@ async fn run_with_workflow_timeout(
     tokio::pin!(fut);
     let timeout_dur = (secs > 0).then(|| std::time::Duration::from_secs(secs));
 
+    // Publish the run's absolute deadline on the shared progress handle
+    // BEFORE arming the timer below, so per-node dispatches can clamp
+    // their own waiting to what is actually left (see
+    // `DispatchJob::deadline`). `Instant::now()` is sampled HERE, a few
+    // statements ahead of the `tokio::time::timeout` call that arms the
+    // real timer, which makes the published deadline very slightly
+    // EARLIER than the enforced one — the conservative direction. The
+    // gap is nanoseconds and is dominated by the dispatcher's own
+    // multi-second clamp reserve; nothing downstream may rely on the two
+    // being exactly equal.
+    //
+    // `secs == 0` (cap disabled) publishes `None`, so a reused engine
+    // handle whose previous run HAD a cap cannot inherit a stale
+    // deadline — the stamp happens on every entry, not only when a cap
+    // exists.
+    progress.set_deadline(timeout_dur.map(|d| std::time::Instant::now() + d));
+
     let inner_result: Result<Result<_, String>, ()> = match (cancel, timeout_dur) {
         (Some(token), Some(dur)) => tokio::select! {
             biased; // honour cancellation before timeout if both fire same tick
