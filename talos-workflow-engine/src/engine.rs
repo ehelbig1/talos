@@ -467,7 +467,7 @@ pub use crate::engine_dispatch_subflow::{JudgeVerdict, SubflowError};
 ///    originally claimed. `engine_graph_load.rs` reads the key from more than
 ///    one place in `graph_json` — node top-level, `data`, and `config` — and a
 ///    census that looked at one shape missed the others. Live count: `send`
-///    (`cxai-commitment-nudge`, archived), `send_critical`
+///    (a commitment-nudge workflow, archived), `send_critical`
 ///    (`ops-critical-notifier`), `ask` + `mark_read` + `send_reply`
 ///    (`pa-ask-email`), `send` (`pa-followup-approval-notifier`, ~434
 ///    runs/week), `send` (`pa-opportunity-nudge`, archived).
