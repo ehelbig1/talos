@@ -678,6 +678,209 @@ pub fn describe_chronic_failure(finding: &ChronicNodeFailure, node_label: &str) 
     msg
 }
 
+// ── Explicitly disabled retry protection ─────────────────────────────────────
+//
+// `default_max_retries_for_module(allowed_methods, capability_world)` grants
+// transient retries to work that CANNOT double-fire a side effect: the
+// pure-compute worlds (`minimal` / `secrets`) and `http` / `agent` with a
+// DECLARED GET/HEAD-only `allowed_methods`. Everything else — governance,
+// messaging, database, unknown worlds, state-changing HTTP — already fails
+// closed to 0. That asymmetry is the whole gate here: a node whose world
+// resolves to 0 anyway is correctly configured and must stay silent.
+//
+// An explicit per-node `retry_count` always wins over that default, including
+// an explicit `0`. So a node can carry `retry_count: 0` on a read-only world
+// and run EXACTLY ONCE — a single DNS blip fails the whole execution — while
+// its sibling on the identical module retries twice. Nothing in the platform
+// says so today: an explicit 0 is a valid configuration, it produces no
+// runtime error, and it looks like every other node until the day it doesn't.
+// That is what this check reports.
+//
+// WHAT IT DOES NOT DO. It does not claim the 0 is wrong, and nothing here
+// mutates a graph. An explicit 0 has legitimate uses on exactly these worlds:
+// a retry re-runs the node's work, and where that work costs money (an LLM
+// completion, a metered API call) each attempt pays again — a timeout is
+// classified transient, so a retry fires even when the first attempt may have
+// completed and been billed. The finding states the fact and the cost, and
+// leaves the decision with the operator. It is a Warning for the same reason
+// every finding above it is: `valid == false` gates `publish_version`, and a
+// configuration opinion must never make a workflow unpublishable.
+//
+// WHY IT DOES NOT WAIT FOR A FAILURE. Gating on observed failures would make
+// this a lagging indicator, which is the exact defect the method-aware default
+// was introduced to remove — the blanket-0 era was invisible until an outage
+// failed ~125 read-only fetches at once. A node that has never run has the
+// same dead retry as one that has run 4,500 times. Observed history is
+// therefore DECORATION on the finding, not its trigger: it is rendered when it
+// exists because "and its most recent failure was transient" is what turns a
+// configuration note into a decision, and omitted when it does not.
+
+/// A node that explicitly disables a retry protection its module's world would
+/// otherwise grant.
+///
+/// Every field is descriptive — the numbers come from
+/// [`talos_workflow_engine_core::default_max_retries_for_module`] and from the
+/// module row, never from a rule restated here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisabledRetryProtection {
+    /// What `default_max_retries_for_module` resolves for this node's module.
+    /// Always `> 0` — a module whose default is already 0 does not produce a
+    /// finding.
+    pub world_default_retries: u32,
+    /// The module's capability world, quoted verbatim so the message names the
+    /// input to the default rather than re-deriving why it applied.
+    pub capability_world: Option<String>,
+    /// The module's declared `allowed_methods`, likewise verbatim. Empty for
+    /// the pure-compute worlds, which do not declare any.
+    pub allowed_methods: Vec<String>,
+}
+
+/// Decide whether a node has explicitly disabled retries its world would grant.
+///
+/// Pure, so the fire / don't-fire decision is tested against real fleet
+/// configurations rather than shadowed by a test-local reimplementation.
+///
+/// Returns `None` unless BOTH:
+/// * the node declares `retry_count` and it is exactly `0` — an ABSENT
+///   `retry_count` is the healthy case (the default applies); and
+/// * [`talos_workflow_engine_core::default_max_retries_for_module`] resolves
+///   `> 0` for this module's `allowed_methods` + `capability_world`.
+///
+/// The second condition is the entire noise gate and is delegated, never
+/// reimplemented: side-effecting worlds already resolve to 0, so a finding on
+/// one would be reporting agreement with the default as if it were a problem.
+///
+/// `retry_count` is read with the same top-level-then-`data` precedence the
+/// engine and [`retry_envelope_overrun`] use, so the three can never disagree
+/// about what a node declared.
+#[must_use]
+pub fn disabled_retry_protection(
+    node: &serde_json::Value,
+    module_methods: &[String],
+    module_world: Option<&str>,
+) -> Option<DisabledRetryProtection> {
+    if node_declared_u64(node, "retry_count")? != 0 {
+        return None;
+    }
+    let world_default_retries =
+        talos_workflow_engine_core::default_max_retries_for_module(module_methods, module_world);
+    if world_default_retries == 0 {
+        return None;
+    }
+    Some(DisabledRetryProtection {
+        world_default_retries,
+        capability_world: module_world.map(str::to_string),
+        allowed_methods: module_methods.to_vec(),
+    })
+}
+
+/// Whether retry intelligence classifies a node's most recent recorded failure
+/// message as transient — i.e. whether the retry this node does not have would
+/// have been ATTEMPTED at all, rather than skipped as permanent.
+///
+/// Delegates to the same `classify_error` + `is_transient_error_type` pair the
+/// dispatcher's smart-retry gate uses
+/// (`talos-workflow-engine-nats::dispatcher`), so the answer cannot drift from
+/// the runtime decision it describes.
+///
+/// `None` when there is no recorded failure message to classify. Note the
+/// input is `execution_events.log_message` — the operator-visible record of
+/// the failure — whereas the dispatcher classifies the job result's `error`
+/// field at the moment it decides. The two are the same failure but not
+/// guaranteed to be the same string, which is why the rendered text calls this
+/// a classification of the RECORDED message.
+#[must_use]
+pub fn latest_failure_is_transient(latest_error: Option<&str>) -> Option<bool> {
+    let msg = latest_error?;
+    Some(talos_retry_intelligence::is_transient_error_type(
+        &talos_retry_intelligence::classify_error(msg),
+    ))
+}
+
+/// Render the operator-facing text for a disabled-retry-protection finding.
+///
+/// Separate from the decision so the exact wording is pinned by tests. The
+/// static configuration fact, the observed record, and the reason an operator
+/// might legitimately keep the `0` are rendered as separate sentences and never
+/// joined by a causal claim.
+///
+/// `observed` decorates the finding when the node ran inside the history
+/// window; absence of history never suppresses it (see the module note above).
+#[must_use]
+pub fn describe_disabled_retry_protection(
+    finding: &DisabledRetryProtection,
+    node_label: &str,
+    observed: Option<&ObservedNodeRecord>,
+    latest_failure_transient: Option<bool>,
+    executions_scanned: i64,
+    window_days: i32,
+) -> String {
+    let DisabledRetryProtection {
+        world_default_retries,
+        capability_world,
+        allowed_methods,
+    } = finding;
+
+    // Name the module's declared inputs rather than restating the rule that
+    // consumed them — the rule lives in `default_max_retries_for_module` and
+    // must have exactly one statement in the codebase.
+    let world = capability_world.as_deref().unwrap_or("unknown");
+    let methods_clause = if allowed_methods.is_empty() {
+        String::new()
+    } else {
+        format!(", allowed_methods [{}]", allowed_methods.join(", "))
+    };
+
+    let mut msg = format!(
+        "Node '{node_label}' sets retry_count explicitly to 0, which disables retries. Its \
+         module (capability world '{world}'{methods_clause}) resolves to {world_default_retries} \
+         transient retries by default, and an explicit value always wins over that default — so \
+         this node runs EXACTLY ONCE and a transient failure (DNS, TLS, connection reset, \
+         timeout) fails the execution on the first attempt."
+    );
+
+    if let Some(ObservedNodeRecord {
+        attempts, failures, ..
+    }) = observed
+    {
+        if *failures > 0 {
+            msg.push_str(&format!(
+                " Observed: {failures} of its last {attempts} attempts failed (across \
+                 {executions_scanned} execution(s) in the last {window_days} day(s), excluding \
+                 cancelled and test runs)."
+            ));
+            match latest_failure_transient {
+                Some(true) => msg.push_str(
+                    " The most recent of those failures classifies as TRANSIENT from its \
+                     recorded message, so a retry would have been attempted had one been \
+                     configured.",
+                ),
+                Some(false) => msg.push_str(
+                    " The most recent of those failures classifies as permanent from its \
+                     recorded message, so a retry would have been skipped anyway — retries are \
+                     not the lever for that failure.",
+                ),
+                None => {}
+            }
+        } else {
+            msg.push_str(&format!(
+                " Observed: it has not failed in its last {attempts} attempts (across \
+                 {executions_scanned} execution(s) in the last {window_days} day(s)), so this is \
+                 a note about exposure, not a report of damage."
+            ));
+        }
+    }
+
+    msg.push_str(&format!(
+        " If the 0 is deliberate, keep it: a retry re-runs the node's work, and where that work \
+         has a cost (an LLM completion, a metered API call) each attempt pays it again — a \
+         timeout counts as transient, so a retry can fire even when the first attempt may have \
+         completed. If it is not deliberate, set retry_count to {world_default_retries} — the \
+         value the module default already resolves to."
+    ));
+
+    msg
+}
 // ── Types ────────────────────────────────────────────────────────────────────
 
 /// Severity of a validation issue.
@@ -1373,6 +1576,14 @@ impl WorkflowValidationService {
         // this claims, what it deliberately does not, and — most importantly —
         // why every finding it produces is a Warning and never an Error.
         let window_days = history_window_days();
+        // Hoisted out of the match so the disabled-retry check below can read
+        // the SAME slice without a second query. Left EMPTY when the history
+        // read failed or the window held nothing — that check must still run
+        // (a node with no record has the same dead retry as one with 4,500
+        // runs), it simply renders no observed clause.
+        let mut observed_by_node: HashMap<Uuid, (ObservedNodeRecord, Option<String>)> =
+            HashMap::new();
+        let mut executions_scanned: i64 = 0;
         let history_coverage = match workflow_repo
             .node_run_history(workflow_id, user_id, window_days, HISTORY_MAX_EXECUTIONS)
             .await
@@ -1383,13 +1594,29 @@ impl WorkflowValidationService {
                 // is how this join silently matches nothing, and zero matched
                 // rows is indistinguishable from "no problems found" — i.e. it
                 // would reproduce the exact bug this check exists to fix.
-                let by_node: HashMap<Uuid, &talos_workflow_repository::NodeRunHistoryRow> =
-                    history.nodes.iter().map(|r| (r.node_id, r)).collect();
+                observed_by_node = history
+                    .nodes
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.node_id,
+                            (
+                                ObservedNodeRecord {
+                                    attempts: r.attempts,
+                                    failures: r.failures,
+                                    timeout_failures: r.timeout_failures,
+                                },
+                                r.latest_error.clone(),
+                            ),
+                        )
+                    })
+                    .collect();
+                executions_scanned = history.executions_scanned;
 
                 for node in &nodes {
                     let node_label = node.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
-                    let Some(row) =
-                        by_node.get(&talos_workflow_engine_core::engine_node_uuid(node_label))
+                    let Some((observed, _)) = observed_by_node
+                        .get(&talos_workflow_engine_core::engine_node_uuid(node_label))
                     else {
                         // Never ran inside the window. Silence is right: a node
                         // with no record is neither healthy nor unhealthy, and
@@ -1419,13 +1646,8 @@ impl WorkflowValidationService {
                             )
                         });
 
-                    let observed = ObservedNodeRecord {
-                        attempts: row.attempts,
-                        failures: row.failures,
-                        timeout_failures: row.timeout_failures,
-                    };
                     let Some(finding) = chronic_node_failure(
-                        &observed,
+                        observed,
                         history.executions_scanned,
                         history.window_days,
                         headroom,
@@ -1470,6 +1692,57 @@ impl WorkflowValidationService {
                 HistoryCoverage::Unavailable
             }
         };
+
+        // ── Explicitly disabled retry protection (Warning) ──────────────
+        //
+        // See the module-level rationale above `DisabledRetryProtection` for
+        // what this claims, why it does NOT wait for an observed failure, and
+        // why it never proposes a mutation.
+        //
+        // Runs OUTSIDE the history loop above on purpose: that loop `continue`s
+        // on a node with no record, and a node that has never run has exactly
+        // the same dead retry as one that has run 4,500 times. Observed history
+        // decorates the finding here; it never gates it.
+        //
+        // Module-dispatched nodes only. A system node has no module row, so
+        // there is no `allowed_methods` / `capability_world` to resolve a
+        // default from — the same reason `retry_envelope_overrun` skips them.
+        // `template_retry` was already fetched for the retry-envelope check, so
+        // this adds no query and no per-node lookup beyond a hash hit.
+        for node in &nodes {
+            let node_label = node.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let Some((methods, world)) = node
+                .get("type")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<Uuid>().ok())
+                .and_then(|tid| template_retry.get(&tid))
+            else {
+                continue;
+            };
+            let Some(finding) = disabled_retry_protection(node, methods, world.as_deref()) else {
+                continue;
+            };
+            let observed =
+                observed_by_node.get(&talos_workflow_engine_core::engine_node_uuid(node_label));
+            issues.push(ValidationIssue {
+                // WARNING, NEVER ERROR — same reason as every finding above:
+                // `valid == false` gates `publish_version`, and an explicit 0
+                // is a legal configuration an operator may have chosen on
+                // purpose. Blocking publication over it would be the platform
+                // overruling the author.
+                severity: ValidationSeverity::Warning,
+                message: describe_disabled_retry_protection(
+                    &finding,
+                    node_label,
+                    observed.map(|(o, _)| o),
+                    latest_failure_is_transient(observed.and_then(|(_, e)| e.as_deref())),
+                    executions_scanned,
+                    window_days,
+                ),
+                node_id: Some(node_label.to_string()),
+                category: "retry-disabled".into(),
+            });
+        }
 
         // ── Crash-recovery at-least-once advisory (Warning) ─────────────
         // Surfaces the durability contract to workflow authors: a controller
@@ -3917,5 +4190,245 @@ mod failure_history_tests {
         assert_eq!(f.executions_scanned, 22);
         assert_eq!(f.window_days, 30);
         assert_eq!(f.observed.attempts, 21);
+    }
+}
+
+// ── Disabled-retry-protection tests ──────────────────────────────────────────
+//
+// These drive `disabled_retry_protection`, `latest_failure_is_transient` and
+// `describe_disabled_retry_protection` — the SAME functions `validate` calls,
+// never a test-local restatement of the rule. Every configuration below was
+// read off the live fleet on 2026-08-28 (world, allowed_methods and
+// retry_count as persisted in `workflows.graph_json` / `modules`), so a change
+// that breaks the gate breaks against real graphs rather than invented ones.
+#[cfg(test)]
+mod disabled_retry_tests {
+    use super::{
+        describe_disabled_retry_protection, disabled_retry_protection, latest_failure_is_transient,
+        ObservedNodeRecord,
+    };
+    use serde_json::json;
+
+    fn methods(m: &[&str]) -> Vec<String> {
+        m.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn rec(attempts: i64, failures: i64) -> ObservedNodeRecord {
+        ObservedNodeRecord {
+            attempts,
+            failures,
+            timeout_failures: 0,
+        }
+    }
+
+    /// `pa-daily-brief` / `gmail` — the node from the 2026-08-28 DNS incident.
+    /// http world, DECLARED GET-only, explicit `retry_count: 0`. It failed
+    /// after 1 attempt while `pa-inbox-organizer` / `gmail` (identical module,
+    /// `retry_count: 2`) survived the same ten minutes.
+    #[test]
+    fn fires_on_the_incident_node() {
+        let node = json!({"id": "gmail", "retry_count": 0});
+        let f = disabled_retry_protection(&node, &methods(&["GET"]), Some("http-node")).unwrap();
+        assert_eq!(f.world_default_retries, 2);
+        assert_eq!(f.capability_world.as_deref(), Some("http-node"));
+        assert_eq!(f.allowed_methods, methods(&["GET"]));
+    }
+
+    /// The healthy shape: no `retry_count` at all, so the method-aware default
+    /// applies and there is nothing to report. Firing here would warn about
+    /// every correctly-configured node on the fleet.
+    #[test]
+    fn silent_when_no_retry_count_is_declared() {
+        let node = json!({"id": "gmail"});
+        assert!(disabled_retry_protection(&node, &methods(&["GET"]), Some("http-node")).is_none());
+    }
+
+    /// The already-fixed sibling — `pa-inbox-organizer` / `gmail`, raised to 2
+    /// on 2026-07-24. An operator who has already acted must not keep hearing
+    /// about it.
+    #[test]
+    fn silent_when_retries_are_enabled() {
+        let node = json!({"id": "gmail", "retry_count": 2});
+        assert!(disabled_retry_protection(&node, &methods(&["GET"]), Some("http-node")).is_none());
+    }
+
+    /// THE NOISE GATE. A side-effecting world already resolves to 0, so an
+    /// explicit 0 there AGREES with the default — reporting it would be
+    /// reporting correctness as a problem, and would put a warning on exactly
+    /// the nodes where a blind retry re-fires a non-idempotent send.
+    #[test]
+    fn silent_where_the_default_is_already_zero() {
+        for (m, world) in [
+            (methods(&["GET", "POST"]), "http-node"), // state-changing HTTP
+            (methods(&["POST"]), "http-node"),
+            (vec![], "messaging-node"),
+            (vec![], "database-node"),
+            (vec![], "governance-node"),
+            (vec![], "network-node"),
+            (vec![], ""), // unknown world fails closed
+        ] {
+            let node = json!({"id": "n", "retry_count": 0});
+            assert!(
+                disabled_retry_protection(&node, &m, Some(world)).is_none(),
+                "must stay silent for world {world:?} methods {m:?}"
+            );
+        }
+    }
+
+    /// An EMPTY `allowed_methods` reads as "allow every verb" at the worker's
+    /// enforcement point, so an http-world module that declares none is
+    /// UNKNOWN, not read-only, and its default is 0. Pinned separately from
+    /// the loop above because this is the one asymmetry in the three
+    /// declaration lists and the easiest to "simplify" away.
+    #[test]
+    fn silent_for_http_with_undeclared_methods() {
+        let node = json!({"id": "n", "retry_count": 0});
+        assert!(disabled_retry_protection(&node, &[], Some("http-node")).is_none());
+    }
+
+    /// The gate is DELEGATED, not restated: for every configuration, the
+    /// finding must fire on exactly the ones where
+    /// `default_max_retries_for_module` resolves non-zero. If that function's
+    /// rule ever changes, this check follows it automatically — and this test
+    /// fails if someone hardcodes a parallel copy of the rule here.
+    #[test]
+    fn fires_exactly_where_the_module_default_is_nonzero() {
+        for (m, world) in [
+            (methods(&["GET"]), "http-node"),
+            (methods(&["GET", "HEAD"]), "http-node"),
+            (methods(&["get"]), "http"),
+            (methods(&["GET", "POST"]), "http-node"),
+            (vec![], "http-node"),
+            (vec![], "minimal-node"),
+            (vec![], "secrets-node"),
+            (vec![], "agent-node"),
+            (methods(&["GET"]), "agent-node"),
+            (vec![], "messaging-node"),
+            (vec![], "database-node"),
+        ] {
+            let expected =
+                talos_workflow_engine_core::default_max_retries_for_module(&m, Some(world)) > 0;
+            let node = json!({"id": "n", "retry_count": 0});
+            assert_eq!(
+                disabled_retry_protection(&node, &m, Some(world)).is_some(),
+                expected,
+                "gate disagreed with default_max_retries_for_module for {world:?} / {m:?}"
+            );
+        }
+    }
+
+    /// `retry_count` is read top-level-first then under `data`, matching
+    /// `retry_envelope_overrun` and the engine. A node that declares it in the
+    /// nested position must not escape the check.
+    #[test]
+    fn reads_nested_retry_count() {
+        let node = json!({"id": "n", "data": {"retry_count": 0}});
+        assert!(disabled_retry_protection(&node, &[], Some("secrets-node")).is_some());
+    }
+
+    /// The exact `log_message` `pa-daily-brief` / `gmail` recorded at
+    /// 11:16:04 on 2026-08-28, copied verbatim from `execution_events`. It
+    /// must classify transient — if it did not, the finding's "a retry would
+    /// have been attempted" sentence would be false on the very incident that
+    /// motivated the check.
+    #[test]
+    fn incident_message_classifies_transient() {
+        let msg = "Job failed after 1 attempts: execution failure: Component returned error: \
+                   list fetch: Error { code: 2, name: \"networkerror\", message: \"\" } \
+                   [reason_class=dns]";
+        assert_eq!(latest_failure_is_transient(Some(msg)), Some(true));
+    }
+
+    /// A permanent failure must classify as such, so the finding tells the
+    /// operator retries are NOT the lever rather than sending them to add one.
+    #[test]
+    fn permanent_message_classifies_permanent() {
+        assert_eq!(
+            latest_failure_is_transient(Some("401 Unauthorized: invalid api key")),
+            Some(false)
+        );
+    }
+
+    /// No recorded message is not a verdict. `None` must stay `None` so the
+    /// rendered text omits the clause entirely rather than guessing.
+    #[test]
+    fn no_message_yields_no_verdict() {
+        assert_eq!(latest_failure_is_transient(None), None);
+    }
+
+    /// The full rendered finding for the incident node. Pinned because the
+    /// operator-facing wording IS the deliverable here — there is no mutation,
+    /// so the text is the entire product.
+    #[test]
+    fn renders_the_incident_finding() {
+        let node = json!({"id": "gmail", "retry_count": 0});
+        let f = disabled_retry_protection(&node, &methods(&["GET"]), Some("http-node")).unwrap();
+        let msg =
+            describe_disabled_retry_protection(&f, "gmail", Some(&rec(22, 1)), Some(true), 22, 30);
+        assert!(msg.contains("sets retry_count explicitly to 0"));
+        assert!(msg.contains("capability world 'http-node', allowed_methods [GET]"));
+        assert!(msg.contains("resolves to 2 transient retries by default"));
+        assert!(msg.contains("runs EXACTLY ONCE"));
+        assert!(msg.contains("1 of its last 22 attempts failed"));
+        assert!(msg.contains("across 22 execution(s) in the last 30 day(s)"));
+        assert!(msg.contains("classifies as TRANSIENT"));
+        assert!(msg.contains("set retry_count to 2"));
+        // F2: the finding must never assert the 0 is wrong.
+        assert!(msg.contains("If the 0 is deliberate, keep it"));
+    }
+
+    /// A node that has never run still gets the finding — the whole point of
+    /// not gating on history. It renders no observed clause and no verdict,
+    /// rather than an empty or invented one.
+    #[test]
+    fn renders_without_history() {
+        let node = json!({"id": "poll", "retry_count": 0});
+        let f = disabled_retry_protection(&node, &methods(&["GET"]), Some("http-node")).unwrap();
+        let msg = describe_disabled_retry_protection(&f, "poll", None, None, 0, 30);
+        assert!(msg.contains("runs EXACTLY ONCE"));
+        assert!(!msg.contains("Observed:"));
+        assert!(!msg.contains("TRANSIENT"));
+        assert!(msg.contains("set retry_count to 2"));
+    }
+
+    /// A clean node says so explicitly — "exposure, not damage". Silence about
+    /// the denominator is what let the original `issues: []` read as health.
+    #[test]
+    fn renders_a_clean_record_as_exposure_not_damage() {
+        let node = json!({"id": "compose_reply", "retry_count": 0});
+        let f = disabled_retry_protection(&node, &[], Some("minimal-node")).unwrap();
+        let msg = describe_disabled_retry_protection(
+            &f,
+            "compose_reply",
+            Some(&rec(4508, 0)),
+            None,
+            50,
+            30,
+        );
+        assert!(msg.contains("has not failed in its last 4508 attempts"));
+        assert!(msg.contains("exposure, not a report of damage"));
+        // A pure-compute module declares no methods — do not render an empty list.
+        assert!(!msg.contains("allowed_methods []"));
+        assert!(msg.contains("capability world 'minimal-node'"));
+    }
+
+    /// When the last failure was permanent the finding must NOT push the
+    /// operator toward a retry — that is `get_workflow_risk_assessment`'s
+    /// mistake, and adding retries to a deterministic failure just burns fuel.
+    #[test]
+    fn permanent_last_failure_steers_away_from_retries() {
+        let node = json!({"id": "extract", "retry_count": 0});
+        let f = disabled_retry_protection(&node, &[], Some("secrets-node")).unwrap();
+        let msg = describe_disabled_retry_protection(
+            &f,
+            "extract",
+            Some(&rec(21, 6)),
+            Some(false),
+            22,
+            30,
+        );
+        assert!(msg.contains("classifies as permanent"));
+        assert!(msg.contains("retries are not the lever"));
+        assert!(!msg.contains("classifies as TRANSIENT"));
     }
 }
