@@ -1011,20 +1011,29 @@ async fn handle_cancel_execution(
         // What the request buys, stated without inflation: a worker holding an
         // in-flight job for this execution flips that job's cancellation flag,
         // so its NEXT off-host call fails non-transiently and is not
-        // re-dispatched. A module making no further host calls still runs to
-        // its fuel limit or timeout. Fuel metering, epoch interruption and the
-        // #686 clamp remain the bound on a runaway module. Audit is not
-        // bypassed — the job fails through the ordinary path and still writes
-        // its terminal row and DLQ entry.
+        // re-dispatched. A module making NO host calls is no longer exempt —
+        // the epoch-deadline callback re-reads the same flag roughly every
+        // 100 ms of guest execution and traps the module out of its own
+        // computation (`talos_worker_runtime::epoch_budget`), so the wall-clock
+        // timeout is no longer the floor on a compute-bound module.
+        //
+        // What is still NOT bought, and must not be claimed: the broadcast is
+        // fire-and-forget with no reply, so the abort remains REQUESTED, never
+        // confirmed; and nothing here reaches a worker that never received the
+        // command. Fuel metering and the #686 clamp remain the bound on a
+        // runaway module that was never cancelled. Audit is not bypassed — the
+        // job fails through the ordinary path and still writes its terminal row
+        // and DLQ entry.
         Ok(outcome) if outcome.marked => {
             let requested = outcome.broadcast.reached_the_fleet();
             let message = if requested {
                 "Execution marked cancelled and a signed cancel was broadcast to the \
                  worker fleet. No further nodes will be dispatched. A worker holding an \
-                 in-flight job stops it at its next off-host call; a module making no \
-                 further host calls still runs to its own timeout or fuel limit. The \
-                 platform receives no acknowledgement, so the abort is requested, never \
-                 confirmed."
+                 in-flight job stops it at its next off-host call, and a module making \
+                 no host calls at all is trapped out of its own computation within about \
+                 100 ms by the epoch-deadline check — a compute-bound module no longer \
+                 runs to its timeout. The platform receives no acknowledgement, so the \
+                 abort is requested, never confirmed."
             } else {
                 "Execution marked cancelled, but NO cancel reached the worker fleet \
                  (see cancel_broadcast). No further nodes will be dispatched; a node \

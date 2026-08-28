@@ -92,9 +92,16 @@ impl ExecutionOrchestrationService {
     /// cancellation flag, which the in-worker egress guards read: the next
     /// off-host call the module attempts fails with `reason_class=cancelled`,
     /// which both transient classifiers treat as NON-transient, so it is not
-    /// re-dispatched. A module that makes no further host calls still runs to
-    /// its fuel limit or its timeout — the flag is a cooperative stop, not a
-    /// pre-emption, and saying otherwise would repeat the defect #687 fixed.
+    /// re-dispatched. A module that makes no host calls at all is no longer
+    /// exempt either: the worker's per-Store epoch-deadline callback
+    /// (`talos_worker_runtime::epoch_budget`) re-reads the same flag roughly
+    /// every 100 ms of guest execution and traps the module out of its own
+    /// computation, so a compute-bound module no longer runs to its timeout.
+    ///
+    /// What is still NOT bought, and must not be claimed — this is the defect
+    /// #687 fixed and it has not gone away: the broadcast is fire-and-forget
+    /// with no reply, so the abort is REQUESTED, never confirmed, and nothing
+    /// here reaches a worker that did not receive the command.
     ///
     /// Audit is not bypassed: the job fails through the ordinary path, so the
     /// `node_failed` row and the DLQ entry are still written.

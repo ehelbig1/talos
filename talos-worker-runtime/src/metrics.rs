@@ -883,6 +883,21 @@ pub struct RuntimeMetrics {
     /// Executions cancelled via cancellation token
     pub executions_cancelled: Counter<u64>,
 
+    /// Executions PREEMPTED mid-computation by the epoch-deadline cancel
+    /// callback (`crate::epoch_budget`).
+    ///
+    /// Deliberately separate from `executions_cancelled`, which counts the
+    /// ~20 host-call guards refusing an off-host call for a cancelled job.
+    /// Those two answer different questions: the guards say "a cancelled job
+    /// tried to reach the network and was stopped", this says "a cancelled job
+    /// was making no host calls at all and had to be trapped out of its own
+    /// computation". Folding them together would make the compute-bound case —
+    /// the one that used to escape cancellation entirely — invisible.
+    ///
+    /// No labels: the increment site is a single branch in the epoch callback,
+    /// and nothing about a job (id, module, actor) may become a label value.
+    pub executions_preempted: Counter<u64>,
+
     /// Quota exceeded events by metric name
     pub quota_exceeded: Counter<u64>,
 
@@ -1072,6 +1087,14 @@ impl RuntimeMetrics {
             executions_cancelled: meter
                 .u64_counter("wasm.executions.cancelled")
                 .with_description("Executions cancelled via cancellation token")
+                .build(),
+
+            executions_preempted: meter
+                .u64_counter("wasm.executions.preempted")
+                .with_description(
+                    "Executions trapped mid-computation by the epoch-deadline \
+                     cancellation callback (no host call was pending)",
+                )
                 .build(),
 
             quota_exceeded: meter
@@ -1367,6 +1390,18 @@ impl RuntimeMetrics {
     /// Record an execution cancellation.
     pub fn record_execution_cancelled(&self) {
         self.executions_cancelled.add(1, &[]);
+    }
+
+    /// Record an execution PREEMPTED mid-computation by the epoch-deadline
+    /// cancel callback. Called from exactly one place —
+    /// `crate::epoch_budget::arm_epoch_deadline`'s abort branch — immediately
+    /// before the guest is trapped, so the counter is one-per-job.
+    ///
+    /// Not pre-seeded at 0, matching its `executions_cancelled` sibling and the
+    /// policy stated on `seed_zero_series`: the questions asked of it are
+    /// `> threshold` shapes, which behave correctly over an absent series.
+    pub fn record_execution_preempted(&self) {
+        self.executions_preempted.add(1, &[]);
     }
 
     /// Record a quota exceeded event.

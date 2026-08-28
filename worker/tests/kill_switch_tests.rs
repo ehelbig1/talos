@@ -14,6 +14,16 @@
 //!  3. `cancellation_aborts_http_promptly` — a cancelled execution's
 //!     outbound HTTP host call short-circuits immediately instead of
 //!     dialing the network.
+//!  3b. `cancellation_preempts_a_compute_bound_module` — the COMPUTE-BOUND
+//!     half of the same guarantee: a guest that makes no host call after
+//!     entry reaches none of the ~20 `is_cancelled()` guards, and used to
+//!     burn its whole timeout. The epoch-deadline callback
+//!     (`talos_worker_runtime::epoch_budget`) re-reads the same flag and
+//!     traps it out of its loop. Its sibling
+//!     `an_uncancelled_compute_bound_job_still_traps_at_its_own_budget`
+//!     is the regression guard: with no cancel, the SAME module on the
+//!     SAME path must still trap near its configured timeout, with the
+//!     ordinary trap message and not the cancellation one.
 //!  4. `pipeline_mid_step_failure_propagates` — a trapping middle step
 //!     aborts the pipeline; later steps never run and the error surfaces.
 //!  5. `concurrency_semaphore_queues_never_drops` — the semaphore the
@@ -477,5 +487,238 @@ async fn concurrency_semaphore_queues_never_drops() {
         sem.available_permits(),
         CAP,
         "all permits must be returned after drain (clean back-pressure)"
+    );
+}
+
+// ============================================================================
+// (3b) Cancellation preempts a COMPUTE-BOUND module
+// ============================================================================
+
+/// A tight loop making no host calls, cancelled mid-flight, on the real
+/// single-node job path.
+///
+/// This is the case #690 could not reach. `LOOP_CORE_WAT` calls
+/// `logging.log` exactly once (to pin the import against dead-code
+/// elimination) and then spins forever — after that first call it crosses no
+/// host-call boundary again, so every one of the ~20 `is_cancelled()` guards
+/// is unreachable to it. Before the epoch-deadline callback the flag could be
+/// set and nothing would read it; the job held its worker slot for the full
+/// `JOB_TIMEOUT`.
+///
+/// Both other kill switches are deliberately disarmed so neither can be
+/// mistaken for the mechanism under test:
+///   * fuel — overridden to 1e12 instructions, unreachable in seconds;
+///   * wall-clock — `JOB_TIMEOUT` is 60 s and the assertion is that the job
+///     dies in a small fraction of that. (`tokio::time::timeout` could not
+///     fire here anyway: a non-yielding sync loop inside `call_async` never
+///     returns to the executor. That is precisely why epochs exist.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancellation_preempts_a_compute_bound_module() {
+    use talos_workflow_job_protocol::LlmTier;
+    use uuid::Uuid;
+
+    /// Long enough that a job dying near it would be a TIMEOUT, not a cancel.
+    const JOB_TIMEOUT: Duration = Duration::from_secs(60);
+    /// Effectively infinite — fuel must not be the limiter.
+    const HUGE_FUEL: u64 = 1_000_000_000_000;
+
+    let rt = Arc::new(TalosRuntime::new().expect("runtime"));
+    // Epoch interruption is inert without the ticker — this is the wiring
+    // `worker/src/main.rs` does at startup.
+    let ticker = worker::runtime::spawn_epoch_ticker(rt.engine_handle());
+
+    let execution_id = Uuid::new_v4();
+    let bytes = build_minimal_component(LOOP_CORE_WAT);
+
+    let job = {
+        let rt = rt.clone();
+        let execution_id = execution_id.to_string();
+        tokio::spawn(async move {
+            rt.execute_job_with_full_features(
+                &bytes,
+                vec![],
+                vec![],
+                128,
+                serde_json::json!({}),
+                None,
+                // Element 0 is the workflow_executions.id — what an operator
+                // cancels, and what `cancel_registry` keys on.
+                Some((
+                    execution_id,
+                    Uuid::new_v4().to_string(),
+                    "oci://loop".to_string(),
+                )),
+                HashMap::new(),
+                None,
+                JOB_TIMEOUT,
+                worker::runtime::RetryPolicy::none(),
+                None,
+                SecurityPolicy::default(),
+                None,            // capability_world_hint — let it inspect
+                Some(HUGE_FUEL), // max_fuel_override
+                false,           // dry_run
+                None,            // actor_id
+                Uuid::nil(),     // user_id
+                LlmTier::Tier2,
+                talos_workflow_job_protocol::WriteCeiling::Write,
+                None, // egress_scope
+                None, // llm_usage_out
+                None, // host_diag_out
+            )
+            .await
+        })
+    };
+
+    // Wait for the job to REGISTER before cancelling. Cancelling earlier would
+    // flag nothing (a 0 return is the normal miss outcome) and the test would
+    // silently degrade into the timeout case it is meant to exclude.
+    let registered = tokio::time::timeout(Duration::from_secs(20), async {
+        while rt.in_flight_cancellable_jobs() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        registered.is_ok(),
+        "the job never registered as in-flight; nothing was cancelled"
+    );
+
+    // Let the guest get properly into its loop, so the abort is a genuine
+    // mid-computation preemption rather than a race against instantiation.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let cancel_at = std::time::Instant::now();
+    let flagged = rt.cancel_execution(execution_id);
+    assert_eq!(flagged, 1, "the cancel must reach exactly this job's flag");
+
+    let res = tokio::time::timeout(Duration::from_secs(20), job)
+        .await
+        .expect("the cancelled job must not run to the 60s timeout")
+        .expect("job task panicked");
+    let elapsed = cancel_at.elapsed();
+    ticker.abort();
+
+    let err = format!("{:#}", res.expect_err("a preempted job must not return Ok"));
+
+    assert!(
+        err.contains("cancelled"),
+        "a preempted job must report the cancellation, got: {err}"
+    );
+    // Requirement: distinguishable from a genuine timeout and from fuel.
+    let lower = err.to_lowercase();
+    assert!(
+        !lower.contains("timed out") && !lower.contains("timeout"),
+        "an operator kill must not read as a wall-clock timeout: {err}"
+    );
+    assert!(
+        !lower.contains("fuel"),
+        "an operator kill must not read as fuel exhaustion: {err}"
+    );
+    assert!(
+        !err.contains("WASM trap encountered"),
+        "the abort must survive the generic trap sanitiser: {err}"
+    );
+    // The controller must not re-dispatch it, and the worker must not retry
+    // it. Both gates key on this token: the worker's
+    // `is_transient_error_text` (pinned by `epoch_budget`'s
+    // `the_abort_message_classifies_non_transient`) and the controller's
+    // `talos_retry_intelligence::classify_error` (pinned by that crate's
+    // `every_reason_class_token_maps_to_the_right_bucket`). Asserting the
+    // TOKEN here rather than re-running a classifier keeps this test free of
+    // a dependency on the controller-side crate.
+    assert!(
+        err.contains("[reason_class=cancelled]"),
+        "a preempted job must carry the non-transient cancelled reason class: {err}"
+    );
+
+    // The mechanism, not the timeout: one epoch tick is 100 ms, so a working
+    // preemption lands in well under a second. 10 s is six times the slowest
+    // plausible CI scheduling delay and still six times below the 60 s budget.
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "preemption must follow the cancel promptly, not at the job timeout \
+         (elapsed {elapsed:?})"
+    );
+
+    assert_eq!(
+        rt.in_flight_cancellable_jobs(),
+        0,
+        "the registry must drain when the preempted job unwinds"
+    );
+}
+
+/// The regression guard for the other half of the change: an UNCANCELLED job
+/// must be unable to tell the difference.
+///
+/// Same module, same path, same disarmed fuel — but no cancel. The sliced
+/// epoch budget must still add up to the original one, so the loop dies near
+/// its configured timeout (not before it, and not appreciably after), with the
+/// ordinary trap message rather than the cancellation one. A bug that let the
+/// slices grow without bound would hang here instead of failing an assert,
+/// which is why the outer `tokio::time::timeout` is well above the budget
+/// rather than snug against it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_uncancelled_compute_bound_job_still_traps_at_its_own_budget() {
+    use talos_workflow_job_protocol::LlmTier;
+    use uuid::Uuid;
+
+    const JOB_TIMEOUT: Duration = Duration::from_secs(3);
+    const HUGE_FUEL: u64 = 1_000_000_000_000;
+
+    let rt = TalosRuntime::new().expect("runtime");
+    let ticker = worker::runtime::spawn_epoch_ticker(rt.engine_handle());
+    let bytes = build_minimal_component(LOOP_CORE_WAT);
+
+    let start = std::time::Instant::now();
+    let res = rt
+        .execute_job_with_full_features(
+            &bytes,
+            vec![],
+            vec![],
+            128,
+            serde_json::json!({}),
+            None,
+            Some((
+                Uuid::new_v4().to_string(),
+                Uuid::new_v4().to_string(),
+                "oci://loop".to_string(),
+            )),
+            HashMap::new(),
+            None,
+            JOB_TIMEOUT,
+            worker::runtime::RetryPolicy::none(),
+            None,
+            SecurityPolicy::default(),
+            None,
+            Some(HUGE_FUEL),
+            false,
+            None,
+            Uuid::nil(),
+            LlmTier::Tier2,
+            talos_workflow_job_protocol::WriteCeiling::Write,
+            None,
+            None,
+            None,
+        )
+        .await;
+    let elapsed = start.elapsed();
+    ticker.abort();
+
+    let err = format!("{:#}", res.expect_err("a runaway loop must not return Ok"));
+    assert!(
+        !err.contains("cancelled"),
+        "an uncancelled job must not be reported as cancelled: {err}"
+    );
+    // `epoch_ticks_for_timeout` rounds UP, so the trap may not land BEFORE the
+    // configured timeout — only at or after it. That contract is unchanged by
+    // the slicing.
+    assert!(
+        elapsed >= JOB_TIMEOUT.saturating_sub(Duration::from_millis(200)),
+        "the epoch budget must not be spent early (elapsed {elapsed:?})"
+    );
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "the sliced budget must still sum to the original one, not extend it \
+         (elapsed {elapsed:?}, budget {JOB_TIMEOUT:?})"
     );
 }
