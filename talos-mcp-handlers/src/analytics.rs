@@ -4123,23 +4123,36 @@ async fn handle_get_workflow_risk_assessment(
 
     let mut risks: Vec<serde_json::Value> = Vec::new();
 
-    // Check: No timeout configured
-    let has_timeout = graph
-        .get("execution_timeout_secs")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0)
-        > 0;
-    if !has_timeout {
+    // Check: workflow-level wall-clock cap DISABLED.
+    //
+    // This finding used to fire whenever `execution_timeout_secs` did not
+    // resolve to a positive number — which folded "the graph says nothing"
+    // together with "the graph says 0". Those are opposites. An absent field
+    // leaves the engine's constructor default in place
+    // (DEFAULT_WORKFLOW_EXECUTION_TIMEOUT_SECS = 300 s), so the workflow runs
+    // under a real cap and the reported "has no execution timeout configured"
+    // was simply false; measured against the live fleet on 2026-08-28 that was
+    // 23 of 30 workflows, every one of them the absent case and every one of
+    // them wrong. An explicit `0` is the engine's documented sentinel for "no
+    // wall-clock cap", which is the genuine exposure this finding was for, and
+    // there were zero of those. Both cases are now classified by
+    // `talos_workflow_validation::workflow_timeout_posture`.
+    if talos_workflow_validation::workflow_timeout_posture(&graph)
+        == talos_workflow_validation::WorkflowTimeoutPosture::ExplicitlyDisabled
+    {
         risks.push(serde_json::json!({
             "risk_level": "medium",
             "category": "timeout",
-            "description": "Workflow has no execution timeout configured",
-            "recommendation": "Set execution_timeout_secs to prevent runaway executions. Use update_node_config or recreate the workflow with a timeout."
+            "description": "Workflow sets execution_timeout_secs to 0, which DISABLES the \
+                            workflow-level wall-clock cap. Per-node timeouts are the only thing \
+                            bounding a runaway execution.",
+            "recommendation": "Set execution_timeout_secs to a positive number of seconds, or \
+                               remove the field to fall back to the engine default of 300s. If \
+                               the 0 is deliberate, confirm every node carries a timeout_secs."
         }));
     }
 
-    // Check: Nodes without retry config
-    // Get template names/categories for nodes to identify HTTP-calling nodes
+    // Check: nodes that explicitly disable the retries their module's world grants.
     let module_ids: Vec<uuid::Uuid> = nodes
         .iter()
         .filter_map(|n| {
@@ -4150,16 +4163,16 @@ async fn handle_get_workflow_risk_assessment(
         .collect();
 
     // Load module metadata in parallel:
-    // - template_info: name + category (from node_templates) for retry/HTTP checks
+    // - module_facts: name / category / capability_world / allowed_methods
     // - installed_secrets: per-install wasm_modules.allowed_secrets (authoritative override)
     // - template_rows: node_templates.allowed_secrets (fallback when no wasm_modules entry)
     //
     // Both installed_secrets and template_rows are needed because wasm_modules may not have
     // an entry (e.g. if the wasm_modules insert failed silently, or if user_id was NULL at
     // install time). Using node_templates as a fallback matches validate_workflow's behavior.
-    let (template_info_vec, installed_secrets_res, template_rows_res) = if !module_ids.is_empty() {
+    let (module_facts_vec, installed_secrets_res, template_rows_res) = if !module_ids.is_empty() {
         tokio::join!(
-            state.analytics_repo.get_risk_module_categories(&module_ids),
+            state.analytics_repo.get_risk_module_facts(&module_ids),
             state
                 .workflow_repo
                 .get_installed_secrets_by_template_ids(&module_ids, user_id),
@@ -4169,10 +4182,13 @@ async fn handle_get_workflow_risk_assessment(
         (Ok(vec![]), Ok(std::collections::HashMap::new()), Ok(vec![]))
     };
 
-    let template_info: std::collections::HashMap<uuid::Uuid, (String, String)> = template_info_vec
+    let module_facts: std::collections::HashMap<
+        uuid::Uuid,
+        talos_analytics_repository::RiskModuleFacts,
+    > = module_facts_vec
         .unwrap_or_default()
         .into_iter()
-        .map(|(id, name, cat)| (id, (name, cat.unwrap_or_else(|| "unknown".to_string()))))
+        .map(|f| (f.id, f))
         .collect();
 
     let installed_secrets = installed_secrets_res.unwrap_or_default();
@@ -4185,43 +4201,110 @@ async fn handle_get_workflow_risk_assessment(
         .map(|r| (r.id, r.allowed_secrets))
         .collect();
 
+    // Every `vault://` reference this graph actually carries, extracted ONCE
+    // through the canonical extractor and shared by all four secret findings
+    // below (`empty_secret_grant`, `vault_path_blocked`, `expiring_secret`,
+    // `secret_no_expiry`).
+    //
+    // `talos_workflow_engine::vault_resolver::extract_vault_refs` is the same
+    // function the controller uses to decide which secrets to prefetch into a
+    // job, and it is kept byte-compatible with the worker's
+    // `resolve_vault_header`: a reference is matched ANYWHERE in a config
+    // value and its path runs to the first whitespace. The risk checks used
+    // `val.starts_with("vault://")` instead, which only matches a bare prefix.
+    // Every catalog integration module carries its reference inside a header
+    // template — `AUTH_HEADER = "Bearer vault://oauth/gmail/<uid>/<email>/
+    // access_token"` — so the prefix test matched none of them. Measured on
+    // the live fleet 2026-08-28: 0 bare-prefix references against 45 embedded
+    // ones, i.e. both HIGH-severity grant findings had zero recall over the
+    // whole fleet while the worker was enforcing exactly the grant they claim
+    // to predict.
+    let node_vault_refs: Vec<(String, uuid::Uuid, Vec<(String, String)>)> = nodes
+        .iter()
+        .filter_map(|node| {
+            let node_id = node.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+            let mid = node
+                .get("type")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<uuid::Uuid>().ok())?;
+            let node_data = node.get("data").cloned().unwrap_or(serde_json::json!({}));
+            let node_config = node_data
+                .get("config")
+                .cloned()
+                .unwrap_or_else(|| node_data.clone());
+            Some((
+                node_id.to_string(),
+                mid,
+                talos_workflow_engine::vault_resolver::extract_vault_refs(&node_config),
+            ))
+        })
+        .collect();
+
+    // `missing_retry`, rebuilt on the engine's own retry rule.
+    //
+    // What this finding used to do: decide "is this an HTTP module" by
+    // substring-matching the module's display NAME and CATEGORY against
+    // {"http", "api", "request", "network"}, then recommend adding retries to
+    // every match that carried no top-level `retry_count`. Both halves were
+    // wrong, and the first was wrong in the dangerous direction. Measured
+    // against the live catalog on 2026-08-28 the name/category predicate
+    // matched exactly two modules — `HTTP Request` and `HTTP Request with
+    // Retry`, both `http-node` declaring {GET,POST,PUT,PATCH,DELETE} — for
+    // which `default_max_retries_for_module` resolves 0 ON PURPOSE, because a
+    // blind retry of a state-changing send re-fires it. So the finding told an
+    // operator, at HIGH severity, to add retries to precisely the nodes the
+    // engine fails closed for: a double-charge / duplicate-message
+    // recommendation. In the same measurement its recall was 0 of the 63
+    // catalog modules whose world DOES grant transient retries, so it also
+    // never fired where retries were the right answer.
+    //
+    // What it does now: delegate to
+    // `talos_workflow_validation::disabled_retry_protection`, added by #696,
+    // which calls `default_max_retries_for_module` rather than restating it
+    // and fires only on the case that is actually a configuration hazard — a
+    // node whose EXPLICIT `retry_count: 0` overrides a world default of > 0.
+    // That preserves #696's distinction between an explicit 0 (a deliberate
+    // choice, which this reports without calling wrong) and an absent one (the
+    // healthy case, where the default applies). It also picks up
+    // `data.retry_count`, which the old top-level-only read missed, via the
+    // same dual-shape accessor the engine uses.
+    //
+    // Severity is medium, not high: an explicit 0 has legitimate uses on
+    // metered work, so this is a decision to surface, not a defect to alarm on.
     for node in &nodes {
         let node_id = node.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-        let module_id_str = node.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let has_retry = node
-            .get("retry_count")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
-            > 0;
-
-        if let Ok(mid) = module_id_str.parse::<uuid::Uuid>() {
-            if let Some((tmpl_name, tmpl_cat)) = template_info.get(&mid) {
-                // MCP-1142 (2026-05-16): hoist the `tmpl_name.to_lowercase()`
-                // clone out of the boolean chain. Pre-fix called
-                // `.to_lowercase()` THREE times in succession on the same
-                // input — same anti-pattern as MCP-1139 (rhai bare-string
-                // heuristic, two clones) and MCP-1140 (placeholder warning
-                // helper, three clones). `tmpl_name` is bounded by template-
-                // name validation so absolute cost is small, but the shape
-                // recurs workspace-wide and is part of the running sweep.
-                // Per-call: 3 heap clones + 3 case-walk passes → 1 clone +
-                // 1 walk + 3 substring scans on the cached lowercase form.
-                let tmpl_name_lower = tmpl_name.to_lowercase();
-                let is_http = tmpl_cat.contains("http")
-                    || tmpl_name_lower.contains("http")
-                    || tmpl_name_lower.contains("api")
-                    || tmpl_name_lower.contains("request")
-                    || tmpl_cat.contains("network");
-                if is_http && !has_retry {
-                    risks.push(serde_json::json!({
-                        "risk_level": "high",
-                        "category": "missing_retry",
-                        "description": format!("Node '{}' uses HTTP module '{}' but has no retry config", node_id, tmpl_name),
-                        "recommendation": "Add retry_count and retry_backoff_ms using update_node_config to handle transient network failures."
-                    }));
-                }
-            }
-        }
+        let Some(mid) = node
+            .get("type")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<uuid::Uuid>().ok())
+        else {
+            continue;
+        };
+        let Some(facts) = module_facts.get(&mid) else {
+            continue;
+        };
+        let Some(finding) = talos_workflow_validation::disabled_retry_protection(
+            node,
+            &facts.allowed_methods,
+            facts.capability_world.as_deref(),
+        ) else {
+            continue;
+        };
+        risks.push(serde_json::json!({
+            "risk_level": "medium",
+            "category": "missing_retry",
+            "node_id": node_id,
+            "description": talos_workflow_validation::describe_disabled_retry_protection(
+                &finding, node_id, None, None, 0, 0,
+            ),
+            // The description (rendered by the shared #696 formatter) already
+            // states both branches of the decision and the value to use. This
+            // names the tool that applies it rather than restating them.
+            "recommendation": format!(
+                "If the 0 is not deliberate: update_node_config(node_id: '{}', retry_count: {}).",
+                node_id, finding.world_default_retries
+            ),
+        }));
     }
 
     // Check: Missing error edges (nodes with no outgoing error edge)
@@ -4283,11 +4366,11 @@ async fn handle_get_workflow_risk_assessment(
             .get_risk_stale_templates(&module_ids)
             .await
             .unwrap_or_default();
-        // template_info already loaded: use it to map stale ids to names
+        // module_facts already loaded: use it to map stale ids to names
         for stale_id in &stale_ids {
-            let name = template_info
+            let name = module_facts
                 .get(stale_id)
-                .map(|(n, _)| n.as_str())
+                .map(|f| f.name.as_str())
                 .unwrap_or("unknown");
             risks.push(serde_json::json!({
                 "risk_level": "medium",
@@ -4298,37 +4381,105 @@ async fn handle_get_workflow_risk_assessment(
         }
     }
 
-    // Check: Secrets expiring within 30 days
-    let expiring_secrets = state
+    // Checks: expiry posture of the secrets THIS workflow references.
+    //
+    // Both findings previously answered a different question than the one they
+    // reported. `expiring_secret` listed every secret of the caller's expiring
+    // inside 30 days and attributed all of them to whichever workflow was
+    // being assessed — no link between the secret and the graph was ever
+    // tested, so on an account with one expiring credential every workflow
+    // reported the same HIGH finding whether it used the credential or not.
+    // `secret_no_expiry` tested whether a secret's display NAME appeared as a
+    // case-insensitive substring anywhere in the raw `graph_json` text, which
+    // matches node labels, descriptions and URLs as readily as a real
+    // reference — a secret named "gmail" would have fired on every workflow
+    // mentioning Gmail.
+    //
+    // Both are answerable exactly: the path inside a `vault://` reference IS
+    // `secrets.key_path`, so the references extracted above join straight onto
+    // the secrets table. A path with no matching row is deliberately silent
+    // here — that is `vault_path_blocked`'s and the engine's `SecretNotResolved`
+    // territory, not an expiry question.
+    let referenced_vault_paths: Vec<String> = node_vault_refs
+        .iter()
+        .flat_map(|(_, _, refs)| refs.iter().map(|(_, path)| path.clone()))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let referenced_secrets = state
         .analytics_repo
-        .get_risk_expiring_secrets(user_id)
+        .get_risk_secret_expiry_for_paths(user_id, &referenced_vault_paths)
         .await
         .unwrap_or_default();
-    for (name, expires_at) in &expiring_secrets {
-        risks.push(serde_json::json!({
-            "risk_level": "high",
-            "category": "expiring_secret",
-            "description": format!("Secret '{}' expires on {}", name, expires_at.format("%Y-%m-%d")),
-            "recommendation": "Rotate the secret before it expires to avoid workflow failures."
-        }));
+    // An ALREADY-expired secret is reported too. The retired query bounded its
+    // window with `expires_at > NOW()`, so a credential that had already lapsed
+    // — the state in which the workflow is broken right now rather than about
+    // to be — dropped out of the report entirely.
+    let now = chrono::Utc::now();
+    let expiry_horizon = now + chrono::Duration::days(30);
+    for secret in &referenced_secrets {
+        match secret.expires_at {
+            Some(expires_at) if expires_at <= expiry_horizon => {
+                let (verb, day) = if expires_at <= now {
+                    ("expired on", expires_at)
+                } else {
+                    ("expires on", expires_at)
+                };
+                risks.push(serde_json::json!({
+                    "risk_level": "high",
+                    "category": "expiring_secret",
+                    "vault_path": secret.key_path,
+                    "description": format!(
+                        "Secret '{}' (vault path '{}') is referenced by this workflow and \
+                         {} {}.",
+                        secret.name,
+                        secret.key_path,
+                        verb,
+                        day.format("%Y-%m-%d")
+                    ),
+                    "recommendation": "Rotate the secret before it expires to avoid workflow failures."
+                }));
+            }
+            None => {
+                risks.push(serde_json::json!({
+                    "risk_level": "medium",
+                    "category": "secret_no_expiry",
+                    "vault_path": secret.key_path,
+                    "description": format!(
+                        "Secret '{}' (vault path '{}') is referenced by this workflow but has \
+                         no expiry set.",
+                        secret.name, secret.key_path
+                    ),
+                    "recommendation": "Set an expiry on this secret to ensure it gets rotated periodically"
+                }));
+            }
+            Some(_) => {}
+        }
     }
 
     // Check: Sub-workflow failure rates.
     //
-    // Pre-collect every sub-workflow ID referenced by node.data.workflow_id,
-    // then batch-fetch 7-day exec counts in a single query. Replaces the
-    // prior per-node `get_risk_exec_counts` round-trip — N+1 → 1+1 — and
-    // adds user_id scoping so the lookup can't indirectly leak counts for
-    // a workflow that doesn't belong to the caller.
+    // Pre-collect every workflow this graph dispatches into, then batch-fetch
+    // 7-day exec counts in a single query. The batch keeps the N+1 → 1+1 shape
+    // and the user_id scoping (so the lookup can't indirectly leak counts for
+    // a workflow that doesn't belong to the caller).
+    //
+    // The reference key was WRONG: this read `node.data.workflow_id`, which is
+    // not a key the engine dispatches on. `talos-workflow-engine`'s
+    // `graph_parser.rs` names a sub-workflow through one of seven distinct
+    // `*_workflow_id` keys — `sub_workflow_id` for a sub_workflow node,
+    // `judge_workflow_id` for judge / ensemble, `child_workflow_id`,
+    // `body_workflow_id`, `fallback_workflow_id`, `reflection_workflow_id`,
+    // `classifier_workflow_id` — and `workflow_id` is none of them. Measured
+    // on the live fleet 2026-08-28: 0 nodes carried `workflow_id`, while 2
+    // carried `sub_workflow_id` and 3 `judge_workflow_id`. The check was dead
+    // — a HIGH-severity cascading-failure warning that could not fire on any
+    // real sub-workflow. `collect_subworkflow_references` matches the shared
+    // `*_workflow_id` convention instead.
     let sub_wf_ids: Vec<uuid::Uuid> = nodes
         .iter()
-        .filter_map(|node| {
-            node.get("data")
-                .and_then(|d| d.as_object())
-                .and_then(|data| data.get("workflow_id"))
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<uuid::Uuid>().ok())
-        })
+        .flat_map(talos_workflow_validation::collect_subworkflow_references)
+        .map(|(_key, id)| id)
         .collect::<std::collections::HashSet<_>>() // de-dupe before fetch
         .into_iter()
         .collect();
@@ -4405,27 +4556,11 @@ async fn handle_get_workflow_risk_assessment(
         }));
     }
 
-    // Check: Secrets without expiry referenced by workflow modules
-    if !module_ids.is_empty() {
-        // Find secrets that modules in this workflow might reference and that have no expiry
-        let secrets_no_expiry = state
-            .analytics_repo
-            .get_risk_no_expiry_secrets(user_id)
-            .await
-            .unwrap_or_default();
-        let graph_str_lower = graph_json_str.to_lowercase();
-        for secret_name in &secrets_no_expiry {
-            // Check if any node in the graph references this secret
-            if graph_str_lower.contains(&secret_name.to_lowercase()) {
-                risks.push(serde_json::json!({
-                    "risk_level": "medium",
-                    "category": "secret_no_expiry",
-                    "description": format!("Secret '{}' is referenced by this workflow but has no expiry set", secret_name),
-                    "recommendation": "Set an expiry on this secret to ensure it gets rotated periodically"
-                }));
-            }
-        }
-    }
+    // `secret_no_expiry` moved up to the vault-path-scoped block alongside
+    // `expiring_secret` — the two ask the same question of the same rows, and
+    // both now resolve the workflow's extracted `vault://` paths against
+    // `secrets.key_path` instead of substring-matching a display name against
+    // the raw graph document.
 
     // Check: Nodes backed by user-authored sandbox modules.
     // Sandbox modules are compiled from user-written source, may have been built
@@ -4503,9 +4638,9 @@ async fn handle_get_workflow_risk_assessment(
                 .get(&mid)
                 .or_else(|| template_secrets.get(&mid));
 
-            let tmpl_name = template_info
+            let tmpl_name = module_facts
                 .get(&mid)
-                .map(|(n, _)| n.as_str())
+                .map(|f| f.name.as_str())
                 .unwrap_or("unknown");
 
             let Some(secrets) = effective_secrets else {
@@ -4535,23 +4670,18 @@ async fn handle_get_workflow_risk_assessment(
             // references vault:// paths. An empty allowed_secrets on a module that
             // doesn't use secrets (e.g. memory-writer, classifiers) is correct and
             // shouldn't produce noise.
-            let node_data = node.get("data").cloned().unwrap_or(serde_json::json!({}));
-            let node_config = node_data
-                .get("config")
-                .cloned()
-                .unwrap_or_else(|| node_data.clone());
-            let has_vault_refs = node_config
-                .as_object()
-                .map(|cfg| {
-                    cfg.values().any(|v| {
-                        v.as_str()
-                            .map(|s| s.starts_with("vault://"))
-                            .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false);
+            //
+            // The reference set comes from `node_vault_refs`, extracted once
+            // above through the canonical `extract_vault_refs`. The prior
+            // `starts_with("vault://")` prefix test matched no real reference
+            // in the fleet — see the note on `node_vault_refs`.
+            let vault_refs: &[(String, String)] = node_vault_refs
+                .iter()
+                .find(|(nid, _, _)| nid == node_id)
+                .map(|(_, _, refs)| refs.as_slice())
+                .unwrap_or(&[]);
 
-            if secrets.is_empty() && has_vault_refs {
+            if secrets.is_empty() && !vault_refs.is_empty() {
                 risks.push(serde_json::json!({
                     "risk_level": "high",
                     "category": "empty_secret_grant",
@@ -4570,37 +4700,31 @@ async fn handle_get_workflow_risk_assessment(
             // Risk C: vault:// config value blocked by effective allowed_secrets.
             // Catches mismatches between what's in the node config and what the grant permits.
             // Also fires for empty-grant nodes (every vault:// ref is blocked).
-            if let Some(cfg_obj) = node_config.as_object() {
-                for (field_key, field_val) in cfg_obj {
-                    if let Some(val_str) = field_val.as_str() {
-                        if let Some(path) = val_str.strip_prefix("vault://") {
-                            if !crate::workflows::vault_path_permitted(path, secrets) {
-                                risks.push(serde_json::json!({
-                                    "risk_level": "high",
-                                    "category": "vault_path_blocked",
-                                    "node_id": node_id,
-                                    "config_field": field_key,
-                                    "vault_path": path,
-                                    "description": format!(
-                                        "Node '{}' config field '{}' references vault path '{}' \
-                                         which is not permitted by the module's allowed_secrets \
-                                         ({}). Every execution will fail with 'unauthorized'.",
-                                        node_id,
-                                        field_key,
-                                        path,
-                                        if secrets.is_empty() {
-                                            "deny-all — no secrets granted".to_string()
-                                        } else {
-                                            format!("[{}]", secrets.join(", "))
-                                        }
-                                    ),
-                                    "recommendation": "Reinstall the module with the vault path \
-                                        added to allowed_secrets, or update the config to use \
-                                        a permitted path."
-                                }));
+            for (field_key, path) in vault_refs {
+                if !crate::workflows::vault_path_permitted(path, secrets) {
+                    risks.push(serde_json::json!({
+                        "risk_level": "high",
+                        "category": "vault_path_blocked",
+                        "node_id": node_id,
+                        "config_field": field_key,
+                        "vault_path": path,
+                        "description": format!(
+                            "Node '{}' config field '{}' references vault path '{}' \
+                             which is not permitted by the module's allowed_secrets \
+                             ({}). Every execution will fail with 'unauthorized'.",
+                            node_id,
+                            field_key,
+                            path,
+                            if secrets.is_empty() {
+                                "deny-all — no secrets granted".to_string()
+                            } else {
+                                format!("[{}]", secrets.join(", "))
                             }
-                        }
-                    }
+                        ),
+                        "recommendation": "Reinstall the module with the vault path \
+                            added to allowed_secrets, or update the config to use \
+                            a permitted path."
+                    }));
                 }
             }
         }

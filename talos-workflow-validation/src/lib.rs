@@ -881,6 +881,90 @@ pub fn describe_disabled_retry_protection(
 
     msg
 }
+
+// ── Risk-assessment decisions ────────────────────────────────────────────────
+//
+// Pure predicates behind `get_workflow_risk_assessment`. They live here rather
+// than inline in the MCP handler for the same reason the sibling retry checks
+// above do: a risk finding is a claim about what the engine WILL do, so its
+// decision has to be testable against the engine's own inputs instead of being
+// asserted by reading the handler.
+
+/// What the workflow-level wall-clock cap actually resolves to.
+///
+/// The distinction this type exists to preserve: an ABSENT
+/// `execution_timeout_secs` is not an absent timeout. The engine's constructor
+/// seeds the field with
+/// [`talos_workflow_engine_core::DEFAULT_WORKFLOW_EXECUTION_TIMEOUT_SECS`] and
+/// `load_graph_from_json` overwrites it only when the graph declares the field
+/// — so a graph that says nothing runs under a real cap, and only an explicit
+/// `0` (the engine's documented "no wall-clock cap" sentinel) runs uncapped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowTimeoutPosture {
+    /// Graph declares nothing; the engine default applies. Not a risk.
+    EngineDefault(u64),
+    /// Graph declares a positive cap.
+    Declared(u64),
+    /// Graph declares `0` — the sentinel that DISABLES the wall-clock cap.
+    /// Per-node timeouts are then the only thing bounding the execution.
+    ExplicitlyDisabled,
+}
+
+/// Classify a graph's workflow-level timeout.
+///
+/// Reads with the same `.as_u64()` encoding contract the engine's own parser
+/// uses (`graph_json.rs`), so a float / negative / string value is classified
+/// as [`WorkflowTimeoutPosture::EngineDefault`] here exactly as it falls back
+/// to the default there.
+#[must_use]
+pub fn workflow_timeout_posture(graph: &serde_json::Value) -> WorkflowTimeoutPosture {
+    match graph
+        .get("execution_timeout_secs")
+        .and_then(serde_json::Value::as_u64)
+    {
+        None => WorkflowTimeoutPosture::EngineDefault(
+            talos_workflow_engine_core::DEFAULT_WORKFLOW_EXECUTION_TIMEOUT_SECS,
+        ),
+        Some(0) => WorkflowTimeoutPosture::ExplicitlyDisabled,
+        Some(secs) => WorkflowTimeoutPosture::Declared(secs),
+    }
+}
+
+/// Suffix shared by every key through which a node names another workflow.
+/// See [`collect_subworkflow_references`].
+const SUBWORKFLOW_REFERENCE_SUFFIX: &str = "_workflow_id";
+
+/// Every workflow a node dispatches into, as `(data key, workflow id)`.
+///
+/// Matched on the `*_workflow_id` naming convention rather than a hardcoded
+/// list, because there is no single list to import: `talos-workflow-engine`'s
+/// `graph_parser.rs` reads SEVEN distinct keys, one per system-node kind —
+/// `sub_workflow_id`, `judge_workflow_id`, `child_workflow_id`,
+/// `body_workflow_id`, `fallback_workflow_id`, `reflection_workflow_id` and
+/// `classifier_workflow_id` — each inside its own typed parser. Copying that
+/// list here would make this a second place the set is stated, and the copy
+/// would go stale the first time an eighth node kind lands.
+///
+/// The convention is the contract, and the test below pins all seven of
+/// today's keys against it. A future parser key that does NOT end in
+/// `_workflow_id` would be missed; that is the residual gap, and it is a
+/// smaller one than the bug this replaces — the risk check previously read
+/// `data.workflow_id`, which is none of the seven, so it matched nothing the
+/// engine dispatches and could never fire on a real sub-workflow.
+#[must_use]
+pub fn collect_subworkflow_references(node: &serde_json::Value) -> Vec<(String, uuid::Uuid)> {
+    let Some(data) = node.get("data").and_then(serde_json::Value::as_object) else {
+        return Vec::new();
+    };
+    data.iter()
+        .filter(|(k, _)| k.ends_with(SUBWORKFLOW_REFERENCE_SUFFIX))
+        .filter_map(|(k, v)| {
+            let id = v.as_str()?.parse::<uuid::Uuid>().ok()?;
+            Some((k.clone(), id))
+        })
+        .collect()
+}
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 /// Severity of a validation issue.
@@ -4430,5 +4514,224 @@ mod disabled_retry_tests {
         assert!(msg.contains("classifies as permanent"));
         assert!(msg.contains("retries are not the lever"));
         assert!(!msg.contains("classifies as TRANSIENT"));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Risk-assessment decisions.
+//
+// These pin `get_workflow_risk_assessment`'s two rebuilt predicates against
+// REAL fleet configurations, read out of the live `modules` table on
+// 2026-08-28. The point of using real rows rather than invented ones is that
+// the bug being fixed was invisible to invented ones: a hand-written
+// "http module" fixture would have had whatever `capability_world` the test
+// author expected, while the actual catalog rows are what made the old
+// name-substring predicate fire on exactly the wrong set.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod risk_assessment_tests {
+    use super::{
+        collect_subworkflow_references, disabled_retry_protection, workflow_timeout_posture,
+        WorkflowTimeoutPosture,
+    };
+    use serde_json::json;
+
+    fn methods(m: &[&str]) -> Vec<String> {
+        m.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    // ── missing_retry ───────────────────────────────────────────────────────
+
+    /// The three modules the retired name/category heuristic could reach.
+    ///
+    /// `HTTP Request` and `HTTP Request with Retry` matched it (their names
+    /// contain "http" and "request"); `Network Scanner` is included because it
+    /// was believed to match too — its category is `Security`, not `Network`,
+    /// so in fact it never did. It is pinned here anyway: it is the module an
+    /// operator is most likely to *think* the check covered, and it is the
+    /// clearest case of a module that must never be told to retry.
+    ///
+    /// All three resolve to a world default of 0, deliberately: a blind retry
+    /// of a state-changing send re-fires it. So none of them may produce a
+    /// finding when `retry_count` is absent, and the old check's HIGH-severity
+    /// "add retry_count" advice on them was a double-charge recommendation.
+    #[test]
+    fn the_fleet_modules_the_old_heuristic_caught_get_no_finding() {
+        let cases: [(&str, &str, Vec<String>); 3] = [
+            (
+                "HTTP Request",
+                "http-node",
+                methods(&["GET", "POST", "PUT", "PATCH", "DELETE"]),
+            ),
+            (
+                "HTTP Request with Retry",
+                "http-node",
+                methods(&["GET", "POST", "PUT", "PATCH", "DELETE"]),
+            ),
+            // Empty allowed_methods = "no declared restriction", which
+            // `default_max_retries_for_module` treats as NOT read-only.
+            ("Network Scanner", "network-node", methods(&[])),
+        ];
+        for (name, world, m) in cases {
+            // Absent retry_count — the shape a freshly added node has, and the
+            // exact shape the old check fired HIGH on.
+            let node = json!({"id": "n1", "data": {}});
+            assert!(
+                disabled_retry_protection(&node, &m, Some(world)).is_none(),
+                "{name} ({world}) must not produce a retry finding: its world default is 0 \
+                 on purpose, so recommending retries risks a duplicate send"
+            );
+            // And an EXPLICIT 0 is likewise silent — it agrees with the
+            // default, so there is nothing to report.
+            let explicit = json!({"id": "n1", "retry_count": 0});
+            assert!(
+                disabled_retry_protection(&explicit, &m, Some(world)).is_none(),
+                "{name} explicit 0 agrees with its world default; reporting it would be \
+                 reporting agreement as a problem"
+            );
+        }
+    }
+
+    /// The recall side. These are real catalog rows whose world DOES grant
+    /// transient retries — the population the old heuristic never reached,
+    /// because none of their names or categories contain http/api/request/
+    /// network. Here an EXPLICIT 0 is the reportable configuration.
+    #[test]
+    fn explicit_zero_on_a_retry_granting_fleet_module_is_reported() {
+        let cases: [(&str, &str, Vec<String>); 3] = [
+            // http-node declaring GET only — read-only, so retries are safe.
+            ("Gmail: List Messages", "http-node", methods(&["GET"])),
+            // secrets-node — pure compute plus secret access.
+            ("LLM Inference", "secrets-node", methods(&[])),
+            // minimal-node — pure compute.
+            ("JSON Transform", "minimal-node", methods(&[])),
+        ];
+        for (name, world, m) in cases {
+            let node = json!({"id": "n1", "retry_count": 0});
+            let finding = disabled_retry_protection(&node, &m, Some(world))
+                .unwrap_or_else(|| panic!("{name} ({world}) explicit 0 must be reported"));
+            assert!(finding.world_default_retries > 0, "{name}");
+
+            // Absent is the healthy case: the default applies, nothing to say.
+            let absent = json!({"id": "n1", "data": {}});
+            assert!(
+                disabled_retry_protection(&absent, &m, Some(world)).is_none(),
+                "{name}: an ABSENT retry_count must never be reported — it is how the \
+                 method-aware default gets to apply"
+            );
+        }
+    }
+
+    /// The old check read only a TOP-LEVEL `retry_count`, so a node carrying
+    /// its retry config under `data` read as having none. The engine accepts
+    /// both shapes; so must this.
+    #[test]
+    fn retry_count_under_data_is_seen() {
+        let m = methods(&["GET"]);
+        let nested_zero = json!({"id": "n1", "data": {"retry_count": 0}});
+        assert!(
+            disabled_retry_protection(&nested_zero, &m, Some("http-node")).is_some(),
+            "an explicit 0 under `data` must be read exactly as a top-level one"
+        );
+        let nested_two = json!({"id": "n1", "data": {"retry_count": 2}});
+        assert!(
+            disabled_retry_protection(&nested_two, &m, Some("http-node")).is_none(),
+            "a non-zero retry_count under `data` must not read as an explicit 0"
+        );
+    }
+
+    // ── timeout ─────────────────────────────────────────────────────────────
+
+    /// The distinction the old predicate collapsed. Absent means the engine
+    /// default applies — 23 of the fleet's 30 workflows were in this state and
+    /// every one of them was told it had "no execution timeout configured".
+    #[test]
+    fn absent_timeout_is_the_engine_default_not_an_absent_cap() {
+        assert_eq!(
+            workflow_timeout_posture(&json!({"nodes": []})),
+            WorkflowTimeoutPosture::EngineDefault(
+                talos_workflow_engine_core::DEFAULT_WORKFLOW_EXECUTION_TIMEOUT_SECS
+            )
+        );
+    }
+
+    /// Only an explicit 0 is genuinely uncapped — the engine's documented
+    /// sentinel, and the case the finding was always meant to catch.
+    #[test]
+    fn explicit_zero_disables_the_cap() {
+        assert_eq!(
+            workflow_timeout_posture(&json!({"execution_timeout_secs": 0})),
+            WorkflowTimeoutPosture::ExplicitlyDisabled
+        );
+        assert_eq!(
+            workflow_timeout_posture(&json!({"execution_timeout_secs": 600})),
+            WorkflowTimeoutPosture::Declared(600)
+        );
+    }
+
+    /// A non-`u64` encoding makes the ENGINE fall back to its default, so it
+    /// must classify as the default here too — not as "disabled", which would
+    /// resurrect the false finding through a different door.
+    #[test]
+    fn non_u64_encodings_classify_as_the_default() {
+        for v in [json!("600"), json!(-1), json!(60.5), json!(null)] {
+            assert!(
+                matches!(
+                    workflow_timeout_posture(&json!({"execution_timeout_secs": v})),
+                    WorkflowTimeoutPosture::EngineDefault(_)
+                ),
+                "{v} must classify as the engine default"
+            );
+        }
+    }
+
+    // ── high_failure_sub_workflow ───────────────────────────────────────────
+
+    /// Every key `talos-workflow-engine`'s `graph_parser.rs` dispatches a
+    /// sub-workflow through, as of 2026-08-28. The old check read
+    /// `data.workflow_id`, which is none of these — so it matched nothing the
+    /// engine actually runs.
+    #[test]
+    fn every_engine_subworkflow_key_is_collected() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        for key in [
+            "sub_workflow_id",
+            "judge_workflow_id",
+            "child_workflow_id",
+            "body_workflow_id",
+            "fallback_workflow_id",
+            "reflection_workflow_id",
+            "classifier_workflow_id",
+        ] {
+            let node = json!({"id": "n1", "data": { key: id }});
+            let refs = collect_subworkflow_references(&node);
+            assert_eq!(refs.len(), 1, "{key} must be collected");
+            assert_eq!(refs[0].0, key);
+            assert_eq!(refs[0].1.to_string(), id);
+        }
+    }
+
+    /// A node naming several sub-workflows (judge nodes carry both a child and
+    /// a judge workflow) must yield all of them, not the first.
+    #[test]
+    fn multiple_references_on_one_node_are_all_collected() {
+        let node = json!({"id": "n1", "data": {
+            "child_workflow_id": "11111111-1111-4111-8111-111111111111",
+            "judge_workflow_id": "22222222-2222-4222-8222-222222222222",
+        }});
+        assert_eq!(collect_subworkflow_references(&node).len(), 2);
+    }
+
+    /// Non-UUID values and unrelated keys are ignored rather than producing a
+    /// finding about a workflow that does not exist.
+    #[test]
+    fn malformed_and_unrelated_keys_are_ignored() {
+        let node = json!({"id": "n1", "data": {
+            "sub_workflow_id": "not-a-uuid",
+            "workflow_name": "reporting",
+            "max_fuel": 8_000_000,
+        }});
+        assert!(collect_subworkflow_references(&node).is_empty());
+        assert!(collect_subworkflow_references(&json!({"id": "n1"})).is_empty());
     }
 }

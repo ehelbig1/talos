@@ -179,6 +179,29 @@ pub struct WorkflowFullRow {
     pub intent: Option<String>,
 }
 
+/// Everything `get_workflow_risk_assessment` needs to know about one module.
+///
+/// `capability_world` + `allowed_methods` are the AUTHORITATIVE inputs to
+/// `talos_workflow_engine_core::default_max_retries_for_module`; `name` and
+/// `category` are display labels only and must never be used to infer what a
+/// module does.
+#[derive(Debug, Clone)]
+pub struct RiskModuleFacts {
+    pub id: Uuid,
+    pub name: String,
+    pub category: Option<String>,
+    pub capability_world: Option<String>,
+    pub allowed_methods: Vec<String>,
+}
+
+/// One secret a workflow actually references, with its expiry.
+#[derive(Debug, Clone)]
+pub struct RiskSecretExpiry {
+    pub name: String,
+    pub key_path: String,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug)]
 pub struct ModuleNameRow {
     pub id: Uuid,
@@ -1550,9 +1573,25 @@ impl AnalyticsRepository {
         wf_id: Uuid,
         user_id: Uuid,
     ) -> Result<Option<WorkflowFullRow>> {
+        // `intent` is a JSONB column and `WorkflowFullRow::intent` is an
+        // `Option<String>`, so it MUST be cast to text here exactly as
+        // `graph_json` is two columns earlier. Without the cast, sqlx 0.8's
+        // `Row::try_get` skips its type-compatibility check only when the
+        // value is NULL (sqlx-core `row.rs`: `if !value.is_null() { … }`), so
+        // every workflow with a still-NULL intent decoded fine and the
+        // mismatch stayed invisible — while the FIRST workflow to register an
+        // intent returned `ColumnDecode` and took the whole row read with it.
+        // That surfaces as `get_workflow_risk_assessment` and
+        // `get_readiness_breakdown` answering "Failed to fetch workflow", and
+        // it made the risk tool's `no_intent` finding unfalsifiable: it could
+        // only ever report "no intent registered", because registering one
+        // broke the call that would have reported otherwise. Every other
+        // crate reads this column as `Option<serde_json::Value>`; this row
+        // type is the lone `Option<String>`, which is why only it needs the
+        // cast.
         let row = sqlx::query(
             "SELECT id, name, graph_json::text AS graph_json, tags, description, \
-                    max_concurrent_executions, capabilities, intent \
+                    max_concurrent_executions, capabilities, intent::text AS intent \
              FROM workflows WHERE id = $1 AND user_id = $2",
         )
         .bind(wf_id)
@@ -3844,15 +3883,27 @@ impl AnalyticsRepository {
         Ok(rows.into_iter().map(|(id, f, t)| (id, (f, t))).collect())
     }
 
-    pub async fn get_risk_module_categories(
-        &self,
-        module_ids: &[Uuid],
-    ) -> Result<Vec<(Uuid, String, Option<String>)>> {
+    /// Per-module facts the risk assessment needs, keyed by canonical id.
+    ///
+    /// Supersedes the older `get_risk_module_categories`, which returned only
+    /// `(id, name, category)`. `category` is a display label (`"Network"`,
+    /// `"Security"`, `"Communication"`) chosen by whoever authored the module
+    /// row; it is NOT a statement about what the module may do. The retry
+    /// check that consumed it was matching substrings of that label and of
+    /// the module NAME to guess "is this an HTTP module", which is a proxy for
+    /// `capability_world` + `allowed_methods` — the two columns
+    /// `talos_workflow_engine_core::default_max_retries_for_module` actually
+    /// reads. Both are returned here so the caller can ask the engine's own
+    /// function instead of guessing. `name` and `category` stay for the
+    /// findings that legitimately render a human label.
+    pub async fn get_risk_module_facts(&self, module_ids: &[Uuid]) -> Result<Vec<RiskModuleFacts>> {
         // Phase 5.1: canonical id match on modules. Category prefers
         // persisted Phase 1.5 column, falls back to kind so sandbox/extracted
         // rows still surface sensibly.
         let rows = sqlx::query(
-            "SELECT id, name, COALESCE(category, kind) AS category FROM modules \
+            "SELECT id, name, COALESCE(category, kind) AS category, \
+                    capability_world, allowed_methods \
+             FROM modules \
              WHERE id = ANY($1) \
              ORDER BY id",
         )
@@ -3860,11 +3911,61 @@ impl AnalyticsRepository {
         .fetch_all(&self.db_pool)
         .await?;
         rows.into_iter()
-            .map(|r| -> Result<(Uuid, String, Option<String>)> {
-                let id: Uuid = r.try_get("id")?;
-                let name: String = r.try_get("name")?;
-                let category: Option<String> = r.try_get::<Option<_>, _>("category")?;
-                Ok((id, name, category))
+            .map(|r| -> Result<RiskModuleFacts> {
+                Ok(RiskModuleFacts {
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
+                    category: r.try_get::<Option<_>, _>("category")?,
+                    capability_world: r.try_get::<Option<_>, _>("capability_world")?,
+                    // NULL `allowed_methods` and `{}` are the SAME thing to
+                    // `default_max_retries_for_module`: an empty slice is
+                    // "declares no method restriction", which that function
+                    // deliberately treats as NOT read-only.
+                    allowed_methods: r
+                        .try_get::<Option<Vec<String>>, _>("allowed_methods")?
+                        .unwrap_or_default(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+    }
+
+    /// Expiry facts for the secrets a workflow actually references, matched on
+    /// `secrets.key_path` — the exact string a `vault://<path>` reference
+    /// resolves against at dispatch and in the worker.
+    ///
+    /// The two secret-expiry risk findings previously answered a different
+    /// question than the one they reported. `expiring_secret` listed EVERY
+    /// secret of the caller's expiring inside 30 days and attributed all of
+    /// them to whichever workflow was being assessed, with no link between the
+    /// two; `secret_no_expiry` tested whether a secret's display NAME appeared
+    /// as a case-insensitive substring anywhere in the raw `graph_json` text,
+    /// which matches node labels, descriptions and URLs as readily as an
+    /// actual reference. Both are answerable exactly, because the vault path
+    /// carried in a node's config IS `secrets.key_path`.
+    pub async fn get_risk_secret_expiry_for_paths(
+        &self,
+        user_id: Uuid,
+        key_paths: &[String],
+    ) -> Result<Vec<RiskSecretExpiry>> {
+        if key_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT name, key_path, expires_at FROM secrets \
+             WHERE created_by = $1 AND key_path = ANY($2) \
+             ORDER BY key_path",
+        )
+        .bind(user_id)
+        .bind(key_paths)
+        .fetch_all(&self.db_pool)
+        .await?;
+        rows.into_iter()
+            .map(|r| -> Result<RiskSecretExpiry> {
+                Ok(RiskSecretExpiry {
+                    name: r.try_get("name")?,
+                    key_path: r.try_get("key_path")?,
+                    expires_at: r.try_get::<Option<_>, _>("expires_at")?,
+                })
             })
             .collect::<Result<Vec<_>>>()
     }
@@ -3910,39 +4011,14 @@ impl AnalyticsRepository {
         Ok(ids)
     }
 
-    pub async fn get_risk_expiring_secrets(
-        &self,
-        user_id: Uuid,
-    ) -> Result<Vec<(String, DateTime<Utc>)>> {
-        let rows = sqlx::query(
-            "SELECT name, expires_at FROM secrets \
-             WHERE created_by = $1 AND expires_at IS NOT NULL \
-               AND expires_at < NOW() + INTERVAL '30 days' AND expires_at > NOW() \
-             ORDER BY expires_at ASC LIMIT 10",
-        )
-        .bind(user_id)
-        .fetch_all(&self.db_pool)
-        .await?;
-        rows.into_iter()
-            .map(|r| -> Result<(String, DateTime<Utc>)> {
-                let name: String = r.try_get("name")?;
-                let expires_at: DateTime<Utc> = r.try_get("expires_at")?;
-                Ok((name, expires_at))
-            })
-            .collect::<Result<Vec<_>>>()
-    }
-
-    pub async fn get_risk_no_expiry_secrets(&self, user_id: Uuid) -> Result<Vec<String>> {
-        let names: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT s.name FROM secrets s \
-             WHERE s.created_by = $1 AND s.expires_at IS NULL \
-             ORDER BY s.name LIMIT 20",
-        )
-        .bind(user_id)
-        .fetch_all(&self.db_pool)
-        .await?;
-        Ok(names)
-    }
+    // `get_risk_expiring_secrets` and `get_risk_no_expiry_secrets` were removed
+    // in the 2026-08 risk-assessment audit. Both selected across ALL of a
+    // user's secrets with no link to the workflow being assessed — the caller
+    // then attributed the whole list to that workflow, or guessed at the link
+    // by substring-matching a secret's display name against the raw graph
+    // document. `get_risk_secret_expiry_for_paths` replaces both by joining on
+    // `secrets.key_path`, which is exactly the string a `vault://` reference
+    // resolves against.
 
     // -- Hygiene report ---------------------------------------------------
 
