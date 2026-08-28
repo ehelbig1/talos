@@ -711,6 +711,44 @@ services:
       # the pre-2026-07-28 dev stack. Generate one with `openssl rand -hex 32`
       # and put it in .env (scripts/setup-dev.sh does this for a fresh clone).
       TALOS_WORKER_REGISTRATION_TOKEN: ${TALOS_WORKER_REGISTRATION_TOKEN:-}
+      # ── Worker-identity reaper (RFC 0010 P2) ─────────────────────────
+      # Deactivates a DEPARTED worker's signing key after a window of liveness
+      # silence, so a key that left the fleet stops being trusted without an
+      # operator running deactivate-worker-identity by hand. Controller-only.
+      # Mirrors chart values controller.workerIdentityReaper; the ordered
+      # runbook is docs/security/operational-runbook.md § "Enabling the
+      # worker-identity reaper". Default OFF — nothing is ever deactivated
+      # while unset, and an EMPTY value parses to the same OFF, so this block
+      # is byte-identical to the pre-2026-08 stack until you set it in .env.
+      #
+      # Do NOT enable this in the same restart that first opens the liveness
+      # network path. A worker that pings ONCE is in the reaper's population
+      # forever (nothing clears last_liveness_at), so a fleet where only some
+      # workers can reach the endpoint gets the rest reaped on schedule.
+      TALOS_WORKER_IDENTITY_REAP_ENABLED: ${TALOS_WORKER_IDENTITY_REAP_ENABLED:-}
+      # Hours of liveness silence after which a PARTICIPATING worker's key is
+      # deactivated. THIS NUMBER IS THE SECURITY PROPERTY, and it is the FIRST
+      # of three additive terms, not the whole of it: + the 300s ping-replay
+      # window (a captured ping stays valid that long, so last_liveness_at can
+      # be advanced past the worker's real last ping), + one 300s reaper sweep
+      # interval, + one worker-key overlay refresh
+      # (TALOS_WORKER_KEY_REFRESH_SECS, default 60s) — ~24h+11m at defaults.
+      # Code default 24h = 1440 consecutive missed pings at the worker's 60s
+      # ping interval, so no transient outage crosses it. Shortening it is a
+      # real trade: it also shortens the warning
+      # TalosWorkerLivenessParticipationDropped can give you. Clamped [1, 87600].
+      TALOS_WORKER_IDENTITY_REAP_HOURS: ${TALOS_WORKER_IDENTITY_REAP_HOURS:-}
+      # The OPT-IN second arm, for rows that never pinged at all (registered
+      # before the liveness protocol existed). Unset/0 = OFF, and OFF is
+      # correct until you are certain. It is separate because it is the UNSAFE
+      # direction of the same idea: it keys on last_seen_at, written only at
+      # boot registration, so it CANNOT distinguish a departed pod from a
+      # healthy worker that has simply been up a long time on an old build.
+      # Setting it is you asserting a fact the controller cannot check —
+      # confirm `talos_worker_liveness_participants` equals your worker count
+      # first. Its reaps are counted separately (arm="pre_protocol") for
+      # exactly this reason. Clamped [1, 87600] when non-zero.
+      TALOS_WORKER_IDENTITY_REAP_PRE_PROTOCOL_HOURS: ${TALOS_WORKER_IDENTITY_REAP_PRE_PROTOCOL_HOURS:-}
       # off | audit | required — RFC 0010 P3 secret-envelope sealing mode.
       # audit/required seal per-execution to the worker's ephemeral key via
       # the claim protocol; required additionally makes workers refuse an
