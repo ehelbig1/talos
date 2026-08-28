@@ -965,6 +965,171 @@ pub fn collect_subworkflow_references(node: &serde_json::Value) -> Vec<(String, 
         .collect()
 }
 
+// ── What the engine calls a node's config ───────────────────────────────────
+//
+// Three checks below judge a node against its configuration: required-key
+// completeness (an Error that gates `publish_version`), vault-reference
+// permission (likewise), and fuel sizing. All three must read the SAME map the
+// engine dispatches, and that map is the FLAT `data` object.
+//
+// `run_single_node_dispatch` shallow-merges every key of `data` over the module
+// artifact's own config; a nested `data.config` object is merged in as ONE
+// opaque key named `config`, which the input-envelope builder then overwrites
+// outright. So `data.config.FOO` is not a config value at run time in any
+// sense — it is unreachable.
+//
+// These checks previously read `data.config` INSTEAD of `data` whenever
+// `data.config` existed. That inverted the required-key Error in both
+// directions on any graph carrying one: real config became invisible (every
+// required key "missing" → `valid: false` on a workflow the engine runs fine,
+// blocking a publish that may itself be the fix), while keys the engine will
+// never see were accepted as satisfying the schema. No node on the live fleet
+// carries `data.config` (measured 2026-08-28: 0 of 104), so the defect was
+// latent rather than firing — which is exactly how it survived.
+
+/// The config map the engine will dispatch for a node: its flat `data` object.
+///
+/// An absent or non-object `data` yields an empty map rather than `None`, so
+/// callers judging completeness see "nothing configured" instead of skipping
+/// the node entirely.
+#[must_use]
+pub fn node_dispatch_config(node: &serde_json::Value) -> serde_json::Value {
+    match node.get("data") {
+        Some(d) if d.is_object() => d.clone(),
+        _ => serde_json::json!({}),
+    }
+}
+
+/// Required config keys a node does not satisfy, in schema order.
+///
+/// A key counts as unsatisfied when it is absent, `null`, or the empty string.
+/// Extracted so the fact that it reads [`node_dispatch_config`]'s map — and
+/// not a nested `data.config` — is pinned by a test rather than asserted by
+/// reading the handler.
+///
+/// # This cannot be an authoritative statement about run time
+///
+/// Nothing in the engine or the worker enforces `config_schema.required`; the
+/// only runtime schema use is a `pattern` check at authoring time. A required
+/// key can legitimately arrive from the module artifact's own config, from an
+/// upstream node's output, or from trigger input, none of which appear in
+/// `graph_json`. This check therefore over-reports by construction, and it is
+/// an Error only because the module catalog's `required` lists name keys that
+/// have no other source in practice — on the live fleet it evaluates 40 keys
+/// across 30 workflows and finds 0 missing (2026-08-28).
+#[must_use]
+pub fn missing_required_config(
+    config_schema: &serde_json::Value,
+    node_config: &serde_json::Value,
+) -> Vec<String> {
+    config_schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .filter(|f| {
+                    node_config
+                        .get(*f)
+                        .map(|v| v.is_null() || v.as_str().is_some_and(str::is_empty))
+                        .unwrap_or(true)
+                })
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// ── Vault references in node config ─────────────────────────────────────────
+//
+// Two Errors, both gating `publish_version`, and both were DEAD.
+//
+// Detection used `strip_prefix("vault://")` — a bare-prefix match. Both
+// runtime resolvers match the marker ANYWHERE in the value: the worker's
+// `resolve_vault_header` (`find("vault://")`, then the token up to the first
+// whitespace) and the controller's prefetch `extract_vault_refs` (the same
+// tokenization). Catalog integration modules carry the reference inside a
+// header template — `AUTH_HEADER = "Bearer vault://oauth/gmail/…/access_token"`
+// — so on the live fleet (2026-08-28) the prefix form matched **0 of 45**
+// references while both resolvers acted on all 45.
+//
+// The consequence is the one that matters: a node reaching for a vault path
+// its module is not granted was reported CLEAN. The worker refuses that path
+// at run time (`check_secret_allowlist` → `Forbiddenhost`), so the workflow
+// fails on its first real run instead of at publish.
+//
+// Detection is now delegated to `extract_vault_refs` outright. Re-deriving the
+// tokenization here would recreate the same class of drift one layer down.
+
+/// One finding about a `vault://` reference in a node's config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VaultConfigFinding {
+    /// The value names a vault path the module's `allowed_secrets` do not
+    /// grant. The worker refuses this path at run time.
+    Blocked {
+        /// Config key holding the reference.
+        field: String,
+        /// The vault path, prefix stripped, as the resolver extracts it.
+        path: String,
+    },
+    /// The value contains a `vault://` marker but no usable path after it —
+    /// the literal reaches the worker unresolved.
+    Malformed {
+        /// Config key holding the reference.
+        field: String,
+        /// `true` when the value carries a doubled `vault://vault://` marker.
+        nested: bool,
+        /// The offending value, for the message.
+        value: String,
+    },
+}
+
+/// Every vault-reference finding for one node's config.
+///
+/// Pure, so the fire / don't-fire decision is tested against the real fleet
+/// shapes rather than shadowed by a test-local reimplementation.
+///
+/// `allowed_secrets` is passed to [`talos_workflow_job_protocol::vault_path_permitted`]
+/// verbatim — it handles the `*` wildcard itself and denies on an empty grant,
+/// so there is no caller-side special case (the previous `has_wildcard`
+/// short-circuit was redundant).
+#[must_use]
+pub fn vault_config_findings(
+    node_config: &serde_json::Value,
+    allowed_secrets: &[String],
+) -> Vec<VaultConfigFinding> {
+    let extracted = talos_workflow_job_protocol::extract_vault_refs(node_config);
+    let referenced: HashSet<&str> = extracted.iter().map(|(k, _)| k.as_str()).collect();
+
+    let mut findings = Vec::new();
+
+    // A value that MENTIONS `vault://` but yielded no ref is malformed.
+    // Deriving this from the extractor's own silence, rather than re-testing
+    // the token shape, keeps one statement of what a reference is.
+    if let Some(obj) = node_config.as_object() {
+        for (field, value) in obj {
+            let Some(val_str) = value.as_str() else {
+                continue;
+            };
+            if !val_str.contains("vault://") || referenced.contains(field.as_str()) {
+                continue;
+            }
+            findings.push(VaultConfigFinding::Malformed {
+                field: field.clone(),
+                nested: val_str.contains("vault://vault://"),
+                value: val_str.to_string(),
+            });
+        }
+    }
+
+    for (field, path) in extracted {
+        if !_vpp(allowed_secrets, &path) {
+            findings.push(VaultConfigFinding::Blocked { field, path });
+        }
+    }
+    findings
+}
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 /// Severity of a validation issue.
@@ -1112,13 +1277,14 @@ impl WorkflowValidationService {
             .unwrap_or_default();
 
         // ── Module existence (batch) ─────────────────────────────────────
+        // Resolved the way the LOADER resolves it (`type` as UUID, then
+        // `data.moduleId`), not by reading `type` alone: a `data.moduleId`
+        // node dispatches a module the engine will look up, and a checker
+        // that cannot see it reports `missing_module: none` for a workflow
+        // whose module does not exist.
         let module_ids: Vec<Uuid> = nodes
             .iter()
-            .filter_map(|n| {
-                n.get("type")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse().ok())
-            })
+            .filter_map(talos_workflow_engine_core::node_module_id)
             .collect();
 
         if !module_ids.is_empty() {
@@ -1299,19 +1465,36 @@ impl WorkflowValidationService {
             let installed_secrets: HashMap<Uuid, Vec<String>> =
                 installed_secrets.unwrap_or_default();
 
-            // A node whose template declares any `allowed_hosts` makes an external
-            // call → potential side effect / cost. On crash-recovery resume an
-            // in-flight node is RE-DISPATCHED (at-least-once), so these are the
-            // nodes an author must make idempotent.
+            // A node whose template declares any `allowed_hosts` makes an
+            // external call, and on crash-recovery resume an in-flight node is
+            // RE-DISPATCHED (at-least-once) — so these are the nodes an author
+            // must make idempotent.
+            //
+            // EXCEPT a module that declares itself read-only. Re-running a
+            // GET/HEAD-only call does not do anything twice, which is exactly
+            // the judgement `default_max_retries_for_module` already makes when
+            // it hands the same modules blind transient retries. Asking the
+            // same question two ways and answering it differently is how a
+            // warning stops being read: on the live fleet (2026-08-28) the
+            // hosts-only predicate named 42 nodes across 23 workflows, 20 of
+            // those nodes were declared GET/HEAD-only, and 6 of the 23
+            // workflows were flagged ENTIRELY on read-only nodes.
+            //
+            // An UNDECLARED `allowed_methods` stays flagged: empty means
+            // "allow every method" at the worker, so it is unknown, not safe
+            // (`methods_are_read_only` states that once, for both callers).
             let side_effecting_ids: std::collections::HashSet<Uuid> = template_rows
                 .iter()
-                .filter(|r| !r.allowed_hosts.is_empty())
+                .filter(|r| {
+                    !r.allowed_hosts.is_empty()
+                        && !talos_workflow_engine_core::methods_are_read_only(&r.allowed_methods)
+                })
                 .map(|r| r.id)
                 .collect();
             side_effecting_node_ids = nodes
                 .iter()
                 .filter_map(|node| {
-                    let tid: Uuid = node.get("type")?.as_str()?.parse().ok()?;
+                    let tid = talos_workflow_engine_core::node_module_id(node)?;
                     side_effecting_ids.contains(&tid).then(|| {
                         node.get("id")
                             .and_then(|v| v.as_str())
@@ -1368,14 +1551,9 @@ impl WorkflowValidationService {
             let context_budget = talos_config::smart_memory_context_byte_budget() as u64;
             for node in &nodes {
                 let node_label = node.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let node_data = node.get("data").cloned().unwrap_or(serde_json::json!({}));
-                // Both shapes: config keys are written flat under `data` by
-                // `build_add_node_payload`, but nested `data.config` occurs in
-                // imported and frontend-authored graphs.
-                let cfg = node_data
-                    .get("config")
-                    .cloned()
-                    .unwrap_or(node_data.clone());
+                // The FLAT `data` map — see `node_dispatch_config`. It is
+                // also where `resolve_node_max_fuel` reads `max_fuel` from.
+                let cfg = node_dispatch_config(node);
 
                 // Only a node that DECLARES a maximum output can be judged
                 // against it. Absent `MAX_TOKENS` there is nothing to size
@@ -1388,10 +1566,7 @@ impl WorkflowValidationService {
                     continue;
                 }
 
-                let tid: Option<Uuid> = node
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse().ok());
+                let tid: Option<Uuid> = talos_workflow_engine_core::node_module_id(node);
                 let (module_fuel, world) = tid
                     .and_then(|t| template_fuel.get(&t))
                     .cloned()
@@ -1465,11 +1640,7 @@ impl WorkflowValidationService {
                     for node in &nodes {
                         let node_label =
                             node.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
-                        let Some(tid) = node
-                            .get("type")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| s.parse::<Uuid>().ok())
-                        else {
+                        let Some(tid) = talos_workflow_engine_core::node_module_id(node) else {
                             // System node (`system:*`) — its cost is the
                             // sub-workflow / judge it drives, not a dispatched
                             // module envelope. Saying nothing is correct.
@@ -1507,6 +1678,20 @@ impl WorkflowValidationService {
                                  resolves to (it declares no retry_count)"
                             )
                         };
+                        // With `resolved_retries == 0` the overrun is the
+                        // node's SINGLE attempt outrunning the budget — there
+                        // is no retry_count to lower, and telling an operator
+                        // to lower one is advice they cannot act on.
+                        let remedy = if resolved_retries == 0 {
+                            "This node makes only one attempt, so there is no retry_count to \
+                             lower: raise execution_timeout_secs above the per-attempt timeout, \
+                             lower this node's timeout_secs to fit, or make the node's work \
+                             smaller."
+                        } else {
+                            "Lower retry_count or raise execution_timeout_secs. Do NOT raise this \
+                             node's timeout_secs: that multiplies the envelope by the attempt \
+                             count and makes the failure arrive sooner."
+                        };
                         issues.push(ValidationIssue {
                             severity: ValidationSeverity::Warning,
                             message: format!(
@@ -1516,10 +1701,7 @@ impl WorkflowValidationService {
                                  one configured attempt can never complete: the retry loop has no \
                                  view of the workflow deadline, so it starts the attempt anyway, \
                                  and when the budget expires the whole execution is dropped — \
-                                 discarding every sibling node that had already finished. Lower \
-                                 retry_count or raise execution_timeout_secs. Do NOT raise this \
-                                 node's timeout_secs: that multiplies the envelope by the attempt \
-                                 count and makes the failure arrive sooner."
+                                 discarding every sibling node that had already finished. {remedy}"
                             ),
                             node_id: Some(node_label.to_string()),
                             category: "retry-envelope".into(),
@@ -1530,43 +1712,15 @@ impl WorkflowValidationService {
 
             for node in &nodes {
                 let node_id = node.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-                let node_data = node.get("data").cloned().unwrap_or(serde_json::json!({}));
-                let node_config = node_data
-                    .get("config")
-                    .cloned()
-                    .unwrap_or_else(|| node_data.clone());
-                let tid: Option<Uuid> = node
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse().ok());
+                // See `node_dispatch_config`: the FLAT `data` map, because
+                // that is the one the engine dispatches.
+                let node_config = node_dispatch_config(node);
+                let tid: Option<Uuid> = talos_workflow_engine_core::node_module_id(node);
 
                 if let Some(tid) = tid {
                     if let Some((module_name, schema, allowed_secrets)) = template_schemas.get(&tid)
                     {
-                        // Required config fields
-                        let required: Vec<String> = schema
-                            .get("required")
-                            .and_then(|r| r.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-
-                        let missing: Vec<String> = required
-                            .iter()
-                            .filter(|f| {
-                                node_config
-                                    .get(f.as_str())
-                                    .map(|v| {
-                                        v.is_null()
-                                            || v.as_str().map(|s| s.is_empty()).unwrap_or(false)
-                                    })
-                                    .unwrap_or(true)
-                            })
-                            .cloned()
-                            .collect();
+                        let missing = missing_required_config(schema, &node_config);
 
                         if !missing.is_empty() {
                             issues.push(ValidationIssue {
@@ -1587,62 +1741,45 @@ impl WorkflowValidationService {
                             });
                         }
 
-                        // Vault path permission check
-                        let has_wildcard = allowed_secrets.iter().any(|s| s == "*");
-                        if let Some(cfg_obj) = node_config.as_object() {
-                            for (field_key, field_val) in cfg_obj {
-                                if let Some(val_str) = field_val.as_str() {
-                                    if let Some(path) = val_str.strip_prefix("vault://") {
-                                        if path.is_empty() {
-                                            issues.push(ValidationIssue {
-                                                severity: ValidationSeverity::Error,
-                                                message: format!(
-                                                    "Node '{}' (module: {}) config field '{}' has an empty \
-                                                     vault:// reference. Must be 'vault://path/to/key'.",
-                                                    node_id, module_name, field_key
-                                                ),
-                                                node_id: Some(node_id.to_string()),
-                                                category: "vault".into(),
-                                            });
-                                            continue;
-                                        }
-                                        if path.starts_with("vault://") {
-                                            issues.push(ValidationIssue {
-                                                severity: ValidationSeverity::Error,
-                                                message: format!(
-                                                    "Node '{}' (module: {}) config field '{}' has a nested \
-                                                     vault:// prefix (value: '{}'). Use a single prefix.",
-                                                    node_id, module_name, field_key, val_str
-                                                ),
-                                                node_id: Some(node_id.to_string()),
-                                                category: "vault".into(),
-                                            });
-                                            continue;
-                                        }
-                                        if !has_wildcard && !_vpp(allowed_secrets, path) {
-                                            issues.push(ValidationIssue {
-                                                severity: ValidationSeverity::Error,
-                                                message: format!(
-                                                    "Node '{}' (module: {}) config field '{}' references \
-                                                     vault path '{}' which is blocked by the module's \
-                                                     allowed_secrets [{}].",
-                                                    node_id,
-                                                    module_name,
-                                                    field_key,
-                                                    path,
-                                                    if allowed_secrets.is_empty() {
-                                                        "deny-all — no secrets granted".to_string()
-                                                    } else {
-                                                        allowed_secrets.join(", ")
-                                                    }
-                                                ),
-                                                node_id: Some(node_id.to_string()),
-                                                category: "vault".into(),
-                                            });
-                                        }
+                        // Vault references — see `vault_config_findings`
+                        // for what the previous bare-prefix match missed.
+                        for finding in vault_config_findings(&node_config, allowed_secrets) {
+                            let message = match &finding {
+                                VaultConfigFinding::Blocked { field, path } => format!(
+                                    "Node '{}' (module: {}) config field '{}' references \
+                                     vault path '{}' which is blocked by the module's \
+                                     allowed_secrets [{}].",
+                                    node_id,
+                                    module_name,
+                                    field,
+                                    path,
+                                    if allowed_secrets.is_empty() {
+                                        "deny-all — no secrets granted".to_string()
+                                    } else {
+                                        allowed_secrets.join(", ")
                                     }
-                                }
-                            }
+                                ),
+                                VaultConfigFinding::Malformed {
+                                    field,
+                                    nested: true,
+                                    value,
+                                } => format!(
+                                    "Node '{node_id}' (module: {module_name}) config field \
+                                     '{field}' has a nested vault:// reference (value: \
+                                     '{value}'). Use a single vault:// marker."
+                                ),
+                                VaultConfigFinding::Malformed { field, .. } => format!(
+                                    "Node '{node_id}' (module: {module_name}) config field \
+                                     '{field}' has an empty vault:// reference. Must be \
+                                     'vault://path/to/key'."
+                                ),
+                            };
+                            issues.push(ValidationIssue {
+                                severity: ValidationSeverity::Error,
+                                message,
+                                node_id: Some(node_id.to_string()),
+                                category: "vault".into(),
+                            });
                         }
                     }
                 }
@@ -1714,10 +1851,7 @@ impl WorkflowValidationService {
                     // drives, not a dispatched module envelope, so there is no
                     // per-attempt timeout or module retry default to report —
                     // exactly the reason `retry_envelope_overrun` skips them.
-                    let headroom = node
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<Uuid>().ok())
+                    let headroom = talos_workflow_engine_core::node_module_id(node)
                         .and_then(|tid| template_retry.get(&tid))
                         .and_then(|(methods, world)| {
                             retry_headroom(
@@ -1795,10 +1929,7 @@ impl WorkflowValidationService {
         // this adds no query and no per-node lookup beyond a hash hit.
         for node in &nodes {
             let node_label = node.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
-            let Some((methods, world)) = node
-                .get("type")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<Uuid>().ok())
+            let Some((methods, world)) = talos_workflow_engine_core::node_module_id(node)
                 .and_then(|tid| template_retry.get(&tid))
             else {
                 continue;
@@ -1836,7 +1967,8 @@ impl WorkflowValidationService {
             issues.push(ValidationIssue {
                 severity: ValidationSeverity::Warning,
                 message: format!(
-                    "{} node(s) make external calls (declared allowed_hosts): {}. \
+                    "{} node(s) make external calls that can change state (declared \
+                     allowed_hosts, and allowed_methods not limited to GET/HEAD): {}. \
                      Crash-recovery resume is AT-LEAST-ONCE — if the controller \
                      restarts while one of these nodes is in flight, it is re-dispatched \
                      and re-runs. Make side-effecting nodes idempotent (e.g. an \
@@ -1866,9 +1998,15 @@ impl WorkflowValidationService {
         ];
         for node in &nodes {
             let node_label = node.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
-            let node_config = node
-                .get("config")
-                .or_else(|| node.get("data").and_then(|d| d.get("config")));
+            // FLAT `data`, for the same reason the config and fuel checks
+            // read it: that is the map the engine merges into module config.
+            // This check previously read top-level `config` / `data.config`,
+            // neither of which the engine treats as a config source and
+            // neither of which any node on the live fleet carries — it saw 0
+            // of the enforcement keys actually present (measured 2026-08-28:
+            // 0 nodes with `data.config`, 0 with top-level `config`, 1 node
+            // carrying `OUTPUT_SCHEMA` flat under `data`).
+            let node_config = node.get("data");
             if let Some(cfg) = node_config {
                 let keys_present: Vec<&str> = LLM_ENFORCEMENT_KEYS
                     .iter()
@@ -4733,5 +4871,245 @@ mod risk_assessment_tests {
         }});
         assert!(collect_subworkflow_references(&node).is_empty());
         assert!(collect_subworkflow_references(&json!({"id": "n1"})).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod vault_config_finding_tests {
+    use super::{vault_config_findings, VaultConfigFinding};
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| (*x).to_string()).collect()
+    }
+
+    /// The exact `AUTH_HEADER` value and `allowed_secrets` grant of the live
+    /// `pa-daily-brief/gmail` node and its `Gmail: List Messages` module
+    /// (read from the fleet 2026-08-28). Every one of the fleet's 45 vault
+    /// references has this shape, and the previous bare-prefix matcher saw
+    /// none of them.
+    fn live_gmail_config() -> serde_json::Value {
+        serde_json::json!({
+            "AUTH_HEADER": "Bearer vault://oauth/gmail/00000000-0000-4000-8000-000000000001/user@example.com/access_token",
+            "QUERY": "newer_than:1d"
+        })
+    }
+
+    #[test]
+    fn permitted_embedded_reference_is_clean() {
+        assert!(vault_config_findings(&live_gmail_config(), &s(&["oauth/gmail"])).is_empty());
+    }
+
+    /// The finding the check exists for, and the one that could not fire.
+    /// Same live value, a module granted only an unrelated path.
+    #[test]
+    fn blocked_embedded_reference_is_reported() {
+        let findings = vault_config_findings(&live_gmail_config(), &s(&["stripe/api_key"]));
+        assert_eq!(findings.len(), 1);
+        match &findings[0] {
+            VaultConfigFinding::Blocked { field, path } => {
+                assert_eq!(field, "AUTH_HEADER");
+                assert!(path.starts_with("oauth/gmail/"));
+                assert!(!path.contains("Bearer"));
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+    }
+
+    /// An EMPTY grant denies everything — the case the doc calls "deny-all".
+    /// `vault_path_permitted` decides this; there is no caller-side wildcard
+    /// or emptiness special case any more.
+    #[test]
+    fn empty_grant_blocks_an_embedded_reference() {
+        let findings = vault_config_findings(&live_gmail_config(), &[]);
+        assert_eq!(findings.len(), 1);
+        assert!(matches!(findings[0], VaultConfigFinding::Blocked { .. }));
+    }
+
+    #[test]
+    fn wildcard_grant_permits_without_a_caller_side_special_case() {
+        assert!(vault_config_findings(&live_gmail_config(), &s(&["*"])).is_empty());
+    }
+
+    /// The live `Send HTML Email (Gmail)` grant is a glob; the live
+    /// `pa-read-later-digest/send` node's reference must clear it.
+    #[test]
+    fn glob_grant_permits_the_live_send_node() {
+        let cfg = serde_json::json!({
+            "AUTH_HEADER": "Bearer vault://oauth/gmail/00000000-0000-4000-8000-000000000001/user@example.com/access_token"
+        });
+        assert!(vault_config_findings(&cfg, &s(&["oauth/gmail/*"])).is_empty());
+    }
+
+    /// A bare-prefix reference still works — the fix widens recall, it does
+    /// not trade one shape for another.
+    #[test]
+    fn bare_prefix_reference_still_checked() {
+        let cfg = serde_json::json!({"KEY": "vault://stripe/api_key"});
+        assert!(vault_config_findings(&cfg, &s(&["stripe"])).is_empty());
+        assert_eq!(
+            vault_config_findings(&cfg, &s(&["gmail"])).len(),
+            1,
+            "a blocked bare-prefix reference must still be reported"
+        );
+    }
+
+    #[test]
+    fn empty_reference_is_malformed_not_blocked() {
+        let cfg = serde_json::json!({"KEY": "vault://"});
+        let findings = vault_config_findings(&cfg, &s(&["*"]));
+        assert_eq!(findings.len(), 1);
+        assert!(matches!(
+            &findings[0],
+            VaultConfigFinding::Malformed { nested: false, field, .. } if field == "KEY"
+        ));
+    }
+
+    #[test]
+    fn doubled_marker_is_reported_as_nested() {
+        let cfg = serde_json::json!({"KEY": "vault://vault://stripe/api_key"});
+        let findings = vault_config_findings(&cfg, &s(&["*"]));
+        assert_eq!(findings.len(), 1);
+        assert!(matches!(
+            &findings[0],
+            VaultConfigFinding::Malformed { nested: true, .. }
+        ));
+    }
+
+    /// A config with no vault reference at all produces nothing, whatever the
+    /// grant — the check must not editorialise about unused grants.
+    #[test]
+    fn config_without_references_is_silent() {
+        let cfg = serde_json::json!({"QUERY": "newer_than:1d", "MAX": 5});
+        assert!(vault_config_findings(&cfg, &[]).is_empty());
+        assert!(vault_config_findings(&cfg, &s(&["*"])).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod dispatch_config_tests {
+    use super::{missing_required_config, node_dispatch_config};
+
+    /// The live `Gmail: List Messages` schema, whose sole required key is
+    /// `AUTH_HEADER`, against the live `pa-daily-brief/gmail` node shape:
+    /// config keys FLAT under `data`.
+    #[test]
+    fn flat_data_satisfies_a_required_key() {
+        let node = serde_json::json!({
+            "id": "gmail",
+            "type": "1f5f4a2c-1c3e-4a7d-9b2f-0c1d2e3f4a5b",
+            "data": {"AUTH_HEADER": "Bearer vault://oauth/gmail/u/e/access_token"}
+        });
+        let schema = serde_json::json!({"required": ["AUTH_HEADER"]});
+        assert!(missing_required_config(&schema, &node_dispatch_config(&node)).is_empty());
+    }
+
+    /// The inverted case. `data.config.AUTH_HEADER` is unreachable at
+    /// dispatch, so the key really IS missing — previously this graph read as
+    /// satisfied, and the mixed shape below read as broken.
+    #[test]
+    fn nested_data_config_does_not_satisfy_a_required_key() {
+        let node = serde_json::json!({
+            "id": "gmail",
+            "type": "1f5f4a2c-1c3e-4a7d-9b2f-0c1d2e3f4a5b",
+            "data": {"config": {"AUTH_HEADER": "Bearer vault://oauth/gmail/u/e/access_token"}}
+        });
+        let schema = serde_json::json!({"required": ["AUTH_HEADER"]});
+        assert_eq!(
+            missing_required_config(&schema, &node_dispatch_config(&node)),
+            vec!["AUTH_HEADER".to_string()]
+        );
+    }
+
+    /// The false-Error direction, which is the one that blocks a publish: a
+    /// node with real flat config that also happens to carry a `data.config`
+    /// object. The engine dispatches the flat keys; the old reader saw only
+    /// the nested object and declared every required key missing.
+    #[test]
+    fn a_stray_data_config_no_longer_hides_real_flat_config() {
+        let node = serde_json::json!({
+            "id": "gmail",
+            "type": "1f5f4a2c-1c3e-4a7d-9b2f-0c1d2e3f4a5b",
+            "data": {
+                "AUTH_HEADER": "Bearer vault://oauth/gmail/u/e/access_token",
+                "config": {"unrelated": true}
+            }
+        });
+        let schema = serde_json::json!({"required": ["AUTH_HEADER"]});
+        assert!(missing_required_config(&schema, &node_dispatch_config(&node)).is_empty());
+    }
+
+    #[test]
+    fn null_and_empty_string_count_as_missing() {
+        let node = serde_json::json!({"data": {"A": null, "B": "", "C": "ok"}});
+        let schema = serde_json::json!({"required": ["A", "B", "C"]});
+        assert_eq!(
+            missing_required_config(&schema, &node_dispatch_config(&node)),
+            vec!["A".to_string(), "B".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_node_without_data_yields_an_empty_map_not_a_skip() {
+        let node = serde_json::json!({"id": "x", "type": "system:collect"});
+        let schema = serde_json::json!({"required": ["A"]});
+        assert_eq!(node_dispatch_config(&node), serde_json::json!({}));
+        assert_eq!(
+            missing_required_config(&schema, &node_dispatch_config(&node)),
+            vec!["A".to_string()]
+        );
+    }
+
+    #[test]
+    fn no_required_list_means_no_findings() {
+        let node = serde_json::json!({"data": {}});
+        assert!(
+            missing_required_config(&serde_json::json!({}), &node_dispatch_config(&node))
+                .is_empty()
+        );
+    }
+}
+
+#[cfg(test)]
+mod single_attempt_overrun_tests {
+    use super::retry_envelope_overrun;
+
+    /// The live `pa-followup-approval-notifier/approval_compose` node
+    /// (2026-08-28): an explicit `retry_count: 0` on a `minimal-node` module,
+    /// inside a 90 s workflow budget, with no declared `timeout_secs` — so
+    /// the engine's 120 s per-attempt default already outruns the budget on
+    /// the node's ONLY attempt.
+    ///
+    /// The predicate is right to fire; the point of pinning it is that
+    /// `resolved_retries == 0`, which is what the message must branch on.
+    /// Telling this operator to "lower retry_count" names a lever that does
+    /// not exist.
+    #[test]
+    fn a_single_attempt_can_overrun_and_reports_zero_retries() {
+        let node = serde_json::json!({
+            "id": "approval_compose",
+            "type": "aaaaaaaa-1111-2222-3333-444444444444",
+            "retry_count": 0
+        });
+        let overrun = retry_envelope_overrun(&node, 90, true, &[], Some("minimal-node"), 120)
+            .expect("120s attempt cannot fit a 90s budget");
+        assert_eq!(overrun.resolved_retries, 0);
+        assert_eq!(overrun.attempts, 1);
+        assert_eq!(overrun.envelope_secs, 120);
+        assert!(overrun.retries_declared);
+    }
+
+    /// The multi-attempt shape, for contrast — `pa-daily-brief`-style
+    /// defaults: 120 s per attempt x 3 attempts inside the platform's own
+    /// 300 s default budget. Here "lower retry_count" IS actionable.
+    #[test]
+    fn platform_default_retries_overrun_the_platform_default_budget() {
+        let node =
+            serde_json::json!({"id": "gmail", "type": "aaaaaaaa-1111-2222-3333-444444444444"});
+        let methods = vec!["GET".to_string()];
+        let overrun = retry_envelope_overrun(&node, 300, true, &methods, Some("http-node"), 120)
+            .expect("3 x 120s plus backoff cannot fit 300s");
+        assert_eq!(overrun.resolved_retries, 2);
+        assert!(!overrun.retries_declared);
+        assert!(overrun.envelope_secs > 300);
     }
 }

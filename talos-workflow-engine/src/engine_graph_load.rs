@@ -305,128 +305,112 @@ impl ParallelWorkflowEngine {
 
         for node in nodes {
             let rf_id = node.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            let module_id_str = node
-                .get("type")
-                .and_then(|v| v.as_str())
-                .filter(|s| Uuid::parse_str(s).is_ok())
-                .or_else(|| {
-                    node.get("data")
-                        .and_then(|d| d.get("moduleId"))
-                        .and_then(|v| v.as_str())
-                });
-            if let Some(module_id_str) = module_id_str {
-                if let Ok(module_id) = Uuid::parse_str(module_id_str) {
-                    // Reuse RF ID if it's a UUID, else derive a
-                    // deterministic UUID from the string via SHA-256.
-                    // The derivation lives in engine-core because readers
-                    // (validation, analytics, traces) have to reproduce it to
-                    // join `execution_events.node_id`, and a drifted copy
-                    // joins ZERO rows instead of erroring.
-                    let node_id = talos_workflow_engine_core::engine_node_uuid(rf_id);
-                    rf_to_node.insert(rf_id.to_string(), node_id);
-                    self.node_labels.insert(node_id, rf_id.to_string());
+            // Resolution lives in engine-core because readers (validation,
+            // analytics) have to reproduce it; a `type`-only copy silently
+            // treats a `data.moduleId` node as module-less.
+            if let Some(module_id) = talos_workflow_engine_core::node_module_id(node) {
+                // Reuse RF ID if it's a UUID, else derive a
+                // deterministic UUID from the string via SHA-256.
+                // The derivation lives in engine-core because readers
+                // (validation, analytics, traces) have to reproduce it to
+                // join `execution_events.node_id`, and a drifted copy
+                // joins ZERO rows instead of erroring.
+                let node_id = talos_workflow_engine_core::engine_node_uuid(rf_id);
+                rf_to_node.insert(rf_id.to_string(), node_id);
+                self.node_labels.insert(node_id, rf_id.to_string());
 
-                    if let Some(data) = node.get("data").cloned() {
-                        if data.is_object()
-                            && !data.as_object().map(|m| m.is_empty()).unwrap_or(true)
-                        {
-                            self.node_configs.insert(node_id, data.clone());
-                        }
-                        // skip_condition → reserved `__skip_condition`.
-                        if let Some(skip_cond) = data
-                            .get("skip_condition")
-                            .and_then(|v| v.as_str())
-                            .or_else(|| node.get("skip_condition").and_then(|v| v.as_str()))
-                            .or_else(|| {
-                                node.get("config")
-                                    .and_then(|c| c.get("skip_condition"))
-                                    .and_then(|v| v.as_str())
-                            })
-                        {
-                            let entry = self
-                                .node_configs
-                                .entry(node_id)
-                                .or_insert_with(|| serde_json::json!({}));
-                            entry.as_object_mut().map(|m| {
-                                m.insert(
-                                    "__skip_condition".to_string(),
-                                    serde_json::json!(skip_cond),
-                                )
-                            });
-                        }
-                        // continue_on_error → reserved `__continue_on_error`.
-                        if data
+                if let Some(data) = node.get("data").cloned() {
+                    if data.is_object() && !data.as_object().map(|m| m.is_empty()).unwrap_or(true) {
+                        self.node_configs.insert(node_id, data.clone());
+                    }
+                    // skip_condition → reserved `__skip_condition`.
+                    if let Some(skip_cond) = data
+                        .get("skip_condition")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| node.get("skip_condition").and_then(|v| v.as_str()))
+                        .or_else(|| {
+                            node.get("config")
+                                .and_then(|c| c.get("skip_condition"))
+                                .and_then(|v| v.as_str())
+                        })
+                    {
+                        let entry = self
+                            .node_configs
+                            .entry(node_id)
+                            .or_insert_with(|| serde_json::json!({}));
+                        entry.as_object_mut().map(|m| {
+                            m.insert("__skip_condition".to_string(), serde_json::json!(skip_cond))
+                        });
+                    }
+                    // continue_on_error → reserved `__continue_on_error`.
+                    if data
+                        .get("continue_on_error")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                        || node
                             .get("continue_on_error")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false)
-                            || node
-                                .get("continue_on_error")
+                    {
+                        let entry = self
+                            .node_configs
+                            .entry(node_id)
+                            .or_insert_with(|| serde_json::json!({}));
+                        entry.as_object_mut().map(|m| {
+                            m.insert("__continue_on_error".to_string(), serde_json::json!(true))
+                        });
+                    }
+                } else {
+                    // Node has no "data" — check top-level and config.skip_condition.
+                    if let Some(skip_cond) = node
+                        .get("skip_condition")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| {
+                            node.get("config")
+                                .and_then(|c| c.get("skip_condition"))
+                                .and_then(|v| v.as_str())
+                        })
+                    {
+                        let entry = self
+                            .node_configs
+                            .entry(node_id)
+                            .or_insert_with(|| serde_json::json!({}));
+                        entry.as_object_mut().map(|m| {
+                            m.insert("__skip_condition".to_string(), serde_json::json!(skip_cond))
+                        });
+                    }
+                    if let Some(true) = node
+                        .get("continue_on_error")
+                        .and_then(|v| v.as_bool())
+                        .or_else(|| {
+                            node.get("config")
+                                .and_then(|c| c.get("continue_on_error"))
                                 .and_then(|v| v.as_bool())
-                                .unwrap_or(false)
-                        {
-                            let entry = self
-                                .node_configs
-                                .entry(node_id)
-                                .or_insert_with(|| serde_json::json!({}));
-                            entry.as_object_mut().map(|m| {
-                                m.insert("__continue_on_error".to_string(), serde_json::json!(true))
-                            });
-                        }
-                    } else {
-                        // Node has no "data" — check top-level and config.skip_condition.
-                        if let Some(skip_cond) = node
-                            .get("skip_condition")
-                            .and_then(|v| v.as_str())
-                            .or_else(|| {
-                                node.get("config")
-                                    .and_then(|c| c.get("skip_condition"))
-                                    .and_then(|v| v.as_str())
-                            })
-                        {
-                            let entry = self
-                                .node_configs
-                                .entry(node_id)
-                                .or_insert_with(|| serde_json::json!({}));
-                            entry.as_object_mut().map(|m| {
-                                m.insert(
-                                    "__skip_condition".to_string(),
-                                    serde_json::json!(skip_cond),
-                                )
-                            });
-                        }
-                        if let Some(true) = node
-                            .get("continue_on_error")
-                            .and_then(|v| v.as_bool())
-                            .or_else(|| {
-                                node.get("config")
-                                    .and_then(|c| c.get("continue_on_error"))
-                                    .and_then(|v| v.as_bool())
-                            })
-                        {
-                            let entry = self
-                                .node_configs
-                                .entry(node_id)
-                                .or_insert_with(|| serde_json::json!({}));
-                            entry.as_object_mut().map(|m| {
-                                m.insert("__continue_on_error".to_string(), serde_json::json!(true))
-                            });
-                        }
+                        })
+                    {
+                        let entry = self
+                            .node_configs
+                            .entry(node_id)
+                            .or_insert_with(|| serde_json::json!({}));
+                        entry.as_object_mut().map(|m| {
+                            m.insert("__continue_on_error".to_string(), serde_json::json!(true))
+                        });
                     }
+                }
 
-                    let kind = node
-                        .get("kind")
-                        .and_then(|k| k.as_str())
-                        .and_then(|k| parse_system_node_kind(k, node));
-                    let retry_policy = read_node_retry_policy_with_actor_cap(node, self.actor_id);
-                    self.add_node(node_id, Some(module_id), retry_policy, kind);
-                    let node_timeout_secs: Option<u64> = node
-                        .get("data")
-                        .and_then(|d| d.get("timeout_secs"))
-                        .or_else(|| node.get("timeout_secs"))
-                        .and_then(|v| v.as_u64());
-                    if let Some(t) = node_timeout_secs {
-                        self.node_timeouts.insert(node_id, t);
-                    }
+                let kind = node
+                    .get("kind")
+                    .and_then(|k| k.as_str())
+                    .and_then(|k| parse_system_node_kind(k, node));
+                let retry_policy = read_node_retry_policy_with_actor_cap(node, self.actor_id);
+                self.add_node(node_id, Some(module_id), retry_policy, kind);
+                let node_timeout_secs: Option<u64> = node
+                    .get("data")
+                    .and_then(|d| d.get("timeout_secs"))
+                    .or_else(|| node.get("timeout_secs"))
+                    .and_then(|v| v.as_u64());
+                if let Some(t) = node_timeout_secs {
+                    self.node_timeouts.insert(node_id, t);
                 }
             } else if node
                 .get("type")
@@ -558,19 +542,8 @@ impl ParallelWorkflowEngine {
         // repeated 2x reallocation cycle in graphs > 8 nodes.
         let mut module_ids = Vec::with_capacity(nodes.len());
         for node in nodes {
-            let module_id_str = node
-                .get("type")
-                .and_then(|v| v.as_str())
-                .filter(|s| Uuid::parse_str(s).is_ok())
-                .or_else(|| {
-                    node.get("data")
-                        .and_then(|d| d.get("moduleId"))
-                        .and_then(|v| v.as_str())
-                });
-            if let Some(id_str) = module_id_str {
-                if let Ok(uuid) = Uuid::parse_str(id_str) {
-                    module_ids.push(uuid);
-                }
+            if let Some(uuid) = talos_workflow_engine_core::node_module_id(node) {
+                module_ids.push(uuid);
             }
         }
         module_ids.sort();

@@ -73,6 +73,97 @@ pub fn engine_node_uuid(graph_node_id: &str) -> Uuid {
     })
 }
 
+/// The module a graph node dispatches, resolved the way the loader resolves it.
+///
+/// `type` parsed as a UUID first, then `data.moduleId` — and `moduleId` is
+/// camelCase, which is the whole reason this is a function. A reader that
+/// looks only at `type` (the shape every node on a typical fleet happens to
+/// use) silently treats a `data.moduleId` node as if it dispatched no module
+/// at all, so every module-gated check skips it and reports nothing. That is
+/// the same silent-empty failure mode as re-deriving [`engine_node_uuid`]:
+/// wrong in the direction that looks like health.
+///
+/// `None` means "this node dispatches no module" — a system node, or a node
+/// the loader will drop entirely.
+///
+/// The loader (`talos-workflow-engine::engine_graph_load`) calls this at both
+/// of its own resolution points, so validation and the engine cannot disagree
+/// about which nodes are module nodes.
+#[must_use]
+pub fn node_module_id(node: &serde_json::Value) -> Option<Uuid> {
+    node.get("type")
+        .and_then(|v| v.as_str())
+        .filter(|s| Uuid::parse_str(s).is_ok())
+        .or_else(|| {
+            node.get("data")
+                .and_then(|d| d.get("moduleId"))
+                .and_then(|v| v.as_str())
+        })
+        .and_then(|s| Uuid::parse_str(s).ok())
+}
+
+#[cfg(test)]
+mod module_id_tests {
+    use super::node_module_id;
+
+    #[test]
+    fn type_uuid_resolves() {
+        let n = serde_json::json!({"id":"a","type":"f9402426-8a42-40d1-a6c2-73a64ce21165"});
+        assert_eq!(
+            node_module_id(&n).map(|u| u.to_string()),
+            Some("f9402426-8a42-40d1-a6c2-73a64ce21165".to_string())
+        );
+    }
+
+    /// The shape the `type`-only readers missed. The loader dispatches this
+    /// node; a checker that skips it reports a clean workflow.
+    #[test]
+    fn camel_case_module_id_under_data_resolves() {
+        let n = serde_json::json!({
+            "id": "a",
+            "type": "customNode",
+            "data": {"moduleId": "f9402426-8a42-40d1-a6c2-73a64ce21165"}
+        });
+        assert!(node_module_id(&n).is_some());
+    }
+
+    /// `snake_case` is NOT read — the loader does not read it either, and
+    /// inventing an alias here would make validation vouch for a node the
+    /// engine drops.
+    #[test]
+    fn snake_case_module_id_is_not_a_module_node() {
+        let n = serde_json::json!({
+            "id": "a",
+            "type": "customNode",
+            "data": {"module_id": "f9402426-8a42-40d1-a6c2-73a64ce21165"}
+        });
+        assert!(node_module_id(&n).is_none());
+    }
+
+    #[test]
+    fn system_node_has_no_module() {
+        let n = serde_json::json!({
+            "id": "judge", "type": "system:judge", "kind": "judge",
+            "data": {"judge_workflow_id": "0377e123-49cc-44b4-8e78-ce86c281868a"}
+        });
+        assert!(node_module_id(&n).is_none());
+    }
+
+    /// `type` wins over `data.moduleId` — the loader's `.or_else` order.
+    #[test]
+    fn type_uuid_wins_over_data_module_id() {
+        let n = serde_json::json!({
+            "id": "a",
+            "type": "f9402426-8a42-40d1-a6c2-73a64ce21165",
+            "data": {"moduleId": "d8c3f879-61fb-41ac-88d4-0dcb134adbb9"}
+        });
+        assert_eq!(
+            node_module_id(&n).map(|u| u.to_string()),
+            Some("f9402426-8a42-40d1-a6c2-73a64ce21165".to_string())
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::engine_node_uuid;
