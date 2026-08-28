@@ -15,6 +15,11 @@ homepage = "https://github.com/aegix-dev/talos-workflow-engine"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Node-identity derivation (`engine_node_uuid`): the graph-node-id -> UUID
+# mapping every `execution_events.node_id` row is keyed by. Pure-Rust, no_std
+# capable, no transitive weight — the alternative is each reader forking the
+# arithmetic, where a drifted copy silently joins zero rows.
+sha2 = "0.10"
 uuid = { version = "1", features = ["serde", "v4"] }
 
 [features]

@@ -318,13 +318,11 @@ impl ParallelWorkflowEngine {
                 if let Ok(module_id) = Uuid::parse_str(module_id_str) {
                     // Reuse RF ID if it's a UUID, else derive a
                     // deterministic UUID from the string via SHA-256.
-                    let node_id = Uuid::parse_str(rf_id).unwrap_or_else(|_| {
-                        use sha2::{Digest, Sha256};
-                        let hash = Sha256::digest(rf_id.as_bytes());
-                        let mut bytes = [0u8; 16];
-                        bytes.copy_from_slice(&hash[..16]);
-                        Uuid::from_bytes(bytes)
-                    });
+                    // The derivation lives in engine-core because readers
+                    // (validation, analytics, traces) have to reproduce it to
+                    // join `execution_events.node_id`, and a drifted copy
+                    // joins ZERO rows instead of erroring.
+                    let node_id = talos_workflow_engine_core::engine_node_uuid(rf_id);
                     rf_to_node.insert(rf_id.to_string(), node_id);
                     self.node_labels.insert(node_id, rf_id.to_string());
 
@@ -437,13 +435,8 @@ impl ParallelWorkflowEngine {
                 .unwrap_or(false)
             {
                 // System node: no module_id, but has a kind.
-                let node_id = Uuid::parse_str(rf_id).unwrap_or_else(|_| {
-                    use sha2::{Digest, Sha256};
-                    let hash = Sha256::digest(rf_id.as_bytes());
-                    let mut bytes = [0u8; 16];
-                    bytes.copy_from_slice(&hash[..16]);
-                    Uuid::from_bytes(bytes)
-                });
+                // Same shared derivation as the module-node branch above.
+                let node_id = talos_workflow_engine_core::engine_node_uuid(rf_id);
                 rf_to_node.insert(rf_id.to_string(), node_id);
                 self.node_labels.insert(node_id, rf_id.to_string());
 

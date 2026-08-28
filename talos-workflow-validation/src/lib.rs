@@ -272,6 +272,412 @@ pub fn retry_envelope_overrun(
     })
 }
 
+// ── Observed failure history (authoring-time, Warning-only) ──────────────────
+//
+// WHY THIS EXISTS.
+// `validate_workflow` answered `valid: true, issues: []` for a live workflow
+// that had failed roughly a third of its runs for weeks — four consecutive
+// daily failures, every one of them on the same node, every one a timeout.
+// The same response printed "Improve success rate — currently 68.2%" as a soft
+// suggestion, so the platform HAD the signal and simply did not connect it to
+// `issues`. An operator reading `issues: []` concludes the workflow is fine.
+//
+// That is the misleading-report class: a field named `valid` carrying a
+// verdict narrower than the name implies, while the data needed to say
+// something true sits in the same response.
+//
+// WHY EVERY FINDING HERE IS A `Warning` AND NEVER AN `Error`.
+// `ValidationResult::valid` is `false` iff an Error exists, and `valid` gates
+// `publish_version`. If a bad week could set `valid = false`, a workflow would
+// become unpublishable because of its operational history — including the case
+// where the operator is publishing THE FIX for exactly those failures. That is
+// a worse failure than the silence being fixed here: it is unrecoverable
+// through the tool, whereas an under-stated warning is merely quiet. History
+// describes what happened; only configuration can make a graph invalid.
+//
+// WHAT IT CLAIMS, NARROWLY. Two independent statements, kept separate on
+// purpose:
+//   1. an OBSERVATION — this node failed N of M observed attempts in a bounded
+//      window, and K of those N named a timeout; and
+//   2. a STATIC FACT about the graph as it is RIGHT NOW — the retries the
+//      engine will resolve for that node, and whether one more attempt could
+//      even fit the workflow budget.
+// It does not claim (2) caused (1). It cannot: the configuration may have
+// changed inside the window (on the workflow that motivated this, the node's
+// `timeout_secs` went 30 -> 110 partway through), and a node can fail for
+// reasons no graph inspection can see. The message says both things and lets
+// the operator join them.
+
+/// How far back the history slice may reach, in days.
+///
+/// Pinned to the execution-retention default rather than chosen freely:
+/// `execution_events` rows CASCADE from `workflow_executions`, which the
+/// retention sweep DELETEs after `EXECUTION_RETENTION_DAYS` (default 30). A
+/// longer lookback cannot return older data — it would just be a window that
+/// silently shrinks to whatever retention happens to be, which is the trap
+/// this check must not fall into. [`history_window_days`] narrows it further
+/// when an operator has configured a shorter retention, so the window is never
+/// wider than the store can actually hold.
+pub const HISTORY_WINDOW_DAYS: i32 = 30;
+
+/// Hard cap on executions in the slice, independent of cadence.
+///
+/// The day window alone is not a bound: a 15-minute poller produces ~2,900
+/// executions in 30 days. 50 keeps the row count bounded (measured: 3.7 ms on
+/// a 4,525-execution workflow, the same work as on a 26-execution one).
+///
+/// **The trade, stated plainly.** On a daily workflow 50 covers the entire
+/// retention window. On a high-frequency one it covers roughly the last twelve
+/// hours, so the check is strongly recency-biased there and will stay quiet
+/// about a chronic-but-rare failure that a 30-day view would surface. That is
+/// the deliberate direction: a high-frequency workflow's last 50 runs reflect
+/// its CURRENT configuration, and a warning about a config that no longer
+/// exists is worse than no warning.
+pub const HISTORY_MAX_EXECUTIONS: i64 = 50;
+
+/// Minimum `node_failed` count before a node is called chronically failing.
+///
+/// Two failures can be one incident — a provider outage spanning two runs of a
+/// daily workflow reads identically to a persistent defect. Three separated
+/// failures is the smallest count that distinguishes a pattern from an
+/// incident. The cost of raising it is latency: on a daily workflow every +1
+/// is another day of silence.
+pub const CHRONIC_MIN_FAILURES: i64 = 3;
+
+/// Minimum observed attempts before a RATE is computed at all.
+///
+/// Guards against publishing a percentage derived from a denominator too small
+/// to mean anything (3 failures in 4 attempts is 75 %, and also just four data
+/// points). It also suppresses the system-node dispatch paths that emit
+/// `node_failed` with no preceding `node_started`, where the only available
+/// denominator is the failure itself.
+pub const CHRONIC_MIN_ATTEMPTS: i64 = 5;
+
+/// Minimum observed failure rate, as a fraction of attempts.
+///
+/// **Calibrated against the live fleet, not assumed** (2026-08-28). Over the
+/// 30-day event history, the per-node failure rates of every node with at
+/// least [`CHRONIC_MIN_FAILURES`] failures are: 28.6 % (`daily-crm-capture` /
+/// `extract` — the node this check exists for), 15.4 %
+/// (`pa-autonomy-digest` / `compose`), then 1.3 %, 0.9 %, 0.4 %, 0.3 %. The
+/// band between 1.3 % and 15.4 % is 12x wide and empty: any threshold inside
+/// it selects the same two nodes and rejects the same four, so 10 % is a
+/// threshold, not a fitted parameter.
+///
+/// The four rejected nodes are high-volume workflows (230–4,525 runs) where a
+/// handful of absolute failures is ordinary background; without this gate
+/// their absolute counts would clear [`CHRONIC_MIN_FAILURES`] on the raw
+/// 30-day view. Both gates are load-bearing.
+pub const CHRONIC_FAILURE_RATE: f64 = 0.10;
+
+/// The lookback to use, never wider than the store can hold.
+///
+/// Reads `EXECUTION_RETENTION_DAYS` so a cluster configured to keep 7 days is
+/// described as a 7-day window instead of a 30-day one that quietly contains 7.
+#[must_use]
+pub fn history_window_days() -> i32 {
+    HISTORY_WINDOW_DAYS.min(talos_config::execution_retention_days())
+}
+
+/// What the history read actually covered. Carried on every
+/// [`ValidationResult`] so an empty `issues` list is never ambiguous.
+///
+/// The three variants exist because "no findings" has three very different
+/// causes and collapsing them is the bug this whole module addresses. In
+/// particular [`Unavailable`](Self::Unavailable) must never render as
+/// [`Empty`](Self::Empty): a failed read reported as "nothing there" is the
+/// error-as-absence shape (`get_schedule_health` returning zeros; #661).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryCoverage {
+    /// History was read and the window held executions.
+    Observed {
+        /// Executions inspected (cancelled and test runs already excluded).
+        executions: i64,
+        /// Lookback in days.
+        window_days: i32,
+    },
+    /// History was read and the window held nothing. The static checks ran;
+    /// the history checks had no input. This is NOT evidence of health.
+    Empty {
+        /// Lookback in days.
+        window_days: i32,
+    },
+    /// The history read failed. No history check ran, and this result says
+    /// nothing at all about the workflow's operational record.
+    Unavailable,
+}
+
+impl HistoryCoverage {
+    /// One sentence naming what was and was not examined, for rendering
+    /// alongside `valid` / `issues`.
+    #[must_use]
+    pub fn note(&self) -> String {
+        match self {
+            Self::Observed {
+                executions,
+                window_days,
+            } => format!(
+                "Execution history consulted: {executions} run(s) in the last {window_days} \
+                 day(s), excluding cancelled and test executions."
+            ),
+            Self::Empty { window_days } => format!(
+                "No execution history in the last {window_days} day(s) — these findings are \
+                 STATIC ONLY. An empty issues list here means nothing has been observed, not \
+                 that the workflow runs cleanly."
+            ),
+            Self::Unavailable => "Execution history could NOT be read — history-based checks \
+                                  did not run. An empty issues list here says nothing about \
+                                  this workflow's operational record."
+                .to_string(),
+        }
+    }
+
+    /// `true` when history-based findings were actually possible.
+    #[must_use]
+    pub fn consulted(&self) -> bool {
+        matches!(self, Self::Observed { .. })
+    }
+}
+
+/// The static half of a chronic-failure finding: what the engine will do on
+/// the NEXT run, derived from the graph alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryHeadroom {
+    /// Retries the engine resolves for this node — declared, clamped, or the
+    /// method-aware module default.
+    pub resolved_retries: u32,
+    /// `true` when the node declares its own `retry_count` (including an
+    /// explicit `0`, which always wins); `false` when the module default
+    /// supplied it.
+    pub retries_declared: bool,
+    /// Per-attempt timeout the engine enforces.
+    pub per_attempt_secs: u64,
+    /// The workflow's enforced wall-clock budget.
+    pub budget_secs: u64,
+    /// Worst-case seconds the node's CURRENT configuration can occupy
+    /// (`resolved_retries + 1` attempts plus backoff).
+    pub current_envelope_secs: u64,
+    /// Budget left over after the current envelope. This is the room available
+    /// for raising `timeout_secs` without any other change — `0` when the node
+    /// already fills or overruns its budget (the overrun case is
+    /// [`retry_envelope_overrun`]'s to report, not this one's).
+    pub spare_secs: u64,
+    /// Worst-case seconds if the node were given ONE more attempt than it
+    /// currently resolves to.
+    pub one_more_attempt_secs: u64,
+    /// `false` when that extra attempt could not fit the budget — i.e. raising
+    /// `retry_count` alone cannot help this node.
+    pub one_more_attempt_fits: bool,
+}
+
+/// Compute the retry headroom for a node, using the SAME resolution rules the
+/// engine applies (and that [`retry_envelope_overrun`] applies) so the two
+/// checks can never disagree about what a node's retry count is.
+///
+/// `budget_secs == 0` means the workflow wall-clock cap is disabled; there is
+/// no container, so headroom is unbounded and this returns `None`.
+#[must_use]
+pub fn retry_headroom(
+    node: &serde_json::Value,
+    budget_secs: u64,
+    has_actor: bool,
+    module_methods: &[String],
+    module_world: Option<&str>,
+    default_node_timeout_secs: u64,
+) -> Option<RetryHeadroom> {
+    if budget_secs == 0 {
+        return None;
+    }
+    let declared =
+        node_declared_u64(node, "retry_count").map(|v| u32::try_from(v).unwrap_or(u32::MAX));
+    let resolved_retries = match declared {
+        Some(n) if has_actor => n,
+        Some(n) => n.min(talos_workflow_engine_core::MAX_RETRIES_UNBUDGETED),
+        None => {
+            talos_workflow_engine_core::default_max_retries_for_module(module_methods, module_world)
+        }
+    };
+    let per_attempt_secs = node_per_attempt_timeout_secs(node, default_node_timeout_secs);
+    let backoff_ms = node_declared_u64(node, "retry_backoff_ms")
+        .unwrap_or(talos_workflow_engine_core::DEFAULT_BACKOFF_MS);
+    let current_envelope_secs =
+        node_retry_envelope_secs(per_attempt_secs, resolved_retries, backoff_ms);
+    let one_more_attempt_secs = node_retry_envelope_secs(
+        per_attempt_secs,
+        resolved_retries.saturating_add(1),
+        backoff_ms,
+    );
+    Some(RetryHeadroom {
+        resolved_retries,
+        retries_declared: declared.is_some(),
+        per_attempt_secs,
+        budget_secs,
+        current_envelope_secs,
+        spare_secs: budget_secs.saturating_sub(current_envelope_secs),
+        one_more_attempt_secs,
+        one_more_attempt_fits: one_more_attempt_secs <= budget_secs,
+    })
+}
+
+/// One node's observed record over the history window, as the classifier
+/// consumes it. Plain scalars so the decision is testable without a database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedNodeRecord {
+    /// Denominator — `greatest(started, completed + failed)`.
+    pub attempts: i64,
+    /// `node_failed` events (never `attempts - completed`; see
+    /// `WorkflowRepository::node_run_history`).
+    pub failures: i64,
+    /// Subset of `failures` whose message named a timeout.
+    pub timeout_failures: i64,
+}
+
+/// A node whose observed failure record clears the chronic thresholds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChronicNodeFailure {
+    /// The observation.
+    pub observed: ObservedNodeRecord,
+    /// Executions the window covered, for stating the sample.
+    pub executions_scanned: i64,
+    /// Lookback in days.
+    pub window_days: i32,
+    /// The static half — `None` for a system node (no module dispatch, so
+    /// per-attempt timeouts and module retry defaults do not apply) or when
+    /// the workflow budget is disabled.
+    pub headroom: Option<RetryHeadroom>,
+}
+
+/// Decide whether an observed record is a chronic failure worth reporting.
+///
+/// Pure, so the fire / don't-fire decision is tested against real fleet
+/// numbers rather than shadowed by a test-local reimplementation. `validate`
+/// calls this and [`describe_chronic_failure`]; it makes no decision itself.
+///
+/// Returns `None` unless ALL of:
+/// * at least [`CHRONIC_MIN_FAILURES`] failures,
+/// * at least [`CHRONIC_MIN_ATTEMPTS`] attempts, and
+/// * a failure rate of at least [`CHRONIC_FAILURE_RATE`].
+#[must_use]
+pub fn chronic_node_failure(
+    observed: &ObservedNodeRecord,
+    executions_scanned: i64,
+    window_days: i32,
+    headroom: Option<RetryHeadroom>,
+) -> Option<ChronicNodeFailure> {
+    if observed.failures < CHRONIC_MIN_FAILURES || observed.attempts < CHRONIC_MIN_ATTEMPTS {
+        return None;
+    }
+    // `attempts >= CHRONIC_MIN_ATTEMPTS` above rules out a zero denominator.
+    #[allow(clippy::cast_precision_loss)]
+    let rate = observed.failures as f64 / observed.attempts as f64;
+    if rate < CHRONIC_FAILURE_RATE {
+        return None;
+    }
+    Some(ChronicNodeFailure {
+        observed: observed.clone(),
+        executions_scanned,
+        window_days,
+        headroom,
+    })
+}
+
+/// Render the operator-facing text for a chronic-failure finding.
+///
+/// Separate from the decision so the exact wording is pinned by tests. The
+/// observation and the static configuration facts are rendered as separate
+/// sentences and never joined by a causal claim.
+#[must_use]
+pub fn describe_chronic_failure(finding: &ChronicNodeFailure, node_label: &str) -> String {
+    let ChronicNodeFailure {
+        observed:
+            ObservedNodeRecord {
+                attempts,
+                failures,
+                timeout_failures,
+            },
+        executions_scanned,
+        window_days,
+        headroom,
+    } = finding;
+
+    let timeout_clause = if *timeout_failures == *failures {
+        ", every one of them a timeout".to_string()
+    } else if *timeout_failures > 0 {
+        format!(", {timeout_failures} of them timeouts")
+    } else {
+        String::new()
+    };
+
+    let mut msg = format!(
+        "Node '{node_label}' failed {failures} of its last {attempts} observed attempts\
+         {timeout_clause} (across {executions_scanned} execution(s) in the last {window_days} \
+         day(s), excluding cancelled and test runs). This is an OBSERVATION about runs that \
+         already happened, not a claim that the current graph caused them — the node's config \
+         may have changed inside that window."
+    );
+
+    if let Some(h) = headroom {
+        let retry_note = if h.retries_declared {
+            format!(
+                "its retry_count is explicitly {} (an explicit value always wins over the \
+                 module default)",
+                h.resolved_retries
+            )
+        } else {
+            format!(
+                "it declares no retry_count, so the method-aware module default resolves to {}",
+                h.resolved_retries
+            )
+        };
+        msg.push_str(&format!(
+            " Statically, as the graph stands now: {retry_note}, and its per-attempt timeout is \
+             {}s, inside a {}s workflow budget.",
+            h.per_attempt_secs, h.budget_secs
+        ));
+
+        // Retries first — whether that lever is even available is the single
+        // most useful fact, and it is a fact about the graph, not a guess.
+        if h.one_more_attempt_fits {
+            msg.push_str(&format!(
+                " One more attempt would occupy ~{}s of that budget, so raising retry_count is \
+                 available IF the failures are transient.",
+                h.one_more_attempt_secs
+            ));
+        } else {
+            msg.push_str(&format!(
+                " One more attempt would need ~{}s, so NO retry fits — raising retry_count alone \
+                 cannot help this node.",
+                h.one_more_attempt_secs
+            ));
+        }
+
+        // Then the timeout lever, sized from the ACTUAL unused budget rather
+        // than waved at. A blanket "do not raise timeout_secs" would be wrong
+        // here: at {attempts} attempt(s) there is real room, and telling an
+        // operator not to use it is worse than saying nothing.
+        if *timeout_failures > 0 {
+            if h.spare_secs > 0 {
+                msg.push_str(&format!(
+                    " Since the failures are timeouts: the current envelope is ~{}s, leaving \
+                     ~{}s of the budget unused, so timeout_secs can be raised into that room. \
+                     Note that raising it is only safe while retry_count stays at {} — each \
+                     extra attempt multiplies the envelope. The other levers are making the \
+                     node's work smaller (narrower query, lower result cap) and raising \
+                     execution_timeout_secs.",
+                    h.current_envelope_secs, h.spare_secs, h.resolved_retries
+                ));
+            } else {
+                msg.push_str(
+                    " Since the failures are timeouts and the current envelope already fills \
+                     the budget, there is no room to raise timeout_secs: make the node's work \
+                     smaller (narrower query, lower result cap) or raise execution_timeout_secs.",
+                );
+            }
+        }
+    }
+    msg
+}
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 /// Severity of a validation issue.
@@ -296,8 +702,20 @@ pub struct ValidationIssue {
 #[derive(Debug)]
 pub struct ValidationResult {
     /// `true` when there are zero `Error`-severity issues.
+    ///
+    /// **Deliberately not influenced by execution history.** Findings in the
+    /// `failure-history` category are always `Warning`, so a workflow that has
+    /// been failing is still publishable — including when what is being
+    /// published is the fix. See the note above [`HISTORY_WINDOW_DAYS`].
     pub valid: bool,
     pub issues: Vec<ValidationIssue>,
+    /// What the execution-history read covered.
+    ///
+    /// Present so an empty `issues` list is never ambiguous: it distinguishes
+    /// "history examined, nothing chronic found" from "no history existed" and
+    /// from "the history read failed". Callers rendering `valid` / `issues`
+    /// should render [`HistoryCoverage::note`] alongside them.
+    pub history: HistoryCoverage,
 }
 
 impl ValidationResult {
@@ -536,6 +954,55 @@ impl WorkflowValidationService {
         let mut side_effecting_node_ids: Vec<String> = Vec::new();
 
         // ── Config completeness + vault permission check ─────────────────
+        // ── Shared inputs for the two history/envelope checks ───────────
+        //
+        // Hoisted above the module block because BOTH the retry-envelope check
+        // (which needs module rows) and the observed-history check (which does
+        // not — a workflow of nothing but system nodes still has a record)
+        // read them, and neither should pay for its own copy of the actor
+        // lookup.
+        //
+        // The ENFORCED budget is the graph's `execution_timeout_secs`, read by
+        // the engine during `load_graph_from_json`, falling back to its 300 s
+        // default. It is NOT `workflows.timeout_seconds` — that column is read
+        // into `WorkflowRow` and never reaches an engine, and on the live fleet
+        // one workflow's column disagrees with its enforced budget by 240 s.
+        // Compare against what runs. `0` disables the wall-clock cap entirely.
+        let budget = graph
+            .get("execution_timeout_secs")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(talos_workflow_engine_core::DEFAULT_WORKFLOW_EXECUTION_TIMEOUT_SECS);
+
+        // An execution with no bound actor has its DECLARED retry count
+        // clamped to `MAX_RETRIES_UNBUDGETED` at graph load. Using the
+        // unclamped value would over-report an envelope that cannot occur —
+        // the one direction a warning must not err in.
+        //
+        // On a DB failure we assume NO actor, which clamps the predicted count
+        // and can only SUPPRESS warnings — never invent one. Logged rather
+        // than swallowed: a silently failing query that degrades a check into
+        // always-quiet is its own class of bug.
+        let has_actor = match workflow_repo
+            .get_workflow_actor_id(workflow_id, user_id)
+            .await
+        {
+            Ok(a) => a.is_some(),
+            Err(e) => {
+                tracing::warn!(
+                    %workflow_id,
+                    error = %e,
+                    "retry-envelope / history check: actor lookup failed; assuming unbound \
+                     (clamps predicted retries, so this can only under-report)"
+                );
+                false
+            }
+        };
+
+        // Per-module retry inputs, populated by the module block below and
+        // read again by the history check after it. Empty for a graph with no
+        // module nodes, which is the correct input for both readers.
+        let mut template_retry: HashMap<Uuid, (Vec<String>, Option<String>)> = HashMap::new();
+
         if !module_ids.is_empty() {
             let (template_rows, installed_secrets) = tokio::join!(
                 workflow_repo.get_templates_by_ids(&module_ids),
@@ -583,7 +1050,7 @@ impl WorkflowValidationService {
             // capability_world)` — so the envelope is NOT computable from the
             // graph alone. That is why this check lives here and not in the
             // pure `validate_graph_timeouts` walker.
-            let template_retry: HashMap<Uuid, (Vec<String>, Option<String>)> = template_rows
+            template_retry = template_rows
                 .iter()
                 .map(|r| {
                     (
@@ -703,46 +1170,11 @@ impl WorkflowValidationService {
             // See the module-level rationale above `node_retry_envelope_secs`
             // for what this claims and what it deliberately does not.
             {
-                // The ENFORCED budget is the graph's `execution_timeout_secs`,
-                // read by the engine during `load_graph_from_json`, falling
-                // back to its 300 s default. It is NOT `workflows.timeout_seconds`
-                // — that column is read into `WorkflowRow` and never reaches an
-                // engine, and on the live fleet one workflow's column disagrees
-                // with its enforced budget by 240 s. Compare against what runs.
-                let budget = graph
-                    .get("execution_timeout_secs")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(talos_workflow_engine_core::DEFAULT_WORKFLOW_EXECUTION_TIMEOUT_SECS);
-
-                // `0` disables the wall-clock cap entirely (per-node timeouts
-                // become the only bound), so there is no container to exceed.
+                // `budget == 0` disables the wall-clock cap entirely (per-node
+                // timeouts become the only bound), so there is no container to
+                // exceed. `budget` and `has_actor` are resolved once above and
+                // shared with the observed-history check.
                 if budget > 0 {
-                    // An execution with no bound actor has its DECLARED count
-                    // clamped to `MAX_RETRIES_UNBUDGETED` at graph load. Using
-                    // the unclamped value would over-report an envelope that
-                    // cannot occur — the one direction a warning must not err in.
-                    //
-                    // On a DB failure we assume NO actor, which clamps the
-                    // predicted count and can only SUPPRESS warnings — never
-                    // invent one. Logged rather than swallowed: a silently
-                    // failing query that degrades a check into always-quiet is
-                    // its own class of bug.
-                    let has_actor = match workflow_repo
-                        .get_workflow_actor_id(workflow_id, user_id)
-                        .await
-                    {
-                        Ok(a) => a.is_some(),
-                        Err(e) => {
-                            tracing::warn!(
-                                %workflow_id,
-                                error = %e,
-                                "retry-envelope check: actor lookup failed; assuming unbound \
-                                 (clamps predicted retries, so this can only under-report)"
-                            );
-                            false
-                        }
-                    };
-
                     for node in &nodes {
                         let node_label =
                             node.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
@@ -929,6 +1361,115 @@ impl WorkflowValidationService {
                 }
             }
         }
+
+        // ── Observed failure history (Warning) ───────────────────────────
+        //
+        // Runs OUTSIDE the module block: a workflow made entirely of system
+        // nodes still has an operational record, and the whole point of this
+        // check is that `issues: []` must not be the answer for a workflow
+        // that has been failing.
+        //
+        // See the module-level rationale above `HISTORY_WINDOW_DAYS` for what
+        // this claims, what it deliberately does not, and — most importantly —
+        // why every finding it produces is a Warning and never an Error.
+        let window_days = history_window_days();
+        let history_coverage = match workflow_repo
+            .node_run_history(workflow_id, user_id, window_days, HISTORY_MAX_EXECUTIONS)
+            .await
+        {
+            Ok(history) => {
+                // Map graph node id -> engine node id with the SAME function
+                // the executor used to write the events. Deriving it locally
+                // is how this join silently matches nothing, and zero matched
+                // rows is indistinguishable from "no problems found" — i.e. it
+                // would reproduce the exact bug this check exists to fix.
+                let by_node: HashMap<Uuid, &talos_workflow_repository::NodeRunHistoryRow> =
+                    history.nodes.iter().map(|r| (r.node_id, r)).collect();
+
+                for node in &nodes {
+                    let node_label = node.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let Some(row) =
+                        by_node.get(&talos_workflow_engine_core::engine_node_uuid(node_label))
+                    else {
+                        // Never ran inside the window. Silence is right: a node
+                        // with no record is neither healthy nor unhealthy, and
+                        // `history_coverage` on the result already tells the
+                        // operator how much was examined.
+                        continue;
+                    };
+
+                    // The static half applies only to module-dispatched nodes.
+                    // A system node's cost is the sub-workflow / judge it
+                    // drives, not a dispatched module envelope, so there is no
+                    // per-attempt timeout or module retry default to report —
+                    // exactly the reason `retry_envelope_overrun` skips them.
+                    let headroom = node
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<Uuid>().ok())
+                        .and_then(|tid| template_retry.get(&tid))
+                        .and_then(|(methods, world)| {
+                            retry_headroom(
+                                node,
+                                budget,
+                                has_actor,
+                                methods,
+                                world.as_deref(),
+                                talos_workflow_engine_core::default_node_timeout_secs(),
+                            )
+                        });
+
+                    let observed = ObservedNodeRecord {
+                        attempts: row.attempts,
+                        failures: row.failures,
+                        timeout_failures: row.timeout_failures,
+                    };
+                    let Some(finding) = chronic_node_failure(
+                        &observed,
+                        history.executions_scanned,
+                        history.window_days,
+                        headroom,
+                    ) else {
+                        continue;
+                    };
+
+                    issues.push(ValidationIssue {
+                        // WARNING, NEVER ERROR. `valid == false` gates
+                        // `publish_version`; letting operational history flip
+                        // it would make a workflow unpublishable because of a
+                        // bad week — including when the thing being published
+                        // is the fix. See the module-level note.
+                        severity: ValidationSeverity::Warning,
+                        message: describe_chronic_failure(&finding, node_label),
+                        node_id: Some(node_label.to_string()),
+                        category: "failure-history".into(),
+                    });
+                }
+
+                if history.executions_scanned == 0 {
+                    HistoryCoverage::Empty { window_days }
+                } else {
+                    HistoryCoverage::Observed {
+                        executions: history.executions_scanned,
+                        window_days,
+                    }
+                }
+            }
+            Err(e) => {
+                // A failed read is NOT an empty history. Reporting it as
+                // `Empty` would tell the operator "nothing has been observed"
+                // when the truth is "we could not look" — the error-as-absence
+                // shape (#661). `Unavailable` says so on the response.
+                tracing::error!(
+                    target: "talos_validation",
+                    %workflow_id,
+                    error = %e,
+                    event_kind = "validation_history_read_failed",
+                    "validate: execution-history read failed — history checks did not run"
+                );
+                HistoryCoverage::Unavailable
+            }
+        };
 
         // ── Crash-recovery at-least-once advisory (Warning) ─────────────
         // Surfaces the durability contract to workflow authors: a controller
@@ -1121,7 +1662,11 @@ impl WorkflowValidationService {
         let valid = !issues
             .iter()
             .any(|i| i.severity == ValidationSeverity::Error);
-        Ok(ValidationResult { valid, issues })
+        Ok(ValidationResult {
+            valid,
+            issues,
+            history: history_coverage,
+        })
     }
 
     /// Trigger-time input-schema check: fetch the workflow's declared
@@ -2656,7 +3201,7 @@ mod fuel_sizing_tests {
     /// i.e. every node an author has deliberately sized. All are LLM nodes in
     /// memory-eligible worlds, so all take the injection allowance.
     const SIZED_FLEET: &[(&str, u64, u64)] = &[
-        ("cxai-crm-capture/extract", 1600, 14_000_000),
+        ("daily-crm-capture/extract", 1600, 14_000_000),
         ("pa-ask/answer", 1500, 8_000_000),
         ("pa-ask-grounded/answer", 1500, 8_000_000),
         ("pa-ask-grounded-judged/answer", 1500, 8_000_000),
@@ -2988,5 +3533,389 @@ mod retry_envelope_tests {
         assert!(node_retry_envelope_secs(600, 64, 60_000) > 0);
         // And a small case is still exact: 4 attempts x 1s + (1+2+4)s backoff.
         assert_eq!(node_retry_envelope_secs(1, 3, 1_000), 4 + 7);
+    }
+}
+
+// ── Observed-history checks ──────────────────────────────────────────────────
+//
+// These exercise the SAME functions `validate` calls (`chronic_node_failure`,
+// `retry_headroom`, `describe_chronic_failure`) — no test-local
+// reimplementation of the thresholds or the wording, because a shadow copy
+// drifts and then proves nothing.
+//
+// The numbers in `fleet_*` come from a live `execution_events` table
+// (2026-08-28) and are the calibration evidence for the constants, not
+// invented inputs.
+#[cfg(test)]
+mod failure_history_tests {
+    use super::{
+        chronic_node_failure, describe_chronic_failure, history_window_days, retry_headroom,
+        ChronicNodeFailure, HistoryCoverage, ObservedNodeRecord, CHRONIC_FAILURE_RATE,
+        CHRONIC_MIN_ATTEMPTS, CHRONIC_MIN_FAILURES, HISTORY_MAX_EXECUTIONS, HISTORY_WINDOW_DAYS,
+    };
+    use serde_json::json;
+
+    /// `DEFAULT_NODE_TIMEOUT_SECS` with no operator override.
+    const NODE_DEFAULT: u64 = talos_workflow_engine_core::DEFAULT_NODE_TIMEOUT_SECS_FALLBACK;
+
+    fn rec(attempts: i64, failures: i64, timeouts: i64) -> ObservedNodeRecord {
+        ObservedNodeRecord {
+            attempts,
+            failures,
+            timeout_failures: timeouts,
+        }
+    }
+
+    /// The live node this check exists for: `daily-crm-capture/extract`.
+    /// Explicit top-level `retry_count: 0`, `data.timeout_secs: 110`, inside a
+    /// 180 s workflow budget.
+    fn extract_node() -> serde_json::Value {
+        json!({
+            "id": "extract",
+            "type": "f9402426-8a42-40d1-a6c2-73a64ce21165",
+            "retry_count": 0,
+            "data": { "timeout_secs": 110 }
+        })
+    }
+
+    // ── The decision ────────────────────────────────────────────────────────
+
+    /// The motivating case fires. 6 failures in 21 attempts = 28.6 %.
+    #[test]
+    fn the_live_case_fires() {
+        let f = chronic_node_failure(&rec(21, 6, 6), 22, 30, None)
+            .expect("6/21 must be reported — this is the workflow the check exists for");
+        assert_eq!(f.observed.failures, 6);
+        assert_eq!(f.observed.timeout_failures, 6);
+    }
+
+    /// Two failures is an incident, not a pattern — even at a high rate.
+    #[test]
+    fn two_failures_stay_quiet_regardless_of_rate() {
+        assert!(chronic_node_failure(&rec(5, 2, 2), 5, 30, None).is_none());
+        assert!(chronic_node_failure(&rec(2, 2, 2), 2, 30, None).is_none());
+    }
+
+    /// A denominator too small to support a percentage produces no percentage.
+    /// This is also what suppresses the system-node dispatch paths that emit
+    /// `node_failed` with no preceding `node_started` (observed live on
+    /// `pa-meeting-prep/prep_judge`: attempts 1, failures 1).
+    #[test]
+    fn tiny_denominators_stay_quiet() {
+        assert!(chronic_node_failure(&rec(1, 1, 1), 1, 30, None).is_none());
+        assert!(chronic_node_failure(&rec(4, 3, 3), 4, 30, None).is_none());
+        // One more attempt and the same 3 failures DOES fire — the boundary is
+        // exactly CHRONIC_MIN_ATTEMPTS, not somewhere nearby.
+        assert!(chronic_node_failure(&rec(CHRONIC_MIN_ATTEMPTS, 3, 3), 5, 30, None).is_some());
+    }
+
+    /// The rate gate is what keeps high-volume workflows quiet: their absolute
+    /// failure counts clear `CHRONIC_MIN_FAILURES` easily. Every one of these
+    /// is a real fleet observation over the raw 30-day view.
+    #[test]
+    fn fleet_high_volume_nodes_stay_quiet_on_rate() {
+        for (attempts, failures, name) in [
+            (2241, 10, "pa-followup-approval-notifier"),
+            (4525, 12, "pa-ask-email"),
+            (584, 5, "alert-triage"),
+            (230, 3, "pa-inbox-organizer-work"),
+        ] {
+            assert!(
+                chronic_node_failure(&rec(attempts, failures, 0), 50, 30, None).is_none(),
+                "{name}: {failures}/{attempts} is background noise and must not warn"
+            );
+        }
+    }
+
+    /// The two nodes the fleet SHOULD surface, and the empty band between them
+    /// and everything else. Any threshold in (0.013, 0.154) selects the same
+    /// set, which is what makes 0.10 a threshold rather than a fitted value.
+    #[test]
+    fn fleet_calibration_band_is_empty_around_the_threshold() {
+        // Fires: the two chronic nodes.
+        assert!(chronic_node_failure(&rec(21, 6, 6), 22, 30, None).is_some()); // 28.6%
+        assert!(chronic_node_failure(&rec(26, 4, 3), 26, 30, None).is_some()); // 15.4%
+                                                                               // Nothing on the fleet with >= CHRONIC_MIN_FAILURES sits between the
+                                                                               // highest quiet rate and the lowest loud one.
+        let highest_quiet = 3.0 / 230.0;
+        let lowest_loud = 4.0 / 26.0;
+        assert!(
+            highest_quiet < CHRONIC_FAILURE_RATE && CHRONIC_FAILURE_RATE < lowest_loud,
+            "threshold {CHRONIC_FAILURE_RATE} must sit inside the empty band \
+             ({highest_quiet}, {lowest_loud})"
+        );
+    }
+
+    /// A clean node is silent no matter how many times it ran.
+    #[test]
+    fn zero_failures_never_fires() {
+        assert!(chronic_node_failure(&rec(500, 0, 0), 50, 30, None).is_none());
+        assert!(chronic_node_failure(&rec(0, 0, 0), 0, 30, None).is_none());
+    }
+
+    /// The constants are what the tests above assume. If someone retunes them,
+    /// this fails before the behavioural tests do and says why.
+    #[test]
+    fn thresholds_are_the_calibrated_values() {
+        assert_eq!(CHRONIC_MIN_FAILURES, 3);
+        assert_eq!(CHRONIC_MIN_ATTEMPTS, 5);
+        assert!((CHRONIC_FAILURE_RATE - 0.10).abs() < f64::EPSILON);
+        assert_eq!(HISTORY_MAX_EXECUTIONS, 50);
+        assert_eq!(HISTORY_WINDOW_DAYS, 30);
+    }
+
+    /// The lookback must never claim a window wider than retention can hold —
+    /// a window that silently shrinks is exactly the trap this check must not
+    /// walk into.
+    #[test]
+    fn window_never_exceeds_retention() {
+        assert!(history_window_days() <= HISTORY_WINDOW_DAYS);
+        assert!(history_window_days() <= talos_config::execution_retention_days());
+        assert!(history_window_days() > 0);
+    }
+
+    // ── The static half ─────────────────────────────────────────────────────
+
+    /// The live node's headroom: `retry_count` explicitly 0, per-attempt 110 s,
+    /// budget 180 s. One more attempt is 2 x 110 + 60 s backoff = 280 s, which
+    /// does not fit — so raising `retry_count` alone cannot help.
+    #[test]
+    fn live_node_has_no_retry_headroom() {
+        let h = retry_headroom(
+            &extract_node(),
+            180,
+            true,
+            &[],
+            Some("http-node"),
+            NODE_DEFAULT,
+        )
+        .expect("a non-zero budget yields headroom");
+        assert_eq!(h.resolved_retries, 0);
+        assert!(
+            h.retries_declared,
+            "an explicit retry_count: 0 is a declaration, not an absent value"
+        );
+        assert_eq!(h.per_attempt_secs, 110);
+        assert_eq!(h.budget_secs, 180);
+        assert!(!h.one_more_attempt_fits);
+        assert!(h.one_more_attempt_secs > 180);
+    }
+
+    /// A cheap node inside the same budget DOES have headroom, so the message
+    /// gives the opposite advice. The check is not hardcoded to pessimism.
+    #[test]
+    fn a_cheap_node_has_retry_headroom() {
+        let node = json!({"id": "cheap", "retry_count": 0, "data": {"timeout_secs": 10}});
+        let h = retry_headroom(&node, 180, true, &[], Some("http-node"), NODE_DEFAULT).unwrap();
+        assert!(h.one_more_attempt_fits);
+    }
+
+    /// A disabled wall-clock cap means there is no container, so there is
+    /// nothing to say about fit.
+    #[test]
+    fn zero_budget_yields_no_headroom() {
+        assert!(retry_headroom(
+            &extract_node(),
+            0,
+            true,
+            &[],
+            Some("http-node"),
+            NODE_DEFAULT
+        )
+        .is_none());
+    }
+
+    /// `retry_headroom` must resolve retries exactly as `retry_envelope_overrun`
+    /// does — same declared-first precedence, same unbudgeted clamp, same
+    /// method-aware default — or the two checks would print contradictory
+    /// retry counts for one node.
+    #[test]
+    fn headroom_and_envelope_agree_on_the_resolved_retry_count() {
+        let cases = [
+            (
+                json!({"id": "n", "retry_count": 7, "data": {"timeout_secs": 5}}),
+                true,
+            ),
+            (
+                json!({"id": "n", "retry_count": 7, "data": {"timeout_secs": 5}}),
+                false,
+            ),
+            (
+                json!({"id": "n", "data": {"retry_count": 2, "timeout_secs": 5}}),
+                true,
+            ),
+            (json!({"id": "n", "data": {"timeout_secs": 5}}), true),
+        ];
+        for (node, has_actor) in cases {
+            let h = retry_headroom(
+                &node,
+                10_000,
+                has_actor,
+                &[],
+                Some("http-node"),
+                NODE_DEFAULT,
+            )
+            .unwrap();
+            // Force an overrun with a budget of 1 s so the envelope function
+            // always returns Some and its resolution can be compared.
+            let e = super::retry_envelope_overrun(
+                &node,
+                1,
+                has_actor,
+                &[],
+                Some("http-node"),
+                NODE_DEFAULT,
+            )
+            .unwrap();
+            assert_eq!(
+                h.resolved_retries, e.resolved_retries,
+                "the two checks disagree about {node}"
+            );
+            assert_eq!(h.retries_declared, e.retries_declared);
+            assert_eq!(h.per_attempt_secs, e.per_attempt_secs);
+        }
+    }
+
+    // ── The wording ─────────────────────────────────────────────────────────
+
+    /// The exact operator-facing text for the live case. Pinned because the
+    /// whole defect was a response that read as reassuring; the replacement
+    /// has to state the counts, the dominant mode, and the static fact — and
+    /// must NOT assert that the current config caused the past failures.
+    #[test]
+    fn live_case_message_states_counts_mode_and_static_fact() {
+        let headroom = retry_headroom(
+            &extract_node(),
+            180,
+            true,
+            &[],
+            Some("http-node"),
+            NODE_DEFAULT,
+        );
+        let finding = chronic_node_failure(&rec(21, 6, 6), 22, 30, headroom).unwrap();
+        let msg = describe_chronic_failure(&finding, "extract");
+
+        assert!(
+            msg.contains("Node 'extract' failed 6 of its last 21 observed attempts"),
+            "{msg}"
+        );
+        assert!(msg.contains("every one of them a timeout"), "{msg}");
+        assert!(
+            msg.contains("22 execution(s) in the last 30 day(s)"),
+            "{msg}"
+        );
+        assert!(msg.contains("excluding cancelled and test runs"), "{msg}");
+        assert!(msg.contains("retry_count is explicitly 0"), "{msg}");
+        assert!(msg.contains("per-attempt timeout is 110s"), "{msg}");
+        assert!(msg.contains("inside a 180s workflow budget"), "{msg}");
+        assert!(msg.contains("NO retry fits"), "{msg}");
+        // The timeout advice must be SIZED, not a blanket prohibition: with
+        // one attempt of 110s inside 180s there really are ~70s of unused
+        // budget, and telling the operator not to use them would be wrong.
+        assert!(msg.contains("leaving ~70s of the budget unused"), "{msg}");
+        assert!(
+            msg.contains("timeout_secs can be raised into that room"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("only safe while retry_count stays at 0"),
+            "{msg}"
+        );
+        // The honesty guard: an OBSERVATION, never a causal claim.
+        assert!(
+            msg.contains("not a claim that the current graph caused them"),
+            "the message must not assert causation it cannot establish: {msg}"
+        );
+    }
+
+    /// Mixed failure modes are reported as a fraction, not as "every one".
+    #[test]
+    fn mixed_modes_do_not_claim_all_timeouts() {
+        let finding = chronic_node_failure(&rec(26, 4, 3), 26, 30, None).unwrap();
+        let msg = describe_chronic_failure(&finding, "compose");
+        assert!(msg.contains("3 of them timeouts"), "{msg}");
+        assert!(!msg.contains("every one of them"), "{msg}");
+    }
+
+    /// No timeouts at all: no timeout clause, and no timeout-specific advice.
+    #[test]
+    fn non_timeout_failures_get_no_timeout_clause() {
+        let finding = chronic_node_failure(&rec(20, 5, 0), 20, 30, None).unwrap();
+        let msg = describe_chronic_failure(&finding, "fetch");
+        assert!(!msg.contains("timeout"), "{msg}");
+        assert!(
+            msg.contains("failed 5 of its last 20 observed attempts"),
+            "{msg}"
+        );
+    }
+
+    /// A system node has no module dispatch, so the message carries the
+    /// observation alone rather than inventing retry facts that do not apply.
+    #[test]
+    fn system_node_message_omits_the_static_half() {
+        let finding = chronic_node_failure(&rec(20, 5, 5), 20, 30, None).unwrap();
+        let msg = describe_chronic_failure(&finding, "prep_judge");
+        assert!(!msg.contains("retry_count"), "{msg}");
+        assert!(!msg.contains("workflow budget"), "{msg}");
+        assert!(
+            msg.contains("failed 5 of its last 20 observed attempts"),
+            "{msg}"
+        );
+    }
+
+    /// A node WITH headroom is told retries are available — the advice tracks
+    /// the configuration rather than always recommending the same thing.
+    #[test]
+    fn headroom_available_changes_the_advice() {
+        let node = json!({"id": "cheap", "retry_count": 0, "data": {"timeout_secs": 10}});
+        let h = retry_headroom(&node, 180, true, &[], Some("http-node"), NODE_DEFAULT);
+        let finding = chronic_node_failure(&rec(20, 5, 5), 20, 30, h).unwrap();
+        let msg = describe_chronic_failure(&finding, "cheap");
+        assert!(msg.contains("raising retry_count is available"), "{msg}");
+        assert!(!msg.contains("NO retry fits"), "{msg}");
+    }
+
+    // ── Absence is not health ───────────────────────────────────────────────
+
+    /// The three "no findings" causes must read differently. This is the whole
+    /// point: `issues: []` on its own is what misled the operator.
+    #[test]
+    fn the_three_empty_causes_are_distinguishable() {
+        let observed = HistoryCoverage::Observed {
+            executions: 22,
+            window_days: 30,
+        };
+        let empty = HistoryCoverage::Empty { window_days: 30 };
+        let unavailable = HistoryCoverage::Unavailable;
+
+        assert!(observed.consulted());
+        assert!(!empty.consulted());
+        assert!(!unavailable.consulted());
+
+        // An empty window must NOT read as a clean bill of health...
+        assert!(empty.note().contains("STATIC ONLY"));
+        assert!(empty.note().contains("not that the workflow runs cleanly"));
+        // ...and a failed read must NOT read as an empty window (#661).
+        assert!(unavailable.note().contains("could NOT be read"));
+        assert_ne!(empty.note(), unavailable.note());
+        assert!(observed.note().contains("22 run(s)"));
+    }
+
+    /// A workflow that never ran produces no history finding — a false warning
+    /// would be as wrong as the silence being fixed.
+    #[test]
+    fn no_history_produces_no_finding() {
+        assert!(chronic_node_failure(&rec(0, 0, 0), 0, 30, None).is_none());
+    }
+
+    /// `ChronicNodeFailure` carries the sample it was drawn from, so a rendered
+    /// finding can always state its own denominator rather than asserting a
+    /// rate with no visible basis.
+    #[test]
+    fn finding_carries_its_own_denominator() {
+        let f: ChronicNodeFailure = chronic_node_failure(&rec(21, 6, 6), 22, 30, None).unwrap();
+        assert_eq!(f.executions_scanned, 22);
+        assert_eq!(f.window_days, 30);
+        assert_eq!(f.observed.attempts, 21);
     }
 }

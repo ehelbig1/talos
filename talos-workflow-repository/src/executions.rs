@@ -1551,6 +1551,356 @@ impl WorkflowRepository {
         }
         Ok(out)
     }
+
+    /// Per-node observed run/failure counts over a bounded slice of a
+    /// workflow's recent execution history.
+    ///
+    /// # What the numbers mean, precisely
+    ///
+    /// Counts come from `execution_events`, keyed by `node_id` — the value
+    /// [`talos_workflow_engine_core::engine_node_uuid`] derives from the
+    /// graph's author-facing node id. Callers map back with the same
+    /// function; deriving it independently is how a join silently matches
+    /// nothing.
+    ///
+    /// * `failures` counts **`node_failed` events only.** It deliberately does
+    ///   NOT use `started - completed`. When one node fails, the executor
+    ///   abandons the run while its siblings are still in flight, and those
+    ///   siblings keep a `node_started` with no terminal event. Measured on the
+    ///   live fleet 2026-08-28: 13 such orphaned starts, every one of them in an
+    ///   execution that a DIFFERENT node failed (e.g. `pa-daily-brief` execution
+    ///   `50ce2d23…`, where `gmail_work` failed and `calendar` + `gmail` were
+    ///   left mid-flight). Subtraction would have blamed the bystanders.
+    /// * `attempts` is `greatest(started, completed + failed)`. `started` alone
+    ///   is not a safe denominator: some system-node dispatch paths emit
+    ///   `node_failed` with no preceding `node_started` (observed on
+    ///   `pa-meeting-prep/prep_judge`), which yields a zero denominator.
+    ///   Taking the larger of the two can only make an observed failure RATE
+    ///   smaller, never larger — the direction a warning must err in.
+    /// * `timeout_failures` is the subset of `failures` whose message names a
+    ///   timeout. It is a substring test on operator-facing prose, so treat it
+    ///   as a hint about the dominant failure mode, not a classification.
+    ///
+    /// # Exclusions, and why
+    ///
+    /// * `status = 'cancelled'` executions are dropped. A cancelled node's job
+    ///   comes back as a non-transient failure (`reason_class=cancelled`) and
+    ///   therefore writes a real `node_failed` row — counting an operator's own
+    ///   cancellations against the workflow would defame a healthy one.
+    /// * `is_test_execution` rows are dropped. `test_workflow` runs synthetic
+    ///   input and its failures are not the operational record.
+    ///
+    /// # Bounds
+    ///
+    /// Two caps, both required. `window_days` bounds how far back in wall time
+    /// the slice reaches; `max_executions` bounds how many executions it can
+    /// contain regardless of cadence. A daily workflow is limited by the first,
+    /// a 15-minute poller by the second. The ordering carries a unique
+    /// tiebreaker (`started_at DESC, id DESC`) so the slice is deterministic
+    /// when several executions share a timestamp.
+    ///
+    /// # Tenancy
+    ///
+    /// Scoped by `workflows.user_id = $2`, byte-for-byte the predicate
+    /// [`WorkflowRepository::get_workflow_graph`] uses, on the same executor.
+    /// A workflow the caller cannot see yields no rows rather than an error.
+    pub async fn node_run_history(
+        &self,
+        workflow_id: Uuid,
+        user_id: Uuid,
+        window_days: i32,
+        max_executions: i64,
+    ) -> Result<NodeRunHistory> {
+        // ONE round trip, deliberately. The executions-scanned count and the
+        // per-node aggregate are produced from the SAME `recent` CTE: split
+        // across two statements they would evaluate `now()` at two different
+        // instants and could describe two different slices, so the denominator
+        // reported to the operator would not be the denominator the counts
+        // came from. The `LEFT JOIN ... ON true` is what keeps the count
+        // reachable when the aggregate is empty — a workflow whose executions
+        // all died before their first node event still has a real "we looked
+        // at N runs" answer, and reporting 0 scanned there would be the
+        // error-as-absence shape this whole check exists to avoid.
+        //
+        // Plan (verified on the live DB 2026-08-28): the `recent` CTE resolves
+        // against `idx_we_workflow_started` (workflow_id, started_at DESC),
+        // stopping after `max_executions` rows; the aggregate walks
+        // `idx_events_execution_id` once per execution. 0.5 ms on a
+        // 26-execution workflow, 3.7 ms on a 4,525-execution one — the LIMIT
+        // makes them the same amount of work. No new index needed.
+        let rows: Vec<(
+            i64,
+            Option<Uuid>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "WITH recent AS ( \
+                 SELECT we.id \
+                 FROM workflow_executions we \
+                 JOIN workflows w ON w.id = we.workflow_id \
+                 WHERE we.workflow_id = $1 \
+                   AND w.user_id = $2 \
+                   AND we.status <> 'cancelled' \
+                   AND NOT we.is_test_execution \
+                   AND we.started_at >= now() - make_interval(days => $3::int) \
+                 ORDER BY we.started_at DESC, we.id DESC \
+                 LIMIT $4 \
+             ), scanned AS ( \
+                 SELECT count(*)::bigint AS n FROM recent \
+             ), agg AS ( \
+                 SELECT ee.node_id, \
+                        count(*) FILTER (WHERE ee.event_type = 'node_started') AS started, \
+                        count(*) FILTER (WHERE ee.event_type = 'node_completed') AS completed, \
+                        count(*) FILTER (WHERE ee.event_type = 'node_failed') AS failures, \
+                        count(*) FILTER (WHERE ee.event_type = 'node_failed' \
+                                           AND ee.log_message ILIKE $5) AS timeout_failures, \
+                        (array_agg(ee.log_message ORDER BY ee.created_at DESC) \
+                           FILTER (WHERE ee.event_type = 'node_failed'))[1] AS latest_error \
+                 FROM execution_events ee \
+                 JOIN recent r ON r.id = ee.execution_id \
+                 WHERE ee.node_id IS NOT NULL \
+                   AND ee.event_type IN ('node_started', 'node_completed', 'node_failed') \
+                 GROUP BY ee.node_id \
+             ) \
+             SELECT s.n, a.node_id, a.started, a.completed, a.failures, \
+                    a.timeout_failures, a.latest_error \
+             FROM scanned s LEFT JOIN agg a ON true",
+        )
+        .bind(workflow_id)
+        .bind(user_id)
+        .bind(window_days)
+        .bind(max_executions)
+        .bind("%timed out%")
+        .fetch_all(&self.db_pool)
+        .await?;
+
+        Ok(fold_node_run_history(rows, window_days))
+    }
+}
+
+/// The raw shape one row of `node_run_history`'s query decodes into:
+/// `(executions_scanned, node_id, started, completed, failed, timed_out, latest_error)`.
+pub type NodeRunHistoryQueryRow = (
+    i64,
+    Option<Uuid>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+);
+
+/// Fold the query's `LEFT JOIN` rows into a [`NodeRunHistory`].
+///
+/// Extracted from the async method so the row semantics are testable without
+/// a database — and they need testing, because getting them wrong produces
+/// ZERO findings, which is indistinguishable from "this workflow is healthy".
+/// That silent-empty failure mode is the exact bug the caller exists to fix.
+///
+/// * `executions_scanned` comes from the one-row `scanned` CTE, so every row
+///   carries the same value; it is read from the first row rather than summed.
+/// * A `NULL` `node_id` is the `LEFT JOIN ... ON true` placeholder emitted
+///   when the aggregate side is empty — it is NOT a node and must not become
+///   a zero-count entry. Its sibling columns are `NULL` on exactly the same
+///   rows, so they are filtered together rather than defaulted apart.
+/// * `attempts` is `greatest(started, completed + failed)`; see
+///   [`WorkflowRepository::node_run_history`] for why `started` alone is not a
+///   safe denominator.
+#[must_use]
+pub fn fold_node_run_history(
+    rows: Vec<NodeRunHistoryQueryRow>,
+    window_days: i32,
+) -> NodeRunHistory {
+    let executions_scanned = rows.first().map_or(0, |r| r.0);
+    let nodes = rows
+        .into_iter()
+        .filter_map(
+            |(_, node_id, started, completed, failures, timeout_failures, latest_error)| {
+                let node_id = node_id?;
+                let started = started.unwrap_or(0);
+                let completed = completed.unwrap_or(0);
+                let failures = failures.unwrap_or(0);
+                Some(NodeRunHistoryRow {
+                    node_id,
+                    attempts: started.max(completed + failures),
+                    failures,
+                    timeout_failures: timeout_failures.unwrap_or(0),
+                    latest_error,
+                })
+            },
+        )
+        .collect();
+    NodeRunHistory {
+        executions_scanned,
+        window_days,
+        nodes,
+    }
+}
+
+#[cfg(test)]
+mod node_run_history_fold_tests {
+    use super::{fold_node_run_history, NodeRunHistoryQueryRow};
+    use uuid::Uuid;
+
+    fn row(
+        n: i64,
+        node: Option<&str>,
+        started: i64,
+        completed: i64,
+        failed: i64,
+        timed_out: i64,
+    ) -> NodeRunHistoryQueryRow {
+        match node {
+            Some(id) => (
+                n,
+                Some(Uuid::parse_str(id).unwrap()),
+                Some(started),
+                Some(completed),
+                Some(failed),
+                Some(timed_out),
+                None,
+            ),
+            None => (n, None, None, None, None, None, None),
+        }
+    }
+
+    /// The live shape: three nodes, 22 executions scanned. `extract` is
+    /// `engine_node_uuid("extract")`.
+    #[test]
+    fn folds_the_live_shape() {
+        let h = fold_node_run_history(
+            vec![
+                row(
+                    22,
+                    Some("283128ac-ef14-943c-127f-7327ca8f57e7"),
+                    15,
+                    15,
+                    0,
+                    0,
+                ),
+                row(
+                    22,
+                    Some("c189b115-c97e-73d0-998b-df1f607c041e"),
+                    22,
+                    21,
+                    1,
+                    0,
+                ),
+                row(
+                    22,
+                    Some("f1cf2fd5-c868-9512-8d55-9088259a132d"),
+                    21,
+                    15,
+                    6,
+                    6,
+                ),
+            ],
+            30,
+        );
+        assert_eq!(h.executions_scanned, 22);
+        assert_eq!(h.nodes.len(), 3);
+        let extract = h
+            .nodes
+            .iter()
+            .find(|r| r.node_id.to_string() == "f1cf2fd5-c868-9512-8d55-9088259a132d")
+            .expect("extract must survive the fold");
+        assert_eq!(extract.attempts, 21);
+        assert_eq!(extract.failures, 6);
+        assert_eq!(extract.timeout_failures, 6);
+    }
+
+    /// A workflow with runs but no node events yields the placeholder row.
+    /// The count MUST survive and the placeholder MUST NOT become a node —
+    /// a phantom node with 0 attempts would be silently harmless here but is
+    /// the shape that makes a denominator lie.
+    #[test]
+    fn placeholder_row_carries_the_count_without_inventing_a_node() {
+        let h = fold_node_run_history(vec![row(7, None, 0, 0, 0, 0)], 30);
+        assert_eq!(h.executions_scanned, 7);
+        assert!(h.nodes.is_empty());
+    }
+
+    /// A workflow with no runs at all: zero scanned, zero nodes. This must be
+    /// distinguishable by the caller from "not read" — it is, because the
+    /// caller only reaches here on `Ok`.
+    #[test]
+    fn empty_window_is_zero_scanned_and_no_nodes() {
+        let h = fold_node_run_history(vec![row(0, None, 0, 0, 0, 0)], 30);
+        assert_eq!(h.executions_scanned, 0);
+        assert!(h.nodes.is_empty());
+    }
+
+    /// `started` alone under-counts when a system-node path emits a failure
+    /// with no start. `greatest` picks the honest denominator, and it is never
+    /// smaller than `failures`.
+    #[test]
+    fn denominator_is_never_smaller_than_the_failures_it_divides() {
+        let h = fold_node_run_history(
+            vec![row(
+                9,
+                Some("08d5dfbc-f68f-94c6-e73c-20c3b5c053df"),
+                0,
+                0,
+                1,
+                1,
+            )],
+            30,
+        );
+        let n = &h.nodes[0];
+        assert_eq!(n.attempts, 1, "started=0 must not yield a zero denominator");
+        assert!(n.attempts >= n.failures);
+    }
+
+    /// A totally empty result set (which the LEFT JOIN should make
+    /// unreachable) degrades to "nothing scanned" rather than panicking on an
+    /// index.
+    #[test]
+    fn no_rows_at_all_does_not_panic() {
+        let h = fold_node_run_history(Vec::new(), 30);
+        assert_eq!(h.executions_scanned, 0);
+        assert!(h.nodes.is_empty());
+    }
+}
+
+/// Observed per-node outcome counts for one node over a bounded history slice.
+///
+/// See [`WorkflowRepository::node_run_history`] for what each field counts and
+/// — more importantly — what it deliberately does not.
+#[derive(Debug, Clone)]
+pub struct NodeRunHistoryRow {
+    /// Engine node id (`engine_node_uuid` of the graph's node id).
+    pub node_id: Uuid,
+    /// `greatest(node_started, node_completed + node_failed)` — the
+    /// denominator. Never smaller than `failures`.
+    pub attempts: i64,
+    /// `node_failed` events. Not `attempts - completed`.
+    pub failures: i64,
+    /// Subset of `failures` whose message names a timeout.
+    pub timeout_failures: i64,
+    /// Most recent failure message, DLP-redacted and 8 KiB-truncated at write
+    /// time by the event sink.
+    pub latest_error: Option<String>,
+}
+
+/// A workflow's per-node history slice, plus the coverage of the slice itself.
+///
+/// `executions_scanned == 0` is a real and meaningful answer — it means the
+/// window held nothing, NOT that everything is fine. Callers must render that
+/// distinction rather than collapsing it into silence.
+#[derive(Debug, Clone)]
+pub struct NodeRunHistory {
+    /// Executions inside the bounded window (after the cancelled / test
+    /// exclusions), capped at the caller's `max_executions`.
+    pub executions_scanned: i64,
+    /// The lookback the caller asked for, echoed so a rendered message can
+    /// state the window it is actually describing.
+    pub window_days: i32,
+    /// One row per node that produced at least one lifecycle event in the
+    /// window. Nodes that never ran are simply absent.
+    pub nodes: Vec<NodeRunHistoryRow>,
 }
 
 #[cfg(test)]
