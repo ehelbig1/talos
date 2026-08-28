@@ -3819,7 +3819,13 @@ impl TalosRuntime {
         // gap where fuel and wall-clock timeout could both miss a
         // tight sync-WASM loop with cheap operators that never yields
         // to the tokio runtime.
-        store.set_epoch_deadline(epoch_ticks_for_timeout(timeout));
+        //
+        // The SAME total budget, handed out in slices so the job's cancel
+        // flag is re-read roughly every tick of guest execution — this is
+        // what makes a compute-bound module (one crossing no host-call
+        // boundary, and therefore reaching none of the ~20 `is_cancelled()`
+        // guards) preemptible at all. See `crate::epoch_budget`.
+        crate::epoch_budget::arm_epoch_deadline(&mut store, timeout);
 
         // Derive string hash from pre-computed bytes (avoids recomputing)
         let module_hash_str = hex::encode(module_hash_bytes);
@@ -4023,6 +4029,26 @@ impl TalosRuntime {
         // Handle runtime error (outer Result) — check for OOM before generic trap
         let output_result = match call_result {
             Err(e) => {
+                // Operator cancellation, checked FIRST. Every arm below this
+                // point either rewrites the error into its own specific message
+                // or passes the raw wasmtime error onward — and the single-node
+                // arm collapses an unrecognised trap to the opaque "WASM trap
+                // encountered" (a wasmtime error can carry guest backtrace
+                // addresses, so it must not reach a caller verbatim). Without
+                // this carve-out an operator-requested abort would surface
+                // looking like a random guest trap, or like the timeout it
+                // exists to replace.
+                //
+                // This cannot change the classification of any OTHER job: the
+                // marker is present only when THIS process raised the abort from
+                // the epoch callback, which happens only when the job's cancel
+                // flag was set. See `crate::epoch_budget`.
+                if crate::epoch_budget::is_cancel_preempt_error(&e) {
+                    return Err(anyhow::anyhow!(
+                        "{}",
+                        crate::epoch_budget::CANCEL_PREEMPT_MESSAGE
+                    ));
+                }
                 if let Some(oom_msg) = oom_msg {
                     return Err(anyhow::anyhow!("{}", oom_msg));
                 }
@@ -4330,8 +4356,11 @@ impl TalosRuntime {
         // SECURITY: Apply Resource Limits
         store.limiter(|ctx| ctx as &mut dyn wasmtime::ResourceLimiter);
 
-        // M1: epoch interruption deadline — see top of file.
-        store.set_epoch_deadline(epoch_ticks_for_timeout(timeout));
+        // M1: epoch interruption deadline — see top of file. Armed through
+        // the same chokepoint as every other store so no dispatch shape can
+        // drift into being un-preemptible; this path registers no execution
+        // id, so its flag stays `false` and the behaviour is unchanged.
+        crate::epoch_budget::arm_epoch_deadline(&mut store, timeout);
 
         // Provide fuel to cap CPU usage
         store.set_fuel(self.fuel_limit)?;
@@ -4388,6 +4417,26 @@ impl TalosRuntime {
 
         let output_result = match call_result {
             Err(e) => {
+                // Operator cancellation, checked FIRST. Every arm below this
+                // point either rewrites the error into its own specific message
+                // or passes the raw wasmtime error onward — and the single-node
+                // arm collapses an unrecognised trap to the opaque "WASM trap
+                // encountered" (a wasmtime error can carry guest backtrace
+                // addresses, so it must not reach a caller verbatim). Without
+                // this carve-out an operator-requested abort would surface
+                // looking like a random guest trap, or like the timeout it
+                // exists to replace.
+                //
+                // This cannot change the classification of any OTHER job: the
+                // marker is present only when THIS process raised the abort from
+                // the epoch callback, which happens only when the job's cancel
+                // flag was set. See `crate::epoch_budget`.
+                if crate::epoch_budget::is_cancel_preempt_error(&e) {
+                    return Err(anyhow::anyhow!(
+                        "{}",
+                        crate::epoch_budget::CANCEL_PREEMPT_MESSAGE
+                    ));
+                }
                 if let Some(oom_msg) = oom_msg {
                     return Err(anyhow::anyhow!("{}", oom_msg));
                 }
@@ -4812,8 +4861,10 @@ impl TalosRuntime {
             // Tier-1 egress deny right here.
             let step_net_reason = store.data().network_reason_handle();
             store.limiter(|ctx| ctx as &mut dyn wasmtime::ResourceLimiter);
-            // M1: epoch interruption deadline — per-step.
-            store.set_epoch_deadline(epoch_ticks_for_timeout(step_timeout));
+            // M1: epoch interruption deadline — per-step. Cancellation must
+            // not be PROTOCOL-DEPENDENT: a pipeline step gets the same
+            // compute-bound preemption a single-node job does.
+            crate::epoch_budget::arm_epoch_deadline(&mut store, step_timeout);
             store.set_fuel(step.max_fuel)?;
 
             // Instantiate from the cached InstancePre.
@@ -4855,6 +4906,26 @@ impl TalosRuntime {
 
             let output_result = match call_result {
                 Err(e) => {
+                    // Operator cancellation, checked FIRST. Every arm below this
+                    // point either rewrites the error into its own specific message
+                    // or passes the raw wasmtime error onward — and the single-node
+                    // arm collapses an unrecognised trap to the opaque "WASM trap
+                    // encountered" (a wasmtime error can carry guest backtrace
+                    // addresses, so it must not reach a caller verbatim). Without
+                    // this carve-out an operator-requested abort would surface
+                    // looking like a random guest trap, or like the timeout it
+                    // exists to replace.
+                    //
+                    // This cannot change the classification of any OTHER job: the
+                    // marker is present only when THIS process raised the abort from
+                    // the epoch callback, which happens only when the job's cancel
+                    // flag was set. See `crate::epoch_budget`.
+                    if crate::epoch_budget::is_cancel_preempt_error(&e) {
+                        return Err(anyhow::anyhow!(
+                            "{}",
+                            crate::epoch_budget::CANCEL_PREEMPT_MESSAGE
+                        ));
+                    }
                     if let Some(oom_msg) = oom_msg {
                         anyhow::bail!("{}", oom_msg);
                     }
@@ -4986,11 +5057,16 @@ impl TalosRuntime {
     /// job, so every other worker returns 0, as does a worker whose copy of
     /// the execution has already finished.
     ///
-    /// It does NOT abort the module mid-instruction. Fuel metering, epoch
-    /// interruption and the per-job timeout remain the bounds on a module that
-    /// makes no further host calls. And it does not bypass audit: the job
-    /// fails through the ordinary path, so its `node_failed` row and DLQ entry
-    /// are still written.
+    /// A module that makes no further host calls is no longer exempt. The
+    /// per-Store epoch-deadline callback ([`crate::epoch_budget`]) re-reads
+    /// this same flag roughly every tick of guest execution — a check the
+    /// compiler emits at every loop back-edge and function entry, needing no
+    /// host call — and traps the guest out of its own computation. Fuel
+    /// metering and the per-job timeout remain the bounds on a runaway module
+    /// that was never cancelled.
+    ///
+    /// It does not bypass audit: the job fails through the ordinary path, so
+    /// its `node_failed` row and DLQ entry are still written.
     pub fn cancel_execution(&self, execution_id: uuid::Uuid) -> usize {
         self.cancel_registry.cancel_execution(execution_id)
     }
@@ -5432,8 +5508,8 @@ impl TalosRuntime {
         let mut store = Store::try_new(&self.engine, context)?;
 
         store.limiter(|ctx| ctx as &mut dyn wasmtime::ResourceLimiter);
-        // M1: epoch interruption deadline.
-        store.set_epoch_deadline(epoch_ticks_for_timeout(timeout));
+        // M1: epoch interruption deadline, through the shared chokepoint.
+        crate::epoch_budget::arm_epoch_deadline(&mut store, timeout);
         store.set_fuel(self.fuel_limit)?;
 
         // Defense-in-depth: pick the linker for the DECLARED capability world
@@ -5477,6 +5553,26 @@ impl TalosRuntime {
 
         let call_result = match call_result {
             Err(e) => {
+                // Operator cancellation, checked FIRST. Every arm below this
+                // point either rewrites the error into its own specific message
+                // or passes the raw wasmtime error onward — and the single-node
+                // arm collapses an unrecognised trap to the opaque "WASM trap
+                // encountered" (a wasmtime error can carry guest backtrace
+                // addresses, so it must not reach a caller verbatim). Without
+                // this carve-out an operator-requested abort would surface
+                // looking like a random guest trap, or like the timeout it
+                // exists to replace.
+                //
+                // This cannot change the classification of any OTHER job: the
+                // marker is present only when THIS process raised the abort from
+                // the epoch callback, which happens only when the job's cancel
+                // flag was set. See `crate::epoch_budget`.
+                if crate::epoch_budget::is_cancel_preempt_error(&e) {
+                    return Err(anyhow::anyhow!(
+                        "{}",
+                        crate::epoch_budget::CANCEL_PREEMPT_MESSAGE
+                    ));
+                }
                 if let Some(oom_msg) = oom_msg {
                     return Err(anyhow::anyhow!("{}", oom_msg));
                 }
