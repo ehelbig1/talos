@@ -9797,6 +9797,7 @@ dependencies = [
  "sqlx",
  "talos-capability-world",
  "talos-config",
+ "talos-retry-intelligence",
  "talos-text-util",
  "talos-workflow-engine-core",
  "talos-workflow-job-protocol",

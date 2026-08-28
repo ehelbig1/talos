@@ -20,6 +20,12 @@ sqlx = { version = "0.8", default-features = false, features = ["postgres", "run
 # crates enter the dependency graph.
 talos-capability-world = { path = "../talos-capability-world" }
 talos-config = { path = "../talos-config" }
+# Disabled-retry-protection check: classifies a node's most recent RECORDED
+# failure message with the SAME `classify_error` + `is_transient_error_type`
+# pair the dispatcher's smart-retry gate uses, so the finding's "a retry would
+# have been attempted" claim cannot drift from the runtime decision it
+# describes. Leaf crate — no talos deps of its own, so no cycle.
+talos-retry-intelligence = { path = "../talos-retry-intelligence" }
 talos-text-util = { path = "../talos-text-util" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
