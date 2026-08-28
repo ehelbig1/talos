@@ -809,6 +809,22 @@ impl DispatchSigner {
             Self::Ed25519(sk) => req.sign_ed25519(sk),
         }
     }
+
+    /// Sign a [`CancelCommand`] under this signer's scheme.
+    ///
+    /// The cancel rides the SAME scheme as job dispatch on purpose. An
+    /// HMAC-only cancel would be refused outright by a fleet running
+    /// `TALOS_DISPATCH_SCHEME=ed25519` with legacy HMAC disabled — the
+    /// producer would publish, the worker would reject on
+    /// `SchemeRefused`, and the operator would see a cancel that "worked"
+    /// and did nothing. Routing it through the same signer is what stops
+    /// this shipping as another built-but-never-effective mechanism.
+    pub fn sign_cancel(&self, cmd: &mut CancelCommand) -> Result<(), String> {
+        match self {
+            Self::Hmac(k) => cmd.sign(k),
+            Self::Ed25519(sk) => cmd.sign_ed25519(sk),
+        }
+    }
 }
 
 /// The process-wide Ed25519 dispatch signer, resolved once from env, or `None`
@@ -5793,6 +5809,228 @@ mod worker_heartbeat_domain_separation_tests {
 }
 
 // ============================================================================
+// Execution cancel command (controller → worker fleet)
+// ============================================================================
+
+/// Domain-separation prefix for the operator-initiated execution CANCEL
+/// command.
+///
+/// Distinct from every other tag on the bus for the usual reason — a MAC over
+/// one message type must never verify as another — and for one specific to
+/// this message: it is the only signed message on the platform whose entire
+/// authority is *destructive*. A byte sequence that could be read both as a
+/// heartbeat and as a cancel would turn an observability publish into a
+/// fleet-wide abort primitive. Prefix-freedom against the other tags is
+/// asserted in `cancel_command_tests::the_cancel_domain_is_distinct_and_prefix_free`.
+pub const EXECUTION_CANCEL_DOMAIN: &[u8] = b"talos/execution-cancel/v1";
+
+/// Freshness window a [`CancelCommand`] is verified under, in seconds.
+///
+/// Deliberately SHORT. A cancel is a fire-and-forget command with no reply, so
+/// unlike a job dispatch there is no request/response round-trip to size
+/// against — the only latency it must tolerate is controller→NATS→worker,
+/// which is milliseconds. Combined with the process-local nonce cache (which
+/// refuses a nonce already seen inside the window), a captured cancel is
+/// usable for **0 replays** and is inert after this many seconds.
+///
+/// It is a third of the 300 s used for `JobRequest`, and that asymmetry is the
+/// point: a stale job dispatch wastes work, a stale cancel destroys it.
+pub const EXECUTION_CANCEL_MAX_AGE_SECS: u64 = 100;
+
+/// Operator-initiated cancellation of one workflow execution, broadcast to the
+/// whole worker fleet.
+///
+/// # Why this message carries no tenancy
+///
+/// There is no `user_id` field, and adding one would be decoration. The worker
+/// is credential-free — it has no Postgres connection and cannot evaluate
+/// ownership of an execution — so a `user_id` on the wire would be a claim
+/// nobody could check. **Tenancy is enforced entirely at the producer**: the
+/// controller publishes only when
+/// `ExecutionRepository::mark_execution_cancelled(exec_id, user_id)` returns
+/// `Ok(true)`, i.e. only after a row matched BOTH the execution id and the
+/// caller's `user_id`. A caller who does not own the execution updates zero
+/// rows and nothing is published.
+///
+/// # Why it is signed
+///
+/// Without a signature this is a denial-of-service primitive: anyone able to
+/// publish on the bus could abort arbitrary executions by guessing or
+/// observing execution ids. The signature is what makes "can reach NATS"
+/// insufficient.
+///
+/// # What it does NOT do
+///
+/// It does not bypass audit. It sets the worker's job-scoped `cancelled` flag,
+/// which the in-worker egress guards read; the job then fails through the
+/// ordinary path and still writes its `node_failed` row and its DLQ entry. It
+/// is not a `select!`-race that drops the reactor future, and it deliberately
+/// does not touch the engine's in-process `CancellationToken` for that reason.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelCommand {
+    /// The `workflow_executions.id` the operator cancelled. Workers match this
+    /// against the execution id every in-flight job was dispatched under.
+    pub workflow_execution_id: Uuid,
+    /// Signature scheme (see [`JobRequest::crypto_scheme`]): 0 = legacy
+    /// `WORKER_SHARED_KEY` HMAC, 1 = controller Ed25519.
+    #[serde(default)]
+    pub crypto_scheme: u8,
+    /// HMAC-SHA256 (scheme 0) or Ed25519 (scheme 1) signature.
+    #[serde(default)]
+    pub signature: Vec<u8>,
+    /// Nonce for replay prevention: `"{unix_secs}:{random_hex}"`.
+    #[serde(default)]
+    pub cancel_nonce: String,
+}
+
+impl CancelCommand {
+    /// An unsigned command for `workflow_execution_id`. Call one of the `sign`
+    /// methods before publishing — an unsigned command is refused by every
+    /// worker.
+    #[must_use]
+    pub fn new(workflow_execution_id: Uuid) -> Self {
+        Self {
+            workflow_execution_id,
+            crypto_scheme: CRYPTO_SCHEME_HMAC,
+            signature: Vec::new(),
+            cancel_nonce: String::new(),
+        }
+    }
+
+    /// Canonical signing payload: domain tag, then the length-prefixed
+    /// execution-id bytes and nonce, in the same construction as
+    /// [`WorkerHeartbeat::signing_payload`].
+    ///
+    /// The uuid is a fixed 16 bytes, so the length prefix is not load-bearing
+    /// for *it* — it is there so the framing rule is uniform and a later field
+    /// cannot be appended without a prefix by pattern-copying the line above
+    /// it. `crypto_scheme` is deliberately NOT bound, exactly as on
+    /// `JobRequest`: it is an unsigned routing hint, and flipping it only ever
+    /// routes the message to a verifier that then rejects it.
+    fn signing_payload(&self) -> Vec<u8> {
+        fn put(v: &mut Vec<u8>, field: &[u8]) {
+            v.extend_from_slice(&(field.len() as u64).to_le_bytes());
+            v.extend_from_slice(field);
+        }
+        let mut v = Vec::with_capacity(EXECUTION_CANCEL_DOMAIN.len() + 64);
+        v.extend_from_slice(EXECUTION_CANCEL_DOMAIN);
+        put(&mut v, self.workflow_execution_id.as_bytes());
+        put(&mut v, self.cancel_nonce.as_bytes());
+        v
+    }
+
+    /// Sign under the legacy `WORKER_SHARED_KEY` HMAC scheme.
+    pub fn sign(&mut self, key: &[u8]) -> Result<(), String> {
+        self.crypto_scheme = CRYPTO_SCHEME_HMAC;
+        self.sign_core(key)
+    }
+
+    /// Sign under the Ed25519 dispatch scheme with the controller's private key.
+    pub fn sign_ed25519(&mut self, signing_key: &DispatchSigningKey) -> Result<(), String> {
+        self.crypto_scheme = CRYPTO_SCHEME_ED25519;
+        self.sign_core_ed25519(signing_key)
+    }
+
+    /// Scheme-dispatching **primary** verify for the worker — the single
+    /// verify-once action point for this message type in a worker process.
+    /// Routes on `self.crypto_scheme` exactly like
+    /// [`JobRequest::verify_dispatch`].
+    ///
+    /// **Verify-once rule (CLAUDE.md).** Call this from exactly ONE subscriber
+    /// per process. A second `verify_dispatch` against the same command fails
+    /// with `"cancel_nonce already seen"` — both would insert into the shared
+    /// `JOB_NONCE_CACHE`. Passive observers use
+    /// [`Self::verify_no_replay_dispatch`].
+    pub fn verify_dispatch(
+        &self,
+        hmac_ring: &talos_workflow_engine_core::WorkerKeyRing,
+        ed_keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+        accept_legacy_hmac: bool,
+    ) -> Result<(), VerifyError> {
+        match self.crypto_scheme {
+            CRYPTO_SCHEME_ED25519 => self.verify_ed25519_core(ed_keys, max_age_secs),
+            CRYPTO_SCHEME_HMAC => {
+                if !accept_legacy_hmac {
+                    return Err(VerifyError::new(
+                        VerifyFailureKind::SchemeRefused,
+                        "legacy HMAC cancel refused (Ed25519-only enforcement enabled)".to_string(),
+                    ));
+                }
+                self.verify_with_ring_core(hmac_ring, max_age_secs)
+            }
+            other => Err(VerifyError::new(
+                VerifyFailureKind::SchemeRefused,
+                format!("unknown cancel crypto_scheme: {other}"),
+            )),
+        }
+    }
+
+    /// Observer half of [`Self::verify_dispatch`]: signature + freshness with
+    /// **no** replay-cache write.
+    ///
+    /// Shipped alongside the primary from day one per CLAUDE.md's "add both
+    /// `verify()` and `verify_no_replay()` together up front" rule — the
+    /// prophylactic split is cheap, and the r300/r301 regression it prevents
+    /// is total. It has no production caller today; that is deliberate and is
+    /// recorded rather than hidden.
+    pub fn verify_no_replay_dispatch(
+        &self,
+        hmac_ring: &talos_workflow_engine_core::WorkerKeyRing,
+        ed_keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+        accept_legacy_hmac: bool,
+    ) -> Result<u64, VerifyError> {
+        match self.crypto_scheme {
+            CRYPTO_SCHEME_ED25519 => self.verify_no_replay_ed25519_core(ed_keys, max_age_secs),
+            CRYPTO_SCHEME_HMAC => {
+                if !accept_legacy_hmac {
+                    return Err(VerifyError::new(
+                        VerifyFailureKind::SchemeRefused,
+                        "legacy HMAC cancel refused (Ed25519-only enforcement enabled)".to_string(),
+                    ));
+                }
+                self.verify_no_replay_with_ring_core(hmac_ring, max_age_secs)
+            }
+            other => Err(VerifyError::new(
+                VerifyFailureKind::SchemeRefused,
+                format!("unknown cancel crypto_scheme: {other}"),
+            )),
+        }
+    }
+
+    /// MAC the current fields WITHOUT minting a fresh nonce, so a test can pin
+    /// the send timestamp and exercise the freshness boundary. Test-only.
+    #[cfg(test)]
+    fn sign_core_with_fixed_nonce_for_test(&mut self, key: &[u8]) {
+        self.crypto_scheme = CRYPTO_SCHEME_HMAC;
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC key");
+        mac.update(&self.signing_payload());
+        self.signature = mac.finalize().into_bytes().to_vec();
+    }
+}
+
+impl SignedMessage for CancelCommand {
+    const NONCE_LABEL: &'static str = "cancel_nonce";
+
+    fn payload_bytes(&self) -> Vec<u8> {
+        self.signing_payload()
+    }
+    fn nonce(&self) -> &str {
+        &self.cancel_nonce
+    }
+    fn set_nonce(&mut self, nonce: String) {
+        self.cancel_nonce = nonce;
+    }
+    fn signature(&self) -> &[u8] {
+        &self.signature
+    }
+    fn set_signature(&mut self, signature: Vec<u8>) {
+        self.signature = signature;
+    }
+}
+
+// ============================================================================
 // Shared-key helper
 // ============================================================================
 
@@ -9000,5 +9238,289 @@ mod tests {
             .map(|i| ("p".to_string(), format!("model-{i:03}"), 1u32, 1u32))
             .collect();
         assert_eq!(aggregate_llm_usage(many).len(), MAX_LLM_USAGE_ENTRIES);
+    }
+}
+
+/// The [`CancelCommand`] security boundary, asserted in both directions.
+///
+/// This message is different in kind from the others on the bus: its whole
+/// authority is destructive, and it is a fleet-wide broadcast that every
+/// worker receives. So the negative cases — unsigned, forged, tampered,
+/// replayed, stale, wrong-scheme, cross-type — carry more weight than the
+/// happy path, and each is asserted against the SAME command that verifies
+/// cleanly, so a test cannot pass by accidentally rejecting everything.
+#[cfg(test)]
+mod cancel_command_tests {
+    use super::*;
+    use talos_workflow_engine_core::{WorkerKeyRing, WorkerSharedKey};
+
+    const KEY: [u8; 32] = [0x11; 32];
+    const OTHER_KEY: [u8; 32] = [0x22; 32];
+
+    fn ring(k: [u8; 32]) -> WorkerKeyRing {
+        WorkerKeyRing::single(WorkerSharedKey::new(k.to_vec()))
+    }
+
+    fn signed(exec: Uuid) -> CancelCommand {
+        let mut cmd = CancelCommand::new(exec);
+        cmd.sign(&KEY).expect("sign");
+        cmd
+    }
+
+    /// The happy path, so every rejection below is a rejection OF SOMETHING
+    /// THAT WOULD OTHERWISE WORK.
+    #[test]
+    fn a_correctly_signed_command_verifies() {
+        let exec = Uuid::new_v4();
+        let cmd = signed(exec);
+        assert_eq!(cmd.crypto_scheme, CRYPTO_SCHEME_HMAC);
+        cmd.verify_dispatch(&ring(KEY), &[], EXECUTION_CANCEL_MAX_AGE_SECS, true)
+            .expect("a freshly signed command must verify");
+        assert_eq!(cmd.workflow_execution_id, exec);
+    }
+
+    /// **The denial-of-service case.** Without a signature check, anyone able
+    /// to publish on the bus could abort arbitrary executions by observing or
+    /// guessing execution ids — the cancel subject is a fleet-wide constant.
+    #[test]
+    fn an_unsigned_command_is_refused() {
+        let cmd = CancelCommand::new(Uuid::new_v4());
+        assert!(cmd.signature.is_empty() && cmd.cancel_nonce.is_empty());
+        let err = cmd
+            .verify_dispatch(&ring(KEY), &[], EXECUTION_CANCEL_MAX_AGE_SECS, true)
+            .expect_err("an unsigned cancel must never be honoured");
+        assert_eq!(err.kind(), VerifyFailureKind::MalformedNonce);
+    }
+
+    /// A signature minted under a different key — the "attacker has bus
+    /// access but not the shared key" case.
+    #[test]
+    fn a_forged_command_is_refused() {
+        let mut cmd = CancelCommand::new(Uuid::new_v4());
+        cmd.sign(&OTHER_KEY).expect("sign");
+        let err = cmd
+            .verify_dispatch(&ring(KEY), &[], EXECUTION_CANCEL_MAX_AGE_SECS, true)
+            .expect_err("a cancel signed with the wrong key must be refused");
+        assert_eq!(err.kind(), VerifyFailureKind::BadSignature);
+    }
+
+    /// The execution id is the ONLY authority-bearing field, so it must be
+    /// bound by the MAC: swapping it must invalidate a captured command
+    /// rather than re-aim it at another tenant's execution.
+    #[test]
+    fn retargeting_a_captured_command_invalidates_it() {
+        let mut cmd = signed(Uuid::new_v4());
+        cmd.workflow_execution_id = Uuid::new_v4();
+        let err = cmd
+            .verify_dispatch(&ring(KEY), &[], EXECUTION_CANCEL_MAX_AGE_SECS, true)
+            .expect_err("re-aiming a captured cancel must break the MAC");
+        assert_eq!(err.kind(), VerifyFailureKind::BadSignature);
+    }
+
+    /// Verify-once. A captured command is not re-firable inside its freshness
+    /// window, and the error string is the byte-stable one callers match on.
+    #[test]
+    fn a_captured_command_cannot_be_replayed() {
+        let cmd = signed(Uuid::new_v4());
+        cmd.verify_dispatch(&ring(KEY), &[], EXECUTION_CANCEL_MAX_AGE_SECS, true)
+            .expect("first primary verify succeeds");
+        let err = cmd
+            .verify_dispatch(&ring(KEY), &[], EXECUTION_CANCEL_MAX_AGE_SECS, true)
+            .expect_err("a replayed cancel must be refused");
+        assert_eq!(err.kind(), VerifyFailureKind::Replay);
+        assert!(
+            err.to_string().contains("cancel_nonce already seen"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The observer half must NOT consume the nonce — otherwise adding any
+    /// passive consumer would silently disarm the primary verifier for every
+    /// message (the r300/r301 outage shape).
+    #[test]
+    fn the_observer_verify_does_not_consume_the_nonce() {
+        let cmd = signed(Uuid::new_v4());
+        cmd.verify_no_replay_dispatch(&ring(KEY), &[], EXECUTION_CANCEL_MAX_AGE_SECS, true)
+            .expect("observer verify succeeds");
+        cmd.verify_dispatch(&ring(KEY), &[], EXECUTION_CANCEL_MAX_AGE_SECS, true)
+            .expect("the primary verify must still succeed after an observer read");
+    }
+
+    /// Outside the freshness window the command is refused on liveness alone.
+    #[test]
+    fn a_stale_command_is_refused() {
+        let mut cmd = CancelCommand::new(Uuid::new_v4());
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - (EXECUTION_CANCEL_MAX_AGE_SECS + 5);
+        cmd.cancel_nonce = format!("{ts}:{}", hex::encode([7u8; 16]));
+        cmd.sign_core_with_fixed_nonce_for_test(&KEY);
+        let err = cmd
+            .verify_dispatch(&ring(KEY), &[], EXECUTION_CANCEL_MAX_AGE_SECS, true)
+            .expect_err("a stale cancel must be refused");
+        assert_eq!(err.kind(), VerifyFailureKind::Stale);
+    }
+
+    /// The window is deliberately shorter than a job dispatch's 300 s: a
+    /// stale dispatch wastes work, a stale cancel destroys it.
+    #[test]
+    fn the_cancel_window_is_tighter_than_a_job_dispatch() {
+        assert!(EXECUTION_CANCEL_MAX_AGE_SECS < 300);
+        assert!(
+            EXECUTION_CANCEL_MAX_AGE_SECS > MAX_FUTURE_SKEW_SECS,
+            "the past window must exceed the future-skew tolerance"
+        );
+    }
+
+    /// Ed25519 is the scheme a fleet running `TALOS_DISPATCH_REQUIRE_ED25519`
+    /// accepts, and the only one it accepts. Both directions.
+    #[test]
+    fn ed25519_signing_verifies_only_against_the_right_controller_key() {
+        let sk = parse_ed25519_signing_key_hex(&hex::encode([3u8; 32])).expect("seed");
+        let other = parse_ed25519_signing_key_hex(&hex::encode([4u8; 32])).expect("seed");
+        let mut cmd = CancelCommand::new(Uuid::new_v4());
+        cmd.sign_ed25519(&sk).expect("sign");
+        assert_eq!(cmd.crypto_scheme, CRYPTO_SCHEME_ED25519);
+
+        // Enforcement ON (`accept_legacy_hmac = false`) — the posture the dev
+        // stack runs — and it still verifies.
+        cmd.verify_dispatch(
+            &ring(KEY),
+            &[sk.verifying_key()],
+            EXECUTION_CANCEL_MAX_AGE_SECS,
+            false,
+        )
+        .expect("an Ed25519 cancel must verify under enforcement");
+
+        let mut replayable = CancelCommand::new(cmd.workflow_execution_id);
+        replayable.sign_ed25519(&sk).expect("sign");
+        let err = replayable
+            .verify_dispatch(
+                &ring(KEY),
+                &[other.verifying_key()],
+                EXECUTION_CANCEL_MAX_AGE_SECS,
+                false,
+            )
+            .expect_err("a different controller key must not verify");
+        assert_eq!(err.kind(), VerifyFailureKind::BadSignature);
+    }
+
+    /// **The reason this message carries a `crypto_scheme` at all.** A fleet
+    /// with Ed25519 enforcement on refuses HMAC. Had the producer signed
+    /// HMAC-only, every cancel in that posture would be refused — a producer
+    /// that publishes and never takes effect, which is the exact defect this
+    /// whole change exists to remove.
+    #[test]
+    fn hmac_is_refused_once_ed25519_enforcement_is_on() {
+        let cmd = signed(Uuid::new_v4());
+        let err = cmd
+            .verify_dispatch(&ring(KEY), &[], EXECUTION_CANCEL_MAX_AGE_SECS, false)
+            .expect_err("legacy HMAC must be refused under enforcement");
+        assert_eq!(err.kind(), VerifyFailureKind::SchemeRefused);
+
+        // FALSIFICATION: the identical command verifies with enforcement off,
+        // so the refusal above is about the SCHEME and not about the command.
+        let ok = signed(cmd.workflow_execution_id);
+        ok.verify_dispatch(&ring(KEY), &[], EXECUTION_CANCEL_MAX_AGE_SECS, true)
+            .expect("the same command verifies when legacy HMAC is accepted");
+    }
+
+    #[test]
+    fn an_unknown_scheme_is_refused() {
+        let mut cmd = signed(Uuid::new_v4());
+        cmd.crypto_scheme = 99;
+        let err = cmd
+            .verify_dispatch(&ring(KEY), &[], EXECUTION_CANCEL_MAX_AGE_SECS, true)
+            .expect_err("an unknown scheme must fail closed");
+        assert_eq!(err.kind(), VerifyFailureKind::SchemeRefused);
+    }
+
+    /// Cross-type confusion, both directions. A heartbeat is signed under the
+    /// same fleet-shared key and rides the same bus; if its bytes could be
+    /// read as a cancel, an observability publish would become a fleet-wide
+    /// abort primitive.
+    #[test]
+    fn a_heartbeat_cannot_be_read_as_a_cancel() {
+        let mut hb = WorkerHeartbeat {
+            worker_id: "dev-worker-fleet".to_string(),
+            capabilities: vec!["wasm".to_string()],
+            cpu_usage_pct: 1.0,
+            build_version: None,
+            signature: vec![],
+            heartbeat_nonce: String::new(),
+        };
+        hb.sign(&KEY).expect("sign");
+
+        // Lift the heartbeat's MAC and nonce onto a cancel: refused.
+        let mut cmd = CancelCommand::new(Uuid::new_v4());
+        cmd.cancel_nonce = hb.heartbeat_nonce.clone();
+        cmd.signature = hb.signature.clone();
+        assert!(cmd
+            .verify_dispatch(&ring(KEY), &[], EXECUTION_CANCEL_MAX_AGE_SECS, true)
+            .is_err());
+
+        // And the reverse.
+        let signed_cmd = signed(Uuid::new_v4());
+        let mut hb2 = hb.clone();
+        hb2.heartbeat_nonce = signed_cmd.cancel_nonce.clone();
+        hb2.signature = signed_cmd.signature.clone();
+        assert!(hb2
+            .verify_no_replay(&KEY, WORKER_HEARTBEAT_MAX_AGE_SECS)
+            .is_err());
+    }
+
+    /// Byte-level domain separation, not just behavioural. Two types are
+    /// distinguishable today by accident of field layout; a domain tag keeps
+    /// them distinguishable after an innocent field addition. Prefix-freedom
+    /// is what stops one framing being reinterpreted as another.
+    #[test]
+    fn the_cancel_domain_is_distinct_and_prefix_free() {
+        let cmd = signed(Uuid::new_v4());
+        assert!(cmd.payload_bytes().starts_with(EXECUTION_CANCEL_DOMAIN));
+
+        let domains: [&[u8]; 4] = [
+            EXECUTION_CANCEL_DOMAIN,
+            WORKER_HEARTBEAT_DOMAIN,
+            WORKER_LIVENESS_POP_DOMAIN,
+            WORKER_REGISTRATION_POP_DOMAIN,
+        ];
+        for (i, a) in domains.iter().enumerate() {
+            for (j, b) in domains.iter().enumerate() {
+                if i != j {
+                    assert!(!a.starts_with(b), "domain {i} must not extend domain {j}");
+                }
+            }
+        }
+    }
+
+    /// The subject is a fleet-wide constant and NOTHING tenant-specific may
+    /// appear in it — NATS subjects are world-readable via `/subsz`. The
+    /// execution id travels in the signed body.
+    #[test]
+    fn the_cancel_subject_carries_no_tenant_data() {
+        assert_eq!(subjects::WORKERS_CMD_CANCEL, "talos.workers.cmd.cancel");
+        assert!(subjects::WORKERS_CMD_CANCEL.starts_with(subjects::NAMESPACE_PREFIX));
+        // No wildcard, no interpolation point, no per-execution suffix.
+        assert!(!subjects::WORKERS_CMD_CANCEL.contains('*'));
+        assert!(!subjects::WORKERS_CMD_CANCEL.contains('>'));
+        let cmd = signed(Uuid::new_v4());
+        assert!(!subjects::WORKERS_CMD_CANCEL.contains(&cmd.workflow_execution_id.to_string()));
+    }
+
+    /// The command round-trips over the wire unchanged — the signature is
+    /// computed over fields, so a serialise/deserialise cycle must preserve
+    /// verifiability.
+    #[test]
+    fn the_command_survives_a_json_round_trip() {
+        let cmd = signed(Uuid::new_v4());
+        let bytes = serde_json::to_vec(&cmd).expect("encode");
+        let back: CancelCommand = serde_json::from_slice(&bytes).expect("decode");
+        assert_eq!(back.workflow_execution_id, cmd.workflow_execution_id);
+        back.verify_dispatch(&ring(KEY), &[], EXECUTION_CANCEL_MAX_AGE_SECS, true)
+            .expect("a round-tripped command must still verify");
+        // Small enough that the worker's 4 KiB payload cap is generous.
+        assert!(bytes.len() < 512, "unexpected wire size: {}", bytes.len());
     }
 }

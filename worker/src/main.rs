@@ -928,6 +928,121 @@ fn dispatch_verify_config() -> &'static DispatchVerifyConfig {
     })
 }
 
+/// Fleet-wide operator-cancel listener.
+///
+/// # Why a PLAIN subscribe and never a queue subscribe
+///
+/// Every other worker subscription in this file is a `queue_subscribe`, because
+/// a job should be executed once by one member. A cancel is the opposite: the
+/// controller does not know which worker holds the execution's in-flight job,
+/// so the command has to reach EVERY worker. A queue group would deliver it to
+/// one arbitrary member and drop it for the rest — the cancel would appear to
+/// work and would silently miss most of the time. Workers that do not hold the
+/// execution treat it as a no-op.
+///
+/// # Verify-once
+///
+/// This is the SINGLE primary verifier for `CancelCommand` in a worker
+/// process. A second `verify_dispatch` against the same command would fail
+/// with `"cancel_nonce already seen"` — both would insert into the shared
+/// `JOB_NONCE_CACHE` (r300/r301). Observers use `verify_no_replay_dispatch`.
+///
+/// # Security
+///
+/// An unsigned or forged command is refused before the registry is touched, so
+/// NATS-publish access alone is not a denial-of-service primitive. Nothing
+/// secret is logged: the execution id is tenant data and is emitted only at
+/// DEBUG on the accepted path, never on the rejected one (an attacker must not
+/// be able to write chosen values into the log by publishing garbage).
+async fn run_cancel_listener(
+    nc: async_nats::Client,
+    runtime: Arc<TalosRuntime>,
+    shared_key: talos_workflow_engine_core::WorkerKeyRing,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let subject = talos_workflow_job_protocol::subjects::WORKERS_CMD_CANCEL;
+    let mut sub = match nc.subscribe(subject).await {
+        Ok(s) => s,
+        Err(e) => {
+            ::tracing::error!(
+                error = %e,
+                subject,
+                "failed to subscribe to the cancel command subject — operator \
+                 cancellation will not reach this worker"
+            );
+            return;
+        }
+    };
+    ::tracing::info!(
+        subject,
+        "Subscribed to operator-cancel commands (plain, fleet-wide)"
+    );
+
+    // A cancel is a 100-byte JSON object. Anything larger is not one, and
+    // deserialising it would be work an unauthenticated publisher chose for us.
+    const MAX_CANCEL_PAYLOAD_BYTES: usize = 4 * 1024;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            msg_opt = sub.next() => {
+                let Some(msg) = msg_opt else { break };
+                if msg.payload.len() > MAX_CANCEL_PAYLOAD_BYTES {
+                    ::tracing::warn!(
+                        payload_bytes = msg.payload.len(),
+                        "rejecting oversized cancel command"
+                    );
+                    continue;
+                }
+                let cmd: talos_workflow_job_protocol::CancelCommand =
+                    match serde_json::from_slice(&msg.payload) {
+                        Ok(c) => c,
+                        Err(_) => {
+                            // No error detail and no payload echo: the sender is
+                            // unauthenticated at this point.
+                            ::tracing::warn!("failed to decode cancel command");
+                            continue;
+                        }
+                    };
+
+                let dvc = dispatch_verify_config();
+                if let Err(e) = cmd.verify_dispatch(
+                    &shared_key,
+                    &dvc.ed_keys,
+                    talos_workflow_job_protocol::EXECUTION_CANCEL_MAX_AGE_SECS,
+                    dvc.accept_legacy_hmac,
+                ) {
+                    ::tracing::warn!(
+                        target: "talos_security",
+                        detail = %talos_workflow_job_protocol::describe_verify_failure(
+                            "cancel command", &e
+                        ),
+                        "refusing unverified cancel command"
+                    );
+                    continue;
+                }
+
+                let flagged = runtime.cancel_execution(cmd.workflow_execution_id);
+                if flagged > 0 {
+                    ::tracing::info!(
+                        execution_id = %cmd.workflow_execution_id,
+                        flagged,
+                        "operator cancel applied to in-flight job(s)"
+                    );
+                } else {
+                    // The COMMON case across the fleet — every worker that does
+                    // not hold this execution lands here. Not an error.
+                    ::tracing::debug!(
+                        execution_id = %cmd.workflow_execution_id,
+                        "cancel command for an execution not in flight here (no-op)"
+                    );
+                }
+            }
+        }
+    }
+    ::tracing::info!("cancel listener stopped");
+}
+
 /// RFC 0010 P2: the worker's per-instance Ed25519 **result-signing** key,
 /// resolved once from `TALOS_WORKER_SIGNING_KEY` (a 32-byte hex seed sourced
 /// from a Secret / KMS — never a committed plaintext). `None` (the default) ⇒
@@ -2589,6 +2704,26 @@ async fn main() -> anyhow::Result<()> {
     let pipeline_semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_pipeline_jobs));
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // ── Operator-cancel listener ──────────────────────────────────────────
+    // Not semaphore-gated: handling a cancel is a signature check plus a scan
+    // of a map bounded by the job concurrency cap, and it must not queue behind
+    // the very jobs it is trying to stop.
+    //
+    // DELIBERATELY NOT joined in the shutdown `select!` below. That select
+    // treats any completed arm as "the worker is finished" — correct for the
+    // two job loops, whose exit means the bus is gone. This task can also end
+    // for a reason that must NOT stop the worker: a failed subscribe. Adding
+    // it as an arm would turn a degraded-cancellation condition (logged at
+    // ERROR, jobs unaffected) into an immediate shutdown of a worker with jobs
+    // in flight. It observes `shutdown_rx` itself, and dropping a tokio
+    // `JoinHandle` does not abort the task.
+    let _cancel_handle = tokio::spawn(run_cancel_listener(
+        nc.clone(),
+        runtime.clone(),
+        shared_key.clone(),
+        shutdown_rx.clone(),
+    ));
 
     // ── Single-node jobs task ─────────────────────────────────────────────
     let single_nc = nc.clone();

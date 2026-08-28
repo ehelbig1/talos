@@ -10,6 +10,7 @@
 
 pub mod audit;
 pub mod bindings;
+pub mod cancel_registry;
 pub mod circuit_breaker;
 pub mod context;
 pub mod error_sanitize;

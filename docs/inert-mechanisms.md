@@ -1,5 +1,53 @@
 # Inert-mechanism inventory — findings
 
+> ## ⚠ STATUS UPDATE — F-1 IS NO LONGER INERT (this document is a snapshot)
+>
+> **F-1a (worker cooperative cancellation) was WIRED**, in the cancel-producer
+> change that follows #687 and #689. The security section below, and the
+> "operator-visible consequence" bullet under F-1, **describe the state before
+> that change** and are kept as the record of why it was done — not as the
+> current state.
+>
+> What is now live:
+> * `TalosRuntime::cancel_execution(execution_id)` sets the job-scoped
+>   `Arc<AtomicBool>` that the 20 `is_cancelled()` guards read, for every job
+>   and every pipeline of that execution running in the process
+>   (`talos-worker-runtime/src/cancel_registry.rs`).
+> * Its production caller is the worker's `run_cancel_listener`
+>   (`worker/src/main.rs`), the single primary verifier of a signed
+>   `CancelCommand` on `talos.workers.cmd.cancel`.
+> * Its production producer is
+>   `ExecutionOrchestrationService::cancel_execution`, which publishes ONLY
+>   when `mark_execution_cancelled(exec_id, user_id)` returned `Ok(true)`.
+> * The MCP `cancel_execution` response no longer says
+>   `"in_flight_node_aborted": false`; it reports `in_flight_abort_requested`
+>   and `cancel_broadcast`.
+> * **F-1c is consequently no longer a dead metric.**
+>   `wasm.executions.cancelled` sits behind branches that production can now
+>   reach.
+>
+> **THE REFUTING CHECK BELOW WAS ITSELF WRONG, and that is worth more than the
+> status change.** It said: *"grep for `.cancel()` and resolve each hit — a
+> `TalosContext` receiver outside `worker/tests/` means this document is
+> stale."* That grep **still returns nothing**, because the wiring stores into
+> the shared `Arc<AtomicBool>` directly (the registry holds the Arc, not the
+> context) rather than going through `TalosContext::cancel()`. A check pinned
+> to ONE spelling of the producer reports "not stale" about a mechanism that is
+> now fully live — the same name-resolution failure the document itself warns
+> about, committed by its own guard.
+>
+> **Corrected refuting check:** grep for writers of the FLAG, not callers of
+> one method — `grep -rn "cancelled.store(" --include='*.rs' .` plus
+> `grep -rn "cancel_execution" talos-worker-runtime/src worker/src`.
+>
+> **Still inert and untouched by that change: F-1b**, the wire
+> `cancellation_token: Option<String>` on `JobRequest` / `PipelineStep` /
+> `TalosContext`. The cancel does NOT ride that field — it is a separate signed
+> message on its own subject — so the field remains `None` everywhere, remains
+> read nowhere, and its `TalosContext` doc comment remains factually wrong.
+> **F-2 (`deadline_unix_secs`) is also untouched and still inert.**
+
+
 **Tree:** `/Users/evanhelbig/projects/talos/.claude/worktrees/inert-inventory`,
 branch `claude/inert-mechanism-inventory`, HEAD `31c13519` (clean).
 The main repo was **not** touched; it is at the same commit and clean.

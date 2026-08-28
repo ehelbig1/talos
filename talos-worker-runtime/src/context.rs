@@ -1921,6 +1921,22 @@ impl TalosContext {
     }
 
     /// Mark this execution as cancelled.
+    ///
+    /// **This method still has no production caller, and that is not the same
+    /// thing as the mechanism being inert.** Operator-initiated cancellation
+    /// stores into the SAME `Arc<AtomicBool>` from outside the context —
+    /// `TalosRuntime::cancel_execution` reaches it through
+    /// [`crate::cancel_registry`], which holds the Arc rather than the
+    /// context, because the context is owned by the wasmtime `Store` for the
+    /// duration of the call. So the flag IS set in production; it is set by a
+    /// different writer.
+    ///
+    /// Kept because it is the natural in-context spelling and is what
+    /// `worker/tests/kill_switch_tests.rs` drives. If you are auditing whether
+    /// cancellation has a producer, grep for writers of the FLAG
+    /// (`cancelled.store(`), not callers of this method — an inventory pinned
+    /// to this one spelling reported a clean "no producer" about a live
+    /// mechanism.
     pub fn cancel(&self) {
         self.cancelled
             .store(true, std::sync::atomic::Ordering::Relaxed);
