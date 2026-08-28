@@ -196,6 +196,31 @@ pub struct TalosMetrics {
     /// label set is touched), so an alert on it is never silenced by the
     /// absent-is-not-zero trap.
     pub module_executions_swept_stuck_total: Counter,
+    /// `module_executions` rows DELETEd by the opt-in row-retention sweep.
+    /// Each one also removed its CASCADEd `module_execution_logs` children.
+    ///
+    /// This is the observability half of an IRREVERSIBLE operation: once the
+    /// row is gone there is no tombstone to count after the fact (unlike the
+    /// payload sweep, whose `payload_pruned_at` can be queried), so if this
+    /// counter does not move, nothing anywhere records that the sweep ran.
+    ///
+    /// **Do not confuse this with `module_execution_orphaned_rows`.** That
+    /// gauge counts rows whose `payload_enc_key_id` references a MISSING DEK
+    /// — a crypto data-loss detector with a `critical` alert behind it. This
+    /// counter counts deliberate retention deletions. They share the word
+    /// "orphan" in prose and nothing else.
+    ///
+    /// Unlabelled deliberately, for the two reasons its `swept_stuck` sibling
+    /// directly above is: the sweep's `DELETE … RETURNING` knows only a row
+    /// count, and `module_id` / `user_id` / `actor_id` would each be unbounded
+    /// cardinality. An unlabelled `Counter` also exports at 0 from process
+    /// start (a `CounterVec` emits nothing until a label set is touched), so
+    /// "the sweep is enabled and deleting nothing" and "the series does not
+    /// exist" stay distinguishable — the absent-is-not-zero trap.
+    ///
+    /// A fleet with `MODULE_EXECUTION_RETENTION_ENABLED` unset leaves this
+    /// flat at 0 forever, which is the correct reading: nothing was deleted.
+    pub module_executions_retention_deleted_total: Counter,
     /// Job results discarded by the fire-and-forget `talos.results.*`
     /// subscriber because the payload would not deserialize into a
     /// `JobResult`.
@@ -1184,6 +1209,19 @@ impl TalosMetrics {
         )?;
         registry.register(Box::new(module_executions_swept_stuck_total.clone()))?;
 
+        let module_executions_retention_deleted_total = Counter::new(
+            "talos_module_executions_retention_deleted_total",
+            "module_executions rows DELETEd by the opt-in row-retention sweep \
+             (MODULE_EXECUTION_RETENTION_ENABLED), each cascading its \
+             module_execution_logs children. Deletion is irreversible and \
+             leaves no tombstone, so this counter is the only record that the \
+             sweep ran. Distinct from talos_module_execution_orphaned_rows, \
+             which counts rows referencing a MISSING DEK. Registration alone \
+             exports it at 0, so an alert on it cannot be silenced by the \
+             series being absent.",
+        )?;
+        registry.register(Box::new(module_executions_retention_deleted_total.clone()))?;
+
         let job_results_dropped_unparseable_total = Counter::new(
             "talos_job_results_dropped_unparseable_total",
             "Job results discarded by the talos.results.* subscriber because \
@@ -1863,6 +1901,7 @@ impl TalosMetrics {
             wasm_log_orphaned_total,
             module_execution_record_started_failures_total,
             module_executions_swept_stuck_total,
+            module_executions_retention_deleted_total,
             job_results_dropped_unparseable_total,
             audit_verification_failures_total,
             worker_key_tofu_conflicts_total,

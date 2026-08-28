@@ -213,6 +213,35 @@ pub struct PayloadRetentionStats {
     pub batches: u32,
 }
 
+/// Outcome of [`ModuleExecutionService::delete_expired_executions`].
+///
+/// Counts only. No execution id, module name, tenant identifier or payload
+/// content — the caller logs this verbatim.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RowRetentionStats {
+    /// Rows DELETEd. Each also removed its `module_execution_logs` children by
+    /// cascade, which this count does NOT include.
+    pub deleted_rows: u64,
+    /// Batches executed. A sweep that stops on the batch cap rather than on a
+    /// short batch resumes where it left off on the next tick.
+    pub batches: u32,
+    /// Rows old enough to delete that were SKIPPED because their parent
+    /// `workflow_executions` row still exists.
+    ///
+    /// This field is what makes `deleted_rows == 0` interpretable. Zero
+    /// deletions with `Some(0)` means nothing was old enough; zero deletions
+    /// with `Some(n)` for large `n` means the age floor IS being reached but
+    /// parents are outliving it — a working sweep, not a broken predicate.
+    ///
+    /// **`Option`, not a bare `i64` defaulting to 0.** The probe is
+    /// best-effort — a failed count must not abort the sweep it only annotates
+    /// — but reporting `0` on failure would make "measured, nothing was
+    /// skipped" and "the probe errored, nothing was ever measured" the same
+    /// number, in the one field whose entire job is to disambiguate a zero.
+    /// `None` means unmeasured, and the sweep WARNs when it happens.
+    pub retained_parent_alive: Option<i64>,
+}
+
 /// Module execution log entry
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ModuleExecutionLog {
@@ -1704,6 +1733,250 @@ impl ModuleExecutionService {
                 break; // last batch
             }
         }
+        Ok(stats)
+    }
+
+    /// DELETE old terminal `module_executions` rows whose parent
+    /// `workflow_executions` row no longer exists.
+    ///
+    /// **This is irreversible, and strictly more destructive than
+    /// [`Self::prune_terminal_payloads`].** That sweep clears two BYTEA columns
+    /// and leaves a `payload_pruned_at` tombstone, so the row's status,
+    /// duration, fuel and error text stay readable and a later reader can tell
+    /// what happened. This removes the row itself: there is no tombstone, and a
+    /// deleted execution is indistinguishable from one that never ran. Each
+    /// deleted row also CASCADEs its `module_execution_logs` children
+    /// (`node_execution_logs_execution_id_fkey`). The caller is expected to gate
+    /// this behind an explicitly-enabled operator flag.
+    ///
+    /// # Why this exists when the payload sweep already frees the space
+    ///
+    /// Payload pruning bounds BYTES. Only row deletion bounds ROW COUNT, and
+    /// row count is the thing that grows without limit. Measured 2026-08-28:
+    /// 36,942 rows accumulated over 51 days (~724/day, matching the ~730/day
+    /// the registry's eviction LATERAL already documents), 133 MB total, of
+    /// which 21 MB heap + 27 MB across 19 indexes is untouchable by a payload
+    /// sweep, plus 37 MB of `module_execution_logs` that only a row DELETE
+    /// reclaims.
+    ///
+    /// # Why the predicate has the shape it does
+    ///
+    /// Four conjunctive clauses, three of them load-bearing safety:
+    ///
+    /// 1. **terminal status only** — never `pending` / `running`. A live row is
+    ///    an in-flight dispatch; deleting it would strand the worker's result.
+    /// 2. **`created_at` older than `retention_days`** — the age BELT, whose
+    ///    natural value is `EXECUTION_RETENTION_DAYS`, because that is when this
+    ///    platform already DELETEs the parent `workflow_executions` row.
+    /// 3. **the parent is gone** — `NOT EXISTS` against `workflow_executions`.
+    ///    This is what makes the sweep a *gap closure* rather than an
+    ///    independent retention policy: it deletes only what the parent sweep
+    ///    would already have taken had the FK that was never added been there.
+    ///    Measured 2026-08-28, this costs nothing — of the 9,018 rows older than
+    ///    30 days, all 9,018 are already parentless, and 0 old rows have a
+    ///    surviving parent. It is pure insurance against a future fleet where
+    ///    a parent outlives the age floor (the parent sweep skips
+    ///    `status='queued'`, so a long-queued execution does exactly that).
+    ///
+    ///    **`workflow_execution_id IS NULL` satisfies this clause**, which is
+    ///    correct but non-obvious: `we.id = NULL` matches no row, so `NOT
+    ///    EXISTS` is TRUE. A standalone module run (`run_sandbox`,
+    ///    `test_module`) has no workflow parent by design, so age is the only
+    ///    bound it can have. On the dev fleet 0 of 36,942 rows are in this
+    ///    state — every row is webhook-triggered — so this arm is presently
+    ///    unexercised in production data and is covered by unit test
+    ///    `deletes_a_parentless_standalone_run`.
+    /// 4. **not among the `corpus_keep` most recent `completed` rows for its
+    ///    `(module_id, user_id)`** — ranked by the readers' own ORDER BY. This
+    ///    is the clause an age-only policy would omit and be wrong for, and the
+    ///    argument is identical to the one on `prune_terminal_payloads`, only
+    ///    with higher stakes: nulling a payload leaves the row visible to
+    ///    `replay_module_regression` (which then finds an empty payload);
+    ///    deleting it removes the row from the corpus ranking entirely. No
+    ///    reader in the workspace is bounded by AGE; the replay and scaffold
+    ///    readers are bounded by RANK, so for a module that ran a few times a
+    ///    year ago and went quiet, its entire corpus is also its oldest data.
+    ///
+    /// # RLS
+    ///
+    /// Both tables have FORCE row-level security. Their `USING` clauses are
+    /// `NULLIF(current_setting(..., true), '') IS NULL OR ...`, i.e. they
+    /// PERMIT when no tenant setting is bound, which is the case on the bare
+    /// system pool this sweep uses. That is load-bearing for clause 3: if
+    /// `workflow_executions` ever gains a policy that DENIES on unset, every
+    /// live parent would become invisible here and the guard would flip from
+    /// "delete only orphans" to "delete everything old".
+    ///
+    /// # What this deliberately does not do
+    ///
+    /// It does not report bytes freed. `octet_length` on the payload columns
+    /// would force a detoast of every row on its way out — reading ~5000 TOAST
+    /// entries per batch purely to produce a log number. `prune_terminal_payloads`
+    /// can afford it because it is already rewriting the row; this cannot.
+    /// Operators read reclaimed space from `pg_total_relation_size`.
+    ///
+    /// # Known behavioural coupling
+    ///
+    /// `talos_registry`'s eviction LATERAL reads `MAX(started_at)` per module
+    /// at unbounded age to order WASM-cache eviction. A module whose every
+    /// execution is deleted here falls back to `COALESCE(e.last_exec,
+    /// m.created_at)`. That fallback exists precisely for this change (see the
+    /// `eviction_order!` comment, which names a future retention policy as the
+    /// reason it is not `NULLS FIRST`). Clause 4 keeps up to `corpus_keep`
+    /// completed rows per module, so a module with any successful history keeps
+    /// a `last_exec`; only a module whose runs were ALL non-`completed` and all
+    /// older than the age floor loses it, and for that module `created_at` is
+    /// the honest answer.
+    pub async fn delete_expired_executions(
+        &self,
+        retention_days: i32,
+        corpus_keep: i64,
+        batch_size: i64,
+    ) -> Result<RowRetentionStats> {
+        // Fail closed on a destructive misconfiguration rather than
+        // substituting a default and deleting something. `talos_config` already
+        // routes the env var through `positive_env_or_default`; this is the
+        // function-boundary half of the same defense, and it is what protects a
+        // caller that computes the value rather than reading the env. With
+        // `retention_days = 0` the age belt becomes `created_at < NOW()`, i.e.
+        // every terminal parentless row on the first sweep.
+        if retention_days <= 0 {
+            tracing::error!(
+                target: "talos_module_executions",
+                event_kind = "row_retention_refused_nonpositive_days",
+                retention_days,
+                "module-execution row retention refused: retention_days must be positive \
+                 (would delete every terminal parentless row on the first sweep)"
+            );
+            return Ok(RowRetentionStats::default());
+        }
+        if batch_size <= 0 {
+            return Ok(RowRetentionStats::default());
+        }
+        let corpus_keep = corpus_keep.max(Self::REPLAY_REACH);
+
+        // Measured ONCE per sweep, before the loop, so a `deleted_rows = 0`
+        // reading is interpretable. Without it, "nothing is old enough" and
+        // "plenty is old enough but every parent is still alive" are the same
+        // number in the log, and an operator who enabled the flag and saw zero
+        // has no way to tell a working sweep from a broken predicate. Errors are
+        // non-fatal: this is a reporting field, not a gate, so a failed count
+        // must not stop the sweep it is only annotating. But it degrades to
+        // `None` rather than `0` — substituting 0 would put an unmeasured value
+        // into the one field that exists to say whether a zero was measured.
+        let retained_parent_alive = match sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM module_executions me \
+             WHERE me.status = ANY($2) \
+               AND me.created_at < NOW() - make_interval(days => $1::int) \
+               AND EXISTS (SELECT 1 FROM workflow_executions we \
+                           WHERE we.id = me.workflow_execution_id)",
+        )
+        .bind(retention_days)
+        .bind(&Self::TERMINAL_STATUSES[..])
+        .fetch_one(&self.db_pool)
+        .await
+        {
+            Ok(n) => Some(n),
+            Err(e) => {
+                tracing::warn!(
+                    target: "talos_module_executions",
+                    event_kind = "row_retention_parent_alive_probe_failed",
+                    error = %e,
+                    "module-execution row retention: could not count rows skipped for a \
+                     surviving parent; a deleted_rows=0 reading this tick is uninterpretable"
+                );
+                None
+            }
+        };
+
+        let mut stats = RowRetentionStats {
+            retained_parent_alive,
+            ..Default::default()
+        };
+
+        // Bound the whole sweep, not just each batch: a first run against a
+        // never-swept table must not hold the pool for an unbounded number of
+        // rounds. Whatever is left is picked up on the next tick, because a
+        // deleted row is self-excluding from the predicate. 20 x 5000 = 100,000
+        // rows per tick, against the 9,018 currently eligible on the dev fleet
+        // and a ~724 rows/day accrual — so steady state is one partial batch.
+        const MAX_BATCHES_PER_SWEEP: u32 = 20;
+
+        while stats.batches < MAX_BATCHES_PER_SWEEP {
+            let deleted: Vec<(Uuid,)> = sqlx::query_as(
+                r#"
+                WITH corpus AS (
+                    SELECT id FROM (
+                        SELECT id,
+                               row_number() OVER (
+                                   PARTITION BY module_id, user_id
+                                   ORDER BY completed_at DESC NULLS LAST, started_at DESC
+                               ) AS rn
+                        FROM module_executions
+                        WHERE status = 'completed'
+                    ) ranked
+                    WHERE rn <= $2
+                ),
+                candidates AS (
+                    SELECT me.id
+                    FROM module_executions me
+                    WHERE me.status = ANY($4)
+                      AND me.created_at < NOW() - make_interval(days => $1::int)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM workflow_executions we
+                          WHERE we.id = me.workflow_execution_id
+                      )
+                      AND NOT EXISTS (SELECT 1 FROM corpus c WHERE c.id = me.id)
+                    ORDER BY me.created_at
+                    LIMIT $3
+                )
+                DELETE FROM module_executions m
+                USING candidates c
+                WHERE m.id = c.id
+                  AND m.status = ANY($4)
+                RETURNING m.id
+                "#,
+            )
+            .bind(retention_days)
+            .bind(corpus_keep)
+            .bind(batch_size)
+            .bind(&Self::TERMINAL_STATUSES[..])
+            .fetch_all(&self.db_pool)
+            .await
+            .context("module-execution row retention sweep failed")?;
+
+            let batch_len = deleted.len() as u64;
+            stats.batches += 1;
+            stats.deleted_rows += batch_len;
+            if batch_len < batch_size as u64 {
+                break; // last batch
+            }
+            // No inter-batch sleep, deliberately. The `workflow_executions`
+            // retention DELETE in `controller/src/bootstrap/background.rs` has
+            // a 100 ms one, but this crate has no `tokio` dependency and the
+            // workspace `tokio` is built without the `time` feature — enabling
+            // it here would widen feature unification for every crate in the
+            // workspace to buy one sleep. `prune_terminal_payloads` directly
+            // above, with the same batch size and the same 20-batch cap, does
+            // not sleep either. Each batch is its own awaited round-trip, so
+            // the pooled connection is returned between batches regardless, and
+            // MAX_BATCHES_PER_SWEEP is the real bound on a single tick's work.
+        }
+
+        // Incremented at the chokepoint rather than at the call site, so a
+        // future second caller cannot silently bypass it — the same reasoning as
+        // `module_executions_swept_stuck_total` below. This is the ONLY durable
+        // record that the sweep ran: unlike the payload sweep there is no
+        // `payload_pruned_at` to count afterwards, because the rows that would
+        // carry it are gone. `global()` is `None` when no registry is installed
+        // (tests, tools), so this is best-effort and not a hard dependency.
+        if stats.deleted_rows > 0 {
+            if let Some(m) = talos_metrics::global() {
+                m.module_executions_retention_deleted_total
+                    .inc_by(stats.deleted_rows as f64);
+            }
+        }
+
         Ok(stats)
     }
 

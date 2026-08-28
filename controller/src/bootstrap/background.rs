@@ -2901,6 +2901,113 @@ pub(crate) fn spawn_cleanup_tasks(
         );
     }
 
+    // ---------- Start module-execution ROW retention sweep (OPT-IN, default OFF) ----------
+    // DELETEs whole `module_executions` rows that are terminal, older than
+    // MODULE_EXECUTION_RETENTION_DAYS, outside their module's completed replay
+    // corpus, AND whose parent `workflow_executions` row no longer exists. Each
+    // deletion cascades that row's `module_execution_logs` children.
+    //
+    // WHY THIS EXISTS SEPARATELY FROM THE PAYLOAD SWEEP ABOVE: that one bounds
+    // BYTES (it NULLs two TOASTed columns and leaves the row). This one bounds
+    // ROW COUNT, which is the quantity that actually grows without limit —
+    // ~724 rows/day, 36,942 accumulated over 51 days on the dev fleet as of
+    // 2026-08-28, of which 9,104 already reference a parent that was deleted
+    // 30 days ago. Payload pruning cannot reclaim the 21 MB heap, the 27 MB
+    // across 19 indexes, or the 37 MB of cascaded `module_execution_logs`.
+    //
+    // WHY IT IS A SECOND FLAG RATHER THAN A WIDER MEANING FOR THE FIRST: the
+    // payload sweep leaves a `payload_pruned_at` tombstone, so a later reader
+    // can tell that data was removed and when. Deleting the row leaves nothing
+    // — a deleted execution and one that never ran are the same absence. An
+    // operator who opted into the smaller, self-documenting loss must not
+    // silently receive the larger, silent one.
+    //
+    // WHY IT IS OFF BY DEFAULT: it inherits the payload sweep's precondition
+    // unchanged (see `talos_config::module_execution_retention_enabled`) —
+    // a strictly larger irreversible deletion cannot carry a weaker
+    // precondition than the smaller one. The off-host backup chain must be
+    // proven end-to-end first.
+    //
+    // The flag and the window are read ONCE here rather than per tick, matching
+    // both sweeps above: a mid-process env mutation must not make a destructive
+    // sweep blink on and off. Operators re-deploy to change them.
+    if talos_config::module_execution_retention_enabled() {
+        let row_retention_service = module_execution_service.clone();
+        let row_retention_days = talos_config::module_execution_retention_days();
+        // Deliberately shares MODULE_PAYLOAD_RETENTION_CORPUS_KEEP rather than
+        // introducing a fourth knob. The corpus it protects is the same corpus,
+        // defined by the same two readers and the same REPLAY_REACH floor; two
+        // independently-settable values for one fact is how they drift apart.
+        let row_corpus_keep = talos_config::module_payload_retention_corpus_keep();
+        let row_batch = talos_config::module_execution_retention_batch();
+        let row_retention_shutdown = bg_shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut shutdown = row_retention_shutdown;
+            // Same 6-hour cadence as the parent-row retention DELETE this is
+            // closing the gap behind. Nothing about it is urgent; a slower tick
+            // just means the next one does more.
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        match row_retention_service
+                            .delete_expired_executions(
+                                row_retention_days,
+                                row_corpus_keep,
+                                row_batch,
+                            )
+                            .await
+                        {
+                            // WARN, not INFO: this is an irreversible deletion
+                            // of execution history. An operator scanning logs at
+                            // the default level should see that it happened and
+                            // how much it took, without having to know the sweep
+                            // exists. The payload sweep logs at INFO because its
+                            // effect is queryable after the fact via
+                            // `payload_pruned_at`; this one leaves nothing to
+                            // query, so the log line is the record.
+                            Ok(stats) if stats.deleted_rows > 0 => tracing::warn!(
+                                deleted_rows = stats.deleted_rows,
+                                batches = stats.batches,
+                                retained_parent_alive = ?stats.retained_parent_alive,
+                                retention_days = row_retention_days,
+                                corpus_keep = row_corpus_keep,
+                                "module-execution row retention: DELETED old parentless \
+                                 executions and their cascaded logs"
+                            ),
+                            Ok(_) => {}
+                            Err(e) => tracing::error!(
+                                "module-execution row retention sweep failed: {}", e
+                            ),
+                        }
+                    }
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            tracing::info!(
+                                "Module-execution row retention loop received shutdown signal"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        tracing::warn!(
+            retention_days = row_retention_days,
+            corpus_keep = row_corpus_keep,
+            batch = row_batch,
+            "Module-execution ROW retention sweep ENABLED (every 6 hours). This DELETEs \
+             execution rows and their logs — IRREVERSIBLE, with no tombstone. Confirm the \
+             off-host backup chain is proven before leaving this on."
+        );
+    } else {
+        tracing::info!(
+            "Module-execution row retention sweep disabled (MODULE_EXECUTION_RETENTION_ENABLED \
+             unset). module_executions rows are retained indefinitely, including those whose \
+             parent workflow execution has already been deleted."
+        );
+    }
+
     // ---------- Crash recovery: resume checkpointed executions ----------
     // RFC 0003 (durable execution). On a controller restart, executions that
     // were mid-flight are wedged in `running` — their in-process engine task

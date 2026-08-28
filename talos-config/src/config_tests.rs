@@ -920,4 +920,70 @@ mod tests {
             env::remove_var(v);
         }
     }
+
+    /// The ROW-retention sweep is a DELETE with no tombstone. Every one of its
+    /// three knobs must fail safe, and "safe" here means *smaller or nothing*.
+    ///
+    /// The `=0`/negative cases are the destructive ones: `MODULE_EXECUTION_
+    /// RETENTION_DAYS=0` makes the age belt `created_at < NOW()`, which selects
+    /// every terminal parentless row on the first sweep, and a negative value
+    /// reaches into future-dated rows as well. Same MCP-1063 family as
+    /// `EXECUTION_RETENTION_DAYS`.
+    #[test]
+    fn module_execution_retention_knobs_fail_safe() {
+        let _g = env_lock();
+        for v in [
+            "MODULE_EXECUTION_RETENTION_ENABLED",
+            "MODULE_EXECUTION_RETENTION_DAYS",
+            "MODULE_EXECUTION_RETENTION_BATCH",
+            "EXECUTION_RETENTION_DAYS",
+        ] {
+            env::remove_var(v);
+        }
+
+        // Default OFF. This is the requirement that a first deploy deletes
+        // nothing without an operator explicitly opting in.
+        assert!(!crate::module_execution_retention_enabled());
+        env::set_var("MODULE_EXECUTION_RETENTION_ENABLED", "nonsense");
+        assert!(
+            !crate::module_execution_retention_enabled(),
+            "an unrecognised token must not enable an irreversible DELETE"
+        );
+        env::set_var("MODULE_EXECUTION_RETENTION_ENABLED", "true");
+        assert!(crate::module_execution_retention_enabled());
+        env::remove_var("MODULE_EXECUTION_RETENTION_ENABLED");
+
+        // Days: parity with the parent sweep by default, destructive values
+        // collapse to it.
+        assert_eq!(
+            crate::module_execution_retention_days(),
+            crate::execution_retention_days(),
+            "retention PARITY with the parent workflow_executions sweep"
+        );
+        for bad in ["0", "-1", "not-a-number"] {
+            env::set_var("MODULE_EXECUTION_RETENTION_DAYS", bad);
+            assert_eq!(
+                crate::module_execution_retention_days(),
+                30,
+                "MODULE_EXECUTION_RETENTION_DAYS={bad} must collapse to the default"
+            );
+        }
+        env::set_var("MODULE_EXECUTION_RETENTION_DAYS", "90");
+        assert_eq!(crate::module_execution_retention_days(), 90);
+        env::remove_var("MODULE_EXECUTION_RETENTION_DAYS");
+
+        // Batch: clamped both ends so one tick's lock-hold stays bounded.
+        assert_eq!(crate::module_execution_retention_batch(), 5000);
+        env::set_var("MODULE_EXECUTION_RETENTION_BATCH", "0");
+        assert_eq!(crate::module_execution_retention_batch(), 5000);
+        env::set_var("MODULE_EXECUTION_RETENTION_BATCH", "999999");
+        assert_eq!(
+            crate::module_execution_retention_batch(),
+            20_000,
+            "clamped so a single batch cannot take an unbounded lock"
+        );
+        env::set_var("MODULE_EXECUTION_RETENTION_BATCH", "250");
+        assert_eq!(crate::module_execution_retention_batch(), 250);
+        env::remove_var("MODULE_EXECUTION_RETENTION_BATCH");
+    }
 }
