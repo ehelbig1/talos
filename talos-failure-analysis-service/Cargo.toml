@@ -9,13 +9,17 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
 thiserror.workspace = true
 tracing.workspace = true
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # Talos crates — repositories
 talos-execution-repository = { path = "../talos-execution-repository" }
+
+# Node-identity derivation. `build_node_display_label_map` keys on the SAME
+# UUID the executor writes into `execution_events.node_id`; a private copy of
+# that arithmetic that drifts joins zero rows in silence.
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 
 # Talos crates — shared types (graph timeout-cap validator for the
 # apply_fix write path — MCP-1227 chokepoint parity)

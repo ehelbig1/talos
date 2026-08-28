@@ -722,6 +722,11 @@ impl talos_oauth::OAuthIntegration for GoogleCalendarService {
         // instead of duplicating. No longer an oauth_accounts FK (migration
         // 20260708210000) — it's purely the per-account vault-key segment.
         let oauth_account_id = {
+            // allow-adhoc-node-uuid: derives from Google's ACCOUNT id, not a
+            // graph node id. Same shape, different contract — the value backs
+            // UNIQUE(user_id, oauth_account_id) and the per-account vault-key
+            // segment, which must stay stable independently of the workflow
+            // engine's node-id mapping.
             use sha2::{Digest, Sha256};
             let digest = Sha256::digest(userinfo.id.as_bytes());
             let mut bytes = [0u8; 16];

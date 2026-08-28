@@ -482,10 +482,16 @@ pub fn extract_secret_name_from_auth_error(msg: &str) -> Option<String> {
     None
 }
 
-/// Build a `SHA256-derived-UUID → display label` map from a workflow's
-/// `graph_json`. `execution_events.node_id` is a SHA256-derived UUID
-/// (graph nodes use string ids like `"node-1"`); the label resolved via
-/// `node.data.label` is the safe bridge back to human-readable names.
+/// Build an `engine node UUID → display label` map from a workflow's
+/// `graph_json`. `execution_events.node_id` carries the value
+/// [`talos_workflow_engine_core::engine_node_uuid`] derives from the graph's
+/// string node id (`"node-1"`); the label resolved via `node.data.label` is
+/// the safe bridge back to human-readable names.
+///
+/// The derivation is NOT re-implemented here. A private copy that drifts from
+/// the executor's does not fail loudly — the map keys stop matching any
+/// `node_id` on disk, every lookup falls through to the raw UUID, and the
+/// surface reads as "this node has no label" rather than "the mapping broke".
 pub fn build_node_display_label_map(
     graph_str: Option<String>,
 ) -> std::collections::HashMap<Uuid, String> {
@@ -495,13 +501,7 @@ pub fn build_node_display_label_map(
             if let Some(nodes) = graph.get("nodes").and_then(|n| n.as_array()) {
                 for node in nodes {
                     if let Some(rf_id) = node.get("id").and_then(|v| v.as_str()) {
-                        let node_uuid = Uuid::parse_str(rf_id).unwrap_or_else(|_| {
-                            use sha2::{Digest, Sha256};
-                            let hash = Sha256::digest(rf_id.as_bytes());
-                            let mut bytes = [0u8; 16];
-                            bytes.copy_from_slice(&hash[..16]);
-                            Uuid::from_bytes(bytes)
-                        });
+                        let node_uuid = talos_workflow_engine_core::engine_node_uuid(rf_id);
                         let label = node
                             .get("data")
                             .and_then(|d| d.get("label"))
@@ -1211,20 +1211,47 @@ mod tests {
         assert!(map.values().any(|v| v == "node-2"));
     }
 
+    /// Pinned against `(graph_json node id, execution_events.node_id)` pairs
+    /// read out of a LIVE events table (2026-08-28) — NOT against a
+    /// test-local re-derivation, which would pass even if both the map and
+    /// the copy drifted together. If this map ever stops keying on what the
+    /// executor actually wrote, every label lookup in the failure analyser
+    /// silently degrades to a raw UUID instead of erroring.
     #[test]
-    fn label_map_sha256_derivation_matches_engine() {
-        // "node-1" is not a UUID → SHA256-derived UUID from its bytes.
-        use sha2::{Digest, Sha256};
-        let hash = Sha256::digest("node-1".as_bytes());
-        let mut bytes = [0u8; 16];
-        bytes.copy_from_slice(&hash[..16]);
-        let expected = Uuid::from_bytes(bytes);
+    fn label_map_keys_match_ids_observed_in_the_events_table() {
+        for (graph_id, observed) in [
+            ("fetch", "e7d3799e-cc09-f5cb-c446-aa0a79bb1fb9"),
+            ("send", "27ce1d1b-f427-0020-e179-9f12e647f5cb"),
+            ("verify_extract", "49aabc38-d51d-b8eb-b360-1ba13d54f45c"),
+        ] {
+            let graph = serde_json::json!({
+                "nodes": [{ "id": graph_id, "data": { "label": "L" } }],
+                "edges": []
+            });
+            let map = build_node_display_label_map(Some(graph.to_string()));
+            let expected: Uuid = observed.parse().expect("pinned id parses");
+            assert_eq!(
+                map.get(&expected).map(String::as_str),
+                Some("L"),
+                "label map no longer keys on the node_id the executor wrote for \
+                 graph node '{graph_id}' — label lookups will fall through to raw UUIDs"
+            );
+        }
+    }
 
+    /// A UUID-shaped graph node id is adopted verbatim, not hashed. No live
+    /// workflow currently uses one (checked against the events table
+    /// 2026-08-28), so this arm is pinned synthetically via the canonical
+    /// function rather than against observed data.
+    #[test]
+    fn label_map_passes_uuid_shaped_ids_through_unhashed() {
+        let explicit = "0f5f4a2c-1c3e-4a7d-9b2f-0c1d2e3f4a5b";
         let graph = serde_json::json!({
-            "nodes": [{ "id": "node-1", "data": { "label": "L" } }],
+            "nodes": [{ "id": explicit, "data": { "label": "L" } }],
             "edges": []
         });
         let map = build_node_display_label_map(Some(graph.to_string()));
+        let expected: Uuid = explicit.parse().expect("explicit id parses");
         assert_eq!(map.get(&expected).map(String::as_str), Some("L"));
     }
 

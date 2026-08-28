@@ -556,8 +556,11 @@ pub async fn dispatch(
 }
 
 /// Build a HashMap from node UUID → node id string (label) using the graph_json.
-/// The engine stores SHA256-derived UUIDs in execution_events.node_id.
-/// This helper reproduces the same derivation so events can show human-readable names.
+/// The engine stores [`talos_workflow_engine_core::engine_node_uuid`] values in
+/// `execution_events.node_id`; this helper keys on the SAME function rather
+/// than a private copy of its arithmetic — a drifted copy would key the map on
+/// UUIDs no row carries, and every lookup would fall through to the raw UUID
+/// with no error anywhere.
 fn build_node_label_map(
     graph_str: Option<String>,
 ) -> std::collections::HashMap<uuid::Uuid, String> {
@@ -567,13 +570,7 @@ fn build_node_label_map(
             if let Some(nodes) = graph.get("nodes").and_then(|n| n.as_array()) {
                 for node in nodes {
                     if let Some(rf_id) = node.get("id").and_then(|v| v.as_str()) {
-                        let node_uuid = uuid::Uuid::parse_str(rf_id).unwrap_or_else(|_| {
-                            use sha2::{Digest, Sha256};
-                            let hash = Sha256::digest(rf_id.as_bytes());
-                            let mut bytes = [0u8; 16];
-                            bytes.copy_from_slice(&hash[..16]);
-                            uuid::Uuid::from_bytes(bytes)
-                        });
+                        let node_uuid = talos_workflow_engine_core::engine_node_uuid(rf_id);
                         map.insert(node_uuid, rf_id.to_string());
                     }
                 }
@@ -3124,10 +3121,9 @@ async fn handle_watch_execution(
     // Build a per-node config map for error context, with credential fields redacted.
     // Build a per-node config map for error context, with credential fields redacted.
     // Node IDs in graph JSON are arbitrary strings (React Flow IDs like "node_1") — the
-    // engine derives execution_events.node_id via SHA256, so we must apply the same
-    // derivation to match events to graph nodes.
+    // engine derives execution_events.node_id via `engine_node_uuid`, so the map must
+    // key on that same function to match events to graph nodes.
     let node_config_map: std::collections::HashMap<uuid::Uuid, serde_json::Value> = {
-        use sha2::{Digest, Sha256};
         graph_json_opt
             .as_deref()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
@@ -3136,13 +3132,8 @@ async fn handle_watch_execution(
             .iter()
             .filter_map(|node| {
                 let id_str = node.get("id").and_then(|v| v.as_str())?;
-                // Mirror the UUID derivation used by the execution engine.
-                let node_uuid = uuid::Uuid::parse_str(id_str).unwrap_or_else(|_| {
-                    let hash = Sha256::digest(id_str.as_bytes());
-                    let mut bytes = [0u8; 16];
-                    bytes.copy_from_slice(&hash[..16]);
-                    uuid::Uuid::from_bytes(bytes)
-                });
+                // The UUID derivation used by the execution engine — the one copy.
+                let node_uuid = talos_workflow_engine_core::engine_node_uuid(id_str);
                 let data = node.get("data").cloned().unwrap_or(serde_json::json!({}));
                 let cfg = data.get("config").cloned().unwrap_or_else(|| data.clone());
                 let redacted = if let Some(obj) = cfg.as_object() {
@@ -4048,18 +4039,13 @@ async fn handle_get_node_execution_history(
     )
 }
 
-/// Engine encoding of `node_id` in `execution_events`: SHA-256 of the
-/// rf_id's first 16 bytes, OR the rf_id verbatim when it parses as a
-/// UUID. Mirrors `talos_workflow_engine::engine::build_graph_from_json`.
+/// Engine encoding of `node_id` in `execution_events`, via the one function
+/// that owns the mapping ([`talos_workflow_engine_core::engine_node_uuid`]):
+/// the rf_id verbatim when it parses as a UUID, otherwise the first 16 bytes
+/// of `SHA-256(rf_id)`. Kept as a named local alias because three call sites
+/// read better with the intent spelled out.
 fn compute_node_uuid_from_rf_id(rf_id: &str) -> uuid::Uuid {
-    if let Ok(u) = rf_id.parse::<uuid::Uuid>() {
-        return u;
-    }
-    use sha2::{Digest, Sha256};
-    let hash = Sha256::digest(rf_id.as_bytes());
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&hash[..16]);
-    uuid::Uuid::from_bytes(bytes)
+    talos_workflow_engine_core::engine_node_uuid(rf_id)
 }
 
 /// Look up an rf_id in the workflow graph from a user-supplied label
@@ -5975,16 +5961,9 @@ async fn handle_get_node_io(
         .iter()
         .find(|(_, label)| label.as_str() == node_id_str)
         .map(|(uuid, _)| *uuid)
-        .unwrap_or_else(|| {
-            // Fall back: try parsing as UUID directly, or SHA256-derive it
-            node_id_str.parse::<Uuid>().unwrap_or_else(|_| {
-                use sha2::{Digest, Sha256};
-                let hash = Sha256::digest(node_id_str.as_bytes());
-                let mut bytes = [0u8; 16];
-                bytes.copy_from_slice(&hash[..16]);
-                Uuid::from_bytes(bytes)
-            })
-        });
+        // Fall back to the engine's own graph-id → node_id mapping, so a
+        // caller passing the rf_id (rather than a label) still resolves.
+        .unwrap_or_else(|| talos_workflow_engine_core::engine_node_uuid(node_id_str));
 
     // Query execution_events for node_input event
     let node_input = match state

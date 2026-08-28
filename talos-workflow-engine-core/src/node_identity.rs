@@ -96,6 +96,18 @@ mod tests {
             ("brief", "29a8825b-d242-f143-86ee-528d76e0e8f1"),
             ("compose", "db669af6-34b7-5c7f-2984-00f3b6c2aa8b"),
             ("prep_judge", "08d5dfbc-f68f-94c6-e73c-20c3b5c053df"),
+            // Re-measured 2026-08-28 when the READER copies of this
+            // derivation were folded into this function. These seven are the
+            // highest-event-count graph ids in the live table (27k, 21k, 13k,
+            // 13k, 13k, 6.8k, 1.7k events respectively), i.e. the joins that
+            // would go silently empty first if the arithmetic ever moved.
+            ("fetch", "e7d3799e-cc09-f5cb-c446-aa0a79bb1fb9"),
+            ("send", "27ce1d1b-f427-0020-e179-9f12e647f5cb"),
+            ("verify_extract", "49aabc38-d51d-b8eb-b360-1ba13d54f45c"),
+            ("thread_load", "d2c92efc-ac1a-c09c-aa75-24ba0db5f35a"),
+            ("compose_reply", "581c25ca-08fb-69f6-3db6-ccbbf9c47c66"),
+            ("ops_digest", "8df29c3b-d313-3be7-d86c-411befdbc31a"),
+            ("classify_severity", "36003222-516e-712b-1a64-03af22644105"),
         ] {
             assert_eq!(
                 engine_node_uuid(graph_id).to_string(),
@@ -108,6 +120,10 @@ mod tests {
 
     /// A UUID-shaped id is adopted verbatim, NOT hashed. Authors who paste a
     /// UUID as the node id get that UUID in the events table.
+    /// NOTE: no live workflow currently uses a UUID-shaped graph node id
+    /// (checked against the events table 2026-08-28), so unlike the hashed
+    /// arm above this one CANNOT be pinned against observed data. It is a
+    /// synthetic assertion on the parse fast path.
     #[test]
     fn uuid_shaped_ids_pass_through_unhashed() {
         let explicit = "0f5f4a2c-1c3e-4a7d-9b2f-0c1d2e3f4a5b";

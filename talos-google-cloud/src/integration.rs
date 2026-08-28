@@ -548,6 +548,11 @@ impl talos_oauth::OAuthIntegration for GoogleCloudIntegrationService {
 /// account id: `Uuid::from_bytes(Sha256(google_account_id)[..16])`.
 /// Same algorithm gcal uses for its `oauth_account_id`.
 pub fn derive_provider_key(google_account_id: &str) -> Uuid {
+    // allow-adhoc-node-uuid: this is the GOOGLE-ACCOUNT-id derivation, not the
+    // graph-node-id one. It shares the arithmetic by coincidence, keys a
+    // different column (`provider_key`), and must stay pinned to Google's
+    // account id — routing it through `engine_node_uuid` would tie an OAuth
+    // identity to the workflow engine's wire contract.
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(google_account_id.as_bytes());
     let mut bytes = [0u8; 16];
@@ -823,6 +828,8 @@ mod tests {
     fn provider_key_matches_gcal_algorithm() {
         // Independent reimplementation of the gcal derivation (lib.rs:724-730):
         // Uuid::from_bytes(Sha256(id)[..16]). Must match byte-for-byte.
+        // allow-adhoc-node-uuid: pins derive_provider_key (account-id
+        // derivation), which is deliberately independent of engine_node_uuid.
         use sha2::{Digest, Sha256};
         let id = "108234567890123456789";
         let digest = Sha256::digest(id.as_bytes());
