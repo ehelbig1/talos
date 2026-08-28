@@ -6218,6 +6218,90 @@ else
 fi
 echo
 
+# ── 71. the graph-node-id → UUID mapping has exactly one implementation ──
+# `execution_events.node_id` does NOT carry the graph's string node id — it
+# carries what `talos_workflow_engine_core::engine_node_uuid` derives from it
+# (the id verbatim if it parses as a UUID, else the first 16 bytes of
+# SHA-256(id) as raw UUID bytes — deliberately NOT Uuid::new_v5, which would
+# rewrite the version/variant nibbles and orphan every row already on disk).
+#
+# #693 made that function the single writer but left the READERS forking the
+# arithmetic: 7 private copies across talos-mcp-handlers (executions.rs ×4,
+# analytics.rs ×2) and talos-failure-analysis-service, plus a test that pinned
+# the map against its OWN re-derivation instead of against observed rows.
+#
+# The failure mode is what makes this worth a lint rather than a style note.
+# A drifted copy does not error, does not panic, and does not log: its join
+# key stops matching any row, the query returns zero rows, and every surface
+# built on it — the node failure breakdown, the execution trace, the failure
+# analyser's label resolution — renders that as "no problems found". A
+# confidently wrong answer, from a one-character difference, in code that
+# still compiles. The producer end has been guarded since #693; this guards
+# the reading end.
+#
+# DETECTION (shape, not string): a `Uuid::from_bytes|from_slice|from_bytes_le|
+# from_u128` construction with a `Sha256::digest` in the 8 lines above it.
+# That window is the whole idiom — digest → [0u8;16] → copy_from_slice →
+# from_bytes is four lines — so it fires on a reformatted or renamed copy, not
+# just on a verbatim one. The canonical home (node_identity.rs) is the only
+# unconditional exemption.
+#
+# STATED LIMITS (each confirmed by running the check, not inferred):
+#  (a) TEXTUAL and window-bounded. A copy that spreads the digest and the
+#      construction more than 8 lines apart, or that hands the bytes through
+#      a helper function, is invisible.
+#  (b) It cannot tell a node-id derivation from any OTHER Sha256→UUID of the
+#      same shape. Two exist and are deliberately independent — gcal's
+#      `oauth_account_id` and talos-google-cloud's `derive_provider_key`, both
+#      keyed on Google's immutable ACCOUNT id. They carry the opt-out.
+#  (c) Tests are NOT exempt. A test that re-derives the expected value locally
+#      passes even when the production copy and the test drift together, which
+#      is exactly what talos-failure-analysis-service's pin did; the fix is to
+#      pin against ids read out of a live events table.
+#  (d) The three token-hash sites in mcp-handlers/auth.rs and the two WASM
+#      content-hash sites (modules.rs, sandbox.rs) format their digest as hex
+#      and never construct a Uuid, so they are out of range by shape and need
+#      no opt-out.
+# Opt-out: `// allow-adhoc-node-uuid: <reason>` within 12 lines above the
+# construction (wider than the 8-line detection window on purpose — a
+# permanent exemption deserves a paragraph of rationale, and the marker can
+# only ever silence a site that carries it).
+bold "▶ check 71: graph-node-id → UUID derivation must route through engine_node_uuid"
+NODEUUID_HOME="talos-workflow-engine-core/src/node_identity.rs"
+NODEUUID_VIOLATIONS=0
+while IFS= read -r hit; do
+    [ -z "$hit" ] && continue
+    file="${hit%%:*}"
+    rest="${hit#*:}"
+    lineno="${rest%%:*}"
+    [ "$file" = "$NODEUUID_HOME" ] && continue
+    start=$(( lineno > 8 ? lineno - 8 : 1 ))
+    sed -n "${start},${lineno}p" "$ROOT/$file" 2>/dev/null \
+        | grep -qE 'Sha256::digest' || continue
+    mstart=$(( lineno > 12 ? lineno - 12 : 1 ))
+    if sed -n "${mstart},${lineno}p" "$ROOT/$file" 2>/dev/null \
+            | grep -q 'allow-adhoc-node-uuid'; then
+        continue
+    fi
+    red "✗ ${file}:${lineno}: private SHA-256 → UUID derivation"
+    NODEUUID_VIOLATIONS=$((NODEUUID_VIOLATIONS + 1))
+done < <(cd "$ROOT" && grep -rnE '\bUuid::(from_bytes|from_slice|from_bytes_le|from_u128)\s*\(' \
+            --include='*.rs' --exclude-dir=target --exclude-dir=vendor . 2>/dev/null \
+         | sed 's|^\./||' | grep -v '^target/' || true)
+
+if [ "$NODEUUID_VIOLATIONS" -gt 0 ]; then
+    red "✗ ${NODEUUID_VIOLATIONS} private copy(ies) of a SHA-256 → UUID derivation"
+    yellow "  → if this maps a GRAPH NODE ID, call talos_workflow_engine_core::engine_node_uuid()."
+    yellow "    A private copy that drifts from the executor's does not fail loudly — its join"
+    yellow "    matches zero rows, and zero rows reads as 'no problems found'."
+    yellow "  → if it derives something else entirely (an account id, a content hash), mark it"
+    yellow "    '// allow-adhoc-node-uuid: <reason>' within 12 lines above the construction."
+    EXIT_CODE=1
+else
+    green "✓ graph-node-id → UUID derivation has one implementation"
+fi
+echo
+
 # ── 54. Lint self-consistency (meta-check) ────────────────────────────
 # The system whose purpose is catching drift drifted from its own docs:
 # by 2026-07-01 the script had 49 checks while CLAUDE.md said 43 and the

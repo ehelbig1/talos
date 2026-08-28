@@ -2535,13 +2535,7 @@ async fn handle_get_error_report(
             if let Some(nodes) = graph.get("nodes").and_then(|n| n.as_array()) {
                 for node in nodes {
                     if let Some(node_id_str) = node.get("id").and_then(|v| v.as_str()) {
-                        let node_uuid = uuid::Uuid::parse_str(node_id_str).unwrap_or_else(|_| {
-                            use sha2::{Digest, Sha256};
-                            let hash = Sha256::digest(node_id_str.as_bytes());
-                            let mut bytes = [0u8; 16];
-                            bytes.copy_from_slice(&hash[..16]);
-                            uuid::Uuid::from_bytes(bytes)
-                        });
+                        let node_uuid = talos_workflow_engine_core::engine_node_uuid(node_id_str);
                         let label = node
                             .get("data")
                             .and_then(|d| d.get("label"))
@@ -3531,20 +3525,17 @@ async fn handle_get_node_failure_breakdown(
         }
     };
 
-    // Build UUID -> label mapping using SHA-256 derivation (same as engine)
+    // Build UUID -> label mapping via `engine_node_uuid` — the SAME function the
+    // executor used to write these `execution_events.node_id` values. A private
+    // copy of the arithmetic that drifts keys the map on UUIDs no row carries,
+    // and every label falls back to the raw UUID with no error.
     let mut uuid_to_label: std::collections::HashMap<uuid::Uuid, String> =
         std::collections::HashMap::new();
     if let Ok(graph) = serde_json::from_str::<serde_json::Value>(&graph_json_str) {
         if let Some(nodes) = graph.get("nodes").and_then(|n| n.as_array()) {
             for node in nodes {
                 if let Some(node_id_str) = node.get("id").and_then(|v| v.as_str()) {
-                    let node_uuid = uuid::Uuid::parse_str(node_id_str).unwrap_or_else(|_| {
-                        use sha2::{Digest, Sha256};
-                        let hash = Sha256::digest(node_id_str.as_bytes());
-                        let mut bytes = [0u8; 16];
-                        bytes.copy_from_slice(&hash[..16]);
-                        uuid::Uuid::from_bytes(bytes)
-                    });
+                    let node_uuid = talos_workflow_engine_core::engine_node_uuid(node_id_str);
                     let label = node
                         .get("data")
                         .and_then(|d| d.get("label"))
