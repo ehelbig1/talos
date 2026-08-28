@@ -3903,6 +3903,23 @@ async fn handle_validate_workflow(
         .map(|i| i.message.clone())
         .collect();
     let valid = validation.valid;
+    // History coverage travels with the verdict. `valid: true, issues: []` is
+    // ambiguous on its own — it reads as "this workflow is fine" whether
+    // history was examined and found clean, was empty, or could not be read.
+    // Rendering the coverage next to the verdict is what makes the empty case
+    // legible rather than reassuring.
+    let history_note = validation.history.note();
+    let history_consulted = validation.history.consulted();
+    let (history_executions, history_window_days) = match &validation.history {
+        talos_workflow_validation::HistoryCoverage::Observed {
+            executions,
+            window_days,
+        } => (Some(*executions), Some(*window_days)),
+        talos_workflow_validation::HistoryCoverage::Empty { window_days } => {
+            (Some(0), Some(*window_days))
+        }
+        talos_workflow_validation::HistoryCoverage::Unavailable => (None, None),
+    };
 
     // Re-fetch graph for readiness score computation (lightweight — single row)
     let graph_json_str = match state.workflow_repo.get_workflow_graph(wf_id, user_id).await {
@@ -4216,6 +4233,12 @@ async fn handle_validate_workflow(
         "issues": issues,
         "warnings": warnings,
         "top_improvements": improvement_actions,
+        "history_coverage": {
+            "consulted": history_consulted,
+            "executions_scanned": history_executions,
+            "window_days": history_window_days,
+            "note": history_note,
+        },
     });
     // #661: say which happened. Absent this field the caller cannot tell a
     // genuinely low score from a score computed on inputs that failed to load.
