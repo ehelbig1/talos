@@ -1109,6 +1109,87 @@ pub fn module_payload_retention_batch() -> i64 {
     positive_env_or_default::<i64>("MODULE_PAYLOAD_RETENTION_BATCH", 5000).clamp(1, 20_000)
 }
 
+/// Is the opt-in `module_executions` ROW-retention sweep enabled?
+/// Default: **false**, and it is strictly more destructive than the payload
+/// sweep above, so it inherits that sweep's precondition unchanged.
+///
+/// # What this deletes, and when
+///
+/// When enabled, a 6-hourly sweep DELETEs whole `module_executions` rows that
+/// are simultaneously: terminal-status, older than
+/// [`module_execution_retention_days`], and outside the
+/// [`module_payload_retention_corpus_keep`] most-recent `completed` rows of
+/// their `(module_id, user_id)`. Each deleted row CASCADEs its
+/// `module_execution_logs` children (`node_execution_logs_execution_id_fkey`,
+/// `ON DELETE CASCADE`). Nothing else in the schema references
+/// `module_executions`.
+///
+/// # Why it is a separate flag from the payload sweep
+///
+/// The payload sweep clears two BYTEA columns and leaves the row — its status,
+/// duration, fuel and error text stay readable, and the `payload_pruned_at`
+/// tombstone says what happened. This sweep removes the row itself, so there
+/// is no tombstone and no reader can tell a deleted execution from one that
+/// never ran. That is a strictly larger loss, and folding it under
+/// `MODULE_PAYLOAD_RETENTION_ENABLED` would let an operator who opted into the
+/// smaller one silently get the larger.
+///
+/// # Why it exists at all when the payload sweep already frees the space
+///
+/// Measured on the dev fleet 2026-08-28, `module_executions` is 133 MB:
+/// 85 MB TOAST (payload — what the payload sweep reclaims), plus 21 MB heap
+/// and 27 MB of indexes across 19 indexes that the payload sweep cannot touch,
+/// plus 37 MB of `module_execution_logs` that only a row DELETE reclaims.
+/// Payload pruning bounds BYTES; only row deletion bounds ROW COUNT, and row
+/// count is what grows without limit (36,942 rows, of which 9,104 already
+/// point at a `workflow_executions` parent that was deleted 30 days ago).
+///
+/// **Stated precondition for turning this on** (unchanged from the payload
+/// sweep, because a strictly larger irreversible deletion cannot have a weaker
+/// one): the off-host backup chain must be proven end-to-end first. As of
+/// 2026-08-13 the daily `pg_dump`s live on the same disk they insure and the
+/// restore drill sources the KEK from the live container rather than from
+/// escrow. Enable it after that is closed, not before.
+pub fn module_execution_retention_enabled() -> bool {
+    bool_env_or_default("MODULE_EXECUTION_RETENTION_ENABLED", false)
+}
+
+/// Age floor (DAYS) for the `module_executions` ROW-retention sweep.
+/// Default: the same value as [`execution_retention_days`] (30) — retention
+/// PARITY with the parent row, not an independent judgement. 30 days is
+/// already the age at which this platform DELETEs the owning
+/// `workflow_executions` row and CASCADEs `execution_events` with it, so a
+/// `module_executions` row older than that has, on the dev fleet, a 100%
+/// chance of being orphaned: of the 9,018 rows older than 30 days, 9,018 have
+/// no surviving parent (measured 2026-08-28).
+///
+/// Routed through `positive_env_or_default` for the same reason its two
+/// siblings are: `=0` would make the predicate `created_at < NOW()`, deleting
+/// every terminal row on the first sweep, and a negative value would delete
+/// future-dated rows too. Same `=0`/negative footgun family as MCP-1063. The
+/// consumer refuses a non-positive value a second time at the function
+/// boundary — defense in depth, matching `prune_terminal_payloads`.
+pub fn module_execution_retention_days() -> i32 {
+    positive_env_or_default::<i32>(
+        "MODULE_EXECUTION_RETENTION_DAYS",
+        execution_retention_days(),
+    )
+}
+
+/// Maximum rows one ROW-retention batch may DELETE. Default: 5000, matching
+/// both the `workflow_executions` retention DELETE and the payload sweep so
+/// all three have the same lock-hold profile.
+///
+/// A batch is larger than it looks: each deleted row CASCADEs its
+/// `module_execution_logs` children. Measured on the dev fleet 2026-08-28
+/// that is 2.33 log rows per execution on average (p99 = 4, max = 44), so a
+/// 5000-row batch is ~16,650 row deletions in total, not 5000. The cascade is
+/// index-supported (`idx_module_execution_logs_execution_id`), so it is an
+/// index lookup per parent rather than a sequential scan.
+pub fn module_execution_retention_batch() -> i64 {
+    positive_env_or_default::<i64>("MODULE_EXECUTION_RETENTION_BATCH", 5000).clamp(1, 20_000)
+}
+
 /// Maximum number of workflow execution rows to keep. Default: 100000.
 ///
 /// MCP-1063 (2026-05-15): same `positive_env_or_default` routing as

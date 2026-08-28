@@ -303,6 +303,15 @@ TC_TESTS=(
     # would silently empty). Nulling an AEAD payload is irreversible, so these
     # are the only guards there are.
     "module_payload_retention_tests"
+    # ── Module-execution ROW retention sweep (added 2026-08-28) ─────────────
+    # The strictly-more-destructive sibling of the sweep above: it DELETEs rows
+    # and CASCADEs their `module_execution_logs` children, leaving NO tombstone
+    # — so unlike the payload sweep there is nothing queryable after the fact to
+    # tell a deleted execution from one that never ran. Proves what it refuses
+    # to touch: non-terminal rows, rows whose parent workflow execution is still
+    # alive, and the completed replay corpus of a rarely-run module (whose
+    # oldest rows ARE its whole corpus).
+    "module_execution_retention_tests"
 )
 for tctest in "${TC_TESTS[@]}"; do
     echo
