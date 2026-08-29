@@ -59,6 +59,22 @@ fi
 # (names, employers, clients, personal emails, tenant ids). Absent file =
 # check skipped, so public contributors are unaffected. Shared across git
 # worktrees via git-common-dir.
+#
+# SCOPE IS STAGED-ONLY, AND THAT IS DELIBERATE — but it is only half the
+# coverage. A staged diff cannot see a marker that landed before this hook
+# existed, or before its term joined the list: such a line is never staged
+# again, so this check is structurally incapable of finding it. Three such
+# markers were sitting on main when that gap was measured. The other half is
+# structural-lint **check 72**, which scans the whole TRACKED TREE and runs at
+# pre-push (via `make lint`).
+#
+# The split is on purpose, not on cost — the full-tree scan measures 0.07s, so
+# it would be affordable here. The reason to keep it out is signal: a
+# pre-commit failure should be about YOUR change. A whole-tree inventory check
+# in the commit path blocks every commit on pre-existing state that the commit
+# has nothing to do with, which is precisely the shape that trains people to
+# reach for `--no-verify`. Whole-tree invariants belong where every other
+# structural check already lives.
 MARKER_FILE="$(git rev-parse --git-common-dir)/info/personal-markers"
 if [ -f "$MARKER_FILE" ]; then
     MARKER_PATTERNS=$(grep -v '^\s*#' "$MARKER_FILE" | grep -v '^\s*$' || true)

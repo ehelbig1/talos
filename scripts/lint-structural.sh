@@ -6302,6 +6302,141 @@ else
 fi
 echo
 
+# ── 72. Personal-information markers anywhere in the TRACKED TREE ─────
+# The pre-commit hook (`.githooks/pre-commit` §4) scans `git diff --cached
+# -U0 | grep '^+'` — STAGED ADDED LINES ONLY. That is the right shape for a
+# commit-time gate ("don't let me add this"), but it has a permanent blind
+# spot: anything that landed BEFORE the hook existed, or before a term was
+# added to the marker list, is never staged again and so is never re-examined.
+# It sits in a PUBLIC repo indefinitely, and the tool built to catch it is
+# structurally incapable of seeing it.
+#
+# That blind spot was not theoretical. Two markers were live on main across
+# three files when this check was written (#697 removed a third, found by
+# accident during unrelated work — one per session, which is not a discovery
+# mechanism). This check closes it by scanning the whole tracked tree instead
+# of a diff.
+#
+# WHY THIS IS A LOCAL LINT AND NOT A CI CHECK. The marker list is
+# operator-local and uncommittable BY CONSTRUCTION — it *contains* the terms
+# it guards, so committing it would publish exactly what it protects. CI
+# therefore cannot read it, and the question becomes whether some generic
+# pattern could stand in. Measured against this tree, no:
+#   - "an email address in source": 263 email-shaped tokens, 48 domains, 127
+#     of them outside example.com — every one legitimate (docs, test fixtures,
+#     vendored Cargo.toml authorship, and talos-dlp-provider's redaction tests,
+#     which must contain email shapes to test that they get redacted). It
+#     would have caught 0 of the 2 markers actually present, because neither
+#     is email-shaped.
+#   - "a UUID in source": 65 distinct non-zeroed UUIDs. One was a marker.
+#     ~1.5% precision.
+#   - "an oauth/ vault path containing @": 10 hits, none of them a marker —
+#     the @-halves were already `user@example.com` / `a@b.com` placeholders.
+# A CI check on those patterns would look like enforcement while catching
+# nothing, so none is offered here. The honest scope is: this is enforceable
+# locally, for the operator who holds the list, at `make lint` / pre-push.
+#
+# ABSENT-FILE BEHAVIOUR (the case CI and every fresh clone hits). Failing hard
+# would make `make lint` unrunnable for every public contributor; passing
+# silently would print a green tick that means "I did not look" while reading
+# as "clean". So it SKIPS, LOUDLY: a distinct yellow ⊘ line, no green ✓, and
+# the pattern count printed on success so an emptied list cannot masquerade as
+# a clean scan either.
+#
+# NO OPT-OUT COMMENT, deliberately. Every other check here has one; this one
+# must not, because the opt-out would have to sit next to the value it
+# exempts — permanently publishing the thing the check exists to remove. The
+# only two resolutions are to replace the value with a placeholder
+# (`user@example.com`, a zeroed UUID) or to narrow the marker list.
+#
+# OUTPUT IS VALUE-FREE. A CI log, a terminal recording and a pasted lint
+# failure are all as public as the repo. Findings are reported as
+# `file:line (marker #N)`; the matched text is never echoed, and a PATH that
+# itself contains a marker has its basename redacted too.
+#
+# STATED LIMITS:
+#  (a) It scans the TREE, not HISTORY. `git grep` without a revision reads the
+#      working tree only. A green tick here means "no marker is in the checked-
+#      out files", NOT "no marker is anywhere in this repository" — every value
+#      it has ever removed is still reachable in the commits that removed it,
+#      including this check's own fix commit (whose `-` lines carry them).
+#      Purging history needs a force-push rewrite, which is a separate and
+#      deliberate act; #697 recorded the same caveat.
+#  (b) TRACKED files only. An untracked file is invisible here; the pre-commit
+#      hook covers it at the moment it is staged.
+#  (c) Fixed-string, case-insensitive, substring. A marker that is a common
+#      word will fire on unrelated text — the list is the operator's to curate,
+#      and since there is no opt-out, an over-broad term must be narrowed in
+#      the list rather than exempted at the call site.
+#  (d) Binary files are skipped (`git grep -I`).
+bold "▶ check 72: personal-information markers in the tracked tree (PUBLIC repo)"
+PI_GIT_COMMON="$(git rev-parse --git-common-dir 2>/dev/null || echo '')"
+case "$PI_GIT_COMMON" in
+    /*) : ;;
+    '') PI_GIT_COMMON="$ROOT/.git" ;;
+    *)  PI_GIT_COMMON="$ROOT/$PI_GIT_COMMON" ;;
+esac
+PI_MARKER_FILE="$PI_GIT_COMMON/info/personal-markers"
+
+PI_PATTERN_FILE="$(mktemp)"
+if [ -f "$PI_MARKER_FILE" ]; then
+    grep -v '^[[:space:]]*#' "$PI_MARKER_FILE" 2>/dev/null \
+        | grep -v '^[[:space:]]*$' > "$PI_PATTERN_FILE" || true
+fi
+PI_PATTERN_COUNT="$(wc -l < "$PI_PATTERN_FILE" | tr -d ' ')"
+
+if [ ! -f "$PI_MARKER_FILE" ]; then
+    yellow "⊘ SKIPPED — no marker list at \$(git rev-parse --git-common-dir)/info/personal-markers"
+    yellow "  This is NOT a clean result: the tree was not scanned. Expected in CI and in"
+    yellow "  any fresh clone — the list is operator-local and uncommittable by design."
+elif [ "$PI_PATTERN_COUNT" -eq 0 ]; then
+    yellow "⊘ SKIPPED — marker list exists but contains no patterns (only comments/blanks)"
+    yellow "  This is NOT a clean result: an emptied list scans nothing and would otherwise"
+    yellow "  report green. Re-populate it or remove the file."
+else
+    PI_HIT_LOCS="$(git grep -n -i -I -F -f "$PI_PATTERN_FILE" -- . 2>/dev/null \
+        | cut -d: -f1,2 || true)"
+    if [ -n "$PI_HIT_LOCS" ]; then
+        # Attribute each location to a marker INDEX (never its value), and
+        # redact any path that is itself a marker hit.
+        PI_VIOLATIONS=0
+        PI_IDX=0
+        PI_ATTRIBUTED="$(mktemp)"
+        while IFS= read -r pat; do
+            [ -z "$pat" ] && continue
+            PI_IDX=$((PI_IDX + 1))
+            git grep -n -i -I -F -e "$pat" -- . 2>/dev/null \
+                | cut -d: -f1,2 \
+                | sed "s|\$| (marker #${PI_IDX})|" >> "$PI_ATTRIBUTED" || true
+        done < "$PI_PATTERN_FILE"
+        while IFS= read -r loc; do
+            [ -z "$loc" ] && continue
+            path="${loc%%:*}"
+            if printf '%s' "$(basename "$path")" | grep -qiF -f "$PI_PATTERN_FILE"; then
+                loc="$(dirname "$path")/<basename redacted>${loc#"$path"}"
+            fi
+            red "✗ ${loc}"
+            PI_VIOLATIONS=$((PI_VIOLATIONS + 1))
+        done < <(sort -u "$PI_ATTRIBUTED")
+        rm -f "$PI_ATTRIBUTED"
+        red "✗ ${PI_VIOLATIONS} personal-information marker hit(s) in the tracked tree"
+        yellow "  → this repository is PUBLIC. The pre-commit hook only sees STAGED ADDED"
+        yellow "    lines, so it cannot find these and never will — they predate the hook or"
+        yellow "    predate their term joining the list."
+        yellow "  → resolve by replacing the value with a placeholder (user@example.com, a"
+        yellow "    zeroed UUID) or, if the term is over-broad, by narrowing the marker list."
+        yellow "    There is deliberately NO opt-out comment: it would have to sit next to"
+        yellow "    the value, publishing the very thing this check exists to remove."
+        yellow "  → marker list (local-only, never committed): \$(git rev-parse"
+        yellow "    --git-common-dir)/info/personal-markers"
+        EXIT_CODE=1
+    else
+        green "✓ tracked tree clean against all ${PI_PATTERN_COUNT} personal-information markers"
+    fi
+fi
+rm -f "$PI_PATTERN_FILE"
+echo
+
 # ── 54. Lint self-consistency (meta-check) ────────────────────────────
 # The system whose purpose is catching drift drifted from its own docs:
 # by 2026-07-01 the script had 49 checks while CLAUDE.md said 43 and the

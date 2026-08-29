@@ -15,10 +15,11 @@ actually LIVE for each such workflow.
 compose AND commented out in the helm chart — so the single choke point
 (`TalosContext::write_ceiling_refuses`, called from every mutating host
 surface: http/webhook/email/memory/db/messaging/object-storage/graphql)
-never refused anything. `cxai-ops`'s `readonly` ceiling was a
-decorative column. **Fixed**: enforced in dev compose and default-on in
-`values.yaml`; validated live (readonly-actor workflow still green —
-its calls are GETs, exactly why the ceiling fits).
+never refused anything. The one actor configured `readonly` carried a
+decorative column, not a ceiling. **Fixed**: enforced in dev compose
+and default-on in `values.yaml`; validated live (readonly-actor
+workflow still green — its calls are GETs, exactly why the ceiling
+fits).
 
 ### F2 (MEDIUM, fixed): hybrid-classify-inbox lacked the security directive
 The module wrapped email content in `<untrusted_data>` but its system
