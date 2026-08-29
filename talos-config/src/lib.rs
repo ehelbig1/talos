@@ -24,6 +24,31 @@ pub fn get_env(var: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
+/// Returns true iff `var` is set AND its value is non-empty.
+///
+/// **This is the one correct way to ask "is this env var configured?"**
+/// `std::env::var(var).is_ok()` is NOT: it returns `true` for `Ok("")`, so a
+/// Helm `values.yaml` placeholder (`talosMasterKey: ""`) or a shell
+/// `export FOO=` reads as "configured" while every downstream consumer in
+/// this workspace treats an empty value as absent — [`get_env`] falls through
+/// to its default, [`read_env_or_file`] falls through to `<VAR>_FILE`.
+///
+/// The class has been repaired eleven times under distinct ticket numbers
+/// (MCP-590/591/592/597/598/599/611/615/620/621/625) and kept coming back
+/// because every fix was local to one call site. MCP-625 is the canonical
+/// writeup: four `security_audit` key checks reported "TALOS_MASTER_KEY is
+/// configured" and awarded +15 points while `kek_provider` refused to load
+/// the empty key — "operators saw a green dashboard while critical security
+/// primitives were disabled". Structural lint check 73 now fails the build on
+/// the bad shape and points here.
+///
+/// Note the asymmetry this helper deliberately preserves: it answers
+/// "configured?", NOT "present?". Code that genuinely needs to distinguish an
+/// empty value from an unset one must call `env::var` directly and say why.
+pub fn env_var_is_set_nonempty(var: &str) -> bool {
+    env::var(var).ok().filter(|v| !v.is_empty()).is_some()
+}
+
 /// Read a secret from an environment variable or from a file whose path is
 /// given by the `<VAR>_FILE` variant (Docker secrets pattern).
 ///
@@ -64,7 +89,15 @@ pub fn read_env_or_file(var: &str) -> Option<String> {
         );
     }
     let file_var = format!("{}_FILE", var);
-    if let Ok(path) = env::var(&file_var) {
+    // 2026-08-28: the `.filter(|v| !v.is_empty())` makes this function's own
+    // doc comment true. It claims "Empty values are treated as missing on BOTH
+    // paths", and that held for the file's CONTENTS (below) but not for the
+    // file's PATH: `JWT_SECRET_FILE=""` bound `Ok("")` and produced a
+    // permanent `Failed to read JWT_SECRET_FILE at ''` ERROR on a boot where
+    // nothing was configured. The return value was `None` either way, so this
+    // is log-noise rather than a behaviour change — but an ERROR that fires on
+    // a misconfiguration it cannot name is how the real ones get skipped.
+    if let Some(path) = env::var(&file_var).ok().filter(|v| !v.is_empty()) {
         match std::fs::read_to_string(&path) {
             Ok(contents) => {
                 let trimmed = contents

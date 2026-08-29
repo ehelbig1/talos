@@ -905,9 +905,15 @@ pub fn compiled_world_short(effective_world: &str) -> &str {
 /// see exactly which leg of the invalidation broke down; the success
 /// log only fires on actual DEL completion.
 async fn invalidate_redis_cache(module_id: Uuid, effective_wm_id: Uuid, user_id: Uuid) {
+    // 2026-08-28: `Ok(u) if !u.is_empty()` — pre-fix `REDIS_URL=""` bound
+    // `Ok("")` and SKIPPED this warning, then failed one line below with a
+    // generic redis-client-open error. The specific signal the operator needs
+    // ("workers may serve stale WASM") was the one that got dropped, which
+    // inverts the intent of the comment above: each failure mode is supposed
+    // to name its own leg.
     let redis_url = match std::env::var("REDIS_URL") {
-        Ok(u) => u,
-        Err(_) => {
+        Ok(u) if !u.is_empty() => u,
+        _ => {
             tracing::warn!(
                 %module_id,
                 "REDIS_URL not set — skipping hot-update cache invalidation; workers may serve stale WASM"

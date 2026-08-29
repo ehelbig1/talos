@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod tests {
     use crate::{
-        bool_env_or_default, execution_max_rows, execution_retention_days, get_allowed_origins,
-        get_env, get_frontend_url, is_allowed_origin, positive_env_or_default,
+        bool_env_or_default, env_var_is_set_nonempty, execution_max_rows, execution_retention_days,
+        get_allowed_origins, get_env, get_frontend_url, is_allowed_origin, positive_env_or_default,
         sanitize_oauth_error_code, validate_shared_secret_token,
     };
     use std::env;
@@ -27,6 +27,77 @@ mod tests {
             // cares about so recovery is safe.
             Err(poison) => poison.into_inner(),
         }
+    }
+
+    /// The whole defect class, pinned as one assertion: for `FOO=""` the
+    /// idiom `env::var("FOO").is_ok()` says CONFIGURED and
+    /// `env_var_is_set_nonempty` says NOT CONFIGURED. Every consumer in this
+    /// workspace agrees with the latter (`get_env` falls through to its
+    /// default here, `read_env_or_file` falls through to `<VAR>_FILE`), which
+    /// is what made the eleven prior repairs — MCP-590/591/592/597/598/599/
+    /// 611/615/620/621/625 — necessary. Structural lint check 73 forbids the
+    /// left-hand shape; this test is why.
+    #[test]
+    fn env_presence_empty_string_is_not_configured() {
+        let _g = env_lock();
+        const K: &str = "TALOS_TEST_EMPTY_ENV_PRESENCE";
+
+        env::set_var(K, "");
+        assert!(
+            env::var(K).is_ok(),
+            "precondition: env::var returns Ok(\"\") for an empty var — if this \
+             ever fails the defect class is gone and check 73 can be retired"
+        );
+        assert!(
+            !env_var_is_set_nonempty(K),
+            "an empty env var must NOT read as configured"
+        );
+        // ...and the rest of the config layer must agree with that verdict.
+        assert_eq!(
+            get_env(K, "fallback"),
+            "fallback",
+            "get_env must fall through to its default for an empty var"
+        );
+
+        env::remove_var(K);
+    }
+
+    #[test]
+    fn env_presence_unset_and_set_cases() {
+        let _g = env_lock();
+        const K: &str = "TALOS_TEST_ENV_PRESENCE_SET";
+
+        env::remove_var(K);
+        assert!(
+            !env_var_is_set_nonempty(K),
+            "unset must read as unconfigured"
+        );
+
+        env::set_var(K, "value");
+        assert!(
+            env_var_is_set_nonempty(K),
+            "a real value must read as configured"
+        );
+
+        env::remove_var(K);
+    }
+
+    /// Whitespace-only is deliberately CONFIGURED, so this helper agrees with
+    /// `get_env` (which returns `" "` verbatim rather than its default) and
+    /// with `read_env_or_file`. Neither trims, so trimming here would make the
+    /// "is it configured?" answer disagree with the value the caller then
+    /// reads. Pinned rather than left to accident — a future change to trim
+    /// must change all three together.
+    #[test]
+    fn env_presence_whitespace_only_is_configured() {
+        let _g = env_lock();
+        const K: &str = "TALOS_TEST_ENV_PRESENCE_WS";
+
+        env::set_var(K, " ");
+        assert!(env_var_is_set_nonempty(K));
+        assert_eq!(get_env(K, "fallback"), " ");
+
+        env::remove_var(K);
     }
 
     /// MCP-643: =0 must collapse to the default (with WARN at runtime;

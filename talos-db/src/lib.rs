@@ -459,9 +459,17 @@ pub async fn init_pool() -> anyhow::Result<Pool<Postgres>> {
 
     // In production we require an explicit DATABASE_URL; fail fast if it's missing.
     // Load DATABASE_URL or return a clear error instead of panicking.
+    // 2026-08-28: `Ok(url) if !url.is_empty()` — pre-fix `DATABASE_URL=""`
+    // satisfied this "must be set" guard and fell through to the production
+    // TLS gate below, which refused the boot citing a MISSING sslmode. A
+    // `databaseUrl: ""` placeholder therefore crash-looped the controller with
+    // an error blaming TLS for an unset variable. Both spellings still fail
+    // closed — only the attribution changes. `init_read_replica_pool` in this
+    // same file (`Ok(url) if !url.is_empty()`) already had the guard; this is
+    // the sibling that did not.
     let db_url = match std::env::var("DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => {
+        Ok(url) if !url.is_empty() => url,
+        _ => {
             return Err(anyhow::anyhow!(
                 "environment variable DATABASE_URL must be set (Postgres connection string)"
             ));

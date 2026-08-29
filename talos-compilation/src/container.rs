@@ -60,10 +60,25 @@ fn nonempty_env_or(name: &str, default: &str) -> String {
 ///
 /// Checks `TALOS_COMPILATION_CONTAINER` env var first; falls back to
 /// production = true, development = false.
+///
+/// 2026-08-28: the `.filter(|v| !v.is_empty())` is load-bearing, and this is
+/// the one site in the empty-env sweep where an empty value changed BEHAVIOUR
+/// rather than a report. Pre-fix the `Ok` arm bound `Ok("")`, and
+/// `!matches!("", "false"|"0"|"no")` is TRUE — so
+/// `TALOS_COMPILATION_CONTAINER=""` forced containerised compilation ON in
+/// development, the opposite of the unset default (`is_production()` = false).
+/// A dev box with no container runtime then fail-closes through
+/// `host_fallback_allowed()` and refuses to compile any module at all. Empty
+/// now means unset, matching this file's own `nonempty_env_or` (whose doc
+/// comment cites the same class) and `talos_config::bool_env_or_default`,
+/// which likewise returns its default on empty.
 fn container_enabled() -> bool {
-    match std::env::var("TALOS_COMPILATION_CONTAINER") {
-        Ok(val) => !matches!(val.to_lowercase().as_str(), "false" | "0" | "no"),
-        Err(_) => talos_config::is_production(),
+    match std::env::var("TALOS_COMPILATION_CONTAINER")
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
+        Some(val) => !matches!(val.to_lowercase().as_str(), "false" | "0" | "no"),
+        None => talos_config::is_production(),
     }
 }
 
@@ -697,6 +712,32 @@ mod tests {
             );
         }
         std::env::remove_var("TALOS_COMPILATION_CONTAINER");
+    }
+
+    /// The empty-env class (lint check 73), pinned as an EQUIVALENCE rather
+    /// than a value: `TALOS_COMPILATION_CONTAINER=""` must give the same
+    /// answer as leaving it unset. Asserting a literal `false` would depend on
+    /// ambient `is_production()`, which this test does not control; asserting
+    /// equivalence holds either way and is exactly the property that broke.
+    /// Pre-fix the `Ok` arm bound `Ok("")` and `!matches!("", "false"|"0"|"no")`
+    /// was TRUE, so a Helm placeholder forced containerised compilation ON in
+    /// development — the opposite of the unset default — and a dev box with no
+    /// container runtime then fail-closed and refused to compile anything.
+    #[test]
+    fn container_enabled_empty_env_is_same_as_unset() {
+        let _g = env_lock();
+
+        std::env::remove_var("TALOS_COMPILATION_CONTAINER");
+        let unset = container_enabled();
+
+        std::env::set_var("TALOS_COMPILATION_CONTAINER", "");
+        let empty = container_enabled();
+
+        std::env::remove_var("TALOS_COMPILATION_CONTAINER");
+        assert_eq!(
+            empty, unset,
+            "an empty TALOS_COMPILATION_CONTAINER must behave exactly as unset"
+        );
     }
 
     #[test]

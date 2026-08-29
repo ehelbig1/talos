@@ -11,8 +11,15 @@ use anyhow::{anyhow, Result};
 /// (`jwtPrivateKey: ""`) doesn't shadow the actual fallback path.
 /// Sibling rule to `read_env_or_file` in talos-config (MCP-597) and
 /// the controller-side `seed_templates` filter (MCP-598).
+///
+/// 2026-08-28: delegates to `talos_config::env_var_is_set_nonempty` rather
+/// than re-implementing it. This crate's private copy was the canonical
+/// spelling of the correct idiom, but being `pub(crate)` it could not be
+/// reused — so `talos-mcp-handlers` grew its own inline closure (MCP-625) and
+/// two other sites kept the broken `.is_ok()` shape. One implementation now,
+/// in the crate every consumer already depends on.
 pub(crate) fn env_var_is_set_nonempty(var: &str) -> bool {
-    std::env::var(var).ok().filter(|v| !v.is_empty()).is_some()
+    talos_config::env_var_is_set_nonempty(var)
 }
 
 /// Returns true iff the secret resolves via EITHER `<VAR>` (direct env)
@@ -389,7 +396,14 @@ impl ConfigValidator {
     /// Warn if Redis is not using TLS in production.
     fn validate_redis_tls(warnings: &mut Vec<String>) {
         if talos_config::is_production() {
-            if let Ok(redis_url) = std::env::var("REDIS_URL") {
+            // The `.filter(|v| !v.is_empty())` matters in the INVERSE
+            // direction from the usual empty-env bug: pre-fix, `REDIS_URL=""`
+            // bound `Ok("")`, `"".starts_with("rediss://")` is false, and the
+            // validator emitted "using plaintext redis:// in production" for a
+            // Redis that is not configured at all. A warning that fires on a
+            // control the operator never enabled is how a real one gets
+            // ignored (the check-69 lesson).
+            if let Some(redis_url) = std::env::var("REDIS_URL").ok().filter(|v| !v.is_empty()) {
                 if !redis_url.starts_with("rediss://") {
                     warnings.push(
                         "  [PRODUCTION] REDIS_URL: Using plaintext 'redis://' in production. \
@@ -402,11 +416,20 @@ impl ConfigValidator {
     }
 
     /// Print configuration summary (for logging)
+    ///
+    /// 2026-08-28: every read below used a raw `env::var` presence test, so an
+    /// empty value printed a CONFIGURED line for a subsystem that is off —
+    /// "Redis: configured" while `init_redis`'s `Client::open("")` fails,
+    /// "NATS: configured" while messaging is unavailable, "Bcrypt cost: "
+    /// (blank), "JWT secret: 0 chars", "Database: " (blank). This function is
+    /// the boot-time operator dashboard, which makes it the same failure mode
+    /// as MCP-625 — a green summary over disabled primitives — and it sat in
+    /// the file that DEFINES `env_var_is_set_nonempty` without calling it.
     pub fn print_summary() {
         tracing::info!("Configuration Summary:");
 
         // Database
-        if let Ok(db_url) = std::env::var("DATABASE_URL") {
+        if let Some(db_url) = std::env::var("DATABASE_URL").ok().filter(|v| !v.is_empty()) {
             // Mask password in URL
             let masked = if let Some(pos) = db_url.rfind('@') {
                 if let Some(proto_pos) = db_url.find("://") {
@@ -423,25 +446,30 @@ impl ConfigValidator {
         }
 
         // Redis
-        match std::env::var("REDIS_URL") {
-            Ok(_) => tracing::info!("  Redis: configured"),
-            Err(_) => tracing::warn!("  Redis: NOT configured (cache will be disabled)"),
+        if env_var_is_set_nonempty("REDIS_URL") {
+            tracing::info!("  Redis: configured");
+        } else {
+            tracing::warn!("  Redis: NOT configured (cache will be disabled)");
         }
 
         // NATS
-        match std::env::var("NATS_URL") {
-            Ok(_) => tracing::info!("  NATS: configured"),
-            Err(_) => tracing::warn!("  NATS: NOT configured (messaging unavailable)"),
+        if env_var_is_set_nonempty("NATS_URL") {
+            tracing::info!("  NATS: configured");
+        } else {
+            tracing::warn!("  NATS: NOT configured (messaging unavailable)");
         }
 
         // Security
-        if let Ok(bcrypt_cost) = std::env::var("BCRYPT_COST") {
+        if let Some(bcrypt_cost) = std::env::var("BCRYPT_COST").ok().filter(|v| !v.is_empty()) {
             tracing::info!("  Bcrypt cost: {}", bcrypt_cost);
         } else {
+            // Matches what the consumers actually do with an empty value:
+            // `talos-api-keys` and `talos-oauth` both parse-and-fall-back, so
+            // the default IS in force and the summary must say so.
             tracing::info!("  Bcrypt cost: 12 (default)");
         }
 
-        if let Ok(jwt_secret) = std::env::var("JWT_SECRET") {
+        if let Some(jwt_secret) = std::env::var("JWT_SECRET").ok().filter(|v| !v.is_empty()) {
             tracing::info!("  JWT secret: {} chars", jwt_secret.len());
         }
 

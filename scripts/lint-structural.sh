@@ -6437,6 +6437,176 @@ fi
 rm -f "$PI_PATTERN_FILE"
 echo
 
+# ── 73. env-var PRESENCE tests must treat an empty value as unset ──────
+# `std::env::var("KEY").is_ok()` returns TRUE for `Ok("")`. A Helm
+# values.yaml placeholder (`talosMasterKey: ""`) or a shell `export FOO=`
+# therefore reads as CONFIGURED, while every consumer in this workspace
+# treats an empty value as absent — `talos_config::get_env` falls through
+# to its default, `read_env_or_file` falls through to `<VAR>_FILE`.
+#
+# This class has been repaired ELEVEN times under distinct ticket numbers
+# (MCP-590/591/592/597/598/599/611/615/620/621/625) and had no structural
+# guard, which is why it kept coming back. MCP-625 is the canonical
+# writeup and the sharpest illustration: four `security_audit` key checks
+# reported "TALOS_MASTER_KEY is configured" and awarded +15 while
+# `kek_provider` refused to load the empty key — "operators saw a green
+# dashboard while critical security primitives were disabled". Its fix
+# was an INLINE CLOSURE, so it did not generalise: when this check was
+# written, `handle_security_audit` STILL contained an instance of the bug
+# 130 lines below the comment describing it, grading the platform's CORS
+# posture. The same locality trap sat in `worker/src/metrics_server.rs`,
+# where MCP-932 removed the shape from one handler and left it in a
+# sibling handler in the same file.
+#
+# TWO LEGS, and both are chosen so the value is PROVABLY never inspected —
+# that is what makes the finding sound rather than a guess:
+#
+#  (a) A presence PREDICATE terminating an env read: `.is_ok()`,
+#      `.is_some()`, `.is_err()`, `.is_none()`. The chain is joined across
+#      lines first (see below), and any chain containing an emptiness or
+#      value guard — `is_empty`, `.filter(`, `.trim(`, `unwrap_or`,
+#      `map_or` — is exempt, because that code either handles empty or
+#      reads the value (in which case empty lands in the same branch as
+#      unset and there is no divergence).
+#
+#  (b) A WILDCARD discard of the value: `Ok(_)` / `Some(_)` in a `match`
+#      or `if let` over an env read. A wildcard cannot examine the value,
+#      so the branch is presence-only by construction. This leg exists
+#      because leg (a) could not see `match env::var("REDIS_URL") { Ok(_)
+#      => info!("Redis: configured"), … }` — two of those printed a green
+#      startup line for a subsystem that was off, in the very file that
+#      DEFINES the correct helper.
+#
+# Lines are joined into LOGICAL lines before matching (a continuation
+# beginning with `.`, `Ok`, `Some`, `Err`, `None`, `=>` or `{` is appended
+# to the previous line), so the split form
+#     std::env::var("X")
+#         .is_ok()
+# is caught — a plain line-based grep misses it, and that is exactly how
+# the first inventory for this check came up short. Comment-only lines are
+# dropped before joining, because the fixes' own comments QUOTE the banned
+# expression verbatim so the next reader knows what not to write (two such
+# comments exist today and both would otherwise be reported); a commented
+# env read cannot execute, so this is a correctness fix, not a weakening.
+#
+# MEASURED, not asserted. Against the tree this check was written on it
+# reports exactly FIVE production sites and ZERO false positives:
+#   talos-mcp-handlers/src/platform.rs (cors_origins, agent_api_configured)
+#   worker/src/metrics_server.rs (METRICS_AUTH_TOKENS auth_status)
+#   talos-config-validator/src/lib.rs (REDIS_URL, NATS_URL summary lines)
+# The four correct `.ok().filter(|v| !v.is_empty()).is_some()` sites in the
+# tree (talos-config-validator, talos-integrations, talos-mcp-handlers
+# search.rs ×2) are all exempted by the guard-token rule, and the three
+# `.is_err()` gates in talos-compilation/tests/* by the test exclusion.
+#
+# STATED LIMITS, each confirmed by running the check rather than inferred:
+#  (a) It is TEXTUAL. A presence test performed inside a helper in another
+#      crate, or on a value already resolved into an `Option<String>` by a
+#      caller, is invisible to both legs.
+#  (b) It deliberately does NOT flag a NAMED binding (`if let Ok(url) =
+#      env::var(..)`, `match env::var(..) { Ok(url) => .. }`). That shape
+#      was MEASURED on the origin/main tree this check was written against:
+#      56 non-test sites (37 `let Ok(name) =` + 19 `match env::var`), of
+#      which 9 were genuinely defective and all 9 are fixed in this same
+#      change — talos-config-validator ×4 (validate_redis_tls REDIS_URL,
+#      print_summary DATABASE_URL/BCRYPT_COST/JWT_SECRET),
+#      talos-config::read_env_or_file (the `<VAR>_FILE` path),
+#      talos-compilation::container_enabled, talos-db::init_pool,
+#      talos-hot-update-service::invalidate_redis_cache, and
+#      talos-worker-runtime::aot_key_ring. That is 16% precision / an 84%
+#      false-positive rate, because the overwhelming majority of that
+#      population filters or parses the value on the very next line and is
+#      correct. Linting it would be enforcement-shaped noise — the failure
+#      mode this repo has repaired repeatedly — so reviewers, not this
+#      check, own that shape. (An earlier draft of this comment claimed
+#      "~35 sites, ~3% precision, two defects". Both numbers were wrong:
+#      the population was undercounted by ignoring `match`, and the defect
+#      count was taken before the sweep finished. Corrected by measurement
+#      against `git archive origin/main`.)
+#  (c) Fail-CLOSED empty handling is not a defect and is not flagged: a
+#      production TLS gate that panics on `REDIS_URL=""`, or a
+#      `KEK_PROVIDER=""` that refuses an unknown backend, refuses to run
+#      rather than misreporting. Those sites use named bindings and are
+#      out of range by (b) anyway — but note that "treat empty as unset"
+#      would WEAKEN them, so a future widening must not sweep them in.
+#  (d) It proves the empty case is HANDLED, never that it is handled
+#      correctly — `.filter(|v| !v.is_empty())` satisfies the check
+#      whatever the surrounding logic then does.
+# Opt-out: `// allow-empty-env-presence: <reason>` on the reported line or
+# within 8 lines above it — for a genuine marker variable whose value is
+# irrelevant and where `FOO=` deliberately means "on".
+bold "▶ check 73: env-var presence tests must treat empty as unset"
+EMPTY_ENV_FAIL=0
+EMPTY_ENV_AWK="$(mktemp)"
+cat > "$EMPTY_ENV_AWK" <<'AWKEOF'
+function flush(   s) {
+    if (buf == "") return
+    s = buf
+    if (s ~ /env::var(_os)?[[:space:]]*\(/) {
+        # Leg (a): presence predicate with no emptiness/value guard.
+        if (s ~ /\.is_(ok|err|some|none)[[:space:]]*\(\)/ &&
+            s !~ /is_empty/ && s !~ /\.filter[[:space:]]*\(/ &&
+            s !~ /\.trim[[:space:]]*\(/ && s !~ /unwrap_or/ && s !~ /map_or/)
+            printf "%s:%d:%s\n", FILENAME, bufline, buf
+        # Leg (b): wildcard discard — the value provably is not inspected.
+        else if (s ~ /(Ok|Some)[[:space:]]*\([[:space:]]*_[[:space:]]*\)/)
+            printf "%s:%d:%s\n", FILENAME, bufline, buf
+    }
+    buf = ""
+}
+{
+    line = $0
+    sub(/^[[:space:]]+/, "", line)
+    if (line ~ /^\/\//) next
+    if (buf != "" && (line ~ /^\./ || line ~ /^(Ok|Some|Err|None|=>|\{)/)) {
+        buf = buf " " line
+        next
+    }
+    flush()
+    buf = line
+    bufline = FNR
+}
+END { flush() }
+AWKEOF
+
+while IFS= read -r hit; do
+    [ -z "$hit" ] && continue
+    file="${hit%%:*}"
+    rest="${hit#*:}"
+    lineno="${rest%%:*}"
+    case "$file" in */tests/*|*_tests.rs|*/test_support.rs|*/benches/*|*/examples/*) continue ;; esac
+    case "$hit" in *allow-empty-env-presence*) continue ;; esac
+    # Opt-out may sit on the line or within the 8 lines above it.
+    start=$((lineno > 8 ? lineno - 8 : 1))
+    if sed -n "${start},${lineno}p" "$ROOT/$file" 2>/dev/null \
+            | grep -q 'allow-empty-env-presence'; then
+        continue
+    fi
+    red "✗ $file:$lineno env-var presence test accepts an empty value as configured"
+    printf '    %s\n' "$(printf '%s' "${rest#*:}" | cut -c1-120)"
+    EMPTY_ENV_FAIL=1
+done < <(cd "$ROOT" && find . -name '*.rs' -not -path './target/*' -not -path '*/target/*' -print0 2>/dev/null \
+         | xargs -0 -n 40 awk -f "$EMPTY_ENV_AWK" 2>/dev/null \
+         | sed 's|^\./||' || true)
+rm -f "$EMPTY_ENV_AWK"
+
+if [ "$EMPTY_ENV_FAIL" -eq 1 ]; then
+    yellow "  → \`env::var(K).is_ok()\` is TRUE for \`Ok(\"\")\`, so a Helm placeholder"
+    yellow "    (\`talosMasterKey: \"\"\`) or \`export FOO=\` reads as CONFIGURED while every"
+    yellow "    consumer here treats empty as absent (get_env falls to its default,"
+    yellow "    read_env_or_file falls to <VAR>_FILE). MCP-625: the security_audit"
+    yellow "    reported \"TALOS_MASTER_KEY is configured\" +15 points while kek_provider"
+    yellow "    refused the empty key — a green dashboard over disabled primitives."
+    yellow "  → use \`talos_config::env_var_is_set_nonempty(\"KEY\")\`, or inline"
+    yellow "    \`.ok().filter(|v| !v.is_empty())\` when you need the value."
+    yellow "  → a genuine marker var whose value is irrelevant may carry"
+    yellow "    \`// allow-empty-env-presence: <reason>\` on or above the line."
+    EXIT_CODE=1
+else
+    green "✓ env-var presence tests all treat an empty value as unset"
+fi
+echo
+
 # ── 54. Lint self-consistency (meta-check) ────────────────────────────
 # The system whose purpose is catching drift drifted from its own docs:
 # by 2026-07-01 the script had 49 checks while CLAUDE.md said 43 and the
