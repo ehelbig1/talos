@@ -1047,7 +1047,7 @@ mod oauth_repair_tests {
     use crate::engine::ParallelWorkflowEngine;
 
     const OAUTH_PATH: &str =
-        "oauth/gmail/56a7eea7-d1e0-4a53-b8ca-6ca4e19bb2f4/user@example.com/access_token";
+        "oauth/gmail/00000000-0000-0000-0000-000000000000/user@example.com/access_token";
     /// Verbatim from `workflow_executions.error_message` on 2026-08-19.
     const LIVE_401: &str = "execution failure: Component returned error: \
          Gmail 401: access_token invalid or expired. Call refresh_oauth_token to force a refresh.";

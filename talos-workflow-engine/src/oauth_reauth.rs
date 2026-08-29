@@ -129,9 +129,9 @@ mod tests {
     #[test]
     fn selects_only_oauth_paths() {
         let paths = owned(&[
-            "oauth/gmail/56a7eea7-d1e0-4a53-b8ca-6ca4e19bb2f4/a@b.com/access_token",
+            "oauth/gmail/00000000-0000-0000-0000-000000000000/a@b.com/access_token",
             "anthropic/api_key",
-            "oauth/google_calendar/56a7eea7-d1e0-4a53-b8ca-6ca4e19bb2f4/cal/access_token",
+            "oauth/google_calendar/00000000-0000-0000-0000-000000000000/cal/access_token",
             "myservice/webhook_token",
         ]);
         let picked = refreshable_oauth_paths(&paths);
