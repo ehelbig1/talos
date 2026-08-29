@@ -166,14 +166,14 @@ pub use module_artifact::WasmModuleArtifact;
 pub use module_execution_store::{ExecutionStartedContext, ModuleExecutionStore};
 pub use module_fetcher::ModuleFetcher;
 pub use node_hook::{NodeCompletionContext, NodeLifecycleHook};
-pub use node_identity::engine_node_uuid;
+pub use node_identity::{engine_node_uuid, node_module_id};
 pub use operator_digest_reader::OperatorDigestReader;
 pub use ops_alerts_reader::OpsAlertsReader;
 pub use pending_approvals_reader::PendingApprovalsReader;
 pub use rate_limit::RateLimitStore;
 pub use retry::{
     default_max_retries_for_module, default_node_timeout_secs, effective_retries_with_idempotency,
-    world_enables_idempotent_retry, RetryPolicy, DEFAULT_BACKOFF_MS,
+    methods_are_read_only, world_enables_idempotent_retry, RetryPolicy, DEFAULT_BACKOFF_MS,
     DEFAULT_NODE_TIMEOUT_SECS_FALLBACK, DEFAULT_TRANSIENT_RETRIES,
     DEFAULT_WORKFLOW_EXECUTION_TIMEOUT_SECS, MAX_RETRIES_UNBUDGETED,
 };

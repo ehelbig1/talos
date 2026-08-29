@@ -2512,6 +2512,103 @@ pub fn vault_path_permitted(allowed: &[String], key_path: &str) -> bool {
     })
 }
 
+/// A detected `vault://` reference in a config object: `(config_key, vault_path)`.
+///
+/// `vault_path` is the path with the `vault://` prefix already stripped,
+/// matching the form stored in the vault, accepted by
+/// `SecretsManager::get_secrets_by_paths`, and expected by
+/// [`vault_path_permitted`].
+pub type VaultRef = (String, String);
+
+/// Extract every `vault://<path>` reference from the top-level string values
+/// of a JSON config object. Malformed refs (empty path after the marker) are
+/// skipped.
+///
+/// Only scans top-level keys — nested objects are not recursed into, matching
+/// the engine's dispatch convention where node config is a flat key/value map.
+///
+/// # This lives here, next to [`vault_path_permitted`], on purpose
+///
+/// Reference DETECTION and reference PERMISSION are two halves of one
+/// question, and splitting them across crates is how they drifted: the
+/// resolvers matched `vault://` anywhere in the value while four separate
+/// authoring-time checkers used `strip_prefix`, which matches only a bare
+/// prefix. Catalog integration modules carry the reference inside a header
+/// template — `AUTH_HEADER = "Bearer vault://oauth/gmail/<uid>/<email>/access_token"`
+/// — so the prefix form matched **0 of 45** references on the live fleet
+/// (measured 2026-08-28) while both runtime resolvers acted on all 45. A
+/// permission check that cannot see the reference reports "clean" for a
+/// blocked path.
+///
+/// The path token runs from `vault://` to the first whitespace (header
+/// templates place the token last) or end-of-value, matching
+/// `talos-worker-runtime`'s `resolve_vault_header`.
+#[must_use]
+pub fn extract_vault_refs(config: &serde_json::Value) -> Vec<VaultRef> {
+    let mut refs = Vec::new();
+    if let Some(obj) = config.as_object() {
+        for (k, v) in obj {
+            if let Some(val_str) = v.as_str() {
+                if let Some(after) = val_str.split("vault://").nth(1) {
+                    let path = after.split_whitespace().next().unwrap_or("");
+                    if !path.is_empty() {
+                        refs.push((k.clone(), path.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    refs
+}
+
+#[cfg(test)]
+mod vault_ref_extraction_tests {
+    use super::extract_vault_refs;
+
+    /// The exact shape carried by every one of the 45 references on the live
+    /// fleet. A bare-prefix matcher returns nothing here.
+    #[test]
+    fn embedded_bearer_reference_is_extracted() {
+        let cfg = serde_json::json!({
+            "AUTH_HEADER":
+                "Bearer vault://oauth/gmail/00000000-0000-4000-8000-000000000001/\
+                 user@example.com/access_token"
+        });
+        let refs = extract_vault_refs(&cfg);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].0, "AUTH_HEADER");
+        assert!(refs[0].1.starts_with("oauth/gmail/"));
+        assert!(!refs[0].1.contains("Bearer"));
+    }
+
+    #[test]
+    fn bare_prefix_reference_is_extracted() {
+        let cfg = serde_json::json!({"KEY": "vault://anthropic/api_key"});
+        assert_eq!(
+            extract_vault_refs(&cfg),
+            vec![("KEY".to_string(), "anthropic/api_key".to_string())]
+        );
+    }
+
+    /// A marker with no path yields no ref — callers treat "value mentions
+    /// vault:// but produced no ref" as malformed.
+    #[test]
+    fn empty_path_yields_no_ref() {
+        assert!(extract_vault_refs(&serde_json::json!({"K": "vault://"})).is_empty());
+        assert!(extract_vault_refs(&serde_json::json!({"K": "vault:// "})).is_empty());
+        assert!(extract_vault_refs(&serde_json::json!({"K": "vault://vault://x"})).is_empty());
+    }
+
+    #[test]
+    fn non_string_and_nested_values_are_ignored() {
+        let cfg = serde_json::json!({
+            "N": 5,
+            "NESTED": {"INNER": "vault://a/b"}
+        });
+        assert!(extract_vault_refs(&cfg).is_empty());
+    }
+}
+
 #[cfg(test)]
 mod vault_matcher_tests {
     use super::vault_path_permitted;

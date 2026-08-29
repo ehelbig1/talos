@@ -117,6 +117,33 @@ pub fn default_node_timeout_secs() -> u64 {
         .unwrap_or(DEFAULT_NODE_TIMEOUT_SECS_FALLBACK)
 }
 
+/// Whether a module's `allowed_methods` declare it incapable of changing
+/// state at its destination — every declared method is `GET` or `HEAD`.
+///
+/// **Extracted so there is exactly one statement of "read-only" in the
+/// codebase.** [`default_max_retries_for_module`] is its first consumer (a
+/// read-only module can be safely re-fired, so it earns transient retries);
+/// the second is workflow validation's crash-recovery advisory, which warns
+/// that an in-flight node is RE-DISPATCHED at-least-once on resume. Both ask
+/// the same question — "does running this twice do something twice?" — and a
+/// second copy of the answer would be free to drift from this one.
+///
+/// # An EMPTY method list is UNKNOWN, not read-only
+///
+/// `!is_empty()` is load-bearing, not defensive: `.all()` over an empty slice
+/// is vacuously true, and an empty list means "allow every method" at the
+/// worker's enforcement point (`talos-worker-runtime/src/host/http.rs`).
+/// Read-only must be DECLARED. See the note on
+/// [`default_max_retries_for_module`] for why `allowed_methods` is the odd
+/// one out among the per-module declaration lists.
+#[must_use]
+pub fn methods_are_read_only(allowed_methods: &[String]) -> bool {
+    !allowed_methods.is_empty()
+        && allowed_methods
+            .iter()
+            .all(|m| matches!(m.trim().to_ascii_uppercase().as_str(), "GET" | "HEAD"))
+}
+
 /// Method-aware default retry count for a module with no explicit
 /// retry configuration.
 ///
@@ -177,13 +204,7 @@ pub fn default_max_retries_for_module(
         .trim()
         .trim_end_matches("-node")
         .to_ascii_lowercase();
-    // `!is_empty()` is load-bearing, not defensive: `.all()` over an empty
-    // slice is vacuously true, and empty means "allow every method" at the
-    // worker's enforcement point. Read-only must be DECLARED.
-    let methods_read_only = !allowed_methods.is_empty()
-        && allowed_methods
-            .iter()
-            .all(|m| matches!(m.trim().to_ascii_uppercase().as_str(), "GET" | "HEAD"));
+    let methods_read_only = methods_are_read_only(allowed_methods);
     match world.as_str() {
         "minimal" | "secrets" => DEFAULT_TRANSIENT_RETRIES,
         "http" | "agent" if methods_read_only => DEFAULT_TRANSIENT_RETRIES,
@@ -275,6 +296,40 @@ impl RetryPolicy {
     ) -> u32 {
         self.max_retries
             .unwrap_or_else(|| default_max_retries_for_module(allowed_methods, capability_world))
+    }
+}
+
+#[cfg(test)]
+mod read_only_declaration_tests {
+    use super::methods_are_read_only;
+
+    fn m(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// The live fleet's two read-only declarations (2026-08-28): every
+    /// `http-node` module reached by a Gmail/Calendar read declares `{GET}`.
+    #[test]
+    fn declared_get_only_is_read_only() {
+        assert!(methods_are_read_only(&m(&["GET"])));
+        assert!(methods_are_read_only(&m(&["GET", "HEAD"])));
+        assert!(methods_are_read_only(&m(&["get", "Head"])));
+    }
+
+    /// `awaiting-nudge` declares `{GET,POST}` on the live fleet — it can
+    /// change state, so a resume that re-dispatches it does something twice.
+    #[test]
+    fn any_mutating_method_is_not_read_only() {
+        assert!(!methods_are_read_only(&m(&["GET", "POST"])));
+        assert!(!methods_are_read_only(&m(&["POST"])));
+    }
+
+    /// The load-bearing case: empty means "allow every method" at the
+    /// worker, so it is UNKNOWN. `.all()` over an empty slice is vacuously
+    /// true, which is the trap.
+    #[test]
+    fn undeclared_methods_are_not_read_only() {
+        assert!(!methods_are_read_only(&[]));
     }
 }
 

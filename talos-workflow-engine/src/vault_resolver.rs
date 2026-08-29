@@ -19,12 +19,11 @@
 use std::collections::HashMap;
 use std::fmt;
 
-/// A detected `vault://` reference in a config object: `(config_key, vault_path)`.
-///
-/// `vault_path` is the path with the `vault://` prefix already stripped,
-/// matching the form stored in the vault and accepted by
-/// `SecretsManager::get_secrets_by_paths`.
-pub type VaultRef = (String, String);
+// Detection moved to `talos-workflow-job-protocol`, next to
+// `vault_path_permitted`: authoring-time checkers need to see exactly the
+// references the runtime acts on, and they cannot depend on this crate.
+// Re-exported so every existing call site keeps resolving.
+pub use talos_workflow_job_protocol::{extract_vault_refs, VaultRef};
 
 /// Error returned from [`replace_vault_values`] when a referenced
 /// secret cannot be substituted.
@@ -88,39 +87,6 @@ impl fmt::Display for VaultResolverError {
 }
 
 impl std::error::Error for VaultResolverError {}
-
-/// Extract every `vault://<path>` reference from the top-level string values
-/// of a JSON config object. Malformed refs (empty path after prefix) are skipped.
-///
-/// Only scans top-level keys — nested objects are not recursed into, matching
-/// the engine's dispatch convention where node config is a flat key/value map.
-pub fn extract_vault_refs(config: &serde_json::Value) -> Vec<VaultRef> {
-    let mut refs = Vec::new();
-    if let Some(obj) = config.as_object() {
-        for (k, v) in obj {
-            if let Some(val_str) = v.as_str() {
-                // Match a `vault://` reference embedded ANYWHERE in the value,
-                // not only as an exact prefix. Catalog integration modules
-                // (Gmail, Google Calendar, …) carry it inside a header template,
-                // e.g. AUTH_HEADER = "Bearer vault://oauth/gmail/<uid>/<email>/access_token".
-                // The old `strip_prefix("vault://")` only matched a bare prefix,
-                // so those embedded refs were never extracted → never prefetched
-                // into the job's secrets → the worker received the literal
-                // "Bearer vault://…" string and every provider call 401'd.
-                // The path token runs from `vault://` to the first whitespace
-                // (header templates place the token last) or end-of-value; this
-                // matches the worker-side resolver's treatment of header values.
-                if let Some(after) = val_str.split("vault://").nth(1) {
-                    let path = after.split_whitespace().next().unwrap_or("");
-                    if !path.is_empty() {
-                        refs.push((k.clone(), path.to_string()));
-                    }
-                }
-            }
-        }
-    }
-    refs
-}
 
 /// Replace `vault://<path>` references in the payload with their resolved
 /// plaintext values. Substitutes in three locations to cover both the
