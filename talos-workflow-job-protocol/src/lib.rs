@@ -6153,9 +6153,30 @@ impl SignedMessage for CancelCommand {
 /// [`WorkerSharedKey`]: talos_workflow_engine_core::WorkerSharedKey
 /// [`WorkerKeyRing`]: talos_workflow_engine_core::WorkerKeyRing
 pub fn load_worker_shared_key() -> Result<talos_workflow_engine_core::WorkerSharedKey, String> {
-    // Support Docker secrets via WORKER_SHARED_KEY_FILE in addition to direct env var
+    // Support Docker secrets via WORKER_SHARED_KEY_FILE in addition to direct env var.
+    //
+    // `.filter(|s| !s.trim().is_empty())` on the DIRECT env var is load-bearing,
+    // not defensive. `env::var` returns `Ok("")` for a variable that is set but
+    // empty — a Helm `values.yaml` placeholder, or `export WORKER_SHARED_KEY=`
+    // — and without the filter that `Some("")` SHORT-CIRCUITS the `_FILE`
+    // fallback, so a populated `WORKER_SHARED_KEY_FILE` is never read.
+    //
+    // The failure is not silent, but it MISDIAGNOSES: the empty string reaches
+    // `hex::decode` (which accepts it) and fails the length check as
+    // "WORKER_SHARED_KEY must be 32 bytes (64 hex chars), got 0 bytes" — which
+    // sends an operator to regenerate a key that was correct all along, sitting
+    // unread in the file.
+    //
+    // The `_FILE` branch below already filtered empties before this fix; the
+    // asymmetry between the two sources is what made the bug easy to miss.
+    // Same class as #701 (`env::var(..).is_ok()` matching `Ok("")`), which
+    // closed the PRESENCE-test variant across 14 sites and added lint check 73.
+    // This is the PRECEDENCE variant: an empty value shadowing a valid
+    // fallback. Check 73 does not catch it — it keys on presence predicates,
+    // and this is an `.ok()` feeding an `or_else` chain.
     let hex_key = std::env::var("WORKER_SHARED_KEY")
         .ok()
+        .filter(|s| !s.trim().is_empty())
         .or_else(|| {
             std::env::var("WORKER_SHARED_KEY_FILE").ok().and_then(|path| {
                 std::fs::read_to_string(&path)
@@ -9619,5 +9640,95 @@ mod cancel_command_tests {
             .expect("a round-tripped command must still verify");
         // Small enough that the worker's 4 KiB payload cap is generous.
         assert!(bytes.len() < 512, "unexpected wire size: {}", bytes.len());
+    }
+}
+
+#[cfg(test)]
+mod worker_shared_key_precedence_tests {
+    //! An EMPTY `WORKER_SHARED_KEY` must not shadow a populated
+    //! `WORKER_SHARED_KEY_FILE`.
+    //!
+    //! `env::var` returns `Ok("")` for a variable that is set but empty, so
+    //! before the fix a `Some("")` short-circuited the `_FILE` fallback and the
+    //! file was never read. The failure was not silent, but it MISDIAGNOSED:
+    //! the empty string reached the length check and reported
+    //! "must be 32 bytes ... got 0 bytes", pointing an operator at a key that
+    //! was correct all along.
+    //!
+    //! These tests mutate process-wide env, so they are serialised against each
+    //! other. Verified safe at author time: no other test in this crate's lib
+    //! module or its three integration binaries reads `WORKER_SHARED_KEY`.
+
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    const VALID_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// Restores both variables on drop, so a panicking assert cannot leak state
+    /// into another test.
+    struct EnvGuard;
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("WORKER_SHARED_KEY");
+            std::env::remove_var("WORKER_SHARED_KEY_FILE");
+        }
+    }
+
+    #[test]
+    fn an_empty_env_var_does_not_shadow_a_populated_key_file() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard;
+
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        writeln!(f, "{VALID_HEX}").expect("write key");
+
+        std::env::set_var("WORKER_SHARED_KEY", "");
+        std::env::set_var("WORKER_SHARED_KEY_FILE", f.path());
+
+        let key = super::load_worker_shared_key()
+            .expect("an empty env var must fall through to the _FILE source");
+        assert_eq!(
+            key.as_bytes().len(),
+            32,
+            "the key must come from the file, not the empty env var"
+        );
+    }
+
+    #[test]
+    fn a_whitespace_only_env_var_also_falls_through() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard;
+
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        writeln!(f, "{VALID_HEX}").expect("write key");
+
+        std::env::set_var("WORKER_SHARED_KEY", "   ");
+        std::env::set_var("WORKER_SHARED_KEY_FILE", f.path());
+
+        assert!(
+            super::load_worker_shared_key().is_ok(),
+            "whitespace is as empty as empty for a hex key"
+        );
+    }
+
+    #[test]
+    fn a_populated_env_var_still_wins_over_the_file() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard;
+
+        let mut f = tempfile::NamedTempFile::new().expect("temp file");
+        writeln!(f, "{}", "f".repeat(64)).expect("write key");
+
+        std::env::set_var("WORKER_SHARED_KEY", VALID_HEX);
+        std::env::set_var("WORKER_SHARED_KEY_FILE", f.path());
+
+        let key = super::load_worker_shared_key().expect("valid env key");
+        assert_eq!(
+            key.as_bytes(),
+            hex::decode(VALID_HEX).unwrap().as_slice(),
+            "a non-empty env var must keep precedence over the file"
+        );
     }
 }
