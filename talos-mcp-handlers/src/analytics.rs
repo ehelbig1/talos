@@ -734,11 +734,19 @@ async fn handle_get_health_dashboard(
     state: &McpState,
     user_id: Uuid,
 ) -> JsonRpcResponse {
-    let failing_rows = state
-        .analytics_repo
-        .get_failing_workflows(user_id, 1)
-        .await
-        .unwrap_or_default();
+    // All four list reads below are DISCLOSED. Pre-fix two swallowed the error
+    // silently and two logged it and substituted `Vec::new()` — but a log is
+    // invisible to the operator holding this output, and an empty list here
+    // renders as "nothing is failing, nothing is stuck". The `*_count` fields
+    // are the sharp edge: `failing_workflow_count: 0` is the single number a
+    // dashboard or alert reads, and it is exactly the number the 2026-07-24
+    // mass-outage incident (see `top_failures_24h` below) proved must not lie.
+    let mut readings = talos_measurement::Readings::new();
+
+    let failing_rows = readings.record_rows(
+        "failing_workflows",
+        state.analytics_repo.get_failing_workflows(user_id, 1).await,
+    );
 
     let failing: Vec<serde_json::Value> = failing_rows
         .iter()
@@ -752,11 +760,13 @@ async fn handle_get_health_dashboard(
         })
         .collect();
 
-    let long_running_rows = state
-        .analytics_repo
-        .get_long_running_executions(user_id)
-        .await
-        .unwrap_or_default();
+    let long_running_rows = readings.record_rows(
+        "long_running_executions",
+        state
+            .analytics_repo
+            .get_long_running_executions(user_id)
+            .await,
+    );
 
     let long_running: Vec<serde_json::Value> = long_running_rows
         .iter()
@@ -777,17 +787,13 @@ async fn handle_get_health_dashboard(
     // PG 16 stores output_data encrypted (`output_data_enc`) — a plain
     // JSONB-path query can't see the bytes; we must decrypt + filter in
     // Rust. See `find_loop_capped_workflows_24h`.
-    let loop_capped_rows = match state
-        .execution_repo
-        .find_loop_capped_workflows_24h(user_id)
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!(error = %e, "find_loop_capped_workflows_24h returned error");
-            Vec::new()
-        }
-    };
+    let loop_capped_rows = readings.record_rows(
+        "loop_capped_workflows",
+        state
+            .execution_repo
+            .find_loop_capped_workflows_24h(user_id)
+            .await,
+    );
 
     let loop_capped: Vec<serde_json::Value> = loop_capped_rows
         .iter()
@@ -807,13 +813,10 @@ async fn handle_get_health_dashboard(
     // then recovering) showed `failing_workflow_count: 0` while the raw
     // failed/completed counts said ~34% of runs died. `top_failures_24h`
     // + `failure_rate_24h_pct` make that class of incident visible.
-    let top_failure_rows = match state.analytics_repo.get_top_failures_24h(user_id).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!(error = %e, "get_top_failures_24h returned error");
-            Vec::new()
-        }
-    };
+    let top_failure_rows = readings.record_rows(
+        "top_failures_24h",
+        state.analytics_repo.get_top_failures_24h(user_id).await,
+    );
 
     let top_failures: Vec<serde_json::Value> = top_failure_rows
         .iter()
@@ -843,21 +846,32 @@ async fn handle_get_health_dashboard(
     // MCP-63 (2026-05-07): mirror array lengths into summary so callers
     // can answer "is anything broken right now" from a single object
     // instead of length-checking two separate top-level arrays.
-    let result = serde_json::json!({
+    // A count derived from a list we could not read is null, not 0. Otherwise
+    // the disclosure sits next to a `0` that still reads as an all-clear.
+    let count_of = |field: &str, rendered: &[serde_json::Value]| -> Option<usize> {
+        if readings.not_measured().contains(&field) {
+            None
+        } else {
+            Some(rendered.len())
+        }
+    };
+
+    let mut result = serde_json::json!({
         "summary": {
             "currently_running": summary.running,
             "failed_last_24h": summary.failed_24h,
             "completed_last_24h": summary.completed_24h,
             "failure_rate_24h_pct": failure_rate_pct(summary.failed_24h, summary.completed_24h),
-            "failing_workflow_count": failing.len(),
-            "long_running_execution_count": long_running.len(),
-            "loop_capped_workflow_count": loop_capped.len(),
+            "failing_workflow_count": count_of("failing_workflows", &failing),
+            "long_running_execution_count": count_of("long_running_executions", &long_running),
+            "loop_capped_workflow_count": count_of("loop_capped_workflows", &loop_capped),
         },
         "failing_workflows": failing,
         "long_running_executions": long_running,
         "loop_capped_workflows": loop_capped,
         "top_failures_24h": top_failures,
     });
+    readings.attach(&mut result);
 
     mcp_text(
         req_id,
@@ -1596,55 +1610,131 @@ async fn handle_get_system_health(
         Err(_) => return mcp_error(req_id, -32000, "Failed to fetch system health"),
     };
 
-    let active_schedules = state
-        .analytics_repo
-        .count_active_schedules_for_user(user_id)
-        .await
-        .unwrap_or(0);
-    let active_webhooks = state
-        .analytics_repo
-        .count_active_webhooks_for_user(user_id)
-        .await
-        .unwrap_or(0);
-    let stale_executions = state
-        .analytics_repo
-        .count_stale_running_executions(user_id)
-        .await
-        .unwrap_or(0);
-    let unack_alerts = state
-        .analytics_repo
-        .count_unacknowledged_alerts(user_id)
-        .await
-        .unwrap_or(0);
+    // Every read below is DISCLOSED, not defaulted. Pre-fix each one ended
+    // `.unwrap_or(0)`, so a database problem rendered this tool's output as a
+    // maximally healthy system: no stuck executions, no unacknowledged alerts,
+    // no errors in the last hour — which is exactly what an operator opens this
+    // tool to check during an incident. `Readings` nulls the field and names it
+    // under `measurement.not_measured`; see `talos_measurement::Readings` for
+    // the class and its two prior local repairs (#699, #702).
+    let mut readings = talos_measurement::Readings::new();
 
-    let (hour_total, hour_failed) = state
-        .analytics_repo
-        .get_recent_exec_error_rate(user_id)
-        .await
-        .unwrap_or((0, 0));
-    let failure_rate_pct = if hour_total > 0 {
-        (hour_failed as f64 / hour_total as f64 * 100.0).round()
-    } else {
-        0.0
-    };
+    let active_schedules = readings.record(
+        "active_schedules",
+        state
+            .analytics_repo
+            .count_active_schedules_for_user(user_id)
+            .await,
+    );
+    let active_webhooks = readings.record(
+        "active_webhooks",
+        state
+            .analytics_repo
+            .count_active_webhooks_for_user(user_id)
+            .await,
+    );
+    let stale_executions = readings.record(
+        "stale_executions",
+        state
+            .analytics_repo
+            .count_stale_running_executions(user_id)
+            .await,
+    );
+    let unack_alerts = readings.record(
+        "unacknowledged_alerts",
+        state
+            .analytics_repo
+            .count_unacknowledged_alerts(user_id)
+            .await,
+    );
 
-    let (wasm_bytes, template_bytes) = state
-        .analytics_repo
-        .get_storage_bytes(user_id)
-        .await
-        .unwrap_or((0, 0));
-    let total_wasm_bytes = wasm_bytes + template_bytes;
-    let wasm_size_mb = total_wasm_bytes as f64 / (1024.0 * 1024.0);
+    let error_rate = readings.record(
+        "recent_failure_rate",
+        state
+            .analytics_repo
+            .get_recent_exec_error_rate(user_id)
+            .await,
+    );
+    let storage = readings.record(
+        "disk_usage",
+        state.analytics_repo.get_storage_bytes(user_id).await,
+    );
 
-    let result = serde_json::json!({
+    let result = render_system_health(
+        db_ok,
+        &SystemHealthReads {
+            total_workflows: counts.workflows,
+            total_modules: counts.modules + counts.templates,
+            total_executions: counts.executions,
+            active_schedules,
+            active_webhooks,
+            stale_executions,
+            unacknowledged_alerts: unack_alerts,
+            error_rate,
+            storage,
+        },
+        &readings,
+    );
+
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&result).unwrap_or_default(),
+    )
+}
+
+/// The six DB-backed readings behind `get_system_health`, each already
+/// resolved to `Some(measured)` / `None(could not measure)`.
+///
+/// A struct rather than nine positional arguments so the renderer can be driven
+/// from a test without a database — the query-failed case is the entire point
+/// of the fix, and it must be pinned against the code that actually ships, not
+/// against a test-local copy of it.
+pub(crate) struct SystemHealthReads {
+    pub total_workflows: i64,
+    pub total_modules: i64,
+    pub total_executions: i64,
+    pub active_schedules: Option<i64>,
+    pub active_webhooks: Option<i64>,
+    pub stale_executions: Option<i64>,
+    pub unacknowledged_alerts: Option<i64>,
+    /// `(total, failed)` executions in the last hour.
+    pub error_rate: Option<(i64, i64)>,
+    /// `(wasm_bytes, template_bytes)`.
+    pub storage: Option<(i64, i64)>,
+}
+
+/// Pure: render the `get_system_health` response.
+///
+/// Every derived number stays `None` when its input was not measured. A rate
+/// over an unmeasured denominator is not 0% — it is nothing — and a megabyte
+/// figure computed from an unmeasured byte count is not "0.00 MB".
+pub(crate) fn render_system_health(
+    db_ok: bool,
+    reads: &SystemHealthReads,
+    readings: &talos_measurement::Readings,
+) -> serde_json::Value {
+    let hour_total = reads.error_rate.map(|(t, _)| t);
+    let hour_failed = reads.error_rate.map(|(_, f)| f);
+    let failure_rate_pct = reads.error_rate.map(|(total, failed)| {
+        if total > 0 {
+            (failed as f64 / total as f64 * 100.0).round()
+        } else {
+            0.0
+        }
+    });
+
+    let total_wasm_bytes = reads.storage.map(|(wasm, template)| wasm + template);
+    let wasm_size_mb = total_wasm_bytes.map(|b| format!("{:.2}", b as f64 / (1024.0 * 1024.0)));
+
+    let mut result = serde_json::json!({
         "database_connected": db_ok,
-        "total_workflows": counts.workflows,
-        "total_modules": counts.modules + counts.templates,
-        "total_executions": counts.executions,
-        "active_schedules": active_schedules,
-        "active_webhooks": active_webhooks,
-        "stale_executions": stale_executions,
-        "unacknowledged_alerts": unack_alerts,
+        "total_workflows": reads.total_workflows,
+        "total_modules": reads.total_modules,
+        "total_executions": reads.total_executions,
+        "active_schedules": reads.active_schedules,
+        "active_webhooks": reads.active_webhooks,
+        "stale_executions": reads.stale_executions,
+        "unacknowledged_alerts": reads.unacknowledged_alerts,
         "recent_failure_rate": {
             "period": "last_hour",
             "total_executions": hour_total,
@@ -1653,14 +1743,11 @@ async fn handle_get_system_health(
         },
         "disk_usage": {
             "total_wasm_bytes": total_wasm_bytes,
-            "total_wasm_mb": format!("{:.2}", wasm_size_mb),
+            "total_wasm_mb": wasm_size_mb,
         },
     });
-
-    mcp_text(
-        req_id,
-        &serde_json::to_string_pretty(&result).unwrap_or_default(),
-    )
+    readings.attach(&mut result);
+    result
 }
 
 /// MCP-68: clean error truncation for the audit-trail prose preview.
@@ -2480,30 +2567,33 @@ async fn handle_get_error_report(
         Err(resp) => return resp,
     };
 
-    // Total failures in period
-    let stats = state
-        .analytics_repo
-        .get_exec_stats(wf_id, user_id, days)
-        .await
-        .unwrap_or(talos_analytics_repository::ExecStats {
-            total: 0,
-            succeeded: 0,
-            failed: 0,
-            running: 0,
-            avg_duration_secs: None,
-        });
-    let total_failures = stats.failed;
+    // `total_failures: 0` is the headline of this tool, and pre-fix a failed
+    // stats query produced it from a hand-written zeroed struct — the tool
+    // that answers "what is breaking" answering "nothing is breaking" because
+    // it could not ask.
+    let mut readings = talos_measurement::Readings::new();
+    let total_failures = readings
+        .record(
+            "total_failures",
+            state
+                .analytics_repo
+                .get_exec_stats(wf_id, user_id, days)
+                .await,
+        )
+        .map(|stats| stats.failed);
 
     // MCP-99 (2026-05-08): error fingerprints now carry `latest_at` so
     // operators can tell whether a fingerprint is fresh or stale.
     // Source rows are ordered by started_at DESC, so the FIRST row seen
     // for a fingerprint is the most recent occurrence. The fuel-bump
     // detector below still wants Vec<String>, so we keep both views.
-    let error_rows = state
-        .analytics_repo
-        .get_error_messages_with_started_at(wf_id, user_id, days, 200)
-        .await
-        .unwrap_or_default();
+    let error_rows = readings.record_rows(
+        "error_fingerprints",
+        state
+            .analytics_repo
+            .get_error_messages_with_started_at(wf_id, user_id, days, 200)
+            .await,
+    );
     let error_msgs: Vec<String> = error_rows.iter().map(|(m, _)| m.clone()).collect();
 
     // Fingerprint grouping shared with the global mode — see
@@ -2511,11 +2601,13 @@ async fn handle_get_error_report(
     let error_fingerprints = group_error_fingerprints(&error_rows, 10);
 
     // Node-level failure breakdown from execution_events
-    let node_failures = state
-        .analytics_repo
-        .get_node_failure_counts(wf_id, user_id, days)
-        .await
-        .unwrap_or_default();
+    let node_failures = readings.record_rows(
+        "node_failure_breakdown",
+        state
+            .analytics_repo
+            .get_node_failure_counts(wf_id, user_id, days)
+            .await,
+    );
 
     // MCP-99 (2026-05-08): resolve node UUIDs to labels via the workflow
     // graph. Pre-fix this surface emitted bare synthetic UUIDs
@@ -2523,9 +2615,16 @@ async fn handle_get_error_report(
     // get_workflow_graph manually. Sister tool `get_node_failure_breakdown`
     // already does the same resolution (per MCP-65); now this surface
     // matches.
+    // Decorative only — this graph read exists solely to
+    // resolve node UUIDs to human labels below. On failure every entry in
+    // `node_failure_breakdown` falls back to its bare UUID (see the
+    // `unwrap_or_else` in the map), so the failure COUNTS are untouched and the
+    // degradation is visible in the output rather than hidden by it. Nothing
+    // here makes a claim about system state.
     let graph_json_str = state
         .analytics_repo
         .get_workflow_graph_json(wf_id, user_id)
+        // allow-benign-default: label prettification only; see the note above.
         .await
         .unwrap_or(None);
     let mut uuid_to_label: std::collections::HashMap<uuid::Uuid, String> =
@@ -2581,11 +2680,13 @@ async fn handle_get_error_report(
     let fuel_bump_antipatterns = detect_fuel_bump_antipattern(&error_msgs);
 
     // Time-of-day pattern: failures grouped by hour
-    let hourly_rows = state
-        .analytics_repo
-        .get_hourly_failure_breakdown(wf_id, user_id, days)
-        .await
-        .unwrap_or_default();
+    let hourly_rows = readings.record_rows(
+        "hourly_failure_pattern",
+        state
+            .analytics_repo
+            .get_hourly_failure_breakdown(wf_id, user_id, days)
+            .await,
+    );
 
     let hourly_pattern: Vec<serde_json::Value> = hourly_rows
         .iter()
@@ -2603,6 +2704,7 @@ async fn handle_get_error_report(
     if !fuel_bump_antipatterns.is_empty() {
         result["fuel_bump_antipatterns"] = serde_json::Value::Array(fuel_bump_antipatterns);
     }
+    readings.attach(&mut result);
 
     mcp_text(
         req_id,
@@ -2637,14 +2739,22 @@ async fn handle_error_report_global(
     };
 
     // Total failures across all the user's workflows in the window.
-    let stats = state
-        .analytics_repo
-        .get_exec_stats_global(user_id, days)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::error!(error = %e, "get_exec_stats_global failed for error report");
-            talos_analytics_repository::ExecStats::empty()
-        });
+    // Pre-fix this logged and substituted an empty ExecStats, so the response
+    // could self-contradict: `total_failures: 0` sitting directly above a
+    // populated `error_fingerprints` list. The other two reads in this handler
+    // already refuse to guess (they return `mcp_error`); this one now nulls and
+    // discloses instead, because a rollup missing one of three sections is
+    // still worth serving.
+    let mut readings = talos_measurement::Readings::new();
+    let total_failures = readings
+        .record(
+            "total_failures",
+            state
+                .analytics_repo
+                .get_exec_stats_global(user_id, days)
+                .await,
+        )
+        .map(|stats| stats.failed);
 
     let error_rows = match state
         .analytics_repo
@@ -2682,13 +2792,14 @@ async fn handle_error_report_global(
         })
         .collect();
 
-    let result = serde_json::json!({
+    let mut result = serde_json::json!({
         "scope": "global",
         "period_days": days,
-        "total_failures": stats.failed,
+        "total_failures": total_failures,
         "error_fingerprints": error_fingerprints,
         "workflow_failure_counts": workflow_failure_counts,
     });
+    readings.attach(&mut result);
 
     mcp_text(
         req_id,
@@ -4122,6 +4233,9 @@ async fn handle_get_workflow_risk_assessment(
         .unwrap_or_default();
 
     let mut risks: Vec<serde_json::Value> = Vec::new();
+    // A risk assessment that could not run one of its probes must say so: an
+    // absent finding and an unaskable question look identical in `risks: []`.
+    let mut readings = talos_measurement::Readings::new();
 
     // Check: workflow-level wall-clock cap DISABLED.
     //
@@ -4361,11 +4475,13 @@ async fn handle_get_workflow_risk_assessment(
 
     // Check: Modules not updated in >90 days
     if !module_ids.is_empty() {
-        let stale_ids = state
-            .analytics_repo
-            .get_risk_stale_templates(&module_ids)
-            .await
-            .unwrap_or_default();
+        let stale_ids = readings.record_rows(
+            "stale_module",
+            state
+                .analytics_repo
+                .get_risk_stale_templates(&module_ids)
+                .await,
+        );
         // module_facts already loaded: use it to map stale ids to names
         for stale_id in &stale_ids {
             let name = module_facts
@@ -4406,11 +4522,13 @@ async fn handle_get_workflow_risk_assessment(
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
-    let referenced_secrets = state
-        .analytics_repo
-        .get_risk_secret_expiry_for_paths(user_id, &referenced_vault_paths)
-        .await
-        .unwrap_or_default();
+    let referenced_secrets = readings.record_rows(
+        "expiring_secret",
+        state
+            .analytics_repo
+            .get_risk_secret_expiry_for_paths(user_id, &referenced_vault_paths)
+            .await,
+    );
     // An ALREADY-expired secret is reported too. The retired query bounded its
     // window with `expires_at > NOW()`, so a credential that had already lapsed
     // — the state in which the workflow is broken right now rather than about
@@ -4483,10 +4601,14 @@ async fn handle_get_workflow_risk_assessment(
         .collect::<std::collections::HashSet<_>>() // de-dupe before fetch
         .into_iter()
         .collect();
-    let exec_counts = state
-        .analytics_repo
-        .get_risk_exec_counts_for_ids(&sub_wf_ids, user_id)
-        .await
+    let exec_counts = readings
+        .record(
+            "high_failure_sub_workflow",
+            state
+                .analytics_repo
+                .get_risk_exec_counts_for_ids(&sub_wf_ids, user_id)
+                .await,
+        )
         .unwrap_or_default();
     for sub_wf_id in &sub_wf_ids {
         let (failed, total) = match exec_counts.get(sub_wf_id) {
@@ -4541,10 +4663,16 @@ async fn handle_get_workflow_risk_assessment(
         .unwrap_or(false);
     if !has_intent {
         // Check if workflow is published
-        let is_published: bool = state
-            .analytics_repo
-            .check_has_active_version(wf_id)
-            .await
+        // The only benign-default site in this handler that does NOT hide a
+        // finding — the `no_intent` risk is pushed either way, and a failure
+        // merely downgrades its severity from medium to low. Disclosed rather
+        // than silently accepted, because a downgraded severity is still a
+        // softer claim than the evidence supports.
+        let is_published: bool = readings
+            .record(
+                "no_intent.risk_level",
+                state.analytics_repo.check_has_active_version(wf_id).await,
+            )
             .unwrap_or(false);
 
         let risk_level = if is_published { "medium" } else { "low" };
@@ -4567,11 +4695,13 @@ async fn handle_get_workflow_risk_assessment(
     // against an older WIT interface, and have no automated update path — making
     // them inherently higher risk than catalog modules which are platform-managed.
     if !module_ids.is_empty() {
-        let sandbox_modules = state
-            .analytics_repo
-            .get_risk_sandbox_modules(&module_ids)
-            .await
-            .unwrap_or_default();
+        let sandbox_modules = readings.record_rows(
+            "sandbox_module",
+            state
+                .analytics_repo
+                .get_risk_sandbox_modules(&module_ids)
+                .await,
+        );
         if !sandbox_modules.is_empty() {
             let sandbox_id_set: std::collections::HashSet<uuid::Uuid> =
                 sandbox_modules.iter().map(|(id, _)| *id).collect();
@@ -4734,13 +4864,19 @@ async fn handle_get_workflow_risk_assessment(
     // Cross-references the live execution history to surface recurring secret failures
     // that indicate a vault_path_blocked or empty_secret_grant config issue in production.
     {
-        let recent_auth_failures = state
-            .analytics_repo
-            .count_recent_auth_failures(wf_id, 7)
-            .await
-            .unwrap_or(None);
+        // `.unwrap_or(None)` here made a DB error indistinguishable from "this
+        // workflow has had no auth failures", so a HIGH-severity finding
+        // vanished from the risk list without a trace. `None` and `Err` are two
+        // different sentences and only one of them is a clean bill of health.
+        let recent_auth_failures = readings.record(
+            "repeated_auth_failures",
+            state
+                .analytics_repo
+                .count_recent_auth_failures(wf_id, 7)
+                .await,
+        );
 
-        if let Some((count, last_failure)) = recent_auth_failures {
+        if let Some(Some((count, last_failure))) = recent_auth_failures {
             if count > 0 {
                 risks.push(serde_json::json!({
                     "risk_level": "high",
@@ -4774,7 +4910,7 @@ async fn handle_get_workflow_risk_assessment(
         level_order(a).cmp(&level_order(b))
     });
 
-    let result = serde_json::json!({
+    let mut result = serde_json::json!({
         "workflow_name": wf_name,
         "workflow_id": wf_id.to_string(),
         "total_risks": risks.len(),
@@ -4783,6 +4919,7 @@ async fn handle_get_workflow_risk_assessment(
         "low": risks.iter().filter(|r| r.get("risk_level").and_then(|l| l.as_str()) == Some("low")).count(),
         "risks": risks,
     });
+    readings.attach(&mut result);
 
     mcp_text(
         req_id,
@@ -4842,21 +4979,32 @@ async fn handle_get_daily_digest(
     let running = summary_row.running;
 
     // Top 3 most active workflows
-    let active_rows = state
-        .analytics_repo
-        .get_top_active_workflows_24h(user_id)
-        .await
-        .unwrap_or_default();
+    // This handler renders a HUMAN-READABLE `summary` that is emailed by the
+    // autonomy digest, and its section headings are emitted only when their
+    // list is non-empty. A failed query therefore did not merely zero a
+    // number — it silently DELETED the "Top Failing Workflows" section from a
+    // digest a human reads as complete. The disclosure is appended to the prose
+    // as well as to the JSON for exactly that reason.
+    let mut readings = talos_measurement::Readings::new();
+    let active_rows = readings.record_rows(
+        "top_active_workflows",
+        state
+            .analytics_repo
+            .get_top_active_workflows_24h(user_id)
+            .await,
+    );
     let top_active: Vec<serde_json::Value> = active_rows.iter().map(|r| {
         serde_json::json!({"workflow_id": r.id.to_string(), "name": r.name, "executions": r.exec_count})
     }).collect();
 
     // Top 3 failing workflows
-    let failing_rows = state
-        .analytics_repo
-        .get_top_failing_workflows_24h(user_id)
-        .await
-        .unwrap_or_default();
+    let failing_rows = readings.record_rows(
+        "top_failing_workflows",
+        state
+            .analytics_repo
+            .get_top_failing_workflows_24h(user_id)
+            .await,
+    );
     let top_failing: Vec<serde_json::Value> = failing_rows
         .iter()
         .map(|r| {
@@ -4876,11 +5024,13 @@ async fn handle_get_daily_digest(
         .collect();
 
     // Upcoming schedules (next 24h)
-    let schedule_rows = state
-        .analytics_repo
-        .get_upcoming_schedules_for_user(user_id)
-        .await
-        .unwrap_or_default();
+    let schedule_rows = readings.record_rows(
+        "upcoming_schedules",
+        state
+            .analytics_repo
+            .get_upcoming_schedules_for_user(user_id)
+            .await,
+    );
     let schedules: Vec<serde_json::Value> = schedule_rows
         .iter()
         .map(|r| {
@@ -4950,7 +5100,12 @@ async fn handle_get_daily_digest(
         }
     }
 
-    let result = serde_json::json!({
+    if !readings.complete() {
+        summary.push_str("\n⚠ INCOMPLETE DIGEST\n");
+        summary.push_str(&format!("  {}\n", readings.note()));
+    }
+
+    let mut result = serde_json::json!({
         "summary": summary,
         "data": {
             "executions": {
@@ -4965,6 +5120,7 @@ async fn handle_get_daily_digest(
             "upcoming_schedules": schedules,
         }
     });
+    readings.attach(&mut result);
 
     mcp_text(
         req_id,
@@ -5761,11 +5917,19 @@ async fn handle_get_readiness_breakdown(
     let description: Option<String> = wf_full.description;
     let caps: Vec<String> = wf_full.capabilities.unwrap_or_default();
     let graph_json_str: String = wf_full.graph_json.unwrap_or_default();
-    let wf_analytics = state
-        .analytics_repo
-        .get_workflow_for_analytics(wf_id, user_id)
-        .await
-        .unwrap_or(None);
+    // Every DB-backed input to the readiness SCORE is disclosed. A score is a
+    // single number an operator reads as a verdict, so a component computed
+    // from a defaulted input has to say which input it did not have.
+    let mut readings = talos_measurement::Readings::new();
+    let wf_analytics = readings
+        .record(
+            "workflow_type",
+            state
+                .analytics_repo
+                .get_workflow_for_analytics(wf_id, user_id)
+                .await,
+        )
+        .flatten();
     let workflow_type: String = wf_analytics
         .and_then(|r| r.workflow_type)
         .unwrap_or_else(|| "production".into());
@@ -5778,14 +5942,17 @@ async fn handle_get_readiness_breakdown(
     // known-historical out-of-band events don't penalise the current score.
     // Saturates at 20 runs — a workflow with 20 successful executions is
     // considered fully reliable; requiring 100 runs was overly punitive.
-    let exec_data = state
-        .analytics_repo
-        .get_readiness_exec_data(wf_id)
-        .await
-        .unwrap_or(talos_analytics_repository::ReadinessExecData {
-            success_rate: None,
-            total_count: 0,
-        });
+    let exec_data = readings.record(
+        "reliability.executions",
+        state.analytics_repo.get_readiness_exec_data(wf_id).await,
+    );
+    if exec_data.is_none() {
+        readings.mark_derived("readiness_score");
+    }
+    let exec_data = exec_data.unwrap_or(talos_analytics_repository::ReadinessExecData {
+        success_rate: None,
+        total_count: 0,
+    });
     let (success_rate, exec_count) = (exec_data.success_rate, exec_data.total_count);
     // Saturation at 10 runs: 5 perfect runs → 50% of reliability credit (not alarming).
     // Linear ramp 0→10 runs, then capped at 1.0. Shared with validate_workflow.
@@ -5815,11 +5982,21 @@ async fn handle_get_readiness_breakdown(
         talos_analytics_repository::compute_documentation_score(has_desc, has_node_desc, has_caps);
 
     // ── Freshness (20%) ───────────────────────────────────────────────────
-    let last_exec_at = state
-        .analytics_repo
-        .get_max_execution_started_at(wf_id)
-        .await
-        .unwrap_or(None);
+    let last_exec_at = readings
+        .record(
+            "freshness.last_execution_at",
+            state
+                .analytics_repo
+                .get_max_execution_started_at(wf_id)
+                .await,
+        )
+        .flatten();
+    if readings
+        .not_measured()
+        .contains(&"freshness.last_execution_at")
+    {
+        readings.mark_derived("readiness_score");
+    }
     let days_since_last =
         last_exec_at.map(|t| chrono::Utc::now().signed_duration_since(t).num_days());
     let freshness = talos_analytics_repository::compute_freshness_score(days_since_last);
@@ -5853,11 +6030,20 @@ async fn handle_get_readiness_breakdown(
                 .any(|e| e.get("edge_type").and_then(|t| t.as_str()) == Some("error"))
         })
         .unwrap_or(false);
-    let expiring_secrets: i64 = state
-        .analytics_repo
-        .count_expiring_secrets(user_id)
-        .await
-        .unwrap_or(0);
+    // `.unwrap_or(0)` fed a defaulted "no secrets are expiring" straight into
+    // the risk component of the readiness score, INFLATING it — the failure
+    // direction that makes a workflow look more production-ready than it is.
+    // The score is still emitted (nulling it would break every consumer), but
+    // both the input and the score it fed are disclosed, and the score is then
+    // an UPPER bound rather than a measurement.
+    let expiring_measured = readings.record(
+        "expiring_secrets",
+        state.analytics_repo.count_expiring_secrets(user_id).await,
+    );
+    if expiring_measured.is_none() {
+        readings.mark_derived("readiness_score");
+    }
+    let expiring_secrets: i64 = expiring_measured.unwrap_or(0);
 
     let risk = talos_analytics_repository::compute_risk_score(
         has_timeout,
@@ -5955,9 +6141,7 @@ async fn handle_get_readiness_breakdown(
         tracing::warn!(wf_id = %wf_id, score = computed_score, error = %e, "readiness_score write-back failed");
     }
 
-    mcp_text(
-        req_id,
-        &serde_json::to_string_pretty(&serde_json::json!({
+    let mut result = serde_json::json!({
             "workflow_id": wf_id.to_string(),
             "name": name,
             "workflow_type": workflow_type,
@@ -6016,8 +6200,12 @@ async fn handle_get_readiness_breakdown(
             },
             "improvements": improvements,
             "total_points_available": total_points_available,
-        }))
-        .unwrap_or_default(),
+    });
+    readings.attach(&mut result);
+
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&result).unwrap_or_default(),
     )
 }
 
@@ -6169,11 +6357,16 @@ async fn handle_get_all_readiness_scores(
             Err(resp) => return resp,
         };
 
-    let rows = state
-        .analytics_repo
-        .list_readiness_scores(user_id, filter_ids.as_deref(), max_score, include_archived)
-        .await
-        .unwrap_or_default();
+    // An empty list here reads as "you have no workflows below this score" —
+    // the all-clear — and every summary count below is derived from its length.
+    let mut readings = talos_measurement::Readings::new();
+    let rows = readings.record_rows(
+        "workflows",
+        state
+            .analytics_repo
+            .list_readiness_scores(user_id, filter_ids.as_deref(), max_score, include_archived)
+            .await,
+    );
 
     let workflows: Vec<serde_json::Value> = rows
         .iter()
@@ -6242,18 +6435,20 @@ async fn handle_get_all_readiness_scores(
 
     let summary = readiness_summary_json(population.as_ref());
 
+    let mut result = serde_json::json!({
+        "total": population.map_or(page_len, |p| p.total),
+        "summary": summary,
+        "workflows_coverage": coverage.to_json(),
+        "workflows_note": "`workflows` is the LOWEST-scoring page (ORDER BY readiness_score \
+                           ASC), not a sample of the fleet. Read `summary` for fleet-wide \
+                           figures and this list for what to fix first.",
+        "workflows": workflows,
+    });
+    readings.attach(&mut result);
+
     mcp_text(
         req_id,
-        &serde_json::to_string_pretty(&serde_json::json!({
-            "total": population.map_or(page_len, |p| p.total),
-            "summary": summary,
-            "workflows_coverage": coverage.to_json(),
-            "workflows_note": "`workflows` is the LOWEST-scoring page (ORDER BY readiness_score \
-                               ASC), not a sample of the fleet. Read `summary` for fleet-wide \
-                               figures and this list for what to fix first.",
-            "workflows": workflows,
-        }))
-        .unwrap_or_default(),
+        &serde_json::to_string_pretty(&result).unwrap_or_default(),
     )
 }
 
@@ -6914,5 +7109,164 @@ mod readiness_population_pins {
         let v = readiness_summary_json(Some(&pop(0, None, 0, 0)));
         assert_eq!(v["avg_score"], serde_json::Value::Null);
         assert_eq!(v["below_50_count"], serde_json::json!(0));
+    }
+}
+
+#[cfg(test)]
+mod system_health_disclosure_tests {
+    use super::{render_system_health, SystemHealthReads};
+    use talos_measurement::Readings;
+
+    /// Every field measured. Nothing is nulled and no `measurement` block is
+    /// added — the healthy response must be byte-identical to the pre-fix one,
+    /// or every dashboard reading this tool moves for no reason.
+    #[test]
+    fn a_fully_measured_report_is_unchanged_and_carries_no_disclosure() {
+        let readings = Readings::new();
+        let out = render_system_health(
+            true,
+            &SystemHealthReads {
+                total_workflows: 30,
+                total_modules: 91,
+                total_executions: 5000,
+                active_schedules: Some(12),
+                active_webhooks: Some(3),
+                stale_executions: Some(0),
+                unacknowledged_alerts: Some(0),
+                error_rate: Some((100, 7)),
+                storage: Some((1024 * 1024, 0)),
+            },
+            &readings,
+        );
+
+        assert_eq!(out["stale_executions"], 0);
+        assert_eq!(out["unacknowledged_alerts"], 0);
+        assert_eq!(out["recent_failure_rate"]["failure_rate_pct"], 7.0);
+        assert_eq!(out["disk_usage"]["total_wasm_mb"], "1.00");
+        assert!(
+            out.get("measurement").is_none(),
+            "a clean run must not grow a disclosure block: {out}"
+        );
+    }
+
+    /// THE regression. The two fields an operator opens this tool for during an
+    /// incident are `stale_executions` and `unacknowledged_alerts`. Pre-fix a
+    /// failed query rendered both as `0` — "no stuck executions, no
+    /// unacknowledged alerts" — which is the most reassuring output the tool
+    /// can produce, emitted precisely because the database was unreachable.
+    #[test]
+    fn a_query_failure_is_null_and_disclosed_never_a_reassuring_zero() {
+        let mut readings = Readings::new();
+        // Drive the REAL recorder with the real error type shape, rather than
+        // hand-constructing a not-measured list.
+        let stale = readings.record(
+            "stale_executions",
+            Err::<i64, _>(anyhow::anyhow!("connection reset by peer")),
+        );
+        let unack = readings.record(
+            "unacknowledged_alerts",
+            Err::<i64, _>(anyhow::anyhow!("connection reset by peer")),
+        );
+        let rate = readings.record(
+            "recent_failure_rate",
+            Err::<(i64, i64), _>(anyhow::anyhow!("connection reset by peer")),
+        );
+
+        let out = render_system_health(
+            true,
+            &SystemHealthReads {
+                total_workflows: 30,
+                total_modules: 91,
+                total_executions: 5000,
+                active_schedules: Some(12),
+                active_webhooks: Some(3),
+                stale_executions: stale,
+                unacknowledged_alerts: unack,
+                error_rate: rate,
+                storage: Some((0, 0)),
+            },
+            &readings,
+        );
+
+        assert!(out["stale_executions"].is_null(), "{out}");
+        assert!(out["unacknowledged_alerts"].is_null(), "{out}");
+        assert_ne!(out["stale_executions"], 0);
+        assert_ne!(out["unacknowledged_alerts"], 0);
+
+        // The derived rate must not survive its inputs. `0%` failures is the
+        // benign reading, and it is unreachable from an unmeasured denominator.
+        assert!(
+            out["recent_failure_rate"]["failure_rate_pct"].is_null(),
+            "{out}"
+        );
+        assert!(
+            out["recent_failure_rate"]["total_executions"].is_null(),
+            "{out}"
+        );
+
+        // Measured fields are untouched by a sibling's failure.
+        assert_eq!(out["active_schedules"], 12);
+
+        // And the degradation travels with the data, not only in the log.
+        assert_eq!(out["measurement"]["complete"], false);
+        let named = out["measurement"]["not_measured"].as_array().unwrap();
+        assert_eq!(named.len(), 3, "{out}");
+        assert!(named.iter().any(|v| v == "stale_executions"));
+        assert!(named.iter().any(|v| v == "unacknowledged_alerts"));
+    }
+
+    /// A measured zero and an unmeasurable field must never serialize the same.
+    /// This is the whole class in one assertion.
+    #[test]
+    fn measured_zero_and_could_not_measure_are_distinguishable_in_the_wire_shape() {
+        let clean = Readings::new();
+        let measured = render_system_health(
+            true,
+            &SystemHealthReads {
+                total_workflows: 0,
+                total_modules: 0,
+                total_executions: 0,
+                active_schedules: Some(0),
+                active_webhooks: Some(0),
+                stale_executions: Some(0),
+                unacknowledged_alerts: Some(0),
+                error_rate: Some((0, 0)),
+                storage: Some((0, 0)),
+            },
+            &clean,
+        );
+
+        let mut broken_readings = Readings::new();
+        for field in [
+            "active_schedules",
+            "active_webhooks",
+            "stale_executions",
+            "unacknowledged_alerts",
+            "recent_failure_rate",
+            "disk_usage",
+        ] {
+            let _: Option<i64> =
+                broken_readings.record(field, Err::<i64, _>(anyhow::anyhow!("db down")));
+        }
+        let unmeasured = render_system_health(
+            true,
+            &SystemHealthReads {
+                total_workflows: 0,
+                total_modules: 0,
+                total_executions: 0,
+                active_schedules: None,
+                active_webhooks: None,
+                stale_executions: None,
+                unacknowledged_alerts: None,
+                error_rate: None,
+                storage: None,
+            },
+            &broken_readings,
+        );
+
+        assert_ne!(
+            measured, unmeasured,
+            "an all-zero system and an unreachable database rendered identically"
+        );
     }
 }

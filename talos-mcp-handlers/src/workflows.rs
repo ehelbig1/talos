@@ -6993,15 +6993,22 @@ async fn handle_get_workflow_health(
             return Some(crate::utils::database_error(req_id.clone()));
         }
     };
-    let stats = state
-        .workflow_repo
-        .get_workflow_execution_stats(wf_id, user_id, days)
-        .await
-        .unwrap_or_else(|_| talos_workflow_repository::WorkflowExecStats::empty());
+    // The headline of a tool called `get_workflow_health`. Pre-fix a failed
+    // query was swallowed — not even logged — into a zeroed stats struct, so
+    // the tool reported a workflow with no failures and no runs. `None` here
+    // nulls `stats` and names it under `measurement.not_measured`.
+    let mut readings = talos_measurement::Readings::new();
+    let stats = readings.record(
+        "stats",
+        state
+            .workflow_repo
+            .get_workflow_execution_stats(wf_id, user_id, days)
+            .await,
+    );
     let mut health = serde_json::json!({
         "workflow_id": wf_id.to_string(),
         "name": wf.name,
-        "stats": stats.to_json(days),
+        "stats": stats.map(|s| s.to_json(days)),
     });
 
     // Check for sub-workflow nodes in the graph. Cap recursion at one
@@ -7053,6 +7060,7 @@ async fn handle_get_workflow_health(
             serde_json::json!(sub_workflows),
         );
     }
+    readings.attach(&mut health);
 
     Some(mcp_text(
         req_id.clone(),
