@@ -103,12 +103,31 @@ pub trait ModuleExecutionStore: Send + Sync {
     /// of `"completed"` / `"failed"` / `"timeout"` / `"cancelled"`
     /// (free-form to match the backing table's check constraint;
     /// impls that enforce an enum validate here).
+    ///
+    /// `duration_ms` is **`Some(monotonic elapsed)` or nothing** — the
+    /// distinction is load-bearing, not stylistic:
+    ///
+    /// * `Some(n)` means the caller measured the dispatch against
+    ///   `CLOCK_MONOTONIC` (`std::time::Instant::elapsed`). That is the
+    ///   only clock that answers "how long did this take" on a host that
+    ///   suspends; a wall-clock subtraction over the same interval
+    ///   includes the sleep. Impls must persist `n` verbatim and record
+    ///   that its provenance is monotonic.
+    /// * `None` means **this path did not measure it**, and the impl is
+    ///   free to derive a wall-clock fallback (`completed_at -
+    ///   started_at`) and label it as such.
+    ///
+    /// It was previously a bare `i32`, which forced paths with no
+    /// measurement to invent one: the pipeline dispatcher passed `0` and
+    /// commented that "the value is moot in practice — the trigger
+    /// overwrites it". A sentinel that only reads correctly because a
+    /// bug discards it is not a value; `None` is.
     async fn record_completed(
         &self,
         id: Uuid,
         status: &str,
         output: &JsonValue,
-        duration_ms: i32,
+        duration_ms: Option<i32>,
         error_message: Option<&str>,
     ) -> Result<(), BoxError>;
 

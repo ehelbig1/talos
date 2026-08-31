@@ -43,10 +43,15 @@ pub struct NodeCompletionContext<'a> {
     /// actor-scoped side effects (for example, an actor-memory write
     /// triggered by an engine protocol field in `output`) key off this.
     pub actor_id: Option<Uuid>,
-    /// Wall-clock execution time in milliseconds, measured from
-    /// dispatch to completion. `0` when the engine didn't record a
-    /// start time (some legacy paths don't); impls should treat `0`
-    /// as "unknown" rather than "instantaneous".
+    /// MONOTONIC execution time in milliseconds, measured from dispatch
+    /// to completion with `std::time::Instant` — despite the field name,
+    /// which is preserved because it is also the name of the column it
+    /// lands in (`execution_cost_rollup.wall_time_ms`). It is a real
+    /// duration: a host suspend during the dispatch does not inflate it,
+    /// where a `completed_at - started_at` subtraction over the same
+    /// interval would. `0` when the engine didn't record a start time
+    /// (some legacy paths don't); impls should treat `0` as "unknown"
+    /// rather than "instantaneous".
     pub wall_time_ms: u64,
 }
 
