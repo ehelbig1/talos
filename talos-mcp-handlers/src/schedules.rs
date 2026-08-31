@@ -563,13 +563,28 @@ async fn handle_get_schedule_health(
 
     // Get schedule info
     let sched_repo = talos_schedule_repo::ScheduleRepository::new(state.db_pool.clone());
+    // `.unwrap_or(None)` collapsed a DB failure into "not found", telling the
+    // operator their schedule does not exist (or is not theirs) over a
+    // connection problem — #699's `count_triggers_like` bug, verbatim. Unlike
+    // the partial degradations below, this row is a PRECONDITION for the whole
+    // response: with no schedule there is nothing to report on, so the right
+    // answer is to fail the call rather than to disclose and continue.
     let sched = match sched_repo
         .get_with_workflow_info(schedule_id, user_id)
         .await
-        .unwrap_or(None)
     {
-        Some(r) => r,
-        None => return mcp_error(req_id, -32000, "Schedule not found or access denied"),
+        Ok(Some(r)) => r,
+        Ok(None) => return mcp_error(req_id, -32000, "Schedule not found or access denied"),
+        Err(e) => {
+            tracing::error!(
+                target: "talos_schedules",
+                event_kind = "schedule_health_lookup_failed",
+                schedule_id = %schedule_id,
+                error = %e,
+                "get_with_workflow_info query failed"
+            );
+            return crate::utils::database_error(req_id);
+        }
     };
 
     let workflow_id = sched.workflow_id;
@@ -602,10 +617,18 @@ async fn handle_get_schedule_health(
                 error = %e,
                 "get_scheduled_24h_execution_stats query failed"
             );
-            data_warnings.push(format!(
-                "stats_24h unavailable: {} (zeros below are not authoritative)",
-                e
-            ));
+            // Same info-disclosure fix as MCP-351 applied to the streak arm
+            // below — which left this sibling in the same function untouched.
+            // A sqlx error carries table / column / constraint names and a
+            // connection error can carry the DSN. The full error is in the
+            // tracing event above; the operator sees only that it failed.
+            // The `stats_24h unavailable` prefix is load-bearing — it is named
+            // by ROLLING_SUCCESS_RATE_NOTE — and is preserved exactly.
+            data_warnings.push(
+                "stats_24h unavailable: query failed (see server logs) \
+                 (zeros below are not authoritative)"
+                    .to_string(),
+            );
             talos_workflow_repository::WorkflowHealthStats {
                 total: 0,
                 succeeded: 0,

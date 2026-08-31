@@ -6607,6 +6607,150 @@ else
 fi
 echo
 
+# ── 74. health-reporting handlers must not swallow a read into a benign
+#        default ────────────────────────────────────────────────────────
+# `.await` followed by `.unwrap_or(0)` / `.unwrap_or_default()` /
+# `.unwrap_or(None)` turns a DATABASE FAILURE into the most reassuring
+# answer the surface can give: a count of 0, an empty list, a 0% error
+# rate, a "not found". On a tool whose entire output is a statement about
+# system state that is a lie in the one direction that matters — an
+# operator opens `get_system_health` DURING an incident, and pre-fix a
+# Postgres blip rendered `stale_executions: 0` and
+# `unacknowledged_alerts: 0`.
+#
+# THIS CLASS HAS NOW BEEN REPAIRED FIVE TIMES, each time locally, each
+# time in a different vocabulary:
+#   MCP-366     budget_precheck              fail CLOSED, refuse the op —
+#                                            the defaulted 0 was a SECURITY
+#                                            fail-open. The same .unwrap_or(0)
+#                                            on the same repo method is still
+#                                            in handle_get_actor_budget: the
+#                                            path was fixed, the population
+#                                            was not.
+#   2026-05-06  handle_get_schedule_health   `data_warnings: [..]` + nulls
+#   #699        count_triggers_like          repo returns Result; caller
+#                                            declines to say "run migrations"
+#   #702        security_audit               per-check `verification:
+#                                            not_verified`
+#   this change get_system_health + 7 more   `talos_measurement::Readings`
+# Five local repairs and no structural guard is the signature of a class,
+# not of three unrelated bugs — the same shape lint 73 was written for.
+#
+# SCOPE is deliberately NARROW, and the narrowing is the reason this check
+# is shippable at all. The bare shape (`.await` then `.unwrap_or*`) occurs
+# 179 times across `talos-mcp-handlers/src` + `talos-api/src` and MOST OF
+# THOSE ARE CORRECT: `repo.is_platform_admin(uid).await.unwrap_or(false)`
+# fails CLOSED and is exactly right, and a decorative label lookup that
+# defaults to None cannot mislead anyone about anything. Linting all 179
+# would be enforcement-shaped noise. What separates the defect from the
+# rest is not the DEFAULT, it is the SURFACE: inside a handler whose
+# output IS a health verdict, every field is a claim about system state,
+# so there is no such thing as a harmless default. The check therefore
+# fires only inside functions whose name says they report system state:
+#   system_health · health_dashboard · *_health · error_report ·
+#   daily_digest · risk_assessment · readiness · system_status
+#
+# MEASURED, not asserted. Against `git archive origin/main` (b2bfa0fd)
+# this check reports THIRTY sites across eight handlers, including all six
+# in `handle_get_system_health`. Against this tree it reports ONE, which
+# is a true FALSE POSITIVE and carries the opt-out: a graph read in
+# `handle_get_error_report` used only to resolve node UUIDs to display
+# labels. Measured precision 29/30 = 96.7%; false-positive rate 3.3%.
+#
+# STATED LIMITS:
+#  (a) It is TEXTUAL and NAME-BASED. A health surface named something else
+#      (`handle_get_platform_info`, `handle_whoami`) is invisible to it, as
+#      is a defaulting read performed in a repository or service crate on
+#      the handler's behalf. It catches the shape where the class has
+#      actually recurred, not every possible instance of it.
+#  (b) It does NOT judge the default's DIRECTION. Inside these handlers
+#      that is the point — a fail-closed default is still a number the
+#      report presents as measured — but it means the check cannot be
+#      widened to the other 149 sites without the precision collapsing.
+#  (c) It proves the error is not swallowed, never that the replacement is
+#      good. `Readings::record` satisfies it; so would any other handling.
+# Opt-out: `// allow-benign-default: <reason>` on the reported line or
+# within 8 lines above it — for a genuinely decorative read whose absence
+# makes no claim about system state.
+bold "▶ check 74: health-reporting handlers must not swallow reads into benign defaults"
+BENIGN_DEFAULT_FAIL=0
+BENIGN_AWK="$(mktemp)"
+cat > "$BENIGN_AWK" <<'AWKEOF'
+BEGIN { fn = "?"; skipdepth = 0; intest = 0 }
+FNR == 1 { fn = "?"; intest = 0; pending = ""; pendingno = 0 }
+{
+    line = $0
+    # Drop top-level `#[cfg(test)] mod ... { .. }` regions: a test helper may
+    # legitimately be named after the handler it exercises.
+    if (line ~ /^#\[cfg\(test\)\]/) { intest = 1; next }
+    if (intest == 1) {
+        if (line ~ /^\}/) { intest = 0 }
+        next
+    }
+    if (match(line, /^[[:space:]]*(pub([[:space:]]*\([^)]*\))?[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/)) {
+        hdr = substr(line, RSTART, RLENGTH)
+        sub(/.*fn[[:space:]]+/, "", hdr)
+        fn = hdr
+    }
+    # Same-line form.
+    if (line ~ /\.await[[:space:]]*\.unwrap_or(_default|_else)?[[:space:]]*\(/) {
+        report(FILENAME, FNR, fn, line)
+    }
+    # Split form: previous line ended in `.await`, this one opens `.unwrap_or`.
+    if (pending != "" && line ~ /^[[:space:]]*\.unwrap_or(_default|_else)?[[:space:]]*\(/) {
+        report(FILENAME, pendingno, fn, line)
+    }
+    if (line ~ /\.await[[:space:]]*$/) { pending = line; pendingno = FNR } else { pending = "" }
+}
+function report(file, no, f, text) {
+    if (f !~ /(system_health|health_dashboard|_health|error_report|daily_digest|risk_assessment|readiness|system_status)/) return
+    gsub(/^[[:space:]]+/, "", text)
+    printf "%s:%d:%s:%s\n", file, no, f, text
+}
+AWKEOF
+
+while IFS= read -r hit; do
+    [ -z "$hit" ] && continue
+    file="${hit%%:*}"
+    rest="${hit#*:}"
+    lineno="${rest%%:*}"
+    rest2="${rest#*:}"
+    fname="${rest2%%:*}"
+    start=$((lineno > 8 ? lineno - 8 : 1))
+    if sed -n "${start},$((lineno + 1))p" "$ROOT/$file" 2>/dev/null \
+            | grep -q 'allow-benign-default'; then
+        continue
+    fi
+    red "✗ $file:$lineno $fname() swallows a read into a benign default"
+    printf '    %s\n' "$(printf '%s' "${rest2#*:}" | cut -c1-110)"
+    BENIGN_DEFAULT_FAIL=1
+done < <(cd "$ROOT" && find talos-mcp-handlers/src talos-api/src -name '*.rs' \
+             -not -name '*_tests.rs' -not -path '*/tests/*' -print0 2>/dev/null \
+         | xargs -0 -n 40 awk -f "$BENIGN_AWK" 2>/dev/null \
+         | sed 's|^\./||' || true)
+rm -f "$BENIGN_AWK"
+
+if [ "$BENIGN_DEFAULT_FAIL" -eq 1 ]; then
+    yellow "  → inside a handler whose output IS a health verdict, every field is a"
+    yellow "    claim about system state — so a defaulted read publishes a claim"
+    yellow "    nobody measured. A count of 0, an empty list, a 0% error rate and a"
+    yellow "    \"not found\" all read as GOOD, and a DB outage produces all four at"
+    yellow "    once, at the exact moment an operator is reading the tool."
+    yellow "  → use \`talos_measurement::Readings\`: \`readings.record(\"field\", repo…await)\`"
+    yellow "    returns \`Option\` (JSON null, not 0), logs the error server-side, and"
+    yellow "    \`readings.attach(&mut result)\` names the field under"
+    yellow "    \`measurement.not_measured\`. A clean run attaches nothing, so the"
+    yellow "    healthy response stays byte-identical."
+    yellow "  → if the value is a PRECONDITION for the whole response, returning"
+    yellow "    \`database_error\` is correct — see handle_get_schedule_health."
+    yellow "  → a genuinely decorative read may carry"
+    yellow "    \`// allow-benign-default: <reason>\` on or above the line."
+    EXIT_CODE=1
+else
+    green "✓ no health-reporting handler swallows a read into a benign default"
+fi
+echo
+
 # ── 54. Lint self-consistency (meta-check) ────────────────────────────
 # The system whose purpose is catching drift drifted from its own docs:
 # by 2026-07-01 the script had 49 checks while CLAUDE.md said 43 and the

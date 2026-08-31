@@ -37,9 +37,13 @@
 //!
 //! # Dependency posture
 //!
-//! Leaf crate: `serde` + `serde_json` only, no I/O, pure math. Nothing in here
-//! may grow a dependency on a repository, service or engine crate — the whole
-//! point is that any layer can annotate a number without inverting the graph.
+//! Leaf crate: `serde`, `serde_json` and the `tracing` facade only — no I/O,
+//! pure math. Nothing in here may grow a dependency on a repository, service or
+//! engine crate — the whole point is that any layer can annotate a number
+//! without inverting the graph. (`tracing` was added for [`Readings::record`],
+//! which must log the upstream error server-side precisely BECAUSE it refuses to
+//! put it in the response; a facade with no subscriber is a no-op and inverts
+//! nothing.)
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -214,6 +218,185 @@ impl Coverage {
             "omitted": self.omitted(),
             "note": self.note(),
         })
+    }
+}
+
+/// Disclosure for a report field whose read FAILED.
+///
+/// # Why this type exists
+///
+/// The read-error sibling of [`Coverage`]. Where `Coverage` exists because a
+/// count carries no ceiling, this exists because **a defaulted value carries no
+/// provenance**: `stale_executions: 0` renders identically whether the query
+/// returned zero rows or never ran at all. Every default in this class points
+/// the same way — a count to `0`, a list to `[]`, a rate to `0%`, a lookup to
+/// `None` — so a database problem makes a health tool report a maximally
+/// healthy system, which is precisely when an operator is reading it.
+///
+/// The class has now been repaired FOUR times before this crate, each time
+/// locally and each time in a different vocabulary:
+///
+/// | Repair | Site | Shape invented there |
+/// |---|---|---|
+/// | MCP-366 (2026-05-11) | `budget_precheck` | fail CLOSED, refuse the operation |
+/// | 2026-05-06 | `handle_get_schedule_health` | `data_warnings: [..]` + null fields |
+/// | #699 | `count_triggers_like` | repo returns `Result`, caller says "not verified" |
+/// | #702 | `security_audit` | per-check `verification: not_verified` |
+///
+/// MCP-366 is the sharpest illustration that a local repair does not
+/// generalise. It fixed `count_executions_last_hour(..).unwrap_or(0)` in the
+/// budget ENFORCEMENT path, where the defaulted `0` was a security fail-open —
+/// "actor at 1000/hr could keep firing during DB hiccups". The identical
+/// `.unwrap_or(0)` on the identical repository method is still there today in
+/// `handle_get_actor_budget`, the tool that REPORTS the budget. The path was
+/// fixed; the population was not.
+///
+/// All four say the same sentence — *could-not-measure is not measured-zero* —
+/// in four vocabularies. This is that sentence, once. It follows the shape the
+/// schedule-health fix converged on (nulled field + a named disclosure list),
+/// because that one was already load-bearing in a shipped response.
+///
+/// # The three rules it encodes
+///
+/// * **A failed read yields `None`, never a default.** [`Self::record`] hands
+///   back an `Option` so the field serializes as JSON `null`. A consumer
+///   comparing against a threshold cannot read `null` as "under the limit" the
+///   way it reads `0`.
+/// * **The response discloses, not just the log.** A `tracing::error!` is
+///   invisible to the operator holding the tool output. The field name lands in
+///   [`Self::to_json`] so the degradation travels with the data.
+/// * **The upstream error string never leaves the host.** Only the field NAME
+///   is disclosed. The error is logged server-side under an `event_kind`. A
+///   `sqlx::Error` routinely embeds the failing SQL, and a connection error
+///   embeds the DSN — which in this workspace can carry a password (#702's leak
+///   analysis; CLAUDE.md: "NEVER return internal error details to API clients").
+///
+/// # Compatibility
+///
+/// [`Self::attach`] adds nothing when every read succeeded, so a healthy
+/// response is byte-identical to the pre-disclosure one. Only a degraded
+/// response changes shape — which is the point.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Readings {
+    not_measured: Vec<&'static str>,
+}
+
+impl Readings {
+    /// An empty ledger — nothing has failed yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one field's read.
+    ///
+    /// `Ok(v)` yields `Some(v)` and changes nothing. `Err` yields `None`, logs
+    /// the error server-side, and records `field` as not measured. `field` is
+    /// `&'static str` on purpose: it must be the literal key the report emits,
+    /// so a reader can match the disclosure to the null.
+    pub fn record<T, E: fmt::Display>(
+        &mut self,
+        field: &'static str,
+        result: Result<T, E>,
+    ) -> Option<T> {
+        match result {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::error!(
+                    target: "talos_measurement",
+                    event_kind = "report_field_not_measured",
+                    field = field,
+                    error = %e,
+                    "a report field could not be measured; it is nulled and disclosed, not defaulted"
+                );
+                self.not_measured.push(field);
+                None
+            }
+        }
+    }
+
+    /// Record a read whose value is a collection.
+    ///
+    /// Returns the rows, or an EMPTY vec on failure — because the rendering
+    /// code downstream is written against a list and rewriting it to
+    /// `Option<Vec<_>>` at every call site buys nothing the disclosure does not
+    /// already buy. The difference from the bug is that the emptiness is now
+    /// ACCOMPANIED: `field` is recorded, so "no failing workflows" and "we could
+    /// not ask about failing workflows" are distinguishable in the response.
+    pub fn record_rows<T, E: fmt::Display>(
+        &mut self,
+        field: &'static str,
+        result: Result<Vec<T>, E>,
+    ) -> Vec<T> {
+        self.record(field, result).unwrap_or_default()
+    }
+
+    /// Disclose a field whose value was DERIVED from something not measured.
+    ///
+    /// For the case where a failed read cannot simply be nulled because a
+    /// downstream number was already computed from its default — a readiness
+    /// score whose risk component consumed a defaulted `0`, say. The score is
+    /// still a number, but it is a number computed as if the missing input were
+    /// benign, so it is disclosed alongside the input it inherited.
+    pub fn mark_derived(&mut self, field: &'static str) {
+        if !self.not_measured.contains(&field) {
+            self.not_measured.push(field);
+        }
+    }
+
+    /// True when every recorded read succeeded.
+    #[must_use]
+    pub fn complete(&self) -> bool {
+        self.not_measured.is_empty()
+    }
+
+    /// The fields that could not be read, in the order they failed.
+    #[must_use]
+    pub fn not_measured(&self) -> &[&'static str] {
+        &self.not_measured
+    }
+
+    /// The disclosure as a JSON object. `None` when nothing failed.
+    #[must_use]
+    pub fn to_json(&self) -> Option<serde_json::Value> {
+        if self.complete() {
+            return None;
+        }
+        Some(serde_json::json!({
+            "complete": false,
+            "not_measured": self.not_measured,
+            "note": self.note(),
+        }))
+    }
+
+    /// One sentence an operator or a model can act on.
+    #[must_use]
+    pub fn note(&self) -> String {
+        if self.complete() {
+            return "complete: every field in this report was measured".to_string();
+        }
+        format!(
+            "DEGRADED: {} field(s) could not be read and are null, NOT zero — {}. \
+             A null here is not evidence of a healthy system; it means nobody could look. \
+             The underlying error is in the server log under event_kind=report_field_not_measured.",
+            self.not_measured.len(),
+            self.not_measured.join(", ")
+        )
+    }
+
+    /// Attach the disclosure to a report object under `measurement`.
+    ///
+    /// A no-op when every read succeeded, so the healthy response is
+    /// byte-identical to the pre-disclosure one. Silently does nothing if
+    /// `report` is not a JSON object — there is no key to attach to, and a
+    /// panic in a health tool is worse than the missing annotation.
+    pub fn attach(&self, report: &mut serde_json::Value) {
+        let Some(disclosure) = self.to_json() else {
+            return;
+        };
+        if let Some(obj) = report.as_object_mut() {
+            obj.insert("measurement".to_string(), disclosure);
+        }
     }
 }
 
@@ -515,6 +698,139 @@ pub fn pearson_ci95(r: f64, n: u64) -> Option<[f64; 2]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Readings: could-not-measure is not measured-zero ---------------
+
+    /// Type alias so the tests read like the call sites: a repo method's
+    /// `anyhow::Result`-shaped return, without pulling anyhow into a leaf crate.
+    type DbResult<T> = Result<T, String>;
+
+    #[test]
+    fn a_failed_read_is_null_not_zero() {
+        let mut r = Readings::new();
+        let ok: DbResult<i64> = Ok(0);
+        let err: DbResult<i64> = Err("connection reset by peer".to_string());
+
+        let measured_zero = r.record("active_schedules", ok);
+        let query_failed = r.record("stale_executions", err);
+
+        // Both render as "no problem" under the old shape. They must not
+        // render the same now.
+        assert_eq!(measured_zero, Some(0));
+        assert_eq!(query_failed, None);
+        assert_ne!(
+            serde_json::json!(measured_zero),
+            serde_json::json!(query_failed),
+            "a measured zero and an unmeasurable field serialized identically — \
+             this is the entire defect"
+        );
+        assert_eq!(serde_json::json!(query_failed), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn only_the_failed_field_is_disclosed() {
+        let mut r = Readings::new();
+        let _ = r.record("active_schedules", DbResult::<i64>::Ok(3));
+        let _ = r.record("stale_executions", DbResult::<i64>::Err("boom".into()));
+        let _ = r.record("unacknowledged_alerts", DbResult::<i64>::Err("boom".into()));
+
+        assert!(!r.complete());
+        assert_eq!(
+            r.not_measured(),
+            ["stale_executions", "unacknowledged_alerts"]
+        );
+    }
+
+    #[test]
+    fn a_healthy_report_is_byte_identical_to_the_pre_disclosure_shape() {
+        let mut r = Readings::new();
+        let _ = r.record("active_schedules", DbResult::<i64>::Ok(3));
+        assert!(r.complete());
+        assert_eq!(r.to_json(), None);
+
+        let before = serde_json::json!({"stale_executions": 0});
+        let mut after = before.clone();
+        r.attach(&mut after);
+        assert_eq!(
+            serde_json::to_string(&before).unwrap(),
+            serde_json::to_string(&after).unwrap(),
+            "attaching a clean ledger changed the response; the all-OK path must not move"
+        );
+    }
+
+    #[test]
+    fn a_degraded_report_carries_the_disclosure() {
+        let mut r = Readings::new();
+        let _ = r.record("stale_executions", DbResult::<i64>::Err("boom".into()));
+
+        let mut report = serde_json::json!({"stale_executions": serde_json::Value::Null});
+        r.attach(&mut report);
+
+        assert_eq!(report["measurement"]["complete"], false);
+        assert_eq!(report["measurement"]["not_measured"][0], "stale_executions");
+        let note = report["measurement"]["note"].as_str().unwrap();
+        assert!(note.contains("DEGRADED"), "{note}");
+        assert!(note.contains("stale_executions"), "{note}");
+    }
+
+    /// #702's leak analysis, applied here: a `sqlx::Error` embeds the failing
+    /// SQL and a connection error embeds the DSN, which in this workspace can
+    /// carry a password. Only the field NAME may be disclosed.
+    #[test]
+    fn the_upstream_error_string_never_reaches_the_response() {
+        const MARKER: &str = "postgres://talos:hunter2@db:5432/talos";
+        let mut r = Readings::new();
+        let _ = r.record(
+            "stale_executions",
+            DbResult::<i64>::Err(format!("could not connect to {MARKER}")),
+        );
+
+        let mut report = serde_json::json!({"stale_executions": serde_json::Value::Null});
+        r.attach(&mut report);
+        let rendered = serde_json::to_string(&report).unwrap();
+        assert!(
+            !rendered.contains(MARKER),
+            "the upstream error leaked into the response: {rendered}"
+        );
+        assert!(
+            !r.note().contains(MARKER),
+            "leaked via note(): {}",
+            r.note()
+        );
+    }
+
+    #[test]
+    fn record_rows_discloses_an_empty_list_it_could_not_fill() {
+        let mut r = Readings::new();
+        let measured: Vec<i32> =
+            r.record_rows("failing_workflows", DbResult::<Vec<i32>>::Ok(vec![]));
+        assert!(measured.is_empty());
+        assert!(
+            r.complete(),
+            "a genuinely empty result is not a degradation"
+        );
+
+        let mut r2 = Readings::new();
+        let failed: Vec<i32> = r2.record_rows(
+            "failing_workflows",
+            DbResult::<Vec<i32>>::Err("boom".into()),
+        );
+        assert!(failed.is_empty());
+        assert!(
+            !r2.complete(),
+            "an empty list from a failed query must not read as 'nothing is failing'"
+        );
+        assert_eq!(r2.not_measured(), ["failing_workflows"]);
+    }
+
+    #[test]
+    fn attach_on_a_non_object_is_a_no_op_not_a_panic() {
+        let mut r = Readings::new();
+        let _ = r.record("x", DbResult::<i64>::Err("boom".into()));
+        let mut arr = serde_json::json!([1, 2, 3]);
+        r.attach(&mut arr);
+        assert_eq!(arr, serde_json::json!([1, 2, 3]));
+    }
 
     // ---- Wilson: bit-identical pins against the pre-move digest ----------
     //
