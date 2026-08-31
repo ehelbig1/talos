@@ -143,10 +143,26 @@ impl ParallelWorkflowEngine {
     ///
     /// `chains_ctx` is the primary scheduler's chain-detection output
     /// (chains slice + `node_to_chain` map); `None` for the seeded
-    /// scheduler, which doesn't run pipeline batching. `wall_time_ms`
-    /// is 0 on the primary (no per-node timing) and the measured
-    /// elapsed time on the seeded scheduler (threaded back through
-    /// `WorkflowContext.node_timings`).
+    /// scheduler, which doesn't run pipeline batching.
+    ///
+    /// `wall_time_ms` is MONOTONIC elapsed milliseconds, or `0` meaning
+    /// UNKNOWN — never "instantaneous". It is read off the
+    /// `std::time::Instant` that `run_scheduler_loop` parks in
+    /// `node_start_times` immediately before dispatching the node, and
+    /// `run_scheduler_loop` is shared by BOTH entry points.
+    ///
+    /// This corrected a false claim, in the same spirit as #708's
+    /// correction of #707's column comment. The previous text said the
+    /// value "is 0 on the primary (no per-node timing) and the measured
+    /// elapsed time on the seeded scheduler". There is no such split: the
+    /// dispatch path measures every module node on either entry point.
+    /// What is really `0` is a per-CALLER property — the four sites that
+    /// evaluate a system node SYNCHRONOUSLY IN PROCESS and never start a
+    /// timer (`route_system_node_output`, plus the verify /
+    /// confidence-gate / dynamic-dispatch failure branches) pass a
+    /// literal `0`. Believing the old text would make it look as though
+    /// binding this value to `execution_events.duration_ms` covered only
+    /// resumed runs, when it in fact covers ~89% of all completion rows.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn handle_completed_future(
         &self,
@@ -220,6 +236,20 @@ impl ParallelWorkflowEngine {
                 log_message: None,
                 iteration_index: None,
                 error_class: None,
+                // MONOTONIC. `wall_time_ms` reaches us from
+                // `run_scheduler_loop`, which reads it back off the
+                // `std::time::Instant` it parked in `node_start_times`
+                // immediately before dispatching this node — the same clock,
+                // and very nearly the same span, as the `dispatch_started`
+                // that #707 rescued for `module_executions`. Until now it
+                // went only to the `on_node_completed` hook, and the trigger
+                // rewrote this event's `duration_ms` as
+                // `completed - started` wall clock: 2.79x inflated in
+                // aggregate on this host, 17x on the worst execution.
+                // `monotonic_ms` maps the `0` unknown-sentinel back to
+                // `None`, so the four literal-`0` callers below keep
+                // deriving exactly as they do today.
+                duration_ms: NodeEventWrite::monotonic_ms(wall_time_ms),
             })
             .await;
         }
@@ -258,9 +288,10 @@ impl ParallelWorkflowEngine {
         // Post-completion hook: drives fuel attribution,
         // `__memory_write__` persistence, and any future cross-cutting
         // per-node observers. Fire-and-forget — the hook returns
-        // quickly; impls spawn internally. The primary scheduler
-        // doesn't track wall time (wall_time_ms == 0); the seeded
-        // scheduler threads it through from `node_start_times`.
+        // quickly; impls spawn internally. `wall_time_ms` is the
+        // monotonic reading from `node_start_times` on BOTH entry points
+        // (see the note on `handle_completed_future`); `0` means the
+        // caller started no timer, not that the node was instantaneous.
         if let Some(hook) = self.node_hook.as_ref() {
             let node_label = self.node_labels.get(&finished_id).map(String::as_str);
             let module_id = self.node_meta.get(&finished_id).and_then(|(m, _, _)| *m);
@@ -500,6 +531,14 @@ impl ParallelWorkflowEngine {
                 // `retry_skipped` → `node_failed` without matching on
                 // the prose in `log_message`.
                 error_class: extract_non_transient_class(&error_msg),
+                // Same monotonic value as the success path — the failure
+                // branch of `handle_completed_future` receives the identical
+                // `wall_time_ms`, so coverage here is symmetric rather than
+                // half-labelled. A node that fails after 110 s of retries is
+                // a 110 s node; the four in-process evaluation paths that
+                // pass a literal `0` supply no measurement and fall through
+                // to the derivation via `monotonic_ms`.
+                duration_ms: NodeEventWrite::monotonic_ms(wall_time_ms),
             })
             .await;
         }

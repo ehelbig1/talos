@@ -249,6 +249,13 @@ CTRL_TESTS=(
     # trigger can prove a supplied duration survives AND an unsupplied one is
     # still derived.
     "module_execution_duration_tests"
+    # The same question one table over (2026-08-31). `execution_events.
+    # duration_ms` was derived by a BEFORE INSERT trigger from two event
+    # timestamps while the engine already held a monotonic `Instant` reading
+    # at two of the three emit sites. Same reason a real Postgres is required:
+    # the discarding is the DATABASE's, and the sentinel/derivation split can
+    # only be observed through the round trip.
+    "execution_event_duration_tests"
     # Where a wasm.log line lands, and what the writer reports when it lands
     # nowhere (2026-07-30). Needs a real Postgres because the thing under test
     # IS the `WHERE EXISTS` guard on the log INSERT — the predicate that

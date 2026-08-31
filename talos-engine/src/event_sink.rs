@@ -82,10 +82,26 @@ impl EventSink for PostgresEventSink {
             };
             talos_dlp_provider::redact_str(truncated)
         });
+        // `duration_source` is bound from THE SAME PARAMETER as the value
+        // it describes ($8), so the label can never disagree with what it
+        // labels — #707's binding rule. A caller-supplied duration is
+        // MONOTONIC by construction: the only two emitters that supply one
+        // read it from a `std::time::Instant` (`run_scheduler_loop`'s
+        // `node_start_times` for module nodes, `dispatch_subworkflow`'s
+        // `dispatch_started` for sub-workflow nodes), and
+        // `NodeEventWrite::monotonic_ms` is the only sanctioned way to
+        // populate the field.
+        //
+        // When $8 is NULL the BEFORE INSERT trigger
+        // (`compute_execution_event_duration`) derives
+        // `created_at - <matching node_started>.created_at` and stamps
+        // 'wallclock' itself, exactly as it did before this column existed.
         if let Err(e) = sqlx::query(
             "INSERT INTO execution_events \
-             (execution_id, event_type, node_id, status, log_message, iteration_index, error_class) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+             (execution_id, event_type, node_id, status, log_message, iteration_index, error_class, \
+              duration_ms, duration_source) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, \
+                     CASE WHEN $8::bigint IS NULL THEN NULL ELSE 'monotonic' END)",
         )
         .bind(event.execution_id)
         .bind(&event.event_type)
@@ -98,6 +114,12 @@ impl EventSink for PostgresEventSink {
         // Legacy events pre-dating engine v0.2 will have None — the column
         // is nullable to accommodate that.
         .bind(event.error_class.as_deref())
+        // $8. `None` here is not "zero milliseconds" — it is "this emitter
+        // measured nothing", which hands the row to the trigger's
+        // wall-clock derivation. `NodeEventWrite::monotonic_ms` is the only
+        // sanctioned producer of this field and maps the engine's `0`
+        // unknown-sentinel to `None` for exactly that reason.
+        .bind(event.duration_ms)
         .execute(&self.pool)
         .await
         {

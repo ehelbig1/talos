@@ -743,6 +743,9 @@ pub(crate) async fn execute_job_with_retry(
                                     )),
                                     iteration_index: None,
                                     error_class: Some(classification.clone()),
+                                    // `retry_skipped` is a classifier decision, not a node
+                                    // completion. Ignored by the trigger.
+                                    duration_ms: None,
                                 },
                             );
                             return Err(format!(
@@ -826,6 +829,10 @@ pub(crate) async fn execute_job_with_retry(
                             log_message: Some(format!("Retry attempt {}", retry_num)),
                             iteration_index: Some(retry_num),
                             error_class: None,
+                            // `node_retrying` marks an attempt boundary inside a span the
+                            // eventual node_completed/node_failed reports in full.
+                            // Ignored by the trigger.
+                            duration_ms: None,
                         },
                     );
                     // MCP-1212 (2026-05-18): re-sign the payload BEFORE

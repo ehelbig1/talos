@@ -1045,6 +1045,9 @@ impl ParallelWorkflowEngine {
                 log_message: None,
                 iteration_index: None,
                 error_class: None,
+                // `node_started` for the sub-workflow span. The measurement is
+                // bound on the matching completion/failure event below.
+                duration_ms: None,
             },
         );
         let dispatch_started = std::time::Instant::now();
@@ -1090,6 +1093,16 @@ impl ParallelWorkflowEngine {
                 log_message,
                 iteration_index: None,
                 error_class: None,
+                // MONOTONIC: `dispatch_started` above is a
+                // `std::time::Instant`. Before this, `elapsed_ms` was
+                // FORMATTED INTO PROSE on the success branch
+                // (`log_message = "sub_workflow duration_ms={}"`) while the
+                // `duration_ms` COLUMN it belongs in was left to the
+                // trigger's wall-clock subtraction — a measurement rendered
+                // to a string beside the field that wanted it. It is bound
+                // on BOTH branches: a sub-workflow that fails took just as
+                // long as one that succeeded.
+                duration_ms: talos_workflow_engine_core::NodeEventWrite::monotonic_ms(elapsed_ms),
             })
             .await;
         }

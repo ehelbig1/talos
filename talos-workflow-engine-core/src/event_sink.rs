@@ -61,6 +61,54 @@ pub struct NodeEventWrite {
     /// Other event types currently leave this `None`; future variants
     /// may populate it consistently with `event_type`.
     pub error_class: Option<String>,
+    /// MONOTONIC elapsed milliseconds for the node this event closes,
+    /// measured by the emitter with [`std::time::Instant`], or `None`
+    /// when the emitter measured nothing.
+    ///
+    /// Only meaningful on `node_completed` / `node_failed`; every other
+    /// event type leaves it `None`.
+    ///
+    /// # `None` is not zero
+    ///
+    /// The backing store derives a wall-clock duration
+    /// (`this event's timestamp - the matching node_started's`) when
+    /// this field is `None`, and labels the result as wall clock. That
+    /// derivation is the ONLY value available for emitters that never
+    /// started a timer — the synthetic `node_started` + `node_completed`
+    /// pairs written after the fact for in-process system nodes, and the
+    /// evaluation paths that report an unmeasured `0`. Do NOT bind a
+    /// placeholder here to "fill the column": a stored `0` is
+    /// indistinguishable from a genuine sub-millisecond duration, of
+    /// which this table already holds real examples. Use
+    /// [`NodeEventWrite::monotonic_ms`] rather than converting by hand.
+    pub duration_ms: Option<i64>,
+}
+
+impl NodeEventWrite {
+    /// Convert an engine-measured `u64` millisecond count into the
+    /// `Option<i64>` this struct's `duration_ms` field expects.
+    ///
+    /// Two conversions, both load-bearing:
+    ///
+    /// * **`0` means UNKNOWN, not instantaneous.** That is the documented
+    ///   contract of
+    ///   [`NodeCompletionContext::wall_time_ms`](crate::NodeCompletionContext),
+    ///   whose `0` marks "the engine didn't record a start time". Mapping
+    ///   it to `None` hands the row back to the store's wall-clock
+    ///   derivation, reproducing the pre-existing behaviour for those
+    ///   paths exactly, instead of storing a real-looking `0 ms`.
+    /// * **Saturating, not casting.** `u64` values above `i64::MAX` have
+    ///   no `i64` representation; a raw `as` cast would wrap to a
+    ///   negative duration. Such a value cannot arise from a real
+    ///   dispatch, which is precisely why it must not be allowed to
+    ///   produce a plausible-looking negative one if it ever does.
+    #[must_use]
+    pub fn monotonic_ms(elapsed_ms: u64) -> Option<i64> {
+        if elapsed_ms == 0 {
+            return None;
+        }
+        Some(i64::try_from(elapsed_ms).unwrap_or(i64::MAX))
+    }
 }
 
 /// Persist or forward per-node execution events.
@@ -99,4 +147,72 @@ pub trait EventSink: Send + Sync {
     /// Emit `event`. See the trait-level docs for the two emission
     /// paths and their latency expectations.
     async fn emit(&self, event: NodeEventWrite);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NodeEventWrite;
+
+    /// THE TRAP THIS CHANGE EXISTS TO AVOID.
+    ///
+    /// `NodeCompletionContext::wall_time_ms` documents `0` as "the
+    /// engine didn't record a start time", explicitly to be read as
+    /// unknown "rather than 'instantaneous'". Four engine sites pass a
+    /// literal `0` for exactly that reason (system-node rejection
+    /// envelopes plus the verify / confidence-gate / dynamic-dispatch
+    /// failure branches).
+    ///
+    /// Binding that sentinel as a value would store a real-looking
+    /// `0 ms` — the same defect #707 caught with the pipeline path's
+    /// `0` on `module_executions`. It is worse on `execution_events`,
+    /// because a genuine `0` is already reachable there: the trigger's
+    /// `::bigint` cast truncates sub-millisecond derivations, and 19
+    /// such rows existed in the 7-day window when this was written
+    /// (measured gaps 0.307–0.490 ms). A sentinel stored as a
+    /// measurement would be indistinguishable from those.
+    #[test]
+    fn zero_wall_time_is_unknown_not_zero() {
+        assert_eq!(
+            NodeEventWrite::monotonic_ms(0),
+            None,
+            "a 0 sentinel must fall back to the store's derivation, never \
+             be stored as a 0 ms measurement"
+        );
+    }
+
+    #[test]
+    fn a_real_measurement_survives_unchanged() {
+        assert_eq!(NodeEventWrite::monotonic_ms(1), Some(1));
+        assert_eq!(NodeEventWrite::monotonic_ms(1234), Some(1234));
+        // The suspend-inflated worst case #707 found, as monotonic ms.
+        assert_eq!(NodeEventWrite::monotonic_ms(105_483), Some(105_483));
+    }
+
+    /// Saturating, not casting: `u64::MAX as i64` is `-1`, and a
+    /// negative duration would be rendered to a user as a bar of
+    /// nonsense width rather than rejected.
+    #[test]
+    fn an_out_of_range_measurement_saturates_rather_than_wrapping() {
+        assert_eq!(NodeEventWrite::monotonic_ms(u64::MAX), Some(i64::MAX));
+        let above_i64 = (i64::MAX as u64) + 1;
+        assert_eq!(NodeEventWrite::monotonic_ms(above_i64), Some(i64::MAX));
+        // The boundary itself is representable and must not saturate.
+        assert_eq!(
+            NodeEventWrite::monotonic_ms(i64::MAX as u64),
+            Some(i64::MAX)
+        );
+        for v in [0_u64, 1, 42, u64::MAX] {
+            if let Some(ms) = NodeEventWrite::monotonic_ms(v) {
+                assert!(ms > 0, "a bound duration must never be <= 0, got {ms}");
+            }
+        }
+    }
+
+    /// `Default` must keep the field `None` so struct-update
+    /// constructions (`..Default::default()`) never accidentally claim
+    /// a measurement.
+    #[test]
+    fn default_claims_no_measurement() {
+        assert_eq!(NodeEventWrite::default().duration_ms, None);
+    }
 }

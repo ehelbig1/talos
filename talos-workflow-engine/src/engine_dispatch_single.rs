@@ -312,6 +312,9 @@ impl ParallelWorkflowEngine {
                     log_message: Some(input_preview),
                     iteration_index: None,
                     error_class: None,
+                    // `node_input` is a payload snapshot, not a lifecycle boundary.
+                    // The trigger ignores this event type entirely.
+                    duration_ms: None,
                 },
             );
         }
