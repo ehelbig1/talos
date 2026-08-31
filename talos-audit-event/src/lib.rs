@@ -115,11 +115,24 @@ impl AuditEvent {
     /// to `sign()`.
     pub fn sign_with_hash(&mut self, event_hash: &str) {
         if let Some(key) = audit_signing_key() {
-            use hmac::{Hmac, Mac};
-            if let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(key) {
-                mac.update(event_hash.as_bytes());
-                self.hmac_signature = Some(hex::encode(mac.finalize().into_bytes()));
-            }
+            self.sign_with_hash_using(event_hash, key);
+        }
+    }
+
+    /// Sign under an EXPLICIT key instead of the process-global
+    /// `TALOS_AUDIT_SIGNING_KEY`.
+    ///
+    /// Extracted from [`sign_with_hash`](Self::sign_with_hash), which now
+    /// delegates here, so the signed bytes can never drift between the
+    /// production path and [`signing_selftest`]. The global key lives in a
+    /// `OnceLock` and is therefore un-parameterisable after first touch; the
+    /// selftest needs a *chosen* key pair (including a deliberately mismatched
+    /// one) to pin the present-but-non-functional case.
+    pub fn sign_with_hash_using(&mut self, event_hash: &str, key: &[u8]) {
+        use hmac::{Hmac, Mac};
+        if let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(key) {
+            mac.update(event_hash.as_bytes());
+            self.hmac_signature = Some(hex::encode(mac.finalize().into_bytes()));
         }
     }
 
@@ -326,6 +339,72 @@ pub fn audit_verify_keys() -> Vec<Vec<u8>> {
         }
     }
     keys
+}
+
+/// What an audit-signing self-test learned.
+///
+/// The three arms exist because "the key env var is set" and "audit events are
+/// actually being signed and are actually verifiable" are three different
+/// facts, and this crate can silently turn the first into neither of the
+/// others: [`audit_signing_key`] REJECTS a key below the 256-bit
+/// effective-entropy floor and returns `None`, so `TALOS_AUDIT_SIGNING_KEY`
+/// generated with `openssl rand -hex 16` leaves every audit event unsigned
+/// while a presence check reports the control as configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigningSelfTest {
+    /// A probe event was signed and a verifier key accepted the signature.
+    Verified,
+    /// Nothing signed the probe event — there is no usable signing key.
+    NotSigned,
+    /// The probe event WAS signed, but no key in the verifier set accepted the
+    /// signature: signing and verification disagree, so already-written events
+    /// will fail `verify_chain`.
+    SignatureRejected,
+}
+
+/// Round-trip an in-memory probe event through the real
+/// [`AuditEvent::sign_with_hash_using`] → [`AuditEvent::verify_signature`]
+/// path under an explicitly supplied key pair.
+///
+/// Pure: no env, no `OnceLock`, no I/O, nothing persisted. The probe event is
+/// constructed on the stack, signed, verified and dropped — it is never
+/// appended to a ledger, published to NATS or written to the database, so the
+/// self-test is safe to run repeatedly.
+#[must_use]
+pub fn signing_selftest(signing_key: Option<&[u8]>, verify_keys: &[Vec<u8>]) -> SigningSelfTest {
+    let Some(signing_key) = signing_key else {
+        return SigningSelfTest::NotSigned;
+    };
+
+    let mut probe = AuditEvent {
+        workflow_id: "__selftest__".to_string(),
+        execution_id: "__selftest__".to_string(),
+        sequence_num: 0,
+        timestamp: 0,
+        actor: "system:security_audit".to_string(),
+        action: "signing_selftest".to_string(),
+        payload: "{}".to_string(),
+        previous_hash: "0".to_string(),
+        hmac_signature: None,
+    };
+    let hash = probe.calculate_hash();
+    probe.sign_with_hash_using(&hash, signing_key);
+
+    match probe.verify_signature(verify_keys) {
+        Some(true) => SigningSelfTest::Verified,
+        // `None` here means `sign_with_hash_using` produced no signature at
+        // all; `Some(false)` means it did and no verifier key accepted it.
+        Some(false) => SigningSelfTest::SignatureRejected,
+        None => SigningSelfTest::NotSigned,
+    }
+}
+
+/// [`signing_selftest`] bound to the process's live audit-signing
+/// configuration — the same [`audit_signing_key`] every producer signs with and
+/// the same [`audit_verify_keys`] every verifier accepts.
+#[must_use]
+pub fn audit_signing_selftest() -> SigningSelfTest {
+    signing_selftest(audit_signing_key().as_deref(), &audit_verify_keys())
 }
 
 use chrono::Utc;

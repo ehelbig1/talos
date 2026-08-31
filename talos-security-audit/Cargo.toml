@@ -1,0 +1,23 @@
+[package]
+name = "talos-security-audit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
+serde_json.workspace = true
+talos-audit-event = { path = "../talos-audit-event" }
+talos-auth = { path = "../talos-auth" }
+talos-config = { path = "../talos-config" }
+talos-secrets-manager = { path = "../talos-secrets-manager" }
+talos-system-repo = { path = "../talos-system-repo" }
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
+tokio = { version = "1", features = ["time"] }
+tracing.workspace = true
+hex = "0.4"
+
+[lints]
+workspace = true

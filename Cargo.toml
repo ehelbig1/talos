@@ -43,6 +43,10 @@ members = [
     "talos-memory-consolidation",
     "talos-memory-ranking",
     "talos-system-repo",
+    # Verifying security audit: every check that CAN be exercised is exercised
+    # (KEK wrap/unwrap, HMAC sign/verify, JWT mint/verify) instead of asserting
+    # that a config value is present.
+    "talos-security-audit",
     "talos-api-keys",
     "talos-graph-rag",
     "talos-security-headers",

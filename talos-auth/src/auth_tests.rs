@@ -645,3 +645,85 @@ mod auth_metric_tests {
         }
     }
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// JWT self-test — the mint→read-header→verify round trip that `security_audit`
+// reports its `jwt_algorithm` check from.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Serialise the env-mutating JWT self-test cases. Same pattern as
+/// `talos-config`'s `env_lock` / `talos-compilation::container::env_lock`.
+fn jwt_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    match LOCK.lock() {
+        Ok(g) => g,
+        Err(poison) => poison.into_inner(),
+    }
+}
+
+/// Control ABSENT: no secret at all, so nothing can be minted.
+#[test]
+fn jwt_selftest_reports_missing_secret() {
+    let _g = jwt_env_lock();
+    let restore = std::env::var("JWT_SECRET").ok();
+    std::env::remove_var("JWT_SECRET");
+    std::env::remove_var("JWT_SECRET_FILE");
+
+    let outcome = crate::jwt_selftest();
+
+    if let Some(v) = restore {
+        std::env::set_var("JWT_SECRET", v);
+    }
+    assert_eq!(outcome, crate::JwtSelfTest::Broken { stage: "secret" });
+}
+
+/// Control PRESENT BUT BROKEN: `JWT_SECRET` is set — every presence check
+/// grades it configured — but it is below the HS256 floor, so the process
+/// cannot mint a token at all. Only a round trip notices.
+#[test]
+fn jwt_selftest_reports_broken_key_material_for_a_short_secret() {
+    let _g = jwt_env_lock();
+    let restore = std::env::var("JWT_SECRET").ok();
+    std::env::remove_var("JWT_SECRET_FILE");
+    std::env::set_var("JWT_SECRET", "too-short");
+
+    let outcome = crate::jwt_selftest();
+
+    match restore {
+        Some(v) => std::env::set_var("JWT_SECRET", v),
+        None => std::env::remove_var("JWT_SECRET"),
+    }
+    assert_eq!(
+        outcome,
+        crate::JwtSelfTest::Broken {
+            stage: "key_material"
+        },
+        "a set-but-unusable JWT_SECRET must report broken, not configured"
+    );
+}
+
+/// Repeat runs agree — the audit is run over and over by operators.
+#[test]
+fn jwt_selftest_is_idempotent() {
+    let _g = jwt_env_lock();
+    let restore_secret = std::env::var("JWT_SECRET").ok();
+    std::env::remove_var("JWT_SECRET_FILE");
+    std::env::set_var("JWT_SECRET", "b".repeat(64));
+
+    let first = crate::jwt_selftest();
+    let second = crate::jwt_selftest();
+
+    match restore_secret {
+        Some(v) => std::env::set_var("JWT_SECRET", v),
+        None => std::env::remove_var("JWT_SECRET"),
+    }
+
+    assert_eq!(first, second);
+    assert_eq!(
+        first,
+        crate::JwtSelfTest::Verified {
+            algorithm: "HS256",
+            asymmetric: false
+        }
+    );
+}

@@ -462,6 +462,32 @@ impl std::fmt::Debug for MlContentMacKey {
     }
 }
 
+/// What a [`SecretsManager::kek_selftest`] wrap→unwrap probe learned about the
+/// installed KEK provider.
+///
+/// Three arms because "the master key is set", "the KEK can wrap" and "the KEK
+/// can unwrap what it wrapped" are three different facts, and only the last one
+/// means every DEK in `encryption_keys` is still recoverable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KekSelfTest {
+    /// A probe DEK round-tripped through the installed provider intact.
+    Verified {
+        /// `KekProvider::name()` — e.g. `env`, `vault://transit/keys/...`.
+        provider: String,
+    },
+    /// The provider is installed but the round trip failed. `stage` is one of
+    /// `wrap`, `unwrap`, `roundtrip`; the underlying error is logged
+    /// server-side under `event_kind = "kek_selftest_failed"` and deliberately
+    /// not carried here.
+    Failed {
+        provider: String,
+        stage: &'static str,
+    },
+    /// The self-test could not run — the provider lock is poisoned, so nothing
+    /// was learned either way.
+    Unavailable,
+}
+
 impl SecretsManager {
     /// Access the underlying database pool (used by OAuthCredentialService for
     /// proactive token refresh when the engine detects expiring OAuth tokens).
@@ -477,6 +503,91 @@ impl SecretsManager {
             .read()
             .map(|g| g.clone())
             .map_err(|_| anyhow!("KEK provider lock poisoned"))
+    }
+
+    /// Wrap and immediately unwrap a freshly generated PROBE DEK through the
+    /// KEK provider that is actually installed, proving the root of the
+    /// encryption tree can still do its job.
+    ///
+    /// Why this exists: "`TALOS_MASTER_KEY` is configured" is not the same
+    /// claim as "the KEK works". A key that is present but the wrong length,
+    /// not hex, all-zero, or — under `KEK_PROVIDER=vault` — backed by a
+    /// transit mount the token can no longer reach, leaves every DEK
+    /// unwrappable, and a presence check reports the control green throughout.
+    ///
+    /// **Side-effect free and idempotent.** The probe DEK is generated here,
+    /// never persisted, never inserted into `encryption_keys`, never entered
+    /// into any cache, and is zeroized on drop. No DEK is rotated and no key
+    /// version is advanced: `EnvKekProvider` runs a local AES-GCM pair, and
+    /// Vault transit `encrypt`/`decrypt` are read-only crypto operations. (A
+    /// Vault-backed KEK does append to Vault's own audit device, if the
+    /// operator enabled one — that is the only trace this leaves anywhere.)
+    ///
+    /// **Leaks nothing.** The result carries the provider NAME — already
+    /// emitted at startup and material-free by the [`kek_provider::KekProvider::name`]
+    /// contract — plus a coarse failure stage. Provider errors can carry
+    /// transport detail, so they are logged server-side and never returned.
+    pub async fn kek_selftest(&self) -> KekSelfTest {
+        let kek = match self.current_kek() {
+            Ok(k) => k,
+            Err(_) => return KekSelfTest::Unavailable,
+        };
+        let provider = kek.name().to_string();
+
+        let mut probe = Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(probe.as_mut());
+
+        let wrapped = match kek.wrap_dek(&probe).await {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!(
+                    target: "talos_security",
+                    event_kind = "kek_selftest_failed",
+                    kek_provider = %provider,
+                    stage = "wrap",
+                    error = %e,
+                    "KEK self-test could not wrap a probe DEK — envelope encryption is broken"
+                );
+                return KekSelfTest::Failed {
+                    provider,
+                    stage: "wrap",
+                };
+            }
+        };
+
+        let unwrapped = match kek.unwrap_dek(&wrapped).await {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::error!(
+                    target: "talos_security",
+                    event_kind = "kek_selftest_failed",
+                    kek_provider = %provider,
+                    stage = "unwrap",
+                    error = %e,
+                    "KEK self-test could not unwrap its own probe DEK — envelope encryption is broken"
+                );
+                return KekSelfTest::Failed {
+                    provider,
+                    stage: "unwrap",
+                };
+            }
+        };
+
+        if unwrapped.as_slice() != probe.as_slice() {
+            tracing::error!(
+                target: "talos_security",
+                event_kind = "kek_selftest_failed",
+                kek_provider = %provider,
+                stage = "roundtrip",
+                "KEK self-test unwrapped different bytes than it wrapped"
+            );
+            return KekSelfTest::Failed {
+                provider,
+                stage: "roundtrip",
+            };
+        }
+
+        KekSelfTest::Verified { provider }
     }
 
     /// Create new secrets manager with the default env-var KEK provider.
@@ -6859,6 +6970,159 @@ mod kek_failure_label_tests {
             1.0,
             "with no legacy configured, an active-provider failure IS a total \
              failure and must reach the series TalosKEKDecryptFailuresBoth selects"
+        );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// KEK self-test — the wrap→unwrap round trip `security_audit`'s
+// `master_encryption_key` check reports from.
+// ────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod kek_selftest_tests {
+    use super::{KekSelfTest, SecretsManager};
+    use crate::kek_provider::KekProvider;
+    use anyhow::{anyhow, Result};
+    use std::pin::Pin;
+    use zeroize::Zeroizing;
+
+    /// A KEK whose wrap or unwrap always fails — the shape of a master key
+    /// that is PRESENT (the provider constructed fine, so every presence check
+    /// says "configured") but cannot actually protect a DEK: a revoked Vault
+    /// token, an unreachable transit mount, a rotated-away key version.
+    struct BrokenKek {
+        fail_on_wrap: bool,
+    }
+
+    impl KekProvider for BrokenKek {
+        fn wrap_dek(
+            &self,
+            dek: &[u8; 32],
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send + '_>> {
+            let dek = *dek;
+            let fail = self.fail_on_wrap;
+            Box::pin(async move {
+                if fail {
+                    // Error text deliberately carries junk a leak test can look
+                    // for: it must never reach the audit response.
+                    Err(anyhow!("transport detail SECRET-MARKER-9f3a"))
+                } else {
+                    Ok(dek.to_vec())
+                }
+            })
+        }
+
+        fn unwrap_dek(
+            &self,
+            _wrapped: &[u8],
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<Zeroizing<Vec<u8>>>> + Send + '_>>
+        {
+            Box::pin(async move { Err(anyhow!("transport detail SECRET-MARKER-9f3a")) })
+        }
+
+        fn name(&self) -> &str {
+            "broken-test-kek"
+        }
+    }
+
+    /// A KEK that "succeeds" but hands back different bytes than it was given.
+    /// The stage no `Result` can report — both calls return `Ok`.
+    struct LyingKek;
+
+    impl KekProvider for LyingKek {
+        fn wrap_dek(
+            &self,
+            _dek: &[u8; 32],
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send + '_>> {
+            Box::pin(async move { Ok(vec![0u8; 32]) })
+        }
+
+        fn unwrap_dek(
+            &self,
+            _wrapped: &[u8],
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<Zeroizing<Vec<u8>>>> + Send + '_>>
+        {
+            Box::pin(async move { Ok(Zeroizing::new(vec![0xAAu8; 32])) })
+        }
+
+        fn name(&self) -> &str {
+            "lying-test-kek"
+        }
+    }
+
+    fn stub_with(kek: std::sync::Arc<dyn KekProvider>) -> SecretsManager {
+        let sm = SecretsManager::test_stub_for_cache();
+        *sm.kek.write().expect("kek lock") = kek;
+        sm
+    }
+
+    /// A working env-backed KEK round-trips a probe DEK and names itself.
+    #[tokio::test]
+    async fn kek_selftest_verifies_a_working_provider() {
+        let sm = SecretsManager::test_stub_for_cache();
+        assert_eq!(
+            sm.kek_selftest().await,
+            KekSelfTest::Verified {
+                provider: "env".to_string()
+            }
+        );
+    }
+
+    /// Repeat-runs must agree — the audit is an operator-facing tool that gets
+    /// run over and over, and each run mints a fresh probe DEK.
+    #[tokio::test]
+    async fn kek_selftest_is_idempotent() {
+        let sm = SecretsManager::test_stub_for_cache();
+        let first = sm.kek_selftest().await;
+        let second = sm.kek_selftest().await;
+        let third = sm.kek_selftest().await;
+        assert_eq!(first, second);
+        assert_eq!(second, third);
+    }
+
+    /// PRESENT BUT BROKEN: the provider exists, so every presence check grades
+    /// the control green, and the round trip is what notices.
+    #[tokio::test]
+    async fn kek_selftest_reports_the_failing_stage() {
+        let wrap_broken = stub_with(std::sync::Arc::new(BrokenKek { fail_on_wrap: true }));
+        assert_eq!(
+            wrap_broken.kek_selftest().await,
+            KekSelfTest::Failed {
+                provider: "broken-test-kek".to_string(),
+                stage: "wrap"
+            }
+        );
+
+        let unwrap_broken = stub_with(std::sync::Arc::new(BrokenKek {
+            fail_on_wrap: false,
+        }));
+        assert_eq!(
+            unwrap_broken.kek_selftest().await,
+            KekSelfTest::Failed {
+                provider: "broken-test-kek".to_string(),
+                stage: "unwrap"
+            }
+        );
+
+        let lying = stub_with(std::sync::Arc::new(LyingKek));
+        assert_eq!(
+            lying.kek_selftest().await,
+            KekSelfTest::Failed {
+                provider: "lying-test-kek".to_string(),
+                stage: "roundtrip"
+            }
+        );
+    }
+
+    /// The provider's own error text — which can carry transport detail — must
+    /// not travel in the self-test result. It goes to the log only.
+    #[tokio::test]
+    async fn kek_selftest_result_carries_no_provider_error_text() {
+        let broken = stub_with(std::sync::Arc::new(BrokenKek { fail_on_wrap: true }));
+        let rendered = format!("{:?}", broken.kek_selftest().await);
+        assert!(
+            !rendered.contains("SECRET-MARKER-9f3a"),
+            "provider error text leaked into the self-test result: {rendered}"
         );
     }
 }
