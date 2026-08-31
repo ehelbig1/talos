@@ -1970,10 +1970,21 @@ impl AnalyticsRepository {
     // -- Latency ----------------------------------------------------------
 
     /// Compact stats for SLA threshold evaluation: total execution count,
-    /// completed count, and p95 latency over a time window. Returns None if
-    /// no executions exist in the window. Used by the background SLA task
-    /// in `main.rs` (formerly an inline query that duplicated the latency
-    /// percentile logic from `get_latency_percentiles_ms`).
+    /// completed count, and p95 latency over a time window. Used by the
+    /// background SLA task in `main.rs` (formerly an inline query that
+    /// duplicated the latency percentile logic from
+    /// `get_latency_percentiles_ms`).
+    ///
+    /// **`None` means the query FAILED, not "no executions."** The docstring
+    /// used to claim the opposite, and it was wrong for a structural reason:
+    /// this is an UNGROUPED aggregate, so Postgres always returns exactly one
+    /// row and `fetch_optional`'s `None` was unreachable. The empty window is
+    /// `Some(SlaWindowStats { total: 0, .. })` — `total == 0` is the "no
+    /// executions" signal. `fetch_one` makes that structural fact visible
+    /// instead of leaving a `None` arm that reads as a handled case.
+    ///
+    /// `p95_ms` stays `Option<f64>`: a percentile over zero completed runs is
+    /// genuinely absent and has no meaningful zero.
     ///
     /// Unlike `get_latency_percentiles_ms`, this method does NOT filter by
     /// user_id — SLA alerting runs as a platform-wide background task.
@@ -1989,10 +2000,9 @@ impl AnalyticsRepository {
         )
         .bind(wf_id)
         .bind(hours)
-        .fetch_optional(&self.db_pool)
+        .fetch_one(&self.db_pool)
         .await
-        .ok()
-        .flatten();
+        .ok();
         row.map(|(total, successes, p95_ms)| SlaWindowStats {
             total,
             successes,
@@ -3110,12 +3120,39 @@ impl AnalyticsRepository {
     /// Returns `(count, last_failure_text)` so the caller can surface a
     /// human-readable timestamp. Filters on common error-message patterns
     /// indicating a vault path / secret-grant misconfiguration.
+    ///
+    /// **An aggregate over nothing is NULL, not 0.** Two shapes were wrong
+    /// here until 2026-08-31, and both only bit on the COMMON case — a
+    /// workflow with no auth failures:
+    ///
+    ///  * `MAX(started_at)` over zero matching rows returns NULL, but the
+    ///    tuple decoded column 1 as `String`. So the query FAILED with
+    ///    `unexpected null; try decoding as an Option` exactly when the answer
+    ///    was "no auth failures" — measured on the live DB 2026-08-31 as 30 of
+    ///    30 workflows. Before #704 the error was swallowed into `0`, which
+    ///    was accidentally the RIGHT answer, so the break was invisible in
+    ///    both directions: correct output, broken query. #704 made report
+    ///    handlers disclose a failed read, which turned the latent bug into a
+    ///    `report_field_not_measured` disclosure on nearly every
+    ///    `get_workflow_risk_assessment` call. `last_failure` is now
+    ///    `Option<String>`: a MAX has no meaningful zero, so the empty set has
+    ///    to stay representable rather than be COALESCEd into a fake
+    ///    timestamp.
+    ///  * An UNGROUPED aggregate always returns exactly one row, so
+    ///    `fetch_optional`'s `None` was unreachable and the caller's
+    ///    `Some(Some(..))` match read as a handled case that could never fire.
+    ///    `fetch_one` is the honest call; the real "no data" signal is
+    ///    `count == 0` (the same idiom as
+    ///    `ExecutionRepository::node_fuel_history`).
+    ///
+    /// Caller-visible behaviour is preserved: an empty window still means "0
+    /// auth failures", now by a route that actually runs.
     pub async fn count_recent_auth_failures(
         &self,
         workflow_id: Uuid,
         days: i32,
-    ) -> Result<Option<(i64, String)>> {
-        let row: Option<(i64, String)> = sqlx::query_as(
+    ) -> Result<(i64, Option<String>)> {
+        let row: (i64, Option<String>) = sqlx::query_as(
             "SELECT COUNT(*)::bigint, \
                     MAX(started_at)::text AS last_failure \
              FROM workflow_executions \
@@ -3128,7 +3165,7 @@ impl AnalyticsRepository {
         )
         .bind(workflow_id)
         .bind(days)
-        .fetch_optional(&self.db_pool)
+        .fetch_one(&self.db_pool)
         .await?;
         Ok(row)
     }

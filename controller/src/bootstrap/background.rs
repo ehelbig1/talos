@@ -3271,11 +3271,22 @@ pub(crate) fn spawn_analytics_tasks(
                 let documentation = has_desc + has_node_desc + has_caps;
 
                 // Freshness (20%)
-                let last_exec: Option<(Option<chrono::DateTime<chrono::Utc>>,)> = sqlx::query_as(
+                //
+                // `MAX(started_at)` is an UNGROUPED aggregate: it returns
+                // exactly one row whose value is NULL when the workflow has
+                // never run. The nesting this replaced (`fetch_optional` into
+                // `Option<(Option<_>,)>`) implied two distinct absences where
+                // Postgres only produces one — the outer `None` was
+                // unreachable. `query_scalar` over `Option<_>` + `fetch_one`
+                // keeps exactly the meaningful absence: "never executed".
+                let last_exec: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar::<
+                    _,
+                    Option<chrono::DateTime<chrono::Utc>>,
+                >(
                     "SELECT MAX(started_at) FROM workflow_executions WHERE workflow_id = $1",
                 )
                 .bind(wf_id)
-                .fetch_optional(&readiness_pool)
+                .fetch_one(&readiness_pool)
                 .await
                 .unwrap_or_else(|e| {
                     tracing::warn!(
@@ -3286,7 +3297,7 @@ pub(crate) fn spawn_analytics_tasks(
                     None
                 });
 
-                let freshness = match last_exec.and_then(|r| r.0) {
+                let freshness = match last_exec {
                     Some(last) => {
                         let days_ago = chrono::Utc::now().signed_duration_since(last).num_days();
                         if days_ago <= 7 {
