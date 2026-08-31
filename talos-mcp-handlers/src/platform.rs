@@ -869,7 +869,13 @@ fn handle_get_public_url_status(req_id: Option<serde_json::Value>) -> JsonRpcRes
         "source": source.as_str(),
         "publicly_reachable": publicly_reachable,
         "ngrok": {
-            "agent_api_configured": std::env::var("TALOS_NGROK_API_URL").is_ok(),
+            // Empty-env class (MCP-625): `.is_ok()` reported CONFIGURED for
+            // `TALOS_NGROK_API_URL=""`, but `talos_public_url::spawn_discovery`
+            // trims the value and returns early when it is empty — the
+            // discovery loop never starts. The operator then read
+            // `agent_api_configured: true` + `agent_api_reachable: false` and
+            // went looking for a network fault, when nothing was configured.
+            "agent_api_configured": talos_config::env_var_is_set_nonempty("TALOS_NGROK_API_URL"),
             "agent_api_reachable": talos_public_url::ngrok_api_reachable(),
             "discovered_url": discovered,
         },
@@ -1360,6 +1366,19 @@ async fn handle_security_audit(
 ) -> JsonRpcResponse {
     let mut checks: Vec<serde_json::Value> = Vec::new();
     let mut score: u32 = 0;
+    // The nine `score +=` literals below sum to 105, which reads as an
+    // over-100 bug on a first pass. They are NOT all reachable together:
+    // check 2 (jwt_algorithm) is the only if/else pair, awarding 10 OR 5 and
+    // never both. Maximum attainable is therefore
+    //   10 prod + 10 jwt + 15 master + 15 worker + 10 aot
+    //   + 10 audit + 10 redis-tls + 10 triggers + 10 cors = 100.
+    // Two consequences worth stating rather than rediscovering:
+    //  * Grade A (>= 90) requires `is_prod`, since check 1's 10 points are
+    //    unearnable outside production. A dev stack tops out at 90, and at 80
+    //    (grade B) with the usual plaintext local Redis — check 7 awards its
+    //    10 only for a NON-EMPTY `rediss://` URL, so an unconfigured Redis
+    //    scores 0 while still reporting `pass`.
+    //  * In production A tolerates exactly one missing 10-point control.
     let max_score: u32 = 100;
 
     // Check 1: Production mode
@@ -1438,11 +1457,20 @@ async fn handle_security_audit(
     // MCP-590/591/592/597/598/599/611/615/620/621.
     //
     // Affected checks: master_encryption_key, job_signing_key,
-    // aot_integrity_key, audit_event_signing. Inline closure so the
-    // four sites share one helper without escaping a module-level
-    // function (this file already has a different `env_set` helper
-    // shape in the validator crate, but this file doesn't depend on it).
-    let env_present = |var: &str| std::env::var(var).ok().filter(|v| !v.is_empty()).is_some();
+    // aot_integrity_key, audit_event_signing.
+    //
+    // 2026-08-28: MCP-625 fixed those four with an INLINE CLOSURE, and the
+    // locality is exactly why the class survived in this same function. Two
+    // sites in this file kept the broken `.is_ok()` shape because a closure
+    // is invisible from outside the block that declares it: `cors_origins`
+    // 130 lines below (under the comment that documents the bug), and
+    // `agent_api_configured` in `handle_get_public_url_status`. A closure
+    // also cannot be unit-tested, so the empty-string case was never pinned.
+    // Both are now repaired against `talos_config::env_var_is_set_nonempty`
+    // — one implementation, workspace-visible, with the empty case pinned by
+    // `env_presence_empty_string_is_not_configured`. Kept bound to the local
+    // name so the four call sites below read unchanged.
+    let env_present = talos_config::env_var_is_set_nonempty;
 
     // Check 3: TALOS_MASTER_KEY set
     let has_master_key = env_present("TALOS_MASTER_KEY");
@@ -1573,7 +1601,18 @@ async fn handle_security_audit(
     }
 
     // Check 9: ALLOWED_ORIGIN set (CORS)
-    let has_origins = std::env::var("ALLOWED_ORIGIN").is_ok();
+    //
+    // 2026-08-28: was `env::var("ALLOWED_ORIGIN").is_ok()` — the exact shape
+    // the MCP-625 comment 130 lines above condemns, inside the function that
+    // documents it. `ALLOWED_ORIGIN=""` reported "explicitly configured" and
+    // awarded +10 while `talos_config::ALLOWED_ORIGINS` splits on ',' and
+    // filters empties, yielding an EMPTY origin list — so `is_origin_allowed`
+    // rejected every origin the check had just graded as configured. (In
+    // production the same empty list panics `ALLOWED_ORIGINS` on first touch,
+    // so the divergence is observable in dev; the misreport is the defect
+    // either way — the audit must not claim a control is on because a
+    // placeholder is present.)
+    let has_origins = env_present("ALLOWED_ORIGIN");
     checks.push(serde_json::json!({
         "check": "cors_origins",
         "status": if has_origins || !is_prod { "pass" } else { "fail" },

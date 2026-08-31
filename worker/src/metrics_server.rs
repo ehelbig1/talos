@@ -441,7 +441,21 @@ async fn handle_connection(
             )
         }
         ("GET", "/") => {
-            let auth_status = if std::env::var("METRICS_AUTH_TOKENS").is_ok() {
+            // 2026-08-28: was `env::var("METRICS_AUTH_TOKENS").is_ok()` — the
+            // SAME `Ok("")` mismatch that MCP-932 removed from
+            // `run_metrics_server` (see its comment ~line 157), left behind in
+            // this sibling handler in the same file. Chokepoint-that-missed-a-
+            // site: the reasoning was written down and the second instance
+            // survived it.
+            //
+            // Honest reachability note: `start_metrics_server` is the sole
+            // entry point and rejects both missing AND `trim().is_empty()`
+            // values, so a truly empty var never reaches this page — the
+            // server fails to start instead. This is therefore defense in
+            // depth, not a live misreport: it makes the display agree with the
+            // gate's OWN semantics rather than depending on a guard in another
+            // function to stay correct.
+            let auth_status = if talos_config::env_var_is_set_nonempty("METRICS_AUTH_TOKENS") {
                 "ENABLED (secure)"
             } else {
                 "DISABLED (insecure - set METRICS_AUTH_TOKENS)"

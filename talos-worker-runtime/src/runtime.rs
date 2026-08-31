@@ -1338,7 +1338,25 @@ fn aot_key_ring() -> &'static AotKeyRing {
         // pod), masking the misconfig as a vague performance issue.
         let is_prod = talos_config::is_production();
 
-        let signing_key = if let Ok(k) = std::env::var("TALOS_AOT_HMAC_KEY") {
+        // 2026-08-28: the `.filter(|v| !v.is_empty())` is the same empty-env
+        // class MCP-671 fixed for `RUST_ENV` four lines above — and it was
+        // still open for the KEY itself, in the same expression. Pre-fix
+        // `if let Ok(k) = env::var("TALOS_AOT_HMAC_KEY")` bound `Ok("")`, so
+        // `TALOS_AOT_HMAC_KEY=""` produced a ZERO-LENGTH HMAC key in dev
+        // (signing AOT blobs under a key an attacker can guess trivially) and
+        // suppressed the "using an ephemeral random key" warning that says the
+        // var is unset. Empty now takes the SAME path as unset: ephemeral +
+        // warning in dev, panic in production — and the panic is now the
+        // accurate "must be set" rather than "is only 0 bytes".
+        //
+        // Note the controller's `security_audit` aot_integrity_key check
+        // already read this var with `unwrap_or_default()` + `is_empty()` and
+        // correctly reported "missing" — so before this fix the audit and the
+        // worker disagreed about whether the key existed.
+        let signing_key = if let Some(k) = std::env::var("TALOS_AOT_HMAC_KEY")
+            .ok()
+            .filter(|v| !v.is_empty())
+        {
             let key_bytes = k.into_bytes();
             if is_prod && key_bytes.len() < 32 {
                 panic!(
