@@ -652,7 +652,17 @@ impl ParallelWorkflowEngine {
             }
         }
 
-        let duration_ms = i32::try_from(dispatch_started.elapsed().as_millis()).unwrap_or(i32::MAX);
+        // MONOTONIC by construction: `dispatch_started` is an `Instant`, so
+        // this is CLOCK_MONOTONIC elapsed across the dispatch. Until
+        // 2026-08-31 the `calculate_module_execution_duration()` BEFORE UPDATE
+        // trigger discarded it and rewrote the column with
+        // `completed_at - started_at`, which on a suspending host is the
+        // dispatch PLUS the sleep — 5 614 s stored for a node that consumed
+        // 105 s. The trigger now only fills when the caller supplies nothing,
+        // so this value survives and the row is labelled
+        // `duration_source = 'monotonic'`.
+        let duration_ms =
+            Some(i32::try_from(dispatch_started.elapsed().as_millis()).unwrap_or(i32::MAX));
 
         // THE 2026-08-12 finding: this arm used to return without ever closing
         // the `module_executions` row `record_started` opened ~140 lines above.
@@ -732,12 +742,21 @@ impl ParallelWorkflowEngine {
     /// The stuck-execution sweep remains the backstop for a row this never
     /// reaches (a dropped reactor future under a workflow-level wall-clock
     /// timeout, a DB outage during this write).
+    ///
+    /// `duration_ms` is `Some(monotonic elapsed)` from a caller that timed the
+    /// dispatch with `Instant`, or `None` from a caller that did not time it —
+    /// see [`ModuleExecutionStore::record_completed`]. Do NOT pass `Some(0)` to
+    /// mean "unmeasured": `0` is a real duration to every reader, and the DB
+    /// derives an honest wall-clock fallback for `None`.
+    ///
+    /// [`ModuleExecutionStore::record_completed`]:
+    ///     talos_workflow_engine_core::ModuleExecutionStore::record_completed
     pub(crate) async fn finalize_module_execution_row(
         &self,
         id: Uuid,
         status: &str,
         output: &JsonValue,
-        duration_ms: i32,
+        duration_ms: Option<i32>,
         error_message: Option<&str>,
     ) {
         let Some(ref store) = self.module_execution_store else {

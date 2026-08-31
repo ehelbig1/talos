@@ -2026,7 +2026,7 @@ impl ParallelWorkflowEngine {
         iter_exec_id: Uuid,
         status: &str,
         output: &JsonValue,
-        duration_ms: i32,
+        duration_ms: Option<i32>,
         error_message: Option<&str>,
     ) {
         self.finalize_module_execution_row(
@@ -2420,8 +2420,11 @@ impl ParallelWorkflowEngine {
             };
 
             let dispatch_outcome = dispatcher.dispatch(body_job).await;
+            // MONOTONIC (`iter_started` is an `Instant`). Wrapped in `Some` so
+            // the DB keeps it instead of re-deriving `completed_at -
+            // started_at`, which counts host-suspend time as work.
             let iter_duration_ms =
-                i32::try_from(iter_started.elapsed().as_millis()).unwrap_or(i32::MAX);
+                Some(i32::try_from(iter_started.elapsed().as_millis()).unwrap_or(i32::MAX));
 
             match dispatch_outcome {
                 Ok(result) => {

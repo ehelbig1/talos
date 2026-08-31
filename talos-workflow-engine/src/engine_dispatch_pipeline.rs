@@ -689,19 +689,26 @@ impl ParallelWorkflowEngine {
                 let status =
                     crate::engine_dispatch_single::classify_dispatch_failure_status(&message);
                 for &step_exec_id in &step_exec_ids {
-                    // `duration_ms: 0`, matching the aborted-trailing-step loop
-                    // below. We know the chain's wall time but NOT any step's,
-                    // and stamping the whole chain duration onto each of N rows
-                    // would fabricate N× the elapsed work. The value is moot in
-                    // practice — the `calculate_module_execution_duration`
-                    // BEFORE UPDATE trigger overwrites it with
-                    // `completed_at - started_at` on this, the row's first
-                    // terminal write — but 0 is the honest thing to pass.
+                    // `None`, matching the aborted-trailing-step loop below. We
+                    // know the chain's elapsed time but NOT any step's, and
+                    // stamping the whole chain duration onto each of N rows
+                    // would fabricate N× the elapsed work.
+                    //
+                    // This used to pass `0` with a comment noting the value was
+                    // "moot in practice" because the
+                    // `calculate_module_execution_duration` BEFORE UPDATE
+                    // trigger overwrote it with `completed_at - started_at`.
+                    // That trigger no longer overwrites a supplied value
+                    // (2026-08-31), so the sentinel would now BE the stored
+                    // duration — a real-looking 0 ms in every aggregate. `None`
+                    // says "not measured" and lets the trigger derive the
+                    // wall-clock fallback, which is byte-identical to what
+                    // these rows recorded before.
                     self.finalize_module_execution_row(
                         step_exec_id,
                         status,
                         &serde_json::Value::Null,
-                        0,
+                        None,
                         Some(&message),
                     )
                     .await;
@@ -732,7 +739,14 @@ impl ParallelWorkflowEngine {
                         _ => "failed",
                     };
                     let error_msg = step_result.error.as_deref().map(|s| self.redact_str(s));
-                    let duration = i32::try_from(step_result.execution_time_ms).unwrap_or(i32::MAX);
+                    // MONOTONIC: the worker times each step with its own
+                    // `Instant` (`talos-worker-runtime::runtime` —
+                    // `step_start.elapsed()`) and relays it as
+                    // `PipelineStepResult::execution_time_ms`. It is a
+                    // measurement of the step, not a subtraction of two
+                    // timestamps, so it survives a host suspend.
+                    let duration =
+                        Some(i32::try_from(step_result.execution_time_ms).unwrap_or(i32::MAX));
                     // Shared chokepoint (`engine_dispatch_single.rs`): owns
                     // the redact-record-log shape for every engine path that
                     // closes a `module_executions` row.
@@ -765,11 +779,14 @@ impl ParallelWorkflowEngine {
             // than lingering forever in "running".
             for i in chain_result.steps.len()..step_exec_ids.len() {
                 if let Some(&step_exec_id) = step_exec_ids.get(i) {
+                    // `None`, not `Some(0)`: this step never ran, so there is
+                    // no duration to report. See the chain-dispatch-error arm
+                    // above for why the old `0` sentinel is no longer safe.
                     self.finalize_module_execution_row(
                         step_exec_id,
                         "failed",
                         &serde_json::Value::Null,
-                        0,
+                        None,
                         Some("Pipeline aborted before this step"),
                     )
                     .await;

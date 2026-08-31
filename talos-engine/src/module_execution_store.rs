@@ -233,7 +233,7 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
         id: Uuid,
         status: &str,
         output: &JsonValue,
-        duration_ms: i32,
+        duration_ms: Option<i32>,
         error_message: Option<&str>,
     ) -> Result<(), BoxError> {
         // Phase A encryption: encrypt output payload at rest. The COALESCE
@@ -424,12 +424,28 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
         // engine never called finalize" from "the engine called it and the
         // guard refused". Distinguishing those two took a full DB census the
         // first time.
+        // `duration_source` is bound from the SAME parameter as `duration_ms`,
+        // so the label can never disagree with the value it describes.
+        //
+        // Binding the literal `'monotonic'` here is a claim about the caller,
+        // and it is justified by the trait contract rather than by hope: every
+        // `Some(n)` reaching `ModuleExecutionStore::record_completed` is
+        // documented — and, at all four production call sites, actually is — an
+        // `Instant::elapsed()` measurement (engine single-node dispatch, loop
+        // iteration, and the worker's own per-step timer relayed through
+        // `PipelineStepResult::execution_time_ms`). The two call sites with no
+        // measurement pass `None` and land in the NULL branch, where the
+        // `calculate_module_execution_duration()` BEFORE UPDATE trigger derives
+        // `completed_at - started_at` and stamps `'wallclock'` itself.
         let refused = sqlx::query(
             "UPDATE module_executions \
              SET status = $1, output_data = $2, output_data_enc = $3, \
                  payload_enc_key_id = COALESCE(payload_enc_key_id, $4), \
                  payload_format = COALESCE($5, payload_format), \
-                 duration_ms = $6, error_message = $7, \
+                 duration_ms = $6, \
+                 duration_source = CASE WHEN $6::int4 IS NULL \
+                                        THEN NULL ELSE 'monotonic' END, \
+                 error_message = $7, \
                  fuel_consumed = COALESCE($8, fuel_consumed), completed_at = NOW() \
              WHERE id = $9 AND status IN ('pending', 'running')",
         )

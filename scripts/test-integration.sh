@@ -241,6 +241,14 @@ CTRL_TESTS=(
     "memory_get_entry_tests"
     "module_execution_status_tests"
     "execution_status_transition_tests"
+    # What `module_executions.duration_ms` MEANS (2026-08-31). The engine
+    # measures each dispatch monotonically and a BEFORE UPDATE trigger used to
+    # overwrite it with a wall-clock subtraction, so on a suspending host the
+    # column recorded sleep as work. The discarding was done by the DATABASE —
+    # no pure-Rust test can see it, and only a real Postgres carrying the real
+    # trigger can prove a supplied duration survives AND an unsupplied one is
+    # still derived.
+    "module_execution_duration_tests"
     # Where a wasm.log line lands, and what the writer reports when it lands
     # nowhere (2026-07-30). Needs a real Postgres because the thing under test
     # IS the `WHERE EXISTS` guard on the log INSERT — the predicate that

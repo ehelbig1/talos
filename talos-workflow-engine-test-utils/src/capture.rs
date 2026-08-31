@@ -295,8 +295,10 @@ pub enum ExecutionStoreCall {
         status: String,
         /// Output payload.
         output: JsonValue,
-        /// Wall-clock duration in ms.
-        duration_ms: i32,
+        /// Monotonic elapsed ms as measured by the dispatching path, or
+        /// `None` when that path did not measure it (the production store
+        /// then lets the DB derive a wall-clock fallback).
+        duration_ms: Option<i32>,
         /// Optional error message (non-None on failures).
         error_message: Option<String>,
     },
@@ -393,7 +395,7 @@ impl ModuleExecutionStore for CaptureModuleExecutionStore {
         id: Uuid,
         status: &str,
         output: &JsonValue,
-        duration_ms: i32,
+        duration_ms: Option<i32>,
         error_message: Option<&str>,
     ) -> Result<(), BoxError> {
         self.calls
