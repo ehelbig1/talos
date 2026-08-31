@@ -1442,10 +1442,32 @@ impl ModuleExecutionService {
     /// reports a successful execution.  The result has already been HMAC-verified by the
     /// worker, so the extra ownership check that `complete_execution` performs is not
     /// needed here.
+    ///
+    /// `duration_ms` is caller-wins, exactly as on
+    /// [`ModuleExecutionStore::record_completed`](talos_workflow_engine_core::ModuleExecutionStore::record_completed):
+    /// `Some(n)` is stored verbatim and labelled `duration_source = 'monotonic'`,
+    /// `None` leaves both columns unset so the
+    /// `calculate_module_execution_duration()` BEFORE UPDATE trigger derives
+    /// `completed_at - started_at` and stamps `'wallclock'` itself.
+    ///
+    /// **`Some(n)` is a claim about the CLOCK, and the caller must be able to
+    /// make it.** Pass `Some` only for a `std::time::Instant::elapsed()`
+    /// measurement — never a value subtracted from two timestamps, and never a
+    /// placeholder. `'monotonic'` is what tells a reader the number is immune
+    /// to a host suspend; on the live stack wall and monotonic have diverged by
+    /// 8.1 hours, so a mislabelled row is not a rounding error.
+    ///
+    /// The webhook module-dispatch caller passes its own `wasm_start.elapsed()`
+    /// — a controller-side `Instant` across the dispatch, the same span class
+    /// the engine's `record_completed` rows carry. The audit-topic result
+    /// subscriber passes `None`; see its call site for why the worker's
+    /// self-reported `JobResult::execution_time_ms` is deliberately not used
+    /// there.
     pub async fn complete_execution_from_worker(
         &self,
         execution_id: Uuid,
         output_data: Option<JsonValue>,
+        duration_ms: Option<i32>,
     ) -> Result<()> {
         // MCP-1199 (2026-05-17): validate size BEFORE redact_json —
         // sibling holdout to MCP-1163's `complete_execution` fix on
@@ -1464,24 +1486,32 @@ impl ModuleExecutionService {
         // workflow-level output.  Regex patterns still catch standard credential formats.
         let output_data = output_data.map(|v| talos_dlp_provider::redact_json(&v));
 
-        // $1 = output_data, $2 = execution_id
+        // $1 = output_data, $2 = duration_ms, $3 = execution_id
         //
         // RETURNING actor_id serves the `__ops_alert__` chokepoint below: a
         // row comes back ONLY when this call actually transitioned the
         // execution (the status guard filters replays/late duplicates), and
         // it carries the actor whose tenancy the ingest resolves against.
+        //
+        // `duration_source` is bound from the SAME parameter as `duration_ms`
+        // (#707's rule), so the label can never disagree with what it
+        // describes: there is no statement that writes one without the other.
         let transitioned = sqlx::query(
             r#"
             UPDATE module_executions
             SET
                 status = 'completed',
                 output_data = $1,
+                duration_ms = $2,
+                duration_source = CASE WHEN $2::int4 IS NULL
+                                       THEN NULL ELSE 'monotonic' END,
                 completed_at = NOW()
-            WHERE id = $2 AND status IN ('pending', 'running')
+            WHERE id = $3 AND status IN ('pending', 'running')
             RETURNING actor_id
             "#,
         )
         .bind(&output_data)
+        .bind(duration_ms)
         .bind(execution_id)
         .fetch_optional(&self.db_pool)
         .await
@@ -1516,12 +1546,17 @@ impl ModuleExecutionService {
 
     /// Fail an execution from a trusted worker result (no user_id ownership check).
     ///
-    /// Same trust model as `complete_execution_from_worker`.
+    /// Same trust model as `complete_execution_from_worker`, and the same
+    /// caller-wins `duration_ms` contract — see that method for what `Some(n)`
+    /// asserts. A failed dispatch took just as long as a successful one, so
+    /// the measurement is no less real; the only difference is that the row
+    /// records what it was doing when it stopped.
     pub async fn fail_execution_from_worker(
         &self,
         execution_id: Uuid,
         error_message: String,
         error_type: Option<String>,
+        duration_ms: Option<i32>,
     ) -> Result<()> {
         let error_message: String = error_message
             .chars()
@@ -1543,7 +1578,11 @@ impl ModuleExecutionService {
         // error_message (MCP-967).
         let error_message = talos_dlp_provider::redact_str(&error_message);
 
-        // $1 = error_message, $2 = error_type, $3 = execution_id
+        // $1 = error_message, $2 = error_type, $3 = duration_ms,
+        // $4 = execution_id.
+        //
+        // `duration_source` bound from the SAME parameter as `duration_ms` —
+        // see `complete_execution_from_worker` for the rule.
         sqlx::query(
             r#"
             UPDATE module_executions
@@ -1551,12 +1590,16 @@ impl ModuleExecutionService {
                 status = 'failed',
                 error_message = $1,
                 error_type = $2,
+                duration_ms = $3,
+                duration_source = CASE WHEN $3::int4 IS NULL
+                                       THEN NULL ELSE 'monotonic' END,
                 completed_at = NOW()
-            WHERE id = $3 AND status IN ('pending', 'running')
+            WHERE id = $4 AND status IN ('pending', 'running')
             "#,
         )
         .bind(&error_message)
         .bind(error_type)
+        .bind(duration_ms)
         .bind(execution_id)
         .execute(&self.db_pool)
         .await

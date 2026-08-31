@@ -1453,11 +1453,39 @@ impl WebhookRouter {
             // no result-subscriber to finalize it (the workflow-dispatch path
             // finalizes via the engine's module_execution_store). Best-effort:
             // a finalize failure must not change the webhook response.
+            //
+            // MONOTONIC: `wasm_duration_ms` is `wasm_start.elapsed()`, an
+            // `Instant` — so it survives a host suspend, which is the whole
+            // point of supplying it. Before this it was computed, written to
+            // the webhook request log, and then DISCARDED here, leaving the
+            // `calculate_module_execution_duration()` trigger to derive
+            // `completed_at - started_at` instead: the exact defect #707 fixed
+            // on the engine path, on a path #707 did not sweep. On the live
+            // stack wall and monotonic have diverged by 8.1 hours, so the
+            // derived value is a nap length, not a duration.
+            //
+            // The span is the CONTROLLER-SIDE dispatch — the same class the
+            // engine's `record_completed` rows carry (`dispatch_started`), so
+            // webhook rows stay comparable with engine rows. It is a little
+            // WIDER than the trigger's derivation would have been: `wasm_start`
+            // is taken before the actor resolution and payload encryption that
+            // precede the row's own INSERT. That is deliberate and matches the
+            // engine path's own reasoning — the dispatch really did take that
+            // long, and the alternative is a number from the wrong clock.
+            //
+            // Deliberately NOT the worker's self-reported
+            // `JobResult::execution_time_ms`: that is a strictly narrower,
+            // WORKER-side span (it excludes the NATS round trip and any queue
+            // wait), so it would put a second span class under one label.
+            // Measured on 12 paired jobs 2026-08-31 the two differ by 5-14 ms
+            // (median 7) on an idle worker, but the gap is unbounded under
+            // queue backlog or a dispatcher retry.
             if let Some(svc) = &self.module_execution_service {
                 let finalize = if success {
                     svc.complete_execution_from_worker(
                         job_id,
                         serde_json::from_str::<serde_json::Value>(&response_body).ok(),
+                        Some(wasm_duration_ms),
                     )
                     .await
                 } else {
@@ -1467,6 +1495,7 @@ impl WebhookRouter {
                             .clone()
                             .unwrap_or_else(|| "webhook module execution failed".to_string()),
                         None,
+                        Some(wasm_duration_ms),
                     )
                     .await
                 };

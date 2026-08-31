@@ -4356,6 +4356,31 @@ pub(crate) fn spawn_nats_log_subscribers(
                                             // signature that covered the raw wire text
                                             // was already verified above.
                                             Some(result.output_payload.into_value()),
+                                            // `None`, NOT `result.execution_time_ms`.
+                                            //
+                                            // The worker's value IS a real monotonic
+                                            // measurement, but of a DIFFERENT SPAN:
+                                            // its own `execute_job`, which excludes the
+                                            // NATS round trip and any queue wait. Every
+                                            // other `duration_source = 'monotonic'` row
+                                            // in this table is a CONTROLLER-side
+                                            // dispatch span (the engine's
+                                            // `dispatch_started`, the webhook router's
+                                            // `wasm_start`). Storing a worker span under
+                                            // the same label would put two
+                                            // non-comparable quantities in one column —
+                                            // the mixed-meaning hazard `duration_source`
+                                            // exists to prevent.
+                                            //
+                                            // This subscriber has no controller-side
+                                            // timer to offer instead: it is a
+                                            // fire-and-forget observer of the global
+                                            // audit topic and never held the dispatch.
+                                            // So the trigger's `completed_at -
+                                            // started_at` derivation stays, correctly
+                                            // labelled `'wallclock'`, and a reader knows
+                                            // to distrust it.
+                                            None,
                                         )
                                         .await
                                     {
@@ -4392,6 +4417,12 @@ pub(crate) fn spawn_nats_log_subscribers(
                                             job_id,
                                             error_msg.clone(),
                                             error_type,
+                                            // `None` for the same reason as the
+                                            // success arm above: this observer holds
+                                            // no controller-side timer, and the
+                                            // worker's span is not the one every other
+                                            // 'monotonic' row in this column measures.
+                                            None,
                                         )
                                         .await
                                     {

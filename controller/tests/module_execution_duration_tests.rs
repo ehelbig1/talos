@@ -282,3 +282,164 @@ async fn a_row_open_past_the_integer_limit_is_still_closable() {
         "a saturated value is still a derived wall-clock one, and must say so"
     );
 }
+
+// ── The worker-finalize path (`ModuleExecutionService`) ──────────────────
+//
+// `record_completed` above is the ENGINE's terminal writer. It is not the only
+// one: `complete_execution_from_worker` / `fail_execution_from_worker` close
+// rows the engine never opened — the webhook module dispatch, and the
+// fire-and-forget audit-topic result subscriber. Those took the trigger's
+// wall-clock derivation unconditionally, because they bound no duration at
+// all, even on the webhook path where a monotonic measurement of the dispatch
+// (`wasm_start.elapsed()`) had already been taken thirty lines earlier and was
+// being written to the webhook request log.
+//
+// These tests pin the SAME caller-wins contract on that path, and — the case
+// that actually matters — pin that the two are distinguishable: a supplied
+// measurement must come back verbatim and labelled 'monotonic', while an
+// absent one must still be derived and labelled 'wallclock'. Without the
+// second half, narrowing the trigger would silently start writing NULL for
+// the audit-subscriber path, which has no measurement to offer.
+
+/// A caller that measured the dispatch must have its number stored, and
+/// labelled as a clock reading rather than a subtraction.
+///
+/// The row is backdated an hour, so the wall-clock derivation would be
+/// ~3 600 000 ms. Pinning the exact 1 234 rather than a bound is deliberate,
+/// for the same reason as the engine-path test above: a trigger that merely
+/// clamped the derivation would satisfy any inequality while still discarding
+/// the measurement.
+#[tokio::test]
+async fn a_worker_finalize_with_a_measurement_is_stored_and_labelled_monotonic() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let (_user, _module, _actor, exec) = seed_running_row(&pool, 3600).await;
+
+    let svc = talos_module_executions::ModuleExecutionService::new(
+        pool.clone(),
+        std::sync::Arc::new(talos_dlp_provider::DlpService::from_env()),
+    );
+    svc.complete_execution_from_worker(exec, Some(serde_json::json!({"ok": true})), Some(1234))
+        .await
+        .expect("complete_execution_from_worker");
+
+    let (duration, source) = read_duration(&pool, exec).await;
+    assert_eq!(
+        duration,
+        Some(1234),
+        "the caller's monotonic measurement must be what is stored; a value \
+         near 3_600_000 means the BEFORE UPDATE trigger overwrote it with \
+         completed_at - started_at"
+    );
+    assert_eq!(
+        source.as_deref(),
+        Some("monotonic"),
+        "a supplied measurement must be labelled, or it is indistinguishable \
+         from the derived rows the sweep writes"
+    );
+}
+
+/// THE DISTINGUISHING CASE. A caller with nothing to offer — the audit-topic
+/// result subscriber, which never held the dispatch and so has no
+/// controller-side timer — must still leave a derived duration behind, and it
+/// must NOT be labelled as a measurement.
+///
+/// This is the half that keeps the change honest. Binding `duration_ms` into
+/// the statement makes it trivially easy to start writing NULL for every
+/// caller that passes `None`, which would take the audit-subscriber and DLQ
+/// paths from "wall-clock, and says so" to "no duration at all".
+#[tokio::test]
+async fn a_worker_finalize_without_a_measurement_is_still_derived_as_wallclock() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let (_user, _module, _actor, exec) = seed_running_row(&pool, 120).await;
+
+    let svc = talos_module_executions::ModuleExecutionService::new(
+        pool.clone(),
+        std::sync::Arc::new(talos_dlp_provider::DlpService::from_env()),
+    );
+    svc.complete_execution_from_worker(exec, Some(serde_json::json!({"ok": true})), None)
+        .await
+        .expect("complete_execution_from_worker");
+
+    let (duration, source) = read_duration(&pool, exec).await;
+    let d = duration.expect(
+        "a caller with no measurement must still get the trigger's derivation, \
+         not NULL — the audit-topic subscriber has no other value to offer",
+    );
+    assert!(
+        (110_000..=130_000).contains(&d),
+        "expected ~120 000 ms derived from completed_at - started_at, got {d}"
+    );
+    assert_eq!(
+        source.as_deref(),
+        Some("wallclock"),
+        "an unmeasured duration must never be labelled 'monotonic': the label \
+         is what tells a reader the number survived a host suspend"
+    );
+}
+
+/// A dispatch that FAILED took just as long as one that succeeded, and the
+/// measurement is no less real. The failure sibling carries the same contract
+/// — checked separately because it is a different statement, and #707's own
+/// finding was that the sibling writer was the one that never grew the guard.
+#[tokio::test]
+async fn a_failed_worker_finalize_carries_its_measurement_too() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let (_user, _module, _actor, exec) = seed_running_row(&pool, 3600).await;
+
+    let svc = talos_module_executions::ModuleExecutionService::new(
+        pool.clone(),
+        std::sync::Arc::new(talos_dlp_provider::DlpService::from_env()),
+    );
+    svc.fail_execution_from_worker(exec, "boom".to_string(), None, Some(77))
+        .await
+        .expect("fail_execution_from_worker");
+
+    let (duration, source) = read_duration(&pool, exec).await;
+    assert_eq!(
+        duration,
+        Some(77),
+        "a failed dispatch's measurement must survive the trigger too"
+    );
+    assert_eq!(source.as_deref(), Some("monotonic"));
+}
+
+/// The label must track the VALUE, not the call. One service, two finalizes,
+/// one with a measurement and one without: the rows must come back carrying
+/// different sources. A `duration_source` hardcoded to 'monotonic' alongside a
+/// conditionally-bound `duration_ms` would pass both single-row tests above
+/// and fail here — which is exactly the disagreement the CASE expression on
+/// the same bind parameter exists to make unrepresentable.
+#[tokio::test]
+async fn the_label_follows_the_value_across_two_finalizes() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let svc = talos_module_executions::ModuleExecutionService::new(
+        pool.clone(),
+        std::sync::Arc::new(talos_dlp_provider::DlpService::from_env()),
+    );
+
+    let (_u1, _m1, _a1, measured) = seed_running_row(&pool, 7200).await;
+    svc.complete_execution_from_worker(measured, None, Some(42))
+        .await
+        .expect("measured finalize");
+
+    let (_u2, _m2, _a2, unmeasured) = seed_running_row(&pool, 7200).await;
+    svc.complete_execution_from_worker(unmeasured, None, None)
+        .await
+        .expect("unmeasured finalize");
+
+    let trustworthy: Vec<i32> = sqlx::query_scalar(
+        "SELECT duration_ms FROM module_executions \
+         WHERE duration_source = 'monotonic' ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("select monotonic rows");
+
+    assert_eq!(
+        trustworthy,
+        vec![42],
+        "only the measured finalize may be labelled monotonic — the other \
+         row's 2-hour wall-clock number is the suspend artifact this filter \
+         exists to exclude"
+    );
+}
