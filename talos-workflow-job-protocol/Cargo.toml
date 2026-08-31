@@ -53,6 +53,9 @@ default = []
 # never compile the harness. Adds no dependencies of its own.
 test-support = []
 
+[dev-dependencies]
+tempfile = "3"  # `_FILE` precedence tests need a real on-disk key file
+
 [lints.rust]
 unsafe_code = "forbid"
 unreachable_pub = "deny"
