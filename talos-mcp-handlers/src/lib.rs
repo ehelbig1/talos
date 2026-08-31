@@ -235,11 +235,11 @@ pub struct McpState {
     /// secrets` SQL. CLAUDE.md priority extraction (was: "Blocked on
     /// wiring SecretsManager into McpState").
     ///
-    /// Intentionally not yet read by any handler — the migration of
-    /// `mcp/secrets.rs::handle_*` requires reconciling the name+namespace
-    /// vs. key_path semantic mismatch first (see Pass 6 handoff). Field
-    /// is reserved for that follow-up.
-    #[allow(dead_code)]
+    /// Read by `handle_security_audit`, which runs the KEK wrap→unwrap
+    /// self-test against the provider actually installed here. The migration
+    /// of `mcp/secrets.rs::handle_*` still needs the name+namespace vs.
+    /// key_path semantic mismatch reconciled first (see Pass 6 handoff) and
+    /// remains a follow-up.
     pub secrets_manager: std::sync::Arc<talos_secrets_manager::SecretsManager>,
     /// Optional Ollama client for Tier 1 (local) LLM inference.
     /// Enabled when OLLAMA_URL is set (default: http://ollama:11434).

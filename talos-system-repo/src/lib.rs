@@ -96,14 +96,22 @@ impl SystemRepository {
 
     /// Count `pg_trigger` rows matching a name pattern. Used by `security_audit`
     /// to verify audit-immutability triggers are installed
-    /// (`tgname LIKE 'trg_%_immutable'`). Returns 0 on DB error so the audit
-    /// keeps running — a missing trigger is itself a finding.
-    pub async fn count_triggers_like(&self, name_pattern: &str) -> i64 {
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pg_trigger WHERE tgname LIKE $1")
-            .bind(name_pattern)
-            .fetch_one(&self.db_pool)
-            .await
-            .unwrap_or(0)
+    /// (`tgname LIKE 'trg_%_immutable'`).
+    ///
+    /// Returns `Err` on DB failure instead of swallowing it as `0`. The old
+    /// `unwrap_or(0)` justified itself with "a missing trigger is itself a
+    /// finding", but the two states are not the same finding: `0` means *the
+    /// triggers are not installed*; a query error means *nobody looked*.
+    /// Collapsing them rendered a Postgres hiccup as "No audit immutability
+    /// triggers found — run migrations", pointing the operator at migrations
+    /// over a connection problem. The caller now distinguishes them.
+    pub async fn count_triggers_like(&self, name_pattern: &str) -> Result<i64> {
+        let count: i64 =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pg_trigger WHERE tgname LIKE $1")
+                .bind(name_pattern)
+                .fetch_one(&self.db_pool)
+                .await?;
+        Ok(count)
     }
 
     /// Resolve an `agent_roles` row id by exact name.

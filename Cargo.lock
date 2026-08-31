@@ -8614,6 +8614,7 @@ dependencies = [
  "talos-scheduler",
  "talos-search-service",
  "talos-secrets-manager",
+ "talos-security-audit",
  "talos-session-brief-service",
  "talos-subworkflow-contract",
  "talos-system-repo",
@@ -9229,6 +9230,23 @@ dependencies = [
  "chrono",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "talos-security-audit"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "redis",
+ "serde_json",
+ "talos-audit-event",
+ "talos-auth",
+ "talos-config",
+ "talos-secrets-manager",
+ "talos-system-repo",
+ "talos-workflow-job-protocol",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -67,6 +67,8 @@ talos-replay-diff = { path = "../talos-replay-diff" }
 talos-replay-service = { path = "../talos-replay-service" }
 talos-inline-compile-service = { path = "../talos-inline-compile-service" }
 talos-search-service = { path = "../talos-search-service" }
+# Verifying security audit — `security_audit` is a thin wrapper over this crate.
+talos-security-audit = { path = "../talos-security-audit" }
 talos-failure-analysis-service = { path = "../talos-failure-analysis-service" }
 talos-hygiene-service = { path = "../talos-hygiene-service" }
 talos-session-brief-service = { path = "../talos-session-brief-service" }

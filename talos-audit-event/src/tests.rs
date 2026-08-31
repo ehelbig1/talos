@@ -522,3 +522,74 @@ fn entropy_floor_hex_boundary_is_64_chars() {
     let odd: String = "a".repeat(33);
     assert_eq!(effective_key_entropy_bytes(&odd), 33);
 }
+
+// ---------------------------------------------------------------------------
+// Signing self-test — the sign→verify round trip `security_audit` reports from.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn signing_selftest_verifies_under_a_matching_key() {
+    let key = b"0123456789abcdef0123456789abcdef".to_vec();
+    assert_eq!(
+        crate::signing_selftest(Some(&key), std::slice::from_ref(&key)),
+        crate::SigningSelfTest::Verified
+    );
+}
+
+/// The control-ABSENT arm: no signing key at all.
+#[test]
+fn signing_selftest_reports_not_signed_without_a_key() {
+    assert_eq!(
+        crate::signing_selftest(None, &[]),
+        crate::SigningSelfTest::NotSigned
+    );
+    // A verifier key set on its own signs nothing.
+    let key = b"0123456789abcdef0123456789abcdef".to_vec();
+    assert_eq!(
+        crate::signing_selftest(None, std::slice::from_ref(&key)),
+        crate::SigningSelfTest::NotSigned
+    );
+}
+
+/// The control-PRESENT-BUT-BROKEN arm, and the reason this self-test exists:
+/// a signing key that no verifier key accepts produces audit events that look
+/// signed and fail `verify_chain`. A presence check cannot see this.
+#[test]
+fn signing_selftest_reports_rejection_when_signer_and_verifier_disagree() {
+    let signing = b"0123456789abcdef0123456789abcdef".to_vec();
+    let verifying = b"ffffffffffffffffffffffffffffffff".to_vec();
+    assert_eq!(
+        crate::signing_selftest(Some(&signing), std::slice::from_ref(&verifying)),
+        crate::SigningSelfTest::SignatureRejected
+    );
+    // An EMPTY verifier set is the shape a below-entropy-floor key produces:
+    // `audit_verify_keys()` drops it, so nothing can accept the signature.
+    assert_eq!(
+        crate::signing_selftest(Some(&signing), &[]),
+        crate::SigningSelfTest::SignatureRejected
+    );
+}
+
+/// `sign_with_hash_using` must produce byte-identical output to the HMAC
+/// construction the rest of this suite signs with — otherwise the self-test
+/// would be validating a different signature than production writes.
+#[test]
+fn sign_with_hash_using_matches_the_canonical_hmac_construction() {
+    let key = b"0123456789abcdef0123456789abcdef";
+    let mut ev = AuditEvent {
+        workflow_id: "wf".to_string(),
+        execution_id: "ex".to_string(),
+        sequence_num: 7,
+        timestamp: 1_700_000_000,
+        actor: "agent:test".to_string(),
+        action: "act".to_string(),
+        payload: "{\"a\":1}".to_string(),
+        previous_hash: "prev".to_string(),
+        hmac_signature: None,
+    };
+    let expected = hmac_sign(&ev, key);
+    let hash = ev.calculate_hash();
+    ev.sign_with_hash_using(&hash, key);
+
+    assert_eq!(ev.hmac_signature.as_deref(), Some(expected.as_str()));
+}

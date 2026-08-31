@@ -444,6 +444,156 @@ impl JwtKeyPair {
     }
 }
 
+/// What a JWT self-test learned about the token-signing configuration.
+///
+/// The distinction that matters: `JWT_ALGORITHM=RS256` in the environment is a
+/// *request*, not a fact. Reading the env var back tells you what an operator
+/// typed; minting a token and reading its `alg` header tells you what the
+/// process will actually sign with. They can differ — `JwtKeyPair::from_env`
+/// upper-cases the value, so `JWT_ALGORITHM=rs256` mints RS256 tokens while a
+/// case-sensitive env comparison reports the deployment as symmetric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JwtSelfTest {
+    /// A probe token was minted and verified. `algorithm` is read off the
+    /// minted token's own header, not off the environment.
+    Verified {
+        algorithm: &'static str,
+        asymmetric: bool,
+    },
+    /// The JWT configuration is present but unusable. `stage` is one of
+    /// `secret`, `key_material`, `sign`, `header`, `verify`; the underlying
+    /// error is logged server-side and deliberately not carried here (PEM and
+    /// hex parse errors can quote bytes of the key material).
+    Broken { stage: &'static str },
+}
+
+/// Name an [`Algorithm`] with a stable, operator-facing string.
+fn algorithm_name(alg: Algorithm) -> &'static str {
+    match alg {
+        Algorithm::HS256 => "HS256",
+        Algorithm::HS384 => "HS384",
+        Algorithm::HS512 => "HS512",
+        Algorithm::ES256 => "ES256",
+        Algorithm::ES384 => "ES384",
+        Algorithm::RS256 => "RS256",
+        Algorithm::RS384 => "RS384",
+        Algorithm::RS512 => "RS512",
+        Algorithm::PS256 => "PS256",
+        Algorithm::PS384 => "PS384",
+        Algorithm::PS512 => "PS512",
+        Algorithm::EdDSA => "EdDSA",
+    }
+}
+
+/// Mint a short-lived PROBE token with the process's real JWT key material,
+/// read the algorithm back off the token's own header, and verify the token
+/// against the matching decoding key.
+///
+/// This is the difference between "`JWT_ALGORITHM` is set to X" and "this
+/// process signs tokens with X and can verify what it signed".
+///
+/// **Side-effect free and idempotent.** The probe token is built on the stack
+/// from a synthetic subject, is never returned to a caller, never stored, and
+/// never handed to `verify_token` (so no auth event, telemetry counter or
+/// session row is produced). It expires 60 s out purely so `validate_exp` has
+/// something valid to check; nothing would accept it anyway — the subject is
+/// not a real user id.
+///
+/// Cost: one HMAC (HS256) or one signature (RS256 ≈ 1 ms, ES256 ≈ 0.1 ms) plus
+/// the PEM parse `JwtKeyPair::from_env` already performs. No DB, no network,
+/// no bcrypt — which is why this does not go through `AuthService::new`, whose
+/// constructor pays a ~100–400 ms bcrypt hash.
+#[must_use]
+pub fn jwt_selftest() -> JwtSelfTest {
+    let Some(secret) = read_env_or_file("JWT_SECRET") else {
+        return JwtSelfTest::Broken { stage: "secret" };
+    };
+
+    let key_pair = match JwtKeyPair::from_env(&secret) {
+        Ok(kp) => kp,
+        Err(e) => {
+            tracing::error!(
+                target: "talos_security",
+                event_kind = "jwt_selftest_failed",
+                stage = "key_material",
+                error = %e,
+                "JWT self-test could not build a key pair from the environment"
+            );
+            return JwtSelfTest::Broken {
+                stage: "key_material",
+            };
+        }
+    };
+
+    let asymmetric = matches!(key_pair, JwtKeyPair::Asymmetric { .. });
+    let now = Utc::now();
+    let claims = Claims {
+        sub: "__security_audit_probe__".to_string(),
+        email: String::new(),
+        exp: (now + Duration::seconds(60)).timestamp() as usize,
+        iat: now.timestamp() as usize,
+        is_2fa_verified: false,
+        iss: "talos".to_string(),
+        aud: Some("talos".to_string()),
+        org: String::new(),
+    };
+
+    let token = match encode(
+        &Header::new(key_pair.algorithm()),
+        &claims,
+        key_pair.encoding_key(),
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!(
+                target: "talos_security",
+                event_kind = "jwt_selftest_failed",
+                stage = "sign",
+                error = %e,
+                "JWT self-test could not mint a probe token"
+            );
+            return JwtSelfTest::Broken { stage: "sign" };
+        }
+    };
+
+    // The authoritative reading: the `alg` the token actually carries.
+    let header = match jsonwebtoken::decode_header(&token) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(
+                target: "talos_security",
+                event_kind = "jwt_selftest_failed",
+                stage = "header",
+                error = %e,
+                "JWT self-test could not read back its own probe token header"
+            );
+            return JwtSelfTest::Broken { stage: "header" };
+        }
+    };
+
+    let mut validation = Validation::new(header.alg);
+    validation.validate_exp = true;
+    validation.validate_nbf = false;
+    validation.set_required_spec_claims(&["exp", "sub"]);
+    validation.set_issuer(&["talos"]);
+    validation.set_audience(&["talos"]);
+    if let Err(e) = decode::<Claims>(&token, key_pair.decoding_key(), &validation) {
+        tracing::error!(
+            target: "talos_security",
+            event_kind = "jwt_selftest_failed",
+            stage = "verify",
+            error = %e,
+            "JWT self-test minted a token its own decoding key rejects"
+        );
+        return JwtSelfTest::Broken { stage: "verify" };
+    }
+
+    JwtSelfTest::Verified {
+        algorithm: algorithm_name(header.alg),
+        asymmetric,
+    }
+}
+
 /// Optional previous-algorithm key pair for migration window.
 /// During JWT algorithm migration, tokens signed with the previous algorithm
 /// are still accepted for verification.

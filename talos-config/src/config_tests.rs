@@ -1057,4 +1057,58 @@ mod tests {
         assert_eq!(crate::module_execution_retention_batch(), 250);
         env::remove_var("MODULE_EXECUTION_RETENTION_BATCH");
     }
+
+    /// The `cors_origins` misreport, pinned at the parser rather than at the
+    /// env-presence helper: `ALLOWED_ORIGIN=""` and `ALLOWED_ORIGIN=","` both
+    /// yield an allowlist with ZERO entries, so a presence check that says
+    /// "configured" is describing something the CORS layer will reject every
+    /// origin against. This is the assertion `security_audit`'s converted
+    /// `cors_origins` check now reports from.
+    #[test]
+    fn parse_allowed_origins_empty_value_yields_no_origins() {
+        assert_eq!(crate::parse_allowed_origins("", false), Ok(vec![]));
+        assert_eq!(crate::parse_allowed_origins(",", false), Ok(vec![]));
+        assert_eq!(crate::parse_allowed_origins("  ,  ", false), Ok(vec![]));
+    }
+
+    #[test]
+    fn parse_allowed_origins_counts_and_trims_entries() {
+        assert_eq!(
+            crate::parse_allowed_origins("http://a.test, http://b.test ,", false),
+            Ok(vec![
+                "http://a.test".to_string(),
+                "http://b.test".to_string()
+            ])
+        );
+    }
+
+    /// Production validation is returned, not panicked — the property that
+    /// lets `security_audit` evaluate the config without poisoning the
+    /// memoised `ALLOWED_ORIGINS` LazyLock for the rest of the process.
+    #[test]
+    fn parse_allowed_origins_production_rejections_are_errors_not_panics() {
+        let empty = crate::parse_allowed_origins("", true).unwrap_err();
+        assert!(
+            empty.starts_with("ALLOWED_ORIGIN must be set in production."),
+            "unexpected message: {empty}"
+        );
+
+        let wildcard = crate::parse_allowed_origins("*", true).unwrap_err();
+        assert_eq!(
+            wildcard,
+            "ALLOWED_ORIGIN contains '*' which is not permitted in production"
+        );
+
+        let scheme = crate::parse_allowed_origins("app.example.com", true).unwrap_err();
+        assert_eq!(
+            scheme,
+            "ALLOWED_ORIGIN 'app.example.com' must start with http:// or https://"
+        );
+
+        // ...and a well-formed production value still parses.
+        assert_eq!(
+            crate::parse_allowed_origins("https://app.example.com", true),
+            Ok(vec!["https://app.example.com".to_string()])
+        );
+    }
 }

@@ -791,54 +791,95 @@ pub fn memory_loop_max_actors_per_org_per_tick() -> i64 {
         .unwrap_or(0)
 }
 
-/// Validated allowed origins, computed once at startup.
-/// Production panics happen at init time, not on every request.
-static ALLOWED_ORIGINS: LazyLock<Vec<String>> = LazyLock::new(|| {
-    let default = if is_production() {
-        "" // ALLOWED_ORIGIN must be explicitly set in production
-    } else {
-        "http://localhost:3000,http://localhost:3001,http://localhost:3002"
-    };
+/// Dev-mode default CORS allowlist. Named so [`check_allowed_origins`] and the
+/// [`ALLOWED_ORIGINS`] initialiser cannot drift apart.
+const DEV_DEFAULT_ALLOWED_ORIGINS: &str =
+    "http://localhost:3000,http://localhost:3001,http://localhost:3002";
 
-    let origins_str = get_env("ALLOWED_ORIGIN", default);
-    let origins: Vec<String> = origins_str
+/// Split + validate a raw `ALLOWED_ORIGIN` value into the allowlist the CORS
+/// layer will actually enforce.
+///
+/// This is the whole of the [`ALLOWED_ORIGINS`] policy, lifted out of the
+/// `LazyLock` initialiser so it can be *evaluated without being applied*. Two
+/// callers, one implementation:
+///
+/// * [`ALLOWED_ORIGINS`] — panics on `Err`, preserving the historical
+///   fail-at-boot behaviour and the exact panic strings.
+/// * [`check_allowed_origins`] — used by `security_audit` to REPORT the
+///   configuration. It must not panic: a `LazyLock` that panics stays poisoned
+///   for the life of the process, so an audit that touched `get_allowed_origins`
+///   directly would brick every later CORS check as a side effect of *looking*.
+///
+/// Empty entries are dropped (`"a,,b"` → 2 origins), which is why a bare
+/// `ALLOWED_ORIGIN=""` yields an EMPTY allowlist rather than one empty origin —
+/// the divergence behind the 2026-08-28 `cors_origins` misreport.
+pub fn parse_allowed_origins(raw: &str, production: bool) -> Result<Vec<String>, String> {
+    let origins: Vec<String> = raw
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
 
-    if is_production() {
+    if production {
         if origins.is_empty() {
-            panic!(
-                "ALLOWED_ORIGIN must be set in production. \
+            return Err("ALLOWED_ORIGIN must be set in production. \
                  Example: ALLOWED_ORIGIN=https://app.example.com"
-            );
+                .to_string());
         }
         for origin in &origins {
             if origin == "*" || origin == "null" {
-                panic!(
+                return Err(format!(
                     "ALLOWED_ORIGIN contains '{}' which is not permitted in production",
                     origin
-                );
+                ));
             }
             if !origin.starts_with("http://") && !origin.starts_with("https://") {
-                panic!(
+                return Err(format!(
                     "ALLOWED_ORIGIN '{}' must start with http:// or https://",
                     origin
-                );
+                ));
             }
         }
-        // SECURITY: Credentials are sent to all allowed origins. Each origin
-        // added expands the attack surface — a compromised origin can steal
-        // session cookies. Log when multiple origins are configured.
-        if origins.len() > 1 {
-            eprintln!(
-                "SECURITY WARNING: {} CORS origins configured with credentials. \
-                 Each origin can receive session cookies. Verify all are trusted: {:?}",
-                origins.len(),
-                origins
-            );
-        }
+    }
+
+    Ok(origins)
+}
+
+/// Evaluate the live `ALLOWED_ORIGIN` configuration WITHOUT initialising the
+/// memoised [`ALLOWED_ORIGINS`] allowlist.
+///
+/// `Ok(origins)` additionally guarantees that touching [`get_allowed_origins`]
+/// is panic-free, so an auditor can safely read the enforced list afterwards.
+pub fn check_allowed_origins() -> Result<Vec<String>, String> {
+    let production = is_production();
+    let default = if production {
+        "" // ALLOWED_ORIGIN must be explicitly set in production
+    } else {
+        DEV_DEFAULT_ALLOWED_ORIGINS
+    };
+    parse_allowed_origins(&get_env("ALLOWED_ORIGIN", default), production)
+}
+
+/// Validated allowed origins, computed once at startup.
+/// Production panics happen at init time, not on every request.
+static ALLOWED_ORIGINS: LazyLock<Vec<String>> = LazyLock::new(|| {
+    let origins = match check_allowed_origins() {
+        Ok(origins) => origins,
+        // Same message, same timing (first touch), same fail-closed posture as
+        // the pre-extraction inline `panic!`s.
+        Err(e) => panic!("{}", e),
+    };
+
+    // SECURITY: Credentials are sent to all allowed origins. Each origin
+    // added expands the attack surface — a compromised origin can steal
+    // session cookies. Log when multiple origins are configured.
+    if is_production() && origins.len() > 1 {
+        eprintln!(
+            "SECURITY WARNING: {} CORS origins configured with credentials. \
+             Each origin can receive session cookies. Verify all are trusted: {:?}",
+            origins.len(),
+            origins
+        );
     }
 
     origins

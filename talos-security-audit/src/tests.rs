@@ -1,0 +1,664 @@
+//! Unit tests for the verifying security audit.
+//!
+//! The tests that matter most are the PRESENT-BUT-BROKEN ones. Each converted
+//! check has at least one: a configuration that every presence test in the
+//! world grades green, and that the round trip catches.
+
+use super::*;
+
+// ───────────────────────────────────────────────────────────────────────────
+// jwt_algorithm
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn jwt_verified_symmetric_passes_on_single_pod() {
+    let c = check_jwt_algorithm(
+        talos_auth::JwtSelfTest::Verified {
+            algorithm: "HS256",
+            asymmetric: false,
+        },
+        "single_pod",
+    );
+    assert_eq!(c.status, Status::Pass);
+    assert_eq!(c.points, 10);
+    assert_eq!(c.verification, Verification::RoundTrip);
+    assert!(c.detail.contains("alg=HS256"));
+}
+
+#[test]
+fn jwt_verified_symmetric_warns_on_microservices() {
+    let c = check_jwt_algorithm(
+        talos_auth::JwtSelfTest::Verified {
+            algorithm: "HS256",
+            asymmetric: false,
+        },
+        "microservices",
+    );
+    assert_eq!(c.status, Status::Warn);
+    assert_eq!(c.points, 5, "the microservices deduction is unchanged");
+}
+
+#[test]
+fn jwt_verified_asymmetric_passes_regardless_of_topology() {
+    for topology in ["single_pod", "microservices"] {
+        let c = check_jwt_algorithm(
+            talos_auth::JwtSelfTest::Verified {
+                algorithm: "RS256",
+                asymmetric: true,
+            },
+            topology,
+        );
+        assert_eq!(c.status, Status::Pass);
+        assert_eq!(c.points, 10);
+    }
+}
+
+/// PRESENT BUT BROKEN. `JWT_ALGORITHM=RS256` with no PEM key material scored
+/// the BEST possible outcome under the presence check — "asymmetric
+/// (recommended)", full marks — while the process could not mint a token.
+#[test]
+fn jwt_broken_key_material_fails_and_never_reads_as_configured() {
+    let c = check_jwt_algorithm(
+        talos_auth::JwtSelfTest::Broken {
+            stage: "key_material",
+        },
+        "single_pod",
+    );
+    assert_eq!(
+        c.status,
+        Status::Fail,
+        "present-but-non-functional must not collapse into warn"
+    );
+    assert_eq!(c.points, 0);
+    assert_eq!(c.verification, Verification::RoundTrip);
+    assert!(c.detail.contains("NON-FUNCTIONAL"));
+    assert!(
+        !c.detail.contains("recommended"),
+        "a broken control must never carry the language of a good one"
+    );
+}
+
+#[test]
+fn jwt_missing_secret_names_the_missing_variable() {
+    let c = check_jwt_algorithm(
+        talos_auth::JwtSelfTest::Broken { stage: "secret" },
+        "single_pod",
+    );
+    assert_eq!(c.status, Status::Fail);
+    assert!(c.detail.contains("JWT_SECRET is not set"));
+}
+
+/// The underlying error never travels — key-parse errors can quote key bytes.
+#[test]
+fn jwt_broken_detail_carries_no_upstream_error_text() {
+    for stage in ["key_material", "sign", "header", "verify"] {
+        let c = check_jwt_algorithm(talos_auth::JwtSelfTest::Broken { stage }, "single_pod");
+        assert!(
+            c.detail.contains("event_kind=jwt_selftest_failed"),
+            "the operator must be pointed at where the cause IS"
+        );
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// master_encryption_key
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn kek_verified_passes_and_names_the_provider() {
+    let c = check_master_encryption_key(Some(KekSelfTest::Verified {
+        provider: "env".to_string(),
+    }));
+    assert_eq!(c.status, Status::Pass);
+    assert_eq!(c.points, 15, "weight unchanged");
+    assert_eq!(c.verification, Verification::RoundTrip);
+    assert!(c.detail.contains("provider: env"));
+}
+
+/// PRESENT BUT BROKEN. The KEK is installed — so `TALOS_MASTER_KEY is
+/// configured` was true and scored +15 — but nothing it wrapped can be
+/// unwrapped.
+#[test]
+fn kek_failed_roundtrip_fails_with_zero_points() {
+    for stage in ["wrap", "unwrap", "roundtrip"] {
+        let c = check_master_encryption_key(Some(KekSelfTest::Failed {
+            provider: "vault://transit/keys/talos-kek".to_string(),
+            stage,
+        }));
+        assert_eq!(c.status, Status::Fail);
+        assert_eq!(c.points, 0);
+        assert_eq!(c.verification, Verification::RoundTrip);
+        assert!(c.detail.contains("NON-FUNCTIONAL"));
+        assert!(c.detail.contains(stage));
+    }
+}
+
+/// A verification that could not run must be DISTINGUISHABLE from one that
+/// ran and passed — the ⊘ SKIPPED lesson. A timeout is not a pass.
+#[test]
+fn kek_timeout_is_not_verified_and_is_not_a_pass() {
+    let c = check_master_encryption_key(None);
+    assert_eq!(c.verification, Verification::NotVerified);
+    assert_ne!(c.status, Status::Pass);
+    assert_eq!(c.points, 0);
+    assert!(c.detail.starts_with("NOT VERIFIED"));
+}
+
+#[test]
+fn kek_unavailable_is_not_verified() {
+    let c = check_master_encryption_key(Some(KekSelfTest::Unavailable));
+    assert_eq!(c.verification, Verification::NotVerified);
+    assert_ne!(c.status, Status::Pass);
+    assert!(c.detail.starts_with("NOT VERIFIED"));
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// job_signing_key
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn job_signing_verified_passes() {
+    let c = check_job_signing_key(JobSigningProbe::Verified);
+    assert_eq!(c.status, Status::Pass);
+    assert_eq!(c.points, 15, "weight unchanged");
+    assert_eq!(c.verification, Verification::RoundTrip);
+}
+
+/// Control ABSENT keeps its historical `warn` — the operator was already told.
+#[test]
+fn job_signing_absent_keeps_its_historical_warn_and_wording() {
+    let c = check_job_signing_key(JobSigningProbe::Absent);
+    assert_eq!(c.status, Status::Warn);
+    assert_eq!(
+        c.detail, "WORKER_SHARED_KEY not set — job payloads are unsigned",
+        "absent wording is byte-stable for existing dashboards"
+    );
+    assert_eq!(c.points, 0);
+}
+
+/// PRESENT BUT BROKEN outranks absent: `warn` for a missing key, `fail` for a
+/// key that is set and cannot sign.
+#[test]
+fn job_signing_unusable_fails_harder_than_absent() {
+    let absent = check_job_signing_key(JobSigningProbe::Absent);
+    let unusable = check_job_signing_key(JobSigningProbe::Unusable);
+    assert_eq!(absent.status, Status::Warn);
+    assert_eq!(unusable.status, Status::Fail);
+    assert_eq!(unusable.points, 0);
+    assert!(unusable.detail.contains("SET but UNUSABLE"));
+    // The hex parse error names a character of the key and its index.
+    assert!(unusable.detail.contains("withheld"));
+}
+
+#[test]
+fn job_signing_roundtrip_failure_fails() {
+    let c = check_job_signing_key(JobSigningProbe::RoundTripFailed);
+    assert_eq!(c.status, Status::Fail);
+    assert_eq!(c.points, 0);
+    assert_eq!(c.verification, Verification::RoundTrip);
+}
+
+/// The probe runs against the process's real `WORKER_SHARED_KEY` (absent in
+/// the test environment) and must be repeatable — in particular it must not
+/// consume a replay nonce, or the second run would fail.
+#[test]
+fn job_signing_probe_is_repeatable() {
+    let first = probe_job_signing_key();
+    let second = probe_job_signing_key();
+    let third = probe_job_signing_key();
+    assert_eq!(first, second);
+    assert_eq!(second, third);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// aot_integrity_key
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn aot_valid_key_passes_but_says_it_was_not_exercised() {
+    let c = check_aot_integrity_key(&"ab".repeat(32)); // 64 hex chars = 32 bytes
+    assert_eq!(c.status, Status::Pass);
+    assert_eq!(c.points, 10);
+    assert_eq!(
+        c.verification,
+        Verification::ConfigPresence,
+        "the enforcing key ring is the worker's; this cannot be a round trip"
+    );
+    assert!(c.detail.contains("Shape only"));
+}
+
+#[test]
+fn aot_short_key_warns_with_the_decoded_length() {
+    let c = check_aot_integrity_key(&"ab".repeat(16)); // 32 hex chars = 16 bytes
+    assert_eq!(c.status, Status::Warn);
+    assert_eq!(c.points, 0);
+    assert!(c.detail.contains("16 bytes decoded"));
+}
+
+#[test]
+fn aot_empty_key_is_info_not_fail() {
+    let c = check_aot_integrity_key("");
+    assert_eq!(c.status, Status::Info);
+    assert_eq!(c.points, 0);
+    assert!(c.detail.contains("ephemeral"));
+}
+
+/// Non-hex values are measured raw, matching the worker's `into_bytes()` path.
+#[test]
+fn aot_non_hex_key_is_measured_raw() {
+    let c = check_aot_integrity_key(&"z".repeat(40));
+    assert_eq!(c.status, Status::Pass);
+    let short = check_aot_integrity_key(&"z".repeat(31));
+    assert_eq!(short.status, Status::Warn);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// audit_event_signing
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn audit_signing_verified_passes() {
+    let c = check_audit_event_signing(talos_audit_event::SigningSelfTest::Verified, true, true);
+    assert_eq!(c.status, Status::Pass);
+    assert_eq!(c.points, 10, "weight unchanged");
+    assert_eq!(c.verification, Verification::RoundTrip);
+}
+
+#[test]
+fn audit_signing_absent_keeps_its_historical_warn_and_wording() {
+    let c = check_audit_event_signing(talos_audit_event::SigningSelfTest::NotSigned, false, false);
+    assert_eq!(c.status, Status::Warn);
+    assert_eq!(
+        c.detail, "TALOS_AUDIT_SIGNING_KEY not set — audit events are unsigned",
+        "absent wording is byte-stable for existing dashboards"
+    );
+    assert_eq!(c.points, 0);
+}
+
+/// THE case this whole change exists for. `TALOS_AUDIT_SIGNING_KEY` generated
+/// with `openssl rand -hex 16` is present and non-empty, so the presence check
+/// reported "Audit events are HMAC-signed for tamper detection" and awarded
+/// +10 — while `audit_signing_key()` had rejected it at the 256-bit entropy
+/// floor and every audit event went out unsigned.
+#[test]
+fn audit_signing_key_rejected_at_the_entropy_floor_fails_loudly() {
+    let c = check_audit_event_signing(talos_audit_event::SigningSelfTest::NotSigned, true, false);
+    assert_eq!(
+        c.status,
+        Status::Fail,
+        "a key that is set and produces no signature is worse than no key"
+    );
+    assert_eq!(c.points, 0);
+    assert_eq!(c.verification, Verification::RoundTrip);
+    assert!(c.detail.contains("REJECTED at load"));
+    assert!(
+        !c.detail.contains("are HMAC-signed for tamper detection"),
+        "must not reuse the wording of the passing case"
+    );
+}
+
+#[test]
+fn audit_signing_signer_verifier_disagreement_fails() {
+    let c = check_audit_event_signing(
+        talos_audit_event::SigningSelfTest::SignatureRejected,
+        true,
+        true,
+    );
+    assert_eq!(c.status, Status::Fail);
+    assert_eq!(c.points, 0);
+    assert!(c.detail.contains("verify_chain"));
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// redis_tls
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn redis_probe_classifies_the_transports_the_client_will_use() {
+    assert_eq!(probe_redis_transport(""), RedisTransport::NotConfigured);
+    assert_eq!(
+        probe_redis_transport("redis://127.0.0.1:6379"),
+        RedisTransport::Plaintext
+    );
+    assert_eq!(
+        probe_redis_transport("rediss://redis.example.com:6379"),
+        RedisTransport::Tls
+    );
+    assert_eq!(
+        probe_redis_transport("unix:///var/run/redis.sock"),
+        RedisTransport::UnixSocket
+    );
+    assert_eq!(
+        probe_redis_transport("not-a-redis-url"),
+        RedisTransport::Unparseable
+    );
+}
+
+/// PRESENT BUT BROKEN, and invisible to the prefix test: this URL starts with
+/// `rediss://`, so `starts_with("rediss://")` reported "Redis using TLS
+/// (rediss://)" and awarded +10 — for a connection that accepts ANY
+/// certificate.
+#[test]
+fn redis_insecure_fragment_is_caught_although_the_prefix_says_tls() {
+    const URL: &str = "rediss://redis.example.com:6379/#insecure";
+    assert!(
+        URL.starts_with("rediss://"),
+        "the old prefix test passes this URL"
+    );
+    assert_eq!(probe_redis_transport(URL), RedisTransport::TlsInsecure);
+
+    let c = check_redis_tls(RedisTransport::TlsInsecure, false);
+    assert_eq!(c.status, Status::Fail);
+    assert_eq!(c.points, 0);
+    assert!(c.detail.contains("verification DISABLED"));
+}
+
+/// An unparseable URL also starts with a plausible scheme and would have
+/// scored +10 in production under a prefix test.
+#[test]
+fn redis_unparseable_url_fails_and_never_echoes_the_url() {
+    const URL: &str = "rediss://user:hunter2@@@:::/bad";
+    let transport = probe_redis_transport(URL);
+    let c = check_redis_tls(transport, true);
+    assert_eq!(transport, RedisTransport::Unparseable);
+    assert_eq!(c.status, Status::Fail);
+    assert!(
+        !c.detail.contains("hunter2"),
+        "a Redis URL can embed a password; it must never be echoed"
+    );
+}
+
+#[test]
+fn redis_plaintext_grades_by_environment_as_before() {
+    assert_eq!(
+        check_redis_tls(RedisTransport::Plaintext, false).status,
+        Status::Info
+    );
+    assert_eq!(
+        check_redis_tls(RedisTransport::Plaintext, true).status,
+        Status::Fail
+    );
+    assert_eq!(check_redis_tls(RedisTransport::Plaintext, true).points, 0);
+}
+
+#[test]
+fn redis_tls_scores_ten_as_before() {
+    let c = check_redis_tls(RedisTransport::Tls, true);
+    assert_eq!(c.status, Status::Pass);
+    assert_eq!(c.points, 10);
+}
+
+#[test]
+fn redis_not_configured_scores_zero_and_stays_pass() {
+    let c = check_redis_tls(RedisTransport::NotConfigured, false);
+    assert_eq!(c.status, Status::Pass);
+    assert_eq!(c.points, 0, "an unconfigured Redis earns nothing");
+    assert_eq!(c.detail, "Redis not configured");
+}
+
+/// The probe must not open a socket — it is called from an interactive
+/// handler. A URL pointing at a black-hole address returns immediately.
+#[test]
+fn redis_probe_does_no_network_io() {
+    let start = std::time::Instant::now();
+    // 198.51.100.0/24 is TEST-NET-2: guaranteed unroutable. A connecting
+    // probe would block here until its connect timeout.
+    let _ = probe_redis_transport("rediss://198.51.100.7:6379");
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(200),
+        "probe_redis_transport must parse only; it took {:?}",
+        start.elapsed()
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// audit_immutability_triggers
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn triggers_present_passes_with_the_historical_wording() {
+    let c = check_audit_immutability_triggers(Some(4));
+    assert_eq!(c.status, Status::Pass);
+    assert_eq!(c.points, 10);
+    assert_eq!(c.detail, "4 immutability trigger(s) active");
+}
+
+#[test]
+fn triggers_absent_fails_with_the_historical_wording() {
+    let c = check_audit_immutability_triggers(Some(0));
+    assert_eq!(c.status, Status::Fail);
+    assert_eq!(
+        c.detail,
+        "No audit immutability triggers found — run migrations"
+    );
+}
+
+/// A failed query is "nobody looked", not "the triggers are missing". The old
+/// `unwrap_or(0)` sent operators to re-run migrations over a database blip.
+#[test]
+fn triggers_query_failure_is_not_verified_and_does_not_blame_migrations() {
+    let c = check_audit_immutability_triggers(None);
+    assert_eq!(c.verification, Verification::NotVerified);
+    assert_ne!(c.status, Status::Pass);
+    assert_eq!(c.points, 0);
+    assert!(c.detail.starts_with("NOT VERIFIED"));
+    assert!(!c.detail.contains("run migrations"));
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// cors_origins
+// ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn cors_explicit_list_passes_and_reports_the_parsed_count() {
+    let parsed = Ok(vec![
+        "https://a.example".to_string(),
+        "https://b.example".to_string(),
+    ]);
+    let c = check_cors_origins(&parsed, true);
+    assert_eq!(c.status, Status::Pass);
+    assert_eq!(c.points, 10, "weight unchanged");
+    assert_eq!(c.verification, Verification::Parsed);
+    assert!(
+        c.detail.contains("2 enforced origin(s)"),
+        "the count is the finding: {}",
+        c.detail
+    );
+}
+
+/// PRESENT BUT BROKEN. `ALLOWED_ORIGIN=","` is non-empty, so the presence test
+/// reported "ALLOWED_ORIGIN is explicitly configured" and awarded +10 — for an
+/// allowlist that rejects every origin.
+#[test]
+fn cors_empty_parsed_list_fails_although_the_variable_is_set() {
+    let parsed = talos_config::parse_allowed_origins(",", false);
+    assert_eq!(
+        parsed,
+        Ok(vec![]),
+        "the separator-only value has no origins"
+    );
+
+    let c = check_cors_origins(&parsed, true);
+    assert_eq!(c.status, Status::Fail);
+    assert_eq!(c.points, 0);
+    assert!(c.detail.contains("ZERO origins"));
+    assert!(
+        !c.detail.contains("explicitly configured"),
+        "must not reuse the wording of the passing case"
+    );
+}
+
+#[test]
+fn cors_dev_defaults_pass_without_scoring() {
+    let parsed = talos_config::parse_allowed_origins(
+        "http://localhost:3000,http://localhost:3001,http://localhost:3002",
+        false,
+    );
+    let c = check_cors_origins(&parsed, false);
+    assert_eq!(c.status, Status::Pass);
+    assert_eq!(
+        c.points, 0,
+        "dev defaults earned nothing before, and do not now"
+    );
+    assert!(c.detail.contains("dev mode"));
+    assert!(c.detail.contains("3 enforced origin(s)"));
+}
+
+#[test]
+fn cors_production_validation_error_fails() {
+    let parsed = talos_config::parse_allowed_origins("*", true);
+    let c = check_cors_origins(&parsed, true);
+    assert_eq!(c.status, Status::Fail);
+    assert_eq!(c.points, 0);
+    assert!(c.detail.contains("not permitted in production"));
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Scoring + report shape
+// ───────────────────────────────────────────────────────────────────────────
+
+/// The reachable maximum really is 100 — worth pinning, because the per-arm
+/// point literals sum to more and read as an over-100 bug.
+#[test]
+fn a_fully_hardened_production_deployment_scores_exactly_max() {
+    let checks = vec![
+        check_production_mode(true),
+        check_jwt_algorithm(
+            talos_auth::JwtSelfTest::Verified {
+                algorithm: "RS256",
+                asymmetric: true,
+            },
+            "microservices",
+        ),
+        check_master_encryption_key(Some(KekSelfTest::Verified {
+            provider: "vault://transit/keys/talos-kek".to_string(),
+        })),
+        check_job_signing_key(JobSigningProbe::Verified),
+        check_aot_integrity_key(&"ab".repeat(32)),
+        check_audit_event_signing(talos_audit_event::SigningSelfTest::Verified, true, true),
+        check_redis_tls(RedisTransport::Tls, true),
+        check_audit_immutability_triggers(Some(6)),
+        check_cors_origins(&Ok(vec!["https://app.example.com".to_string()]), true),
+    ];
+    let report = render_report(&checks);
+    assert_eq!(report["security_score"], 100);
+    assert_eq!(report["max_score"], 100);
+    assert_eq!(report["grade"], "A");
+    assert_eq!(report["status_counts"]["fail"], 0);
+    assert_eq!(report["verification_counts"]["not_verified"], 0);
+}
+
+/// Grade thresholds are untouched by this change.
+#[test]
+fn grade_thresholds_are_unchanged() {
+    assert_eq!(grade_for(100), "A");
+    assert_eq!(grade_for(90), "A");
+    assert_eq!(grade_for(89), "B");
+    assert_eq!(grade_for(75), "B");
+    assert_eq!(grade_for(74), "C");
+    assert_eq!(grade_for(60), "C");
+    assert_eq!(grade_for(59), "D");
+    assert_eq!(grade_for(40), "D");
+    assert_eq!(grade_for(39), "F");
+    assert_eq!(grade_for(0), "F");
+}
+
+/// Every check carries a `verification` field, and the response explains what
+/// each value means — otherwise "pass" spans both "I exercised it" and "I read
+/// an environment variable" exactly as before.
+#[test]
+fn every_check_reports_how_it_was_established() {
+    let checks = vec![
+        check_production_mode(false),
+        check_master_encryption_key(None),
+        check_aot_integrity_key(""),
+    ];
+    let report = render_report(&checks);
+    for c in report["checks"].as_array().expect("checks array") {
+        let v = c["verification"].as_str().expect("verification string");
+        assert!(
+            ["round_trip", "parsed", "config_presence", "not_verified"].contains(&v),
+            "unknown verification value {v}"
+        );
+        assert!(
+            report["verification_legend"][v].is_string(),
+            "{v} must be documented in the legend"
+        );
+    }
+    assert_eq!(report["verification_counts"]["not_verified"], 1);
+}
+
+/// The pre-existing response contract is preserved: same keys, same check
+/// names, same status vocabulary.
+#[test]
+fn response_shape_is_backwards_compatible() {
+    let checks = vec![check_production_mode(true)];
+    let report = render_report(&checks);
+    for key in [
+        "security_score",
+        "max_score",
+        "grade",
+        "grade_thresholds",
+        "status_counts",
+        "status_legend",
+        "checks",
+        "recommendation",
+    ] {
+        assert!(report.get(key).is_some(), "missing legacy key {key}");
+    }
+    let first = &report["checks"][0];
+    assert_eq!(first["check"], "production_mode");
+    assert!(first["status"].is_string());
+    assert!(first["detail"].is_string());
+}
+
+/// The nine check names an operator's scripts key on.
+#[test]
+fn check_names_are_unchanged() {
+    let names = vec![
+        check_production_mode(false).name,
+        check_jwt_algorithm(
+            talos_auth::JwtSelfTest::Broken { stage: "secret" },
+            "single_pod",
+        )
+        .name,
+        check_master_encryption_key(None).name,
+        check_job_signing_key(JobSigningProbe::Absent).name,
+        check_aot_integrity_key("").name,
+        check_audit_event_signing(talos_audit_event::SigningSelfTest::NotSigned, false, false).name,
+        check_redis_tls(RedisTransport::NotConfigured, false).name,
+        check_audit_immutability_triggers(Some(1)).name,
+        check_cors_origins(&Ok(vec!["http://localhost:3000".to_string()]), false).name,
+    ];
+    assert_eq!(
+        names,
+        vec![
+            "production_mode",
+            "jwt_algorithm",
+            "master_encryption_key",
+            "job_signing_key",
+            "aot_integrity_key",
+            "audit_event_signing",
+            "redis_tls",
+            "audit_immutability_triggers",
+            "cors_origins",
+        ]
+    );
+}
+
+/// No probe outcome may produce a `pass` alongside `not_verified`. A green
+/// tick that means "I did not look" is the defect this whole line of work
+/// keeps finding.
+#[test]
+fn nothing_that_was_not_verified_is_ever_reported_as_a_pass() {
+    let unverified = vec![
+        check_master_encryption_key(None),
+        check_master_encryption_key(Some(KekSelfTest::Unavailable)),
+        check_audit_immutability_triggers(None),
+    ];
+    for c in unverified {
+        assert_eq!(c.verification, Verification::NotVerified, "{}", c.name);
+        assert_ne!(c.status, Status::Pass, "{}", c.name);
+        assert_eq!(c.points, 0, "{}", c.name);
+    }
+}
