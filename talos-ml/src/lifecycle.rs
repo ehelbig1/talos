@@ -729,7 +729,12 @@ impl LifecycleService {
         model_id: Uuid,
         min_band: i16,
     ) -> Result<Option<(f64, i64)>> {
-        let row: Option<(i64, i64)> = sqlx::query_as(
+        // Ungrouped aggregate ⇒ exactly one row, always. `fetch_optional`'s
+        // `None` was unreachable; the real "no observations" signal is
+        // `total == 0`, which the `.then()` below already keys on. The SUMs
+        // are COALESCEd, so the zero here is the correct answer for an empty
+        // set rather than a NULL papered over.
+        let (agree, total): (i64, i64) = sqlx::query_as(
             "SELECT COALESCE(SUM(s.agree_count), 0)::bigint, \
                     COALESCE(SUM(s.total_count), 0)::bigint \
              FROM ml_shadow_stats s \
@@ -738,14 +743,10 @@ impl LifecycleService {
         )
         .bind(model_id)
         .bind(min_band)
-        .fetch_optional(&mut *conn)
+        .fetch_one(&mut *conn)
         .await
         .context("read shadow agreement")?;
-        Ok(
-            row.and_then(|(agree, total)| {
-                (total > 0).then(|| (agree as f64 / total as f64, total))
-            }),
-        )
+        Ok((total > 0).then(|| (agree as f64 / total as f64, total)))
     }
 
     /// All-history sibling of [`Self::shadow_agreement`] — sums every
@@ -757,20 +758,17 @@ impl LifecycleService {
         model_id: Uuid,
         min_band: i16,
     ) -> Result<Option<(f64, i64)>> {
-        let row: Option<(i64, i64)> = sqlx::query_as(
+        // Ungrouped aggregate ⇒ exactly one row; see `shadow_agreement`.
+        let (agree, total): (i64, i64) = sqlx::query_as(
             "SELECT COALESCE(SUM(agree_count), 0)::bigint, COALESCE(SUM(total_count), 0)::bigint \
              FROM ml_shadow_stats WHERE model_id = $1 AND band >= $2",
         )
         .bind(model_id)
         .bind(min_band)
-        .fetch_optional(&mut *conn)
+        .fetch_one(&mut *conn)
         .await
         .context("read lifetime shadow agreement")?;
-        Ok(
-            row.and_then(|(agree, total)| {
-                (total > 0).then(|| (agree as f64 / total as f64, total))
-            }),
-        )
+        Ok((total > 0).then(|| (agree as f64 / total as f64, total)))
     }
 
     /// Store one reviewable divergence (encrypted features), pruning

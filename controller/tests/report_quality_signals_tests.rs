@@ -853,3 +853,133 @@ async fn an_abstention_neither_disputes_nor_drags_a_real_verdict() {
     assert_eq!(rows[0].judge_score, Some(0.7));
     assert!(!rows[0].judge_disputed);
 }
+
+// ── Auth-failure risk signal: the empty set ────────────────────────────
+//
+// `AnalyticsRepository::count_recent_auth_failures` backs the
+// `repeated_auth_failures` field of `get_workflow_risk_assessment`. Its
+// query is an UNGROUPED aggregate over `workflow_executions`, and until
+// 2026-08-31 it decoded `MAX(started_at)` into a non-`Option` `String`.
+// An aggregate over nothing is NULL, not 0 — so the query FAILED with
+// "unexpected null; try decoding as an Option" in exactly the case that
+// is overwhelmingly common and overwhelmingly good news: a workflow with
+// no auth failures. Measured on the live DB the day of the fix: 30 of 30
+// workflows took the broken branch.
+//
+// The bug was invisible for as long as the error was swallowed into `0`,
+// because `0` was the correct answer — right output, broken query. #704
+// made report handlers disclose a failed read instead of defaulting it,
+// which converted the latent break into a `report_field_not_measured`
+// disclosure on nearly every call.
+//
+// These tests exist because the empty-set case was the one case never
+// tested. They need a real Postgres: the defect IS the decode of a real
+// NULL from a real ungrouped aggregate, which no mock reproduces.
+
+#[tokio::test]
+async fn auth_failure_count_over_an_empty_window_is_zero_not_a_decode_error() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let repo = talos_analytics_repository::AnalyticsRepository::new(pool.clone());
+
+    let user = Uuid::new_v4();
+    let wf = Uuid::new_v4();
+    seed_user(&pool, user, "authfail-empty@quality.test").await;
+    seed_workflow(&pool, wf, user, "pa-no-auth-failures").await;
+
+    // A real workflow with ZERO executions of any kind. `COUNT(*)` is 0 and
+    // `MAX(started_at)` is NULL — the shape that used to fail the decode.
+    let (count, last_failure) = repo
+        .count_recent_auth_failures(wf, 7)
+        .await
+        .expect("an empty window is an answer, not an error");
+
+    assert_eq!(count, 0, "no matching executions means zero failures");
+    assert_eq!(
+        last_failure, None,
+        "MAX over an empty set has no meaningful zero — it must stay absent \
+         rather than be COALESCEd into a fabricated timestamp"
+    );
+}
+
+#[tokio::test]
+async fn auth_failure_count_for_an_unknown_workflow_still_returns_a_row() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let repo = talos_analytics_repository::AnalyticsRepository::new(pool.clone());
+
+    // Pins the structural fact that retired the `fetch_optional` here: an
+    // ungrouped aggregate returns EXACTLY ONE ROW even when nothing matches
+    // and the workflow does not exist at all. Any caller branching on a
+    // "no row" case was reading dead code; `count == 0` is the real signal.
+    let (count, last_failure) = repo
+        .count_recent_auth_failures(Uuid::new_v4(), 7)
+        .await
+        .expect("ungrouped aggregate always produces a row");
+
+    assert_eq!(count, 0);
+    assert_eq!(last_failure, None);
+}
+
+#[tokio::test]
+async fn auth_failure_count_reports_the_most_recent_failure_when_there_are_some() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let repo = talos_analytics_repository::AnalyticsRepository::new(pool.clone());
+
+    let user = Uuid::new_v4();
+    let wf = Uuid::new_v4();
+    let actor = Uuid::new_v4();
+    seed_user(&pool, user, "authfail-some@quality.test").await;
+    seed_workflow(&pool, wf, user, "pa-blocked-vault-path").await;
+    sqlx::query("INSERT INTO actors (id, user_id, name) VALUES ($1, $2, 'authfail-actor')")
+        .bind(actor)
+        .bind(user)
+        .execute(&pool)
+        .await
+        .expect("seed actor");
+
+    // Two in-window auth failures, one in-window failure with an unrelated
+    // error, and one auth failure OUTSIDE the 7-day window. Only the first
+    // two may count, and `last_failure` must be the newer of them.
+    let rows = [
+        ("failed", Some("HTTP 401 unauthorized"), 1_i64),
+        ("failed", Some("access denied for vault path"), 3),
+        ("failed", Some("connection reset by peer"), 2),
+        ("failed", Some("unauthorized"), 30),
+    ];
+    for (status, err, days_ago) in rows {
+        sqlx::query(
+            "INSERT INTO workflow_executions \
+                 (id, workflow_id, user_id, status, actor_id, error_message, started_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, NOW() - make_interval(days => $7::int))",
+        )
+        .bind(Uuid::new_v4())
+        .bind(wf)
+        .bind(user)
+        .bind(status)
+        .bind(actor)
+        .bind(err)
+        .bind(days_ago as i32)
+        .execute(&pool)
+        .await
+        .expect("seed execution");
+    }
+
+    let (count, last_failure) = repo
+        .count_recent_auth_failures(wf, 7)
+        .await
+        .expect("populated window");
+
+    assert_eq!(
+        count, 2,
+        "only in-window executions whose error matches the auth patterns count"
+    );
+    let last = last_failure.expect("count > 0 implies a MAX over a NOT NULL column");
+    // The newest matching failure is the 1-day-old one, so the reported
+    // timestamp must be newer than 2 days ago.
+    let parsed = chrono::DateTime::parse_from_str(&last, "%Y-%m-%d %H:%M:%S%.f%#z")
+        .map(|d| d.with_timezone(&chrono::Utc))
+        .expect("MAX(started_at)::text parses as a timestamp");
+    assert!(
+        parsed > chrono::Utc::now() - chrono::Duration::days(2),
+        "last_failure must be the MOST RECENT matching failure, got {last}"
+    );
+}

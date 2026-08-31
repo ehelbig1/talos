@@ -4876,7 +4876,13 @@ async fn handle_get_workflow_risk_assessment(
                 .await,
         );
 
-        if let Some(Some((count, last_failure))) = recent_auth_failures {
+        // `count == 0` is the "no auth failures" signal, not an absent row: the
+        // repository's query is an UNGROUPED aggregate, so it always returns
+        // exactly one row. The old `Some(Some(..))` match implied a reachable
+        // "no row" case that Postgres can never produce, and its inner
+        // `String` decode of a NULL `MAX(started_at)` is what made every
+        // no-failure workflow read as a failed measurement.
+        if let Some((count, last_failure)) = recent_auth_failures {
             if count > 0 {
                 risks.push(serde_json::json!({
                     "risk_level": "high",
@@ -4887,7 +4893,12 @@ async fn handle_get_workflow_risk_assessment(
                          This strongly indicates a vault path blocked by allowed_secrets \
                          or a missing secret grant.",
                         count,
-                        last_failure
+                        // `count > 0` implies at least one matching row and
+                        // `started_at` is NOT NULL, so this is `Some` in
+                        // practice — but a MAX has no meaningful zero, so the
+                        // absent case gets a word rather than a fabricated
+                        // timestamp.
+                        last_failure.as_deref().unwrap_or("unknown")
                     ),
                     "recommendation": "Run validate_workflow to identify which node config fields \
                         reference vault paths blocked by the module's allowed_secrets. \
