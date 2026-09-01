@@ -3352,3 +3352,239 @@ mod output_shaping_tests {
         );
     }
 }
+
+// ── Authoring-time vault-grant check ────────────────────────────────────────
+//
+// Reported 2026-09-01 by black-box authoring stress test: adding an HTTP
+// Request node (whose `allowed_secrets` is EMPTY, i.e. deny-all) with
+// `AUTH_HEADER: "Bearer vault://anthropic/api_key"` was accepted silently.
+// `validate_workflow` reports it as an Error afterwards — but the module's
+// grant is on the row the handler ALREADY loaded, so the check was possible
+// at the moment the config was written and simply was not made.
+//
+// NOT A HARD ERROR, deliberately, and for a different reason than the fan-in
+// case: a blocked reference is a CONTENT problem the author can fix from
+// either end, and the "widen the grant afterwards" order is real —
+// `update_module_secrets` exists as a tool for exactly that. Both
+// `add_node_to_workflow` and `update_node_config` are also UPSERTS used to
+// re-bind or re-position an existing node, so rejecting would block edits to
+// a node whose config already carries the reference. A cycle, by contrast,
+// is never valid at any later point, which is why THAT one is refused.
+//
+// This does not replace the validation check: graphs mutated by import or a
+// raw `graph_json` write never pass through a handler.
+//
+// GRANT EQUIVALENCE (checked, not assumed): `WorkflowValidationService`
+// resolves the "effective" grant as `installed_secrets.get(id)
+// .unwrap_or(row.allowed_secrets)`, but both come from the SAME `modules`
+// row by the same `id` — `get_installed_secrets_by_template_ids` only adds
+// `AND user_id = $2`. So for a given id the two values are equal when the
+// row is the caller's, and absent-then-fallback when it is not. Passing
+// `NodeTemplateRow::allowed_secrets` here cannot disagree with the verdict
+// `validate_workflow` will later reach, and costs no extra query.
+
+/// A node config's vault references that the module's grant will refuse.
+pub(crate) struct BlockedVaultReport {
+    /// One entry per blocked or malformed reference, for the machine-readable
+    /// response field.
+    pub entries: Vec<serde_json::Value>,
+    /// Leading warning text. A PREFIX — the reported defect is that a
+    /// trailing note loses to a leading success sentence.
+    pub summary: String,
+    /// A `next_steps`-shaped remediation line.
+    pub next_step: String,
+}
+
+/// Findings for one node's config against its module's `allowed_secrets`,
+/// or `None` when every reference is permitted (the common case, which must
+/// leave the response byte-identical to before).
+///
+/// Detection is delegated to [`talos_workflow_validation::vault_config_findings`]
+/// — the same pure function `validate_workflow` uses, so the two surfaces
+/// cannot drift. In particular it uses `extract_vault_refs`, which finds
+/// EMBEDDED references (`"Bearer vault://…"` — the shape a bare
+/// `strip_prefix` misses and the shape the report was filed against), and
+/// `vault_path_permitted`, which treats an empty grant as deny-all.
+pub(crate) fn describe_blocked_vault_refs(
+    node_id: &str,
+    module_name: &str,
+    config: &serde_json::Value,
+    allowed_secrets: &[String],
+) -> Option<BlockedVaultReport> {
+    use talos_workflow_validation::VaultConfigFinding;
+
+    let findings = talos_workflow_validation::vault_config_findings(config, allowed_secrets);
+    if findings.is_empty() {
+        return None;
+    }
+
+    let grant = if allowed_secrets.is_empty() {
+        "deny-all — no secrets granted".to_string()
+    } else {
+        allowed_secrets.join(", ")
+    };
+
+    let mut entries = Vec::new();
+    let mut blocked_fields: Vec<String> = Vec::new();
+    let mut malformed_fields: Vec<String> = Vec::new();
+    for f in &findings {
+        match f {
+            VaultConfigFinding::Blocked { field, path } => {
+                blocked_fields.push(field.clone());
+                entries.push(serde_json::json!({
+                    "kind": "blocked",
+                    "field": field,
+                    "vault_path": path,
+                    "module_allowed_secrets": allowed_secrets,
+                }));
+            }
+            // The value is deliberately NOT echoed: a malformed `vault://`
+            // field can hold a pasted literal secret. Only the field name.
+            VaultConfigFinding::Malformed { field, nested, .. } => {
+                malformed_fields.push(field.clone());
+                entries.push(serde_json::json!({
+                    "kind": if *nested { "malformed_nested" } else { "malformed_empty" },
+                    "field": field,
+                }));
+            }
+        }
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if !blocked_fields.is_empty() {
+        parts.push(format!(
+            "config field(s) [{}] reference a vault path blocked by the module's allowed_secrets \
+             [{grant}]",
+            blocked_fields.join(", ")
+        ));
+    }
+    if !malformed_fields.is_empty() {
+        parts.push(format!(
+            "config field(s) [{}] contain a malformed vault:// reference",
+            malformed_fields.join(", ")
+        ));
+    }
+
+    let summary = format!(
+        "⚠ SECRET ACCESS WILL FAIL — node '{node_id}' (module: {module_name}) {}. The module \
+         cannot read these at runtime: the vault:// substitution returns NotFound and the node \
+         fails on every execution. Saved anyway: ",
+        parts.join("; ")
+    );
+    let next_step = format!(
+        "Grant the paths (update_module_secrets for module '{module_name}') or change the \
+         config to a path within the existing grant [{grant}] — then re-run validate_workflow"
+    );
+
+    Some(BlockedVaultReport {
+        entries,
+        summary,
+        next_step,
+    })
+}
+
+#[cfg(test)]
+mod blocked_vault_report_tests {
+    use super::describe_blocked_vault_refs;
+    use serde_json::json;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// The reported reproduction: an HTTP Request node — whose
+    /// `allowed_secrets` is EMPTY, i.e. deny-all — given
+    /// `AUTH_HEADER: "Bearer vault://anthropic/api_key"` was accepted with no
+    /// comment at all. The reference is EMBEDDED in a larger string, which is
+    /// why detection routes through `extract_vault_refs` rather than a
+    /// `strip_prefix`.
+    #[test]
+    fn the_reported_empty_grant_http_node_is_reported() {
+        let cfg = json!({
+            "URL": "https://api.anthropic.com/v1/messages",
+            "AUTH_HEADER": "Bearer vault://anthropic/api_key"
+        });
+        let r = describe_blocked_vault_refs("http_1", "HTTP Request", &cfg, &[])
+            .expect("a deny-all grant must report the reference");
+
+        assert_eq!(r.entries.len(), 1);
+        assert_eq!(r.entries[0]["kind"], "blocked");
+        assert_eq!(r.entries[0]["field"], "AUTH_HEADER");
+        assert_eq!(r.entries[0]["vault_path"], "anthropic/api_key");
+
+        assert!(
+            r.summary.starts_with("⚠ SECRET ACCESS WILL FAIL"),
+            "the warning must LEAD, not trail: {}",
+            r.summary
+        );
+        assert!(
+            r.summary.contains("deny-all — no secrets granted"),
+            "an empty grant must be spelled out, not printed as []: {}",
+            r.summary
+        );
+        assert!(r.summary.contains("AUTH_HEADER"), "{}", r.summary);
+        assert!(
+            r.next_step.contains("update_module_secrets"),
+            "{}",
+            r.next_step
+        );
+    }
+
+    /// The normal path must produce nothing at all, so a correctly-granted
+    /// node's response is byte-identical to before this change.
+    #[test]
+    fn a_permitted_reference_is_silent() {
+        let cfg = json!({ "AUTH_HEADER": "Bearer vault://gmail/token" });
+        assert!(describe_blocked_vault_refs("n", "M", &cfg, &s(&["gmail"])).is_none());
+        assert!(describe_blocked_vault_refs("n", "M", &cfg, &s(&["*"])).is_none());
+        assert!(describe_blocked_vault_refs("n", "M", &cfg, &s(&["gmail/*"])).is_none());
+        // A config with no vault references at all.
+        assert!(describe_blocked_vault_refs("n", "M", &json!({"URL": "https://x"}), &[]).is_none());
+    }
+
+    /// The grant separator is `/`, so a same-prefix-different-module grant
+    /// does NOT cover the path — the verdict must match
+    /// `vault_path_permitted`, which is the runtime's own matcher.
+    #[test]
+    fn a_near_miss_prefix_is_still_blocked() {
+        let cfg = json!({ "AUTH_HEADER": "Bearer vault://stripe-live/key" });
+        let r = describe_blocked_vault_refs("n", "M", &cfg, &s(&["stripe"]))
+            .expect("stripe does not grant stripe-live");
+        assert_eq!(r.entries[0]["vault_path"], "stripe-live/key");
+    }
+
+    /// A malformed reference can hold a pasted literal secret under a typo'd
+    /// field, so the VALUE must never be echoed — only the field name. Same
+    /// rule `unknown_argument_warning` already follows.
+    #[test]
+    fn a_malformed_reference_never_echoes_its_value() {
+        let cfg = json!({ "AUTH_HEADER": "Bearer vault://vault://sk-live-DEADBEEF" });
+        let r = describe_blocked_vault_refs("n", "M", &cfg, &s(&["*"]))
+            .expect("a nested marker is malformed regardless of grant");
+        let rendered = serde_json::to_string(&r.entries).unwrap();
+        assert!(
+            !rendered.contains("sk-live-DEADBEEF") && !r.summary.contains("sk-live-DEADBEEF"),
+            "the value leaked: {rendered} / {}",
+            r.summary
+        );
+        assert_eq!(r.entries[0]["kind"], "malformed_nested");
+        assert_eq!(r.entries[0]["field"], "AUTH_HEADER");
+    }
+
+    /// Several bad fields collapse into one report naming all of them.
+    #[test]
+    fn multiple_blocked_fields_are_reported_together() {
+        let cfg = json!({
+            "A": "vault://one/key",
+            "B": "Bearer vault://two/key",
+            "C": "no reference here"
+        });
+        let r = describe_blocked_vault_refs("n", "M", &cfg, &[]).expect("both are blocked");
+        assert_eq!(r.entries.len(), 2);
+        assert!(
+            r.summary.contains('A') && r.summary.contains('B'),
+            "{}",
+            r.summary
+        );
+    }
+}
