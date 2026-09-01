@@ -23,6 +23,56 @@
 //! is what makes `retry_condition: error_message.contains("circuit-open")`
 //! writable and lets both transient classifiers tell the causes apart.
 //!
+//! # The collapse is not unique to `networkerror`
+//!
+//! `invalidurl` collapses THREE causes — a hostile-guest URL byte cap, a
+//! genuine author typo, and the plaintext-scheme SECURITY refusal (which
+//! exists because a `vault://` header would otherwise go out in the clear).
+//! An operator reading `Error { code: 0, name: "invalidurl", message: "" }`
+//! cannot tell a policy denial from a typo, and `invalidurl` matched NO arm
+//! in `talos_retry_intelligence::classify_error`, so every one of them was
+//! filed under `unknown`. `forbiddenhost` collapses 28 emitting sites across
+//! at least ten distinct policies whose remediations differ completely —
+//! "add the host to allowed_hosts" is the wrong advice for a capability-world
+//! or method-allowlist denial.
+//!
+//! So a class is stored as a [`Reason`]: the token PLUS the WIT discriminant
+//! it is allowed to explain. See
+//! [`crate::runtime::last_network_reason_suffix`] for why that pairing —
+//! rather than "stamp whenever a class is latched" — is what keeps the latch
+//! from mis-attributing a stale cause to an unrelated later failure.
+//!
+//! # What this does NOT cover (measured, not assumed)
+//!
+//! The classes below are raised on the `wit_http` surface only. The three
+//! sibling egress surfaces were measured against all three downstream
+//! classifiers and are deliberately left alone here, because each needs a
+//! different change and one of them changes retry behaviour:
+//!
+//! * **`host/graphql.rs`** — its WIT enum has no deny variant at all, so EVERY
+//!   policy denial (capability-world, allowed-hosts, SSRF, tier-1 egress)
+//!   returns `networkerror`. Both transient gates therefore classify a
+//!   capability denial `network_transient` and the controller RE-DISPATCHES
+//!   it. That is a correctness bug on the discriminant this module already
+//!   covers, and the fix — latch the class at each deny site, paired with
+//!   [`WIT_NETWORKERROR`] — needs no new machinery. It is the highest-value
+//!   follow-up and is deliberately not bundled here, because it is the only
+//!   one that MOVES a message from transient to non-transient.
+//! * **`host/http_stream.rs`** — its WIT enum spells the tokens with hyphens
+//!   (`forbidden-host`, `invalid-url`), which the existing `forbiddenhost`
+//!   arms do not match. A `forbidden-host` denial currently classifies
+//!   `auth_failure` / `http_403` — non-transient, so safe, but it points the
+//!   operator at a credential that is fine. Covering it means new `WIT_*`
+//!   consts for the hyphenated spellings.
+//! * **`host/webhook.rs`** — denials return `sendfailed`, which matches no arm
+//!   anywhere and lands in `unknown` / `runtime_error` / `other`. Same
+//!   `invalidurl`-style diagnostic gap, same non-transient (safe) reading.
+//!
+//! The ~50 `capability-world` denials on the NON-HTTP host functions (cache,
+//! files, memory, state, object_storage, …) are further out still: the latch
+//! is per-execution and HTTP-shaped, and covering them needs a general
+//! per-call reason mechanism rather than this one.
+//!
 //! # Sanitization contract
 //!
 //! Verbatim from [`crate::context::TalosContext::emit_host_diagnostic`]: the
@@ -87,6 +137,188 @@ pub const TIMEOUT: &str = "timeout";
 /// error.
 pub const SECRET_LOOKUP: &str = "secret-lookup";
 
+// ── HTTP-surface POLICY / CAP denials ────────────────────────────────────
+//
+// These are the causes behind the OTHER two `wit_http::Error` discriminants.
+// Every one of them is DETERMINISTIC — the same call re-runs the same policy
+// decision or re-hits the same cap — so every one is in [`NON_TRANSIENT`]
+// below. That is not a coincidence to be relied on loosely: it is what makes
+// a mis-attribution among these tokens unable to change a retry decision.
+//
+// The token is the SAME string the site already passes to
+// `TalosContext::record_capability_denied` as its `policy`, so the
+// `[host:<policy>]` diagnostic and the `[reason_class=…]` marker cannot drift
+// into disagreeing about why a call was refused. Two deliberate deviations,
+// both documented at their consts: [`NO_ALLOWLIST`] and [`PRIVATE_IP`].
+
+/// The caller-supplied URL exceeded `MAX_OUTBOUND_URL_BYTES`.
+///
+/// A hostile-guest DoS guard (`url::Url::parse` is O(N)), not an author typo —
+/// which is exactly the distinction the bare `invalidurl` discriminant loses.
+pub const URL_TOO_LONG: &str = "url-too-long";
+/// `url::Url::parse` rejected the caller's URL. The ONE genuine author error
+/// among the `invalidurl` causes.
+pub const URL_PARSE: &str = "url-parse";
+/// A non-`https` scheme was refused (`WASM_ALLOW_INSECURE_HTTP` is off).
+///
+/// A SECURITY refusal — plaintext egress can leak a `vault://`-substituted
+/// header in flight — reported to the guest as `invalidurl`, i.e. as a typo.
+/// Live instance: workflow execution `43b78079-d0a0-4aff-83f1-e3e80dc7195a`.
+pub const INSECURE_SCHEME: &str = "insecure-scheme";
+/// The module's `capability_world` does not grant HTTP at all.
+pub const CAPABILITY_WORLD: &str = "capability-world";
+/// The module declared an EMPTY `allowed_hosts`, which denies every host.
+///
+/// Deviation from the `policy` token (`no-allowlist-configured`) and the only
+/// one that is not cosmetic: `configured` contains the substring `config`,
+/// which `talos_ops_alerts_repository::self_monitor` tests for in an arm
+/// ABOVE its `forbiddenhost` arm. Reusing the policy string verbatim would
+/// re-class an egress denial as `missing_config` in the ops-alert dedup key
+/// whenever the module's own text also said "missing" — a downstream class
+/// change is drift too. Pinned by `tokens_never_collide_with_a_foreign_needle`.
+pub const NO_ALLOWLIST: &str = "no-allowlist";
+/// SSRF: the target resolved (or was written) as a private / loopback /
+/// link-local / CGNAT / IPv4-mapped address.
+///
+/// The `policy` token here is an OPEN family — `private-ip`,
+/// `private-ip-cgnat`, `private-ip-ipv4-mapped-ipv6`, `private-ip-nat64`, … —
+/// derived per-address by `talos_ssrf_classify`. [`ALL`] must stay CLOSED (the
+/// snapshot test and the hand-written classifier arms depend on it), so the
+/// class is the family's common PREFIX: every member starts with `private-ip`,
+/// so nothing drifts and the precise variant stays in the `[host:…]`
+/// diagnostic.
+pub const PRIVATE_IP: &str = "private-ip";
+/// The host is not matched by any `allowed_hosts` pattern.
+pub const ALLOWED_HOSTS: &str = "allowed-hosts";
+/// A Tier-1 actor was refused an EXTERNAL LLM PROVIDER host.
+///
+/// Distinct from [`TIER1_EGRESS`], which is the blanket local-egress-only
+/// resolver gate inferred from a connect-phase failure. This one is the
+/// destination deny-list and is known at validation time.
+pub const TIER1_LLM_EGRESS: &str = "tier1-llm-egress";
+/// A Tier-1 actor was refused a PUBLIC IP literal.
+pub const TIER1_PUBLIC_IP_EGRESS: &str = "tier1-public-ip-egress";
+/// A read-only actor attempted a mutating HTTP method.
+pub const WRITE_CEILING: &str = "write-ceiling";
+/// A read-only actor under `TALOS_WRITE_CEILING_STRICT_EGRESS` attempted a
+/// read from a host admitted only by a wildcard rather than named explicitly.
+pub const WRITE_CEILING_STRICT_EGRESS: &str = "write-ceiling-strict-egress";
+/// The HTTP method is not in the module's `allowed_methods`.
+pub const METHOD_ALLOWLIST: &str = "method-allowlist";
+/// `MAX_HTTP_CALLS_PER_EXECUTION` is spent for this execution.
+///
+/// No `policy` token exists for this site (it does not audit), so the token is
+/// minted here. Hyphenated deliberately: `rate limit` with a SPACE is a needle
+/// in two downstream classifiers' own buckets.
+pub const EXECUTION_RATE_LIMIT: &str = "execution-rate-limit";
+/// `MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION` is spent for this host.
+pub const PER_HOST_RATE_LIMIT: &str = "per-host-rate-limit";
+/// The OUTBOUND request carried more headers than `MAX_OUTBOUND_HEADERS`.
+///
+/// Named apart from [`HEADER_CAP`], which is the INBOUND response cap — the
+/// two have opposite remediations (shrink your request vs. the upstream is
+/// misbehaving) and opposite directions of travel.
+pub const REQUEST_HEADER_CAP: &str = "request-header-cap";
+/// The OUTBOUND body exceeded `MAX_OUTBOUND_HTTP_BODY_BYTES`.
+pub const REQUEST_BODY_CAP: &str = "request-body-cap";
+
+/// The HTTP-surface policy / cap classes, as one list.
+///
+/// These are the tokens minted for the `invalidurl` and `forbiddenhost`
+/// discriminants. Kept as a named subset of [`ALL`] because three separate
+/// things need exactly this set and nothing else: the non-transient property
+/// test below, the foreign-needle collision test below, and the hand-written
+/// mirror arm in `talos_retry_intelligence::classify_error` (which cannot
+/// import it — see [`ALL`]).
+///
+/// UNLIKE the transport classes above, every member is DETERMINISTIC, so every
+/// member is also in [`NON_TRANSIENT`]. `every_http_policy_class_is_non_transient`
+/// enforces that rather than trusting the eye.
+pub const HTTP_POLICY_CLASSES: &[&str] = &[
+    URL_TOO_LONG,
+    URL_PARSE,
+    INSECURE_SCHEME,
+    CAPABILITY_WORLD,
+    NO_ALLOWLIST,
+    PRIVATE_IP,
+    ALLOWED_HOSTS,
+    TIER1_LLM_EGRESS,
+    TIER1_PUBLIC_IP_EGRESS,
+    WRITE_CEILING,
+    WRITE_CEILING_STRICT_EGRESS,
+    METHOD_ALLOWLIST,
+    EXECUTION_RATE_LIMIT,
+    PER_HOST_RATE_LIMIT,
+    REQUEST_HEADER_CAP,
+    REQUEST_BODY_CAP,
+];
+
+// ── The guest-visible WIT discriminants a class is allowed to explain ────
+//
+// These are the `name` strings the generated bindings render into the guest's
+// `Error { code: N, name: "…", message: "" }` Debug output — the literal text
+// the node-failure message carries. A class is latched TOGETHER with the one
+// it explains; see [`Reason`].
+
+/// `wit_http::Error::Networkerror` / `wit_graphql::Error::Networkerror`.
+pub const WIT_NETWORKERROR: &str = "networkerror";
+/// `wit_http::Error::Invalidurl`.
+pub const WIT_INVALIDURL: &str = "invalidurl";
+/// `wit_http::Error::Forbiddenhost`.
+pub const WIT_FORBIDDENHOST: &str = "forbiddenhost";
+/// `wit_http::Error::Timeout`.
+pub const WIT_TIMEOUT: &str = "timeout";
+
+/// A latched host-side failure: the [`reason_class`](self) token PLUS the WIT
+/// discriminant it is allowed to explain.
+///
+/// The pairing is the whole safety mechanism. The latch is set on failure and
+/// cleared only on `fetch` SUCCESS, so a module that swallows a failure and
+/// then fails for an unrelated reason still holds a stale class. Binding the
+/// class to the token it explains means the marker can only ever land on a
+/// message that carries that exact opaque discriminant — an
+/// `insecure-scheme` class raised at an `invalidurl` site can never be stamped
+/// onto a `forbiddenhost` or a `401`. See
+/// [`crate::runtime::last_network_reason_suffix`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reason {
+    /// One of the `reason_class` consts. Never request-derived.
+    pub class: &'static str,
+    /// One of the `WIT_*` consts — the discriminant name the guest will see.
+    pub wit: &'static str,
+}
+
+impl Reason {
+    /// A class raised at a site returning `wit_http::Error::Networkerror`.
+    pub const fn network(class: &'static str) -> Self {
+        Self {
+            class,
+            wit: WIT_NETWORKERROR,
+        }
+    }
+    /// A class raised at a site returning `wit_http::Error::Invalidurl`.
+    pub const fn invalid_url(class: &'static str) -> Self {
+        Self {
+            class,
+            wit: WIT_INVALIDURL,
+        }
+    }
+    /// A class raised at a site returning `wit_http::Error::Forbiddenhost`.
+    pub const fn forbidden_host(class: &'static str) -> Self {
+        Self {
+            class,
+            wit: WIT_FORBIDDENHOST,
+        }
+    }
+    /// A class raised at a site returning `wit_http::Error::Timeout`.
+    pub const fn timeout(class: &'static str) -> Self {
+        Self {
+            class,
+            wit: WIT_TIMEOUT,
+        }
+    }
+}
+
 /// Every token this module can emit. Exists so the classifiers on both sides
 /// can be pinned against the producer by test rather than by hand-copied
 /// string lists — a token added or renamed here fails `closed_set_snapshot`
@@ -106,6 +338,22 @@ pub const ALL: &[&str] = &[
     RESPONSE_STREAM,
     TIMEOUT,
     SECRET_LOOKUP,
+    URL_TOO_LONG,
+    URL_PARSE,
+    INSECURE_SCHEME,
+    CAPABILITY_WORLD,
+    NO_ALLOWLIST,
+    PRIVATE_IP,
+    ALLOWED_HOSTS,
+    TIER1_LLM_EGRESS,
+    TIER1_PUBLIC_IP_EGRESS,
+    WRITE_CEILING,
+    WRITE_CEILING_STRICT_EGRESS,
+    METHOD_ALLOWLIST,
+    EXECUTION_RATE_LIMIT,
+    PER_HOST_RATE_LIMIT,
+    REQUEST_HEADER_CAP,
+    REQUEST_BODY_CAP,
 ];
 
 /// Tokens whose cause is deterministic — a retry re-runs the same policy
@@ -118,6 +366,26 @@ pub const NON_TRANSIENT: &[&str] = &[
     RESPONSE_TOO_LARGE,
     HEADER_CAP,
     SECRET_LOOKUP,
+    // Every HTTP-surface policy / cap denial. A policy re-runs identically and
+    // a cap re-trips identically, so none of them may earn a retry. Listed in
+    // the same order as `ALL` so a missing entry is visible by eye as well as
+    // by `closed_set_snapshot`.
+    URL_TOO_LONG,
+    URL_PARSE,
+    INSECURE_SCHEME,
+    CAPABILITY_WORLD,
+    NO_ALLOWLIST,
+    PRIVATE_IP,
+    ALLOWED_HOSTS,
+    TIER1_LLM_EGRESS,
+    TIER1_PUBLIC_IP_EGRESS,
+    WRITE_CEILING,
+    WRITE_CEILING_STRICT_EGRESS,
+    METHOD_ALLOWLIST,
+    EXECUTION_RATE_LIMIT,
+    PER_HOST_RATE_LIMIT,
+    REQUEST_HEADER_CAP,
+    REQUEST_BODY_CAP,
 ];
 
 /// The rendered marker appended to a node-failure message, e.g.
@@ -460,6 +728,22 @@ mod tests {
                 "response-stream",
                 "timeout",
                 "secret-lookup",
+                "url-too-long",
+                "url-parse",
+                "insecure-scheme",
+                "capability-world",
+                "no-allowlist",
+                "private-ip",
+                "allowed-hosts",
+                "tier1-llm-egress",
+                "tier1-public-ip-egress",
+                "write-ceiling",
+                "write-ceiling-strict-egress",
+                "method-allowlist",
+                "execution-rate-limit",
+                "per-host-rate-limit",
+                "request-header-cap",
+                "request-body-cap",
             ]
         );
         assert_eq!(
@@ -471,8 +755,221 @@ mod tests {
                 "response-too-large",
                 "header-cap",
                 "secret-lookup",
+                "url-too-long",
+                "url-parse",
+                "insecure-scheme",
+                "capability-world",
+                "no-allowlist",
+                "private-ip",
+                "allowed-hosts",
+                "tier1-llm-egress",
+                "tier1-public-ip-egress",
+                "write-ceiling",
+                "write-ceiling-strict-egress",
+                "method-allowlist",
+                "execution-rate-limit",
+                "per-host-rate-limit",
+                "request-header-cap",
+                "request-body-cap",
             ]
         );
+    }
+
+    /// Every token appended to a node-failure message is TEXT that three
+    /// OTHER classifiers then pattern-match. None of them can be updated in
+    /// lockstep from here — two are in crates this one deliberately does not
+    /// depend on, and one is a repository crate — so the guard is that a token
+    /// must not contain a needle any of them tests for in an arm ABOVE the arm
+    /// the message already lands in.
+    ///
+    /// This is not hypothetical. `no-allowlist-configured` — the literal
+    /// `policy` string the site already passes to `record_capability_denied`,
+    /// i.e. the obvious token to reuse — contains `config`, and
+    /// `talos_ops_alerts_repository::self_monitor` tests
+    /// `has("missing") && has("config")` in an arm ABOVE its `forbiddenhost`
+    /// arm. Reusing it verbatim would silently re-class an egress denial as
+    /// `missing_config` (a dedup-key segment) for any module whose own error
+    /// text also said "missing". [`NO_ALLOWLIST`] is the shortened token, and
+    /// this test is why.
+    #[test]
+    fn tokens_never_collide_with_a_foreign_needle() {
+        // Needles tested by an arm that runs BEFORE the arm a
+        // `forbiddenhost` / `invalidurl` message already reaches, in:
+        //   * talos_ops_alerts_repository::self_monitor::classify  (repo crate)
+        //   * talos_failure_analysis_service::classify_error
+        //   * talos_retry_intelligence::classify_error
+        //   * crate::runtime::is_transient_error_text
+        // Plus the needles those crates use for buckets a marker must never
+        // drag a message into (a timeout / rate-limit / auth reading).
+        const FOREIGN_NEEDLES: &[&str] = &[
+            "approval denied",
+            "approval was denied",
+            "missing",
+            "config",
+            "fuel exhausted",
+            "out of fuel",
+            "circuit open",
+            "circuit breaker open",
+            "output_schema",
+            "output schema",
+            "required keys",
+            "got prose",
+            "signature",
+            "hmac",
+            "no upstream",
+            "timeout",
+            "timed out",
+            "deadline exceeded",
+            "rate limit",
+            "too many requests",
+            "unauthorized",
+            "forbidden",
+            "not found",
+            "notfound",
+            "invalid token",
+            "access_token invalid",
+            "wasm trap",
+            "trap: ",
+            "panic",
+            "memory",
+            "oom",
+            "vault",
+            "secret",
+            "sql",
+            "query",
+            "database",
+            "postgres",
+            "sqlite",
+            "deadlock",
+            "connection pool",
+            "connection refused",
+            "connection reset",
+            "connection aborted",
+            "connection failed",
+            "connectionfailed",
+            "broken pipe",
+            "unexpected eof",
+            "no route to host",
+            "failed to connect",
+            "connect error",
+            "dns",
+            "network",
+            "expected",
+            "found ",
+            "invalid type",
+            "invalid json",
+            "trailing characters",
+            "serde",
+            "from_str",
+            "cargo",
+            "compile",
+            "401",
+            "403",
+            "404",
+            "429",
+            "500",
+            "502",
+            "503",
+            "504",
+            "temporary failure",
+            "try again",
+            "unavailable",
+            "lock timeout",
+            "pool timed out",
+            "pool exhausted",
+            "no available connection",
+            "no such host",
+        ];
+        // Scoped to the classes this change MINTS. The four pre-existing
+        // transport tokens deliberately ARE downstream vocabulary — `dns`,
+        // `tls`, `timeout` and `secret-lookup` each contain a needle by
+        // design, because each already has a HAND-WRITTEN arm in the
+        // classifier that reads it, and each is stamped only onto a
+        // `networkerror` (or `timeout`) message whose bucket those arms
+        // already own. Asserting their collisions here would fail the test on
+        // shipped, intentional behaviour, so they are exempt BY NAME rather
+        // than by the list happening not to mention them.
+        const EXEMPT: &[&str] = &[DNS, TLS, TIMEOUT, SECRET_LOOKUP];
+        for t in EXEMPT {
+            assert!(ALL.contains(t), "exemption names a token not in ALL: {t:?}");
+        }
+        for t in HTTP_POLICY_CLASSES {
+            for n in FOREIGN_NEEDLES {
+                assert!(
+                    !t.contains(n),
+                    "reason_class token {t:?} contains {n:?}, a needle a DOWNSTREAM \
+                     classifier keys on — appending [reason_class={t}] to a message \
+                     would silently move it into that bucket. Rename the token."
+                );
+            }
+        }
+        // Every token in ALL is either a minted HTTP class (checked above) or
+        // a named exemption. Without this the check silently stops covering a
+        // token added to ALL but not to HTTP_POLICY_CLASSES.
+        for t in ALL {
+            assert!(
+                HTTP_POLICY_CLASSES.contains(t)
+                    || EXEMPT.contains(t)
+                    || !FOREIGN_NEEDLES.iter().any(|n| t.contains(n)),
+                "token {t:?} is in ALL, is not an HTTP policy class, is not a named \
+                 exemption, and collides with a downstream needle"
+            );
+        }
+        assert_eq!(TIMEOUT, WIT_TIMEOUT);
+    }
+
+    /// Every class the HTTP surface can raise is DETERMINISTIC, so every one
+    /// of them must be non-transient. Stated as a property over the two lists
+    /// rather than left to the eye: this is the invariant that makes a
+    /// mis-attribution AMONG these tokens unable to change a retry decision,
+    /// which is the whole reason the pairing is safe to extend.
+    #[test]
+    fn every_http_policy_class_is_non_transient() {
+        assert_eq!(HTTP_POLICY_CLASSES.len(), 16);
+        for t in HTTP_POLICY_CLASSES {
+            assert!(ALL.contains(t), "{t:?} missing from ALL");
+            assert!(
+                NON_TRANSIENT.contains(t),
+                "{t:?} is an HTTP policy/cap denial and MUST be non-transient"
+            );
+        }
+    }
+
+    /// `PRIVATE_IP` is the CLOSED-set stand-in for `talos_ssrf_classify`'s
+    /// open policy family. The substitution is only honest if it is a prefix
+    /// of every member — otherwise the marker and the `[host:…]` diagnostic
+    /// name different things.
+    #[test]
+    fn private_ip_class_is_a_prefix_of_every_ssrf_policy_variant() {
+        for policy in [
+            "private-ip",
+            "private-ip-unspecified",
+            "private-ip-cgnat",
+            "private-ip-ipv4-mapped-ipv6",
+            "private-ip-cgnat-ipv4-mapped-ipv6",
+            "private-ip-ipv4-compat-ipv6",
+            "private-ip-nat64",
+            "private-ip-6to4",
+            "private-ip-embedded-ipv4",
+        ] {
+            assert!(
+                policy.starts_with(PRIVATE_IP),
+                "SSRF policy {policy:?} is not covered by the {PRIVATE_IP:?} class"
+            );
+        }
+    }
+
+    /// The pairing constructors must produce the WIT token the emitting site
+    /// actually returns — a `Reason::forbidden_host` that carried
+    /// `networkerror` would be stamped onto the wrong messages and withheld
+    /// from the right ones.
+    #[test]
+    fn reason_constructors_bind_the_right_discriminant() {
+        assert_eq!(Reason::network(DNS).wit, "networkerror");
+        assert_eq!(Reason::invalid_url(URL_PARSE).wit, "invalidurl");
+        assert_eq!(Reason::forbidden_host(ALLOWED_HOSTS).wit, "forbiddenhost");
+        assert_eq!(Reason::timeout(TIMEOUT).wit, "timeout");
+        assert_eq!(Reason::forbidden_host(ALLOWED_HOSTS).class, ALLOWED_HOSTS);
     }
 
     #[test]

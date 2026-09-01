@@ -975,6 +975,7 @@ impl TalosContext {
             // parity fix as `http::fetch_all`.
             self.emit_network_failure(
                 crate::reason_class::CANCELLED,
+                crate::reason_class::WIT_NETWORKERROR,
                 "the execution was cancelled before the GraphQL query was sent",
             )
             .await;
