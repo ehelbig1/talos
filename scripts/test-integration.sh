@@ -45,12 +45,60 @@ docker run -d --rm --name "$PG_NAME" \
 # responder↔worker handshake + the engine-nats full dispatch→claim→open loop).
 docker run -d --rm --name "$NATS_NAME" -p "${NATS_PORT}:4222" nats:2.10-alpine >/dev/null
 
-echo "▶ waiting for Postgres…"
-for _ in $(seq 1 60); do
-    docker exec "$PG_NAME" pg_isready >/dev/null 2>&1 && break
-    sleep 1
-done
-docker exec "$PG_NAME" pg_isready >/dev/null 2>&1 || { echo "Postgres never became ready"; exit 1; }
+# ── Readiness gates ─────────────────────────────────────────────────────────
+#
+# All three probes target the MAPPED TCP PORT from the host, never the
+# container's local socket, and each one proves the property the next command
+# actually depends on.
+#
+# The Postgres gate used to be `docker exec "$PG_NAME" pg_isready`, which talks
+# to the container's UNIX SOCKET. The official entrypoint runs a TEMPORARY
+# server on the socket ONLY — `docker-entrypoint.sh` starts it with
+# `-c listen_addresses=''` to run initdb and any init scripts, then
+# `docker_temp_server_stop`s it and starts the real one. So the socket probe
+# returns READY against a server that is about to shut down, the loop breaks,
+# and the next command races the shutdown. Observed on PR #717 as
+#
+#     ▶ waiting for Postgres…
+#     psql: FATAL:  the database system is shutting down
+#
+# on a branch that touches no script, no Makefile and no workflow — while the
+# same job was green on a sibling PR and on main. Measured directly against a
+# fresh pgvector:pg17 container: there is a window in which the socket probe
+# reports READY and a TCP probe does not. `listen_addresses=''` is what makes
+# the TCP probe immune — the temp server cannot answer it at all.
+#
+# `pg_isready` only proves the postmaster ACCEPTS connections, so the gate ends
+# with a real `SELECT 1`: authentication, the default database and query
+# execution are what every following command needs.
+#
+# Redis and NATS previously had NO gate whatsoever — started with `docker run
+# -d` and used ~100 lines later. That is the same defect one step worse, and it
+# is a latent flake on a loaded runner rather than a safe omission.
+wait_for() {
+    local label="$1" attempts="$2"; shift 2
+    echo "▶ waiting for ${label}…"
+    for _ in $(seq 1 "$attempts"); do
+        "$@" >/dev/null 2>&1 && return 0
+        sleep 1
+    done
+    echo "✗ ${label} never became ready"
+    return 1
+}
+
+wait_for "Postgres (TCP ${PG_PORT})" 60 \
+    docker exec "$PG_NAME" pg_isready -h 127.0.0.1 -p 5432 -U "$PG_USER" || exit 1
+wait_for "Postgres (accepting queries)" 30 \
+    docker exec -e PGPASSWORD="$PG_PASS" "$PG_NAME" \
+        psql -h 127.0.0.1 -U "$PG_USER" -d talos -c 'SELECT 1' || exit 1
+
+wait_for "Redis (TCP ${REDIS_PORT})" 30 \
+    docker exec "$REDIS_NAME" redis-cli -h 127.0.0.1 ping || exit 1
+
+# NATS ships no client binary in the alpine image; its monitoring port is not
+# published, so probe the client port's TCP reachability from the host instead.
+wait_for "NATS (TCP ${NATS_PORT})" 30 \
+    bash -c "printf '' >/dev/tcp/127.0.0.1/${NATS_PORT}" || exit 1
 
 PG_BASE="postgres://${PG_USER}:${PG_PASS}@127.0.0.1:${PG_PORT}"
 MIGRATED_URL="${PG_BASE}/talos"
