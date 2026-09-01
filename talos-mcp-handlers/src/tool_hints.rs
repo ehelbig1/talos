@@ -623,24 +623,54 @@ mod tests {
     fn cross_crate_hint_builders_conform_to_the_schemas_they_name() {
         // talos-failure-analysis-service: remediation playbooks. Drive EVERY
         // bucket, including the fall-through, so no arm is left unscanned.
+        //
+        // The list was DRIFTED when the reason_class buckets were added
+        // (2026-09): six entries — `compile_error`, `parse_error`,
+        // `permission_denied`, `not_found`, `server_error`, `rate_limited` —
+        // were names `classify_error` has never emitted, so they all landed on
+        // the `_` fall-through and this test passed VACUOUSLY for them, while
+        // seven real buckets (`module_compile_error`, `json_parse`,
+        // `http_401`, `http_403`, `http_404`, `http_5xx`, `rate_limit`) were
+        // never scanned at all. Corrected below and kept in sync with
+        // `remediation_steps`' own match arms.
         let buckets = [
+            // Prose-matched buckets.
             "output_schema_violation",
             "host_not_allowed",
-            "compile_error",
-            "parse_error",
+            "module_compile_error",
+            "json_parse",
             "fuel_exhausted",
             "timeout",
-            "auth_error",
-            "permission_denied",
-            "not_found",
-            "server_error",
+            "http_401",
+            "http_403",
+            "http_404",
+            "http_5xx",
             "missing_secret",
-            "rate_limited",
+            "rate_limit",
             "wasm_trap",
             "network_error",
             "config_error",
+            "auth_error",
             "database_error",
             "runtime_error",
+            // Host-stamped `[reason_class=…]` denial buckets. Every tool these
+            // name is checked to EXIST here — which is the guard that stops a
+            // playbook prescribing a tool that was removed (six hints once
+            // named `set_secret`, deleted by MCP-1201).
+            "circuit_open",
+            "execution_cancelled",
+            "response_too_large",
+            "request_too_large",
+            "invalid_url",
+            "insecure_scheme",
+            "capability_world_denied",
+            "ssrf_blocked",
+            "egress_tier_denied",
+            "write_ceiling_denied",
+            "method_not_allowed",
+            "egress_budget_exceeded",
+            "introspection_denied",
+            // The fall-through.
             "an_unmatched_bucket_name",
         ];
         for bucket in buckets {

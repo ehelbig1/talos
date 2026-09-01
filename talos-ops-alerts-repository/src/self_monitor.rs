@@ -139,6 +139,136 @@ pub struct ErrorClass {
     pub severity_hint: &'static str,
 }
 
+/// Map a host-stamped [`talos_reason_class::Family`] onto this surface's
+/// alert-class vocabulary.
+///
+/// # The class is a DEDUP-KEY SEGMENT, so these names are data
+///
+/// [`failure_dedup_key`] renders `talos/{workflow}/{node}/{class}` into
+/// `ops_alerts.dedup_key`, which is under `UNIQUE (user_id, dedup_key)`. A
+/// class name is therefore an alert row's identity: the same class bumps an
+/// existing row's occurrence count, a different class opens a new one.
+///
+/// Consequences of THIS change, stated rather than discovered later:
+/// * `egress_denied` is DELIBERATELY KEPT for the host-allowlist family, and
+///   an unmarked bare `forbiddenhost` still lands there. So the common case
+///   keeps its key and its history — no split.
+/// * The other denial families move OFF `egress_denied` (marked messages only)
+///   onto their own classes. Any currently-open `…/egress_denied` row for one
+///   of those causes stops being bumped and a new row opens at the finer
+///   class. The old row is not orphaned: the success-side auto-resolve matches
+///   on the workflow PREFIX, not the class, so it clears on the workflow's
+///   next successful unattended run.
+/// * Marked messages that previously landed in `other` (every denial on the
+///   `graphql` / `webhook` / `http_stream` surfaces, plus every `invalidurl`)
+///   had a per-message FINGERPRINT key. Those MERGE into one class each,
+///   which is the point — they were one fault scattered across as many rows as
+///   the module had wordings.
+///
+/// Severity hints follow the module's stated rule: deterministic modes that
+/// need an operator hint `high`, wobbles `medium`, known-transient `low`. They
+/// seed NEW rows only and never overwrite a correction.
+#[must_use]
+pub fn classify_reason_class(family: talos_reason_class::Family) -> ErrorClass {
+    use talos_reason_class::Family as F;
+    match family {
+        // Reuses the pre-existing class, so a transport failure that now
+        // carries a marker keeps the dedup key it had when it did not.
+        F::Transport => ErrorClass {
+            class: "network",
+            label: "transient network error",
+            severity_hint: "low",
+        },
+        F::Timeout => ErrorClass {
+            class: "timeout",
+            label: "execution timeout",
+            severity_hint: "medium",
+        },
+        F::HostAllowlist => ErrorClass {
+            class: "egress_denied",
+            label: "HTTP egress denied (host not allowed)",
+            severity_hint: "high",
+        },
+        F::SecretLookup => ErrorClass {
+            class: "missing_secret",
+            label: "vault lookup failed for a request header",
+            severity_hint: "high",
+        },
+        F::CircuitOpen => ErrorClass {
+            class: "circuit_open",
+            label: "per-host circuit breaker open",
+            severity_hint: "medium",
+        },
+        // NOT added to `NON_ALERTING_CLASSES`, though a cancellation is
+        // human-driven like `approval_denied`. The reconciler only scans
+        // `status IN ('completed','failed')`, so a cancelled EXECUTION never
+        // reaches here at all; this class can only be a node whose in-flight
+        // call was abandoned while the run failed for some other reason, and
+        // suppressing that would hide a real failure. Low severity says
+        // "probably not your bug" without silencing it.
+        F::Cancelled => ErrorClass {
+            class: "cancelled",
+            label: "call abandoned by execution cancellation",
+            severity_hint: "low",
+        },
+        F::ResponseCap => ErrorClass {
+            class: "response_cap",
+            label: "upstream response exceeded a host cap",
+            severity_hint: "medium",
+        },
+        F::RequestCap => ErrorClass {
+            class: "request_cap",
+            label: "outbound request exceeded a host cap",
+            severity_hint: "medium",
+        },
+        F::MalformedUrl => ErrorClass {
+            class: "invalid_url",
+            label: "malformed request URL (authoring error)",
+            severity_hint: "high",
+        },
+        F::InsecureScheme => ErrorClass {
+            class: "insecure_scheme",
+            label: "plaintext http:// target refused",
+            severity_hint: "high",
+        },
+        F::CapabilityWorld => ErrorClass {
+            class: "capability_world",
+            label: "module capability world does not grant this call",
+            severity_hint: "high",
+        },
+        F::PrivateAddress => ErrorClass {
+            class: "ssrf_blocked",
+            label: "egress denied (private/loopback address)",
+            severity_hint: "high",
+        },
+        F::ActorEgressTier => ErrorClass {
+            class: "egress_tier",
+            label: "egress denied by the actor's tier / egress scope",
+            severity_hint: "high",
+        },
+        F::WriteCeiling => ErrorClass {
+            class: "write_ceiling",
+            label: "call denied by the actor's write ceiling",
+            severity_hint: "high",
+        },
+        F::MethodAllowlist => ErrorClass {
+            class: "method_denied",
+            label: "HTTP method not in the module's allowed_methods",
+            severity_hint: "high",
+        },
+        F::EgressBudget => ErrorClass {
+            class: "egress_budget",
+            label: "per-execution egress budget spent",
+            severity_hint: "medium",
+        },
+        F::GraphqlIntrospection => ErrorClass {
+            class: "introspection_denied",
+            label: "GraphQL introspection refused",
+            severity_hint: "high",
+        },
+    }
+}
+
 /// Classify an execution error message into a stable class.
 ///
 /// Deterministic failure modes that need an operator (config, fuel,
@@ -170,6 +300,38 @@ pub fn classify_execution_error(msg: &str) -> ErrorClass {
             label: "human approval denied",
             severity_hint: "low",
         }
+    } else if let Some((_, fam)) = talos_reason_class::token_family(&m) {
+        // SECOND, immediately below `approval_denied` and above every prose
+        // needle. Since #714/#717 the worker appends `[reason_class=<token>]`
+        // at the site that actually refused the call, and that token is the
+        // only authoritative statement about the cause in this string —
+        // everything below is a substring guess at text the module wrote.
+        //
+        // `approval_denied` stays first deliberately (see above): it is the
+        // one NON-ALERTING class, and a marker arm that outranked it could
+        // turn a human clicking "reject" into a page.
+        //
+        // What this arm FIXES, beyond adding vocabulary:
+        //   * `tier1-llm-egress` contains the substring `llm`, so a Tier-1
+        //     DATA-EGRESS DENIAL was classified `llm` / "LLM backend failure"
+        //     — a privacy control filed as a backend wobble, at severity
+        //     `medium`. Verified by driving this function, not by reading it.
+        //   * `no-allowlist` is deliberately shortened from the policy's own
+        //     `no-allowlist-configured` because `configured` contains
+        //     `config`, which the `missing_config` arm below keys on. With the
+        //     marker read FIRST that hazard no longer depends on the token's
+        //     spelling — but the shortened token stays, because the retry
+        //     classifier's arm and the worker's collision test both pin it.
+        //   * The three SIBLING egress surfaces (`graphql`, `webhook`,
+        //     `http_stream`) render WIT names this chain matches nothing on
+        //     (`sendfailed`, `forbidden-host`, `connection-failed`,
+        //     `rate-limited`), so every denial on them fell into `other` and
+        //     got a per-message FINGERPRINT dedup key — one alert row per
+        //     wording, no occurrence history.
+        //
+        // An UNMARKED message is untouched: `token_family` returns `None` and
+        // the chain below runs byte-identically.
+        classify_reason_class(fam)
     } else if has("fuel exhausted") {
         ErrorClass {
             class: "fuel_exhausted",
@@ -923,11 +1085,19 @@ mod tests {
         // Guard against a typo drifting NON_ALERTING_CLASSES away from a
         // class classify_execution_error can actually emit — otherwise
         // the skip would silently never fire.
-        let known = [
+        //
+        // The MARKER half is DERIVED from the producer's closed set rather
+        // than typed out: a hand list rots (this one was already missing
+        // `result_stale` before the marker classes existed), and the whole
+        // point of `talos-reason-class` is that the vocabulary has one home.
+        // Only the PROSE half — classes reached by substring on module text,
+        // which have no machine-readable producer — is written out.
+        let mut known: Vec<&str> = vec![
             "approval_denied",
             "fuel_exhausted",
             "missing_config",
             "egress_denied",
+            "result_stale",
             "signature",
             "contract",
             "timeout",
@@ -937,6 +1107,11 @@ mod tests {
             "stale",
             "other",
         ];
+        known.extend(
+            talos_reason_class::ALL.iter().map(|t| {
+                classify_reason_class(talos_reason_class::family(t).expect("total")).class
+            }),
+        );
         for c in NON_ALERTING_CLASSES {
             assert!(
                 known.contains(&c),
@@ -997,5 +1172,284 @@ mod tests {
         let wf = Uuid::nil();
         let key = failure_dedup_key(wf, Some("send"), "networkerror");
         assert!(key.starts_with(&workflow_dedup_prefix(wf)));
+    }
+
+    // ── reason_class marker vocabulary ──────────────────────────────────────
+
+    /// The ten WIT discriminant names an egress failure can carry, across all
+    /// four surfaces. Both `forbiddenhost` (`wit_http`) and `forbidden-host`
+    /// (`wit_http_stream`, which spells its cases with hyphens and renders
+    /// them verbatim) are here, because they classify differently.
+    const WIT_NAMES: &[&str] = &[
+        "networkerror",
+        "invalidurl",
+        "forbiddenhost",
+        "timeout",
+        "queryerror",
+        "sendfailed",
+        "forbidden-host",
+        "invalid-url",
+        "connection-failed",
+        "rate-limited",
+    ];
+
+    /// The shape the engine actually writes to
+    /// `workflow_executions.error_message` — the reconciler's input.
+    fn row_error(wit: &str, token: Option<&str>) -> String {
+        let inner = format!(
+            r#"Component returned error: fetch: Error {{ code: 2, name: "{wit}", message: "" }}"#
+        );
+        let inner = match token {
+            Some(t) => format!("{inner} [reason_class={t}]"),
+            None => inner,
+        };
+        format!(
+            "Scheduled workflow failed: workflow execution failed: node 'fetch' failed: {inner}"
+        )
+    }
+
+    /// **NOTHING UNMARKED MOVES — and therefore no existing dedup key forks.**
+    ///
+    /// The class is a dedup-key segment under `UNIQUE (user_id, dedup_key)`,
+    /// so a changed class on an UNMARKED message would strand every open
+    /// alert of that class and reset its occurrence count. Every row already
+    /// on disk predates the marker.
+    ///
+    /// Pinned as LITERALS, measured against the pre-change classifier. Note
+    /// how much of the pre-marker vocabulary was `other`: that is one alert
+    /// row per message FINGERPRINT, so a denial on the graphql / webhook /
+    /// http-stream surfaces had no occurrence history at all.
+    #[test]
+    fn unmarked_messages_classify_exactly_as_before() {
+        let expected: &[(&str, &str)] = &[
+            ("networkerror", "network"),
+            ("invalidurl", "other"),
+            ("forbiddenhost", "egress_denied"),
+            ("timeout", "timeout"),
+            ("queryerror", "other"),
+            ("sendfailed", "other"),
+            ("forbidden-host", "other"),
+            ("invalid-url", "other"),
+            ("connection-failed", "other"),
+            ("rate-limited", "other"),
+        ];
+        assert_eq!(expected.len(), WIT_NAMES.len());
+        for (wit, class) in expected {
+            assert_eq!(
+                classify_execution_error(&row_error(wit, None)).class,
+                *class,
+                "UNMARKED {wit:?} moved class — that forks every open alert's dedup key"
+            );
+        }
+    }
+
+    /// **THE LIVE MISCLASSIFICATION THIS ARM FIXES.**
+    ///
+    /// `tier1-llm-egress` contains the substring `llm`, and the `llm` arm sat
+    /// below the point a marked message reached — so a Tier-1 DATA-EGRESS
+    /// DENIAL (a privacy control refusing to let an actor's data reach an
+    /// external provider) was filed as an "LLM backend failure" at severity
+    /// `medium`, in its own dedup bucket alongside genuine model outages.
+    ///
+    /// The worker's `tokens_never_collide_with_a_foreign_needle` test exists
+    /// to catch exactly this and did not, because `llm` was not in its needle
+    /// list. That list is extended in the same change; this is the assertion
+    /// from the reading end.
+    #[test]
+    fn a_tier1_egress_denial_is_not_an_llm_backend_failure() {
+        let ec = classify_execution_error(&row_error("forbiddenhost", Some("tier1-llm-egress")));
+        assert_eq!(ec.class, "egress_tier");
+        assert_ne!(ec.class, "llm");
+        assert_eq!(ec.severity_hint, "high");
+        // A genuine LLM failure still classifies as one.
+        let real = classify_execution_error(
+            "Scheduled workflow failed: node 'ask' failed: llm provider returned 500",
+        );
+        assert_eq!(real.class, "llm");
+    }
+
+    /// Every token → class, driven through the real classifier over the real
+    /// message shape, against every discriminant the marker could ride on.
+    ///
+    /// Written per TOKEN rather than derived from `family()`, so the mapping
+    /// itself is the claim under test.
+    #[test]
+    fn every_reason_class_token_maps_to_its_alert_class() {
+        let cases: &[(&str, &str, &str)] = &[
+            // token, class, severity_hint
+            ("dns", "network", "low"),
+            ("tls", "network", "low"),
+            ("connect-refused", "network", "low"),
+            ("connect-failed", "network", "low"),
+            ("send-failed", "network", "low"),
+            ("response-stream", "network", "low"),
+            ("timeout", "timeout", "medium"),
+            // KEPT on the pre-existing class so the common denial does not
+            // fork its dedup key.
+            ("no-allowlist", "egress_denied", "high"),
+            ("allowed-hosts", "egress_denied", "high"),
+            ("secret-lookup", "missing_secret", "high"),
+            ("circuit-open", "circuit_open", "medium"),
+            ("cancelled", "cancelled", "low"),
+            ("response-too-large", "response_cap", "medium"),
+            ("header-cap", "response_cap", "medium"),
+            ("request-header-cap", "request_cap", "medium"),
+            ("request-body-cap", "request_cap", "medium"),
+            ("url-too-long", "invalid_url", "high"),
+            ("url-parse", "invalid_url", "high"),
+            ("insecure-scheme", "insecure_scheme", "high"),
+            ("capability-world", "capability_world", "high"),
+            ("private-ip", "ssrf_blocked", "high"),
+            ("tier1-egress", "egress_tier", "high"),
+            ("tier1-llm-egress", "egress_tier", "high"),
+            ("tier1-public-ip-egress", "egress_tier", "high"),
+            ("write-ceiling", "write_ceiling", "high"),
+            ("write-ceiling-strict-egress", "write_ceiling", "high"),
+            ("method-allowlist", "method_denied", "high"),
+            ("execution-rate-limit", "egress_budget", "medium"),
+            ("per-host-rate-limit", "egress_budget", "medium"),
+            ("sse-stream-cap", "egress_budget", "medium"),
+            ("graphql-introspection", "introspection_denied", "high"),
+        ];
+        assert_eq!(
+            cases.len(),
+            talos_reason_class::ALL.len(),
+            "the table must cover the producer's closed set exactly"
+        );
+        for (token, class, sev) in cases {
+            assert!(
+                talos_reason_class::ALL.contains(token),
+                "{token:?} is not in the producer's closed set"
+            );
+            for wit in WIT_NAMES {
+                let ec = classify_execution_error(&row_error(wit, Some(token)));
+                assert_eq!(ec.class, *class, "token {token:?} on {wit:?}");
+                assert_eq!(ec.severity_hint, *sev, "token {token:?} severity");
+                assert!(!ec.label.is_empty());
+            }
+        }
+    }
+
+    /// A class name is a dedup-key SEGMENT, and the key is rendered into a
+    /// `TEXT` column that is joined on. Every class must stay in the
+    /// documented `[a-z0-9_]` alphabet — a hyphen or a slash from a token
+    /// leaking through would make a key that reads as a different path.
+    #[test]
+    fn every_class_is_a_legal_dedup_key_segment() {
+        for token in talos_reason_class::ALL {
+            let fam = talos_reason_class::family(token).expect("total");
+            let ec = classify_reason_class(fam);
+            assert!(
+                ec.class
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                "class {:?} for token {token:?} is not [a-z0-9_]",
+                ec.class
+            );
+            assert!(!ec.class.is_empty());
+        }
+    }
+
+    /// The three sibling egress surfaces used to scatter one fault across as
+    /// many `other_<fingerprint>` rows as the module had wordings. They now
+    /// collapse onto one key per (workflow, node, cause) — which is a MERGE,
+    /// the direction that recovers occurrence history rather than losing it.
+    #[test]
+    fn sibling_surface_denials_share_one_dedup_key_instead_of_a_fingerprint_each() {
+        let wf = Uuid::nil();
+        let a = failure_dedup_key(
+            wf,
+            Some("send"),
+            &row_error("sendfailed", Some("allowed-hosts")),
+        );
+        let b = failure_dedup_key(
+            wf,
+            Some("send"),
+            &format!(
+                "{} (attempt 2)",
+                row_error("sendfailed", Some("allowed-hosts"))
+            ),
+        );
+        assert_eq!(a, b, "two wordings of one denial must share a key");
+        assert!(a.ends_with("/egress_denied"), "unexpected key: {a}");
+        assert!(!a.contains("other_"), "still fingerprinted: {a}");
+
+        // A DIFFERENT cause on the same node keeps its own key — the split
+        // that is the point of the change.
+        let c = failure_dedup_key(
+            wf,
+            Some("send"),
+            &row_error("sendfailed", Some("tier1-llm-egress")),
+        );
+        assert_ne!(a, c);
+        assert!(c.ends_with("/egress_tier"), "unexpected key: {c}");
+    }
+
+    /// An unknown token — an older controller reading a newer worker — falls
+    /// through to the pre-marker chain rather than inventing a class.
+    #[test]
+    fn an_unknown_token_falls_through_instead_of_guessing() {
+        let ec = classify_execution_error(&row_error("forbiddenhost", Some("from-the-future")));
+        assert_eq!(ec.class, "egress_denied");
+        let ec = classify_execution_error(&row_error("invalidurl", Some("from-the-future")));
+        assert_eq!(ec.class, "other");
+    }
+
+    /// A rejected approval gate must stay FIRST and stay non-alerting, even if
+    /// the message somehow also carries a marker. Nobody should be paged for a
+    /// human clicking "reject".
+    #[test]
+    fn approval_denial_still_outranks_the_marker_arm() {
+        let msg = "Execution denied: module abc approval was denied \
+                   [reason_class=allowed-hosts]";
+        let ec = classify_execution_error(msg);
+        assert_eq!(ec.class, "approval_denied");
+        assert!(!ec.is_alerting());
+    }
+
+    /// The `has("missing") && has("config")` arm sits directly BELOW the
+    /// marker arm now, and that ordering is deliberate.
+    ///
+    /// #714 shortened `no-allowlist-configured` to `no-allowlist` precisely
+    /// because `configured` contains `config`, and this arm would then have
+    /// re-classed an egress denial as `missing_config` for any module whose
+    /// own text also said "missing". With the marker read FIRST, the host's
+    /// statement wins over module prose regardless of the token's spelling —
+    /// asserted here so the ordering is a property, not an accident of where
+    /// the arm happens to sit.
+    ///
+    /// The shortened token still stays: the retry classifier's hand-written
+    /// arm and the worker's collision test both pin it.
+    #[test]
+    fn a_marked_denial_outranks_the_missing_config_prose_arm() {
+        let msg = "workflow execution failed: node 'fetch' failed: Missing 'AUTH_HEADER' in \
+                   config; Error { name: \"forbiddenhost\" } [reason_class=no-allowlist]";
+        assert_eq!(classify_execution_error(msg).class, "egress_denied");
+        // Unmarked, the same prose still reaches missing_config.
+        let unmarked = "workflow execution failed: node 'fetch' failed: \
+                        Missing 'AUTH_HEADER' in config";
+        assert_eq!(
+            classify_execution_error(unmarked).class,
+            "missing_config",
+            "the prose arm must be untouched for messages that carry no marker"
+        );
+    }
+
+    /// Every class the marker arm can produce is a KNOWN class, and none of
+    /// them is silently non-alerting. The alerting decision is deliberate:
+    /// a policy denial is a real fault that needs an operator, unlike an
+    /// approval rejection.
+    #[test]
+    fn every_marker_class_alerts() {
+        for token in talos_reason_class::ALL {
+            let fam = talos_reason_class::family(token).expect("total");
+            let ec = classify_reason_class(fam);
+            assert!(
+                ec.is_alerting(),
+                "class {:?} (token {token:?}) is non-alerting — a host-refused \
+                 call is a fault, not an expected human-driven outcome",
+                ec.class
+            );
+        }
     }
 }

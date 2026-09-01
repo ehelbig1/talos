@@ -16,6 +16,13 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Talos crates — repositories
 talos-execution-repository = { path = "../talos-execution-repository" }
 
+# The worker's `[reason_class=…]` marker vocabulary. Consumed rather than
+# re-mirrored: this classifier reads worker failure text, and before #714/#717
+# it knew ZERO of the thirty-one tokens the worker stamps, so an egress denial
+# reached the operator as `runtime_error` with the cause sitting in the string
+# this function had just read.
+talos-reason-class = { path = "../talos-reason-class" }
+
 # Node-identity derivation. `build_node_display_label_map` keys on the SAME
 # UUID the executor writes into `execution_events.node_id`; a private copy of
 # that arithmetic that drifts joins zero rows in silence.

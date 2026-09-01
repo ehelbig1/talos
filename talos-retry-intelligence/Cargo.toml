@@ -15,3 +15,13 @@ uuid.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# Drift pin only — deliberately NOT a production dependency.
+#
+# `HTTP_POLICY_DENIAL_CLASSES` above is a hand mirror of the worker's closed
+# token set, and this crate sits on the retry hot path, so its runtime
+# behaviour is left byte-identical. What the dev-dep buys is that a token
+# renamed upstream now fails a test HERE instead of silently ceasing to match
+# — see `the_hand_mirror_still_matches_the_shared_vocabulary`.
+talos-reason-class = { path = "../talos-reason-class" }

@@ -8086,6 +8086,7 @@ dependencies = [
  "anyhow",
  "serde_json",
  "talos-execution-repository",
+ "talos-reason-class",
  "talos-workflow-engine-core",
  "talos-workflow-types",
  "thiserror 1.0.69",
@@ -8938,6 +8939,7 @@ dependencies = [
  "talos-actor-repository",
  "talos-dlp-provider",
  "talos-metrics",
+ "talos-reason-class",
  "talos-text-util",
  "talos-workflow-authorization",
  "talos-workflow-engine-core",
@@ -8993,6 +8995,10 @@ dependencies = [
  "tracing",
  "uuid",
 ]
+
+[[package]]
+name = "talos-reason-class"
+version = "0.1.0"
 
 [[package]]
 name = "talos-registry"
@@ -9069,6 +9075,7 @@ dependencies = [
  "anyhow",
  "serde",
  "sqlx",
+ "talos-reason-class",
  "tracing",
  "uuid",
 ]
