@@ -37,6 +37,9 @@ mod host_impl_tests;
 #[cfg(test)]
 mod cancellation_tests;
 
+#[cfg(test)]
+mod reason_class_denial_tests;
+
 mod cache;
 mod crypto;
 mod data;

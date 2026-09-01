@@ -54,6 +54,48 @@ pub(crate) fn http_method_mutates(method: &wit_http::Method) -> bool {
     }
 }
 
+/// Latch `class` against the `forbiddenhost` discriminant and return it.
+///
+/// The one place a `wit_http` POLICY or CAP denial becomes a WIT error. It
+/// exists so the class and the discriminant are chosen in the SAME expression:
+/// the marker is only ever stamped onto a guest error that carries the token
+/// the class was paired with (see
+/// [`crate::runtime::last_network_reason_suffix`]), so a pairing built
+/// anywhere other than the `return Err(...)` is a pairing that can silently go
+/// wrong. Latch-only by design — these sites already publish their operator
+/// diagnostic through `record_capability_denied`, and the pure caps
+/// deliberately publish none.
+///
+/// `&TalosContext` (not `&mut`) so the `fetch_all` validation loop, which
+/// holds an immutable borrow of the request vector, can call it inline.
+fn deny_forbidden(ctx: &TalosContext, class: &'static str) -> wit_http::Error {
+    ctx.record_http_denial(class, reason_class::WIT_FORBIDDENHOST);
+    wit_http::Error::Forbiddenhost
+}
+
+/// Latch `class` against the `invalidurl` discriminant and return it.
+/// Sibling of [`deny_forbidden`]; see its doc for why the pairing lives here.
+fn deny_invalid_url(ctx: &TalosContext, class: &'static str) -> wit_http::Error {
+    ctx.record_http_denial(class, reason_class::WIT_INVALIDURL);
+    wit_http::Error::Invalidurl
+}
+
+/// Map a `tier1_egress_deny_reason` policy onto its closed-set reason class.
+///
+/// An explicit `match` rather than passing the policy string straight through:
+/// the policy vocabulary lives in `host::egress` and can grow, while
+/// [`reason_class::ALL`] must stay CLOSED (`closed_set_snapshot` and the
+/// hand-written classifier arms both depend on it). A future policy therefore
+/// falls back to the generic [`reason_class::TIER1_EGRESS`] — which IS in the
+/// set and IS non-transient — instead of stamping a token no classifier knows.
+fn tier1_egress_class(policy: &str) -> &'static str {
+    match policy {
+        "tier1-llm-egress" => reason_class::TIER1_LLM_EGRESS,
+        "tier1-public-ip-egress" => reason_class::TIER1_PUBLIC_IP_EGRESS,
+        _ => reason_class::TIER1_EGRESS,
+    }
+}
+
 // ============================================================================
 // HTTP
 // ============================================================================
@@ -94,7 +136,7 @@ impl wit_http::Host for TalosContext {
             CapabilityWorld::Minimal | CapabilityWorld::Unknown
         ) {
             tracing::warn!("WASM module attempted HTTP request but lacks Http capability");
-            return Err(wit_http::Error::Forbiddenhost);
+            return Err(deny_forbidden(self, reason_class::CAPABILITY_WORLD));
         }
         // MCP-1148: cap URL bytes BEFORE invoking `url::Url::parse`.
         // The parser is O(N); a hostile guest could ship a 10 MB URL
@@ -106,10 +148,17 @@ impl wit_http::Host for TalosContext {
                 limit = MAX_OUTBOUND_URL_BYTES,
                 "wit_http::fetch rejected: URL length exceeds cap"
             );
-            return Err(wit_http::Error::Invalidurl);
+            return Err(deny_invalid_url(self, reason_class::URL_TOO_LONG));
         }
         // Validate and parse the URL first.
-        let url: url::Url = req.url.parse().map_err(|_| wit_http::Error::Invalidurl)?;
+        let url: url::Url = match req.url.parse() {
+            Ok(u) => u,
+            // A genuine author typo — the ONE `invalidurl` cause that is not a
+            // host decision. Telling it apart from the byte cap above and the
+            // plaintext-scheme SECURITY refusal below is the point of the class:
+            // all three reach the operator as `name: "invalidurl"`.
+            Err(_) => return Err(deny_invalid_url(self, reason_class::URL_PARSE)),
+        };
 
         // HTTPS-only by default. Plaintext outbound traffic can leak
         // `vault://` headers; the SSRF gate protects destination but
@@ -140,7 +189,7 @@ impl wit_http::Host for TalosContext {
                     "WASM module attempted non-https HTTP request — denied. \
                      Set WASM_ALLOW_INSECURE_HTTP=1 to permit plaintext outbound."
                 );
-                return Err(wit_http::Error::Invalidurl);
+                return Err(deny_invalid_url(self, reason_class::INSECURE_SCHEME));
             }
         }
 
@@ -164,7 +213,7 @@ impl wit_http::Host for TalosContext {
                 "WASM module attempted HTTP request but no host allowlist is configured — \
                  denying. Set WASM_ALLOWED_HOSTS=\"*\" to allow all hosts."
             );
-            return Err(wit_http::Error::Forbiddenhost);
+            return Err(deny_forbidden(self, reason_class::NO_ALLOWLIST));
         }
 
         // DNS rebinding / SSRF protection: if the host parses as an IP address literal,
@@ -182,7 +231,7 @@ impl wit_http::Host for TalosContext {
                 policy,
                 "WASM module attempted to reach a private IP literal — blocking"
             );
-            return Err(wit_http::Error::Forbiddenhost);
+            return Err(deny_forbidden(self, reason_class::PRIVATE_IP));
         }
 
         let host_match = match host_allowlist_match_kind(&self.allowed_hosts, host) {
@@ -195,7 +244,7 @@ impl wit_http::Host for TalosContext {
                     allowed_count = self.allowed_hosts.len(),
                     "WASM module attempted to reach a forbidden host"
                 );
-                return Err(wit_http::Error::Forbiddenhost);
+                return Err(deny_forbidden(self, reason_class::ALLOWED_HOSTS));
             }
         };
 
@@ -221,7 +270,7 @@ impl wit_http::Host for TalosContext {
                     policy,
                     "tier-1 actor egress refused (external LLM host or public IP literal)"
                 );
-                return Err(wit_http::Error::Forbiddenhost);
+                return Err(deny_forbidden(self, tier1_egress_class(policy)));
             }
         }
 
@@ -232,7 +281,7 @@ impl wit_http::Host for TalosContext {
         if http_method_mutates(&req.method)
             && self.write_ceiling_refuses("http-fetch", host).await
         {
-            return Err(wit_http::Error::Forbiddenhost);
+            return Err(deny_forbidden(self, reason_class::WRITE_CEILING));
         }
         // Strict-egress gate for the READ side: a GET URL is guest-
         // influenceable outbound data (exfil channel), so with
@@ -242,7 +291,7 @@ impl wit_http::Host for TalosContext {
         if !http_method_mutates(&req.method)
             && self.read_egress_refuses("http-fetch", host, host_match).await
         {
-            return Err(wit_http::Error::Forbiddenhost);
+            return Err(deny_forbidden(self, reason_class::WRITE_CEILING_STRICT_EGRESS));
         }
 
         // Rate limit + cancellation: charged AFTER the cheap pure-validation
@@ -255,7 +304,7 @@ impl wit_http::Host for TalosContext {
             if let Some(ref m) = self.metrics {
                 m.record_rate_limit_exceeded("http");
             }
-            return Err(wit_http::Error::Forbiddenhost);
+            return Err(deny_forbidden(self, reason_class::EXECUTION_RATE_LIMIT));
         }
         // M-6: per-host rate limit charged AFTER the global cap admits.
         // Failure here yields the global counter back? — no, intentionally
@@ -281,7 +330,7 @@ impl wit_http::Host for TalosContext {
             if let Some(ref m) = self.metrics {
                 m.record_rate_limit_exceeded("http_per_host");
             }
-            return Err(wit_http::Error::Forbiddenhost);
+            return Err(deny_forbidden(self, reason_class::PER_HOST_RATE_LIMIT));
         }
         if self.is_cancelled() {
             tracing::info!(module_id = ?self.module_id, "Execution cancelled");
@@ -290,6 +339,7 @@ impl wit_http::Host for TalosContext {
             }
             self.emit_network_failure(
                 reason_class::CANCELLED,
+                reason_class::WIT_NETWORKERROR,
                 "the execution was cancelled before the request was sent",
             )
             .await;
@@ -388,7 +438,7 @@ impl wit_http::Host for TalosContext {
                                  IP literals to private ranges remain blocked unconditionally.",
                                 host = host,
                             );
-                            return Err(wit_http::Error::Forbiddenhost);
+                            return Err(deny_forbidden(self, reason_class::PRIVATE_IP));
                         }
                     }
                 }
@@ -403,6 +453,7 @@ impl wit_http::Host for TalosContext {
                     // class from every policy deny that shares this enum.
                     self.emit_network_failure(
                         reason_class::DNS,
+                        reason_class::WIT_NETWORKERROR,
                         &format!(
                             "hostname resolution failed for '{host}' — DNS unavailable \
                              or name does not exist; the request was not sent"
@@ -445,7 +496,7 @@ impl wit_http::Host for TalosContext {
                 allowed_methods = ?self.allowed_methods,
                 "WASM module attempted a disallowed HTTP method"
             );
-            return Err(wit_http::Error::Forbiddenhost);
+            return Err(deny_forbidden(self, reason_class::METHOD_ALLOWLIST));
         }
 
         // Check circuit breaker before making request
@@ -485,6 +536,7 @@ impl wit_http::Host for TalosContext {
             tracing::warn!(host = %host, "Circuit breaker open - rejecting HTTP request");
             self.emit_network_failure(
                 reason_class::CIRCUIT_OPEN,
+                reason_class::WIT_NETWORKERROR,
                 &format!(
                     "circuit breaker open for '{host}' after recent failures — \
                      request rejected without being sent; it closes automatically"
@@ -508,7 +560,7 @@ impl wit_http::Host for TalosContext {
                 limit = MAX_OUTBOUND_HEADERS,
                 "wit_http::fetch rejected: header count exceeds cap"
             );
-            return Err(wit_http::Error::Forbiddenhost);
+            return Err(deny_forbidden(self, reason_class::REQUEST_HEADER_CAP));
         }
         let headers = req.headers.clone();
         // MCP-1014 (2026-05-15): cap caller-supplied body size. Same
@@ -525,7 +577,7 @@ impl wit_http::Host for TalosContext {
                 limit = MAX_OUTBOUND_HTTP_BODY_BYTES,
                 "wit_http::fetch rejected: body exceeds cap"
             );
-            return Err(wit_http::Error::Forbiddenhost);
+            return Err(deny_forbidden(self, reason_class::REQUEST_BODY_CAP));
         }
         let body = req.body.clone();
         // MCP-584: clamp caller-supplied timeout to MAX_HTTP_TIMEOUT_MS
@@ -561,10 +613,15 @@ impl wit_http::Host for TalosContext {
             .request(reqwest_method, &url_str)
             .timeout(std::time::Duration::from_millis(timeout_ms));
         for (name, value) in &headers {
-            let resolved = self
+            let resolved = match self
                 .resolve_vault_header(name.as_str(), value.as_str())
                 .await
-                .map_err(|_| wit_http::Error::Forbiddenhost)?;
+            {
+                Ok(v) => v,
+                // Leaves the circuit-breaker permit unsettled on the way out,
+                // exactly as the `?` it replaces did — see the permit doc above.
+                Err(_) => return Err(deny_forbidden(self, reason_class::SECRET_LOOKUP)),
+            };
             builder = builder.header(name.as_str(), resolved.as_ref());
         }
         // Opt-in idempotency (Task 3): when the engine stamped a stable
@@ -680,6 +737,7 @@ impl wit_http::Host for TalosContext {
                 if e.is_timeout() {
                     self.emit_network_failure(
                         reason_class::TIMEOUT,
+                        reason_class::WIT_TIMEOUT,
                         &format!("request to '{host_str}' timed out"),
                     )
                     .await;
@@ -723,6 +781,7 @@ impl wit_http::Host for TalosContext {
                     // produce the generic reason below.
                     self.emit_network_failure(
                         reason_class::TIER1_EGRESS,
+                        reason_class::WIT_NETWORKERROR,
                         &format!(
                             "'{host_str}' was blocked by this workflow's actor \
                              (local-egress-only — data must not leave the host). To reach \
@@ -744,7 +803,7 @@ impl wit_http::Host for TalosContext {
                     }
                     _ => "the request failed after connecting (reset or protocol error)",
                 };
-                self.emit_network_failure(class, &format!("request to '{host_str}': {prose}"))
+                self.emit_network_failure(class, reason_class::WIT_NETWORKERROR, &format!("request to '{host_str}': {prose}"))
                     .await;
                 return Err(wit_http::Error::Networkerror);
             }
@@ -770,6 +829,7 @@ impl wit_http::Host for TalosContext {
             );
             self.emit_network_failure(
                 reason_class::HEADER_CAP,
+                reason_class::WIT_NETWORKERROR,
                 &format!(
                     "the response from '{host_str}' carried more headers than the \
                      inbound cap ({MAX_INBOUND_HEADERS}) allows"
@@ -809,6 +869,7 @@ impl wit_http::Host for TalosContext {
         if let Some(name) = oversize_header {
             self.emit_network_failure(
                 reason_class::HEADER_CAP,
+                reason_class::WIT_NETWORKERROR,
                 &format!(
                     "the response from '{host_str}' carried a '{name}' header larger \
                      than the inbound cap ({MAX_INBOUND_HEADER_VALUE_BYTES} bytes)"
@@ -858,6 +919,7 @@ impl wit_http::Host for TalosContext {
                     }
                     self.emit_network_failure(
                         reason_class::RESPONSE_STREAM,
+                        reason_class::WIT_NETWORKERROR,
                         &format!(
                             "the response body from '{host_str}' failed mid-transfer \
                              (transport reset or decode error)"
@@ -874,6 +936,7 @@ impl wit_http::Host for TalosContext {
                 );
                 self.emit_network_failure(
                     reason_class::RESPONSE_TOO_LARGE,
+                    reason_class::WIT_NETWORKERROR,
                     &format!(
                         "the response body from '{host_str}' exceeded the {max_resp}-byte \
                          limit (WASM_HTTP_MAX_RESPONSE_BYTES) and was not delivered"
@@ -956,6 +1019,7 @@ impl wit_http::Host for TalosContext {
             }
             self.emit_network_failure(
                 reason_class::CANCELLED,
+                reason_class::WIT_NETWORKERROR,
                 "the execution was cancelled before the batch request was sent",
             )
             .await;
@@ -970,6 +1034,10 @@ impl wit_http::Host for TalosContext {
             CapabilityWorld::Minimal | CapabilityWorld::Unknown
         ) {
             tracing::warn!("fetch_all: module lacks Http capability");
+            self.record_http_denial(
+                reason_class::CAPABILITY_WORLD,
+                reason_class::WIT_FORBIDDENHOST,
+            );
             return reqs
                 .iter()
                 .map(|_| Err(wit_http::Error::Forbiddenhost))
@@ -1007,7 +1075,7 @@ impl wit_http::Host for TalosContext {
                     limit = MAX_OUTBOUND_HTTP_BODY_BYTES,
                     "fetch_all: per-request body exceeds cap"
                 );
-                validated.push(Err(wit_http::Error::Forbiddenhost));
+                validated.push(Err(deny_forbidden(self, reason_class::REQUEST_BODY_CAP)));
                 continue;
             }
 
@@ -1022,7 +1090,7 @@ impl wit_http::Host for TalosContext {
                     limit = MAX_OUTBOUND_URL_BYTES,
                     "fetch_all: per-request URL exceeds cap"
                 );
-                validated.push(Err(wit_http::Error::Invalidurl));
+                validated.push(Err(deny_invalid_url(self, reason_class::URL_TOO_LONG)));
                 continue;
             }
 
@@ -1030,7 +1098,7 @@ impl wit_http::Host for TalosContext {
             let url: url::Url = match req.url.parse() {
                 Ok(u) => u,
                 Err(_) => {
-                    validated.push(Err(wit_http::Error::Invalidurl));
+                    validated.push(Err(deny_invalid_url(self, reason_class::URL_PARSE)));
                     continue;
                 }
             };
@@ -1054,7 +1122,7 @@ impl wit_http::Host for TalosContext {
                         &format!("{scheme} {host}"),
                     )
                     .await;
-                    validated.push(Err(wit_http::Error::Invalidurl));
+                    validated.push(Err(deny_invalid_url(self, reason_class::INSECURE_SCHEME)));
                     continue;
                 }
             }
@@ -1063,7 +1131,7 @@ impl wit_http::Host for TalosContext {
             if self.allowed_hosts.is_empty() {
                 self.record_capability_denied("http-fetch-all", "no-allowlist-configured", &host)
                     .await;
-                validated.push(Err(wit_http::Error::Forbiddenhost));
+                validated.push(Err(deny_forbidden(self, reason_class::NO_ALLOWLIST)));
                 continue;
             }
 
@@ -1073,7 +1141,7 @@ impl wit_http::Host for TalosContext {
             if let Some((ip, policy)) = denied_ip_literal(&url) {
                 self.record_capability_denied("http-fetch-all", policy, &ip.to_string())
                     .await;
-                validated.push(Err(wit_http::Error::Forbiddenhost));
+                validated.push(Err(deny_forbidden(self, reason_class::PRIVATE_IP)));
                 continue;
             }
 
@@ -1083,7 +1151,7 @@ impl wit_http::Host for TalosContext {
                 None => {
                     self.record_capability_denied("http-fetch-all", "allowed-hosts", &host)
                         .await;
-                    validated.push(Err(wit_http::Error::Forbiddenhost));
+                    validated.push(Err(deny_forbidden(self, reason_class::ALLOWED_HOSTS)));
                     continue;
                 }
             };
@@ -1104,7 +1172,7 @@ impl wit_http::Host for TalosContext {
                         policy,
                         "tier-1 actor fetch_all egress refused (external LLM host or public IP literal)"
                     );
-                    validated.push(Err(wit_http::Error::Forbiddenhost));
+                    validated.push(Err(deny_forbidden(self, tier1_egress_class(policy))));
                     continue;
                 }
             }
@@ -1115,7 +1183,7 @@ impl wit_http::Host for TalosContext {
             if http_method_mutates(&req.method)
                 && self.write_ceiling_refuses("http-fetch-all", &host).await
             {
-                validated.push(Err(wit_http::Error::Forbiddenhost));
+                validated.push(Err(deny_forbidden(self, reason_class::WRITE_CEILING)));
                 continue;
             }
             // 5c. Strict-egress gate for the READ side (see the fetch()
@@ -1126,7 +1194,10 @@ impl wit_http::Host for TalosContext {
                     .read_egress_refuses("http-fetch-all", &host, host_match)
                     .await
             {
-                validated.push(Err(wit_http::Error::Forbiddenhost));
+                validated.push(Err(deny_forbidden(
+                    self,
+                    reason_class::WRITE_CEILING_STRICT_EGRESS,
+                )));
                 continue;
             }
 
@@ -1150,7 +1221,7 @@ impl wit_http::Host for TalosContext {
                     &format!("{} {}", method_str, host),
                 )
                 .await;
-                validated.push(Err(wit_http::Error::Forbiddenhost));
+                validated.push(Err(deny_forbidden(self, reason_class::METHOD_ALLOWLIST)));
                 continue;
             }
 
@@ -1175,7 +1246,7 @@ impl wit_http::Host for TalosContext {
                     &host_for_limit,
                 )
                 .await;
-                validated.push(Err(wit_http::Error::Forbiddenhost));
+                validated.push(Err(deny_forbidden(self, reason_class::PER_HOST_RATE_LIMIT)));
                 continue;
             }
 
@@ -1218,7 +1289,7 @@ impl wit_http::Host for TalosContext {
                                 policy,
                                 "fetch_all: hostname resolved to a private IP — blocking"
                             );
-                            validated.push(Err(wit_http::Error::Forbiddenhost));
+                            validated.push(Err(deny_forbidden(self, reason_class::PRIVATE_IP)));
                             continue;
                         }
                     }
@@ -1246,7 +1317,7 @@ impl wit_http::Host for TalosContext {
                     limit = MAX_OUTBOUND_HEADERS,
                     "wit_http::fetch_all entry rejected: header count exceeds cap"
                 );
-                validated.push(Err(wit_http::Error::Forbiddenhost));
+                validated.push(Err(deny_forbidden(self, reason_class::REQUEST_HEADER_CAP)));
                 continue;
             }
             let reqwest_method = match req.method {
@@ -1268,7 +1339,7 @@ impl wit_http::Host for TalosContext {
                 }
             }
             if header_failed {
-                validated.push(Err(wit_http::Error::Forbiddenhost));
+                validated.push(Err(deny_forbidden(self, reason_class::SECRET_LOOKUP)));
                 continue;
             }
 
@@ -1313,6 +1384,16 @@ impl wit_http::Host for TalosContext {
             tracing::warn!(module_id = ?self.module_id, "fetch_all: HTTP call rate limit exceeded");
             if let Some(ref m) = self.metrics {
                 m.record_rate_limit_exceeded("http");
+            }
+            // Latch only when this overflow actually CONVERTED an admitted entry.
+            // With zero Ok entries the batch's real cause is whatever the
+            // per-entry loop already latched, and overwriting it would replace a
+            // precise class with a coarser one.
+            if actual_calls > 0 {
+                self.record_http_denial(
+                    reason_class::EXECUTION_RATE_LIMIT,
+                    reason_class::WIT_FORBIDDENHOST,
+                );
             }
             return validated
                 .into_iter()
@@ -1600,6 +1681,7 @@ impl wit_http::Host for TalosContext {
                     if egress_gated && matches!(e, wit_http::Error::Networkerror) {
                         self.emit_network_failure(
                             reason_class::TIER1_EGRESS,
+                            reason_class::WIT_NETWORKERROR,
                             &format!(
                                 "fetch_all[{idx}]: '{host}' blocked by this workflow's actor \
                                  (local-egress-only). Set the actor's egress_scope to \
@@ -1646,6 +1728,7 @@ impl wit_http::Host for TalosContext {
                 // Slot number only — never the vault path or the value.
                 self.emit_network_failure(
                     reason_class::SECRET_LOOKUP,
+                    reason_class::WIT_NETWORKERROR,
                     &format!(
                         "secret slot {slot} could not be resolved for the Authorization \
                          header; the request was not sent"
@@ -1693,6 +1776,7 @@ impl wit_http::Host for TalosContext {
                 // Slot number + the caller's own header name only.
                 self.emit_network_failure(
                     reason_class::SECRET_LOOKUP,
+                    reason_class::WIT_NETWORKERROR,
                     &format!(
                         "secret slot {slot} could not be resolved for the '{header_name}' \
                          header; the request was not sent"

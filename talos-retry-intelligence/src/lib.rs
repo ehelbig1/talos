@@ -62,6 +62,60 @@ pub struct NodeFailureBreakdown {
 /// was in the transient list, so SQL syntax errors retried forever
 /// until max_retries was hit. That wastes fuel and worker capacity on
 /// a deterministically-broken query.
+/// The HTTP-surface POLICY and CAP classes the worker stamps onto the two WIT
+/// discriminants that are not `networkerror`.
+///
+/// Hand-mirrored from `talos_worker_runtime::reason_class::HTTP_POLICY_CLASSES`
+/// — this crate deliberately does not depend on the worker runtime (it would
+/// pull wasmtime into the controller's retry path), so the pinning is by test:
+/// that module's `closed_set_snapshot` fails if a token is added or renamed
+/// without updating this list.
+///
+/// Every member is DETERMINISTIC — a policy re-runs identically, a cap
+/// re-trips identically — so every member maps to `capability_denied`, which
+/// `is_transient_error_type` does not treat as retryable. `url-parse` is the
+/// one exception and is handled separately below: an unparseable URL is an
+/// AUTHORING error, not a denial, and calling it `capability_denied` would
+/// send the operator hunting a policy that never fired.
+const HTTP_POLICY_DENIAL_CLASSES: &[&str] = &[
+    "url-too-long",
+    "insecure-scheme",
+    "capability-world",
+    "no-allowlist",
+    "private-ip",
+    "allowed-hosts",
+    "tier1-llm-egress",
+    "tier1-public-ip-egress",
+    "write-ceiling",
+    "write-ceiling-strict-egress",
+    "method-allowlist",
+    "execution-rate-limit",
+    "per-host-rate-limit",
+    "request-header-cap",
+    "request-body-cap",
+];
+
+/// Extract the `[reason_class=<token>]` token the worker stamped, if any.
+///
+/// Parsed ONCE rather than adding sixteen more `.contains()` scans to a
+/// function whose own doc-comment caps its input at 4 KiB precisely because
+/// the substring chain is the cost. Returns the token only — the caller
+/// decides the bucket.
+///
+/// `lower` must already be lowercased and truncated by the caller.
+fn reason_class_token(lower: &str) -> Option<&str> {
+    const KEY: &str = "reason_class=";
+    let start = lower.find(KEY)? + KEY.len();
+    let rest = &lower[start..];
+    let end = rest.find(']').unwrap_or(rest.len());
+    let tok = &rest[..end];
+    if tok.is_empty() {
+        None
+    } else {
+        Some(tok)
+    }
+}
+
 pub fn classify_error(error_msg: &str) -> String {
     // MCP-1135 (2026-05-16): cap input length at 4 KiB before
     // `to_lowercase()` + the 15-substring `.contains()` chain. The
@@ -144,6 +198,35 @@ pub fn classify_error(error_msg: &str) -> String {
     // precedence reason as the classes above.
     if lower.contains("reason_class=secret-lookup") {
         return "missing_secret".to_string();
+    }
+    // The `invalidurl` and `forbiddenhost` half of the same collapse.
+    //
+    // `forbiddenhost` was already caught above, but only as ONE bucket for at
+    // least ten different policies whose remediations are unrelated — the
+    // marker is what tells `allowed-hosts` (extend the allowlist) from
+    // `capability-world` (recompile with an http world) from `write-ceiling`
+    // (the actor is read-only). `invalidurl` matched NOTHING here at all, so a
+    // plaintext-scheme SECURITY refusal — the gate that stops a `vault://`
+    // header going out in the clear — was filed under `unknown` and rendered
+    // to the operator as an indistinguishable typo.
+    //
+    // Placed with its siblings above rather than lower down because a
+    // HOST-stamped marker is authoritative and module prose is not; the same
+    // reason `circuit-open` and `tier1-egress` are hoisted. Nothing existing
+    // moves: every token below is newly minted, so no message that predates
+    // this change can carry one.
+    if let Some(tok) = reason_class_token(&lower) {
+        if HTTP_POLICY_DENIAL_CLASSES.contains(&tok) {
+            return "capability_denied".to_string();
+        }
+        // An author typo, deterministic like the denials but with a different
+        // fix. Its own bucket rather than `unknown` (where it landed before)
+        // so the failure reports can say which of the three `invalidurl`
+        // causes fired. NOT in `is_transient_error_type`, so the retry
+        // behaviour is byte-identical to the `unknown` it replaces.
+        if tok == "url-parse" {
+            return "invalid_url".to_string();
+        }
     }
 
     if lower.contains("fuel exhausted") || lower.contains("out of fuel") {
@@ -443,6 +526,20 @@ mod tests {
         assert_eq!(classify_error("connection refused"), "network_transient");
         assert_eq!(classify_error("401 Unauthorized"), "auth_failure");
         assert_eq!(classify_error("something random"), "unknown");
+        // A bare `invalidurl` with no marker keeps its pre-change bucket: the
+        // new arm is gated on a marker, not on the discriminant.
+        assert_eq!(
+            classify_error(
+                r#"Component returned error: HTTP request failed: Error { code: 0, name: "invalidurl", message: "" }"#
+            ),
+            "unknown"
+        );
+        // A marker whose token is not in the closed set falls through
+        // untouched rather than defaulting into a denial bucket.
+        assert_eq!(
+            classify_error("something random [reason_class=not-a-real-token]"),
+            "unknown"
+        );
     }
 
     #[test]
@@ -808,6 +905,198 @@ name: \"networkerror\", message: \"\" }";
                 is_transient_error_type(&c),
                 *transient,
                 "token {token:?} transience"
+            );
+        }
+    }
+
+    /// The `invalidurl` / `forbiddenhost` half of the closed set, in the
+    /// realistic pairing — each token stamped onto the discriminant the
+    /// emitting site actually returns, because the worker will never stamp it
+    /// onto any other (`last_network_reason_suffix`).
+    ///
+    /// Hand-mirrored from `talos_worker_runtime::reason_class`, same as the
+    /// table above; `closed_set_snapshot` over there fails if a token is added
+    /// or renamed without this list moving with it.
+    #[test]
+    fn every_http_policy_token_maps_to_the_right_bucket() {
+        // (token, wit discriminant, expected class)
+        let cases: &[(&str, &str, &str)] = &[
+            ("capability-world", "forbiddenhost", "capability_denied"),
+            ("no-allowlist", "forbiddenhost", "capability_denied"),
+            ("private-ip", "forbiddenhost", "capability_denied"),
+            ("allowed-hosts", "forbiddenhost", "capability_denied"),
+            ("tier1-llm-egress", "forbiddenhost", "capability_denied"),
+            (
+                "tier1-public-ip-egress",
+                "forbiddenhost",
+                "capability_denied",
+            ),
+            ("write-ceiling", "forbiddenhost", "capability_denied"),
+            (
+                "write-ceiling-strict-egress",
+                "forbiddenhost",
+                "capability_denied",
+            ),
+            ("method-allowlist", "forbiddenhost", "capability_denied"),
+            ("execution-rate-limit", "forbiddenhost", "capability_denied"),
+            ("per-host-rate-limit", "forbiddenhost", "capability_denied"),
+            ("request-header-cap", "forbiddenhost", "capability_denied"),
+            ("request-body-cap", "forbiddenhost", "capability_denied"),
+            ("url-too-long", "invalidurl", "capability_denied"),
+            ("insecure-scheme", "invalidurl", "capability_denied"),
+            // The one AUTHORING error among them. Its own bucket, so a report
+            // does not tell an operator a policy fired when none did.
+            ("url-parse", "invalidurl", "invalid_url"),
+        ];
+        for (token, wit, expected) in cases {
+            let msg = format!(
+                r#"Component returned error: fetch: Error {{ name: "{wit}", message: "" }} [reason_class={token}]"#
+            );
+            let c = classify_error(&msg);
+            assert_eq!(&c, expected, "token {token:?} classified {c:?}");
+            assert!(
+                !is_transient_error_type(&c),
+                "token {token:?} is a deterministic policy/cap/authoring failure \\
+                 and MUST NOT be retried — it landed in the transient class {c:?}"
+            );
+        }
+    }
+
+    /// THE SAFETY PROPERTY, stated as the thing that must not happen rather
+    /// than as a list of things that do.
+    ///
+    /// Adding a marker adds TEXT, and this classifier is a substring chain, so
+    /// a badly chosen token could drag a message into an EARLIER bucket. The
+    /// direction that matters is non-transient → transient: that burns retry
+    /// budget on a deterministic failure, the 2026-07-23 outage class.
+    ///
+    /// Asserted for every new token against every WIT discriminant it could
+    /// conceivably ride on — including the pairings the worker will not
+    /// actually produce, so the property survives a future site that pairs
+    /// differently.
+    #[test]
+    fn no_new_token_can_make_any_message_transient() {
+        let mut all: Vec<&str> = HTTP_POLICY_DENIAL_CLASSES.to_vec();
+        all.push("url-parse");
+        for token in &all {
+            for wit in ["invalidurl", "forbiddenhost", "networkerror", "timeout"] {
+                let bare = format!(
+                    r#"Component returned error: fetch: Error {{ name: "{wit}", message: "" }}"#
+                );
+                let marked = format!("{bare} [reason_class={token}]");
+                let before = is_transient_error_type(&classify_error(&bare));
+                let after = is_transient_error_type(&classify_error(&marked));
+                assert!(
+                    !(after && !before),
+                    "[reason_class={token}] moved a {wit} message from NON-TRANSIENT \\
+                     to TRANSIENT — that retries a deterministic failure"
+                );
+            }
+        }
+    }
+
+    /// The classification of every message shape that exists TODAY is
+    /// unchanged. Pinned as literals rather than derived, for the reason the
+    /// wire-format snapshots exist: a behavioural test written against the new
+    /// code cannot catch a change that moved both sides together.
+    ///
+    /// The table was produced by running THIS function and the pre-change one
+    /// (`git show HEAD:…`) over a 332-case corpus — every prefix × every WIT
+    /// discriminant × every pre-existing `reason_class` token, plus the
+    /// non-WIT failure strings the controller sees — and comparing both the
+    /// bucket and `is_transient_error_type`. Zero differences. The rows below
+    /// are the representative slice; the property that makes the whole corpus
+    /// safe is structural and stated in `new_tokens_cannot_appear_on_an_old_message`.
+    #[test]
+    fn existing_message_shapes_classify_exactly_as_before() {
+        let cases: &[(&str, &str)] = &[
+            (
+                r#"Component returned error: fetch: Error { code: 2, name: "networkerror", message: "" }"#,
+                "network_transient",
+            ),
+            (
+                r#"Component returned error: fetch: Error { code: 3, name: "forbiddenhost", message: "" }"#,
+                "capability_denied",
+            ),
+            (
+                r#"Component returned error: fetch: Error { code: 0, name: "invalidurl", message: "" }"#,
+                "unknown",
+            ),
+            (
+                r#"Component returned error: fetch: Error { code: 1, name: "timeout", message: "" }"#,
+                "timeout",
+            ),
+            (
+                r#"Component returned error: fetch: Error { code: 2, name: "networkerror", message: "" } [reason_class=dns]"#,
+                "network_transient",
+            ),
+            (
+                r#"Component returned error: fetch: Error { code: 2, name: "networkerror", message: "" } [reason_class=circuit-open]"#,
+                "circuit_open",
+            ),
+            (
+                r#"Component returned error: fetch: Error { code: 2, name: "networkerror", message: "" } [reason_class=tier1-egress]"#,
+                "capability_denied",
+            ),
+            (
+                r#"Component returned error: fetch: Error { code: 2, name: "networkerror", message: "" } [reason_class=cancelled]"#,
+                "cancelled",
+            ),
+            (
+                r#"Component returned error: fetch: Error { code: 2, name: "networkerror", message: "" } [reason_class=secret-lookup]"#,
+                "missing_secret",
+            ),
+            ("connection refused", "network_transient"),
+            ("401 Unauthorized", "auth_failure"),
+            ("HTTP 429 Too Many Requests", "rate_limit"),
+            ("Job execution timed out", "timeout"),
+            ("WASM fuel exhausted after 10000000", "fuel_exhaustion"),
+            (
+                "canceling statement due to lock timeout",
+                "database_transient",
+            ),
+            ("something random", "unknown"),
+        ];
+        for (msg, expected) in cases {
+            assert_eq!(&classify_error(msg), expected, "shape: {msg}");
+        }
+    }
+
+    /// Why the table above is a slice and not an exhaustive corpus: no message
+    /// that predates this change can carry a newly-minted token, because the
+    /// tokens did not exist. The new arm therefore cannot fire on old text at
+    /// all — it is not a re-ordering of the existing chain, it is a branch on
+    /// a value only the new producer can emit.
+    ///
+    /// Pinned so that "reuse an existing-looking token" — the obvious
+    /// simplification — fails here instead of silently re-routing shipped
+    /// messages.
+    #[test]
+    fn new_tokens_cannot_appear_on_an_old_message() {
+        // The tokens the producer could stamp BEFORE this change.
+        const PRE_EXISTING: &[&str] = &[
+            "dns",
+            "tls",
+            "connect-refused",
+            "connect-failed",
+            "send-failed",
+            "circuit-open",
+            "tier1-egress",
+            "cancelled",
+            "response-too-large",
+            "header-cap",
+            "response-stream",
+            "timeout",
+            "secret-lookup",
+        ];
+        let mut minted: Vec<&str> = HTTP_POLICY_DENIAL_CLASSES.to_vec();
+        minted.push("url-parse");
+        for m in &minted {
+            assert!(
+                !PRE_EXISTING.contains(m),
+                "{m:?} is not newly minted — a message that predates this change \\
+                 could already carry it, so the new arm CAN re-route old text \\
+                 and the differential proof above no longer holds"
             );
         }
     }

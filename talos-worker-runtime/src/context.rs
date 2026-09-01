@@ -396,10 +396,20 @@ pub struct TalosContext {
     /// the claim to exactly what the code knows: *the last HTTP call this
     /// module made failed host-side, with this class*.
     ///
+    /// The latch holds a [`crate::reason_class::Reason`] — the class token
+    /// PAIRED with the WIT discriminant that class is allowed to explain — not
+    /// a bare token. The pairing is what bounds a stale latch: see
+    /// [`crate::runtime::last_network_reason_suffix`]. Before it, the bound
+    /// was a hardcoded "the guest error must say `networkerror`", which
+    /// covered exactly one of the enum's four values and silently excluded
+    /// every `invalidurl` / `forbiddenhost` policy denial from ever being
+    /// explained.
+    ///
     /// `Arc<Mutex<…>>` because `runtime` must keep a handle after the
     /// `TalosContext` is moved into the wasmtime `Store` (same shape as
-    /// `stderr_capture`). `&'static str` because the token set is closed.
-    pub(crate) last_network_reason: Arc<std::sync::Mutex<Option<&'static str>>>,
+    /// `stderr_capture`). `&'static str` fields because the token set is
+    /// closed.
+    pub(crate) last_network_reason: Arc<std::sync::Mutex<Option<crate::reason_class::Reason>>>,
 
     /// Per-execution event emission counter for the events interface.
     pub(crate) event_emit_count: AtomicU64,
@@ -1573,9 +1583,35 @@ impl TalosContext {
     /// `class` must be one of the `reason_class` consts — never a
     /// request-derived string. `message` is bound by the same sanitization
     /// contract as [`Self::emit_host_diagnostic`].
-    pub(crate) async fn emit_network_failure(&mut self, class: &'static str, message: &str) {
-        self.record_network_outcome(Some(class));
+    /// `wit` is the discriminant name the caller is about to return to the
+    /// guest — one of the `reason_class::WIT_*` consts. It is a PARAMETER and
+    /// not a constant because the pairing is what licenses the marker: a class
+    /// raised at a `Timeout` site must never be stamped onto a `networkerror`
+    /// message, and vice versa. Passing it at the call site keeps the two
+    /// visibly together where a reviewer reads the `return Err(...)`.
+    pub(crate) async fn emit_network_failure(
+        &mut self,
+        class: &'static str,
+        wit: &'static str,
+        message: &str,
+    ) {
+        self.record_network_outcome(Some(crate::reason_class::Reason { class, wit }));
         self.emit_host_diagnostic(class, message).await;
+    }
+
+    /// Latch a host-side denial WITHOUT publishing a diagnostic.
+    ///
+    /// The HTTP policy-denial sites already publish their `[host:<policy>]`
+    /// diagnostic through `record_capability_denied` (and the pure-cap sites
+    /// deliberately publish none at all), so this is the latch half on its
+    /// own. Adding a second diagnostic at those ~34 sites would duplicate the
+    /// audit-backed one and double-spend `HOST_DIAG_CAP`.
+    ///
+    /// `&self` for the same reason as [`Self::record_network_outcome`]: the
+    /// `fetch_all` validation loop holds an immutable borrow of the request
+    /// vector while it runs.
+    pub(crate) fn record_http_denial(&self, class: &'static str, wit: &'static str) {
+        self.record_network_outcome(Some(crate::reason_class::Reason { class, wit }));
     }
 
     /// Record the class of the latest host-side HTTP outcome — `Some(class)`
@@ -1586,7 +1622,7 @@ impl TalosContext {
     /// disturbing borrow shapes in the middle of a request pipeline. A
     /// poisoned mutex is recovered rather than propagated: losing a
     /// diagnostic breadcrumb must never change a call's outcome.
-    pub(crate) fn record_network_outcome(&self, class: Option<&'static str>) {
+    pub(crate) fn record_network_outcome(&self, class: Option<crate::reason_class::Reason>) {
         let mut guard = self
             .last_network_reason
             .lock()
@@ -1611,7 +1647,9 @@ impl TalosContext {
 
     /// Handle onto [`Self::last_network_reason`] for the runtime to keep after
     /// this context is moved into the wasmtime `Store`.
-    pub(crate) fn network_reason_handle(&self) -> Arc<std::sync::Mutex<Option<&'static str>>> {
+    pub(crate) fn network_reason_handle(
+        &self,
+    ) -> Arc<std::sync::Mutex<Option<crate::reason_class::Reason>>> {
         self.last_network_reason.clone()
     }
 

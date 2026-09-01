@@ -1851,10 +1851,10 @@ pub(crate) fn first_open_circuit_host_in<'a>(
 ///
 /// 1. A host-side HTTP failure is latched (`TalosContext::last_network_reason`
 ///    is `Some`; a later successful `fetch` clears it).
-/// 2. **`guest_error` actually carries the opaque `networkerror` token.** The
-///    marker exists for exactly one job: to say WHICH of the eight causes hid
-///    behind the payload-less WIT discriminant. Any other failure text needs
-///    no explanation and must not receive one.
+/// 2. **`guest_error` actually carries the WIT discriminant that latched class
+///    was raised to explain.** The marker exists for exactly one job: to say
+///    WHICH cause hid behind a payload-less WIT discriminant. Any other
+///    failure text needs no explanation and must not receive one.
 ///
 /// Condition 2 closes a real mis-attribution: the latch is set on failure and
 /// cleared on `fetch` SUCCESS, but nothing else clears it — not `fetch_all`,
@@ -1863,27 +1863,47 @@ pub(crate) fn first_open_circuit_host_in<'a>(
 /// unrelated reason would inherit the stale class, and the controller's
 /// `classify_error` checks its `network_transient` bucket BEFORE
 /// `auth_failure` — meaning `"401 Unauthorized [reason_class=dns]"` would
-/// classify transient and retry a permanent auth error forever. Gating on the
-/// token means a message with no `networkerror` in it classifies exactly as it
-/// did before this change.
+/// classify transient and retry a permanent auth error forever.
+///
+/// # Why the token is PAIRED and not widened
+///
+/// Condition 2 used to be the hardcoded literal `"networkerror"`, which is
+/// only one of `wit_http`'s four values. `invalidurl` and `forbiddenhost`
+/// collapse their own causes just as badly — a plaintext-scheme SECURITY
+/// refusal reaches the operator as `name: "invalidurl"`, indistinguishable
+/// from a typo — but no class raised at those sites could ever be stamped.
+///
+/// The two obvious extensions are both wrong. DROPPING condition 2 reinstates
+/// the `401 [reason_class=dns]` mis-attribution verbatim. WIDENING it to "any
+/// WIT token" is the same bug one step removed: a stale `dns` class latched by
+/// a swallowed `fetch` would then be stamped onto a later `forbiddenhost`, and
+/// `dns` is in the classifier's TRANSIENT bucket while `forbiddenhost` is not
+/// — so a capability denial would be re-classed transient and retried.
+///
+/// So the latch stores a [`crate::reason_class::Reason`]: the class TOGETHER
+/// with the one discriminant it may explain, decided at the emitting site. A
+/// class raised at an `invalidurl` site can only ever land on a message
+/// carrying `invalidurl`. The guarantee is exactly as strong as before, per
+/// token instead of for one token, and a message carrying none of them
+/// classifies precisely as it did before this change.
 ///
 /// Free function (not a closure) so both rules are unit-testable — a mutation
 /// that always emits a suffix must fail a test, not ship.
 pub(crate) fn last_network_reason_suffix(
-    latch: &std::sync::Arc<std::sync::Mutex<Option<&'static str>>>,
+    latch: &std::sync::Arc<std::sync::Mutex<Option<crate::reason_class::Reason>>>,
     guest_error: &str,
 ) -> String {
     let guard = latch.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(class) = *guard else {
+    let Some(reason) = *guard else {
         return String::new();
     };
     // Cheap containment check on the WIT enum's rendered name. The generated
     // bindings render `Error { code: 2, name: "networkerror", message: "" }`;
     // a `{:?}` of the enum renders `Networkerror`. Lowercase covers both.
-    if !guest_error.to_lowercase().contains("networkerror") {
+    if !guest_error.to_lowercase().contains(reason.wit) {
         return String::new();
     }
-    format!(" {}", crate::reason_class::marker(class))
+    format!(" {}", crate::reason_class::marker(reason.class))
 }
 
 /// The `execution_id` a pipeline step stamps on its `wasm.log.*` entries.
@@ -5832,7 +5852,7 @@ mod pipeline_step_retry_tests {
         use std::sync::{Arc, Mutex};
         // Mutation guard: a version that always emits a marker would start
         // attributing a stale class to unrelated failures.
-        let latch: Arc<Mutex<Option<&'static str>>> = Arc::new(Mutex::new(None));
+        let latch: Arc<Mutex<Option<crate::reason_class::Reason>>> = Arc::new(Mutex::new(None));
         assert_eq!(last_network_reason_suffix(&latch, WIT_NETWORKERROR), "");
     }
 
@@ -5840,7 +5860,9 @@ mod pipeline_step_retry_tests {
     fn suffix_renders_the_marker_when_a_failure_is_latched() {
         use crate::reason_class;
         use std::sync::{Arc, Mutex};
-        let latch: Arc<Mutex<Option<&'static str>>> = Arc::new(Mutex::new(Some(reason_class::DNS)));
+        let latch: Arc<Mutex<Option<reason_class::Reason>>> = Arc::new(Mutex::new(Some(
+            reason_class::Reason::network(reason_class::DNS),
+        )));
         assert_eq!(
             last_network_reason_suffix(&latch, WIT_NETWORKERROR),
             " [reason_class=dns]"
@@ -5865,12 +5887,23 @@ mod pipeline_step_retry_tests {
     fn stale_latch_cannot_retag_an_unrelated_failure() {
         use crate::reason_class;
         use std::sync::{Arc, Mutex};
-        let latch: Arc<Mutex<Option<&'static str>>> = Arc::new(Mutex::new(Some(reason_class::DNS)));
+        let latch: Arc<Mutex<Option<reason_class::Reason>>> = Arc::new(Mutex::new(Some(
+            reason_class::Reason::network(reason_class::DNS),
+        )));
         for unrelated in [
             "Component returned error: 401 Unauthorized",
             "Component returned error: invalid JSON at line 3",
             "Component returned error: 404 Not Found",
             "Pipeline step 'x' returned error: business rule violated",
+            // The case the PAIRING adds, and the reason condition 2 was not
+            // simply widened to "any WIT token". `dns` is in the TRANSIENT
+            // bucket; `forbiddenhost` is a capability denial that must never
+            // retry. A latch that stamped any class onto any WIT error would
+            // re-class this policy denial as transient — the same
+            // mis-attribution the original literal-"networkerror" gate
+            // prevented, one step removed.
+            r#"Component returned error: fetch: Error { code: 3, name: "forbiddenhost", message: "" }"#,
+            r#"Component returned error: fetch: Error { code: 0, name: "invalidurl", message: "" }"#,
         ] {
             assert_eq!(
                 last_network_reason_suffix(&latch, unrelated),
@@ -5932,7 +5965,8 @@ mod pipeline_step_retry_tests {
 
         // 3. The host site emits TIER1_EGRESS; the guest still sees only the
         //    payload-less discriminant, so the marker is what carries it.
-        let latch: Arc<Mutex<Option<&'static str>>> = Arc::new(Mutex::new(Some(rc::TIER1_EGRESS)));
+        let latch: Arc<Mutex<Option<rc::Reason>>> =
+            Arc::new(Mutex::new(Some(rc::Reason::network(rc::TIER1_EGRESS))));
         let guest = r#"Component returned error: list fetch: Error { code: 2, name: "networkerror", message: "" }"#;
         let suffix = last_network_reason_suffix(&latch, guest);
         assert_eq!(suffix, " [reason_class=tier1-egress]");

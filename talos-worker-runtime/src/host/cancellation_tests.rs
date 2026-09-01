@@ -97,7 +97,7 @@ async fn fetch_all_cancel_guard_latches_the_reason_class() {
     }
     assert_eq!(
         *latch.lock().unwrap(),
-        Some(reason_class::CANCELLED),
+        Some(reason_class::Reason::network(reason_class::CANCELLED)),
         "the guard returned without stamping [reason_class=cancelled]; the \
          controller will classify this bare `networkerror` as network_transient \
          and RE-DISPATCH the job onto a fresh, uncancelled context"
@@ -131,7 +131,10 @@ async fn fetch_all_cancellation_precedes_the_capability_gate() {
     let out = <TalosContext as wit_http::Host>::fetch_all(&mut ctx, vec![a_request()]).await;
 
     assert!(matches!(out[0], Err(wit_http::Error::Networkerror)));
-    assert_eq!(*latch.lock().unwrap(), Some(reason_class::CANCELLED));
+    assert_eq!(
+        *latch.lock().unwrap(),
+        Some(reason_class::Reason::network(reason_class::CANCELLED))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -143,8 +146,9 @@ async fn fetch_all_cancellation_precedes_the_capability_gate() {
 /// test that only checked the fixed direction passes against the broken tree.
 #[test]
 fn the_marker_is_what_makes_a_cancelled_egress_non_transient() {
-    let latch: Arc<std::sync::Mutex<Option<&'static str>>> =
-        Arc::new(std::sync::Mutex::new(Some(reason_class::CANCELLED)));
+    let latch: Arc<std::sync::Mutex<Option<reason_class::Reason>>> = Arc::new(
+        std::sync::Mutex::new(Some(reason_class::Reason::network(reason_class::CANCELLED))),
+    );
 
     let suffix = crate::runtime::last_network_reason_suffix(&latch, GUEST_NETWORKERROR);
     assert_eq!(suffix, " [reason_class=cancelled]");
@@ -167,7 +171,8 @@ fn the_marker_is_what_makes_a_cancelled_egress_non_transient() {
 /// guards depend on rather than trusting the guards' own logging.
 #[test]
 fn an_unlatched_context_appends_no_marker() {
-    let latch: Arc<std::sync::Mutex<Option<&'static str>>> = Arc::new(std::sync::Mutex::new(None));
+    let latch: Arc<std::sync::Mutex<Option<reason_class::Reason>>> =
+        Arc::new(std::sync::Mutex::new(None));
     assert_eq!(
         crate::runtime::last_network_reason_suffix(&latch, GUEST_NETWORKERROR),
         ""
@@ -271,7 +276,7 @@ async fn cancelling_an_execution_stops_the_next_egress_call() {
     );
     assert_eq!(
         *latch.lock().unwrap(),
-        Some(reason_class::CANCELLED),
+        Some(reason_class::Reason::network(reason_class::CANCELLED)),
         "the egress refusal must be stamped `cancelled`"
     );
 
@@ -328,7 +333,10 @@ async fn a_cancel_for_another_execution_does_not_stop_this_one() {
     let my_latch = my_ctx.network_reason_handle();
     let out = <TalosContext as wit_http::Host>::fetch_all(&mut my_ctx, vec![a_request()]).await;
     assert!(matches!(out[0], Err(wit_http::Error::Networkerror)));
-    assert_eq!(*my_latch.lock().unwrap(), Some(reason_class::CANCELLED));
+    assert_eq!(
+        *my_latch.lock().unwrap(),
+        Some(reason_class::Reason::network(reason_class::CANCELLED))
+    );
 
     // Theirs never latched anything — the guard was never reached for it.
     // (Its `fetch_all` is deliberately not called; see the module note above
