@@ -4521,6 +4521,27 @@ pub(crate) fn spawn_late_background_tasks(
     let cleanup_shutdown = bg_shutdown_rx.clone();
     tokio::spawn(async move {
         let mut shutdown = cleanup_shutdown;
+        let cleanup_repo =
+            crate::execution_repository::ExecutionRepository::new(cleanup_pool.clone());
+        // The Postgres-clock instant this controller process began owning the
+        // sweep. Every timestamp it gets compared against is Postgres-generated,
+        // so reading it from the DATABASE removes controller/Postgres clock skew
+        // from the comparison entirely — which matters, because the margin that
+        // separates "orphaned by a restart" from "overran" can be seconds (17 s
+        // in the 2026-08-31 incident this attribution exists for). `None` when
+        // the read fails: the sweep then states facts and makes no ownership
+        // claim rather than guessing. See `talos_execution_repository::stale_sweep`.
+        let sweep_epoch = match cleanup_repo.sweep_ownership_epoch().await {
+            Ok(t) => Some(t),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Stale-execution sweep could not read its ownership epoch — swept rows \
+                     will be closed without restart attribution"
+                );
+                None
+            }
+        };
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
         loop {
             tokio::select! {
@@ -4535,18 +4556,72 @@ pub(crate) fn spawn_late_background_tasks(
                     // future time, also matches everything). Same `=0` footgun
                     // class as MCP-638/643/661/663/664 — this one's the highest-
                     // blast-radius of the set (mass execution kill).
-                    let stale_minutes: i32 =
-                        talos_config::positive_env_or_default("STALE_EXECUTION_MINUTES", 60i32);
-                    let result = sqlx::query(
-                        "UPDATE workflow_executions SET status = 'failed', \
-                         error_message = 'Auto-cleaned: execution stale (running > configured threshold)', \
-                         completed_at = NOW() \
-                         WHERE status IN ('running') AND status != 'queued' AND started_at < NOW() - make_interval(mins => $1::int)"
-                    ).bind(stale_minutes).execute(&cleanup_pool).await;
-                    if let Ok(r) = result {
-                        if r.rows_affected() > 0 {
-                            tracing::info!(count = r.rows_affected(), "Auto-cleaned stale executions");
+                    // (The repository method refuses non-positive values too.)
+                    let stale_minutes: i64 =
+                        talos_config::positive_env_or_default("STALE_EXECUTION_MINUTES", 60i64);
+                    // Read-then-write, per row, instead of one bulk UPDATE: the
+                    // message the operator ends up reading is the ONLY account of
+                    // why the execution ended, and a constant string describing
+                    // the sweep's own rule is not that account. See the module
+                    // docs on `stale_sweep` for the incident.
+                    let stale = cleanup_repo
+                        .list_stale_running_executions(
+                            stale_minutes,
+                            talos_execution_repository::stale_sweep::STALE_SWEEP_BATCH,
+                        )
+                        .await;
+                    match stale {
+                        Ok(rows) => {
+                            let mut closed = 0u64;
+                            let mut orphaned = 0u64;
+                            for ev in &rows {
+                                // Resolved through the ONE public bridge from
+                                // `execution_events.node_id` back to a display
+                                // label; a private re-derivation of
+                                // `engine_node_uuid` that drifts does not fail
+                                // loudly, it just stops matching (check 71).
+                                let label = ev.in_flight_node.and_then(|n| {
+                                    talos_failure_analysis_service::build_node_display_label_map(
+                                        ev.graph_json.clone(),
+                                    )
+                                    .get(&n)
+                                    .cloned()
+                                });
+                                let msg = talos_execution_repository::stale_sweep::
+                                    describe_stale_execution(ev, sweep_epoch, label.as_deref());
+                                if talos_execution_repository::stale_sweep::
+                                    orphaned_before_this_process(ev, sweep_epoch)
+                                {
+                                    orphaned += 1;
+                                }
+                                match cleanup_repo.fail_stale_execution(ev.id, &msg).await {
+                                    // `false` = the row reached a real terminal
+                                    // status between the read and the write. That
+                                    // outcome is the true one and stands.
+                                    Ok(true) => closed += 1,
+                                    Ok(false) => {}
+                                    Err(e) => tracing::warn!(
+                                        target: "talos_audit",
+                                        execution_id = %ev.id,
+                                        error = %e,
+                                        "Stale-execution sweep failed to close a row — it stays \
+                                         'running' until the next tick"
+                                    ),
+                                }
+                            }
+                            if closed > 0 {
+                                tracing::info!(
+                                    count = closed,
+                                    orphaned_by_restart = orphaned,
+                                    "Auto-cleaned stale executions"
+                                );
+                            }
                         }
+                        Err(e) => tracing::warn!(
+                            target: "talos_audit",
+                            error = %e,
+                            "Stale-execution sweep could not list candidates"
+                        ),
                     }
                 }
                 _ = shutdown.changed() => {
