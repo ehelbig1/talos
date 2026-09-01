@@ -1,0 +1,15 @@
+[package]
+name = "talos-reason-class"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Deliberately ZERO dependencies. The whole point of this crate is that every
+# controller-side consumer of the worker's `[reason_class=…]` marker can depend
+# on it without pulling wasmtime (which is why `talos_worker_runtime::reason_class`
+# itself is not the shared home — see this crate's module docs).
+
+[lints]
+workspace = true

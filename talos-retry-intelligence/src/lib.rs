@@ -1322,4 +1322,51 @@ name: \"networkerror\", message: \"\" }";
         // Must not panic.
         let _ = classify_error(&s);
     }
+
+    /// **DRIFT PIN.** `HTTP_POLICY_DENIAL_CLASSES` above is a hand mirror of
+    /// `talos_worker_runtime::reason_class::HTTP_POLICY_CLASSES`, which this
+    /// crate cannot import (it would pull wasmtime onto the retry path). Since
+    /// 2026-09 that vocabulary has ONE controller-side home,
+    /// `talos-reason-class` — a zero-dependency leaf that the failure analyser
+    /// and the ops-alert reconciler consume directly.
+    ///
+    /// This crate stays on its own hand-written arms so the retry hot path is
+    /// untouched, but a renamed or dropped token must not silently stop
+    /// matching here. A mirror entry that is no longer a real token is not a
+    /// compile error and not a behaviour change an existing test would notice
+    /// — it is an arm that never fires again, which is precisely how
+    /// `classify_error` came to know zero of them on the other two surfaces.
+    #[test]
+    fn the_hand_mirror_still_matches_the_shared_vocabulary() {
+        for t in HTTP_POLICY_DENIAL_CLASSES {
+            assert!(
+                talos_reason_class::ALL.contains(t),
+                "HTTP_POLICY_DENIAL_CLASSES names {t:?}, which is no longer a token \
+                 the worker can stamp — this arm can never fire again. Reconcile with \
+                 talos_reason_class::ALL."
+            );
+        }
+        // `url-parse` is the one member of the worker's HTTP_POLICY_CLASSES
+        // this list deliberately omits (it gets its own `invalid_url` bucket,
+        // because an unparseable URL is an authoring error, not a denial).
+        // Asserted so the omission stays deliberate rather than becoming an
+        // accident nobody remembers.
+        assert!(!HTTP_POLICY_DENIAL_CLASSES.contains(&"url-parse"));
+        assert_eq!(classify_error("x [reason_class=url-parse]"), "invalid_url");
+
+        // And every token in the shared set still classifies to SOMETHING
+        // this crate names — never the `unknown` fall-through, which would
+        // mean the host told us the cause and we discarded it.
+        for t in talos_reason_class::ALL {
+            let msg = format!(
+                r#"Component returned error: fetch: Error {{ name: "networkerror", message: "" }} [reason_class={t}]"#
+            );
+            assert_ne!(
+                classify_error(&msg),
+                "unknown",
+                "token {t:?} classifies as `unknown` — the worker named the cause \
+                 and this classifier threw it away"
+            );
+        }
+    }
 }

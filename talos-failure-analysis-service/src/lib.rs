@@ -141,6 +141,109 @@ pub fn truncate_for_classify(s: &str) -> &str {
     &s[..end]
 }
 
+/// Map a host-stamped [`talos_reason_class::Family`] onto this surface's
+/// `(error_type, description)` vocabulary.
+///
+/// Split out of [`classify_error`] so the mapping is drivable directly by
+/// test, and so the ONE place that decides "which remediation playbook does
+/// this cause deserve" is visible in one screen.
+///
+/// # Why several families get a NEW bucket rather than an existing one
+///
+/// A bucket exists to select a [`remediation_steps`] playbook, so two causes
+/// share a bucket only when the same instructions resolve both. Before this
+/// existed, every `forbiddenhost` denial — at least five materially different
+/// policies — answered `host_not_allowed`, whose playbook says to widen
+/// `allowed_hosts`. For an SSRF block or a Tier-1 egress refusal that is not
+/// merely unhelpful, it is advice that CANNOT work, given confidently.
+///
+/// Three families deliberately reuse an existing bucket, because the existing
+/// playbook is already the right one:
+/// * [`Family::HostAllowlist`] → `host_not_allowed` (this IS that bucket's
+///   actual case, and it keeps the marked and unmarked forms together)
+/// * [`Family::Transport`] → `network_error`
+/// * [`Family::Timeout`] → `timeout`
+/// * [`Family::SecretLookup`] → `missing_secret`
+///
+/// [`Family::HostAllowlist`]: talos_reason_class::Family::HostAllowlist
+/// [`Family::Transport`]: talos_reason_class::Family::Transport
+/// [`Family::Timeout`]: talos_reason_class::Family::Timeout
+/// [`Family::SecretLookup`]: talos_reason_class::Family::SecretLookup
+#[must_use]
+pub fn classify_reason_class(family: talos_reason_class::Family) -> (&'static str, &'static str) {
+    use talos_reason_class::Family as F;
+    match family {
+        F::Transport => (
+            "network_error",
+            "A network or infrastructure connection failed — the backing service may be unreachable.",
+        ),
+        F::Timeout => (
+            "timeout",
+            "The module exceeded its execution-time limit. Bump timeout_secs or split the work.",
+        ),
+        F::SecretLookup => (
+            "missing_secret",
+            "A required secret credential was not found in the vault.",
+        ),
+        F::CircuitOpen => (
+            "circuit_open",
+            "The worker's per-host circuit breaker is open: recent calls to this host failed enough times that the breaker is fast-failing new ones without attempting them. Nothing is misconfigured — the target host is being treated as down.",
+        ),
+        F::Cancelled => (
+            "execution_cancelled",
+            "The execution was cancelled while this call was in flight, so the host abandoned it. This is not a fault in the module.",
+        ),
+        F::ResponseCap => (
+            "response_too_large",
+            "The UPSTREAM response exceeded a host size cap (body bytes or header count) and was refused after the request went out. The remote endpoint is returning more than the sandbox will read.",
+        ),
+        F::RequestCap => (
+            "request_too_large",
+            "The module's OUTBOUND request exceeded a host size cap (body bytes or header count) and was refused before anything left the sandbox. Note this is the opposite direction from response_too_large.",
+        ),
+        F::MalformedUrl => (
+            "invalid_url",
+            "The URL the module built could not be used — it failed to parse, or exceeded the host's URL byte cap. This is an AUTHORING error, not a policy denial: no gate refused you.",
+        ),
+        F::InsecureScheme => (
+            "insecure_scheme",
+            "The host refused a plaintext http:// target. This is a SECURITY gate, not an allowlist miss — it is what stops a vault:// -substituted credential header going out in the clear. Widening allowed_hosts will not lift it.",
+        ),
+        F::CapabilityWorld => (
+            "capability_world_denied",
+            "The module's compiled capability_world does not grant this kind of call at all, so it was refused before any host policy was consulted. This is fixed on the MODULE, by recompiling into a world that grants it — not by changing any allowlist.",
+        ),
+        F::HostAllowlist => (
+            "host_not_allowed",
+            "The module tried to reach a host that's not in its allowed_hosts list.",
+        ),
+        F::PrivateAddress => (
+            "ssrf_blocked",
+            "SSRF gate: the target resolved (or was written) as a private, loopback, link-local, CGNAT or IPv4-mapped address, and the host refused to send the request. Adding the name to allowed_hosts does NOT lift this and is not meant to — the check runs on the resolved address, after the allowlist.",
+        ),
+        F::ActorEgressTier => (
+            "egress_tier_denied",
+            "The ACTOR's data-egress ceiling refused this destination — an external LLM provider, a public IP literal, or all public egress under local-only scope. This is a privacy control on the actor, not a capability of the module: no module-level change lifts it.",
+        ),
+        F::WriteCeiling => (
+            "write_ceiling_denied",
+            "The ACTOR's write ceiling refused this call — a mutating HTTP method, or (under strict egress) a read through a wildcard host match rather than a named host. Fixed on the actor, or by making the call read-only.",
+        ),
+        F::MethodAllowlist => (
+            "method_not_allowed",
+            "The HTTP verb the module used is not in its declared allowed_methods. The host is allowed; the method is not.",
+        ),
+        F::EgressBudget => (
+            "egress_budget_exceeded",
+            "A per-EXECUTION egress budget is spent: total outbound calls, calls to one host, or concurrent SSE streams. This is a Talos-side budget, NOT an upstream API rate limit — the request never left the sandbox, so waiting for a remote window to reset changes nothing.",
+        ),
+        F::GraphqlIntrospection => (
+            "introspection_denied",
+            "A GraphQL introspection query (__schema / __type) was refused — either by the actor's privacy class or by the operator-wide introspection block. Query the fields you need explicitly instead.",
+        ),
+    }
+}
+
 /// Classify a raw error message into a `(error_type, description)`
 /// bucket. Strings preserved verbatim from the pre-extraction handler.
 pub fn classify_error(msg: &str) -> (&'static str, &'static str) {
@@ -155,6 +258,30 @@ pub fn classify_error(msg: &str) -> (&'static str, &'static str) {
     // first paragraph by construction (LLM/HTTP/host-allowlist
     // errors).
     let lower = truncate_for_classify(msg).to_lowercase();
+
+    // ── The HOST-STAMPED cause, ahead of every prose gate ─────────────
+    //
+    // Since #714/#717 the worker appends `[reason_class=<token>]` to the
+    // node-failure message at the site that actually refused the call. That
+    // token is the ONLY authoritative statement about the cause in this
+    // string: everything below is a substring guess at module prose, and the
+    // WIT error enum the guest sees is payload-less, so a Tier-1 egress deny,
+    // an SSRF block, a wrong capability world and a genuine host-allowlist
+    // miss all render as the same opaque `forbiddenhost` / `invalidurl`.
+    //
+    // Hoisted FIRST for the same reason `talos_retry_intelligence` hoists its
+    // marker arms: a host-stamped marker is authoritative and module prose is
+    // not. Nothing UNMARKED moves — `token()` returns `None` and the chain
+    // below runs byte-identically, which
+    // `unmarked_messages_classify_exactly_as_before` pins as literals.
+    //
+    // An unknown token (an older controller reading a newer worker) also
+    // falls through: `token_family` returns `None` unless the token is in the
+    // closed set this build knows.
+    if let Some((_, fam)) = talos_reason_class::token_family(&lower) {
+        return classify_reason_class(fam);
+    }
+
     // ── Most specific gates first ────────────────────────────────────
     // Order matters: each branch is `else if`; the first match wins.
     if lower.contains("output_schema enforcement fired")
@@ -331,8 +458,8 @@ pub fn remediation_steps(error_type: &str, module_label: &str) -> Vec<serde_json
         "host_not_allowed" => vec![
             serde_json::json!({ "step": 1, "action": "inspect_worker_logs", "description": format!("Confirm WHICH gate refused node '{}' with tail_worker_logs — the worker records the refusal as `[host:<policy>] <capability> denied by policy '<policy>' (target: ...)`, naming the policy. allowed_hosts is only one of the policies that can deny; an insecure-scheme or tier-1 egress refusal reads identically from the module's downstream error, and widening allowed_hosts will not fix those.", module_label), "tool": "tail_worker_logs" }),
             serde_json::json!({ "step": 2, "action": "identify_target_host", "description": format!("Inspect node '{}' source code or HTTP request URL — find the hostname it tried to reach.", module_label), "tool": "get_module_info" }),
-            serde_json::json!({ "step": 3, "action": "extend_allowed_hosts", "description": "If step 1 named the allowed_hosts policy: recompile the module via hot_update_module (NOT update_node_config — allowed_hosts is a module-level setting baked at compile time). Add the host to allowed_hosts. Use ['*'] to allow all hosts (not recommended for production).", "tool": "hot_update_module" }),
-            serde_json::json!({ "step": 4, "action": "retry", "description": "Retry the execution after the module recompiles.", "tool": "retry_execution" }),
+            serde_json::json!({ "step": 3, "action": "extend_allowed_hosts", "description": "If step 1 named the allowed_hosts policy: add the host with update_module_hosts (module-level, replaces the list, no recompile). hot_update_module also works and is the right call if you are changing the source anyway. NOT update_node_config — allowed_hosts is a module setting, not node config. Use ['*'] to allow all hosts (not recommended for production).", "tool": "update_module_hosts" }),
+            serde_json::json!({ "step": 4, "action": "retry", "description": "Retry the execution once the module's host list is updated.", "tool": "retry_execution" }),
         ],
         "module_compile_error" => vec![
             serde_json::json!({ "step": 1, "action": "review_error", "description": "Read the compiler error in raw_error — rustc errors include line numbers.", "tool": null }),
@@ -408,6 +535,91 @@ pub fn remediation_steps(error_type: &str, module_label: &str) -> Vec<serde_json
             serde_json::json!({ "step": 1, "action": "check_connection", "description": format!("Verify the database connection URL secret used by node '{}' is correct and the DB is reachable.", module_label), "tool": null }),
             serde_json::json!({ "step": 2, "action": "check_secret", "description": "Confirm the database/connection_url secret is provisioned (via the dashboard Settings → Secrets — secret writes require 2FA and aren't available through MCP).", "tool": null }),
             serde_json::json!({ "step": 3, "action": "retry", "description": "Retry after fixing the connection.", "tool": "retry_execution" }),
+        ],
+        // ── Host-stamped `[reason_class=…]` denial playbooks ──────────────
+        //
+        // One arm per remediation, which is the whole point: before these
+        // existed every one of these causes answered `host_not_allowed` and
+        // was told to widen `allowed_hosts`. That instruction resolves
+        // exactly ONE of them. For an SSRF block, a Tier-1 egress refusal or
+        // a capability-world miss it is advice that cannot work.
+        //
+        // Every arm's step 1 is `tail_worker_logs`, because the marker names
+        // the POLICY but the worker's own `[host:<policy>] … (target: …)`
+        // line is the only place the TARGET and the precise family variant
+        // (`private-ip-cgnat` vs `private-ip-nat64`, `tier1-introspection` vs
+        // `env-introspection-block`) appear — those are collapsed to a family
+        // prefix on the wire so the closed token set stays closed.
+        "circuit_open" => vec![
+            serde_json::json!({ "step": 1, "action": "inspect_worker_logs", "description": format!("Read the worker's lines for node '{}' with tail_worker_logs — the breaker records which host it opened on and the underlying failures that opened it. The breaker is a SYMPTOM: something made repeated calls to that host fail.", module_label), "tool": "tail_worker_logs" }),
+            serde_json::json!({ "step": 2, "action": "check_target_health", "description": "Check whether the target host is actually healthy (status page, direct curl from outside Talos). The breaker exists so a down host stops consuming worker capacity; it is not a Talos misconfiguration.", "tool": null }),
+            serde_json::json!({ "step": 3, "action": "retry", "description": "The breaker closes on its own cooldown. Once the host is healthy, retry — do NOT add retry_count for this: a fast-fail is deliberately non-transient, so in-execution retries only burn attempts.", "tool": "retry_execution" }),
+        ],
+        "execution_cancelled" => vec![
+            serde_json::json!({ "step": 1, "action": "confirm_cancellation", "description": format!("The in-flight call from node '{}' was abandoned because the EXECUTION was cancelled — this is not a fault in the module. Confirm who cancelled it and when.", module_label), "tool": "get_execution_status" }),
+            serde_json::json!({ "step": 2, "action": "rerun_if_unintended", "description": "If the cancellation was unintended (an operator cancel, a concurrency-limit sweep), simply re-run. There is nothing to fix in the workflow.", "tool": "retry_execution" }),
+        ],
+        "response_too_large" => vec![
+            serde_json::json!({ "step": 1, "action": "inspect_worker_logs", "description": format!("Read the worker's lines for node '{}' with tail_worker_logs — they name which cap tripped (response body bytes vs. header count) and the target host.", module_label), "tool": "tail_worker_logs" }),
+            serde_json::json!({ "step": 2, "action": "narrow_the_request", "description": "The request DID go out; the upstream answered with more than the sandbox will read. Narrow the response at the source: page the endpoint, ask for fewer fields (Gmail format=metadata, a Jira `fields` param), or filter server-side. This is cheaper than any cap change and also cuts fuel.", "tool": "get_module_info" }),
+            serde_json::json!({ "step": 3, "action": "retry", "description": "Retry once the module requests a smaller response.", "tool": "retry_execution" }),
+        ],
+        "request_too_large" => vec![
+            serde_json::json!({ "step": 1, "action": "inspect_worker_logs", "description": format!("Read the worker's lines for node '{}' with tail_worker_logs — they name which OUTBOUND cap tripped (request body bytes vs. header count). Note the direction: this is what the module SENT, not what it received.", module_label), "tool": "tail_worker_logs" }),
+            serde_json::json!({ "step": 2, "action": "inspect_what_it_sent", "description": format!("Look at the input that reached node '{}' — an oversized outbound body is almost always an upstream node handing it a larger payload than the design assumed.", module_label), "tool": "get_node_io" }),
+            serde_json::json!({ "step": 3, "action": "shrink_or_batch", "description": "Split the send into batches, or trim the payload before it reaches this node. Nothing left the sandbox, so no upstream state changed — a batched re-send is safe.", "tool": null }),
+        ],
+        "invalid_url" => vec![
+            serde_json::json!({ "step": 1, "action": "inspect_resolved_input", "description": format!("No policy refused this — the URL node '{}' built could not be parsed, or was longer than the host's URL byte cap. Look at the resolved config and input the node actually ran with.", module_label), "tool": "get_node_io" }),
+            serde_json::json!({ "step": 2, "action": "read_the_builder", "description": format!("Read how node '{}' assembles its URL — the usual causes are an unsubstituted template placeholder, a missing upstream field concatenated as an empty string, or an unencoded query value.", module_label), "tool": "get_module_source" }),
+            serde_json::json!({ "step": 3, "action": "fix_config_or_source", "description": "Fix the config value with update_node_config if the URL comes from config; fix the builder with hot_update_module if it is assembled in source.", "tool": "update_node_config" }),
+            serde_json::json!({ "step": 4, "action": "retry", "description": "Retry once the URL resolves correctly.", "tool": "retry_execution" }),
+        ],
+        "insecure_scheme" => vec![
+            serde_json::json!({ "step": 1, "action": "inspect_worker_logs", "description": format!("Read the worker's lines for node '{}' with tail_worker_logs — they name the plaintext target that was refused. This is a SECURITY gate, not an allowlist miss: widening allowed_hosts will not lift it.", module_label), "tool": "tail_worker_logs" }),
+            serde_json::json!({ "step": 2, "action": "switch_to_https", "description": "Change the target to https://. The gate exists because a vault:// -substituted credential header on a plaintext request goes out in the clear — so the correct fix is always TLS, never an exemption.", "tool": "update_node_config" }),
+            serde_json::json!({ "step": 3, "action": "retry", "description": "Retry once the target is https://.", "tool": "retry_execution" }),
+        ],
+        "capability_world_denied" => vec![
+            serde_json::json!({ "step": 1, "action": "inspect_worker_logs", "description": format!("Read the worker's lines for node '{}' with tail_worker_logs — they name the capability the module attempted and the world it was compiled with.", module_label), "tool": "tail_worker_logs" }),
+            serde_json::json!({ "step": 2, "action": "check_declared_world", "description": format!("Confirm the world node '{}' was compiled with. The refusal happened BEFORE any host policy ran, so no allowlist change is relevant.", module_label), "tool": "get_module_info" }),
+            serde_json::json!({ "step": 3, "action": "pick_the_right_world", "description": "Look up which world grants the capability the module needs, and take the least-privileged one that does.", "tool": "describe_capability_world" }),
+            serde_json::json!({ "step": 4, "action": "check_your_ceiling", "description": "Confirm your own capability ceiling permits that world — if it does not, the recompile will be refused too, and the ceiling is the real blocker.", "tool": "get_my_capability_ceiling" }),
+            serde_json::json!({ "step": 5, "action": "recompile", "description": "Recompile the module into that world with hot_update_module. capability_world is baked at compile time; there is no runtime setting for it.", "tool": "hot_update_module" }),
+        ],
+        "ssrf_blocked" => vec![
+            serde_json::json!({ "step": 1, "action": "inspect_worker_logs", "description": format!("Read the worker's lines for node '{}' with tail_worker_logs — they name the precise SSRF variant (loopback, link-local, CGNAT, IPv4-mapped, NAT64) and the target. The wire marker collapses those to one family, so this is the only place the variant appears.", module_label), "tool": "tail_worker_logs" }),
+            serde_json::json!({ "step": 2, "action": "trace_the_target", "description": format!("Find where node '{}' got that target. The check runs on the RESOLVED address, after the allowlist — so a public hostname whose DNS answer is private trips it just as a literal 10.x does.", module_label), "tool": "get_node_io" }),
+            serde_json::json!({ "step": 3, "action": "point_at_a_public_endpoint", "description": "Point the node at a routable public endpoint. Do NOT try to lift this by widening allowed_hosts — the SSRF check runs after it and is not an allowlist. If the module genuinely needs to reach a service inside the cluster, that is an architecture change (a controller-side integration), not a module setting.", "tool": null }),
+        ],
+        "egress_tier_denied" => vec![
+            serde_json::json!({ "step": 1, "action": "inspect_worker_logs", "description": format!("Read the worker's lines for node '{}' with tail_worker_logs — they say WHICH egress control fired: the external-LLM-provider deny, the public-IP-literal deny, or the blanket local-egress-only resolver gate. The three have different fixes.", module_label), "tool": "tail_worker_logs" }),
+            serde_json::json!({ "step": 2, "action": "read_the_actor", "description": "Read the bound actor's max_llm_tier and egress_scope. This is a PRIVACY control on the actor, not a capability of the module — no allowed_hosts, capability_world or node-config change lifts it.", "tool": "get_actor_summary" }),
+            serde_json::json!({ "step": 3, "action": "allow_public_egress", "description": "If the actor is tier1 and the target is a legitimate public API (not an LLM provider), set egress_scope=public. That is the house pattern for a privacy actor: tier1 keeps the LLM local while public egress reaches declared allowed_hosts.", "tool": "set_actor_egress_scope" }),
+            serde_json::json!({ "step": 4, "action": "reconsider_the_llm_tier", "description": "If the target IS an external LLM provider, the actor is tier1 on purpose — its data must not leave the host. Either point the node at the local Ollama tier, or make a deliberate decision to raise the ceiling to tier2 (which permits that actor's data to leave).", "tool": "set_actor_llm_tier_ceiling" }),
+            serde_json::json!({ "step": 5, "action": "retry", "description": "Retry once the actor's ceiling matches the intent.", "tool": "retry_execution" }),
+        ],
+        "write_ceiling_denied" => vec![
+            serde_json::json!({ "step": 1, "action": "inspect_worker_logs", "description": format!("Read the worker's lines for node '{}' with tail_worker_logs — they say whether a mutating METHOD was refused, or (under strict egress) a read admitted only by a wildcard host match rather than a named host.", module_label), "tool": "tail_worker_logs" }),
+            serde_json::json!({ "step": 2, "action": "read_the_actor", "description": "Read the bound actor's write ceiling. A read-only actor refusing a POST is the control working as designed — confirm the call SHOULD be mutating before changing anything.", "tool": "get_actor_summary" }),
+            serde_json::json!({ "step": 3, "action": "decide_deliberately", "description": "Either make the call read-only (usually the right answer for a reporting workflow), or raise the actor's write ceiling with set_actor_write_ceiling if the mutation is genuinely intended. For the strict-egress case, naming the host explicitly in allowed_hosts instead of matching it by wildcard also resolves it.", "tool": "set_actor_write_ceiling" }),
+            serde_json::json!({ "step": 4, "action": "retry", "description": "Retry once the ceiling and the call agree.", "tool": "retry_execution" }),
+        ],
+        "method_not_allowed" => vec![
+            serde_json::json!({ "step": 1, "action": "inspect_worker_logs", "description": format!("Read the worker's lines for node '{}' with tail_worker_logs — they name the verb that was refused. The HOST was allowed; the METHOD was not.", module_label), "tool": "tail_worker_logs" }),
+            serde_json::json!({ "step": 2, "action": "check_declared_methods", "description": format!("Check node '{}''s module allowed_methods list against the verb it issued.", module_label), "tool": "get_module_info" }),
+            serde_json::json!({ "step": 3, "action": "declare_the_method", "description": "Add the verb with update_module_methods. Declare the verbs you actually use rather than clearing the list: an EMPTY allowed_methods means 'allow everything' AND forfeits the automatic read-only retry default, so new nodes from that module get retry_count 0.", "tool": "update_module_methods" }),
+            serde_json::json!({ "step": 4, "action": "retry", "description": "Retry once the method is declared.", "tool": "retry_execution" }),
+        ],
+        "egress_budget_exceeded" => vec![
+            serde_json::json!({ "step": 1, "action": "inspect_worker_logs", "description": format!("Read the worker's lines for node '{}' with tail_worker_logs — they name which per-execution budget was spent: total outbound calls, calls to one host, or concurrent SSE streams.", module_label), "tool": "tail_worker_logs" }),
+            serde_json::json!({ "step": 2, "action": "count_the_calls", "description": format!("Look at what node '{}' was iterating over. A spent call budget almost always means an unbounded loop over an upstream collection that grew — cap the collection (take(N)) rather than raising the budget.", module_label), "tool": "get_node_io" }),
+            serde_json::json!({ "step": 3, "action": "do_not_treat_as_rate_limit", "description": "This is a TALOS-side per-execution budget, not an upstream API rate limit: the request never left the sandbox. Waiting for a remote window to reset, or lowering set_module_rate_limit, changes nothing. For the SSE case, close streams when done — that cap is concurrency, and it clears on close.", "tool": null }),
+        ],
+        "introspection_denied" => vec![
+            serde_json::json!({ "step": 1, "action": "inspect_worker_logs", "description": format!("Read the worker's lines for node '{}' with tail_worker_logs — they say whether the actor's privacy class refused the introspection, or the operator-wide introspection block did.", module_label), "tool": "tail_worker_logs" }),
+            serde_json::json!({ "step": 2, "action": "find_the_introspection", "description": format!("Find the __schema / __type selection in node '{}''s query. Client libraries sometimes send one automatically on first use.", module_label), "tool": "get_module_source" }),
+            serde_json::json!({ "step": 3, "action": "query_explicitly", "description": "Replace the introspection with an explicit field selection. Introspection reveals a third-party schema's shape to the actor, which is exactly what the privacy class is refusing; hand-writing the query is the intended path, not an exemption.", "tool": null }),
         ],
         _ => vec![
             serde_json::json!({ "step": 1, "action": "inspect_worker_logs", "description": format!("Read the WORKER's own log lines for node '{}' with tail_worker_logs. This is the fall-through bucket, so the error text matched no specific gate — and a host-policy denial is exactly that case: `[host:<policy>] <capability> denied by policy '<policy>' (target: ...)` is written by the worker at WARN, lands in module_execution_logs, and is NOT in the engine event stream this analysis classified. The module's own downstream error (an 'invalidurl', a bare HTTP failure) is what you were shown; the control that actually fired is only here.", module_label), "tool": "tail_worker_logs" }),
@@ -633,6 +845,22 @@ impl FailureAnalysisService {
             if let Some(ref ec) = ev.error_class {
                 if let Some(obj) = failed_node.as_object_mut() {
                     obj.insert("engine_error_class".to_string(), serde_json::json!(ec));
+                }
+            }
+
+            // The exact host-stamped token, when the worker put one on this
+            // message. `error_type` is the REMEDIATION bucket and deliberately
+            // merges causes that share a fix (`no-allowlist` and
+            // `allowed-hosts` are one bucket); this field is the precise
+            // cause, so an operator or agent that wants to distinguish them
+            // does not have to re-parse `raw_error`. Present only when a
+            // marker is present, exactly like `engine_error_class` — never a
+            // fabricated "unknown".
+            if let Some(tok) =
+                talos_reason_class::token(&truncate_for_classify(error_text).to_lowercase())
+            {
+                if let Some(obj) = failed_node.as_object_mut() {
+                    obj.insert("reason_class".to_string(), serde_json::json!(tok));
                 }
             }
 
@@ -1330,5 +1558,344 @@ Component returned error: HTTP request failed: Error { code: 0, name: \"invalidu
     fn label_map_empty_on_none_or_malformed() {
         assert!(build_node_display_label_map(None).is_empty());
         assert!(build_node_display_label_map(Some("not json".to_string())).is_empty());
+    }
+
+    // ── reason_class marker vocabulary ──────────────────────────────────────
+
+    /// The ten WIT discriminant names an egress failure can carry, across all
+    /// four surfaces. `wit_http` renders unhyphenated (`forbiddenhost`);
+    /// `wit_http_stream` renders HYPHENATED (`forbidden-host`) — wit-bindgen
+    /// emits the case name verbatim — which is why both spellings are here and
+    /// why they classify differently below.
+    const WIT_NAMES: &[&str] = &[
+        "networkerror",
+        "invalidurl",
+        "forbiddenhost",
+        "timeout",
+        "queryerror",
+        "sendfailed",
+        "forbidden-host",
+        "invalid-url",
+        "connection-failed",
+        "rate-limited",
+    ];
+
+    fn guest_error(wit: &str) -> String {
+        format!(
+            r#"Component returned error: fetch: Error {{ code: 2, name: "{wit}", message: "" }}"#
+        )
+    }
+
+    /// **(b) NOTHING UNMARKED MOVES.**
+    ///
+    /// The marker arm is hoisted above every prose gate, so the one thing this
+    /// change must not do is disturb a message that carries no marker — and
+    /// every row already on disk is such a message. Pinned as LITERALS rather
+    /// than derived: a behavioural test written against the new code cannot
+    /// catch a drift that moved the classifier and the expectation together.
+    ///
+    /// These ten values were MEASURED against the pre-change classifier, not
+    /// chosen. Two are worth reading twice, because they are pre-existing
+    /// defects this change deliberately does not touch on the unmarked path:
+    /// `forbidden-host` (the http-stream spelling) answers `http_403` — "the
+    /// credential lacks the required scope" for what is actually a host
+    /// denial — and `connection-failed` answers `runtime_error` because the
+    /// chain's needle is `connection failed` with a SPACE.
+    #[test]
+    fn unmarked_messages_classify_exactly_as_before() {
+        let expected: &[(&str, &str)] = &[
+            ("networkerror", "network_error"),
+            ("invalidurl", "runtime_error"),
+            ("forbiddenhost", "host_not_allowed"),
+            ("timeout", "timeout"),
+            ("queryerror", "runtime_error"),
+            ("sendfailed", "runtime_error"),
+            ("forbidden-host", "http_403"),
+            ("invalid-url", "runtime_error"),
+            ("connection-failed", "runtime_error"),
+            ("rate-limited", "runtime_error"),
+        ];
+        assert_eq!(expected.len(), WIT_NAMES.len());
+        for (wit, bucket) in expected {
+            assert_eq!(
+                classify_error(&guest_error(wit)).0,
+                *bucket,
+                "UNMARKED {wit:?} moved bucket — the marker arm must be inert \
+                 on a message that carries no marker"
+            );
+        }
+    }
+
+    /// **(a) EVERY TOKEN LANDS ON A PLAYBOOK THAT COULD RESOLVE IT.**
+    ///
+    /// Drives the real `classify_error` over the real closed set — the list
+    /// comes from `talos_reason_class::ALL`, not from a copy here, so a token
+    /// added upstream fails `every_reason_class_token_is_covered` below rather
+    /// than silently skipping this table.
+    ///
+    /// The expectations are written per TOKEN, not per family, because the
+    /// mapping from cause to remediation is the claim under test and deriving
+    /// it from the same `family()` call the production path uses would make
+    /// the assertion vacuous.
+    #[test]
+    fn every_reason_class_token_maps_to_its_remediation_bucket() {
+        let cases: &[(&str, &str)] = &[
+            // Transport — reuses the existing bucket.
+            ("dns", "network_error"),
+            ("tls", "network_error"),
+            ("connect-refused", "network_error"),
+            ("connect-failed", "network_error"),
+            ("send-failed", "network_error"),
+            ("response-stream", "network_error"),
+            // Reuse: the existing playbooks are already right.
+            ("timeout", "timeout"),
+            ("secret-lookup", "missing_secret"),
+            ("no-allowlist", "host_not_allowed"),
+            ("allowed-hosts", "host_not_allowed"),
+            // New buckets — one per remediation.
+            ("circuit-open", "circuit_open"),
+            ("cancelled", "execution_cancelled"),
+            ("response-too-large", "response_too_large"),
+            ("header-cap", "response_too_large"),
+            ("request-header-cap", "request_too_large"),
+            ("request-body-cap", "request_too_large"),
+            ("url-too-long", "invalid_url"),
+            ("url-parse", "invalid_url"),
+            ("insecure-scheme", "insecure_scheme"),
+            ("capability-world", "capability_world_denied"),
+            ("private-ip", "ssrf_blocked"),
+            ("tier1-egress", "egress_tier_denied"),
+            ("tier1-llm-egress", "egress_tier_denied"),
+            ("tier1-public-ip-egress", "egress_tier_denied"),
+            ("write-ceiling", "write_ceiling_denied"),
+            ("write-ceiling-strict-egress", "write_ceiling_denied"),
+            ("method-allowlist", "method_not_allowed"),
+            ("execution-rate-limit", "egress_budget_exceeded"),
+            ("per-host-rate-limit", "egress_budget_exceeded"),
+            ("sse-stream-cap", "egress_budget_exceeded"),
+            ("graphql-introspection", "introspection_denied"),
+        ];
+
+        for (token, bucket) in cases {
+            // Asserted against EVERY discriminant it could ride on, not just
+            // the one its own site returns: the marker is authoritative
+            // wherever it appears, and a future emitting site that pairs
+            // differently must not change the answer.
+            for wit in WIT_NAMES {
+                let marked = format!("{} [reason_class={token}]", guest_error(wit));
+                assert_eq!(
+                    classify_error(&marked).0,
+                    *bucket,
+                    "[reason_class={token}] on a {wit:?} message classified wrongly"
+                );
+            }
+            // And a non-empty description, since the description is what the
+            // operator actually reads.
+            let marked = format!("{} [reason_class={token}]", guest_error("networkerror"));
+            assert!(!classify_error(&marked).1.is_empty());
+        }
+    }
+
+    /// The table above must cover the producer's closed set — TOTALITY, so a
+    /// token added upstream cannot slip through untested.
+    #[test]
+    fn every_reason_class_token_is_covered_by_a_family() {
+        for token in talos_reason_class::ALL {
+            assert!(
+                talos_reason_class::family(token).is_some(),
+                "token {token:?} has no Family, so classify_error falls through \
+                 to its pre-marker bucket for it"
+            );
+        }
+        assert_eq!(talos_reason_class::ALL.len(), 31);
+    }
+
+    /// A token this build has never heard of — an older controller reading a
+    /// newer worker — must fall through to the pre-marker chain, never to a
+    /// guessed bucket.
+    #[test]
+    fn an_unknown_token_falls_through_instead_of_guessing() {
+        let msg = format!(
+            "{} [reason_class=from-the-future]",
+            guest_error("forbiddenhost")
+        );
+        assert_eq!(classify_error(&msg).0, "host_not_allowed");
+        let msg = format!(
+            "{} [reason_class=from-the-future]",
+            guest_error("invalidurl")
+        );
+        assert_eq!(classify_error(&msg).0, "runtime_error");
+    }
+
+    /// The 4 KiB cap and the marker's position interact, and the interaction
+    /// is in the SAFE direction: the worker APPENDS the marker, so on an
+    /// over-cap message it is truncated away and the message classifies
+    /// exactly as it did before markers existed. Asserted rather than
+    /// described, because "we thought about it" is not a guarantee.
+    ///
+    /// Left as-is deliberately: the cap bounds an O(N) scan over a
+    /// guest-influenced string, and a policy denial — the case the marker
+    /// exists for — is short by construction, since the request never left
+    /// the host and there is no response body to inflate the message.
+    #[test]
+    fn a_marker_past_the_cap_reverts_to_the_pre_marker_bucket() {
+        let mut s = guest_error("invalidurl");
+        s.push_str(&"x".repeat(5000));
+        s.push_str(" [reason_class=insecure-scheme]");
+        assert_eq!(
+            classify_error(&s).0,
+            "runtime_error",
+            "an over-cap marker must be invisible, not half-read"
+        );
+        // Under the cap, the same message is explained.
+        let short = format!(
+            "{} [reason_class=insecure-scheme]",
+            guest_error("invalidurl")
+        );
+        assert_eq!(classify_error(&short).0, "insecure_scheme");
+    }
+
+    /// The bucket a live denial actually produces, end to end.
+    ///
+    /// The string is the shape observed on the deployed stack after #714/#717:
+    /// the same `invalidurl` body as the pre-marker capture pinned by
+    /// `a_host_policy_denial_reaches_the_classifier_only_as_its_downstream_error`
+    /// above, plus the marker the worker now appends. That test asserts the
+    /// UNMARKED form still answers `runtime_error`; this one asserts the
+    /// MARKED form no longer does — the two together are the whole change.
+    #[test]
+    fn the_observed_live_denial_is_now_explained() {
+        const OBSERVED: &str = "Job failed after 1 attempts: execution failure: \
+Component returned error: HTTP request failed: Error { code: 0, name: \"invalidurl\", message: \"\" } \
+[reason_class=insecure-scheme]";
+        let (bucket, description) = classify_error(OBSERVED);
+        assert_eq!(bucket, "insecure_scheme");
+        assert!(
+            description.contains("SECURITY gate"),
+            "the description must say this is not an allowlist miss: {description}"
+        );
+        // And the playbook must not PRESCRIBE widening allowed_hosts. It may
+        // — and does — mention it in order to rule it out, which is a
+        // different act and the more useful one for an operator arriving
+        // from the old advice.
+        let steps = remediation_steps(bucket, "fetch-node");
+        let all_text = serde_json::to_string(&steps).unwrap();
+        assert!(
+            !all_text.contains("update_module_hosts"),
+            "the insecure_scheme playbook prescribes update_module_hosts, which cannot fix it"
+        );
+        assert!(
+            all_text.contains("widening allowed_hosts will not lift it"),
+            "the insecure_scheme playbook must explicitly rule out the advice this \
+             bucket used to be given: {all_text}"
+        );
+    }
+
+    /// Every playbook reachable from a host-stamped POLICY denial must name
+    /// `tail_worker_logs`.
+    ///
+    /// Not decoration: the marker carries the family, but the worker's own
+    /// `[host:<policy>] … (target: …)` line is the only place the TARGET and
+    /// the precise variant appear — `private-ip` stands for an open SSRF
+    /// family and `graphql-introspection` for a two-member one, both collapsed
+    /// on the wire so the token set stays closed.
+    ///
+    /// `missing_secret` and `response_too_large`'s siblings are excluded by
+    /// name below where their existing playbook is already the right one and
+    /// does not need the worker log.
+    #[test]
+    fn every_denial_playbook_names_the_tool_that_shows_the_target() {
+        for bucket in [
+            "host_not_allowed",
+            "insecure_scheme",
+            "capability_world_denied",
+            "ssrf_blocked",
+            "egress_tier_denied",
+            "write_ceiling_denied",
+            "method_not_allowed",
+            "egress_budget_exceeded",
+            "introspection_denied",
+            "request_too_large",
+            "response_too_large",
+            "circuit_open",
+        ] {
+            let steps = remediation_steps(bucket, "some_node");
+            assert!(
+                steps
+                    .iter()
+                    .any(|s| s.get("tool").and_then(|t| t.as_str()) == Some("tail_worker_logs")),
+                "remediation_steps({bucket}) does not name tail_worker_logs — the \
+                 `[host:<policy>] … (target: …)` line is the only place the target \
+                 and the precise policy variant appear"
+            );
+        }
+    }
+
+    /// The advice that was ACTIVELY WRONG, stated as the thing that must not
+    /// come back.
+    ///
+    /// `remediation_steps("host_not_allowed")` says to widen `allowed_hosts`.
+    /// Before this change every one of these causes answered that bucket. A
+    /// playbook for a cause `allowed_hosts` cannot fix must not mention it as
+    /// the remedy.
+    #[test]
+    fn no_denial_playbook_prescribes_a_fix_that_cannot_work() {
+        for bucket in [
+            "ssrf_blocked",
+            "egress_tier_denied",
+            "capability_world_denied",
+            "insecure_scheme",
+            "write_ceiling_denied",
+            "introspection_denied",
+        ] {
+            let text = serde_json::to_string(&remediation_steps(bucket, "n")).unwrap();
+            assert!(
+                !text.contains("update_module_hosts"),
+                "{bucket} prescribes update_module_hosts, which cannot resolve it"
+            );
+        }
+        // The bucket where it IS the fix still says so.
+        let text = serde_json::to_string(&remediation_steps("host_not_allowed", "n")).unwrap();
+        assert!(text.contains("update_module_hosts"));
+    }
+
+    /// Every new bucket has a real playbook — not the `_` fall-through, which
+    /// would tell the operator "this matched no specific gate" about a failure
+    /// the host named precisely.
+    #[test]
+    fn every_new_bucket_has_its_own_playbook() {
+        let fallthrough = serde_json::to_string(&remediation_steps("no_such_bucket", "n")).unwrap();
+        for bucket in [
+            "circuit_open",
+            "execution_cancelled",
+            "response_too_large",
+            "request_too_large",
+            "invalid_url",
+            "insecure_scheme",
+            "capability_world_denied",
+            "ssrf_blocked",
+            "egress_tier_denied",
+            "write_ceiling_denied",
+            "method_not_allowed",
+            "egress_budget_exceeded",
+            "introspection_denied",
+        ] {
+            let steps = remediation_steps(bucket, "my-node");
+            assert!(!steps.is_empty(), "bucket {bucket} has no steps");
+            assert_ne!(
+                serde_json::to_string(&steps).unwrap(),
+                fallthrough,
+                "bucket {bucket} fell through to the generic playbook"
+            );
+            for (i, s) in steps.iter().enumerate() {
+                assert_eq!(
+                    s.get("step").and_then(|v| v.as_u64()),
+                    Some(i as u64 + 1),
+                    "bucket {bucket} step numbering broken"
+                );
+                assert!(s.get("description").is_some());
+                assert!(s.get("action").is_some());
+            }
+        }
     }
 }
