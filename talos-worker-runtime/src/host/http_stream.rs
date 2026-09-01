@@ -2,6 +2,43 @@
 
 use super::*;
 
+use crate::reason_class;
+
+/// Latch `class` against the `forbidden-host` discriminant and return it.
+///
+/// The `http-stream` WIT enum spells its cases with HYPHENS — `invalid-url`,
+/// `forbidden-host`, `connection-failed`, `rate-limited` — and wit-bindgen
+/// renders the case name verbatim into the guest's `Debug` and `Display`
+/// output. So `forbiddenhost`, the token every existing classifier arm keys
+/// on, does NOT match: a `forbidden-host` denial instead matched the substring
+/// `forbidden` and was filed as `auth_failure` / `http_403`, pointing the
+/// operator at a credential that was never the problem. Non-transient either
+/// way, so this whole file is a remediation fix, not a retry fix.
+///
+/// Unlike `graphql` and `webhook`, the pairing here is NOT vacuous: every
+/// `ForbiddenHost` and every `InvalidUrl` site is a policy denial, and no
+/// transport failure returns either. A `connect` transport failure happens
+/// inside the spawned SSE task and never reaches the guest as an error at all
+/// — the stream simply yields no events — so the three `ConnectionFailed`
+/// sites are one cancellation and two mutex-poison guards.
+fn stream_deny_forbidden(ctx: &TalosContext, class: &'static str) -> wit_http_stream::Error {
+    ctx.record_http_denial(class, reason_class::WIT_FORBIDDEN_HOST_HYPHENATED);
+    wit_http_stream::Error::ForbiddenHost
+}
+
+/// Latch `class` against the hyphenated `invalid-url` discriminant.
+/// Sibling of [`stream_deny_forbidden`]; see its doc for the spelling trap.
+fn stream_deny_invalid_url(ctx: &TalosContext, class: &'static str) -> wit_http_stream::Error {
+    ctx.record_http_denial(class, reason_class::WIT_INVALID_URL_HYPHENATED);
+    wit_http_stream::Error::InvalidUrl
+}
+
+/// Latch `class` against the hyphenated `rate-limited` discriminant.
+fn stream_deny_rate_limited(ctx: &TalosContext, class: &'static str) -> wit_http_stream::Error {
+    ctx.record_http_denial(class, reason_class::WIT_RATE_LIMITED);
+    wit_http_stream::Error::RateLimited
+}
+
 // ============================================================================
 // HTTP Stream (SSE consumption)
 // ============================================================================
@@ -33,9 +70,10 @@ impl wit_http_stream::Host for TalosContext {
                 &target_host,
             )
             .await;
-            return Err(wit_http_stream::Error::ForbiddenHost);
+            return Err(stream_deny_forbidden(self, reason_class::CAPABILITY_WORLD));
         }
         if self.is_cancelled() {
+            self.record_http_denial(reason_class::CANCELLED, reason_class::WIT_CONNECTION_FAILED);
             return Err(wit_http_stream::Error::ConnectionFailed);
         }
 
@@ -52,16 +90,19 @@ impl wit_http_stream::Host for TalosContext {
                 limit = MAX_OUTBOUND_URL_BYTES,
                 "wit_http_stream::connect rejected: URL length exceeds cap"
             );
-            return Err(wit_http_stream::Error::InvalidUrl);
+            return Err(stream_deny_invalid_url(self, reason_class::URL_TOO_LONG));
         }
 
         // Enforce concurrent stream cap.
         {
-            let streams = self
-                .streams
-                .sse
-                .lock()
-                .map_err(|_| wit_http_stream::Error::ConnectionFailed)?;
+            let streams = self.streams.sse.lock().map_err(|_| {
+                // A poisoned mutex is a host-internal fault, not an egress
+                // outcome, so there is no honest class for it — CLEAR, so a
+                // swallowed earlier denial cannot be stamped onto it. This is
+                // the totality rule: every failing return DECIDES the latch.
+                self.record_network_outcome(None);
+                wit_http_stream::Error::ConnectionFailed
+            })?;
             if streams.len() >= MAX_SSE_STREAMS_PER_EXECUTION {
                 tracing::warn!(
                     module_id = ?self.module_id,
@@ -69,14 +110,14 @@ impl wit_http_stream::Host for TalosContext {
                     "SSE stream limit reached ({} max)",
                     MAX_SSE_STREAMS_PER_EXECUTION
                 );
-                return Err(wit_http_stream::Error::RateLimited);
+                return Err(stream_deny_rate_limited(self, reason_class::SSE_STREAM_CAP));
             }
         }
 
         // Parse and validate URL (same SSRF protections as http::fetch).
         let parsed: url::Url = url
             .parse()
-            .map_err(|_| wit_http_stream::Error::InvalidUrl)?;
+            .map_err(|_| stream_deny_invalid_url(self, reason_class::URL_PARSE))?;
 
         let host = parsed.host_str().unwrap_or("").to_string();
 
@@ -106,14 +147,14 @@ impl wit_http_stream::Host for TalosContext {
                     host = %host,
                     "WASM module attempted non-https SSE stream — denied."
                 );
-                return Err(wit_http_stream::Error::InvalidUrl);
+                return Err(stream_deny_invalid_url(self, reason_class::INSECURE_SCHEME));
             }
         }
 
         if self.allowed_hosts.is_empty() {
             self.record_capability_denied("http-stream", "no-allowlist-configured", &host)
                 .await;
-            return Err(wit_http_stream::Error::ForbiddenHost);
+            return Err(stream_deny_forbidden(self, reason_class::NO_ALLOWLIST));
         }
         // SSRF: block private IPs via the shared classifier (covers
         // CGNAT and IPv4-mapped IPv6 the duplicated logic was missing).
@@ -125,14 +166,14 @@ impl wit_http_stream::Host for TalosContext {
                 policy,
                 "WASM module attempted SSE stream to a private IP literal — blocking"
             );
-            return Err(wit_http_stream::Error::ForbiddenHost);
+            return Err(stream_deny_forbidden(self, reason_class::PRIVATE_IP));
         }
         let host_match = match host_allowlist_match_kind(&self.allowed_hosts, &host) {
             Some(kind) => kind,
             None => {
                 self.record_capability_denied("http-stream", "allowed-hosts", &host)
                     .await;
-                return Err(wit_http_stream::Error::ForbiddenHost);
+                return Err(stream_deny_forbidden(self, reason_class::ALLOWED_HOSTS));
             }
         };
         // Strict-egress gate: an SSE connect is a READ channel, but its URL
@@ -144,17 +185,29 @@ impl wit_http_stream::Host for TalosContext {
             .read_egress_refuses("http-stream", &host, host_match)
             .await
         {
-            return Err(wit_http_stream::Error::ForbiddenHost);
+            return Err(stream_deny_forbidden(
+                self,
+                reason_class::WRITE_CEILING_STRICT_EGRESS,
+            ));
         }
 
         // DNS rebinding — same shared check used by fetch / webhook / graphql.
-        if matches!(parsed.host(), Some(url::Host::Domain(_)))
-            && self
-                .validate_no_dns_rebinding(&host, "http-stream")
-                .await
-                .is_err()
-        {
-            return Err(wit_http_stream::Error::ForbiddenHost);
+        if matches!(parsed.host(), Some(url::Host::Domain(_))) {
+            // The ONE mixed site — an SSRF answer (deterministic denial) and a
+            // resolver failure (transient, not a denial) share one `Err`. The
+            // resolver failure CLEARS rather than latching `dns`, for the same
+            // reason as `webhook`: `forbidden-host` is non-transient today and
+            // `dns` is in the transient bucket, so latching it would newly
+            // grant a retry that does not exist.
+            if let Err(e) = self.validate_no_dns_rebinding(&host, "http-stream").await {
+                return Err(match reason_class::dns_rebinding_class(e) {
+                    Some(class) => stream_deny_forbidden(self, class),
+                    None => {
+                        self.record_network_outcome(None);
+                        wit_http_stream::Error::ForbiddenHost
+                    }
+                });
+            }
         }
 
         // Tier-1 LLM egress ceiling — SSE stream to an external LLM
@@ -173,7 +226,10 @@ impl wit_http_stream::Host for TalosContext {
                     policy,
                     "tier-1 actor HTTP stream egress refused (external LLM host or public IP literal)"
                 );
-                return Err(wit_http_stream::Error::ForbiddenHost);
+                return Err(stream_deny_forbidden(
+                    self,
+                    reason_class::tier1_egress_class(policy),
+                ));
             }
         }
 
@@ -205,18 +261,21 @@ impl wit_http_stream::Host for TalosContext {
             if let Some(ref m) = self.metrics {
                 m.record_rate_limit_exceeded("sse_per_host");
             }
-            return Err(wit_http_stream::Error::RateLimited);
+            return Err(stream_deny_rate_limited(
+                self,
+                reason_class::PER_HOST_RATE_LIMIT,
+            ));
         }
 
         let (tx, rx) = tokio::sync::mpsc::channel::<crate::context::SseEventInternal>(1_000);
         let stream_id = uuid::Uuid::new_v4().to_string();
 
         {
-            let mut streams = self
-                .streams
-                .sse
-                .lock()
-                .map_err(|_| wit_http_stream::Error::ConnectionFailed)?;
+            let mut streams = self.streams.sse.lock().map_err(|_| {
+                // Host-internal fault; CLEAR (see the sibling guard above).
+                self.record_network_outcome(None);
+                wit_http_stream::Error::ConnectionFailed
+            })?;
             streams.insert(stream_id.clone(), rx);
         }
 
@@ -232,7 +291,10 @@ impl wit_http_stream::Host for TalosContext {
                 limit = MAX_OUTBOUND_HEADERS,
                 "wit_http_stream::connect rejected: header count exceeds cap"
             );
-            return Err(wit_http_stream::Error::ForbiddenHost);
+            return Err(stream_deny_forbidden(
+                self,
+                reason_class::REQUEST_HEADER_CAP,
+            ));
         }
         // Resolve vault:// headers.
         let resolved_headers: Vec<(String, String)> = {
@@ -241,7 +303,7 @@ impl wit_http_stream::Host for TalosContext {
                 let resolved = self
                     .resolve_vault_header(k.as_str(), v.as_str())
                     .await
-                    .map_err(|_| wit_http_stream::Error::ForbiddenHost)?;
+                    .map_err(|_| stream_deny_forbidden(self, reason_class::SECRET_LOOKUP))?;
                 hdrs.push((k.clone(), resolved.into_owned()));
             }
             hdrs

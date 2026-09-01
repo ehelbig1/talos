@@ -40,6 +40,9 @@ mod cancellation_tests;
 #[cfg(test)]
 mod reason_class_denial_tests;
 
+#[cfg(test)]
+mod sibling_egress_reason_tests;
+
 mod cache;
 mod crypto;
 mod data;
