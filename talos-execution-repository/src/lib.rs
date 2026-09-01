@@ -14,6 +14,10 @@ use uuid::Uuid;
 /// confidence-gate executions (`/approval-actions/{token}/{action}`).
 pub mod approval_links;
 
+/// The fleet-wide stale-execution sweep and the attribution it writes —
+/// "orphaned by a controller restart" vs "genuinely overran".
+pub mod stale_sweep;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Row DTOs
 // ─────────────────────────────────────────────────────────────────────────────
