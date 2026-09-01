@@ -329,9 +329,10 @@ pub fn remediation_steps(error_type: &str, module_label: &str) -> Vec<serde_json
             serde_json::json!({ "step": 4, "action": "retry", "description": "Retry the execution after the prompt change. SCHEMA enforcement is best-effort defence; a tightened prompt usually fixes it without needing schema relaxation.", "tool": "retry_execution" }),
         ],
         "host_not_allowed" => vec![
-            serde_json::json!({ "step": 1, "action": "identify_target_host", "description": format!("Inspect node '{}' source code or HTTP request URL — find the hostname it tried to reach.", module_label), "tool": "get_module_info" }),
-            serde_json::json!({ "step": 2, "action": "extend_allowed_hosts", "description": "Recompile the module via hot_update_module (NOT update_node_config — allowed_hosts is a module-level setting baked at compile time). Add the host to allowed_hosts. Use ['*'] to allow all hosts (not recommended for production).", "tool": "hot_update_module" }),
-            serde_json::json!({ "step": 3, "action": "retry", "description": "Retry the execution after the module recompiles.", "tool": "retry_execution" }),
+            serde_json::json!({ "step": 1, "action": "inspect_worker_logs", "description": format!("Confirm WHICH gate refused node '{}' with tail_worker_logs — the worker records the refusal as `[host:<policy>] <capability> denied by policy '<policy>' (target: ...)`, naming the policy. allowed_hosts is only one of the policies that can deny; an insecure-scheme or tier-1 egress refusal reads identically from the module's downstream error, and widening allowed_hosts will not fix those.", module_label), "tool": "tail_worker_logs" }),
+            serde_json::json!({ "step": 2, "action": "identify_target_host", "description": format!("Inspect node '{}' source code or HTTP request URL — find the hostname it tried to reach.", module_label), "tool": "get_module_info" }),
+            serde_json::json!({ "step": 3, "action": "extend_allowed_hosts", "description": "If step 1 named the allowed_hosts policy: recompile the module via hot_update_module (NOT update_node_config — allowed_hosts is a module-level setting baked at compile time). Add the host to allowed_hosts. Use ['*'] to allow all hosts (not recommended for production).", "tool": "hot_update_module" }),
+            serde_json::json!({ "step": 4, "action": "retry", "description": "Retry the execution after the module recompiles.", "tool": "retry_execution" }),
         ],
         "module_compile_error" => vec![
             serde_json::json!({ "step": 1, "action": "review_error", "description": "Read the compiler error in raw_error — rustc errors include line numbers.", "tool": null }),
@@ -409,9 +410,10 @@ pub fn remediation_steps(error_type: &str, module_label: &str) -> Vec<serde_json
             serde_json::json!({ "step": 3, "action": "retry", "description": "Retry after fixing the connection.", "tool": "retry_execution" }),
         ],
         _ => vec![
-            serde_json::json!({ "step": 1, "action": "inspect_logs", "description": format!("Review the full error message for node '{}' in get_execution_logs.", module_label), "tool": "get_execution_logs" }),
-            serde_json::json!({ "step": 2, "action": "trace", "description": "Use get_execution_status(detail: true) for a full data-flow view of what succeeded before the failure.", "tool": "get_execution_status" }),
-            serde_json::json!({ "step": 3, "action": "test_sandbox", "description": "Reproduce in isolation using run_sandbox with the same input data.", "tool": "run_sandbox" }),
+            serde_json::json!({ "step": 1, "action": "inspect_worker_logs", "description": format!("Read the WORKER's own log lines for node '{}' with tail_worker_logs. This is the fall-through bucket, so the error text matched no specific gate — and a host-policy denial is exactly that case: `[host:<policy>] <capability> denied by policy '<policy>' (target: ...)` is written by the worker at WARN, lands in module_execution_logs, and is NOT in the engine event stream this analysis classified. The module's own downstream error (an 'invalidurl', a bare HTTP failure) is what you were shown; the control that actually fired is only here.", module_label), "tool": "tail_worker_logs" }),
+            serde_json::json!({ "step": 2, "action": "inspect_logs", "description": format!("Review the engine's node-state event stream for node '{}' in get_execution_logs — node_input carries the resolved config the node actually ran with.", module_label), "tool": "get_execution_logs" }),
+            serde_json::json!({ "step": 3, "action": "trace", "description": "Use get_execution_status(detail: true) for a full data-flow view of what succeeded before the failure.", "tool": "get_execution_status" }),
+            serde_json::json!({ "step": 4, "action": "test_sandbox", "description": "Reproduce in isolation using run_sandbox with the same input data.", "tool": "run_sandbox" }),
         ],
     }
 }
@@ -1004,6 +1006,75 @@ mod tests {
     }
 
     // ── classify_error buckets ──────────────────────────────────────────────
+
+    /// A HOST-POLICY DENIAL IS INVISIBLE TO `classify_error`, AND THAT IS WHY
+    /// THE FALL-THROUGH PLAYBOOK MUST NAME `tail_worker_logs`.
+    ///
+    /// The worker refuses the call and records the reason itself —
+    /// `[host:insecure-scheme] http-fetch denied by policy 'insecure-scheme'
+    /// (target: http host.docker.internal)`, WARN, into `module_execution_logs`.
+    /// What reaches the ENGINE, and therefore what `classify_error` is handed,
+    /// is only the module's downstream error after the refusal. The string
+    /// below is the verbatim `execution_events.log_message` of a real failure
+    /// (workflow_execution 43b78079-d0a0-4aff-83f1-e3e80dc7195a, 2026-09-01):
+    /// it names no host, no policy, and no denial, so it matches none of the
+    /// specific gates — including `host_not_allowed` — and lands in the
+    /// fall-through bucket.
+    ///
+    /// This is a TRIPWIRE, not a pin on a value I chose. If a future gate
+    /// starts catching this shape, this test fails and tells you the real
+    /// requirement: the `tail_worker_logs` step must MOVE to whichever bucket
+    /// now claims it, because a classifier reading only the downstream error
+    /// can never identify a policy denial on its own.
+    #[test]
+    fn a_host_policy_denial_reaches_the_classifier_only_as_its_downstream_error() {
+        const OBSERVED: &str = "Job failed after 1 attempts: execution failure: \
+Component returned error: HTTP request failed: Error { code: 0, name: \"invalidurl\", message: \"\" }";
+
+        let (bucket, _) = classify_error(OBSERVED);
+        assert_eq!(
+            bucket, "runtime_error",
+            "the observed host-denial error now classifies as `{bucket}`; move the \
+             tail_worker_logs remediation step into that bucket's arm"
+        );
+
+        // The refusal itself is not in this string in any form — that is the
+        // whole defect, stated as an assertion rather than as prose.
+        let lower = OBSERVED.to_lowercase();
+        for absent in ["denied", "policy", "insecure-scheme", "host:", "forbidden"] {
+            assert!(
+                !lower.contains(absent),
+                "the downstream error unexpectedly carries `{absent}` — if the worker \
+                 now propagates the refusal reason, the classifier can gate on it directly"
+            );
+        }
+    }
+
+    /// Both buckets an operator reaches on a policy denial must name the ONLY
+    /// tool that returns the worker's own lines.
+    ///
+    /// `host_not_allowed` is the bucket that is explicitly about host gating;
+    /// the fall-through is where a denial actually lands (see the test above).
+    /// Before this was enforced, neither named `tail_worker_logs` — it was
+    /// named in ZERO operator-facing hints anywhere in the workspace — and the
+    /// fall-through's step 1 sent the operator to `get_execution_logs`, which
+    /// reads `execution_events` and structurally cannot contain the line.
+    #[test]
+    fn the_playbooks_for_a_policy_denial_name_the_tool_that_shows_it() {
+        for bucket in ["host_not_allowed", "runtime_error", "an_unmatched_bucket"] {
+            let steps = remediation_steps(bucket, "some_node");
+            let names_it = steps
+                .iter()
+                .any(|s| s.get("tool").and_then(|t| t.as_str()) == Some("tail_worker_logs"));
+            assert!(
+                names_it,
+                "remediation_steps({bucket}) does not name tail_worker_logs — a host-policy \
+                 denial is written by the worker into module_execution_logs, which no other \
+                 surface reachable from a workflow-execution id reads, so this playbook cannot \
+                 explain the failure it is for"
+            );
+        }
+    }
 
     #[test]
     fn classify_error_buckets() {
