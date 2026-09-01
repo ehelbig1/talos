@@ -339,7 +339,11 @@ impl ParallelWorkflowEngine {
         };
 
         let final_result = if let Some(expr) = aggregation_expr {
-            if self.eval_bool(expr, &aggregated) {
+            if self.eval_bool_kinded(
+                crate::condition_eval::ConditionKind::FanIn,
+                expr,
+                &aggregated,
+            ) {
                 aggregated
             } else {
                 serde_json::json!({"__aggregation_failed": true})
@@ -559,7 +563,11 @@ impl ParallelWorkflowEngine {
     ) -> (JsonValue, bool) {
         let node_id = self.graph[node_idx];
         let parent_output = self.gather_inputs(node_idx, results);
-        let passed = self.eval_bool(condition, &parent_output);
+        let passed = self.eval_bool_kinded(
+            crate::condition_eval::ConditionKind::Verify,
+            condition,
+            &parent_output,
+        );
 
         let verify_result = if passed {
             let mut out = parent_output;

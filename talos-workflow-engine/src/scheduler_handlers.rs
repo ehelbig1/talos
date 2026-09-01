@@ -739,7 +739,11 @@ impl ParallelWorkflowEngine {
         let mut current_output = self.gather_inputs(node_idx, results);
         let mut iteration = 0u32;
         while iteration < max_iters {
-            if !self.eval_bool(&condition, &current_output) {
+            if !self.eval_bool_kinded(
+                crate::condition_eval::ConditionKind::WhileLoop,
+                &condition,
+                &current_output,
+            ) {
                 break;
             }
             iteration += 1;
@@ -1141,6 +1145,30 @@ impl ParallelWorkflowEngine {
     /// The trigger node's output is overlaid onto the skip-condition
     /// context so expressions can reference trigger-level fields
     /// without every upstream chain explicitly propagating them.
+    ///
+    /// # An expression that FAILS to evaluate is not an expression that
+    /// returned false
+    ///
+    /// This is the platform's one FAIL-OPEN condition. `false` here means
+    /// "do not skip", so a broken expression RUNS the node its author gated —
+    /// a typo in `"dry_run == true"` fires the send. The default is
+    /// deliberately NOT flipped (failing closed would silently DROP work, and
+    /// would change behaviour for every workflow whose condition is merely
+    /// currently-false), so the failure is made VISIBLE instead:
+    ///
+    /// * `talos_condition_eval_failures_total{kind="skip_condition"}` — the
+    ///   alertable signal, incremented in
+    ///   [`ParallelWorkflowEngine::eval_condition`].
+    /// * a `condition_eval_failed` WARN carrying the node id and label, so an
+    ///   operator can answer "which node ran because its gate broke?" from
+    ///   the logs of a single execution.
+    ///
+    /// Authoring-time validation is the cheaper catch and is enforced on
+    /// every MCP write path (`add_skip_condition`, `add_node_to_workflow`,
+    /// `update_node_config` update/merge) — a skip condition that cannot
+    /// PARSE is now rejected before it is ever persisted. This path remains
+    /// the backstop for the failures parsing cannot see: an unbound variable,
+    /// a non-bool result, an operation-limit trip.
     pub(crate) fn check_skip_condition(
         &self,
         node_idx: NodeIndex,
@@ -1170,8 +1198,35 @@ impl ParallelWorkflowEngine {
                 }
             }
         }
-        if !self.eval_bool(skip_cond, &skip_context) {
-            return None;
+        match self.eval_condition(
+            crate::condition_eval::ConditionKind::Skip,
+            skip_cond,
+            &skip_context,
+        ) {
+            Ok(true) => {}
+            // Evaluated cleanly and said "don't skip" — the ordinary case.
+            Ok(false) => return None,
+            Err(error) => {
+                // The counter and the kind-level WARN already fired inside
+                // `eval_condition`. This second line adds what only this call
+                // site knows: WHICH node ran anyway. Without it the operator
+                // has a rate but no way to reach the workflow. The node label
+                // and uuid only — never the context, which `eval_condition`
+                // already logged scrubbed.
+                tracing::warn!(
+                    target: "talos_workflow_engine",
+                    event_kind = "skip_condition_failed_open",
+                    %execution_id,
+                    %node_id,
+                    node_label = %self.progress_label(node_id),
+                    skip_condition = %skip_cond,
+                    error = %error,
+                    "skip_condition could not be evaluated — the node was NOT \
+                     skipped and RAN. Validate the expression with \
+                     test_condition against a representative payload."
+                );
+                return None;
+            }
         }
         tracing::info!(
             %node_id,
@@ -2178,7 +2233,11 @@ impl ParallelWorkflowEngine {
                         "output": last_output,
                     })
                 };
-                if !self.eval_bool(condition, &condition_ctx) {
+                if !self.eval_bool_kinded(
+                    crate::condition_eval::ConditionKind::Loop,
+                    condition,
+                    &condition_ctx,
+                ) {
                     break;
                 }
             }

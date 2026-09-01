@@ -1128,12 +1128,10 @@ impl ParallelWorkflowEngine {
 
     // ── Thin shims over the configured trait objects ──────────────────
     //
-    // These exist so engine-body call sites read as `self.eval_bool(...)`
-    // instead of `self.expression_evaluator.as_ref().map(|e| e.eval_bool(...)).unwrap_or(false)`.
+    // These exist so engine-body call sites read as `self.eval_json(...)`
+    // instead of `self.expression_evaluator.as_ref().map(|e| e.eval_json(...))…`.
     // Each shim falls back to a "safe default" when the trait is unset:
-    // - `eval_bool` → `false` (condition not satisfied)
-    // - `eval_bool_with_error` → `Err("no evaluator")` so callers surface the misconfiguration
-    // - `eval_json` → `Err("no evaluator")` likewise
+    // - `eval_json` → `Err("no evaluator")` so callers surface the misconfiguration
     // - `eval_i64` → `None`
     // - `redact_str` / `redact_json` → passthrough (no scrubbing)
     // - `classify_error` / `is_transient_error` → `"unknown"` / `false`
@@ -1176,20 +1174,21 @@ impl ParallelWorkflowEngine {
         }
     }
 
-    pub(crate) fn eval_bool(&self, expression: &str, context: &JsonValue) -> bool {
-        self.expression_evaluator
-            .as_ref()
-            .map(|e| e.eval_bool(expression, context))
-            .unwrap_or(false)
-    }
-
-    fn try_eval_bool(&self, expression: &str, context: &JsonValue) -> Result<bool, String> {
-        self.expression_evaluator
-            .as_ref()
-            .ok_or_else(|| "no ExpressionEvaluator configured".to_string())?
-            .try_eval_bool(expression, context)
-            .map_err(|e| e.to_string())
-    }
+    // NOTE: there is deliberately no `eval_bool` shim here any more.
+    //
+    // It existed to spell `self.expression_evaluator…eval_bool(…)
+    // .unwrap_or(false)`, and that `false` silently absorbed BOTH "the
+    // expression said no" and "the expression could not be evaluated at all".
+    // For a node's `skip_condition` those are opposites: the second RUNS the
+    // node the author gated. Every boolean condition now routes through
+    // `ParallelWorkflowEngine::eval_condition` / `eval_bool_kinded` in
+    // `crate::condition_eval`, which take a `ConditionKind`, count the
+    // failure on `talos_condition_eval_failures_total{kind}`, and apply the
+    // SAME `false` default explicitly at the call site.
+    //
+    // Do not reintroduce a kind-less boolean shim. `false` is not one
+    // semantic, and a shim that cannot say which one it meant is how the
+    // fail-open skip gate stayed invisible.
 
     pub(crate) fn eval_json(
         &self,

@@ -55,7 +55,7 @@ where
 /// `field_name` and includes the line/column from `rhai::ParseError`.
 /// Callers map this to MCP -32602 verbatim — no error-class branching
 /// needed.
-fn validate_rhai_expression(field_name: &str, source: &str) -> Result<(), String> {
+pub(crate) fn validate_rhai_expression(field_name: &str, source: &str) -> Result<(), String> {
     with_rhai_validation_engine(|eng| eng.compile(source)).map_err(|e| {
         format!(
             "{} Rhai syntax error at line {}, column {}: {}",
@@ -66,6 +66,70 @@ fn validate_rhai_expression(field_name: &str, source: &str) -> Result<(), String
         )
     })?;
     Ok(())
+}
+
+/// The ONE authoring-time gate for a node's `skip_condition`, on every write
+/// path that accepts one as a named parameter.
+///
+/// # Why a skip condition earns its own gate
+///
+/// `skip_condition` is the platform's only FAIL-OPEN expression. At runtime an
+/// expression that cannot be evaluated defaults to `false`, and `false` on a
+/// skip condition means "do not skip" — so a broken gate RUNS the node its
+/// author wrote it to stop. A typo in `"dry_run == true"` fires the send, the
+/// workflow reports `completed`, and the only evidence is a counter
+/// (`talos_condition_eval_failures_total{kind="skip_condition"}`) plus a WARN.
+/// Rejecting at authoring time is the cheapest possible catch: an expression
+/// that cannot PARSE can never gate anything, so persisting it is never right.
+///
+/// # What this proves, and what it cannot
+///
+/// PARSE only. It cannot see the failure that actually bit — an unbound
+/// variable (`input.dry_run` when the trigger key binds bare as `dry_run`)
+/// parses perfectly and only fails at eval, against a context this function
+/// does not have. `test_condition` with a representative payload is the tool
+/// for that half, and `add_skip_condition` attaches
+/// [`dry_run_skip_condition`]'s warning pointing there.
+///
+/// Returns the TRIMMED expression so callers persist exactly what was
+/// validated (MCP-235: whitespace slipped past the empty check, then Rhai
+/// returned unit `()` at runtime — a non-bool, i.e. the fail-open case).
+pub(crate) fn validate_skip_condition(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("skip_condition must be non-empty and non-whitespace".to_string());
+    }
+    if raw.len() > 2000 {
+        return Err("skip_condition must be ≤ 2000 characters".to_string());
+    }
+    validate_rhai_expression("skip_condition", trimmed)?;
+    Ok(trimmed.to_string())
+}
+
+/// Authoring-time dry run for a `skip_condition`, the sibling of
+/// [`dry_run_retry_condition`].
+///
+/// NEVER a rejection — the real context may define variables no probe can
+/// guess, and refusing a valid condition because an empty scope could not
+/// resolve it would be worse than the bug. Returns a warning naming the
+/// fail-open consequence and the tool that can settle it.
+fn dry_run_skip_condition(condition: &str) -> Option<String> {
+    match talos_engine::rhai_helpers::evaluate_condition_with_error(
+        condition,
+        &serde_json::json!({}),
+    ) {
+        Ok(_) => None,
+        Err(e) => Some(format!(
+            "skip_condition parsed but could not be proven evaluable: a dry run against an \
+             empty context failed with: {e}. That is expected for any condition referencing \
+             upstream or trigger fields. It matters here because a skip_condition that fails \
+             to evaluate at RUNTIME defaults to false — meaning the node is NOT skipped and \
+             RUNS. Note the scope: trigger and upstream output fields bind as BARE variables \
+             (`dry_run == true`), not under an `input` wrapper; the whole context is also \
+             available as `ctx` / `inputs`, and `is_error` / `error_message` are always \
+             injected. Verify with test_condition against a representative payload."
+        )),
+    }
 }
 
 /// Representative synthetic error payload used to dry-run `retry_condition`
@@ -1028,13 +1092,13 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "add_skip_condition",
-            "description": "Add a Rhai expression to a workflow node that, when true, causes the node to be skipped at runtime. The expression is evaluated against the gathered inputs.",
+            "description": "Add a Rhai expression to a workflow node that, when true, causes the node to be skipped at runtime.\n\nSCOPE: the expression is evaluated against the node's gathered inputs with the trigger payload overlaid, and fields bind as BARE variables — write `dry_run == true`, NOT `input.dry_run == true` (there is no `input` wrapper unless an upstream output actually has an `input` key). The whole context is also bound as `ctx` and `inputs` for nested access (`ctx.user.tier`), and `is_error` / `error_message` are always injected. With ONE parent the parent's output is passed unwrapped (its fields are the bare variables); with TWO OR MORE the context is keyed by node label, so the labels are the variables.\n\nFAIL-OPEN WARNING: if the expression cannot be evaluated at runtime (unbound variable, non-bool result) the engine defaults it to false — meaning the node is NOT skipped and RUNS. Syntax is rejected here at save time, but a name that does not exist only fails at eval; verify with test_condition against a representative payload before relying on this to gate a send.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "workflow_id": { "type": "string", "description": "UUID of the workflow" },
                     "node_id": { "type": "string", "description": "ID of the node within the workflow graph" },
-                    "skip_condition": { "type": "string", "description": "Rhai expression that returns true to skip the node" }
+                    "skip_condition": { "type": "string", "description": "Rhai expression that returns true to skip the node. Bare variable names, e.g. \"dry_run == true\". Rejected at save time if it does not parse; max 2000 chars." }
                 },
                 "required": ["workflow_id", "node_id", "skip_condition"]
             }
@@ -1728,13 +1792,22 @@ async fn handle_update_node_config(
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
                 // Validate skip_condition if caller is trying to set it here.
+                // Full parse gate, not just a length cap: a skip_condition is
+                // FAIL-OPEN at runtime (an expression that cannot evaluate
+                // defaults to false = "do not skip" = the gated node RUNS), and
+                // until 2026-09 this path persisted any string that fit in 2000
+                // characters while its own error text told callers to use
+                // `add_skip_condition` "for validated updates".
                 if let Some(sc) = filtered.get("skip_condition") {
-                    if let Some(expr) = sc.as_str() {
-                        if expr.len() > 2000 {
-                            return mcp_error(req_id, -32602, "skip_condition must be ≤ 2000 characters; use add_skip_condition for validated updates");
+                    match sc.as_str() {
+                        Some(expr) => {
+                            if let Err(msg) = validate_skip_condition(expr) {
+                                return mcp_error(req_id, -32602, &msg);
+                            }
                         }
-                    } else {
-                        return mcp_error(req_id, -32602, "skip_condition must be a string; use add_skip_condition for validated updates");
+                        None => {
+                            return mcp_error(req_id, -32602, "skip_condition must be a string; use add_skip_condition for validated updates");
+                        }
                     }
                 }
                 serde_json::Value::Object(filtered)
@@ -1819,8 +1892,11 @@ async fn handle_update_node_config(
                 // RFC 7386 "delete this key" instruction, not a type error.
                 if let Some(sc) = filtered.get("skip_condition") {
                     if let Some(expr) = sc.as_str() {
-                        if expr.len() > 2000 {
-                            return mcp_error(req_id, -32602, "skip_condition must be ≤ 2000 characters; use add_skip_condition for validated updates");
+                        // Same full parse gate as `update_config` above — see
+                        // the comment there for why a length cap alone is not
+                        // enough on a fail-open expression.
+                        if let Err(msg) = validate_skip_condition(expr) {
+                            return mcp_error(req_id, -32602, &msg);
                         }
                     } else if !sc.is_null() {
                         return mcp_error(req_id, -32602, "skip_condition must be a string (or null to delete it); use add_skip_condition for validated updates");
@@ -3708,32 +3784,26 @@ async fn handle_add_skip_condition(
     // returns unit `()` instead of bool — silently treats every node
     // as "should NOT skip" rather than the operator's intended skip
     // logic. MCP-208 family.
-    let skip_condition = match args.get("skip_condition").and_then(|v| v.as_str()) {
-        Some(c) if c.trim().is_empty() => {
-            return mcp_error(
-                req_id,
-                -32602,
-                "Missing or empty (whitespace-only) 'skip_condition'",
-            )
-        }
-        Some(c) if c.len() > 2000 => {
-            return mcp_error(req_id, -32602, "skip_condition must be ≤2000 characters")
-        }
-        Some(c) => c.trim().to_string(),
+    //
+    // 2026-09: the length/trim/parse trio moved into the shared
+    // `validate_skip_condition` because this handler was the ONLY one of the
+    // five write paths that even attempted a syntax check, while its tool
+    // description and three sibling handlers all told callers to come here
+    // "for validated updates". The parse check itself was a substring probe
+    // (`msg.contains("Syntax error")`) over the RUNTIME evaluator's error
+    // text — it inspected the message of a call made with an empty context,
+    // so it depended on Rhai's error-string wording to tell a parse failure
+    // from an unbound variable. `validate_rhai_expression` compiles instead,
+    // which answers the question directly.
+    let raw_skip_condition = match args.get("skip_condition").and_then(|v| v.as_str()) {
+        Some(c) => c,
         None => return mcp_error(req_id, -32602, "Missing or empty 'skip_condition'"),
     };
-
-    // Validate the Rhai expression by attempting a dry-run parse
-    if let Err(msg) = talos_engine::rhai_helpers::evaluate_condition_with_error(
-        &skip_condition,
-        &serde_json::json!({}),
-    ) {
-        // evaluate_condition_with_error returns Err on parse errors, but also on eval errors
-        // with empty context. We only reject obvious parse failures.
-        if msg.contains("Syntax error") || msg.contains("Parse error") {
-            return mcp_error(req_id, -32602, &format!("Invalid Rhai expression: {}", msg));
-        }
-    }
+    let skip_condition = match validate_skip_condition(raw_skip_condition) {
+        Ok(c) => c,
+        Err(msg) => return mcp_error(req_id, -32602, &msg),
+    };
+    let dry_run_warning = dry_run_skip_condition(&skip_condition);
 
     let graph_json_str = match fetch_graph_json(state, workflow_id, user_id, &req_id).await {
         Ok(gj) => gj,
@@ -3796,11 +3866,14 @@ async fn handle_add_skip_condition(
     .await
     .message_suffix();
 
+    let warning = dry_run_warning
+        .map(|w| format!("\n⚠ {w}"))
+        .unwrap_or_default();
     mcp_text(
         req_id,
         &format!(
-            "Skip condition added to node '{}' in workflow {}.\nCondition: {}{}",
-            node_id, workflow_id, skip_condition, note
+            "Skip condition added to node '{}' in workflow {}.\nCondition: {}{}{}",
+            node_id, workflow_id, skip_condition, note, warning
         ),
     )
 }
@@ -6239,5 +6312,78 @@ mod retry_condition_dry_run_tests {
             warning.contains("could not be proven evaluable"),
             "{warning}"
         );
+    }
+}
+
+/// The authoring-time gate on the platform's one FAIL-OPEN expression.
+#[cfg(test)]
+mod skip_condition_validation_tests {
+    use super::{dry_run_skip_condition, validate_skip_condition};
+
+    #[test]
+    fn rejects_an_expression_that_cannot_parse() {
+        // The cheapest catch there is: an expression that cannot parse can
+        // never gate anything, so persisting it would guarantee the fail-open
+        // path at every run of the workflow.
+        let err = validate_skip_condition("dry_run ==").expect_err("must reject");
+        assert!(
+            err.contains("skip_condition") && err.contains("Rhai syntax error"),
+            "the message must name the field and the position: {err}"
+        );
+        assert!(validate_skip_condition("if {").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_and_whitespace_only() {
+        // MCP-235: whitespace slipped past an `is_empty` check, then Rhai
+        // returned unit `()` at runtime — a non-bool, i.e. the fail-open case.
+        for input in ["", "   ", "\t\n"] {
+            assert!(
+                validate_skip_condition(input).is_err(),
+                "{input:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_over_the_length_cap() {
+        let long = format!("x{}", "y".repeat(2000));
+        assert!(validate_skip_condition(&long).is_err());
+    }
+
+    #[test]
+    fn accepts_and_trims_a_valid_expression() {
+        assert_eq!(
+            validate_skip_condition("  dry_run == true  ").as_deref(),
+            Ok("dry_run == true"),
+            "callers persist the returned value, so it must be the trimmed form"
+        );
+    }
+
+    /// The gate is PARSE-only, and saying so matters: an unbound variable —
+    /// the wrong-scope typo that actually causes the fail-open run — parses
+    /// perfectly. Accepting it here is correct (no context exists at
+    /// authoring time); pretending otherwise would be the real defect.
+    #[test]
+    fn accepts_an_unbound_variable_and_warns_about_it() {
+        let expr = "input.dry_run == true";
+        assert!(
+            validate_skip_condition(expr).is_ok(),
+            "a name this function cannot resolve is not a syntax error"
+        );
+        let warning = dry_run_skip_condition(expr).expect("the dry run must flag it");
+        assert!(
+            warning.contains("RUNS"),
+            "the warning must state the fail-open consequence: {warning}"
+        );
+        assert!(
+            warning.contains("test_condition"),
+            "and name the tool that can settle it: {warning}"
+        );
+    }
+
+    #[test]
+    fn a_context_free_expression_produces_no_warning() {
+        assert!(dry_run_skip_condition("1 == 1").is_none());
     }
 }
