@@ -1766,23 +1766,16 @@ impl AnalyticsRepository {
             .collect::<Result<Vec<_>>>()
     }
 
-    /// Phase 5.1: queries unified modules table; canonical id only.
-    pub async fn check_template_ids_exist(&self, ids: &[Uuid]) -> Result<Vec<Uuid>> {
-        let rows: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM modules WHERE id = ANY($1)")
-            .bind(ids)
-            .fetch_all(&self.db_pool)
-            .await?;
-        Ok(rows)
-    }
-
-    /// Phase 5.1: queries unified modules table; canonical id only.
-    pub async fn check_module_ids_exist(&self, ids: &[Uuid]) -> Result<Vec<Uuid>> {
-        let rows: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM modules WHERE id = ANY($1)")
-            .bind(ids)
-            .fetch_all(&self.db_pool)
-            .await?;
-        Ok(rows)
-    }
+    // `check_template_ids_exist` / `check_module_ids_exist` were DELETED here
+    // (2026-09-01) with the fleet-validator convergence. They were
+    // BYTE-IDENTICAL to each other — both `SELECT id FROM modules WHERE id =
+    // ANY($1)`, a survival of the pre-Phase-5.1 split between `node_templates`
+    // and `wasm_modules` — and the fleet sweep, their only caller, ran BOTH on
+    // every invocation, issuing the same query twice and unioning the two
+    // identical results. It now uses `WorkflowRepository::modules_exist`, which
+    // is a third copy of the same statement and is the one the shared validator
+    // already used. Three spellings of one query is how a checker starts
+    // disagreeing with itself; one is the point.
 
     // -- System status ----------------------------------------------------
 

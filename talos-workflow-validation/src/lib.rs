@@ -7,7 +7,7 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
-use talos_workflow_repository::{NodeTemplateRow, WorkflowRepository};
+use talos_workflow_repository::{NodeRunHistory, NodeTemplateRow, WorkflowRepository};
 
 // Re-use the vault path permission check from the MCP module.
 use talos_workflow_job_protocol::vault_path_permitted as _vpp;
@@ -1242,11 +1242,85 @@ pub(crate) fn is_trivially_true_condition(raw: &str) -> bool {
 
 // ── Service ──────────────────────────────────────────────────────────────────
 
+/// The module ids a graph dispatches, resolved the way the LOADER resolves
+/// them (`type` as UUID, then `data.moduleId`).
+///
+/// Public because a caller batching the validator's inputs across many
+/// workflows has to know which module rows to fetch, and re-deriving that
+/// locally is how a batched caller silently disagrees with the checker about
+/// which modules a graph uses.
+#[must_use]
+pub fn graph_module_ids(graph: &serde_json::Value) -> Vec<Uuid> {
+    graph
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .map(|nodes| {
+            nodes
+                .iter()
+                .filter_map(talos_workflow_engine_core::node_module_id)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Everything [`WorkflowValidationService::validate`] reads from the database,
+/// resolved up front.
+///
+/// # Why this type exists
+///
+/// There were once TWO workflow validators: the per-workflow tool called
+/// [`WorkflowValidationService::validate`], and the fleet-wide sweep
+/// (`validate_all_workflows`) carried its own inline re-implementation because
+/// calling `validate` in a loop would have been an N+1 — `validate` issues five
+/// queries per workflow, and the fleet path already batch-loads the same rows
+/// across every workflow at once.
+///
+/// The duplicate drifted, exactly as a duplicate does. Measured on the live
+/// fleet (2026-09-01, 28 workflows): the inline copy missed **86 warnings** and
+/// one **error** the shared validator finds — including a `vault://` reference
+/// to a path the module's `allowed_secrets` denies, which the inline copy could
+/// not see because it matched `vault://` as a bare PREFIX while all 39 vault
+/// references on the fleet are embedded (`Bearer vault://…`). Its only
+/// security check had 0/39 recall.
+///
+/// So: one checker, two ways in. `validate` loads its own inputs for a single
+/// workflow; a batched caller loads the same rows for many workflows in one
+/// round trip each and calls [`validate_prepared`] per workflow. Neither path
+/// owns a second copy of a check.
+pub struct PreparedValidation {
+    /// Identifies the workflow in log lines only — no lookup is performed.
+    pub workflow_id: Uuid,
+    /// Raw `graph_json`. Parsed HERE rather than by the caller so both entry
+    /// points parse it identically, malformed-graph fallback included.
+    pub graph_json: String,
+    /// Module ids that exist. May be a superset covering several workflows;
+    /// only membership is consulted.
+    pub existing_modules: HashSet<Uuid>,
+    /// Template rows for this graph's module ids. May be a superset — the
+    /// checker indexes it by id and only reads ids the graph dispatches.
+    pub templates: Vec<NodeTemplateRow>,
+    /// Per-install `allowed_secrets` overrides. May be a superset.
+    pub installed_secrets: HashMap<Uuid, Vec<String>>,
+    /// Whether this workflow has a bound actor. Drives the retry clamp — see
+    /// `MAX_RETRIES_UNBUDGETED`. `false` is the SUPPRESSING direction.
+    pub has_actor: bool,
+    /// The execution-history slice, or the read error. `Err` becomes
+    /// [`HistoryCoverage::Unavailable`] — never `Empty`, which would report a
+    /// failed read as "nothing has been observed".
+    pub history: std::result::Result<NodeRunHistory, String>,
+}
+
 pub struct WorkflowValidationService;
 
 impl WorkflowValidationService {
     /// Validate a workflow's graph for structural correctness, module existence,
     /// config completeness, and vault permission compliance.
+    ///
+    /// Loads the five inputs [`PreparedValidation`] names, then delegates to
+    /// [`validate_prepared`] — which holds every check. A batched caller
+    /// (`validate_all_workflows`) loads the same rows for many workflows at
+    /// once and calls [`validate_prepared`] directly; see [`PreparedValidation`]
+    /// for why that seam exists.
     ///
     /// Returns `Ok(ValidationResult)` — callers decide how to handle errors vs.
     /// warnings.  Database failures bubble up as `Err`.
@@ -1255,12 +1329,108 @@ impl WorkflowValidationService {
         workflow_id: Uuid,
         user_id: Uuid,
     ) -> Result<ValidationResult> {
-        let graph_json_str = workflow_repo
+        let graph_json = workflow_repo
             .get_workflow_graph(workflow_id, user_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Workflow not found or access denied"))?;
 
-        let graph: serde_json::Value = serde_json::from_str(&graph_json_str)
+        let graph: serde_json::Value = serde_json::from_str(&graph_json)
+            .unwrap_or_else(|_| serde_json::json!({"nodes":[],"edges":[]}));
+        let module_ids = graph_module_ids(&graph);
+
+        let existing_modules: HashSet<Uuid> = if module_ids.is_empty() {
+            HashSet::new()
+        } else {
+            workflow_repo
+                .modules_exist(&module_ids)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .collect()
+        };
+
+        // An execution with no bound actor has its DECLARED retry count
+        // clamped to `MAX_RETRIES_UNBUDGETED` at graph load. Using the
+        // unclamped value would over-report an envelope that cannot occur —
+        // the one direction a warning must not err in.
+        //
+        // On a DB failure we assume NO actor, which clamps the predicted count
+        // and can only SUPPRESS warnings — never invent one. Logged rather
+        // than swallowed: a silently failing query that degrades a check into
+        // always-quiet is its own class of bug.
+        let has_actor = match workflow_repo
+            .get_workflow_actor_id(workflow_id, user_id)
+            .await
+        {
+            Ok(a) => a.is_some(),
+            Err(e) => {
+                tracing::warn!(
+                    %workflow_id,
+                    error = %e,
+                    "retry-envelope / history check: actor lookup failed; assuming unbound \
+                     (clamps predicted retries, so this can only under-report)"
+                );
+                false
+            }
+        };
+
+        let (templates, installed_secrets) = if module_ids.is_empty() {
+            (Vec::new(), HashMap::new())
+        } else {
+            let (template_rows, installed_secrets) = tokio::join!(
+                workflow_repo.get_templates_by_ids(&module_ids),
+                workflow_repo.get_installed_secrets_by_template_ids(&module_ids, user_id),
+            );
+            (
+                template_rows.unwrap_or_default(),
+                installed_secrets.unwrap_or_default(),
+            )
+        };
+
+        let history = workflow_repo
+            .node_run_history(
+                workflow_id,
+                user_id,
+                history_window_days(),
+                HISTORY_MAX_EXECUTIONS,
+            )
+            .await
+            .map_err(|e| e.to_string());
+
+        Ok(validate_prepared(PreparedValidation {
+            workflow_id,
+            graph_json,
+            existing_modules,
+            templates,
+            installed_secrets,
+            has_actor,
+            history,
+        }))
+    }
+}
+
+/// Every validation check, over inputs already resolved.
+///
+/// **This is the only implementation.** Both the per-workflow tool and the
+/// fleet-wide sweep reach the same checks through it — see
+/// [`PreparedValidation`] for the drift this seam exists to prevent, and what
+/// the drift had already cost.
+///
+/// Pure: no I/O, so the whole check set is unit-testable from a graph literal.
+#[must_use]
+pub fn validate_prepared(prepared: PreparedValidation) -> ValidationResult {
+    {
+        let PreparedValidation {
+            workflow_id,
+            graph_json,
+            existing_modules,
+            templates,
+            installed_secrets,
+            has_actor,
+            history: history_read,
+        } = prepared;
+
+        let graph: serde_json::Value = serde_json::from_str(&graph_json)
             .unwrap_or_else(|_| serde_json::json!({"nodes":[],"edges":[]}));
 
         let mut issues: Vec<ValidationIssue> = Vec::new();
@@ -1288,12 +1458,7 @@ impl WorkflowValidationService {
             .collect();
 
         if !module_ids.is_empty() {
-            let existing: HashSet<Uuid> = workflow_repo
-                .modules_exist(&module_ids)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
+            let existing = &existing_modules;
 
             for mid in &module_ids {
                 if !existing.contains(mid) {
@@ -1426,30 +1591,7 @@ impl WorkflowValidationService {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(talos_workflow_engine_core::DEFAULT_WORKFLOW_EXECUTION_TIMEOUT_SECS);
 
-        // An execution with no bound actor has its DECLARED retry count
-        // clamped to `MAX_RETRIES_UNBUDGETED` at graph load. Using the
-        // unclamped value would over-report an envelope that cannot occur —
-        // the one direction a warning must not err in.
-        //
-        // On a DB failure we assume NO actor, which clamps the predicted count
-        // and can only SUPPRESS warnings — never invent one. Logged rather
-        // than swallowed: a silently failing query that degrades a check into
-        // always-quiet is its own class of bug.
-        let has_actor = match workflow_repo
-            .get_workflow_actor_id(workflow_id, user_id)
-            .await
-        {
-            Ok(a) => a.is_some(),
-            Err(e) => {
-                tracing::warn!(
-                    %workflow_id,
-                    error = %e,
-                    "retry-envelope / history check: actor lookup failed; assuming unbound \
-                     (clamps predicted retries, so this can only under-report)"
-                );
-                false
-            }
-        };
+        // `has_actor` is resolved by the caller — see `PreparedValidation`.
 
         // Per-module retry inputs, populated by the module block below and
         // read again by the history check after it. Empty for a graph with no
@@ -1457,13 +1599,21 @@ impl WorkflowValidationService {
         let mut template_retry: HashMap<Uuid, (Vec<String>, Option<String>)> = HashMap::new();
 
         if !module_ids.is_empty() {
-            let (template_rows, installed_secrets) = tokio::join!(
-                workflow_repo.get_templates_by_ids(&module_ids),
-                workflow_repo.get_installed_secrets_by_template_ids(&module_ids, user_id),
-            );
-            let template_rows: Vec<NodeTemplateRow> = template_rows.unwrap_or_default();
-            let installed_secrets: HashMap<Uuid, Vec<String>> =
-                installed_secrets.unwrap_or_default();
+            // A batched caller supplies rows covering MANY graphs. Narrow to
+            // the ids this graph dispatches before deriving anything: every
+            // map below is read by id, but `side_effecting_ids` and the
+            // durability advisory are built by SCANNING these rows, and a
+            // superset there would attribute another workflow's modules to
+            // this one.
+            let wanted: HashSet<Uuid> = module_ids.iter().copied().collect();
+            let template_rows: Vec<NodeTemplateRow> = templates
+                .into_iter()
+                .filter(|r| wanted.contains(&r.id))
+                .collect();
+            let installed_secrets: HashMap<Uuid, Vec<String>> = installed_secrets
+                .into_iter()
+                .filter(|(id, _)| wanted.contains(id))
+                .collect();
 
             // A node whose template declares any `allowed_hosts` makes an
             // external call, and on crash-recovery resume an in-flight node is
@@ -1805,10 +1955,7 @@ impl WorkflowValidationService {
         let mut observed_by_node: HashMap<Uuid, (ObservedNodeRecord, Option<String>)> =
             HashMap::new();
         let mut executions_scanned: i64 = 0;
-        let history_coverage = match workflow_repo
-            .node_run_history(workflow_id, user_id, window_days, HISTORY_MAX_EXECUTIONS)
-            .await
-        {
+        let history_coverage = match history_read {
             Ok(history) => {
                 // Map graph node id -> engine node id with the SAME function
                 // the executor used to write the events. Deriving it locally
@@ -2157,13 +2304,15 @@ impl WorkflowValidationService {
         let valid = !issues
             .iter()
             .any(|i| i.severity == ValidationSeverity::Error);
-        Ok(ValidationResult {
+        ValidationResult {
             valid,
             issues,
             history: history_coverage,
-        })
+        }
     }
+}
 
+impl WorkflowValidationService {
     /// Trigger-time input-schema check: fetch the workflow's declared
     /// `input_schema`, validate `trigger_input` against it, and return a
     /// typed [`InputSchemaCheck`] outcome the caller maps to JSON-RPC.
@@ -5111,5 +5260,312 @@ mod single_attempt_overrun_tests {
         assert_eq!(overrun.resolved_retries, 2);
         assert!(!overrun.retries_declared);
         assert!(overrun.envelope_secs > 300);
+    }
+}
+
+/// Convergence guards for the fleet-wide sweep.
+///
+/// Every test here drives the REAL [`validate_prepared`] — the function both
+/// `validate_workflow` and `validate_all_workflows` now call — over graph
+/// shapes taken from the live fleet. Each one pins a finding the fleet view
+/// used to drop, so a future re-divergence fails here rather than silently
+/// shrinking the sweep again.
+///
+/// The inline duplicate these replace is described on [`PreparedValidation`].
+#[cfg(test)]
+mod fleet_convergence_tests {
+    use super::{
+        graph_module_ids, validate_prepared, HistoryCoverage, PreparedValidation,
+        ValidationSeverity,
+    };
+    use talos_workflow_repository::{NodeRunHistory, NodeTemplateRow};
+    use uuid::Uuid;
+
+    fn module_id() -> Uuid {
+        Uuid::parse_str("90af4599-c6f4-4f6c-8fb4-6af84954db70").unwrap()
+    }
+
+    /// An `http-node` module declaring an egress host and a GET-only method
+    /// list — the shape every Gmail/Calendar fetch node on the live fleet has.
+    fn http_get_template(allowed_secrets: Vec<String>) -> NodeTemplateRow {
+        NodeTemplateRow {
+            id: module_id(),
+            name: "HTTP Request".into(),
+            config_schema: serde_json::json!({}),
+            allowed_secrets,
+            allowed_hosts: vec!["gmail.googleapis.com".into()],
+            max_retries: 0,
+            allowed_methods: vec!["GET".into()],
+            capability_world: Some("http-node".into()),
+            max_fuel: None,
+        }
+    }
+
+    fn prepared(graph: serde_json::Value, templates: Vec<NodeTemplateRow>) -> PreparedValidation {
+        let module_ids = graph_module_ids(&graph);
+        PreparedValidation {
+            workflow_id: Uuid::from_u128(7),
+            graph_json: graph.to_string(),
+            existing_modules: module_ids.into_iter().collect(),
+            templates,
+            installed_secrets: std::collections::HashMap::new(),
+            has_actor: true,
+            history: Ok(NodeRunHistory {
+                executions_scanned: 0,
+                window_days: 30,
+                nodes: Vec::new(),
+            }),
+        }
+    }
+
+    fn messages(result: &super::ValidationResult, severity: ValidationSeverity) -> Vec<String> {
+        result
+            .issues
+            .iter()
+            .filter(|i| i.severity == severity)
+            .map(|i| i.message.clone())
+            .collect()
+    }
+
+    /// THE convergence test.
+    ///
+    /// The retry-envelope check has a production incident behind it, and it
+    /// was structurally invisible to the fleet sweep: the inline copy had no
+    /// concept of retries, timeouts, or the workflow budget. This graph is
+    /// `pa-awaiting-response/awaiting_work` as it stands on the live fleet —
+    /// `retry_count: 2` at the default 120 s per attempt inside a 300 s
+    /// budget, which the per-workflow tool reports as a ~369 s envelope.
+    #[test]
+    fn the_fleet_path_now_sees_the_retry_envelope_overrun() {
+        let graph = serde_json::json!({
+            "execution_timeout_secs": 300,
+            "nodes": [{
+                "id": "awaiting_work",
+                "type": module_id().to_string(),
+                "retry_count": 2,
+                "data": { "URL": "https://gmail.googleapis.com/x" }
+            }],
+            "edges": []
+        });
+        let result = validate_prepared(prepared(graph, vec![http_get_template(vec!["*".into()])]));
+
+        let warnings = messages(&result, ValidationSeverity::Warning);
+        let envelope = warnings
+            .iter()
+            .find(|m| m.contains("retry envelope"))
+            .unwrap_or_else(|| panic!("no retry-envelope warning; got {warnings:#?}"));
+        assert!(envelope.contains("3 attempts x 120s"), "{envelope}");
+        assert!(envelope.contains("budget of 300s"), "{envelope}");
+
+        // And it is a WARNING, so it must NOT make the workflow invalid —
+        // the count contract the fleet response now states explicitly.
+        assert!(result.valid, "a retry-envelope overrun is not an error");
+    }
+
+    /// The ERROR the fleet view missed, and the reason it missed it.
+    ///
+    /// `stress-04-security` sets `AUTH_HEADER` to `Bearer vault://…` against a
+    /// module with an EMPTY `allowed_secrets` (deny-all). The inline copy
+    /// tested `strip_prefix("vault://")`, which is `None` for an embedded
+    /// reference — and **all 39 vault references on the live fleet are
+    /// embedded**, so its only security check never fired once.
+    #[test]
+    fn the_fleet_path_now_sees_an_embedded_vault_reference_denied_by_allowed_secrets() {
+        let graph = serde_json::json!({
+            "nodes": [{
+                "id": "exfil_attempt",
+                "type": module_id().to_string(),
+                "retry_count": 0,
+                "data": {
+                    "AUTH_HEADER": "Bearer vault://anthropic/api_key",
+                    "METHOD": "GET",
+                    "URL": "http://host.docker.internal:11434/api/tags"
+                }
+            }],
+            "edges": []
+        });
+        let result = validate_prepared(prepared(graph, vec![http_get_template(vec![])]));
+
+        let errors = messages(&result, ValidationSeverity::Error);
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert!(errors[0].contains("anthropic/api_key"), "{}", errors[0]);
+        assert!(errors[0].contains("allowed_secrets"), "{}", errors[0]);
+        assert!(!result.valid, "a denied vault path is an ERROR");
+    }
+
+    /// The bare-prefix form the inline copy COULD see still fires — the fix
+    /// widened recall, it did not trade one shape for another.
+    #[test]
+    fn the_bare_prefix_vault_form_is_still_caught() {
+        let graph = serde_json::json!({
+            "nodes": [{
+                "id": "n",
+                "type": module_id().to_string(),
+                "data": { "AUTH_HEADER": "vault://anthropic/api_key" }
+            }],
+            "edges": []
+        });
+        let result = validate_prepared(prepared(graph, vec![http_get_template(vec![])]));
+        assert!(!result.valid);
+        assert_eq!(messages(&result, ValidationSeverity::Error).len(), 1);
+    }
+
+    /// The severity DISAGREEMENT, in the direction that mattered: the inline
+    /// copy pushed unreachable nodes into its issues list, so a fleet sweep
+    /// called such a workflow INVALID while `validate_workflow` called the
+    /// same workflow VALID with a warning. One checker, one answer.
+    #[test]
+    fn an_unreachable_node_is_a_warning_not_an_error() {
+        let graph = serde_json::json!({
+            "nodes": [
+                {"id": "a", "data": {}},
+                {"id": "b", "data": {}},
+                {"id": "orphan", "data": {}}
+            ],
+            "edges": [
+                {"source": "a", "target": "b"},
+                {"source": "b", "target": "orphan"},
+                {"source": "orphan", "target": "b"}
+            ]
+        });
+        let result = validate_prepared(prepared(graph, vec![]));
+        // The cycle b->orphan->b is the error here; what matters is that
+        // reachability itself never contributes an Error.
+        assert!(result
+            .issues
+            .iter()
+            .filter(|i| i.category == "reachability")
+            .all(|i| i.severity == ValidationSeverity::Warning));
+    }
+
+    /// The checks the fleet sweep gained wholesale. Each of these categories
+    /// had ZERO representation in the inline copy.
+    #[test]
+    fn checks_the_inline_copy_had_no_concept_of_now_reach_the_fleet_path() {
+        let graph = serde_json::json!({
+            "execution_timeout_secs": 300,
+            "nodes": [
+                {
+                    "id": "root_a",
+                    "type": module_id().to_string(),
+                    "retry_count": 0,
+                    "data": { "URL": "https://gmail.googleapis.com/a" }
+                },
+                {
+                    "id": "root_b",
+                    "type": module_id().to_string(),
+                    "retry_count": 0,
+                    "data": { "URL": "https://gmail.googleapis.com/b" }
+                }
+            ],
+            "edges": []
+        });
+        let result = validate_prepared(prepared(graph, vec![http_get_template(vec!["*".into()])]));
+
+        let categories: std::collections::HashSet<&str> =
+            result.issues.iter().map(|i| i.category.as_str()).collect();
+        // Multiple parallel roots — the typo'd-edge hint.
+        assert!(categories.contains("parallel_roots"), "{categories:?}");
+        // Explicit retry_count: 0 against a module default of 2.
+        assert!(categories.contains("retry-disabled"), "{categories:?}");
+        // Isolated nodes (no edges at all).
+        assert!(categories.contains("isolated"), "{categories:?}");
+        assert!(result.valid, "all three are warnings");
+    }
+
+    /// A failed batch history read must reach the response as `Unavailable`,
+    /// never as an empty window. "We could not look" and "we looked and found
+    /// nothing" render as different sentences, and collapsing them is the
+    /// error-as-absence shape this file argues against throughout.
+    #[test]
+    fn a_failed_history_read_is_unavailable_not_empty() {
+        let graph = serde_json::json!({"nodes": [], "edges": []});
+        let mut p = prepared(graph, vec![]);
+        p.history = Err("connection reset".into());
+        let result = validate_prepared(p);
+        assert!(matches!(result.history, HistoryCoverage::Unavailable));
+        assert!(result.history.note().contains("could NOT be read"));
+        assert!(!result.history.consulted());
+    }
+
+    /// An empty window is `Empty`, distinct from both `Observed` and
+    /// `Unavailable` — the third state the fleet response counts separately.
+    #[test]
+    fn an_empty_window_is_empty_not_observed() {
+        let graph = serde_json::json!({"nodes": [], "edges": []});
+        let result = validate_prepared(prepared(graph, vec![]));
+        assert!(matches!(
+            result.history,
+            HistoryCoverage::Empty { window_days: 30 }
+        ));
+        assert!(!result.history.consulted());
+    }
+
+    /// A batched caller hands `validate_prepared` template rows and secret
+    /// grants covering the WHOLE fleet. Rows belonging to other workflows must
+    /// not leak into this one's findings — the durability advisory and the
+    /// side-effecting-node list are built by SCANNING those rows, so a
+    /// superset would attribute another workflow's modules to this one.
+    #[test]
+    fn superset_inputs_do_not_leak_another_workflows_modules() {
+        let other = Uuid::from_u128(999);
+        let graph = serde_json::json!({
+            "nodes": [{
+                "id": "n",
+                "type": module_id().to_string(),
+                "retry_count": 2,
+                "data": { "URL": "https://gmail.googleapis.com/x" }
+            }],
+            "edges": []
+        });
+        let mut foreign = http_get_template(vec![]);
+        foreign.id = other;
+        foreign.name = "SOMEONE ELSES MODULE".into();
+        foreign.allowed_methods = vec!["POST".into()];
+
+        let mut p = prepared(graph, vec![http_get_template(vec!["*".into()]), foreign]);
+        // The fleet-wide existence set legitimately contains ids this graph
+        // never mentions; that must not invent a finding either.
+        p.existing_modules.insert(other);
+        p.installed_secrets.insert(other, vec!["*".into()]);
+
+        let result = validate_prepared(p);
+        for issue in &result.issues {
+            assert!(
+                !issue.message.contains("SOMEONE ELSES MODULE"),
+                "foreign module leaked into a finding: {}",
+                issue.message
+            );
+            assert!(
+                !issue.message.contains(&other.to_string()),
+                "foreign module id leaked into a finding: {}",
+                issue.message
+            );
+        }
+    }
+
+    /// The seam itself: a caller supplying inputs by hand must reach exactly
+    /// the same verdict the loading path would. `graph_module_ids` is public
+    /// for this reason — a batched caller that derived module ids differently
+    /// would fetch the wrong rows and quietly check less.
+    #[test]
+    fn graph_module_ids_resolves_both_node_shapes_the_loader_resolves() {
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        let graph = serde_json::json!({
+            "nodes": [
+                {"id": "by_type", "type": a.to_string()},
+                {"id": "by_data", "data": {"moduleId": b.to_string()}},
+                {"id": "system_node", "kind": "collect"}
+            ],
+            "edges": []
+        });
+        let ids = graph_module_ids(&graph);
+        assert!(ids.contains(&a), "{ids:?}");
+        assert!(
+            ids.contains(&b),
+            "`data.moduleId` nodes must resolve too: {ids:?}"
+        );
+        assert_eq!(ids.len(), 2, "a system node contributes no module id");
     }
 }

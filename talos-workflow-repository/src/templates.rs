@@ -740,7 +740,7 @@ impl WorkflowRepository {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NodeTemplateRow {
     pub id: Uuid,
     pub name: String,
