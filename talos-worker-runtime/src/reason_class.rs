@@ -521,8 +521,24 @@ pub(crate) fn dns_rebinding_class(err: &str) -> Option<&'static str> {
 /// Every token this module can emit. Exists so the classifiers on both sides
 /// can be pinned against the producer by test rather than by hand-copied
 /// string lists — a token added or renamed here fails `closed_set_snapshot`
-/// below, whose failure message points at the two classifier arms that must
-/// be updated with it.
+/// below, whose failure message points at the mirror that must be updated
+/// with it.
+///
+/// **There is now ONE controller-side mirror, not several.** No controller
+/// crate can depend on this one (it would pull wasmtime into the retry path,
+/// the MCP handler tree and the ops-alert reconciler), so the token list is
+/// hand-mirrored — but as of 2026-09 it is mirrored exactly once, in the
+/// zero-dependency `talos-reason-class` crate, which also owns the marker
+/// parser and the token → remediation-FAMILY map. Three consumers read it
+/// from there: `talos_retry_intelligence::classify_error` (which keeps its
+/// own hand-written arms and is pinned to the crate by test),
+/// `talos_failure_analysis_service::classify_error`, and
+/// `talos_ops_alerts_repository::self_monitor::classify_execution_error`.
+///
+/// So: **adding or renaming a token here means editing `talos-reason-class`'s
+/// `ALL` and its `family()` map, and nothing else.** Both `closed_set_snapshot`
+/// tests — this module's and that crate's — carry the identical literal list,
+/// so a change on either side fails on both.
 pub const ALL: &[&str] = &[
     DNS,
     TLS,
@@ -1061,6 +1077,16 @@ mod tests {
             "connect error",
             "dns",
             "network",
+            // `talos_ops_alerts_repository::self_monitor`'s LLM-backend arm.
+            // ABSENT until 2026-09, and its absence was not theoretical:
+            // `tier1-llm-egress` contains `llm`, so a Tier-1 DATA-EGRESS
+            // DENIAL classified as an "LLM backend failure" at severity
+            // `medium` — a privacy control filed as a model outage, in its own
+            // dedup bucket. This test's whole purpose is to refuse that, and it
+            // passed the entire time because the needle was not listed.
+            // See the EXEMPT note below for why the token is not renamed.
+            "llm",
+            "model served nothing",
             "expected",
             "found ",
             "invalid type",
@@ -1096,11 +1122,28 @@ mod tests {
         // already own. Asserting their collisions here would fail the test on
         // shipped, intentional behaviour, so they are exempt BY NAME rather
         // than by the list happening not to mention them.
-        const EXEMPT: &[&str] = &[DNS, TLS, TIMEOUT, SECRET_LOOKUP];
+        //
+        // [`TIER1_LLM_EGRESS`] joins them for a DIFFERENT reason, and the
+        // difference matters. It is not intentional vocabulary: its `llm`
+        // substring was a genuine collision that misfiled every Tier-1 egress
+        // denial as an LLM backend failure. Renaming it now is the WRONG fix —
+        // the token is on the wire, mirrored by hand in
+        // `talos_retry_intelligence::HTTP_POLICY_DENIAL_CLASSES` and pinned by
+        // `closed_set_snapshot` on both sides, and a rename would fork every
+        // consumer for a cosmetic gain. The collision is instead NEUTRALISED at
+        // the reading end: `self_monitor` (like the failure analyser, and like
+        // the retry classifier before them) now parses the marker in an arm
+        // ABOVE every prose needle, so no token can drag a message anywhere.
+        // The needle stays listed so a FUTURE token minted with `llm` in it —
+        // which would have no such arm protecting it — still fails here.
+        const EXEMPT: &[&str] = &[DNS, TLS, TIMEOUT, SECRET_LOOKUP, TIER1_LLM_EGRESS];
         for t in EXEMPT {
             assert!(ALL.contains(t), "exemption names a token not in ALL: {t:?}");
         }
         for t in HTTP_POLICY_CLASSES {
+            if EXEMPT.contains(t) {
+                continue;
+            }
             for n in FOREIGN_NEEDLES {
                 assert!(
                     !t.contains(n),

@@ -23,6 +23,12 @@ sqlx = { version = "0.8", default-features = false, features = ["postgres", "run
 talos-actor-repository = { path = "../talos-actor-repository" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-metrics = { path = "../talos-metrics" }
+# The worker's `[reason_class=…]` marker vocabulary. This classifier reads
+# worker failure text and knew ZERO of the thirty-one tokens: every egress
+# denial on the three sibling surfaces landed in `other`, and
+# `tier1-llm-egress` was actively misfiled as an LLM BACKEND failure because
+# the token contains the substring `llm`.
+talos-reason-class = { path = "../talos-reason-class" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 thiserror = "2.0"
 tokio = { version = "1", features = ["rt", "time"] }
