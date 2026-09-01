@@ -815,6 +815,9 @@ impl ParallelWorkflowEngine {
                 log_message: None,
                 iteration_index: None,
                 error_class: None,
+                // A skipped node ran for no time at all — but `None` here means
+                // "unmeasured", and the trigger ignores `node_skipped` anyway.
+                duration_ms: None,
             },
         );
     }
@@ -839,6 +842,8 @@ impl ParallelWorkflowEngine {
                 log_message: Some(format!("Loop iteration {iteration}/{max_iters}")),
                 iteration_index: Some(iteration as i32),
                 error_class: None,
+                // Loop progress marker, not a completion. Ignored by the trigger.
+                duration_ms: None,
             },
         );
     }
@@ -864,6 +869,9 @@ impl ParallelWorkflowEngine {
                 log_message: None,
                 iteration_index: None,
                 error_class: None,
+                // See the note on the paired `node_completed` below: this
+                // `node_started` is written AFTER the node already finished.
+                duration_ms: None,
             })
             .await;
             sink.emit(NodeEventWrite {
@@ -874,6 +882,18 @@ impl ParallelWorkflowEngine {
                 log_message: Some(log_message),
                 iteration_index: None,
                 error_class: None,
+                // DELIBERATELY UNMEASURED, and the one site where that needs
+                // saying. This helper emits a SYNTHETIC node_started +
+                // node_completed PAIR from one spawned task, after the in-process
+                // system node has already finished — nothing timed it. The
+                // interval the trigger derives here is therefore the gap between
+                // two adjacent INSERTs (measured live at 0.307–0.490 ms, which is
+                // why all 19 zero-valued rows in the table are these), not the
+                // duration of any work. Binding a fabricated value would be worse
+                // than a wrong number that at least labels itself 'wallclock'.
+                // ~128 rows/day, the whole of this column's remaining wall-clock
+                // population.
+                duration_ms: None,
             })
             .await;
         });

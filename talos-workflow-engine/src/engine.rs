@@ -2747,6 +2747,10 @@ impl ParallelWorkflowEngine {
                         log_message: None,
                         iteration_index: None,
                         error_class: None,
+                        // `node_started` opens the span the completion event closes;
+                        // there is nothing elapsed to report yet. The trigger ignores
+                        // this event type entirely.
+                        duration_ms: None,
                     },
                 );
                 executing.push(Box::pin(fut)

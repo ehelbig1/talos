@@ -447,6 +447,7 @@ mod tests {
             log_message: None,
             iteration_index: None,
             error_class: None,
+            duration_ms: None,
         })
         .await;
         sink.emit(NodeEventWrite {
@@ -457,6 +458,7 @@ mod tests {
             log_message: None,
             iteration_index: None,
             error_class: None,
+            duration_ms: None,
         })
         .await;
 
