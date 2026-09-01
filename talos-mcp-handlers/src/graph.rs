@@ -579,6 +579,278 @@ pub(crate) struct AddedSystemNode {
     /// The bare auto-publish sync note (possibly empty), for handlers that
     /// don't print `wiring_out` and want to append it to their own message.
     pub auto_publish_note: String,
+    /// In-degree of the new node in the POST-MUTATION graph — edges from this
+    /// call's `connect_from` PLUS any that were already there.
+    pub incoming_edge_count: usize,
+    /// `Some` only for kinds whose output is a pure function of their
+    /// in-edges ([`kind_is_edge_driven`]). Computed HERE, at the one
+    /// chokepoint every `add_*_node` handler goes through, so a future
+    /// edge-driven kind gets the datum without a per-handler re-derivation.
+    pub fan_in_posture: Option<FanInPosture>,
+}
+
+impl AddedSystemNode {
+    /// Message PREFIX stating the node is inert, or `""` when it is not
+    /// edge-driven or is correctly wired. Handlers put this at the FRONT of
+    /// their message — a suffix loses to the success sentence.
+    pub fn inert_prefix(&self, kind: &str) -> String {
+        self.fan_in_posture
+            .map(|p| fan_in_posture_prefix(kind, &self.node_id, p))
+            .unwrap_or_default()
+    }
+
+    /// `true` when this node gathers nothing — the machine-readable twin of
+    /// [`Self::inert_prefix`], surfaced as a top-level `inert` response field.
+    pub fn is_inert(&self) -> bool {
+        self.fan_in_posture == Some(FanInPosture::Inert)
+    }
+
+    /// `next_steps` entries for an under-wired edge-driven node (empty
+    /// otherwise).
+    pub fn fan_in_next_steps(&self) -> Vec<String> {
+        self.fan_in_posture
+            .map(|p| fan_in_posture_next_steps(&self.node_id, p))
+            .unwrap_or_default()
+    }
+}
+
+// ── Fan-in posture: a node whose whole specification is its in-edges ────────
+//
+// Reported 2026-09-01 by black-box authoring stress test: calling
+// `add_collect_node` with a wrong parameter name (`from_nodes` instead of
+// `connect_from`) answered
+//   "Collect node 'collect' added to workflow …"
+// with `edges_wired: []` and `parent_branches: []`, and `get_workflow_graph`
+// then showed 3 nodes / 0 edges. The central unknown-argument warning
+// (utils::unknown_argument_warning) DID fire and was appended — but it is
+// appended AFTER a success message, and the success message dominates.
+//
+// Every OTHER `add_*_node` helper validates its own semantic requirement as a
+// REQUIRED CONFIG FIELD and hard-errors when it is missing: `add_loop_node`
+// requires `body_node_id` (and checks it exists in the graph),
+// `add_judge_node` requires `judge_workflow_id`, `add_ensemble_node` requires
+// `child_workflow_id`, and so on. `collect` is the one kind with NO config at
+// all — `SystemNodeKind::Collect` is the sole unit variant of the enum — so
+// its entire specification is "which edges point at me", and that is exactly
+// the input nothing validated.
+//
+// WHAT ACTUALLY HAPPENS AT RUNTIME (measured against the engine, not assumed):
+// a node with zero incoming edges is a graph ROOT, and
+// `ParallelWorkflowEngine::ensure_trigger_node_wired_to_roots` wires the
+// synthetic `__trigger__` node to EVERY root before the run. So a parentless
+// collect does not emit `{count: 0}` — it emits `{count: 1, items: [<the
+// trigger payload>]}`, having gathered the trigger instead of the branches
+// the author meant to fan in, while those branches run in parallel as roots
+// of their own and are discarded. Silent, and wrong in a way that reads as
+// plausible output.
+//
+// NOT A HARD ERROR, deliberately. Top-down authoring is a legitimate order:
+// `add_node_to_workflow` accepts `connect_to`, so an author can create the
+// collect first and point parents at it afterwards, and `upsert_system_node`
+// is an UPSERT whose documented use includes re-calling to re-wire. Rejecting
+// a parentless collect would break both. The house precedents for this exact
+// situation both report rather than reject — `fix_fan_in` answers "No fan-in
+// detected on this node — fewer than 2 incoming edges" and mutates nothing,
+// `add_error_handler` answers "All nodes already have outgoing error edges".
+// So the fix is an unmissable `inert: true` plus a message that LEADS with the
+// defect, not a rejection and not a suffix.
+
+/// System-node kinds whose output is a pure function of their INCOMING EDGES,
+/// with nothing else to fall back on.
+///
+/// - `collect` — always. `SystemNodeKind::Collect` carries no config;
+///   `collect_parent_outputs_for_node` reads `neighbors_directed(Incoming)`
+///   and nothing else.
+/// - `synthesize` — only when it carries no `synthesis_expr`. In that state
+///   `synthesize_parent_outputs` produces byte-identical output to collect
+///   (`{items, count}`), which the handler's own response text already says
+///   ("No expression — behaves like collect"). WITH an expression it is a
+///   different node: the expression can legitimately operate on the trigger
+///   payload, so a parentless expr-bearing synthesize is a real authoring
+///   choice and is left alone.
+///
+/// Everything else is deliberately excluded, and the exclusions are the
+/// substance of this function — see the `f1_table` tests. Producer kinds
+/// (`assistant_report`, `operator_digest`, `ops_alerts_digest`,
+/// `pending_approvals`) query the database and are CORRECT with zero parents.
+/// Invoker kinds (`loop`, `sub_workflow`, `agent_loop`, `react_loop`,
+/// `ensemble`, `reflective_retry`, `llm_dispatch`, `capability_dispatch`,
+/// `dispatch`) run a target against whatever input they receive — running
+/// straight off the trigger is the ordinary shape of a workflow's first node,
+/// and their required target IS validated as a config field. Consumer kinds
+/// (`verify`, `inline_judge`, `judge`, `confidence_gate`) read
+/// `gather_inputs`, which for a root resolves to the trigger payload —
+/// verifying or judging the trigger is a legitimate authoring choice.
+pub(crate) fn kind_is_edge_driven(kind: &str, data: &serde_json::Value) -> bool {
+    match kind {
+        "collect" => true,
+        "synthesize" => data.get("synthesis_expr").is_none(),
+        _ => false,
+    }
+}
+
+/// How an edge-driven node's authored in-degree reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FanInPosture {
+    /// Zero authored parents. The node is INERT as a fan-in: at runtime the
+    /// engine wires it to the synthetic trigger and it gathers the trigger
+    /// payload instead of any branch.
+    Inert,
+    /// Exactly one authored parent. Not a fan-in — it wraps a single branch
+    /// output in `{items, count: 1}`. Legal, occasionally deliberate
+    /// (normalising one branch to the collect shape), usually incomplete.
+    /// Same threshold `fix_fan_in` uses ("fewer than 2 incoming edges").
+    SingleBranch,
+    /// Two or more authored parents — a real fan-in.
+    FanIn,
+}
+
+/// Classify an edge-driven node from its authored in-degree.
+pub(crate) fn classify_fan_in(incoming_edges: usize) -> FanInPosture {
+    match incoming_edges {
+        0 => FanInPosture::Inert,
+        1 => FanInPosture::SingleBranch,
+        _ => FanInPosture::FanIn,
+    }
+}
+
+/// Count edges in `graph` whose `target` is `node_id`.
+///
+/// Reads the POST-MUTATION graph, so it counts edges from any source —
+/// this call's `connect_from`, an earlier `add_edge`, an import — rather
+/// than only the arguments this call happened to supply. That is what makes
+/// "add the collect, wire it later, re-call to confirm" work.
+pub(crate) fn count_incoming_edges(graph: &serde_json::Value, node_id: &str) -> usize {
+    graph
+        .get("edges")
+        .and_then(|e| e.as_array())
+        .map_or(0, |edges| {
+            edges
+                .iter()
+                .filter(|e| e.get("target").and_then(|t| t.as_str()) == Some(node_id))
+                .count()
+        })
+}
+
+/// The message PREFIX for an edge-driven node's response.
+///
+/// A PREFIX, not a suffix: the reported defect is that a trailing warning
+/// loses to a leading "… added to workflow …". Empty for [`FanInPosture::FanIn`],
+/// so a correctly-wired node's message is byte-identical to before.
+pub(crate) fn fan_in_posture_prefix(kind: &str, node_id: &str, posture: FanInPosture) -> String {
+    match posture {
+        FanInPosture::FanIn => String::new(),
+        FanInPosture::Inert => format!(
+            "⚠ INERT — '{node_id}' has NO incoming edges, so it gathers none of \
+             the branches you meant to fan in. A {kind} node's entire \
+             specification is which edges point at it, and there are none, so it \
+             is a graph ROOT: on the trigger path the engine wires every root to \
+             the synthetic trigger node, and this one emits \
+             {{\"count\": 1, \"items\": [<the trigger payload>]}} while the branches \
+             run in parallel as roots of their own and are discarded. Wire its \
+             parents with `connect_from` (note: an argument name the tool does \
+             not declare is IGNORED, so check tools/list if you passed one) or \
+             with add_edge. Node saved: "
+        ),
+        FanInPosture::SingleBranch => format!(
+            "⚠ NOT A FAN-IN — '{node_id}' has exactly 1 incoming edge, so it wraps \
+             one branch in {{\"count\": 1, \"items\": [...]}} rather than joining \
+             several. Deliberate if you wanted that shape; otherwise a parent edge \
+             is missing. Node saved: "
+        ),
+    }
+}
+
+/// The `message` field of an `add_collect_node` response.
+///
+/// Extracted as a pure function so the reported reproduction — a
+/// wrong-parameter call that answered plain success over a disconnected node
+/// — is pinned against the string the handler actually emits, rather than
+/// against a test-local restatement of it.
+pub(crate) fn collect_node_message(
+    node_id: &str,
+    workflow_id: &Uuid,
+    posture: Option<FanInPosture>,
+    auto_publish_note: &str,
+) -> String {
+    let prefix = posture
+        .map(|p| fan_in_posture_prefix("collect", node_id, p))
+        .unwrap_or_default();
+    format!(
+        "{prefix}Collect node '{node_id}' added to workflow {workflow_id}. Fan-in node — gathers \
+         all parent branch outputs into {{count, items: [...]}}.{auto_publish_note}"
+    )
+}
+
+/// `next_steps` entries for an edge-driven node, or empty when correctly wired.
+pub(crate) fn fan_in_posture_next_steps(node_id: &str, posture: FanInPosture) -> Vec<String> {
+    match posture {
+        FanInPosture::FanIn => Vec::new(),
+        FanInPosture::Inert | FanInPosture::SingleBranch => vec![
+            format!(
+                "Wire the parent branches: add_edge workflow_id=… source=<branch> target={node_id} \
+                 (once per branch)"
+            ),
+            "Confirm the wiring: get_workflow_graph, then validate_workflow".to_string(),
+        ],
+    }
+}
+
+/// Reject a graph mutation that would leave the graph cyclic.
+///
+/// The engine requires a DAG (`WorkflowEngineError::GraphCyclic`) and
+/// `validate_workflow` reports "Graph contains a cycle" as an Error — but the
+/// call that BROKE the graph succeeded. Reproduced 2026-09-01: `add_edge`
+/// closing a 2-node cycle was accepted silently.
+///
+/// This is a HARD ERROR, and unlike the fan-in case that costs nothing: the
+/// sibling tool `add_edge_to_workflow` in `workflows.rs` has rejected cycles
+/// all along, so the two edge-adding tools simply disagreed. There is also no
+/// authoring order that needs a transient cycle — an edge that closes one is
+/// never valid later, so refusing it cannot break a legitimate flow the way
+/// refusing a not-yet-wired collect would.
+///
+/// `validate_acyclic` is the tested pure helper already used by
+/// `create_workflow`; it catches self-loops (`a → a`) too. Validation keeps
+/// its own check — graphs mutated by import or a raw `graph_json` write never
+/// pass through here.
+fn reject_if_cyclic(
+    graph: &serde_json::Value,
+    req_id: &Option<serde_json::Value>,
+) -> Result<(), JsonRpcResponse> {
+    let empty: Vec<serde_json::Value> = Vec::new();
+    let edges = graph
+        .get("edges")
+        .and_then(|e| e.as_array())
+        .unwrap_or(&empty);
+    let node_ids: std::collections::HashSet<&str> = graph
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .map(|ns| {
+            ns.iter()
+                .filter_map(|n| n.get("id").and_then(|v| v.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    match talos_workflow_creation_helpers::validate_acyclic(edges, &node_ids) {
+        Ok(()) => Ok(()),
+        // The helper's message states a fact about the GRAPH ("contains a
+        // cycle involving node 'X'") and deliberately does not claim this
+        // call caused it — a workflow imported or hand-edited into a cyclic
+        // state fails here too, on the first edge write after the fact. That
+        // is the honest reading; the suffix names the way out for both cases.
+        // Node/edge REMOVAL does not route through this gate, so a graph that
+        // is already cyclic can still be repaired.
+        Err(msg) => Err(mcp_error(
+            req_id.clone(),
+            -32602,
+            &format!(
+                "{msg} The edge was NOT saved. If the graph was already cyclic before this \
+                 call, remove the back-edge first (remove_edge) — validate_workflow lists \
+                 the current structure."
+            ),
+        )),
+    }
 }
 
 /// Shared boilerplate for `add_*_node` MCP handlers that write a
@@ -643,6 +915,9 @@ pub(crate) async fn upsert_system_node(
     let mut graph: serde_json::Value = serde_json::from_str(&graph_json_str)
         .unwrap_or_else(|_| serde_json::json!({"nodes": [], "edges": []}));
 
+    // Cloned before `data` is moved into the node — `kind_is_edge_driven`
+    // needs it (a `synthesize` WITH an expression is not edge-driven).
+    let graph_data_for_kind = data.clone();
     let new_node = serde_json::json!({
         "id": node_id,
         "type": format!("system:{}", kind),
@@ -680,6 +955,17 @@ pub(crate) async fn upsert_system_node(
             edges.push(serde_json::json!({ "source": &node_id, "target": to }));
         }
     }
+
+    // `connect_from` / `connect_to` are edge writes like any other, and this
+    // one helper backs every `add_*_node` tool — so the cycle gate belongs
+    // here, not only on `add_edge`. Runs BEFORE the save so a cycle is never
+    // persisted.
+    reject_if_cyclic(&graph, req_id)?;
+
+    // Read the in-degree off the FINAL graph (see `count_incoming_edges`).
+    let incoming_edge_count = count_incoming_edges(&graph, &node_id);
+    let fan_in_posture = kind_is_edge_driven(kind, &graph_data_for_kind)
+        .then(|| classify_fan_in(incoming_edge_count));
 
     save_graph_json(
         state,
@@ -719,6 +1005,8 @@ pub(crate) async fn upsert_system_node(
         wiring_in,
         wiring_out,
         auto_publish_note,
+        incoming_edge_count,
+        fan_in_posture,
     })
 }
 
@@ -796,7 +1084,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "add_edge",
-            "description": "Add an edge between two existing nodes in a workflow without rebuilding the whole workflow.",
+            "description": "Add an edge between two existing nodes in a workflow without rebuilding the whole workflow. Both endpoints must already exist. The workflow engine requires a DAG, so an edge that would leave the graph cyclic (including a self-edge) is REFUSED and not saved — remove the back-edge first if the graph was already cyclic.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -964,7 +1252,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "add_collect_node",
-            "description": "Add a collect node to an existing workflow. Gathers all parent branch outputs into a JSON array for aggregate operations after parallel fan-out. For new workflows, prefer declaring this node inline via node_type: 'collect' in create_workflow. Use this tool to add the node to an existing workflow. Use connect_from to wire one or more branch endpoints in the same call.",
+            "description": "Add a collect node to an existing workflow. Gathers all parent branch outputs into a JSON array for aggregate operations after parallel fan-out. For new workflows, prefer declaring this node inline via node_type: 'collect' in create_workflow. Use this tool to add the node to an existing workflow. Use connect_from to wire one or more branch endpoints in the same call. connect_from is what this node IS: a collect with no incoming edges gathers nothing — it becomes a graph root and receives the trigger payload instead of the branches — so if you do not pass connect_from here you must add the parent edges with add_edge. The response reports inert: true when that has happened.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2246,12 +2534,78 @@ async fn handle_update_node_config(
         _ => return mcp_error(req_id, -32602, &format!("Unknown action '{}'. Use 'update_config', 'merge_config', 'update_retry', 'update_position', 'remove_node', or 'remove_edge'.", action)),
     }
 
+    // ── Vault-grant check on the POST-MUTATION config ────────────────────
+    //
+    // The sibling of the `add_node_to_workflow` check. Placed AFTER the
+    // action match rather than inside the two config arms so `update_config`
+    // (replace) and `merge_config` (RFC 7386 patch) are covered by one site
+    // reading the config that was actually persisted — a merge produces a
+    // value neither the caller's patch nor the old config equals, so
+    // checking the ARGUMENT would inspect something that was never stored.
+    //
+    // Unlike `add_node_to_workflow`, this handler holds no template row, so
+    // the check costs one lookup. It is skipped silently when the node
+    // carries no resolvable module id (system nodes, inline nodes) or the
+    // row cannot be read — `validate_workflow` remains the backstop, and a
+    // false "clean" here must never become a false ERROR.
+    let mut blocked_vault: Option<crate::utils::BlockedVaultReport> = None;
+    if matches!(action, "update_config" | "merge_config") {
+        if let Some(node_id) = args.get("node_id").and_then(|v| v.as_str()).map(str::trim) {
+            let node = graph
+                .get("nodes")
+                .and_then(|n| n.as_array())
+                .and_then(|ns| talos_workflow_repository::find_node_in_array(ns, node_id).cloned());
+            if let Some(node) = node {
+                if let Some(tid) = talos_workflow_engine_core::node_module_id(&node) {
+                    // Same two-step id resolution `add_node_to_workflow`
+                    // uses: `tid` may be a modules row id or a wasm_modules
+                    // id whose template_id FK has to be followed.
+                    let resolved_tid = match state.workflow_repo.get_templates_by_ids(&[tid]).await
+                    {
+                        Ok(v) if !v.is_empty() => tid,
+                        _ => state
+                            .module_repo
+                            .find_template_id_via_wasm_module(tid)
+                            .await
+                            .ok()
+                            .flatten()
+                            .unwrap_or(tid),
+                    };
+                    if let Ok(templates) = state
+                        .workflow_repo
+                        .get_templates_by_ids(&[resolved_tid])
+                        .await
+                    {
+                        if let Some(template) = templates.first() {
+                            let cfg = node.get("data").cloned().unwrap_or(serde_json::json!({}));
+                            blocked_vault = crate::utils::describe_blocked_vault_refs(
+                                node_id,
+                                &template.name,
+                                &cfg,
+                                &template.allowed_secrets,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let updated_json = graph.to_string();
     if let Err(e) = save_graph_json(state, wf_id, user_id, &updated_json, &req_id).await {
         return e;
     }
 
-    let mut msg = format!("Workflow {} updated (action: {}).", wf_id, action);
+    // The blocked-secret line LEADS the message — a trailing warning after
+    // "Workflow … updated" reads as success with a footnote, which is the
+    // shape this change exists to remove.
+    let mut msg = match &blocked_vault {
+        Some(r) => format!(
+            "{}workflow {} updated (action: {}).",
+            r.summary, wf_id, action
+        ),
+        None => format!("Workflow {} updated (action: {}).", wf_id, action),
+    };
     for w in &template_warnings {
         msg.push_str(&format!("\n\nWarning: {}", w));
     }
@@ -2303,6 +2657,24 @@ async fn handle_update_node_config(
             .await
             .message_suffix(),
     );
+
+    if let Some(r) = &blocked_vault {
+        msg.push_str(&format!("\n\nNext step: {}", r.next_step));
+        let block = serde_json::json!({
+            "secret_access_blocked": r.entries,
+            "next_step": r.next_step,
+        });
+        match machine_block.as_mut().and_then(|mb| mb.as_object_mut()) {
+            Some(obj) => {
+                if let Some(src) = block.as_object() {
+                    for (k, v) in src {
+                        obj.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            None => machine_block = Some(block),
+        }
+    }
 
     match machine_block {
         Some(mb) => mcp_text_with_json(req_id, &msg, mb),
@@ -2719,6 +3091,14 @@ async fn handle_add_edge(
         edges.push(new_edge);
     }
 
+    // Cycle gate — BEFORE the save, so a cycle is never persisted. The
+    // sibling `add_edge_to_workflow` has rejected cycles all along; this tool
+    // accepted them silently and left `validate_workflow` to report the
+    // damage after the fact. See `reject_if_cyclic`.
+    if let Err(resp) = reject_if_cyclic(&graph, &req_id) {
+        return resp;
+    }
+
     let updated_json = graph.to_string();
     // MCP-737: propagate save errors — see duplicate_node above for rationale.
     if let Err(resp) = save_graph_json(state, wf_id, user_id, &updated_json, &req_id).await {
@@ -2979,6 +3359,12 @@ async fn handle_add_collect_node(
     if let Some(ref t) = connect_to {
         edges_wired.push(format!("{} → {}", added.node_id, t));
     }
+    // A collect node with no in-edges gathers nothing (see `FanInPosture`).
+    // The prefix LEADS the message; `inert` is the machine-readable claim.
+    let mut next_steps = added.fan_in_next_steps();
+    if next_steps.is_empty() {
+        next_steps.push("Confirm the wiring: get_workflow_graph".to_string());
+    }
     mcp_text(
         req_id,
         &serde_json::to_string_pretty(&serde_json::json!({
@@ -2988,9 +3374,14 @@ async fn handle_add_collect_node(
             "parent_branches": connect_from_sources,
             "downstream": connect_to,
             "edges_wired": edges_wired,
-            "message": format!(
-                "Collect node '{}' added to workflow {}. Fan-in node — gathers all parent branch outputs into {{count, items: [...]}}.{}",
-                added.node_id, added.workflow_id, added.auto_publish_note
+            "incoming_edge_count": added.incoming_edge_count,
+            "inert": added.is_inert(),
+            "next_steps": next_steps,
+            "message": collect_node_message(
+                &added.node_id,
+                &added.workflow_id,
+                added.fan_in_posture,
+                &added.auto_publish_note,
             ),
         }))
         .unwrap_or_default(),
@@ -4904,11 +5295,20 @@ async fn handle_add_synthesize_node(
         .unwrap_or_else(|| {
             "\nNo expression — behaves like collect (outputs {items, count})".to_string()
         });
+    // Only the NO-EXPRESSION form is edge-driven — with an expression the
+    // node can legitimately operate on the trigger payload, so
+    // `inert_prefix` returns "" there and this message is unchanged.
+    let posture_prefix = added.inert_prefix("synthesize");
     mcp_text(
         req_id,
         &format!(
-            "Synthesize node '{}' added to workflow {}.{}{}{}",
-            added.node_id, added.workflow_id, expr_note, added.wiring_in, added.wiring_out
+            "{}Synthesize node '{}' added to workflow {}.{}{}{}",
+            posture_prefix,
+            added.node_id,
+            added.workflow_id,
+            expr_note,
+            added.wiring_in,
+            added.wiring_out
         ),
     )
 }
@@ -6385,5 +6785,288 @@ mod skip_condition_validation_tests {
     #[test]
     fn a_context_free_expression_produces_no_warning() {
         assert!(dry_run_skip_condition("1 == 1").is_none());
+    }
+}
+
+#[cfg(test)]
+mod fan_in_posture_tests {
+    use super::{
+        classify_fan_in, collect_node_message, count_incoming_edges, fan_in_posture_next_steps,
+        fan_in_posture_prefix, kind_is_edge_driven, AddedSystemNode, FanInPosture,
+    };
+    use serde_json::json;
+
+    /// The reported reproduction, replayed against the production message
+    /// builder: `add_collect_node` called with a wrong parameter name
+    /// (`from_nodes` — not declared, therefore ignored) leaves the graph at
+    /// 3 nodes / 0 edges, and the pre-fix response opened
+    /// "Collect node 'collect' added to workflow …".
+    #[test]
+    fn the_reported_wrong_parameter_call_does_not_report_plain_success() {
+        // Exactly what get_workflow_graph showed after the repro call.
+        let graph = json!({
+            "nodes": [
+                { "id": "a" },
+                { "id": "b" },
+                { "id": "collect", "kind": "collect", "data": {} }
+            ],
+            "edges": []
+        });
+        let incoming = count_incoming_edges(&graph, "collect");
+        assert_eq!(incoming, 0, "the repro graph has no edges at all");
+
+        let posture = kind_is_edge_driven("collect", &json!({})).then(|| classify_fan_in(incoming));
+        assert_eq!(posture, Some(FanInPosture::Inert));
+
+        let wf = uuid::Uuid::nil();
+        let msg = collect_node_message("collect", &wf, posture, "");
+
+        assert!(
+            !msg.starts_with("Collect node"),
+            "the success sentence must not lead the message: {msg}"
+        );
+        assert!(msg.starts_with("⚠ INERT"), "message: {msg}");
+        assert!(
+            msg.contains("NO incoming edges"),
+            "the message must name the actual defect: {msg}"
+        );
+        // The remediation must mention the ignored-argument trap that caused
+        // this reproduction, not just "wire it up".
+        assert!(
+            msg.contains("tools/list"),
+            "message should point at the declared-parameter list: {msg}"
+        );
+    }
+
+    /// A correctly-wired collect must be byte-identical to the pre-fix
+    /// response — this change adds nothing to the normal path.
+    #[test]
+    fn a_wired_collect_message_is_unchanged() {
+        let wf = uuid::Uuid::nil();
+        let msg = collect_node_message("collect", &wf, Some(FanInPosture::FanIn), "");
+        assert_eq!(
+            msg,
+            format!(
+                "Collect node 'collect' added to workflow {wf}. Fan-in node — gathers all \
+                 parent branch outputs into {{count, items: [...]}}."
+            )
+        );
+        // And a kind that is not edge-driven passes `None`, same result.
+        assert_eq!(collect_node_message("collect", &wf, None, ""), msg);
+    }
+
+    /// The one-parent case is reported as "not a fan-in", not as inert — the
+    /// same threshold `fix_fan_in` uses ("fewer than 2 incoming edges").
+    #[test]
+    fn one_parent_is_reported_as_not_a_fan_in_not_as_inert() {
+        assert_eq!(classify_fan_in(1), FanInPosture::SingleBranch);
+        let p = fan_in_posture_prefix("collect", "c", FanInPosture::SingleBranch);
+        assert!(p.contains("NOT A FAN-IN"), "{p}");
+        assert!(!p.contains("INERT"), "{p}");
+    }
+
+    #[test]
+    fn posture_boundaries() {
+        assert_eq!(classify_fan_in(0), FanInPosture::Inert);
+        assert_eq!(classify_fan_in(2), FanInPosture::FanIn);
+        assert_eq!(classify_fan_in(50), FanInPosture::FanIn);
+        assert!(fan_in_posture_prefix("collect", "c", FanInPosture::FanIn).is_empty());
+        assert!(fan_in_posture_next_steps("c", FanInPosture::FanIn).is_empty());
+        assert_eq!(fan_in_posture_next_steps("c", FanInPosture::Inert).len(), 2);
+    }
+
+    /// Counts the POST-MUTATION graph, so an edge added by an earlier
+    /// `add_edge` call counts even though this call supplied no
+    /// `connect_from` — which is what makes "add now, wire later, re-call"
+    /// work rather than reporting a permanently-inert node.
+    #[test]
+    fn incoming_count_reads_the_graph_not_the_arguments() {
+        let graph = json!({
+            "nodes": [{ "id": "a" }, { "id": "b" }, { "id": "c" }],
+            "edges": [
+                { "source": "a", "target": "c" },
+                { "source": "b", "target": "c" },
+                { "source": "c", "target": "a" }
+            ]
+        });
+        assert_eq!(count_incoming_edges(&graph, "c"), 2);
+        assert_eq!(count_incoming_edges(&graph, "a"), 1);
+        assert_eq!(count_incoming_edges(&graph, "b"), 0);
+        assert_eq!(count_incoming_edges(&graph, "absent"), 0);
+        // Malformed edge arrays must read as zero, never panic.
+        assert_eq!(count_incoming_edges(&json!({}), "c"), 0);
+        assert_eq!(
+            count_incoming_edges(&json!({"edges": [{"source": "a"}, 7]}), "c"),
+            0
+        );
+    }
+
+    // ── F1: the edge-driven kind table ──────────────────────────────────
+    //
+    // The EXCLUSIONS are the substance. `collect` was found by accident;
+    // asserting only that it fires would be the chokepoint-that-misses-a-site
+    // shape. Each name below is a kind an `add_*_node` tool can create.
+
+    #[test]
+    fn f1_table_collect_is_always_edge_driven() {
+        assert!(kind_is_edge_driven("collect", &json!({})));
+        // collect has no config at all, so nothing can change the verdict.
+        assert!(kind_is_edge_driven("collect", &json!({"anything": 1})));
+    }
+
+    #[test]
+    fn f1_table_synthesize_is_edge_driven_only_without_an_expression() {
+        // No expression: byte-identical to collect ({items, count}) — the
+        // handler's own response text already says "behaves like collect".
+        assert!(kind_is_edge_driven("synthesize", &json!({})));
+        // With an expression it is a different node: the expression can
+        // legitimately operate on the trigger payload a root receives.
+        assert!(!kind_is_edge_driven(
+            "synthesize",
+            &json!({"synthesis_expr": "items.len()"})
+        ));
+    }
+
+    #[test]
+    fn f1_table_producer_kinds_are_correct_with_zero_parents() {
+        // These query the database and generate their own output; a
+        // zero-parent producer is the NORMAL shape, not a defect.
+        for kind in [
+            "assistant_report",
+            "operator_digest",
+            "ops_alerts_digest",
+            "pending_approvals",
+        ] {
+            assert!(
+                !kind_is_edge_driven(kind, &json!({"days": 7})),
+                "{kind} generates its own data and must not be called inert"
+            );
+        }
+    }
+
+    #[test]
+    fn f1_table_invoker_kinds_are_not_edge_driven() {
+        // Each runs a target against whatever input it receives — running
+        // straight off the trigger is the ordinary shape of a first node —
+        // and each already hard-errors when its target is missing.
+        for kind in [
+            "loop",
+            "sub_workflow",
+            "agent_loop",
+            "react_loop",
+            "ensemble",
+            "reflective_retry",
+            "llm_dispatch",
+            "capability_dispatch",
+            "dispatch",
+            "wait",
+        ] {
+            assert!(!kind_is_edge_driven(kind, &json!({})), "{kind}");
+        }
+    }
+
+    #[test]
+    fn f1_table_consumer_kinds_are_not_edge_driven() {
+        // These read `gather_inputs`, which for a root resolves to the
+        // trigger payload — verifying or judging the trigger is a real
+        // authoring choice, so zero parents is not a defect.
+        for kind in ["verify", "inline_judge", "judge", "confidence_gate"] {
+            assert!(!kind_is_edge_driven(kind, &json!({})), "{kind}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_future_kind_is_not_edge_driven() {
+        // Fail toward silence: a new kind must be added to the table
+        // deliberately rather than inheriting an inert warning it may not
+        // deserve.
+        assert!(!kind_is_edge_driven("some_future_kind", &json!({})));
+    }
+
+    #[test]
+    fn added_system_node_surfaces_the_posture_it_was_given() {
+        let mut added = AddedSystemNode {
+            workflow_id: uuid::Uuid::nil(),
+            node_id: "c".to_string(),
+            wiring_in: String::new(),
+            wiring_out: String::new(),
+            auto_publish_note: String::new(),
+            incoming_edge_count: 0,
+            fan_in_posture: Some(FanInPosture::Inert),
+        };
+        assert!(added.is_inert());
+        assert!(added.inert_prefix("collect").starts_with("⚠ INERT"));
+        assert_eq!(added.fan_in_next_steps().len(), 2);
+
+        added.fan_in_posture = Some(FanInPosture::FanIn);
+        assert!(!added.is_inert());
+        assert!(added.inert_prefix("collect").is_empty());
+
+        // A non-edge-driven kind carries no posture and stays silent.
+        added.fan_in_posture = None;
+        assert!(!added.is_inert());
+        assert!(added.inert_prefix("judge").is_empty());
+        assert!(added.fan_in_next_steps().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod cycle_gate_tests {
+    use super::reject_if_cyclic;
+    use serde_json::json;
+
+    fn err_text(graph: &serde_json::Value) -> Option<String> {
+        reject_if_cyclic(graph, &None)
+            .err()
+            .map(|resp| serde_json::to_string(&resp).expect("response serialises"))
+    }
+
+    /// The reported reproduction: `loop_back → call_child` closing a two-node
+    /// cycle was accepted silently, and only `validate_workflow` reported it.
+    #[test]
+    fn the_reported_two_node_cycle_is_refused() {
+        let graph = json!({
+            "nodes": [{ "id": "call_child" }, { "id": "loop_back" }],
+            "edges": [
+                { "source": "call_child", "target": "loop_back" },
+                { "source": "loop_back", "target": "call_child" }
+            ]
+        });
+        let e = err_text(&graph).expect("a cycle must be refused");
+        assert!(e.contains("cycle"), "error should name the cycle: {e}");
+    }
+
+    #[test]
+    fn a_self_loop_is_refused() {
+        let graph = json!({
+            "nodes": [{ "id": "a" }],
+            "edges": [{ "source": "a", "target": "a" }]
+        });
+        assert!(err_text(&graph).is_some());
+    }
+
+    #[test]
+    fn a_dag_a_diamond_and_an_empty_graph_pass() {
+        for graph in [
+            json!({"nodes": [{"id":"a"},{"id":"b"}], "edges": [{"source":"a","target":"b"}]}),
+            json!({
+                "nodes": [{"id":"a"},{"id":"b"},{"id":"c"},{"id":"d"}],
+                "edges": [
+                    {"source":"a","target":"b"}, {"source":"a","target":"c"},
+                    {"source":"b","target":"d"}, {"source":"c","target":"d"}
+                ]
+            }),
+            json!({"nodes": [], "edges": []}),
+            // Disconnected nodes with no edges — the shape the collect repro
+            // produced. Not a cycle; must not be refused.
+            json!({"nodes": [{"id":"a"},{"id":"b"},{"id":"collect"}], "edges": []}),
+            // Missing keys entirely.
+            json!({}),
+        ] {
+            assert!(
+                reject_if_cyclic(&graph, &None).is_ok(),
+                "acyclic graph refused: {graph}"
+            );
+        }
     }
 }

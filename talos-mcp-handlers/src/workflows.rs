@@ -2314,6 +2314,11 @@ async fn handle_add_node_to_workflow(
     // modules like human-approval resolve to 0 (no retry storms on rejection)
     // while read-only fetchers resolve to transient retries.
     let mut template_max_retries: Option<i32> = None;
+    // Vault references this node's config declares that the module's grant
+    // will refuse — see `utils::describe_blocked_vault_refs`. Populated from
+    // the SAME template row already loaded for the retry default and the two
+    // config validations below, so the check costs no extra query.
+    let mut blocked_vault: Option<crate::utils::BlockedVaultReport> = None;
     if !module_id.is_empty() {
         if let Ok(tid) = module_id.parse::<uuid::Uuid>() {
             // Resolve tid: it may be a node_templates.id (from install_module_from_catalog
@@ -2368,6 +2373,18 @@ async fn handle_add_node_to_workflow(
                             &format!("Config pattern validation failed — {}", pattern_err),
                         );
                     }
+
+                    // Vault-grant check. Reported: an HTTP Request node
+                    // (empty allowed_secrets = deny-all) accepted
+                    // `AUTH_HEADER: "Bearer vault://anthropic/api_key"`
+                    // silently, and only `validate_workflow` said so later.
+                    // Reported, not rejected — see the helper's rationale.
+                    blocked_vault = crate::utils::describe_blocked_vault_refs(
+                        node_id,
+                        &template.name,
+                        &config,
+                        &template.allowed_secrets,
+                    );
                 }
             }
         }
@@ -2589,13 +2606,33 @@ async fn handle_add_node_to_workflow(
     let node_max_fuel_override = node_max_fuel_override(&config);
     let effective_max_fuel = effective_max_fuel(node_max_fuel_override, applied_max_fuel);
 
+    // The response body is pure JSON — `status` IS the headline here, so a
+    // blocked reference must change IT rather than ride along in a field
+    // underneath a literal "added". The stress-test finding was precisely
+    // that a success token beside a warning reads as success.
+    let (status, blocked_entries) = match &blocked_vault {
+        Some(r) => ("added_but_secret_access_blocked", r.entries.clone()),
+        None => ("added", Vec::new()),
+    };
+    if let Some(r) = &blocked_vault {
+        checklist.insert(
+            0,
+            serde_json::json!({
+                "action": r.summary.trim_end_matches("Saved anyway: ").trim(),
+                "tool": "update_module_secrets",
+                "note": r.next_step,
+            }),
+        );
+    }
+
     mcp_text(
         req_id,
         &serde_json::to_string_pretty(&serde_json::json!({
             "node_id": node_id_str,
             "workflow_id": wf_id_str,
             "module_id": module_id,
-            "status": "added",
+            "status": status,
+            "secret_access_blocked": blocked_entries,
             "edges_added": {
                 "connect_from": connect_from,
                 "connect_to": connect_to,
