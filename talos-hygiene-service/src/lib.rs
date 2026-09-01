@@ -81,6 +81,34 @@ pub fn share_pct(part: i64, whole: i64) -> Option<f64> {
 /// string form has to carry the same refusal the number does, or the null is
 /// undone the moment it reaches a sentence.
 #[must_use]
+/// The copy-pasteable `generate_typed_scaffold` calls the untyped-Value
+/// recommendation carries, one per flagged module.
+///
+/// Extracted out of `HygieneService::generate` (async, DB-backed, untestable)
+/// so the hint can be checked against `generate_typed_scaffold`'s real schema
+/// — see `talos_mcp_handlers::tool_hints`. A hint that names a tool or an
+/// argument the server does not declare is worse than no hint: the operator
+/// pastes it and the call is rejected.
+pub fn build_typed_scaffold_fix_commands(
+    modules: &[talos_analytics_repository::UntypedValueModuleRow],
+) -> Vec<serde_json::Value> {
+    modules
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "module_name": m.name,
+                "module_id": m.id.to_string(),
+                "tool": "generate_typed_scaffold",
+                "arguments": {
+                    "name": format!("{}-typed", m.name),
+                    "source_module_id": m.id.to_string(),
+                },
+                "next": "Review generated structs, fill in run body, then call compile_custom_sandbox with a fuel_budget derived from expected payload shape, then hot_update_module on the original to swap the implementation.",
+            })
+        })
+        .collect()
+}
+
 pub fn render_share_pct(pct: Option<f64>) -> String {
     match pct {
         Some(p) => format!("{p}%"),
@@ -665,22 +693,7 @@ impl HygieneService {
             // any MCP client; they reference source_module_id so the scaffold
             // generator pulls real captured samples via the DLP-scrubbed path
             // shipped in commit 1355e86 — no hand-crafted JSON required.
-            let fix_commands: Vec<serde_json::Value> = h
-                .untyped_value_modules
-                .iter()
-                .map(|m| {
-                    serde_json::json!({
-                        "module_name": m.name,
-                        "module_id": m.id.to_string(),
-                        "tool": "generate_typed_scaffold",
-                        "arguments": {
-                            "name": format!("{}-typed", m.name),
-                            "source_module_id": m.id.to_string(),
-                        },
-                        "next": "Review generated structs, fill in run body, then call compile_custom_sandbox with a fuel_budget derived from expected payload shape, then hot_update_module on the original to swap the implementation.",
-                    })
-                })
-                .collect();
+            let fix_commands = build_typed_scaffold_fix_commands(&h.untyped_value_modules);
             // Serialize the HygieneReport struct's module list into a compact
             // {id,name} array for the recommendation payload. Keeping the id
             // surfaced makes the recommendation self-contained.

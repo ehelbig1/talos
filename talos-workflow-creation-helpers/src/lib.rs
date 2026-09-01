@@ -740,7 +740,10 @@ pub fn build_create_workflow_response(inputs: CreateResponseInputs) -> Value {
     next_steps_checklist.push(serde_json::json!({
         "step": next_steps_checklist.len() + 1,
         "action": "Full readiness check",
-        "tool": format!("get_workflow_quickstart with workflow_id: {}", wf_id_str),
+        // `tool` carries a TOOL NAME, never prose — a caller copy-pastes it.
+        // This field used to hold "get_workflow_quickstart with workflow_id: …".
+        "tool": "get_workflow_quickstart",
+        "args": { "workflow_id": &wf_id_str },
     }));
     next_steps_checklist.push(serde_json::json!({
         "step": next_steps_checklist.len() + 1,
@@ -763,9 +766,13 @@ pub fn build_create_workflow_response(inputs: CreateResponseInputs) -> Value {
     next_steps_checklist.push(serde_json::json!({
         "step": next_steps_checklist.len() + 1,
         "action": "After several runs — compare output evolution across executions",
-        "tool": "get_execution_delta",
-        "args": { "workflow_id": &wf_id_str, "n": 5 },
-        "note": "get_execution_delta shows field-level changes across the last N executions. Excellent for spotting regressions, verifying improvements, and demo presentations. Run after 3+ executions.",
+        // `get_execution_delta` is a deprecated alias that still dispatches but
+        // is NOT advertised in tools/list, so a client driven by tools/list
+        // cannot call it. The canonical spelling is compare_executions
+        // view='delta'.
+        "tool": "compare_executions",
+        "args": { "view": "delta", "workflow_id": &wf_id_str, "n": 5 },
+        "note": "compare_executions view='delta' shows field-level changes across the last N executions. Excellent for spotting regressions, verifying improvements, and demo presentations. Run after 3+ executions.",
     }));
     if inputs.ready_to_run {
         next_steps.push(format!(

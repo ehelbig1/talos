@@ -184,6 +184,13 @@ pub struct WasmModuleInfo {
     pub size_bytes: i64,
     pub has_source_code: bool,
     pub rate_limit_per_minute: Option<i32>,
+    /// The module row's `config_schema` JSONB, verbatim and un-normalised.
+    ///
+    /// `None` = the column is SQL NULL. `Some({})` — which every `sandbox` /
+    /// `extracted` row carries — is NOT the same as "this module takes no
+    /// config": it means nothing ever declared one. Callers must keep the two
+    /// distinguishable (see `config_schema_status` in the MCP layer).
+    pub config_schema: Option<serde_json::Value>,
 }
 
 /// Sandbox-template info returned by `get_node_template_info`.
@@ -197,6 +204,45 @@ pub struct NodeTemplateInfo {
     pub allowed_hosts: Vec<String>,
     pub allowed_secrets: Vec<String>,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// See `WasmModuleInfo::config_schema` — same NULL-vs-`{}` caveat.
+    pub config_schema: Option<serde_json::Value>,
+}
+
+/// One module a caller can reference by id right now, from
+/// `list_visible_module_ids`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisibleModule {
+    /// The id to pass to `add_node_to_workflow`.
+    pub id: Uuid,
+    /// True when this is the caller's OWN row (installed / compiled / hot-
+    /// updated by them); false when it is the shared global catalog row.
+    /// This is the distinction the catalog listing's `installed` flag was
+    /// really reporting — it never meant "usable".
+    pub personal: bool,
+}
+
+/// Collapse `(name, VisibleModule)` rows into one entry per name, with the
+/// caller's OWN copy winning over the shared global row.
+///
+/// Split out of `list_visible_module_ids` so the precedence rule is testable
+/// without Postgres. Order-independent on purpose: relying on `ORDER BY` would
+/// make the rule invisible at the point it matters.
+fn resolve_visible_modules(
+    rows: Vec<(String, VisibleModule)>,
+) -> std::collections::HashMap<String, VisibleModule> {
+    let mut out: std::collections::HashMap<String, VisibleModule> =
+        std::collections::HashMap::new();
+    for (name, entry) in rows {
+        match out.get(&name) {
+            // A personal row displaces a global one; a global row never
+            // displaces a personal one.
+            Some(existing) if existing.personal && !entry.personal => {}
+            _ => {
+                out.insert(name, entry);
+            }
+        }
+    }
+    out
 }
 
 /// Workflow reference returned by the dependency-scan helpers.
@@ -1006,7 +1052,7 @@ impl ModuleRepository {
     ) -> Result<Option<WasmModuleInfo>> {
         let row = sqlx::query(
             "SELECT id, name, capability_world, compiled_at, \
-                    allowed_hosts, allowed_secrets, \
+                    allowed_hosts, allowed_secrets, config_schema, \
                     COALESCE(LENGTH(wasm_bytes)::bigint, size_bytes::bigint) AS size_bytes, \
                     (source_code IS NOT NULL) AS has_source_code, \
                     rate_limit_per_minute \
@@ -1045,6 +1091,7 @@ impl ModuleRepository {
                     .try_get::<Option<_>, _>("has_source_code")?
                     .unwrap_or(false),
                 rate_limit_per_minute: r.try_get::<Option<_>, _>("rate_limit_per_minute")?,
+                config_schema: r.try_get::<Option<serde_json::Value>, _>("config_schema")?,
             })
         })
         .transpose()
@@ -1124,6 +1171,7 @@ impl ModuleRepository {
     ) -> Result<Option<NodeTemplateInfo>> {
         let row = sqlx::query(
             "SELECT name, kind, capability_world, allowed_hosts, allowed_secrets, \
+                    config_schema, \
                     COALESCE(LENGTH(wasm_bytes)::bigint, size_bytes::bigint) AS size_bytes, \
                     (source_code IS NOT NULL) AS has_source_code, \
                     created_at \
@@ -1165,6 +1213,7 @@ impl ModuleRepository {
                     .try_get::<Option<_>, _>("allowed_secrets")?
                     .unwrap_or_default(),
                 created_at: r.try_get::<Option<_>, _>("created_at")?,
+                config_schema: r.try_get::<Option<serde_json::Value>, _>("config_schema")?,
             })
         })
         .transpose()
@@ -3299,6 +3348,44 @@ impl ModuleRepository {
         Ok(out)
     }
 
+    /// Map of module name → the id a caller can actually pass to
+    /// `add_node_to_workflow`, for every module VISIBLE to `user_id`.
+    ///
+    /// Visibility is the same predicate the rest of the module surface uses —
+    /// `user_id IS NULL OR user_id = $1` (see `get_template_for_user`) — so a
+    /// GLOBAL catalog row (`user_id IS NULL`, 75 of them today) is usable
+    /// as-is, with no install step. `list_user_template_names` sees only the
+    /// personal half, which is why the catalog listing built on it reported
+    /// `module_id: null` for a module that was directly usable.
+    ///
+    /// `modules.name` is unique only PER USER (`modules_user_name_uniq`), so a
+    /// name can resolve to both a global row and the caller's own copy. The
+    /// personal copy WINS, because that is the row `hot_update_module` edits;
+    /// resolution is order-independent rather than relying on `ORDER BY`.
+    pub async fn list_visible_module_ids(
+        &self,
+        user_id: Uuid,
+    ) -> Result<std::collections::HashMap<String, VisibleModule>> {
+        let rows = sqlx::query(
+            "SELECT id, name, (user_id IS NOT NULL) AS personal FROM modules \
+             WHERE user_id IS NULL OR user_id = $1",
+        )
+        .bind(user_id)
+        .fetch_all(&self.db_pool)
+        .await?;
+        let mut decoded: Vec<(String, VisibleModule)> = Vec::with_capacity(rows.len());
+        for row in rows {
+            decoded.push((
+                row.try_get("name")?,
+                VisibleModule {
+                    id: row.try_get("id")?,
+                    personal: row.try_get("personal")?,
+                },
+            ));
+        }
+        Ok(resolve_visible_modules(decoded))
+    }
+
     /// Phase 5: map of module name → id for a user. Used by the catalog
     /// listing handler to mark catalog entries as installed without N+1
     /// queries.
@@ -3317,6 +3404,69 @@ impl ModuleRepository {
             // reachable skip was drift.
             .map(|row| -> Result<(String, Uuid)> { Ok((row.try_get("name")?, row.try_get("id")?)) })
             .collect::<Result<std::collections::HashMap<String, Uuid>>>()
+    }
+}
+
+#[cfg(test)]
+mod visible_module_tests {
+    use super::{resolve_visible_modules, VisibleModule};
+    use uuid::Uuid;
+
+    fn global(id: Uuid) -> VisibleModule {
+        VisibleModule {
+            id,
+            personal: false,
+        }
+    }
+    fn personal(id: Uuid) -> VisibleModule {
+        VisibleModule { id, personal: true }
+    }
+
+    /// A global catalog row with no personal copy is still USABLE, and its id
+    /// must be reported. Withholding it is what made the catalog listing tell
+    /// callers to install a module they could already reference.
+    #[test]
+    fn a_global_row_alone_resolves_to_its_own_id() {
+        let g = Uuid::from_u128(1);
+        let out = resolve_visible_modules(vec![("JSON Transform".into(), global(g))]);
+        let entry = out.get("JSON Transform").expect("resolved");
+        assert_eq!(entry.id, g);
+        assert!(!entry.personal, "a shared row is not 'installed'");
+    }
+
+    /// `modules.name` is unique only per user, so both rows legitimately
+    /// exist. The personal copy is the one hot_update_module edits, so it
+    /// wins — and it must win regardless of row order.
+    #[test]
+    fn a_personal_copy_wins_over_the_global_row_in_either_order() {
+        let g = Uuid::from_u128(1);
+        let mine = Uuid::from_u128(2);
+        for rows in [
+            vec![
+                ("HTTP Request".to_string(), global(g)),
+                ("HTTP Request".to_string(), personal(mine)),
+            ],
+            vec![
+                ("HTTP Request".to_string(), personal(mine)),
+                ("HTTP Request".to_string(), global(g)),
+            ],
+        ] {
+            let out = resolve_visible_modules(rows);
+            let entry = out.get("HTTP Request").expect("resolved");
+            assert_eq!(entry.id, mine, "the personal copy must win");
+            assert!(entry.personal);
+        }
+    }
+
+    #[test]
+    fn distinct_names_do_not_interfere() {
+        let out = resolve_visible_modules(vec![
+            ("A".into(), global(Uuid::from_u128(1))),
+            ("B".into(), personal(Uuid::from_u128(2))),
+        ]);
+        assert_eq!(out.len(), 2);
+        assert!(!out["A"].personal);
+        assert!(out["B"].personal);
     }
 }
 

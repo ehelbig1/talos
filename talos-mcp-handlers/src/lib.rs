@@ -172,6 +172,7 @@ pub mod schemas;
 pub mod search;
 pub mod secrets;
 pub mod ssrf_resolver;
+pub mod tool_hints;
 pub mod types;
 pub mod utils;
 pub mod versions;

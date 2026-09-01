@@ -85,7 +85,14 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_module_info",
-            "description": "Get detailed information about a compiled module: name, capability world, size, allowed hosts, allowed secrets, and whether source code is available. Never returns actual wasm bytes or source code.",
+            "description": "Get detailed information about a compiled module: name, capability world, size, allowed hosts, \
+                allowed secrets, whether source code is available, and its CONFIG SCHEMA — the keys the module accepts, \
+                their types, and which are required. Never returns actual wasm bytes or source code. \
+                Read `config_schema_status` before `config_schema`: 'declared' means `config_keys` / `required_config_keys` \
+                are authoritative; 'declared_empty' means the module genuinely takes no config; 'not_declared' means NO \
+                schema was ever recorded, which is NOT the same as taking no config — catalog modules declare one in \
+                talos.json, but modules built via compile_custom_sandbox / hot_update_module do not, so use \
+                get_module_source to see which keys their run() reads from data[\"config\"].",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -272,7 +279,18 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "list_module_catalog",
-            "description": "List built-in module templates available for installation. Returns metadata grouped by category. Each entry shows 'installed' (bool) and 'module_id' (UUID or null). Workflow authoring flow: (1) list_module_catalog — find module, note 'name' and 'installed'; (2) if not installed: install_module_from_catalog(name: '<name>') → returns module_id UUID; (3) add_node_to_workflow(module_id: '<UUID>'). PAGINATION: full unfiltered catalog is large (80KB+); prefer filtering by category/capability_world or searching by query. 'limit' caps returned modules (default 50, max 200).",
+            "description": "List built-in module templates. Returns metadata grouped by category. \
+                Read 'availability' + 'usable_module_id', NOT 'installed' — most catalog modules are shared GLOBAL rows \
+                that are usable with no install step, and they report installed:false because that flag means \
+                'you have your own copy'. Workflow authoring flow: (1) list_module_catalog — find the module; \
+                (2) if availability is 'installed' or 'usable_shared', go straight to \
+                add_node_to_workflow(module_id: '<usable_module_id>'); only availability 'needs_install' requires \
+                install_module_from_catalog(name: '<name>') first. Install anyway when you want a PRIVATE copy to \
+                modify with hot_update_module. Each entry also carries 'config_schema_keys' — the config keys the \
+                module accepts; get_module_info returns the full schema with types and required-ness. \
+                'module_id' is a deprecated alias of 'usable_module_id'. PAGINATION: full unfiltered catalog is large \
+                (80KB+); prefer filtering by category/capability_world or searching by query. 'limit' caps returned \
+                modules (default 50, max 200).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -280,7 +298,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "capability_world": { "type": "string", "description": "Filter by WIT capability world (e.g. 'http-node', 'agent-node')." },
                     "query": { "type": "string", "description": "Substring match against name / display_name / description. Case-insensitive." },
                     "search": { "type": "string", "description": "Alias for 'query' (accepted so the sibling tools' param name also works)." },
-                    "installed_only": { "type": "boolean", "description": "If true, return only modules already installed by the current user. Default: false." },
+                    "installed_only": { "type": "boolean", "description": "If true, return only modules the current user has their OWN copy of (availability 'installed'). Does NOT include shared global catalog modules, which are usable without installing. Default: false." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Max modules to return (default: 50, max: 200). matching_count = post-filter pre-pagination count; catalog_total_count = catalog-wide pre-filter; returned_count = items in this page. total_available + total are kept as deprecated aliases of matching_count + catalog_total_count." },
                     "offset": { "type": "integer", "minimum": 0, "description": "Skip the first N modules (default: 0). Combine with limit for pagination." }
                 },
@@ -939,6 +957,15 @@ async fn handle_get_module_info(
             "rate_limit_per_minute": info.rate_limit_per_minute,
             "compiled_at": info.compiled_at.map(|t| t.to_rfc3339()),
         });
+        // The tool named for module info must answer "which config keys does
+        // this take?" — the question every add_node_to_workflow failure
+        // ("missing required config key 'SELECTOR'") asks. It previously did
+        // not, and the answer was only reachable through
+        // list_module_catalog.config_schema_keys.
+        merge_object(
+            &mut result,
+            project_config_schema(info.config_schema.as_ref()),
+        );
         // Suppress the noisy field when nothing's wrong so the operator
         // attention-budget goes to the missing-bytes case.
         if info.size_bytes > 0 {
@@ -995,6 +1022,10 @@ async fn handle_get_module_info(
             "has_source_code": tmpl.has_source_code,
             "compiled_at": tmpl.created_at.map(|t| t.to_rfc3339()),
         });
+        merge_object(
+            &mut result,
+            project_config_schema(tmpl.config_schema.as_ref()),
+        );
         if tmpl.size_bytes > 0 {
             if let Some(map) = result.as_object_mut() {
                 map.remove("bytes_status");
@@ -1043,6 +1074,76 @@ fn mutation_profile_for_world(capability_world: Option<&str>) -> serde_json::Val
                  actors' reads to hosts NAMED in allowed_hosts). Labels match the \
                  worker's write-ceiling audit events one-to-one.",
     })
+}
+
+/// Project a module row's `config_schema` into the three fields
+/// `get_module_info` returns for it.
+///
+/// The whole point is that an ABSENT declaration must be distinguishable from
+/// a DECLARED-EMPTY one. Every `kind='catalog'` row carries a real schema with
+/// `properties`; every `kind='sandbox'` / `kind='extracted'` row carries a
+/// literal `{}` (measured: 29 of 29 on the live stack). Returning `{}` under a
+/// field called `config_schema` would read as "this module takes no config",
+/// which for a hand-compiled module is exactly wrong — it takes whatever its
+/// `run()` reads out of `data["config"]`, and nothing recorded what that is.
+///
+/// So the status is the load-bearing field:
+/// * `declared` — `properties` is non-empty; `config_keys` is authoritative.
+/// * `declared_empty` — `properties` exists and is empty; the module really
+///   does take no config.
+/// * `not_declared` — no schema, or a schema with no `properties`. The module
+///   MAY still require config; read its source (`get_module_source`) or its
+///   `setup_instructions` in `list_module_catalog`.
+fn project_config_schema(config_schema: Option<&serde_json::Value>) -> serde_json::Value {
+    let properties = config_schema
+        .and_then(|s| s.get("properties"))
+        .and_then(|p| p.as_object());
+    let required: Vec<String> = config_schema
+        .and_then(|s| s.get("required"))
+        .and_then(|r| r.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    match properties {
+        Some(props) if !props.is_empty() => serde_json::json!({
+            "config_schema_status": "declared",
+            "config_schema": config_schema,
+            "config_keys": props.keys().cloned().collect::<Vec<_>>(),
+            "required_config_keys": required,
+        }),
+        Some(_) => serde_json::json!({
+            "config_schema_status": "declared_empty",
+            "config_schema": config_schema,
+            "config_keys": Vec::<String>::new(),
+            "required_config_keys": Vec::<String>::new(),
+            "config_schema_note": "This module declares that it takes no config.",
+        }),
+        None => serde_json::json!({
+            "config_schema_status": "not_declared",
+            "config_schema": serde_json::Value::Null,
+            "config_keys": serde_json::Value::Null,
+            "required_config_keys": serde_json::Value::Null,
+            "config_schema_note": "No config schema is recorded for this module — which is NOT the \
+                                   same as 'takes no config'. Catalog modules declare one in their \
+                                   talos.json; modules compiled through compile_custom_sandbox / \
+                                   hot_update_module do not, so read the source (get_module_source) \
+                                   to see which keys its run() pulls from data[\"config\"].",
+        }),
+    }
+}
+
+/// Copy every key of `extra` (a JSON object) into `target` (a JSON object).
+/// No-op if either is not an object.
+fn merge_object(target: &mut serde_json::Value, extra: serde_json::Value) {
+    if let (Some(t), serde_json::Value::Object(e)) = (target.as_object_mut(), extra) {
+        for (k, v) in e {
+            t.insert(k, v);
+        }
+    }
 }
 
 fn host_managed_access_for_world(capability_world: Option<&str>) -> serde_json::Value {
@@ -2695,11 +2796,18 @@ async fn handle_list_module_catalog(
 
     let catalog_dir = std::path::Path::new("/app/module-templates");
 
-    // Batch-fetch installed module names → IDs for this user so we can mark
-    // catalog entries as installed without N+1 queries.
-    let installed = state
+    // Batch-fetch every module VISIBLE to this user (global catalog rows +
+    // their own copies) → id, so we can report the id a caller can actually
+    // use without N+1 queries.
+    //
+    // This deliberately does NOT use `list_user_template_names`, which sees
+    // only the personal half. That is what made the listing report
+    // `installed: false, module_id: null` for a global catalog row that
+    // `add_node_to_workflow` accepts as-is — the response withheld the very id
+    // that would have avoided a pointless `install_module_from_catalog`.
+    let visible = state
         .module_repo
-        .list_user_template_names(agent.user_id.unwrap_or_else(uuid::Uuid::nil))
+        .list_visible_module_ids(agent.user_id.unwrap_or_else(uuid::Uuid::nil))
         .await
         .unwrap_or_default();
 
@@ -2869,7 +2977,10 @@ async fn handle_list_module_catalog(
                     return false;
                 }
             }
-            // Installed-only filter: resolved identically to the response field below.
+            // Installed-only filter: resolved identically to the response
+            // field below. `installed` keeps its historical meaning — "this
+            // user has their OWN copy" — so a global catalog row that is
+            // usable but not personally installed is still excluded here.
             if installed_only {
                 let display_name = m
                     .get("display_name")
@@ -2877,7 +2988,8 @@ async fn handle_list_module_catalog(
                     .or_else(|| m.get("name").and_then(|v| v.as_str()))
                     .unwrap_or("");
                 let install_name = m.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                if !installed.contains_key(display_name) && !installed.contains_key(install_name) {
+                let personal = |n: &str| visible.get(n).map(|v| v.personal).unwrap_or(false);
+                if !personal(display_name) && !personal(install_name) {
                     return false;
                 }
             }
@@ -2914,12 +3026,26 @@ async fn handle_list_module_catalog(
                         .or_else(|| m.get("name").and_then(|v| v.as_str()))
                         .unwrap_or("");
                     let install_name = m.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    // A module is "installed" if its display_name exists in node_templates
-                    // (that is how install_module_from_catalog stores it).
-                    let installed_entry = installed.get(display_name)
-                        .or_else(|| installed.get(install_name));
-                    let is_installed = installed_entry.is_some();
-                    let module_id = installed_entry.map(|id| id.to_string());
+                    // Resolve the module row this catalog entry maps to, over
+                    // the caller's FULL visibility (global rows + own copies).
+                    let visible_entry = visible.get(display_name)
+                        .or_else(|| visible.get(install_name));
+                    // `installed` = "I have my own copy", which is what the
+                    // flag always meant and what `installed_only` filters on.
+                    // It is NOT a usability signal: a global catalog row is
+                    // `installed: false` and directly usable.
+                    let is_installed = visible_entry.map(|v| v.personal).unwrap_or(false);
+                    // The id to pass to add_node_to_workflow, present whenever
+                    // ANY visible row backs this entry. Null only means the
+                    // catalog directory has no seeded module row yet (its
+                    // compile failed, or the seeder has not run) — in which
+                    // case install_module_from_catalog IS the next step.
+                    let usable_module_id = visible_entry.map(|v| v.id.to_string());
+                    let availability = match &usable_module_id {
+                        Some(_) if is_installed => "installed",
+                        Some(_) => "usable_shared",
+                        None => "needs_install",
+                    };
                     // MCP-13 (closed): emit only `required_secrets` (the
                     // canonical name used everywhere else in the system —
                     // workflows.rs, talos-workflow-creation-helpers, GraphQL).
@@ -2935,7 +3061,12 @@ async fn handle_list_module_catalog(
                         "setup_instructions": m.get("setup_instructions"),
                         "required_secrets": m.get("requires_secrets"),
                         "installed": is_installed,
-                        "module_id": module_id,
+                        // Back-compat alias of `usable_module_id`. Pre-fix this
+                        // was null for every global catalog row, so no caller
+                        // can be relying on that null to mean anything.
+                        "module_id": usable_module_id,
+                        "usable_module_id": usable_module_id,
+                        "availability": availability,
                     })
                 }).collect::<Vec<_>>()
             })
@@ -2972,6 +3103,12 @@ async fn handle_list_module_catalog(
                 "returned_count": "Entries actually returned in this page (post-limit).",
                 "has_more": "True when matching_count > offset + returned_count — call again with offset+limit to see the next page.",
                 "deprecated_aliases": "`total` is an alias of `catalog_total_count`; `total_available` is an alias of `matching_count`. Prefer the explicit names in new code.",
+            },
+            "_availability_legend": {
+                "usable_module_id": "The module_id to pass to add_node_to_workflow. Present whenever a module row backs this catalog entry — including the shared global row, which needs NO install step.",
+                "availability": "installed = you have your own copy (hot_update_module edits it). usable_shared = the global catalog row is usable as-is via usable_module_id; install only if you want a private copy to modify. needs_install = no module row exists yet, call install_module_from_catalog.",
+                "installed": "Whether YOU have your own copy. It is NOT a usability signal — `installed: false` with a non-null usable_module_id means ready to use. This is also what installed_only filters on.",
+                "module_id": "Deprecated alias of usable_module_id.",
             },
             "filters_applied": serde_json::json!({
                 "category": category_filter,
@@ -4183,4 +4320,77 @@ async fn handle_get_catalog_status(
         req_id,
         &serde_json::to_string_pretty(&report).unwrap_or_default(),
     )
+}
+
+#[cfg(test)]
+mod config_schema_projection_tests {
+    use super::project_config_schema;
+
+    /// The whole point of the projection: `{}` (what every hand-compiled
+    /// module row carries) must NOT read as "takes no config".
+    #[test]
+    fn empty_object_is_not_declared_not_declared_empty() {
+        let p = project_config_schema(Some(&serde_json::json!({})));
+        assert_eq!(p["config_schema_status"], "not_declared");
+        assert!(p["config_schema"].is_null());
+        assert!(p["config_keys"].is_null());
+        assert!(!p["config_schema_note"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn absent_schema_is_not_declared() {
+        let p = project_config_schema(None);
+        assert_eq!(p["config_schema_status"], "not_declared");
+        assert!(p["config_keys"].is_null());
+    }
+
+    /// A schema that explicitly declares an EMPTY property set is a real
+    /// statement — "this module takes no config" — and must be legible as one.
+    #[test]
+    fn explicit_empty_properties_is_declared_empty() {
+        let p = project_config_schema(Some(&serde_json::json!({
+            "type": "object", "properties": {}
+        })));
+        assert_eq!(p["config_schema_status"], "declared_empty");
+        assert_eq!(p["config_keys"], serde_json::json!([]));
+        assert_eq!(p["required_config_keys"], serde_json::json!([]));
+    }
+
+    /// The catalog case — modelled on the live `HTTP Request` row, which is
+    /// where the reported friction started ("missing required config key").
+    #[test]
+    fn declared_schema_surfaces_keys_and_requiredness() {
+        let p = project_config_schema(Some(&serde_json::json!({
+            "type": "object",
+            "required": ["URL"],
+            "properties": {
+                "URL": { "type": "string" },
+                "METHOD": { "type": "string", "default": "GET" },
+            }
+        })));
+        assert_eq!(p["config_schema_status"], "declared");
+        let mut keys: Vec<&str> = p["config_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["METHOD", "URL"]);
+        assert_eq!(p["required_config_keys"], serde_json::json!(["URL"]));
+        // The raw schema travels too, so types/defaults/enums are readable.
+        assert_eq!(p["config_schema"]["properties"]["METHOD"]["default"], "GET");
+    }
+
+    /// A malformed `required` (not an array of strings) must not poison the
+    /// key list — the schema is operator-supplied data, not a trusted type.
+    #[test]
+    fn malformed_required_degrades_to_empty_not_panic() {
+        let p = project_config_schema(Some(&serde_json::json!({
+            "properties": { "A": {} },
+            "required": "A",
+        })));
+        assert_eq!(p["config_schema_status"], "declared");
+        assert_eq!(p["required_config_keys"], serde_json::json!([]));
+    }
 }

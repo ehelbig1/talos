@@ -2,7 +2,7 @@
   "name": "webhook-fanout",
   "version": "v1.0.0",
   "display_name": "Webhook Fanout",
-  "description": "Iterate an upstream array and POST each item to a target URL with a vault-resolved bearer-style auth header. Designed for the common Talos\u2192external-app integration pattern (e.g. pa-followup-tracker dispatching tasks into a sister app). Continues on per-item failures by default; surfaces an error sample so transient issues don't silently drop items.",
+  "description": "Iterate an upstream array and POST each item to a target URL with a vault-resolved bearer-style auth header. Designed for the common Talos\u2192external-app integration pattern (e.g. pa-followup-tracker dispatching tasks into a sister app). Continues on per-item failures by default; surfaces an error sample so transient issues don't silently drop items. EGRESS: allowed_hosts is [\"*\"], so this module's own host grant places no restriction on which host it reaches - the destination is whatever the node's config resolves to. What still constrains it: the worker's SSRF resolver (private, loopback and link-local addresses are refused), the bound actor's egress_scope (scope 'local' refuses public egress outright), and max_llm_tier (a tier1 actor is refused every external LLM host regardless of allowed_hosts). To pin this node to specific hosts, install a private copy and narrow allowed_hosts with update_module_hosts.",
   "category": "Network",
   "capability_world": "http-node",
   "allowed_hosts": [
