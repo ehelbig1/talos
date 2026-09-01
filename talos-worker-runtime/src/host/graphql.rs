@@ -3,6 +3,8 @@
 
 use super::*;
 
+use crate::reason_class;
+
 /// L-17 (2026-05-22): shape-based introspection-query detector.
 /// Returns true if the GraphQL `query` text looks like it's asking
 /// for schema introspection at the top level (`__schema` or
@@ -610,6 +612,92 @@ mod introspection_detector_tests {
 // GraphQL client
 // ============================================================================
 
+/// Latch `class` against the `networkerror` discriminant and return it.
+///
+/// The ONE place a `wit_graphql` failure becomes a WIT error, and the reason
+/// it is a function rather than seventeen inline `record_http_denial` calls:
+/// `wit_graphql::Error` has **no deny variant at all** (`networkerror`,
+/// `parseerror`, `queryerror`, `invalidvariables`), so every policy denial,
+/// every cap, the URL-parse failure, the secret-slot failure, the cancellation
+/// AND the genuine transport failure all return the SAME `networkerror`.
+///
+/// [`crate::reason_class::Reason`]'s pairing — which is what stops a stale
+/// class riding an unrelated later failure on `host::http` — is therefore
+/// VACUOUS here: every one of those messages carries the same token. The bound
+/// that replaces it is TOTALITY. Every failing return of
+/// `execute_graphql_inner` goes through this helper or through
+/// [`TalosContext::record_network_outcome`], so the latch always describes
+/// THIS call, and the transport site (which is transient, and the only one
+/// that is) overwrites any deny class immediately before returning. That is
+/// what makes it impossible for a swallowed denial to suppress a real
+/// transport retry — see the module doc of [`crate::reason_class`] for the two
+/// designs rejected in favour of it.
+///
+/// Latch-only: the policy sites already publish their operator diagnostic
+/// through `record_capability_denied`, and the pure caps deliberately publish
+/// none.
+///
+/// `&TalosContext` (not `&mut`) so it composes inside a `map_err` closure that
+/// only holds a shared borrow.
+fn gql_deny(ctx: &TalosContext, class: &'static str) -> wit_graphql::Error {
+    ctx.record_http_denial(class, reason_class::WIT_NETWORKERROR);
+    wit_graphql::Error::Networkerror
+}
+
+impl TalosContext {
+    /// Latch the honest transport class for a failed `wit_graphql` send, and
+    /// log the sanitized detail to the WORKER LOG only.
+    ///
+    /// A named method rather than an inline block for the reason the testing
+    /// convention gives: the graphql transport path cannot be reached from a
+    /// test — every route to it passes the SSRF gate, which is the point of
+    /// the gate — so the safety property ("a swallowed denial cannot suppress
+    /// a later transport retry") is proven by calling THIS function with a
+    /// real `reqwest::Error`, i.e. the same call with the same argument the
+    /// production site makes, rather than by a test-local copy of the logic.
+    ///
+    /// The class comes from the same `classify_reqwest_send_error` the
+    /// single-fetch path uses, which reads the SOURCE CHAIN only — never
+    /// reqwest's own `Display`, which appends the full request URL and its
+    /// query string. Every class it can return is TRANSIENT, so the retry
+    /// reading is identical to the bare `networkerror` this replaced; only the
+    /// diagnosis is new.
+    pub(crate) async fn record_graphql_transport_outcome(
+        &mut self,
+        host: &str,
+        e: &reqwest::Error,
+    ) {
+        let class = reason_class::classify_reqwest_send_error(e);
+        // The sanitized raw detail is WORKER-LOG ONLY and never crosses the
+        // host→guest boundary. Gated on the SAME per-execution `HOST_DIAG_CAP`
+        // the diagnostic channel spends — and the `emit_network_failure` below
+        // is what SPENDS it. A peek that never spends would leave this line
+        // bounded only by `MAX_GRAPHQL_QUERIES_PER_EXECUTION` (200) × the
+        // sanitizer's 2000-char truncation, i.e. a second uncapped stream;
+        // `host::http`'s transport site pairs the peek with a spend for
+        // exactly this reason.
+        if self.host_diag_budget_remaining() {
+            tracing::warn!(
+                module_id = ?self.module_id,
+                host,
+                reason = class,
+                detail = %reason_class::sanitized_transport_detail(e),
+                "wit_graphql::execute transport failure (sanitized transport detail)"
+            );
+        }
+        // Latch + publish in one step, exactly as the single-fetch path does.
+        // `host` is safe to name: the module author declared it in
+        // `allowed_hosts`. The path, the query string and the resolved IP are
+        // not, and none of them appears here.
+        self.emit_network_failure(
+            class,
+            reason_class::WIT_NETWORKERROR,
+            &format!("the GraphQL request to '{host}' failed before a response was read"),
+        )
+        .await;
+    }
+}
+
 impl wit_graphql::Host for TalosContext {
     async fn execute(
         &mut self,
@@ -677,7 +765,7 @@ impl TalosContext {
                 world = ?self.capability_world,
                 "WASM module attempted graphql call but lacks the required capability"
             );
-            return Err(wit_graphql::Error::Networkerror);
+            return Err(gql_deny(self, reason_class::CAPABILITY_WORLD));
         }
         // Write-ceiling gate: a GraphQL operation may be a query (read) or a
         // mutation, and the operation type can't be cheaply proven read-only
@@ -685,6 +773,14 @@ impl TalosContext {
         // and refuse for read-only actors. An actor that needs GraphQL reads
         // uses the `Write` ceiling. Inert unless enforcement is on.
         if self.write_ceiling_refuses("graphql-execute", "").await {
+            // Paired with `queryerror`, the discriminant this arm returns —
+            // NOT with `networkerror`. The token matters here beyond
+            // diagnostics: `queryerror` contains `query`, which
+            // `talos_retry_intelligence` keys on for `database_error`, so a
+            // read-only actor's refusal was being reported as a DATABASE
+            // failure. Both readings are non-transient, so this changes the
+            // remediation an operator is shown and nothing else.
+            self.record_http_denial(reason_class::WRITE_CEILING, reason_class::WIT_QUERYERROR);
             return Err(wit_graphql::Error::Queryerror);
         }
         // MCP-787 (2026-05-14): pure-validation surfaces (query size,
@@ -726,7 +822,7 @@ impl TalosContext {
                 limit = MAX_OUTBOUND_URL_BYTES,
                 "wit_graphql::execute rejected: URL length exceeds cap"
             );
-            return Err(wit_graphql::Error::Networkerror);
+            return Err(gql_deny(self, reason_class::URL_TOO_LONG));
         }
         // MCP-1105: cap caller-supplied header count. See
         // MAX_OUTBOUND_HEADERS doc-comment. graphql adds extra urgency
@@ -739,7 +835,7 @@ impl TalosContext {
                 limit = MAX_OUTBOUND_HEADERS,
                 "wit_graphql::execute rejected: header count exceeds cap"
             );
-            return Err(wit_graphql::Error::Networkerror);
+            return Err(gql_deny(self, reason_class::REQUEST_HEADER_CAP));
         }
         // MCP-584: clamp caller-supplied timeout in GraphQL exactly
         // as in http::fetch — `option<u32>` is unbounded otherwise.
@@ -749,7 +845,10 @@ impl TalosContext {
         // multi-GB requests to the remote server (OOM + bandwidth abuse).
         const MAX_GRAPHQL_QUERY_BYTES: usize = 1_000_000; // 1 MB
         if query.len() > MAX_GRAPHQL_QUERY_BYTES {
-            return Err(wit_graphql::Error::Networkerror);
+            // The GraphQL query IS the request body, so it shares
+            // `request-body-cap` with `http`'s outbound-body cap rather than
+            // minting a second token for the same thing.
+            return Err(gql_deny(self, reason_class::REQUEST_BODY_CAP));
         }
         if let Some(ref vars) = variables {
             if vars.len() > MAX_GRAPHQL_QUERY_BYTES {
@@ -831,17 +930,27 @@ impl TalosContext {
                     &url,
                 )
                 .await;
-                return Err(wit_graphql::Error::Networkerror);
+                return Err(gql_deny(self, reason_class::GRAPHQL_INTROSPECTION));
             }
         }
 
         let allowed_hosts = self.allowed_hosts.clone();
 
+        // Hoisted out of the validation block below so the transport-failure
+        // diagnostic can name it. The HOST is the one piece of the URL that is
+        // safe to report: the module author already declared it in
+        // `allowed_hosts`, whereas the path and query string routinely carry
+        // access tokens. See the sanitization contract in `reason_class`.
+        let target_host: String;
+
         // Enforce host allowlist for GraphQL endpoints too.
         // Empty allowlist = DENY ALL (same policy as the HTTP host function).
         {
-            let parsed: url::Url = url.parse().map_err(|_| wit_graphql::Error::Networkerror)?;
+            let parsed: url::Url = url
+                .parse()
+                .map_err(|_| gql_deny(self, reason_class::URL_PARSE))?;
             let host = parsed.host_str().unwrap_or("").to_string();
+            target_host = host.clone();
 
             // HTTPS-only by default. The GraphQL Error enum has no
             // dedicated insecure-scheme variant; `Networkerror` is the
@@ -868,7 +977,7 @@ impl TalosContext {
                         host = %host,
                         "WASM module attempted non-https GraphQL request — denied."
                     );
-                    return Err(wit_graphql::Error::Networkerror);
+                    return Err(gql_deny(self, reason_class::INSECURE_SCHEME));
                 }
             }
 
@@ -880,7 +989,7 @@ impl TalosContext {
                     "WASM module attempted GraphQL request but no host allowlist is \
                              configured — denying."
                 );
-                return Err(wit_graphql::Error::Networkerror);
+                return Err(gql_deny(self, reason_class::NO_ALLOWLIST));
             }
 
             // SSRF protection: shared classifier covers CGNAT and IPv4-mapped IPv6
@@ -893,25 +1002,32 @@ impl TalosContext {
                     policy,
                     "WASM module attempted GraphQL request to a private IP literal — blocking"
                 );
-                return Err(wit_graphql::Error::Networkerror);
+                return Err(gql_deny(self, reason_class::PRIVATE_IP));
             }
 
             if !host_allowlist_match(&allowed_hosts, &host) {
                 self.record_capability_denied("graphql", "allowed-hosts", &host)
                     .await;
-                return Err(wit_graphql::Error::Networkerror);
+                return Err(gql_deny(self, reason_class::ALLOWED_HOSTS));
             }
 
             // DNS rebinding — resolve hostname URLs and reject if any answer
             // falls in the private deny-list. IP literals already handled
             // above by classify_private_ip.
-            if matches!(parsed.host(), Some(url::Host::Domain(_)))
-                && self
-                    .validate_no_dns_rebinding(&host, "graphql")
-                    .await
-                    .is_err()
-            {
-                return Err(wit_graphql::Error::Networkerror);
+            if matches!(parsed.host(), Some(url::Host::Domain(_))) {
+                // The ONE mixed site: `validate_no_dns_rebinding` answers
+                // `Err(policy)` for an SSRF hit (deterministic, a denial) and
+                // `Err("dns-resolution-failed")` for a resolver failure
+                // (transient, not a denial at all). Reading its `Err` as one
+                // thing would file a DNS blip as a capability denial and
+                // permanently un-retry it — so the two are split.
+                if let Err(e) = self.validate_no_dns_rebinding(&host, "graphql").await {
+                    // `dns` is TRANSIENT, exactly as a bare `networkerror`
+                    // already was here, so the resolver-failure reading is
+                    // unchanged and only gains a name.
+                    let class = reason_class::dns_rebinding_class(e).unwrap_or(reason_class::DNS);
+                    return Err(gql_deny(self, class));
+                }
             }
 
             // Tier-1 LLM egress ceiling — same host deny-list as fetch.
@@ -931,7 +1047,7 @@ impl TalosContext {
                         policy,
                         "tier-1 actor GraphQL egress refused (external LLM host or public IP literal)"
                     );
-                    return Err(wit_graphql::Error::Networkerror);
+                    return Err(gql_deny(self, reason_class::tier1_egress_class(policy)));
                 }
             }
         }
@@ -946,7 +1062,7 @@ impl TalosContext {
             tracing::warn!(
                 "WASM module attempted GraphQL (POST) but POST is not in allowed_methods"
             );
-            return Err(wit_graphql::Error::Networkerror);
+            return Err(gql_deny(self, reason_class::METHOD_ALLOWLIST));
         }
 
         // MCP-537 (rate limit + cancellation): now charged AFTER all pure
@@ -957,7 +1073,7 @@ impl TalosContext {
             if let Some(ref m) = self.metrics {
                 m.record_rate_limit_exceeded("graphql");
             }
-            return Err(wit_graphql::Error::Networkerror);
+            return Err(gql_deny(self, reason_class::EXECUTION_RATE_LIMIT));
         }
         if self.is_cancelled() {
             tracing::info!(module_id = ?self.module_id, "Execution cancelled before GraphQL query");
@@ -1004,7 +1120,7 @@ impl TalosContext {
                 let resolved = self
                     .resolve_vault_header(k.as_str(), v.as_str())
                     .await
-                    .map_err(|_| wit_graphql::Error::Networkerror)?;
+                    .map_err(|_| gql_deny(self, reason_class::SECRET_LOOKUP))?;
                 req_builder = req_builder.header(k.as_str(), resolved.as_ref());
             }
 
@@ -1072,7 +1188,19 @@ impl TalosContext {
                     let backoff_ms = (100u64 * 2u64.saturating_pow(attempts - 1)).min(30_000);
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 }
-                Err(_) => return Err(wit_graphql::Error::Networkerror),
+                Err(e) => {
+                    // THE transport site — the only one of the 17
+                    // `Networkerror` returns that is a genuine, retryable
+                    // failure. It latches UNCONDITIONALLY, and that is the
+                    // load-bearing half of the totality rule: whatever deny
+                    // class a swallowed earlier call left behind is
+                    // OVERWRITTEN here, immediately before returning, so it
+                    // can never be stamped onto this message and veto a retry
+                    // this failure is entitled to.
+                    self.record_graphql_transport_outcome(&target_host, &e)
+                        .await;
+                    return Err(wit_graphql::Error::Networkerror);
+                }
             }
         }
     }

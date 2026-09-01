@@ -80,21 +80,12 @@ fn deny_invalid_url(ctx: &TalosContext, class: &'static str) -> wit_http::Error 
     wit_http::Error::Invalidurl
 }
 
-/// Map a `tier1_egress_deny_reason` policy onto its closed-set reason class.
-///
-/// An explicit `match` rather than passing the policy string straight through:
-/// the policy vocabulary lives in `host::egress` and can grow, while
-/// [`reason_class::ALL`] must stay CLOSED (`closed_set_snapshot` and the
-/// hand-written classifier arms both depend on it). A future policy therefore
-/// falls back to the generic [`reason_class::TIER1_EGRESS`] — which IS in the
-/// set and IS non-transient — instead of stamping a token no classifier knows.
-fn tier1_egress_class(policy: &str) -> &'static str {
-    match policy {
-        "tier1-llm-egress" => reason_class::TIER1_LLM_EGRESS,
-        "tier1-public-ip-egress" => reason_class::TIER1_PUBLIC_IP_EGRESS,
-        _ => reason_class::TIER1_EGRESS,
-    }
-}
+/// Re-export of the shared policy→class mapper. It moved to
+/// [`crate::reason_class::tier1_egress_class`] when `graphql`, `webhook` and
+/// `http_stream` grew the same denial — all four surfaces call the same
+/// `tier1_egress_deny_reason`, so a per-file copy of the mapping is exactly
+/// the drift this workspace keeps paying for.
+use crate::reason_class::tier1_egress_class;
 
 // ============================================================================
 // HTTP
@@ -1299,6 +1290,21 @@ impl wit_http::Host for TalosContext {
                             error = %e,
                             "fetch_all: DNS resolution failed for SSRF check"
                         );
+                        // Latch DNS, paired with the discriminant this arm
+                        // returns. Two reasons, and the second is the one that
+                        // matters. (a) Diagnostic: the single-fetch twin
+                        // already says `dns`. (b) SAFETY: `networkerror` is
+                        // the discriminant `wit_graphql`'s denials are now
+                        // paired with, so an UNLATCHED `networkerror` here
+                        // would be a message a stale graphql capability
+                        // denial could be stamped onto — turning a genuine,
+                        // retryable DNS blip into a non-transient
+                        // `capability_denied`. Writing the class is what makes
+                        // the latch describe THIS call. `dns` is transient, so
+                        // the reading is unchanged from the bare token.
+                        self.record_network_outcome(Some(reason_class::Reason::network(
+                            reason_class::DNS,
+                        )));
                         validated.push(Err(wit_http::Error::Networkerror));
                         continue;
                     }
@@ -1661,9 +1667,32 @@ impl wit_http::Host for TalosContext {
         // was actually built with, NOT `max_llm_tier == Tier1`. See
         // `TalosContext::local_egress_only`.
         let egress_gated = self.local_egress_only;
+        // The batch's DISPATCH failures cannot latch from where they happen —
+        // the send/response path runs inside a moved future with no `self`
+        // (see the comment above `builder.send()`). That left every one of
+        // them returning an UNLATCHED `networkerror`, which was invisible
+        // while `networkerror` was only ever raised by `host::http`, and is
+        // not any more: `wit_graphql`'s policy denials are now paired with the
+        // same discriminant. An unlatched `networkerror` is a message a stale
+        // graphql capability denial could be stamped onto — and the two shapes
+        // that matter here (a transport failure and a mid-stream body error)
+        // are GENUINELY TRANSIENT, so that would suppress a retry they are
+        // entitled to. The 2026-07-23 outage class, one surface over.
+        //
+        // So the batch decides the latch ONCE, after the loop, rather than
+        // per-entry: per-entry writes would race each other (entry 1's clear
+        // erasing entry 0's egress class) purely on completion order.
+        // `egress_attributed` records that the loop wrote a real class;
+        // `unattributed_dispatch_failure` records that at least one entry
+        // failed with no class of its own. VALIDATION failures are excluded by
+        // construction — they carry `request_hosts[idx] == None`, never enter
+        // the guard below, and keep the class they latched at validation time.
+        let mut egress_attributed = false;
+        let mut unattributed_dispatch_failure = false;
         for (idx, r) in &indexed {
             if let Err(e) = r {
                 if let Some(Some(host)) = request_hosts.get(*idx) {
+                    unattributed_dispatch_failure = true;
                     // A Networkerror under a local-egress-only actor is almost
                     // always that gate (same reasoning as the single-fetch
                     // path); surface the actionable reason instead of the
@@ -1689,6 +1718,7 @@ impl wit_http::Host for TalosContext {
                             ),
                         )
                         .await;
+                        egress_attributed = true;
                         continue;
                     }
                     let class = match e {
@@ -1702,6 +1732,16 @@ impl wit_http::Host for TalosContext {
                     .await;
                 }
             }
+        }
+        // CLEAR rather than latch: the moved future is gone by now, so the
+        // honest transport class is no longer recoverable, and inventing one
+        // would be worse than none. Clearing is provably transience-neutral
+        // for every shape this can produce — a bare `networkerror` is
+        // TRANSIENT in both gates with or without a marker, and `timeout` is
+        // transient in both — while leaving the latch alone would let an
+        // unrelated stale class decide the retry.
+        if unattributed_dispatch_failure && !egress_attributed {
+            self.record_network_outcome(None);
         }
         indexed.into_iter().map(|(_, r)| r).collect()
     }

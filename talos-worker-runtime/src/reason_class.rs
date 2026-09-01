@@ -42,36 +42,78 @@
 //! rather than "stamp whenever a class is latched" — is what keeps the latch
 //! from mis-attributing a stale cause to an unrelated later failure.
 //!
-//! # What this does NOT cover (measured, not assumed)
+//! # Coverage, and what is still outside it (measured, not assumed)
 //!
-//! The classes below are raised on the `wit_http` surface only. The three
-//! sibling egress surfaces were measured against all three downstream
-//! classifiers and are deliberately left alone here, because each needs a
-//! different change and one of them changes retry behaviour:
+//! All FOUR egress surfaces are covered: `host/http` (`fetch` / `fetch_all`),
+//! `host/graphql`, `host/webhook` and `host/http_stream`. Each needed a
+//! different amount of work, and the measurements that decided it are worth
+//! keeping because the obvious reading of the code was wrong in every case:
 //!
-//! * **`host/graphql.rs`** — its WIT enum has no deny variant at all, so EVERY
-//!   policy denial (capability-world, allowed-hosts, SSRF, tier-1 egress)
-//!   returns `networkerror`. Both transient gates therefore classify a
-//!   capability denial `network_transient` and the controller RE-DISPATCHES
-//!   it. That is a correctness bug on the discriminant this module already
-//!   covers, and the fix — latch the class at each deny site, paired with
-//!   [`WIT_NETWORKERROR`] — needs no new machinery. It is the highest-value
-//!   follow-up and is deliberately not bundled here, because it is the only
-//!   one that MOVES a message from transient to non-transient.
-//! * **`host/http_stream.rs`** — its WIT enum spells the tokens with hyphens
-//!   (`forbidden-host`, `invalid-url`), which the existing `forbiddenhost`
-//!   arms do not match. A `forbidden-host` denial currently classifies
-//!   `auth_failure` / `http_403` — non-transient, so safe, but it points the
-//!   operator at a credential that is fine. Covering it means new `WIT_*`
-//!   consts for the hyphenated spellings.
-//! * **`host/webhook.rs`** — denials return `sendfailed`, which matches no arm
-//!   anywhere and lands in `unknown` / `runtime_error` / `other`. Same
-//!   `invalidurl`-style diagnostic gap, same non-transient (safe) reading.
+//! * **`host/graphql.rs`** — 17 sites return `Networkerror`, and **16 of them
+//!   are deterministic**; exactly ONE is the genuine transport failure. Since
+//!   a bare `networkerror` is TRANSIENT in every classifier, every one of
+//!   those 16 denials was being re-dispatched: an SSRF block and a Tier-1
+//!   data-egress refusal each burned three attempts and told the operator
+//!   "network transient". This is the only surface where the marker moves a
+//!   message from transient to non-transient.
+//! * **`host/webhook.rs`** — 16 sites return `Sendfailed`, 15 of them
+//!   deterministic. `sendfailed` matches no arm in any classifier, so every
+//!   one already read as `unknown` / `runtime_error` / `other` — NON-transient,
+//!   hence a pure diagnostic fix with no retry consequence in either direction.
+//! * **`host/http_stream.rs`** — the WIT enum spells its cases with hyphens
+//!   (`forbidden-host`, `invalid-url`, `connection-failed`, `rate-limited`),
+//!   which no `forbiddenhost` arm matches. `forbidden-host` contains
+//!   "forbidden" and so classified `auth_failure` / `http_403`: non-transient,
+//!   but pointing the operator at a credential that was never the problem.
+//!   Its three `ConnectionFailed` sites are NOT transport failures (one
+//!   cancellation, two mutex-poison guards) — a `connect` transport failure
+//!   happens in a spawned task and never reaches the guest as an error at all.
+//!
+//! ## Totality, not clearing — and why
+//!
+//! `wit_graphql`'s deny sites and its ONE transport site return the SAME
+//! discriminant, so [`Reason`]'s pairing is vacuous there: a stale deny class
+//! latched by a swallowed denial could land on a later GENUINE transport
+//! failure and SUPPRESS its retry. Under-retrying real transient failures is
+//! the 2026-07-23 outage class, so that had to be closed before the denials
+//! could be latched at all.
+//!
+//! The rule adopted is **totality**: on all four surfaces, every failing
+//! return either latches a class paired with the discriminant it returns, or
+//! explicitly CLEARS the latch. The transport site therefore always overwrites
+//! whatever was there immediately before returning, and no stale class can
+//! ride it.
+//!
+//! Two designs were rejected in favour of it, both measured rather than
+//! assumed:
+//!
+//! * **Clear the latch at every host-call ENTRY.** Sufficient for the
+//!   graphql hazard, and fail-safe against a future unlatched return — but it
+//!   also destroys a class latched by an EARLIER call on ANOTHER surface. A
+//!   `circuit-open` latched by `fetch`, swallowed, followed by a successful
+//!   `graphql` call, would lose its marker and the fetch message would go back
+//!   to reading `networkerror` ⇒ TRANSIENT. That is a deterministic failure
+//!   becoming retryable — the same defect one direction over.
+//! * **Clear on SUCCESS on the new surfaces** (what `fetch` does). Same
+//!   objection: clearing can only ever REMOVE a marker, and removing a
+//!   [`NON_TRANSIENT`] one is the forbidden direction. `fetch`'s clear-on-
+//!   success predates the pairing and is left exactly as it ships; it is not
+//!   replicated onto the three siblings.
+//!
+//! A host-call SEQUENCE NUMBER was considered and buys nothing over totality
+//! (the suffix reader has no independent sequence to compare against, so
+//! "not the most recent call" and "cleared" are the same observable). Adding a
+//! deny variant to the three WIT enums is a full ABI break — every compiled
+//! module recompiles in lockstep, and this repository carries 75 catalog
+//! templates with checked-in `bindings.rs` — so it is out of the question for
+//! a diagnostic.
+//!
+//! ## Still outside
 //!
 //! The ~50 `capability-world` denials on the NON-HTTP host functions (cache,
-//! files, memory, state, object_storage, …) are further out still: the latch
-//! is per-execution and HTTP-shaped, and covering them needs a general
-//! per-call reason mechanism rather than this one.
+//! files, memory, state, object_storage, …): the latch is per-execution and
+//! egress-shaped, and covering them needs a general per-call reason mechanism
+//! rather than this one.
 //!
 //! # Sanitization contract
 //!
@@ -220,12 +262,39 @@ pub const PER_HOST_RATE_LIMIT: &str = "per-host-rate-limit";
 /// misbehaving) and opposite directions of travel.
 pub const REQUEST_HEADER_CAP: &str = "request-header-cap";
 /// The OUTBOUND body exceeded `MAX_OUTBOUND_HTTP_BODY_BYTES`.
-pub const REQUEST_BODY_CAP: &str = "request-body-cap";
-
-/// The HTTP-surface policy / cap classes, as one list.
 ///
-/// These are the tokens minted for the `invalidurl` and `forbiddenhost`
-/// discriminants. Kept as a named subset of [`ALL`] because three separate
+/// Also the class for `wit_graphql`'s 1 MB query cap: a GraphQL query IS the
+/// request body, so minting a second token for it would split one cap across
+/// two names that mean the same thing to an operator.
+pub const REQUEST_BODY_CAP: &str = "request-body-cap";
+/// A GraphQL introspection query (`__schema` / `__type`) was refused.
+///
+/// The site's `policy` is an open two-member family (`tier1-introspection`
+/// when a privacy-class actor probes a third-party schema shape,
+/// `env-introspection-block` under the operator-wide
+/// `TALOS_WIT_GRAPHQL_BLOCK_INTROSPECTION`), collapsed to one class for the
+/// same reason [`PRIVATE_IP`] is: [`ALL`] must stay CLOSED. The precise
+/// variant stays in the `[host:…]` diagnostic.
+pub const GRAPHQL_INTROSPECTION: &str = "graphql-introspection";
+/// `MAX_SSE_STREAMS_PER_EXECUTION` concurrent SSE streams are already open.
+///
+/// Named apart from [`EXECUTION_RATE_LIMIT`] deliberately: that one is a
+/// CUMULATIVE per-execution call budget which, once spent, stays spent, while
+/// this is a CONCURRENCY cap that clears the moment the guest calls
+/// `http-stream::close`. The remediations are opposite (raise the budget vs.
+/// close your streams), and a class exists to name a remediation.
+pub const SSE_STREAM_CAP: &str = "sse-stream-cap";
+
+/// The EGRESS-surface policy / cap classes, as one list.
+///
+/// Named `HTTP_POLICY_CLASSES` from when `host::http` was the only covered
+/// surface; it now spans all four (`http`, `graphql`, `webhook`,
+/// `http_stream`). The name is load-bearing downstream — the hand-mirrored
+/// `talos_retry_intelligence::HTTP_POLICY_DENIAL_CLASSES` is pinned to it by
+/// `closed_set_snapshot` — so it is left alone rather than renamed for tidiness.
+///
+/// These are the tokens minted for every discriminant that is not a transport
+/// failure. Kept as a named subset of [`ALL`] because three separate
 /// things need exactly this set and nothing else: the non-transient property
 /// test below, the foreign-needle collision test below, and the hand-written
 /// mirror arm in `talos_retry_intelligence::classify_error` (which cannot
@@ -251,6 +320,8 @@ pub const HTTP_POLICY_CLASSES: &[&str] = &[
     PER_HOST_RATE_LIMIT,
     REQUEST_HEADER_CAP,
     REQUEST_BODY_CAP,
+    GRAPHQL_INTROSPECTION,
+    SSE_STREAM_CAP,
 ];
 
 // ── The guest-visible WIT discriminants a class is allowed to explain ────
@@ -266,8 +337,44 @@ pub const WIT_NETWORKERROR: &str = "networkerror";
 pub const WIT_INVALIDURL: &str = "invalidurl";
 /// `wit_http::Error::Forbiddenhost`.
 pub const WIT_FORBIDDENHOST: &str = "forbiddenhost";
-/// `wit_http::Error::Timeout`.
+/// `wit_http::Error::Timeout` and `wit_webhook::Error::Timeout`.
 pub const WIT_TIMEOUT: &str = "timeout";
+/// `wit_graphql::Error::Queryerror`.
+///
+/// One emitting site (the write-ceiling gate), and it needs a marker for a
+/// reason the count hides: `queryerror` contains the substring **`query`**,
+/// which `talos_retry_intelligence::classify_error` keys on for its
+/// `database_error` bucket. A read-only actor refused a GraphQL operation was
+/// therefore reported as a DATABASE failure. Non-transient either way, so this
+/// is a remediation fix, not a retry fix.
+pub const WIT_QUERYERROR: &str = "queryerror";
+/// `wit_webhook::Error::Sendfailed`.
+///
+/// Note this is NOT a prefix or suffix of [`SEND_FAILED`] (`send-failed`) —
+/// the WIT case is unhyphenated and the reason class is hyphenated, so no
+/// message can satisfy one by carrying the other.
+pub const WIT_SENDFAILED: &str = "sendfailed";
+/// `wit_http_stream::Error::ForbiddenHost`.
+///
+/// The `http-stream` WIT enum spells its cases with HYPHENS, and wit-bindgen
+/// renders the case name verbatim into both `Debug` (`name: "forbidden-host"`)
+/// and `Display` (`forbidden-host (error 1)`) — verified against the
+/// checked-in `module-templates/*/src/bindings.rs`. So `forbiddenhost`, the
+/// `wit_http` spelling, does NOT match it, which is why this surface needed
+/// its own consts rather than reusing [`WIT_FORBIDDENHOST`].
+pub const WIT_FORBIDDEN_HOST_HYPHENATED: &str = "forbidden-host";
+/// `wit_http_stream::Error::InvalidUrl`. Hyphenated; see
+/// [`WIT_FORBIDDEN_HOST_HYPHENATED`].
+pub const WIT_INVALID_URL_HYPHENATED: &str = "invalid-url";
+/// `wit_http_stream::Error::ConnectionFailed`.
+///
+/// Despite the name, NONE of its three emitting sites is a transport failure:
+/// one is a cancellation and two are mutex-poison guards. A `connect`
+/// transport failure happens inside a spawned task and never reaches the guest
+/// as an error at all — the stream simply yields no events.
+pub const WIT_CONNECTION_FAILED: &str = "connection-failed";
+/// `wit_http_stream::Error::RateLimited`.
+pub const WIT_RATE_LIMITED: &str = "rate-limited";
 
 /// A latched host-side failure: the [`reason_class`](self) token PLUS the WIT
 /// discriminant it is allowed to explain.
@@ -317,6 +424,98 @@ impl Reason {
             wit: WIT_TIMEOUT,
         }
     }
+    /// A class raised at a site returning `wit_graphql::Error::Queryerror`.
+    pub const fn graphql_query_error(class: &'static str) -> Self {
+        Self {
+            class,
+            wit: WIT_QUERYERROR,
+        }
+    }
+    /// A class raised at a site returning `wit_webhook::Error::Sendfailed`.
+    pub const fn webhook_send_failed(class: &'static str) -> Self {
+        Self {
+            class,
+            wit: WIT_SENDFAILED,
+        }
+    }
+    /// A class raised at a site returning
+    /// `wit_http_stream::Error::ForbiddenHost`.
+    pub const fn stream_forbidden_host(class: &'static str) -> Self {
+        Self {
+            class,
+            wit: WIT_FORBIDDEN_HOST_HYPHENATED,
+        }
+    }
+    /// A class raised at a site returning `wit_http_stream::Error::InvalidUrl`.
+    pub const fn stream_invalid_url(class: &'static str) -> Self {
+        Self {
+            class,
+            wit: WIT_INVALID_URL_HYPHENATED,
+        }
+    }
+    /// A class raised at a site returning
+    /// `wit_http_stream::Error::ConnectionFailed`.
+    pub const fn stream_connection_failed(class: &'static str) -> Self {
+        Self {
+            class,
+            wit: WIT_CONNECTION_FAILED,
+        }
+    }
+    /// A class raised at a site returning
+    /// `wit_http_stream::Error::RateLimited`.
+    pub const fn stream_rate_limited(class: &'static str) -> Self {
+        Self {
+            class,
+            wit: WIT_RATE_LIMITED,
+        }
+    }
+}
+
+/// Map a `tier1_egress_deny_reason` policy onto its closed-set reason class.
+///
+/// An explicit `match` rather than passing the policy string straight through:
+/// the policy vocabulary lives in `host::egress` and can grow, while [`ALL`]
+/// must stay CLOSED (`closed_set_snapshot` and the hand-written classifier
+/// arms both depend on it). A future policy therefore falls back to the
+/// generic [`TIER1_EGRESS`] — which IS in the set and IS non-transient —
+/// instead of stamping a token no classifier knows.
+///
+/// Lives here rather than in `host::http` because all four egress surfaces
+/// (`http`, `graphql`, `webhook`, `http_stream`) call the same
+/// `tier1_egress_deny_reason` and must agree on the mapping; a per-file copy
+/// is the drift this workspace has paid for repeatedly.
+pub(crate) fn tier1_egress_class(policy: &str) -> &'static str {
+    match policy {
+        "tier1-llm-egress" => TIER1_LLM_EGRESS,
+        "tier1-public-ip-egress" => TIER1_PUBLIC_IP_EGRESS,
+        _ => TIER1_EGRESS,
+    }
+}
+
+/// Split `TalosContext::validate_no_dns_rebinding`'s `Err` into the two
+/// materially different things it means.
+///
+/// That function is the ONE MIXED deny site on every surface that calls it: it
+/// returns `Err(policy)` for an SSRF answer (the hostname resolved into a
+/// private range — deterministic, a denial) and `Err("dns-resolution-failed")`
+/// when the resolver itself failed (transient, and NOT a denial at all).
+/// Reading its `Err` as one thing is how a DNS blip would have been filed as a
+/// capability denial and permanently un-retried.
+///
+/// `Some(PRIVATE_IP)` is the SSRF case — the family PREFIX, for the same
+/// closed-set reason as [`PRIVATE_IP`] itself. `None` is the resolver failure;
+/// each caller then decides what preserves ITS surface's current transience
+/// (`graphql` latches [`DNS`], which is transient exactly as a bare
+/// `networkerror` already was; `webhook` and `http_stream` CLEAR, because
+/// their discriminants are non-transient today and latching a transient class
+/// would GRANT a retry that does not exist — on `webhook` that would be a
+/// retry of a mutating POST).
+pub(crate) fn dns_rebinding_class(err: &str) -> Option<&'static str> {
+    if err == "dns-resolution-failed" {
+        None
+    } else {
+        Some(PRIVATE_IP)
+    }
 }
 
 /// Every token this module can emit. Exists so the classifiers on both sides
@@ -354,6 +553,8 @@ pub const ALL: &[&str] = &[
     PER_HOST_RATE_LIMIT,
     REQUEST_HEADER_CAP,
     REQUEST_BODY_CAP,
+    GRAPHQL_INTROSPECTION,
+    SSE_STREAM_CAP,
 ];
 
 /// Tokens whose cause is deterministic — a retry re-runs the same policy
@@ -386,6 +587,8 @@ pub const NON_TRANSIENT: &[&str] = &[
     PER_HOST_RATE_LIMIT,
     REQUEST_HEADER_CAP,
     REQUEST_BODY_CAP,
+    GRAPHQL_INTROSPECTION,
+    SSE_STREAM_CAP,
 ];
 
 /// The rendered marker appended to a node-failure message, e.g.
@@ -744,6 +947,8 @@ mod tests {
                 "per-host-rate-limit",
                 "request-header-cap",
                 "request-body-cap",
+                "graphql-introspection",
+                "sse-stream-cap",
             ]
         );
         assert_eq!(
@@ -771,6 +976,8 @@ mod tests {
                 "per-host-rate-limit",
                 "request-header-cap",
                 "request-body-cap",
+                "graphql-introspection",
+                "sse-stream-cap",
             ]
         );
     }
@@ -925,7 +1132,7 @@ mod tests {
     /// which is the whole reason the pairing is safe to extend.
     #[test]
     fn every_http_policy_class_is_non_transient() {
-        assert_eq!(HTTP_POLICY_CLASSES.len(), 16);
+        assert_eq!(HTTP_POLICY_CLASSES.len(), 18);
         for t in HTTP_POLICY_CLASSES {
             assert!(ALL.contains(t), "{t:?} missing from ALL");
             assert!(

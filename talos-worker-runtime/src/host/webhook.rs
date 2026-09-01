@@ -2,6 +2,31 @@
 
 use super::*;
 
+use crate::reason_class;
+
+/// Latch `class` against the `sendfailed` discriminant and return it.
+///
+/// `wit_webhook::Error` is `{ invalidurl, sendfailed, timeout }` — no deny
+/// variant — so 16 sites return `Sendfailed` and **15 of them are
+/// deterministic**: a write-ceiling refusal, four caps, a URL parse failure,
+/// five policy denials, a rate-limit, two cancellations and a secret-slot
+/// failure. Exactly ONE is the genuine transport failure.
+///
+/// Measured before it was written: `sendfailed` matches no arm in ANY of the
+/// four downstream classifiers, so every one of those 16 already read
+/// `unknown` / `runtime_error` / `other` — all NON-transient. That is why this
+/// surface is a pure diagnostic fix with **no retry consequence in either
+/// direction**, and why the transport site CLEARS rather than latching a
+/// transport class: `send-failed` / `connect-refused` / `dns` are all
+/// TRANSIENT in `talos_retry_intelligence`, so latching one would newly GRANT
+/// controller-level re-dispatch to a mutating POST that has none today — on
+/// top of `send`'s own internal `1 + max_retries` loop. Granting a retry is
+/// not this change's business.
+fn webhook_deny(ctx: &TalosContext, class: &'static str) -> wit_webhook::Error {
+    ctx.record_http_denial(class, reason_class::WIT_SENDFAILED);
+    wit_webhook::Error::Sendfailed
+}
+
 // ============================================================================
 // Webhook sender
 // ============================================================================
@@ -35,7 +60,7 @@ impl wit_webhook::Host for TalosContext {
         // Write-ceiling gate: an outbound webhook is a mutation/side effect —
         // refuse for read-only actors. Inert unless enforcement is on.
         if self.write_ceiling_refuses("webhook-send", &url).await {
-            return Err(wit_webhook::Error::Sendfailed);
+            return Err(webhook_deny(self, reason_class::WRITE_CEILING));
         }
         // MCP-1148: cap URL bytes BEFORE invoking `url::Url::parse`
         // below. Sibling-parity with wit_http::fetch / wit_graphql.
@@ -46,7 +71,7 @@ impl wit_webhook::Host for TalosContext {
                 limit = MAX_OUTBOUND_URL_BYTES,
                 "wit_webhook::send rejected: URL length exceeds cap"
             );
-            return Err(wit_webhook::Error::Sendfailed);
+            return Err(webhook_deny(self, reason_class::URL_TOO_LONG));
         }
         // MCP-1105: cap caller-supplied header count. See
         // MAX_OUTBOUND_HEADERS doc-comment for the per-vault-resolve
@@ -59,7 +84,7 @@ impl wit_webhook::Host for TalosContext {
                 limit = MAX_OUTBOUND_HEADERS,
                 "wit_webhook::send rejected: header count exceeds cap"
             );
-            return Err(wit_webhook::Error::Sendfailed);
+            return Err(webhook_deny(self, reason_class::REQUEST_HEADER_CAP));
         }
         let headers = req.headers.clone();
         // MCP-1014 (2026-05-15): cap caller-supplied webhook body. Pre-fix
@@ -88,7 +113,7 @@ impl wit_webhook::Host for TalosContext {
                 limit = MAX_OUTBOUND_HTTP_BODY_BYTES,
                 "wit_webhook::send rejected: body exceeds cap"
             );
-            return Err(wit_webhook::Error::Sendfailed);
+            return Err(webhook_deny(self, reason_class::REQUEST_BODY_CAP));
         }
         let body = req.body.clone();
         // MCP-583: cap caller-supplied retry config. Pre-fix
@@ -111,7 +136,9 @@ impl wit_webhook::Host for TalosContext {
             .min(MAX_WEBHOOK_RETRY_DELAY_MS) as u64;
 
         // SSRF protection: validate URL and enforce host allowlist (same as HTTP fetch).
-        let parsed_url: url::Url = url.parse().map_err(|_| wit_webhook::Error::Sendfailed)?;
+        let parsed_url: url::Url = url
+            .parse()
+            .map_err(|_| webhook_deny(self, reason_class::URL_PARSE))?;
         let host = parsed_url.host_str().unwrap_or("").to_string();
 
         // HTTPS-only by default. Webhook deliveries are the highest-
@@ -139,7 +166,7 @@ impl wit_webhook::Host for TalosContext {
                     host = %host,
                     "WASM module attempted non-https webhook send — denied."
                 );
-                return Err(wit_webhook::Error::Sendfailed);
+                return Err(webhook_deny(self, reason_class::INSECURE_SCHEME));
             }
         }
 
@@ -151,7 +178,7 @@ impl wit_webhook::Host for TalosContext {
                 host = %host,
                 "WASM module attempted webhook request but no host allowlist is configured — denying."
             );
-            return Err(wit_webhook::Error::Sendfailed);
+            return Err(webhook_deny(self, reason_class::NO_ALLOWLIST));
         }
 
         // Block private/loopback/link-local IP addresses to prevent SSRF.
@@ -165,7 +192,7 @@ impl wit_webhook::Host for TalosContext {
                 policy,
                 "WASM module attempted webhook to a private IP literal — blocking"
             );
-            return Err(wit_webhook::Error::Sendfailed);
+            return Err(webhook_deny(self, reason_class::PRIVATE_IP));
         }
 
         if !host_allowlist_match(&self.allowed_hosts, &host) {
@@ -176,19 +203,28 @@ impl wit_webhook::Host for TalosContext {
                 allowed_count = self.allowed_hosts.len(),
                 "WASM module attempted webhook to a forbidden host"
             );
-            return Err(wit_webhook::Error::Sendfailed);
+            return Err(webhook_deny(self, reason_class::ALLOWED_HOSTS));
         }
 
         // DNS rebinding — for hostname-based URLs, resolve and reject when
         // any answer falls in the private deny-list. Skipped for IP literals
         // (already handled by classify_private_ip above).
-        if matches!(parsed_url.host(), Some(url::Host::Domain(_)))
-            && self
-                .validate_no_dns_rebinding(&host, "webhook")
-                .await
-                .is_err()
-        {
-            return Err(wit_webhook::Error::Sendfailed);
+        if matches!(parsed_url.host(), Some(url::Host::Domain(_))) {
+            // The ONE mixed site — an SSRF answer (deterministic denial) and a
+            // resolver failure (transient, not a denial) share one `Err`. On
+            // this surface the resolver failure CLEARS instead of latching
+            // `dns`: `sendfailed` is non-transient today, and `dns` is in the
+            // transient bucket, so latching it would newly grant a retry to a
+            // mutating POST. See `webhook_deny`.
+            if let Err(e) = self.validate_no_dns_rebinding(&host, "webhook").await {
+                return Err(match reason_class::dns_rebinding_class(e) {
+                    Some(class) => webhook_deny(self, class),
+                    None => {
+                        self.record_network_outcome(None);
+                        wit_webhook::Error::Sendfailed
+                    }
+                });
+            }
         }
 
         // Tier-1 LLM egress ceiling — webhook dispatch is yet another
@@ -207,7 +243,7 @@ impl wit_webhook::Host for TalosContext {
                     policy,
                     "tier-1 actor webhook egress refused (external LLM host or public IP literal)"
                 );
-                return Err(wit_webhook::Error::Sendfailed);
+                return Err(webhook_deny(self, reason_class::tier1_egress_class(policy)));
             }
         }
 
@@ -219,14 +255,14 @@ impl wit_webhook::Host for TalosContext {
             if let Some(ref m) = self.metrics {
                 m.record_rate_limit_exceeded("webhook");
             }
-            return Err(wit_webhook::Error::Sendfailed);
+            return Err(webhook_deny(self, reason_class::EXECUTION_RATE_LIMIT));
         }
         if self.is_cancelled() {
             tracing::info!(module_id = ?self.module_id, "Execution cancelled before webhook send");
             if let Some(ref m) = self.metrics {
                 m.record_execution_cancelled();
             }
-            return Err(wit_webhook::Error::Sendfailed);
+            return Err(webhook_deny(self, reason_class::CANCELLED));
         }
 
         // Dry-run mode: mock webhook POST calls
@@ -293,7 +329,7 @@ impl wit_webhook::Host for TalosContext {
                 let resolved = self
                     .resolve_vault_header(k.as_str(), v.as_str())
                     .await
-                    .map_err(|_| wit_webhook::Error::Sendfailed)?;
+                    .map_err(|_| webhook_deny(self, reason_class::SECRET_LOOKUP))?;
                 req_builder = req_builder.header(k.as_str(), resolved.as_ref());
             }
             // Opt-in idempotency (Task 3): a webhook send is always a POST
@@ -364,6 +400,9 @@ impl wit_webhook::Host for TalosContext {
                 Err(e) if retries < max_retries => {
                     retries += 1;
                     if e.is_timeout() {
+                        // Same reasoning as the terminal transport arm below:
+                        // decide the latch rather than inherit one.
+                        self.record_network_outcome(None);
                         return Err(wit_webhook::Error::Timeout);
                     }
                     // MCP-583: re-check cancellation between retries so
@@ -380,11 +419,22 @@ impl wit_webhook::Host for TalosContext {
                         if let Some(ref m) = self.metrics {
                             m.record_execution_cancelled();
                         }
-                        return Err(wit_webhook::Error::Sendfailed);
+                        return Err(webhook_deny(self, reason_class::CANCELLED));
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(retry_delay_ms)).await;
                 }
                 Err(e) => {
+                    // THE transport site. It CLEARS rather than latching — the
+                    // totality rule requires every failing return to DECIDE
+                    // the latch, not that every one names a class. Clearing is
+                    // what stops a swallowed earlier denial being stamped onto
+                    // a real transport failure, and it is provably
+                    // transience-neutral here: with or without a marker,
+                    // `sendfailed` reads non-transient and `timeout` reads
+                    // transient in every classifier. Latching a transport
+                    // class instead would newly grant a retry to a mutating
+                    // POST — see `webhook_deny`.
+                    self.record_network_outcome(None);
                     return Err(if e.is_timeout() {
                         wit_webhook::Error::Timeout
                     } else {

@@ -62,8 +62,15 @@ pub struct NodeFailureBreakdown {
 /// was in the transient list, so SQL syntax errors retried forever
 /// until max_retries was hit. That wastes fuel and worker capacity on
 /// a deterministically-broken query.
-/// The HTTP-surface POLICY and CAP classes the worker stamps onto the two WIT
-/// discriminants that are not `networkerror`.
+/// The EGRESS-surface POLICY and CAP classes the worker stamps.
+///
+/// Originally the classes for `wit_http`'s two non-`networkerror`
+/// discriminants; it now spans all four egress surfaces. Three of them
+/// (`graphql`, `webhook`, `http_stream`) have WIT enums with NO deny variant
+/// at all, so their denials ride the same discriminant as their transport
+/// failures and the marker is the only thing that tells them apart. The worker
+/// guarantees the marker describes the call that produced the message — see
+/// `talos_worker_runtime::reason_class`'s "totality, not clearing" section.
 ///
 /// Hand-mirrored from `talos_worker_runtime::reason_class::HTTP_POLICY_CLASSES`
 /// — this crate deliberately does not depend on the worker runtime (it would
@@ -93,6 +100,8 @@ const HTTP_POLICY_DENIAL_CLASSES: &[&str] = &[
     "per-host-rate-limit",
     "request-header-cap",
     "request-body-cap",
+    "graphql-introspection",
+    "sse-stream-cap",
 ];
 
 /// Extract the `[reason_class=<token>]` token the worker stamped, if any.
@@ -1139,6 +1148,161 @@ name: \"networkerror\", message: \"\" }";
             "fuel_exhaustion"
         );
         assert_eq!(classify_error("something random"), "unknown");
+    }
+
+    // ── The three sibling egress surfaces (#714 follow-up) ──────────────
+    //
+    // `wit_http` was covered first. Its three siblings — `graphql`, `webhook`,
+    // `http_stream` — were then inventoried by script, and the shape of the
+    // problem is different on each:
+    //
+    //   * graphql:     17 `networkerror` returns, 16 deterministic, 1 transport.
+    //                  `networkerror` is TRANSIENT here, so every one of those
+    //                  16 denials was being re-dispatched. The live bug.
+    //   * webhook:     16 `sendfailed` returns, 15 deterministic, 1 transport.
+    //                  `sendfailed` matches no arm at all → `unknown` →
+    //                  non-transient. Diagnostic only.
+    //   * http_stream: hyphenated WIT cases (`forbidden-host`), which the
+    //                  `forbiddenhost` arms miss; `forbidden-host` matched
+    //                  `forbidden` and read as `auth_failure`.
+
+    /// The graphql shapes, which are the ONLY ones whose transience moves.
+    ///
+    /// Both directions, because a one-directional assertion passes on the
+    /// broken tree too: the unmarked message must still be `network_transient`
+    /// (that is the bug, and it is what the marker has to overcome) and the
+    /// marked one must be `capability_denied`.
+    #[test]
+    fn graphql_denials_stop_being_retried_as_network_blips() {
+        const BARE: &str = r#"Component returned error: gql: Error { code: 0, name: "networkerror", message: "" }"#;
+        assert_eq!(
+            classify_error(BARE),
+            "network_transient",
+            "premise: a bare graphql networkerror really was retried"
+        );
+        assert!(is_transient_error_type(&classify_error(BARE)));
+
+        for token in [
+            "capability-world",
+            "no-allowlist",
+            "private-ip",
+            "allowed-hosts",
+            "tier1-llm-egress",
+            "tier1-public-ip-egress",
+            "method-allowlist",
+            "execution-rate-limit",
+            "request-header-cap",
+            "request-body-cap",
+            "url-too-long",
+            "insecure-scheme",
+            "graphql-introspection",
+        ] {
+            let marked = format!("{BARE} [reason_class={token}]");
+            let c = classify_error(&marked);
+            assert_eq!(&c, "capability_denied", "token {token}");
+            assert!(
+                !is_transient_error_type(&c),
+                "graphql denial {token} is still retryable"
+            );
+        }
+
+        // The ONE transport site keeps its retry. This is the property the
+        // worker's totality rule exists to preserve — a swallowed denial must
+        // not veto it.
+        for token in [
+            "dns",
+            "tls",
+            "connect-refused",
+            "connect-failed",
+            "send-failed",
+        ] {
+            let marked = format!("{BARE} [reason_class={token}]");
+            let c = classify_error(&marked);
+            assert_eq!(&c, "network_transient", "transport token {token}");
+            assert!(is_transient_error_type(&c));
+        }
+
+        // And the `queryerror` half: `queryerror` contains `query`, so a
+        // read-only actor's write-ceiling refusal was reported as a DATABASE
+        // error. Non-transient either way — a remediation fix.
+        const Q: &str =
+            r#"Component returned error: gql: Error { code: 2, name: "queryerror", message: "" }"#;
+        assert_eq!(classify_error(Q), "database_error", "premise");
+        assert_eq!(
+            classify_error(&format!("{Q} [reason_class=write-ceiling]")),
+            "capability_denied"
+        );
+    }
+
+    /// `webhook` and `http_stream`: the bucket moves, the TRANSIENCE does not.
+    /// Both were already non-transient in every direction, which is why these
+    /// two surfaces carry no retry risk at all.
+    #[test]
+    fn webhook_and_stream_denials_change_bucket_but_never_transience() {
+        const SENDFAILED: &str =
+            r#"Component returned error: hook: Error { code: 1, name: "sendfailed", message: "" }"#;
+        const FORBIDDEN: &str = r#"Component returned error: sse: Error { code: 1, name: "forbidden-host", message: "" }"#;
+        // Premises: what shipped.
+        assert_eq!(classify_error(SENDFAILED), "unknown");
+        assert_eq!(
+            classify_error(FORBIDDEN),
+            "auth_failure",
+            "premise: `forbidden-host` matched the substring `forbidden` and \
+             sent the operator after a credential that was fine"
+        );
+        assert!(!is_transient_error_type("unknown"));
+        assert!(!is_transient_error_type("auth_failure"));
+
+        for (shape, token) in [
+            (SENDFAILED, "allowed-hosts"),
+            (SENDFAILED, "private-ip"),
+            (SENDFAILED, "no-allowlist"),
+            (SENDFAILED, "write-ceiling"),
+            (FORBIDDEN, "capability-world"),
+            (FORBIDDEN, "allowed-hosts"),
+            (FORBIDDEN, "write-ceiling-strict-egress"),
+            (FORBIDDEN, "per-host-rate-limit"),
+        ] {
+            let c = classify_error(&format!("{shape} [reason_class={token}]"));
+            assert_eq!(&c, "capability_denied", "{token} on {shape}");
+            assert!(!is_transient_error_type(&c));
+        }
+        // The stream concurrency cap, distinct from the per-host budget.
+        assert_eq!(
+            classify_error(r#"Error { name: "rate-limited" } [reason_class=sse-stream-cap]"#),
+            "capability_denied"
+        );
+    }
+
+    /// The two tokens minted by the sibling-surface change are newly minted
+    /// too, so the `new_tokens_cannot_appear_on_an_old_message` argument still
+    /// covers the whole set. Asserted rather than assumed: reusing an
+    /// existing-looking token is the obvious simplification and it would
+    /// silently re-route shipped messages.
+    #[test]
+    fn the_sibling_surface_tokens_are_also_newly_minted() {
+        for t in ["graphql-introspection", "sse-stream-cap"] {
+            assert!(HTTP_POLICY_DENIAL_CLASSES.contains(&t));
+            // Not a substring of any pre-existing token, and no pre-existing
+            // token is a substring of it — so no old message can carry one.
+            for old in [
+                "dns",
+                "tls",
+                "connect-refused",
+                "connect-failed",
+                "send-failed",
+                "circuit-open",
+                "tier1-egress",
+                "cancelled",
+                "response-too-large",
+                "header-cap",
+                "response-stream",
+                "timeout",
+                "secret-lookup",
+            ] {
+                assert!(!t.contains(old), "{t} contains {old}");
+            }
+        }
     }
 
     #[test]
