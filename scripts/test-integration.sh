@@ -109,6 +109,12 @@ TESTS=(
     "talos-organizations:personal_org_resolution:migrated"
     "talos-advanced-repository:scratch_rls:migrated"
     "talos-execution-repository:crash_recovery:migrated"
+    # The attributed stale-execution sweep. Both properties it pins are SQL
+    # properties — "the last node that started and never reported" is a LATERAL
+    # over execution_events, and "the row finalized between the read and the
+    # write" is a status-guarded UPDATE — so only a live database can evaluate
+    # them. The wording itself is unit-tested in src/stale_sweep.rs.
+    "talos-execution-repository:stale_execution_sweep:migrated"
     # Preview-vs-action scope pins: the per-user predicate on the pinned-module
     # wasm write (a user-scoped read used to drive a cross-tenant UPDATE) and the
     # age filter on the cleanup DELETE (which the find_unreferenced_modules
