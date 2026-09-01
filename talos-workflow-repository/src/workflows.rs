@@ -467,6 +467,37 @@ impl WorkflowRepository {
         Ok(actor_id.flatten())
     }
 
+    /// Which of `workflow_ids` have a bound actor — [`Self::get_workflow_actor_id`]
+    /// for many workflows in ONE round trip.
+    ///
+    /// Exists for the fleet-wide validator, which needs `has_actor` per
+    /// workflow to predict the retry clamp (`MAX_RETRIES_UNBUDGETED`). Calling
+    /// the singular method in a loop is the N+1 the sweep's batching exists to
+    /// avoid.
+    ///
+    /// Returns only the ids that BOTH belong to `user_id` and carry a non-null
+    /// `actor_id`. An id missing from the set is unbound, not-yours, or absent
+    /// — all three of which the caller treats as "no actor", which is the
+    /// clamping (warning-SUPPRESSING) direction.
+    pub async fn workflows_with_bound_actor(
+        &self,
+        workflow_ids: &[Uuid],
+        user_id: Uuid,
+    ) -> Result<std::collections::HashSet<Uuid>> {
+        if workflow_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM workflows \
+             WHERE id = ANY($1) AND user_id = $2 AND actor_id IS NOT NULL",
+        )
+        .bind(workflow_ids)
+        .bind(user_id)
+        .fetch_all(&self.db_pool)
+        .await?;
+        Ok(ids.into_iter().collect())
+    }
+
     /// Fetch the active version's graph_json and version id. Falls back to the draft if no
     /// active version exists. Returns None if the workflow is not found.
     pub async fn get_active_version_graph(

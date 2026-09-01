@@ -210,7 +210,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "validate_all_workflows",
-            "description": "Batch-validate all workflows for the current user: checks module existence and cycle detection for each.",
+            "description": "Batch-validate every workflow for the current user, running the SAME checks validate_workflow runs. Returns errors (which make a workflow invalid) and warnings (which do NOT) separately: valid_count/invalid_count count workflows by ERROR only, while warning_count/workflows_with_warnings are independent. Detail lists are capped — `truncated` names exactly what was omitted, and the counts are always exact. `history` reports how many workflows the execution-history checks could actually see.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -1271,12 +1271,221 @@ async fn handle_get_workflow_changelog(
         &serde_json::to_string_pretty(&result).unwrap_or_default(),
     )
 }
+/// Cap on the workflows rendered into `issues` / `warnings`.
+///
+/// The COUNTS are always exact and always over every workflow — only the
+/// per-workflow detail lists are bounded. A truncated list that reads as
+/// complete is the defect this whole change is about, so the response says
+/// exactly what it dropped under `truncated`.
+const FLEET_MAX_DETAIL_WORKFLOWS: usize = 50;
 
+/// Cap on findings rendered per workflow, per severity.
+///
+/// Measured on the live fleet (2026-09-01): 86 warnings across 28 workflows,
+/// max 7 on one. At 500 workflows the uncapped body would be megabytes.
+const FLEET_MAX_FINDINGS_PER_WORKFLOW: usize = 10;
+
+/// Accumulates one `ValidationResult` per workflow into the
+/// `validate_all_workflows` response.
+///
+/// A separate type, driven from a test, because the COUNT SEMANTICS are the
+/// part of this response most easily got wrong and least easily noticed:
+///
+/// * `valid_count` / `invalid_count` partition workflows by **Error only**. A
+///   workflow with warnings and no errors is VALID. Letting a warning quietly
+///   start counting as invalid would be the same class of silent redefinition
+///   that this whole change exists to undo.
+/// * `error_count` / `warning_count` / `workflows_with_warnings` are EXACT
+///   over every workflow, and are computed before any cap applies. A cap may
+///   shorten the detail lists; it may never move a count.
+/// * `truncated` states what the caps dropped. A truncated list that reads as
+///   complete is precisely the defect this repository keeps paying for, so it
+///   is reported rather than inferred from a length.
+#[derive(Default)]
+pub(crate) struct FleetValidationTally {
+    valid_count: u32,
+    invalid_count: u32,
+    error_count: usize,
+    warning_count: usize,
+    workflows_with_warnings: u32,
+    history_consulted: u32,
+    history_empty: u32,
+    history_unavailable: u32,
+    issues_list: Vec<serde_json::Value>,
+    warnings_list: Vec<serde_json::Value>,
+    issue_workflows_omitted: u32,
+    warning_workflows_omitted: u32,
+    findings_omitted: usize,
+}
+
+impl FleetValidationTally {
+    pub(crate) fn record(
+        &mut self,
+        workflow_id: Uuid,
+        workflow_name: &str,
+        result: &talos_workflow_validation::ValidationResult,
+    ) {
+        use talos_workflow_validation::HistoryCoverage;
+
+        match &result.history {
+            HistoryCoverage::Observed { .. } => self.history_consulted += 1,
+            HistoryCoverage::Empty { .. } => self.history_empty += 1,
+            HistoryCoverage::Unavailable => self.history_unavailable += 1,
+        }
+
+        let errors = result.errors();
+        let warnings = result.warnings();
+
+        // Counts first, and unconditionally — before any cap can be reached.
+        self.error_count += errors.len();
+        self.warning_count += warnings.len();
+        if errors.is_empty() {
+            self.valid_count += 1;
+        } else {
+            self.invalid_count += 1;
+        }
+        if !warnings.is_empty() {
+            self.workflows_with_warnings += 1;
+        }
+        debug_assert_eq!(
+            errors.len() + warnings.len(),
+            result.issues.len(),
+            "ValidationSeverity gained a variant neither bucket counts"
+        );
+
+        Self::push(
+            &mut self.issues_list,
+            &mut self.issue_workflows_omitted,
+            &mut self.findings_omitted,
+            workflow_id,
+            workflow_name,
+            &errors,
+            "issues",
+        );
+        Self::push(
+            &mut self.warnings_list,
+            &mut self.warning_workflows_omitted,
+            &mut self.findings_omitted,
+            workflow_id,
+            workflow_name,
+            &warnings,
+            "warnings",
+        );
+    }
+
+    fn push(
+        bucket: &mut Vec<serde_json::Value>,
+        omitted_workflows: &mut u32,
+        findings_omitted: &mut usize,
+        workflow_id: Uuid,
+        workflow_name: &str,
+        findings: &[&talos_workflow_validation::ValidationIssue],
+        key: &str,
+    ) {
+        if findings.is_empty() {
+            return;
+        }
+        if bucket.len() >= FLEET_MAX_DETAIL_WORKFLOWS {
+            *omitted_workflows += 1;
+            *findings_omitted += findings.len();
+            return;
+        }
+        let shown = findings.len().min(FLEET_MAX_FINDINGS_PER_WORKFLOW);
+        *findings_omitted += findings.len() - shown;
+        bucket.push(serde_json::json!({
+            "workflow_id": workflow_id.to_string(),
+            "workflow_name": workflow_name,
+            key: findings[..shown]
+                .iter()
+                .map(|i| i.message.clone())
+                .collect::<Vec<_>>(),
+            // Present even when nothing was dropped, so a reader never has to
+            // infer completeness from a list length.
+            "total_for_workflow": findings.len(),
+        }));
+    }
+
+    pub(crate) fn render(self, window_days: i32) -> serde_json::Value {
+        // MCP-110 (2026-05-08): emit canonical `count` alongside legacy
+        // `total` for envelope consistency with list_workflows / list_executions.
+        let total_workflows = self.valid_count + self.invalid_count;
+        serde_json::json!({
+            "valid_count": self.valid_count,
+            "invalid_count": self.invalid_count,
+            "count": total_workflows,
+            "total": total_workflows,
+            "error_count": self.error_count,
+            "warning_count": self.warning_count,
+            "workflows_with_warnings": self.workflows_with_warnings,
+            "issues": self.issues_list,
+            "warnings": self.warnings_list,
+            "truncated": {
+                "issue_workflows_omitted": self.issue_workflows_omitted,
+                "warning_workflows_omitted": self.warning_workflows_omitted,
+                "findings_omitted": self.findings_omitted,
+                "max_detail_workflows": FLEET_MAX_DETAIL_WORKFLOWS,
+                "max_findings_per_workflow": FLEET_MAX_FINDINGS_PER_WORKFLOW,
+            },
+            // What the history-based checks could actually see. An empty
+            // `warnings` list is not evidence of health when history was
+            // unavailable — this says which it was.
+            "history": {
+                "window_days": window_days,
+                "consulted": self.history_consulted,
+                "empty": self.history_empty,
+                "unavailable": self.history_unavailable,
+            },
+        })
+    }
+}
+
+/// Fleet-wide validation.
+///
+/// **ONE checker.** This runs `talos_workflow_validation::validate_prepared`
+/// — the same function `validate_workflow` runs — over inputs batch-loaded
+/// once for every workflow. It does NOT carry its own copy of any check.
+///
+/// # Why it used to, and what that cost
+///
+/// This handler previously re-implemented validation inline, because calling
+/// `WorkflowValidationService::validate` in a loop issues five queries per
+/// workflow and the sweep already batch-loaded the same rows across all of
+/// them (MCP-402 had removed exactly that N+1 from the existence checks). The
+/// duplicate then drifted, as a duplicate does. Measured against the live
+/// fleet on 2026-09-01, the inline copy reported **28 workflows, 1 invalid**
+/// where the shared validator finds **2 invalid and 86 warnings**:
+///
+/// * It missed an **ERROR**, not just warnings: `stress-04-security`'s
+///   `AUTH_HEADER` references `vault://anthropic/api_key` against a module
+///   whose `allowed_secrets` is empty (deny-all). The inline vault check
+///   matched `vault://` as a bare PREFIX via `strip_prefix`, and **all 39
+///   vault references on the fleet are embedded** (`Bearer vault://…`) — so
+///   its only security check had **0/39 recall** and was dead code on the
+///   entire live corpus.
+/// * It reported unreachable nodes as an ERROR where the shared validator
+///   grades them a Warning, so the two surfaces disagreed on `valid` in the
+///   other direction too.
+/// * Every check added to `talos-workflow-validation` since — retry
+///   envelopes, fuel sizing, observed failure history, disabled retries,
+///   at-least-once durability — was invisible fleet-wide. The retry-envelope
+///   check has a production incident behind it.
+///
+/// # How this stays out of the N+1
+///
+/// Five batched loads, ONE round trip each, regardless of workflow count:
+/// module existence, template rows, installed secret grants, actor bindings,
+/// and execution history (`node_run_history_batch`'s `LATERAL`, which keeps
+/// the per-workflow `LIMIT` that a flat `ANY($1)` would collapse). Then a
+/// pure, I/O-free `validate_prepared` per workflow.
 async fn handle_validate_all_workflows(
     req_id: Option<serde_json::Value>,
     state: &McpState,
     user_id: Uuid,
 ) -> JsonRpcResponse {
+    use talos_workflow_validation::{
+        graph_module_ids, validate_prepared, PreparedValidation, HISTORY_MAX_EXECUTIONS,
+    };
+
     let workflows = match state
         .analytics_repo
         .list_workflows_with_graphs(user_id)
@@ -1289,294 +1498,135 @@ async fn handle_validate_all_workflows(
         }
     };
 
-    let mut valid_count = 0u32;
-    let mut invalid_count = 0u32;
-    let mut issues_list: Vec<serde_json::Value> = Vec::new();
-
-    // Pre-load secret grants for all modules across all workflows in one batch
-    // to avoid N+1 queries. Collect ALL distinct module IDs from ALL workflows upfront.
-    let all_module_ids: Vec<uuid::Uuid> = {
-        let mut ids = std::collections::HashSet::new();
-        for wf_row in &workflows {
-            let g: serde_json::Value =
-                serde_json::from_str(&wf_row.graph_json.clone().unwrap_or_default())
-                    .unwrap_or(serde_json::json!({"nodes":[]}));
-            if let Some(ns) = g.get("nodes").and_then(|n| n.as_array()) {
-                for n in ns {
-                    if let Some(id) = n
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<uuid::Uuid>().ok())
-                    {
-                        ids.insert(id);
-                    }
-                }
-            }
-        }
-        ids.into_iter().collect()
-    };
-
-    // Batch-load effective allowed_secrets:
-    // installed_secrets = wasm_modules (authoritative per-install override)
-    // template_secrets  = node_templates (fallback when no wasm_modules entry exists)
-    //
-    // MCP-402 (2026-05-11): batch ALSO the existence checks. Pre-fix
-    // `check_template_ids_exist` and `check_module_ids_exist` were
-    // called INSIDE the per-workflow loop below, so a user with 500
-    // workflows incurred 2 * 500 = 1000 extra DB roundtrips on
-    // every `validate_all_workflows` call — even though the entire
-    // set of module ids is already aggregated in `all_module_ids`
-    // (see lines 1054-1073). The N+1 sat next to existing batching
-    // for installed_secrets / template_secrets and was easy to miss.
-    // Hoist both existence queries out of the loop so they each run
-    // once; build a single `existing_modules` HashSet that the
-    // per-workflow loop consults. Pure win — fewer queries, same
-    // per-workflow validation logic.
-    let (installed_secrets_batch, template_secrets_batch, existing_templates, existing_wasm) =
-        if !all_module_ids.is_empty() {
-            tokio::join!(
-                state
-                    .workflow_repo
-                    .get_installed_secrets_by_template_ids(&all_module_ids, user_id),
-                state.workflow_repo.get_templates_by_ids(&all_module_ids),
-                state
-                    .analytics_repo
-                    .check_template_ids_exist(&all_module_ids),
-                state.analytics_repo.check_module_ids_exist(&all_module_ids),
-            )
-        } else {
-            (
-                Ok(std::collections::HashMap::new()),
-                Ok(vec![]),
-                Ok(vec![]),
-                Ok(vec![]),
-            )
-        };
-    let installed_secrets_batch = installed_secrets_batch.unwrap_or_default();
-    let template_secrets_batch: std::collections::HashMap<uuid::Uuid, Vec<String>> =
-        template_secrets_batch
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| (r.id, r.allowed_secrets))
-            .collect();
-    let existing_modules: std::collections::HashSet<uuid::Uuid> = existing_templates
-        .unwrap_or_default()
-        .into_iter()
-        .chain(existing_wasm.unwrap_or_default())
+    // Parse each graph ONCE. `validate_prepared` re-parses from the same
+    // string with the same malformed-graph fallback, so the two never
+    // disagree about what the graph is; this copy only resolves module ids.
+    let workflow_ids: Vec<uuid::Uuid> = workflows.iter().map(|w| w.id).collect();
+    let per_workflow_modules: Vec<Vec<uuid::Uuid>> = workflows
+        .iter()
+        .map(|w| {
+            let graph: serde_json::Value =
+                serde_json::from_str(w.graph_json.as_deref().unwrap_or(""))
+                    .unwrap_or_else(|_| serde_json::json!({"nodes": [], "edges": []}));
+            graph_module_ids(&graph)
+        })
         .collect();
 
-    for wf_row in &workflows {
-        let wf_id = wf_row.id;
-        let wf_name = wf_row.name.clone();
-        let graph_json_str: String = wf_row.graph_json.clone().unwrap_or_default();
-
-        let graph: serde_json::Value = serde_json::from_str(&graph_json_str)
-            .unwrap_or(serde_json::json!({"nodes":[],"edges":[]}));
-
-        let mut wf_issues: Vec<String> = Vec::new();
-
-        let nodes = graph
-            .get("nodes")
-            .and_then(|n| n.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let edges = graph
-            .get("edges")
-            .and_then(|e| e.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        // Check module existence
-        let module_ids: Vec<uuid::Uuid> = nodes
+    let all_module_ids: Vec<uuid::Uuid> = {
+        let mut seen = std::collections::HashSet::new();
+        per_workflow_modules
             .iter()
-            .filter_map(|n| {
-                n.get("type")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse().ok())
-            })
+            .flatten()
+            .copied()
+            .filter(|id| seen.insert(*id))
+            .collect()
+    };
+
+    // ── The five batched loads ────────────────────────────────────────────
+    // Each is ONE query for the WHOLE fleet. This is the constraint that
+    // made the inline duplicate exist; it is met here rather than worked
+    // around. `tokio::join!` so they overlap on the wire too.
+    let window_days = talos_workflow_validation::history_window_days();
+    let (existing, templates, installed_secrets, bound_actors, history) = tokio::join!(
+        state.workflow_repo.modules_exist(&all_module_ids),
+        state.workflow_repo.get_templates_by_ids(&all_module_ids),
+        state
+            .workflow_repo
+            .get_installed_secrets_by_template_ids(&all_module_ids, user_id),
+        state
+            .workflow_repo
+            .workflows_with_bound_actor(&workflow_ids, user_id),
+        state.workflow_repo.node_run_history_batch(
+            &workflow_ids,
+            user_id,
+            window_days,
+            HISTORY_MAX_EXECUTIONS,
+        ),
+    );
+
+    let existing_modules: std::collections::HashSet<uuid::Uuid> =
+        existing.unwrap_or_default().into_iter().collect();
+    let templates_by_id: std::collections::HashMap<uuid::Uuid, _> = templates
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| (r.id, r))
+        .collect();
+    let installed_secrets = installed_secrets.unwrap_or_default();
+    let bound_actors = bound_actors.unwrap_or_default();
+    // A FAILED batch history read must not read as "no history" for all 28
+    // workflows — that is the error-as-absence shape `HistoryCoverage` exists
+    // to prevent. The message is carried into every workflow's result, which
+    // renders it as `history.unavailable`.
+    let history = match history {
+        Ok(map) => Ok(map),
+        Err(e) => {
+            tracing::error!(
+                target: "talos_validation",
+                error = %e,
+                event_kind = "fleet_validation_history_read_failed",
+                "validate_all_workflows: batched execution-history read failed — \
+                 history checks did not run for ANY workflow"
+            );
+            Err(e.to_string())
+        }
+    };
+
+    let mut tally = FleetValidationTally::default();
+
+    for (wf_row, module_ids) in workflows.iter().zip(per_workflow_modules.iter()) {
+        // Narrow every fleet-wide map to the modules THIS workflow dispatches
+        // before handing it over. Two reasons, and the second is the load-
+        // bearing one:
+        //
+        // 1. Cost: this is O(this workflow's nodes), where cloning the whole
+        //    fleet map per workflow would be O(workflows x fleet modules).
+        // 2. Correctness: `validate_prepared` builds its side-effecting-node
+        //    list and its durability advisory by SCANNING the template rows,
+        //    so a superset would attribute another workflow's modules to this
+        //    one. It re-narrows defensively; this is the primary narrowing.
+        let existing: std::collections::HashSet<uuid::Uuid> = module_ids
+            .iter()
+            .copied()
+            .filter(|id| existing_modules.contains(id))
+            .collect();
+        let templates: Vec<_> = module_ids
+            .iter()
+            .filter_map(|id| templates_by_id.get(id).cloned())
+            .collect();
+        let installed: std::collections::HashMap<uuid::Uuid, Vec<String>> = module_ids
+            .iter()
+            .filter_map(|id| installed_secrets.get(id).map(|v| (*id, v.clone())))
             .collect();
 
-        if !module_ids.is_empty() {
-            // MCP-402: consult the pre-batched existence set.
-            for mid in &module_ids {
-                if !existing_modules.contains(mid) {
-                    wf_issues.push(format!("Module '{}' not found", mid));
-                }
-            }
-        }
+        let wf_history = match &history {
+            // An id absent from a SUCCESSFUL batch means the workflow has no
+            // executions in the window — a real empty slice, not a failed
+            // read. `node_run_history_batch` returns a row for every id it was
+            // asked about, so this is belt-and-braces.
+            Ok(map) => Ok(map.get(&wf_row.id).cloned().unwrap_or(
+                talos_workflow_repository::NodeRunHistory {
+                    executions_scanned: 0,
+                    window_days,
+                    nodes: Vec::new(),
+                },
+            )),
+            Err(e) => Err(e.clone()),
+        };
 
-        // Cycle detection using petgraph
-        let node_ids: Vec<&str> = nodes
-            .iter()
-            .filter_map(|n| n.get("id").and_then(|v| v.as_str()))
-            .collect();
+        let result = validate_prepared(PreparedValidation {
+            workflow_id: wf_row.id,
+            graph_json: wf_row.graph_json.clone().unwrap_or_default(),
+            existing_modules: existing,
+            templates,
+            installed_secrets: installed,
+            has_actor: bound_actors.contains(&wf_row.id),
+            history: wf_history,
+        });
 
-        let node_index_map: std::collections::HashMap<&str, usize> = node_ids
-            .iter()
-            .enumerate()
-            .map(|(i, id)| (*id, i))
-            .collect();
-
-        let mut digraph = petgraph::graph::DiGraph::<&str, ()>::new();
-        let graph_indices: Vec<petgraph::graph::NodeIndex> =
-            node_ids.iter().map(|id| digraph.add_node(id)).collect();
-
-        for edge in &edges {
-            let src = edge.get("source").and_then(|v| v.as_str()).unwrap_or("");
-            let tgt = edge.get("target").and_then(|v| v.as_str()).unwrap_or("");
-            if let (Some(&si), Some(&ti)) = (node_index_map.get(src), node_index_map.get(tgt)) {
-                digraph.add_edge(graph_indices[si], graph_indices[ti], ());
-            }
-        }
-
-        if petgraph::algo::is_cyclic_directed(&digraph) {
-            wf_issues.push("Graph contains a cycle".to_string());
-        }
-
-        // Check for orphaned edges
-        let node_id_set: std::collections::HashSet<&str> = node_ids.iter().copied().collect();
-        for edge in &edges {
-            let src = edge.get("source").and_then(|v| v.as_str()).unwrap_or("");
-            let tgt = edge.get("target").and_then(|v| v.as_str()).unwrap_or("");
-            if !node_id_set.contains(src) {
-                wf_issues.push(format!("Edge source '{}' does not match any node", src));
-            }
-            if !node_id_set.contains(tgt) {
-                wf_issues.push(format!("Edge target '{}' does not match any node", tgt));
-            }
-        }
-
-        // Reachability analysis — detect nodes unreachable from any root.
-        // Skip if a cycle was already found (the cycle itself is the structural problem).
-        if !wf_issues.iter().any(|i| i.contains("cycle")) && nodes.len() > 1 {
-            let mut reachable: std::collections::HashSet<petgraph::graph::NodeIndex> =
-                std::collections::HashSet::new();
-            for (&idx, _) in graph_indices.iter().zip(node_ids.iter()) {
-                if digraph
-                    .edges_directed(idx, petgraph::Direction::Incoming)
-                    .next()
-                    .is_none()
-                {
-                    let mut dfs = petgraph::visit::Dfs::new(&digraph, idx);
-                    while let Some(visited) = dfs.next(&digraph) {
-                        reachable.insert(visited);
-                    }
-                }
-            }
-            let unreachable: Vec<&str> = graph_indices
-                .iter()
-                .zip(node_ids.iter())
-                .filter_map(|(&idx, &id)| {
-                    if !reachable.contains(&idx) {
-                        Some(id)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if !unreachable.is_empty() {
-                wf_issues.push(format!(
-                    "Unreachable node(s): [{}] — remove with update_workflow action:remove_node",
-                    unreachable.join(", ")
-                ));
-            }
-        }
-
-        // Vault path × allowed_secrets checks using pre-loaded batch maps.
-        // Detects: (1) malformed vault:// paths, (2) paths blocked by allowed_secrets.
-        for node in &nodes {
-            let node_id = node.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-            let Ok(mid) = node
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .parse::<uuid::Uuid>()
-            else {
-                continue;
-            };
-
-            // Prefer wasm_modules entry (operator override); fall back to node_templates default.
-            let effective_secrets: Option<&Vec<String>> = installed_secrets_batch
-                .get(&mid)
-                .or_else(|| template_secrets_batch.get(&mid));
-            let Some(allowed_secrets) = effective_secrets else {
-                continue;
-            };
-
-            let has_wildcard = allowed_secrets.iter().any(|s| s == "*");
-
-            let node_data = node.get("data").cloned().unwrap_or(serde_json::json!({}));
-            let node_config = node_data
-                .get("config")
-                .cloned()
-                .unwrap_or_else(|| node_data.clone());
-
-            if let Some(cfg_obj) = node_config.as_object() {
-                for (field_key, field_val) in cfg_obj {
-                    if let Some(val_str) = field_val.as_str() {
-                        if let Some(path) = val_str.strip_prefix("vault://") {
-                            if path.is_empty() {
-                                wf_issues.push(format!(
-                                    "Node '{}' config field '{}' has empty vault:// reference \
-                                     ('vault://'). Must be 'vault://path/to/key'.",
-                                    node_id, field_key
-                                ));
-                                continue;
-                            }
-                            if path.starts_with("vault://") {
-                                wf_issues.push(format!(
-                                    "Node '{}' config field '{}' has nested vault:// prefix \
-                                     ('{}'). Use single prefix: 'vault://path/to/key'.",
-                                    node_id, field_key, val_str
-                                ));
-                                continue;
-                            }
-                            if !has_wildcard
-                                && !crate::workflows::vault_path_permitted(path, allowed_secrets)
-                            {
-                                wf_issues.push(format!(
-                                    "Node '{}' config field '{}' references vault path '{}' \
-                                     blocked by allowed_secrets [{}]. Will fail with \
-                                     'unauthorized' at runtime. Reinstall module with path \
-                                     added to allowed_secrets.",
-                                    node_id,
-                                    field_key,
-                                    path,
-                                    if allowed_secrets.is_empty() {
-                                        "deny-all".to_string()
-                                    } else {
-                                        allowed_secrets.join(", ")
-                                    }
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if wf_issues.is_empty() {
-            valid_count += 1;
-        } else {
-            invalid_count += 1;
-            issues_list.push(serde_json::json!({
-                "workflow_id": wf_id.to_string(),
-                "workflow_name": wf_name,
-                "issues": wf_issues,
-            }));
-        }
+        tally.record(wf_row.id, &wf_row.name, &result);
     }
 
-    // MCP-110 (2026-05-08): emit canonical `count` alongside legacy
-    // `total` for envelope consistency with list_workflows / list_executions.
-    let total_workflows = valid_count + invalid_count;
-    let result = serde_json::json!({
-        "valid_count": valid_count,
-        "invalid_count": invalid_count,
-        "count": total_workflows,
-        "total": total_workflows,
-        "issues": issues_list,
-    });
+    let result = tally.render(window_days);
 
     mcp_text(
         req_id,
@@ -7279,5 +7329,242 @@ mod system_health_disclosure_tests {
             measured, unmeasured,
             "an all-zero system and an unreachable database rendered identically"
         );
+    }
+}
+
+/// The `validate_all_workflows` output contract.
+///
+/// Every test drives the REAL [`FleetValidationTally`] the handler drives —
+/// the counts and the truncation disclosure are pinned against shipping code,
+/// not a test-local restatement of it.
+#[cfg(test)]
+mod fleet_validation_tally_tests {
+    use super::{
+        FleetValidationTally, FLEET_MAX_DETAIL_WORKFLOWS, FLEET_MAX_FINDINGS_PER_WORKFLOW,
+    };
+    use talos_workflow_validation::{
+        HistoryCoverage, ValidationIssue, ValidationResult, ValidationSeverity,
+    };
+    use uuid::Uuid;
+
+    fn issue(severity: ValidationSeverity, message: &str) -> ValidationIssue {
+        ValidationIssue {
+            severity,
+            message: message.to_string(),
+            node_id: None,
+            category: "test".into(),
+        }
+    }
+
+    fn result(issues: Vec<ValidationIssue>, history: HistoryCoverage) -> ValidationResult {
+        ValidationResult {
+            valid: !issues
+                .iter()
+                .any(|i| i.severity == ValidationSeverity::Error),
+            issues,
+            history,
+        }
+    }
+
+    fn observed() -> HistoryCoverage {
+        HistoryCoverage::Observed {
+            executions: 5,
+            window_days: 30,
+        }
+    }
+
+    /// The count contract, stated as a test because a warning silently
+    /// becoming "invalid" is the regression this response shape invites.
+    #[test]
+    fn warnings_never_make_a_workflow_invalid() {
+        let mut t = FleetValidationTally::default();
+        t.record(
+            Uuid::from_u128(1),
+            "warns-a-lot",
+            &result(
+                vec![
+                    issue(ValidationSeverity::Warning, "w1"),
+                    issue(ValidationSeverity::Warning, "w2"),
+                    issue(ValidationSeverity::Warning, "w3"),
+                ],
+                observed(),
+            ),
+        );
+        let out = t.render(30);
+        assert_eq!(out["valid_count"], 1);
+        assert_eq!(out["invalid_count"], 0);
+        assert_eq!(out["warning_count"], 3);
+        assert_eq!(out["error_count"], 0);
+        assert_eq!(out["workflows_with_warnings"], 1);
+        // A valid workflow with warnings appears in `warnings` and NOT in `issues`.
+        assert_eq!(out["issues"].as_array().unwrap().len(), 0);
+        assert_eq!(out["warnings"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn one_error_makes_a_workflow_invalid_regardless_of_warnings() {
+        let mut t = FleetValidationTally::default();
+        t.record(
+            Uuid::from_u128(1),
+            "broken",
+            &result(
+                vec![
+                    issue(ValidationSeverity::Error, "cycle"),
+                    issue(ValidationSeverity::Warning, "w"),
+                ],
+                observed(),
+            ),
+        );
+        let out = t.render(30);
+        assert_eq!(out["valid_count"], 0);
+        assert_eq!(out["invalid_count"], 1);
+        assert_eq!(out["error_count"], 1);
+        assert_eq!(out["warning_count"], 1);
+        // The SAME workflow appears in both lists, once per severity.
+        assert_eq!(out["issues"].as_array().unwrap().len(), 1);
+        assert_eq!(out["warnings"].as_array().unwrap().len(), 1);
+    }
+
+    /// `count` / `total` count WORKFLOWS. `error_count` / `warning_count`
+    /// count FINDINGS. Conflating them is how a fleet report starts claiming
+    /// more broken workflows than exist.
+    #[test]
+    fn workflow_counts_and_finding_counts_are_different_numbers() {
+        let mut t = FleetValidationTally::default();
+        for i in 0..3u128 {
+            t.record(
+                Uuid::from_u128(i),
+                "wf",
+                &result(
+                    vec![
+                        issue(ValidationSeverity::Warning, "a"),
+                        issue(ValidationSeverity::Warning, "b"),
+                    ],
+                    observed(),
+                ),
+            );
+        }
+        let out = t.render(30);
+        assert_eq!(out["count"], 3, "three workflows");
+        assert_eq!(out["total"], 3);
+        assert_eq!(out["warning_count"], 6, "six findings");
+        assert_eq!(out["workflows_with_warnings"], 3);
+    }
+
+    /// A cap may shorten a list. It may NEVER move a count.
+    #[test]
+    fn truncation_shortens_the_list_but_never_the_counts() {
+        let mut t = FleetValidationTally::default();
+        let over = FLEET_MAX_FINDINGS_PER_WORKFLOW + 4;
+        t.record(
+            Uuid::from_u128(1),
+            "noisy",
+            &result(
+                (0..over)
+                    .map(|i| issue(ValidationSeverity::Warning, &format!("w{i}")))
+                    .collect(),
+                observed(),
+            ),
+        );
+        let out = t.render(30);
+        assert_eq!(
+            out["warning_count"], over,
+            "the count is over EVERY finding"
+        );
+        let entry = &out["warnings"][0];
+        assert_eq!(
+            entry["warnings"].as_array().unwrap().len(),
+            FLEET_MAX_FINDINGS_PER_WORKFLOW
+        );
+        assert_eq!(
+            entry["total_for_workflow"], over,
+            "each entry states its own true total"
+        );
+        assert_eq!(out["truncated"]["findings_omitted"], 4);
+    }
+
+    #[test]
+    fn a_workflow_past_the_detail_cap_is_counted_and_disclosed_not_silently_dropped() {
+        let mut t = FleetValidationTally::default();
+        let n = FLEET_MAX_DETAIL_WORKFLOWS + 3;
+        for i in 0..n as u128 {
+            t.record(
+                Uuid::from_u128(i),
+                "wf",
+                &result(vec![issue(ValidationSeverity::Warning, "w")], observed()),
+            );
+        }
+        let out = t.render(30);
+        assert_eq!(out["count"], n as u64, "every workflow is counted");
+        assert_eq!(out["warning_count"], n, "every finding is counted");
+        assert_eq!(out["workflows_with_warnings"], n as u64);
+        assert_eq!(
+            out["warnings"].as_array().unwrap().len(),
+            FLEET_MAX_DETAIL_WORKFLOWS
+        );
+        assert_eq!(out["truncated"]["warning_workflows_omitted"], 3);
+        assert_eq!(out["truncated"]["findings_omitted"], 3);
+    }
+
+    #[test]
+    fn nothing_omitted_reports_zero_rather_than_omitting_the_disclosure() {
+        let mut t = FleetValidationTally::default();
+        t.record(
+            Uuid::from_u128(1),
+            "fine",
+            &result(vec![issue(ValidationSeverity::Warning, "w")], observed()),
+        );
+        let out = t.render(30);
+        assert_eq!(out["truncated"]["findings_omitted"], 0);
+        assert_eq!(out["truncated"]["warning_workflows_omitted"], 0);
+        assert_eq!(out["truncated"]["issue_workflows_omitted"], 0);
+        // The caps themselves are reported, so a reader can tell a full list
+        // from one that merely happens to sit at the limit.
+        assert_eq!(
+            out["truncated"]["max_findings_per_workflow"],
+            FLEET_MAX_FINDINGS_PER_WORKFLOW
+        );
+    }
+
+    /// An empty `warnings` list means something different depending on
+    /// whether history could be read. The response says which.
+    #[test]
+    fn history_coverage_is_reported_per_state() {
+        let mut t = FleetValidationTally::default();
+        t.record(Uuid::from_u128(1), "a", &result(vec![], observed()));
+        t.record(
+            Uuid::from_u128(2),
+            "b",
+            &result(vec![], HistoryCoverage::Empty { window_days: 30 }),
+        );
+        t.record(
+            Uuid::from_u128(3),
+            "c",
+            &result(vec![], HistoryCoverage::Unavailable),
+        );
+        let out = t.render(30);
+        assert_eq!(out["history"]["consulted"], 1);
+        assert_eq!(out["history"]["empty"], 1);
+        assert_eq!(out["history"]["unavailable"], 1);
+        assert_eq!(out["history"]["window_days"], 30);
+        // All three are still VALID workflows — history coverage is a
+        // statement about what was examined, never a verdict.
+        assert_eq!(out["valid_count"], 3);
+    }
+
+    /// A clean fleet must be legible as clean: zeros everywhere, empty lists,
+    /// and the pre-existing `valid_count`/`invalid_count`/`count`/`total`
+    /// keys unchanged in name and meaning for existing callers.
+    #[test]
+    fn the_legacy_keys_survive_unchanged_for_existing_callers() {
+        let mut t = FleetValidationTally::default();
+        t.record(Uuid::from_u128(1), "clean", &result(vec![], observed()));
+        let out = t.render(30);
+        for key in ["valid_count", "invalid_count", "count", "total", "issues"] {
+            assert!(out.get(key).is_some(), "legacy key `{key}` disappeared");
+        }
+        assert_eq!(out["valid_count"], 1);
+        assert_eq!(out["invalid_count"], 0);
+        assert_eq!(out["issues"].as_array().unwrap().len(), 0);
     }
 }

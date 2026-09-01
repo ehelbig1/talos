@@ -1679,6 +1679,97 @@ impl WorkflowRepository {
 
         Ok(fold_node_run_history(rows, window_days))
     }
+
+    /// [`Self::node_run_history`] for MANY workflows in ONE round trip.
+    ///
+    /// Exists so the fleet-wide validator (`validate_all_workflows`) can run
+    /// the SAME history checks the per-workflow tool runs without issuing one
+    /// query per workflow. Calling `node_run_history` in a loop is the N+1 the
+    /// fleet sweep's whole batching design exists to avoid; measured on the
+    /// live DB (2026-09-01, 28 workflows / 9,321 executions / 110,297 events)
+    /// the loop costs 28 round trips and ~55 ms of server time (0.65 ms
+    /// execution + 1.3 ms planning each) where this costs ONE round trip and
+    /// **17.2 ms** total.
+    ///
+    /// The `LATERAL` is what makes the per-workflow `LIMIT` survive batching:
+    /// a plain `workflow_id = ANY($1)` with one outer `LIMIT` would return the
+    /// N most recent executions ACROSS the whole set, so a busy workflow would
+    /// consume the entire budget and every quiet one would report an empty
+    /// history — "no history" being indistinguishable from "healthy" is the
+    /// exact error-as-absence shape `NodeRunHistory` documents against.
+    ///
+    /// Workflows with no executions in the window are present in the result
+    /// with `executions_scanned == 0` — an ABSENT key means the id was not
+    /// asked for, never that the read found nothing.
+    pub async fn node_run_history_batch(
+        &self,
+        workflow_ids: &[Uuid],
+        user_id: Uuid,
+        window_days: i32,
+        max_executions: i64,
+    ) -> Result<std::collections::HashMap<Uuid, NodeRunHistory>> {
+        if workflow_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows: Vec<(
+            Uuid,
+            i64,
+            Option<Uuid>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "WITH wf AS ( \
+                 SELECT unnest($1::uuid[]) AS wid \
+             ), recent AS ( \
+                 SELECT wf.wid, r.id \
+                 FROM wf CROSS JOIN LATERAL ( \
+                     SELECT we.id \
+                     FROM workflow_executions we \
+                     JOIN workflows w ON w.id = we.workflow_id \
+                     WHERE we.workflow_id = wf.wid \
+                       AND w.user_id = $2 \
+                       AND we.status <> 'cancelled' \
+                       AND NOT we.is_test_execution \
+                       AND we.started_at >= now() - make_interval(days => $3::int) \
+                     ORDER BY we.started_at DESC, we.id DESC \
+                     LIMIT $4 \
+                 ) r \
+             ), scanned AS ( \
+                 SELECT wf.wid, \
+                        (SELECT count(*)::bigint FROM recent WHERE recent.wid = wf.wid) AS n \
+                 FROM wf \
+             ), agg AS ( \
+                 SELECT r.wid, ee.node_id, \
+                        count(*) FILTER (WHERE ee.event_type = 'node_started') AS started, \
+                        count(*) FILTER (WHERE ee.event_type = 'node_completed') AS completed, \
+                        count(*) FILTER (WHERE ee.event_type = 'node_failed') AS failures, \
+                        count(*) FILTER (WHERE ee.event_type = 'node_failed' \
+                                           AND ee.log_message ILIKE $5) AS timeout_failures, \
+                        (array_agg(ee.log_message ORDER BY ee.created_at DESC) \
+                           FILTER (WHERE ee.event_type = 'node_failed'))[1] AS latest_error \
+                 FROM execution_events ee \
+                 JOIN recent r ON r.id = ee.execution_id \
+                 WHERE ee.node_id IS NOT NULL \
+                   AND ee.event_type IN ('node_started', 'node_completed', 'node_failed') \
+                 GROUP BY r.wid, ee.node_id \
+             ) \
+             SELECT s.wid, s.n, a.node_id, a.started, a.completed, a.failures, \
+                    a.timeout_failures, a.latest_error \
+             FROM scanned s LEFT JOIN agg a ON a.wid = s.wid",
+        )
+        .bind(workflow_ids)
+        .bind(user_id)
+        .bind(window_days)
+        .bind(max_executions)
+        .bind("%timed out%")
+        .fetch_all(&self.db_pool)
+        .await?;
+
+        Ok(fold_node_run_history_batch(rows, window_days))
+    }
 }
 
 /// The raw shape one row of `node_run_history`'s query decodes into:
@@ -1737,6 +1828,124 @@ pub fn fold_node_run_history(
         executions_scanned,
         window_days,
         nodes,
+    }
+}
+
+/// One row of `node_run_history_batch`'s query: the workflow id, then exactly
+/// the columns [`NodeRunHistoryQueryRow`] carries.
+pub type NodeRunHistoryBatchRow = (
+    Uuid,
+    i64,
+    Option<Uuid>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+);
+
+/// Group `node_run_history_batch`'s flat rows per workflow, then fold each
+/// group through the SAME [`fold_node_run_history`] the single-workflow path
+/// uses.
+///
+/// Split out and public so the grouping is unit-testable without a database —
+/// the `LEFT JOIN` emits one all-NULL row for a workflow with no history, and
+/// a grouper that dropped it would turn "we looked and found nothing" into "we
+/// did not look", which is the distinction `NodeRunHistory` exists to keep.
+#[must_use]
+pub fn fold_node_run_history_batch(
+    rows: Vec<NodeRunHistoryBatchRow>,
+    window_days: i32,
+) -> std::collections::HashMap<Uuid, NodeRunHistory> {
+    let mut grouped: std::collections::HashMap<Uuid, Vec<NodeRunHistoryQueryRow>> =
+        std::collections::HashMap::new();
+    for (wid, n, node_id, started, completed, failures, timeout_failures, latest_error) in rows {
+        grouped.entry(wid).or_default().push((
+            n,
+            node_id,
+            started,
+            completed,
+            failures,
+            timeout_failures,
+            latest_error,
+        ));
+    }
+    grouped
+        .into_iter()
+        .map(|(wid, rows)| (wid, fold_node_run_history(rows, window_days)))
+        .collect()
+}
+
+#[cfg(test)]
+mod node_run_history_batch_fold_tests {
+    use super::fold_node_run_history_batch;
+    use uuid::Uuid;
+
+    #[test]
+    fn each_workflow_folds_independently() {
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        let n1 = Uuid::from_u128(11);
+        let n2 = Uuid::from_u128(22);
+        let out = fold_node_run_history_batch(
+            vec![
+                (a, 7, Some(n1), Some(7), Some(6), Some(1), Some(1), None),
+                (b, 3, Some(n2), Some(3), Some(3), Some(0), Some(0), None),
+            ],
+            30,
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[&a].executions_scanned, 7);
+        assert_eq!(out[&a].nodes.len(), 1);
+        assert_eq!(out[&a].nodes[0].failures, 1);
+        assert_eq!(out[&b].executions_scanned, 3);
+        assert_eq!(out[&b].nodes[0].failures, 0);
+    }
+
+    #[test]
+    fn a_workflow_with_no_history_is_present_with_zero_not_absent() {
+        // The LEFT JOIN's all-NULL row. Dropping it would make "history read,
+        // window empty" indistinguishable from "this workflow was never
+        // asked about" — the caller renders those two as DIFFERENT sentences.
+        let a = Uuid::from_u128(1);
+        let out = fold_node_run_history_batch(vec![(a, 0, None, None, None, None, None, None)], 30);
+        assert!(out.contains_key(&a));
+        assert_eq!(out[&a].executions_scanned, 0);
+        assert!(out[&a].nodes.is_empty());
+        assert_eq!(out[&a].window_days, 30);
+    }
+
+    #[test]
+    fn multiple_nodes_of_one_workflow_land_in_one_entry() {
+        let a = Uuid::from_u128(1);
+        let out = fold_node_run_history_batch(
+            vec![
+                (
+                    a,
+                    5,
+                    Some(Uuid::from_u128(11)),
+                    Some(5),
+                    Some(5),
+                    Some(0),
+                    Some(0),
+                    None,
+                ),
+                (
+                    a,
+                    5,
+                    Some(Uuid::from_u128(12)),
+                    Some(5),
+                    Some(4),
+                    Some(1),
+                    Some(1),
+                    Some("timed out".into()),
+                ),
+            ],
+            30,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[&a].executions_scanned, 5);
+        assert_eq!(out[&a].nodes.len(), 2);
     }
 }
 
