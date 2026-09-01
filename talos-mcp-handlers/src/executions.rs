@@ -90,7 +90,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_execution_logs",
-            "description": "Get the event timeline (WASM module logs) for an execution, including node statuses, log messages, and timestamps.",
+            "description": "Get the ENGINE's node-state event timeline for an execution — node_started / node_input / node_completed / node_failed / node_skipped, with statuses and timestamps.\n\nThis is NOT the WASM module's own log output, despite the name. A host-policy denial (`[host:<policy>] <capability> denied by policy '<policy>' (target: ...)`) is written by the WORKER, not the engine, so it never appears here — this tool shows only the downstream error the module returned afterwards, which for a blocked egress reads as a bad URL or a generic HTTP failure and hides the control that actually fired. Whenever a node failed for a reason the event stream does not explain, call tail_worker_logs(execution_id) as well: given a workflow-execution id it is the only surface that returns the worker's own lines. (The GraphQL `moduleExecutionLogs` query and the `talos://executions/{id}/logs` resource read the same rows, but both are keyed by a module_executions id, which an operator holding a workflow-execution id does not have.)",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -362,7 +362,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "analyze_execution_failure",
-            "description": "Diagnose why a failed workflow execution failed. Fetches failed-node events, classifies error type (output_schema_violation / host_not_allowed / module_compile_error / json_parse / missing_secret / rate_limit / fuel_exhausted / wasm_trap / timeout / network_error / config_error / http_401 / http_403 / http_404 / http_5xx / auth_error / database_error / runtime_error), and returns numbered remediation steps. Call this immediately after an execution fails to get actionable next steps. When apply_fix=true and a config_error is detected with an extractable field, automatically patches the workflow graph.",
+            "description": "Diagnose why a failed workflow execution failed. Fetches failed-node events, classifies error type (output_schema_violation / host_not_allowed / module_compile_error / json_parse / missing_secret / rate_limit / fuel_exhausted / wasm_trap / timeout / network_error / config_error / http_401 / http_403 / http_404 / http_5xx / auth_error / database_error / runtime_error), and returns numbered remediation steps. Call this immediately after an execution fails to get actionable next steps.\n\nSCOPE LIMIT: the classification is derived ONLY from the engine's own `node_failed` event text. A host-policy denial is recorded by the WORKER (`[host:<policy>] <capability> denied by policy ...`) and never reaches that text, so a blocked egress arrives here as whatever the module returned afterwards — commonly a bare `invalidurl` or HTTP failure that classifies as runtime_error, NOT as host_not_allowed. Treat runtime_error as \"unexplained\" rather than \"explained\", and run tail_worker_logs(execution_id) before acting on it; the remediation steps say the same. When apply_fix=true and a config_error is detected with an extractable field, automatically patches the workflow graph.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1355,10 +1355,30 @@ fn redact_actor_context_in_place(v: &mut serde_json::Value) -> bool {
 
 // ── tail_worker_logs ────────────────────────────────────────────────────────
 //
-// Returns ascending-time-ordered log lines from `workflow_execution_logs`,
-// the table the wasm-log subscriber writes worker stdout/structured-log
-// output into for workflow-execution IDs. Different from get_execution_logs
-// (engine event timeline). Authorized via workflow ownership.
+// Returns ascending-time-ordered worker log lines. Different from
+// get_execution_logs (engine event timeline). Authorized via workflow
+// ownership.
+//
+// The source is a UNION of TWO tables and the union is load-bearing, so
+// naming only the first is misleading enough to have cost a reading of this
+// code. `tail_workflow_logs` (talos-execution-repository) unions
+// `workflow_execution_logs` with `module_execution_logs` joined back to the
+// parent through `module_executions.workflow_execution_id`. WHICH branch a
+// line lands in is decided by DISPATCH SHAPE, not by run type: single-node
+// dispatch stamps `wasm.log.{job_id}` where job_id IS the per-node
+// `module_executions.id` (→ branch 2), while pipeline/chained steps stamp the
+// parent workflow-execution id (→ branch 1).
+//
+// Do NOT "simplify" this to either branch alone, and do NOT reimplement the
+// branch-2 join in a sibling read surface. On the 2026-09 dev corpus
+// `workflow_execution_logs` held ZERO rows against ~97.7k module-scoped ones
+// — so a hand-rolled branch-2-only join looks complete against live data
+// while silently dropping every pipeline-dispatched node. This tool is the
+// only read surface reachable FROM A WORKFLOW-EXECUTION ID that returns the
+// `[host:<policy>] <capability> denied by policy` lines — GraphQL
+// `moduleExecutionLogs` and the `talos://executions/{id}/logs` resource read
+// the same rows but are keyed by a module_executions id. So a copy that
+// misses half of them is worse than the pointer that sends the operator here.
 
 async fn handle_tail_worker_logs(
     req_id: Option<serde_json::Value>,
