@@ -3141,6 +3141,68 @@ groups:
             all test runs, which the detector excludes by design.
 
   # ────────────────────────────────────────────────────────────────────
+  # A workflow node's `skip_condition` is the platform's ONE fail-open
+  # expression, and this is the only signal that it failed open.
+  #
+  # `talos_condition_eval_failures_total{kind}` counts Rhai conditions the
+  # engine could not evaluate and replaced with its silent `false` default.
+  # For five of the six kinds `false` is CONSERVATIVE — the branch is not
+  # taken, the loop stops, the check fails. For `kind="skip_condition"` it is
+  # PERMISSIVE: `false` means "do not skip", so the node the author gated RUNS.
+  # A typo in the expression that was supposed to hold a send back on a dry run
+  # fires the send, and the workflow reports `completed`.
+  #
+  # Hence one alert on that kind alone rather than a single alert on the
+  # unlabelled total. Pooling them would bury the case where work HAPPENED
+  # inside a background rate of cases where work was correctly withheld, and
+  # the two call for opposite remediations. There is deliberately NO alert on
+  # the conservative kinds: they are worth investigating but self-announce
+  # (a branch that never runs, a verify that always fails), and an alert that
+  # fires for both meanings is one operators learn to read as neither. Query
+  # them directly:
+  #   sum by (kind) (increase(talos_condition_eval_failures_total[24h]))
+  #
+  # Threshold is `> 0` because every increment is a real, individually
+  # actionable event — a specific node in a specific workflow ran ungated —
+  # not a rate to be tolerated. The series is pre-seeded at 0 for every kind
+  # in `TalosMetrics::new`, so `increase()` is well-defined from process start
+  # and no `absent()` arm is needed here (contrast the fleet detectors, whose
+  # producers emit nothing until first use).
+  #
+  # To diagnose: the engine logs `event_kind="skip_condition_failed_open"` at
+  # WARN with the execution id, node id and node label alongside every one of
+  # these increments. Syntax errors cannot reach here — every MCP write path
+  # rejects an unparseable skip_condition at authoring time — so an increment
+  # means an unbound variable, a non-bool result, or an operation-limit trip.
+  # Reproduce it with the `test_condition` tool against a representative
+  # payload; its `variables_in_scope` field lists the names that actually bind
+  # (top-level fields bind BARE — there is no `input` wrapper).
+  - name: talos.workflow.conditions
+    interval: 30s
+    rules:
+      - alert: TalosSkipConditionFailingOpen
+        expr: |
+          increase(talos_condition_eval_failures_total{kind="skip_condition"}[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          category: reliability-degraded
+        annotations:
+          summary: "A node's skip_condition failed to evaluate — the node ran ungated"
+          description: |
+            {{ $value | printf "%.0f" }} skip_condition evaluation(s) failed in
+            the last 15m. Each one is a workflow node that its author gated and
+            that RAN ANYWAY: the engine's silent default for a failed condition
+            is false, and false on a skip_condition means "do not skip".
+            If the gated node sends email, calls a third-party API, or writes
+            anything, treat this as work that happened without authorization
+            rather than as a warning.
+            Grep the controller for event_kind="skip_condition_failed_open" to
+            get the execution id, node id and node label; the paired
+            event_kind="condition_eval_failed" line carries the Rhai error and
+            the DLP-scrubbed context.
+
+  # ────────────────────────────────────────────────────────────────────
   # Infrastructure availability. These series come from kube-state-metrics
   # (bundled with kube-prometheus-stack — the same operator the
   # ServiceMonitors assume). If you don't run kube-state-metrics, these

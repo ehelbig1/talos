@@ -235,7 +235,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                         "description": "Optional map of crate name → version string for the inline compile (e.g. {\"chrono\": \"0.4\", \"url\": \"2\"}). serde and serde_json are pre-bundled. Only allowlisted crates are accepted — see compile_custom_sandbox.dependencies for the full list. Mirrors compile_custom_sandbox semantics so inline-compiled nodes don't have to be compiled separately just to pull a dependency."
                     },
                     "config": { "type": "object", "description": "Per-node module config key/value pairs merged with the module's default config. Also carries per-node ENGINE HINTS, chiefly `max_fuel` (integer): a node-level fuel budget that OVERRIDES the module row's default at dispatch. Set it when this node sees a bigger payload than the module's typical one (e.g. a fan-in collect payload). The response echoes it back as `node_max_fuel_override`, and `effective_max_fuel` reports what the node will actually run with — note `applied_max_fuel` is the MODULE row and is expected to differ." },
-                    "skip_condition": { "type": "string", "description": "Rhai expression evaluated before the node runs — if it returns true the node is skipped and execution continues with the next node. Example: \"input.dry_run == true\"." },
+                    "skip_condition": { "type": "string", "description": "Rhai expression evaluated before the node runs — if it returns true the node is skipped and execution continues with the next node. Fields bind as BARE variables: \"dry_run == true\", NOT \"input.dry_run == true\" (there is no `input` wrapper unless an upstream output has an `input` key); use `ctx.a.b` for nested access. `is_error` / `error_message` are always in scope. FAIL-OPEN: an expression that cannot be evaluated defaults to false, i.e. the node is NOT skipped and RUNS — syntax is rejected at save time, but verify names with test_condition against a representative payload. Max 2000 chars." },
                     "continue_on_error": { "type": "boolean", "description": "If true, a node failure does not halt the workflow — execution continues with downstream nodes. Use with care: downstream nodes receive error output. Default: false." },
                     "timeout_secs": { "type": "number", "description": "Per-node execution timeout in seconds (default: 60). Nodes that exceed this limit are treated as timed-out failures. Set higher when a node calls an LLM (Ollama synthesis typically 20-45s), performs large HTTP fetches, or runs expensive SQL. Use the global set_wasm_config `execution_timeout_secs` to change the default for nodes that don't specify one." },
                     "retry_count": { "type": "number", "description": "Max retries on failure. Omit to take the method-aware default: read-only / pure-compute modules (minimal/secrets worlds, or http/agent with a DECLARED GET/HEAD-only allowed_methods) get transient retries; governance / messaging / database / unknown worlds and state-changing HTTP fail closed to 0. Setting retry_backoff_ms or retry_condition alone does NOT imply a count — they answer how far apart and when, never how many. An explicit value here always wins, including 0." },
@@ -1598,6 +1598,38 @@ async fn handle_create_workflow(
         return mcp_error(req_id, -32602, &msg);
     }
 
+    // The FIFTH skip_condition write path, and the one with no named
+    // parameter: `build_graph_node` copies a node's `config` object verbatim
+    // into `data`, and the engine's graph loader reads `data.skip_condition`.
+    // So a create_workflow node carrying `config.skip_condition` persists an
+    // unvalidated fail-open gate — while this tool's own description tells
+    // callers skip_condition belongs on `add_node_to_workflow`. Gate it here
+    // rather than inside the helper crate: the helper is a pure builder with
+    // no error channel, and the Rhai validator lives on the handler side.
+    //
+    // The raw graph-JSON importers (import_workflow / import_yaml_workflow /
+    // import_platform_state) are DELIBERATELY not gated. Those restore
+    // previously-exported state, and rejecting an expression that is already
+    // live in an export would make an existing workflow unrestorable — a
+    // worse failure than the one being prevented. The runtime counter and
+    // the WARN cover conditions that arrive that way.
+    for node in &input_nodes {
+        let Some(expr) = node
+            .get("config")
+            .and_then(|c| c.get("skip_condition"))
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        if let Err(msg) = crate::graph::validate_skip_condition(expr) {
+            let label = node
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unnamed node>");
+            return mcp_error(req_id, -32602, &format!("node '{label}': {msg}"));
+        }
+    }
+
     if let Err(resp) = validate_structural_nodes(
         &req_id,
         &input_nodes,
@@ -2372,9 +2404,16 @@ async fn handle_add_node_to_workflow(
                 );
             }
         }
+        // Full parse gate, not just the length cap this used to be. A
+        // skip_condition is the platform's one FAIL-OPEN expression: at
+        // runtime an expression that cannot evaluate defaults to false, and
+        // false means "do not skip" — the node the author gated RUNS. An
+        // expression that cannot PARSE can never gate anything, so persisting
+        // it is never right. Shared with `add_skip_condition` and both
+        // `update_node_config` actions so the five write paths agree.
         if let Some(s) = args.get("skip_condition").and_then(|v| v.as_str()) {
-            if s.len() > 2000 {
-                return mcp_error(req_id, -32602, "skip_condition must be ≤ 2000 characters");
+            if let Err(msg) = crate::graph::validate_skip_condition(s) {
+                return mcp_error(req_id, -32602, &msg);
             }
         }
 

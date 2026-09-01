@@ -126,6 +126,7 @@ impl RetryClassifier for NothingTransientClassifier {
 #[allow(clippy::struct_field_names)] // the `_value` suffix is intentional
 pub struct StubExpressionEvaluator {
     bool_value: bool,
+    bool_error: Option<String>,
     i64_value: Option<i64>,
     json_value: JsonValue,
 }
@@ -134,6 +135,7 @@ impl Default for StubExpressionEvaluator {
     fn default() -> Self {
         Self {
             bool_value: false,
+            bool_error: None,
             i64_value: None,
             json_value: JsonValue::Null,
         }
@@ -149,6 +151,22 @@ impl StubExpressionEvaluator {
     /// Set the value returned by `eval_bool` / `try_eval_bool`.
     pub fn with_bool(mut self, value: bool) -> Self {
         self.bool_value = value;
+        self
+    }
+
+    /// Make `try_eval_bool` FAIL with `message` instead of returning a value.
+    ///
+    /// Exists so callers can test the branch where an expression could not be
+    /// evaluated at all — which for a node's `skip_condition` is the opposite
+    /// of the expression returning `false`: the first RUNS the gated node, the
+    /// second is the author's intent. A stub that can only return `false`
+    /// cannot tell those apart, so neither can a test written against it.
+    ///
+    /// `eval_bool` is unaffected: its signature has nowhere to put an error,
+    /// which is precisely why the engine no longer routes conditions through
+    /// it (see `talos_workflow_engine::condition_eval`).
+    pub fn with_bool_error(mut self, message: impl Into<String>) -> Self {
+        self.bool_error = Some(message.into());
         self
     }
 
@@ -171,7 +189,10 @@ impl ExpressionEvaluator for StubExpressionEvaluator {
     }
 
     fn try_eval_bool(&self, _expression: &str, _context: &JsonValue) -> Result<bool, BoxError> {
-        Ok(self.bool_value)
+        match self.bool_error.as_deref() {
+            Some(msg) => Err(msg.into()),
+            None => Ok(self.bool_value),
+        }
     }
 
     fn eval_i64(&self, _expression: &str, _context: &JsonValue) -> Option<i64> {

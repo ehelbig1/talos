@@ -412,7 +412,11 @@ impl ParallelWorkflowEngine {
                         );
                         if let Some(ref cond) = edge_ref.weight().condition {
                             let unwrapped = Self::unwrap_output(&output);
-                            if !self.eval_bool(cond, unwrapped) {
+                            if !self.eval_bool_kinded(
+                                crate::condition_eval::ConditionKind::Edge,
+                                cond,
+                                unwrapped,
+                            ) {
                                 tracing::info!(
                                     child_node_id = %child_node_id,
                                     condition = %cond,

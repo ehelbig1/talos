@@ -18,14 +18,15 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "test_condition",
-            "description": "Test a Rhai condition expression against a JSON payload. Returns whether the condition evaluates to true or false, or any parse error.",
+            "description": "Test a Rhai condition expression against a JSON payload — the same evaluator the engine uses for edge conditions, node skip_conditions, loop conditions, verify checks and actor approval-policy triggers. Returns {result, error, variables_in_scope}.\n\nSCOPE (this is the part that bites): top-level payload fields bind as BARE variables — `dry_run == true`, not `input.dry_run == true`. There is NO `input` wrapper unless the payload itself has an `input` key; if it does, that object's keys are ALSO flattened to bare names (same for a `config` key). The whole payload is additionally available as `ctx` and `inputs`, so `ctx.user.tier` works for nested access. `is_error` (bool) and `error_message` (string) are always injected and win over payload keys of the same name. The response's `variables_in_scope` lists exactly what bound, read out of the engine's own scope builder.\n\nWHY THIS MATTERS: an expression that FAILS to evaluate is not one that returned false. The engine defaults a failed evaluation to false — which on an edge condition means the branch is not taken, but on a node's skip_condition means \"do not skip\", i.e. the node you gated RUNS. A wrong-scope typo is an unbound-variable error, and this tool is where you catch it.\n\nPass the payload as either `payload` or `context` (aliases; `payload` wins if both are given).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "condition": { "type": "string", "description": "Rhai condition expression (e.g. 'score >= 50', 'status == \"ok\"')" },
-                    "payload": { "type": "object", "description": "JSON object to evaluate the condition against" }
+                    "condition": { "type": "string", "description": "Rhai condition expression. Bare variable names refer to top-level payload fields (e.g. 'score >= 50', 'status == \"ok\"', 'dry_run == true'); use ctx.a.b for nested access." },
+                    "payload": { "type": "object", "description": "JSON object to evaluate the condition against. Use a REPRESENTATIVE payload — an empty object makes every field name report 'Variable not found'." },
+                    "context": { "type": "object", "description": "Alias for `payload` (the engine's own term for the same thing). Ignored when `payload` is also supplied." }
                 },
-                "required": ["condition", "payload"]
+                "required": ["condition"]
             }
         }),
         serde_json::json!({

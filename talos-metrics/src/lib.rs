@@ -113,6 +113,44 @@ pub fn record_workflow_outcome(status: &str) {
     }
 }
 
+/// The closed set of `kind` label values on
+/// `talos_condition_eval_failures_total`, in the order they are pre-seeded.
+///
+/// Lives HERE rather than beside the enum that produces it
+/// (`talos_workflow_engine::ConditionKind`) for one reason: the pre-seed
+/// loop in [`TalosMetrics::new`] and the increment sites must agree, and
+/// this crate is the only one both of them already depend on. The engine's
+/// `ConditionKind::label()` returns these `&'static str`s and a unit test
+/// there asserts every variant's label is a member — so a new variant that
+/// forgets to seed fails the engine's tests rather than silently exporting
+/// a series that only appears after the first failure.
+///
+/// **Every value must be a compile-time constant.** These are label values
+/// on a `CounterVec`; a caller-derived string here is unbounded cardinality.
+pub const CONDITION_EVAL_KINDS: &[&str] = &[
+    CONDITION_EVAL_KIND_SKIP,
+    CONDITION_EVAL_KIND_EDGE,
+    CONDITION_EVAL_KIND_WHILE_LOOP,
+    CONDITION_EVAL_KIND_LOOP,
+    CONDITION_EVAL_KIND_FAN_IN,
+    CONDITION_EVAL_KIND_VERIFY,
+];
+
+/// A node's `skip_condition`. **The only FAIL-OPEN kind**: `false` means
+/// "do not skip", so a broken expression RUNS the node the author gated.
+pub const CONDITION_EVAL_KIND_SKIP: &str = "skip_condition";
+/// An edge `condition`. `false` means "do not traverse" — the child is
+/// skipped, so a broken expression silently drops a branch.
+pub const CONDITION_EVAL_KIND_EDGE: &str = "edge_condition";
+/// A `WhileLoop` system node's condition. `false` breaks the loop.
+pub const CONDITION_EVAL_KIND_WHILE_LOOP: &str = "while_loop";
+/// A `Loop` system node's per-iteration condition. `false` breaks the loop.
+pub const CONDITION_EVAL_KIND_LOOP: &str = "loop";
+/// A `FanIn` node's `aggregation_expr`. `false` marks the aggregation failed.
+pub const CONDITION_EVAL_KIND_FAN_IN: &str = "fan_in_aggregation";
+/// A `Verify` node's condition. `false` fails the check — loudly.
+pub const CONDITION_EVAL_KIND_VERIFY: &str = "verify";
+
 /// Global metrics registry and collectors
 pub struct TalosMetrics {
     pub registry: Registry,
@@ -149,6 +187,33 @@ pub struct TalosMetrics {
     // `outcome`: resumed | failed | reclaimed. Lets operators alert on a
     // restart-resume sweep that silently does nothing or whose resumes fail.
     pub crash_recovery_total: CounterVec,
+
+    /// Rhai expressions that FAILED TO EVALUATE and were replaced by the
+    /// call site's silent default. Labelled by [`CONDITION_EVAL_KINDS`].
+    ///
+    /// This is the counter `talos-engine`'s `rhai_helpers` L-30 comment asked
+    /// for and nobody built: *"Operators need a metric to alert on the rate so
+    /// a regression after a refactor surfaces."* Until 2026-09 the only trace
+    /// of a broken condition was one WARN line, and a WARN line is not a
+    /// signal anything on this platform can alert on.
+    ///
+    /// **The `kind` label is the whole point, and it is worth its
+    /// cardinality** (six values, all `&'static str`). `false` is the
+    /// conservative default for a ROUTING condition — "do not take this
+    /// branch" — and the PERMISSIVE default for a SKIP condition, where
+    /// `false` means "do not skip" and therefore RUNS the node the author
+    /// gated. One primitive, two semantics, opposite safe defaults. Collapsed
+    /// into a single unlabelled counter the two are indistinguishable, and
+    /// they call for opposite remediations: a fail-open skip gate means work
+    /// happened that should not have (a send fired on a dry run), a
+    /// fail-closed edge condition means a branch was silently not taken. That
+    /// is the "dimension collapsed by aggregation" trap — the label is
+    /// cheaper than the ambiguity.
+    ///
+    /// A NON-ZERO value on `kind="skip_condition"` should be treated as an
+    /// incident, not a warning: every increment is one node that ran despite
+    /// a gate its author wrote to stop it.
+    pub condition_eval_failures_total: CounterVec,
 
     // ---- Detector metrics (2026-08) ----
     //
@@ -1164,6 +1229,34 @@ impl TalosMetrics {
                 .inc_by(0.0);
         }
 
+        let condition_eval_failures_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_condition_eval_failures_total",
+                "Rhai condition expressions that failed to evaluate and were \
+                 replaced by the call site's silent default. \
+                 kind=skip_condition is FAIL-OPEN — the node the author gated \
+                 RAN. Every other kind fails conservatively (branch not taken, \
+                 loop broken, check failed).",
+            ),
+            &["kind"],
+        )?;
+        registry.register(Box::new(condition_eval_failures_total.clone()))?;
+        // Pre-seed every kind at 0. The expected steady state is zero, so
+        // without seeding the series is ABSENT and `increase(...[15m]) > 0`
+        // has nothing to reference until the first failure — the detector
+        // silenced by exactly the condition it detects. Seeding also keeps
+        // "gate present and quiet" distinguishable from "gate deleted".
+        //
+        // The list is closed and compile-time-known (see CONDITION_EVAL_KINDS)
+        // — seeding a caller-derived value would be unbounded cardinality, and
+        // seeding a kind nothing increments would imply a wired signal that
+        // does not exist.
+        for kind in CONDITION_EVAL_KINDS {
+            condition_eval_failures_total
+                .with_label_values(&[kind])
+                .inc_by(0.0);
+        }
+
         // ---- Detector metrics (2026-08) ----
         let wasm_log_orphaned_total = CounterVec::new(
             prometheus::Opts::new(
@@ -1898,6 +1991,7 @@ impl TalosMetrics {
             workflow_executions_total,
             workflow_execution_duration_seconds,
             crash_recovery_total,
+            condition_eval_failures_total,
             wasm_log_orphaned_total,
             module_execution_record_started_failures_total,
             module_executions_swept_stuck_total,

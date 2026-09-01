@@ -21,6 +21,9 @@ cap-std = "3.4"
 dashmap = "6.1.0"
 futures = "0.3"
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol", version = "0.3" }
+# Process-global counter for `talos_condition_eval_failures_total` (see
+# `condition_eval.rs`). A true leaf (prometheus + anyhow) — no cycle risk.
+talos-metrics = { path = "../talos-metrics", version = "0.1" }
 petgraph = "0.6"
 regex = "1.12"
 rhai = { version = "1.19", features = ["serde"] }

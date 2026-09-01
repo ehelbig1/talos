@@ -194,8 +194,23 @@ async fn handle_test_condition(
         Some(c) => c,
         _ => return mcp_error(req_id, -32602, "Missing or empty 'condition' parameter"),
     };
+    // `context` is accepted as an alias for `payload`.
+    //
+    // This is not a convenience. The engine's own vocabulary is `context`
+    // (`evaluate_condition(condition, context)`, the `ctx` binding), and the
+    // tool that exists to DEBUG a condition took `payload`. A caller passing
+    // `context` got the generic unknown-argument warning — so not silent, but
+    // the evaluation still ran against an EMPTY object and answered
+    // "Variable not found: <name>" for names that are perfectly valid at
+    // runtime. That is the single most misleading answer this tool can give,
+    // because it is the same message the real defect produces.
+    //
+    // Precedence: `payload` wins when both are supplied, so no existing call
+    // changes behaviour. Both are declared in the schema, so genuinely
+    // unknown arguments still warn exactly as before.
     let payload = args
         .get("payload")
+        .or_else(|| args.get("context"))
         .cloned()
         .unwrap_or(serde_json::json!({}));
     if serde_json::to_string(&payload)
@@ -206,6 +221,14 @@ async fn handle_test_condition(
         return mcp_error(req_id, -32602, "payload exceeds 1 MB limit");
     }
 
+    // The variable names that ACTUALLY bind, read out of the production scope
+    // builder rather than re-derived here. "Variable not found: input" is only
+    // actionable next to the list of names that would have resolved — and no
+    // user-facing doc states the binding rules (trigger and upstream fields
+    // bind BARE, there is no `input` wrapper unless the payload has one), so
+    // this list is the only place an author can learn them.
+    let variables_in_scope = talos_engine::rhai_helpers::condition_scope_variables(&payload);
+
     // Use the Rhai engine directly to get error details
     let eval_result =
         talos_engine::rhai_helpers::evaluate_condition_with_error(condition, &payload);
@@ -214,7 +237,8 @@ async fn handle_test_condition(
             req_id,
             &serde_json::to_string_pretty(&serde_json::json!({
                 "result": result,
-                "error": serde_json::Value::Null
+                "error": serde_json::Value::Null,
+                "variables_in_scope": variables_in_scope,
             }))
             .unwrap_or_default(),
         ),
@@ -222,7 +246,14 @@ async fn handle_test_condition(
             req_id,
             &serde_json::to_string_pretty(&serde_json::json!({
                 "result": serde_json::Value::Null,
-                "error": e
+                "error": e,
+                "variables_in_scope": variables_in_scope,
+                "hint": "An expression that FAILS to evaluate is not an expression that \
+                         returned false. On an edge condition the branch is not taken; on a \
+                         node's skip_condition the default is false = \"do not skip\", so the \
+                         node RUNS. Check the name against variables_in_scope — top-level \
+                         payload fields bind as BARE variables, there is no `input` wrapper \
+                         unless the payload itself has an `input` key.",
             }))
             .unwrap_or_default(),
         ),
@@ -1116,5 +1147,97 @@ mod graph_view_tests {
         let err = parse_graph_view(&json!({"view": 3})).unwrap_err();
         assert!(err.contains("'view' must be a string"), "{err}");
         assert!(err.contains("number"), "{err}");
+    }
+}
+
+/// `test_condition` is the tool an author reaches for when a condition
+/// misbehaves. Before 2026-09 it could not answer the question that brings
+/// them there: it took `payload` while the engine's own term is `context`, so
+/// a `context`-only call evaluated against `{}` and reported "Variable not
+/// found" for names that are valid at runtime — the same message the real
+/// defect produces.
+#[cfg(test)]
+mod test_condition_tests {
+    use super::handle_test_condition;
+    use serde_json::json;
+
+    /// Pull the single JSON text block out of an `mcp_text` response.
+    fn body(resp: &crate::types::JsonRpcResponse) -> serde_json::Value {
+        let text = resp.result.as_ref().expect("result")["content"][0]["text"]
+            .as_str()
+            .expect("text block");
+        serde_json::from_str(text).expect("the body is JSON")
+    }
+
+    #[tokio::test]
+    async fn context_is_accepted_as_an_alias_for_payload() {
+        let resp = handle_test_condition(
+            None,
+            &json!({ "condition": "dry_run == true", "context": { "dry_run": true } }),
+        )
+        .await;
+        let out = body(&resp);
+        assert_eq!(
+            out["result"],
+            json!(true),
+            "a `context`-only call must evaluate against that object, not {{}}"
+        );
+        assert_eq!(out["error"], json!(null));
+    }
+
+    #[tokio::test]
+    async fn payload_wins_when_both_are_supplied() {
+        // Precedence is pinned so adding the alias cannot change any existing
+        // call's answer.
+        let resp = handle_test_condition(
+            None,
+            &json!({
+                "condition": "dry_run == true",
+                "payload": { "dry_run": true },
+                "context": { "dry_run": false },
+            }),
+        )
+        .await;
+        assert_eq!(body(&resp)["result"], json!(true));
+    }
+
+    /// The reported scope must be the REAL one. This is the field that turns
+    /// "Variable not found: input" into an actionable answer.
+    #[tokio::test]
+    async fn reports_the_variables_actually_in_scope() {
+        let resp = handle_test_condition(
+            None,
+            &json!({ "condition": "input.dry_run == true", "payload": { "dry_run": true } }),
+        )
+        .await;
+        let out = body(&resp);
+        assert_eq!(out["result"], json!(null));
+        assert!(
+            out["error"].as_str().unwrap_or_default().contains("input"),
+            "the unbound name must be named: {}",
+            out["error"]
+        );
+        let scope: Vec<String> = serde_json::from_value(out["variables_in_scope"].clone())
+            .expect("variables_in_scope is a string array");
+        assert!(
+            scope.iter().any(|v| v == "dry_run"),
+            "the name that WOULD have worked must be listed: {scope:?}"
+        );
+        assert!(
+            !scope.iter().any(|v| v == "input"),
+            "and the wrapper the author assumed must not be: {scope:?}"
+        );
+        assert!(
+            out["hint"].as_str().unwrap_or_default().contains("RUNS"),
+            "the hint must state the fail-open consequence"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_payload_still_evaluates_against_an_empty_context() {
+        // Unchanged: `payload` was already defaulted, so dropping it from the
+        // schema's `required` list matches what the handler always did.
+        let resp = handle_test_condition(None, &json!({ "condition": "1 == 1" })).await;
+        assert_eq!(body(&resp)["result"], json!(true));
     }
 }

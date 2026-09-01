@@ -64,87 +64,151 @@ thread_local! {
     );
 }
 
-/// Helper function to evaluate Rhai conditions using JSON context.
-pub fn evaluate_condition(condition: &str, context: &JsonValue) -> bool {
-    let decoded = decode_html_entities(condition);
-    let condition = decoded.as_ref();
-    RHAI_ENGINE.with(|engine| {
-        let mut scope = Scope::new();
+/// Build the Rhai [`Scope`] a condition expression is evaluated in.
+///
+/// # One builder, not two kept "in lockstep"
+///
+/// This block used to be COPIED into `evaluate_condition` and
+/// `evaluate_condition_with_error`, with a comment on the second telling the
+/// next author to keep them identical — because they had already drifted
+/// twice (MCP-465: one checked only `error` and not `__error`; one inverted
+/// heuristic precedence with `if !scope.contains(...)`). Those are not preview
+/// warts: `evaluate_condition_with_error` is the RUNTIME path for actor
+/// approval policies and, since 2026-09, for every engine condition including
+/// the fail-open `skip_condition` gate. A convention two functions must both
+/// remember is exactly the thing that produced the drift, so there is now one
+/// function and no convention.
+///
+/// # What binds, in precedence order (lowest first)
+///
+/// 1. Every top-level key of an object context, as a BARE variable.
+/// 2. The keys of a nested `input` / `config` object, flattened to bare
+///    variables — but only where they do not collide with (1).
+/// 3. `is_error` (bool) and `error_message` (string), pushed
+///    UNCONDITIONALLY. Rhai resolves back-to-front, so these win over a
+///    payload key of the same name — the heuristic is the authority on
+///    whether the upstream node errored, not caller data.
+/// 4. `ctx` and `inputs`, both bound to the WHOLE context.
+///
+/// Note what is NOT here: there is no `input` WRAPPER unless the context
+/// itself has an `input` key. `input.dry_run` against a trigger payload of
+/// `{"dry_run": true}` is an unbound-variable ERROR, not `false` — the exact
+/// shape that made a fail-open skip gate look like a working one.
+fn build_condition_scope<'a>(context: &'a JsonValue) -> Scope<'a> {
+    let mut scope = Scope::new();
+    let mut detected_error = false;
+    let mut detected_error_message = String::new();
 
-        // Map JSON fields into script scope for easy access.
-        // Also flatten nested "input" and "config" objects so bare variable
-        // names like `score` work even when the context is wrapped as
-        // `{"config": {...}, "input": {"score": 75}}`.
-        //
-        // Error state variables: `is_error` (bool) and `error_message` (String)
-        // are injected so conditions can branch on error status, e.g.
-        //   `is_error == true`  or  `error_message.contains("timeout")`
-        let mut detected_error = false;
-        let mut detected_error_message = String::new();
-
-        if let JsonValue::Object(map) = context {
-            // Detect error state from the context JSON:
-            // 1. An `__error` or `error` field indicates an error.
-            // 2. If the context only contains a string that looks like an error.
-            for key in &["__error", "error"] {
-                if let Some(val) = map.get(*key) {
-                    // Only treat as an error if the value is a non-empty, non-null value.
-                    // Templates like database-query always emit {"error": null} on success,
-                    // so key presence alone is not sufficient.
-                    match val {
-                        JsonValue::Null => {}
-                        JsonValue::String(s) if s.is_empty() => {}
-                        JsonValue::Bool(false) => {}
-                        JsonValue::String(s) => {
-                            detected_error = true;
-                            detected_error_message = s.clone();
-                            break;
-                        }
-                        other => {
-                            detected_error = true;
-                            detected_error_message = other.to_string();
-                            break;
-                        }
+    if let JsonValue::Object(map) = context {
+        // Detect error state from the context JSON:
+        // 1. An `__error` or `error` field indicates an error.
+        // 2. If the context only contains a string that looks like an error.
+        for key in &["__error", "error"] {
+            if let Some(val) = map.get(*key) {
+                // Only treat as an error if the value is a non-empty, non-null value.
+                // Templates like database-query always emit {"error": null} on success,
+                // so key presence alone is not sufficient.
+                match val {
+                    JsonValue::Null => {}
+                    JsonValue::String(s) if s.is_empty() => {}
+                    JsonValue::Bool(false) => {}
+                    JsonValue::String(s) => {
+                        detected_error = true;
+                        detected_error_message = s.clone();
+                        break;
+                    }
+                    other => {
+                        detected_error = true;
+                        detected_error_message = other.to_string();
+                        break;
                     }
                 }
             }
+        }
 
-            for (key, val) in map {
-                if let Ok(dynamic) = rhai::serde::to_dynamic(val) {
-                    scope.push_dynamic(key, dynamic);
-                }
-                // Flatten common nested objects
-                if key == "input" || key == "config" {
-                    if let JsonValue::Object(inner) = val {
-                        for (inner_key, inner_val) in inner {
-                            // Don't overwrite existing top-level keys
-                            if !map.contains_key(inner_key) {
-                                if let Ok(d) = rhai::serde::to_dynamic(inner_val) {
-                                    scope.push_dynamic(inner_key, d);
-                                }
+        for (key, val) in map {
+            if let Ok(dynamic) = rhai::serde::to_dynamic(val) {
+                scope.push_dynamic(key.as_str(), dynamic);
+            }
+            // Flatten common nested objects
+            if key == "input" || key == "config" {
+                if let JsonValue::Object(inner) = val {
+                    for (inner_key, inner_val) in inner {
+                        // Don't overwrite existing top-level keys
+                        if !map.contains_key(inner_key) {
+                            if let Ok(d) = rhai::serde::to_dynamic(inner_val) {
+                                scope.push_dynamic(inner_key.as_str(), d);
                             }
                         }
                     }
                 }
             }
-        } else if let JsonValue::String(s) = context {
-            // A bare error string as context also counts as an error.
-            // MCP-1139: capped, single-pass heuristic.
-            if looks_like_error_string(s) {
-                detected_error = true;
-                detected_error_message = s.clone();
-            }
         }
-
-        // Inject error state variables into scope
-        scope.push("is_error", detected_error);
-        scope.push("error_message", detected_error_message);
-
-        // Also provide the whole context as 'ctx' for more complex pathing.
-        if let Ok(ctx_dynamic) = rhai::serde::to_dynamic(context) {
-            scope.push_dynamic("ctx", ctx_dynamic.clone());
-            scope.push_dynamic("inputs", ctx_dynamic);
+    } else if let JsonValue::String(s) = context {
+        // A bare error string as context also counts as an error.
+        // MCP-1139: capped, single-pass heuristic.
+        if looks_like_error_string(s) {
+            detected_error = true;
+            detected_error_message = s.clone();
         }
+    }
+
+    // Pushed unconditionally — Rhai's scope lookup walks back-to-front, so
+    // this layer wins over any payload key pushed in the loop above.
+    scope.push("is_error", detected_error);
+    scope.push("error_message", detected_error_message);
+
+    // Also provide the whole context as 'ctx' / 'inputs' for nested pathing.
+    if let Ok(ctx_dynamic) = rhai::serde::to_dynamic(context) {
+        scope.push_dynamic("ctx", ctx_dynamic.clone());
+        scope.push_dynamic("inputs", ctx_dynamic);
+    }
+
+    scope
+}
+
+/// The variable names a condition expression can reference against `context`,
+/// deduplicated and sorted.
+///
+/// Read OUT OF the real [`build_condition_scope`] rather than re-derived, so
+/// the answer cannot drift from what the evaluator actually binds — a
+/// re-implementation would reproduce the author's assumption about the scope,
+/// which is the bug this exists to diagnose.
+///
+/// Backs the `variables_in_scope` field on the `test_condition` MCP tool.
+/// That tool is what an author reaches for when a condition misbehaves, and
+/// "Variable not found: input" is only actionable next to the list of names
+/// that WOULD have resolved.
+pub fn condition_scope_variables(context: &JsonValue) -> Vec<String> {
+    let scope = build_condition_scope(context);
+    let mut names: Vec<String> = scope
+        .iter_raw()
+        .map(|(name, _, _)| name.to_string())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// Evaluate a Rhai condition, folding every failure into `false`.
+///
+/// # This is no longer the workflow engine's condition path
+///
+/// As of 2026-09 all six engine call sites route through
+/// `talos_workflow_engine`'s `eval_condition` (i.e. the `try_eval_bool` /
+/// [`evaluate_condition_with_error`] half of this pair), because `false` here
+/// means two different things and the caller has to be able to tell them
+/// apart: for a node's `skip_condition`, "the expression said don't skip" and
+/// "the expression could not be evaluated" are opposites, and the second RUNS
+/// the node the author gated. This function survives as the
+/// `ExpressionEvaluator::eval_bool` trait impl and for callers that genuinely
+/// want a total function; do not reintroduce it on a path where a silent
+/// default carries a decision.
+pub fn evaluate_condition(condition: &str, context: &JsonValue) -> bool {
+    let decoded = decode_html_entities(condition);
+    let condition = decoded.as_ref();
+    RHAI_ENGINE.with(|engine| {
+        let mut scope = build_condition_scope(context);
 
         match engine.eval_with_scope::<bool>(&mut scope, condition) {
             Ok(res) => {
@@ -161,6 +225,16 @@ pub fn evaluate_condition(condition: &str, context: &JsonValue) -> bool {
                 // crashing on a bad expression would take down legitimate
                 // workflows). Operators need a metric to alert on the
                 // rate so a regression after a refactor surfaces.
+                //
+                // That metric now EXISTS —
+                // `talos_condition_eval_failures_total{kind}` — but it is
+                // incremented one level up, in
+                // `talos_workflow_engine::condition_eval::eval_condition`,
+                // because only the CALLER knows which kind of condition this
+                // was and therefore whether the `false` default is
+                // conservative or permissive. This site is off that path (see
+                // the fn doc) and deliberately does not count: it would
+                // attribute an unknown kind and dilute the series.
                 //
                 // MCP-536: DLP-scrub the context before logging. The
                 // context is the merged JSON output of prior nodes —
@@ -190,90 +264,22 @@ pub fn evaluate_condition(condition: &str, context: &JsonValue) -> bool {
 /// propagates the error message so callers (like the MCP `test_condition` tool
 /// AND `talos-actor-policies::rhai_eval::evaluate`) can display / log it.
 ///
-/// MCP-465: this is NOT only a preview helper — actor approval policies
-/// evaluate their `trigger_condition` through this exact path at runtime.
-/// Any divergence from `evaluate_condition` (the edge evaluator) is a real
-/// production-semantics bug, not just a UX wart. Keep the two in lockstep.
+/// MCP-465: this is NOT only a preview helper. Actor approval policies
+/// evaluate their `trigger_condition` through it at runtime, and since 2026-09
+/// so does every workflow-engine condition — including the fail-open
+/// `skip_condition` gate, which needs the error to distinguish "don't skip"
+/// from "couldn't tell".
+///
+/// The two functions no longer need to be "kept in lockstep": both build their
+/// scope with [`build_condition_scope`], so the MCP-465 drift cannot recur by
+/// omission. What still differs, deliberately, is only the error handling.
 pub fn evaluate_condition_with_error(condition: &str, context: &JsonValue) -> Result<bool, String> {
     let decoded = decode_html_entities(condition);
     let condition = decoded.as_ref();
     RHAI_ENGINE.with(|engine| {
-        let mut scope = Scope::new();
-
-        // MCP-465: mirror `evaluate_condition` exactly.
-        // Previous implementation diverged in two ways that surfaced as
-        // preview-vs-runtime drift AND as wrong behavior in actor-policy
-        // evaluation:
-        //   1. Only checked the `error` key, not `__error` — workflows
-        //      that surface module failures via `__error` (the canonical
-        //      engine envelope key) made conditions like `is_error`
-        //      stay false in preview/policies even though the real
-        //      edge evaluator flagged them.
-        //   2. Used `if !scope.contains("is_error")` to inject the
-        //      heuristic, which inverted precedence: payload-provided
-        //      values won over heuristic detection. The real evaluator
-        //      pushes unconditionally so the heuristic wins.
-        // Both fixed below; structure now matches `evaluate_condition`.
-        let mut detected_error = false;
-        let mut detected_error_message = String::new();
-        if let JsonValue::Object(map) = context {
-            for key in &["__error", "error"] {
-                if let Some(val) = map.get(*key) {
-                    match val {
-                        JsonValue::Null => {}
-                        JsonValue::String(s) if s.is_empty() => {}
-                        JsonValue::Bool(false) => {}
-                        JsonValue::String(s) => {
-                            detected_error = true;
-                            detected_error_message = s.clone();
-                            break;
-                        }
-                        other => {
-                            detected_error = true;
-                            detected_error_message = other.to_string();
-                            break;
-                        }
-                    }
-                }
-            }
-
-            for (key, val) in map {
-                if let Ok(dynamic) = rhai::serde::to_dynamic(val) {
-                    scope.push_dynamic(key, dynamic);
-                }
-                if key == "input" || key == "config" {
-                    if let JsonValue::Object(inner) = val {
-                        for (inner_key, inner_val) in inner {
-                            if !map.contains_key(inner_key) {
-                                if let Ok(d) = rhai::serde::to_dynamic(inner_val) {
-                                    scope.push_dynamic(inner_key, d);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } else if let JsonValue::String(s) = context {
-            // MCP-1139: capped, single-pass heuristic (sibling of the
-            // `evaluate_condition` site above, MCP-465 lockstep
-            // constraint). Both call paths share the same helper.
-            if looks_like_error_string(s) {
-                detected_error = true;
-                detected_error_message = s.clone();
-            }
-        }
-
-        // Push heuristic values unconditionally — Rhai's scope lookup
-        // walks back-to-front, so this layer wins over any payload key
-        // pushed in the for-loop above. Matches `evaluate_condition`.
-        scope.push("is_error", detected_error);
-        scope.push("error_message", detected_error_message);
-
-        if let Ok(ctx_dynamic) = rhai::serde::to_dynamic(context) {
-            scope.push_dynamic("ctx", ctx_dynamic.clone());
-            scope.push_dynamic("inputs", ctx_dynamic);
-        }
-
+        // Same scope as `evaluate_condition`, by construction rather than by
+        // convention — see `build_condition_scope`.
+        let mut scope = build_condition_scope(context);
         engine
             .eval_with_scope::<bool>(&mut scope, condition)
             .map_err(|e| e.to_string())
@@ -499,6 +505,109 @@ mod html_entity_decode_tests {
             "status != 401 &amp;&amp; status != 403",
             &ctx
         ));
+    }
+
+    /// The engine's `skip_condition` gate calls `try_eval_bool` — i.e. THIS
+    /// function — and now distinguishes an evaluation FAILURE from a clean
+    /// `false`. That distinction is only worth anything if the wrong-scope
+    /// typo actually lands in the Err arm, so pin it against the real
+    /// evaluator rather than assuming.
+    ///
+    /// The live defect: a trigger key binds BARE (`should_skip`), not under
+    /// an `input` wrapper, so `input.should_skip == true` is a lookup of an
+    /// undefined variable. Rhai ABORTS; the caller saw `false`; `false` on a
+    /// skip condition means "do not skip" — so the gated node ran.
+    #[test]
+    fn a_wrong_scope_skip_condition_is_an_error_not_a_clean_false() {
+        let ctx = json!({ "should_skip": true });
+
+        // Correct scope: the trigger key is a bare variable.
+        assert_eq!(
+            evaluate_condition_with_error("should_skip == true", &ctx),
+            Ok(true),
+            "trigger keys bind at TOP LEVEL — this is the form that works"
+        );
+
+        // Wrong scope: `input` is not defined in this context.
+        let wrong = evaluate_condition_with_error("input.should_skip == true", &ctx);
+        assert!(
+            wrong.is_err(),
+            "an unbound variable must reach the caller as an ERROR; if this \
+             ever starts returning Ok(false) the engine can no longer tell a \
+             broken skip gate from an open one. Got: {wrong:?}"
+        );
+
+        // And the historical fail-to-false primitive collapses BOTH to the
+        // same `false`. This assertion is the reason `eval_bool` is no longer
+        // on the engine's condition path.
+        assert!(!evaluate_condition("input.should_skip == true", &ctx));
+        assert!(!evaluate_condition("should_skip == false", &ctx));
+    }
+
+    /// A non-boolean result is also a failure, not a `false`. `add_skip_condition`
+    /// rejects whitespace for this reason (MCP-235); an expression like
+    /// `count` that yields an int reaches the same Err arm.
+    #[test]
+    fn a_non_bool_skip_condition_is_an_error_not_a_clean_false() {
+        let ctx = json!({ "count": 3 });
+        assert!(
+            evaluate_condition_with_error("count", &ctx).is_err(),
+            "a non-bool result must not be silently read as \"do not skip\""
+        );
+        assert!(!evaluate_condition("count", &ctx));
+    }
+
+    /// `condition_scope_variables` must report names that ACTUALLY resolve.
+    ///
+    /// The list is what `test_condition` shows an author who just got
+    /// "Variable not found", so a name in it that does not evaluate would be
+    /// worse than no list at all. Every reported name is therefore checked by
+    /// EVALUATING it, not by re-deriving the binding rules.
+    #[test]
+    fn every_reported_scope_variable_actually_resolves() {
+        let ctx = json!({
+            "should_skip": true,
+            "input": { "nested_only": 1 },
+            "config": { "cfg_only": 2 },
+        });
+        let names = condition_scope_variables(&ctx);
+        for name in &names {
+            assert!(
+                evaluate_condition_with_error(&format!("{name} != ()"), &ctx).is_ok(),
+                "reported `{name}` as in scope but it does not resolve"
+            );
+        }
+        for expected in [
+            "should_skip", // top-level trigger key, BARE
+            "nested_only", // flattened out of `input`
+            "cfg_only",    // flattened out of `config`
+            "is_error",
+            "error_message",
+            "ctx",
+            "inputs",
+            "input", // present only because the context HAS an `input` key
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "expected `{expected}` in scope, got {names:?}"
+            );
+        }
+    }
+
+    /// The converse, and the one that matters for the live defect: with no
+    /// `input` key in the context there is NO `input` wrapper, so the natural
+    /// -looking `input.should_skip` names nothing.
+    #[test]
+    fn there_is_no_input_wrapper_unless_the_context_has_one() {
+        let ctx = json!({ "should_skip": true });
+        let names = condition_scope_variables(&ctx);
+        assert!(
+            !names.iter().any(|n| n == "input"),
+            "`input` must not appear as a binding for a bare trigger payload — \
+             it is the wrapper authors assume and the engine does not provide. \
+             Got {names:?}"
+        );
+        assert!(names.iter().any(|n| n == "should_skip"));
     }
 
     #[test]

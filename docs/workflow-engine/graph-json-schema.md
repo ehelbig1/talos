@@ -114,10 +114,59 @@ Unknown top-level keys are ignored.
   // Optional control-flow hints. The engine stores these as
   // `__skip_condition` / `__continue_on_error` reserved keys on the
   // node's config; see `talos_workflow_engine_core::reserved_keys`.
-  "skip_condition":       "upstream.skip",
+  // Bare variable names — see "Expression scope" below.
+  "skip_condition":       "dry_run == true",
   "continue_on_error":    true
 }
 ```
+
+### Expression scope
+
+Every Rhai expression in this schema — edge `condition`, node
+`skip_condition`, `retry_condition`, `retry_delay_expression`, a loop's
+`condition`, a verify node's `condition` — is evaluated in the SAME scope,
+built by one function (`talos_engine::rhai_helpers::build_condition_scope`).
+The bindings, lowest precedence first:
+
+| Binding | What it is |
+|---|---|
+| bare names | every top-level key of the context object |
+| bare names | keys of a nested `input` / `config` object, flattened — only where they don't collide with a top-level key |
+| `is_error`, `error_message` | injected unconditionally; they WIN over a payload key of the same name |
+| `ctx`, `inputs` | the whole context, for nested paths (`ctx.user.tier`) |
+
+**There is no `input` wrapper** unless the context itself has an `input` key.
+`input.dry_run` against a trigger payload of `{"dry_run": true}` names nothing.
+
+The context a node's expression sees follows the ARITY RULE: with exactly one
+parent it is that parent's output UNWRAPPED (its fields are the bare
+variables); with two or more it is an object KEYED BY NODE LABEL (the labels
+are the variables). A `skip_condition` additionally has the trigger node's
+output overlaid, so trigger fields are bare variables too.
+
+`test_condition` evaluates through this exact path and returns
+`variables_in_scope` — the names actually bound, read out of the engine's own
+scope builder rather than re-derived.
+
+### When an expression cannot be evaluated
+
+An unbound variable, a non-bool result, or an operation-limit trip is an
+evaluation FAILURE, not `false`. The engine applies `false` as the default
+anyway (aborting a workflow on a bad expression would be worse) and counts the
+failure on `talos_condition_eval_failures_total{kind}`. What that default DOES
+differs by kind, and one of them is permissive:
+
+| Expression | `false` means | Direction |
+|---|---|---|
+| `skip_condition` | do not skip — **the node RUNS** | **fail-OPEN** |
+| edge `condition` | edge not traversed, child skipped | conservative |
+| loop `condition` | stop iterating | conservative |
+| fan-in `aggregation_expr` | aggregation marked failed | conservative |
+| verify `condition` | check failed | conservative |
+
+So a typo in a `skip_condition` that gates a send FIRES the send. Syntax is
+rejected at authoring time on every MCP write path; an unbound name is not
+visible until eval, which is what `test_condition` is for.
 
 Nodes whose `type` is NOT a resolvable module id (not a UUID, no
 `data.moduleId` fallback) and whose `kind` is also absent are
