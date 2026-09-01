@@ -24,35 +24,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The canonical static-schema module list. Must stay in lockstep with
+/// The canonical static-schema module list, owned by `crate::tool_hints`
+/// (which also needs it, to check authoring hints against the schemas they
+/// name). Must stay in lockstep with
 /// `static_tool_count()` in lib.rs — `every_tool_schemas_module_is_registered`
 /// enforces the filesystem side (a `tool_schemas` fn in a file not listed
 /// here fails), and `advertised_count_matches_static_tool_count` enforces
 /// the lib.rs side.
 fn all_static_schemas() -> Vec<(&'static str, Vec<serde_json::Value>)> {
-    vec![
-        ("advanced", crate::advanced::tool_schemas()),
-        ("platform", crate::platform::tool_schemas()),
-        ("search", crate::search::tool_schemas()),
-        ("workflows", crate::workflows::tool_schemas()),
-        ("modules", crate::modules::tool_schemas()),
-        ("sandbox", crate::sandbox::tool_schemas()),
-        ("executions", crate::executions::tool_schemas()),
-        ("actor", crate::actor::tool_schemas()),
-        ("analytics", crate::analytics::tool_schemas()),
-        ("secrets", crate::secrets::tool_schemas()),
-        ("schedules", crate::schedules::tool_schemas()),
-        ("versions", crate::versions::tool_schemas()),
-        ("webhooks", crate::webhooks::tool_schemas()),
-        ("graph", crate::graph::tool_schemas()),
-        ("knowledge_graph", crate::knowledge_graph::tool_schemas()),
-        ("alerts", crate::alerts::tool_schemas()),
-        ("ops_alerts", crate::ops_alerts::tool_schemas()),
-        ("schemas", crate::schemas::tool_schemas()),
-        ("ollama", crate::ollama::tool_schemas()),
-        ("ml", crate::ml::tool_schemas()),
-        ("evaluation", crate::evaluation::tool_schemas()),
-    ]
+    crate::tool_hints::all_static_schema_modules()
 }
 
 fn src_dir() -> std::path::PathBuf {

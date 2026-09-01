@@ -349,7 +349,7 @@ pub fn remediation_steps(error_type: &str, module_label: &str) -> Vec<serde_json
             serde_json::json!({ "step": 3, "action": "switch_to_typed", "description": "If the module uses serde_json::Value parsing on a large payload, switching to typed #[derive(Deserialize)] structs is 3-10x cheaper than bumping fuel.", "tool": null }),
         ],
         "timeout" => vec![
-            serde_json::json!({ "step": 1, "action": "review_timeout", "description": format!("Check the timeout_secs setting on node '{}'.", module_label), "tool": "get_workflow_raw_json" }),
+            serde_json::json!({ "step": 1, "action": "review_timeout", "description": format!("Check the timeout_secs setting on node '{}'. Call get_workflow with view='raw_json' to see the node's data verbatim.", module_label), "tool": "get_workflow" }),
             serde_json::json!({ "step": 2, "action": "bump_timeout", "description": "Re-add the node with a higher timeout_secs (default 60). LLM nodes typically need 30-90s; large HTTP fetches 30-60s; expensive SQL 60-120s.", "tool": "add_node_to_workflow" }),
             serde_json::json!({ "step": 3, "action": "split_work", "description": "If the timeout reflects genuine workload size (e.g., processing 1000 items), consider splitting into a loop or fan-out/fan-in pattern so each node has bounded work.", "tool": null }),
         ],

@@ -2,7 +2,7 @@
   "name": "http-retry",
   "version": "v1.0.0",
   "display_name": "HTTP Request with Retry",
-  "description": "Make outbound HTTP requests with configurable retry and exponential backoff. Retries on transient errors (429, 5xx) up to MAX_RETRIES times.",
+  "description": "Make outbound HTTP requests with configurable retry and exponential backoff. Retries on transient errors (429, 5xx) up to MAX_RETRIES times. EGRESS: allowed_hosts is [\"*\"], so this module's own host grant places no restriction on which host it reaches - the destination is whatever the node's config resolves to. What still constrains it: the worker's SSRF resolver (private, loopback and link-local addresses are refused), the bound actor's egress_scope (scope 'local' refuses public egress outright), and max_llm_tier (a tier1 actor is refused every external LLM host regardless of allowed_hosts). To pin this node to specific hosts, install a private copy and narrow allowed_hosts with update_module_hosts.",
   "category": "Network",
   "capability_world": "http-node",
   "allowed_hosts": ["*"],

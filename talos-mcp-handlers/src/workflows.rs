@@ -1961,6 +1961,62 @@ pub(crate) fn effective_max_fuel(
         .or(module_max_fuel)
 }
 
+/// The `next_steps_checklist` `add_node_to_workflow` returns.
+///
+/// Pure so the hints can be checked against the schemas of the tools they
+/// name — see `crate::tool_hints`. Until this was extracted the "Wire into
+/// graph" step suggested `add_edge` with `source_node_id` / `target_node_id`,
+/// which `add_edge` does not declare (it takes `source` / `target`), so the
+/// suggested call failed and no test could see it.
+pub(crate) fn build_add_node_checklist(
+    wf_id_str: &str,
+    node_id_str: &str,
+    module_id: &str,
+    config_is_empty: bool,
+    already_connected: bool,
+) -> Vec<serde_json::Value> {
+    let is_structural = module_id.is_empty()
+        || module_id.starts_with("system:")
+        || matches!(
+            module_id,
+            "condition" | "fan-out" | "fan-in" | "collect" | "capability-dispatch"
+        );
+
+    let mut checklist: Vec<serde_json::Value> = Vec::new();
+    if !is_structural && config_is_empty {
+        checklist.push(serde_json::json!({
+            "step": 1,
+            "action": "Configure node",
+            "tool": "update_node_config",
+            "args": { "workflow_id": wf_id_str, "node_id": node_id_str },
+            "note": "Set module-specific parameters (API keys, URLs, timeouts, etc.) before running. \
+                     get_module_info(module_id) reports the module's config_schema — the exact keys \
+                     it accepts and which are required.",
+        }));
+    }
+    if !already_connected {
+        checklist.push(serde_json::json!({
+            "step": checklist.len() + 1,
+            "action": "Wire into graph",
+            "tool": "add_edge",
+            "args": {
+                "workflow_id": wf_id_str,
+                "source": "<upstream_node_id>",
+                "target": node_id_str,
+            },
+            "note": "Connect this node to its predecessor. Use connect_from/connect_to on future add_node_to_workflow calls to skip this step.",
+        }));
+    }
+    checklist.push(serde_json::json!({
+        "step": checklist.len() + 1,
+        "action": "Test workflow",
+        "tool": "test_workflow",
+        "args": { "workflow_id": wf_id_str, "assert_status": "completed" },
+        "note": "Runs synchronously and validates assertions. Preferred over trigger_workflow during authoring.",
+    }));
+    checklist
+}
+
 async fn handle_add_node_to_workflow(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
@@ -2541,44 +2597,15 @@ async fn handle_add_node_to_workflow(
     let wf_id_str = wf_id.to_string();
     let node_id_str = node_id.to_string();
     let config_is_empty = config.as_object().map(|m| m.is_empty()).unwrap_or(true);
-    let is_structural = module_id.is_empty()
-        || module_id.starts_with("system:")
-        || matches!(
-            module_id,
-            "condition" | "fan-out" | "fan-in" | "collect" | "capability-dispatch"
-        );
     let already_connected = connect_from.is_some() || connect_to.is_some();
 
-    let mut checklist: Vec<serde_json::Value> = Vec::new();
-    if !is_structural && config_is_empty {
-        checklist.push(serde_json::json!({
-            "step": 1,
-            "action": "Configure node",
-            "tool": "update_node_config",
-            "args": { "workflow_id": &wf_id_str, "node_id": &node_id_str },
-            "note": "Set module-specific parameters (API keys, URLs, timeouts, etc.) before running.",
-        }));
-    }
-    if !already_connected {
-        checklist.push(serde_json::json!({
-            "step": checklist.len() + 1,
-            "action": "Wire into graph",
-            "tool": "add_edge",
-            "args": {
-                "workflow_id": &wf_id_str,
-                "source_node_id": "<upstream_node_id>",
-                "target_node_id": &node_id_str,
-            },
-            "note": "Connect this node to its predecessor. Use connect_from/connect_to on future add_node_to_workflow calls to skip this step.",
-        }));
-    }
-    checklist.push(serde_json::json!({
-        "step": checklist.len() + 1,
-        "action": "Test workflow",
-        "tool": "test_workflow",
-        "args": { "workflow_id": &wf_id_str, "assert_status": "completed" },
-        "note": "Runs synchronously and validates assertions. Preferred over trigger_workflow during authoring.",
-    }));
+    let mut checklist = build_add_node_checklist(
+        &wf_id_str,
+        &node_id_str,
+        module_id,
+        config_is_empty,
+        already_connected,
+    );
 
     // Surface the resulting module's effective max_fuel so callers tuning
     // fuel_budget can verify their value actually landed. Pre-r247 this
@@ -4154,13 +4181,27 @@ async fn handle_validate_workflow(
     let mut all_improvements: Vec<(i32, serde_json::Value)> = Vec::new();
 
     for issue in &structural_issues {
-        all_improvements.push((40, serde_json::json!({
-            "priority": "critical",
-            "action": issue,
-            "tool": if issue.contains("cycle") { "remove_edge" } else { "delete_node or reinstall_module_from_catalog" },
-            "points_available": 40,
-            "component": "structural",
-        })));
+        // A cycle is fixed by dropping the back-edge; a dangling edge endpoint
+        // or an unresolvable module is fixed by re-pointing the node at a real
+        // module. Both must name a tool that EXISTS — the pre-fix strings were
+        // `delete_node or reinstall_module_from_catalog`, neither of which the
+        // server advertises (see `crate::tool_hints`).
+        let is_cycle = issue.contains("cycle");
+        let tool = if is_cycle {
+            "remove_edge"
+        } else {
+            "swap_node_module"
+        };
+        all_improvements.push((
+            40,
+            serde_json::json!({
+                "priority": "critical",
+                "action": issue,
+                "tool": tool,
+                "points_available": 40,
+                "component": "structural",
+            }),
+        ));
     }
     for issue in &config_issues {
         all_improvements.push((
@@ -4180,9 +4221,10 @@ async fn handle_validate_workflow(
             serde_json::json!({
                 "priority": "high",
                 "action": issue,
-                "tool": "reinstall_module_from_catalog (add vault path to allowed_secrets)",
+                "tool": "update_module_secrets",
                 "points_available": 20,
                 "component": "secrets",
+                "note": "Add the vault path to the module's allowed_secrets grant.",
             }),
         ));
     }
@@ -4261,13 +4303,16 @@ async fn handle_validate_workflow(
     }
     // Risk
     if !has_timeout {
-        all_improvements.push((3, serde_json::json!({
-            "priority": "low",
-            "action": "Set execution_timeout_secs on the workflow graph to prevent runaway executions",
-            "tool": "update_workflow_graph",
-            "points_available": 3,
-            "component": "risk",
-        })));
+        all_improvements.push((
+            3,
+            serde_json::json!({
+                "priority": "low",
+                "action": "Set an execution timeout on the workflow to prevent runaway executions",
+                "tool": "set_workflow_execution_timeout",
+                "points_available": 3,
+                "component": "risk",
+            }),
+        ));
     }
     if !has_error_edges {
         all_improvements.push((
@@ -4287,9 +4332,10 @@ async fn handle_validate_workflow(
             serde_json::json!({
                 "priority": "low",
                 "action": w,
-                "tool": "reinstall_module_from_catalog",
+                "tool": "swap_node_module",
                 "points_available": 2,
                 "component": "compatibility",
+                "note": "Re-point the node at a current module; find_module_alternatives lists candidates.",
             }),
         ));
     }
@@ -7569,8 +7615,11 @@ fn shape_llm_response(
             "step": 2,
             "action": "provision_secrets",
             "description": "Store required API credentials",
-            "tool": "set_secret",
-            "hint": "Each module's setup instructions list the exact key_path and how to obtain the credential"
+            // MCP-1201: `set_secret` was removed from MCP; secret writes are
+            // GraphQL-only (require_2fa + SecretsWrite). Naming it here sent
+            // callers at a tool that no longer exists.
+            "tool": null,
+            "hint": "Each module's setup instructions list the exact key_path and how to obtain the credential. Provision the credential in the dashboard (Settings → Secrets) — secret writes require 2FA and aren't available through MCP."
         }),
         serde_json::json!({
             "step": 3,
@@ -7671,7 +7720,9 @@ fn shape_explicit_response(e: talos_workflow_creation::ExplicitModuleOutcome) ->
             "step": qs_step,
             "action": "provision_secrets",
             "description": "Store required API credentials",
-            "tool": "set_secret",
+            // MCP-1201: secret writes are GraphQL-only. See shape_llm_response.
+            "tool": null,
+            "hint": "Provision the credential in the dashboard (Settings → Secrets) — secret writes require 2FA and aren't available through MCP.",
         }));
         qs_step += 1;
     }
@@ -8431,8 +8482,9 @@ async fn handle_instantiate_workflow_pattern(
                     "step": ip_step,
                     "action": "provision_secrets",
                     "description": "Store required API credentials",
-                    "tool": "set_secret",
-                    "hint": "See required_secrets for the key_path values needed",
+                    // MCP-1201: secret writes are GraphQL-only.
+                    "tool": null,
+                    "hint": "See required_secrets for the key_path values needed. Provision the credential in the dashboard (Settings → Secrets) — secret writes require 2FA and aren't available through MCP.",
                 }));
                 ip_step += 1;
             }
@@ -8811,7 +8863,9 @@ async fn handle_get_workflow_quickstart(
                 blockers.push(serde_json::json!({
                     "type": "missing_secret",
                     "key_path": key_path,
-                    "tool": "set_secret",
+                    // MCP-1201: secret writes are GraphQL-only.
+                    "tool": null,
+                    "note": "Provision the credential in the dashboard (Settings → Secrets) — secret writes require 2FA and aren't available through MCP.",
                 }));
             }
             secrets_status.push(serde_json::json!({
@@ -8872,8 +8926,9 @@ async fn handle_get_workflow_quickstart(
             "step": step,
             "action": "provision_secrets",
             "description": "Store required API credentials in the secret vault",
-            "tool": "set_secret",
-            "hint": "See secrets_status for which key_paths need provisioning"
+            // MCP-1201: secret writes are GraphQL-only.
+            "tool": null,
+            "hint": "See secrets_status for which key_paths need provisioning. Provision the credential in the dashboard (Settings → Secrets) — secret writes require 2FA and aren't available through MCP."
         }));
         step += 1;
     }
@@ -9590,7 +9645,10 @@ async fn handle_swap_node_module(
                 } else {
                     format!("Provision required secrets: {}", new_required_secrets.join(", "))
                 },
-                "tool": if !new_required_secrets.is_empty() { "set_secret" } else { "" }
+                // MCP-1201: secret writes are GraphQL-only, so there is no MCP
+                // tool for this step in either branch.
+                "tool": null,
+                "hint": if new_required_secrets.is_empty() { "" } else { "Provision the credential in the dashboard (Settings → Secrets) — secret writes require 2FA and aren't available through MCP." }
             },
             {
                 "step": 3,

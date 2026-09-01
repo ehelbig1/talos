@@ -2,7 +2,7 @@
   "name": "data-pipeline-etl",
   "version": "v1.0.0",
   "display_name": "Data Pipeline ETL",
-  "description": "Extract data from a source URL (JSON array), transform it, and load it into a database table. Optionally injects a Bearer token from a stored secret for authenticated endpoints.",
+  "description": "Extract data from a source URL (JSON array), transform it, and load it into a database table. Optionally injects a Bearer token from a stored secret for authenticated endpoints. EGRESS: allowed_hosts is [\"*\"], so this module's own host grant places no restriction on which host it reaches - the destination is whatever the node's config resolves to. What still constrains it: the worker's SSRF resolver (private, loopback and link-local addresses are refused), the bound actor's egress_scope (scope 'local' refuses public egress outright), and max_llm_tier (a tier1 actor is refused every external LLM host regardless of allowed_hosts). To pin this node to specific hosts, install a private copy and narrow allowed_hosts with update_module_hosts.",
   "category": "Data",
   "capability_world": "database-node",
   "allowed_hosts": ["*"],

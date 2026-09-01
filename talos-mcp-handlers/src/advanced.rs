@@ -3930,8 +3930,8 @@ async fn handle_deploy_workflow(
                         "warning": "Workflow published successfully but schedule creation failed. Use create_schedule to add scheduling.",
                         "next_steps": [
                             format!("Verify with trigger_workflow workflow_id={}", wf_id),
-                            format!("Monitor with get_execution_history workflow_id={}", wf_id),
-                            "Set failure alerts with create_alert_rule",
+                            format!("Monitor with list_executions workflow_id={}", wf_id),
+                            "Set failure alerts with set_failure_notification",
                         ]
                     }))
                     .unwrap_or_default(),
@@ -3957,15 +3957,15 @@ async fn handle_deploy_workflow(
             {
                 "step": 2,
                 "action": "Monitor execution history",
-                "tool": "get_execution_history",
+                "tool": "list_executions",
                 "args": { "workflow_id": &wf_id_str },
             },
             {
                 "step": 3,
                 "action": "Set failure alerts (recommended for production)",
-                "tool": "create_alert_rule",
-                "args": { "workflow_id": &wf_id_str },
-                "note": "Get notified on failures without polling get_execution_history.",
+                "tool": "set_failure_notification",
+                "args": { "workflow_id": &wf_id_str, "webhook_url": "<https://your-endpoint>" },
+                "note": "Get notified on failures without polling list_executions. Pass an empty webhook_url to clear.",
             },
         ],
     });
