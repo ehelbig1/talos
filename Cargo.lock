@@ -7506,6 +7506,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "talos-db",
+ "talos-measurement",
  "talos-secrets-manager",
  "talos-workflow-job-protocol",
  "tokio",
