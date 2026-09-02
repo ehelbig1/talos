@@ -123,6 +123,65 @@ impl Verification {
     }
 }
 
+/// What a check is actually measuring.
+///
+/// This axis exists because `production_mode` is not a security *control* —
+/// it is a statement about where this deployment is running, and its ten
+/// points are unearnable on a developer's laptop no matter how well every
+/// control is configured. Collapsing it into the same undifferentiated score
+/// as a broken KEK is a real modelling choice, so the report now says which
+/// is which instead of leaving the operator to infer it from the check name.
+///
+/// **The weights are unchanged** — posture is still scored exactly as it
+/// always was, so a score recorded last month still means what it meant. What
+/// is new is that `score_accounting.forfeited_by_kind` lets a reader subtract
+/// it: "30 points short, of which 10 is because this is a dev box" is a
+/// different sentence from "30 points of broken controls", and before this
+/// field the response could not tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckKind {
+    /// A security control: something that protects the system, and whose
+    /// absence or malfunction is a security finding anywhere it runs.
+    Control,
+    /// A deployment-posture fact. Scored, but not a control — a dev stack
+    /// cannot earn these points and is not less secure for it.
+    DeploymentPosture,
+}
+
+impl CheckKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CheckKind::Control => "control",
+            CheckKind::DeploymentPosture => "deployment_posture",
+        }
+    }
+}
+
+/// The point weight and kind of every check, keyed by check name.
+///
+/// **This is the only place a weight is written down.** Each check function
+/// awards `points` for the outcome it found; the *maximum* that check could
+/// have awarded is a property of the check, not of the outcome, so it lives
+/// here. Keeping it out of the per-arm literals is what makes
+/// `max_points` uniform across a check's arms by construction — a
+/// `jwt_algorithm` that warns at 5 still reports `max_points: 10`, so
+/// `security_score / max_score` decomposes the same way whatever the
+/// deployment looks like.
+///
+/// The nine weights sum to [`MAX_SCORE`]; `weights_sum_to_max_score` pins it.
+const CHECK_WEIGHTS: &[(&str, u32, CheckKind)] = &[
+    ("production_mode", 10, CheckKind::DeploymentPosture),
+    ("jwt_algorithm", 10, CheckKind::Control),
+    ("master_encryption_key", 15, CheckKind::Control),
+    ("job_signing_key", 15, CheckKind::Control),
+    ("aot_integrity_key", 10, CheckKind::Control),
+    ("audit_event_signing", 10, CheckKind::Control),
+    ("redis_tls", 10, CheckKind::Control),
+    ("audit_immutability_triggers", 10, CheckKind::Control),
+    ("cors_origins", 10, CheckKind::Control),
+];
+
 /// One rendered check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Check {
@@ -135,12 +194,45 @@ pub struct Check {
 }
 
 impl Check {
+    /// The most this check could have awarded, from [`CHECK_WEIGHTS`].
+    ///
+    /// An unlisted name falls back to `self.points`, i.e. a forfeit of zero.
+    /// That is the safe direction: an unregistered check can never invent a
+    /// shortfall the operator is then asked to explain. `every_check_name_has_a_weight`
+    /// is what stops the fallback being reached in production.
+    #[must_use]
+    pub fn max_points(&self) -> u32 {
+        CHECK_WEIGHTS
+            .iter()
+            .find(|(n, _, _)| *n == self.name)
+            .map_or(self.points, |(_, max, _)| *max)
+    }
+
+    /// Whether this check grades a security control or a deployment fact.
+    #[must_use]
+    pub fn kind(&self) -> CheckKind {
+        CHECK_WEIGHTS
+            .iter()
+            .find(|(n, _, _)| *n == self.name)
+            .map_or(CheckKind::Control, |(_, _, k)| *k)
+    }
+
+    /// Points this outcome did NOT award. Saturating, so a hypothetical
+    /// over-award reports `0` rather than wrapping.
+    #[must_use]
+    pub fn forfeited(&self) -> u32 {
+        self.max_points().saturating_sub(self.points)
+    }
+
     fn json(&self) -> serde_json::Value {
         serde_json::json!({
             "check": self.name,
             "status": self.status.as_str(),
             "detail": self.detail,
             "verification": self.verification.as_str(),
+            "points": self.points,
+            "max_points": self.max_points(),
+            "kind": self.kind().as_str(),
         })
     }
 }
@@ -604,6 +696,24 @@ pub fn probe_redis_transport(redis_url: &str) -> RedisTransport {
     }
 }
 
+/// Render `redis_tls`.
+///
+/// **Known scoring wrinkle, surfaced rather than fixed.** Two arms report no
+/// problem and still forfeit all ten points: `NotConfigured` (`pass`, "Redis
+/// not configured") and `UnixSocket` (`info`, "transport TLS does not
+/// apply"). A deployment with no Redis, or one reaching it over a unix
+/// socket, therefore cannot reach `max_score` however well it is configured.
+///
+/// That is real, and it is now VISIBLE — both arms appear in
+/// `score_accounting.shortfalls` carrying their own detail as the reason, so
+/// an operator can see the ten points and why. It is not repaired here
+/// because the repair is not local: making a check inapplicable means making
+/// the denominator per-deployment, and [`GRADE_A`] and friends are ABSOLUTE
+/// point thresholds, not percentages. Under a variable denominator, 80/90
+/// (89 %) would grade B while 90/100 (90 %) grades A — the letter would stop
+/// meaning one thing. Re-grading on percentage is a deliberate change to
+/// every historical comparison an operator has made, and belongs in its own
+/// change with its own justification, not smuggled in beside a reporting fix.
 #[must_use]
 pub fn check_redis_tls(transport: RedisTransport, is_prod: bool) -> Check {
     match transport {
@@ -763,7 +873,7 @@ pub fn check_cors_origins(parsed: &Result<Vec<String>, String>, explicitly_set: 
 // Scoring + assembly
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Maximum attainable score.
+/// Maximum attainable score — the sum of every entry in [`CHECK_WEIGHTS`].
 ///
 /// The per-outcome point values sum to more than this across all arms, which
 /// reads as an over-100 bug on a first pass. They are not all attainable
@@ -771,11 +881,17 @@ pub fn check_cors_origins(parsed: &Result<Vec<String>, String>, explicitly_set: 
 /// is 10 prod + 10 jwt + 15 master + 15 worker + 10 aot + 10 audit + 10
 /// redis-tls + 10 triggers + 10 cors = 100.
 ///
-/// Two consequences worth stating rather than rediscovering:
-///  * Grade A (≥ 90) requires production, since `production_mode`'s 10 points
-///    are unearnable outside it. A dev stack tops out at 90, and at 80
-///    (grade B) with the usual plaintext local Redis.
+/// Three consequences worth stating rather than rediscovering:
+///  * `production_mode`'s 10 points are unearnable outside production, so a
+///    dev stack tops out at exactly 90 — which is precisely [`GRADE_A`].
+///    Grade A is therefore *reachable* in development, but only at
+///    perfection: every other control must be at full marks, including
+///    `rediss://` for the local Redis and a persistent `TALOS_AOT_HMAC_KEY`.
+///    One missing 10-point control in dev is a B.
 ///  * In production, A tolerates exactly one missing 10-point control.
+///  * Because posture is scored, part of any shortfall may be posture rather
+///    than control health. `score_accounting.forfeited_by_kind` splits it;
+///    see [`CheckKind`] for why that split is reported instead of removed.
 pub const MAX_SCORE: u32 = 100;
 
 pub const GRADE_A: u32 = 90;
@@ -796,6 +912,95 @@ pub fn grade_for(score: u32) -> &'static str {
     } else {
         "F"
     }
+}
+
+/// Build the `recommendation` string from the FACTS, never from the score.
+///
+/// The string this replaced was selected purely by score band, and the
+/// grade-C band read *"Acceptable for development — address failures before
+/// production"*. On the deployment that motivated this change that sentence
+/// was emitted alongside `"fail": 0`: it told the operator to go and fix an
+/// empty set. Advice keyed off an aggregate cannot know whether the thing it
+/// names exists, so this builds one clause per class and emits a clause only
+/// when that class has members. `recommendation_names_only_present_classes`
+/// is the guard.
+///
+/// Unverified checks are pulled out of the warn clause and named separately:
+/// they carry `Status::Warn`, but "could not tell" and "configured below the
+/// recommended level" are different jobs for the operator, and
+/// [`Verification::NotVerified`]'s whole contract is that it never reads as a
+/// verdict about the control.
+#[must_use]
+pub fn recommendation_for(checks: &[Check]) -> String {
+    fn names(checks: &[Check], f: impl Fn(&Check) -> bool) -> Vec<&'static str> {
+        checks.iter().filter(|c| f(c)).map(|c| c.name).collect()
+    }
+
+    let failing = names(checks, |c| c.status == Status::Fail);
+    let unverified = names(checks, |c| c.verification == Verification::NotVerified);
+    let warning = names(checks, |c| {
+        c.status == Status::Warn && c.verification != Verification::NotVerified
+    });
+    // Points lost by checks that reported no problem at all. This is the
+    // class the old wording had no vocabulary for, and the entire reason a
+    // clean report could still be a C.
+    let quiet_shortfall: Vec<&Check> = checks
+        .iter()
+        .filter(|c| {
+            !matches!(c.status, Status::Fail | Status::Warn)
+                && c.verification != Verification::NotVerified
+                && c.forfeited() > 0
+        })
+        .collect();
+
+    let score: u32 = checks.iter().map(|c| c.points).sum();
+    let max: u32 = checks.iter().map(Check::max_points).sum();
+    let mut parts = vec![format!(
+        "Score {}/{} (grade {}).",
+        score,
+        max,
+        grade_for(score)
+    )];
+
+    if !failing.is_empty() {
+        parts.push(format!(
+            "Fix {} failing control(s): {}.",
+            failing.len(),
+            failing.join(", ")
+        ));
+    }
+    if !unverified.is_empty() {
+        parts.push(format!(
+            "{} check(s) could not be verified ({}) — that says what was not learned, not that the control is good.",
+            unverified.len(),
+            unverified.join(", ")
+        ));
+    }
+    if !warning.is_empty() {
+        parts.push(format!(
+            "Harden {} warning(s): {}.",
+            warning.len(),
+            warning.join(", ")
+        ));
+    }
+    if !quiet_shortfall.is_empty() {
+        let lost: u32 = quiet_shortfall.iter().map(|c| c.forfeited()).sum();
+        let detail: Vec<String> = quiet_shortfall
+            .iter()
+            .map(|c| format!("{} (-{})", c.name, c.forfeited()))
+            .collect();
+        parts.push(format!(
+            "{} point(s) are not awarded by check(s) that reported no problem: {} — see score_accounting.",
+            lost,
+            detail.join(", ")
+        ));
+    }
+    if parts.len() == 1 {
+        parts.push(
+            "No failing, warning or unverified checks, and every check scored in full.".to_string(),
+        );
+    }
+    parts.join(" ")
 }
 
 /// Render a finished check list into the canonical `security_audit` response.
@@ -827,10 +1032,63 @@ pub fn render_report(checks: &[Check]) -> serde_json::Value {
         }
     }
 
+    // The denominator is DERIVED from the same checks the response renders,
+    // not read from the MAX_SCORE constant. A constant can disagree with the
+    // list (add a tenth check, forget to bump it) and the response would then
+    // print a ratio neither half of which the reader can check.
+    // `weights_sum_to_max_score` pins the two together for the production nine.
+    let max_score: u32 = checks.iter().map(Check::max_points).sum();
+    let forfeited = max_score.saturating_sub(score);
+    let shortfalls: Vec<serde_json::Value> = checks
+        .iter()
+        .filter(|c| c.forfeited() > 0)
+        .map(|c| {
+            serde_json::json!({
+                "check": c.name,
+                "status": c.status.as_str(),
+                "kind": c.kind().as_str(),
+                "awarded": c.points,
+                "max_points": c.max_points(),
+                "forfeited": c.forfeited(),
+                "reason": c.detail,
+            })
+        })
+        .collect();
+    let forfeited_control: u32 = checks
+        .iter()
+        .filter(|c| c.kind() == CheckKind::Control)
+        .map(Check::forfeited)
+        .sum();
+    let forfeited_posture: u32 = checks
+        .iter()
+        .filter(|c| c.kind() == CheckKind::DeploymentPosture)
+        .map(Check::forfeited)
+        .sum();
+
     serde_json::json!({
         "security_score": score,
-        "max_score": MAX_SCORE,
+        "max_score": max_score,
         "grade": grade,
+        // Why this number, in full. Before this block the response emitted a
+        // score no emitted field could reconstruct, and a status legend that
+        // asserted the opposite of the arithmetic — `info` was described as
+        // "not security-graded" while three info outcomes were forfeiting ten
+        // points each. Anything an operator needs to answer "why 70?" is here.
+        "score_accounting": {
+            "awarded": score,
+            "max": max_score,
+            "forfeited": forfeited,
+            "formula": "security_score = sum(checks[].points); max_score = sum(checks[].max_points). EVERY status can forfeit points, `info` included — a status is a description of the finding, not a statement about whether it is scored.",
+            "forfeited_by_kind": {
+                "control": forfeited_control,
+                "deployment_posture": forfeited_posture,
+            },
+            "kind_legend": {
+                "control": "A security control. Points not awarded here are control health.",
+                "deployment_posture": "A fact about WHERE this is deployed, not a control. Scored (the weights are unchanged and historical scores stay comparable), but a development stack cannot earn these points and is not less secure for it — subtract them before reading the score as control health.",
+            },
+            "shortfalls": shortfalls,
+        },
         "grade_thresholds": {
             "A": GRADE_A,
             "B": GRADE_B,
@@ -845,10 +1103,10 @@ pub fn render_report(checks: &[Check]) -> serde_json::Value {
             "info": info_count,
         },
         "status_legend": {
-            "pass": "Security control is configured correctly.",
+            "pass": "The check found nothing to fix. It may still forfeit points — a control that is not configured at all (no Redis, dev-default CORS) passes without scoring; see checks[].points and score_accounting.shortfalls.",
             "warn": "Control is configured but not at the recommended hardening level, or could not be verified.",
             "fail": "Control is missing, misconfigured, or present-but-non-functional — fix before going to production.",
-            "info": "Configuration noted; not security-graded (e.g. dev-mode posture).",
+            "info": "Configuration noted, and NOT a control failure in this environment. It is still scored: an info outcome forfeits that check's points, which is why a report with zero failures and zero warnings can score well under max. score_accounting.shortfalls names every point not awarded.",
         },
         "verification_counts": {
             "round_trip": round_trip,
@@ -863,10 +1121,7 @@ pub fn render_report(checks: &[Check]) -> serde_json::Value {
             "not_verified": "The verification could not run here. The status says what was NOT learned — it never means the control is good.",
         },
         "checks": checks.iter().map(Check::json).collect::<Vec<_>>(),
-        "recommendation": if score >= GRADE_A { "Excellent security posture" }
-            else if score >= GRADE_B { "Good — address warnings for production hardening" }
-            else if score >= GRADE_C { "Acceptable for development — address failures before production" }
-            else { "Critical gaps — do not deploy to production without fixing failures" },
+        "recommendation": recommendation_for(checks),
     })
 }
 
