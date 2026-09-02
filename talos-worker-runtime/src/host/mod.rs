@@ -43,6 +43,9 @@ mod reason_class_denial_tests;
 #[cfg(test)]
 mod sibling_egress_reason_tests;
 
+#[cfg(test)]
+mod sse_connect_failure_tests;
+
 mod cache;
 mod crypto;
 mod data;

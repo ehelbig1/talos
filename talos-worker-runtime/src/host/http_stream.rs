@@ -17,10 +17,21 @@ use crate::reason_class;
 ///
 /// Unlike `graphql` and `webhook`, the pairing here is NOT vacuous: every
 /// `ForbiddenHost` and every `InvalidUrl` site is a policy denial, and no
-/// transport failure returns either. A `connect` transport failure happens
-/// inside the spawned SSE task and never reaches the guest as an error at all
-/// — the stream simply yields no events — so the three `ConnectionFailed`
-/// sites are one cancellation and two mutex-poison guards.
+/// transport failure returns either.
+///
+/// `ConnectionFailed` is the mixed one. Until 2026-09 it was raised only by a
+/// cancellation and two mutex-poison guards, because the connection was
+/// established INSIDE the spawned SSE task and a transport failure there had
+/// no path back to the guest — `connect` answered `Ok(stream_id)` and the
+/// stream then yielded nothing, so a module could not tell a dead connection
+/// from a quiet endpoint. Measured on the unmodified tree: `connect` returned
+/// `Ok`, the latch was `None`, and `next_event` answered `None` in 795 µs.
+/// The connection-establishment phase now runs in `connect` itself, so that
+/// discriminant additionally carries the four transport classes
+/// [`reason_class::classify_reqwest_send_error`] can mint. None of them makes
+/// a `connection-failed` message transient (checked exhaustively by
+/// `no_stream_class_can_grant_a_new_retry`); `timeout` would, which is why the
+/// pre-header stall collapses to [`reason_class::CONNECT_FAILED`] instead.
 fn stream_deny_forbidden(ctx: &TalosContext, class: &'static str) -> wit_http_stream::Error {
     ctx.record_http_denial(class, reason_class::WIT_FORBIDDEN_HOST_HYPHENATED);
     wit_http_stream::Error::ForbiddenHost
@@ -42,6 +53,177 @@ fn stream_deny_rate_limited(ctx: &TalosContext, class: &'static str) -> wit_http
 // ============================================================================
 // HTTP Stream (SSE consumption)
 // ============================================================================
+
+impl TalosContext {
+    /// Latch the honest transport class for a failed SSE connection-ESTABLISHMENT
+    /// send, publish the operator diagnostic, and hand back the discriminant.
+    ///
+    /// Sibling of [`TalosContext::record_graphql_transport_outcome`], and a
+    /// named method for the same testing reason: the SSE transport path cannot
+    /// be reached from a hermetic test through the front door — every route to
+    /// it passes the SSRF gate, which is the point of the gate — so the
+    /// properties are proven by calling THIS function with a real
+    /// `reqwest::Error`, i.e. the same call with the same argument the
+    /// production site makes.
+    ///
+    /// `classify_reqwest_send_error` reads the SOURCE CHAIN only, never
+    /// reqwest's `Display` (which appends the full URL and its query string).
+    /// It can return exactly four tokens — `tls`, `connect-refused`,
+    /// `connect-failed`, `send-failed` — and NONE of them makes a
+    /// `connection-failed` message read transient, so this cannot grant a
+    /// retry that did not exist. It is `timeout` that would, and this function
+    /// can never mint it.
+    pub(crate) async fn record_stream_transport_outcome(
+        &mut self,
+        host: &str,
+        e: &reqwest::Error,
+    ) -> wit_http_stream::Error {
+        let class = reason_class::classify_reqwest_send_error(e);
+        // The sanitized raw detail is WORKER-LOG ONLY and never crosses the
+        // host→guest boundary: URL erased, DLP-redacted, IP/path-sanitized.
+        // Gated on the SAME per-execution `HOST_DIAG_CAP` the diagnostic
+        // channel spends — and the `emit_network_failure` below is what SPENDS
+        // it — so this is not a second, unbounded stream.
+        if self.host_diag_budget_remaining() {
+            tracing::warn!(
+                module_id = ?self.module_id,
+                host,
+                reason = class,
+                detail = %reason_class::sanitized_transport_detail(e),
+                "wit_http_stream::connect transport failure (sanitized transport detail)"
+            );
+        }
+        // Same attribution split as `host::http`'s send path, and it keys on
+        // `local_egress_only` — the posture this context's own client was
+        // BUILT with — never on `max_llm_tier == Tier1`, which disagrees with
+        // it in both directions since the `egress_scope` split.
+        if reason_class::is_local_egress_attributable(class, self.local_egress_only) {
+            self.emit_network_failure(
+                reason_class::TIER1_EGRESS,
+                reason_class::WIT_CONNECTION_FAILED,
+                &format!(
+                    "the SSE stream to '{host}' was blocked by this workflow's actor \
+                     (local-egress-only — data must not leave the host). To reach an \
+                     external endpoint, set the actor's egress_scope to 'public' \
+                     (set_actor_egress_scope) or bind a Tier-2 actor."
+                ),
+            )
+            .await;
+            return wit_http_stream::Error::ConnectionFailed;
+        }
+        // Fixed prose per class — never the reqwest string. `host` is safe to
+        // name: the module author declared it in `allowed_hosts`. The path,
+        // the query string and the resolved IP are not, and none appears here.
+        let prose = match class {
+            reason_class::TLS => "the TLS handshake failed (certificate or protocol)",
+            reason_class::CONNECT_REFUSED => "the peer refused the connection",
+            reason_class::CONNECT_FAILED => {
+                "the connection could not be established (unreachable or no route)"
+            }
+            _ => "the request failed after connecting (reset or protocol error)",
+        };
+        self.emit_network_failure(
+            class,
+            reason_class::WIT_CONNECTION_FAILED,
+            &format!("the SSE stream to '{host}' could not be opened: {prose}"),
+        )
+        .await;
+        wit_http_stream::Error::ConnectionFailed
+    }
+
+    /// The endpoint accepted the TCP/TLS connection and then never sent
+    /// response headers within the establishment budget.
+    ///
+    /// COLLAPSED to [`reason_class::CONNECT_FAILED`] rather than given the
+    /// honest [`reason_class::TIMEOUT`], and that is a deliberate, load-bearing
+    /// choice rather than sloppiness. `connection-failed` reads NON-transient
+    /// bare, and `runtime::is_transient_error_text` matches the bare substring
+    /// `timeout` — so a `[reason_class=timeout]` marker on this discriminant
+    /// would move the message from non-transient to TRANSIENT and newly grant
+    /// a retry to a surface that has never had one. That is the one direction
+    /// this workspace has already paid for, so the class stays inside the
+    /// non-transient set and the precise variant ("timed out before response
+    /// headers") is carried by the `[host:…]` diagnostic instead. Same
+    /// collapse-and-explain shape as [`reason_class::PRIVATE_IP`] and
+    /// [`reason_class::GRAPHQL_INTROSPECTION`].
+    ///
+    /// Deliberately does NOT consult `is_local_egress_attributable`: under
+    /// local-egress-only the resolver hands hyper an EMPTY address list, which
+    /// fails IMMEDIATELY as a connect error — it never stalls — so attributing
+    /// a stall to the egress gate would point the operator at the wrong knob.
+    pub(crate) async fn record_stream_connect_stall(
+        &mut self,
+        host: &str,
+        budget_secs: u64,
+    ) -> wit_http_stream::Error {
+        self.emit_network_failure(
+            reason_class::CONNECT_FAILED,
+            reason_class::WIT_CONNECTION_FAILED,
+            &format!(
+                "the SSE endpoint at '{host}' accepted the connection but sent no \
+                 response headers within {budget_secs}s, so the stream was abandoned"
+            ),
+        )
+        .await;
+        wit_http_stream::Error::ConnectionFailed
+    }
+
+    /// The endpoint answered the connect with a non-2xx status. No event can
+    /// ever arrive on such a stream, so `connect` refuses instead of handing
+    /// back a stream id that will only ever end.
+    ///
+    /// CLEARS the latch rather than stamping one. There is no honest token for
+    /// "the upstream said 404" in the closed [`reason_class::ALL`] set, and
+    /// minting one is not free: `talos_reason_class::Family` is deliberately
+    /// not `#[non_exhaustive]`, so a genuinely new remediation family forces
+    /// every controller-side classifier to be edited in the same change, and
+    /// mapping it onto an existing family would be a lie (an HTTP error status
+    /// is not a transport failure and not a policy denial). Clearing satisfies
+    /// #717's totality rule — every failing return DECIDES the latch — leaves
+    /// the guest with the correct non-transient bare `connection-failed`, and
+    /// still tells the operator the status through the diagnostic channel.
+    ///
+    /// The status is an integer parsed by the HTTP stack, not guest- or
+    /// upstream-authored text, so interpolating it obeys the sanitization
+    /// contract. It reaches `workflow_execution_logs`, never the node-failure
+    /// message the retry gates scan — which matters, because that gate matches
+    /// the bare substrings "429", "502", "503" and "504".
+    pub(crate) async fn record_stream_upstream_status(
+        &mut self,
+        host: &str,
+        status: u16,
+    ) -> wit_http_stream::Error {
+        self.record_network_outcome(None);
+        self.emit_host_diagnostic(
+            "sse-upstream-status",
+            &format!(
+                "the SSE endpoint at '{host}' answered the connect with HTTP {status} \
+                 instead of a 2xx, so no events can arrive on this stream"
+            ),
+        )
+        .await;
+        wit_http_stream::Error::ConnectionFailed
+    }
+
+    /// Turn an abnormal [`SseStreamEnd`] into ONE operator diagnostic.
+    ///
+    /// Called from `next_event` at the exact moment the guest observes the
+    /// stream ending, which is the only moment a `&mut self` exists — the
+    /// spawned reader has no context to emit from. The guest still sees plain
+    /// `None`, because `next-event -> option<sse-event>` has no error arm and
+    /// widening it would invalidate 75 catalog templates' checked-in
+    /// `bindings.rs`.
+    ///
+    /// NO reason class is latched. Nothing is returned to the guest here for a
+    /// class to explain, and a latch with no paired discriminant is precisely
+    /// the stale-marker hazard [`reason_class::Reason`] exists to prevent — it
+    /// would sit in the slot waiting to be stamped onto an unrelated later
+    /// failure on any surface sharing the token.
+    pub(crate) async fn report_stream_end(&mut self, end: crate::context::SseStreamEnd) {
+        let (reason, message) = end.describe();
+        self.emit_host_diagnostic(reason, message).await;
+    }
+}
 
 impl wit_http_stream::Host for TalosContext {
     async fn connect(
@@ -267,18 +449,6 @@ impl wit_http_stream::Host for TalosContext {
             ));
         }
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<crate::context::SseEventInternal>(1_000);
-        let stream_id = uuid::Uuid::new_v4().to_string();
-
-        {
-            let mut streams = self.streams.sse.lock().map_err(|_| {
-                // Host-internal fault; CLEAR (see the sibling guard above).
-                self.record_network_outcome(None);
-                wit_http_stream::Error::ConnectionFailed
-            })?;
-            streams.insert(stream_id.clone(), rx);
-        }
-
         // MCP-1105: cap caller-supplied header count. See
         // MAX_OUTBOUND_HEADERS doc-comment. SSE streams are long-lived
         // (kept open for the full execution timeout) so even one
@@ -309,7 +479,92 @@ impl wit_http_stream::Host for TalosContext {
             hdrs
         };
 
-        let client = self.http_client.clone();
+        // ── Connection establishment runs HERE, not in the spawned task ────
+        //
+        // This is the 2026-09 fix for the silent-connect-failure gap. Before
+        // it, everything below the `tokio::spawn` boundary — the send, the
+        // establishment timeout and the status check — failed with no path
+        // back to the guest: `connect` had already answered `Ok(stream_id)`,
+        // so the module saw a healthy stream that happened to carry no events
+        // and could not distinguish that from a quiet endpoint. It could not
+        // retry, report, or log what it never learned about.
+        //
+        // Awaiting here is what makes the failure KNOWABLE before a stream id
+        // is minted, which is the only shape the WIT permits: `connect` is
+        // `result<string, error>` and can carry `connection-failed`, while
+        // `next-event` is `option<sse-event>` and has no error arm at all.
+        //
+        // Two consequences, both accepted deliberately:
+        //   * `connect` now blocks for up to the establishment budget. It is
+        //     not new latency — pre-fix the guest blocked for exactly as long
+        //     inside its first `next_event`, then got `None` — but it does
+        //     SERIALISE the establishment of several streams that previously
+        //     raced. With MAX_SSE_STREAMS_PER_EXECUTION = 5 the pathological
+        //     all-stalling case is 5 × the budget. Truthfulness wins.
+        //   * `resolved_headers` (which may carry `vault://`-substituted
+        //     secrets) is consumed HERE and no longer moved into a long-lived
+        //     spawned task. Strictly less secret lifetime than before.
+        let mut req_builder = self
+            .http_client
+            .get(&url)
+            .header("Accept", "text/event-stream")
+            .header("Cache-Control", "no-cache");
+        for (k, v) in resolved_headers {
+            req_builder = req_builder.header(k, v);
+        }
+
+        // MCP-721 (2026-05-13): cap the initial connection-establishment
+        // phase at 30 s. Pre-fix `req_builder.send().await` had no timeout —
+        // if the SSE server stalled (never sent response headers) the task
+        // hung indefinitely. SSE legitimately needs long-lived BODIES, so
+        // ONLY establishment is bounded; the bytes_stream loop below stays
+        // unbounded (that is the point of streaming) and is policed instead by
+        // the cancellation flag.
+        const SSE_CONNECT_TIMEOUT_SECS: u64 = 30;
+        let response = match tokio::time::timeout(
+            std::time::Duration::from_secs(SSE_CONNECT_TIMEOUT_SECS),
+            req_builder.send(),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return Err(self.record_stream_transport_outcome(&host, &e).await),
+            Err(_) => {
+                return Err(self
+                    .record_stream_connect_stall(&host, SSE_CONNECT_TIMEOUT_SECS)
+                    .await)
+            }
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(self
+                .record_stream_upstream_status(&host, status.as_u16())
+                .await);
+        }
+
+        // ── Only now is a stream id minted and registered ─────────────────
+        //
+        // The registration used to sit ABOVE the header cap and the vault
+        // resolve, so either of those returning `Err` leaked a dead receiver
+        // into `streams.sse` that nothing ever removed. Measured on the
+        // unmodified tree: three connects with an unresolvable `vault://`
+        // header grew the map 1 → 2 → 3 while every call returned
+        // `forbidden-host`. MAX_SSE_STREAMS_PER_EXECUTION is 5, so a handful
+        // of FAILED connects permanently exhausted an execution's stream
+        // budget. Registering last makes the leak unreachable by
+        // construction rather than by remembering to clean up on each path.
+        let (tx, rx) = tokio::sync::mpsc::channel::<crate::context::SseChannelItem>(1_000);
+        let stream_id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut streams = self.streams.sse.lock().map_err(|_| {
+                // Host-internal fault; CLEAR (see the sibling guard above).
+                self.record_network_outcome(None);
+                wit_http_stream::Error::ConnectionFailed
+            })?;
+            streams.insert(stream_id.clone(), rx);
+        }
+
         let url_owned = url.clone();
         // Wasm-security review 2026-05-23 (M): clone the execution's
         // cancellation flag into the spawned task so it can exit
@@ -322,52 +577,24 @@ impl wit_http_stream::Host for TalosContext {
         let cancelled = self.cancelled.clone();
 
         tokio::spawn(async move {
-            let mut req_builder = client
-                .get(&url_owned)
-                .header("Accept", "text/event-stream")
-                .header("Cache-Control", "no-cache");
-            for (k, v) in &resolved_headers {
-                req_builder = req_builder.header(k.as_str(), v.as_str());
-            }
+            use crate::context::{SseChannelItem, SseStreamEnd};
 
-            // MCP-721 (2026-05-13): cap the initial connection-establishment
-            // phase at 30 s. Pre-fix `req_builder.send().await` had no
-            // timeout — if the SSE server stalled (never sent response
-            // headers), this spawned task hung indefinitely waiting. The
-            // guest's `cancel_stream` / `close` only signal via the `tx`/`rx`
-            // channel, which the task only checks on each `tx.send()` AFTER
-            // headers arrive — meaning a stall before headers leaks the
-            // task forever. SSE legitimately needs long-lived bodies, so
-            // ONLY the initial send is timed-out here; the bytes_stream
-            // loop below remains unbounded (intended for streaming).
-            const SSE_CONNECT_TIMEOUT_SECS: u64 = 30;
-            let response = match tokio::time::timeout(
-                std::time::Duration::from_secs(SSE_CONNECT_TIMEOUT_SECS),
-                req_builder.send(),
-            )
-            .await
-            {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, "SSE connection failed");
-                    return;
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        url = %url_owned,
-                        timeout_secs = SSE_CONNECT_TIMEOUT_SECS,
-                        "SSE connection timed out before response headers"
-                    );
-                    return;
-                }
-            };
-
-            if !response.status().is_success() {
-                tracing::warn!(
-                    status = response.status().as_u16(),
-                    "SSE endpoint returned error"
-                );
-                return;
+            // Why an abnormal ending is ANNOUNCED rather than just logged: a
+            // mid-stream reset, a byte-cap trip and a clean upstream close are
+            // all `next_event -> None` to the guest, and `option<sse-event>`
+            // cannot be widened without invalidating every catalog template's
+            // checked-in bindings. So the reader posts one terminal marker on
+            // the channel it already owns and `next_event` converts it into a
+            // single operator diagnostic. A CLEAN close posts nothing — it
+            // simply drops `tx` — so the signal means "this stream died", not
+            // "this stream finished".
+            //
+            // `try_send` on a full channel would drop the marker, and
+            // `send().await` is correct here: ordering after the last event is
+            // the whole point, and an `Err` just means the guest already
+            // stopped listening.
+            async fn announce(tx: &tokio::sync::mpsc::Sender<SseChannelItem>, end: SseStreamEnd) {
+                let _ = tx.send(SseChannelItem::End(end)).await;
             }
 
             // Parse SSE stream: accumulate lines, emit on blank lines.
@@ -417,18 +644,35 @@ impl wit_http_stream::Host for TalosContext {
                                 url = %url_owned,
                                 "SSE stream task observed execution cancellation — exiting"
                             );
+                            announce(&tx, SseStreamEnd::Cancelled).await;
                             return;
                         }
                         continue;
                     }
                 };
                 let chunk_result = match chunk_result {
+                    // Clean upstream close: the ONLY ending that announces
+                    // nothing, because it is the only one where an empty tail
+                    // is the honest answer.
                     Some(c) => c,
                     None => break,
                 };
                 let chunk = match chunk_result {
                     Ok(c) => c,
-                    Err(_) => break,
+                    Err(e) => {
+                        // Pre-2026-09 this was a bare `Err(_) => break` — the
+                        // ONE failure mode on this surface that logged nothing
+                        // ANYWHERE, host or guest. Bounded: it terminates the
+                        // loop, so at most one line per stream and at most
+                        // MAX_SSE_STREAMS_PER_EXECUTION per execution.
+                        tracing::warn!(
+                            url = %url_owned,
+                            detail = %reason_class::sanitized_transport_detail(&e),
+                            "SSE stream failed mid-body (sanitized transport detail)"
+                        );
+                        announce(&tx, SseStreamEnd::TransportError).await;
+                        return;
+                    }
                 };
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
 
@@ -439,6 +683,7 @@ impl wit_http_stream::Host for TalosContext {
                         actual_bytes = buffer.len(),
                         "SSE buffer exceeded max event size with no newline; aborting stream"
                     );
+                    announce(&tx, SseStreamEnd::EventBytesCap).await;
                     return;
                 }
 
@@ -454,7 +699,7 @@ impl wit_http_stream::Host for TalosContext {
                                 data: data_lines.join("\n"),
                                 id: event_id.take(),
                             };
-                            if tx.send(event).await.is_err() {
+                            if tx.send(SseChannelItem::Event(event)).await.is_err() {
                                 return; // Receiver dropped (close called)
                             }
                             data_lines.clear();
@@ -470,6 +715,7 @@ impl wit_http_stream::Host for TalosContext {
                                 accumulated_bytes = data_bytes,
                                 "SSE event data exceeded max size before blank-line boundary; aborting stream"
                             );
+                            announce(&tx, SseStreamEnd::EventBytesCap).await;
                             return;
                         }
                         data_lines.push(v);
@@ -493,20 +739,39 @@ impl wit_http_stream::Host for TalosContext {
             streams.remove(&stream_id)?
         };
 
-        let event = rx.recv().await;
+        let item = rx.recv().await;
 
-        // Put back if we got an event; if None (channel closed), stream is done.
-        if event.is_some() {
+        // Put back only if the stream can still produce events. A terminal
+        // marker and a closed channel are both ENDINGS, so neither is
+        // reinserted and a second call answers `None` from the map lookup.
+        if matches!(item, Some(crate::context::SseChannelItem::Event(_))) {
             if let Ok(mut streams) = self.streams.sse.lock() {
                 streams.insert(stream_id, rx);
             }
         }
 
-        event.map(|e| wit_http_stream::SseEvent {
-            event_type: e.event_type,
-            data: e.data,
-            id: e.id,
-        })
+        match item {
+            Some(crate::context::SseChannelItem::Event(e)) => Some(wit_http_stream::SseEvent {
+                event_type: e.event_type,
+                data: e.data,
+                id: e.id,
+            }),
+            // The stream died rather than finishing. The guest still gets a
+            // plain `None` — `next-event -> option<sse-event>` has no error
+            // arm and widening it would invalidate the checked-in
+            // `bindings.rs` of every catalog template — but the OPERATOR now
+            // gets one `[host:…]` line saying which of the four endings it
+            // was. Fires at most once per stream (the marker is the last item
+            // and the receiver is not reinserted) and spends the same
+            // `HOST_DIAG_CAP` budget as every other diagnostic.
+            Some(crate::context::SseChannelItem::End(end)) => {
+                self.report_stream_end(end).await;
+                None
+            }
+            // Sender dropped with no marker: a clean upstream close, or a
+            // `close()` that removed the receiver. Neither is a fault.
+            None => None,
+        }
     }
 
     async fn close(&mut self, stream_id: String) {

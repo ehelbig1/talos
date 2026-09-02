@@ -65,9 +65,16 @@
 //!   which no `forbiddenhost` arm matches. `forbidden-host` contains
 //!   "forbidden" and so classified `auth_failure` / `http_403`: non-transient,
 //!   but pointing the operator at a credential that was never the problem.
-//!   Its three `ConnectionFailed` sites are NOT transport failures (one
-//!   cancellation, two mutex-poison guards) — a `connect` transport failure
-//!   happens in a spawned task and never reaches the guest as an error at all.
+//!   At the time of that fix its three `ConnectionFailed` sites were NOT
+//!   transport failures (one cancellation, two mutex-poison guards), because a
+//!   `connect` transport failure happened in a spawned task and never reached
+//!   the guest as an error at all. **Closed 2026-09** — the
+//!   connection-establishment phase moved into `connect`, so that discriminant
+//!   now also carries the four [`classify_reqwest_send_error`] classes. It is
+//!   the one place a TRANSIENT-bucket token is latched on a NON-transient
+//!   discriminant, which is safe only because none of those four is a
+//!   substring the retry gate matches; `timeout` is, so the pre-header stall
+//!   collapses to [`CONNECT_FAILED`] instead of minting it.
 //!
 //! ## Totality, not clearing — and why
 //!
@@ -368,10 +375,25 @@ pub const WIT_FORBIDDEN_HOST_HYPHENATED: &str = "forbidden-host";
 pub const WIT_INVALID_URL_HYPHENATED: &str = "invalid-url";
 /// `wit_http_stream::Error::ConnectionFailed`.
 ///
-/// Despite the name, NONE of its three emitting sites is a transport failure:
-/// one is a cancellation and two are mutex-poison guards. A `connect`
-/// transport failure happens inside a spawned task and never reaches the guest
-/// as an error at all — the stream simply yields no events.
+/// The MIXED discriminant on this surface, and the only one where a
+/// transient-bucket class is legitimately paired with a non-transient
+/// discriminant:
+/// * deterministic sites — a cancellation and two mutex-poison guards (the
+///   latter CLEAR rather than latch), plus the upstream non-2xx refusal added
+///   2026-09, which also clears;
+/// * transport sites — the connection-establishment phase, which until 2026-09
+///   ran inside a spawned task where its failure had no path back to the guest
+///   at all (`connect` answered `Ok(stream_id)` and the stream then yielded
+///   nothing, so a module could not tell a dead connection from a quiet
+///   endpoint).
+///
+/// The pairing is what keeps that safe. `connection-failed` reads NON-transient
+/// bare and must STAY so: the four classes
+/// [`classify_reqwest_send_error`] can mint are all invisible to
+/// `runtime::is_transient_error_text`, but `timeout` is not — its bare
+/// substring is matched — which is why the pre-header stall collapses to
+/// [`CONNECT_FAILED`]. `no_stream_class_can_grant_a_new_retry` asserts the
+/// whole (class × discriminant) matrix rather than trusting the eye.
 pub const WIT_CONNECTION_FAILED: &str = "connection-failed";
 /// `wit_http_stream::Error::RateLimited`.
 pub const WIT_RATE_LIMITED: &str = "rate-limited";
