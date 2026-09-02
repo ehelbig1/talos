@@ -2535,6 +2535,10 @@ async fn handle_set_module_rate_limit(
     // (user_id IS NULL) — that row is shared, so its rate_limit affects every
     // tenant. A normal user is scoped to modules they own; an attempt against a
     // catalog module simply matches 0 rows → "not found or access denied".
+    // allow-benign-default: fail-CLOSED. `false` here DENIES the catalog-module
+    // write, so a database error costs the caller a refusal, never a privilege.
+    // This is the canonical correct shape check 74 exists to leave alone, and
+    // converting it would be a security regression in the loosening direction.
     let allow_catalog = state
         .actor_repo
         .is_platform_admin(user_id)
@@ -2586,11 +2590,45 @@ async fn handle_get_module_rate_limit(
         Err(resp) => return resp,
     };
 
-    let rpm = state
+    // `rate_limit_per_minute: null` is the operator-facing spelling of "this
+    // module is UNTHROTTLED". The pre-2026-09-02 `.unwrap_or(None)` produced
+    // that exact answer from a database error, so the one question this tool
+    // exists to answer — is there a ceiling on this module? — was answered
+    // "no ceiling" by an outage.
+    //
+    // `talos_measurement::Readings` is the house mechanism for this class, and
+    // it is deliberately NOT used here: this response has exactly ONE field, so
+    // a disclosure attached beside a nulled `rate_limit_per_minute` is an error
+    // wearing a report's clothes. The `Readings` doctrine's own escape hatch
+    // applies — when the failed read IS the response, refuse (the same call
+    // `handle_get_schedule_health` makes).
+    //
+    // KNOWN, PRE-EXISTING and deliberately not widened here: a successful
+    // `Ok(None)` still conflates "no such module / not yours" with "module
+    // exists, no limit set", because the repository returns `Option<i32>` for
+    // both. Separating those needs a repository signature change and is a
+    // different defect from the swallowed error.
+    let rpm = match state
         .module_repo
         .get_module_rate_limit(module_id, user_id)
         .await
-        .unwrap_or(None);
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(
+                module_id = %module_id,
+                error = %e,
+                "get_module_rate_limit: rate-limit read failed"
+            );
+            return mcp_error(
+                req_id,
+                -32000,
+                "Could not read this module's rate limit. A module with NO limit and a limit \
+                 that could not be read are not the same thing — retry rather than reading \
+                 this as unthrottled.",
+            );
+        }
+    };
 
     let result = serde_json::json!({
         "module_id": module_id.to_string(),

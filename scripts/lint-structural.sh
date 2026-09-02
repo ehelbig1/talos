@@ -6650,6 +6650,36 @@ echo
 #   system_health · health_dashboard · *_health · error_report ·
 #   daily_digest · risk_assessment · readiness · system_status
 #
+# GLOB WIDENING, 2026-09-02 — and read what it is before reusing it.
+# Seven more terms were added: budget · clone_actor · enqueue ·
+# plan_and_execute · workflow_triggers · module_rate_limit · suggest_retry.
+# Those are the
+# handlers repaired that day, so this widening is a REGRESSION GUARD for
+# the sites this change fixed, NOT a discovery mechanism for the next
+# ones. It is a snapshot, and a snapshot is not a gate (check 64) — which
+# is exactly why leg 74b exists and why the glob is NOT the answer to
+# "how do we cover the surface nobody has looked at yet".
+#
+# It was measured before it was written, in both directions. Against
+# `git archive HEAD` (the pre-fix tree) the widened terms report 15 real
+# sites: three in `handle_get_actor_budget`, three in `handle_clone_actor`,
+# five in `handle_list_workflow_triggers`, two in `handle_enqueue_workflow`,
+# two in `handle_plan_and_execute_workflow`, two in
+# `handle_suggest_retry_config`, plus `handle_get_module_rate_limit` —
+# every site the change repaired. Against
+# this tree they report exactly ONE, and it is the correct fail-CLOSED
+# `is_platform_admin(..).unwrap_or(false)` in
+# `handle_set_module_rate_limit`, now carrying the marker. So the widened
+# terms ship at ZERO with 15/16 = 93.75% precision, comparable to the
+# original glob's 96.7%.
+#
+# That one marker also widens what the OPT-OUT means, deliberately and
+# once. It previously read "a genuinely decorative read"; a fail-closed
+# authorization default is not decorative, it is conservative, and both
+# belong under the same rule: the marker is for a default that MAKES NO
+# FAVOURABLE CLAIM. Stretching the old wording to cover it silently would
+# have been the drift this file exists to catch, so the wording moved.
+#
 # MEASURED, not asserted. Against `git archive origin/main` (b2bfa0fd)
 # this check reports THIRTY sites across eight handlers, including all six
 # in `handle_get_system_health`. Against this tree it reports ONE, which
@@ -6669,15 +6699,75 @@ echo
 #      widened to the other 149 sites without the precision collapsing.
 #  (c) It proves the error is not swallowed, never that the replacement is
 #      good. `Readings::record` satisfies it; so would any other handling.
+# THE `.ok()` SPELLING, 2026-09-02. `.await.ok()` is the same defect in a
+# different word — `Result` to `Option`, error discarded, the caller then
+# reading `None` as an ordinary absent value — and the regex did not
+# mention it. It was found by MUTATION rather than by review: of seven
+# mutations of that day's six fixes, six were caught and exactly one
+# survived, `get_actor_budget`'s policy read reverted from a `match` to
+# `.ok().flatten()`. That is the highest-severity site in the whole set
+# (the SPEND CEILING, rendered `null`, which reads as "unlimited"), so the
+# one surviving mutation was on the one field that mattered most.
+#
+# Scope is what makes it cheap: `.ok()` is ubiquitous in Rust and means a
+# dozen things, but the intersection of "immediately after `.await`" and
+# "inside a check-74 handler" contained exactly TWO sites across
+# `talos-mcp-handlers/src` + `talos-api/src`. Both were genuine: the
+# policy read, and `handle_get_all_readiness_scores`'s population
+# aggregate, which disclosed its failure in `summary.population` prose
+# while the `Readings` ledger next to it stayed clean and therefore
+# rendered "complete: every field in this report was measured". Two
+# disclosures in one response, contradicting each other. Both are fixed,
+# so the extension ships at ZERO with no opt-out marker anywhere.
+#
+# `map_or` joined the same alternation in the same pass, for the opposite
+# reason: it closes evasion E5 (`.await.map_or(0, |v| v)`) and its
+# measured population in scope is ZERO on BOTH trees, so it costs nothing
+# and needs no marker. Do NOT read the alternation as closed — see limit
+# (e).
+#
+# THE NESTED-`fn` HOLE, closed 2026-09-02 and worth stating because the
+# check could never see its own worst case. Function attribution rebound on
+# ANY `fn` header, indented or not, so an inline helper stole the enclosing
+# handler's name for everything below it. `handle_get_actor_budget` defines
+# two `opt_or_unlimited_*` helpers mid-body, and the LLM-TOKEN-LEDGER read
+# under them — `sum_llm_tokens_last_24h(..).unwrap_or(0)`, the most
+# security-adjacent number in the handler — was filed under
+# `opt_or_unlimited_i64` and filtered out by the glob. Widening the glob
+# would not have helped; the site was invisible by construction. Rebinding
+# is now gated on indentation (same level or shallower), with a column-0
+# `}` resetting the tracker so a method inside an `impl` still starts a new
+# function rather than inheriting the last top-level `fn` above it. Proven
+# by probe in three directions: a read below an inline helper is attributed
+# to the handler and FIRES; a non-reporting sibling method inside an `impl`
+# does NOT inherit the health handler above it; a `*_readiness` sibling
+# method IS seen under its own name. Both legs carry the same rule.
+#
+#  (e) The default-spelling alternation is NOT a closed set, and adding
+#      to it must never be read as closing it. Three evasions were
+#      measured as SURVIVORS on 2026-09-02 and are left open on purpose:
+#      `match … { Err(_) => <default> }` (a block, not a chain — this is
+#      the shape TWO of the three original SLA defects took, and a grep
+#      cannot tell it from correct error handling), a default applied to
+#      an ALREADY-RESOLVED local one statement later, and any handling
+#      routed through a helper in another crate. What the check buys is
+#      that the ORDINARY spelling — the one every instance of this class
+#      has actually used — cannot come back silently.
+#  (d) A widened glob is a SNAPSHOT of the handlers someone has already
+#      looked at. It protects them from regressing; it says nothing about
+#      the next report surface. Only leg 74b's scope is derived from the
+#      code and therefore cannot rot.
 # Opt-out: `// allow-benign-default: <reason>` on the reported line or
-# within 8 lines above it — for a genuinely decorative read whose absence
-# makes no claim about system state.
+# within 8 lines above it — for a default that MAKES NO FAVOURABLE CLAIM.
+# Two shapes qualify: a genuinely decorative read whose absence claims
+# nothing about system state, and a fail-CLOSED default that costs the
+# caller a refusal rather than granting anything. Nothing else.
 bold "▶ check 74: health-reporting handlers must not swallow reads into benign defaults"
 BENIGN_DEFAULT_FAIL=0
 BENIGN_AWK="$(mktemp)"
 cat > "$BENIGN_AWK" <<'AWKEOF'
-BEGIN { fn = "?"; skipdepth = 0; intest = 0 }
-FNR == 1 { fn = "?"; intest = 0; pending = ""; pendingno = 0 }
+BEGIN { fn = "?"; fnindent = 0; skipdepth = 0; intest = 0 }
+FNR == 1 { fn = "?"; fnindent = 0; intest = 0; pending = ""; pendingno = 0 }
 {
     line = $0
     # Drop top-level `#[cfg(test)] mod ... { .. }` regions: a test helper may
@@ -6687,23 +6777,46 @@ FNR == 1 { fn = "?"; intest = 0; pending = ""; pendingno = 0 }
         if (line ~ /^\}/) { intest = 0 }
         next
     }
+    # A column-0 `}` closes a top-level item, so the next `fn` — at whatever
+    # indentation — starts a fresh function. Without this reset, a method inside
+    # an `impl` would inherit the name of the last top-level `fn` above it.
+    if (line ~ /^\}/) { fn = "?"; fnindent = 0 }
+    # A NESTED `fn` must not steal the enclosing handler's name. Measured
+    # 2026-09-02: `handle_get_actor_budget` defined two `opt_or_unlimited_*`
+    # helpers inline, and the `sum_llm_tokens_last_24h(..).unwrap_or(0)` BELOW
+    # them — the LLM-token ledger read, the most security-adjacent number in
+    # that handler — was attributed to `opt_or_unlimited_i64` and filtered out
+    # by the glob. The check could never have seen it, with or without the
+    # widening. Rebind only on a fn at the SAME indentation or shallower, so an
+    # inline helper leaves the handler's name in place while a sibling method
+    # inside an `impl` still starts a new function.
     if (match(line, /^[[:space:]]*(pub([[:space:]]*\([^)]*\))?[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/)) {
         hdr = substr(line, RSTART, RLENGTH)
+        indent = match(line, /[^[:space:]]/) - 1
         sub(/.*fn[[:space:]]+/, "", hdr)
-        fn = hdr
+        if (fn == "?" || indent <= fnindent) { fn = hdr; fnindent = indent }
     }
+    # `.ok()` joined the alternation 2026-09-02 — see "THE `.ok()` SPELLING" in
+    # this check's header. It is the same defect in a different word, and it was
+    # the ONLY spelling left standing when every other mutation of that day's
+    # six fixes was caught.
     # Same-line form.
-    if (line ~ /\.await[[:space:]]*\.unwrap_or(_default|_else)?[[:space:]]*\(/) {
+    if (line ~ /\.await[[:space:]]*\.(unwrap_or(_default|_else)?|ok|map_or)[[:space:]]*\(/) {
         report(FILENAME, FNR, fn, line)
     }
-    # Split form: previous line ended in `.await`, this one opens `.unwrap_or`.
-    if (pending != "" && line ~ /^[[:space:]]*\.unwrap_or(_default|_else)?[[:space:]]*\(/) {
+    # Split form: previous line ended in `.await`, this one opens the default.
+    if (pending != "" && line ~ /^[[:space:]]*\.(unwrap_or(_default|_else)?|ok|map_or)[[:space:]]*\(/) {
         report(FILENAME, pendingno, fn, line)
     }
     if (line ~ /\.await[[:space:]]*$/) { pending = line; pendingno = FNR } else { pending = "" }
 }
 function report(file, no, f, text) {
-    if (f !~ /(system_health|health_dashboard|_health|error_report|daily_digest|risk_assessment|readiness|system_status)/) return
+    # The second group (budget…module_rate_limit) was added 2026-09-02 as a
+    # REGRESSION GUARD for the six handlers fixed that day, NOT as a discovery
+    # mechanism. See "GLOB WIDENING" in this check's header for the measurement
+    # in both directions and for why that distinction is the whole
+    # justification.
+    if (f !~ /(system_health|health_dashboard|_health|error_report|daily_digest|risk_assessment|readiness|system_status|budget|clone_actor|enqueue|plan_and_execute|workflow_triggers|module_rate_limit|suggest_retry)/) return
     gsub(/^[[:space:]]+/, "", text)
     printf "%s:%d:%s:%s\n", file, no, f, text
 }
@@ -6810,16 +6923,20 @@ rm -f "$BENIGN_AWK"
 bold "▶ check 74b: a Readings ledger must cover every awaited read in its function"
 READINGS_AWK="$(mktemp)"
 cat > "$READINGS_AWK" <<'AWKEOF'
-BEGIN { intest = 0; has_readings = 0; nhits = 0; fn = "?" }
-FNR == 1 { flush(); intest = 0; pending = ""; FILE = FILENAME }
+BEGIN { intest = 0; has_readings = 0; nhits = 0; fn = "?"; fnindent = 0 }
+FNR == 1 { flush(); intest = 0; pending = ""; fn = "?"; fnindent = 0; FILE = FILENAME }
 {
     line = $0
     if (line ~ /^#\[cfg\(test\)\]/) { intest = 1; next }
     if (intest == 1) { if (line ~ /^\}/) { intest = 0 } ; next }
     if (match(line, /^[[:space:]]*(pub([[:space:]]*\([^)]*\))?[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/)) {
-        flush()
-        hdr = substr(line, RSTART, RLENGTH); sub(/.*fn[[:space:]]+/, "", hdr); fn = hdr
+        hdr = substr(line, RSTART, RLENGTH)
+        indent = match(line, /[^[:space:]]/) - 1
+        sub(/.*fn[[:space:]]+/, "", hdr)
+        # Same nested-fn rule as leg 74 — see the note there.
+        if (fn == "?" || indent <= fnindent) { flush(); fn = hdr; fnindent = indent }
     }
+    if (line ~ /^\}/) { flush(); fn = "?"; fnindent = 0 }
     if (line ~ /Readings::(new|default)\(\)/) { has_readings = 1 }
     if (line ~ /\.await[[:space:]]*\.unwrap_or(_default|_else)?[[:space:]]*\(/) { record(FNR, line) }
     if (pending != "" && line ~ /^[[:space:]]*\.unwrap_or(_default|_else)?[[:space:]]*\(/) { record(pendingno, line) }

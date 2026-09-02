@@ -2352,22 +2352,54 @@ async fn handle_list_workflow_triggers(
         Err(resp) => return resp,
     };
 
-    // Verify ownership
-    let wf = state
+    // Verify ownership.
+    //
+    // A FAILED read is not an absent workflow: collapsing both into
+    // `workflow_not_found_error` tells the operator their workflow does not
+    // exist, which is the one conclusion a database outage should never
+    // produce. (This site is inside a function that now builds a `Readings`,
+    // which is how structural lint 74b surfaced it. The ledger is the wrong
+    // instrument for a PRECONDITION — there is no report to disclose against if
+    // we cannot establish the workflow — so it refuses honestly instead.)
+    let wf = match state
         .analytics_repo
         .get_workflow_for_analytics(wf_id, user_id)
         .await
-        .unwrap_or(None);
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(
+                workflow_id = %wf_id,
+                error = %e,
+                "list_workflow_triggers: ownership read failed"
+            );
+            return mcp_error(
+                req_id,
+                -32000,
+                "Could not verify this workflow, so its triggers cannot be listed. This is a \
+                 database error, NOT a missing workflow — retry.",
+            );
+        }
+    };
     if wf.is_none() {
         return crate::utils::workflow_not_found_error(req_id);
     }
 
+    // This tool answers exactly one question — what can start this workflow? —
+    // and it answers it with three independent reads plus a derived
+    // `manual_only`. Every one of those reads defaulted to EMPTY before
+    // 2026-09-02, so a database outage produced `total_trigger_count: 0` and
+    // `manual_only: true`: a positive, confident claim that the workflow has NO
+    // automated trigger, for a workflow that may be firing on a cron every
+    // fifteen minutes. Route each read through the ledger so an empty list and
+    // an unreadable one are distinguishable.
+    let mut readings = talos_measurement::Readings::new();
+
     // 1. Schedules
-    let schedule_rows = state
-        .analytics_repo
-        .list_workflow_schedules(wf_id)
-        .await
-        .unwrap_or_default();
+    let schedule_rows = readings.record_rows(
+        "schedules",
+        state.analytics_repo.list_workflow_schedules(wf_id).await,
+    );
     // MCP-35 (2026-05-07): emit schedule_id + timezone +
     // last_triggered_at + next_trigger_at so callers chaining
     // list_workflow_triggers → get_schedule_health don't need a
@@ -2386,12 +2418,19 @@ async fn handle_list_workflow_triggers(
         })
         .collect();
 
-    // 2. Webhooks: find module_ids in graph, then look up webhook_triggers
-    let graph_json = state
-        .analytics_repo
-        .get_workflow_graph_json(wf_id, user_id)
-        .await
-        .unwrap_or(None);
+    // 2. Webhooks: find module_ids in graph, then look up webhook_triggers.
+    // The graph read is not decorative here — it is the ONLY source of the
+    // module ids the webhook lookup keys on, so losing it silently zeroes the
+    // whole webhook arm. Disclose it under the field it actually determines.
+    let graph_json = readings
+        .record(
+            "webhooks",
+            state
+                .analytics_repo
+                .get_workflow_graph_json(wf_id, user_id)
+                .await,
+        )
+        .flatten();
 
     let mut webhook_module_ids: Vec<uuid::Uuid> = Vec::new();
     if let Some(ref gj) = graph_json {
@@ -2413,11 +2452,13 @@ async fn handle_list_workflow_triggers(
     }
 
     let webhooks: Vec<serde_json::Value> = if !webhook_module_ids.is_empty() {
-        let webhook_rows = state
-            .analytics_repo
-            .list_webhooks_for_modules(&webhook_module_ids, wf_id)
-            .await
-            .unwrap_or_default();
+        let webhook_rows = readings.record_rows(
+            "webhooks",
+            state
+                .analytics_repo
+                .list_webhooks_for_modules(&webhook_module_ids, wf_id)
+                .await,
+        );
         webhook_rows
             .iter()
             .map(|r| {
@@ -2444,11 +2485,13 @@ async fn handle_list_workflow_triggers(
     // PostgreSQL stops after 20 hits, returning only the matching
     // {id, name} pairs (~5KB total).
     let wf_id_str = wf_id.to_string();
-    let parent_rows = state
-        .analytics_repo
-        .find_workflows_referencing_workflow_id(user_id, wf_id, &wf_id_str, 20)
-        .await
-        .unwrap_or_default();
+    let parent_rows = readings.record_rows(
+        "parent_workflows",
+        state
+            .analytics_repo
+            .find_workflows_referencing_workflow_id(user_id, wf_id, &wf_id_str, 20)
+            .await,
+    );
     let parent_workflows: Vec<serde_json::Value> = parent_rows
         .iter()
         .map(|(id, name)| {
@@ -2459,14 +2502,44 @@ async fn handle_list_workflow_triggers(
         })
         .collect();
 
-    let manual_only = schedules.is_empty() && webhooks.is_empty() && parent_workflows.is_empty();
+    let result = render_workflow_triggers(schedules, webhooks, parent_workflows, &mut readings);
 
-    // MCP-83 (2026-05-07): emit per-array counts + a derived
-    // total_trigger_count so callers can answer "is this workflow
-    // trigger-only / manual / multi-source" from one object lookup.
-    // manual_only is preserved as a derived flag (and remains
-    // consistent with total_trigger_count == 0 by definition).
-    let result = serde_json::json!({
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&result).unwrap_or_default(),
+    )
+}
+
+/// Pure renderer for `list_workflow_triggers`, so the "is this workflow
+/// manual-only?" verdict is testable without Postgres.
+///
+/// MCP-83 (2026-05-07): emit per-array counts + a derived `total_trigger_count`
+/// so callers can answer "is this workflow trigger-only / manual / multi-source"
+/// from one object lookup.
+///
+/// 2026-09-02: `manual_only` is a VERDICT over three independently-failable
+/// reads, so it is only emitted when all three succeeded. `false` would
+/// under-claim harmlessly, but `true` — the value a total outage produced — is
+/// the one an operator acts on ("nothing runs this on its own, safe to leave
+/// it"). A verdict computed from an input nobody could read is not a verdict;
+/// it is `null`, named under `measurement.not_measured`. `total_trigger_count`
+/// survives as a LOWER BOUND, flagged as such, because a partial answer to
+/// "what triggers this" is still worth having as long as it says it is partial.
+pub(crate) fn render_workflow_triggers(
+    schedules: Vec<serde_json::Value>,
+    webhooks: Vec<serde_json::Value>,
+    parent_workflows: Vec<serde_json::Value>,
+    readings: &mut talos_measurement::Readings,
+) -> serde_json::Value {
+    let degraded = !readings.complete();
+    let manual_only = if degraded {
+        readings.mark_derived("manual_only");
+        None
+    } else {
+        Some(schedules.is_empty() && webhooks.is_empty() && parent_workflows.is_empty())
+    };
+
+    let mut result = serde_json::json!({
         "schedule_count": schedules.len(),
         "webhook_count": webhooks.len(),
         "parent_workflow_count": parent_workflows.len(),
@@ -2476,11 +2549,11 @@ async fn handle_list_workflow_triggers(
         "parent_workflows": parent_workflows,
         "manual_only": manual_only,
     });
-
-    mcp_text(
-        req_id,
-        &serde_json::to_string_pretty(&result).unwrap_or_default(),
-    )
+    if degraded {
+        result["total_trigger_count_is_a_lower_bound"] = serde_json::json!(true);
+    }
+    readings.attach(&mut result);
+    result
 }
 
 async fn handle_get_workflow_call_tree(
@@ -3604,11 +3677,27 @@ async fn handle_suggest_retry_config(
         // ownership gate, exactly the field we need). Big perf win
         // on a path operators hit when asking "what retry config
         // should I use for this fresh workflow".
-        let graph_str = state
+        //
+        // 2026-09-02: this read used to `.unwrap_or(None)` while the execution-
+        // history read three dozen lines above already carried
+        // `history_read_failed` for the SAME reason and cited check 74 for it.
+        // One read in a function got the treatment and its sibling did not, so
+        // a failed graph read still rendered `detected_module_types` as four
+        // confident `false`s — presented as DETECTION RESULTS, and used as the
+        // stated basis of the recommendation. Same flag, same vocabulary.
+        let graph_read = state
             .workflow_repo
             .get_workflow_graph_for_similarity(wf_id, user_id)
-            .await
-            .unwrap_or(None);
+            .await;
+        let module_types_read_failed = graph_read.is_err();
+        if let Err(ref e) = graph_read {
+            tracing::error!(
+                %wf_id,
+                error = %e,
+                "suggest_retry_config: workflow graph read failed — module types unknown"
+            );
+        }
+        let graph_str = graph_read.unwrap_or(None);
 
         let module_ids: Vec<uuid::Uuid> = graph_str
             .as_deref()
@@ -3623,11 +3712,24 @@ async fn handle_suggest_retry_config(
             })
             .collect();
 
-        let module_names = state
+        // The SECOND read behind `detected_module_types`, and the same defect
+        // one step downstream: an empty name set makes all four flags `false`
+        // exactly as an unread graph does. Fixing only the graph read would
+        // have left the identical lie reachable by a different query failing —
+        // which is the shape of the whole population this change is about.
+        let names_read = state
             .analytics_repo
             .list_module_and_template_names(&module_ids)
-            .await
-            .unwrap_or_default();
+            .await;
+        if let Err(ref e) = names_read {
+            tracing::error!(
+                %wf_id,
+                error = %e,
+                "suggest_retry_config: module-name read failed — module types unknown"
+            );
+        }
+        let module_types_read_failed = module_types_read_failed || names_read.is_err();
+        let module_names = names_read.unwrap_or_default();
         let name_lower_set: Vec<String> =
             module_names.iter().map(|m| m.name.to_lowercase()).collect();
 
@@ -3685,7 +3787,12 @@ async fn handle_suggest_retry_config(
             &serde_json::to_string_pretty(&serde_json::json!({
                 "workflow_id": wf_id.to_string(),
                 "basis": "module_type_defaults",
-                "note": if history_read_failed {
+                "note": if module_types_read_failed {
+                    "The workflow-graph read FAILED, so the module types behind this \
+                     recommendation are UNKNOWN — `detected_module_types` is null, not four \
+                     `false`s. These are the generic fallback defaults. Re-run once the graph \
+                     query succeeds."
+                } else if history_read_failed {
                     "The execution-history read FAILED — this is NOT a statement that the \
                      workflow has no history. These are module-type-based defaults. Re-run once \
                      the history query succeeds."
@@ -3695,11 +3802,20 @@ async fn handle_suggest_retry_config(
                      few executions for a calibrated suggestion."
                 },
                 "history_read_failed": history_read_failed,
-                "detected_module_types": {
-                    "llm": has_llm,
-                    "http": has_http,
-                    "database": has_db,
-                    "queue": has_queue,
+                "module_types_read_failed": module_types_read_failed,
+                // Four `false`s from an unread graph are not a detection
+                // result; they are the absence of one, and they are what the
+                // module-type defaults below were derived from. Null the
+                // detection and say the derivation inherited it.
+                "detected_module_types": if module_types_read_failed {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!({
+                        "llm": has_llm,
+                        "http": has_http,
+                        "database": has_db,
+                        "queue": has_queue,
+                    })
                 },
                 "suggested_retry_count": bounded_retry_count,
                 "unbounded_module_type_retry_count": suggested_retry_count,
@@ -7218,11 +7334,24 @@ async fn handle_get_all_readiness_scores(
     // falling average, and `below_50_count` saturates at exactly 50 forever.
     // The `workflows` array below is unchanged — a "worst 50, fix these first"
     // list is what that query is genuinely good for.
-    let population = state
-        .analytics_repo
-        .readiness_population(user_id, filter_ids.as_deref(), max_score, include_archived)
-        .await
-        .ok();
+    // 2026-09-02: this read was `.ok()`, so `summary.population` disclosed the
+    // failure in prose while the `Readings` ledger beside it stayed CLEAN — and
+    // a clean ledger renders "complete: every field in this report was
+    // measured". The disclosure and the ledger contradicted each other in the
+    // same response. Record it so the two agree.
+    let population = readings.record(
+        "summary",
+        state
+            .analytics_repo
+            .readiness_population(user_id, filter_ids.as_deref(), max_score, include_archived)
+            .await,
+    );
+    if population.is_none() {
+        // `total` below falls back to the PAGE length, which is a real number
+        // computed from an unmeasured population — exactly what `mark_derived`
+        // is for. Nulling it would break every caller that paginates on it.
+        readings.mark_derived("total");
+    }
 
     let page_len = i64::try_from(workflows.len()).unwrap_or(i64::MAX);
     // `total` keeps meaning what its name says. When the population query
@@ -8869,5 +8998,89 @@ mod error_report_cap_disclosure_tests {
         let cov = Coverage::new(NODE_FAILURE_BREAKDOWN_CAP, NODE_FAILURE_BREAKDOWN_CAP);
         assert!(cov.truncated());
         assert!(cov.note().contains("20"), "{}", cov.note());
+    }
+}
+
+/// Disclosure semantics for `list_workflow_triggers`.
+///
+/// Drives the REAL `render_workflow_triggers`. The verdict under test is
+/// `manual_only`, which is the field an operator acts on ("nothing runs this on
+/// its own") and the one a total database outage used to assert.
+#[cfg(test)]
+mod trigger_completeness_disclosure_tests {
+    use super::render_workflow_triggers;
+    use talos_measurement::Readings;
+
+    fn one(kind: &str) -> Vec<serde_json::Value> {
+        vec![serde_json::json!({ "kind": kind })]
+    }
+
+    #[test]
+    fn a_genuinely_untriggered_workflow_still_says_manual_only() {
+        let mut readings = Readings::new();
+        let out = render_workflow_triggers(vec![], vec![], vec![], &mut readings);
+        assert_eq!(out["manual_only"], true);
+        assert_eq!(out["total_trigger_count"], 0);
+        assert!(
+            out.get("measurement").is_none(),
+            "a clean run must stay byte-identical to the pre-disclosure response: {out}"
+        );
+        assert!(out.get("total_trigger_count_is_a_lower_bound").is_none());
+    }
+
+    #[test]
+    fn a_triggered_workflow_reads_the_same_as_before() {
+        let mut readings = Readings::new();
+        let out = render_workflow_triggers(one("schedule"), one("webhook"), vec![], &mut readings);
+        assert_eq!(out["manual_only"], false);
+        assert_eq!(out["total_trigger_count"], 2);
+        assert_eq!(out["schedule_count"], 1);
+        assert_eq!(out["webhook_count"], 1);
+        assert!(out.get("measurement").is_none());
+    }
+
+    #[test]
+    fn an_unreadable_arm_withholds_the_verdict_rather_than_asserting_manual_only() {
+        let mut readings = Readings::new();
+        let schedules =
+            readings.record_rows("schedules", Err::<Vec<serde_json::Value>, _>("db down"));
+        let out = render_workflow_triggers(schedules, vec![], vec![], &mut readings);
+
+        assert!(
+            out["manual_only"].is_null(),
+            "`manual_only: true` from an outage is the claim this change exists to \
+             remove; got {}",
+            out["manual_only"]
+        );
+        assert_ne!(out["manual_only"], true);
+        assert_eq!(out["total_trigger_count_is_a_lower_bound"], true);
+        let disclosed = out["measurement"]["not_measured"].as_array().unwrap();
+        assert!(disclosed.iter().any(|f| f == "schedules"));
+        assert!(disclosed.iter().any(|f| f == "manual_only"));
+    }
+
+    #[test]
+    fn a_lost_arm_does_not_erase_the_arms_that_were_read() {
+        // Partial is still useful — as long as it says it is partial.
+        let mut readings = Readings::new();
+        let webhooks =
+            readings.record_rows("webhooks", Err::<Vec<serde_json::Value>, _>("db down"));
+        let out = render_workflow_triggers(one("schedule"), webhooks, vec![], &mut readings);
+        assert_eq!(out["schedule_count"], 1);
+        assert_eq!(out["total_trigger_count"], 1);
+        assert_eq!(out["total_trigger_count_is_a_lower_bound"], true);
+        assert!(out["manual_only"].is_null());
+    }
+
+    #[test]
+    fn the_verdict_is_withheld_even_when_the_arms_that_were_read_are_non_empty() {
+        // `manual_only: false` would be harmlessly true here, but withholding is
+        // the rule: a verdict over an unmeasured population is not a verdict, and
+        // a rule with an exception is a rule nobody applies consistently.
+        let mut readings = Readings::new();
+        let parents =
+            readings.record_rows("parent_workflows", Err::<Vec<serde_json::Value>, _>("x"));
+        let out = render_workflow_triggers(one("schedule"), vec![], parents, &mut readings);
+        assert!(out["manual_only"].is_null());
     }
 }

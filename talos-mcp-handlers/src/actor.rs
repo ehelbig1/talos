@@ -2908,46 +2908,122 @@ async fn handle_get_actor_budget(
         Err(e) => return e,
     };
 
-    let policy = state
-        .actor_repo
-        .get_actor_budget_policy(actor_id)
-        .await
-        .ok()
-        .flatten();
-    let execs_last_hour = state
-        .actor_repo
-        .count_executions_last_hour(actor_id)
-        .await
-        .unwrap_or(0);
-    let workflow_count = state
-        .actor_repo
-        .count_active_workflows_for_actor(actor_id)
-        .await
-        .unwrap_or(0);
-    let trend_rows = state
-        .actor_repo
-        .get_execution_trend_7d(actor_id)
-        .await
-        .unwrap_or_default();
+    // MCP-366 (2026-05-11) fail-CLOSED the `.unwrap_or(0)` on
+    // `count_executions_last_hour` and `sum_llm_tokens_last_24h` in the budget
+    // ENFORCEMENT path (`talos_actor_repository::budget_precheck`), where a
+    // defaulted `0` let an actor at its cap keep firing through a Postgres
+    // hiccup. The PATH was fixed; the POPULATION was not. This handler — the
+    // tool that REPORTS the same budget, read by the same operator, backed by
+    // the same three repository methods — kept every default until 2026-09-02.
+    //
+    // What it published on a total DB outage was, byte for byte, what it
+    // publishes for a brand-new actor with no policy and no activity:
+    // `policy: null`, `executions_last_hour: 0`, `active_workflow_count: 0`,
+    // `llm_tokens_last_24h: 0`, and a seven-day trend of zeros. Every one of
+    // those points the same way — no ceiling, no consumption, nothing to worry
+    // about — and `policy: null` in particular reads as UNLIMITED.
+    //
+    // Note also that the GraphQL twin of this data (`talos-api`'s `llmUsage`
+    // resolver) already `?`-propagated both reads it shares with this handler,
+    // so the same question answered over two protocols gave an error on one and
+    // a confident zero on the other.
+    let mut readings = talos_measurement::Readings::new();
 
-    let day_counts: std::collections::HashMap<String, i64> = trend_rows
-        .into_iter()
-        .map(|(d, n)| (d.format("%Y-%m-%d").to_string(), n))
-        .collect();
+    // The POLICY is a PRECONDITION, not a field. `load_actor_budget`'s own doc
+    // says it "returns `Err` only on genuine DB failure so callers can
+    // distinguish 'no policy' from 'fetch failed'" — a distinction `.ok()
+    // .flatten()` threw away. There is no honest way to render usage against a
+    // ceiling nobody could read, and rendering `null` there is the one lie an
+    // operator acts on. Refuse, the way `handle_get_schedule_health` does.
+    let policy = match state.actor_repo.get_actor_budget_policy(actor_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(
+                actor_id = %actor_id,
+                error = %e,
+                "get_actor_budget: budget policy read failed; refusing to report a ceiling"
+            );
+            return mcp_error(
+                req_id,
+                -32000,
+                "Could not read this actor's budget policy, so no ceiling and no headroom can \
+                 be reported. An actor with NO budget and an actor whose budget could not be \
+                 read are not the same thing — retry rather than reading this as 'unlimited'.",
+            );
+        }
+    };
 
-    let fuel_trend_7d: Vec<serde_json::Value> = (0..7)
-        .map(|i| {
-            let day = (chrono::Utc::now() - chrono::Duration::days(i))
-                .format("%Y-%m-%d")
-                .to_string();
-            let execs = day_counts.get(&day).copied().unwrap_or(0);
-            serde_json::json!({
-                "date": day,
-                "executions": execs,
-            })
-        })
-        .collect();
+    // The three usage counters are independent: one failing does not invalidate
+    // the others, so each is nulled and named rather than collapsing the whole
+    // report. `Readings::record` logs the sqlx error server-side (it can embed
+    // the failing SQL, and a connection error the DSN) and puts only the FIELD
+    // NAME in the response.
+    let usage = ActorBudgetUsage {
+        executions_last_hour: readings.record(
+            "current_usage.executions_last_hour",
+            state.actor_repo.count_executions_last_hour(actor_id).await,
+        ),
+        active_workflow_count: readings.record(
+            "current_usage.active_workflow_count",
+            state
+                .actor_repo
+                .count_active_workflows_for_actor(actor_id)
+                .await,
+        ),
+        // R2 token ledger: current trailing-24h consumption alongside the
+        // ceiling so operators can see headroom in one call.
+        llm_tokens_last_24h: readings.record(
+            "current_usage.llm_tokens_last_24h",
+            state.actor_repo.sum_llm_tokens_last_24h(actor_id).await,
+        ),
+    };
 
+    let trend = readings.record(
+        "execution_trend_7d",
+        state.actor_repo.get_execution_trend_7d(actor_id).await,
+    );
+
+    let payload = render_actor_budget(
+        actor_id,
+        policy.as_ref(),
+        &usage,
+        trend.as_deref(),
+        chrono::Utc::now(),
+        &readings,
+    );
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&payload).unwrap_or_default(),
+    )
+}
+
+/// The three rolling-window counters `get_actor_budget` reports.
+///
+/// Each is `Option` because each is independently measurable and independently
+/// failable. `None` means NOBODY COULD LOOK — it never means zero. The whole
+/// point of the type is that you cannot construct one of these from a
+/// `.unwrap_or(0)` without noticing you did.
+pub(crate) struct ActorBudgetUsage {
+    pub executions_last_hour: Option<i64>,
+    pub active_workflow_count: Option<i64>,
+    pub llm_tokens_last_24h: Option<i64>,
+}
+
+/// Pure renderer for `get_actor_budget`, so the disclosure semantics are
+/// testable without Postgres. Every input is already resolved; this function
+/// performs no I/O and takes no defaults of its own.
+///
+/// A healthy read is byte-identical to the pre-disclosure response: the three
+/// counters serialize as numbers, the trend as the same seven-element array,
+/// and `Readings::attach` adds nothing when the ledger is clean.
+pub(crate) fn render_actor_budget(
+    actor_id: Uuid,
+    policy: Option<&talos_actor_repository::ActorBudgetPolicy>,
+    usage: &ActorBudgetUsage,
+    trend: Option<&[(chrono::NaiveDate, i64)]>,
+    now: chrono::DateTime<chrono::Utc>,
+    readings: &talos_measurement::Readings,
+) -> serde_json::Value {
     fn opt_or_unlimited_i32(v: Option<i32>) -> serde_json::Value {
         match v {
             Some(n) => serde_json::json!(n),
@@ -2960,7 +3036,7 @@ async fn handle_get_actor_budget(
             None => serde_json::json!("unlimited"),
         }
     }
-    let policy_json = policy.as_ref().map(|p| {
+    let policy_json = policy.map(|p| {
         serde_json::json!({
             "max_executions_per_hour":      opt_or_unlimited_i32(p.max_executions_per_hour),
             "max_executions_total":         opt_or_unlimited_i64(p.max_executions_total),
@@ -2975,28 +3051,45 @@ async fn handle_get_actor_budget(
         })
     });
 
-    // R2 token ledger: current trailing-24h consumption alongside the
-    // ceiling so operators can see headroom in one call.
-    let llm_tokens_last_24h = state
-        .actor_repo
-        .sum_llm_tokens_last_24h(actor_id)
-        .await
-        .unwrap_or(0);
+    let trend_json = match trend {
+        Some(rows) => {
+            let day_counts: std::collections::HashMap<String, i64> = rows
+                .iter()
+                .map(|(d, n)| (d.format("%Y-%m-%d").to_string(), *n))
+                .collect();
+            let days: Vec<serde_json::Value> = (0..7)
+                .map(|i| {
+                    let day = (now - chrono::Duration::days(i))
+                        .format("%Y-%m-%d")
+                        .to_string();
+                    // Legitimately zero: the query SUCCEEDED and returned no row
+                    // for this day, which means no executions on it. This is the
+                    // one `unwrap_or(0)` in the handler that is a real
+                    // measurement rather than a substitute for one.
+                    let execs = day_counts.get(&day).copied().unwrap_or(0);
+                    serde_json::json!({ "date": day, "executions": execs })
+                })
+                .collect();
+            serde_json::Value::Array(days)
+        }
+        // Seven days of `executions: 0` drawn from a failed query is a
+        // FABRICATED flat trend — the shape an operator reads as "this actor is
+        // idle". Emit null and let the disclosure name it.
+        None => serde_json::Value::Null,
+    };
 
-    mcp_text(
-        req_id,
-        &serde_json::to_string_pretty(&serde_json::json!({
-            "actor_id": actor_id,
-            "policy": policy_json,
-            "current_usage": {
-                "executions_last_hour": execs_last_hour,
-                "active_workflow_count": workflow_count,
-                "llm_tokens_last_24h": llm_tokens_last_24h,
-            },
-            "execution_trend_7d": fuel_trend_7d,
-        }))
-        .unwrap_or_default(),
-    )
+    let mut out = serde_json::json!({
+        "actor_id": actor_id,
+        "policy": policy_json,
+        "current_usage": {
+            "executions_last_hour": usage.executions_last_hour,
+            "active_workflow_count": usage.active_workflow_count,
+            "llm_tokens_last_24h": usage.llm_tokens_last_24h,
+        },
+        "execution_trend_7d": trend_json,
+    });
+    readings.attach(&mut out);
+    out
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -5143,6 +5236,10 @@ async fn handle_clone_actor(
     // collision before inserting. Same atomic pattern as
     // create_actor's insert_actor_with_limit_check.
     const MAX_ACTORS_PER_USER: i64 = 1000;
+    /// Upper bound on the post-clone embedding backfill. Also the cap used when
+    /// the copied-row count is UNKNOWN, so an unmeasurable clone still gets a
+    /// bounded backfill rather than none at all.
+    const MAX_CLONE_BACKFILL_ROWS: i64 = 10_000;
 
     let new_actor_id = Uuid::new_v4();
     let rows = match state
@@ -5184,17 +5281,37 @@ async fn handle_clone_actor(
     }
 
     // Copy budget + approval policies + memories from source actor.
-    let budget_copied = state
-        .actor_repo
-        .copy_budget_policy(new_actor_id, source_actor_id)
-        .await
-        .unwrap_or(false);
-    let policies_copied = state
-        .actor_repo
-        .copy_approval_policies(new_actor_id, source_actor_id)
-        .await
-        .unwrap_or(0);
-    if policies_copied > 0 {
+    //
+    // The actor row is already committed by this point, so a failure here
+    // cannot be rolled back — it produces a PARTIALLY cloned actor. The
+    // pre-2026-09-02 defaults reported that partial actor as a complete one:
+    // `budget_copied: false` / `approval_policies_copied: 0` are exactly what a
+    // source actor with no budget and no policies produces, and the response's
+    // own `next_steps` then told the operator to "Review the cloned budget" —
+    // which would show nothing and confirm the wrong story. A clone that
+    // silently drops the source's SPEND CEILING and its APPROVAL GATES is a
+    // governance regression, not a cosmetic one.
+    let mut readings = talos_measurement::Readings::new();
+
+    let budget_copied = readings.record(
+        "budget_copied",
+        state
+            .actor_repo
+            .copy_budget_policy(new_actor_id, source_actor_id)
+            .await,
+    );
+    let policies_copied = readings.record(
+        "approval_policies_copied",
+        state
+            .actor_repo
+            .copy_approval_policies(new_actor_id, source_actor_id)
+            .await,
+    );
+    // Invalidate on UNKNOWN as well as on a positive count. A failed bulk
+    // INSERT may still have committed rows before erroring, and a cache
+    // invalidation costs one miss — treating "we could not tell" as "definitely
+    // zero" is the assumption this whole change exists to remove.
+    if policies_copied != Some(0) {
         // The destination actor just gained new policies via the bulk
         // INSERT — invalidate its policy cache so the next evaluation
         // picks them up instead of waiting out the TTL.
@@ -5204,24 +5321,32 @@ async fn handle_clone_actor(
     // Semantic + episodic memories only (working/scratchpad excluded — ephemeral).
     // Embedding is intentionally not copied; the post-clone backfill task
     // regenerates them downstream.
-    let memories_copied = state
-        .actor_repo
-        .clone_actor_memories(user_id, new_actor_id, source_actor_id)
-        .await
-        .unwrap_or(0);
+    let memories_copied = readings.record(
+        "memories_copied",
+        state
+            .actor_repo
+            .clone_actor_memories(user_id, new_actor_id, source_actor_id)
+            .await,
+    );
 
     // The bulk COPY above preserves content but skips embedding
     // computation, so cloned memories would be invisible to semantic
     // recall until the nightly backfill runs. Fire a targeted backfill
     // now on a detached task — it's best-effort and must not block the
     // clone response.
-    if memories_copied > 0 {
+    //
+    // Same rule as the policy-cache invalidation above: an UNKNOWN count runs
+    // the backfill (bounded at the cap), because a swallowed error previously
+    // skipped it outright and left any rows that DID land permanently invisible
+    // to semantic recall.
+    if memories_copied != Some(0) {
+        let backfill_cap = memories_copied.unwrap_or(MAX_CLONE_BACKFILL_ROWS);
         let pool = state.db_pool.clone();
         tokio::spawn(async move {
             if let Err(e) = talos_actor_memory_service::backfill_embeddings_for_actor(
                 &pool,
                 new_actor_id,
-                memories_copied.min(10_000),
+                backfill_cap.min(MAX_CLONE_BACKFILL_ROWS),
             )
             .await
             {
@@ -5246,9 +5371,11 @@ async fn handle_clone_actor(
         ),
     );
 
-    mcp_text(
-        req_id,
-        &serde_json::to_string_pretty(&serde_json::json!({
+    // `budget_copied` / `approval_policies_copied` / `memories_copied` are
+    // `Option` here: `null` means the copy could not be measured, and the
+    // `measurement` block `attach` adds names exactly which. `false` and `0`
+    // now mean only what they say — the source had nothing to copy.
+    let mut result = serde_json::json!({
             "actor_id": new_actor_id,
             "name": new_name,
             "status": "active",
@@ -5265,8 +5392,11 @@ async fn handle_clone_actor(
                 format!("Review the cloned budget with get_actor_budget(actor_id: '{}')", new_actor_id),
                 format!("Review the cloned approval policies with list_actor_approval_policies(actor_id: '{}')", new_actor_id),
             ]
-        }))
-        .unwrap_or_default(),
+    });
+    readings.attach(&mut result);
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&result).unwrap_or_default(),
     )
 }
 
@@ -6583,4 +6713,187 @@ async fn handle_get_few_shot_examples(
         }))
         .unwrap_or_default(),
     )
+}
+
+/// Disclosure semantics for `get_actor_budget`.
+///
+/// These drive the REAL `render_actor_budget` — the same function the handler
+/// calls — because the defect this file's history is full of is a report that
+/// looks right while the wiring behind it is wrong. A test that reimplemented
+/// the rendering would have passed on every day the bug was live.
+#[cfg(test)]
+mod actor_budget_disclosure_tests {
+    use super::{render_actor_budget, ActorBudgetUsage};
+    use talos_actor_repository::ActorBudgetPolicy;
+    use talos_measurement::Readings;
+
+    fn a_policy() -> ActorBudgetPolicy {
+        ActorBudgetPolicy {
+            max_executions_per_hour: Some(100),
+            max_executions_total: None,
+            max_fuel_per_execution: None,
+            max_fuel_per_hour: None,
+            max_outbound_requests_per_hour: None,
+            max_workflow_count: Some(5),
+            max_workflows_per_minute: 3,
+            max_compilations_per_hour: 2,
+            on_budget_exceeded: "block".to_string(),
+            max_llm_tokens_per_day: Some(50_000),
+        }
+    }
+
+    fn measured() -> ActorBudgetUsage {
+        ActorBudgetUsage {
+            executions_last_hour: Some(7),
+            active_workflow_count: Some(2),
+            llm_tokens_last_24h: Some(1234),
+        }
+    }
+
+    fn at() -> chrono::DateTime<chrono::Utc> {
+        "2026-09-02T12:00:00Z".parse().unwrap()
+    }
+
+    fn trend() -> Vec<(chrono::NaiveDate, i64)> {
+        vec![("2026-09-02".parse().unwrap(), 7)]
+    }
+
+    #[test]
+    fn a_healthy_report_carries_no_disclosure_at_all() {
+        let out = render_actor_budget(
+            uuid::Uuid::nil(),
+            Some(&a_policy()),
+            &measured(),
+            Some(&trend()),
+            at(),
+            &Readings::new(),
+        );
+        assert!(
+            out.get("measurement").is_none(),
+            "a clean run must stay byte-identical to the pre-disclosure response: {out}"
+        );
+        assert_eq!(out["current_usage"]["executions_last_hour"], 7);
+        assert_eq!(out["current_usage"]["llm_tokens_last_24h"], 1234);
+        assert_eq!(out["execution_trend_7d"].as_array().unwrap().len(), 7);
+    }
+
+    #[test]
+    fn an_unmeasurable_counter_is_null_and_named_never_zero() {
+        let mut readings = Readings::new();
+        let usage = ActorBudgetUsage {
+            executions_last_hour: readings.record(
+                "current_usage.executions_last_hour",
+                Err::<i64, _>("db down"),
+            ),
+            active_workflow_count: Some(2),
+            llm_tokens_last_24h: readings.record(
+                "current_usage.llm_tokens_last_24h",
+                Err::<i64, _>("db down"),
+            ),
+        };
+        let out = render_actor_budget(
+            uuid::Uuid::nil(),
+            Some(&a_policy()),
+            &usage,
+            Some(&trend()),
+            at(),
+            &readings,
+        );
+
+        // The whole point: `0` is what MCP-366's enforcement-path twin refused
+        // to accept, and the reporting twin used to publish.
+        assert!(out["current_usage"]["executions_last_hour"].is_null());
+        assert!(out["current_usage"]["llm_tokens_last_24h"].is_null());
+        assert_ne!(out["current_usage"]["executions_last_hour"], 0);
+        assert_ne!(out["current_usage"]["llm_tokens_last_24h"], 0);
+        // The one that DID succeed keeps its value.
+        assert_eq!(out["current_usage"]["active_workflow_count"], 2);
+
+        let disclosed = out["measurement"]["not_measured"].as_array().unwrap();
+        assert!(disclosed
+            .iter()
+            .any(|f| f == "current_usage.executions_last_hour"));
+        assert!(disclosed
+            .iter()
+            .any(|f| f == "current_usage.llm_tokens_last_24h"));
+        assert!(!disclosed
+            .iter()
+            .any(|f| f == "current_usage.active_workflow_count"));
+        assert_eq!(out["measurement"]["complete"], false);
+    }
+
+    #[test]
+    fn a_failed_trend_read_is_null_not_seven_fabricated_zero_days() {
+        let mut readings = Readings::new();
+        let trend: Option<Vec<(chrono::NaiveDate, i64)>> = readings.record(
+            "execution_trend_7d",
+            Err::<Vec<(chrono::NaiveDate, i64)>, _>("db down"),
+        );
+        let out = render_actor_budget(
+            uuid::Uuid::nil(),
+            Some(&a_policy()),
+            &measured(),
+            trend.as_deref(),
+            at(),
+            &readings,
+        );
+        assert!(
+            out["execution_trend_7d"].is_null(),
+            "seven days of `executions: 0` drawn from a failed query reads as an idle \
+             actor; got {}",
+            out["execution_trend_7d"]
+        );
+        assert!(out["measurement"]["not_measured"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "execution_trend_7d"));
+    }
+
+    #[test]
+    fn an_empty_but_successful_trend_still_renders_seven_honest_zero_days() {
+        // A successful read that returned no rows genuinely means no executions.
+        // This is the case the `null` above must NOT be confused with.
+        let out = render_actor_budget(
+            uuid::Uuid::nil(),
+            Some(&a_policy()),
+            &measured(),
+            Some(&[]),
+            at(),
+            &Readings::new(),
+        );
+        let days = out["execution_trend_7d"].as_array().unwrap();
+        assert_eq!(days.len(), 7);
+        assert!(days.iter().all(|d| d["executions"] == 0));
+        assert!(out.get("measurement").is_none());
+    }
+
+    #[test]
+    fn an_absent_policy_still_renders_null_because_the_handler_refuses_a_failed_one() {
+        // `policy: null` remains the honest rendering of "this actor has no
+        // budget row". It is only a lie when it comes from a FAILED read, which
+        // is why the handler returns an error there rather than reaching this
+        // renderer at all.
+        let out = render_actor_budget(
+            uuid::Uuid::nil(),
+            None,
+            &measured(),
+            Some(&trend()),
+            at(),
+            &Readings::new(),
+        );
+        assert!(out["policy"].is_null());
+    }
+
+    #[test]
+    fn the_note_says_null_is_not_a_healthy_zero() {
+        let mut readings = Readings::new();
+        let _: Option<i64> = readings.record(
+            "current_usage.executions_last_hour",
+            Err::<i64, _>("db down"),
+        );
+        let note = readings.note();
+        assert!(note.contains("DEGRADED"), "{note}");
+        assert!(note.contains("null, NOT zero"), "{note}");
+    }
 }
