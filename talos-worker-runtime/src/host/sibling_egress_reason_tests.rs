@@ -23,10 +23,16 @@
 //! * **`http_stream`** — its WIT enum is hyphenated (`forbidden-host`,
 //!   `invalid-url`, `connection-failed`, `rate-limited`), which no
 //!   `forbiddenhost` arm matches; `forbidden-host` instead matched the
-//!   substring `forbidden` and read as `auth_failure` / `http_403`. Its three
-//!   `ConnectionFailed` sites are NOT transport failures — one cancellation
-//!   and two mutex-poison guards. A `connect` transport failure happens in a
-//!   spawned task and never reaches the guest as an error at all.
+//!   substring `forbidden` and read as `auth_failure` / `http_403`. At the
+//!   time of #717 its three `ConnectionFailed` sites were NOT transport
+//!   failures — one cancellation and two mutex-poison guards — because a
+//!   `connect` transport failure happened in a spawned task and never reached
+//!   the guest as an error at all. **That gap is closed as of 2026-09**: the
+//!   connection-establishment phase moved into `connect`, so the discriminant
+//!   now also carries the four classes `classify_reqwest_send_error` mints.
+//!   See `host/sse_connect_failure_tests.rs`; the invariant that survives is
+//!   [`no_stream_class_can_grant_a_new_retry`], which is stronger than the
+//!   "every latched class is in NON_TRANSIENT" proxy it replaced.
 //!
 //! ## The property these tests exist to pin
 //!
@@ -86,20 +92,20 @@ const GUEST_GQL_QUERYERROR: &str =
     r#"Component returned error: gql: Error { code: 2, name: "queryerror", message: "" }"#;
 const GUEST_WEBHOOK_SENDFAILED: &str =
     r#"Component returned error: hook: Error { code: 1, name: "sendfailed", message: "" }"#;
-const GUEST_STREAM_FORBIDDEN: &str =
+pub(super) const GUEST_STREAM_FORBIDDEN: &str =
     r#"Component returned error: sse: Error { code: 1, name: "forbidden-host", message: "" }"#;
-const GUEST_STREAM_INVALID_URL: &str =
+pub(super) const GUEST_STREAM_INVALID_URL: &str =
     r#"Component returned error: sse: Error { code: 0, name: "invalid-url", message: "" }"#;
-const GUEST_STREAM_CONNECTION_FAILED: &str =
+pub(super) const GUEST_STREAM_CONNECTION_FAILED: &str =
     r#"Component returned error: sse: Error { code: 2, name: "connection-failed", message: "" }"#;
-const GUEST_STREAM_RATE_LIMITED: &str =
+pub(super) const GUEST_STREAM_RATE_LIMITED: &str =
     r#"Component returned error: sse: Error { code: 3, name: "rate-limited", message: "" }"#;
 
-fn ctx_with(world: CapabilityWorld, allowed_hosts: Vec<String>) -> TalosContext {
+pub(super) fn ctx_with(world: CapabilityWorld, allowed_hosts: Vec<String>) -> TalosContext {
     ctx_full(world, allowed_hosts, vec![], LlmTier::Tier2)
 }
 
-fn ctx_full(
+pub(super) fn ctx_full(
     world: CapabilityWorld,
     allowed_hosts: Vec<String>,
     allowed_methods: Vec<String>,
@@ -144,7 +150,7 @@ fn hook(url: &str) -> wit_webhook::WebhookRequest {
 
 /// Render the node-failure message the runtime would build, using the
 /// PRODUCTION suffix function against the PRODUCTION latch.
-fn message_for(ctx: &TalosContext, guest_error: &str) -> String {
+pub(super) fn message_for(ctx: &TalosContext, guest_error: &str) -> String {
     let latch = ctx.network_reason_handle();
     format!(
         "{guest_error}{}",
@@ -152,7 +158,7 @@ fn message_for(ctx: &TalosContext, guest_error: &str) -> String {
     )
 }
 
-fn latched_class(ctx: &TalosContext) -> Option<&'static str> {
+pub(super) fn latched_class(ctx: &TalosContext) -> Option<&'static str> {
     ctx.network_reason_handle().lock().unwrap().map(|r| r.class)
 }
 
@@ -294,7 +300,7 @@ async fn distinct_graphql_policies_latch_distinct_classes() {
 /// `validate_no_dns_rebinding` entirely, which is the only way to exercise
 /// those gates without a resolver. It is reserved for documentation and is
 /// never routed, so nothing can be reached at it.
-const PUBLIC_IP_LITERAL: &str = "203.0.113.10";
+pub(super) const PUBLIC_IP_LITERAL: &str = "203.0.113.10";
 
 /// A Tier-1 (privacy-class) actor's data-egress ceiling refused a GraphQL
 /// target. The highest-consequence misclassification of the set: the egress
@@ -434,7 +440,7 @@ async fn a_swallowed_graphql_denial_cannot_suppress_a_later_transport_retry() {
 /// A REAL `reqwest::Error` from a connect that cannot succeed. Hermetic:
 /// loopback only, no listener, no external network. Same technique as
 /// `reason_class::tests::real_reqwest_error_is_classified_and_never_leaks_its_url`.
-async fn hermetic_connect_error() -> reqwest::Error {
+pub(super) async fn hermetic_connect_error() -> reqwest::Error {
     let port = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         l.local_addr().expect("addr").port()
@@ -665,17 +671,18 @@ fn the_transient_by_token_classes_are_never_latched_on_these_surfaces() {
             !WEBHOOK_LATCHED_CLASSES.contains(class),
             "webhook must never latch the transient token {class:?}"
         );
-        assert!(
-            !STREAM_LATCHED_CLASSES.contains(class),
-            "http_stream must never latch the transient token {class:?}"
-        );
+        // `http_stream` deliberately DOES latch four of these now (its
+        // connection-establishment phase runs in `connect` as of 2026-09), so
+        // the token-membership proxy no longer applies to it. The property it
+        // stood for is asserted directly, against the retry gate itself, by
+        // `no_stream_class_can_grant_a_new_retry`.
     }
 }
 
 /// Every class `host::http_stream` can latch, transcribed from its call sites.
 /// Companion to [`WEBHOOK_LATCHED_CLASSES`]; a list rather than a derivation
 /// so a drift between code and list is what fails.
-const STREAM_LATCHED_CLASSES: &[&str] = &[
+pub(super) const STREAM_LATCHED_CLASSES: &[&str] = &[
     reason_class::CAPABILITY_WORLD,
     reason_class::CANCELLED,
     reason_class::URL_TOO_LONG,
@@ -692,30 +699,50 @@ const STREAM_LATCHED_CLASSES: &[&str] = &[
     reason_class::PER_HOST_RATE_LIMIT,
     reason_class::REQUEST_HEADER_CAP,
     reason_class::SECRET_LOOKUP,
+    // Added 2026-09 with the connection-establishment move. These four are
+    // the complete output of `classify_reqwest_send_error`, and they are
+    // TRANSIENT-bucket tokens — which is exactly why the invariant below had
+    // to stop being "is it in NON_TRANSIENT" and start being "does it change
+    // what the retry gate says".
+    reason_class::TLS,
+    reason_class::CONNECT_REFUSED,
+    reason_class::CONNECT_FAILED,
+    reason_class::SEND_FAILED,
 ];
 
-/// Every class `http_stream` latches is deterministic, so every one must be in
-/// [`reason_class::NON_TRANSIENT`]. The surface has no transport-failure
-/// return at all — a `connect` transport failure happens in a spawned task —
-/// so there is nothing here a retry could ever help.
+/// **No class this surface can latch may grant a retry that did not exist.**
+///
+/// This replaces the older `every_class_http_stream_latches_is_non_transient`,
+/// whose premise ("the surface has no transport-failure return at all") stopped
+/// being true when the connection-establishment phase moved into `connect`.
+/// Membership in [`reason_class::NON_TRANSIENT`] was only ever a PROXY for the
+/// property that matters; this asserts the property itself, against the real
+/// gate, for every (class, discriminant) pair the surface can produce.
+///
+/// All four `http_stream` discriminants read NON-transient bare, so the bar is
+/// absolute: nothing may flip. The one token that would is `timeout` — the
+/// gate matches its bare substring — which is precisely why the pre-header
+/// stall collapses to `connect-failed`. `a_stream_connect_stall_must_not_mint_timeout`
+/// takes that in the falsifying direction.
 #[test]
-fn every_class_http_stream_latches_is_non_transient() {
-    for class in STREAM_LATCHED_CLASSES {
-        assert!(reason_class::ALL.contains(class), "{class:?} not in ALL");
+fn no_stream_class_can_grant_a_new_retry() {
+    for shape in [
+        GUEST_STREAM_FORBIDDEN,
+        GUEST_STREAM_INVALID_URL,
+        GUEST_STREAM_CONNECTION_FAILED,
+        GUEST_STREAM_RATE_LIMITED,
+    ] {
         assert!(
-            reason_class::NON_TRANSIENT.contains(class),
-            "http_stream latches {class:?}, which is not in NON_TRANSIENT"
+            !crate::runtime::is_transient_error_text(shape),
+            "premise: every http_stream discriminant reads non-transient bare"
         );
-        for shape in [
-            GUEST_STREAM_FORBIDDEN,
-            GUEST_STREAM_INVALID_URL,
-            GUEST_STREAM_CONNECTION_FAILED,
-            GUEST_STREAM_RATE_LIMITED,
-        ] {
+        for class in STREAM_LATCHED_CLASSES {
+            assert!(reason_class::ALL.contains(class), "{class:?} not in ALL");
             let marked = format!("{shape} {}", reason_class::marker(class));
             assert!(
                 !crate::runtime::is_transient_error_text(&marked),
-                "[reason_class={class}] made {shape} transient"
+                "[reason_class={class}] made {shape} TRANSIENT — this surface must \
+                 never gain a retry it did not have"
             );
         }
     }
