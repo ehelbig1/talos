@@ -1032,6 +1032,42 @@ pub fn compute_reliability_score(success_rate: Option<f64>, exec_count: i64) -> 
     success_rate.unwrap_or(0.0) * (exec_count as f64 / 10.0).min(1.0) * 50.0
 }
 
+/// The reliability points a workflow would gain by executing up to the
+/// 10-run saturation point, assuming EVERY added run succeeds.
+///
+/// Derived from [`compute_reliability_score`] rather than restated, so the
+/// advice can never drift from the score it claims to move: the score is
+/// `s · min(n/10, 1) · 50`, so after `10 − n` further all-successful runs the
+/// window holds `s·n + (10 − n)` completions out of 10 and the score is
+/// `50 − 5n(1 − s)`. The gain is therefore `50 − 5n`, independent of `s`.
+///
+/// The `s`-independence is the whole point of splitting this out. The pre-fix
+/// advice said "Run N more times to reach **full** reliability credit", which
+/// is FALSE for any `s < 1.0` — at `n = 5, s = 0.6` the caller who follows it
+/// exactly lands on 40/50, not 50, and `5n(1 − s)` points stay unreachable by
+/// running more. The number was right; the destination was not. Callers must
+/// pair this with [`reliability_gain_from_success_rate`], which accounts for
+/// exactly the remainder — the two are additive and sum to the full gap.
+#[must_use]
+pub fn reliability_gain_from_more_runs(exec_count: i64) -> f64 {
+    if exec_count >= 10 {
+        return 0.0;
+    }
+    50.0 * (1.0 - exec_count.max(0) as f64 / 10.0)
+}
+
+/// The reliability points currently forfeited to failures, at the CURRENT run
+/// count.
+///
+/// `50 · (1 − s) · min(n/10, 1)`. Unlike the pre-fix `50 · (1 − s)`, this
+/// carries the run-count ramp, so below the saturation point it does not claim
+/// points the ramp is withholding anyway — at `n ≥ 10` the two are identical.
+#[must_use]
+pub fn reliability_gain_from_success_rate(success_rate: Option<f64>, exec_count: i64) -> f64 {
+    let s = success_rate.unwrap_or(0.0).clamp(0.0, 1.0);
+    50.0 * (1.0 - s) * (exec_count.max(0) as f64 / 10.0).min(1.0)
+}
+
 /// Pure: compute the documentation component (0–20 pts) of a workflow's
 /// readiness score.
 ///
@@ -5371,5 +5407,101 @@ mod capability_query_pins {
             )),
             "the untiebroken cut reappeared"
         );
+    }
+}
+
+#[cfg(test)]
+mod reliability_gain_tests {
+    use super::{
+        compute_reliability_score, reliability_gain_from_more_runs,
+        reliability_gain_from_success_rate,
+    };
+
+    /// THE regression, stated as arithmetic. `get_readiness_breakdown` told the
+    /// caller "Run N more times to reach FULL reliability credit". The score is
+    /// a PRODUCT — `s · min(n/10, 1) · 50` — so at any `s < 1.0` the run-count
+    /// lever alone cannot reach 50, and the shortfall `50·(1−s)·n/10` is exactly
+    /// what the second lever accounts for.
+    ///
+    /// Driven against the REAL `compute_reliability_score`, not a restated
+    /// formula, so a change to the scoring rule fails this rather than silently
+    /// making the advice wrong again.
+    #[test]
+    fn running_more_does_not_reach_full_credit_below_a_perfect_success_rate() {
+        // The worked case from the report: 5 runs at 60%.
+        let (n, s) = (5i64, Some(0.6));
+        let now = compute_reliability_score(s, n);
+        let gain = reliability_gain_from_more_runs(n);
+
+        // After 10-n further ALL-SUCCESSFUL runs the window holds s·n + (10−n)
+        // completions out of 10 — that is the destination the advice promises.
+        let after_all_success =
+            compute_reliability_score(Some((s.unwrap() * n as f64 + (10 - n) as f64) / 10.0), 10);
+        assert!(
+            (now + gain - after_all_success).abs() < 1e-9,
+            "gain must be exact: {now} + {gain} != {after_all_success}"
+        );
+        assert!(
+            after_all_success < 50.0 - 1e-9,
+            "the pre-fix advice claimed FULL credit ({after_all_success} is not 50)"
+        );
+        // And the shortfall is exactly the other lever's value.
+        let forfeit = reliability_gain_from_success_rate(s, n);
+        assert!(
+            (50.0 - after_all_success - forfeit).abs() < 1e-9,
+            "shortfall {} must equal the success-rate lever {forfeit}",
+            50.0 - after_all_success
+        );
+    }
+
+    /// The two levers are ADDITIVE and together close the whole gap, which is
+    /// why they must both fire rather than sit in an `else if` chain — pre-fix
+    /// `total_points_available` understated the real gap by `5n(1−s)`.
+    #[test]
+    fn the_two_levers_sum_to_the_whole_gap_at_every_n_and_s() {
+        for n in [0i64, 1, 3, 5, 9, 10, 25, 400] {
+            for s in [0.0f64, 0.25, 0.6, 0.95, 1.0] {
+                let gap = 50.0 - compute_reliability_score(Some(s), n);
+                let sum = reliability_gain_from_more_runs(n)
+                    + reliability_gain_from_success_rate(Some(s), n);
+                assert!(
+                    (gap - sum).abs() < 1e-9,
+                    "n={n} s={s}: gap {gap} != levers {sum}"
+                );
+            }
+        }
+    }
+
+    /// At and above saturation the run lever is spent and the success-rate
+    /// lever is the pre-fix `50·(1−s)` unchanged — the fix must not move the
+    /// numbers where they were already right.
+    #[test]
+    fn at_saturation_the_success_rate_lever_is_byte_identical_to_the_old_formula() {
+        for n in [10i64, 11, 999] {
+            for s in [0.0f64, 0.5, 0.94, 1.0] {
+                assert_eq!(reliability_gain_from_more_runs(n), 0.0, "n={n}");
+                assert!(
+                    (reliability_gain_from_success_rate(Some(s), n) - 50.0 * (1.0 - s)).abs()
+                        < 1e-12,
+                    "n={n} s={s}"
+                );
+            }
+        }
+    }
+
+    /// A missing success rate is 0.0 in the score, so it must be 0.0 here too —
+    /// the advice may not disagree with the number it is advising about. And a
+    /// negative run count (schema drift) must not produce a gain above the
+    /// component's own 50-point ceiling.
+    #[test]
+    fn absent_and_out_of_range_inputs_track_the_score() {
+        assert_eq!(
+            reliability_gain_from_success_rate(None, 10),
+            reliability_gain_from_success_rate(Some(0.0), 10)
+        );
+        assert_eq!(reliability_gain_from_more_runs(-5), 50.0);
+        assert_eq!(reliability_gain_from_success_rate(Some(0.0), -5), 0.0);
+        // Out-of-range rates are clamped rather than producing negative points.
+        assert_eq!(reliability_gain_from_success_rate(Some(1.5), 10), 0.0);
     }
 }
