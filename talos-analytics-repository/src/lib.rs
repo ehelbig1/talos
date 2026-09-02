@@ -6,6 +6,13 @@
 /// methods and format the JSON-RPC response.
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+/// A read's own outcome, kept SEPARATE from [`Result`] (which is
+/// `anyhow::Result` here). The hygiene sweep's futures return a nested
+/// `Result<SqlxResult<T>>` so the two error classes stay distinguishable:
+/// the outer one is row-mapping / schema drift and propagates loudly (check
+/// 52); the inner one is the QUERY failing and is recorded in the report's
+/// ledger instead of being defaulted away.
+type SqlxResult<T> = std::result::Result<T, sqlx::Error>;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
@@ -845,6 +852,20 @@ pub const TWIN_SCAN_GRAPH_LIMIT: i64 = 100;
 /// another crate's SQL.
 pub const HYGIENE_FINDING_LIMIT: i64 = 25;
 
+/// The wildcard-secret verdict: `Some(true)` at least one module can read the
+/// whole vault, `Some(false)` the scan ran and none can, `None` the scan
+/// itself could not be read.
+///
+/// A pure function rather than an inline `map` because the collapse it exists
+/// to prevent — `!names.is_empty()` over a defaulted `[]`, i.e. an unread scan
+/// reporting "no module can read your whole vault" — is a SECURITY claim, and
+/// an expression inside a 900-line DB-bound sweep cannot be unit-tested. This
+/// can. `the_wildcard_verdict_has_one_implementation` pins the sweep to it.
+#[must_use]
+pub fn wildcard_verdict(names: Option<&[String]>) -> Option<bool> {
+    names.map(|n| !n.is_empty())
+}
+
 /// Row cap on the `get_all_readiness_scores` page.
 ///
 /// As with [`HYGIENE_FINDING_LIMIT`], this does NOT drive the SQL — the query
@@ -908,14 +929,145 @@ pub const TWIN_SCAN_MAX_GRAPH_BYTES: i64 = 262_144;
 /// 4 MB is ~65× the current whole-fleet total (62 KB).
 pub const TWIN_SCAN_TOTAL_BYTES: i64 = 4_194_304;
 
+/// One hygiene check, named by the report key its rows land under and by the
+/// row cap the SQL behind it actually runs with.
+///
+/// # Why the name is the REPORT key and not the struct field
+///
+/// The disclosure this table drives is read by an operator (or a model)
+/// holding the tool output, and its only job is to let them find the field
+/// that is null. A name they cannot locate in the response — `undescribed`
+/// when the JSON says `undescribed_workflows` — is a disclosure that names
+/// nothing. `hygiene_check_names_are_report_keys` in `talos-hygiene-service`
+/// resolves every name in this table against the JSON the service really
+/// emits, so the two cannot drift.
+///
+/// # Why the cap travels here
+///
+/// Same reason [`HYGIENE_FINDING_LIMIT`] exists, generalised: the caps are
+/// SQL literals in this crate and the counting happens in another one. There
+/// are **three** distinct caps plus two genuinely uncapped checks, so a single
+/// exported constant would misstate five of the thirteen list checks — which is
+/// the disclosure defect one level up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HygieneCheck {
+    /// The key the check's findings are rendered under in the report JSON. A
+    /// `.`-separated path when the check lands inside a nested object.
+    pub field: &'static str,
+    /// Row cap the SQL runs under. `0` means the read is genuinely uncapped —
+    /// [`talos_measurement::Coverage::complete`] territory, not "unknown".
+    pub cap: i64,
+    /// True when the check produces a LIST of findings (so a cap can bind).
+    /// A scalar `COUNT(*)` sees the whole population by construction.
+    pub is_list: bool,
+}
+
+impl HygieneCheck {
+    const fn list(field: &'static str, cap: i64) -> Self {
+        Self {
+            field,
+            cap,
+            is_list: true,
+        }
+    }
+    const fn count(field: &'static str) -> Self {
+        Self {
+            field,
+            cap: 0,
+            is_list: false,
+        }
+    }
+}
+
+/// Every check [`AnalyticsRepository::get_hygiene_report`] runs, with the
+/// report key it is disclosed under and the cap in force.
+///
+/// This is the ONE list. The repository records read failures against these
+/// names, the service renders coverage from these caps, and
+/// `hygiene_check_caps_match_the_sql_literals` pins each cap to the literal in
+/// the query beside it. Adding a check without adding it here leaves its
+/// failure invisible — which is the entire defect this table exists to close.
+pub const HYGIENE_CHECKS: &[HygieneCheck] = &[
+    HygieneCheck::list("undescribed_workflows", HYGIENE_FINDING_LIMIT),
+    HygieneCheck::list("uncapabilized_workflows", HYGIENE_FINDING_LIMIT),
+    HygieneCheck::count("summary.suppressed_internal_test_workflows"),
+    HygieneCheck::count("summary.suppressed_low_score_count"),
+    HygieneCheck::count("unembedded_workflow_count"),
+    HygieneCheck::count("summary.total_workflows"),
+    HygieneCheck::list("orphaned_modules", HYGIENE_FINDING_LIMIT),
+    HygieneCheck::list("promotable_modules", HYGIENE_FINDING_LIMIT),
+    HygieneCheck::list("stale_executions", HYGIENE_FINDING_LIMIT),
+    HygieneCheck::list("dormant_workflows", HYGIENE_FINDING_LIMIT),
+    HygieneCheck::list("stale_draft_workflows", HYGIENE_FINDING_LIMIT),
+    // No LIMIT: the idle-actor query is already narrowed by three NOT EXISTS
+    // guards and returns single digits in practice.
+    HygieneCheck::list("idle_actors", 0),
+    HygieneCheck::count("summary.wildcard_secret_grant"),
+    HygieneCheck::list("orphaned_secrets", HYGIENE_FINDING_LIMIT),
+    HygieneCheck::list("secrets_without_expiry", HYGIENE_FINDING_LIMIT),
+    HygieneCheck::list("expiring_actor_memories", EXPIRING_MEMORY_LIMIT),
+    HygieneCheck::list("workflows_needing_schema", NEEDS_SCHEMA_LIMIT),
+    // No LIMIT: the untyped-Value scan is a source-code regex over the
+    // caller's own sandbox modules.
+    HygieneCheck::list("untyped_value_modules", 0),
+    HygieneCheck::list("workflow_twins", TWIN_SCAN_GRAPH_LIMIT),
+];
+
+/// Report key for the twin-divergence scan, which is the one check whose
+/// finding list is not named after its own query.
+pub const HYGIENE_FIELD_TWINS: &str = "workflow_twins";
+
+/// Row cap on the expiring-actor-memory check. Distinct from
+/// [`HYGIENE_FINDING_LIMIT`]: this list is a 24-hour TTL horizon, not a
+/// finding sample, so it runs deeper.
+pub const EXPIRING_MEMORY_LIMIT: i64 = 50;
+
+/// Row cap on the workflows-needing-input-schema check.
+pub const NEEDS_SCHEMA_LIMIT: i64 = 20;
+
+/// Cap on the secrets scanned before the orphan predicate is applied in Rust.
+///
+/// A SECOND ceiling on `orphaned_secrets`, upstream of its
+/// [`HYGIENE_FINDING_LIMIT`] output cap: the SQL reads at most this many of the
+/// user's secrets, and only those are ever tested for orphanhood. A vault
+/// larger than this has secrets that were never examined, and no `take(25)`
+/// disclosure can see that.
+pub const ORPHAN_SECRET_SCAN_LIMIT: i64 = 200;
+
+/// The result of one hygiene sweep, plus the ledger saying which of its
+/// checks actually ran.
+///
+/// # Why `readings` is not optional
+///
+/// Every list below is a `Vec`, and an empty `Vec` is what BOTH "this check
+/// found nothing" and "this check's query failed" produced before #726. The
+/// report is assembled with `tokio::join!` rather than `try_join!` on purpose
+/// — one dead query must not destroy fifteen live ones, and a partial report
+/// genuinely beats no report. The defect was never the concurrency; it was
+/// that the partial-ness was invisible, so a database outage rendered as
+/// `total_issues: 0` and an empty `recommendations` list: "your platform is
+/// clean", from zero measurements.
+///
+/// [`talos_measurement::Readings`] is the ledger. Every check that could not
+/// be read is recorded against the REPORT key it would have been rendered
+/// under (see [`HYGIENE_CHECKS`]), the upstream error is logged server-side
+/// and never travels, and the consumer can tell an empty list from an unasked
+/// question.
 #[derive(Debug)]
 pub struct HygieneReport {
     pub undescribed: Vec<HygieneWorkflowRow>,
     pub uncapabilized: Vec<HygieneWorkflowRow>,
-    pub suppressed_count: i64,
-    pub suppressed_low_score_count: i64,
-    pub unembedded_count: i64,
-    pub total_workflow_count: i64,
+    /// `None` when the count could not be read. NEVER `0` — see `readings`.
+    pub suppressed_count: Option<i64>,
+    /// `None` when the count could not be read.
+    pub suppressed_low_score_count: Option<i64>,
+    /// `None` when the count could not be read.
+    pub unembedded_count: Option<i64>,
+    /// `None` when the count could not be read. This is the denominator of
+    /// `embedding_coverage_percent`, so a defaulted `0` here did not merely
+    /// misstate a total — it silently changed a coverage share into a share
+    /// of nothing.
+    pub total_workflow_count: Option<i64>,
     pub orphaned_modules: Vec<OrphanedModuleRow>,
     /// User-compiled modules with >=3 workflow dependents — promote-to-template
     /// candidates.
@@ -924,7 +1076,9 @@ pub struct HygieneReport {
     pub dormant_workflows: Vec<DormantWorkflowRow>,
     pub stale_draft_workflows: Vec<StaleDraftRow>,
     pub idle_actors: Vec<IdleActorRow>,
-    pub has_wildcard_module: bool,
+    /// `None` when the wildcard scan could not be read — distinct from
+    /// `Some(false)`, which means the scan ran and found no wildcard grant.
+    pub has_wildcard_module: Option<bool>,
     /// Names of modules/templates that have wildcard secret access, for attribution.
     pub wildcard_module_names: Vec<String>,
     pub orphaned_secrets: Vec<OrphanedSecretRow>,
@@ -952,7 +1106,58 @@ pub struct HygieneReport {
     /// failure as "no rows" (best-effort report), which for the twin scan
     /// would render as a complete-looking, clean "0 pairs" section — so
     /// this one flag travels to the report and the note owns the gap.
+    ///
+    /// Kept alongside `readings` rather than folded into it: this bool feeds
+    /// the `workflow_twins.scan_failed` field an operator already reads and
+    /// tests already pin. The ledger is the INDEX of what did not run; this is
+    /// the one section that renders its own gap inline.
     pub workflow_graphs_scan_failed: bool,
+    /// Which checks could not be measured, keyed by the report field they
+    /// would have appeared under. Empty means every check ran.
+    pub readings: talos_measurement::Readings,
+}
+
+impl HygieneReport {
+    /// A report in which every check ran and found nothing, EXCEPT those
+    /// `readings` records as unmeasured.
+    ///
+    /// The ledger is a required argument, deliberately: there is no way to
+    /// construct an all-clear hygiene report without stating whether it is
+    /// clear because nothing was found or clear because nothing was looked at.
+    /// Same move as [`talos_measurement::Coverage::new`] requiring the cap and
+    /// `EncryptedSecrets` losing its `Default` (structural lint check 17) — a
+    /// type beats a lint, because a lint has to find you.
+    #[must_use]
+    pub fn empty(readings: talos_measurement::Readings) -> Self {
+        let missing = |field: &str| readings.not_measured().contains(&field);
+        Self {
+            undescribed: Vec::new(),
+            uncapabilized: Vec::new(),
+            suppressed_count: (!missing("summary.suppressed_internal_test_workflows")).then_some(0),
+            suppressed_low_score_count: (!missing("summary.suppressed_low_score_count"))
+                .then_some(0),
+            unembedded_count: (!missing("unembedded_workflow_count")).then_some(0),
+            total_workflow_count: (!missing("summary.total_workflows")).then_some(0),
+            orphaned_modules: Vec::new(),
+            promotable_modules: Vec::new(),
+            stale_executions: Vec::new(),
+            dormant_workflows: Vec::new(),
+            stale_draft_workflows: Vec::new(),
+            idle_actors: Vec::new(),
+            has_wildcard_module: (!missing("summary.wildcard_secret_grant")).then_some(false),
+            wildcard_module_names: Vec::new(),
+            orphaned_secrets: Vec::new(),
+            secrets_without_expiry: Vec::new(),
+            expiring_actor_memories: Vec::new(),
+            workflows_needing_schema: Vec::new(),
+            untyped_value_modules: Vec::new(),
+            workflow_graphs: Vec::new(),
+            workflow_graphs_truncated: false,
+            workflow_graphs_skipped: 0,
+            workflow_graphs_scan_failed: missing(HYGIENE_FIELD_TWINS),
+            readings,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4119,7 +4324,7 @@ impl AnalyticsRepository {
         // indistinguishable from one that did. Same check-28/60 principle as
         // the readiness-routing cut at ~:2419.
         let undescribed_fut = async {
-            let rows: Vec<HygieneWorkflowRow> = sqlx::query(
+            let fetched = sqlx::query(
                 "SELECT id, name, readiness_score, NULL::text AS description, created_at \
              FROM workflows \
              WHERE user_id = $1 AND is_enabled = true \
@@ -4131,25 +4336,32 @@ impl AnalyticsRepository {
             )
             .bind(user_id)
             .fetch_all(&self.db_pool)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| -> Result<HygieneWorkflowRow> {
-                Ok(HygieneWorkflowRow {
-                    id: r.try_get("id")?,
-                    name: r.try_get("name")?,
-                    readiness_score: r.try_get::<Option<_>, _>("readiness_score")?,
-                    description: r.try_get::<Option<_>, _>("description")?,
-                    created_at: r.try_get("created_at")?,
+            .await;
+            // The QUERY error is disclosed, not defaulted: an empty list must not
+            // be able to mean "nobody asked". The ROW-MAPPING error below still
+            // propagates with `?` (schema drift is loud, per check 52).
+            let raw = match fetched {
+                Ok(raw) => raw,
+                Err(e) => return Ok(Err(e)),
+            };
+            let rows: Vec<HygieneWorkflowRow> = raw
+                .into_iter()
+                .map(|r| -> Result<HygieneWorkflowRow> {
+                    Ok(HygieneWorkflowRow {
+                        id: r.try_get("id")?,
+                        name: r.try_get("name")?,
+                        readiness_score: r.try_get::<Option<_>, _>("readiness_score")?,
+                        description: r.try_get::<Option<_>, _>("description")?,
+                        created_at: r.try_get("created_at")?,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-            Ok(rows)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Ok(rows))
         };
 
         // 2. Uncapabilized workflows (same `, id` tiebreaker rationale as #1).
         let uncapabilized_fut = async {
-            let rows: Vec<HygieneWorkflowRow> = sqlx::query(
+            let fetched = sqlx::query(
                 "SELECT id, name, readiness_score, description, created_at \
              FROM workflows \
              WHERE user_id = $1 AND is_enabled = true \
@@ -4161,25 +4373,32 @@ impl AnalyticsRepository {
             )
             .bind(user_id)
             .fetch_all(&self.db_pool)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| -> Result<HygieneWorkflowRow> {
-                Ok(HygieneWorkflowRow {
-                    id: r.try_get("id")?,
-                    name: r.try_get("name")?,
-                    readiness_score: r.try_get::<Option<_>, _>("readiness_score")?,
-                    description: r.try_get::<Option<_>, _>("description")?,
-                    created_at: r.try_get("created_at")?,
+            .await;
+            // The QUERY error is disclosed, not defaulted: an empty list must not
+            // be able to mean "nobody asked". The ROW-MAPPING error below still
+            // propagates with `?` (schema drift is loud, per check 52).
+            let raw = match fetched {
+                Ok(raw) => raw,
+                Err(e) => return Ok(Err(e)),
+            };
+            let rows: Vec<HygieneWorkflowRow> = raw
+                .into_iter()
+                .map(|r| -> Result<HygieneWorkflowRow> {
+                    Ok(HygieneWorkflowRow {
+                        id: r.try_get("id")?,
+                        name: r.try_get("name")?,
+                        readiness_score: r.try_get::<Option<_>, _>("readiness_score")?,
+                        description: r.try_get::<Option<_>, _>("description")?,
+                        created_at: r.try_get("created_at")?,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-            Ok(rows)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Ok(rows))
         };
 
         // 3. Suppressed count (internal/test workflow types)
         let suppressed_count_fut = async {
-            let v: i64 = sqlx::query_scalar(
+            let v: Result<i64, sqlx::Error> = sqlx::query_scalar(
                 "SELECT COUNT(*)::bigint FROM workflows \
              WHERE user_id = $1 AND is_enabled = true \
                AND (status IS NULL OR status != 'archived') \
@@ -4187,14 +4406,13 @@ impl AnalyticsRepository {
             )
             .bind(user_id)
             .fetch_one(&self.db_pool)
-            .await
-            .unwrap_or(0);
+            .await;
             v
         };
 
         // 3b. Suppressed low-score count (drafts with readiness_score < 10 excluded from hygiene)
         let suppressed_low_score_count_fut = async {
-            let v: i64 = sqlx::query_scalar(
+            let v: Result<i64, sqlx::Error> = sqlx::query_scalar(
                 "SELECT COUNT(*)::bigint FROM workflows \
              WHERE user_id = $1 AND is_enabled = true \
                AND (status IS NULL OR status != 'archived') \
@@ -4203,35 +4421,46 @@ impl AnalyticsRepository {
             )
             .bind(user_id)
             .fetch_one(&self.db_pool)
-            .await
-            .unwrap_or(0);
+            .await;
             v
         };
 
         // 4. Unembedded count
         let unembedded_count_fut = async {
-            let v: i64 = sqlx::query_scalar(
+            let v: Result<i64, sqlx::Error> = sqlx::query_scalar(
                 "SELECT COUNT(*)::bigint FROM workflows WHERE user_id = $1 AND embedding IS NULL",
             )
             .bind(user_id)
             .fetch_one(&self.db_pool)
-            .await
-            .unwrap_or(0);
+            .await;
             v
         };
 
         // 5. Total workflow count
         let total_workflow_count_fut = async {
-            let v: i64 =
+            let v: Result<i64, sqlx::Error> =
                 sqlx::query_scalar("SELECT COUNT(*)::bigint FROM workflows WHERE user_id = $1")
                     .bind(user_id)
                     .fetch_one(&self.db_pool)
-                    .await
-                    .unwrap_or(0);
+                    .await;
             v
         };
 
+        // The ledger. Every check that could not be READ is recorded here
+        // against the report key it would have been rendered under, so the
+        // consumer can tell an empty list from an unasked question. The
+        // upstream error is logged server-side by `Readings::record` and never
+        // travels — a `sqlx::Error` routinely embeds the failing SQL, and a
+        // connection error embeds the DSN.
+        //
+        // It is built HERE rather than passed in because the caller has
+        // nothing to contribute to it and because this is the only layer that
+        // ever sees the errors: the service downstream cannot leak what it was
+        // never handed.
+        let mut readings = talos_measurement::Readings::new();
+
         // Batch A — 6 independent count/list queries.
+        #[allow(clippy::type_complexity)]
         let (
             undescribed,
             uncapabilized,
@@ -4240,12 +4469,12 @@ impl AnalyticsRepository {
             unembedded_count,
             total_workflow_count,
         ): (
-            anyhow::Result<Vec<HygieneWorkflowRow>>,
-            anyhow::Result<Vec<HygieneWorkflowRow>>,
-            i64,
-            i64,
-            i64,
-            i64,
+            anyhow::Result<SqlxResult<Vec<HygieneWorkflowRow>>>,
+            anyhow::Result<SqlxResult<Vec<HygieneWorkflowRow>>>,
+            SqlxResult<i64>,
+            SqlxResult<i64>,
+            SqlxResult<i64>,
+            SqlxResult<i64>,
         ) = tokio::join!(
             undescribed_fut,
             uncapabilized_fut,
@@ -4254,8 +4483,18 @@ impl AnalyticsRepository {
             unembedded_count_fut,
             total_workflow_count_fut,
         );
-        let undescribed = undescribed?;
-        let uncapabilized = uncapabilized?;
+        let undescribed = readings.record_rows("undescribed_workflows", undescribed?);
+        let uncapabilized = readings.record_rows("uncapabilized_workflows", uncapabilized?);
+        let suppressed_count = readings.record(
+            "summary.suppressed_internal_test_workflows",
+            suppressed_count,
+        );
+        let suppressed_low_score_count = readings.record(
+            "summary.suppressed_low_score_count",
+            suppressed_low_score_count,
+        );
+        let unembedded_count = readings.record("unembedded_workflow_count", unembedded_count);
+        let total_workflow_count = readings.record("summary.total_workflows", total_workflow_count);
 
         // 6. Orphaned modules — Phase 4 prep: query the unified `modules`
         // table and treat a module as orphan when no workflow graph_json
@@ -4268,7 +4507,7 @@ impl AnalyticsRepository {
         // become structurally redundant — they remain here as a
         // belt-and-suspenders until the column drop in Phase 4 final.
         let orphaned_modules_fut = async {
-            let rows: Vec<OrphanedModuleRow> = sqlx::query(
+            let fetched = sqlx::query(
                 "SELECT m.id, m.name, m.compiled_at, m.size_bytes \
              FROM modules m \
              WHERE m.user_id = $1 \
@@ -4282,19 +4521,26 @@ impl AnalyticsRepository {
             )
             .bind(user_id)
             .fetch_all(&self.db_pool)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| -> Result<OrphanedModuleRow> {
-                Ok(OrphanedModuleRow {
-                    id: r.try_get("id")?,
-                    name: r.try_get("name")?,
-                    size_bytes: r.try_get::<Option<_>, _>("size_bytes")?,
-                    compiled_at: r.try_get("compiled_at")?,
+            .await;
+            // The QUERY error is disclosed, not defaulted: an empty list must not
+            // be able to mean "nobody asked". The ROW-MAPPING error below still
+            // propagates with `?` (schema drift is loud, per check 52).
+            let raw = match fetched {
+                Ok(raw) => raw,
+                Err(e) => return Ok(Err(e)),
+            };
+            let rows: Vec<OrphanedModuleRow> = raw
+                .into_iter()
+                .map(|r| -> Result<OrphanedModuleRow> {
+                    Ok(OrphanedModuleRow {
+                        id: r.try_get("id")?,
+                        name: r.try_get("name")?,
+                        size_bytes: r.try_get::<Option<_>, _>("size_bytes")?,
+                        compiled_at: r.try_get("compiled_at")?,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-            Ok(rows)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Ok(rows))
         };
 
         // 6b. Promotable modules — user-compiled (kind sandbox/extracted)
@@ -4306,7 +4552,7 @@ impl AnalyticsRepository {
         // scope. The alias can't be filtered in WHERE (Postgres), so the count
         // is computed in a subselect and filtered in the outer query.
         let promotable_modules_fut = async {
-            let rows: Vec<PromotableModuleRow> = sqlx::query(
+            let fetched = sqlx::query(
                 "SELECT id, name, dependent_count FROM ( \
                      SELECT m.id, m.name, \
                             (SELECT COUNT(*) FROM workflows w \
@@ -4323,23 +4569,30 @@ impl AnalyticsRepository {
             )
             .bind(user_id)
             .fetch_all(&self.db_pool)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| -> Result<PromotableModuleRow> {
-                Ok(PromotableModuleRow {
-                    id: r.try_get("id")?,
-                    name: r.try_get("name")?,
-                    dependent_count: r.try_get("dependent_count")?,
+            .await;
+            // The QUERY error is disclosed, not defaulted: an empty list must not
+            // be able to mean "nobody asked". The ROW-MAPPING error below still
+            // propagates with `?` (schema drift is loud, per check 52).
+            let raw = match fetched {
+                Ok(raw) => raw,
+                Err(e) => return Ok(Err(e)),
+            };
+            let rows: Vec<PromotableModuleRow> = raw
+                .into_iter()
+                .map(|r| -> Result<PromotableModuleRow> {
+                    Ok(PromotableModuleRow {
+                        id: r.try_get("id")?,
+                        name: r.try_get("name")?,
+                        dependent_count: r.try_get("dependent_count")?,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-            Ok(rows)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Ok(rows))
         };
 
         // 7. Stale executions
         let stale_executions_fut = async {
-            let rows: Vec<StaleExecutionRow> = sqlx::query(
+            let fetched = sqlx::query(
                 "SELECT we.id, we.workflow_id, w.name AS workflow_name, we.started_at, we.status \
              FROM workflow_executions we \
              JOIN workflows w ON w.id = we.workflow_id \
@@ -4349,25 +4602,32 @@ impl AnalyticsRepository {
             )
             .bind(user_id)
             .fetch_all(&self.db_pool)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| -> Result<StaleExecutionRow> {
-                Ok(StaleExecutionRow {
-                    id: r.try_get("id")?,
-                    workflow_id: r.try_get("workflow_id")?,
-                    workflow_name: r.try_get("workflow_name")?,
-                    started_at: r.try_get("started_at")?,
-                    status: r.try_get("status")?,
+            .await;
+            // The QUERY error is disclosed, not defaulted: an empty list must not
+            // be able to mean "nobody asked". The ROW-MAPPING error below still
+            // propagates with `?` (schema drift is loud, per check 52).
+            let raw = match fetched {
+                Ok(raw) => raw,
+                Err(e) => return Ok(Err(e)),
+            };
+            let rows: Vec<StaleExecutionRow> = raw
+                .into_iter()
+                .map(|r| -> Result<StaleExecutionRow> {
+                    Ok(StaleExecutionRow {
+                        id: r.try_get("id")?,
+                        workflow_id: r.try_get("workflow_id")?,
+                        workflow_name: r.try_get("workflow_name")?,
+                        started_at: r.try_get("started_at")?,
+                        status: r.try_get("status")?,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-            Ok(rows)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Ok(rows))
         };
 
         // 8. Dormant workflows
         let dormant_workflows_fut = async {
-            let rows: Vec<DormantWorkflowRow> = sqlx::query(
+            let fetched = sqlx::query(
                 "SELECT w.id, w.name, w.created_at, MAX(we.started_at) AS last_execution \
              FROM workflows w \
              LEFT JOIN workflow_executions we ON we.workflow_id = w.id AND we.user_id = w.user_id \
@@ -4378,24 +4638,33 @@ impl AnalyticsRepository {
             )
             .bind(user_id)
             .fetch_all(&self.db_pool)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| -> Result<DormantWorkflowRow> { Ok(DormantWorkflowRow {
-                id: r.try_get("id")?,
-                name: r.try_get("name")?,
-                created_at: r.try_get("created_at")?,
-                last_execution: r.try_get::<Option<_>, _>("last_execution")?,
-            }) })
-            .collect::<Result<Vec<_>>>()?;
-            Ok(rows)
+            .await;
+            // The QUERY error is disclosed, not defaulted: an empty list must not
+            // be able to mean "nobody asked". The ROW-MAPPING error below still
+            // propagates with `?` (schema drift is loud, per check 52).
+            let raw = match fetched {
+                Ok(raw) => raw,
+                Err(e) => return Ok(Err(e)),
+            };
+            let rows: Vec<DormantWorkflowRow> = raw
+                .into_iter()
+                .map(|r| -> Result<DormantWorkflowRow> {
+                    Ok(DormantWorkflowRow {
+                        id: r.try_get("id")?,
+                        name: r.try_get("name")?,
+                        created_at: r.try_get("created_at")?,
+                        last_execution: r.try_get::<Option<_>, _>("last_execution")?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Ok(rows))
         };
 
         // 9. Stale draft workflows.
         // M-I: project graph_json so fix_all can run the
         // substantive-draft predicate before recommending deletion.
         let stale_draft_workflows_fut = async {
-            let rows: Vec<StaleDraftRow> = sqlx::query(
+            let fetched = sqlx::query(
                 "SELECT w.id, w.name, w.created_at, w.graph_json::text AS graph_json \
              FROM workflows w \
              WHERE w.user_id = $1 AND w.status = 'draft' \
@@ -4405,19 +4674,26 @@ impl AnalyticsRepository {
             )
             .bind(user_id)
             .fetch_all(&self.db_pool)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| -> Result<StaleDraftRow> {
-                Ok(StaleDraftRow {
-                    id: r.try_get("id")?,
-                    name: r.try_get("name")?,
-                    created_at: r.try_get("created_at")?,
-                    graph_json: r.try_get::<Option<_>, _>("graph_json")?,
+            .await;
+            // The QUERY error is disclosed, not defaulted: an empty list must not
+            // be able to mean "nobody asked". The ROW-MAPPING error below still
+            // propagates with `?` (schema drift is loud, per check 52).
+            let raw = match fetched {
+                Ok(raw) => raw,
+                Err(e) => return Ok(Err(e)),
+            };
+            let rows: Vec<StaleDraftRow> = raw
+                .into_iter()
+                .map(|r| -> Result<StaleDraftRow> {
+                    Ok(StaleDraftRow {
+                        id: r.try_get("id")?,
+                        name: r.try_get("name")?,
+                        created_at: r.try_get("created_at")?,
+                        graph_json: r.try_get::<Option<_>, _>("graph_json")?,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-            Ok(rows)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Ok(rows))
         };
 
         // 10. Idle actors
@@ -4433,7 +4709,7 @@ impl AnalyticsRepository {
         // actor_memory + workflows; no decryption happens and the lint rule
         // (raw INSERT/UPDATE/DELETE on actor_memory) does not apply.
         let idle_actors_fut = async {
-            let rows: Vec<IdleActorRow> = sqlx::query(
+            let fetched = sqlx::query(
                 "SELECT a.id, a.name, a.status, MAX(e.started_at) AS last_active, COUNT(DISTINCT e.id) AS total_executions \
              FROM actors a \
              LEFT JOIN workflow_executions e ON e.actor_id = a.id \
@@ -4447,49 +4723,54 @@ impl AnalyticsRepository {
             )
             .bind(user_id)
             .fetch_all(&self.db_pool)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| -> Result<IdleActorRow> { Ok(IdleActorRow {
-                id: r.try_get("id")?,
-                name: r.try_get("name")?,
-                status: r.try_get("status")?,
-                last_active: r.try_get::<Option<_>, _>("last_active")?,
-                total_executions: r.try_get::<Option<_>, _>("total_executions")?.unwrap_or(0),
-            }) })
-            .collect::<Result<Vec<_>>>()?;
-            Ok(rows)
+            .await;
+            // The QUERY error is disclosed, not defaulted: an empty list must not
+            // be able to mean "nobody asked". The ROW-MAPPING error below still
+            // propagates with `?` (schema drift is loud, per check 52).
+            let raw = match fetched {
+                Ok(raw) => raw,
+                Err(e) => return Ok(Err(e)),
+            };
+            let rows: Vec<IdleActorRow> = raw
+                .into_iter()
+                .map(|r| -> Result<IdleActorRow> {
+                    Ok(IdleActorRow {
+                        id: r.try_get("id")?,
+                        name: r.try_get("name")?,
+                        status: r.try_get("status")?,
+                        last_active: r.try_get::<Option<_>, _>("last_active")?,
+                        total_executions: r
+                            .try_get::<Option<_>, _>("total_executions")?
+                            .unwrap_or(0),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Ok(rows))
         };
 
         // 11. Wildcard module check + attribution
         // Phase 5: single SELECT on the unified `modules` table.
         let wildcard_module_names_fut = async {
-            let names: Vec<String> = sqlx::query(
-                "SELECT DISTINCT name FROM modules \
+            // BOTH failure modes — the query and the per-row `name` read — now
+            // yield `Err`, which the join site records as unmeasured. Before,
+            // the query error defaulted to `[]` and the drift error was logged
+            // and then ALSO defaulted to `[]`: the loudest signal this check
+            // could produce was a log line nobody holding the tool output can
+            // see, under a response that said "no wildcard grants".
+            let names: Result<Vec<String>, sqlx::Error> = async {
+                sqlx::query(
+                    "SELECT DISTINCT name FROM modules \
              WHERE user_id = $1 AND '*' = ANY(allowed_secrets) \
              ORDER BY name",
-            )
-            .bind(user_id)
-            .fetch_all(&self.db_pool)
-            .await
-            .unwrap_or_default()
-            .iter()
-            // A `.filter_map(... .ok())` here silently DROPPED rows on schema
-            // drift, so the wildcard-secret hygiene check would report "none"
-            // for a reason unrelated to there being none. The enclosing future
-            // yields Vec<String> (no `?` available), so the drift is logged
-            // loudly instead of being absorbed row by row.
-            .map(|r| r.try_get::<String, _>("name"))
-            .collect::<std::result::Result<Vec<String>, _>>()
-            .unwrap_or_else(|e| {
-                tracing::error!(
-                    error = %e,
-                    "platform hygiene: wildcard-secret module scan could not read \
-                     `modules.name` — reporting an EMPTY list; this is schema drift, \
-                     not an absence of wildcard grants"
-                );
-                Vec::new()
-            });
+                )
+                .bind(user_id)
+                .fetch_all(&self.db_pool)
+                .await?
+                .iter()
+                .map(|r| r.try_get::<String, _>("name"))
+                .collect::<std::result::Result<Vec<String>, _>>()
+            }
+            .await;
             names
         };
 
@@ -4506,13 +4787,13 @@ impl AnalyticsRepository {
             idle_actors,
             wildcard_module_names,
         ): (
-            anyhow::Result<Vec<OrphanedModuleRow>>,
-            anyhow::Result<Vec<PromotableModuleRow>>,
-            anyhow::Result<Vec<StaleExecutionRow>>,
-            anyhow::Result<Vec<DormantWorkflowRow>>,
-            anyhow::Result<Vec<StaleDraftRow>>,
-            anyhow::Result<Vec<IdleActorRow>>,
-            Vec<String>,
+            anyhow::Result<SqlxResult<Vec<OrphanedModuleRow>>>,
+            anyhow::Result<SqlxResult<Vec<PromotableModuleRow>>>,
+            anyhow::Result<SqlxResult<Vec<StaleExecutionRow>>>,
+            anyhow::Result<SqlxResult<Vec<DormantWorkflowRow>>>,
+            anyhow::Result<SqlxResult<Vec<StaleDraftRow>>>,
+            anyhow::Result<SqlxResult<Vec<IdleActorRow>>>,
+            SqlxResult<Vec<String>>,
         ) = tokio::join!(
             orphaned_modules_fut,
             promotable_modules_fut,
@@ -4522,13 +4803,20 @@ impl AnalyticsRepository {
             idle_actors_fut,
             wildcard_module_names_fut,
         );
-        let orphaned_modules = orphaned_modules?;
-        let promotable_modules = promotable_modules?;
-        let stale_executions = stale_executions?;
-        let dormant_workflows = dormant_workflows?;
-        let stale_draft_workflows = stale_draft_workflows?;
-        let idle_actors = idle_actors?;
-        let has_wildcard_module = !wildcard_module_names.is_empty();
+        let orphaned_modules = readings.record_rows("orphaned_modules", orphaned_modules?);
+        let promotable_modules = readings.record_rows("promotable_modules", promotable_modules?);
+        let stale_executions = readings.record_rows("stale_executions", stale_executions?);
+        let dormant_workflows = readings.record_rows("dormant_workflows", dormant_workflows?);
+        let stale_draft_workflows =
+            readings.record_rows("stale_draft_workflows", stale_draft_workflows?);
+        let idle_actors = readings.record_rows("idle_actors", idle_actors?);
+        // `None` (scan unreadable) is NOT `Some(false)` (scan ran, no wildcard
+        // grant). Collapsing the two with `!names.is_empty()` is what let a
+        // failed scan report "no module can read your whole vault".
+        let wildcard_module_names =
+            readings.record("summary.wildcard_secret_grant", wildcard_module_names);
+        let has_wildcard_module = wildcard_verdict(wildcard_module_names.as_deref());
+        let wildcard_module_names = wildcard_module_names.unwrap_or_default();
 
         // 12. Orphaned secrets (only when no wildcard module).
         //
@@ -4547,8 +4835,15 @@ impl AnalyticsRepository {
         // Correct implementation in pure SQL is ugly; instead we fetch all of
         // the user's secrets + the union of their grant entries, then filter
         // in Rust using a matcher that mirrors the host-side logic exactly.
+        //
+        // A `None` wildcard verdict (the scan itself was unreadable) suppresses
+        // the orphan list exactly like a `Some(true)` would, because an
+        // unsuppressed list under an unknown wildcard grant is a list of
+        // possible false positives pointed at a DELETE button. The suppression
+        // is disclosed via `mark_derived` below rather than rendering as a
+        // clean `[]`.
         let orphaned_secrets_fut = async {
-            Ok(if !has_wildcard_module {
+            Ok(if has_wildcard_module == Some(false) {
                 // The secrets list and the grants union are independent of
                 // each other — run them concurrently (still gated on
                 // !has_wildcard_module so behavior is unchanged).
@@ -4631,7 +4926,7 @@ impl AnalyticsRepository {
             // fire on the one credential class it does not apply to trains the
             // operator to ignore it, and takes the real signal (a static,
             // never-rotated API key / PAT) down with it.
-            let rows: Vec<SecretWithoutExpiryRow> = sqlx::query(
+            let fetched = sqlx::query(
                 "SELECT name, key_path, created_at FROM secrets \
              WHERE created_by = $1 AND expires_at IS NULL \
                AND key_path NOT ILIKE 'oauth/%' \
@@ -4641,23 +4936,30 @@ impl AnalyticsRepository {
             )
             .bind(user_id)
             .fetch_all(&self.db_pool)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| -> Result<SecretWithoutExpiryRow> {
-                Ok(SecretWithoutExpiryRow {
-                    name: r.try_get("name")?,
-                    key_path: r.try_get("key_path")?,
-                    created_at: r.try_get("created_at")?,
+            .await;
+            // The QUERY error is disclosed, not defaulted: an empty list must not
+            // be able to mean "nobody asked". The ROW-MAPPING error below still
+            // propagates with `?` (schema drift is loud, per check 52).
+            let raw = match fetched {
+                Ok(raw) => raw,
+                Err(e) => return Ok(Err(e)),
+            };
+            let rows: Vec<SecretWithoutExpiryRow> = raw
+                .into_iter()
+                .map(|r| -> Result<SecretWithoutExpiryRow> {
+                    Ok(SecretWithoutExpiryRow {
+                        name: r.try_get("name")?,
+                        key_path: r.try_get("key_path")?,
+                        created_at: r.try_get("created_at")?,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-            Ok(rows)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Ok(rows))
         };
 
         // 14. Expiring actor memories
         let expiring_actor_memories_fut = async {
-            let rows: Vec<ExpiringMemoryRow> = sqlx::query(
+            let fetched = sqlx::query(
                 "SELECT m.actor_id, m.key, m.memory_type, m.expires_at, a.name AS actor_name \
              FROM actor_memory m \
              JOIN actors a ON a.id = m.actor_id \
@@ -4667,25 +4969,32 @@ impl AnalyticsRepository {
             )
             .bind(user_id)
             .fetch_all(&self.db_pool)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| -> Result<ExpiringMemoryRow> {
-                Ok(ExpiringMemoryRow {
-                    actor_id: r.try_get("actor_id")?,
-                    key: r.try_get("key")?,
-                    memory_type: r.try_get::<Option<_>, _>("memory_type")?,
-                    expires_at: r.try_get("expires_at")?,
-                    actor_name: r.try_get("actor_name")?,
+            .await;
+            // The QUERY error is disclosed, not defaulted: an empty list must not
+            // be able to mean "nobody asked". The ROW-MAPPING error below still
+            // propagates with `?` (schema drift is loud, per check 52).
+            let raw = match fetched {
+                Ok(raw) => raw,
+                Err(e) => return Ok(Err(e)),
+            };
+            let rows: Vec<ExpiringMemoryRow> = raw
+                .into_iter()
+                .map(|r| -> Result<ExpiringMemoryRow> {
+                    Ok(ExpiringMemoryRow {
+                        actor_id: r.try_get("actor_id")?,
+                        key: r.try_get("key")?,
+                        memory_type: r.try_get::<Option<_>, _>("memory_type")?,
+                        expires_at: r.try_get("expires_at")?,
+                        actor_name: r.try_get("actor_name")?,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-            Ok(rows)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Ok(rows))
         };
 
         // 15. Workflows needing schema
         let workflows_needing_schema_fut = async {
-            let rows: Vec<NeedsSchemaRow> = sqlx::query(
+            let fetched = sqlx::query(
                 "SELECT w.id, w.name, COUNT(e.id)::bigint AS execution_count, MAX(e.started_at) AS last_run \
              FROM workflows w \
              JOIN workflow_executions e ON e.workflow_id = w.id AND e.status = 'completed' \
@@ -4698,17 +5007,26 @@ impl AnalyticsRepository {
             )
             .bind(user_id)
             .fetch_all(&self.db_pool)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| -> Result<NeedsSchemaRow> { Ok(NeedsSchemaRow {
-                id: r.try_get("id")?,
-                name: r.try_get("name")?,
-                execution_count: r.try_get::<Option<_>, _>("execution_count")?.unwrap_or(0),
-                last_run: r.try_get::<Option<_>, _>("last_run")?,
-            }) })
-            .collect::<Result<Vec<_>>>()?;
-            Ok(rows)
+            .await;
+            // The QUERY error is disclosed, not defaulted: an empty list must not
+            // be able to mean "nobody asked". The ROW-MAPPING error below still
+            // propagates with `?` (schema drift is loud, per check 52).
+            let raw = match fetched {
+                Ok(raw) => raw,
+                Err(e) => return Ok(Err(e)),
+            };
+            let rows: Vec<NeedsSchemaRow> = raw
+                .into_iter()
+                .map(|r| -> Result<NeedsSchemaRow> {
+                    Ok(NeedsSchemaRow {
+                        id: r.try_get("id")?,
+                        name: r.try_get("name")?,
+                        execution_count: r.try_get::<Option<_>, _>("execution_count")?.unwrap_or(0),
+                        last_run: r.try_get::<Option<_>, _>("last_run")?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Ok(rows))
         };
 
         // 16. Untyped serde_json::Value parser lint — performance anti-pattern.
@@ -4757,8 +5075,9 @@ impl AnalyticsRepository {
         //     (`compilation::analyze::lint_source_code`) covers that case
         //     accurately.
         let untyped_value_modules_fut = async {
-            let rows: Vec<UntypedValueModuleRow> = sqlx::query_as::<_, (Uuid, String)>(
-                "SELECT id, name FROM modules \
+            let rows: Result<Vec<UntypedValueModuleRow>, sqlx::Error> =
+                sqlx::query_as::<_, (Uuid, String)>(
+                    "SELECT id, name FROM modules \
              WHERE user_id = $1 \
                AND kind IN ('sandbox', 'extracted') \
                AND source_code IS NOT NULL \
@@ -4767,16 +5086,17 @@ impl AnalyticsRepository {
                AND position('from_str(&input)' in source_code) = 0 \
                AND position('from_str(input.as_str())' in source_code) = 0 \
              ORDER BY name",
-            )
-            .bind(user_id)
-            .bind(r":\s*serde_json::Value\s*=\s*serde_json::from_str")
-            .bind(r"serde_json::from_str::<serde_json::Value>")
-            .fetch_all(&self.db_pool)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(id, name)| UntypedValueModuleRow { id, name })
-            .collect();
+                )
+                .bind(user_id)
+                .bind(r":\s*serde_json::Value\s*=\s*serde_json::from_str")
+                .bind(r"serde_json::from_str::<serde_json::Value>")
+                .fetch_all(&self.db_pool)
+                .await
+                .map(|raw| {
+                    raw.into_iter()
+                        .map(|(id, name)| UntypedValueModuleRow { id, name })
+                        .collect()
+                });
             rows
         };
 
@@ -4812,8 +5132,16 @@ impl AnalyticsRepository {
             .bind(TWIN_SCAN_MAX_GRAPH_BYTES)
             .fetch_all(&self.db_pool)
             .await;
-            let scan_failed = fetched.is_err();
-            let rows = fetched.unwrap_or_default();
+            // The scan's own failure now travels TWICE, on purpose: as an
+            // `Err` the join site records in the ledger (so the check appears
+            // in `measurement.not_measured` alongside its siblings), and — via
+            // the caller deriving `workflow_graphs_scan_failed` from it — as
+            // the inline `workflow_twins.scan_failed` an operator already
+            // reads. One mechanism, two renderings; not two mechanisms.
+            let rows = match fetched {
+                Ok(rows) => rows,
+                Err(e) => return Ok(Err(e)),
+            };
             let truncated = rows.len() as i64 >= TWIN_SCAN_GRAPH_LIMIT;
             let mut skipped: i64 = 0;
             let mut budget_remaining: i64 = TWIN_SCAN_TOTAL_BYTES;
@@ -4836,7 +5164,7 @@ impl AnalyticsRepository {
                     graph_json,
                 });
             }
-            Ok((graphs, truncated, skipped, scan_failed))
+            Ok(Ok((graphs, truncated, skipped)))
         };
 
         // Batch C — #12 (orphaned_secrets, gated on has_wildcard_module from
@@ -4851,11 +5179,11 @@ impl AnalyticsRepository {
             workflow_graphs,
         ): (
             anyhow::Result<Vec<OrphanedSecretRow>>,
-            anyhow::Result<Vec<SecretWithoutExpiryRow>>,
-            anyhow::Result<Vec<ExpiringMemoryRow>>,
-            anyhow::Result<Vec<NeedsSchemaRow>>,
-            Vec<UntypedValueModuleRow>,
-            anyhow::Result<(Vec<TwinScanGraphRow>, bool, i64, bool)>,
+            anyhow::Result<SqlxResult<Vec<SecretWithoutExpiryRow>>>,
+            anyhow::Result<SqlxResult<Vec<ExpiringMemoryRow>>>,
+            anyhow::Result<SqlxResult<Vec<NeedsSchemaRow>>>,
+            SqlxResult<Vec<UntypedValueModuleRow>>,
+            anyhow::Result<SqlxResult<(Vec<TwinScanGraphRow>, bool, i64)>>,
         ) = tokio::join!(
             orphaned_secrets_fut,
             secrets_without_expiry_fut,
@@ -4864,20 +5192,37 @@ impl AnalyticsRepository {
             untyped_value_modules_fut,
             workflow_graphs_fut,
         );
+        // #12 stays FAIL-CLOSED and is deliberately NOT routed through the
+        // ledger. Its documented hazard runs the other way: an empty `grants`
+        // union makes `secret_path_in_any_grant` report EVERY secret as
+        // orphaned, so `[]` must never be able to mean "the query failed". A
+        // hard error is already distinguishable from an empty result here —
+        // the caller gets an error, not a clean report — which is the property
+        // this change is about. Left as it is, on purpose.
         let orphaned_secrets = orphaned_secrets?;
-        let secrets_without_expiry = secrets_without_expiry?;
-        let expiring_actor_memories = expiring_actor_memories?;
-        let workflows_needing_schema = workflows_needing_schema?;
+        if has_wildcard_module != Some(false) {
+            // Suppressed, not measured: either a wildcard grant makes the
+            // orphan predicate meaningless, or the wildcard scan itself could
+            // not be read. Both render as `[]`, so both must be disclosed.
+            readings.mark_derived("orphaned_secrets");
+        }
+        let secrets_without_expiry =
+            readings.record_rows("secrets_without_expiry", secrets_without_expiry?);
+        let expiring_actor_memories =
+            readings.record_rows("expiring_actor_memories", expiring_actor_memories?);
+        let workflows_needing_schema =
+            readings.record_rows("workflows_needing_schema", workflows_needing_schema?);
+        let untyped_value_modules =
+            readings.record_rows("untyped_value_modules", untyped_value_modules);
         // Same fail-loud posture as the sibling futs: a `try_get` error here
         // is schema drift on `workflows.id/name/graph_json`, which every
         // other hygiene query reads too — surfacing it beats a silent
         // default (check 52).
-        let (
-            workflow_graphs,
-            workflow_graphs_truncated,
-            workflow_graphs_skipped,
-            workflow_graphs_scan_failed,
-        ) = workflow_graphs?;
+        let workflow_graphs_scan = workflow_graphs?;
+        let workflow_graphs_scan_failed = workflow_graphs_scan.is_err();
+        let (workflow_graphs, workflow_graphs_truncated, workflow_graphs_skipped) = readings
+            .record(HYGIENE_FIELD_TWINS, workflow_graphs_scan)
+            .unwrap_or((Vec::new(), false, 0));
 
         Ok(HygieneReport {
             undescribed,
@@ -4903,6 +5248,7 @@ impl AnalyticsRepository {
             workflow_graphs_truncated,
             workflow_graphs_skipped,
             workflow_graphs_scan_failed,
+            readings,
         })
     }
 
@@ -5279,6 +5625,401 @@ impl AnalyticsRepository {
 /// predicate, in the SAME subquery. Silently changing either one (a status
 /// filter on the count, a different window on the rate) would leave every test
 /// green while the row started claiming a denominator it does not have.
+/// #726: the hygiene sweep's read outcomes must be DISCLOSED, not defaulted.
+///
+/// The pre-fix function collapsed every query error into `.unwrap_or_default()`
+/// / `.unwrap_or(0)` and said so in its own comment, so a database outage
+/// produced fifteen empty lists, `total_issues: 0` and an empty
+/// `recommendations` — "your platform is clean", from zero measurements. The
+/// `tokio::join!` (not `try_join!`) design is correct and is preserved; what
+/// was missing is that the partial-ness was invisible.
+///
+/// These are SOURCE pins because `get_hygiene_report` needs Postgres. The
+/// BEHAVIOUR of the disclosure is driven end-to-end against the real
+/// production assembly function in `talos_hygiene_service::build_report`'s
+/// test module, which is pure. The division is deliberate: a pin can prove the
+/// swallow is gone from the wiring, and only a behavioural test can prove the
+/// report then says the right thing.
+#[cfg(test)]
+mod hygiene_disclosure_pins {
+    use super::{
+        HygieneCheck, HygieneReport, EXPIRING_MEMORY_LIMIT, HYGIENE_CHECKS, HYGIENE_FIELD_TWINS,
+        HYGIENE_FINDING_LIMIT, NEEDS_SCHEMA_LIMIT, ORPHAN_SECRET_SCAN_LIMIT, TWIN_SCAN_GRAPH_LIMIT,
+    };
+
+    /// The body of `get_hygiene_report`, from its signature to the next
+    /// `pub async fn`. Scoping matters: this file has ~180 other queries and a
+    /// whole-file grep would be answering a different question.
+    fn sweep_body() -> &'static str {
+        let src = include_str!("lib.rs");
+        let start = src
+            .find(concat!("pub async fn ", "get_hygiene_report"))
+            .expect("the hygiene sweep still exists");
+        let rest = &src[start + 20..];
+        let end = rest
+            .find("\n    pub async fn ")
+            .expect("the sweep is followed by another method");
+        &rest[..end]
+    }
+
+    /// The defect, stated as a shape: an awaited read followed by a benign
+    /// default. This is structural lint check 74's regex, applied to the crate
+    /// the lint cannot see (74/74b are scoped to `talos-mcp-handlers/src` and
+    /// `talos-api/src`, so neither leg has ever looked at this function).
+    ///
+    /// FAILS on the pre-#726 tree at 15 sites; passes here at 0.
+    #[test]
+    fn the_sweep_never_defaults_a_failed_query() {
+        let body = sweep_body();
+        let mut offenders: Vec<String> = Vec::new();
+        let lines: Vec<&str> = body.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim();
+            // Same-line form, and the split form the house style actually uses
+            // (`.await` at the end of one line, `.unwrap_or*` opening the next).
+            let same_line = t.contains(".await.unwrap_or");
+            let split = t.ends_with(".await")
+                && lines
+                    .get(i + 1)
+                    .is_some_and(|n| n.trim_start().starts_with(".unwrap_or"));
+            if same_line || split {
+                offenders.push(format!("line {}: {t}", i + 1));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a hygiene query is defaulting its own failure again — an empty list would once more \
+             be indistinguishable from an unasked question:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// Every check the sweep records must be in [`HYGIENE_CHECKS`], and every
+    /// entry in the table must be recorded by the sweep.
+    ///
+    /// This is the anti-drift guard that matters: a check added without a table
+    /// entry has a cap nobody discloses, and a table entry nothing records is a
+    /// name the report will never use. Both directions fail.
+    #[test]
+    fn the_check_table_matches_what_the_sweep_records() {
+        let body = sweep_body();
+        let mut recorded: Vec<String> = Vec::new();
+        // The `readings.` receiver is deliberately NOT part of the needle:
+        // rustfmt breaks the chain onto its own line for the longer calls, and
+        // a needle that assumes one formatting is a pin that a `cargo fmt` can
+        // silently disarm.
+        for marker in [
+            concat!(".", "record_rows("),
+            concat!(".", "record("),
+            concat!(".", "mark_derived("),
+        ] {
+            let mut from = 0usize;
+            while let Some(i) = body[from..].find(marker) {
+                let at = from + i + marker.len();
+                // rustfmt breaks a long call across lines, so the first
+                // argument may start on the next one.
+                let arg = body[at..].trim_start();
+                from = at;
+                let Some(rest) = arg.strip_prefix('"') else {
+                    continue; // a non-literal first argument (HYGIENE_FIELD_TWINS)
+                };
+                let end = rest.find('"').expect("a closing quote");
+                recorded.push(rest[..end].to_string());
+            }
+        }
+        // The twin scan is recorded under the exported constant rather than a
+        // literal, precisely so the one check whose finding list is not named
+        // after its own query cannot drift.
+        assert!(
+            body.contains(concat!(".", "record(HYGIENE_FIELD_TWINS")),
+            "the twin scan must be recorded under HYGIENE_FIELD_TWINS"
+        );
+        recorded.push(HYGIENE_FIELD_TWINS.to_string());
+
+        let table: Vec<&str> = HYGIENE_CHECKS.iter().map(|c| c.field).collect();
+        for r in &recorded {
+            assert!(
+                table.contains(&r.as_str()),
+                "the sweep records `{r}` but HYGIENE_CHECKS does not list it, so its cap is \
+                 undisclosed and the coverage block cannot see it"
+            );
+        }
+        for t in &table {
+            assert!(
+                recorded.iter().any(|r| r == t),
+                "HYGIENE_CHECKS lists `{t}` but nothing in the sweep records it, so a failure \
+                 of that check would still be invisible"
+            );
+        }
+        assert_eq!(
+            recorded.len(),
+            HYGIENE_CHECKS.len(),
+            "one check is recorded twice, or the table has a duplicate"
+        );
+    }
+
+    /// A cap that is not the cap in force is a disclosure that names the wrong
+    /// ceiling — this bug class one level up, which is exactly what
+    /// `hygiene_finding_limit_matches_the_sql_literals` already says about the
+    /// one constant that existed before. There are THREE distinct caps plus
+    /// two uncapped reads, so each is anchored to the query that owns it.
+    #[test]
+    fn hygiene_check_caps_match_the_sql_literals() {
+        let body = sweep_body();
+        // Needles are `concat!`-assembled so this test's own text is not a match.
+        for (anchor, cap) in [
+            (
+                concat!("ORDER BY readiness_score DESC NULLS LAST, id", " LIMIT "),
+                HYGIENE_FINDING_LIMIT,
+            ),
+            (
+                concat!("ORDER BY m.compiled_at DESC", " LIMIT "),
+                HYGIENE_FINDING_LIMIT,
+            ),
+            (
+                concat!("ORDER BY dependent_count DESC", " LIMIT "),
+                HYGIENE_FINDING_LIMIT,
+            ),
+            (
+                concat!("ORDER BY we.started_at ASC", " LIMIT "),
+                HYGIENE_FINDING_LIMIT,
+            ),
+            (
+                concat!("ORDER BY m.expires_at ASC", " LIMIT "),
+                EXPIRING_MEMORY_LIMIT,
+            ),
+            (
+                concat!("ORDER BY COUNT(e.id) DESC", " LIMIT "),
+                NEEDS_SCHEMA_LIMIT,
+            ),
+            (
+                concat!("ORDER BY s.created_at ASC", " LIMIT "),
+                ORPHAN_SECRET_SCAN_LIMIT,
+            ),
+        ] {
+            let needle = format!("{anchor}{cap}");
+            assert!(
+                body.contains(&needle),
+                "no hygiene query runs `{needle}` any more; a cap constant and its SQL literal \
+                 have drifted, so summary.coverage.caps now names a ceiling that is not in force"
+            );
+        }
+        // The twin scan binds its cap rather than inlining it.
+        assert!(
+            body.contains(concat!(".bind(", "TWIN_SCAN_GRAPH_LIMIT)")),
+            "the twin scan must bind TWIN_SCAN_GRAPH_LIMIT"
+        );
+        assert_eq!(
+            HYGIENE_CHECKS
+                .iter()
+                .find(|c| c.field == HYGIENE_FIELD_TWINS)
+                .map(|c| c.cap),
+            Some(TWIN_SCAN_GRAPH_LIMIT)
+        );
+        // And the orphaned-secrets OUTPUT cap is a Rust `take`, not SQL — the
+        // 200 above is a second, upstream ceiling on what is even examined.
+        assert!(
+            body.contains(&format!(".take({HYGIENE_FINDING_LIMIT})")),
+            "the orphaned-secrets list no longer takes HYGIENE_FINDING_LIMIT"
+        );
+    }
+
+    /// A cap of `0` in the table is a CLAIM that the read is unbounded. If one
+    /// of those queries grows a LIMIT, the coverage block will report
+    /// `complete` over a truncated list — absence reading as completeness,
+    /// which is the whole defect class.
+    #[test]
+    fn the_uncapped_checks_really_are_uncapped() {
+        let body = sweep_body();
+        for (name, anchor) in [
+            ("idle_actors", "ORDER BY last_active ASC NULLS FIRST"),
+            ("untyped_value_modules", "position('from_str(&input)'"),
+        ] {
+            assert_eq!(
+                HYGIENE_CHECKS
+                    .iter()
+                    .find(|c| c.field == name)
+                    .map(|c| c.cap),
+                Some(0),
+                "{name} is declared capped but the table says otherwise"
+            );
+            let at = body.find(anchor).unwrap_or_else(|| {
+                panic!("the {name} query no longer contains its anchor `{anchor}`")
+            });
+            // The query text ends at the closing `",` of the SQL literal.
+            let tail_end = body[at..].find("\",").expect("the SQL literal is closed");
+            assert!(
+                !body[at..at + tail_end].contains("LIMIT"),
+                "the {name} query grew a LIMIT but HYGIENE_CHECKS still declares it uncapped, so \
+                 summary.coverage would call a truncated list complete"
+            );
+        }
+    }
+
+    /// [`HygieneReport::empty`] must not be able to manufacture an all-clear
+    /// report: the ledger is a required argument, and the fields it names come
+    /// back as `None`/`true` rather than as reassuring defaults.
+    #[test]
+    fn an_empty_report_inherits_its_ledger() {
+        let clean = HygieneReport::empty(talos_measurement::Readings::new());
+        assert_eq!(clean.total_workflow_count, Some(0));
+        assert_eq!(clean.has_wildcard_module, Some(false));
+        assert!(!clean.workflow_graphs_scan_failed);
+        assert!(clean.readings.complete());
+
+        let mut degraded = talos_measurement::Readings::new();
+        degraded.mark_derived("summary.total_workflows");
+        degraded.mark_derived("summary.wildcard_secret_grant");
+        degraded.mark_derived(HYGIENE_FIELD_TWINS);
+        let r = HygieneReport::empty(degraded);
+        assert_eq!(
+            r.total_workflow_count, None,
+            "an unread workflow count must be null, never 0 — 0 is a denominator"
+        );
+        assert_eq!(
+            r.has_wildcard_module, None,
+            "an unread wildcard scan must not report `no wildcard grant`"
+        );
+        assert!(r.workflow_graphs_scan_failed);
+        assert_eq!(
+            r.suppressed_count,
+            Some(0),
+            "unrelated checks are unaffected"
+        );
+    }
+
+    /// The ledger the sweep FILLS must be the ledger the report CARRIES.
+    ///
+    /// Written because the obvious mutation — `readings: Readings::new()` in
+    /// the returned struct literal — left every other test in this change
+    /// green: the behavioural tests construct a `HygieneReport` directly, so
+    /// none of them can see the wiring. A guard that cannot fail on the wiring
+    /// it guards is the class this whole change is about, one level up.
+    #[test]
+    fn the_returned_report_carries_the_ledger_the_sweep_filled() {
+        let body = sweep_body();
+        assert_eq!(
+            body.matches(concat!("Readings", "::new()")).count(),
+            1,
+            "the sweep constructs more than one ledger, so at least one of them is being \
+             discarded — the report would then claim every check ran"
+        );
+        // Field-init shorthand: anything else is a different value.
+        assert!(
+            body.contains("\n            readings,\n"),
+            "the returned HygieneReport no longer uses the field-init shorthand for `readings`, \
+             so it may be carrying a ledger other than the one the sweep filled"
+        );
+    }
+
+    /// The wildcard collapse must go through the one pure function that is
+    /// actually unit-tested. Same reason: the sweep is DB-bound, so an inline
+    /// `map(|n| !n.is_empty())` here is unreachable by any test.
+    #[test]
+    fn the_wildcard_verdict_has_one_implementation() {
+        let body = sweep_body();
+        assert!(
+            body.contains(concat!("wildcard_verdict", "(wildcard_module_names")),
+            "the sweep stopped routing the wildcard scan through `wildcard_verdict`; an inline \
+             collapse there cannot be tested and turns an unread scan into a security all-clear"
+        );
+        assert!(
+            !body.contains(concat!("map(|n| !n.", "is_empty())")),
+            "an inline wildcard collapse is back in the sweep"
+        );
+    }
+
+    /// The three states, exhaustively. `Some(false)` and `None` are the pair
+    /// that must never merge: one says "no module can read your whole vault",
+    /// the other says "nobody checked".
+    #[test]
+    fn the_wildcard_verdict_keeps_unknown_apart_from_none_found() {
+        use super::wildcard_verdict;
+        assert_eq!(wildcard_verdict(None), None);
+        assert_eq!(wildcard_verdict(Some(&[])), Some(false));
+        assert_eq!(
+            wildcard_verdict(Some(&["some-module".to_string()])),
+            Some(true)
+        );
+    }
+
+    /// END-TO-END, against the REAL `get_hygiene_report`, with every query
+    /// failing — and without touching a live database.
+    ///
+    /// The trick is a lazily-connected pool pointed at a closed port, in the
+    /// spirit of `SecretsManager::test_stub_for_cache`: nothing connects until
+    /// a query runs, and then every one of them fails with a connection error.
+    /// That is exactly the "Postgres blip" this whole change is about, and it
+    /// is the only test here that exercises the WIRING rather than the
+    /// renderer.
+    ///
+    /// It exists because a call-site mutation — returning a fresh
+    /// `Readings::new()` from the struct literal instead of the ledger the
+    /// sweep filled — left every other test in this change GREEN. A source pin
+    /// now guards that too, but a pin proves the text and this proves the
+    /// behaviour.
+    ///
+    /// Note what it also demonstrates: under a TOTAL outage the sweep still
+    /// returns `Ok`, not `Err`. That is the `join!`-over-`try_join!` design
+    /// working as intended — a partial report beats no report — and it is only
+    /// safe because the ledger comes back full.
+    #[tokio::test]
+    async fn a_total_outage_returns_a_fully_disclosed_report_not_a_clean_one() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .acquire_timeout(std::time::Duration::from_millis(400))
+            .connect_lazy("postgres://nobody:nobody@127.0.0.1:1/nothing")
+            .expect("a lazy pool never connects at construction");
+        let repo = super::AnalyticsRepository::new(pool);
+        let report = repo.get_hygiene_report(uuid::Uuid::nil()).await.expect(
+            "a dead database must still yield a report — that is why the sweep uses \
+                     tokio::join! rather than try_join!",
+        );
+
+        assert!(
+            !report.readings.complete(),
+            "every query failed and the report claims every check was measured"
+        );
+        let missing = report.readings.not_measured();
+        for check in HYGIENE_CHECKS {
+            assert!(
+                missing.contains(&check.field),
+                "`{}` failed to read and was not disclosed; its empty result is \
+                 indistinguishable from a clean one",
+                check.field
+            );
+        }
+        // And the defaults that used to be published as findings are gone.
+        assert_eq!(report.total_workflow_count, None);
+        assert_eq!(report.unembedded_count, None);
+        assert_eq!(report.suppressed_count, None);
+        assert_eq!(report.has_wildcard_module, None);
+        assert!(report.workflow_graphs_scan_failed);
+        assert!(report.stale_executions.is_empty());
+    }
+
+    /// The list/count split drives whether a `Coverage` is even meaningful: a
+    /// scalar `COUNT(*)` sees its whole population by construction.
+    #[test]
+    fn only_list_checks_carry_a_cap() {
+        for c in HYGIENE_CHECKS {
+            let HygieneCheck {
+                field,
+                cap,
+                is_list,
+            } = *c;
+            if !is_list {
+                assert_eq!(cap, 0, "the scalar check `{field}` declares a row cap");
+            }
+        }
+        assert_eq!(
+            HYGIENE_CHECKS.iter().filter(|c| c.is_list).count(),
+            14,
+            "the number of list checks changed; summary.coverage.caps changed shape with it"
+        );
+    }
+}
+
 #[cfg(test)]
 mod capability_query_pins {
     use super::{HYGIENE_FINDING_LIMIT, READINESS_PAGE_LIMIT};

@@ -6756,6 +6756,19 @@ rm -f "$BENIGN_AWK"
 # adopting the disclosure pattern, so a new report surface is covered the
 # moment it adopts it and nobody has to remember a name.
 #
+# ...WHICH IS WHAT IT SAID WHILE ITS `find` LISTED TWO DIRECTORIES. Widened to
+# the WORKSPACE on 2026-09-02 (#726), because the sentence above was false as
+# shipped and falsely in the reassuring direction. #726 moved the hygiene
+# report's disclosure into `talos-analytics-repository` — a crate that now
+# builds a `Readings` in the function that used to default fifteen reads — and
+# this leg could not see one line of it. A scope claimed to be derived from the
+# code, enforced by a hardcoded path list, is the "gate that doesn't gate"
+# class (#624) sitting inside the check written to prevent it.
+# MEASURED before widening: the workspace-wide population is ONE site,
+# `handle_get_error_report`'s label lookup, which already carries the
+# `allow-benign-default` marker for being label prettification. So the widened
+# leg still ships at ZERO, not as a ratchet.
+#
 # WHAT IT ASSERTS, and why it is a STRONGER claim than leg 74's inside its
 # scope: `Readings::note()` renders "complete: every field in this report
 # was measured", and `attach` adds NOTHING when the ledger is clean. So a
@@ -6773,7 +6786,15 @@ rm -f "$BENIGN_AWK"
 # STATED LIMITS — all three in the loud or the honest direction:
 #  (a) It only sees functions that ALREADY adopted `Readings`. A report
 #      surface that never adopted it is invisible here, so this COMPLEMENTS
-#      leg 74's glob, it does not replace it.
+#      leg 74's glob, it does not replace it. (Leg 74 stays scoped to
+#      `talos-mcp-handlers/src` + `talos-api/src`: its filter is a name glob
+#      over HANDLER names, and running that over 100+ crates would fire on
+#      every `*_health` helper in the workspace at a precision nobody measured.
+#      Only THIS leg, whose scope is a code property, is safe to widen.)
+#  (a2) Its function tracking is TEXTUAL: an `async` block inside a function
+#      belongs to that function, which is what makes it see the hygiene sweep's
+#      sixteen `join!`ed futures at all — and equally means a defaulted read in
+#      a nested closure counts against the enclosing `fn`. Loud direction.
 #  (b) It inherits leg 74's regex exactly: `.await` immediately followed by
 #      `.unwrap_or*`, same line or split. A `match { Err(_) => <default> }`
 #      block, a `.ok()`, or an `unwrap_or` on an ALREADY-RESOLVED local is
@@ -6830,7 +6851,7 @@ while IFS= read -r hit; do
     red "✗ $file:$lineno $fname() defaults a read beside a Readings ledger"
     printf '    %s\n' "$(printf '%s' "${rest2#*:}" | cut -c1-110)"
     READINGS_FAIL=1
-done < <(cd "$ROOT" && find talos-mcp-handlers/src talos-api/src -name '*.rs' \
+done < <(cd "$ROOT" && find . -path ./target -prune -o -name '*.rs' \
              -not -name '*_tests.rs' -not -path '*/tests/*' -print0 2>/dev/null \
          | xargs -0 -n 40 awk -f "$READINGS_AWK" 2>/dev/null \
          | sed 's|^\./||' || true)
