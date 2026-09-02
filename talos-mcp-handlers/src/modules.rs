@@ -427,7 +427,7 @@ pub async fn dispatch(
         }
         "restore_pinned_modules" => Some(handle_restore_pinned_modules(req_id, state, agent).await),
         "find_module_alternatives" => {
-            Some(handle_find_module_alternatives(req_id, args, state).await)
+            Some(handle_find_module_alternatives(req_id, args, state, agent).await)
         }
         _ => None,
     }
@@ -3790,7 +3790,14 @@ async fn handle_find_module_alternatives(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
     state: &McpState,
+    agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
+    // Every lookup below matches on a CALLER-SUPPLIED name or capability
+    // keyword, so each one needs the authenticated identity to scope by.
+    // Pre-fix this handler took no `agent` at all — which is why the four
+    // repository calls could not have been scoped even if someone had
+    // noticed: the tenant was not in the room.
+    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
     // MCP-354 (2026-05-11): pre-fix `s.chars().take(N).collect()`
     // silently truncated operator-provided search keys — a 300-char
     // `module_name` was queried as the first 200 chars, and the
@@ -3922,7 +3929,7 @@ async fn handle_find_module_alternatives(
         // Fetch target module
         let target = match state
             .module_repo
-            .lookup_template_by_name_ci(target_name)
+            .lookup_template_by_name_ci(target_name, user_id)
             .await
         {
             Ok(Some(r)) => r,
@@ -3950,7 +3957,13 @@ async fn handle_find_module_alternatives(
         // Try pg_trgm similarity search first; fall back to category + alphabetical
         let (rows, search_method) = match state
             .module_repo
-            .find_template_alternatives_trgm(target_id, &search_text, &target_category, limit)
+            .find_template_alternatives_trgm(
+                target_id,
+                &search_text,
+                &target_category,
+                user_id,
+                limit,
+            )
             .await
         {
             Ok(rows) => (rows, "trigram"),
@@ -3958,7 +3971,12 @@ async fn handle_find_module_alternatives(
                 // pg_trgm not available — fall back to category-priority ordering
                 let fallback = state
                     .module_repo
-                    .find_template_alternatives_by_category(target_id, &target_category, limit)
+                    .find_template_alternatives_by_category(
+                        target_id,
+                        &target_category,
+                        user_id,
+                        limit,
+                    )
                     .await
                     .unwrap_or_default();
                 (fallback, "category")
@@ -4011,14 +4029,14 @@ async fn handle_find_module_alternatives(
 
     let (rows, search_method) = match state
         .module_repo
-        .find_templates_by_capability_trgm(&cap, &ilike_pattern, limit)
+        .find_templates_by_capability_trgm(&cap, &ilike_pattern, user_id, limit)
         .await
     {
         Ok(rows) => (rows, "trigram"),
         Err(_) => {
             let fallback = state
                 .module_repo
-                .find_templates_by_capability_ilike(&ilike_pattern, limit)
+                .find_templates_by_capability_ilike(&ilike_pattern, user_id, limit)
                 .await
                 .unwrap_or_default();
             (fallback, "ilike")

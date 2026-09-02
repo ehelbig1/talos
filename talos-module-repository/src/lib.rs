@@ -325,10 +325,38 @@ fn template_alternative_row_from_pg(row: sqlx::postgres::PgRow) -> Result<Templa
         config_schema: row
             .try_get::<Option<serde_json::Value>, _>("config_schema")?
             .unwrap_or(serde_json::Value::Null),
-        // similarity() returns PostgreSQL real (f32); cast to f64. Missing column → None.
-        score: row.try_get::<Option<f32>, _>("score")?.map(|s| s as f64),
-        same_category: row.try_get::<Option<_>, _>("same_category")?,
+        // similarity() returns PostgreSQL real (f32); cast to f64.
+        //
+        // `score` and `same_category` are the only two columns here that are
+        // ABSENT BY DESIGN from some of the six queries that share this
+        // mapper — the plain name lookup and the two non-pg_trgm fallbacks
+        // project neither. This comment already said "missing column → None",
+        // but the conversion to `?`-propagation (the MCP-636 sweep, correct
+        // for every other column) made an absent column a hard error, so
+        // `lookup_template_by_name_ci` failed 100% of the time — taking
+        // `find_module_alternatives`'s whole by-name branch with it — and the
+        // two fallbacks returned empty through `.unwrap_or_default()` at their
+        // call sites, i.e. "pg_trgm is unavailable AND so is the fallback".
+        // Absence here is the contract, not drift, so it maps to None; every
+        // other failure (decode, type change) still propagates.
+        score: optional_column::<f32>(&row, "score")?.map(|s| s as f64),
+        same_category: optional_column::<bool>(&row, "same_category")?,
     })
+}
+
+/// Read a column that some of the sharing queries deliberately do not project.
+/// A genuinely missing column yields `None`; a NULL yields `None`; anything
+/// else — a decode failure, a type change — propagates, so this stays a
+/// narrower exception to check 52 rather than a hole in it.
+fn optional_column<'r, T>(row: &'r sqlx::postgres::PgRow, column: &str) -> Result<Option<T>>
+where
+    T: sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>,
+{
+    match row.try_get::<Option<T>, _>(column) {
+        Ok(v) => Ok(v),
+        Err(sqlx::Error::ColumnNotFound(_)) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Snapshot used by `hot_update_module` to resolve a module's current state
@@ -1770,15 +1798,28 @@ impl ModuleRepository {
     /// the unified modules table; `kind` projected as `category` for
     /// back-compat (catalog/sandbox/extracted instead of the old free-form
     /// category strings — coarser but consistent with the new model).
+    ///
+    /// Scoped catalog-or-mine — see
+    /// [`ModuleRepository::resolve_module_id_by_name_for_user`] for why that
+    /// is the predicate and not a flat `user_id = $n`. Pre-fix this
+    /// turned a caller-supplied NAME into another tenant's `modules.id`,
+    /// `description` and `allowed_secrets` — a strictly larger disclosure than
+    /// the id-only leak MCP-956 closed on the suggestion surface.
     pub async fn lookup_template_by_name_ci(
         &self,
         name: &str,
+        user_id: Uuid,
     ) -> Result<Option<TemplateAlternativeRow>> {
         let row = sqlx::query(
             "SELECT id, name, kind AS category, description, allowed_secrets, config_schema \
-             FROM modules WHERE LOWER(name) = LOWER($1) LIMIT 1",
+             FROM modules \
+             WHERE LOWER(name) = LOWER($1) \
+               AND (user_id IS NULL OR user_id = $2) \
+             ORDER BY (user_id IS NULL), compiled_at DESC NULLS LAST, id \
+             LIMIT 1",
         )
         .bind(name)
+        .bind(user_id)
         .fetch_optional(&self.db_pool)
         .await?;
         row.map(template_alternative_row_from_pg).transpose()
@@ -1788,11 +1829,21 @@ impl ModuleRepository {
     /// flag to drive UI ranking. The pg_trgm extension may not be installed
     /// in all deployments — callers should fall back to category ordering on
     /// error.
+    ///
+    /// Scoped catalog-or-mine. The `category IS NOT NULL` filter made this
+    /// catalog-only *in effect* on every deployment observed to date (no write
+    /// path sets `category` on a user-owned row), which is exactly why it was
+    /// easy to leave unscoped: the leak is LATENT, and one future write that
+    /// stamps a category on a sandbox module turns a discovery list into a
+    /// cross-tenant enumeration of names, descriptions and required secrets.
+    /// The predicate makes the property hold by construction instead of by
+    /// coincidence. `, id` closes the check-28/60 tie in the ranking.
     pub async fn find_template_alternatives_trgm(
         &self,
         target_id: Uuid,
         search_text: &str,
         target_category: &str,
+        user_id: Uuid,
         limit: i64,
     ) -> Result<Vec<TemplateAlternativeRow>> {
         // Phase 5.1: query the unified `modules` table; canonical id exclusion.
@@ -1806,13 +1857,16 @@ impl ModuleRepository {
              FROM modules \
              WHERE id != $1 \
                AND category IS NOT NULL \
+               AND (user_id IS NULL OR user_id = $4) \
              ORDER BY (GREATEST(similarity(name, $2), similarity(COALESCE(description, ''), $2)) \
-                       + 0.1 * CASE WHEN (category = $3) THEN 1.0::float8 ELSE 0.0::float8 END) DESC \
-             LIMIT $4",
+                       + 0.1 * CASE WHEN (category = $3) THEN 1.0::float8 ELSE 0.0::float8 END) DESC, \
+                      id \
+             LIMIT $5",
         )
         .bind(target_id)
         .bind(search_text)
         .bind(target_category)
+        .bind(user_id)
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
@@ -1827,19 +1881,24 @@ impl ModuleRepository {
         &self,
         target_id: Uuid,
         target_category: &str,
+        user_id: Uuid,
         limit: i64,
     ) -> Result<Vec<TemplateAlternativeRow>> {
-        // Phase 5.1: canonical id exclusion only.
+        // Phase 5.1: canonical id exclusion only. Scoped catalog-or-mine for
+        // the same reason as the trgm sibling above; `name` is unique only
+        // per user, so `, id` is what actually makes the order total.
         let rows = sqlx::query(
             "SELECT id, name, category, description, allowed_secrets, config_schema \
              FROM modules \
              WHERE id != $1 \
                AND category IS NOT NULL \
-             ORDER BY (category = $2) DESC, name ASC \
-             LIMIT $3",
+               AND (user_id IS NULL OR user_id = $3) \
+             ORDER BY (category = $2) DESC, name ASC, id \
+             LIMIT $4",
         )
         .bind(target_id)
         .bind(target_category)
+        .bind(user_id)
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
@@ -1853,10 +1912,13 @@ impl ModuleRepository {
         &self,
         capability: &str,
         ilike_pattern: &str,
+        user_id: Uuid,
         limit: i64,
     ) -> Result<Vec<TemplateAlternativeRow>> {
         // Phase 4 prep: query the unified `modules` table. No target
-        // exclusion (this is a free-form discovery search).
+        // exclusion (this is a free-form discovery search) — which makes the
+        // catalog-or-mine scope load-bearing here rather than incidental:
+        // this is the widest name/description matcher in the crate.
         let rows = sqlx::query(
             "SELECT id, name, category, description, allowed_secrets, config_schema, \
                 GREATEST( \
@@ -1865,15 +1927,17 @@ impl ModuleRepository {
                 ) AS score \
              FROM modules \
              WHERE category IS NOT NULL \
+               AND (user_id IS NULL OR user_id = $3) \
                AND ( similarity(name, $1) > 0.05 \
                   OR similarity(COALESCE(description, ''), $1) > 0.05 \
                   OR LOWER(name) LIKE LOWER($2) \
                   OR LOWER(COALESCE(description, '')) LIKE LOWER($2) ) \
-             ORDER BY score DESC \
-             LIMIT $3",
+             ORDER BY score DESC, id \
+             LIMIT $4",
         )
         .bind(capability)
         .bind(ilike_pattern)
+        .bind(user_id)
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
@@ -1886,6 +1950,7 @@ impl ModuleRepository {
     pub async fn find_templates_by_capability_ilike(
         &self,
         ilike_pattern: &str,
+        user_id: Uuid,
         limit: i64,
     ) -> Result<Vec<TemplateAlternativeRow>> {
         // Phase 4 prep: query the unified `modules` table.
@@ -1893,11 +1958,13 @@ impl ModuleRepository {
             "SELECT id, name, category, description, allowed_secrets, config_schema \
              FROM modules \
              WHERE category IS NOT NULL \
+               AND (user_id IS NULL OR user_id = $2) \
                AND (LOWER(name) LIKE LOWER($1) OR LOWER(COALESCE(description, '')) LIKE LOWER($1)) \
-             ORDER BY name ASC \
-             LIMIT $2",
+             ORDER BY name ASC, id \
+             LIMIT $3",
         )
         .bind(ilike_pattern)
+        .bind(user_id)
         .bind(limit)
         .fetch_all(&self.db_pool)
         .await?;
@@ -1926,49 +1993,140 @@ impl ModuleRepository {
     /// LOWER, space/underscore→dash on stored name, kebab+strip on stored
     /// name, AND a symmetric normalisation that handles inputs like
     /// "Data_Validator" matching stored "Data Validator". Used by
-    /// `create_workflow_from_spec`.
-    pub async fn find_template_id_by_name_normalised(&self, name: &str) -> Result<Option<Uuid>> {
+    /// `create_workflow_from_spec` and the actor scaffold.
+    ///
+    /// Scoped catalog-or-mine, and totally ordered — see
+    /// [`ModuleRepository::resolve_module_id_by_name_for_user`].
+    pub async fn find_template_id_by_name_normalised(
+        &self,
+        name: &str,
+        user_id: Uuid,
+    ) -> Result<Option<Uuid>> {
         let row: Option<(Uuid,)> = sqlx::query_as(
             "SELECT id FROM modules \
-             WHERE LOWER(name) = LOWER($1) \
-                OR LOWER(REPLACE(REPLACE(name, ' ', '-'), '_', '-')) = LOWER($1) \
-                OR LOWER(REGEXP_REPLACE(REPLACE(REPLACE(name, ' ', '-'), '_', '-'), \
-                         '[^a-z0-9-]', '', 'gi')) = LOWER($1) \
-                OR LOWER(REPLACE(REPLACE($1, ' ', '-'), '_', '-')) \
-                   = LOWER(REPLACE(REPLACE(name, ' ', '-'), '_', '-')) \
+             WHERE (user_id IS NULL OR user_id = $2) \
+               AND ( LOWER(name) = LOWER($1) \
+                  OR LOWER(REPLACE(REPLACE(name, ' ', '-'), '_', '-')) = LOWER($1) \
+                  OR LOWER(REGEXP_REPLACE(REPLACE(REPLACE(name, ' ', '-'), '_', '-'), \
+                           '[^a-z0-9-]', '', 'gi')) = LOWER($1) \
+                  OR LOWER(REPLACE(REPLACE($1, ' ', '-'), '_', '-')) \
+                     = LOWER(REPLACE(REPLACE(name, ' ', '-'), '_', '-')) ) \
+             ORDER BY (user_id IS NULL), compiled_at DESC NULLS LAST, id \
              LIMIT 1",
         )
         .bind(name)
+        .bind(user_id)
         .fetch_optional(&self.db_pool)
         .await?;
         Ok(row.map(|(id,)| id))
     }
 
-    /// Phase 5: find a `modules.id` by stripping `-` and `_` then ILIKE
-    /// comparison against the stripped name column. Used by
-    /// `plan_and_execute` (primary matcher).
-    pub async fn find_template_id_by_strip_normalise(&self, name: &str) -> Result<Option<Uuid>> {
+    /// Resolve a caller-supplied module NAME to a `modules.id` the caller can
+    /// actually dispatch.
+    ///
+    /// This is the whole of what `plan_and_execute_workflow` used to do inline:
+    /// try an exact strip-normalised match, then fall back to a fuzzy
+    /// `%a%b%`-style ILIKE. Both steps live here, private, so the handler has
+    /// no unscoped-lookup-shaped block left to reintroduce and no pattern to
+    /// build by hand.
+    ///
+    /// # Why `user_id IS NULL OR user_id = $n`, not `user_id = $n`
+    ///
+    /// The catalog lives in this same table as `user_id IS NULL`; a flat
+    /// owner predicate would make every catalog module unresolvable and break
+    /// module installation platform-wide. The name is unique only *per user*
+    /// (`modules_user_name_uniq (user_id, name) WHERE user_id IS NOT NULL`)
+    /// plus once for the catalog (`modules_catalog_name_uniq`), so a bare name
+    /// match genuinely reaches other tenants' rows.
+    ///
+    /// # Why an app-layer predicate and not a tenant-scoped transaction
+    ///
+    /// RLS cannot express this boundary. `modules_tenant_isolation` keys on
+    /// `org_id` and permits unconditionally when `app.current_org_ids` is
+    /// unset, catalog rows are `org_id IS NULL` (permitted by a dedicated
+    /// arm), and the application role carries `rolbypassrls`. Even a correct
+    /// `begin_org_scoped` transaction would let one member read another
+    /// member's private module. This is a USER boundary; RLS enforces an ORG
+    /// one. Same conclusion `ml_registry_tenancy_tests` records for the
+    /// serving path.
+    ///
+    /// # Why the ORDER BY
+    ///
+    /// `LIMIT 1` over a tie picks by heap order. On a live install today eight
+    /// names exist in BOTH the catalog and a user's own copy (installing a
+    /// catalog module writes a user-owned row of the same name), so the
+    /// pre-fix lookup was already a coin flip on the most commonly named
+    /// modules. `(user_id IS NULL)` sorts the caller's own row first — an
+    /// installed copy shadows the catalog original, which is what the caller
+    /// meant and what `Registry::get_module` will resolve — then newest, then
+    /// `id` to make the order total. Check 28 / check 60.
+    pub async fn resolve_module_id_by_name_for_user(
+        &self,
+        name: &str,
+        user_id: Uuid,
+    ) -> Result<Option<Uuid>> {
+        // `-`/`_`/space fold to `%` on purpose: that is the fuzz this lookup
+        // is for. A literal `%` or `\` in the input is NOT — it is a wildcard
+        // the caller injected, and `module_name: "%"` used to resolve to an
+        // arbitrary row. Escape those two first (Postgres LIKE's default
+        // escape character is `\`), then fold. No module name in any observed
+        // catalog contains either character, so this is byte-identical for
+        // every real name.
+        let escaped = name.replace('\\', "\\\\").replace('%', "\\%");
+        if let Some(id) = self
+            .find_module_id_strip_normalised(&escaped, user_id)
+            .await?
+        {
+            return Ok(Some(id));
+        }
+        let folded = escaped.to_lowercase().replace(['-', '_', ' '], "%");
+        self.find_module_id_by_ilike(&format!("%{}%", folded), user_id)
+            .await
+    }
+
+    /// Step 1 of [`Self::resolve_module_id_by_name_for_user`]: strip `-` and
+    /// `_` from both sides, then compare. Private — the only correct way to
+    /// reach it is through the scoped resolver.
+    async fn find_module_id_strip_normalised(
+        &self,
+        name: &str,
+        user_id: Uuid,
+    ) -> Result<Option<Uuid>> {
         let id: Option<Uuid> = sqlx::query_scalar(
             "SELECT id FROM modules \
              WHERE LOWER(REPLACE(REPLACE(name, '-', ''), '_', '')) \
-                ILIKE LOWER(REPLACE(REPLACE($1, '-', ''), '_', '')) \
+                   ILIKE LOWER(REPLACE(REPLACE($1, '-', ''), '_', '')) \
+               AND (user_id IS NULL OR user_id = $2) \
+             ORDER BY (user_id IS NULL), compiled_at DESC NULLS LAST, id \
              LIMIT 1",
         )
         .bind(name)
+        .bind(user_id)
         .fetch_optional(&self.db_pool)
         .await?;
         Ok(id)
     }
 
-    /// Phase 5: find a `modules.id` by ILIKE pattern. Caller supplies the
-    /// pre-built `%pattern%` string. Used by `plan_and_execute` as a
-    /// fallback.
-    pub async fn find_template_id_by_ilike(&self, ilike_pattern: &str) -> Result<Option<Uuid>> {
-        let id: Option<Uuid> =
-            sqlx::query_scalar("SELECT id FROM modules WHERE LOWER(name) ILIKE $1 LIMIT 1")
-                .bind(ilike_pattern)
-                .fetch_optional(&self.db_pool)
-                .await?;
+    /// Step 2 of [`Self::resolve_module_id_by_name_for_user`]: the fuzzy
+    /// fallback. Private for the same reason as step 1 — and because the
+    /// `%pattern%` is now built by the resolver, a caller cannot hand this a
+    /// pattern that was never escaped.
+    async fn find_module_id_by_ilike(
+        &self,
+        ilike_pattern: &str,
+        user_id: Uuid,
+    ) -> Result<Option<Uuid>> {
+        let id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM modules \
+             WHERE LOWER(name) ILIKE $1 \
+               AND (user_id IS NULL OR user_id = $2) \
+             ORDER BY (user_id IS NULL), compiled_at DESC NULLS LAST, id \
+             LIMIT 1",
+        )
+        .bind(ilike_pattern)
+        .bind(user_id)
+        .fetch_optional(&self.db_pool)
+        .await?;
         Ok(id)
     }
 
