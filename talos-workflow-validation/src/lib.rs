@@ -208,6 +208,60 @@ fn node_declared_u64(node: &serde_json::Value, key: &str) -> Option<u64> {
         .and_then(serde_json::Value::as_u64)
 }
 
+/// The retry count the engine will resolve for a node, and whether the node
+/// declared it.
+///
+/// **One resolver, three consumers.** [`retry_envelope_overrun`],
+/// [`retry_headroom`] and [`node_retry_advice`] all need this answer, and it is
+/// not a one-liner: a declared count wins (including `0`), an actor-less
+/// execution has a DECLARED count clamped at graph load, and an absent count
+/// routes to the method-aware module classifier. Three copies of that would be
+/// three chances to disagree about what a node's retry count is — and the whole
+/// value of these checks is that they agree with the engine and with each
+/// other.
+///
+/// The returned flag is `true` when the count came from the node's own
+/// `retry_count` (including an explicit `0`), `false` when
+/// [`talos_workflow_engine_core::default_max_retries_for_module`] supplied it.
+#[must_use]
+pub fn resolved_node_retries(
+    node: &serde_json::Value,
+    has_actor: bool,
+    module_methods: &[String],
+    module_world: Option<&str>,
+) -> (u32, bool) {
+    let declared =
+        node_declared_u64(node, "retry_count").map(|v| u32::try_from(v).unwrap_or(u32::MAX));
+    let resolved = match declared {
+        Some(n) if has_actor => n,
+        // An actor-less execution has its DECLARED count clamped at graph load;
+        // predicting the unclamped one would report an envelope that cannot run.
+        Some(n) => n.min(talos_workflow_engine_core::MAX_RETRIES_UNBUDGETED),
+        None => {
+            talos_workflow_engine_core::default_max_retries_for_module(module_methods, module_world)
+        }
+    };
+    (resolved, declared.is_some())
+}
+
+/// The base backoff the engine will apply between a node's attempts.
+fn node_backoff_ms(node: &serde_json::Value) -> u64 {
+    node_declared_u64(node, "retry_backoff_ms")
+        .unwrap_or(talos_workflow_engine_core::DEFAULT_BACKOFF_MS)
+}
+
+/// Why an operator might legitimately keep a node at zero retries, stated once.
+///
+/// Shared verbatim by [`describe_disabled_retry_protection`] (where the 0 is
+/// already in place) and by [`node_retry_advice`] (where a raise is being
+/// proposed). The caveat is identical in both directions — it is a fact about
+/// what a retry costs, not about which way the configuration is moving — so a
+/// second wording of it would be two accounts of one thing.
+pub const RETRY_COST_CAVEAT: &str =
+    "a retry re-runs the node's work, and where that work has a cost (an LLM completion, a \
+     metered API call) each attempt pays it again — a timeout counts as transient, so a retry \
+     can fire even when the first attempt may have completed";
+
 /// A node whose configured retry envelope cannot fit its workflow's budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryEnvelopeOverrun {
@@ -245,20 +299,10 @@ pub fn retry_envelope_overrun(
     if budget_secs == 0 {
         return None;
     }
-    let declared =
-        node_declared_u64(node, "retry_count").map(|v| u32::try_from(v).unwrap_or(u32::MAX));
-    let resolved_retries = match declared {
-        Some(n) if has_actor => n,
-        // An actor-less execution has its DECLARED count clamped at graph load;
-        // predicting the unclamped one would report an envelope that cannot run.
-        Some(n) => n.min(talos_workflow_engine_core::MAX_RETRIES_UNBUDGETED),
-        None => {
-            talos_workflow_engine_core::default_max_retries_for_module(module_methods, module_world)
-        }
-    };
+    let (resolved_retries, retries_declared) =
+        resolved_node_retries(node, has_actor, module_methods, module_world);
     let per_attempt_secs = node_per_attempt_timeout_secs(node, default_node_timeout_secs);
-    let backoff_ms = node_declared_u64(node, "retry_backoff_ms")
-        .unwrap_or(talos_workflow_engine_core::DEFAULT_BACKOFF_MS);
+    let backoff_ms = node_backoff_ms(node);
     let envelope_secs = node_retry_envelope_secs(per_attempt_secs, resolved_retries, backoff_ms);
     if envelope_secs <= budget_secs {
         return None;
@@ -268,8 +312,132 @@ pub fn retry_envelope_overrun(
         attempts: u64::from(resolved_retries).saturating_add(1),
         per_attempt_secs,
         resolved_retries,
-        retries_declared: declared.is_some(),
+        retries_declared,
     })
+}
+
+/// Render the operator-facing text for a retry-envelope overrun.
+///
+/// Extracted from `validate_prepared` so the retry ADVISOR
+/// (`suggest_retry_config`) can quote the same explanation the VALIDATOR
+/// prints instead of composing a second account of the same mechanism. Two
+/// surfaces describing one engine behaviour in two vocabularies is how an
+/// operator ends up believing they are two different problems.
+#[must_use]
+pub fn describe_retry_envelope_overrun(
+    overrun: &RetryEnvelopeOverrun,
+    node_label: &str,
+    budget_secs: u64,
+) -> String {
+    let RetryEnvelopeOverrun {
+        envelope_secs,
+        attempts,
+        per_attempt_secs,
+        resolved_retries,
+        retries_declared,
+    } = overrun;
+    let retry_note = if *retries_declared {
+        format!("its declared retry_count of {resolved_retries}")
+    } else {
+        format!(
+            "the {resolved_retries} method-aware default retries its module resolves to (it \
+             declares no retry_count)"
+        )
+    };
+    // With `resolved_retries == 0` the overrun is the node's SINGLE attempt
+    // outrunning the budget — there is no retry_count to lower, and telling an
+    // operator to lower one is advice they cannot act on.
+    let remedy = if *resolved_retries == 0 {
+        "This node makes only one attempt, so there is no retry_count to lower: raise \
+         execution_timeout_secs above the per-attempt timeout, lower this node's timeout_secs to \
+         fit, or make the node's work smaller."
+    } else {
+        "Lower retry_count or raise execution_timeout_secs. Do NOT raise this node's \
+         timeout_secs: that multiplies the envelope by the attempt count and makes the failure \
+         arrive sooner."
+    };
+    format!(
+        "Node '{node_label}' has a retry envelope of ~{envelope_secs}s ({attempts} attempts x \
+         {per_attempt_secs}s, plus backoff, from {retry_note}) inside a workflow budget of \
+         {budget_secs}s. At least one configured attempt can never complete: the retry loop has \
+         no view of the workflow deadline, so it starts the attempt anyway, and when the budget \
+         expires the whole execution is dropped — discarding every sibling node that had already \
+         finished. {remedy}"
+    )
+}
+
+/// Whether a module's DECLARED permissions make it capable of changing state at
+/// an external destination — it declares egress hosts and its method allowlist
+/// is not restricted to `GET`/`HEAD`.
+///
+/// **Extracted so there is exactly one statement of this predicate.** It was
+/// inline in `validate_prepared`, which made it invisible to the retry advisor
+/// — and "may this node be retried without doing something twice?" is the
+/// single most important input to a retry recommendation. A second copy would
+/// be free to drift from the crash-recovery advisory that already uses it, and
+/// the two would then disagree about the same node.
+///
+/// An UNDECLARED `allowed_methods` counts as side-effecting: empty means "allow
+/// every verb" at the worker's enforcement point, so it is unknown, not safe.
+/// [`talos_workflow_engine_core::methods_are_read_only`] states that once, for
+/// this caller and for the retry-default classifier.
+#[must_use]
+pub fn module_is_side_effecting(allowed_hosts: &[String], allowed_methods: &[String]) -> bool {
+    !allowed_hosts.is_empty() && !talos_workflow_engine_core::methods_are_read_only(allowed_methods)
+}
+
+/// The largest retry count whose worst-case envelope still fits `budget_secs`.
+///
+/// `None` when `budget_secs == 0` — the wall-clock cap is disabled, so there is
+/// no container and no ceiling. `Some(0)` means not even the node's single
+/// first attempt fits, i.e. no retry count is safe and the problem is the
+/// per-attempt timeout, not the retry count.
+///
+/// **Searches over [`node_retry_envelope_secs`] rather than solving for a
+/// count.** A closed form would be a second statement of the envelope formula,
+/// and the first thing that would drift is the backoff term — which is exactly
+/// where [`retry_envelope_overrun`] and this function must agree, because this
+/// one exists to answer "then what count would NOT trip that warning?". The
+/// envelope is monotonic in the count and the count is capped at
+/// `talos_workflow_types::MAX_RETRY_COUNT`, so the search is bounded and cheap.
+#[must_use]
+pub fn max_retries_within_budget(
+    per_attempt_secs: u64,
+    base_backoff_ms: u64,
+    budget_secs: u64,
+) -> Option<u32> {
+    if budget_secs == 0 {
+        return None;
+    }
+    // Mirrors `validate_graph_timeouts`' own per-node ceiling. Searching past
+    // it would return a count the graph validator rejects as an Error.
+    const MAX_SEARCH: u32 = 100;
+    let mut best = 0u32;
+    for retries in 0..=MAX_SEARCH {
+        if node_retry_envelope_secs(per_attempt_secs, retries, base_backoff_ms) <= budget_secs {
+            best = retries;
+        } else {
+            // Monotonic: once it stops fitting it never fits again.
+            break;
+        }
+    }
+    Some(best)
+}
+
+/// The largest retry count a NODE may carry and still fit its workflow budget,
+/// reading its per-attempt timeout and backoff exactly as the engine does.
+///
+/// `None` when the wall-clock cap is disabled (`budget_secs == 0`).
+#[must_use]
+pub fn node_budget_retry_ceiling(
+    node: &serde_json::Value,
+    budget_secs: u64,
+    default_node_timeout_secs: u64,
+) -> Option<u32> {
+    let per_attempt_secs = node_per_attempt_timeout_secs(node, default_node_timeout_secs);
+    let backoff_ms = node_declared_u64(node, "retry_backoff_ms")
+        .unwrap_or(talos_workflow_engine_core::DEFAULT_BACKOFF_MS);
+    max_retries_within_budget(per_attempt_secs, backoff_ms, budget_secs)
 }
 
 // ── Observed failure history (authoring-time, Warning-only) ──────────────────
@@ -488,18 +656,10 @@ pub fn retry_headroom(
     if budget_secs == 0 {
         return None;
     }
-    let declared =
-        node_declared_u64(node, "retry_count").map(|v| u32::try_from(v).unwrap_or(u32::MAX));
-    let resolved_retries = match declared {
-        Some(n) if has_actor => n,
-        Some(n) => n.min(talos_workflow_engine_core::MAX_RETRIES_UNBUDGETED),
-        None => {
-            talos_workflow_engine_core::default_max_retries_for_module(module_methods, module_world)
-        }
-    };
+    let (resolved_retries, retries_declared) =
+        resolved_node_retries(node, has_actor, module_methods, module_world);
     let per_attempt_secs = node_per_attempt_timeout_secs(node, default_node_timeout_secs);
-    let backoff_ms = node_declared_u64(node, "retry_backoff_ms")
-        .unwrap_or(talos_workflow_engine_core::DEFAULT_BACKOFF_MS);
+    let backoff_ms = node_backoff_ms(node);
     let current_envelope_secs =
         node_retry_envelope_secs(per_attempt_secs, resolved_retries, backoff_ms);
     let one_more_attempt_secs = node_retry_envelope_secs(
@@ -509,7 +669,7 @@ pub fn retry_headroom(
     );
     Some(RetryHeadroom {
         resolved_retries,
-        retries_declared: declared.is_some(),
+        retries_declared,
         per_attempt_secs,
         budget_secs,
         current_envelope_secs,
@@ -806,6 +966,19 @@ pub fn latest_failure_is_transient(latest_error: Option<&str>) -> Option<bool> {
 ///
 /// `observed` decorates the finding when the node ran inside the history
 /// window; absence of history never suppresses it (see the module note above).
+///
+/// `budget_ceiling` is [`node_budget_retry_ceiling`] for this node — the
+/// largest retry count whose envelope fits the workflow budget. It exists
+/// because this message ENDS IN A NUMBER an operator is invited to apply, and
+/// until #721 that number was never checked against the budget it would have to
+/// fit inside. Measured on the live fleet 2026-09-01: **33 of the 35 nodes this
+/// finding fires on** would, on following the "set retry_count to 2" sentence,
+/// immediately trip [`retry_envelope_overrun`] on the same workflow (361 s of
+/// envelope in a 300 s budget for the ordinary 120 s / 500 ms shape). So one
+/// tool's two warnings contradicted each other — the same defect the retry
+/// advisor was rebuilt to remove, one surface over. Pass `None` only when the
+/// budget genuinely cannot be resolved or is disabled; the remedy then keeps
+/// its unqualified form.
 #[must_use]
 pub fn describe_disabled_retry_protection(
     finding: &DisabledRetryProtection,
@@ -814,6 +987,7 @@ pub fn describe_disabled_retry_protection(
     latest_failure_transient: Option<bool>,
     executions_scanned: i64,
     window_days: i32,
+    budget_ceiling: Option<u32>,
 ) -> String {
     let DisabledRetryProtection {
         world_default_retries,
@@ -872,14 +1046,649 @@ pub fn describe_disabled_retry_protection(
     }
 
     msg.push_str(&format!(
-        " If the 0 is deliberate, keep it: a retry re-runs the node's work, and where that work \
-         has a cost (an LLM completion, a metered API call) each attempt pays it again — a \
-         timeout counts as transient, so a retry can fire even when the first attempt may have \
-         completed. If it is not deliberate, set retry_count to {world_default_retries} — the \
-         value the module default already resolves to."
+        " If the 0 is deliberate, keep it: {RETRY_COST_CAVEAT}."
     ));
 
+    // The remedy half. `world_default_retries` is what the module default
+    // resolves to; whether it FITS is a different question, and answering only
+    // the first one is how this sentence came to contradict the sibling
+    // retry-envelope warning on 33 of the 35 nodes it fires on.
+    match budget_ceiling {
+        Some(ceiling) if ceiling >= *world_default_retries => msg.push_str(&format!(
+            " If it is not deliberate, set retry_count to {world_default_retries} — the value \
+             the module default already resolves to, and its envelope fits this workflow's \
+             budget."
+        )),
+        Some(0) => msg.push_str(
+            " If it is not deliberate, note that NO retry count fits this workflow's budget at \
+             this node's per-attempt timeout — even its single first attempt can outrun the \
+             budget. Raise execution_timeout_secs or lower this node's timeout_secs before \
+             adding retries.",
+        ),
+        Some(ceiling) => msg.push_str(&format!(
+            " If it is not deliberate, do NOT simply set retry_count to {world_default_retries}: \
+             that envelope does not fit this workflow's budget and would trip the \
+             retry-envelope warning on this same node. The largest count that fits is {ceiling} \
+             — set that, or raise execution_timeout_secs (or lower this node's timeout_secs) \
+             first and then use {world_default_retries}."
+        )),
+        // Budget unresolvable or the wall-clock cap is disabled: there is no
+        // container, so the module default is unqualified advice again.
+        None => msg.push_str(&format!(
+            " If it is not deliberate, set retry_count to {world_default_retries} — the value \
+             the module default already resolves to."
+        )),
+    }
+
     msg
+}
+
+// ── Per-node retry advice ────────────────────────────────────────────────────
+//
+// WHY THIS LIVES HERE AND NOT IN THE ADVISOR HANDLER.
+// `suggest_retry_config` analysed a workflow's execution history and returned
+// ONE blanket suggestion for the whole workflow. On one live workflow
+// (2026-09-01) it returned `retry_count: 3` off a 3 % failure rate while
+// `validate_workflow`, in the same deployment, reported that two of that
+// workflow's nodes ALREADY overran their 300 s budget at `retry_count: 2` and
+// that one of them makes state-changing external calls. Following the advice
+// would have taken a 369 s overrun to 487 s and handed extra attempts to a
+// node the platform itself flags as a double-delivery risk.
+//
+// The failure was not the arithmetic. It was that a workflow-level number
+// cannot express a per-node constraint, and that the advisor had no view of
+// the checks the validator was already running. So the fix is not a smarter
+// number: it is to make the advisor CONSUME the validator's decisions —
+// [`retry_envelope_overrun`], [`retry_headroom`], [`disabled_retry_protection`]
+// and [`module_is_side_effecting`] — rather than restate them. #720 is the
+// standing reason: `validate_all_workflows` reimplemented validation inline and
+// drifted into a second, narrower checker whose only security check had 0/39
+// recall on the live corpus. A second inline copy of the retry rules inside the
+// advisor would be that defect one surface over.
+//
+// WHAT THE ADVICE CLAIMS, narrowly. For each module-dispatched node: the count
+// the engine will resolve today, the largest count whose envelope fits the
+// workflow's ENFORCED budget, and whether the node's module declares it capable
+// of changing state at an external destination. The recommendation is the
+// data-driven proposal bounded by those two facts. It does NOT claim the
+// resulting count is optimal, and it never claims to know WHY a node carries
+// the count it carries — see [`NodeRetryAdvice::provenance_note`].
+//
+// WHAT IT DELIBERATELY DOES NOT DO. It does not mutate a graph, and it does not
+// resolve retries differently from the engine even where the engine is arguably
+// generous: a node declaring `__idempotency_key__` is upgraded 0 -> 2 at
+// dispatch by `effective_retries_with_idempotency`, which neither
+// [`retry_envelope_overrun`] nor [`retry_headroom`] model. Zero nodes on the
+// live fleet declare one, so the divergence is latent; modelling it HERE and
+// not there would make the advisor and the validator disagree about the same
+// node, which is the failure being fixed.
+
+/// A ceiling that held the recommendation below what the failure data alone
+/// would have proposed. Each variant names the check that supplied it, never a
+/// rule restated here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetryAdviceBound {
+    /// The workflow's wall-clock budget. `max_retries` is
+    /// [`max_retries_within_budget`] for this node's per-attempt timeout and
+    /// backoff — i.e. the largest count that does NOT trip
+    /// [`retry_envelope_overrun`].
+    Budget {
+        /// Largest retry count whose envelope fits.
+        max_retries: u32,
+        /// The enforced workflow budget in seconds.
+        budget_secs: u64,
+        /// Envelope seconds the proposed (rejected) count would have occupied.
+        proposed_envelope_secs: u64,
+    },
+    /// The author's own count, or the module's method-aware default — whichever
+    /// is HIGHER. Raising a node above both would hand blind re-fires to work
+    /// the platform fails closed for, on nobody's authority.
+    ModuleDefault {
+        /// The cap actually applied: `max(current_retries, world_default_retries)`.
+        /// Carried explicitly because naming only the module default would
+        /// misreport the cap on any node whose author declared MORE than the
+        /// default (`organize_work` is capped at its own 2, not at its
+        /// state-changing module's 0).
+        cap_retries: u32,
+        /// The count the node resolves to today.
+        current_retries: u32,
+        /// What the module's world + methods resolve to.
+        world_default_retries: u32,
+        /// The module's capability world, quoted verbatim.
+        capability_world: Option<String>,
+        /// The module's declared method allowlist, quoted verbatim.
+        allowed_methods: Vec<String>,
+    },
+}
+
+/// One node's retry recommendation, with every fact it rests on.
+///
+/// Deliberately carries the inputs alongside the answer: a recommendation an
+/// operator cannot audit is a recommendation they have to take on trust, and
+/// the tool this replaces was confidently wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeRetryAdvice {
+    /// Graph node id.
+    pub node_id: String,
+    /// Retries the engine resolves for this node TODAY.
+    pub current_retries: u32,
+    /// `true` when the node declares its own `retry_count` (an explicit `0`
+    /// included); `false` when the module default supplied it.
+    pub retries_declared: bool,
+    /// The recommendation. Equal to `current_retries` when no change is advised.
+    pub recommended_retries: u32,
+    /// Per-attempt timeout the engine enforces for this node.
+    pub per_attempt_secs: u64,
+    /// Base backoff between attempts.
+    pub backoff_ms: u64,
+    /// The workflow's ENFORCED wall-clock budget (`0` = cap disabled).
+    pub budget_secs: u64,
+    /// Worst-case envelope of the CURRENT configuration.
+    pub current_envelope_secs: u64,
+    /// Worst-case envelope of the RECOMMENDED configuration. Always within
+    /// `budget_secs` when the budget is enabled and any count fits at all.
+    pub recommended_envelope_secs: u64,
+    /// Largest count that fits the budget; `None` when the cap is disabled.
+    pub budget_ceiling: Option<u32>,
+    /// What [`talos_workflow_engine_core::default_max_retries_for_module`]
+    /// resolves for this node's module. `0` for every world that fails closed.
+    pub world_default_retries: u32,
+    /// The largest count this node may carry without tripping a check the
+    /// platform already runs: `min(max(current, world_default), budget_ceiling)`.
+    /// The recommendation is the proposal clamped to this.
+    pub safe_max_retries: u32,
+    /// `true` when the node's module declares egress hosts and a method
+    /// allowlist not limited to GET/HEAD — [`module_is_side_effecting`].
+    pub state_changing: bool,
+    /// `true` when the node's CURRENT configuration already overruns the budget.
+    pub currently_overruns: bool,
+    /// Ceilings that bound the recommendation below the proposal, if any.
+    pub bounds: Vec<RetryAdviceBound>,
+    /// Operator-facing sentences. Every one is either rendered by a shared
+    /// formatter (`describe_*`) or states a fact this struct also carries.
+    pub notes: Vec<String>,
+}
+
+impl NodeRetryAdvice {
+    /// Whether acting on this advice changes the graph.
+    #[must_use]
+    pub fn changes_current(&self) -> bool {
+        self.recommended_retries != self.current_retries
+    }
+
+    /// The direction of the change, for rendering.
+    #[must_use]
+    pub fn action(&self) -> &'static str {
+        match self.recommended_retries.cmp(&self.current_retries) {
+            std::cmp::Ordering::Greater => "raise",
+            std::cmp::Ordering::Less => "lower",
+            std::cmp::Ordering::Equal => "keep",
+        }
+    }
+
+    /// What is NOT known about why this node carries the count it carries.
+    ///
+    /// **This is the one sentence in the output that exists to prevent a
+    /// confident wrong claim.** It is tempting to report an explicit
+    /// `retry_count: 0` as a leftover of the pre-2026-07-24 node-creation path,
+    /// which stamped `modules.max_retries` (DB default `0`) verbatim onto every
+    /// MCP-created node and so disabled the retry machinery fleet-wide. Some of
+    /// them certainly are.
+    ///
+    /// The platform cannot tell WHICH. Measured on the live fleet 2026-09-01:
+    /// nothing records per-node authorship or a per-node timestamp;
+    /// `workflows.created_at` cannot date the value because every workflow
+    /// created before the fix has been written since; and across
+    /// `workflow_versions`, 44 of the 51 explicit-zero nodes appear in at least
+    /// one published version while the `retry_count` value has changed in
+    /// **none** of them — a stamped `0` and a deliberately chosen `0` are the
+    /// same time series. So provenance is not merely unmeasured here, it is not
+    /// recoverable from the data the platform keeps, and the honest output says
+    /// so instead of guessing.
+    #[must_use]
+    pub fn provenance_note(&self) -> Option<&'static str> {
+        (self.retries_declared && self.current_retries == 0).then_some(
+            "This node's retry_count of 0 is EXPLICIT, but whether it was chosen or was stamped \
+             by the pre-2026-07-24 node-creation default (which wrote modules.max_retries — DB \
+             default 0 — verbatim) is NOT recoverable: the platform records no per-node \
+             authorship or timestamp, and across published versions this value has never \
+             changed, which is what both cases look like. Treat the recommendation as a question \
+             for whoever owns the node, not as a correction.",
+        )
+    }
+}
+
+/// Everything [`node_retry_advice`] needs about one node.
+///
+/// A struct rather than fourteen positional parameters: the inputs come from
+/// three different places (the graph, the module row, the history slice) and a
+/// caller silently swapping two `&[String]`s would produce advice that is wrong
+/// in a way nothing would catch.
+pub struct NodeRetryContext<'a> {
+    /// The graph node.
+    pub node: &'a serde_json::Value,
+    /// Its graph id, for rendering.
+    pub node_label: &'a str,
+    /// The workflow's ENFORCED budget — the graph's `execution_timeout_secs`,
+    /// falling back to
+    /// [`talos_workflow_engine_core::DEFAULT_WORKFLOW_EXECUTION_TIMEOUT_SECS`].
+    /// NOT `workflows.timeout_seconds`, which never reaches an engine.
+    pub budget_secs: u64,
+    /// Whether the workflow has a bound actor (drives the unbudgeted clamp).
+    pub has_actor: bool,
+    /// The module's declared `allowed_methods`.
+    pub module_methods: &'a [String],
+    /// The module's declared `allowed_hosts`.
+    pub module_hosts: &'a [String],
+    /// The module's capability world.
+    pub module_world: Option<&'a str>,
+    /// The per-attempt timeout the engine falls back to.
+    pub default_node_timeout_secs: u64,
+    /// The count the workflow-level failure analysis proposes, if any. `None`
+    /// means the data proposes nothing (every run succeeded, or the history
+    /// could not be read) — the advice then only ever LOWERS a node that
+    /// already overruns, or surfaces a disabled protection.
+    pub desired_retries: Option<u32>,
+    /// This node's observed record over the history window, when it ran.
+    pub observed: Option<&'a ObservedNodeRecord>,
+    /// Whether its most recent recorded failure classifies as transient.
+    pub latest_failure_transient: Option<bool>,
+    /// Executions the history slice covered.
+    pub executions_scanned: i64,
+    /// Days the history slice covered.
+    pub window_days: i32,
+}
+
+/// Recommend a retry count for ONE node, bounded by what the platform would
+/// immediately warn about.
+///
+/// The bounding rules, in the order they apply:
+///
+/// 1. **Never grant more than the author already chose OR the module's own
+///    method-aware default would grant** — `max(current, world_default)`. This
+///    single rule is what keeps a send node from being handed blind re-fires:
+///    [`talos_workflow_engine_core::default_max_retries_for_module`] already
+///    fails closed to `0` for governance / messaging / database / unknown
+///    worlds and for state-changing HTTP, and that judgement is delegated here,
+///    never restated.
+/// 2. **Never exceed the budget ceiling** — [`max_retries_within_budget`], the
+///    inverse of [`retry_envelope_overrun`]. This is what makes it structurally
+///    impossible for this function to recommend a count the validator would
+///    warn about on the same node.
+///
+/// LOWERING is always permitted and is not bounded by either rule: a node whose
+/// current envelope already overruns is advised down regardless of what the
+/// failure data says, because that overrun discards every completed sibling
+/// node when the budget expires.
+#[must_use]
+pub fn node_retry_advice(ctx: NodeRetryContext<'_>) -> NodeRetryAdvice {
+    let NodeRetryContext {
+        node,
+        node_label,
+        budget_secs,
+        has_actor,
+        module_methods,
+        module_hosts,
+        module_world,
+        default_node_timeout_secs,
+        desired_retries,
+        observed,
+        latest_failure_transient,
+        executions_scanned,
+        window_days,
+    } = ctx;
+
+    let (current_retries, retries_declared) =
+        resolved_node_retries(node, has_actor, module_methods, module_world);
+    let per_attempt_secs = node_per_attempt_timeout_secs(node, default_node_timeout_secs);
+    let backoff_ms = node_backoff_ms(node);
+    let current_envelope_secs =
+        node_retry_envelope_secs(per_attempt_secs, current_retries, backoff_ms);
+    let budget_ceiling = max_retries_within_budget(per_attempt_secs, backoff_ms, budget_secs);
+    let state_changing = module_is_side_effecting(module_hosts, module_methods);
+    let world_default_retries =
+        talos_workflow_engine_core::default_max_retries_for_module(module_methods, module_world);
+
+    // The proposal. The failure data speaks first; failing that, a node whose
+    // explicit 0 overrides a positive world default is itself a proposal worth
+    // surfacing (that is `disabled_retry_protection`'s entire finding, reused
+    // rather than re-derived). Otherwise the status quo is the proposal, and
+    // only the budget can move it.
+    let disabled = disabled_retry_protection(node, module_methods, module_world);
+    let proposal = desired_retries
+        .or_else(|| disabled.as_ref().map(|d| d.world_default_retries))
+        .unwrap_or(current_retries);
+
+    let mut bounds = Vec::new();
+
+    // Rule 1 — never above author-or-platform.
+    let author_or_platform = current_retries.max(world_default_retries);
+    // Rule 2 — never above the budget ceiling. Absent a budget there is no
+    // container, so this term is unbounded rather than zero.
+    //
+    // THIS `.min` IS THE GUARD. Deleting the `budget_ceiling` term is what
+    // reproduces the `retry_count: 3` recommendation on a workflow whose nodes
+    // already overrun at 2 — see `the_budget_ceiling_is_load_bearing`.
+    let safe_max_retries = author_or_platform.min(budget_ceiling.unwrap_or(u32::MAX));
+
+    if proposal > author_or_platform {
+        bounds.push(RetryAdviceBound::ModuleDefault {
+            cap_retries: author_or_platform,
+            current_retries,
+            world_default_retries,
+            capability_world: module_world.map(str::to_string),
+            allowed_methods: module_methods.to_vec(),
+        });
+    }
+    if let Some(ceiling) = budget_ceiling {
+        if proposal.min(author_or_platform) > ceiling {
+            bounds.push(RetryAdviceBound::Budget {
+                max_retries: ceiling,
+                budget_secs,
+                proposed_envelope_secs: node_retry_envelope_secs(
+                    per_attempt_secs,
+                    proposal.min(author_or_platform),
+                    backoff_ms,
+                ),
+            });
+        }
+    }
+
+    let recommended_retries = proposal.min(safe_max_retries);
+
+    let recommended_envelope_secs =
+        node_retry_envelope_secs(per_attempt_secs, recommended_retries, backoff_ms);
+
+    // ── Notes. Every sentence is either a shared formatter's output or a
+    // restatement of a field on this struct — never a new account of a rule.
+    let mut notes = Vec::new();
+
+    let overrun = retry_envelope_overrun(
+        node,
+        budget_secs,
+        has_actor,
+        module_methods,
+        module_world,
+        default_node_timeout_secs,
+    );
+    let currently_overruns = overrun.is_some();
+    if let Some(ref o) = overrun {
+        notes.push(describe_retry_envelope_overrun(o, node_label, budget_secs));
+    }
+
+    if let Some(ref d) = disabled {
+        notes.push(describe_disabled_retry_protection(
+            d,
+            node_label,
+            observed,
+            latest_failure_transient,
+            executions_scanned,
+            window_days,
+            budget_ceiling,
+        ));
+    }
+
+    if state_changing {
+        notes.push(format!(
+            "Node '{node_label}' makes external calls that can change state (its module declares \
+             egress hosts and its allowed_methods are not limited to GET/HEAD), so an attempt \
+             that timed out may already have taken effect at the destination and a retry is a \
+             SECOND send (double charge / duplicate message). Its retries are therefore never \
+             raised here. Opt back in deliberately by declaring __idempotency_key__ on the node, \
+             which makes the worker emit an Idempotency-Key header so the destination \
+             deduplicates the retried request."
+        ));
+    }
+
+    if recommended_retries > current_retries {
+        notes.push(format!("Raising retries is not free: {RETRY_COST_CAVEAT}."));
+    }
+
+    NodeRetryAdvice {
+        node_id: node_label.to_string(),
+        current_retries,
+        retries_declared,
+        recommended_retries,
+        per_attempt_secs,
+        backoff_ms,
+        budget_secs,
+        current_envelope_secs,
+        recommended_envelope_secs,
+        budget_ceiling,
+        world_default_retries,
+        safe_max_retries,
+        state_changing,
+        currently_overruns,
+        bounds,
+        notes,
+    }
+}
+
+/// A node the advisor deliberately says nothing about, and why.
+///
+/// Exists because an absent recommendation and an unanswerable question look
+/// identical in a list of recommendations — the same shape
+/// [`HistoryCoverage`] exists to prevent for `issues: []`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedRetryNode {
+    /// Graph node id.
+    pub node_id: String,
+    /// Why no advice is offered.
+    pub reason: &'static str,
+}
+
+/// Retry advice for a whole workflow: one recommendation per module-dispatched
+/// node, plus what could not be advised on.
+#[derive(Debug, Clone)]
+pub struct WorkflowRetryAdvice {
+    /// The workflow.
+    pub workflow_id: Uuid,
+    /// The ENFORCED wall-clock budget the recommendations were fitted inside.
+    pub budget_secs: u64,
+    /// Where that budget came from, so an operator can tell a declared cap from
+    /// the engine default without inspecting the graph.
+    pub budget_source: &'static str,
+    /// Whether the workflow has a bound actor (drives the unbudgeted clamp).
+    pub has_actor: bool,
+    /// Per-node advice, in graph order.
+    pub nodes: Vec<NodeRetryAdvice>,
+    /// Nodes with no advice, each carrying its reason.
+    pub skipped: Vec<SkippedRetryNode>,
+    /// What the execution-history read actually covered. Carried for the same
+    /// reason [`ValidationResult`] carries it: a recommendation derived from
+    /// nothing must not read as a recommendation derived from a clean record.
+    pub history: HistoryCoverage,
+}
+
+impl WorkflowRetryAdvice {
+    /// The largest single count that could be applied to EVERY advised node
+    /// without exceeding any node's [`NodeRetryAdvice::safe_max_retries`].
+    ///
+    /// `None` when there is no advised node to bound it.
+    ///
+    /// **Offered only because the tool's existing response shape has a
+    /// workflow-level `retry_count` field that callers already read, and that
+    /// field has to become safe rather than disappear.** It is a poor
+    /// instrument and the output says so: the minimum over a set of nodes with
+    /// genuinely different constraints will be too low for some of them, which
+    /// is the whole reason the advice is per-node now.
+    #[must_use]
+    pub fn blanket_safe_retries(&self) -> Option<u32> {
+        self.nodes.iter().map(|n| n.safe_max_retries).min()
+    }
+
+    /// Nodes whose CURRENT configuration already overruns the budget.
+    #[must_use]
+    pub fn overrunning_nodes(&self) -> Vec<&NodeRetryAdvice> {
+        self.nodes.iter().filter(|n| n.currently_overruns).collect()
+    }
+}
+
+/// Build per-node retry advice from inputs already resolved.
+///
+/// Shares [`PreparedValidation`] with [`validate_prepared`] deliberately: the
+/// advisor needs exactly the graph, module rows, actor binding and history
+/// slice the validator needs, and giving it a second input type would be the
+/// first step toward giving it a second set of rules. Pure — no I/O — so the
+/// whole recommendation is unit-testable from a graph literal.
+///
+/// `desired_retries` is what the caller's failure-history analysis proposes.
+/// `None` means it proposes nothing; the advice then only lowers nodes that
+/// already overrun and surfaces disabled protections.
+#[must_use]
+pub fn retry_advice_prepared(
+    prepared: PreparedValidation,
+    desired_retries: Option<u32>,
+) -> WorkflowRetryAdvice {
+    let PreparedValidation {
+        workflow_id,
+        graph_json,
+        templates,
+        has_actor,
+        history: history_read,
+        ..
+    } = prepared;
+
+    let graph: serde_json::Value =
+        serde_json::from_str(&graph_json).unwrap_or_else(|_| serde_json::json!({"nodes":[]}));
+    let nodes = graph
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // The ENFORCED budget, resolved exactly as `validate_prepared` resolves it
+    // and as the engine's `load_graph_from_json` resolves it. NOT
+    // `workflows.timeout_seconds`, which is read into `WorkflowRow` and never
+    // reaches an engine — on the live fleet one workflow's column disagrees
+    // with its enforced budget by 240 s.
+    let (budget_secs, budget_source) = match workflow_timeout_posture(&graph) {
+        WorkflowTimeoutPosture::Declared(secs) => (secs, "graph execution_timeout_secs"),
+        WorkflowTimeoutPosture::EngineDefault(secs) => (
+            secs,
+            "engine default (graph declares no execution_timeout_secs)",
+        ),
+        WorkflowTimeoutPosture::ExplicitlyDisabled => (
+            0,
+            "wall-clock cap DISABLED (graph sets execution_timeout_secs to 0)",
+        ),
+    };
+
+    let template_retry: HashMap<Uuid, (Vec<String>, Vec<String>, Option<String>)> = templates
+        .iter()
+        .map(|r| {
+            (
+                r.id,
+                (
+                    r.allowed_methods.clone(),
+                    r.allowed_hosts.clone(),
+                    r.capability_world.clone(),
+                ),
+            )
+        })
+        .collect();
+
+    // Same history slice, mapped with the same `engine_node_uuid` the executor
+    // used to WRITE the events. Deriving that join locally is how it silently
+    // matches nothing, and zero matched rows is indistinguishable from a clean
+    // record (#721 / lint check 71).
+    let mut observed_by_node: HashMap<Uuid, (ObservedNodeRecord, Option<String>)> = HashMap::new();
+    let mut executions_scanned: i64 = 0;
+    let window_days = history_window_days();
+    let history = match history_read {
+        Ok(h) => {
+            observed_by_node = h
+                .nodes
+                .iter()
+                .map(|r| {
+                    (
+                        r.node_id,
+                        (
+                            ObservedNodeRecord {
+                                attempts: r.attempts,
+                                failures: r.failures,
+                                timeout_failures: r.timeout_failures,
+                            },
+                            r.latest_error.clone(),
+                        ),
+                    )
+                })
+                .collect();
+            executions_scanned = h.executions_scanned;
+            if h.executions_scanned == 0 {
+                HistoryCoverage::Empty { window_days }
+            } else {
+                HistoryCoverage::Observed {
+                    executions: h.executions_scanned,
+                    window_days,
+                }
+            }
+        }
+        Err(e) => {
+            // A failed read is NOT an empty history. Reporting "no failures"
+            // because a query failed is the benign-default defect (check 74).
+            tracing::error!(
+                target: "talos_validation",
+                %workflow_id,
+                error = %e,
+                event_kind = "retry_advice_history_read_failed",
+                "retry_advice: execution-history read failed — advice carries no observed record"
+            );
+            HistoryCoverage::Unavailable
+        }
+    };
+
+    let mut advice = Vec::new();
+    let mut skipped = Vec::new();
+    for node in &nodes {
+        let node_label = node.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let Some(tid) = talos_workflow_engine_core::node_module_id(node) else {
+            skipped.push(SkippedRetryNode {
+                node_id: node_label.to_string(),
+                reason: "system node (system:*) — its cost is the sub-workflow or judge it \
+                         drives, not a dispatched module envelope, so it has no per-attempt \
+                         timeout or module retry default to advise on",
+            });
+            continue;
+        };
+        let Some((methods, hosts, world)) = template_retry.get(&tid) else {
+            skipped.push(SkippedRetryNode {
+                node_id: node_label.to_string(),
+                reason: "module row not found — allowed_methods / capability_world are the \
+                         inputs to every retry decision, so no advice can be given without it",
+            });
+            continue;
+        };
+        let observed =
+            observed_by_node.get(&talos_workflow_engine_core::engine_node_uuid(node_label));
+        advice.push(node_retry_advice(NodeRetryContext {
+            node,
+            node_label,
+            budget_secs,
+            has_actor,
+            module_methods: methods,
+            module_hosts: hosts,
+            module_world: world.as_deref(),
+            default_node_timeout_secs: talos_workflow_engine_core::default_node_timeout_secs(),
+            desired_retries,
+            observed: observed.map(|(o, _)| o),
+            latest_failure_transient: latest_failure_is_transient(
+                observed.and_then(|(_, e)| e.as_deref()),
+            ),
+            executions_scanned,
+            window_days,
+        }));
+    }
+
+    WorkflowRetryAdvice {
+        workflow_id,
+        budget_secs,
+        budget_source,
+        has_actor,
+        nodes: advice,
+        skipped,
+        history,
+    }
 }
 
 // ── Risk-assessment decisions ────────────────────────────────────────────────
@@ -1329,6 +2138,41 @@ impl WorkflowValidationService {
         workflow_id: Uuid,
         user_id: Uuid,
     ) -> Result<ValidationResult> {
+        Ok(validate_prepared(
+            Self::prepare(workflow_repo, workflow_id, user_id).await?,
+        ))
+    }
+
+    /// Per-node retry advice for one workflow, over the SAME inputs
+    /// [`Self::validate`] uses.
+    ///
+    /// One loader, two pure consumers. The advisor cannot read a different
+    /// graph, a different module row set, a different actor binding or a
+    /// different history slice from the validator, so the two surfaces cannot
+    /// disagree about the facts before they even reach a rule.
+    pub async fn retry_advice(
+        workflow_repo: &WorkflowRepository,
+        workflow_id: Uuid,
+        user_id: Uuid,
+        desired_retries: Option<u32>,
+    ) -> Result<WorkflowRetryAdvice> {
+        Ok(retry_advice_prepared(
+            Self::prepare(workflow_repo, workflow_id, user_id).await?,
+            desired_retries,
+        ))
+    }
+
+    /// Load the five inputs [`PreparedValidation`] names for one workflow.
+    ///
+    /// Extracted from [`Self::validate`] so [`Self::retry_advice`] reaches the
+    /// identical rows through the identical queries. Behaviour is unchanged —
+    /// including the deliberate fail-quiet choices documented inline, each of
+    /// which errs toward suppressing a finding rather than inventing one.
+    pub async fn prepare(
+        workflow_repo: &WorkflowRepository,
+        workflow_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<PreparedValidation> {
         let graph_json = workflow_repo
             .get_workflow_graph(workflow_id, user_id)
             .await?
@@ -1397,7 +2241,7 @@ impl WorkflowValidationService {
             .await
             .map_err(|e| e.to_string());
 
-        Ok(validate_prepared(PreparedValidation {
+        Ok(PreparedValidation {
             workflow_id,
             graph_json,
             existing_modules,
@@ -1405,7 +2249,7 @@ impl WorkflowValidationService {
             installed_secrets,
             has_actor,
             history,
-        }))
+        })
     }
 }
 
@@ -1635,10 +2479,7 @@ pub fn validate_prepared(prepared: PreparedValidation) -> ValidationResult {
             // (`methods_are_read_only` states that once, for both callers).
             let side_effecting_ids: std::collections::HashSet<Uuid> = template_rows
                 .iter()
-                .filter(|r| {
-                    !r.allowed_hosts.is_empty()
-                        && !talos_workflow_engine_core::methods_are_read_only(&r.allowed_methods)
-                })
+                .filter(|r| module_is_side_effecting(&r.allowed_hosts, &r.allowed_methods))
                 .map(|r| r.id)
                 .collect();
             side_effecting_node_ids = nodes
@@ -1813,46 +2654,13 @@ pub fn validate_prepared(prepared: PreparedValidation) -> ValidationResult {
                             continue;
                         };
 
-                        let RetryEnvelopeOverrun {
-                            envelope_secs,
-                            attempts,
-                            per_attempt_secs,
-                            resolved_retries,
-                            retries_declared,
-                        } = overrun;
-                        let retry_note = if retries_declared {
-                            format!("its declared retry_count of {resolved_retries}")
-                        } else {
-                            format!(
-                                "the {resolved_retries} method-aware default retries its module \
-                                 resolves to (it declares no retry_count)"
-                            )
-                        };
-                        // With `resolved_retries == 0` the overrun is the
-                        // node's SINGLE attempt outrunning the budget — there
-                        // is no retry_count to lower, and telling an operator
-                        // to lower one is advice they cannot act on.
-                        let remedy = if resolved_retries == 0 {
-                            "This node makes only one attempt, so there is no retry_count to \
-                             lower: raise execution_timeout_secs above the per-attempt timeout, \
-                             lower this node's timeout_secs to fit, or make the node's work \
-                             smaller."
-                        } else {
-                            "Lower retry_count or raise execution_timeout_secs. Do NOT raise this \
-                             node's timeout_secs: that multiplies the envelope by the attempt \
-                             count and makes the failure arrive sooner."
-                        };
                         issues.push(ValidationIssue {
                             severity: ValidationSeverity::Warning,
-                            message: format!(
-                                "Node '{node_label}' has a retry envelope of ~{envelope_secs}s \
-                                 ({attempts} attempts x {per_attempt_secs}s, plus backoff, from \
-                                 {retry_note}) inside a workflow budget of {budget}s. At least \
-                                 one configured attempt can never complete: the retry loop has no \
-                                 view of the workflow deadline, so it starts the attempt anyway, \
-                                 and when the budget expires the whole execution is dropped — \
-                                 discarding every sibling node that had already finished. {remedy}"
-                            ),
+                            // Rendered by the SHARED formatter so the retry
+                            // advisor quotes this exact explanation rather
+                            // than composing a second account of the same
+                            // engine behaviour.
+                            message: describe_retry_envelope_overrun(&overrun, node_label, budget),
                             node_id: Some(node_label.to_string()),
                             category: "retry-envelope".into(),
                         });
@@ -2100,6 +2908,15 @@ pub fn validate_prepared(prepared: PreparedValidation) -> ValidationResult {
                     latest_failure_is_transient(observed.and_then(|(_, e)| e.as_deref())),
                     executions_scanned,
                     window_days,
+                    // The remedy sentence ends in a number the operator is
+                    // invited to apply. Measured 2026-09-01, 33 of the 35
+                    // fleet nodes this fires on would have tripped the
+                    // sibling retry-envelope warning on following it.
+                    node_budget_retry_ceiling(
+                        node,
+                        budget,
+                        talos_workflow_engine_core::default_node_timeout_secs(),
+                    ),
                 ),
                 node_id: Some(node_label.to_string()),
                 category: "retry-disabled".into(),
@@ -4735,7 +5552,19 @@ mod disabled_retry_tests {
         let node = json!({"id": "gmail", "retry_count": 0});
         let f = disabled_retry_protection(&node, &methods(&["GET"]), Some("http-node")).unwrap();
         let msg =
-            describe_disabled_retry_protection(&f, "gmail", Some(&rec(22, 1)), Some(true), 22, 30);
+            // Budget ceiling 4 >= the module default of 2, so the remedy
+             // keeps its unqualified form. The constrained shapes — which are
+             // 33 of the 35 nodes on the live fleet — are pinned separately
+             // below.
+            describe_disabled_retry_protection(
+                &f,
+                "gmail",
+                Some(&rec(22, 1)),
+                Some(true),
+                22,
+                30,
+                Some(4),
+            );
         assert!(msg.contains("sets retry_count explicitly to 0"));
         assert!(msg.contains("capability world 'http-node', allowed_methods [GET]"));
         assert!(msg.contains("resolves to 2 transient retries by default"));
@@ -4755,7 +5584,7 @@ mod disabled_retry_tests {
     fn renders_without_history() {
         let node = json!({"id": "poll", "retry_count": 0});
         let f = disabled_retry_protection(&node, &methods(&["GET"]), Some("http-node")).unwrap();
-        let msg = describe_disabled_retry_protection(&f, "poll", None, None, 0, 30);
+        let msg = describe_disabled_retry_protection(&f, "poll", None, None, 0, 30, Some(4));
         assert!(msg.contains("runs EXACTLY ONCE"));
         assert!(!msg.contains("Observed:"));
         assert!(!msg.contains("TRANSIENT"));
@@ -4775,6 +5604,7 @@ mod disabled_retry_tests {
             None,
             50,
             30,
+            Some(4),
         );
         assert!(msg.contains("has not failed in its last 4508 attempts"));
         assert!(msg.contains("exposure, not a report of damage"));
@@ -4797,6 +5627,7 @@ mod disabled_retry_tests {
             Some(false),
             22,
             30,
+            Some(4),
         );
         assert!(msg.contains("classifies as permanent"));
         assert!(msg.contains("retries are not the lever"));
@@ -5567,5 +6398,608 @@ mod fleet_convergence_tests {
             "`data.moduleId` nodes must resolve too: {ids:?}"
         );
         assert_eq!(ids.len(), 2, "a system node contributes no module id");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-node retry advice (#721).
+//
+// The fixtures below are a REAL observed graph and module
+// rows, read out of the live database on 2026-09-01. That workflow is the one
+// on which `suggest_retry_config` returned `retry_count: 3` while
+// `validate_workflow` was simultaneously reporting that two of its nodes
+// already overran the 300 s budget at 2 — so a test built on invented shapes
+// would not be testing the thing that broke.
+#[cfg(test)]
+mod retry_advice_tests {
+    use super::{
+        describe_disabled_retry_protection, disabled_retry_protection, max_retries_within_budget,
+        module_is_side_effecting, node_budget_retry_ceiling, node_retry_advice,
+        node_retry_envelope_secs, resolved_node_retries, retry_advice_prepared,
+        retry_envelope_overrun, HistoryCoverage, NodeRetryContext, PreparedValidation,
+        RetryAdviceBound,
+    };
+    use serde_json::json;
+
+    fn methods(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+    fn hosts() -> Vec<String> {
+        vec!["gmail.googleapis.com".to_string()]
+    }
+
+    /// Observed budget: the graph declares no
+    /// `execution_timeout_secs`, so the engine default applies.
+    const BUDGET: u64 = 300;
+    /// No node in that workflow overrides `WASM_EXECUTION_TIMEOUT_SECS`.
+    const NODE_TIMEOUT: u64 = 120;
+
+    /// gmail_work: `Gmail: List Messages`, http-node, allowed_methods [GET],
+    /// allowed_hosts [gmail.googleapis.com], retry_count 2, backoff 3000 ms.
+    fn gmail_work() -> serde_json::Value {
+        json!({"id": "gmail_work", "retry_count": 2, "retry_backoff_ms": 3000})
+    }
+    /// organize_work: `gmail-organize`, http-node, allowed_methods [GET, POST]
+    /// — the state-changing one.
+    fn organize_work() -> serde_json::Value {
+        json!({"id": "organize_work", "retry_count": 2, "retry_backoff_ms": 3000})
+    }
+    /// classify_work: `LLM Inference`, secrets-node, explicit retry_count 0,
+    /// timeout_secs 120.
+    fn classify_work() -> serde_json::Value {
+        json!({"id": "classify_work", "retry_count": 0, "timeout_secs": 120})
+    }
+
+    fn advise(
+        node: &serde_json::Value,
+        label: &str,
+        module_methods: &[String],
+        module_hosts: &[String],
+        world: &str,
+        desired: Option<u32>,
+    ) -> super::NodeRetryAdvice {
+        node_retry_advice(NodeRetryContext {
+            node,
+            node_label: label,
+            budget_secs: BUDGET,
+            has_actor: true,
+            module_methods,
+            module_hosts,
+            module_world: Some(world),
+            default_node_timeout_secs: NODE_TIMEOUT,
+            desired_retries: desired,
+            observed: None,
+            latest_failure_transient: None,
+            executions_scanned: 50,
+            window_days: 30,
+        })
+    }
+
+    /// The observed contradiction, reproduced and then closed.
+    ///
+    /// `suggest_retry_config` proposed 3 for this workflow. At 3 retries
+    /// gmail_work's envelope is 4 x 120 s + 3000 ms x (2^3 - 1) = 501 s inside
+    /// a 300 s budget — the validator's `retry_envelope_overrun` fires on it.
+    /// The advisor must land on a count the validator would NOT warn about.
+    #[test]
+    fn the_reported_contradiction_is_gone() {
+        let node = gmail_work();
+        let a = advise(
+            &node,
+            "gmail_work",
+            &methods(&["GET"]),
+            &hosts(),
+            "http-node",
+            Some(3),
+        );
+
+        // Ground truth from the live row, re-derived rather than asserted.
+        assert_eq!(a.current_retries, 2);
+        assert!(a.retries_declared);
+        assert_eq!(a.current_envelope_secs, 369, "120*3 + 3000*(2^2-1)/1000");
+        assert!(a.currently_overruns, "369s does not fit a 300s budget");
+
+        // The proposal was 3; the answer is 1.
+        assert_eq!(a.recommended_retries, 1);
+        assert_eq!(a.action(), "lower");
+        assert_eq!(
+            a.recommended_envelope_secs, 243,
+            "120*2 + 3000*(2^1-1)/1000"
+        );
+        assert!(a.recommended_envelope_secs <= BUDGET);
+
+        // And the bound is attributed, not silent.
+        assert!(a
+            .bounds
+            .iter()
+            .any(|b| matches!(b, RetryAdviceBound::Budget { max_retries: 1, .. })));
+    }
+
+    /// **MUTATION PROOF.** The guard is the `.min(budget_ceiling.unwrap_or(
+    /// u32::MAX))` term in `node_retry_advice`'s `safe_max_retries`.
+    ///
+    /// Delete that term (leaving `let safe_max_retries = author_or_platform;`)
+    /// and this test fails: `author_or_platform` for gmail_work is
+    /// `max(current 2, module default 2) = 2`, so the recommendation becomes 2
+    /// — whose 369 s envelope is exactly the configuration `validate_workflow`
+    /// warns about today. The assertion below is deliberately expressed by
+    /// feeding the recommendation back through the VALIDATOR's own
+    /// `retry_envelope_overrun`, so it cannot pass by agreeing with a private
+    /// copy of the arithmetic.
+    #[test]
+    fn the_budget_ceiling_is_load_bearing() {
+        for (node, label, ms, hs, world) in [
+            (
+                gmail_work(),
+                "gmail_work",
+                methods(&["GET"]),
+                hosts(),
+                "http-node",
+            ),
+            (
+                organize_work(),
+                "organize_work",
+                methods(&["GET", "POST"]),
+                hosts(),
+                "http-node",
+            ),
+            (
+                classify_work(),
+                "classify_work",
+                vec![],
+                vec![],
+                "secrets-node",
+            ),
+        ] {
+            let a = advise(&node, label, &ms, &hs, world, Some(3));
+
+            // Apply the recommendation to the node and re-run the validator's
+            // check on the result. It must find nothing.
+            let mut applied = node.clone();
+            applied["retry_count"] = json!(a.recommended_retries);
+            let overrun =
+                retry_envelope_overrun(&applied, BUDGET, true, &ms, Some(world), NODE_TIMEOUT);
+            assert!(
+                overrun.is_none(),
+                "advisor recommended retry_count {} for '{}', which the validator would warn \
+                 about: {:?}",
+                a.recommended_retries,
+                label,
+                overrun
+            );
+
+            // …and the counterfactual is real: the unbounded proposal WOULD
+            // have been warned about, so the assertion above is not vacuous.
+            let mut unbounded = node.clone();
+            unbounded["retry_count"] = json!(3);
+            assert!(
+                retry_envelope_overrun(&unbounded, BUDGET, true, &ms, Some(world), NODE_TIMEOUT)
+                    .is_some(),
+                "fixture no longer reproduces the overrun for '{label}' — the proof is vacuous"
+            );
+        }
+    }
+
+    /// A state-changing node is never handed extra attempts, whatever the
+    /// failure data says — and the reason is stated, not merely enforced.
+    #[test]
+    fn a_state_changing_node_is_never_raised() {
+        let node = json!({"id": "organize_work", "retry_count": 0, "retry_backoff_ms": 3000});
+        let a = advise(
+            &node,
+            "organize_work",
+            &methods(&["GET", "POST"]),
+            &hosts(),
+            "http-node",
+            Some(3),
+        );
+        assert!(a.state_changing);
+        assert_eq!(a.current_retries, 0);
+        assert_eq!(a.recommended_retries, 0, "a retry here is a second send");
+        assert_eq!(a.action(), "keep");
+        assert!(a.notes.iter().any(|n| n.contains("SECOND send")));
+        // The cap is the node's OWN declared 0, not the module default — and
+        // the bound must say so rather than naming only the default.
+        assert!(a.bounds.iter().any(|b| matches!(
+            b,
+            RetryAdviceBound::ModuleDefault {
+                cap_retries: 0,
+                current_retries: 0,
+                world_default_retries: 0,
+                ..
+            }
+        )));
+    }
+
+    /// A node whose AUTHOR declared more than the module default is capped at
+    /// the author's value, and the bound reports that value — not the default.
+    /// Naming only the default would misreport the cap on exactly the
+    /// state-changing node this advice matters most for.
+    #[test]
+    fn the_cap_names_the_value_that_actually_applied() {
+        let a = advise(
+            &organize_work(),
+            "organize_work",
+            &methods(&["GET", "POST"]),
+            &hosts(),
+            "http-node",
+            Some(3),
+        );
+        assert!(a.state_changing);
+        assert_eq!(
+            a.world_default_retries, 0,
+            "state-changing HTTP fails closed"
+        );
+        assert!(a.bounds.iter().any(|b| matches!(
+            b,
+            RetryAdviceBound::ModuleDefault {
+                cap_retries: 2,
+                current_retries: 2,
+                world_default_retries: 0,
+                ..
+            }
+        )));
+        // Still lowered to 1 by the budget, and never raised above 2.
+        assert_eq!(a.recommended_retries, 1);
+    }
+
+    /// The read-only sibling on the SAME host IS raisable — proving the gate is
+    /// the declared method allowlist, not the presence of egress.
+    #[test]
+    fn a_read_only_sibling_on_the_same_host_is_raisable() {
+        let node = json!({"id": "feedback_work", "retry_count": 0});
+        let a = advise(
+            &node,
+            "feedback_work",
+            &methods(&["GET"]),
+            &hosts(),
+            "http-node",
+            None,
+        );
+        assert!(!a.state_changing);
+        assert_eq!(a.world_default_retries, 2);
+        // Raised — but to 1, not 2: 120*3 + 500*3/1000 = 361 > 300.
+        assert_eq!(a.recommended_retries, 1);
+        assert_eq!(a.action(), "raise");
+        assert!(a
+            .notes
+            .iter()
+            .any(|n| n.contains("Raising retries is not free")));
+    }
+
+    /// An LLM node carries the cost caveat when a raise is proposed. Reused
+    /// verbatim from `RETRY_COST_CAVEAT`, not reworded.
+    #[test]
+    fn a_metered_node_carries_the_cost_caveat() {
+        let a = advise(
+            &classify_work(),
+            "classify_work",
+            &[],
+            &[],
+            "secrets-node",
+            Some(3),
+        );
+        assert_eq!(a.recommended_retries, 1);
+        assert!(a.notes.iter().any(|n| n.contains(super::RETRY_COST_CAVEAT)));
+    }
+
+    /// Provenance is admitted as unknown, and only where it is even a question.
+    #[test]
+    fn provenance_is_admitted_not_guessed() {
+        let explicit_zero = advise(
+            &classify_work(),
+            "classify_work",
+            &[],
+            &[],
+            "secrets-node",
+            None,
+        );
+        let note = explicit_zero
+            .provenance_note()
+            .expect("an explicit 0 raises the question");
+        assert!(note.contains("NOT recoverable"));
+        assert!(note.contains("no per-node authorship"));
+        // The stamp must appear only as one HORN of an open question, never as
+        // a verdict, and the note must hand the decision to a human.
+        assert!(note.contains("whether it was chosen or was stamped"));
+        assert!(note.contains("question for whoever owns the node"));
+        assert!(!note.contains("not a correction."));
+        assert!(note.contains("not as a correction"));
+
+        // A declared non-zero raises no provenance question at all.
+        let declared_two = advise(
+            &gmail_work(),
+            "gmail_work",
+            &methods(&["GET"]),
+            &hosts(),
+            "http-node",
+            None,
+        );
+        assert!(declared_two.provenance_note().is_none());
+
+        // Neither does an ABSENT retry_count — the module default supplied it,
+        // and there is nothing an author might or might not have chosen.
+        let absent = advise(
+            &json!({"id": "n"}),
+            "n",
+            &methods(&["GET"]),
+            &hosts(),
+            "http-node",
+            None,
+        );
+        assert!(!absent.retries_declared);
+        assert!(absent.provenance_note().is_none());
+    }
+
+    /// A zero proposal must never be read as "strip the retries this node
+    /// already has". The advisor's callers pass `None` for the
+    /// deterministic-failure and all-succeeded classes precisely because
+    /// `Some(0)` would propose lowering a healthy node to zero — this pins the
+    /// difference so a caller cannot reintroduce it silently.
+    #[test]
+    fn no_proposal_is_not_a_proposal_of_zero() {
+        let node = json!({"id": "healthy", "retry_count": 1, "retry_backoff_ms": 500});
+        let ms = methods(&["GET"]);
+
+        let none = advise(&node, "healthy", &ms, &hosts(), "http-node", None);
+        assert_eq!(none.recommended_retries, 1, "left alone");
+        assert_eq!(none.action(), "keep");
+
+        // Whereas an explicit zero proposal IS honoured — the semantics are
+        // real, which is why the caller must not conflate the two.
+        let zero = advise(&node, "healthy", &ms, &hosts(), "http-node", Some(0));
+        assert_eq!(zero.recommended_retries, 0);
+        assert_eq!(zero.action(), "lower");
+    }
+
+    /// With no data-driven proposal, a node that fits its budget and declares
+    /// nothing surprising is left entirely alone.
+    #[test]
+    fn no_proposal_and_no_problem_means_no_change() {
+        let node = json!({"id": "quiet", "retry_count": 1, "retry_backoff_ms": 500});
+        let a = advise(
+            &node,
+            "quiet",
+            &methods(&["GET"]),
+            &hosts(),
+            "http-node",
+            None,
+        );
+        assert_eq!(a.recommended_retries, 1);
+        assert!(!a.changes_current());
+        assert!(a.bounds.is_empty());
+        assert!(!a.currently_overruns);
+    }
+
+    // ── The ceiling itself ──────────────────────────────────────────────────
+
+    #[test]
+    fn budget_ceiling_is_the_inverse_of_the_overrun_check() {
+        // For every shape, the ceiling must be the largest count the overrun
+        // check accepts — and one more must be rejected.
+        for (per_attempt, backoff, budget) in [
+            (120u64, 3000u64, 300u64),
+            (120, 500, 300),
+            (150, 500, 240),
+            (90, 500, 300),
+        ] {
+            let ceiling =
+                max_retries_within_budget(per_attempt, backoff, budget).expect("budget is enabled");
+            assert!(
+                node_retry_envelope_secs(per_attempt, ceiling, backoff) <= budget,
+                "ceiling {ceiling} does not fit {budget}s"
+            );
+            assert!(
+                node_retry_envelope_secs(per_attempt, ceiling + 1, backoff) > budget,
+                "ceiling {ceiling} is not maximal for {budget}s"
+            );
+        }
+    }
+
+    #[test]
+    fn a_disabled_wall_clock_cap_has_no_ceiling() {
+        assert_eq!(max_retries_within_budget(120, 500, 0), None);
+        assert_eq!(
+            node_budget_retry_ceiling(&gmail_work(), 0, NODE_TIMEOUT),
+            None
+        );
+    }
+
+    #[test]
+    fn a_single_attempt_that_outruns_the_budget_yields_a_zero_ceiling() {
+        // 400 s per attempt cannot fit a 300 s budget even once.
+        assert_eq!(max_retries_within_budget(400, 500, 300), Some(0));
+    }
+
+    // ── The predicate lifted out of `validate_prepared` ─────────────────────
+
+    #[test]
+    fn side_effecting_matches_the_validators_own_reading() {
+        // Declared GET/HEAD-only with hosts: NOT side-effecting.
+        assert!(!module_is_side_effecting(&hosts(), &methods(&["GET"])));
+        assert!(!module_is_side_effecting(
+            &hosts(),
+            &methods(&["GET", "HEAD"])
+        ));
+        // Any mutating verb: side-effecting.
+        assert!(module_is_side_effecting(
+            &hosts(),
+            &methods(&["GET", "POST"])
+        ));
+        // UNDECLARED methods mean "every verb" at the worker, so unknown is
+        // side-effecting — the asymmetry `methods_are_read_only` states once.
+        assert!(module_is_side_effecting(&hosts(), &[]));
+        // No egress at all: nothing to change.
+        assert!(!module_is_side_effecting(&[], &[]));
+    }
+
+    // ── The remedy sentence, now budget-aware (the within-tool contradiction)
+
+    #[test]
+    fn the_remedy_refuses_a_value_that_would_not_fit() {
+        let node = json!({"id": "classify_work", "retry_count": 0, "timeout_secs": 120});
+        let f = disabled_retry_protection(&node, &[], Some("secrets-node")).unwrap();
+        // 120 s per attempt, 500 ms backoff, 300 s budget → ceiling 1, while
+        // the module default is 2. This is 33 of the 35 fleet nodes.
+        let ceiling = node_budget_retry_ceiling(&node, 300, 120);
+        assert_eq!(ceiling, Some(1));
+        let msg =
+            describe_disabled_retry_protection(&f, "classify_work", None, None, 0, 30, ceiling);
+        assert!(msg.contains("do NOT simply set retry_count to 2"));
+        assert!(msg.contains("The largest count that fits is 1"));
+        // The un-budgeted form must be gone from this shape.
+        assert!(!msg.contains("If it is not deliberate, set retry_count to 2"));
+    }
+
+    #[test]
+    fn the_remedy_says_so_when_no_count_fits_at_all() {
+        let node = json!({"id": "big", "retry_count": 0, "timeout_secs": 400});
+        let f = disabled_retry_protection(&node, &[], Some("minimal-node")).unwrap();
+        let msg = describe_disabled_retry_protection(
+            &f,
+            "big",
+            None,
+            None,
+            0,
+            30,
+            node_budget_retry_ceiling(&node, 300, 120),
+        );
+        assert!(msg.contains("NO retry count fits"));
+        assert!(!msg.contains("set retry_count to 2"));
+    }
+
+    #[test]
+    fn an_unresolvable_budget_keeps_the_unqualified_remedy() {
+        let node = json!({"id": "n", "retry_count": 0});
+        let f = disabled_retry_protection(&node, &[], Some("minimal-node")).unwrap();
+        let msg = describe_disabled_retry_protection(&f, "n", None, None, 0, 30, None);
+        assert!(msg.contains("set retry_count to 2"));
+    }
+
+    // ── One resolver, three consumers ───────────────────────────────────────
+
+    #[test]
+    fn the_shared_resolver_answers_for_every_consumer() {
+        // Declared wins, including 0.
+        assert_eq!(
+            resolved_node_retries(
+                &json!({"retry_count": 0}),
+                true,
+                &methods(&["GET"]),
+                Some("http-node")
+            ),
+            (0, true)
+        );
+        // Absent routes to the method-aware default.
+        assert_eq!(
+            resolved_node_retries(&json!({}), true, &methods(&["GET"]), Some("http-node")),
+            (2, false)
+        );
+        // Actor-less clamps a DECLARED count only.
+        assert_eq!(
+            resolved_node_retries(&json!({"retry_count": 9}), false, &[], Some("minimal-node")),
+            (talos_workflow_engine_core::MAX_RETRIES_UNBUDGETED, true)
+        );
+        // Nested `data` shape is read too.
+        assert_eq!(
+            resolved_node_retries(
+                &json!({"data": {"retry_count": 1}}),
+                true,
+                &[],
+                Some("minimal-node")
+            ),
+            (1, true)
+        );
+    }
+
+    // ── Workflow assembly ───────────────────────────────────────────────────
+
+    fn prepared(
+        graph: serde_json::Value,
+        history: Result<talos_workflow_repository::NodeRunHistory, String>,
+    ) -> PreparedValidation {
+        PreparedValidation {
+            workflow_id: uuid::Uuid::nil(),
+            graph_json: graph.to_string(),
+            existing_modules: std::collections::HashSet::new(),
+            templates: Vec::new(),
+            installed_secrets: std::collections::HashMap::new(),
+            has_actor: true,
+            history,
+        }
+    }
+
+    /// A system node gets an explicit skip with a reason, never silence.
+    #[test]
+    fn system_nodes_are_skipped_with_a_stated_reason() {
+        let advice = retry_advice_prepared(
+            prepared(
+                json!({"nodes": [{"id": "judge", "type": "system:inline_judge"}]}),
+                Ok(talos_workflow_repository::NodeRunHistory {
+                    executions_scanned: 5,
+                    window_days: 30,
+                    nodes: vec![],
+                }),
+            ),
+            Some(3),
+        );
+        assert!(advice.nodes.is_empty());
+        assert_eq!(advice.skipped.len(), 1);
+        assert!(advice.skipped[0].reason.contains("system node"));
+        assert_eq!(advice.blanket_safe_retries(), None);
+    }
+
+    /// A FAILED history read must never render as an empty one.
+    #[test]
+    fn a_failed_history_read_is_not_an_empty_history() {
+        let unavailable =
+            retry_advice_prepared(prepared(json!({"nodes": []}), Err("boom".into())), None);
+        assert!(matches!(unavailable.history, HistoryCoverage::Unavailable));
+        assert!(unavailable.history.note().contains("could NOT be read"));
+
+        let empty = retry_advice_prepared(
+            prepared(
+                json!({"nodes": []}),
+                Ok(talos_workflow_repository::NodeRunHistory {
+                    executions_scanned: 0,
+                    window_days: 30,
+                    nodes: vec![],
+                }),
+            ),
+            None,
+        );
+        assert!(matches!(empty.history, HistoryCoverage::Empty { .. }));
+        assert!(empty.history.note().contains("STATIC ONLY"));
+    }
+
+    /// The enforced budget comes from the GRAPH, and its source is named.
+    #[test]
+    fn the_budget_is_the_enforced_one_and_says_where_it_came_from() {
+        let default_budget =
+            retry_advice_prepared(prepared(json!({"nodes": []}), Err("x".into())), None);
+        assert_eq!(default_budget.budget_secs, 300);
+        assert!(default_budget.budget_source.contains("engine default"));
+
+        let declared = retry_advice_prepared(
+            prepared(
+                json!({"nodes": [], "execution_timeout_secs": 420}),
+                Err("x".into()),
+            ),
+            None,
+        );
+        assert_eq!(declared.budget_secs, 420);
+        assert!(declared
+            .budget_source
+            .contains("graph execution_timeout_secs"));
+
+        let disabled = retry_advice_prepared(
+            prepared(
+                json!({"nodes": [], "execution_timeout_secs": 0}),
+                Err("x".into()),
+            ),
+            None,
+        );
+        assert_eq!(disabled.budget_secs, 0);
+        assert!(disabled.budget_source.contains("DISABLED"));
     }
 }

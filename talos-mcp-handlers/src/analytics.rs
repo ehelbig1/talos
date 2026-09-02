@@ -3152,6 +3152,174 @@ pub(crate) fn is_deterministic_failure(lower_msg: &str) -> bool {
         || lower_msg.contains("forbidden")
 }
 
+/// Render the per-node half of `suggest_retry_config`'s answer, and the largest
+/// single count that is safe for every advised node.
+///
+/// **Every retry-safety judgement here is DELEGATED, not reimplemented.**
+/// `WorkflowValidationService::retry_advice` loads the same rows
+/// `validate_workflow` loads and runs `retry_advice_prepared`, which consumes
+/// `retry_envelope_overrun`, `retry_headroom`, `disabled_retry_protection` and
+/// `module_is_side_effecting` — the same functions `validate_prepared` calls.
+/// This function only formats. That split is the point of #721: the advisor
+/// used to answer a retry question with no view of the checks the validator was
+/// already running, and returned `retry_count: 3` for a workflow whose nodes
+/// the validator had flagged as overrunning at 2. Re-deriving any of it here
+/// would recreate exactly the drift #720 removed from the fleet sweep.
+///
+/// Returns `(block, blanket_safe_retries)`. `blanket_safe_retries` is `None`
+/// when the advice could not be produced — the caller must then say its
+/// suggestion is UNBOUNDED rather than silently emit an unchecked number.
+async fn build_retry_advice_block(
+    state: &McpState,
+    wf_id: Uuid,
+    user_id: Uuid,
+    desired_retries: Option<u32>,
+) -> (serde_json::Value, Option<u32>) {
+    let advice = match talos_workflow_validation::WorkflowValidationService::retry_advice(
+        &state.workflow_repo,
+        wf_id,
+        user_id,
+        desired_retries,
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!(%wf_id, error = %e, "suggest_retry_config: retry advice unavailable");
+            return (
+                serde_json::json!({
+                    "available": false,
+                    "note": "Per-node retry advice could NOT be produced (the graph, module rows \
+                             or execution history could not be read). The workflow-level \
+                             suggestion below is therefore UNBOUNDED: it has not been checked \
+                             against any node's retry envelope, workflow budget, or ability to \
+                             change state at an external destination. Run validate_workflow \
+                             before applying it.",
+                }),
+                None,
+            );
+        }
+    };
+
+    let nodes: Vec<serde_json::Value> = advice
+        .nodes
+        .iter()
+        .map(|n| {
+            let mut obj = serde_json::json!({
+                "node_id": n.node_id,
+                "action": n.action(),
+                "current_retry_count": n.current_retries,
+                "recommended_retry_count": n.recommended_retries,
+                "retry_count_source": if n.retries_declared {
+                    "declared on the node (an explicit value always wins over the module default)"
+                } else {
+                    "module method-aware default (the node declares no retry_count)"
+                },
+                "per_attempt_timeout_secs": n.per_attempt_secs,
+                "retry_backoff_ms": n.backoff_ms,
+                "current_envelope_secs": n.current_envelope_secs,
+                "recommended_envelope_secs": n.recommended_envelope_secs,
+                "workflow_budget_secs": n.budget_secs,
+                "budget_ceiling_retry_count": n.budget_ceiling,
+                "module_default_retry_count": n.world_default_retries,
+                "safe_max_retry_count": n.safe_max_retries,
+                "state_changing": n.state_changing,
+                "currently_overruns_budget": n.currently_overruns,
+                "bounded_by": n.bounds.iter().map(describe_retry_bound).collect::<Vec<_>>(),
+                "notes": n.notes,
+            });
+            if let Some(map) = obj.as_object_mut() {
+                if let Some(prov) = n.provenance_note() {
+                    map.insert("provenance".into(), serde_json::Value::String(prov.into()));
+                }
+                if n.changes_current() {
+                    map.insert(
+                        "apply_with".into(),
+                        serde_json::Value::String(format!(
+                            "update_node_config(workflow_id: '{}', node_id: '{}', retry_count: {})",
+                            wf_id, n.node_id, n.recommended_retries
+                        )),
+                    );
+                }
+            }
+            obj
+        })
+        .collect();
+
+    let blanket = advice.blanket_safe_retries();
+    let changed = advice.nodes.iter().filter(|n| n.changes_current()).count();
+    let overrunning = advice.overrunning_nodes().len();
+    let total_graph_nodes = advice.nodes.len() + advice.skipped.len();
+
+    let block = serde_json::json!({
+        "available": true,
+        // Every count states its population — an unlabelled "4" here would be
+        // read as "4 of the workflow's nodes" when it is 4 of the
+        // module-dispatched ones.
+        "population": format!(
+            "{} module-dispatched node(s) advised of {} graph node(s); {} skipped (see \
+             `skipped`). Counts below are over the ADVISED nodes only.",
+            advice.nodes.len(), total_graph_nodes, advice.skipped.len()
+        ),
+        "workflow_budget_secs": advice.budget_secs,
+        "workflow_budget_source": advice.budget_source,
+        "workflow_has_bound_actor": advice.has_actor,
+        "history_coverage": advice.history.note(),
+        "nodes_recommended_to_change": changed,
+        "nodes_currently_overrunning_budget": overrunning,
+        "blanket_safe_retry_count": blanket,
+        "nodes": nodes,
+        "skipped": advice.skipped.iter().map(|s| serde_json::json!({
+            "node_id": s.node_id,
+            "reason": s.reason,
+        })).collect::<Vec<_>>(),
+    });
+
+    (block, blanket)
+}
+
+/// Render one `RetryAdviceBound` for the response.
+fn describe_retry_bound(bound: &talos_workflow_validation::RetryAdviceBound) -> serde_json::Value {
+    match bound {
+        talos_workflow_validation::RetryAdviceBound::Budget {
+            max_retries,
+            budget_secs,
+            proposed_envelope_secs,
+        } => serde_json::json!({
+            "bound": "workflow_budget",
+            "max_retry_count": max_retries,
+            "workflow_budget_secs": budget_secs,
+            "rejected_envelope_secs": proposed_envelope_secs,
+            "reason": "A higher count's worst-case envelope exceeds the workflow's enforced \
+                       wall-clock budget. The retry loop has no view of that deadline, so it \
+                       starts an attempt that cannot finish; when the budget expires the whole \
+                       execution is dropped, discarding every sibling node that had already \
+                       completed.",
+        }),
+        talos_workflow_validation::RetryAdviceBound::ModuleDefault {
+            cap_retries,
+            current_retries,
+            world_default_retries,
+            capability_world,
+            allowed_methods,
+        } => serde_json::json!({
+            "bound": "author_or_module_default",
+            "max_retry_count": cap_retries,
+            "current_retry_count": current_retries,
+            "module_default_retry_count": world_default_retries,
+            "capability_world": capability_world,
+            "allowed_methods": allowed_methods,
+            "reason": "The recommendation is never raised above the HIGHER of what the node \
+                       already declares and what its module's own method-aware default grants, \
+                       because that default is the platform's idempotency judgement: \
+                       governance, messaging, database, unknown worlds and state-changing HTTP \
+                       fail closed to 0 precisely so a blind retry cannot re-fire a \
+                       non-idempotent send. Granting more than both would be on nobody's \
+                       authority.",
+        }),
+    }
+}
+
 async fn handle_suggest_retry_config(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
@@ -3172,12 +3340,28 @@ async fn handle_suggest_retry_config(
         return crate::utils::workflow_not_found_error(req_id);
     }
 
-    // Load recent executions (last 30 days) via retry_config_executions
-    let exec_rows = state
+    // Load recent executions (last 30 days) via retry_config_executions.
+    //
+    // A FAILED read is not an empty history. Pre-#721 this was
+    // `.unwrap_or_default()`, so a Postgres blip routed the request into the
+    // cold-start branch below, which announces "No execution history found" —
+    // a database error rendered as a confident statement about the workflow's
+    // operational record, and the basis for a recommendation. That is the
+    // benign-default class lint check 74 exists for. The branch is now taken
+    // only on a genuinely empty window, and the error is named in the output.
+    let exec_read = state
         .analytics_repo
         .get_retry_config_executions(wf_id, user_id)
-        .await
-        .unwrap_or_default();
+        .await;
+    let history_read_failed = exec_read.is_err();
+    if let Err(ref e) = exec_read {
+        tracing::error!(
+            %wf_id,
+            error = %e,
+            "suggest_retry_config: execution-history read failed — advice is static-only"
+        );
+    }
+    let exec_rows = exec_read.unwrap_or_default();
 
     if exec_rows.is_empty() {
         // Cold-start path: no execution history yet. Infer defaults from module types.
@@ -3258,25 +3442,49 @@ async fn handle_suggest_retry_config(
             (2u32, 1000u64, "linear", "No execution history available. 2 retries with 1s linear backoff is a conservative general default.")
         };
 
+        // Bound the module-type default the same way the history path is
+        // bounded. A fresh workflow is exactly where a blanket number does the
+        // most damage: it has no observed record to contradict it, and its
+        // nodes still have real budgets and real send semantics.
+        let (advice_block, blanket) =
+            build_retry_advice_block(state, wf_id, user_id, Some(suggested_retry_count)).await;
+        let bounded_retry_count = blanket
+            .map(|b| suggested_retry_count.min(b))
+            .unwrap_or(suggested_retry_count);
+
         return mcp_text(
             req_id,
             &serde_json::to_string_pretty(&serde_json::json!({
                 "workflow_id": wf_id.to_string(),
                 "basis": "module_type_defaults",
-                "note": "No execution history found — these are module-type-based defaults, not data-driven recommendations. Re-run after a few executions for a calibrated suggestion.",
+                "note": if history_read_failed {
+                    "The execution-history read FAILED — this is NOT a statement that the \
+                     workflow has no history. These are module-type-based defaults. Re-run once \
+                     the history query succeeds."
+                } else {
+                    "No execution history found in the analysis window — these are \
+                     module-type-based defaults, not data-driven recommendations. Re-run after a \
+                     few executions for a calibrated suggestion."
+                },
+                "history_read_failed": history_read_failed,
                 "detected_module_types": {
                     "llm": has_llm,
                     "http": has_http,
                     "database": has_db,
                     "queue": has_queue,
                 },
-                "suggested_retry_count": suggested_retry_count,
+                "suggested_retry_count": bounded_retry_count,
+                "unbounded_module_type_retry_count": suggested_retry_count,
                 "suggested_backoff_ms": suggested_backoff_ms,
                 "suggested_strategy": strategy,
                 "reasoning": reasoning,
+                "per_node": advice_block,
                 "apply_with": {
                     "tool": "update_node_config",
-                    "hint": "Set retry_count and retry_backoff_ms on each node via update_node_config."
+                    "hint": "Apply the PER-NODE recommendations in `per_node.nodes`, not this \
+                             single number. `suggested_retry_count` is the largest value that is \
+                             safe for every advised node, which is by construction too low for \
+                             some of them."
                 }
             }))
             .unwrap_or_default(),
@@ -3397,10 +3605,71 @@ async fn handle_suggest_retry_config(
         ));
     }
 
+    // ── Bound the class-derived number against what the platform would warn
+    // about, per node (#721).
+    //
+    // `suggested_retry_count` above is derived from the workflow's failure
+    // MIX. That is a real signal and it is kept — but it is a statement about
+    // error classes, not about whether any particular node can afford another
+    // attempt. On one live workflow it produced `retry_count: 3` for a
+    // workflow whose gmail_work and organize_work nodes already overran their
+    // 300 s budget at 2, and one of which the platform separately flags as
+    // making state-changing external calls. The number was not wrong about the
+    // failures; it was answering a question it could not see the constraints
+    // for.
+    //
+    // The bound is `blanket_safe_retry_count` — the minimum over every advised
+    // node of that node's own `safe_max_retries`, which the validation crate
+    // computes from `max_retries_within_budget` (the inverse of
+    // `retry_envelope_overrun`) and `default_max_retries_for_module`. Nothing
+    // about that judgement is restated here.
+    //
+    // A class-derived count of ZERO is passed as `None`, not as `Some(0)`. The
+    // deterministic-failure and all-succeeded branches both leave
+    // `suggested_retry_count` at 0, and that is a statement about the retry
+    // CONDITION ("retries are not the lever for these failures"), never an
+    // instruction to strip the retries every node already has. `Some(0)` would
+    // propose lowering every node in the workflow to zero — advice to disable
+    // working retry protection, issued because nothing had failed.
+    let (advice_block, blanket) = build_retry_advice_block(
+        state,
+        wf_id,
+        user_id,
+        (suggested_retry_count > 0).then_some(suggested_retry_count),
+    )
+    .await;
+    let unbounded_retry_count = suggested_retry_count;
+    let bounded_retry_count = blanket
+        .map(|b| suggested_retry_count.min(b))
+        .unwrap_or(suggested_retry_count);
+    if bounded_retry_count < unbounded_retry_count {
+        reasoning.push(format!(
+            "The failure mix alone would suggest retry_count {unbounded_retry_count}, but that \
+             value is not safe for every node in this workflow: the largest count that fits \
+             every advised node's retry envelope inside the workflow budget — and that never \
+             raises a node above the retries its module's own method-aware default grants — is \
+             {bounded_retry_count}. Apply the per-node recommendations instead; a single \
+             workflow-wide number is the instrument that produced the contradiction."
+        ));
+    }
+    if blanket.is_none() {
+        reasoning.push(
+            "Per-node advice could NOT be produced, so this suggestion is UNBOUNDED — it has \
+             not been checked against any node's retry envelope, the workflow budget, or any \
+             node's ability to change state at an external destination. Run validate_workflow \
+             before applying it."
+                .to_string(),
+        );
+    }
+
     let mut suggestion = serde_json::json!({
-        "retry_count": suggested_retry_count,
+        "retry_count": bounded_retry_count,
         "retry_backoff_ms": suggested_backoff_ms,
         "retry_condition": retry_condition,
+        // The class-derived value BEFORE the per-node bound, kept so nothing
+        // is hidden and the two can be compared.
+        "unbounded_retry_count": unbounded_retry_count,
+        "bounded_by_node_constraints": blanket.is_some(),
     });
     if let (Some(adv), Some(map)) = (retry_advisory, suggestion.as_object_mut()) {
         map.insert(
@@ -3412,12 +3681,20 @@ async fn handle_suggest_retry_config(
     let result = serde_json::json!({
         "workflow_id": wf_id.to_string(),
         "analysis_period": "30 days",
+        // Every count states its population: these are WORKFLOW EXECUTIONS in
+        // the window, not node attempts, and `per_node.population` names its
+        // own separately.
+        "population": format!(
+            "{total} workflow execution(s) in the analysis window (cancelled and test runs \
+             excluded). Per-node advice is scoped separately — see per_node.population."
+        ),
         "total_executions": total,
         "succeeded": succeeded,
         "failed": failed,
         "failure_rate_percent": talos_analytics_repository::format_percent(failure_rate * 100.0),
         "error_class": error_class,
         "suggestion": suggestion,
+        "per_node": advice_block,
         "reasoning": reasoning,
         "retry_condition_legend": {
             "none": "Disable retry. Use when failures are deterministic (same input → same outcome).",
@@ -4454,20 +4731,46 @@ async fn handle_get_workflow_risk_assessment(
         ) else {
             continue;
         };
+        // The value this finding invites the operator to apply has to fit the
+        // budget it would run inside. Measured 2026-09-01, 33 of the 35 fleet
+        // nodes this fires on would have tripped the retry-envelope warning on
+        // following the un-budgeted form. Resolved through the SAME budget
+        // posture classifier the timeout finding above uses, and the same
+        // ceiling function the validator and the retry advisor use.
+        let budget_ceiling = talos_workflow_validation::node_budget_retry_ceiling(
+            node,
+            match talos_workflow_validation::workflow_timeout_posture(&graph) {
+                talos_workflow_validation::WorkflowTimeoutPosture::Declared(s) => s,
+                talos_workflow_validation::WorkflowTimeoutPosture::EngineDefault(s) => s,
+                talos_workflow_validation::WorkflowTimeoutPosture::ExplicitlyDisabled => 0,
+            },
+            talos_workflow_engine_core::default_node_timeout_secs(),
+        );
+        let applied_retry_count = budget_ceiling.map_or(finding.world_default_retries, |c| {
+            c.min(finding.world_default_retries)
+        });
         risks.push(serde_json::json!({
             "risk_level": "medium",
             "category": "missing_retry",
             "node_id": node_id,
             "description": talos_workflow_validation::describe_disabled_retry_protection(
-                &finding, node_id, None, None, 0, 0,
+                &finding, node_id, None, None, 0, 0, budget_ceiling,
             ),
             // The description (rendered by the shared #696 formatter) already
             // states both branches of the decision and the value to use. This
             // names the tool that applies it rather than restating them.
-            "recommendation": format!(
-                "If the 0 is not deliberate: update_node_config(node_id: '{}', retry_count: {}).",
-                node_id, finding.world_default_retries
-            ),
+            "recommendation": if applied_retry_count == 0 {
+                format!(
+                    "If the 0 is not deliberate: no retry count fits this workflow's budget at \
+                     node '{node_id}'s per-attempt timeout — raise execution_timeout_secs or \
+                     lower the node's timeout_secs first."
+                )
+            } else {
+                format!(
+                    "If the 0 is not deliberate: update_node_config(node_id: '{node_id}', \
+                     retry_count: {applied_retry_count})."
+                )
+            },
         }));
     }
 
@@ -7566,5 +7869,56 @@ mod fleet_validation_tally_tests {
         assert_eq!(out["valid_count"], 1);
         assert_eq!(out["invalid_count"], 0);
         assert_eq!(out["issues"].as_array().unwrap().len(), 0);
+    }
+}
+
+/// The rendering half of `suggest_retry_config`'s per-node advice (#721).
+///
+/// The DECISIONS are tested in `talos-workflow-validation` against the same
+/// functions `validate_workflow` calls — that is the whole point of the split.
+/// What is testable here is that the handler does not lose or misname them on
+/// the way out, which is where the previous version's confident number came
+/// from.
+#[cfg(test)]
+mod retry_advice_rendering_tests {
+    use super::describe_retry_bound;
+    use talos_workflow_validation::RetryAdviceBound;
+
+    #[test]
+    fn a_budget_bound_names_the_ceiling_and_the_rejected_envelope() {
+        let v = describe_retry_bound(&RetryAdviceBound::Budget {
+            max_retries: 1,
+            budget_secs: 300,
+            proposed_envelope_secs: 369,
+        });
+        assert_eq!(v["bound"], "workflow_budget");
+        assert_eq!(v["max_retry_count"], 1);
+        assert_eq!(v["workflow_budget_secs"], 300);
+        assert_eq!(v["rejected_envelope_secs"], 369);
+        assert!(v["reason"]
+            .as_str()
+            .unwrap()
+            .contains("discarding every sibling node"));
+    }
+
+    /// The cap reported must be the one that APPLIED, not the module default —
+    /// on `organize_work` those are 2 and 0 and reporting the default would
+    /// tell an operator their state-changing node is capped at 0 when the
+    /// engine will make three attempts.
+    #[test]
+    fn a_cap_bound_reports_the_value_that_applied_not_the_module_default() {
+        let v = describe_retry_bound(&RetryAdviceBound::ModuleDefault {
+            cap_retries: 2,
+            current_retries: 2,
+            world_default_retries: 0,
+            capability_world: Some("http-node".into()),
+            allowed_methods: vec!["GET".into(), "POST".into()],
+        });
+        assert_eq!(v["bound"], "author_or_module_default");
+        assert_eq!(v["max_retry_count"], 2);
+        assert_eq!(v["current_retry_count"], 2);
+        assert_eq!(v["module_default_retry_count"], 0);
+        assert_eq!(v["capability_world"], "http-node");
+        assert!(v["reason"].as_str().unwrap().contains("HIGHER of"));
     }
 }
