@@ -662,3 +662,528 @@ fn nothing_that_was_not_verified_is_ever_reported_as_a_pass() {
         assert_eq!(c.points, 0, "{}", c.name);
     }
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// Score honesty: the number must be reconstructible from the emitted fields,
+// and the advice must name only conditions that exist
+//
+// The defect these pin was live and observable in one response: zero
+// failures, zero warnings, a legend saying `info` is "not security-graded",
+// a score of 70 — and the 30-point gap was exactly three info outcomes
+// forfeiting ten points each. Nothing tested the legend against the
+// arithmetic, or the advice against the counts, so both could say whatever
+// they liked.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// The nine checks a development stack with plaintext Redis, an ephemeral AOT
+/// key and an explicit CORS list actually produces. Reproduced here rather
+/// than asserted abstractly because the contradiction was only visible in a
+/// whole report: each field was defensible alone.
+fn dev_stack_checks() -> Vec<Check> {
+    vec![
+        check_production_mode(false),
+        check_jwt_algorithm(
+            talos_auth::JwtSelfTest::Verified {
+                algorithm: "HS256",
+                asymmetric: false,
+            },
+            "single_pod",
+        ),
+        check_master_encryption_key(Some(KekSelfTest::Verified {
+            provider: "env".to_string(),
+        })),
+        check_job_signing_key(JobSigningProbe::Verified),
+        check_aot_integrity_key(""),
+        check_audit_event_signing(talos_audit_event::SigningSelfTest::Verified, true, true),
+        check_redis_tls(RedisTransport::Plaintext, false),
+        check_audit_immutability_triggers(Some(4)),
+        check_cors_origins(&Ok(vec!["http://localhost:3000".to_string()]), true),
+    ]
+}
+
+/// Sum the emitted `checks[]` and demand the emitted totals agree.
+///
+/// This is the guard for "why 70?": if a future change awards points from
+/// anywhere other than a check's own `points`, or renders a denominator that
+/// is not the sum of the emitted `max_points`, the response stops being
+/// reconstructible and this fails.
+fn assert_score_reconstructs(report: &serde_json::Value) {
+    let checks = report["checks"].as_array().expect("checks array");
+    let awarded: u64 = checks
+        .iter()
+        .map(|c| {
+            c["points"]
+                .as_u64()
+                .expect("checks[].points must be emitted")
+        })
+        .sum();
+    let max: u64 = checks
+        .iter()
+        .map(|c| {
+            c["max_points"]
+                .as_u64()
+                .expect("checks[].max_points must be emitted")
+        })
+        .sum();
+
+    assert_eq!(
+        report["security_score"].as_u64(),
+        Some(awarded),
+        "security_score is no longer the sum of the emitted checks[].points — \
+         an operator cannot reconstruct the score from the response"
+    );
+    assert_eq!(
+        report["max_score"].as_u64(),
+        Some(max),
+        "max_score is no longer the sum of the emitted checks[].max_points"
+    );
+
+    let acct = &report["score_accounting"];
+    assert_eq!(acct["awarded"].as_u64(), Some(awarded));
+    assert_eq!(acct["max"].as_u64(), Some(max));
+    assert_eq!(
+        acct["forfeited"].as_u64(),
+        Some(max - awarded),
+        "score_accounting.forfeited must be max - awarded"
+    );
+
+    let shortfalls = acct["shortfalls"].as_array().expect("shortfalls array");
+    let listed: u64 = shortfalls
+        .iter()
+        .map(|s| s["forfeited"].as_u64().expect("shortfall forfeited"))
+        .sum();
+    assert_eq!(
+        listed,
+        max - awarded,
+        "score_accounting.shortfalls must account for EVERY point not awarded — \
+         {} point(s) went missing with no entry naming them",
+        (max - awarded) as i64 - listed as i64
+    );
+
+    let by_kind = &acct["forfeited_by_kind"];
+    assert_eq!(
+        by_kind["control"].as_u64().unwrap_or_default()
+            + by_kind["deployment_posture"].as_u64().unwrap_or_default(),
+        max - awarded,
+        "forfeited_by_kind must partition the shortfall"
+    );
+
+    // Per-check sanity: nothing may award more than its own weight, or the
+    // ratio the response prints is not a ratio.
+    for c in checks {
+        assert!(
+            c["points"].as_u64().unwrap_or_default()
+                <= c["max_points"].as_u64().unwrap_or_default(),
+            "{} awarded more than its weight",
+            c["check"]
+        );
+    }
+}
+
+#[test]
+fn the_score_is_reconstructible_from_the_emitted_fields() {
+    assert_score_reconstructs(&render_report(&dev_stack_checks()));
+}
+
+/// The same guard over deliberately awkward shapes, so it is not pinned to
+/// one deployment: everything broken, everything unverified, everything full.
+#[test]
+fn the_score_reconstructs_on_failing_unverified_and_perfect_reports() {
+    let all_broken = vec![
+        check_production_mode(false),
+        check_jwt_algorithm(
+            talos_auth::JwtSelfTest::Broken { stage: "secret" },
+            "single_pod",
+        ),
+        check_master_encryption_key(Some(KekSelfTest::Failed {
+            provider: "env".to_string(),
+            stage: "unwrap",
+        })),
+        check_job_signing_key(JobSigningProbe::Unusable),
+        check_aot_integrity_key("abcd"),
+        check_audit_event_signing(talos_audit_event::SigningSelfTest::NotSigned, true, false),
+        check_redis_tls(RedisTransport::TlsInsecure, true),
+        check_audit_immutability_triggers(Some(0)),
+        check_cors_origins(&Ok(vec![]), true),
+    ];
+    let report = render_report(&all_broken);
+    assert_score_reconstructs(&report);
+    assert_eq!(report["security_score"], 0);
+    assert_eq!(report["score_accounting"]["forfeited"], 100);
+
+    let unverified = vec![
+        check_master_encryption_key(None),
+        check_audit_immutability_triggers(None),
+    ];
+    assert_score_reconstructs(&render_report(&unverified));
+
+    // The all-green production report: no shortfall, so no shortfall entries.
+    let perfect = render_report(&[
+        check_production_mode(true),
+        check_jwt_algorithm(
+            talos_auth::JwtSelfTest::Verified {
+                algorithm: "RS256",
+                asymmetric: true,
+            },
+            "microservices",
+        ),
+        check_master_encryption_key(Some(KekSelfTest::Verified {
+            provider: "vault".to_string(),
+        })),
+        check_job_signing_key(JobSigningProbe::Verified),
+        check_aot_integrity_key(&"ab".repeat(32)),
+        check_audit_event_signing(talos_audit_event::SigningSelfTest::Verified, true, true),
+        check_redis_tls(RedisTransport::Tls, true),
+        check_audit_immutability_triggers(Some(6)),
+        check_cors_origins(&Ok(vec!["https://app.example.com".to_string()]), true),
+    ]);
+    assert_score_reconstructs(&perfect);
+    assert_eq!(perfect["security_score"], 100);
+    assert_eq!(
+        perfect["score_accounting"]["shortfalls"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+}
+
+/// The legend must not deny what the arithmetic does.
+///
+/// `info` outcomes forfeit points. The legend used to read "Configuration
+/// noted; not security-graded", which is the exact opposite, and it was
+/// printed in the same response as the 30-point gap those info outcomes
+/// caused. This asserts the contradiction cannot come back: whenever a status
+/// class forfeits points in a report, its legend may not claim to be ungraded,
+/// and must point at where the points went.
+#[test]
+fn no_status_legend_denies_the_grading_it_receives() {
+    let checks = dev_stack_checks();
+    let report = render_report(&checks);
+
+    // Precondition: this report really does forfeit points on `info`, or the
+    // assertions below are vacuous.
+    let info_forfeit: u32 = checks
+        .iter()
+        .filter(|c| c.status == Status::Info)
+        .map(Check::forfeited)
+        .sum();
+    assert_eq!(
+        info_forfeit, 30,
+        "fixture drifted — three info outcomes forfeiting 10 each is the shape \
+         that made the legend false"
+    );
+
+    for status in ["pass", "warn", "fail", "info"] {
+        let forfeited: u32 = checks
+            .iter()
+            .filter(|c| c.status.as_str() == status)
+            .map(Check::forfeited)
+            .sum();
+        if forfeited == 0 {
+            continue;
+        }
+        let legend = report["status_legend"][status]
+            .as_str()
+            .expect("every status must be documented");
+        let lowered = legend.to_lowercase();
+        for denial in ["not security-graded", "not graded", "not scored"] {
+            assert!(
+                !lowered.contains(denial),
+                "status_legend.{status} says {denial:?} while {status} outcomes \
+                 forfeit {forfeited} point(s) in this very report"
+            );
+        }
+        assert!(
+            lowered.contains("score_accounting") || lowered.contains("points"),
+            "status_legend.{status} forfeits points but does not tell the reader \
+             where they went"
+        );
+    }
+}
+
+/// Advice may not name a class with zero members.
+///
+/// The replaced string was chosen by score band alone, so at 70 it emitted
+/// "address failures before production" over `fail: 0`. Each clause is now
+/// gated on its own class, and this drives every combination of present and
+/// absent classes to prove the gating holds in both directions.
+#[test]
+fn recommendation_names_only_present_classes() {
+    struct Case {
+        label: &'static str,
+        checks: Vec<Check>,
+    }
+    let cases = vec![
+        Case {
+            label: "clean dev stack (the live 70/C report)",
+            checks: dev_stack_checks(),
+        },
+        Case {
+            label: "a failure present",
+            checks: vec![
+                check_cors_origins(&Ok(vec![]), true),
+                check_production_mode(true),
+            ],
+        },
+        Case {
+            label: "a warning that is not an unverified",
+            checks: vec![check_job_signing_key(JobSigningProbe::Absent)],
+        },
+        Case {
+            label: "an unverified check",
+            checks: vec![check_master_encryption_key(None)],
+        },
+        Case {
+            label: "full marks",
+            checks: vec![check_production_mode(true)],
+        },
+    ];
+
+    for Case { label, checks } in cases {
+        let text = recommendation_for(&checks);
+        // Drive the RENDERED report too, not only the helper. A mutation that
+        // rewires `render_report` back to a score band leaves this helper
+        // perfectly correct and unused — measured, that is exactly what
+        // happened when this guard tested the helper alone.
+        let rendered = render_report(&checks);
+        assert_eq!(
+            rendered["recommendation"].as_str(),
+            Some(text.as_str()),
+            "[{label}] render_report no longer emits recommendation_for's answer, \
+             so the advice is being selected somewhere this test cannot see"
+        );
+        let lowered = text.to_lowercase();
+
+        let has_fail = checks.iter().any(|c| c.status == Status::Fail);
+        let has_unverified = checks
+            .iter()
+            .any(|c| c.verification == Verification::NotVerified);
+        let has_warn = checks
+            .iter()
+            .any(|c| c.status == Status::Warn && c.verification != Verification::NotVerified);
+
+        assert_eq!(
+            lowered.contains("failing control"),
+            has_fail,
+            "[{label}] recommendation talks about failing controls but fail count \
+             is {}: {text}",
+            checks.iter().filter(|c| c.status == Status::Fail).count()
+        );
+        assert_eq!(
+            lowered.contains("could not be verified"),
+            has_unverified,
+            "[{label}] unverified clause does not match the population: {text}"
+        );
+        assert_eq!(
+            lowered.contains("harden"),
+            has_warn,
+            "[{label}] warning clause does not match the population: {text}"
+        );
+
+        // Every check the advice names must exist in the report it describes.
+        for c in &checks {
+            if c.status == Status::Fail || c.status == Status::Warn || c.forfeited() > 0 {
+                continue;
+            }
+            assert!(
+                !text.contains(c.name),
+                "[{label}] recommendation names {}, which has nothing to report: {text}",
+                c.name
+            );
+        }
+    }
+}
+
+/// The specific sentence that was false, pinned as its own case.
+#[test]
+fn a_report_with_no_failures_never_tells_the_operator_to_address_failures() {
+    let report = render_report(&dev_stack_checks());
+    assert_eq!(report["status_counts"]["fail"], 0);
+    assert_eq!(report["status_counts"]["warn"], 0);
+    assert_eq!(report["security_score"], 70);
+    assert_eq!(report["grade"], "C");
+
+    let rec = report["recommendation"].as_str().expect("recommendation");
+    for forbidden in ["failure", "failing control"] {
+        assert!(
+            !rec.to_lowercase().contains(forbidden),
+            "a report with fail: 0 must not mention {forbidden:?}: {rec}"
+        );
+    }
+    // And it must explain the gap rather than leaving it unaccounted.
+    for named in ["production_mode", "aot_integrity_key", "redis_tls"] {
+        assert!(
+            rec.contains(named),
+            "the 30-point gap is {named} among others, and the advice does not \
+             name it: {rec}"
+        );
+    }
+}
+
+/// A dev stack tops out at exactly [`GRADE_A`], so grade A IS reachable
+/// outside production — but only at perfection. Worth pinning: the natural
+/// assumption is that A is unreachable in development, and acting on that
+/// would justify re-weighting something that does not need it.
+#[test]
+fn grade_a_is_reachable_in_development_only_at_perfection() {
+    let mut checks = dev_stack_checks();
+    checks[4] = check_aot_integrity_key(&"ab".repeat(32));
+    checks[6] = check_redis_tls(RedisTransport::Tls, false);
+    let report = render_report(&checks);
+
+    assert_eq!(report["security_score"], 90);
+    assert_eq!(report["grade"], "A");
+    // The whole remaining gap is posture, and the response says so.
+    assert_eq!(report["score_accounting"]["forfeited"], 10);
+    assert_eq!(
+        report["score_accounting"]["forfeited_by_kind"]["deployment_posture"],
+        10
+    );
+    assert_eq!(
+        report["score_accounting"]["forfeited_by_kind"]["control"],
+        0
+    );
+
+    // One missing control in dev drops to B, so there is no slack.
+    checks[6] = check_redis_tls(RedisTransport::Plaintext, false);
+    assert_eq!(render_report(&checks)["grade"], "B");
+}
+
+/// Weights live in exactly one table, and it agrees with [`MAX_SCORE`].
+///
+/// Without this the derived `max_score` and the constant the grade thresholds
+/// were calibrated against could silently diverge — a tenth check would make
+/// `GRADE_A` mean something other than 90%.
+#[test]
+fn weights_sum_to_max_score() {
+    let sum: u32 = CHECK_WEIGHTS.iter().map(|(_, p, _)| *p).sum();
+    assert_eq!(sum, MAX_SCORE, "CHECK_WEIGHTS no longer sums to MAX_SCORE");
+    assert_eq!(CHECK_WEIGHTS.len(), 9);
+}
+
+/// Every arm of every check: its name is weighted, and it never awards more
+/// than its weight. `max_points` is a property of the CHECK, so a warn arm
+/// still reports the full weight and the shortfall shows up as forfeited.
+#[test]
+fn every_arm_is_weighted_and_within_its_weight() {
+    let arms: Vec<Check> = vec![
+        check_production_mode(true),
+        check_production_mode(false),
+        check_jwt_algorithm(
+            talos_auth::JwtSelfTest::Verified {
+                algorithm: "RS256",
+                asymmetric: true,
+            },
+            "microservices",
+        ),
+        check_jwt_algorithm(
+            talos_auth::JwtSelfTest::Verified {
+                algorithm: "HS256",
+                asymmetric: false,
+            },
+            "single_pod",
+        ),
+        check_jwt_algorithm(
+            talos_auth::JwtSelfTest::Verified {
+                algorithm: "HS256",
+                asymmetric: false,
+            },
+            "microservices",
+        ),
+        check_jwt_algorithm(
+            talos_auth::JwtSelfTest::Broken { stage: "secret" },
+            "single_pod",
+        ),
+        check_jwt_algorithm(
+            talos_auth::JwtSelfTest::Broken { stage: "mint" },
+            "single_pod",
+        ),
+        check_master_encryption_key(Some(KekSelfTest::Verified {
+            provider: "env".to_string(),
+        })),
+        check_master_encryption_key(Some(KekSelfTest::Failed {
+            provider: "env".to_string(),
+            stage: "wrap",
+        })),
+        check_master_encryption_key(Some(KekSelfTest::Unavailable)),
+        check_master_encryption_key(None),
+        check_job_signing_key(JobSigningProbe::Verified),
+        check_job_signing_key(JobSigningProbe::Absent),
+        check_job_signing_key(JobSigningProbe::Unusable),
+        check_job_signing_key(JobSigningProbe::RoundTripFailed),
+        check_aot_integrity_key(&"ab".repeat(32)),
+        check_aot_integrity_key("abcd"),
+        check_aot_integrity_key(""),
+        check_audit_event_signing(talos_audit_event::SigningSelfTest::Verified, true, true),
+        check_audit_event_signing(talos_audit_event::SigningSelfTest::NotSigned, false, false),
+        check_audit_event_signing(talos_audit_event::SigningSelfTest::NotSigned, true, false),
+        check_audit_event_signing(talos_audit_event::SigningSelfTest::NotSigned, true, true),
+        check_redis_tls(RedisTransport::NotConfigured, false),
+        check_redis_tls(RedisTransport::Tls, true),
+        check_redis_tls(RedisTransport::TlsInsecure, true),
+        check_redis_tls(RedisTransport::Plaintext, true),
+        check_redis_tls(RedisTransport::Plaintext, false),
+        check_redis_tls(RedisTransport::UnixSocket, false),
+        check_redis_tls(RedisTransport::Unparseable, false),
+        check_audit_immutability_triggers(Some(4)),
+        check_audit_immutability_triggers(Some(0)),
+        check_audit_immutability_triggers(None),
+        check_cors_origins(&Ok(vec!["https://app.example.com".to_string()]), true),
+        check_cors_origins(&Ok(vec!["http://localhost:3000".to_string()]), false),
+        check_cors_origins(&Ok(vec![]), true),
+        check_cors_origins(&Err("bad".to_string()), true),
+    ];
+
+    for arm in &arms {
+        let weighted = CHECK_WEIGHTS.iter().find(|(n, _, _)| *n == arm.name);
+        let (_, weight, _) =
+            weighted.unwrap_or_else(|| panic!("check {} has no entry in CHECK_WEIGHTS", arm.name));
+        assert_eq!(
+            arm.max_points(),
+            *weight,
+            "{} must report its weight regardless of outcome",
+            arm.name
+        );
+        assert!(
+            arm.points <= *weight,
+            "{} awarded {} against a weight of {weight}",
+            arm.name,
+            arm.points
+        );
+    }
+}
+
+/// Deployment posture is one check, deliberately. If a second one appears the
+/// score has quietly become more about where it runs than about what is
+/// configured, and that should be a decision, not a drift.
+#[test]
+fn only_production_mode_is_deployment_posture() {
+    let posture: Vec<&str> = CHECK_WEIGHTS
+        .iter()
+        .filter(|(_, _, k)| *k == CheckKind::DeploymentPosture)
+        .map(|(n, _, _)| *n)
+        .collect();
+    assert_eq!(posture, vec!["production_mode"]);
+}
+
+/// `verification` semantics are untouched by the scoring work: an unverified
+/// check still never passes, and the shortfall entry for one must not read as
+/// a verdict on the control.
+#[test]
+fn scoring_changes_did_not_disturb_verification_semantics() {
+    let report = render_report(&[
+        check_master_encryption_key(None),
+        check_audit_immutability_triggers(None),
+    ]);
+    for c in report["checks"].as_array().expect("checks") {
+        assert_eq!(c["verification"], "not_verified");
+        assert_ne!(c["status"], "pass");
+        assert_eq!(c["points"], 0);
+    }
+    let rec = report["recommendation"].as_str().expect("recommendation");
+    assert!(rec.contains("could not be verified"));
+    assert!(
+        !rec.to_lowercase().contains("failing control"),
+        "an unverified check is not a failure: {rec}"
+    );
+}
