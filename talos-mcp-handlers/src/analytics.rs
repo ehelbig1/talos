@@ -2043,13 +2043,22 @@ async fn handle_get_workflow_sla_report(
         Err(resp) => return resp,
     };
 
-    let wf = state
+    // A FAILED ownership read is not an absent workflow. `.unwrap_or(None)`
+    // collapsed both into `workflow_not_found_error`, so a database problem
+    // told the caller their workflow does not exist — on a surface whose whole
+    // next move is to report that workflow's compliance. Fail loud instead;
+    // the two sibling reads below already do.
+    match state
         .analytics_repo
         .get_workflow_for_analytics(wf_id, user_id)
         .await
-        .unwrap_or(None);
-    if wf.is_none() {
-        return crate::utils::workflow_not_found_error(req_id);
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => return crate::utils::workflow_not_found_error(req_id),
+        Err(e) => {
+            tracing::error!("get_workflow_sla_report ownership read failed: {}", e);
+            return mcp_error(req_id, -32000, "Failed to fetch SLA data");
+        }
     }
 
     let stats = match state
@@ -2067,12 +2076,6 @@ async fn handle_get_workflow_sla_report(
     let total = stats.total;
     let succeeded = stats.succeeded;
 
-    let actual_success_rate = if total > 0 {
-        (succeeded as f64 / total as f64) * 100.0
-    } else {
-        100.0
-    };
-
     let lat = match state
         .analytics_repo
         .get_latency_percentiles_ms(wf_id, user_id, days)
@@ -2085,35 +2088,198 @@ async fn handle_get_workflow_sla_report(
         }
     };
 
-    let (p50_ms, p95_ms, p99_ms) = (lat.p50_ms, lat.p95_ms, lat.p99_ms);
-
     // Count completed executions whose duration exceeded the target.
-    // Pre-fix this was hardcoded to 0, which made the SLA report
-    // misleading: p95/p99 could be 100x the target while
-    // violations_count stayed at 0. Errors degrade to 0 with a
-    // structured tracing event so operators can see the failure mode
-    // rather than getting silent zeros.
-    let violations_count: i64 = match state
-        .analytics_repo
-        .count_sla_duration_violations(wf_id, user_id, i64::from(days), target_max_duration_ms)
-        .await
-    {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::warn!(
-                target: "talos_analytics",
-                event_kind = "sla_violations_count_failed",
-                workflow_id = %wf_id,
-                error = %e,
-                "count_sla_duration_violations failed; reporting 0"
-            );
-            0
-        }
+    //
+    // Pre-fix this was hardcoded to 0, which made the SLA report misleading:
+    // p95/p99 could be 100x the target while violations_count stayed at 0.
+    // The first repair made it a real count but degraded a FAILED read to 0
+    // — "reporting 0" — so a database problem rendered as *zero violations*
+    // on a compliance surface. It is now routed through
+    // `talos_measurement::Readings`: a failed read is null and named under
+    // `measurement.not_measured`, never a benign zero.
+    let mut readings = talos_measurement::Readings::new();
+    let violations_count = readings.record(
+        "duration.violations_count",
+        state
+            .analytics_repo
+            .count_sla_duration_violations(wf_id, user_id, i64::from(days), target_max_duration_ms)
+            .await,
+    );
+
+    let result = render_sla_report(
+        &SlaTargets {
+            success_rate_pct: target_success_rate,
+            max_duration_ms: target_max_duration_ms,
+            days,
+        },
+        &SlaReads {
+            total,
+            succeeded,
+            running: stats.running,
+            p50_ms: lat.p50_ms,
+            p95_ms: lat.p95_ms,
+            p99_ms: lat.p99_ms,
+            violations_count,
+        },
+        &readings,
+    );
+
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&result).unwrap_or_default(),
+    )
+}
+
+/// The caller-supplied SLA targets, exactly as validated by the handler.
+pub(crate) struct SlaTargets {
+    /// Target success rate as a PERCENTAGE (0-100), not a fraction.
+    pub success_rate_pct: f64,
+    pub max_duration_ms: f64,
+    pub days: i32,
+}
+
+/// The DB-backed reads behind `get_workflow_sla_report`, each already resolved
+/// to a measured value or to "not measured".
+///
+/// A struct rather than positional arguments so [`render_sla_report`] can be
+/// driven from a test without a database — the zero-execution and failed-read
+/// cases are the entire point of the fix, and they must be pinned against the
+/// code that actually ships, not against a test-local copy of it. Same shape as
+/// [`SystemHealthReads`].
+pub(crate) struct SlaReads {
+    /// Executions STARTED in the window, every status — including runs still
+    /// in flight. This is the denominator of `success_rate`.
+    pub total: i64,
+    /// Executions in the window that reached `completed`.
+    pub succeeded: i64,
+    /// Executions in the window still `running` — outcome not yet known, but
+    /// already counted in `total`.
+    pub running: i64,
+    pub p50_ms: Option<f64>,
+    pub p95_ms: Option<f64>,
+    pub p99_ms: Option<f64>,
+    /// `None` when the violations count could not be read.
+    pub violations_count: Option<i64>,
+}
+
+/// Pure: render the `get_workflow_sla_report` response.
+///
+/// # Absence is not compliance
+///
+/// This is a COMPLIANCE surface, so every default in it points the same
+/// dangerous way. Pre-fix, a workflow that had never run reported
+/// `in_compliance: true`, `success_rate.actual: 100.0`, `met: true` beside
+/// `total_executions: 0` — a perfect score asserted from nothing — via three
+/// separate mechanisms:
+///
+/// 1. `let success_rate = if total > 0 { .. } else { 100.0 }` — an empty window
+///    scored as a perfect window.
+/// 2. `p99_ms.unwrap_or(0.0) <= target` — a NULL p99 is 0.0, which is under
+///    every target, so `duration_met` was true FROM ABSENCE. The same response
+///    emitted `p99: null` in the next line.
+/// 3. `count_sla_duration_violations(..)` degrading to `0` on error — a
+///    database failure rendered as *zero violations*.
+///
+/// Every measurable quantity here is therefore an `Option`, and every verdict
+/// derived from one is three-valued. `in_compliance` uses a KNOWN-FAILURE-WINS
+/// lattice rather than a plain three-valued AND: a component that is
+/// `Some(false)` makes the whole verdict `false` even when the other component
+/// is unmeasured, because a violation you can see is still a violation. Only
+/// when nothing is known to be violated AND something could not be measured
+/// does the verdict become `null` / `not_measurable`.
+///
+/// `compliance_status` names the state in words beside the tri-state boolean,
+/// so a consumer that treats `null` as falsy still gets the distinction
+/// between "failed the SLA" and "there was no SLA to fail".
+pub(crate) fn render_sla_report(
+    targets: &SlaTargets,
+    reads: &SlaReads,
+    readings: &talos_measurement::Readings,
+) -> serde_json::Value {
+    // A rate over an empty window is not 100%, and it is not 0% either — it
+    // does not exist. `Measurement::rate` returns `None` at n == 0 for exactly
+    // this reason; the percentage here is the same judgement, kept as a plain
+    // f64 because this surface renders percentages, not fractions.
+    let actual_success_rate: Option<f64> = if reads.total > 0 {
+        Some((reads.succeeded as f64 / reads.total as f64) * 100.0)
+    } else {
+        None
     };
 
-    let success_rate_met = actual_success_rate >= target_success_rate;
-    let duration_met = p99_ms.unwrap_or(0.0) <= target_max_duration_ms;
-    let in_compliance = success_rate_met && duration_met;
+    let success_rate_met: Option<bool> = actual_success_rate.map(|a| a >= targets.success_rate_pct);
+    // NOT `p99.unwrap_or(0.0)`. A window with no completed executions has no
+    // p99, and "no latency" is not "fast".
+    let duration_met: Option<bool> = reads.p99_ms.map(|p| p <= targets.max_duration_ms);
+
+    // Known-failure-wins lattice — see the type docs.
+    let in_compliance: Option<bool> =
+        if success_rate_met == Some(false) || duration_met == Some(false) {
+            Some(false)
+        } else if success_rate_met.is_none() || duration_met.is_none() {
+            None
+        } else {
+            Some(true)
+        };
+    let compliance_status = match in_compliance {
+        Some(true) => "in_compliance",
+        Some(false) => "out_of_compliance",
+        None => "not_measurable",
+    };
+
+    // MCP-92 (2026-05-07): round percentile millis to 1 decimal so the
+    // f64-conversion artifacts (e.g. 22205.164099999998 → 22205.2) don't
+    // leak. Operates on Option<f64> (the percentile lookup returns None
+    // when there are no completed executions in the window).
+    let round_1dp_opt = |v: Option<f64>| -> Option<f64> {
+        v.and_then(|f| {
+            if f.is_finite() {
+                Some((f * 10.0).round() / 10.0)
+            } else {
+                None
+            }
+        })
+    };
+
+    let days = targets.days;
+    let target_success_rate = targets.success_rate_pct;
+    let total = reads.total;
+
+    let mut result = serde_json::json!({
+        "in_compliance": in_compliance,
+        "compliance_status": compliance_status,
+        "success_rate": {
+            "target": target_success_rate,
+            "actual": actual_success_rate.map(talos_analytics_repository::format_percent),
+            "met": success_rate_met,
+            // Every count states its population (CLAUDE.md). The denominator
+            // is every execution STARTED in the window, so a run still in
+            // flight counts against the rate until it completes.
+            "population": format!(
+                "{total} execution(s) started in the trailing {days} day(s), all statuses;                  {succeeded} reached 'completed' and {running} are still running (an in-flight                  run is in the denominator but not the numerator, so the rate is a lower bound                  while runs are open)",
+                total = total,
+                days = days,
+                succeeded = reads.succeeded,
+                running = reads.running,
+            ),
+        },
+        "duration": {
+            "target_ms": targets.max_duration_ms,
+            "p50": round_1dp_opt(reads.p50_ms),
+            "p95": round_1dp_opt(reads.p95_ms),
+            "p99": round_1dp_opt(reads.p99_ms),
+            "met": duration_met,
+            "violations_count": reads.violations_count,
+            "population": "percentiles and violations_count cover COMPLETED executions in the                            window only; failed, cancelled and in-flight runs contribute no                            duration",
+        },
+        "period_days": days,
+        "total_executions": total,
+    });
+
+    if in_compliance.is_none() {
+        result["compliance_note"] = serde_json::json!(
+            "NOT MEASURABLE, not compliant. At least one SLA component had no data in this              window, so no compliance verdict was reached: a null `met` means nobody could              look, never that the target was cleared. An empty window is not a perfect              window."
+        );
+    }
 
     // MCP-4: warn when total_executions is too small for the target_success_rate
     // to be statistically meaningful. With N=13 samples, a single failure is
@@ -2131,57 +2297,48 @@ async fn handle_get_workflow_sla_report(
     // capability router judge sample size by the same rule. The old inline
     // version returned a 0 sentinel where there is no threshold; the shared
     // one returns None, which is the same branch below.
+    //
+    // `None` from the shared helper means the target admits NO finite
+    // threshold (0% or 100%), and pre-fix that silently omitted the whole
+    // qualification: at `target_success_rate: 100` — the STRICTEST target the
+    // validator accepts — the one mitigation on this surface disappeared and
+    // the verdict was rendered unqualified. That branch is now stated rather
+    // than skipped. The helper itself is unchanged: there genuinely is no
+    // finite N at which a 100% target survives one bad run, and re-deriving a
+    // local answer here would fork it.
     let min_n_for_target: Option<u64> =
         talos_measurement::min_n_for_rate_target(target_success_rate / 100.0);
-    // MCP-92 (2026-05-07): round percentile millis to 1 decimal so the
-    // f64-conversion artifacts (e.g. 22205.164099999998 → 22205.2) don't
-    // leak. Operates on Option<f64> (the percentile lookup returns None
-    // when there are no completed executions in the window).
-    let round_1dp_opt = |v: Option<f64>| -> Option<f64> {
-        v.and_then(|f| {
-            if f.is_finite() {
-                Some((f * 10.0).round() / 10.0)
-            } else {
-                None
-            }
-        })
-    };
-    let mut result = serde_json::json!({
-        "in_compliance": in_compliance,
-        "success_rate": {
-            "target": target_success_rate,
-            "actual": talos_analytics_repository::format_percent(actual_success_rate),
-            "met": success_rate_met,
-        },
-        "duration": {
-            "target_ms": target_max_duration_ms,
-            "p50": round_1dp_opt(p50_ms),
-            "p95": round_1dp_opt(p95_ms),
-            "p99": round_1dp_opt(p99_ms),
-            "violations_count": violations_count,
-        },
-        "period_days": days,
-        "total_executions": total,
-    });
     // `total` is a row count (>= 0); the saturating conversion keeps a
     // hypothetical negative from wrapping into a huge u64 and suppressing the
     // warning (check 21).
     let total_u = u64::try_from(total).unwrap_or(0);
-    if let Some(min_n_for_target) = min_n_for_target.filter(|m| total_u < *m) {
+    if total_u == 0 {
+        result["sample_size_warning"] = serde_json::json!(format!(
+            "No executions at all in the trailing {days} day(s), so nothing about this              workflow's SLA was measured. The success rate, the latency percentiles and the              compliance verdict are all null — a workflow that has never run is UNMEASURED,              not compliant. Trigger it, or widen `days`, before reading any verdict here."
+        ));
+        if let Some(m) = min_n_for_target {
+            result["min_n_for_meaningful_target"] = serde_json::json!(m);
+        }
+    } else if let Some(min_n_for_target) = min_n_for_target.filter(|m| total_u < *m) {
         result["sample_size_warning"] = serde_json::json!(format!(
             "Sample size ({total}) is below the threshold ({min_n_for_target}) needed for a {target_success_rate}% target to be statistically meaningful. A single failure is {failure_pct:.1}% of {total} runs — verdict may not be actionable. Consider lowering target_success_rate, extending the days window, or accepting the verdict as advisory.",
             total = total,
             min_n_for_target = min_n_for_target,
             target_success_rate = target_success_rate,
-            failure_pct = if total > 0 { 100.0 / total as f64 } else { 0.0 },
+            failure_pct = 100.0 / total as f64,
         ));
         result["min_n_for_meaningful_target"] = serde_json::json!(min_n_for_target);
+    } else if min_n_for_target.is_none() {
+        // target is 0% or 100%: no finite sample size makes the verdict robust.
+        result["sample_size_warning"] = serde_json::json!(format!(
+            "A {target_success_rate}% target has NO finite sufficiency threshold, so no sample              size makes this verdict robust: at 100% a single failure fails the target no              matter how many runs precede it, and at 0% the target is met unconditionally.              `min_n_for_meaningful_target` is omitted because none exists — that omission is              not a statement that the sample is large enough.",
+            target_success_rate = target_success_rate,
+        ));
     }
 
-    mcp_text(
-        req_id,
-        &serde_json::to_string_pretty(&result).unwrap_or_default(),
-    )
+    // A failed read is null AND named, never a benign zero.
+    readings.attach(&mut result);
+    result
 }
 
 async fn handle_list_workflow_triggers(
@@ -2641,14 +2798,30 @@ async fn handle_get_error_report(
         "error_fingerprints",
         state
             .analytics_repo
-            .get_error_messages_with_started_at(wf_id, user_id, days, 200)
+            .get_error_messages_with_started_at(wf_id, user_id, days, ERROR_MESSAGE_SAMPLE_CAP)
             .await,
     );
     let error_msgs: Vec<String> = error_rows.iter().map(|(m, _)| m.clone()).collect();
 
     // Fingerprint grouping shared with the global mode — see
     // `group_error_fingerprints`.
-    let error_fingerprints = group_error_fingerprints(&error_rows, 10);
+    // Coverage of the SAMPLE the fingerprints are computed over — NOT of the
+    // window. `total_failures` beside it is a full-window COUNT, so a workflow
+    // with 5 000 failures rendered `total_failures: 5000` next to fingerprint
+    // counts that cannot sum past 200, with nothing saying so; a reader
+    // comparing the two under-reads every fingerprint by a factor of 25. Worse,
+    // when a storm dominates the most recent 200 rows a distinct long-running
+    // error vanishes from the list entirely while its executions keep inflating
+    // `total_failures`.
+    //
+    // `available` is deliberately left UNMEASURED rather than filled from
+    // `total_failures`: the two count different sets (failures WITH an error
+    // message vs. all failed executions), and a plausible-looking wrong
+    // population is worse than an honest "at least", which is what
+    // `Coverage::note()` says in that state.
+    let fingerprint_sample_coverage =
+        talos_measurement::Coverage::new(error_rows.len() as i64, ERROR_MESSAGE_SAMPLE_CAP);
+    let error_fingerprints = group_error_fingerprints(&error_rows, ERROR_FINGERPRINT_TOP_K);
 
     // Node-level failure breakdown from execution_events
     let node_failures = readings.record_rows(
@@ -2748,7 +2921,16 @@ async fn handle_get_error_report(
         "period_days": days,
         "total_failures": total_failures,
         "error_fingerprints": error_fingerprints,
+        "error_fingerprints_coverage": error_fingerprint_coverage_json(
+            &fingerprint_sample_coverage,
+            ERROR_MESSAGE_SAMPLE_CAP,
+        ),
         "node_failure_breakdown": node_breakdown,
+        "node_failure_breakdown_coverage": talos_measurement::Coverage::new(
+            node_breakdown.len() as i64,
+            NODE_FAILURE_BREAKDOWN_CAP,
+        )
+        .to_json(),
         "hourly_failure_pattern": hourly_pattern,
     });
     if !fuel_bump_antipatterns.is_empty() {
@@ -2761,6 +2943,46 @@ async fn handle_get_error_report(
         &serde_json::to_string_pretty(&result).unwrap_or_default(),
     )
 }
+
+/// Pure: the cap disclosure that travels with `error_fingerprints`.
+///
+/// Shared by both `get_error_report` modes so the sentence cannot drift between
+/// them — the two differ only in their sample cap.
+fn error_fingerprint_coverage_json(
+    sample: &talos_measurement::Coverage,
+    cap: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "sample": sample.to_json(),
+        "groups_shown_max": ERROR_FINGERPRINT_TOP_K,
+        "note": format!(
+            "Every `count` under error_fingerprints is a count WITHIN a sample of at most {cap} \
+             of the window's most recent failures, and at most the {k} largest groups are shown. \
+             `total_failures` is a FULL-WINDOW count over a different population (all failed \
+             executions, with or without an error message), so the fingerprint counts do not sum \
+             to it and the two must not be compared. When the sample is truncated a distinct \
+             low-volume error can be absent from this list entirely while still contributing to \
+             total_failures.",
+            cap = cap,
+            k = ERROR_FINGERPRINT_TOP_K,
+        ),
+    })
+}
+
+/// Most recent failed-execution error messages the workflow-scoped fingerprint
+/// sample reads.
+///
+/// Named rather than passed as a bare `200` so the cap can TRAVEL into the
+/// response — `Coverage::new` requires it, which is the whole point of the
+/// type: the cap is normally a literal the reporting site does not have.
+const ERROR_MESSAGE_SAMPLE_CAP: i64 = 200;
+/// Fingerprint groups surfaced, largest-first, out of however many the sample
+/// produced. Applies to BOTH the workflow-scoped and the global mode.
+const ERROR_FINGERPRINT_TOP_K: usize = 10;
+/// The `LIMIT 20` inside `AnalyticsRepository::get_node_failure_counts`.
+/// Restated here only so it can be disclosed; pinned by
+/// `node_failure_breakdown_cap_is_stated_and_disclosed`.
+const NODE_FAILURE_BREAKDOWN_CAP: i64 = 20;
 
 /// Global (no `workflow_id`) mode of `get_error_report`: a user-scoped,
 /// platform-wide failure rollup for the window. Motivated by the same
@@ -2817,7 +3039,9 @@ async fn handle_error_report_global(
             return mcp_error(req_id, -32000, "Failed to fetch error report");
         }
     };
-    let error_fingerprints = group_error_fingerprints(&error_rows, 10);
+    let fingerprint_sample_coverage =
+        talos_measurement::Coverage::new(error_rows.len() as i64, GLOBAL_ERROR_ROWS_CAP);
+    let error_fingerprints = group_error_fingerprints(&error_rows, ERROR_FINGERPRINT_TOP_K);
 
     let per_workflow_rows = match state
         .analytics_repo
@@ -2847,6 +3071,10 @@ async fn handle_error_report_global(
         "period_days": days,
         "total_failures": total_failures,
         "error_fingerprints": error_fingerprints,
+        "error_fingerprints_coverage": error_fingerprint_coverage_json(
+            &fingerprint_sample_coverage,
+            GLOBAL_ERROR_ROWS_CAP,
+        ),
         "workflow_failure_counts": workflow_failure_counts,
     });
     readings.attach(&mut result);
@@ -3496,6 +3724,9 @@ async fn handle_suggest_retry_config(
     let mut succeeded = 0usize;
     let mut timeout_errors = 0usize;
     let mut rate_limit_errors = 0usize;
+    // Failing EXECUTIONS matching either transient predicate, counted once
+    // each — the two predicates above overlap, so their sum is not a count.
+    let mut transient_errors = 0usize;
     let mut deterministic_errors = 0usize;
     let mut error_messages: Vec<String> = Vec::new();
 
@@ -3506,17 +3737,27 @@ async fn handle_suggest_retry_config(
                 failed += 1;
                 if let Some(ref msg) = error_msg {
                     let lower = msg.to_lowercase();
-                    if lower.contains("timeout")
-                        || lower.contains("429")
-                        || lower.contains("rate limit")
-                    {
+                    // NOTE the two predicates OVERLAP: "429" and "rate limit"
+                    // satisfy both, so a single failure increments BOTH
+                    // counters. That is correct for the per-class comparison
+                    // below (`rate_limit_errors > timeout_errors` picks the
+                    // backoff), but `timeout_errors + rate_limit_errors` is
+                    // NOT a count of failures — it reached 2× `failed` in the
+                    // reasoning string, which then reported e.g. "Detected 2
+                    // timeout/rate-limit errors out of 1 failures". A count
+                    // larger than its own denominator is not a rounding
+                    // artefact; it tells the reader the population is
+                    // something other than what it is. `transient_errors`
+                    // counts each failing EXECUTION at most once.
+                    let (is_timeout, is_rate_limit) = classify_transient_failure(&lower);
+                    if is_timeout {
                         timeout_errors += 1;
                     }
-                    if lower.contains("429")
-                        || lower.contains("rate limit")
-                        || lower.contains("too many")
-                    {
+                    if is_rate_limit {
                         rate_limit_errors += 1;
+                    }
+                    if is_timeout || is_rate_limit {
+                        transient_errors += 1;
                     }
                     if is_deterministic_failure(&lower) {
                         deterministic_errors += 1;
@@ -3566,8 +3807,15 @@ async fn handle_suggest_retry_config(
         error_class = "deterministic";
     } else if timeout_errors > 0 || rate_limit_errors > 0 {
         reasoning.push(format!(
-            "Detected {} timeout/rate-limit errors out of {} failures. Exponential backoff recommended.",
-            timeout_errors + rate_limit_errors, failed
+            "Detected {transient} timeout/rate-limit failure(s) out of {failed} failed \
+             execution(s) in the window ({timeout} matched the timeout predicate and \
+             {rate_limit} the rate-limit predicate; the two OVERLAP on \"429\" and \"rate \
+             limit\", so those are per-predicate tallies, not a total). Exponential backoff \
+             recommended.",
+            transient = transient_errors,
+            failed = failed,
+            timeout = timeout_errors,
+            rate_limit = rate_limit_errors,
         ));
         suggested_retry_count = 3;
         suggested_backoff_ms = if rate_limit_errors > timeout_errors {
@@ -3707,6 +3955,28 @@ async fn handle_suggest_retry_config(
         req_id,
         &serde_json::to_string_pretty(&result).unwrap_or_default(),
     )
+}
+
+/// Pure: the two OVERLAPPING transient-failure predicates behind
+/// `suggest_retry_config`, returned as `(is_timeout, is_rate_limit)`.
+///
+/// They deliberately overlap — `"429"` and `"rate limit"` satisfy both — because
+/// the caller compares them against each other to pick a backoff
+/// (`rate_limit_errors > timeout_errors` → 5 s, else 2 s). Extracted so the
+/// overlap is visible and pinned in one place instead of being an emergent
+/// property of two adjacent `if` blocks, which is how it came to be summed.
+///
+/// **Their sum is not a count of anything.** Summing them double-counts every
+/// message matching both, and the pre-fix reasoning string did exactly that
+/// against a `failed` denominator: one execution failing with "rate limit
+/// exceeded" rendered as "Detected 2 timeout/rate-limit errors out of 1
+/// failures". Use the OR of the pair to count executions.
+fn classify_transient_failure(lower: &str) -> (bool, bool) {
+    let is_timeout =
+        lower.contains("timeout") || lower.contains("429") || lower.contains("rate limit");
+    let is_rate_limit =
+        lower.contains("429") || lower.contains("rate limit") || lower.contains("too many");
+    (is_timeout, is_rate_limit)
 }
 
 /// `pub(crate)`: also the view='topology' arm of the consolidated
@@ -4472,27 +4742,14 @@ async fn handle_get_workflow_performance_report(
         }
     };
 
-    // Performance trend: compare last 24h avg to previous 24h avg
-    let trend = match state
-        .analytics_repo
-        .get_performance_trend(wf_id, user_id)
-        .await
-    {
-        Ok((recent, previous)) => match (recent, previous) {
-            (Some(r), Some(p)) if p > 0.0 => {
-                let change_pct = ((r - p) / p) * 100.0;
-                if change_pct < -10.0 {
-                    "improving"
-                } else if change_pct > 10.0 {
-                    "degrading"
-                } else {
-                    "stable"
-                }
-            }
-            _ => "insufficient_data",
-        },
-        Err(_) => "insufficient_data",
-    };
+    // Performance trend: compare last 24h avg to previous 24h avg.
+    let trend = render_performance_trend(
+        state
+            .analytics_repo
+            .get_performance_trend(wf_id, user_id)
+            .await,
+        days,
+    );
 
     let result = serde_json::json!({
         "workflow_name": wf_name,
@@ -4516,6 +4773,118 @@ async fn handle_get_workflow_performance_report(
         req_id,
         &serde_json::to_string_pretty(&result).unwrap_or_default(),
     )
+}
+
+/// Improvement over the previous 24h is `change_pct` below this (a NEGATIVE
+/// percentage: latency went down).
+const TREND_IMPROVING_BELOW_PCT: f64 = -10.0;
+/// Degradation is `change_pct` above this.
+const TREND_DEGRADING_ABOVE_PCT: f64 = 10.0;
+
+/// Pure: render the `performance_trend` block of `get_workflow_performance_report`.
+///
+/// # Why this is an object and no longer a bare string
+///
+/// It emitted one of `improving` / `degrading` / `stable` / `insufficient_data`
+/// and nothing else, which made it wrong in three separate ways at once:
+///
+/// * **A DB error rendered as `"insufficient_data"`** (`Err(_) => ..`, the error
+///   discarded into `_` and not even logged). A dropped connection, a query
+///   timeout and an RLS denial produced output byte-identical to a workflow
+///   that simply ran twice yesterday. `not_measured` is now its own verdict and
+///   the error is logged server-side — never returned, per the secret-handling
+///   rule.
+/// * **The window was undisclosed and contradicted its neighbour.** The trend
+///   is 24h vs the preceding 24h, while `period_days` in the same object
+///   advertises 7-90 days. A reader had no way to know the two numbers describe
+///   different spans.
+/// * **The inputs and thresholds were unemitted.** One slow run in a two-run
+///   day flips the verdict to `degrading` with nothing in the payload to show
+///   the sample was two. The averages and the ±10% cut-points now travel with
+///   the verdict.
+///
+/// The sibling `node_timing_breakdown` in the same response already shipped a
+/// full provenance note (`NODE_TIMING_BREAKDOWN_NOTE`); this brings the trend up
+/// to that standard. Note the caveat this canNOT fix: `get_performance_trend`
+/// selects no counts, so the number of executions behind each average is not
+/// available at this layer. The note says so rather than implying a sample size.
+fn render_performance_trend<E: std::fmt::Display>(
+    read: Result<(Option<f64>, Option<f64>), E>,
+    period_days: i32,
+) -> serde_json::Value {
+    let window = format!(
+        "the last 24h compared with the preceding 24h — NOT the {period_days}-day \
+         `period_days` window the rest of this report uses"
+    );
+    let thresholds = serde_json::json!({
+        "improving_change_pct_below": TREND_IMPROVING_BELOW_PCT,
+        "degrading_change_pct_above": TREND_DEGRADING_ABOVE_PCT,
+        "metric": "mean wall-clock duration of executions with status='completed'",
+    });
+
+    let (recent, previous) = match read {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::error!(
+                target: "talos_analytics",
+                event_kind = "performance_trend_not_measured",
+                error = %e,
+                "performance trend read failed; reported as not_measured, never as a verdict"
+            );
+            return serde_json::json!({
+                "verdict": "not_measured",
+                "recent_avg_ms": serde_json::Value::Null,
+                "previous_avg_ms": serde_json::Value::Null,
+                "change_pct": serde_json::Value::Null,
+                "window": window,
+                "thresholds": thresholds,
+                "note": "The trend query FAILED. This is NOT a statement that there were too \
+                         few executions to compare — nobody could look. Pre-fix this case was \
+                         indistinguishable from `insufficient_data`.",
+            });
+        }
+    };
+
+    let round_2dp = |v: Option<f64>| {
+        v.filter(|x| x.is_finite())
+            .map(|x| (x * 100.0).round() / 100.0)
+    };
+
+    match (recent, previous) {
+        (Some(r), Some(p)) if p > 0.0 && r.is_finite() && p.is_finite() => {
+            let change_pct = ((r - p) / p) * 100.0;
+            let verdict = if change_pct < TREND_IMPROVING_BELOW_PCT {
+                "improving"
+            } else if change_pct > TREND_DEGRADING_ABOVE_PCT {
+                "degrading"
+            } else {
+                "stable"
+            };
+            serde_json::json!({
+                "verdict": verdict,
+                "recent_avg_ms": round_2dp(Some(r)),
+                "previous_avg_ms": round_2dp(Some(p)),
+                "change_pct": round_2dp(Some(change_pct)),
+                "window": window,
+                "thresholds": thresholds,
+                "note": "Sample sizes are NOT available at this layer — the trend query selects \
+                         averages only, so a verdict computed over two executions is \
+                         indistinguishable here from one computed over two hundred. Treat it as \
+                         a direction, not a measurement.",
+            })
+        }
+        _ => serde_json::json!({
+            "verdict": "insufficient_data",
+            "recent_avg_ms": round_2dp(recent),
+            "previous_avg_ms": round_2dp(previous),
+            "change_pct": serde_json::Value::Null,
+            "window": window,
+            "thresholds": thresholds,
+            "note": "At least one of the two 24h buckets had no completed executions (or a \
+                     zero previous average), so there was nothing to compare. The read \
+                     SUCCEEDED — a failed read reports `not_measured` instead.",
+        }),
+    }
 }
 
 async fn handle_get_workflow_risk_assessment(
@@ -6310,6 +6679,9 @@ async fn handle_get_readiness_breakdown(
         "reliability.executions",
         state.analytics_repo.get_readiness_exec_data(wf_id).await,
     );
+    // Carried into the improvement list below: an exec_count of 0 that came from
+    // a FAILED read must not be published as "this workflow has never run".
+    let reliability_measured = exec_data.is_some();
     if exec_data.is_none() {
         readings.mark_derived("readiness_score");
     }
@@ -6440,13 +6812,84 @@ async fn handle_get_readiness_breakdown(
             "component": "risk"
         }));
     }
+    // Reliability advice. Two independent levers, NOT an `else if` chain.
+    //
+    // `compute_reliability_score` is `s · min(n/10, 1) · 50` — a PRODUCT of the
+    // success rate and the run-count ramp — so below saturation both levers are
+    // live at once and they are exactly additive:
+    //   (50 − 5n)  +  5n(1 − s)  =  50 − 5sn  =  the whole gap.
+    // Pre-fix the success-rate arm sat behind `else if exec_count < 10`, so a
+    // workflow with 5 runs at 60% was told only to "run it more" and
+    // `total_points_available` understated its real gap by 5n(1−s). Both arms
+    // now fire, and both derive their points from the score's own formula.
     if exec_count == 0 {
-        improvements.push(serde_json::json!({"action": "Execute the workflow at least once to establish reliability baseline", "points_available": 50, "component": "reliability"}));
+        // "Zero runs" and "we could not read the runs" are different facts, and
+        // the second one must not be published as the first: telling the owner
+        // of a workflow with thousands of executions to "execute it at least
+        // once" is a fabricated claim about system state. `readings` already
+        // discloses the failed read; the ACTION TEXT has to say it too, because
+        // that is the sentence an operator (or a model) acts on.
+        let action = if reliability_measured {
+            "Execute the workflow at least once to establish reliability baseline".to_string()
+        } else {
+            "Reliability could NOT BE READ (see measurement.not_measured) — this is NOT a \
+             statement that the workflow has never run. Re-check before acting on it."
+                .to_string()
+        };
+        improvements.push(serde_json::json!({
+            "action": action,
+            "points_available": if reliability_measured { 50 } else { 0 },
+            "component": "reliability",
+            "measured": reliability_measured,
+        }));
     } else if exec_count < 10 {
-        let remaining = (50.0 * (1.0 - exec_count as f64 / 10.0)) as i32;
-        improvements.push(serde_json::json!({"action": format!("Run {} more times to reach full reliability credit (currently {}/10 runs)", 10 - exec_count, exec_count), "points_available": remaining, "component": "reliability"}));
-    } else if success_rate.unwrap_or(0.0) < 0.95 {
-        improvements.push(serde_json::json!({"action": "Improve success rate — currently below 95%", "points_available": (50.0 * (1.0 - success_rate.unwrap_or(0.0))) as i32, "component": "reliability"}));
+        let remaining =
+            talos_analytics_repository::reliability_gain_from_more_runs(exec_count) as i32;
+        let forfeit_after = talos_analytics_repository::reliability_gain_from_success_rate(
+            success_rate,
+            exec_count,
+        );
+        // The destination is stated truthfully. "Full reliability credit" is
+        // reachable by running more ONLY at a 100% success rate; below that,
+        // 5n(1−s) points stay behind however many times you run it.
+        let action = if forfeit_after > 0.0 {
+            format!(
+                "Run {} more times (currently {}/10 runs) — worth {} pts. This does NOT reach \
+                 full reliability credit: at the current {:.0}% success rate, {} pts stay \
+                 forfeit to failures no matter how many runs you add, because the score is \
+                 success_rate × run-ramp, not a sum.",
+                10 - exec_count,
+                exec_count,
+                remaining,
+                success_rate.unwrap_or(0.0) * 100.0,
+                forfeit_after.round() as i32,
+            )
+        } else {
+            format!(
+                "Run {} more times to reach full reliability credit (currently {}/10 runs)",
+                10 - exec_count,
+                exec_count
+            )
+        };
+        improvements.push(serde_json::json!({
+            "action": action,
+            "points_available": remaining,
+            "component": "reliability",
+        }));
+    }
+    if exec_count > 0 && success_rate.unwrap_or(0.0) < 0.95 {
+        let pts = talos_analytics_repository::reliability_gain_from_success_rate(
+            success_rate,
+            exec_count,
+        ) as i32;
+        improvements.push(serde_json::json!({
+            "action": format!(
+                "Improve success rate — currently {:.0}%, below the 95% bar",
+                success_rate.unwrap_or(0.0) * 100.0
+            ),
+            "points_available": pts,
+            "component": "reliability",
+        }));
     }
     if freshness == 0.0 {
         improvements.push(serde_json::json!({"action": "Execute within the last 30 days to restore freshness score", "points_available": 10, "component": "freshness"}));
@@ -7920,5 +8363,511 @@ mod retry_advice_rendering_tests {
         assert_eq!(v["module_default_retry_count"], 0);
         assert_eq!(v["capability_world"], "http-node");
         assert!(v["reason"].as_str().unwrap().contains("HIGHER of"));
+    }
+}
+
+#[cfg(test)]
+mod sla_absence_disclosure_tests {
+    use super::{render_sla_report, SlaReads, SlaTargets};
+    use talos_measurement::Readings;
+
+    fn targets(success_pct: f64) -> SlaTargets {
+        SlaTargets {
+            success_rate_pct: success_pct,
+            max_duration_ms: 5000.0,
+            days: 30,
+        }
+    }
+
+    fn empty_reads() -> SlaReads {
+        SlaReads {
+            total: 0,
+            succeeded: 0,
+            running: 0,
+            p50_ms: None,
+            p95_ms: None,
+            p99_ms: None,
+            violations_count: Some(0),
+        }
+    }
+
+    /// THE regression, verified live on the deployed stack before the fix: a
+    /// workflow with ZERO executions reported `in_compliance: true`,
+    /// `success_rate.actual: 100.0`, `met: true` — a perfect compliance score
+    /// asserted from nothing, on the one surface whose entire output is a
+    /// compliance claim.
+    ///
+    /// Mutating `actual_success_rate` back to `.unwrap_or(100.0)`, or
+    /// `duration_met` back to `p99.unwrap_or(0.0) <= target`, must fail this.
+    #[test]
+    fn a_workflow_that_never_ran_is_not_measurable_never_compliant() {
+        let out = render_sla_report(&targets(99.0), &empty_reads(), &Readings::new());
+
+        assert!(
+            out["in_compliance"].is_null(),
+            "an empty window must not yield a compliance verdict: {out}"
+        );
+        assert_eq!(out["compliance_status"], "not_measurable");
+        assert!(
+            out["success_rate"]["actual"].is_null(),
+            "a rate over zero runs does not exist; it is not 100%: {out}"
+        );
+        assert!(out["success_rate"]["met"].is_null(), "{out}");
+        assert!(
+            out["duration"]["met"].is_null(),
+            "an absent p99 is not a fast p99: {out}"
+        );
+        assert_eq!(out["total_executions"], 0);
+        // The response must SAY which state it is in, not leave the reader to
+        // infer it from a null.
+        let note = out["compliance_note"].as_str().unwrap_or_default();
+        assert!(note.contains("NOT MEASURABLE"), "{out}");
+        let warn = out["sample_size_warning"].as_str().unwrap_or_default();
+        assert!(
+            warn.contains("No executions at all"),
+            "the n=0 warning must name the emptiness, not compute a failure \
+             percentage over zero runs: {out}"
+        );
+        // Pre-fix this sentence read "A single failure is 0.0% of 0 runs",
+        // which is arithmetic over an empty set rendered as a fact.
+        assert!(!warn.contains("of 0 runs"), "{out}");
+    }
+
+    /// At `target_success_rate: 100` — the STRICTEST target the argument
+    /// validator accepts — `min_n_for_rate_target` returns `None`, and pre-fix
+    /// that silently omitted `sample_size_warning` and
+    /// `min_n_for_meaningful_target` entirely. So the one mitigation on this
+    /// surface disappeared exactly where the verdict was hardest to meet, and
+    /// the claim was rendered unqualified.
+    #[test]
+    fn the_strictest_target_still_qualifies_its_verdict() {
+        for reads in [
+            empty_reads(),
+            SlaReads {
+                total: 500,
+                succeeded: 500,
+                running: 0,
+                p50_ms: Some(100.0),
+                p95_ms: Some(200.0),
+                p99_ms: Some(300.0),
+                violations_count: Some(0),
+            },
+        ] {
+            let total = reads.total;
+            let out = render_sla_report(&targets(100.0), &reads, &Readings::new());
+            let warn = out["sample_size_warning"].as_str().unwrap_or_else(|| {
+                panic!("a 100% target must never be rendered unqualified (total={total}): {out}")
+            });
+            assert!(!warn.is_empty());
+            // The omission of the threshold must be EXPLAINED, not silent.
+            if total > 0 {
+                assert!(warn.contains("NO finite sufficiency threshold"), "{out}");
+                assert!(
+                    out.get("min_n_for_meaningful_target").is_none(),
+                    "no finite threshold exists at 100%, so none may be quoted: {out}"
+                );
+            }
+        }
+    }
+
+    /// Mechanism 2, isolated from the empty-window case: the window HAS runs,
+    /// the success rate IS measured and met, but no execution reached
+    /// `completed`, so there is no p99. `p99.unwrap_or(0.0) <= target` made
+    /// `duration_met` true FROM ABSENCE while the same response emitted
+    /// `p99: null` one line below it.
+    #[test]
+    fn an_absent_p99_is_not_a_fast_p99() {
+        let out = render_sla_report(
+            &targets(0.0),
+            &SlaReads {
+                total: 10,
+                succeeded: 0,
+                running: 10,
+                p50_ms: None,
+                p95_ms: None,
+                p99_ms: None,
+                violations_count: Some(0),
+            },
+            &Readings::new(),
+        );
+
+        // A 0% target is met by any rate, so the success half is Some(true)
+        // and the ONLY thing keeping the verdict from `true` is the honest
+        // treatment of the missing p99.
+        assert_eq!(out["success_rate"]["met"], true, "{out}");
+        assert!(out["duration"]["p99"].is_null(), "{out}");
+        assert!(
+            out["duration"]["met"].is_null(),
+            "no latency data is not fast latency: {out}"
+        );
+        assert!(out["in_compliance"].is_null(), "{out}");
+        assert_eq!(out["compliance_status"], "not_measurable");
+    }
+
+    /// The fix must not launder a REAL violation into "not measurable". A
+    /// component known to be `false` wins over a component that is unknown —
+    /// a violation you can see is still a violation.
+    #[test]
+    fn a_known_violation_wins_over_an_unmeasured_component() {
+        let out = render_sla_report(
+            &targets(99.0),
+            &SlaReads {
+                total: 20,
+                succeeded: 10,
+                running: 0,
+                p50_ms: None,
+                p95_ms: None,
+                p99_ms: None,
+                violations_count: Some(0),
+            },
+            &Readings::new(),
+        );
+
+        assert_eq!(out["success_rate"]["met"], false, "{out}");
+        assert!(out["duration"]["met"].is_null(), "{out}");
+        assert_eq!(
+            out["in_compliance"], false,
+            "an unmeasured duration must not upgrade a failed success rate to \
+             'not measurable': {out}"
+        );
+        assert_eq!(out["compliance_status"], "out_of_compliance");
+    }
+
+    /// Mechanism 3: `count_sla_duration_violations` failing used to log a
+    /// warning and return `0` — a database error rendering as *zero
+    /// violations* on a compliance surface. Drives the REAL `Readings`
+    /// recorder rather than hand-building a not-measured list.
+    #[test]
+    fn a_failed_violations_read_is_null_and_disclosed_never_zero() {
+        let mut readings = Readings::new();
+        let violations = readings.record(
+            "duration.violations_count",
+            Err::<i64, _>(anyhow::anyhow!("connection reset by peer")),
+        );
+
+        let out = render_sla_report(
+            &targets(99.0),
+            &SlaReads {
+                total: 200,
+                succeeded: 200,
+                running: 0,
+                p50_ms: Some(100.0),
+                p95_ms: Some(200.0),
+                p99_ms: Some(300.0),
+                violations_count: violations,
+            },
+            &readings,
+        );
+
+        assert!(
+            out["duration"]["violations_count"].is_null(),
+            "a failed count must be null, not a reassuring 0: {out}"
+        );
+        let disclosed = out["measurement"]["not_measured"]
+            .as_array()
+            .unwrap_or_else(|| panic!("degraded read must be disclosed: {out}"));
+        assert!(
+            disclosed
+                .iter()
+                .any(|f| f.as_str() == Some("duration.violations_count")),
+            "{out}"
+        );
+        // The error string itself must never reach the client.
+        assert!(
+            !out.to_string().contains("connection reset"),
+            "upstream error leaked into the response: {out}"
+        );
+    }
+
+    /// The other direction: a fully measured, genuinely compliant workflow must
+    /// still read as compliant, carry no disclosure block, and not grow a
+    /// sample-size warning once the sample clears the threshold. A fix that
+    /// nulls everything is not an improvement.
+    #[test]
+    fn a_fully_measured_compliant_report_still_reads_true() {
+        let out = render_sla_report(
+            &targets(99.0),
+            &SlaReads {
+                total: 500,
+                succeeded: 499,
+                running: 0,
+                p50_ms: Some(100.04),
+                p95_ms: Some(200.0),
+                p99_ms: Some(4999.0),
+                violations_count: Some(0),
+            },
+            &Readings::new(),
+        );
+
+        assert_eq!(out["in_compliance"], true, "{out}");
+        assert_eq!(out["compliance_status"], "in_compliance");
+        assert_eq!(out["success_rate"]["met"], true);
+        assert_eq!(out["duration"]["met"], true);
+        // MCP-92 rounding survives the move into the pure renderer.
+        assert_eq!(out["duration"]["p50"], 100.0, "{out}");
+        assert!(
+            out.get("measurement").is_none(),
+            "a clean run must not grow a disclosure block: {out}"
+        );
+        assert!(
+            out.get("sample_size_warning").is_none(),
+            "a sufficient sample must not be qualified: {out}"
+        );
+    }
+
+    /// Every count states its population. The success-rate denominator is
+    /// every execution STARTED in the window — including runs still in flight,
+    /// which are in the denominator but can never be in the numerator.
+    #[test]
+    fn the_success_rate_population_names_the_in_flight_runs() {
+        let out = render_sla_report(
+            &targets(99.0),
+            &SlaReads {
+                total: 10,
+                succeeded: 7,
+                running: 3,
+                p50_ms: Some(10.0),
+                p95_ms: Some(20.0),
+                p99_ms: Some(30.0),
+                violations_count: Some(0),
+            },
+            &Readings::new(),
+        );
+
+        let pop = out["success_rate"]["population"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(pop.contains("all statuses"), "{out}");
+        assert!(pop.contains("3 are still running"), "{out}");
+        let dpop = out["duration"]["population"].as_str().unwrap_or_default();
+        assert!(dpop.contains("COMPLETED executions"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod performance_trend_disclosure_tests {
+    use super::render_performance_trend;
+
+    type R = Result<(Option<f64>, Option<f64>), anyhow::Error>;
+
+    /// THE regression: `Err(_) => "insufficient_data"` discarded the error into
+    /// `_` and rendered a database failure as a benign sample-size verdict. A
+    /// dropped connection and a workflow that ran twice yesterday produced
+    /// byte-identical output.
+    #[test]
+    fn a_failed_read_is_not_measured_never_insufficient_data() {
+        let out = render_performance_trend(
+            Err::<(Option<f64>, Option<f64>), _>(anyhow::anyhow!("connection reset by peer")),
+            30,
+        );
+        assert_eq!(out["verdict"], "not_measured", "{out}");
+        assert_ne!(
+            out["verdict"], "insufficient_data",
+            "a failed read must not be reported as a small sample: {out}"
+        );
+        assert!(out["recent_avg_ms"].is_null(), "{out}");
+        // The upstream error string never leaves the host.
+        assert!(!out.to_string().contains("connection reset"), "{out}");
+    }
+
+    /// A genuinely short window is still `insufficient_data` — the fix must not
+    /// relabel every empty comparison as a failure.
+    #[test]
+    fn an_empty_bucket_is_still_insufficient_data() {
+        let out = render_performance_trend(Ok((Some(120.0), None)) as R, 30);
+        assert_eq!(out["verdict"], "insufficient_data", "{out}");
+        assert_eq!(out["recent_avg_ms"], 120.0, "{out}");
+        assert!(out["previous_avg_ms"].is_null(), "{out}");
+        // A zero previous average cannot be a denominator either.
+        let zero = render_performance_trend(Ok((Some(120.0), Some(0.0))) as R, 30);
+        assert_eq!(zero["verdict"], "insufficient_data", "{zero}");
+    }
+
+    /// The verdict must travel with the inputs, the thresholds and — above all
+    /// — its own window, because `period_days` in the same response advertises
+    /// a different one. One slow run in a two-run day flips this to
+    /// "degrading"; a reader who cannot see the window cannot see that.
+    #[test]
+    fn a_verdict_states_its_inputs_thresholds_and_window() {
+        let out = render_performance_trend(Ok((Some(200.0), Some(100.0))) as R, 7);
+        assert_eq!(out["verdict"], "degrading", "{out}");
+        assert_eq!(out["recent_avg_ms"], 200.0);
+        assert_eq!(out["previous_avg_ms"], 100.0);
+        assert_eq!(out["change_pct"], 100.0);
+        assert_eq!(out["thresholds"]["degrading_change_pct_above"], 10.0);
+        assert_eq!(out["thresholds"]["improving_change_pct_below"], -10.0);
+        let window = out["window"].as_str().unwrap_or_default();
+        assert!(window.contains("24h"), "{out}");
+        assert!(
+            window.contains("7-day"),
+            "the window must name the period_days it does NOT use: {out}"
+        );
+        // Sample size is genuinely unavailable at this layer; say so rather
+        // than imply one.
+        assert!(
+            out["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("NOT available"),
+            "{out}"
+        );
+    }
+
+    /// Both verdict boundaries still land where they did — the disclosure must
+    /// not move the classification.
+    #[test]
+    fn the_thresholds_themselves_are_unchanged() {
+        // -10% exactly is "stable" (strictly below improves).
+        assert_eq!(
+            render_performance_trend(Ok((Some(90.0), Some(100.0))) as R, 30)["verdict"],
+            "stable"
+        );
+        assert_eq!(
+            render_performance_trend(Ok((Some(89.0), Some(100.0))) as R, 30)["verdict"],
+            "improving"
+        );
+        assert_eq!(
+            render_performance_trend(Ok((Some(110.0), Some(100.0))) as R, 30)["verdict"],
+            "stable"
+        );
+        assert_eq!(
+            render_performance_trend(Ok((Some(111.0), Some(100.0))) as R, 30)["verdict"],
+            "degrading"
+        );
+    }
+}
+
+#[cfg(test)]
+mod transient_failure_overlap_tests {
+    use super::classify_transient_failure;
+
+    /// The two predicates OVERLAP by design, and summing them is what produced
+    /// "Detected 2 timeout/rate-limit errors out of 1 failures" — a numerator
+    /// twice its own denominator. This pins the overlap so nobody re-derives
+    /// the sum believing the predicates are disjoint.
+    #[test]
+    fn the_two_predicates_overlap_so_their_sum_is_not_a_count() {
+        for msg in ["http 429 too many requests", "provider rate limit exceeded"] {
+            let (t, r) = classify_transient_failure(msg);
+            assert!(t && r, "{msg} must match BOTH predicates");
+            // The bug, stated as arithmetic: the sum exceeds the one execution.
+            assert_eq!(usize::from(t) + usize::from(r), 2, "{msg}");
+            // The fix: the OR counts the execution once.
+            assert_eq!(usize::from(t || r), 1, "{msg}");
+        }
+    }
+
+    #[test]
+    fn each_predicate_still_has_its_own_exclusive_territory() {
+        // Needed for the backoff choice (`rate_limit_errors > timeout_errors`)
+        // to mean anything.
+        assert_eq!(classify_transient_failure("request timeout"), (true, false));
+        assert_eq!(
+            classify_transient_failure("too many open connections"),
+            (false, true)
+        );
+        assert_eq!(
+            classify_transient_failure("output_schema_violation"),
+            (false, false)
+        );
+    }
+}
+
+#[cfg(test)]
+mod error_report_cap_disclosure_tests {
+    use super::{
+        error_fingerprint_coverage_json, ERROR_FINGERPRINT_TOP_K, ERROR_MESSAGE_SAMPLE_CAP,
+        GLOBAL_ERROR_ROWS_CAP, NODE_FAILURE_BREAKDOWN_CAP,
+    };
+    use talos_measurement::Coverage;
+
+    /// THE regression: `total_failures` is a FULL-WINDOW count and it sat
+    /// directly beside fingerprint counts drawn from a 200-row sample, with no
+    /// cap stated anywhere. A workflow with 5 000 failures rendered
+    /// `total_failures: 5000` next to counts that cannot sum past 200.
+    #[test]
+    fn a_truncated_sample_says_so_and_refuses_to_claim_a_population() {
+        let cov = Coverage::new(ERROR_MESSAGE_SAMPLE_CAP, ERROR_MESSAGE_SAMPLE_CAP);
+        assert!(cov.truncated(), "a read at its cap must read as truncated");
+        let out = error_fingerprint_coverage_json(&cov, ERROR_MESSAGE_SAMPLE_CAP);
+        assert_eq!(out["sample"]["truncated"], true, "{out}");
+        // The population was NOT measured, so it must not be asserted — an
+        // unmeasurable gap is not a zero gap.
+        assert!(out["sample"]["available"].is_null(), "{out}");
+        assert!(out["sample"]["omitted"].is_null(), "{out}");
+        assert!(
+            out["sample"]["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("AT LEAST"),
+            "{out}"
+        );
+        let note = out["note"].as_str().unwrap_or_default();
+        assert!(note.contains("200"), "the cap must be named: {out}");
+        assert!(
+            note.contains("do not sum to it"),
+            "the note must say the two counts are not comparable: {out}"
+        );
+    }
+
+    /// An UNtruncated sample must not be dressed up as a truncated one — the
+    /// disclosure has to be able to say "complete" or it means nothing.
+    #[test]
+    fn a_short_sample_reads_as_complete() {
+        let cov = Coverage::new(7, ERROR_MESSAGE_SAMPLE_CAP);
+        assert!(!cov.truncated());
+        let out = error_fingerprint_coverage_json(&cov, ERROR_MESSAGE_SAMPLE_CAP);
+        assert_eq!(out["sample"]["truncated"], false, "{out}");
+        assert!(
+            out["sample"]["note"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("complete"),
+            "{out}"
+        );
+    }
+
+    /// The two `get_error_report` modes share one renderer but have DIFFERENT
+    /// caps, and each must disclose its own — a shared sentence naming the
+    /// wrong number is the drift this helper exists to prevent.
+    #[test]
+    fn each_mode_discloses_its_own_cap() {
+        let wf = error_fingerprint_coverage_json(
+            &Coverage::new(ERROR_MESSAGE_SAMPLE_CAP, ERROR_MESSAGE_SAMPLE_CAP),
+            ERROR_MESSAGE_SAMPLE_CAP,
+        );
+        let global = error_fingerprint_coverage_json(
+            &Coverage::new(GLOBAL_ERROR_ROWS_CAP, GLOBAL_ERROR_ROWS_CAP),
+            GLOBAL_ERROR_ROWS_CAP,
+        );
+        assert_ne!(ERROR_MESSAGE_SAMPLE_CAP, GLOBAL_ERROR_ROWS_CAP);
+        assert!(wf["note"].as_str().unwrap_or_default().contains("200"));
+        assert!(global["note"].as_str().unwrap_or_default().contains("500"));
+        assert!(!global["note"].as_str().unwrap_or_default().contains("200"));
+        // Both name the same group cap, because both use the same top-k.
+        for o in [&wf, &global] {
+            assert_eq!(o["groups_shown_max"], ERROR_FINGERPRINT_TOP_K);
+        }
+    }
+
+    /// `NODE_FAILURE_BREAKDOWN_CAP` is a hand-restated copy of a `LIMIT` that
+    /// lives in SQL in another crate, so it can silently drift. This is the
+    /// tripwire: it reads the actual statement rather than trusting the
+    /// constant.
+    #[test]
+    fn node_failure_breakdown_cap_is_stated_and_disclosed() {
+        let sql = include_str!("../../talos-analytics-repository/src/lib.rs");
+        let needle = format!(
+            "GROUP BY ee.node_id ORDER BY fail_count DESC LIMIT {NODE_FAILURE_BREAKDOWN_CAP}"
+        );
+        assert!(
+            sql.contains(&needle),
+            "get_node_failure_counts no longer uses LIMIT {NODE_FAILURE_BREAKDOWN_CAP}; the \
+             disclosed cap in get_error_report is now a lie"
+        );
+        // And the disclosure itself carries the number.
+        let cov = Coverage::new(NODE_FAILURE_BREAKDOWN_CAP, NODE_FAILURE_BREAKDOWN_CAP);
+        assert!(cov.truncated());
+        assert!(cov.note().contains("20"), "{}", cov.note());
     }
 }

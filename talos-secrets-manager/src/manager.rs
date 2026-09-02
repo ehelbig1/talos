@@ -4200,6 +4200,17 @@ impl SecretsManager {
     }
 
     /// Lightweight rows for the secret-health report (just creation + expiry).
+    ///
+    /// **Ordered OLDEST-FIRST, deliberately.** `check_secret_health` has exactly
+    /// two rules — "no expiry on something that looks like a token" and "created
+    /// more than 90 days ago" — and under the old `created_at DESC` the rows the
+    /// `LIMIT` dropped were strictly the OLDEST, i.e. precisely the rows the
+    /// 90-day rule exists to find and the ones most likely to be un-expiring
+    /// legacy tokens. The cap was hiding the check's own target population. ASC
+    /// dominates DESC for both rules, and `created_at` is a total order under a
+    /// bounded read so the tie-break concern of check 28 does not bind here.
+    /// Truncation is disclosed to the caller via `talos_measurement::Coverage`;
+    /// see [`Self::count_secrets_for_health_check`] for the population.
     pub async fn list_secrets_for_health_check(
         &self,
         user_id: Uuid,
@@ -4208,7 +4219,7 @@ impl SecretsManager {
         let rows = sqlx::query(
             "SELECT name, key_path, created_at, expires_at \
              FROM secrets WHERE created_by = $1 \
-             ORDER BY created_at DESC LIMIT $2",
+             ORDER BY created_at ASC, key_path ASC LIMIT $2",
         )
         .bind(user_id)
         .bind(limit)
@@ -4224,6 +4235,21 @@ impl SecretsManager {
                 })
             })
             .collect()
+    }
+
+    /// How many secrets this user owns — the POPULATION behind
+    /// [`Self::list_secrets_for_health_check`]'s capped read.
+    ///
+    /// Exists so `check_secret_health` can say what its cap dropped instead of
+    /// emitting `total_secrets_checked: 200` and letting the reader assume that
+    /// is the whole vault. Same `created_by = $1` predicate as the list read, so
+    /// the two are counting the same set.
+    pub async fn count_secrets_for_health_check(&self, user_id: Uuid) -> Result<i64> {
+        let row = sqlx::query("SELECT COUNT(*)::bigint AS n FROM secrets WHERE created_by = $1")
+            .bind(user_id)
+            .fetch_one(&self.db_pool)
+            .await?;
+        Ok(row.try_get::<Option<i64>, _>("n")?.unwrap_or(0))
     }
 
     /// Invalidate DEK cache (call after key rotation or security incident).

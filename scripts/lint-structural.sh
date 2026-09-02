@@ -6730,6 +6730,127 @@ done < <(cd "$ROOT" && find talos-mcp-handlers/src talos-api/src -name '*.rs' \
          | sed 's|^\./||' || true)
 rm -f "$BENIGN_AWK"
 
+# ── 74b. Sub-leg: a `Readings` ledger must cover every awaited read ───────
+# Not a new numbered check (`--count` stays 74) — same rule, second scope.
+#
+# WHY A SECOND SCOPE. Leg 74's function filter is a HAND-MAINTAINED NAME
+# GLOB, which is the rot mode this repo has paid for repeatedly (#624: a
+# hardcoded list rots; check 64: a sweep is a snapshot, not a gate). It was
+# MEASURED against the pre-fix tree for the SLA compliance bug and the
+# result settles the shape of the guard:
+#
+#   Adding `sla` to leg 74's glob makes it fire on `handle_get_workflow_
+#   sla_report` at exactly ONE line — the ownership lookup's
+#   `.await\n.unwrap_or(None)` — and on NONE of the three defects the bug
+#   was about (`else { 100.0 }`, `p99.unwrap_or(0.0) <= target`, and a
+#   `match { Err => 0 }` violations count). Two of those three have no
+#   `.await` in the expression at all and the third is a match block, so
+#   they were never in leg 74's range. Widening the glob would have turned
+#   the check RED on the right handler for the wrong line, then GREEN once
+#   that line was fixed — a green tick standing over all three real
+#   defects. That is the "gate that doesn't gate" class (#624), so the
+#   glob was deliberately NOT widened.
+#
+# THIS LEG'S SCOPE IS DERIVED FROM THE CODE, NOT LISTED: any function that
+# constructs a `talos_measurement::Readings`. A handler opts itself in by
+# adopting the disclosure pattern, so a new report surface is covered the
+# moment it adopts it and nobody has to remember a name.
+#
+# WHAT IT ASSERTS, and why it is a STRONGER claim than leg 74's inside its
+# scope: `Readings::note()` renders "complete: every field in this report
+# was measured", and `attach` adds NOTHING when the ledger is clean. So a
+# defaulted read sitting BESIDE a clean ledger does not merely omit a
+# disclosure — it publishes an affirmative, false completeness claim. The
+# disclosure lies about itself, which is one level worse than no
+# disclosure at all.
+#
+# MEASURED, not asserted. Against this tree the population was TWO, both
+# the same `.await\n.unwrap_or(None)` ownership/label shape: the SLA
+# handler's (fixed in this change) and `handle_get_error_report`'s, which
+# already carried leg 74's `allow-benign-default` marker for being label
+# prettification. It therefore ships at ZERO, not as a ratchet.
+#
+# STATED LIMITS — all three in the loud or the honest direction:
+#  (a) It only sees functions that ALREADY adopted `Readings`. A report
+#      surface that never adopted it is invisible here, so this COMPLEMENTS
+#      leg 74's glob, it does not replace it.
+#  (b) It inherits leg 74's regex exactly: `.await` immediately followed by
+#      `.unwrap_or*`, same line or split. A `match { Err(_) => <default> }`
+#      block, a `.ok()`, or an `unwrap_or` on an ALREADY-RESOLVED local is
+#      invisible. Concretely: this leg would NOT have caught any of the
+#      three original SLA mechanisms. It catches the REGRESSION shape (the
+#      call-site `.await.unwrap_or(0)`), which is what the unit tests
+#      provably cannot see, and that division of labour is the point —
+#      the renderer is guarded by `sla_absence_disclosure_tests`, the
+#      wiring by this leg.
+#  (c) It proves the read is not swallowed, never that the handling is
+#      good — same limit as leg 74(c).
+# Opt-out: the same `// allow-benign-default: <reason>` marker.
+bold "▶ check 74b: a Readings ledger must cover every awaited read in its function"
+READINGS_AWK="$(mktemp)"
+cat > "$READINGS_AWK" <<'AWKEOF'
+BEGIN { intest = 0; has_readings = 0; nhits = 0; fn = "?" }
+FNR == 1 { flush(); intest = 0; pending = ""; FILE = FILENAME }
+{
+    line = $0
+    if (line ~ /^#\[cfg\(test\)\]/) { intest = 1; next }
+    if (intest == 1) { if (line ~ /^\}/) { intest = 0 } ; next }
+    if (match(line, /^[[:space:]]*(pub([[:space:]]*\([^)]*\))?[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/)) {
+        flush()
+        hdr = substr(line, RSTART, RLENGTH); sub(/.*fn[[:space:]]+/, "", hdr); fn = hdr
+    }
+    if (line ~ /Readings::(new|default)\(\)/) { has_readings = 1 }
+    if (line ~ /\.await[[:space:]]*\.unwrap_or(_default|_else)?[[:space:]]*\(/) { record(FNR, line) }
+    if (pending != "" && line ~ /^[[:space:]]*\.unwrap_or(_default|_else)?[[:space:]]*\(/) { record(pendingno, line) }
+    if (line ~ /\.await[[:space:]]*$/) { pending = line; pendingno = FNR } else { pending = "" }
+}
+END { flush() }
+function record(no, text) { gsub(/^[[:space:]]+/, "", text); nhits++; hno[nhits] = no; htx[nhits] = text }
+function flush(  i) {
+    if (has_readings == 1 && nhits > 0) {
+        for (i = 1; i <= nhits; i++) printf "%s:%d:%s:%s\n", FILE, hno[i], fn, htx[i]
+    }
+    nhits = 0; has_readings = 0; delete hno; delete htx
+}
+AWKEOF
+
+READINGS_FAIL=0
+while IFS= read -r hit; do
+    [ -z "$hit" ] && continue
+    file="${hit%%:*}"
+    rest="${hit#*:}"
+    lineno="${rest%%:*}"
+    rest2="${rest#*:}"
+    fname="${rest2%%:*}"
+    start=$((lineno > 8 ? lineno - 8 : 1))
+    if sed -n "${start},$((lineno + 1))p" "$ROOT/$file" 2>/dev/null \
+            | grep -q 'allow-benign-default'; then
+        continue
+    fi
+    red "✗ $file:$lineno $fname() defaults a read beside a Readings ledger"
+    printf '    %s\n' "$(printf '%s' "${rest2#*:}" | cut -c1-110)"
+    READINGS_FAIL=1
+done < <(cd "$ROOT" && find talos-mcp-handlers/src talos-api/src -name '*.rs' \
+             -not -name '*_tests.rs' -not -path '*/tests/*' -print0 2>/dev/null \
+         | xargs -0 -n 40 awk -f "$READINGS_AWK" 2>/dev/null \
+         | sed 's|^\./||' || true)
+rm -f "$READINGS_AWK"
+
+if [ "$READINGS_FAIL" -eq 1 ]; then
+    yellow "  → this function builds a \`talos_measurement::Readings\`, so a clean run"
+    yellow "    makes it publish \"complete: every field in this report was measured\""
+    yellow "    and \`attach\` adds no disclosure at all. A defaulted read beside it is"
+    yellow "    therefore not a missing disclosure — it is a FALSE completeness claim."
+    yellow "  → route it through the ledger: \`readings.record(\"field\", repo…await)\`."
+    yellow "  → a genuinely decorative read may carry"
+    yellow "    \`// allow-benign-default: <reason>\` on or above the line."
+    EXIT_CODE=1
+else
+    green "✓ every Readings ledger covers all awaited reads in its function"
+fi
+echo
+
+
 if [ "$BENIGN_DEFAULT_FAIL" -eq 1 ]; then
     yellow "  → inside a handler whose output IS a health verdict, every field is a"
     yellow "    claim about system state — so a defaulted read publishes a claim"

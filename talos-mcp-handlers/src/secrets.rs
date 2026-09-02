@@ -630,9 +630,17 @@ async fn handle_check_secret_health(
     state: &McpState,
     user_id: Uuid,
 ) -> JsonRpcResponse {
+    // The cap the audit runs under. Pre-fix it was a bare literal passed into a
+    // `created_at DESC` read and emitted as `total_secrets_checked: 200` with no
+    // ceiling stated, so a 250-secret vault reported an audit of "200 secrets"
+    // that had silently skipped its own 50 oldest — the rows the >90-day
+    // rotation rule exists to find. The read is now oldest-first AND the
+    // truncation is disclosed via `talos_measurement::Coverage`.
+    const SECRET_HEALTH_SCAN_CAP: i64 = 200;
+
     let rows = match state
         .secrets_manager
-        .list_secrets_for_health_check(user_id, 200)
+        .list_secrets_for_health_check(user_id, SECRET_HEALTH_SCAN_CAP)
         .await
     {
         Ok(r) => r,
@@ -641,6 +649,18 @@ async fn handle_check_secret_health(
             return mcp_error(req_id, -32000, "Failed to fetch secrets");
         }
     };
+
+    // The population behind the capped read. A FAILED count is disclosed and
+    // left unknown — `Coverage::available: None` means "not measured", and
+    // NEVER "nothing was omitted".
+    let mut readings = talos_measurement::Readings::new();
+    let population = readings.record(
+        "coverage.available",
+        state
+            .secrets_manager
+            .count_secrets_for_health_check(user_id)
+            .await,
+    );
 
     let token_patterns = ["token", "key", "pat", "api"];
     let now = chrono::Utc::now();
@@ -677,12 +697,26 @@ async fn handle_check_secret_health(
         }
     }
 
-    let result = serde_json::json!({
+    let mut coverage = talos_measurement::Coverage::new(rows.len() as i64, SECRET_HEALTH_SCAN_CAP);
+    if let Some(n) = population {
+        coverage = coverage.with_available(n);
+    }
+
+    let mut result = serde_json::json!({
         "count": findings.len(),
         "total_secrets_checked": rows.len(),
         "issues_found": findings.len(),
         "findings": findings,
+        // Every cap discloses what it dropped. `issues_found` is a count over
+        // the SCANNED rows, never over the vault.
+        "coverage": coverage.to_json(),
+        "scan_order": "oldest-first by created_at, so a truncated scan keeps the rows the \
+                       90-day rotation rule targets and drops the NEWEST instead",
     });
+    if coverage.truncated() {
+        result["issues_found_is_a_lower_bound"] = serde_json::json!(true);
+    }
+    readings.attach(&mut result);
 
     mcp_text(
         req_id,
