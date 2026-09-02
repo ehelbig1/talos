@@ -2565,26 +2565,69 @@ async fn handle_enqueue_workflow(
         5.0 // platform default: 5 executions per second
     };
 
-    // Validate workflow exists and belongs to user
+    // Validate workflow exists and belongs to user.
+    //
+    // A failed read is not an absent workflow. Both still refuse — which is why
+    // this was never a safety defect — but "Workflow not found or access
+    // denied" sends the operator to check permissions during a database
+    // incident, and it is the same sentence the sibling handlers already carry
+    // repair comments about.
     let wf_graph = match state
         .execution_repo
         .get_workflow_graph_for_user(wf_id, user_id)
         .await
-        .unwrap_or(None)
     {
-        Some(g) => g,
-        None => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Ok(Some(g)) => g,
+        Ok(None) => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Err(e) => {
+            tracing::error!(
+                workflow_id = %wf_id,
+                error = %e,
+                "enqueue_workflow: workflow graph read failed"
+            );
+            return mcp_error(
+                req_id,
+                -32000,
+                "Could not read this workflow, so nothing was enqueued. This is a database \
+                 error, NOT a missing or forbidden workflow — retry.",
+            );
+        }
     };
 
-    // Try active published version first, fall back to draft graph
+    // Try active published version first, fall back to draft graph.
+    //
+    // `Ok(None)` — no published version — legitimately falls back to the draft;
+    // that is the documented semantics. `Err` must NOT, and until 2026-09-02 it
+    // did: `.unwrap_or(None)` made a database error take the SAME branch, so a
+    // transient failure silently enqueued the DRAFT graph in place of the
+    // published one. That is not a reporting defect, it is a substitution — up
+    // to `rate_per_second` executions of unreviewed graph content, and the
+    // `authorize_workflow_trigger` capability/ceiling gate below is then
+    // evaluated against the draft rather than against the version the operator
+    // published. Refuse instead: an enqueue that cannot tell which graph it
+    // would run must not guess.
     let (graph_json, version_id) = match state
         .execution_repo
         .get_active_version_graph(wf_id, user_id)
         .await
-        .unwrap_or(None)
     {
-        Some((vid, gj)) => (gj, Some(vid)),
-        None => (wf_graph, None),
+        Ok(Some((vid, gj))) => (gj, Some(vid)),
+        Ok(None) => (wf_graph, None),
+        Err(e) => {
+            tracing::error!(
+                workflow_id = %wf_id,
+                error = %e,
+                "enqueue_workflow: active-version read failed; refusing rather than \
+                 silently enqueueing the draft graph"
+            );
+            return mcp_error(
+                req_id,
+                -32000,
+                "Could not determine whether this workflow has an active published version, \
+                 so the graph to enqueue is unknown. Falling back to the draft here would run \
+                 unpublished content under the published workflow's name — retry instead.",
+            );
+        }
     };
 
     let nats = match &state.nats_client {

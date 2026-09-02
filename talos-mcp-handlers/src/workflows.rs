@@ -10599,20 +10599,47 @@ async fn handle_plan_and_execute_workflow(
             if let Some(mid) = crate::utils::optional_uuid(subtask, "module_id") {
                 Some(mid)
             } else if let Some(module_name) = subtask.get("module_name").and_then(|v| v.as_str()) {
+                // A module_name that resolves to NOTHING produces an empty-graph
+                // subtask further down — deliberately, so a plan naming a
+                // module that genuinely does not exist still yields a runnable
+                // (no-op) step. But until 2026-09-02 a DATABASE ERROR on either
+                // lookup took that same branch: the subtask workflow was
+                // created, PUBLISHED and wired into the orchestrator with
+                // `{"nodes": [], "edges": []}`, and the caller was told the plan
+                // was built. The step then did nothing, silently, forever.
+                // "We could not look it up" is not "it is not there".
                 let name_lower = module_name.to_lowercase().replace(['-', '_', ' '], "%");
                 let pattern = format!("%{}%", name_lower);
-                let primary = state
-                    .module_repo
-                    .find_template_id_by_strip_normalise(module_name)
-                    .await
-                    .unwrap_or(None);
-                match primary {
-                    Some(id) => Some(id),
-                    None => state
+                let lookup = async {
+                    match state
                         .module_repo
-                        .find_template_id_by_ilike(&pattern)
-                        .await
-                        .unwrap_or(None),
+                        .find_template_id_by_strip_normalise(module_name)
+                        .await?
+                    {
+                        Some(id) => Ok(Some(id)),
+                        None => state.module_repo.find_template_id_by_ilike(&pattern).await,
+                    }
+                }
+                .await;
+                match lookup {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "plan_and_execute_workflow: module lookup failed for subtask '{}'",
+                            task_name
+                        );
+                        return mcp_error(
+                            req_id,
+                            -32000,
+                            &format!(
+                                "Could not look up the module for subtask '{}'. Building the \
+                                 plan anyway would publish a subtask that silently does \
+                                 nothing — retry rather than accepting an empty step.",
+                                task_name
+                            ),
+                        );
+                    }
                 }
             } else {
                 None

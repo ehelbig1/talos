@@ -247,9 +247,21 @@ impl Coverage {
 /// generalise. It fixed `count_executions_last_hour(..).unwrap_or(0)` in the
 /// budget ENFORCEMENT path, where the defaulted `0` was a security fail-open —
 /// "actor at 1000/hr could keep firing during DB hiccups". The identical
-/// `.unwrap_or(0)` on the identical repository method is still there today in
-/// `handle_get_actor_budget`, the tool that REPORTS the budget. The path was
-/// fixed; the population was not.
+/// `.unwrap_or(0)` on the identical repository method sat untouched in
+/// `handle_get_actor_budget`, the tool that REPORTS the budget, for **four
+/// months afterwards**. The path was fixed; the population was not.
+///
+/// It was swept on 2026-09-02, and the sweep is worth reading as evidence
+/// rather than as a fix: the reporting handler was still defaulting FIVE reads,
+/// its GraphQL twin (`talos-api`'s `llmUsage` resolver) had been
+/// `?`-propagating the same two repository methods the whole time — so one
+/// question answered over two protocols gave an error on one and a confident
+/// zero on the other — and `handle_terminate_actor`, 890 lines above it IN THE
+/// SAME FILE, already carried a nine-line comment repairing this exact class
+/// for one of the same methods. Three independent repairs, one file, one
+/// population, no sweep between them. That is what "a local repair does not
+/// generalise" costs when nothing structural follows it, and it is why
+/// structural lint check 74 was widened in the same change.
 ///
 /// All four say the same sentence — *could-not-measure is not measured-zero* —
 /// in four vocabularies. This is that sentence, once. It follows the shape the
