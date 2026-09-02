@@ -683,6 +683,76 @@ pub struct SseEventInternal {
     pub id: Option<String>,
 }
 
+/// Why the spawned SSE body-reader stopped feeding its channel ABNORMALLY.
+///
+/// The `http-stream` WIT spells `next-event` as `-> option<sse-event>`, which
+/// has no error arm, and widening it would break the checked-in `bindings.rs`
+/// of every catalog template — so a mid-stream failure CANNOT reach the guest
+/// without an ABI break. What it can reach is the OPERATOR: the reader sends
+/// one of these as the final item on the existing channel and
+/// [`TalosContext::report_stream_end`] turns it into one
+/// `[host:<reason>]` diagnostic on the execution log stream.
+///
+/// A clean upstream close sends NOTHING — the task simply drops the sender —
+/// so the diagnostic fires only when the stream ended for a reason the guest
+/// would otherwise read as "the endpoint had nothing to say". Exactly one
+/// item can follow the last event, so this costs at most one
+/// `HOST_DIAG_CAP` slot per stream and at most
+/// `MAX_SSE_STREAMS_PER_EXECUTION` per execution.
+///
+/// Deliberately carries NO error text. The raw `reqwest` string is logged —
+/// sanitized, worker-log only — at the site that owns it; nothing derived
+/// from it crosses into a channel a guest-visible surface reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SseStreamEnd {
+    /// The response body failed mid-stream (reset, TLS alert, decode error).
+    /// The ONLY one of these that logged nothing anywhere before 2026-09.
+    TransportError,
+    /// A Talos byte cap tripped: either the un-newlined receive buffer or the
+    /// accumulated `data:` payload exceeded `TALOS_SSE_MAX_EVENT_BYTES`.
+    EventBytesCap,
+    /// The execution was cancelled while the stream was open.
+    Cancelled,
+}
+
+impl SseStreamEnd {
+    /// `(reason-tag, operator-facing prose)`.
+    ///
+    /// Both halves are FIXED strings — see the sanitization contract on
+    /// [`TalosContext::emit_host_diagnostic`]. The tag is the `[host:<tag>]`
+    /// marker; it is deliberately NOT a [`crate::reason_class`] token,
+    /// because nothing is returned to the guest here for a class to explain
+    /// and a latch with no paired discriminant is exactly the stale-marker
+    /// hazard the pairing rule exists to prevent.
+    pub(crate) const fn describe(self) -> (&'static str, &'static str) {
+        match self {
+            Self::TransportError => (
+                "sse-stream-transport-error",
+                "the SSE stream ended because the connection failed mid-stream, \
+                 not because the endpoint finished sending. Events already \
+                 delivered are complete; the rest of the stream was lost.",
+            ),
+            Self::EventBytesCap => (
+                "sse-event-bytes-cap",
+                "the SSE stream was aborted because a single event exceeded \
+                 TALOS_SSE_MAX_EVENT_BYTES. Raise that limit or ask the \
+                 endpoint for smaller events.",
+            ),
+            Self::Cancelled => (
+                "sse-stream-cancelled",
+                "the SSE stream was closed because the execution was cancelled.",
+            ),
+        }
+    }
+}
+
+/// What travels on an SSE stream's channel: the events, then at most one
+/// terminal [`SseStreamEnd`] marker. See that type for why the marker exists.
+pub(crate) enum SseChannelItem {
+    Event(SseEventInternal),
+    End(SseStreamEnd),
+}
+
 /// Host-internal registry of active streaming receivers for one execution.
 ///
 /// Groups the two per-execution stream maps that were previously loose
@@ -705,8 +775,7 @@ pub struct StreamRegistry {
         std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Receiver<serde_json::Value>>>,
     /// Active HTTP SSE streams indexed by stream ID. Each holds a
     /// receiver for parsed SSE events (`None` = stream ended).
-    pub(crate) sse:
-        std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Receiver<SseEventInternal>>>,
+    pub(crate) sse: std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Receiver<SseChannelItem>>>,
 }
 
 impl StreamRegistry {
