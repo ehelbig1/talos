@@ -54,6 +54,36 @@ fi
 
 EXIT_CODE=0
 
+# ── Shared whole-tree scan scope ──────────────────────────────────────
+# A repo-root walk (`find .` / `grep -r … .`) can descend into a SECOND
+# CHECKOUT OF THIS SAME REPOSITORY and report ANOTHER BRANCH's code as a
+# finding in this tree:
+#
+#   * `.claude/worktrees/<session>/` — agent worktrees. Every path-anchored
+#     exemption in this script ("the one legal `engine_node_uuid`
+#     implementation is `talos-workflow-engine-core/src/node_identity.rs`",
+#     "the one legal manifest `dependencies` reader is
+#     `talos-compilation/src/catalog.rs`") stops matching under a
+#     `.claude/worktrees/<name>/` prefix, so BYTE-IDENTICAL code is
+#     reported as a violation. Measured 2026-09-02 against a tree with six
+#     sibling worktrees (5,518 extra `.rs` files): 110 red lines, 108 of
+#     them from a worktree, on a checkout whose own content is clean —
+#     and the two remaining lines were the INFLATED summary count and the
+#     failure verdict. Runtime went 2:10 → 4:05 for the privilege.
+#   * `.git/` — git metadata; submodule checkouts live under
+#     `.git/modules/`.
+#
+# Only two files under `.claude/` are tracked (`hooks/session-start.sh`,
+# `settings.json`) and neither is `.rs`, so pruning costs no coverage.
+#
+# EVERY whole-tree scan MUST use these. Site-specific prunes (target,
+# vendor, node_modules) stay at the site — they vary by check and are not
+# about second checkouts. Check 75 enforces the rule; it exists because
+# eleven scans got this right by hand and the ten added after them did
+# not, the newest of them two days old.
+TREE_PRUNE_FIND=( -not -path '*/.claude/*' -not -path '*/.git/*' )
+TREE_PRUNE_GREP=( --exclude-dir=.claude --exclude-dir=.git )
+
 # ── 1. Raw actor_memory SQL + legacy value-column projections ─────────
 bold "▶ check 1: actor_memory writes + value-column projections outside talos-memory/"
 
@@ -544,7 +574,7 @@ while IFS= read -r match; do
     printf '  %s\n' "$match"
     TRIGGER_TYPE_VIOLATIONS=$((TRIGGER_TYPE_VIOLATIONS + 1))
 done < <(
-    find . -name '*.rs' -not -path '*/target/*' -not -path '*/.claude/*' \
+    find . -name '*.rs' -not -path '*/target/*' "${TREE_PRUNE_FIND[@]}" \
         -print0 2>/dev/null \
     | xargs -0 -I{} awk -v F='{}' '
         /trigger_type/ { interesting[NR] = $0 }
@@ -611,7 +641,7 @@ while IFS= read -r match; do
     printf '  %s\n' "$match"
     IS_ACTIVE_VIOLATIONS=$((IS_ACTIVE_VIOLATIONS + 1))
 done < <(
-    find . -name '*.rs' -not -path '*/target/*' -not -path '*/.claude/*' \
+    find . -name '*.rs' -not -path '*/target/*' "${TREE_PRUNE_FIND[@]}" \
         -print0 2>/dev/null \
     | xargs -0 -I{} awk -v F='{}' '
         /is_active|\benabled[[:space:]]*=/ {
@@ -696,8 +726,7 @@ done < <(grep -rEn '^\s*let _\s*=\s*sqlx::query' \
             --include='*.rs' \
             --exclude-dir=target \
             --exclude-dir=tests \
-            --exclude-dir=.claude \
-            --exclude-dir=.git \
+            "${TREE_PRUNE_GREP[@]}" \
             . 2>/dev/null \
         | grep -v '_test\.rs:\|_tests\.rs:\|/tests/\|/test/' \
         || true)
@@ -856,8 +885,7 @@ done < <(grep -rEn 'if let Err.*=.*\.post\(.*\.send\(\)\.await' \
             --include='*.rs' \
             --exclude-dir=target \
             --exclude-dir=tests \
-            --exclude-dir=.claude \
-            --exclude-dir=.git \
+            "${TREE_PRUNE_GREP[@]}" \
             . 2>/dev/null \
         | grep -v '_test\.rs:\|_tests\.rs:\|/tests/\|/test/' \
         || true)
@@ -923,8 +951,7 @@ done < <(grep -rEn '\.unwrap_or\(([0-9]+|[A-Z_][A-Z0-9_]*)\)\s*\.min\(([0-9]+|[A
             --include='*.rs' \
             --exclude-dir=target \
             --exclude-dir=tests \
-            --exclude-dir=.claude \
-            --exclude-dir=.git \
+            "${TREE_PRUNE_GREP[@]}" \
             . 2>/dev/null \
         | grep -v '_test\.rs:\|_tests\.rs:\|/tests/\|/test/' \
         || true)
@@ -3730,12 +3757,12 @@ bold "▶ check 52: silent try_get().unwrap_or reads (workspace-wide, must be 0)
 # node_modules (defensive; frontend has no .rs but the walk is cheaper skipped).
 REPO_SILENT_READ_COUNT="$( { grep -rEc '\.try_get(::<[^(]*>)?\([^)]*\)\.unwrap_or' \
         --include='*.rs' \
-        --exclude-dir=target --exclude-dir=.git --exclude-dir=.claude --exclude-dir=node_modules \
+        --exclude-dir=target --exclude-dir=node_modules "${TREE_PRUNE_GREP[@]}" \
         . 2>/dev/null || true; } \
     | awk -F: '{s+=$2} END {print s+0}')"
 if [ "$REPO_SILENT_READ_COUNT" -ne 0 ]; then
     red "✗ ${REPO_SILENT_READ_COUNT} silent try_get().unwrap_or read(s) workspace-wide (must be 0):"
-    grep -rEn '\.try_get(::<[^(]*>)?\([^)]*\)\.unwrap_or' --include='*.rs' --exclude-dir=target --exclude-dir=.git --exclude-dir=.claude --exclude-dir=node_modules . 2>/dev/null | sed 's/^/    /'
+    grep -rEn '\.try_get(::<[^(]*>)?\([^)]*\)\.unwrap_or' --include='*.rs' --exclude-dir=target --exclude-dir=node_modules "${TREE_PRUNE_GREP[@]}" . 2>/dev/null | sed 's/^/    /'
     yellow "  → a renamed/dropped column would read as a silent default, not an error."
     yellow "    Read as Option and propagate: .try_get::<Option<_>, _>(\"col\")?.unwrap_or(default)"
     yellow "    or use a typed FromRow / query_as! mapping."
@@ -3746,8 +3773,8 @@ fi
 # 52b: the same read split across two lines. Line-based grep cannot see it;
 # this per-file perl pass can. Must also be 0 — same rule, same fix.
 REPO_SILENT_READ_ML="$(find . -name '*.rs' \
-        -not -path './target/*' -not -path './.git/*' \
-        -not -path './.claude/*' -not -path './node_modules/*' -print0 2>/dev/null \
+        -not -path './target/*' -not -path './node_modules/*' \
+        "${TREE_PRUNE_FIND[@]}" -print0 2>/dev/null \
     | xargs -0 perl -ne 'BEGIN{$/=undef} my @l=split/\n/,$_; for my $i (0..$#l-1){ next if $l[$i]=~/\?/; if ($l[$i]=~/\.try_get(?:::<[^(]*>)?\([^)]*\)\s*$/ && $l[$i+1]=~/^\s*\.unwrap_or/){ print "$ARGV:".($i+1)."\n" } }' 2>/dev/null)"
 REPO_SILENT_READ_ML_COUNT="$(printf '%s' "$REPO_SILENT_READ_ML" | grep -c . || true)"
 if [ "$REPO_SILENT_READ_ML_COUNT" -ne 0 ]; then
@@ -3818,8 +3845,8 @@ while ($code =~ /\.try_get(?:::<(?:[^<>()]|<[^<>()]*>)*>)?\s*\((?:[^()]|\([^()]*
     print "$ARGV:" . ($lo+1) . "\n";
 }'
 TRYGET_OK_HITS="$(find . -name '*.rs' \
-        -not -path './target/*' -not -path './.git/*' \
-        -not -path './.claude/*' -not -path './node_modules/*' -print0 2>/dev/null \
+        -not -path './target/*' -not -path './node_modules/*' \
+        "${TREE_PRUNE_FIND[@]}" -print0 2>/dev/null \
     | xargs -0 perl -ne "$TRYGET_OK_PERL" 2>/dev/null || true)"
 TRYGET_OK_COUNT="$(printf '%s' "$TRYGET_OK_HITS" | grep -c . || true)"
 if [ "$TRYGET_OK_COUNT" -ne 0 ]; then
@@ -4782,8 +4809,8 @@ $(echo "$hit" | sed 's/^/    /')
             fi
         fi
     done <<< "$(find . -name '*.rs' -type f \
-                    -not -path '*/target/*' -not -path '*/.git/*' \
-                    -not -path '*/.claude/*')"
+                    -not -path '*/target/*' \
+                    "${TREE_PRUNE_FIND[@]}")"
 
     # A check that scans nothing reports success. Fail loud instead — this is
     # what an absolute-path walk from inside a `.claude/worktrees/…` checkout
@@ -4969,7 +4996,7 @@ $(
     done <<< "$(find . -type d -name tests \
                     -not -path './target/*' -not -path './vendor/*' \
                     -not -path './frontend/*' -not -path '*/node_modules/*' \
-                    -not -path './.git/*' -not -path './.claude/*' \
+                    "${TREE_PRUNE_FIND[@]}" \
                     -exec sh -c 'ls -1 "$1"/*.rs "$1"/*/main.rs 2>/dev/null' _ {} \; | sort)"
 
     # --- (d) the reverse direction: a runner entry naming a target that does
@@ -5530,7 +5557,7 @@ $PROM_RULES_CANON"
         REGISTERED_METRICS="$(grep -rhoE '"talos_[a-z0-9_]+"' \
             --include='*.rs' \
             --exclude-dir=target \
-            --exclude-dir=.git \
+            "${TREE_PRUNE_GREP[@]}" \
             "$ROOT" 2>/dev/null | tr -d '"' | sort -u || true)"
         # OTEL instrument declarations → the names the Prometheus exporter
         # actually renders. See the long note above for the mapping and its
@@ -5540,7 +5567,7 @@ $PROM_RULES_CANON"
             '\.(u64_counter|f64_counter|u64_up_down_counter|i64_up_down_counter|f64_up_down_counter|u64_gauge|i64_gauge|f64_gauge|u64_histogram|f64_histogram|u64_observable_counter|f64_observable_counter|i64_observable_gauge|f64_observable_gauge)\("[a-z0-9_.]+"' \
             --include='*.rs' \
             --exclude-dir=target \
-            --exclude-dir=.git \
+            "${TREE_PRUNE_GREP[@]}" \
             "$ROOT" 2>/dev/null \
             | perl -ne '
                 next unless /\.(\w+)\("([a-z0-9_.]+)"/;
@@ -5914,7 +5941,7 @@ while IFS= read -r hit; do
     yellow "    what stops the next compile path from quietly omitting the field."
     CT_FAIL=1
 done < <(cd "$ROOT" && grep -rnE '\b[A-Za-z_][A-Za-z0-9_]*(meta|manifest|tpl|talos_json)[A-Za-z0-9_]*\s*(\.\s*get\("dependencies"\)|\["dependencies"\])|\b(meta|manifest|tpl|talos_json)\s*(\.\s*get\("dependencies"\)|\["dependencies"\])' \
-         --include='*.rs' --exclude-dir=target . 2>/dev/null \
+         --include='*.rs' --exclude-dir=target "${TREE_PRUNE_GREP[@]}" . 2>/dev/null \
          | sed 's|^\./||' | grep -v '^target/' || true)
 
 # (b) catalog-dir readers that compile must use the type
@@ -5931,7 +5958,7 @@ while IFS= read -r file; do
     yellow "    CompilationService::compile_catalog_template, so the template's declared"
     yellow "    dependencies cannot be dropped on this path."
     CT_FAIL=1
-done < <(cd "$ROOT" && grep -rl 'module-templates' --include='*.rs' --exclude-dir=target . 2>/dev/null \
+done < <(cd "$ROOT" && grep -rl 'module-templates' --include='*.rs' --exclude-dir=target "${TREE_PRUNE_GREP[@]}" . 2>/dev/null \
          | sed 's|^\./||' | grep -v '^target/' || true)
 
 # (c) the dependency-less convenience must stay deleted. Whole crate, and a
@@ -5976,7 +6003,7 @@ while IFS= read -r file; do
             next if join("\n", @lines[$lo .. $hi]) =~ /allow-depless-compile/;
             print "$lnum\n";
         }' "$file" || true)
-done < <(cd "$ROOT" && grep -rl 'compile_to_wasm_with_config' --include='*.rs' --exclude-dir=target . 2>/dev/null \
+done < <(cd "$ROOT" && grep -rl 'compile_to_wasm_with_config' --include='*.rs' --exclude-dir=target "${TREE_PRUNE_GREP[@]}" . 2>/dev/null \
          | sed 's|^\./||' | grep -v '^target/' || true)
 
 if [ "$CT_FAIL" -eq 1 ]; then
@@ -6041,7 +6068,7 @@ while IFS= read -r file; do
     yellow "    itself and logs BatchSpanProcessor.ExportError on every flush, forever."
     yellow "  → a demo/manual binary may mark itself \`// allow-hardcoded-trace-endpoint: <reason>\`."
     TRACE_FAIL=1
-done < <(cd "$ROOT" && grep -rlE '\binit_tracing\s*\(' --include='*.rs' --exclude-dir=target . 2>/dev/null \
+done < <(cd "$ROOT" && grep -rlE '\binit_tracing\s*\(' --include='*.rs' --exclude-dir=target "${TREE_PRUNE_GREP[@]}" . 2>/dev/null \
          | sed 's|^\./||' | grep -v '^target/' || true)
 
 # (b) endpoint env vars are read in exactly one place.
@@ -6058,7 +6085,7 @@ while IFS= read -r hit; do
     yellow "    re-introduce the default that made 'disabled' unreachable."
     TRACE_FAIL=1
 done < <(cd "$ROOT" && grep -rnE 'env::var\s*\(\s*"(JAEGER_ENDPOINT|OTEL_EXPORTER_OTLP_TRACES_ENDPOINT|OTEL_EXPORTER_OTLP_ENDPOINT)"' \
-         --include='*.rs' --exclude-dir=target . 2>/dev/null \
+         --include='*.rs' --exclude-dir=target "${TREE_PRUNE_GREP[@]}" . 2>/dev/null \
          | sed 's|^\./||' | grep -v '^target/' \
          | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
 # ^ comment lines are dropped: the fix's own comments QUOTE the removed
@@ -6286,7 +6313,7 @@ while IFS= read -r hit; do
     red "✗ ${file}:${lineno}: private SHA-256 → UUID derivation"
     NODEUUID_VIOLATIONS=$((NODEUUID_VIOLATIONS + 1))
 done < <(cd "$ROOT" && grep -rnE '\bUuid::(from_bytes|from_slice|from_bytes_le|from_u128)\s*\(' \
-            --include='*.rs' --exclude-dir=target --exclude-dir=vendor . 2>/dev/null \
+            --include='*.rs' --exclude-dir=target --exclude-dir=vendor "${TREE_PRUNE_GREP[@]}" . 2>/dev/null \
          | sed 's|^\./||' | grep -v '^target/' || true)
 
 if [ "$NODEUUID_VIOLATIONS" -gt 0 ]; then
@@ -6585,7 +6612,8 @@ while IFS= read -r hit; do
     red "✗ $file:$lineno env-var presence test accepts an empty value as configured"
     printf '    %s\n' "$(printf '%s' "${rest#*:}" | cut -c1-120)"
     EMPTY_ENV_FAIL=1
-done < <(cd "$ROOT" && find . -name '*.rs' -not -path './target/*' -not -path '*/target/*' -print0 2>/dev/null \
+done < <(cd "$ROOT" && find . -name '*.rs' -not -path './target/*' -not -path '*/target/*' \
+         "${TREE_PRUNE_FIND[@]}" -print0 2>/dev/null \
          | xargs -0 -n 40 awk -f "$EMPTY_ENV_AWK" 2>/dev/null \
          | sed 's|^\./||' || true)
 rm -f "$EMPTY_ENV_AWK"
@@ -6969,6 +6997,7 @@ while IFS= read -r hit; do
     printf '    %s\n' "$(printf '%s' "${rest2#*:}" | cut -c1-110)"
     READINGS_FAIL=1
 done < <(cd "$ROOT" && find . -path ./target -prune -o -name '*.rs' \
+             "${TREE_PRUNE_FIND[@]}" \
              -not -name '*_tests.rs' -not -path '*/tests/*' -print0 2>/dev/null \
          | xargs -0 -n 40 awk -f "$READINGS_AWK" 2>/dev/null \
          | sed 's|^\./||' || true)
@@ -7007,6 +7036,138 @@ if [ "$BENIGN_DEFAULT_FAIL" -eq 1 ]; then
     EXIT_CODE=1
 else
     green "✓ no health-reporting handler swallows a read into a benign default"
+fi
+echo
+
+# ── 75. Whole-tree scans must not walk a second checkout ──────────────
+# A repo-root walk that descends into `.claude/worktrees/<session>/`
+# reports ANOTHER BRANCH's source as a finding in THIS tree. It is not
+# merely noise: every path-anchored exemption in this script names a
+# path relative to the repo root, so under a worktree prefix the ONE
+# legal implementation stops being recognised and byte-identical code is
+# reported as a violation. Measured 2026-09-02 on a tree with six
+# sibling worktrees (5,518 extra .rs files): 110 red lines where the
+# same tree alone produces 0, 108 of them prefixed `.claude/worktrees/`,
+# and the two that were not were the INFLATED summary count ("41 private
+# copies", true value 0) and the failure verdict. So the number an
+# operator would act on is wrong in the same direction as the noise.
+#
+# This is a class, not a bug: ELEVEN scans pruned `.claude` by hand and
+# the TEN added after them did not — checks 58/65(c), 68, 69, 71, 73 and
+# 74b, the last of them two days old. Three of those ten fired falsely;
+# the other seven are latent, and 58/65(c) fails in the QUIET direction
+# (a worktree copy supplies registration evidence, so an alert on a
+# metric this tree never registers reads as covered).
+#
+# Run against the pre-fix script this check reports all 21 repo-root
+# scans, not just the ten — and that is the intended reading. The rule
+# is the SHARED LIST, not "some prune": the eleven correct sites spelled
+# the same intent four different ways (`'*/.claude/*'`, `'./.claude/*'`,
+# `--exclude-dir=.claude`, and one that pruned `.git` but not `.claude`),
+# and each spelling is a place the next copy can drift.
+#
+# The rule: every repo-root scan uses the shared `TREE_PRUNE_FIND` /
+# `TREE_PRUNE_GREP` defined at the top of this file. One definition, so
+# the next scan inherits it instead of re-deciding.
+#
+# Three directions, because "uses the shared list" is worth only as much
+# as the list being real and the detector seeing anything:
+#   (a) every repo-root scan statement names one of the two arrays;
+#   (b) both arrays are non-empty and both name `.claude` — an emptied
+#       array would silence (a) at every site at once;
+#   (c) the detector must MATCH SOMETHING. A scan-shape change that
+#       makes the walk unrecognisable would otherwise turn this check
+#       into a green tick over zero statements (checks 64/65's lesson).
+#
+# Stated limits, each confirmed by mutation rather than inferred:
+#   * It is TEXTUAL and statement-scoped (a line plus its backslash
+#     continuations). A scan whose root arrives in a VARIABLE
+#     (`find "$dir"`, `grep -r "$SCOPE"`) is invisible — deliberately,
+#     since a scoped `$dir` is the common and correct case; so is a scan
+#     built with `eval` or assembled across a pipeline.
+#   * It proves the array is REFERENCED, never that the reference is in
+#     an effective position — `"${TREE_PRUNE_FIND[@]}"` placed after a
+#     `-print0` would satisfy it. What it buys is that a NEW scan cannot
+#     be added without the author meeting the rule.
+#   * `rg`, `fd` and `git grep` are out of range. `git grep` needs no
+#     prune (it reads tracked files, and a worktree checkout is not
+#     tracked here) — that is why check 72 is not on this list.
+#   * `.claude` is pruned WHOLESALE, not just `.claude/worktrees/`. Only
+#     two files under it are tracked and neither is `.rs`, so the
+#     coverage cost is nil; a future tracked `.rs` there would need an
+#     explicit narrowing.
+# Opt-out `# allow-unpruned-tree-scan: <reason>` on the statement's
+# first line, for a scan that must genuinely see a second checkout.
+bold "▶ check 75: whole-tree scans prune .claude worktrees and .git"
+SCAN_SCOPE_FAIL=0
+
+# (b) the shared lists must be real before (a) means anything.
+if [ "${#TREE_PRUNE_FIND[@]}" -eq 0 ] || [ "${#TREE_PRUNE_GREP[@]}" -eq 0 ]; then
+    red "✗ TREE_PRUNE_FIND / TREE_PRUNE_GREP is empty — every scan would pass vacuously"
+    SCAN_SCOPE_FAIL=1
+elif ! printf '%s\n' "${TREE_PRUNE_FIND[@]}" | grep -q '\.claude' \
+     || ! printf '%s\n' "${TREE_PRUNE_GREP[@]}" | grep -q '\.claude'; then
+    red "✗ the shared prune lists no longer name .claude"
+    SCAN_SCOPE_FAIL=1
+fi
+
+SCAN_SCOPE_REPORT="$(perl -0777 -ne '
+    my @l = split /\n/, $_;
+    my $seen = 0;
+    for my $i (0 .. $#l) {
+        next if $l[$i] =~ /^\s*#/;
+        next unless $l[$i] =~ /(?:grep\s+-\S*r\S*\s|find\s)/;
+        my $stmt = $l[$i];
+        my $j = $i;
+        while ($stmt =~ /\\$/ && $j < $#l) {
+            $j++;
+            $stmt =~ s/\\$//;
+            $stmt .= " " . $l[$j];
+        }
+        $stmt =~ s/\s+/ /g;
+        # A repo-ROOT scan: `find` on the cwd, or a recursive grep whose
+        # search root is the cwd or $ROOT. A scan rooted at a named
+        # subdirectory is correctly scoped already and out of range.
+        my $rooted = ($stmt =~ /find \x2E /)
+            || ($stmt =~ /grep\s+-\S*r\S*\s/
+                && $stmt =~ /(?: \x2E 2>| \x2E \)| \x2E $|"\$ROOT" 2>)/);
+        next unless $rooted;
+        $seen++;
+        next if $stmt =~ /TREE_PRUNE_(?:FIND|GREP)/;
+        next if $l[$i] =~ /allow-unpruned-tree-scan/;
+        printf("BAD %d %.110s\n", $i + 1, $stmt);
+    }
+    printf("SEEN %d\n", $seen);
+' "${BASH_SOURCE[0]}")"
+
+while IFS= read -r bad; do
+    [ -z "$bad" ] && continue
+    red "✗ lint-structural.sh:${bad#BAD }"
+    SCAN_SCOPE_FAIL=1
+done <<< "$(printf '%s\n' "$SCAN_SCOPE_REPORT" | grep '^BAD ' || true)"
+
+SCAN_SCOPE_SEEN="$(printf '%s\n' "$SCAN_SCOPE_REPORT" | sed -n 's/^SEEN //p')"
+if [ "${SCAN_SCOPE_SEEN:-0}" -lt 5 ]; then
+    red "✗ check 75 recognised only ${SCAN_SCOPE_SEEN:-0} repo-root scan(s) — the"
+    yellow "    detector has stopped matching this script's own scan shape, so a"
+    yellow "    green tick here would stand over nothing. Fix the detector, not the"
+    yellow "    threshold."
+    SCAN_SCOPE_FAIL=1
+fi
+
+if [ "$SCAN_SCOPE_FAIL" -eq 1 ]; then
+    yellow "  → a repo-root walk descends into .claude/worktrees/<session>/, which"
+    yellow "    holds OTHER branches' source. Path-anchored exemptions do not match"
+    yellow "    under that prefix, so identical code is reported as a violation and"
+    yellow "    any count this check prints is inflated by whatever is checked out"
+    yellow "    beside you."
+    yellow "  → append \"\${TREE_PRUNE_FIND[@]}\" (walks) or \"\${TREE_PRUNE_GREP[@]}\""
+    yellow "    (recursive greps) to the statement. They are defined once at the top"
+    yellow "    of this file; per-check prunes (target, vendor, node_modules) stay"
+    yellow "    where they are."
+    EXIT_CODE=1
+else
+    green "✓ all ${SCAN_SCOPE_SEEN} repo-root scans prune second checkouts"
 fi
 echo
 
