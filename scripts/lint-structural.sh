@@ -7220,6 +7220,152 @@ else
 fi
 echo
 
+# ── 76. An input-schema read must be CLASSIFIED, not defaulted ────────
+# `workflows.input_schema` decides whether the input-validation gate runs
+# at all, so a read of it that does not come back with a definite answer
+# must REFUSE — never fall into the same branch as "this workflow
+# declares no schema". A gate that silently does not run is
+# indistinguishable, in every response and every log, from a gate that
+# passed.
+#
+# Three sites had the defect and each spelled it differently, which is
+# why this is a check and not a review note.
+# `WorkflowValidationService::check_trigger_input` degraded a fetch `Err`
+# to `None` and SAID SO in its doc comment, justifying it as availability
+# ("rather than rejecting all triggers on a transient DB hiccup") —
+# refuted by its own single caller, where the three repository reads and
+# the authorization resolve ABOVE it all return `Err` on a DB failure, so
+# a transient hiccup had already killed the trigger three reads earlier.
+# `handle_call_workflow` and `handle_test_workflow` wrote
+# `if let Ok(Some(schema)) = …`, which routes BOTH the read error and the
+# unknown-workflow answer into the silent skip branch — under comments
+# claiming the gate exists so "a sync-call doesn't bypass the gate" and so
+# "a green test is [not] silently less strict than a real trigger".
+#
+# Two legs, because either alone is trivially evaded:
+#   (a) The FLATTENING projection `get_workflow_input_schema` may be
+#       called only inside `talos-workflow-repository/`. Its own doc
+#       comment says it collapses "no such workflow" into "no schema", so
+#       every outside caller inherits that flattening whatever it then
+#       does with the value. Outside callers take the three-way
+#       `_scoped` sibling.
+#   (b) A `_scoped` call outside the repository crate must have a
+#       classifier named within the 6 lines above it
+#       (`classify_input_schema_read` / `decide_trigger_input` /
+#       `enforce_declared_input_schema`). Without (b), (a) is defeated in
+#       one line by `get_workflow_input_schema_scoped(..).await.ok()
+#       .flatten().flatten()`, which reproduces the original defect
+#       exactly — CONFIRMED by mutation, leg (b) fires on it.
+#   (c) The three DECISION functions must not be called into a `let _ =`.
+#       Legs (a) and (b) both live at the READ; neither can see a call
+#       site that runs the gate correctly and then throws the answer
+#       away. `let _ = decide_input_schema_outcome(validation, wf);` was
+#       MEASURED as a survivor of every other instrument here — all 31
+#       crate tests green, legs (a) and (b) green, check 10 green (it is
+#       scoped to `talos-mcp-handlers/src`) — which is the #724 shape
+#       exactly. The BARE-statement discard
+#       (`decide_input_schema_outcome(..);`) needs no lint: the three
+#       functions carry `#[must_use]`, so CI's `-D warnings` refuses it.
+#       `let _ =` is the documented way to silence `#[must_use]`, so it
+#       is the one spelling a lint has to cover.
+#
+# Measured before it was written, in both directions: **3 findings on the
+# pre-fix tree — exactly the three defects, no false positives — and 0
+# after.** A FILE-scoped formulation ("the file must name a classifier")
+# was built first and REJECTED on measurement: all three MCP sites live in
+# one file that already named `classify_input_schema_read` from the
+# reporting fix, so it reported 0 on a tree containing 2 of the 3 defects
+# — a gate that does not gate (#624, checks 64/65).
+#
+# Scope is DERIVED from the method name, not a hand-maintained list of
+# handlers, so a brand-new enforcement site in a crate nobody has thought
+# about is covered the day it is written (probe-confirmed against a fresh
+# call added to `talos-scheduler`).
+#
+# Stated limits, each confirmed by mutation rather than inferred:
+#   * Both legs are TEXTUAL and line-based. A read reached through a
+#     wrapper in another crate, or a method renamed by a re-export alias,
+#     is invisible to both.
+#   * (b) is WINDOW-bounded at 6 lines. The three live sites pass the
+#     read straight into the classifier call with no intervening binding
+#     (measured max distance 3 lines), but a reflow or an added comment
+#     that pushes the classifier further up reads as unclassified — a
+#     FALSE POSITIVE, which is the loud direction.
+#   * (b) proves a classifier is NEARBY, never that its answer is
+#     honoured. `classify_input_schema_read(read); /* ignored */` would
+#     satisfy it. The refusal behaviour itself is pinned by unit tests
+#     (`trigger_input_failclosed_tests`, `trigger_input_gate_tests`,
+#     `input_schema_enforcement_tests`) which drive the production
+#     decision functions.
+#   * Neither leg says anything about the OTHER fail-open enforcement
+#     gates in this workspace (capability ceilings, rate limits, policy
+#     evaluation). This check is about one read; that population is its
+#     own problem and a wider regex would be enforcement-shaped noise.
+#   * `<crate>/tests/` binaries are excluded; a `#[cfg(test)]` module
+#     inside `src/` is NOT, so a test that calls the flattening read
+#     directly must carry the opt-out.
+# Opt-outs `// allow-flattened-schema-read: <reason>` (a) and
+# `// allow-unclassified-schema-read: <reason>` (b), on the reported line
+# or within 8 lines above.
+bold "▶ check 76: input-schema reads are classified, not defaulted"
+SCHEMA_READ_FAIL=0
+SCHEMA_CLASSIFIERS='classify_input_schema_read|decide_trigger_input|enforce_declared_input_schema'
+
+# Does the marker sit on the line, or within the 8 lines above it?
+schema_read_exempt() {
+    local file="$1" line="$2" marker="$3" lo
+    lo=$(( line > 8 ? line - 8 : 1 ))
+    sed -n "${lo},${line}p" "$file" | grep -q "$marker"
+}
+
+while IFS=: read -r f n _rest; do
+    [ -n "${f:-}" ] || continue
+    case "$f" in ./talos-workflow-repository/*) continue ;; esac
+    case "$f" in */tests/*) continue ;; esac
+    if schema_read_exempt "$f" "$n" 'allow-flattened-schema-read:'; then continue; fi
+    red "✗ $f:$n calls the FLATTENING get_workflow_input_schema outside the repository crate"
+    SCHEMA_READ_FAIL=$((SCHEMA_READ_FAIL + 1))
+done < <(grep -rn --include='*.rs' --exclude-dir=target --exclude-dir=vendor \
+             --exclude-dir=node_modules "${TREE_PRUNE_GREP[@]}" \
+             -E '\.get_workflow_input_schema\(' . 2>/dev/null || true)
+
+while IFS=: read -r f n _rest; do
+    [ -n "${f:-}" ] || continue
+    case "$f" in ./talos-workflow-repository/*) continue ;; esac
+    case "$f" in */tests/*) continue ;; esac
+    lo=$(( n > 6 ? n - 6 : 1 ))
+    if sed -n "${lo},${n}p" "$f" | grep -qE "$SCHEMA_CLASSIFIERS"; then continue; fi
+    if schema_read_exempt "$f" "$n" 'allow-unclassified-schema-read:'; then continue; fi
+    red "✗ $f:$n reads the input schema without a classifier in the 6 lines above"
+    SCHEMA_READ_FAIL=$((SCHEMA_READ_FAIL + 1))
+done < <(grep -rn --include='*.rs' --exclude-dir=target --exclude-dir=vendor \
+             --exclude-dir=node_modules "${TREE_PRUNE_GREP[@]}" \
+             -E '\.get_workflow_input_schema_scoped\(' . 2>/dev/null || true)
+
+SCHEMA_DECISION_FNS='decide_input_schema_outcome|enforce_declared_input_schema|decide_trigger_input'
+while IFS=: read -r f n _rest; do
+    [ -n "${f:-}" ] || continue
+    case "$f" in */tests/*) continue ;; esac
+    if schema_read_exempt "$f" "$n" 'allow-unclassified-schema-read:'; then continue; fi
+    red "✗ $f:$n discards the input-schema gate's answer into \`let _ =\`"
+    SCHEMA_READ_FAIL=$((SCHEMA_READ_FAIL + 1))
+done < <(grep -rn --include='*.rs' --exclude-dir=target --exclude-dir=vendor \
+             --exclude-dir=node_modules "${TREE_PRUNE_GREP[@]}" \
+             -E 'let[[:space:]]+_[[:space:]]*=.*('"$SCHEMA_DECISION_FNS"')\(' . 2>/dev/null || true)
+
+if [ "$SCHEMA_READ_FAIL" -gt 0 ]; then
+    yellow "  → a read that did not come back with a definite answer must REFUSE."
+    yellow "    Take the three-way get_workflow_input_schema_scoped (Err /"
+    yellow "    no-such-workflow / schema-or-not) and pass it straight into a"
+    yellow "    classifier: classify_input_schema_read (MCP handlers) or"
+    yellow "    WorkflowValidationService::decide_trigger_input (trigger path)."
+    yellow "    Only a definite Ok(Some(None)) may skip validation."
+    EXIT_CODE=1
+else
+    green "✓ every input-schema read outside the repository crate is classified"
+fi
+echo
+
 # ── 54. Lint self-consistency (meta-check) ────────────────────────────
 # The system whose purpose is catching drift drifted from its own docs:
 # by 2026-07-01 the script had 49 checks while CLAUDE.md said 43 and the

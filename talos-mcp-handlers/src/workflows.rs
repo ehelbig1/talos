@@ -4426,21 +4426,24 @@ async fn handle_call_workflow(
     }
 
     // Input schema enforcement — matches `handle_trigger_workflow` /
-    // `handle_test_workflow` so a sync-call doesn't bypass the gate.
-    if let Ok(Some(schema)) = state
-        .workflow_repo
-        .get_workflow_input_schema(wf_id, user_id)
-        .await
-    {
-        let errors =
-            talos_workflow_validation::validate_input_against_schema(&schema, &input_payload);
-        if !errors.is_empty() {
-            return Some(mcp_error(
-                req_id.clone(),
-                -32602,
-                &format!("Input schema validation failed: {}", errors.join("; ")),
-            ));
-        }
+    // `handle_test_workflow` so a sync-call doesn't bypass the gate. All
+    // three FAIL CLOSED: an unreadable schema is refused, never treated as
+    // "no schema declared". The `if let Ok(Some(schema))` this replaced
+    // discarded both the `Err` and the "no such workflow" arms into the
+    // skip-the-gate branch, so the parity claim in the line above held for
+    // the happy path only.
+    if let Some(resp) = enforce_declared_input_schema(
+        classify_input_schema_read(
+            state
+                .workflow_repo
+                .get_workflow_input_schema_scoped(wf_id, user_id)
+                .await,
+        ),
+        &input_payload,
+        req_id.clone(),
+        "call_workflow",
+    ) {
+        return Some(resp);
     }
 
     // MCP-227 (2026-05-08): pre-fix `timeout_secs: -5` (or any
@@ -6603,21 +6606,21 @@ async fn handle_test_workflow(
     // invalid input before dispatch; `test_workflow` must do the same
     // so tests don't pass with payloads that would fail in production.
     // Without this, a green test is silently less strict than a real
-    // trigger on the same workflow.
-    if let Ok(Some(schema)) = state
-        .workflow_repo
-        .get_workflow_input_schema(wf_id, user_id)
-        .await
-    {
-        let errors =
-            talos_workflow_validation::validate_input_against_schema(&schema, &input_payload);
-        if !errors.is_empty() {
-            return Some(mcp_error(
-                req_id.clone(),
-                -32602,
-                &format!("Input schema validation failed: {}", errors.join("; ")),
-            ));
-        }
+    // trigger on the same workflow — which is precisely what the old
+    // `if let Ok(Some(schema))` reintroduced whenever the schema read did
+    // not come back with a definite answer. FAILS CLOSED.
+    if let Some(resp) = enforce_declared_input_schema(
+        classify_input_schema_read(
+            state
+                .workflow_repo
+                .get_workflow_input_schema_scoped(wf_id, user_id)
+                .await,
+        ),
+        &input_payload,
+        req_id.clone(),
+        "test_workflow",
+    ) {
+        return Some(resp);
     }
 
     // Optional actor_id override + ownership/lifecycle gate. Mirrors
@@ -9855,6 +9858,65 @@ pub(crate) fn classify_input_schema_read<E: std::fmt::Display>(
     }
 }
 
+/// ENFORCE a workflow's declared input schema, failing CLOSED.
+///
+/// Returns `Some(error_response)` when the caller must STOP, `None` when the
+/// input may proceed. Exactly one outcome returns `None` without validating
+/// anything, and it is [`InputSchemaLookup::NoSchema`] — the case where the
+/// read came back and definitely said this workflow declares no schema.
+///
+/// This is the enforcement twin of `render_input_validation`, which REPORTS
+/// the same lookup. #730 fixed the reporting surface; the two enforcement
+/// call sites (`call_workflow`, `test_workflow`) were still spelled
+/// `if let Ok(Some(schema)) = …`, which routes BOTH the read error and the
+/// unknown-workflow answer into the silent skip-the-gate branch. A gate that
+/// does not run looks exactly like a gate that passed, so `call_workflow`'s
+/// own comment — that it exists *"so a sync-call doesn't bypass the gate"* —
+/// and `test_workflow`'s — that without it *"a green test is silently less
+/// strict than a real trigger"* — were both true only while the database was
+/// answering. Both handlers already fail closed on the very next workflow
+/// read (`get_active_version_graph`), so refusing here costs nothing a
+/// sustained outage had not already cost; the window this bought was a
+/// failure specific to this one query, in which it dispatched unchecked
+/// input.
+///
+/// `surface` names the calling tool for the log line only — it never reaches
+/// the client.
+#[must_use]
+pub(crate) fn enforce_declared_input_schema(
+    lookup: InputSchemaLookup,
+    input: &serde_json::Value,
+    req_id: Option<serde_json::Value>,
+    surface: &'static str,
+) -> Option<JsonRpcResponse> {
+    match lookup {
+        InputSchemaLookup::Unreadable(e) => {
+            tracing::error!(
+                target: "talos_mcp_handlers::workflows",
+                event_kind = "input_schema_read_failed",
+                surface = surface,
+                error = %e,
+                "input-schema read failed — refusing rather than running an unvalidated payload"
+            );
+            Some(crate::utils::database_error(req_id))
+        }
+        InputSchemaLookup::NotFound => Some(crate::utils::workflow_not_found_error(req_id)),
+        InputSchemaLookup::NoSchema => None,
+        InputSchemaLookup::Present(schema) => {
+            let errors = talos_workflow_validation::validate_input_against_schema(&schema, input);
+            if errors.is_empty() {
+                None
+            } else {
+                Some(mcp_error(
+                    req_id,
+                    -32602,
+                    &format!("Input schema validation failed: {}", errors.join("; ")),
+                ))
+            }
+        }
+    }
+}
+
 /// Render the two REPORTABLE outcomes. The refusals never reach here — passing
 /// one yields a body that says so rather than a reassuring default, so a future
 /// miswiring is loud instead of silent.
@@ -12000,5 +12062,157 @@ mod input_schema_lookup_tests {
             !bad["errors"].as_array().map(Vec::is_empty).unwrap_or(true),
             "a real validation failure still populates errors[]"
         );
+    }
+}
+
+#[cfg(test)]
+mod input_schema_enforcement_tests {
+    //! Guards on `enforce_declared_input_schema` — the ENFORCEMENT twin of
+    //! the reporting helper above. Pre-fix, `handle_call_workflow` and
+    //! `handle_test_workflow` each spelled this gate
+    //! `if let Ok(Some(schema)) = …`, which routed a read ERROR and an
+    //! unknown-workflow answer into the same silent skip-the-gate branch as
+    //! "no schema declared".
+    use super::{classify_input_schema_read, enforce_declared_input_schema, InputSchemaLookup};
+    use serde_json::json;
+
+    type Read = Result<Option<Option<serde_json::Value>>, String>;
+
+    fn schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "required": ["to"],
+            "properties": { "to": { "type": "string" } }
+        })
+    }
+
+    // MCP renders errors as a TOOL RESULT with `isError: true` +
+    // `errorCode`, not as a JSON-RPC `error` object (see `mcp_error`). The
+    // `isError` assertion is the load-bearing one: without it a client
+    // reads the refusal as a successful tool call.
+    fn body(resp: &talos_mcp::JsonRpcResponse) -> &serde_json::Value {
+        let r = resp.result.as_ref().expect("a refusal carries a result");
+        assert_eq!(
+            r["isError"],
+            serde_json::json!(true),
+            "a refusal must be marked isError, or the client reads it as success"
+        );
+        r
+    }
+    fn code_of(resp: &talos_mcp::JsonRpcResponse) -> i64 {
+        body(resp)["errorCode"].as_i64().expect("errorCode present")
+    }
+    fn message_of(resp: &talos_mcp::JsonRpcResponse) -> String {
+        body(resp)["content"][0]["text"]
+            .as_str()
+            .expect("message present")
+            .to_string()
+    }
+
+    fn run(read: Read, input: serde_json::Value) -> Option<talos_mcp::JsonRpcResponse> {
+        enforce_declared_input_schema(
+            classify_input_schema_read(read),
+            &input,
+            Some(json!(1)),
+            "unit_test",
+        )
+    }
+
+    /// THE regression, in the shape both handlers had. A read that FAILED
+    /// must stop the call, not run the workflow unvalidated.
+    #[test]
+    fn a_failed_read_refuses_instead_of_skipping_the_gate() {
+        let resp = run(Err("connection closed".into()), json!({"anything": true}))
+            .expect("a failed schema read must refuse");
+        assert_eq!(code_of(&resp), -32000);
+        // Generic message: the repository's error text never reaches the
+        // client (it is logged instead).
+        assert_eq!(message_of(&resp), "Database error");
+        assert!(
+            !message_of(&resp).contains("connection closed"),
+            "the DB error text must not leak to the caller"
+        );
+    }
+
+    /// The repository's flattening read collapses this into the same `None`
+    /// as "no schema declared", so pre-fix a mistyped workflow id ran the
+    /// gate-less path too.
+    #[test]
+    fn an_unknown_workflow_refuses_instead_of_skipping_the_gate() {
+        let resp = run(Ok(None), json!({})).expect("an unknown workflow must refuse");
+        assert_eq!(code_of(&resp), -32000);
+        assert_eq!(message_of(&resp), "Workflow not found or access denied");
+    }
+
+    /// 27 of 28 live workflows. The ONE case that may skip validation is a
+    /// read that came back and said, definitely, "no schema".
+    #[test]
+    fn a_definite_no_schema_still_accepts_anything() {
+        assert!(run(Ok(Some(None)), json!({"whatever": [1, 2, 3]})).is_none());
+    }
+
+    #[test]
+    fn a_declared_schema_is_still_enforced() {
+        assert!(
+            run(Ok(Some(Some(schema()))), json!({"to": "somebody"})).is_none(),
+            "input matching the schema must proceed"
+        );
+        let resp = run(Ok(Some(Some(schema()))), json!({})).expect("bad input must refuse");
+        assert_eq!(code_of(&resp), -32602);
+        assert!(message_of(&resp).starts_with("Input schema validation failed:"));
+    }
+
+    /// Only ONE lookup outcome proceeds without checking the payload. Stated
+    /// as a test so a variant added to `InputSchemaLookup` must be
+    /// classified here rather than defaulting into the accept branch.
+    #[test]
+    fn exactly_one_lookup_proceeds_without_validating() {
+        let lookups = [
+            ("unreadable", InputSchemaLookup::Unreadable("x".into())),
+            ("not found", InputSchemaLookup::NotFound),
+            ("no schema", InputSchemaLookup::NoSchema),
+            ("present", InputSchemaLookup::Present(schema())),
+        ];
+        let proceeding: Vec<&str> = lookups
+            .into_iter()
+            .filter(|(_, l)| {
+                enforce_declared_input_schema(
+                    match l {
+                        InputSchemaLookup::Unreadable(e) => {
+                            InputSchemaLookup::Unreadable(e.clone())
+                        }
+                        InputSchemaLookup::NotFound => InputSchemaLookup::NotFound,
+                        InputSchemaLookup::NoSchema => InputSchemaLookup::NoSchema,
+                        InputSchemaLookup::Present(s) => InputSchemaLookup::Present(s.clone()),
+                    },
+                    // An EMPTY payload: it satisfies no schema, so `present`
+                    // refuses and cannot mask a fail-open in another arm.
+                    &json!({}),
+                    Some(json!(1)),
+                    "unit_test",
+                )
+                .is_none()
+            })
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(proceeding, vec!["no schema"]);
+    }
+
+    /// The two enforcement handlers and the reporting handler must agree
+    /// about which read outcomes are refusals. If `render_input_validation`
+    /// ever reported one of these as acceptable while the gate refused it,
+    /// `validate_workflow_input` would green-light a payload `call_workflow`
+    /// then rejects.
+    #[test]
+    fn enforcement_and_reporting_refuse_the_same_two_outcomes() {
+        for (label, read) in [
+            ("unreadable", Err("boom".to_string()) as Read),
+            ("not found", Ok(None) as Read),
+        ] {
+            assert!(
+                run(read, json!({})).is_some(),
+                "{label} must be a refusal on the enforcement path"
+            );
+        }
     }
 }
