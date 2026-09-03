@@ -904,8 +904,30 @@ impl AdapterSet {
     /// caller-provided error type via the inner
     /// [`load_from_graph_json`](ParallelWorkflowEngine::load_from_graph_json)
     /// error string.
+    ///
+    /// # `workflow_id` is a PARAMETER, not something the caller may forget
+    ///
+    /// `AdapterSet` copies the parent's adapters but NOT its workflow id, and
+    /// [`NodeCompletionContext::workflow_id`] falls back to the per-run
+    /// `execution_id` when none is set — so a sub-engine hydrated without one
+    /// stamps every `execution_cost_rollup` and `dead_letter_queue` row with a
+    /// synthetic uuid that no `workflows` row carries. Every fuel/cost query
+    /// joins `workflows` (that join IS the tenancy predicate), so those rows
+    /// are written and then joined away: measured 2026-09-03, 394 rollup rows
+    /// fleet-wide, including a node at 99.2% of its ceiling on the day before
+    /// it died of fuel exhaustion while the fuel report read `at_risk: 0`.
+    ///
+    /// It is a required argument rather than a `set_workflow_id` call the
+    /// caller is trusted to remember because THREE independent sites hydrate a
+    /// sub-engine here (sub-workflow dispatch, dynamic/capability dispatch, and
+    /// the agent-loop body) and repairing only the one that was diagnosed would
+    /// have converted a uniform bug into a per-dispatch-kind one. A type beats
+    /// a lint; a lint has to find you.
+    ///
+    /// [`NodeCompletionContext::workflow_id`]: talos_workflow_engine_core::NodeCompletionContext::workflow_id
     pub fn into_engine_with_graph(
         self,
+        workflow_id: Uuid,
         graph_json: &JsonValue,
     ) -> Result<ParallelWorkflowEngine, crate::WorkflowEngineError> {
         // Recursion-depth guard: every sub-workflow handler hydrates
@@ -923,6 +945,9 @@ impl AdapterSet {
             });
         }
         let mut engine = self.into_engine();
+        // Attribute this engine's nodes to the workflow DEFINITION it runs, not
+        // to the synthetic per-run id the caller is about to seed.
+        engine.set_workflow_id(workflow_id);
         engine.load_from_graph_json(graph_json)?;
         Ok(engine)
     }

@@ -1358,7 +1358,7 @@ impl ParallelWorkflowEngine {
         // typed error.
         let mut sub_engine = self
             .adapter_set()
-            .into_engine_with_graph(&graph_json)
+            .into_engine_with_graph(sub_wf_id, &graph_json)
             .map_err(|e| SubflowError::BuildFailed(e.to_string()))?;
 
         // The sub-workflow runs under a synthetic execution id with no
