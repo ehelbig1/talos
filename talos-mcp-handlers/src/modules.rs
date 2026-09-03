@@ -916,12 +916,41 @@ async fn handle_get_module_info(
     // `id` stays the input the caller used (back-compat); `wasm_module_id`
     // and `template_id` are surfaced alongside so callers don't have to drop
     // into psql to find the other UUID for hot_update_module.
-    if let Some(info) = state
+    //
+    // #730: this read is NOT defaulted. `.unwrap_or(None)` fell THROUGH to the
+    // template branch on a DB error, and — since both branches now read the
+    // one unified `modules` table — a persistent failure ended at
+    // "Module not found or access denied": a definite claim that the module is
+    // gone or the caller is unauthorised, produced by never having looked.
+    // Both are answers an operator acts on (recompile, re-grant), and neither
+    // was true. A transient failure was worse in a quieter way — the fallback
+    // succeeds and silently returns the SAME row under a DIFFERENT projection
+    // (`source` from `kind` rather than "compiled", no `wasm_module_id` /
+    // `template_id` / `rate_limit_per_minute`, `compiled_at` from
+    // `created_at`), with nothing in the response saying so.
+    let compiled = match state
         .module_repo
         .get_wasm_module_info(module_id, user_id)
         .await
-        .unwrap_or(None)
     {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(
+                target: "talos_mcp_handlers::modules",
+                event_kind = "get_module_info_read_failed",
+                module_id = %module_id,
+                error = %e,
+                "get_module_info: module read failed — refusing to report 'not found'"
+            );
+            return mcp_error(
+                req_id,
+                -32000,
+                "Could not read this module (see server logs). This is a read failure, \
+                 NOT a statement that the module is missing or that access was denied.",
+            );
+        }
+    };
+    if let Some(info) = compiled {
         let host_managed = host_managed_access_for_world(Some(info.capability_world.as_str()));
         // MCP-33 (2026-05-07): when size_bytes=0 on a row that claims
         // source='compiled', the underlying `wasm_bytes` column is empty
@@ -996,12 +1025,32 @@ async fn handle_get_module_info(
     // Scoped helper gates `WHERE id = $1 AND (user_id IS NULL OR
     // user_id = $2)` — catalog rows (NULL owner) and own private
     // rows both resolve; other users' private rows do not.
-    if let Some(tmpl) = state
+    //
+    // #730: same rule as the compiled branch above — a failed read here used to
+    // become the "Module not found or access denied" line below.
+    let fallback = match state
         .module_repo
         .get_node_template_info_for_user(module_id, user_id)
         .await
-        .unwrap_or(None)
     {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(
+                target: "talos_mcp_handlers::modules",
+                event_kind = "get_module_info_template_read_failed",
+                module_id = %module_id,
+                error = %e,
+                "get_module_info: template read failed — refusing to report 'not found'"
+            );
+            return mcp_error(
+                req_id,
+                -32000,
+                "Could not read this module (see server logs). This is a read failure, \
+                 NOT a statement that the module is missing or that access was denied.",
+            );
+        }
+    };
+    if let Some(tmpl) = fallback {
         let host_managed = host_managed_access_for_world(tmpl.capability_world.as_deref());
         let bytes_status = if tmpl.size_bytes > 0 {
             "populated"
@@ -1214,14 +1263,41 @@ async fn handle_test_secret_access(
         .unwrap_or(&raw_path)
         .to_string();
 
-    // Resolve module → (capability_world, allowed_secrets). Try wasm_modules first
-    // (compiled path), fall back to node_templates (sandbox path).
-    let (capability_world, allowed_secrets, source) = match state
+    // This tool's whole output is a claim about a module's SECRET GRANT, so
+    // every input to it is a precondition. #730: both reads were
+    // `.unwrap_or(None)`, so a DB failure produced either
+    // "Module not found or access denied" or — if only the first read failed —
+    // a `capability_world` of "unknown", which `world_allows_secrets` then
+    // reports as *"World 'unknown' does NOT import the secrets interface.
+    // Recompile with capability_world: secrets-node"*. That is a specific,
+    // actionable, wrong instruction about a module whose world was never read.
+    let mut readings = talos_measurement::Readings::new();
+    let compiled = match state
         .module_repo
         .get_wasm_module_info(module_id, user_id)
         .await
-        .unwrap_or(None)
     {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(
+                target: "talos_mcp_handlers::modules",
+                event_kind = "test_secret_access_read_failed",
+                module_id = %module_id,
+                error = %e,
+                "test_secret_access: module read failed — refusing to grade a grant we could not read"
+            );
+            return mcp_error(
+                req_id,
+                -32000,
+                "Could not read this module's capability world and allowed_secrets, so no \
+                 gate could be evaluated (see server logs). This is a read failure, NOT a \
+                 statement that the module is missing or that any gate failed.",
+            );
+        }
+    };
+    // Resolve module → (capability_world, allowed_secrets). Try the compiled
+    // projection first, fall back to the template projection (sandbox path).
+    let (capability_world, allowed_secrets, source) = match compiled {
         Some(info) => (
             info.capability_world,
             info.allowed_secrets,
@@ -1233,20 +1309,40 @@ async fn handle_test_secret_access(
         // private template UUID and learn whether it has access to a
         // given secret path (probing allowed_secrets across the
         // tenant boundary).
-        None => match state
-            .module_repo
-            .get_node_template_info_for_user(module_id, user_id)
-            .await
-            .unwrap_or(None)
-        {
-            Some(tmpl) => (
-                tmpl.capability_world
-                    .unwrap_or_else(|| "unknown".to_string()),
-                tmpl.allowed_secrets,
-                tmpl.category,
-            ),
-            None => return mcp_error(req_id, -32000, "Module not found or access denied"),
-        },
+        None => {
+            let fallback = match state
+                .module_repo
+                .get_node_template_info_for_user(module_id, user_id)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(
+                        target: "talos_mcp_handlers::modules",
+                        event_kind = "test_secret_access_template_read_failed",
+                        module_id = %module_id,
+                        error = %e,
+                        "test_secret_access: template read failed — refusing to grade a grant we could not read"
+                    );
+                    return mcp_error(
+                        req_id,
+                        -32000,
+                        "Could not read this module's capability world and allowed_secrets, so no \
+                         gate could be evaluated (see server logs). This is a read failure, NOT a \
+                         statement that the module is missing or that any gate failed.",
+                    );
+                }
+            };
+            match fallback {
+                Some(tmpl) => (
+                    tmpl.capability_world
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    tmpl.allowed_secrets,
+                    tmpl.category,
+                ),
+                None => return mcp_error(req_id, -32000, "Module not found or access denied"),
+            }
+        }
     };
 
     // Gate 1: capability world. The worker requires one of these worlds for
@@ -1313,15 +1409,34 @@ async fn handle_test_secret_access(
 
     // Gate 4: vault presence — the path may pass all gates but not exist.
     // Cheap existence check; never returns the value.
-    let exists = state
-        .secrets_manager
-        .secret_exists_by_path(&secret_path, user_id)
-        .await
-        .unwrap_or(false);
+    //
+    // #730: the DIRECTION of this default is correct and deliberately unchanged
+    // — a failed read still yields `passed: false`, which costs the caller a
+    // refusal (`would_succeed: false`) rather than granting anything. What was
+    // wrong is that it was INDISTINGUISHABLE: the reason read "No secret stored
+    // at path X … Add it in the dashboard", sending an operator to create a
+    // secret that may already be there, over a vault we never reached. So the
+    // read is recorded, the reason states which of the two happened, and
+    // `checked` says whether the answer is evidence.
+    let presence_read = readings.record(
+        "gates.vault_presence",
+        state
+            .secrets_manager
+            .secret_exists_by_path(&secret_path, user_id)
+            .await,
+    );
+    let presence_checked = presence_read.is_some();
+    let exists = presence_read.unwrap_or(false);
     let gate_presence = serde_json::json!({
         "name": "vault_presence",
         "passed": exists,
-        "reason": if exists {
+        "checked": presence_checked,
+        "reason": if !presence_checked {
+            format!(
+                "Could NOT check whether a secret is stored at path '{}' — the vault lookup failed (see server logs). This gate is reported as not passed so the overall verdict stays conservative; it is NOT evidence that the secret is absent, so do not add one on the strength of it.",
+                secret_path
+            )
+        } else if exists {
             format!("Secret exists at path '{}' for this user.", secret_path)
         } else {
             format!(
@@ -1332,18 +1447,21 @@ async fn handle_test_secret_access(
     });
 
     let all_pass = world_allowed && !is_reserved && allow_pass && exists;
+    let mut body = serde_json::json!({
+        "module_id": module_id,
+        "module_source": source,
+        "capability_world": capability_world,
+        "allowed_secrets": allowed_secrets,
+        "secret_path": secret_path,
+        "would_succeed": all_pass,
+        "gates": [gate_capability, gate_reserved, gate_allowlist, gate_presence],
+    });
+    // No-op when every read succeeded, so the healthy response is
+    // byte-identical to the pre-#730 one.
+    readings.attach(&mut body);
     mcp_text(
         req_id,
-        &serde_json::to_string_pretty(&serde_json::json!({
-            "module_id": module_id,
-            "module_source": source,
-            "capability_world": capability_world,
-            "allowed_secrets": allowed_secrets,
-            "secret_path": secret_path,
-            "would_succeed": all_pass,
-            "gates": [gate_capability, gate_reserved, gate_allowlist, gate_presence],
-        }))
-        .unwrap_or_default(),
+        &serde_json::to_string_pretty(&body).unwrap_or_default(),
     )
 }
 

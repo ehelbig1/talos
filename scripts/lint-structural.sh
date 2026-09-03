@@ -6785,6 +6785,41 @@ echo
 #      looked at. It protects them from regressing; it says nothing about
 #      the next report surface. Only leg 74b's scope is derived from the
 #      code and therefore cannot rot.
+#
+# #730 WIDENING (2026-09-02), the third group. Five terms — `module_info`,
+# `validate_workflow_input`, `version_diff`, `archive_policy`,
+# `secret_access` — for five CONFIGURATION-claim surfaces, the same
+# regression-guard footing as the second group and NOT a discovery
+# mechanism. Measured in both directions before it was written: against a
+# `git archive` of the pre-fix tree the five terms report **11 sites**, of
+# which **9** are the real defects (`handle_get_module_info` ×2,
+# `handle_test_secret_access` ×3, `handle_get_version_diff_summary` ×2,
+# `handle_validate_workflow_input`, `handle_get_archive_policy`) and 2 are
+# the correct fail-CLOSED `is_platform_admin(..).unwrap_or(false)` in
+# `handle_set_archive_policy` / `handle_get_secret_access_log`, which now
+# carry the marker; on the fixed tree they report **ZERO**. 9/11 = 81.8%,
+# lower than the second group's 94.1% — and honestly so, because both
+# false positives are the same known-correct shape the opt-out's second
+# clause was written for, not a shape the check misjudged.
+#
+# What that measurement makes plain about this whole leg: the OLD glob
+# reported **0** of those 9 on the pre-fix tree. The tools were
+# `get_module_info` (a DB error rendering "Module not found or access
+# denied" — an existence-and-authorisation verdict from a read that never
+# returned), `validate_workflow_input` (a DB error, AND a workflow that
+# simply does not exist, both rendering `unvalidated: true` beside the
+# advice "gate on `unvalidated === true` to accept schema-less input
+# intentionally" — verified live against a nil UUID, no outage required),
+# `get_version_diff_summary` ("No published version — all changes are
+# new"), `get_archive_policy` (`source: "environment"`), and
+# `test_secret_access` (a `capability_world` of "unknown" grading a
+# module's SECRET grant, instructing "Recompile with capability_world:
+# secrets-node"). Not one is named "health": the surface glob's blind spot
+# is not depth, it is VOCABULARY. `get_archive_policy` is the sharpest —
+# MCP-552 had already fixed byte-for-byte this defect in the sibling
+# `handle_get_wasm_config` ("would proclaim `source: 'env defaults only'`
+# even when the DB was unreachable") in May 2026, four months and one file
+# away, and nothing swept it.
 # Opt-out: `// allow-benign-default: <reason>` on the reported line or
 # within 8 lines above it — for a default that MAKES NO FAVOURABLE CLAIM.
 # Two shapes qualify: a genuinely decorative read whose absence claims
@@ -6841,10 +6876,11 @@ FNR == 1 { fn = "?"; fnindent = 0; intest = 0; pending = ""; pendingno = 0 }
 function report(file, no, f, text) {
     # The second group (budget…module_rate_limit) was added 2026-09-02 as a
     # REGRESSION GUARD for the six handlers fixed that day, NOT as a discovery
-    # mechanism. See "GLOB WIDENING" in this check's header for the measurement
-    # in both directions and for why that distinction is the whole
-    # justification.
-    if (f !~ /(system_health|health_dashboard|_health|error_report|daily_digest|risk_assessment|readiness|system_status|budget|clone_actor|enqueue|plan_and_execute|workflow_triggers|module_rate_limit|suggest_retry)/) return
+    # mechanism. The third (module_info…secret_access) was added 2026-09-02 by
+    # #730 on the same footing. See "GLOB WIDENING" in this check's header for
+    # the measurement in both directions and for why that distinction is the
+    # whole justification.
+    if (f !~ /(system_health|health_dashboard|_health|error_report|daily_digest|risk_assessment|readiness|system_status|budget|clone_actor|enqueue|plan_and_execute|workflow_triggers|module_rate_limit|suggest_retry|module_info|validate_workflow_input|version_diff|archive_policy|secret_access)/) return
     gsub(/^[[:space:]]+/, "", text)
     printf "%s:%d:%s:%s\n", file, no, f, text
 }
@@ -6936,10 +6972,18 @@ rm -f "$BENIGN_AWK"
 #      belongs to that function, which is what makes it see the hygiene sweep's
 #      sixteen `join!`ed futures at all — and equally means a defaulted read in
 #      a nested closure counts against the enclosing `fn`. Loud direction.
-#  (b) It inherits leg 74's regex exactly: `.await` immediately followed by
-#      `.unwrap_or*`, same line or split. A `match { Err(_) => <default> }`
-#      block, a `.ok()`, or an `unwrap_or` on an ALREADY-RESOLVED local is
-#      invisible. Concretely: this leg would NOT have caught any of the
+#  (b) It inherits leg 74's regex — `.await` immediately followed by
+#      `.unwrap_or*` / `.ok()` / `.map_or(`, same line or split. **It did not
+#      until #730**: the sentence "inherits leg 74's regex exactly" shipped on
+#      2026-09-02 next to code that matched `.unwrap_or*` alone, hours after
+#      leg 74 gained `ok|map_or`, and the very next line of this comment then
+#      listed `.ok()` as invisible — the header contradicting itself, with the
+#      first half reading as the reassuring one. `.ok()` is also the exact
+#      spelling #727 found only by mutation, on the single
+#      highest-severity field in its set. Widening it cost ZERO new sites,
+#      measured on both trees. Still invisible: a
+#      `match { Err(_) => <default> }` block and an `unwrap_or` on an
+#      ALREADY-RESOLVED local. Concretely: this leg would NOT have caught any of the
 #      three original SLA mechanisms. It catches the REGRESSION shape (the
 #      call-site `.await.unwrap_or(0)`), which is what the unit tests
 #      provably cannot see, and that division of labour is the point —
@@ -6966,8 +7010,13 @@ FNR == 1 { flush(); intest = 0; pending = ""; fn = "?"; fnindent = 0; FILE = FIL
     }
     if (line ~ /^\}/) { flush(); fn = "?"; fnindent = 0 }
     if (line ~ /Readings::(new|default)\(\)/) { has_readings = 1 }
-    if (line ~ /\.await[[:space:]]*\.unwrap_or(_default|_else)?[[:space:]]*\(/) { record(FNR, line) }
-    if (pending != "" && line ~ /^[[:space:]]*\.unwrap_or(_default|_else)?[[:space:]]*\(/) { record(pendingno, line) }
+    # #730: `ok|map_or` added so this genuinely IS leg 74's alternation. The
+    # header claimed "inherits leg 74's regex exactly" from the day it landed
+    # while the code omitted the two spellings leg 74 had gained hours earlier —
+    # and `.ok()` is the spelling #727 found only by mutation. Measured before
+    # widening: ZERO new sites, on the original tree and on the fixed one.
+    if (line ~ /\.await[[:space:]]*\.(unwrap_or(_default|_else)?|ok|map_or)[[:space:]]*\(/) { record(FNR, line) }
+    if (pending != "" && line ~ /^[[:space:]]*\.(unwrap_or(_default|_else)?|ok|map_or)[[:space:]]*\(/) { record(pendingno, line) }
     if (line ~ /\.await[[:space:]]*$/) { pending = line; pendingno = FNR } else { pending = "" }
 }
 END { flush() }

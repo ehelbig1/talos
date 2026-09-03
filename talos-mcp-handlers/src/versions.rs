@@ -723,24 +723,70 @@ async fn handle_get_version_diff_summary(
         Err(resp) => return resp,
     };
 
-    // Get draft graph
-    let draft_json = match state
+    // Get draft graph.
+    //
+    // #730: not defaulted. `.unwrap_or(None)` turned a DB failure into
+    // "Workflow not found or access denied" — a definite claim about existence
+    // and authorisation, reached by never having looked.
+    let draft_read = match state
         .workflow_repo
         .get_workflow_graph_for_similarity(wf_id, user_id)
         .await
-        .unwrap_or(None)
     {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(
+                target: "talos_mcp_handlers::versions",
+                event_kind = "version_diff_draft_read_failed",
+                workflow_id = %wf_id,
+                error = %e,
+                "get_version_diff_summary: draft-graph read failed — refusing to report 'not found'"
+            );
+            return mcp_error(
+                req_id,
+                -32000,
+                "Could not read this workflow's draft graph (see server logs). This is a \
+                 read failure, NOT a statement that the workflow is missing or that access \
+                 was denied.",
+            );
+        }
+    };
+    let draft_json = match draft_read {
         Some(g) => g,
         None => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
     };
 
-    // Get active published version
-    let published_json = match state
+    // Get active published version.
+    //
+    // #730: this is the FAVOURABLE half of the same defect. A failed read
+    // rendered `"No published version — all changes are new"` — the reading an
+    // operator takes as "there is nothing to diff against, publish away",
+    // produced from a query that never returned. Absent and unreadable are now
+    // different answers.
+    let published_read = match state
         .workflow_repo
         .get_active_version_graph_text(wf_id)
         .await
-        .unwrap_or(None)
     {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(
+                target: "talos_mcp_handlers::versions",
+                event_kind = "version_diff_published_read_failed",
+                workflow_id = %wf_id,
+                error = %e,
+                "get_version_diff_summary: published-version read failed — refusing to report 'no published version'"
+            );
+            return mcp_error(
+                req_id,
+                -32000,
+                "Could not read this workflow's active published version (see server logs). \
+                 This is a read failure, NOT a statement that no published version exists — \
+                 there may be one, and this draft may differ from it.",
+            );
+        }
+    };
+    let published_json = match published_read {
         Some(p) => p,
         None => {
             // Return a structured envelope mirroring the populated branch's
