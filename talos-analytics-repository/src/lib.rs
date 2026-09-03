@@ -376,6 +376,119 @@ impl NodeFuelHeadroom {
     }
 }
 
+/// The classifier's verdict string for a fuel-meter kill.
+///
+/// `talos_retry_intelligence::classify_error` is the single authority on what a
+/// fuel death is; this is only the token it answers with. Pinned by
+/// `the_sql_prefilter_is_a_superset_of_the_classifier` so an upstream rename
+/// fails a test here instead of silently emptying the deaths section.
+pub const FUEL_EXHAUSTION_CLASS: &str = "fuel_exhaustion";
+
+/// The one token the SQL pre-filter matches on before the Rust classifier runs.
+///
+/// It exists to keep the scan cheap, NOT to decide anything: it must be a
+/// substring of every phrase the classifier maps to [`FUEL_EXHAUSTION_CLASS`],
+/// so widening the classifier can never leave this behind. Re-stating the
+/// classifier's phrase list here is what would make the two drift.
+pub const FUEL_MESSAGE_PREFILTER: &str = "fuel";
+
+/// Row cap for the node-budget graph scan. Mirrors [`TWIN_SCAN_GRAPH_LIMIT`]'s
+/// reasoning on the same population (the fleet is a few dozen active graphs);
+/// kept as its own constant so tuning one scan does not silently retune the
+/// other. Hitting it is disclosed through the returned `Coverage`.
+pub const NODE_BUDGET_GRAPH_LIMIT: i64 = 100;
+
+/// Per-graph node cap for the same scan. A graph with more nodes than this is
+/// read partially rather than unboundedly; 200 is ~4x the largest live graph.
+pub const NODE_BUDGET_NODES_PER_GRAPH: usize = 200;
+
+/// A node that was KILLED by the fuel meter.
+///
+/// Distinct from every other type in this file in one decisive way: it does not
+/// come from `execution_cost_rollup`. Nothing in that table can represent this
+/// event — see [`AnalyticsRepository::get_fuel_exhaustion_deaths`].
+#[derive(Debug, Clone)]
+pub struct FuelExhaustionDeath {
+    /// The workflow the engine attributed the failing node to. For a
+    /// sub-workflow run recorded before the engine began stamping the
+    /// sub-workflow's own id this is a synthetic per-run uuid that resolves to
+    /// no workflow row — which is why `workflow_name` is optional.
+    pub workflow_id: Uuid,
+    pub workflow_name: Option<String>,
+    /// `engine_node_uuid(node label)` — the derived id the engine writes. The
+    /// label is recoverable only from the owning graph, so a caller that wants
+    /// one must resolve it through
+    /// `talos_workflow_engine_core::engine_node_uuid`; deriving it a second way
+    /// is what structural lint check 71 forbids.
+    pub node_uuid: Uuid,
+    pub execution_id: Uuid,
+    pub occurred_at: DateTime<Utc>,
+    /// The ceiling the worker enforced, parsed out of the failure text.
+    /// `None` when the message did not carry one — absence of the number is
+    /// not evidence about the number.
+    pub enforced_limit: Option<i64>,
+}
+
+/// One module-backed graph node and the fuel ceiling it would run under.
+///
+/// Derived from the workflow GRAPH, not from execution history, so it can
+/// describe a node that has never run — including one whose first run will be
+/// its last.
+#[derive(Debug, Clone)]
+pub struct NodeBudgetRow {
+    pub workflow_id: Uuid,
+    pub workflow_name: String,
+    /// The graph node id, which is also the label the engine dispatches under
+    /// and stores in `execution_cost_rollup.node_id`.
+    pub node_id: String,
+    pub module_id: Uuid,
+    pub module_name: String,
+    /// The node's `data.max_fuel` override, when it has one.
+    pub node_max_fuel: Option<i64>,
+    /// `modules.max_fuel` — what the node inherits when it has no override.
+    pub module_max_fuel: Option<i64>,
+}
+
+impl NodeBudgetRow {
+    /// The ceiling this node would actually run under: its own override, else
+    /// the module row. `None` when neither is set, i.e. the node falls back to
+    /// the worker's own default and nothing in this database says what that is.
+    #[must_use]
+    pub fn effective_max_fuel(&self) -> Option<i64> {
+        self.node_max_fuel.or(self.module_max_fuel)
+    }
+
+    /// True when this node takes the module default rather than declaring its
+    /// own budget. CLAUDE.md: "ALWAYS set explicit `max_fuel` on every workflow
+    /// node. Default fuel (1M-5M) is rarely correct."
+    #[must_use]
+    pub fn inherits_module_default(&self) -> bool {
+        self.node_max_fuel.is_none()
+    }
+}
+
+/// Extract the enforced fuel ceiling from a worker failure message.
+///
+/// Best-effort by design: the worker has emitted three phrasings over time and
+/// will emit more. Returning `None` is always correct-and-honest; guessing is
+/// not, so there is no fallback constant here.
+#[must_use]
+pub fn parse_enforced_fuel_limit(msg: &str) -> Option<i64> {
+    static RE_LIMIT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        // Three worker phrasings, oldest last. A raw string with no line
+        // continuations on purpose: `r"..\<newline>"` keeps the backslash
+        // LITERAL, which silently changes the pattern.
+        regex::Regex::new(
+            r"(?i)current fuel limit:\s*(\d+)|of a (\d+)-instruction budget|fuel exhausted after (\d+)",
+        )
+        .expect("valid fuel limit regex")
+    });
+    let caps = RE_LIMIT.captures(msg)?;
+    (1..=3)
+        .filter_map(|i| caps.get(i))
+        .find_map(|m| m.as_str().parse::<i64>().ok())
+}
+
 #[derive(Debug)]
 pub struct VersionChangelogRow {
     pub version_number: Option<i32>,
@@ -5422,6 +5535,21 @@ impl AnalyticsRepository {
     /// a node that has ONLY ever run under test (1 pair of the 77) is invisible
     /// here — acceptable, because it has no production traffic to protect.
     ///
+    /// The `workflow_executions` join is a LEFT join and the test predicate is
+    /// `NOT COALESCE(we.is_test_execution, false)`, deliberately. A SUB-workflow
+    /// run has no `workflow_executions` row at all (`execute_subworkflow_graph`
+    /// seeds a synthetic execution id and detaches the event sink for exactly
+    /// that reason), so an inner join silently deleted every sub-workflow node
+    /// from the DETECTOR — 86 rollup rows over the last 30 days when this was
+    /// measured, topped by a node sitting at 99.2% of its ceiling the day before
+    /// it died of fuel exhaustion. A missing row now reads as "not a test",
+    /// which is the correct reading for a sub-workflow and is the LOUD
+    /// direction: the only way it can be wrong is by counting a sub-workflow
+    /// dispatched from a `test_workflow` run as production traffic, which adds a
+    /// warning rather than hiding one. (`is_test_execution` is not propagated
+    /// into sub-engines; propagating it would be the way to close that, and is
+    /// not worth a wire change to suppress a louder warning.)
+    ///
     /// ## Bounds
     ///
     /// `LIMIT $N` on the aggregate (one row per pair). At 24k rollup rows the
@@ -5441,12 +5569,12 @@ impl AnalyticsRepository {
             "WITH scoped AS ( \
                 SELECT r.workflow_id, r.node_id, r.fuel_consumed, r.max_fuel, r.recorded_at \
                 FROM execution_cost_rollup r \
-                JOIN workflow_executions we ON we.id = r.execution_id \
+                LEFT JOIN workflow_executions we ON we.id = r.execution_id \
                 JOIN workflows w ON w.id = r.workflow_id \
                 WHERE r.recorded_at > NOW() - make_interval(days => $1::int) \
                   AND r.max_fuel > 0 \
                   AND r.fuel_consumed > 0 \
-                  AND NOT we.is_test_execution \
+                  AND NOT COALESCE(we.is_test_execution, false) \
                   AND ($2::uuid IS NULL OR w.user_id = $2) \
              ), latest AS ( \
                 SELECT DISTINCT ON (workflow_id, node_id) \
@@ -5487,6 +5615,232 @@ impl AnalyticsRepository {
                 },
             )
             .collect())
+    }
+
+    /// Nodes that DIED of fuel exhaustion in the last `days` days.
+    ///
+    /// # Why this is a second source and not another rollup query
+    ///
+    /// `execution_cost_rollup` is written from `on_node_completed` only, and
+    /// only when the node's output carries `__fuel_consumed__ > 0`. A node
+    /// killed by the fuel meter never completes and never produces that output,
+    /// so **the exact event a fuel report exists to warn about is structurally
+    /// absent from the table every other section of that report reads.** Adding
+    /// a sample floor, a percentile, or a threshold to a rollup query cannot
+    /// reach it; only a different source can.
+    ///
+    /// `dead_letter_queue` is that source. The engine's `on_node_failed` hook
+    /// writes one row per terminal node failure carrying `(workflow_id,
+    /// execution_id, node_id, error_message)` — the `(workflow, node)` unit that
+    /// matters, and the error text is already DLP-scrubbed on the way in.
+    /// `module_executions` was evaluated and rejected: measured on the live
+    /// database, 84 fuel deaths were recorded in `dead_letter_queue` and only 2
+    /// of them had a `module_executions` row saying `failed` — the rest were
+    /// left `running` and later swept to `status = 'timeout'`, so a
+    /// module-execution query reports 2 deaths where 84 happened.
+    ///
+    /// # Tenancy
+    ///
+    /// `dead_letter_queue` carries no owner column, so ownership is proved two
+    /// ways and a row needs either: the DLQ row's `workflow_id` resolves to a
+    /// workflow this user owns, OR a `module_executions` row for the same
+    /// execution belongs to this user. The second arm is not redundant — a
+    /// sub-workflow run stamped its rows with a synthetic id before the engine
+    /// began setting one (`execute_subworkflow_graph`), so historical rows have
+    /// a `workflow_id` that resolves to nothing at all. Dropping them for want
+    /// of a join would mean the surface reported "no deaths" on the very
+    /// incident that motivated it.
+    ///
+    /// # What is deliberately NOT returned
+    ///
+    /// The raw `error_message` never leaves this function. Only the parsed
+    /// integer ceiling does. DLQ text is scrubbed, but it is still a
+    /// worker-authored string, and a fuel report has no need of prose.
+    pub async fn get_fuel_exhaustion_deaths(
+        &self,
+        user_id: Uuid,
+        days: i32,
+        limit: i64,
+    ) -> Result<Vec<FuelExhaustionDeath>> {
+        // The SQL predicate is a deliberate SUPERSET of the classifier's, not a
+        // copy of it: `FUEL_MESSAGE_PREFILTER` is one token that every phrase
+        // the canonical classifier maps to `fuel_exhaustion` contains, and the
+        // authority on whether a row IS a fuel death remains
+        // `talos_retry_intelligence::classify_error` below. Duplicating the
+        // classifier's phrase list in SQL is how the two drift apart;
+        // `the_sql_prefilter_is_a_superset_of_the_classifier` pins the
+        // relationship.
+        let rows = sqlx::query(
+            "SELECT d.workflow_id, w.name AS workflow_name, d.node_id, d.execution_id, \
+                    d.created_at, d.error_message \
+               FROM dead_letter_queue d \
+               LEFT JOIN workflows w ON w.id = d.workflow_id \
+              WHERE d.created_at > NOW() - make_interval(days => $2::int) \
+                AND d.error_message ILIKE $4 \
+                AND ( w.user_id = $1 \
+                      OR EXISTS ( SELECT 1 FROM module_executions me \
+                                   WHERE me.workflow_execution_id = d.execution_id \
+                                     AND me.user_id = $1 ) ) \
+              ORDER BY d.created_at DESC, d.id \
+              LIMIT $3",
+        )
+        .bind(user_id)
+        .bind(days)
+        .bind(limit)
+        .bind(format!("%{FUEL_MESSAGE_PREFILTER}%"))
+        .fetch_all(&self.db_pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let error_message: String = r.try_get("error_message")?;
+            if talos_retry_intelligence::classify_error(&error_message) != FUEL_EXHAUSTION_CLASS {
+                continue;
+            }
+            out.push(FuelExhaustionDeath {
+                workflow_id: r.try_get("workflow_id")?,
+                workflow_name: r.try_get::<Option<String>, _>("workflow_name")?,
+                node_uuid: r.try_get("node_id")?,
+                execution_id: r.try_get("execution_id")?,
+                occurred_at: r.try_get("created_at")?,
+                enforced_limit: parse_enforced_fuel_limit(&error_message),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Every module-backed node in the caller's workflow graphs, with the fuel
+    /// ceiling it would run under.
+    ///
+    /// This is the only fuel surface that does not depend on execution history,
+    /// which is the point: it can name a node that is about to die instead of
+    /// one that already has. A node inherits `modules.max_fuel` unless its
+    /// graph `data.max_fuel` overrides it, so a module shared by several
+    /// workflows can be correctly sized in one and starved in another — and the
+    /// per-MODULE half of the fuel report, which groups by `modules.id`, cannot
+    /// express that as anything but one averaged number.
+    ///
+    /// Both fuel deaths on the live database when this was written were exactly
+    /// that shape: the dead node was the one running at the module default
+    /// while its siblings carried a large per-node override.
+    ///
+    /// Bounded the same four ways as the hygiene twin scan (user-scoped,
+    /// [`NODE_BUDGET_GRAPH_LIMIT`] rows, a server-side per-graph byte guard, and
+    /// a client-side aggregate budget); the returned [`Coverage`] carries the
+    /// cap so a short answer can never read as a complete one.
+    pub async fn get_node_budgets(
+        &self,
+        user_id: Uuid,
+    ) -> Result<(Vec<NodeBudgetRow>, talos_measurement::Coverage)> {
+        let graph_rows = sqlx::query(
+            "SELECT id, name, \
+                    CASE WHEN octet_length(graph_json) <= $3 THEN graph_json END AS graph_json \
+               FROM workflows \
+              WHERE user_id = $1 \
+                AND (status IS NULL OR status != 'archived') \
+                AND graph_json IS NOT NULL \
+              ORDER BY name, id LIMIT $2",
+        )
+        .bind(user_id)
+        .bind(NODE_BUDGET_GRAPH_LIMIT)
+        .bind(TWIN_SCAN_MAX_GRAPH_BYTES)
+        .fetch_all(&self.db_pool)
+        .await?;
+
+        let coverage =
+            talos_measurement::Coverage::new(graph_rows.len() as i64, NODE_BUDGET_GRAPH_LIMIT);
+
+        // (workflow_id, workflow_name, node graph id, module id, node override)
+        let mut pending: Vec<(Uuid, String, String, Uuid, Option<i64>)> = Vec::new();
+        let mut module_ids: Vec<Uuid> = Vec::new();
+        let mut budget_remaining: i64 = TWIN_SCAN_TOTAL_BYTES;
+        for r in graph_rows {
+            let Some(graph_json) = r.try_get::<Option<String>, _>("graph_json")? else {
+                continue;
+            };
+            let len = graph_json.len() as i64;
+            if len > budget_remaining {
+                continue;
+            }
+            budget_remaining -= len;
+            let wf_id: Uuid = r.try_get("id")?;
+            let wf_name: String = r.try_get("name")?;
+            // Fail-soft per graph: a malformed body must not sink the report.
+            let Ok(graph) = serde_json::from_str::<serde_json::Value>(&graph_json) else {
+                continue;
+            };
+            let Some(nodes) = graph.get("nodes").and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            for node in nodes.iter().take(NODE_BUDGET_NODES_PER_GRAPH) {
+                let Some(node_id) = node.get("id").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                // A graph node's `type` is the module uuid for module-backed
+                // nodes and a system-node keyword otherwise; the parse is the
+                // discriminator, and a system node has no tunable budget.
+                let Some(module_id) = node
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|t| Uuid::parse_str(t).ok())
+                else {
+                    continue;
+                };
+                let node_max_fuel = node
+                    .get("data")
+                    .and_then(|d| d.get("max_fuel"))
+                    .and_then(serde_json::Value::as_i64)
+                    .filter(|v| *v > 0);
+                if !module_ids.contains(&module_id) {
+                    module_ids.push(module_id);
+                }
+                pending.push((
+                    wf_id,
+                    wf_name.clone(),
+                    node_id.to_string(),
+                    module_id,
+                    node_max_fuel,
+                ));
+            }
+        }
+
+        // One batched read for every referenced module — never one per node.
+        let mut modules: std::collections::HashMap<Uuid, (String, Option<i64>)> =
+            std::collections::HashMap::new();
+        if !module_ids.is_empty() {
+            let module_rows =
+                sqlx::query("SELECT id, name, max_fuel FROM modules WHERE id = ANY($1)")
+                    .bind(&module_ids)
+                    .fetch_all(&self.db_pool)
+                    .await?;
+            for r in module_rows {
+                let id: Uuid = r.try_get("id")?;
+                let name: String = r.try_get("name")?;
+                let max_fuel: Option<i64> = r.try_get("max_fuel")?;
+                modules.insert(id, (name, max_fuel));
+            }
+        }
+
+        let out = pending
+            .into_iter()
+            .filter_map(
+                |(workflow_id, workflow_name, node_id, module_id, node_max_fuel)| {
+                    // A node whose module row is gone is not a budget we can reason
+                    // about — it cannot run at all.
+                    let (module_name, module_max_fuel) = modules.get(&module_id)?.clone();
+                    Some(NodeBudgetRow {
+                        workflow_id,
+                        workflow_name,
+                        node_id,
+                        module_id,
+                        module_name,
+                        node_max_fuel,
+                        module_max_fuel,
+                    })
+                },
+            )
+            .collect();
+        Ok((out, coverage))
     }
 
     /// Per-node fuel-consumption stats for ONE workflow, aggregated across its
@@ -6244,5 +6598,148 @@ mod reliability_gain_tests {
         assert_eq!(reliability_gain_from_success_rate(Some(0.0), -5), 0.0);
         // Out-of-range rates are clamped rather than producing negative points.
         assert_eq!(reliability_gain_from_success_rate(Some(1.5), 10), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod fuel_blindspot_tests {
+    use super::{
+        parse_enforced_fuel_limit, NodeBudgetRow, FUEL_EXHAUSTION_CLASS, FUEL_MESSAGE_PREFILTER,
+    };
+    use uuid::Uuid;
+
+    /// The two failure texts observed on the live database, verbatim (module
+    /// and workflow names removed — this repository is public). Both are real
+    /// worker output, not invented shapes: one from the 2026-08-17 death, one
+    /// from the 2026-09-03 death that motivated this work.
+    const LIVE_MESSAGES: [&str; 2] = [
+        "Job failed after 1 attempts: execution failure: WASM fuel exhausted after 1404000 \
+         instructions. Your module ran out of computation budget. Split into smaller modules \
+         or reduce payload size. Current fuel limit: 1404000 (configurable via WASM_FUEL_LIMIT \
+         or per-node max_fuel config).",
+        "Job failed (non-transient: fuel_exhaustion): execution failure: WASM fuel exhausted: \
+         the module consumed 1000000 instructions of a 1000000-instruction budget",
+    ];
+
+    /// The relationship the deaths query depends on, stated as an assertion
+    /// rather than as a comment: the SQL pre-filter must be a SUPERSET of the
+    /// classifier, so the cheap scan can never exclude a row the authority
+    /// would have accepted.
+    ///
+    /// This is also the tripwire for an upstream rename of the verdict token —
+    /// which would otherwise empty the section silently, since "no fuel deaths"
+    /// and "no row matched the token" render identically.
+    #[test]
+    fn the_sql_prefilter_is_a_superset_of_the_classifier() {
+        for msg in LIVE_MESSAGES {
+            assert_eq!(
+                talos_retry_intelligence::classify_error(msg),
+                FUEL_EXHAUSTION_CLASS,
+                "the canonical classifier no longer calls this a fuel death: {msg}"
+            );
+            assert!(
+                msg.to_ascii_lowercase().contains(FUEL_MESSAGE_PREFILTER),
+                "the SQL pre-filter would have excluded a row the classifier accepts: {msg}"
+            );
+        }
+        // The classifier's other trigger phrase, which the pre-filter must also
+        // survive even though no live row has carried it yet.
+        assert_eq!(
+            talos_retry_intelligence::classify_error("the module ran out of fuel"),
+            FUEL_EXHAUSTION_CLASS
+        );
+        assert!("the module ran out of fuel".contains(FUEL_MESSAGE_PREFILTER));
+    }
+
+    /// A non-fuel failure must not be counted as one. The deaths section is a
+    /// claim an operator acts on; inflating it trains them to ignore it.
+    #[test]
+    fn an_unrelated_failure_is_not_a_fuel_death() {
+        let msg = "Job failed after 1 attempts: execution failure: Component returned error: \
+                   list fetch: networkerror";
+        assert_ne!(
+            talos_retry_intelligence::classify_error(msg),
+            FUEL_EXHAUSTION_CLASS
+        );
+    }
+
+    #[test]
+    fn the_enforced_limit_is_parsed_from_every_live_phrasing() {
+        assert_eq!(parse_enforced_fuel_limit(LIVE_MESSAGES[0]), Some(1_404_000));
+        assert_eq!(parse_enforced_fuel_limit(LIVE_MESSAGES[1]), Some(1_000_000));
+    }
+
+    /// Absence of the number is reported as absence, never as a zero — a `0`
+    /// ceiling would render as "this node had no budget", which is a different
+    /// and false claim.
+    #[test]
+    fn an_unparseable_message_yields_none_not_zero() {
+        assert_eq!(parse_enforced_fuel_limit("WASM fuel exhausted"), None);
+        assert_eq!(parse_enforced_fuel_limit(""), None);
+    }
+
+    fn budget(node: Option<i64>, module: Option<i64>) -> NodeBudgetRow {
+        NodeBudgetRow {
+            workflow_id: Uuid::nil(),
+            workflow_name: "wf".into(),
+            node_id: "n".into(),
+            module_id: Uuid::nil(),
+            module_name: "m".into(),
+            node_max_fuel: node,
+            module_max_fuel: module,
+        }
+    }
+
+    /// The precedence the engine actually applies: a node override wins, and
+    /// only its ABSENCE falls back to the module row. Getting this backwards is
+    /// the bug the divergence section exists to find, so it is pinned here.
+    #[test]
+    fn the_node_override_wins_and_only_its_absence_inherits() {
+        assert_eq!(
+            budget(Some(12_000_000), Some(1_000_000)).effective_max_fuel(),
+            Some(12_000_000)
+        );
+        assert!(!budget(Some(12_000_000), Some(1_000_000)).inherits_module_default());
+        assert_eq!(
+            budget(None, Some(1_000_000)).effective_max_fuel(),
+            Some(1_000_000)
+        );
+        assert!(budget(None, Some(1_000_000)).inherits_module_default());
+        assert_eq!(budget(None, None).effective_max_fuel(), None);
+    }
+
+    /// SOURCE pin: the headroom DETECTOR must not require a
+    /// `workflow_executions` row.
+    ///
+    /// A sub-workflow run has none — `execute_subworkflow_graph` seeds a
+    /// synthetic execution id — so an inner join deletes every sub-workflow
+    /// node from the detector. Measured on the live database before the fix: 86
+    /// rollup rows over 30 days were dropped this way, topped by a node at
+    /// 99.2% of its ceiling the day before it died. This needs Postgres to
+    /// exercise behaviourally, so the shape is pinned in the text instead.
+    #[test]
+    fn the_headroom_detector_does_not_require_a_workflow_execution_row() {
+        let src = include_str!("lib.rs");
+        let start = src
+            .find(concat!("pub async fn ", "get_node_fuel_headroom"))
+            .expect("the headroom query still exists");
+        let body = &src[start..];
+        let end = body[1..]
+            .find("pub async fn ")
+            .map_or(body.len(), |i| i + 1);
+        let body = &body[..end];
+        assert!(
+            body.contains("LEFT JOIN workflow_executions we"),
+            "the workflow_executions join must be a LEFT join"
+        );
+        assert!(
+            body.contains("NOT COALESCE(we.is_test_execution, false)"),
+            "a missing workflow_executions row must read as NOT a test execution"
+        );
+        // The exact pre-fix text, which would silently restore the blindness.
+        assert!(
+            !body.contains("AND NOT we.is_test_execution \\"),
+            "the inner-join test predicate reappeared"
+        );
     }
 }

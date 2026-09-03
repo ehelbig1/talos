@@ -241,6 +241,7 @@ jobs:
             --test fan_in_join \
             --test precheck_errors \
             --test rate_limit_store \
+            --test subflow_fuel_attribution \
             --test subflow_recursion \
             --test system_node_failure_routing \
             --test trigger_input \

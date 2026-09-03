@@ -15,6 +15,7 @@ serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-db = { path = "../talos-db" }
 talos-measurement = { path = "../talos-measurement" }
+talos-retry-intelligence = { path = "../talos-retry-intelligence" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 tokio = { version = "1", features = ["macros", "rt"] }

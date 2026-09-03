@@ -401,7 +401,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_fuel_usage_report",
-            "description": "Aggregate fuel (computation) consumption across recent workflow executions. Shows top fuel-intensive modules with p50, p95, max stats and flags modules near the fuel limit.",
+            "description": "Aggregate fuel (computation) consumption across recent workflow executions. Shows top fuel-intensive modules with p50, p95, max stats and flags modules near the fuel limit. Also reports two things the consumption aggregates structurally cannot contain: fuel_exhaustion_deaths (nodes the fuel meter KILLED — a killed node never completes, so it writes no execution_cost_rollup row and is absent from at_risk/high_utilisation_nodes), and node_ceiling_divergence (one module running under different per-node ceilings across workflows, read from the graphs, so it names a node BEFORE its first failure).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -6659,6 +6659,12 @@ async fn handle_get_fuel_usage_report(
     // is reported as such rather than as an empty one — an empty array would
     // read as "no node is at risk".
     const HIGH_UTILISATION_THRESHOLD: f64 = 0.80;
+    // Every degraded read below lands in ONE ledger. The headroom section
+    // already carried a bespoke `high_utilisation_error` string; it is
+    // `mark_derived`-ed into the ledger too rather than left beside it, because
+    // a response asserting `measurement.complete: true` next to a populated
+    // `high_utilisation_error` would be two surfaces contradicting each other.
+    let mut readings = talos_measurement::Readings::new();
     let (high_utilisation_nodes, high_utilisation_error) = match state
         .analytics_repo
         .get_node_fuel_headroom(Some(user_id), 30, 200)
@@ -6690,6 +6696,7 @@ async fn handle_get_fuel_usage_report(
                 error = %e,
                 "get_fuel_usage_report: per-node headroom query failed"
             );
+            readings.mark_derived("high_utilisation_nodes");
             (
                 Vec::new(),
                 Some(
@@ -6701,7 +6708,91 @@ async fn handle_get_fuel_usage_report(
         }
     };
 
-    let result = serde_json::json!({
+    // ── Nodes that ALREADY DIED of fuel exhaustion ──────────────────────
+    //
+    // THE SECTION THAT MAKES `at_risk: 0` FALSIFIABLE. Everything above this
+    // point reads `execution_cost_rollup`, which is written from
+    // `on_node_completed` and only when the output carries
+    // `__fuel_consumed__ > 0`. A node the fuel meter killed never completes, so
+    // it never writes that row: the precise event these sections exist to warn
+    // about is the one event their source structurally cannot contain. Observed
+    // 2026-09-03 — a node died of fuel exhaustion at 12:00 and this tool
+    // answered `at_risk: 0`, `high_utilisation_nodes: 0`, with the module absent
+    // from the listing entirely.
+    //
+    // Sourced from `dead_letter_queue` instead, which the engine writes from
+    // `on_node_failed` per `(workflow, execution, node)`. See
+    // `AnalyticsRepository::get_fuel_exhaustion_deaths` for why
+    // `module_executions` is NOT the source (it recorded 2 of 84 live deaths).
+    let deaths = readings.record_rows(
+        "fuel_exhaustion_deaths",
+        state
+            .analytics_repo
+            .get_fuel_exhaustion_deaths(user_id, days.max(FUEL_DEATH_MIN_DAYS), FUEL_DEATH_LIMIT)
+            .await,
+    );
+
+    // ── Node budgets straight from the graphs ───────────────────────────
+    //
+    // The only fuel evidence here that does not require the node to have run.
+    // Serves two purposes: it resolves the deaths above from their derived node
+    // uuid back to a human label, and it answers the question no
+    // execution-history query can — *which node is going to die next*.
+    let (node_budgets, budget_coverage) = match readings.record(
+        "node_ceiling_divergence",
+        state.analytics_repo.get_node_budgets(user_id).await,
+    ) {
+        Some((rows, coverage)) => (rows, Some(coverage)),
+        None => (Vec::new(), None),
+    };
+
+    // uuid -> label, built with the SAME `engine_node_uuid` the engine used to
+    // write these ids. A private copy of that arithmetic keys the map on uuids
+    // no row carries and every label silently falls back to a raw uuid — the
+    // class structural lint check 71 exists for.
+    let mut node_label_by_uuid: std::collections::HashMap<uuid::Uuid, String> =
+        std::collections::HashMap::new();
+    for b in &node_budgets {
+        node_label_by_uuid
+            .entry(talos_workflow_engine_core::engine_node_uuid(&b.node_id))
+            .or_insert_with(|| b.node_id.clone());
+    }
+
+    let fuel_exhaustion_deaths: Vec<serde_json::Value> = deaths
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "workflow_id": d.workflow_id,
+                // Null when the recorded workflow id resolves to no workflow
+                // row — historically the case for every sub-workflow run, whose
+                // rows carried a synthetic per-run id.
+                "workflow_name": d.workflow_name,
+                "node": node_label_by_uuid.get(&d.node_uuid),
+                "node_uuid": d.node_uuid,
+                "execution_id": d.execution_id,
+                "occurred_at": d.occurred_at.to_rfc3339(),
+                "enforced_fuel_limit": d.enforced_limit,
+            })
+        })
+        .collect();
+
+    // ── Same module, divergent ceilings ─────────────────────────────────
+    //
+    // Both fuel deaths on the live database when this was written had the same
+    // shape: a node running a SHARED module at the module default while its
+    // siblings in other workflows carried a large per-node override. That is
+    // invisible to the per-module section by construction — it groups by
+    // `modules.id`, so the starved node and the well-provisioned one collapse
+    // into one averaged number.
+    let divergences = detect_ceiling_divergence(&node_budgets);
+    let node_ceiling_divergence: Vec<serde_json::Value> =
+        divergences.iter().map(CeilingDivergence::to_json).collect();
+    let starved_nodes = divergences
+        .iter()
+        .filter(|d| d.has_starved_sibling())
+        .count();
+
+    let mut result = serde_json::json!({
         "period_days": days,
         "modules_analyzed": stats.len(),
         "summary": {
@@ -6709,6 +6800,13 @@ async fn handle_get_fuel_usage_report(
             "over_provisioned": over_provisioned.len(),
             "well_tuned": well_tuned.len(),
             "high_utilisation_nodes": high_utilisation_nodes.len(),
+            // Not derived from execution_cost_rollup. `at_risk: 0` beside a
+            // non-zero count here is not a contradiction to resolve by trusting
+            // the first number — it is the rollup source saying nothing about
+            // an event it cannot hold.
+            "fuel_exhaustion_deaths": fuel_exhaustion_deaths.len(),
+            "modules_with_divergent_node_ceilings": node_ceiling_divergence.len(),
+            "nodes_starved_at_the_module_default": starved_nodes,
         },
         "at_risk": at_risk,
         "over_provisioned": over_provisioned,
@@ -6733,12 +6831,193 @@ async fn handle_get_fuel_usage_report(
              same ENFORCED basis, per (workflow, node) and peak-not-percentile — so the \
              two sections now agree on what the denominator means.",
         "note": "Apply recommendations via hot_update_module(name, fuel_budget=recommended_max_fuel) — bumps modules.max_fuel without recompiling source. If enforced_ceiling_min/max differ from module_row_max_fuel, some nodes override the module budget and bumping the row will not change what they enforce.",
+        "fuel_exhaustion_deaths": fuel_exhaustion_deaths,
+        "fuel_exhaustion_deaths_note": format!(
+            "Nodes the fuel meter KILLED, over the last {} day(s) (at least {}), from \
+             dead_letter_queue — NOT from execution_cost_rollup. A killed node never \
+             completes, so it never writes a rollup row and is structurally absent from \
+             every other section of this report, including at_risk and \
+             high_utilisation_nodes. Read a non-empty list here as evidence that those \
+             counts are answering a narrower question, not as a contradiction. \
+             `workflow_name: null` means the recorded workflow id resolves to no workflow \
+             row; that was the case for every sub-workflow run before the engine began \
+             stamping the sub-workflow's own id.",
+            days.max(FUEL_DEATH_MIN_DAYS),
+            FUEL_DEATH_MIN_DAYS,
+        ),
+        "node_ceiling_divergence": node_ceiling_divergence,
+        "node_ceiling_divergence_note": "Modules whose nodes run under DIFFERENT fuel \
+             ceilings across workflows, read from the workflow graphs — no execution \
+             history required, so this can name a node before its first failure rather \
+             than after. `starved_sibling: true` marks the shape that produced both fuel \
+             deaths on this platform: one node inheriting modules.max_fuel while a sibling \
+             running the SAME module carries a much larger per-node override. The \
+             per-module sections above cannot express this — they group by module id, so \
+             the starved node and the well-provisioned one collapse into one average. \
+             CLAUDE.md: 'ALWAYS set explicit max_fuel on every workflow node.'",
+        "blind_spots": {
+            "rollup_sections_cannot_see_a_killed_node": true,
+            "detail": "modules[], at_risk[], over_provisioned[] and high_utilisation_nodes[] \
+                 are all derived from execution_cost_rollup, which the engine writes only on \
+                 node COMPLETION and only when the output carries __fuel_consumed__ > 0. A \
+                 node killed by the fuel meter produces neither, so it contributes no row to \
+                 any of them. fuel_exhaustion_deaths[] and node_ceiling_divergence[] are the \
+                 two sections that do not have this blind spot.",
+        },
     });
+    if let Some(cov) = budget_coverage {
+        if cov.truncated() {
+            result["node_ceiling_divergence_coverage"] = serde_json::json!({
+                "graphs_scanned": cov.returned,
+                "cap": cov.cap,
+                "note": "the graph scan hit its cap — an empty or short divergence list \
+                     is not evidence that nothing diverged",
+            });
+        }
+    }
+    readings.attach(&mut result);
 
     mcp_text(
         req_id,
         &serde_json::to_string_pretty(&result).unwrap_or_default(),
     )
+}
+
+/// Lower bound on the fuel-death lookback, in days.
+///
+/// The deaths section deliberately does NOT shrink with `period_days`. A fuel
+/// death is rare and terminal; a report run with `days=1` that answers "no
+/// deaths" because it only looked at today would be the blindness this section
+/// exists to remove, wearing the fix's clothes. `period_days` still widens it.
+const FUEL_DEATH_MIN_DAYS: i32 = 30;
+
+/// Row cap on the deaths list. Generous on purpose — 84 deaths accumulated on
+/// the live database across two months without one of them ever reaching this
+/// report, so under-reading them is the failure mode to avoid.
+const FUEL_DEATH_LIMIT: i64 = 200;
+
+/// One module whose nodes do not agree on how much fuel they get.
+#[derive(Debug, Clone)]
+pub(crate) struct CeilingDivergence {
+    module_id: uuid::Uuid,
+    module_name: String,
+    /// `(workflow name, node id, effective ceiling, inherits the module default)`
+    nodes: Vec<(String, String, i64, bool)>,
+    min_ceiling: i64,
+    max_ceiling: i64,
+}
+
+impl CeilingDivergence {
+    /// True when the LOWEST-budgeted node is one that declares no ceiling of
+    /// its own. This is the specific shape that killed two nodes on this
+    /// platform: the module default is not a considered budget for that node,
+    /// it is the absence of one, and a sibling's much larger override is
+    /// evidence that the considered budget is far bigger.
+    pub(crate) fn has_starved_sibling(&self) -> bool {
+        self.nodes
+            .iter()
+            .any(|(_, _, ceiling, inherits)| *inherits && *ceiling == self.min_ceiling)
+            && self.max_ceiling > self.min_ceiling
+    }
+
+    /// Ratio of the widest to the narrowest ceiling among this module's nodes.
+    ///
+    /// `min_ceiling` is guaranteed positive by `detect_ceiling_divergence`,
+    /// which drops non-positive ceilings before grouping — so this cannot go
+    /// infinite. That matters because the obvious rounding helper here
+    /// (`format_percent`) maps a non-finite input to `0.0`, and a spread of
+    /// "0.0" is the most reassuring number this field can carry.
+    fn spread(&self) -> f64 {
+        debug_assert!(
+            self.min_ceiling > 0,
+            "non-positive ceilings are filtered out"
+        );
+        if self.min_ceiling <= 0 {
+            return 0.0;
+        }
+        let ratio = self.max_ceiling as f64 / self.min_ceiling as f64;
+        (ratio * 10.0).round() / 10.0
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "module_id": self.module_id,
+            "module_name": self.module_name,
+            "min_effective_ceiling": self.min_ceiling,
+            "max_effective_ceiling": self.max_ceiling,
+            "spread_ratio": self.spread(),
+            "starved_sibling": self.has_starved_sibling(),
+            "nodes": self.nodes.iter().map(|(wf, node, ceiling, inherits)| {
+                serde_json::json!({
+                    "workflow": wf,
+                    "node": node,
+                    "effective_max_fuel": ceiling,
+                    "inherits_module_default": inherits,
+                })
+            }).collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// Group graph nodes by module and keep the modules whose nodes disagree about
+/// the ceiling.
+///
+/// Pure — no I/O — so the ranking and the starved-sibling rule are testable
+/// without a database. A node whose ceiling is unknown (neither an override nor
+/// a module row) is EXCLUDED rather than treated as zero: nothing in the
+/// database says what limit it runs under, and inventing one would manufacture
+/// a divergence.
+pub(crate) fn detect_ceiling_divergence(
+    rows: &[talos_analytics_repository::NodeBudgetRow],
+) -> Vec<CeilingDivergence> {
+    let mut by_module: std::collections::HashMap<uuid::Uuid, CeilingDivergence> =
+        std::collections::HashMap::new();
+    for row in rows {
+        // A ceiling that is unknown OR non-positive is dropped, not defaulted:
+        // nothing in the database says what limit such a node runs under, and
+        // inventing one would manufacture a divergence.
+        let Some(ceiling) = row.effective_max_fuel().filter(|c| *c > 0) else {
+            continue;
+        };
+        let entry = by_module
+            .entry(row.module_id)
+            .or_insert_with(|| CeilingDivergence {
+                module_id: row.module_id,
+                module_name: row.module_name.clone(),
+                nodes: Vec::new(),
+                min_ceiling: i64::MAX,
+                max_ceiling: i64::MIN,
+            });
+        entry.min_ceiling = entry.min_ceiling.min(ceiling);
+        entry.max_ceiling = entry.max_ceiling.max(ceiling);
+        entry.nodes.push((
+            row.workflow_name.clone(),
+            row.node_id.clone(),
+            ceiling,
+            row.inherits_module_default(),
+        ));
+    }
+    let mut out: Vec<CeilingDivergence> = by_module
+        .into_values()
+        .filter(|d| d.min_ceiling < d.max_ceiling)
+        .collect();
+    for d in &mut out {
+        // Narrowest first, so the node at risk is the one an operator reads.
+        d.nodes.sort_by(|a, b| {
+            a.2.cmp(&b.2)
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.1.cmp(&b.1))
+        });
+    }
+    // Widest spread first; `module_id` is the unique tiebreaker so the order is
+    // total and stable across runs on identical data.
+    out.sort_by(|a, b| {
+        b.spread()
+            .partial_cmp(&a.spread())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.module_id.cmp(&b.module_id))
+    });
+    out
 }
 
 async fn handle_get_readiness_breakdown(
@@ -9082,5 +9361,177 @@ mod trigger_completeness_disclosure_tests {
             readings.record_rows("parent_workflows", Err::<Vec<serde_json::Value>, _>("x"));
         let out = render_workflow_triggers(one("schedule"), vec![], parents, &mut readings);
         assert!(out["manual_only"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod fuel_report_blindspot_tests {
+    use super::{detect_ceiling_divergence, CeilingDivergence, FUEL_DEATH_MIN_DAYS};
+    use talos_analytics_repository::NodeBudgetRow;
+    use uuid::Uuid;
+
+    fn node(
+        module: Uuid,
+        module_name: &str,
+        wf: &str,
+        node_id: &str,
+        node_max: Option<i64>,
+        module_max: Option<i64>,
+    ) -> NodeBudgetRow {
+        NodeBudgetRow {
+            workflow_id: Uuid::new_v4(),
+            workflow_name: wf.into(),
+            node_id: node_id.into(),
+            module_id: module,
+            module_name: module_name.into(),
+            node_max_fuel: node_max,
+            module_max_fuel: module_max,
+        }
+    }
+
+    /// THE incident, as data. One module, two nodes: one carries a 12M override,
+    /// the other declares nothing and inherits the 1M module row. The node that
+    /// died was the second one, and no per-module aggregate can say so because
+    /// both nodes group under one module id.
+    #[test]
+    fn a_node_inheriting_the_module_default_beside_an_overridden_sibling_is_flagged() {
+        let m = Uuid::new_v4();
+        let rows = vec![
+            node(
+                m,
+                "shared",
+                "workflow-a",
+                "recall",
+                Some(12_000_000),
+                Some(1_000_000),
+            ),
+            node(m, "shared", "workflow-b", "recall", None, Some(1_000_000)),
+        ];
+        let out = detect_ceiling_divergence(&rows);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].has_starved_sibling());
+        let json = out[0].to_json();
+        assert_eq!(json["min_effective_ceiling"], 1_000_000);
+        assert_eq!(json["max_effective_ceiling"], 12_000_000);
+        assert_eq!(json["spread_ratio"], 12.0);
+        assert_eq!(json["starved_sibling"], true);
+        // Narrowest first — the node at risk is the one an operator reads.
+        assert_eq!(json["nodes"][0]["workflow"], "workflow-b");
+        assert_eq!(json["nodes"][0]["inherits_module_default"], true);
+    }
+
+    /// Divergence alone is not the alarm. Two nodes that each declare a
+    /// DIFFERENT deliberate budget are reported (an operator may still want to
+    /// know) but must not be marked starved — that flag is what says "this one
+    /// was never sized".
+    #[test]
+    fn two_deliberate_overrides_diverge_but_are_not_starved() {
+        let m = Uuid::new_v4();
+        let rows = vec![
+            node(m, "shared", "a", "n", Some(8_000_000), Some(1_000_000)),
+            node(m, "shared", "b", "n", Some(12_000_000), Some(1_000_000)),
+        ];
+        let out = detect_ceiling_divergence(&rows);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].has_starved_sibling());
+    }
+
+    /// Agreement is not a finding. A module whose nodes all run at the same
+    /// ceiling — including all inheriting the same module row — must not appear.
+    #[test]
+    fn agreeing_ceilings_are_not_reported() {
+        let m = Uuid::new_v4();
+        let rows = vec![
+            node(m, "shared", "a", "n", None, Some(1_000_000)),
+            node(m, "shared", "b", "n", Some(1_000_000), Some(1_000_000)),
+        ];
+        assert!(detect_ceiling_divergence(&rows).is_empty());
+    }
+
+    /// A node whose ceiling nothing in the database states is DROPPED, not read
+    /// as zero. Treating "unknown" as 0 would both manufacture a divergence and
+    /// make the spread ratio infinite.
+    #[test]
+    fn an_unknown_ceiling_is_dropped_rather_than_read_as_zero() {
+        let m = Uuid::new_v4();
+        let rows = vec![
+            node(m, "shared", "a", "n", None, None),
+            node(m, "shared", "b", "n", Some(8_000_000), None),
+        ];
+        assert!(detect_ceiling_divergence(&rows).is_empty());
+        // Same for a non-positive module row.
+        let rows = vec![
+            node(m, "shared", "a", "n", None, Some(0)),
+            node(m, "shared", "b", "n", Some(8_000_000), Some(0)),
+        ];
+        assert!(detect_ceiling_divergence(&rows).is_empty());
+    }
+
+    /// Ranking is widest-spread-first with a UNIQUE tiebreaker, so two runs
+    /// against identical data return the same order (check 28's principle).
+    #[test]
+    fn ranking_is_total_and_stable() {
+        let (a, b) = {
+            let mut ids = [Uuid::new_v4(), Uuid::new_v4()];
+            ids.sort();
+            (ids[0], ids[1])
+        };
+        let rows = vec![
+            node(a, "a", "w", "n1", Some(2_000_000), Some(1_000_000)),
+            node(a, "a", "w", "n2", Some(1_000_000), Some(1_000_000)),
+            node(b, "b", "w", "n3", Some(2_000_000), Some(1_000_000)),
+            node(b, "b", "w", "n4", Some(1_000_000), Some(1_000_000)),
+        ];
+        let first = detect_ceiling_divergence(&rows);
+        let mut reversed = rows.clone();
+        reversed.reverse();
+        let second = detect_ceiling_divergence(&reversed);
+        let ids = |v: &[CeilingDivergence]| {
+            v.iter()
+                .map(|d| d.to_json()["module_id"].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&first), ids(&second));
+        // Equal spreads, so the module-id tiebreaker decides.
+        assert_eq!(first[0].to_json()["module_id"], serde_json::json!(a));
+    }
+
+    /// The deaths lookback must not shrink with `period_days`. A `days=1` call
+    /// answering "no deaths" because it only looked at today would reinstate the
+    /// blindness in the section built to remove it.
+    #[test]
+    fn the_death_lookback_never_shrinks_below_its_floor() {
+        assert_eq!(1_i32.max(FUEL_DEATH_MIN_DAYS), FUEL_DEATH_MIN_DAYS);
+        assert_eq!(7_i32.max(FUEL_DEATH_MIN_DAYS), FUEL_DEATH_MIN_DAYS);
+        // …but a wider request still widens it.
+        assert_eq!(60_i32.max(FUEL_DEATH_MIN_DAYS), 60);
+    }
+
+    /// SOURCE pin. The deaths section is the ONLY thing standing between this
+    /// report and `at_risk: 0` on the day of a fuel death, and its whole value
+    /// is that it does not read the rollup table. A future refactor that
+    /// "unified" it onto `execution_cost_rollup` would leave the section name,
+    /// the note, and the summary counter in place while emptying it forever.
+    #[test]
+    fn the_deaths_section_is_not_sourced_from_the_rollup_table() {
+        let src = include_str!("analytics.rs");
+        let start = src
+            .find(concat!("async fn ", "handle_get_fuel_usage_report"))
+            .expect("the fuel report handler still exists");
+        let body = &src[start..];
+        let end = body[1..].find("\nasync fn ").map_or(body.len(), |i| i + 1);
+        let body = &body[..end];
+        assert!(
+            body.contains("get_fuel_exhaustion_deaths"),
+            "the fuel report must still call the deaths query"
+        );
+        assert!(
+            body.contains("get_node_budgets"),
+            "the fuel report must still read the graphs for node ceilings"
+        );
+        assert!(
+            body.contains("engine_node_uuid"),
+            "node labels must be resolved with the canonical derivation (lint check 71)"
+        );
     }
 }

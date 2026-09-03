@@ -1564,7 +1564,10 @@ impl ParallelWorkflowEngine {
         let Some(graph_json) = self.get_sub_workflow_graph(sub_wf_id, user_id).await else {
             return origin.not_found_error(sub_wf_id);
         };
-        let mut sub_engine = match self.adapter_set().into_engine_with_graph(&graph_json) {
+        let hydrated = self
+            .adapter_set()
+            .into_engine_with_graph(sub_wf_id, &graph_json);
+        let mut sub_engine = match hydrated {
             Ok(e) => e,
             Err(e) => return origin.build_error(e),
         };
@@ -1794,140 +1797,141 @@ impl ParallelWorkflowEngine {
 
                     let iter_input_value = serde_json::Value::Object(iter_input);
 
-                    let iter_result =
-                        match adapter_set_al.clone().into_engine_with_graph(&graph_json) {
-                            Ok(mut sub_engine) => {
-                                // Fail-closed binding (H2 + identity): the
-                                // per-iteration sub-engine inherits the PARENT
-                                // identity + ceilings from `adapter_set_al`;
-                                // rebind to the body-workflow's own actor and
-                                // tighten to the pre-resolved
-                                // most-restrictive(parent, body-actor) ceilings.
-                                if let Some(binding) = sub_binding {
-                                    ParallelWorkflowEngine::apply_subworkflow_binding(
-                                        &mut sub_engine,
-                                        &binding,
-                                    );
-                                }
-                                let sub_execution_id = Uuid::new_v4();
-                                let trigger_node_id = Uuid::new_v4();
-                                sub_engine.add_node(trigger_node_id, None, None, None);
-                                sub_engine
-                                    .node_labels
-                                    .insert(trigger_node_id, "__trigger__".to_string());
+                    let hydrated = adapter_set_al
+                        .clone()
+                        .into_engine_with_graph(body_wf_id, &graph_json);
+                    let iter_result = match hydrated {
+                        Ok(mut sub_engine) => {
+                            // Fail-closed binding (H2 + identity): the
+                            // per-iteration sub-engine inherits the PARENT
+                            // identity + ceilings from `adapter_set_al`;
+                            // rebind to the body-workflow's own actor and
+                            // tighten to the pre-resolved
+                            // most-restrictive(parent, body-actor) ceilings.
+                            if let Some(binding) = sub_binding {
+                                ParallelWorkflowEngine::apply_subworkflow_binding(
+                                    &mut sub_engine,
+                                    &binding,
+                                );
+                            }
+                            let sub_execution_id = Uuid::new_v4();
+                            let trigger_node_id = Uuid::new_v4();
+                            sub_engine.add_node(trigger_node_id, None, None, None);
+                            sub_engine
+                                .node_labels
+                                .insert(trigger_node_id, "__trigger__".to_string());
 
-                                let root_indices: Vec<petgraph::graph::NodeIndex> = sub_engine
-                                    .graph
-                                    .node_indices()
-                                    .filter(|&idx| {
-                                        sub_engine.graph[idx] != trigger_node_id
-                                            && sub_engine
-                                                .graph
-                                                .neighbors_directed(idx, Direction::Incoming)
-                                                .count()
-                                                == 0
+                            let root_indices: Vec<petgraph::graph::NodeIndex> = sub_engine
+                                .graph
+                                .node_indices()
+                                .filter(|&idx| {
+                                    sub_engine.graph[idx] != trigger_node_id
+                                        && sub_engine
+                                            .graph
+                                            .neighbors_directed(idx, Direction::Incoming)
+                                            .count()
+                                            == 0
+                                })
+                                .collect();
+                            for root_idx in &root_indices {
+                                let root_id = sub_engine.graph[*root_idx];
+                                let _ = sub_engine.add_edge(
+                                    trigger_node_id,
+                                    root_id,
+                                    EdgeLogic {
+                                        source_handle: "output".to_string(),
+                                        target_handle: "input".to_string(),
+                                        mapping: None,
+                                        condition: None,
+                                        edge_type: "default".to_string(),
+                                    },
+                                );
+                            }
+
+                            let mut initial_results = HashMap::new();
+                            initial_results.insert(trigger_node_id, iter_input_value);
+
+                            let sub_labels = sub_engine.node_labels.clone();
+                            match sub_engine
+                                .run_with_seed_with_transport(
+                                    dispatcher_al.clone(),
+                                    worker_shared_key_al.clone(),
+                                    initial_results,
+                                    sub_execution_id,
+                                )
+                                .await
+                            {
+                                Ok(ctx) => {
+                                    let mut sub_outputs = serde_json::Map::new();
+                                    for (nid, output) in &ctx.results {
+                                        if output
+                                            .get("__skipped")
+                                            .and_then(|v| v.as_bool())
+                                            .unwrap_or(false)
+                                        {
+                                            continue;
+                                        }
+                                        let key = sub_labels
+                                            .get(nid)
+                                            .cloned()
+                                            .unwrap_or_else(|| nid.to_string());
+                                        if key == "__trigger__" {
+                                            continue;
+                                        }
+                                        // Strip reserved `__*` metadata keys (e.g.
+                                        // `__fuel_consumed__`, `__dispatched_by`) from
+                                        // the per-node body output. These are worker
+                                        // / engine annotations, not user payload —
+                                        // and when inject_history=true, the full
+                                        // iter_result is fed back into the NEXT
+                                        // iteration's module input. Leaving `__*`
+                                        // keys in place balloons the input JSON the
+                                        // body must re-parse, causing `__fuel_consumed__`
+                                        // to appear to accumulate across iterations
+                                        // (21k → 54k → 79k). Mirrors the iter_input
+                                        // cleanup at the top of the loop body.
+                                        let mut cleaned =
+                                            ParallelWorkflowEngine::unwrap_output(output).clone();
+                                        if let Some(obj) = cleaned.as_object_mut() {
+                                            obj.retain(|k, _| !k.starts_with("__"));
+                                        }
+                                        sub_outputs.insert(key, cleaned);
+                                    }
+                                    // Single-terminal collapse — matches the convention
+                                    // used by `collapse_subworkflow_output` for judge /
+                                    // ensemble / sub_workflow. Without this, the
+                                    // iter_result is a label-wrapped map (e.g.
+                                    // `{"step": {"finished": true}}`) and the
+                                    // finished-signal check at the top level misses
+                                    // the flag — the loop runs to max_iterations
+                                    // despite the body clearly signalling done.
+                                    if sub_outputs.len() == 1 {
+                                        sub_outputs
+                                            .into_values()
+                                            .next()
+                                            .unwrap_or(serde_json::Value::Null)
+                                    } else {
+                                        serde_json::Value::Object(sub_outputs)
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        iteration,
+                                        error = %e,
+                                        "AgentLoop body workflow failed on iteration"
+                                    );
+                                    serde_json::json!({
+                                        "__error": true,
+                                        "error_message": e.to_string(),
                                     })
-                                    .collect();
-                                for root_idx in &root_indices {
-                                    let root_id = sub_engine.graph[*root_idx];
-                                    let _ = sub_engine.add_edge(
-                                        trigger_node_id,
-                                        root_id,
-                                        EdgeLogic {
-                                            source_handle: "output".to_string(),
-                                            target_handle: "input".to_string(),
-                                            mapping: None,
-                                            condition: None,
-                                            edge_type: "default".to_string(),
-                                        },
-                                    );
-                                }
-
-                                let mut initial_results = HashMap::new();
-                                initial_results.insert(trigger_node_id, iter_input_value);
-
-                                let sub_labels = sub_engine.node_labels.clone();
-                                match sub_engine
-                                    .run_with_seed_with_transport(
-                                        dispatcher_al.clone(),
-                                        worker_shared_key_al.clone(),
-                                        initial_results,
-                                        sub_execution_id,
-                                    )
-                                    .await
-                                {
-                                    Ok(ctx) => {
-                                        let mut sub_outputs = serde_json::Map::new();
-                                        for (nid, output) in &ctx.results {
-                                            if output
-                                                .get("__skipped")
-                                                .and_then(|v| v.as_bool())
-                                                .unwrap_or(false)
-                                            {
-                                                continue;
-                                            }
-                                            let key = sub_labels
-                                                .get(nid)
-                                                .cloned()
-                                                .unwrap_or_else(|| nid.to_string());
-                                            if key == "__trigger__" {
-                                                continue;
-                                            }
-                                            // Strip reserved `__*` metadata keys (e.g.
-                                            // `__fuel_consumed__`, `__dispatched_by`) from
-                                            // the per-node body output. These are worker
-                                            // / engine annotations, not user payload —
-                                            // and when inject_history=true, the full
-                                            // iter_result is fed back into the NEXT
-                                            // iteration's module input. Leaving `__*`
-                                            // keys in place balloons the input JSON the
-                                            // body must re-parse, causing `__fuel_consumed__`
-                                            // to appear to accumulate across iterations
-                                            // (21k → 54k → 79k). Mirrors the iter_input
-                                            // cleanup at the top of the loop body.
-                                            let mut cleaned =
-                                                ParallelWorkflowEngine::unwrap_output(output)
-                                                    .clone();
-                                            if let Some(obj) = cleaned.as_object_mut() {
-                                                obj.retain(|k, _| !k.starts_with("__"));
-                                            }
-                                            sub_outputs.insert(key, cleaned);
-                                        }
-                                        // Single-terminal collapse — matches the convention
-                                        // used by `collapse_subworkflow_output` for judge /
-                                        // ensemble / sub_workflow. Without this, the
-                                        // iter_result is a label-wrapped map (e.g.
-                                        // `{"step": {"finished": true}}`) and the
-                                        // finished-signal check at the top level misses
-                                        // the flag — the loop runs to max_iterations
-                                        // despite the body clearly signalling done.
-                                        if sub_outputs.len() == 1 {
-                                            sub_outputs
-                                                .into_values()
-                                                .next()
-                                                .unwrap_or(serde_json::Value::Null)
-                                        } else {
-                                            serde_json::Value::Object(sub_outputs)
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            iteration,
-                                            error = %e,
-                                            "AgentLoop body workflow failed on iteration"
-                                        );
-                                        serde_json::json!({
-                                            "__error": true,
-                                            "error_message": e.to_string(),
-                                        })
-                                    }
                                 }
                             }
-                            Err(e) => serde_json::json!({
-                                "__error": true,
-                                "error_message": format!("Failed to build agent body: {e}"),
-                            }),
-                        };
+                        }
+                        Err(e) => serde_json::json!({
+                            "__error": true,
+                            "error_message": format!("Failed to build agent body: {e}"),
+                        }),
+                    };
 
                     // Check for finish signals in the iteration output.
                     let iter_finished = iter_result

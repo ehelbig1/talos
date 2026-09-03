@@ -83,14 +83,14 @@ fn into_engine_with_graph_enforces_depth_check() {
     // depth 0 → 1: OK (next_depth = 1 ≤ 2).
     let s1 = engine
         .adapter_set()
-        .into_engine_with_graph(&trivial_graph)
+        .into_engine_with_graph(Uuid::new_v4(), &trivial_graph)
         .expect("depth 1 within cap");
     assert_eq!(s1.current_subflow_depth(), 1);
 
     // depth 1 → 2: OK (next_depth = 2 ≤ 2).
     let s2 = s1
         .adapter_set()
-        .into_engine_with_graph(&trivial_graph)
+        .into_engine_with_graph(Uuid::new_v4(), &trivial_graph)
         .expect("depth 2 within cap");
     assert_eq!(s2.current_subflow_depth(), 2);
 
@@ -101,7 +101,9 @@ fn into_engine_with_graph_enforces_depth_check() {
     // `ParallelWorkflowEngine` doesn't impl `Debug` (the Arc<dyn>
     // adapters can't reasonably stringify), so the manual match is
     // load-bearing — `expect_err` would require it.
-    let result = s2.adapter_set().into_engine_with_graph(&trivial_graph);
+    let result = s2
+        .adapter_set()
+        .into_engine_with_graph(Uuid::new_v4(), &trivial_graph);
     let err = match result {
         Ok(_) => panic!("depth 3 must exceed cap"),
         Err(e) => e,

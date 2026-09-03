@@ -7507,6 +7507,7 @@ dependencies = [
  "sqlx",
  "talos-db",
  "talos-measurement",
+ "talos-retry-intelligence",
  "talos-secrets-manager",
  "talos-workflow-job-protocol",
  "tokio",
