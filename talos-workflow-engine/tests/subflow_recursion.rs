@@ -190,32 +190,35 @@ async fn self_referential_subworkflow_terminates_with_recursion_error() {
 
     let dispatcher = Arc::new(ScriptedDispatcher::new());
     let started = std::time::Instant::now();
-    let ctx = engine
+    let result = engine
         .run_with_transport(dispatcher, None, Uuid::new_v4())
-        .await
-        .expect("workflow returns ok with error envelope, not Err");
+        .await;
     let elapsed = started.elapsed();
 
-    // The sub-workflow handler converts the recursion error into an
-    // error envelope (`__error: true`). The exact message differs by
-    // handler; what matters is the workflow terminated quickly
-    // instead of stack-overflowing.
+    // What matters first is that the workflow terminated quickly instead
+    // of stack-overflowing — that is what the depth guard buys.
     assert!(
         elapsed < std::time::Duration::from_secs(2),
         "self-referential workflow should terminate promptly, took {elapsed:?}"
     );
-    let envelope = ctx.results.values().next().expect("has a result");
-    assert_eq!(
-        envelope.get("__error").and_then(|v| v.as_bool()),
-        Some(true)
-    );
-    let msg = envelope
-        .get("error_message")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+
+    // …and that the refusal FAILS THE RUN. This assertion is the inverse
+    // of what it used to be, deliberately. The sub-workflow handler turns
+    // the recursion refusal into an `{__error: true}` envelope, and the
+    // reactor used to commit that envelope as an ordinary successful node
+    // result — so this test read `.expect("workflow returns ok with error
+    // envelope, not Err")` and pinned the defect: a run whose only node
+    // was refused reported `completed`, and (in the deployed controller)
+    // did so beside a `node_failed` event with `error_message` NULL. The
+    // envelope now routes through the reactor's one failure path, so the
+    // run's fate matches the event describing it.
+    let err = match result {
+        Ok(_) => panic!("a refused sub-workflow dispatch must fail the run"),
+        Err(e) => e.to_string(),
+    };
     assert!(
-        msg.contains("recursion") || msg.contains("depth") || msg.contains("Sub-workflow"),
-        "expected a recursion-related error message, got: {msg}"
+        err.contains("recursion") || err.contains("depth") || err.contains("Sub-workflow"),
+        "expected a recursion-related error message, got: {err}"
     );
 }
 
