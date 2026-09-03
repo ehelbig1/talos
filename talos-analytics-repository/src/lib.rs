@@ -450,11 +450,34 @@ pub struct NodeBudgetRow {
 }
 
 impl NodeBudgetRow {
-    /// The ceiling this node would actually run under: its own override, else
-    /// the module row. `None` when neither is set, i.e. the node falls back to
-    /// the worker's own default and nothing in this database says what that is.
+    /// The ceiling this node is CONFIGURED with: its own override, else the
+    /// module row. `None` when neither is set, i.e. the node falls back to the
+    /// worker's own default and nothing in this database says what that is.
+    ///
+    /// # This is NOT necessarily the ceiling a dispatch enforces
+    ///
+    /// It was called `effective_max_fuel` until 2026-09-03, and that name
+    /// asserted a finality it reads only two of the three inputs for.
+    /// `ParallelWorkflowEngine::resolve_node_max_fuel` computes
+    /// `baseline.max(learned).min(max_fuel_per_node)`, so the enforced value
+    /// diverges from this one in BOTH directions:
+    ///
+    /// * **UP** — adaptive fuel (`talos_engine::adaptive_fuel`) applies a
+    ///   learned p95/max-derived ceiling as a FLOOR. Measured on the live
+    ///   database: `pa-daily-brief/gmail` is configured at 2_020_000 and ran
+    ///   under enforced ceilings up to 4_264_652.
+    /// * **DOWN** — the engine-wide `max_fuel_per_node` clamp (default 50M)
+    ///   caps a larger configured value.
+    ///
+    /// Neither input is derivable from configuration: the learned floor is a
+    /// function of a sliding 30-day history and DECAYS as big runs age out (the
+    /// same node's enforced ceiling fell back to its configured 2_020_000 on
+    /// 2026-08-21), and it is absent entirely below `MIN_SAMPLES`. So a caller
+    /// that wants what actually ran must read `execution_cost_rollup.max_fuel`
+    /// — the worker's own `__fuel_limit__` stamp — and treat THIS value as the
+    /// configured baseline it is. See `AnalyticsRepository::get_node_fuel_headroom`.
     #[must_use]
-    pub fn effective_max_fuel(&self) -> Option<i64> {
+    pub fn configured_max_fuel(&self) -> Option<i64> {
         self.node_max_fuel.or(self.module_max_fuel)
     }
 
@@ -6696,16 +6719,16 @@ mod fuel_blindspot_tests {
     #[test]
     fn the_node_override_wins_and_only_its_absence_inherits() {
         assert_eq!(
-            budget(Some(12_000_000), Some(1_000_000)).effective_max_fuel(),
+            budget(Some(12_000_000), Some(1_000_000)).configured_max_fuel(),
             Some(12_000_000)
         );
         assert!(!budget(Some(12_000_000), Some(1_000_000)).inherits_module_default());
         assert_eq!(
-            budget(None, Some(1_000_000)).effective_max_fuel(),
+            budget(None, Some(1_000_000)).configured_max_fuel(),
             Some(1_000_000)
         );
         assert!(budget(None, Some(1_000_000)).inherits_module_default());
-        assert_eq!(budget(None, None).effective_max_fuel(), None);
+        assert_eq!(budget(None, None).configured_max_fuel(), None);
     }
 
     /// SOURCE pin: the headroom DETECTOR must not require a

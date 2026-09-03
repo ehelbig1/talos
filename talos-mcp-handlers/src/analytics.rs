@@ -6664,31 +6664,21 @@ async fn handle_get_fuel_usage_report(
     // `mark_derived`-ed into the ledger too rather than left beside it, because
     // a response asserting `measurement.complete: true` next to a populated
     // `high_utilisation_error` would be two surfaces contradicting each other.
+    const HEADROOM_ROW_CAP: i64 = 200;
     let mut readings = talos_measurement::Readings::new();
-    let (high_utilisation_nodes, high_utilisation_error) = match state
+    // The SAME read serves two sections. `high_utilisation_nodes` keeps the
+    // >=80% filter it always had; the full row set is also the only source of
+    // ENFORCED ceilings — the worker's own `__fuel_limit__` stamp — which the
+    // divergence section below needs because a configured ceiling is not what
+    // a dispatch runs under (adaptive fuel raises it, `max_fuel_per_node`
+    // clamps it). One query, two consumers: a second query for the same rows
+    // would only invite the two sections to disagree.
+    let (headroom_rows, high_utilisation_error) = match state
         .analytics_repo
-        .get_node_fuel_headroom(Some(user_id), 30, 200)
+        .get_node_fuel_headroom(Some(user_id), 30, HEADROOM_ROW_CAP)
         .await
     {
-        Ok(rows) => (
-            rows.iter()
-                .filter(|r| r.utilisation() >= HIGH_UTILISATION_THRESHOLD)
-                .map(|r| {
-                    serde_json::json!({
-                        "workflow_id": r.workflow_id,
-                        "workflow_name": r.workflow_name,
-                        "node": r.node_label,
-                        "samples": r.samples,
-                        "peak_fuel": r.peak_fuel,
-                        "enforced_ceiling": r.current_ceiling,
-                        "utilization_pct": talos_analytics_repository::format_percent(
-                            r.utilisation() * 100.0,
-                        ),
-                    })
-                })
-                .collect::<Vec<_>>(),
-            None,
-        ),
+        Ok(rows) => (rows, None),
         Err(e) => {
             tracing::error!(
                 target: "talos_analytics",
@@ -6697,6 +6687,13 @@ async fn handle_get_fuel_usage_report(
                 "get_fuel_usage_report: per-node headroom query failed"
             );
             readings.mark_derived("high_utilisation_nodes");
+            // The divergence section still renders — it is graph-derived and
+            // does not need this read — but every one of its `starved_sibling`
+            // verdicts falls back to configuration alone, so the ledger has to
+            // say so. Without this the response would claim "complete: every
+            // field in this report was measured" beside verdicts computed as if
+            // no enforced evidence existed.
+            readings.mark_derived("node_ceiling_divergence.observed_enforced_ceiling");
             (
                 Vec::new(),
                 Some(
@@ -6707,6 +6704,26 @@ async fn handle_get_fuel_usage_report(
             )
         }
     };
+    let enforced_evidence = enforced_evidence_from_headroom(&headroom_rows);
+    let enforced_evidence_coverage =
+        talos_measurement::Coverage::new(headroom_rows.len() as i64, HEADROOM_ROW_CAP);
+    let high_utilisation_nodes: Vec<serde_json::Value> = headroom_rows
+        .iter()
+        .filter(|r| r.utilisation() >= HIGH_UTILISATION_THRESHOLD)
+        .map(|r| {
+            serde_json::json!({
+                "workflow_id": r.workflow_id,
+                "workflow_name": r.workflow_name,
+                "node": r.node_label,
+                "samples": r.samples,
+                "peak_fuel": r.peak_fuel,
+                "enforced_ceiling": r.current_ceiling,
+                "utilization_pct": talos_analytics_repository::format_percent(
+                    r.utilisation() * 100.0,
+                ),
+            })
+        })
+        .collect();
 
     // ── Nodes that ALREADY DIED of fuel exhaustion ──────────────────────
     //
@@ -6784,12 +6801,20 @@ async fn handle_get_fuel_usage_report(
     // invisible to the per-module section by construction — it groups by
     // `modules.id`, so the starved node and the well-provisioned one collapse
     // into one averaged number.
-    let divergences = detect_ceiling_divergence(&node_budgets);
+    let divergences = detect_ceiling_divergence(&node_budgets, &enforced_evidence);
     let node_ceiling_divergence: Vec<serde_json::Value> =
         divergences.iter().map(CeilingDivergence::to_json).collect();
     let starved_nodes = divergences
         .iter()
         .filter(|d| d.has_starved_sibling())
+        .count();
+    // Counted separately so a suppression is VISIBLE. If these two differ, some
+    // module is starved-by-configuration but currently covered by an adaptive
+    // floor — a state that lapses on its own as the floor decays, with no
+    // config change to notice.
+    let starved_by_config_shape = divergences
+        .iter()
+        .filter(|d| d.starved_config_shape())
         .count();
 
     let mut result = serde_json::json!({
@@ -6807,6 +6832,13 @@ async fn handle_get_fuel_usage_report(
             "fuel_exhaustion_deaths": fuel_exhaustion_deaths.len(),
             "modules_with_divergent_node_ceilings": node_ceiling_divergence.len(),
             "nodes_starved_at_the_module_default": starved_nodes,
+            // >= starved_nodes. The difference is the modules whose narrowest
+            // node inherits the module default but is currently running under a
+            // HIGHER adaptive-fuel floor. They are suppressed above because
+            // they are not at risk today; they are counted here because the
+            // floor is history-derived and decays, so nothing about the
+            // configuration has been fixed.
+            "nodes_starved_at_the_module_default_by_configuration": starved_by_config_shape,
         },
         "at_risk": at_risk,
         "over_provisioned": over_provisioned,
@@ -6854,6 +6886,18 @@ async fn handle_get_fuel_usage_report(
              running the SAME module carries a much larger per-node override. The \
              per-module sections above cannot express this — they group by module id, so \
              the starved node and the well-provisioned one collapse into one average. \
+             CONFIGURED vs ENFORCED: `configured_max_fuel` (and min/max_configured_ceiling) \
+             is what the graph and the module row say. It is NOT what a dispatch runs \
+             under — the engine resolves max(configured, adaptive-fuel learned floor) \
+             clamped to max_fuel_per_node — so each node also carries \
+             `observed_enforced_ceiling`, the worker's own __fuel_limit__ stamp from its \
+             most recent run. A null there means the node has not run inside the 30-day \
+             window, NOT that the configured value was in force. `starved_sibling` is \
+             SUPPRESSED where that evidence refutes it (the enforced ceiling is higher); \
+             `starved_sibling_config_shape` keeps the unsuppressed configuration fact, and \
+             `starved_sibling_basis` names which of the two the verdict rests on. A \
+             suppression can lapse with no config change: the learned floor is computed \
+             from a sliding 30-day history and decays as large runs age out of it. \
              CLAUDE.md: 'ALWAYS set explicit max_fuel on every workflow node.'",
         "blind_spots": {
             "rollup_sections_cannot_see_a_killed_node": true,
@@ -6874,6 +6918,20 @@ async fn handle_get_fuel_usage_report(
                      is not evidence that nothing diverged",
             });
         }
+    }
+    if enforced_evidence_coverage.truncated() {
+        // A capped evidence read makes every ABSENT `observed_enforced_ceiling`
+        // ambiguous: the node may simply not have been read. Say so, because a
+        // null that means "not read" and a null that means "has not run" lead
+        // to opposite actions.
+        result["node_ceiling_divergence_enforced_evidence_coverage"] = serde_json::json!({
+            "pairs_read": enforced_evidence_coverage.returned,
+            "cap": enforced_evidence_coverage.cap,
+            "note": enforced_evidence_coverage.note(),
+            "consequence": "a null observed_enforced_ceiling below may mean the pair was not \
+                 read rather than that the node has not run, so an unsuppressed \
+                 starved_sibling here may lack evidence it would otherwise have had",
+        });
     }
     readings.attach(&mut result);
 
@@ -6896,13 +6954,48 @@ const FUEL_DEATH_MIN_DAYS: i32 = 30;
 /// report, so under-reading them is the failure mode to avoid.
 const FUEL_DEATH_LIMIT: i64 = 200;
 
+/// What a worker actually enforced for one `(workflow, node)` pair.
+///
+/// The counterweight to every configured number in this section. A configured
+/// ceiling is what the graph and the module row say; this is
+/// `execution_cost_rollup.max_fuel` — the worker's own `__fuel_limit__` stamp —
+/// so it already contains the adaptive-fuel learned floor and the engine-wide
+/// `max_fuel_per_node` clamp that no configuration read can see.
+///
+/// Absence is not zero and not agreement: a node that has not run inside the
+/// headroom window has no entry here at all, and the report must say so rather
+/// than assume its configured ceiling was the one in force.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EnforcedObservation {
+    /// `max_fuel` from the node's most recent row in the window.
+    pub(crate) enforced_ceiling: i64,
+    /// `MAX(fuel_consumed)` over the window.
+    pub(crate) peak_fuel: i64,
+    /// Rows in the window. Reported so an operator can weigh the evidence.
+    pub(crate) runs: i64,
+}
+
+/// One graph node inside a divergence, with its configured budget and — when it
+/// has run — the budget a worker actually enforced.
+#[derive(Debug, Clone)]
+pub(crate) struct DivergenceNode {
+    workflow: String,
+    node: String,
+    /// The CONFIGURED ceiling: the node's `data.max_fuel` override, else the
+    /// module row. Named for what it is; it was called the "effective" ceiling
+    /// until 2026-09-03, which asserted a finality it reads two of three inputs
+    /// for (see [`EnforcedObservation`]).
+    configured_ceiling: i64,
+    inherits: bool,
+    observed: Option<EnforcedObservation>,
+}
+
 /// One module whose nodes do not agree on how much fuel they get.
 #[derive(Debug, Clone)]
 pub(crate) struct CeilingDivergence {
     module_id: uuid::Uuid,
     module_name: String,
-    /// `(workflow name, node id, effective ceiling, inherits the module default)`
-    nodes: Vec<(String, String, i64, bool)>,
+    nodes: Vec<DivergenceNode>,
     min_ceiling: i64,
     max_ceiling: i64,
 }
@@ -6914,10 +7007,80 @@ impl CeilingDivergence {
     /// it is the absence of one, and a sibling's much larger override is
     /// evidence that the considered budget is far bigger.
     pub(crate) fn has_starved_sibling(&self) -> bool {
+        self.starved_config_shape() && !self.starved_shape_contradicted()
+    }
+
+    /// The CONFIGURATION shape alone — no execution evidence consulted.
+    ///
+    /// Kept separate from [`Self::has_starved_sibling`] because the two answer
+    /// different questions and the report emits both: this one is "was this
+    /// node ever sized", which is a fact about the graph and is true whether or
+    /// not the node is currently at risk.
+    pub(crate) fn starved_config_shape(&self) -> bool {
         self.nodes
             .iter()
-            .any(|(_, _, ceiling, inherits)| *inherits && *ceiling == self.min_ceiling)
+            .any(|n| n.inherits && n.configured_ceiling == self.min_ceiling)
             && self.max_ceiling > self.min_ceiling
+    }
+
+    /// True when observed evidence REFUTES the starvation reading — i.e. every
+    /// min-ceiling inheriting node has actually run under a ceiling STRICTLY
+    /// GREATER than the one it is configured with, because adaptive fuel raised
+    /// it.
+    ///
+    /// # Why the bar is this high
+    ///
+    /// The learned floor is not a property of the configuration, it is a
+    /// function of a sliding 30-day history, and it DECAYS. Measured on the
+    /// live database 2026-09-03: `pa-daily-brief/gmail` is configured at
+    /// 2_020_000, ran under enforced ceilings up to 4_264_652 between
+    /// 2026-07-09 and 2026-08-20, and then fell back to exactly 2_020_000 for
+    /// every run since 2026-08-21 — the 2026-07-22 peak (2_209_030, whose
+    /// ×1.3 is the 2_871_739 enforced on 2026-08-20) aged out of the window and
+    /// the floor stopped binding. Its all-time peak is 109% of the ceiling now
+    /// in force, so it is a TRUE positive and must stay flagged.
+    ///
+    /// So the refutation is keyed on the MOST RECENT enforced ceiling, never on
+    /// "adaptive raised it at some point", and a node with no evidence is never
+    /// refuted — absence of evidence is not evidence of coverage.
+    pub(crate) fn starved_shape_contradicted(&self) -> bool {
+        let mut saw_one = false;
+        for n in &self.nodes {
+            if !(n.inherits && n.configured_ceiling == self.min_ceiling) {
+                continue;
+            }
+            saw_one = true;
+            match n.observed {
+                Some(o) if o.enforced_ceiling > n.configured_ceiling => {}
+                _ => return false,
+            }
+        }
+        saw_one
+    }
+
+    /// One phrase naming what the `starved_sibling` verdict rests on, so the
+    /// boolean is never read without its basis.
+    pub(crate) fn starved_sibling_basis(&self) -> &'static str {
+        if !self.starved_config_shape() {
+            return "not applicable: the narrowest ceiling is a deliberate override, not an \
+                    inherited module default";
+        }
+        if self.starved_shape_contradicted() {
+            return "SUPPRESSED: the narrowest node inherits the module default, but the ceiling \
+                    a worker most recently ENFORCED for it is higher — adaptive fuel is \
+                    currently raising it. The learned floor decays as large runs age out of \
+                    its 30-day window, so this suppression can lapse without any config change";
+        }
+        if self
+            .nodes
+            .iter()
+            .any(|n| n.inherits && n.configured_ceiling == self.min_ceiling && n.observed.is_some())
+        {
+            return "CONFIRMED by execution evidence: the narrowest node inherits the module \
+                    default and the ceiling a worker most recently enforced for it is no higher";
+        }
+        "configuration only: the narrowest node inherits the module default and has NOT run \
+         inside the 30-day enforced-ceiling window, so nothing refutes or confirms it"
     }
 
     /// Ratio of the widest to the narrowest ceiling among this module's nodes.
@@ -6943,20 +7106,79 @@ impl CeilingDivergence {
         serde_json::json!({
             "module_id": self.module_id,
             "module_name": self.module_name,
-            "min_effective_ceiling": self.min_ceiling,
-            "max_effective_ceiling": self.max_ceiling,
+            "min_configured_ceiling": self.min_ceiling,
+            "max_configured_ceiling": self.max_ceiling,
             "spread_ratio": self.spread(),
             "starved_sibling": self.has_starved_sibling(),
-            "nodes": self.nodes.iter().map(|(wf, node, ceiling, inherits)| {
+            "starved_sibling_config_shape": self.starved_config_shape(),
+            "starved_sibling_basis": self.starved_sibling_basis(),
+            "nodes": self.nodes.iter().map(|n| {
                 serde_json::json!({
-                    "workflow": wf,
-                    "node": node,
-                    "effective_max_fuel": ceiling,
-                    "inherits_module_default": inherits,
+                    "workflow": n.workflow,
+                    "node": n.node,
+                    "configured_max_fuel": n.configured_ceiling,
+                    "inherits_module_default": n.inherits,
+                    // The ceiling a worker most recently ENFORCED, and the peak
+                    // it consumed under it. null means the node has not run
+                    // inside the 30-day window — NOT that the configured value
+                    // was in force.
+                    "observed_enforced_ceiling": n.observed.map(|o| o.enforced_ceiling),
+                    "observed_peak_fuel": n.observed.map(|o| o.peak_fuel),
+                    "observed_runs": n.observed.map(|o| o.runs),
+                    // Peak against what was actually enforced. >100% is not
+                    // possible for a completed run under the ceiling in force,
+                    // so a value near or above 100 means the ceiling has since
+                    // been LOWERED — which is exactly what happens when an
+                    // adaptive floor decays out from under a node.
+                    "observed_peak_pct_of_enforced": n.observed.and_then(|o| {
+                        (o.enforced_ceiling > 0).then(|| {
+                            talos_analytics_repository::format_percent(
+                                (o.peak_fuel as f64 / o.enforced_ceiling as f64) * 100.0,
+                            )
+                        })
+                    }),
                 })
             }).collect::<Vec<_>>(),
         })
     }
+}
+
+/// Enforced-ceiling evidence keyed by the pair a rollup row identifies.
+pub(crate) type EnforcedEvidence =
+    std::collections::HashMap<(uuid::Uuid, String), EnforcedObservation>;
+
+/// Index the headroom rows by the key a [`NodeBudgetRow`] can be looked up
+/// under.
+///
+/// [`NodeBudgetRow`]: talos_analytics_repository::NodeBudgetRow
+///
+/// # Why this is a named function and not an inline `.map()`
+///
+/// The join is `(workflow_id, node label)`, and the two sides spell the label
+/// differently: the graph side calls it `node_id` (the graph node id) and the
+/// rollup side calls it `node_label`. They ARE the same string — the engine
+/// dispatches under the graph node id and writes it into
+/// `execution_cost_rollup.node_id` — but nothing in the type system says so, and
+/// a key mismatch here fails SILENTLY: every lookup misses, every
+/// `observed_enforced_ceiling` renders null, and the report reads exactly like
+/// a fleet where no node has ever run. Extracted so the join is exercised by a
+/// test over both real row types rather than over a hand-built map that could
+/// agree with a wrong key.
+pub(crate) fn enforced_evidence_from_headroom(
+    rows: &[talos_analytics_repository::NodeFuelHeadroom],
+) -> EnforcedEvidence {
+    rows.iter()
+        .map(|r| {
+            (
+                (r.workflow_id, r.node_label.clone()),
+                EnforcedObservation {
+                    enforced_ceiling: r.current_ceiling,
+                    peak_fuel: r.peak_fuel,
+                    runs: r.samples,
+                },
+            )
+        })
+        .collect()
 }
 
 /// Group graph nodes by module and keep the modules whose nodes disagree about
@@ -6967,8 +7189,15 @@ impl CeilingDivergence {
 /// a module row) is EXCLUDED rather than treated as zero: nothing in the
 /// database says what limit it runs under, and inventing one would manufacture
 /// a divergence.
+///
+/// `evidence` carries what a worker actually enforced per `(workflow_id, node
+/// label)`. It is CONSULTED, never SUBSTITUTED: the divergence is still
+/// computed from configuration, because that is the question this section
+/// answers and because a node with no history has no evidence to substitute.
+/// An empty map reproduces the pre-2026-09-03 output modulo the renamed keys.
 pub(crate) fn detect_ceiling_divergence(
     rows: &[talos_analytics_repository::NodeBudgetRow],
+    evidence: &EnforcedEvidence,
 ) -> Vec<CeilingDivergence> {
     let mut by_module: std::collections::HashMap<uuid::Uuid, CeilingDivergence> =
         std::collections::HashMap::new();
@@ -6976,7 +7205,7 @@ pub(crate) fn detect_ceiling_divergence(
         // A ceiling that is unknown OR non-positive is dropped, not defaulted:
         // nothing in the database says what limit such a node runs under, and
         // inventing one would manufacture a divergence.
-        let Some(ceiling) = row.effective_max_fuel().filter(|c| *c > 0) else {
+        let Some(ceiling) = row.configured_max_fuel().filter(|c| *c > 0) else {
             continue;
         };
         let entry = by_module
@@ -6990,12 +7219,15 @@ pub(crate) fn detect_ceiling_divergence(
             });
         entry.min_ceiling = entry.min_ceiling.min(ceiling);
         entry.max_ceiling = entry.max_ceiling.max(ceiling);
-        entry.nodes.push((
-            row.workflow_name.clone(),
-            row.node_id.clone(),
-            ceiling,
-            row.inherits_module_default(),
-        ));
+        entry.nodes.push(DivergenceNode {
+            workflow: row.workflow_name.clone(),
+            node: row.node_id.clone(),
+            configured_ceiling: ceiling,
+            inherits: row.inherits_module_default(),
+            observed: evidence
+                .get(&(row.workflow_id, row.node_id.clone()))
+                .copied(),
+        });
     }
     let mut out: Vec<CeilingDivergence> = by_module
         .into_values()
@@ -7004,9 +7236,10 @@ pub(crate) fn detect_ceiling_divergence(
     for d in &mut out {
         // Narrowest first, so the node at risk is the one an operator reads.
         d.nodes.sort_by(|a, b| {
-            a.2.cmp(&b.2)
-                .then_with(|| a.0.cmp(&b.0))
-                .then_with(|| a.1.cmp(&b.1))
+            a.configured_ceiling
+                .cmp(&b.configured_ceiling)
+                .then_with(|| a.workflow.cmp(&b.workflow))
+                .then_with(|| a.node.cmp(&b.node))
         });
     }
     // Widest spread first; `module_id` is the unique tiebreaker so the order is
@@ -9366,8 +9599,11 @@ mod trigger_completeness_disclosure_tests {
 
 #[cfg(test)]
 mod fuel_report_blindspot_tests {
-    use super::{detect_ceiling_divergence, CeilingDivergence, FUEL_DEATH_MIN_DAYS};
-    use talos_analytics_repository::NodeBudgetRow;
+    use super::{
+        detect_ceiling_divergence, enforced_evidence_from_headroom, CeilingDivergence,
+        EnforcedEvidence, EnforcedObservation, FUEL_DEATH_MIN_DAYS,
+    };
+    use talos_analytics_repository::{NodeBudgetRow, NodeFuelHeadroom};
     use uuid::Uuid;
 
     fn node(
@@ -9389,6 +9625,39 @@ mod fuel_report_blindspot_tests {
         }
     }
 
+    /// Same as [`node`] but with a caller-chosen workflow id, so a test can key
+    /// enforced evidence to the row it describes.
+    fn node_in(
+        wf_id: Uuid,
+        module: Uuid,
+        module_name: &str,
+        wf: &str,
+        node_id: &str,
+        node_max: Option<i64>,
+        module_max: Option<i64>,
+    ) -> NodeBudgetRow {
+        NodeBudgetRow {
+            workflow_id: wf_id,
+            ..node(module, module_name, wf, node_id, node_max, module_max)
+        }
+    }
+
+    fn evidence(entries: &[(Uuid, &str, i64, i64, i64)]) -> EnforcedEvidence {
+        entries
+            .iter()
+            .map(|(wf, node, enforced, peak, runs)| {
+                (
+                    (*wf, (*node).to_string()),
+                    EnforcedObservation {
+                        enforced_ceiling: *enforced,
+                        peak_fuel: *peak,
+                        runs: *runs,
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// THE incident, as data. One module, two nodes: one carries a 12M override,
     /// the other declares nothing and inherits the 1M module row. The node that
     /// died was the second one, and no per-module aggregate can say so because
@@ -9407,17 +9676,284 @@ mod fuel_report_blindspot_tests {
             ),
             node(m, "shared", "workflow-b", "recall", None, Some(1_000_000)),
         ];
-        let out = detect_ceiling_divergence(&rows);
+        let out = detect_ceiling_divergence(&rows, &EnforcedEvidence::new());
         assert_eq!(out.len(), 1);
         assert!(out[0].has_starved_sibling());
         let json = out[0].to_json();
-        assert_eq!(json["min_effective_ceiling"], 1_000_000);
-        assert_eq!(json["max_effective_ceiling"], 12_000_000);
+        assert_eq!(json["min_configured_ceiling"], 1_000_000);
+        assert_eq!(json["max_configured_ceiling"], 12_000_000);
         assert_eq!(json["spread_ratio"], 12.0);
         assert_eq!(json["starved_sibling"], true);
         // Narrowest first — the node at risk is the one an operator reads.
         assert_eq!(json["nodes"][0]["workflow"], "workflow-b");
         assert_eq!(json["nodes"][0]["inherits_module_default"], true);
+    }
+
+    /// The graph side and the rollup side must actually JOIN.
+    ///
+    /// They spell the same string differently — `NodeBudgetRow::node_id` (the
+    /// graph node id) vs `NodeFuelHeadroom::node_label` (what the engine wrote
+    /// into `execution_cost_rollup.node_id`) — and a mismatch fails silently:
+    /// every lookup misses, every `observed_enforced_ceiling` is null, and the
+    /// report is indistinguishable from a fleet where nothing has ever run.
+    /// Driven over both PRODUCTION row types rather than a hand-built map,
+    /// which could agree with a wrong key.
+    #[test]
+    fn a_headroom_row_joins_to_the_graph_node_it_describes() {
+        let m = Uuid::new_v4();
+        let wf = Uuid::new_v4();
+        let rows = vec![
+            node(
+                m,
+                "shared",
+                "workflow-a",
+                "recall",
+                Some(12_000_000),
+                Some(1_000_000),
+            ),
+            node_in(
+                wf,
+                m,
+                "shared",
+                "pa-daily-brief",
+                "gmail",
+                None,
+                Some(1_000_000),
+            ),
+        ];
+        let headroom = vec![NodeFuelHeadroom {
+            workflow_id: wf,
+            workflow_name: "pa-daily-brief".into(),
+            node_label: "gmail".into(),
+            samples: 55,
+            peak_fuel: 2_209_030,
+            current_ceiling: 4_264_652,
+        }];
+        let out = detect_ceiling_divergence(&rows, &enforced_evidence_from_headroom(&headroom));
+        let json = out[0].to_json();
+        assert_eq!(
+            json["nodes"][0]["observed_enforced_ceiling"], 4_264_652,
+            "the headroom row must reach the graph node it describes"
+        );
+        assert_eq!(json["nodes"][0]["observed_runs"], 55);
+        // …and the evidence must actually change the verdict, or the join is
+        // decorative.
+        assert_eq!(json["starved_sibling"], false);
+    }
+
+    /// A CONFIGURED ceiling is not the ceiling a dispatch enforces, and the
+    /// report must not name it as if it were.
+    ///
+    /// `ParallelWorkflowEngine::resolve_node_max_fuel` computes
+    /// `baseline.max(learned).min(max_fuel_per_node)`. This section reads only
+    /// the baseline, so every number it emits is configuration. Until
+    /// 2026-09-03 it emitted them under `effective_max_fuel` /
+    /// `min_effective_ceiling` / `max_effective_ceiling` and carried no
+    /// enforced evidence at all — a field whose name asserts finality it has
+    /// two of three inputs for.
+    #[test]
+    fn configured_and_enforced_ceilings_are_named_separately() {
+        let m = Uuid::new_v4();
+        let wf_b = Uuid::new_v4();
+        let rows = vec![
+            node(
+                m,
+                "shared",
+                "workflow-a",
+                "recall",
+                Some(12_000_000),
+                Some(1_000_000),
+            ),
+            node_in(
+                wf_b,
+                m,
+                "shared",
+                "workflow-b",
+                "recall",
+                None,
+                Some(1_000_000),
+            ),
+        ];
+        let ev = evidence(&[(wf_b, "recall", 3_000_000, 900_000, 7)]);
+        let out = detect_ceiling_divergence(&rows, &ev);
+        let json = out[0].to_json();
+
+        // The configured numbers say so in their names.
+        assert_eq!(json["min_configured_ceiling"], 1_000_000);
+        assert_eq!(json["max_configured_ceiling"], 12_000_000);
+        assert_eq!(json["nodes"][0]["configured_max_fuel"], 1_000_000);
+        // …and the finality-asserting spellings are gone, not aliased. An alias
+        // would let a reader keep the wrong mental model.
+        assert!(json.get("min_effective_ceiling").is_none());
+        assert!(json.get("max_effective_ceiling").is_none());
+        assert!(json["nodes"][0].get("effective_max_fuel").is_none());
+
+        // The ENFORCED evidence is present and is a different number.
+        assert_eq!(json["nodes"][0]["observed_enforced_ceiling"], 3_000_000);
+        assert_eq!(json["nodes"][0]["observed_peak_fuel"], 900_000);
+        assert_eq!(json["nodes"][0]["observed_runs"], 7);
+        assert_eq!(json["nodes"][0]["observed_peak_pct_of_enforced"], 30.0);
+    }
+
+    /// The false positive this change exists to remove: a node inheriting the
+    /// module default that adaptive fuel is CURRENTLY raising is not starved,
+    /// and the pre-failure detector must not cry wolf about it.
+    #[test]
+    fn a_live_adaptive_floor_suppresses_the_starved_flag() {
+        let m = Uuid::new_v4();
+        let wf_b = Uuid::new_v4();
+        let rows = vec![
+            node(
+                m,
+                "shared",
+                "workflow-a",
+                "recall",
+                Some(12_000_000),
+                Some(1_000_000),
+            ),
+            node_in(
+                wf_b,
+                m,
+                "shared",
+                "workflow-b",
+                "recall",
+                None,
+                Some(1_000_000),
+            ),
+        ];
+        // Configured 1M, most recently ENFORCED 4M — adaptive is raising it.
+        let ev = evidence(&[(wf_b, "recall", 4_000_000, 900_000, 12)]);
+        let out = detect_ceiling_divergence(&rows, &ev);
+        assert!(
+            !out[0].has_starved_sibling(),
+            "evidence that the enforced ceiling is higher must suppress the flag"
+        );
+        // …but the configuration fact is NOT erased. The node still has no
+        // considered budget; it is merely not at risk today.
+        assert!(out[0].starved_config_shape());
+        let json = out[0].to_json();
+        assert_eq!(json["starved_sibling"], false);
+        assert_eq!(json["starved_sibling_config_shape"], true);
+        assert!(json["starved_sibling_basis"]
+            .as_str()
+            .unwrap()
+            .starts_with("SUPPRESSED"));
+    }
+
+    /// THE live case, as data — `pa-daily-brief/gmail` on 2026-09-03.
+    ///
+    /// Configured 2_020_000 (module row, no override) beside siblings at
+    /// 14_000_000. Adaptive DID raise it, to 4_264_652, between 2026-07-09 and
+    /// 2026-08-20 — and then let go: every run since 2026-08-21 enforced
+    /// exactly 2_020_000, because the 2026-07-22 peak of 2_209_030 aged out of
+    /// the learned floor's 30-day window. Its all-time peak is 109% of the
+    /// ceiling now in force.
+    ///
+    /// So the suppression must key on the MOST RECENT enforced ceiling, never
+    /// on "adaptive raised it at some point": this node is a TRUE positive and
+    /// must stay flagged.
+    #[test]
+    fn a_decayed_adaptive_floor_does_not_suppress_the_flag() {
+        let m = Uuid::new_v4();
+        let wf = Uuid::new_v4();
+        let rows = vec![
+            node(
+                m,
+                "Gmail: List Messages",
+                "pa-inbox-triage",
+                "fetch_mail",
+                Some(14_000_000),
+                Some(2_020_000),
+            ),
+            node_in(
+                wf,
+                m,
+                "Gmail: List Messages",
+                "pa-daily-brief",
+                "gmail",
+                None,
+                Some(2_020_000),
+            ),
+        ];
+        let ev = evidence(&[(wf, "gmail", 2_020_000, 2_209_030, 55)]);
+        let out = detect_ceiling_divergence(&rows, &ev);
+        assert!(
+            out[0].has_starved_sibling(),
+            "an enforced ceiling equal to the configured one refutes nothing"
+        );
+        let json = out[0].to_json();
+        assert_eq!(json["starved_sibling"], true);
+        assert!(json["starved_sibling_basis"]
+            .as_str()
+            .unwrap()
+            .starts_with("CONFIRMED"));
+        // Peak above 100% of the ceiling in force is the tell that the ceiling
+        // was LOWERED under this node — exactly what a decaying floor does.
+        assert_eq!(json["nodes"][0]["observed_peak_pct_of_enforced"], 109.4);
+    }
+
+    /// Absence of evidence is not evidence of coverage. A node that has not run
+    /// inside the enforced-ceiling window keeps its flag, and its observed
+    /// fields are null rather than backfilled from the configured value —
+    /// which would be the defect wearing the fix's clothes.
+    #[test]
+    fn a_node_with_no_enforced_evidence_is_never_suppressed() {
+        let m = Uuid::new_v4();
+        let rows = vec![
+            node(
+                m,
+                "shared",
+                "workflow-a",
+                "recall",
+                Some(12_000_000),
+                Some(1_000_000),
+            ),
+            node(m, "shared", "workflow-b", "recall", None, Some(1_000_000)),
+        ];
+        let out = detect_ceiling_divergence(&rows, &EnforcedEvidence::new());
+        assert!(out[0].has_starved_sibling());
+        let json = out[0].to_json();
+        assert!(json["nodes"][0]["observed_enforced_ceiling"].is_null());
+        assert!(json["nodes"][0]["observed_peak_pct_of_enforced"].is_null());
+        assert!(json["starved_sibling_basis"]
+            .as_str()
+            .unwrap()
+            .starts_with("configuration only"));
+    }
+
+    /// Two nodes share the narrowest ceiling and only one of them has evidence.
+    /// The module is still flagged: suppressing on a partial refutation would
+    /// hide the node nobody has data for, which is the worse of the two.
+    #[test]
+    fn partial_evidence_does_not_suppress() {
+        let m = Uuid::new_v4();
+        let wf_b = Uuid::new_v4();
+        let rows = vec![
+            node(
+                m,
+                "shared",
+                "workflow-a",
+                "recall",
+                Some(12_000_000),
+                Some(1_000_000),
+            ),
+            node_in(
+                wf_b,
+                m,
+                "shared",
+                "workflow-b",
+                "recall",
+                None,
+                Some(1_000_000),
+            ),
+            node(m, "shared", "workflow-c", "recall", None, Some(1_000_000)),
+        ];
+        let ev = evidence(&[(wf_b, "recall", 9_000_000, 800_000, 30)]);
+        let out = detect_ceiling_divergence(&rows, &ev);
+        assert!(
+            out[0].has_starved_sibling(),
+            "one covered node must not vouch for an uncovered sibling"
+        );
     }
 
     /// Divergence alone is not the alarm. Two nodes that each declare a
@@ -9431,7 +9967,7 @@ mod fuel_report_blindspot_tests {
             node(m, "shared", "a", "n", Some(8_000_000), Some(1_000_000)),
             node(m, "shared", "b", "n", Some(12_000_000), Some(1_000_000)),
         ];
-        let out = detect_ceiling_divergence(&rows);
+        let out = detect_ceiling_divergence(&rows, &EnforcedEvidence::new());
         assert_eq!(out.len(), 1);
         assert!(!out[0].has_starved_sibling());
     }
@@ -9445,7 +9981,7 @@ mod fuel_report_blindspot_tests {
             node(m, "shared", "a", "n", None, Some(1_000_000)),
             node(m, "shared", "b", "n", Some(1_000_000), Some(1_000_000)),
         ];
-        assert!(detect_ceiling_divergence(&rows).is_empty());
+        assert!(detect_ceiling_divergence(&rows, &EnforcedEvidence::new()).is_empty());
     }
 
     /// A node whose ceiling nothing in the database states is DROPPED, not read
@@ -9458,13 +9994,13 @@ mod fuel_report_blindspot_tests {
             node(m, "shared", "a", "n", None, None),
             node(m, "shared", "b", "n", Some(8_000_000), None),
         ];
-        assert!(detect_ceiling_divergence(&rows).is_empty());
+        assert!(detect_ceiling_divergence(&rows, &EnforcedEvidence::new()).is_empty());
         // Same for a non-positive module row.
         let rows = vec![
             node(m, "shared", "a", "n", None, Some(0)),
             node(m, "shared", "b", "n", Some(8_000_000), Some(0)),
         ];
-        assert!(detect_ceiling_divergence(&rows).is_empty());
+        assert!(detect_ceiling_divergence(&rows, &EnforcedEvidence::new()).is_empty());
     }
 
     /// Ranking is widest-spread-first with a UNIQUE tiebreaker, so two runs
@@ -9482,10 +10018,10 @@ mod fuel_report_blindspot_tests {
             node(b, "b", "w", "n3", Some(2_000_000), Some(1_000_000)),
             node(b, "b", "w", "n4", Some(1_000_000), Some(1_000_000)),
         ];
-        let first = detect_ceiling_divergence(&rows);
+        let first = detect_ceiling_divergence(&rows, &EnforcedEvidence::new());
         let mut reversed = rows.clone();
         reversed.reverse();
-        let second = detect_ceiling_divergence(&reversed);
+        let second = detect_ceiling_divergence(&reversed, &EnforcedEvidence::new());
         let ids = |v: &[CeilingDivergence]| {
             v.iter()
                 .map(|d| d.to_json()["module_id"].clone())
