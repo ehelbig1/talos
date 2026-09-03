@@ -543,13 +543,34 @@ pub async fn test_watch_channel_handler(
         .await
     {
         Ok(Some(i)) => i,
-        _ => {
+        Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(ApiResponse::<serde_json::Value> {
                     success: false,
                     data: None,
                     error: Some("Integration not found".into()),
+                }),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            // The pre-fix `_` arm reported a database failure as
+            // "Integration not found". Split it: log the full chain
+            // server-side, return a generic 500 — the same posture the
+            // `get_access_token` arm immediately below already used.
+            tracing::error!(
+                user_id = %user_id,
+                channel_uuid = %channel_uuid,
+                error = %e,
+                "gcp probe: integration lookup failed"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<serde_json::Value> {
+                    success: false,
+                    data: None,
+                    error: Some("Failed to look up integration".into()),
                 }),
             )
                 .into_response();

@@ -65,14 +65,32 @@ pub async fn latest_briefing_handler(
     Extension(secrets_manager): Extension<std::sync::Arc<talos_secrets_manager::SecretsManager>>,
 ) -> impl IntoResponse {
     // 1. Find the briefing workflow
-    let wf_id: Option<Uuid> = sqlx::query_scalar(
+    let wf_id: Option<Uuid> = match sqlx::query_scalar(
         "SELECT id FROM workflows WHERE user_id = $1 AND name = 'daily-morning-briefing' LIMIT 1",
     )
     .bind(user_id)
     .fetch_optional(&db_pool)
     .await
-    .ok()
-    .flatten();
+    {
+        Ok(id) => id,
+        Err(e) => {
+            // `.ok().flatten()` rendered a database failure as
+            // "No briefing workflow found" + "Create a workflow named
+            // 'daily-morning-briefing' first" — a determinate instruction
+            // to build something the user may already have.
+            tracing::error!(%user_id, "latest_briefing_handler: workflow lookup failed: {:#}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html(
+                    "<h1>Could not look up your briefing workflow</h1>\
+                     <p>This is a read failure, not a missing workflow. \
+                     Check controller logs.</p>"
+                        .to_string(),
+                ),
+            )
+                .into_response();
+        }
+    };
 
     let wf_id = match wf_id {
         Some(id) => id,
@@ -107,13 +125,17 @@ pub async fn latest_briefing_handler(
     // read dispatches on `output_data_format` and supplies the same AAD via
     // `decrypt_versioned` — a bare `decrypt_value_by_key` (empty AAD)
     // tag-fails every v1 row written after the 2026-05-28 sweep.
-    let row: Option<(
-        Uuid,
-        Option<serde_json::Value>,
-        Option<Vec<u8>>,
-        Option<Uuid>,
-        i16,
-    )> = sqlx::query_as(
+    #[allow(clippy::type_complexity)]
+    let row: Result<
+        Option<(
+            Uuid,
+            Option<serde_json::Value>,
+            Option<Vec<u8>>,
+            Option<Uuid>,
+            i16,
+        )>,
+        sqlx::Error,
+    > = sqlx::query_as(
         "SELECT id, output_data, output_data_enc, output_enc_key_id, output_data_format \
          FROM workflow_executions \
          WHERE workflow_id = $1 AND user_id = $2 AND status = 'completed' \
@@ -123,9 +145,27 @@ pub async fn latest_briefing_handler(
     .bind(wf_id)
     .bind(user_id)
     .fetch_optional(&db_pool)
-    .await
-    .ok()
-    .flatten();
+    .await;
+    let row = match row {
+        Ok(r) => r,
+        Err(e) => {
+            // Same collapse as the workflow lookup above: pre-fix this
+            // reported a failed read as "No completed briefing found" +
+            // "Run the daily-morning-briefing workflow first", which is a
+            // claim about the user's execution history we had not read.
+            tracing::error!(%user_id, "latest_briefing_handler: execution lookup failed: {:#}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html(
+                    "<h1>Could not look up your latest briefing</h1>\
+                     <p>This is a read failure, not an absent briefing. \
+                     Check controller logs.</p>"
+                        .to_string(),
+                ),
+            )
+                .into_response();
+        }
+    };
 
     let output_json: serde_json::Value = match row {
         Some((exec_id, plaintext, enc_bytes, key_id, output_format)) => {

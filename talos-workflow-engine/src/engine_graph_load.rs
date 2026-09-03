@@ -213,14 +213,23 @@ impl ParallelWorkflowEngine {
         // Async follow-ups: rate-limit pre-load + sub-workflow graph
         // prefetch. Kept out of `parse_graph_document` so the sync entry
         // point doesn't need a runtime.
-        self.preload_rate_limits_and_subflows().await;
+        self.preload_rate_limits_and_subflows().await?;
         Ok(())
     }
 
     /// Async post-parse: batch-load per-module rate limits and
     /// pre-fetch all sub-workflow graphs referenced by system nodes.
     /// Eliminates N+1 queries during node dispatch.
-    async fn preload_rate_limits_and_subflows(&mut self) {
+    /// # Refusal on an unreadable rate-limit set
+    ///
+    /// A `load_rate_limits` failure returns
+    /// [`WorkflowEngineError::RateLimitsUnavailable`] instead of
+    /// leaving the map empty. An empty map is not a degraded answer
+    /// here: `check_rate_limit` reads an absent entry as UNLIMITED, so
+    /// swallowing the failure would run the whole workflow with every
+    /// per-module limit silently switched off, with nothing in the
+    /// execution record to say the control had not run.
+    async fn preload_rate_limits_and_subflows(&mut self) -> Result<(), crate::WorkflowEngineError> {
         if let Some(ref fetcher) = self.module_fetcher {
             let module_ids: Vec<Uuid> = self
                 .node_meta
@@ -231,7 +240,9 @@ impl ParallelWorkflowEngine {
                 .collect();
 
             if !module_ids.is_empty() {
-                let rate_limits = fetcher.load_rate_limits(&module_ids).await;
+                let rate_limits = fetcher.load_rate_limits(&module_ids).await.map_err(|e| {
+                    crate::WorkflowEngineError::RateLimitsUnavailable(e.to_string())
+                })?;
                 for (id, limit) in rate_limits {
                     self.rate_limits.insert(id, limit);
                 }
@@ -244,6 +255,7 @@ impl ParallelWorkflowEngine {
             }
         }
         self.populate_sub_workflow_cache().await;
+        Ok(())
     }
 
     /// Single authoritative synchronous parser for React-Flow graph JSON.

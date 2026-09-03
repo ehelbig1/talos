@@ -47,7 +47,25 @@ pub trait ModuleFetcher: Send + Sync {
     /// rate-limit concept opt out implicitly, and the engine then
     /// performs no rate limiting. A Postgres-backed impl might run a
     /// single `UNION ALL` over its module tables.
-    async fn load_rate_limits(&self, _module_ids: &[Uuid]) -> HashMap<Uuid, i32> {
-        HashMap::new()
+    ///
+    /// # Why this returns `Result` (and an empty map does not mean
+    /// "no limits")
+    ///
+    /// An **absent** entry is read downstream as UNLIMITED:
+    /// `check_rate_limit` does `*self.rate_limits.get(&id)?` and the
+    /// `?` on that `Option` early-returns "dispatch may proceed". So an
+    /// empty map produced by a FAILED read is not a degraded answer, it
+    /// is the removal of an enforcement control the operator explicitly
+    /// configured — and it is indistinguishable, in the map alone, from
+    /// the legitimate "nothing declares a limit" case.
+    ///
+    /// An impl that cannot determine the limits MUST therefore return
+    /// `Err`, never `Ok(empty)`. The engine refuses the graph load on
+    /// `Err` rather than running the workflow with rate limiting
+    /// silently switched off — the same posture as
+    /// `SecretsResolverMissing` and `ModuleFetcherMissing`, which also
+    /// refuse rather than dispatch under a control that is not there.
+    async fn load_rate_limits(&self, _module_ids: &[Uuid]) -> Result<HashMap<Uuid, i32>, BoxError> {
+        Ok(HashMap::new())
     }
 }
