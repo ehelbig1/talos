@@ -391,8 +391,26 @@ async fn dispatch_single_message(
         .await
     {
         Ok(aid) => {
-            // One joined SELECT, fail-OPEN to actor-less Tier-2 on any error
-            // (air-gapped actor stays air-gapped via the egress override).
+            // One joined SELECT, fail-OPEN to actor-less Tier-2 on any error.
+            //
+            // The parenthetical this comment used to carry — "air-gapped actor
+            // stays air-gapped via the egress override" — was FALSE, and the
+            // measurement is worth keeping: the fallback passes `None` for
+            // egress, and `resolve_local_egress_only` reads
+            // `None => matches!(max_llm_tier, Tier1)`, so `(Tier2, _, None)`
+            // derives PUBLIC egress. Three live tier-1 actors rely on exactly
+            // that tier-derived default (`egress_scope IS NULL`). The claim
+            // would hold only for an actor with an EXPLICIT
+            // `egress_scope='local'`, and there are none.
+            //
+            // Currently VACUOUS rather than exploitable: all five call sites
+            // resolve the DEFAULT actor via `resolve_effective_actor(_, None)`,
+            // and that actor is tier2/write, so the fallback grants what it
+            // already has. It becomes live the moment the default actor is
+            // tier-1. Splitting `Ok(None)` (designed, actor-less Tier-2) from
+            // `Err(_)` (a read that failed) is the fix, and it needs a
+            // decision about inbound-push semantics — see
+            // `get_module_bound_ceilings`.
             let (tier, write_ceiling, egress) = actor_repo.get_module_bound_ceilings(aid).await;
             (Some(aid), tier, write_ceiling, egress)
         }

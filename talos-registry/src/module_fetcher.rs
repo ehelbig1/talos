@@ -45,6 +45,23 @@ impl ModuleFetcher for ModuleRegistry {
         .bind(module_ids)
         .fetch_all(&self.db_pool)
         .await
+        .map_err(|e| {
+            // Was a bare `.unwrap_or_default()` with NO log at all: a failed
+            // read produced an empty map, which is indistinguishable from
+            // "no module declares a limit" — so every per-module rate limit
+            // silently vanished for the whole execution. The empty-map
+            // fallback is KEPT (a dispatcher must not die because a limit
+            // lookup blipped) but it is no longer silent.
+            tracing::warn!(
+                target: "talos_rpc",
+                error = %e,
+                module_count = module_ids.len(),
+                "per-module rate-limit lookup failed; this execution runs with \
+                 NO per-module limits — an empty result here is a READ FAILURE, \
+                 not an absence of configured limits"
+            );
+            e
+        })
         .unwrap_or_default();
         rows.into_iter().collect()
     }
