@@ -169,6 +169,16 @@ TESTS=(
     # survey has and the DELETE had lost). Both are SQL properties — a live
     # database is the only thing that can evaluate a WHERE clause.
     "talos-module-repository:preview_action_scope:migrated"
+    # Can user B resolve user A's private module by NAME? `modules.name` is
+    # unique only per user, and the two lookups behind
+    # `plan_and_execute_workflow`'s `module_name` resolution carried no owner
+    # predicate at all — a caller-supplied string became another tenant's
+    # module id (and, through the by-name row read, its description and
+    # required secrets). RLS cannot stand in for the predicate here: the
+    # policy keys on `org_id`, permits when `app.current_org_ids` is unset,
+    # and the app role carries `rolbypassrls`. Every property is a WHERE or
+    # ORDER BY clause, so only a live database can evaluate one.
+    "talos-module-repository:module_lookup_tenancy:migrated"
     "talos-memory:integration:migrated"
     "talos-system-repo:revocation_query:migrated"
 )
