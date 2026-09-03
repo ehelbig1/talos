@@ -3138,10 +3138,40 @@ impl WorkflowValidationService {
     /// even when validation fails, instead of short-circuiting. The caller
     /// (handler) shapes the dry-run JSON response from [`InputSchemaCheck::DryRun`].
     ///
-    /// Database fetch errors degrade to `NoSchema` (logged at error level)
-    /// — matching pre-extraction handler behavior, which intentionally
-    /// allowed triggers to proceed when schema-fetch failed rather than
-    /// rejecting all triggers on a transient DB hiccup.
+    /// **This gate fails CLOSED.** A read that does not come back with a
+    /// definite answer yields [`InputSchemaCheck::Unreadable`] or
+    /// [`InputSchemaCheck::WorkflowNotFound`] — never `NoSchema`. Both are
+    /// refusals the caller must map to an error.
+    ///
+    /// It did not always. Until this change the fetch `Err` arm returned
+    /// `None`, which the match below read as "this workflow declares no
+    /// schema", and the trigger dispatched an UNVALIDATED payload. The
+    /// stated justification was availability: *"rather than rejecting all
+    /// triggers on a transient DB hiccup"*. That justification is refuted
+    /// by this function's own caller. In
+    /// `talos_execution_orchestration::trigger`, the three repository reads
+    /// and the authorization resolve that run BEFORE this one
+    /// (`is_execution_paused`, `get_workflow`, `get_active_version_graph`,
+    /// `resolve_effective_actor`) every one of them returns `Err` to the
+    /// caller on a DB failure. On a transient hiccup the trigger is already
+    /// dead three reads earlier; the availability this arm claimed to buy
+    /// had been spent above it. The read AFTER it in each MCP twin
+    /// (`get_active_version_graph`) fails closed too — so the window this
+    /// arm actually covered was a failure specific to this one query, in
+    /// which the only thing it bought was dispatching input nobody checked.
+    ///
+    /// The `Ok(None)` arm is separated for the same reason: the repository's
+    /// flattening method collapses "no such workflow" into "no schema", and
+    /// a workflow that vanished between step 2 and here is not a workflow
+    /// that declares no schema.
+    ///
+    /// `validate_only=true` requests dry-run mode — the result is returned
+    /// even when validation fails, instead of short-circuiting. The caller
+    /// (handler) shapes the dry-run JSON response from
+    /// [`InputSchemaCheck::DryRun`]. Dry-run does NOT soften the two
+    /// refusals: a dry run that answers "valid, no schema" for a schema it
+    /// could not read tells the operator the payload is safe to send, which
+    /// is the same lie one step earlier.
     pub async fn check_trigger_input(
         workflow_repo: &WorkflowRepository,
         workflow_id: Uuid,
@@ -3149,14 +3179,42 @@ impl WorkflowValidationService {
         trigger_input: &serde_json::Value,
         validate_only: bool,
     ) -> InputSchemaCheck {
-        let input_schema = match workflow_repo
-            .get_workflow_input_schema(workflow_id, user_id)
-            .await
-        {
-            Ok(s) => s,
+        // The three-way read (#730): Err / no-such-workflow / schema-or-not.
+        // Do NOT swap this for the flattening `get_workflow_input_schema` —
+        // that one cannot tell absence of a workflow from absence of a
+        // schema, and nothing outside the repository crate may call it.
+        // The read is passed STRAIGHT into the classifier, with no
+        // intervening binding, so there is nowhere to put an `.ok()`.
+        Self::decide_trigger_input(
+            workflow_repo
+                .get_workflow_input_schema_scoped(workflow_id, user_id)
+                .await,
+            trigger_input,
+            validate_only,
+        )
+    }
+
+    /// The decision half of [`Self::check_trigger_input`], split out so the
+    /// fail-closed mapping is testable without a database. The handler and
+    /// the tests drive THIS function; nothing re-implements the mapping.
+    #[must_use]
+    pub fn decide_trigger_input<E: std::fmt::Display>(
+        read: Result<Option<Option<serde_json::Value>>, E>,
+        trigger_input: &serde_json::Value,
+        validate_only: bool,
+    ) -> InputSchemaCheck {
+        let input_schema = match read {
+            Ok(Some(schema)) => schema,
+            Ok(None) => return InputSchemaCheck::WorkflowNotFound,
             Err(e) => {
-                tracing::error!("get_workflow_input_schema error: {}", e);
-                None
+                tracing::error!(
+                    target: "talos_workflow_validation",
+                    event_kind = "trigger_input_schema_read_failed",
+                    error = %e,
+                    "input-schema read failed — refusing the trigger rather than \
+                     dispatching an unvalidated payload"
+                );
+                return InputSchemaCheck::Unreadable(e.to_string());
             }
         };
 
@@ -3185,11 +3243,27 @@ impl WorkflowValidationService {
 
 /// Trigger-time outcome of [`WorkflowValidationService::check_trigger_input`].
 ///
-/// The variants split into "continue" (NoSchema, Valid), "block" (Invalid),
-/// and "early-return-with-result" (DryRun) buckets — the handler picks a
-/// JSON-RPC response shape per bucket.
+/// The variants split into "continue" (NoSchema, Valid), "block" (Invalid,
+/// Unreadable, WorkflowNotFound), and "early-return-with-result" (DryRun)
+/// buckets — the handler picks a JSON-RPC response shape per bucket.
+///
+/// Only ONE variant means "dispatch without validating", and it is reachable
+/// only from a read that came back saying, definitely, that this workflow
+/// declares no schema. Adding a variant here is deliberately a breaking
+/// change for callers: the single `match` in the orchestration crate is
+/// exhaustive, so a new absence-of-answer case cannot be silently folded
+/// into `NoSchema` by a future edit — it will not compile until someone
+/// decides what it means.
 #[derive(Debug)]
 pub enum InputSchemaCheck {
+    /// The schema read FAILED. We know nothing about this workflow's schema,
+    /// so we cannot know the input is acceptable. Caller must refuse — this
+    /// is NOT `NoSchema`.
+    Unreadable(String),
+    /// The read succeeded and no workflow with that id is visible to the
+    /// caller. Also not `NoSchema`: a workflow that does not exist has not
+    /// told us it accepts anything.
+    WorkflowNotFound,
     /// No `input_schema` is set on the workflow. Triggers proceed; any
     /// input is accepted.
     NoSchema,
@@ -7001,5 +7075,155 @@ mod retry_advice_tests {
         );
         assert_eq!(disabled.budget_secs, 0);
         assert!(disabled.budget_source.contains("DISABLED"));
+    }
+}
+
+#[cfg(test)]
+mod trigger_input_failclosed_tests {
+    use super::{InputSchemaCheck, WorkflowValidationService};
+    use serde_json::json;
+
+    /// The repository read's three-way shape (#730), spelled out so each
+    /// test states which of the three absences it is exercising.
+    type Read = Result<Option<Option<serde_json::Value>>, String>;
+
+    fn unreadable() -> Read {
+        Err("connection closed mid-query".to_string())
+    }
+    fn no_such_workflow() -> Read {
+        Ok(None)
+    }
+    fn exists_no_schema() -> Read {
+        Ok(Some(None))
+    }
+    fn exists_with_schema() -> Read {
+        Ok(Some(Some(json!({
+            "type": "object",
+            "required": ["to"],
+            "properties": { "to": { "type": "string" } }
+        }))))
+    }
+
+    /// THE regression. Pre-fix this arm returned `None`, the match read
+    /// `None` as "no schema declared", and the trigger dispatched a payload
+    /// nothing had checked.
+    #[test]
+    fn a_failed_read_is_not_no_schema() {
+        let out = WorkflowValidationService::decide_trigger_input(unreadable(), &json!({}), false);
+        assert!(
+            matches!(out, InputSchemaCheck::Unreadable(_)),
+            "a failed schema read must refuse, got {out:?}"
+        );
+    }
+
+    /// Dry-run does not soften the refusal. Answering `DryRun{schema:None,
+    /// errors:[]}` renders as "valid — no schema", i.e. advice to send the
+    /// payload, for a schema we never saw.
+    #[test]
+    fn a_failed_read_is_not_a_clean_dry_run() {
+        let out = WorkflowValidationService::decide_trigger_input(unreadable(), &json!({}), true);
+        assert!(
+            matches!(out, InputSchemaCheck::Unreadable(_)),
+            "a dry run over an unreadable schema must refuse, got {out:?}"
+        );
+    }
+
+    /// The repository's FLATTENING method collapses this into the same
+    /// `None` as "no schema". The scoped read keeps them apart and this
+    /// asserts we use the distinction rather than re-flattening it.
+    #[test]
+    fn an_absent_workflow_is_not_no_schema() {
+        for dry in [false, true] {
+            let out = WorkflowValidationService::decide_trigger_input(
+                no_such_workflow(),
+                &json!({}),
+                dry,
+            );
+            assert!(
+                matches!(out, InputSchemaCheck::WorkflowNotFound),
+                "absent workflow (dry={dry}) must refuse, got {out:?}"
+            );
+        }
+    }
+
+    /// 27 of the 28 live workflows are in this state. A definite "this
+    /// workflow declares no schema" still accepts anything — the fix must
+    /// not tighten the ordinary path.
+    #[test]
+    fn a_definite_absence_still_accepts_any_input() {
+        let out =
+            WorkflowValidationService::decide_trigger_input(exists_no_schema(), &json!({}), false);
+        assert!(matches!(out, InputSchemaCheck::NoSchema), "got {out:?}");
+    }
+
+    #[test]
+    fn a_definite_absence_still_gives_the_dry_run_operator_hint() {
+        match WorkflowValidationService::decide_trigger_input(exists_no_schema(), &json!({}), true)
+        {
+            InputSchemaCheck::DryRun { schema, errors } => {
+                assert!(schema.is_none());
+                assert!(errors.is_empty());
+            }
+            other => panic!("expected the pre-existing DryRun hint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_declared_schema_is_still_enforced_both_ways() {
+        let ok = WorkflowValidationService::decide_trigger_input(
+            exists_with_schema(),
+            &json!({"to": "somebody"}),
+            false,
+        );
+        assert!(matches!(ok, InputSchemaCheck::Valid), "got {ok:?}");
+
+        let bad = WorkflowValidationService::decide_trigger_input(
+            exists_with_schema(),
+            &json!({}),
+            false,
+        );
+        match bad {
+            InputSchemaCheck::Invalid(errors) => assert!(!errors.is_empty()),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_declared_schema_dry_run_reports_instead_of_refusing() {
+        match WorkflowValidationService::decide_trigger_input(
+            exists_with_schema(),
+            &json!({}),
+            true,
+        ) {
+            InputSchemaCheck::DryRun { schema, errors } => {
+                assert!(schema.is_some());
+                assert!(!errors.is_empty(), "the dry run must REPORT the failure");
+            }
+            other => panic!("expected DryRun, got {other:?}"),
+        }
+    }
+
+    /// Only ONE outcome means "dispatch without validating anything", and it
+    /// is reachable only from `Ok(Some(None))`. Stated as a test so a future
+    /// variant added to `InputSchemaCheck` has to be classified here too.
+    #[test]
+    fn exactly_one_read_outcome_skips_validation_without_checking() {
+        let reads: Vec<(&str, Read)> = vec![
+            ("read failed", unreadable()),
+            ("no such workflow", no_such_workflow()),
+            ("exists, no schema", exists_no_schema()),
+            ("exists, has schema", exists_with_schema()),
+        ];
+        let skipping: Vec<&str> = reads
+            .into_iter()
+            .filter(|(_, r)| {
+                matches!(
+                    WorkflowValidationService::decide_trigger_input(r.clone(), &json!({}), false),
+                    InputSchemaCheck::NoSchema
+                )
+            })
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(skipping, vec!["exists, no schema"]);
     }
 }

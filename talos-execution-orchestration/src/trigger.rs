@@ -244,8 +244,14 @@ impl ExecutionOrchestrationService {
             };
 
         // 6. Input schema validation. The validation service handles
-        // dry-run vs. dispatch-mode internally; we surface the four
+        // dry-run vs. dispatch-mode internally; we surface the six
         // possible outcomes as typed paths.
+        //
+        // This gate FAILS CLOSED (see `check_trigger_input`). Note that
+        // every read above — steps 1, 2, 3 and the step-4 authorization
+        // resolve — already returns `Err` to our caller on a DB failure, so
+        // an unreadable schema is refused for exactly the same reason and
+        // costs no availability that steps 1-4 had not already spent.
         let validation = talos_workflow_validation::WorkflowValidationService::check_trigger_input(
             &self.workflow_repo,
             workflow_id,
@@ -254,19 +260,8 @@ impl ExecutionOrchestrationService {
             dry_run,
         )
         .await;
-        match validation {
-            talos_workflow_validation::InputSchemaCheck::NoSchema
-            | talos_workflow_validation::InputSchemaCheck::Valid => {}
-            talos_workflow_validation::InputSchemaCheck::Invalid(errors) => {
-                return Err(OrchestrationError::ValidationFailed(errors.join("; ")));
-            }
-            talos_workflow_validation::InputSchemaCheck::DryRun { schema, errors } => {
-                return Ok(TriggerOutcome::DryRun(DryRunResult {
-                    workflow_id,
-                    schema,
-                    errors,
-                }));
-            }
+        if let Some(outcome) = decide_input_schema_outcome(validation, workflow_id)? {
+            return Ok(outcome);
         }
 
         // 7. Input size cap. The replay path enforces the same limit;
@@ -878,6 +873,181 @@ impl ExecutionOrchestrationService {
             },
             trace: None,
         }))
+    }
+}
+
+/// Map the input-schema check onto the trigger's control flow.
+///
+/// * `Ok(None)` — proceed to dispatch.
+/// * `Ok(Some(TriggerOutcome::DryRun(_)))` — return the dry-run result.
+/// * `Err(_)` — REFUSE. Three of the six variants land here.
+///
+/// This lives OUTSIDE `trigger()` on purpose. Inlined in an async method
+/// that needs a repository, a NATS handle and an actor repo, the mapping was
+/// unreachable from any unit test — so a future edit folding `Unreadable`
+/// back into the proceed arm (`Unreadable(_) => {}`, one line, no compiler
+/// complaint) would restore the exact defect this change removes with every
+/// test still green. Mutate this function and `trigger_input_gate_tests`
+/// fails.
+#[must_use]
+pub(crate) fn decide_input_schema_outcome(
+    validation: talos_workflow_validation::InputSchemaCheck,
+    workflow_id: Uuid,
+) -> Result<Option<TriggerOutcome>, OrchestrationError> {
+    use talos_workflow_validation::InputSchemaCheck as Check;
+    match validation {
+        // The ONLY two variants that dispatch without a refusal, and both
+        // required a read that came back with a definite answer.
+        Check::NoSchema | Check::Valid => Ok(None),
+        Check::Invalid(errors) => Err(OrchestrationError::ValidationFailed(errors.join("; "))),
+        // The read failed. `Internal` (not `ValidationFailed`) because the
+        // caller's payload is not at fault and a retry is the right action —
+        // the same class the three reads ABOVE this gate already return on a
+        // DB failure. The MCP/GraphQL layers collapse `Internal` to a generic
+        // message, so no schema or query detail reaches the client.
+        Check::Unreadable(e) => Err(OrchestrationError::Internal(anyhow::anyhow!(
+            "could not read the workflow's input schema, so the trigger input was not \
+             validated: {e}"
+        ))),
+        // Step 2 loaded this workflow moments ago, so reaching here means it
+        // was deleted mid-trigger. Answer the way step 2 would have — never
+        // "it declares no schema".
+        Check::WorkflowNotFound => Err(OrchestrationError::WorkflowNotFound(workflow_id)),
+        Check::DryRun { schema, errors } => Ok(Some(TriggerOutcome::DryRun(DryRunResult {
+            workflow_id,
+            schema,
+            errors,
+        }))),
+    }
+}
+
+#[cfg(test)]
+mod trigger_input_gate_tests {
+    use super::decide_input_schema_outcome;
+    use crate::{OrchestrationError, TriggerOutcome};
+    use talos_workflow_validation::InputSchemaCheck as Check;
+    use uuid::Uuid;
+
+    // `TriggerOutcome` deliberately has no `Debug` (it carries execution
+    // payloads), so these helpers stand in for `expect` / `expect_err`
+    // rather than deriving `Debug` onto a payload-bearing type for tests.
+    fn refusal(
+        r: Result<Option<TriggerOutcome>, OrchestrationError>,
+        what: &str,
+    ) -> OrchestrationError {
+        match r {
+            Err(e) => e,
+            Ok(_) => panic!("{what} must NOT be allowed to proceed"),
+        }
+    }
+    fn proceeds(r: Result<Option<TriggerOutcome>, OrchestrationError>) -> bool {
+        matches!(r, Ok(None))
+    }
+    fn dry_run(
+        r: Result<Option<TriggerOutcome>, OrchestrationError>,
+    ) -> crate::outcome::DryRunResult {
+        match r {
+            Ok(Some(TriggerOutcome::DryRun(d))) => d,
+            Ok(Some(_)) => panic!("expected a DryRun outcome"),
+            Ok(None) => panic!("expected a DryRun outcome, got proceed"),
+            Err(e) => panic!("expected a DryRun outcome, got refusal: {e}"),
+        }
+    }
+
+    /// THE regression test. Pre-fix, an input-schema read that FAILED was
+    /// degraded to `NoSchema` inside `check_trigger_input`, and this call
+    /// site let it through — the workflow ran on a payload nothing checked.
+    #[test]
+    fn an_unreadable_schema_refuses_the_trigger() {
+        let err = refusal(
+            decide_input_schema_outcome(Check::Unreadable("connection closed".into()), Uuid::nil()),
+            "a trigger whose input schema could not be read",
+        );
+        assert!(
+            matches!(err, OrchestrationError::Internal(_)),
+            "expected a retryable Internal, got {err:?}"
+        );
+        // -32000: the same class the reads ABOVE this gate produce on a DB
+        // failure. NOT -32602, which would blame the caller's payload.
+        assert_eq!(err.jsonrpc_code(), -32000);
+    }
+
+    /// A dry run must not answer "valid, no schema" for a schema it could
+    /// not read: that tells the operator the payload is safe to send, which
+    /// is the same claim the dispatch path was making one step later.
+    #[test]
+    fn an_unreadable_schema_refuses_the_dry_run_too() {
+        let err = refusal(
+            decide_input_schema_outcome(Check::Unreadable("timeout".into()), Uuid::nil()),
+            "a dry run over an unreadable schema",
+        );
+        assert!(matches!(err, OrchestrationError::Internal(_)));
+    }
+
+    #[test]
+    fn a_vanished_workflow_is_not_a_schemaless_one() {
+        let wf = Uuid::new_v4();
+        let err = refusal(
+            decide_input_schema_outcome(Check::WorkflowNotFound, wf),
+            "a trigger for a workflow that does not exist",
+        );
+        assert!(matches!(err, OrchestrationError::WorkflowNotFound(id) if id == wf));
+        assert_eq!(err.jsonrpc_code(), -32001);
+    }
+
+    #[test]
+    fn a_definite_no_schema_still_proceeds() {
+        // 27 of the 28 live workflows are in this state; the fix must not
+        // touch them.
+        assert!(proceeds(decide_input_schema_outcome(
+            Check::NoSchema,
+            Uuid::nil()
+        )));
+        assert!(proceeds(decide_input_schema_outcome(
+            Check::Valid,
+            Uuid::nil()
+        )));
+    }
+
+    #[test]
+    fn invalid_input_still_blames_the_caller() {
+        let err = refusal(
+            decide_input_schema_outcome(
+                Check::Invalid(vec!["missing 'to'".into(), "bad 'n'".into()]),
+                Uuid::nil(),
+            ),
+            "input that fails its declared schema",
+        );
+        assert_eq!(err.jsonrpc_code(), -32602);
+        assert!(err.to_string().contains("missing 'to'; bad 'n'"));
+    }
+
+    #[test]
+    fn dry_run_semantics_are_unchanged() {
+        let wf = Uuid::new_v4();
+        // Schema present + errors: REPORTED, not raised.
+        let d = dry_run(decide_input_schema_outcome(
+            Check::DryRun {
+                schema: Some(serde_json::json!({"type": "object"})),
+                errors: vec!["nope".into()],
+            },
+            wf,
+        ));
+        assert_eq!(d.workflow_id, wf);
+        assert_eq!(d.errors, vec!["nope".to_string()]);
+        assert!(d.schema.is_some());
+
+        // Schema DEFINITELY absent: still the pre-existing "operator hint"
+        // shape — valid, no schema, no errors.
+        let d = dry_run(decide_input_schema_outcome(
+            Check::DryRun {
+                schema: None,
+                errors: vec![],
+            },
+            wf,
+        ));
+        assert!(d.schema.is_none());
+        assert!(d.errors.is_empty());
     }
 }
 
