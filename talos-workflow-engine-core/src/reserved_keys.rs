@@ -131,6 +131,46 @@ pub fn output_reports_error(output: &serde_json::Value) -> bool {
     classify_error_flag(output.get(ERROR_FLAG)).is_failed()
 }
 
+/// The operator-facing reason `output` reports a failure, or `None` when
+/// it reports none.
+///
+/// Two places carry the reason and they are checked in that order:
+///
+/// 1. an explicit non-empty `error_message` string — what every envelope
+///    the engine itself synthesizes writes;
+/// 2. failing that, the [`ERROR_FLAG`] marker's own value, whenever the
+///    marker is something other than a bare boolean.
+///
+/// The second source exists because [`classify_error_flag`] already
+/// computes it and the bool-returning [`output_reports_error`] throws it
+/// away. A module reporting the mis-shaped `{"__error": "upstream 502"}`
+/// — the shape #733 taught the classifier to READ as a failure — has no
+/// `error_message` field at all, so the run that #733 correctly began
+/// failing was described to the operator as a generic "rejected output"
+/// while the actual reason sat unread in the very key that triggered the
+/// failure. A bare `true` is deliberately NOT used: rendering it would
+/// put the string `"true"` where a reason belongs, which is worse than
+/// the caller's own fallback wording.
+pub fn error_reason(output: &serde_json::Value) -> Option<String> {
+    let marker = output.get(ERROR_FLAG);
+    let ErrorFlag::Failed { message } = classify_error_flag(marker) else {
+        return None;
+    };
+    if let Some(msg) = output
+        .get("error_message")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Some(msg.to_string());
+    }
+    // A boolean marker is a flag, not a message: `classify_error_flag`
+    // renders `true` as the string "true", which is not a reason.
+    if matches!(marker, Some(serde_json::Value::Bool(_))) {
+        return None;
+    }
+    Some(message)
+}
+
 /// Signals downstream aggregators that input fan-in collapsed with
 /// missing or erroring branches.
 pub const AGGREGATION_FAILED: &str = "__aggregation_failed";
@@ -921,6 +961,94 @@ mod tests {
             serde_json::Value::Null,
         ] {
             assert!(!output_reports_error(&v), "non-object output: {v}");
+        }
+    }
+
+    // ── error_reason ────────────────────────────────────────────────
+
+    #[test]
+    fn error_reason_is_none_when_the_output_reports_no_error() {
+        for v in [
+            json!({}),
+            json!({ "__error": false }),
+            json!({ "__error": null }),
+            json!({ "__error": "" }),
+            // An `error_message` with no failing marker is not a failure:
+            // presence of the field is not the test, the marker is.
+            json!({ "error_message": "stale field" }),
+            json!("a bare string output"),
+        ] {
+            assert_eq!(error_reason(&v), None, "not a failure: {v}");
+        }
+    }
+
+    #[test]
+    fn error_reason_prefers_the_explicit_error_message_field() {
+        assert_eq!(
+            error_reason(&json!({ "__error": true, "error_message": "child 404" })),
+            Some("child 404".to_string())
+        );
+        // …and prefers it over the marker's own text when both carry one.
+        assert_eq!(
+            error_reason(&json!({ "__error": "marker text", "error_message": "field text" })),
+            Some("field text".to_string())
+        );
+    }
+
+    #[test]
+    fn error_reason_falls_back_to_a_string_marker() {
+        // The #733 shape: the reason is IN the marker and there is no
+        // `error_message` field to read it from.
+        assert_eq!(
+            error_reason(&json!({ "__error": "upstream 502" })),
+            Some("upstream 502".to_string())
+        );
+    }
+
+    #[test]
+    fn error_reason_never_renders_a_boolean_marker_as_a_reason() {
+        // `"true"` in a field an operator reads as the failure reason is
+        // worse than the caller's own fallback wording.
+        assert_eq!(error_reason(&json!({ "__error": true })), None);
+        assert_eq!(
+            error_reason(&json!({ "__error": true, "error_message": "" })),
+            None,
+            "an empty error_message must not be preferred over nothing"
+        );
+        assert_eq!(
+            error_reason(&json!({ "__error": true, "error_message": "   " })),
+            None,
+            "whitespace is not a reason"
+        );
+    }
+
+    #[test]
+    fn error_reason_renders_a_non_string_non_bool_marker() {
+        // Numbers / arrays / objects all classify as failures, so each has
+        // to render as SOMETHING rather than silently becoming the generic
+        // fallback — the marker is all the detail that exists.
+        assert_eq!(error_reason(&json!({ "__error": 502 })), Some("502".into()));
+        assert_eq!(
+            error_reason(&json!({ "__error": {"code": 7} })),
+            Some("{\"code\":7}".into())
+        );
+    }
+
+    #[test]
+    fn error_reason_agrees_with_output_reports_error() {
+        // The two must never disagree about WHETHER an output failed —
+        // `error_reason` returning `Some` is the strictly stronger claim.
+        for v in [
+            json!({}),
+            json!({ "__error": false }),
+            json!({ "__error": true }),
+            json!({ "__error": "boom" }),
+            json!({ "__error": true, "error_message": "boom" }),
+            json!({ "__error": 0 }),
+        ] {
+            if error_reason(&v).is_some() {
+                assert!(output_reports_error(&v), "reason without a failure: {v}");
+            }
         }
     }
 }

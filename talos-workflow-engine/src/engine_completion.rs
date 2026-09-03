@@ -20,7 +20,7 @@
 //! auditable in isolation.
 
 use std::collections::{HashMap, VecDeque};
-use talos_workflow_engine_core::reserved_keys::output_reports_error;
+use talos_workflow_engine_core::reserved_keys::{error_reason, output_reports_error};
 
 use petgraph::graph::NodeIndex;
 use petgraph::Direction;
@@ -77,12 +77,22 @@ impl ParallelWorkflowEngine {
     /// commits (verify-node: b69aad5, `confidence_gate`: a7dd2b3,
     /// `expression_dispatch`: a941df4) so every system-node caller in
     /// the reactor body uses one consistent mechanism.
+    ///
+    /// `wall_time_ms` is MONOTONIC elapsed milliseconds for the dispatch,
+    /// or `0` meaning UNKNOWN — never "instantaneous"; it is bound onto
+    /// whichever completion event the failure path writes, exactly as on
+    /// the module-dispatch path (see `handle_completed_future`). Callers
+    /// that evaluate their system node SYNCHRONOUSLY IN PROCESS start no
+    /// timer and pass a literal `0`; `try_dispatch_sub_workflow` measures
+    /// its own dispatch and passes the real reading, so a sub-workflow
+    /// that FAILS is timed the same as one that succeeds.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn route_system_node_output(
         &self,
         node_idx: NodeIndex,
         output: JsonValue,
         execution_id: Uuid,
+        wall_time_ms: u64,
         chains_ctx: Option<(&[Vec<NodeIndex>], &HashMap<NodeIndex, usize>)>,
         exec_ctx: &Option<Box<dyn talos_workflow_engine_core::ExecutionSanitizer>>,
         results: &mut HashMap<Uuid, JsonValue>,
@@ -95,18 +105,22 @@ impl ParallelWorkflowEngine {
         // `executing.next()` completion path marks its own nodes and
         // never reaches this function, so there is no double count.
         self.progress.mark_finished(self.graph[node_idx]);
-        let is_error = output_reports_error(&output);
-        if is_error {
-            let msg = output
-                .get("error_message")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .unwrap_or_else(|| "system node rejected output".to_string());
+        // The failure REASON, where the envelope carries one. An envelope
+        // with no `error_message` field — the mis-shaped `{"__error":
+        // "…"}` string form #733 taught the classifier to read — used to
+        // fail the run under the generic wording below, discarding the
+        // very text that caused the failure.
+        let reason = if output_reports_error(&output) {
+            Some(error_reason(&output).unwrap_or_else(|| "system node rejected output".to_string()))
+        } else {
+            None
+        };
+        if let Some(msg) = reason {
             self.handle_completed_future(
                 node_idx,
                 Err(msg),
                 execution_id,
-                0,
+                wall_time_ms,
                 chains_ctx,
                 exec_ctx,
                 results,

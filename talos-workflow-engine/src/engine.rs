@@ -2072,6 +2072,7 @@ impl ParallelWorkflowEngine {
                         node_idx,
                         output,
                         execution_id,
+                        0, // no timer on this in-process path — UNKNOWN, not instant
                         chains_ctx,
                         &exec_ctx,
                         &mut results,
@@ -2100,6 +2101,7 @@ impl ParallelWorkflowEngine {
                         node_idx,
                         output,
                         execution_id,
+                        0, // no timer on this in-process path — UNKNOWN, not instant
                         chains_ctx,
                         &exec_ctx,
                         &mut results,
@@ -2126,6 +2128,7 @@ impl ParallelWorkflowEngine {
                         node_idx,
                         output,
                         execution_id,
+                        0, // no timer on this in-process path — UNKNOWN, not instant
                         chains_ctx,
                         &exec_ctx,
                         &mut results,
@@ -2152,6 +2155,7 @@ impl ParallelWorkflowEngine {
                         node_idx,
                         output,
                         execution_id,
+                        0, // no timer on this in-process path — UNKNOWN, not instant
                         chains_ctx,
                         &exec_ctx,
                         &mut results,
@@ -2249,6 +2253,7 @@ impl ParallelWorkflowEngine {
                         node_idx,
                         output,
                         execution_id,
+                        0, // no timer on this in-process path — UNKNOWN, not instant
                         chains_ctx,
                         &exec_ctx,
                         &mut results,
@@ -2283,6 +2288,7 @@ impl ParallelWorkflowEngine {
                         node_idx,
                         output,
                         execution_id,
+                        0, // no timer on this in-process path — UNKNOWN, not instant
                         chains_ctx,
                         &exec_ctx,
                         &mut results,
@@ -2314,6 +2320,7 @@ impl ParallelWorkflowEngine {
                         node_idx,
                         output,
                         execution_id,
+                        0, // no timer on this in-process path — UNKNOWN, not instant
                         chains_ctx,
                         &exec_ctx,
                         &mut results,
@@ -2394,6 +2401,7 @@ impl ParallelWorkflowEngine {
                         node_idx,
                         output,
                         execution_id,
+                        0, // no timer on this in-process path — UNKNOWN, not instant
                         chains_ctx,
                         &exec_ctx,
                         &mut results,
@@ -2425,6 +2433,7 @@ impl ParallelWorkflowEngine {
                         node_idx,
                         output,
                         execution_id,
+                        0, // no timer on this in-process path — UNKNOWN, not instant
                         chains_ctx,
                         &exec_ctx,
                         &mut results,
@@ -2436,6 +2445,21 @@ impl ParallelWorkflowEngine {
                 }
 
                 // ── AgentLoop dispatch (ReAct-style iterative sub-workflow) ──
+                //
+                // Routed, not committed: `try_dispatch_agent_loop` returns a
+                // top-level `{__error: true}` envelope for the four hard
+                // failures it can hit before/around the loop (no registry, no
+                // user context, body workflow not found, whole-loop timeout).
+                // Committing those as a node result made the workflow report
+                // `completed` — an AgentLoop pointed at a deleted body ran
+                // zero iterations and looked like a clean run, with no
+                // `node_failed` event anywhere. `ReActLoop` shares this
+                // dispatcher and therefore this fix.
+                //
+                // The per-ITERATION `__error` envelopes are nested under
+                // `history` / `final_output` and are deliberately NOT
+                // top-level, so a loop that survives a bad iteration still
+                // reads as a success here — unchanged.
                 #[cfg(feature = "llm-primitives")]
                 if let Some(output) = self
                     .try_dispatch_agent_loop(
@@ -2447,8 +2471,23 @@ impl ParallelWorkflowEngine {
                     )
                     .await
                 {
-                    commit_result!(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    let chains_ctx = if chains_live {
+                        Some((chains.as_slice(), &node_to_chain))
+                    } else {
+                        None
+                    };
+                    self.route_system_node_output(
+                        node_idx,
+                        output,
+                        execution_id,
+                        0, // no timer on this in-process path — UNKNOWN, not instant
+                        chains_ctx,
+                        &exec_ctx,
+                        &mut results,
+                        &mut pending,
+                        &mut ready,
+                    )
+                    .await?;
                     continue;
                 }
 
@@ -2525,15 +2564,47 @@ impl ParallelWorkflowEngine {
                     // and — crucially — yields results in INPUT ORDER, so the
                     // `sub_wf_batch.zip(outputs)` mapping below stays correct
                     // (unlike `buffer_unordered`).
-                    let outputs: Vec<Option<JsonValue>> = futures::stream::iter(dispatch_futs)
-                        .buffered(max_concurrent_nodes)
-                        .collect()
-                        .await;
+                    let outputs: Vec<Option<(JsonValue, u64)>> =
+                        futures::stream::iter(dispatch_futs)
+                            .buffered(max_concurrent_nodes)
+                            .collect()
+                            .await;
 
-                    for ((idx, id), output) in sub_wf_batch.into_iter().zip(outputs) {
-                        if let Some(out) = output {
-                            commit_result!(id, out);
-                            self.unblock_successors(idx, &mut pending, &mut ready);
+                    // A sub-workflow that came back reporting an error takes
+                    // the SAME failure path as every other node kind, rather
+                    // than being committed as a successful result. Before
+                    // this, `try_dispatch_sub_workflow` wrote a `node_failed`
+                    // event and the reactor then committed the very envelope
+                    // that event described as a success — the run reported
+                    // `completed` with `error_message` NULL beside a
+                    // `node_failed` row for one of its nodes. Routing here
+                    // means error edges and `__continue_on_error` decide the
+                    // outcome, exactly as the judge / ensemble / verify
+                    // branches above already do, and the `node_failed` event
+                    // is written by the code that decides the run's fate.
+                    //
+                    // `elapsed_ms` is the dispatch's MONOTONIC duration,
+                    // measured inside the handler; the failure event carries
+                    // the same measurement the success event does.
+                    let chains_ctx = if chains_live {
+                        Some((chains.as_slice(), &node_to_chain))
+                    } else {
+                        None
+                    };
+                    for ((idx, _id), output) in sub_wf_batch.into_iter().zip(outputs) {
+                        if let Some((out, elapsed_ms)) = output {
+                            self.route_system_node_output(
+                                idx,
+                                out,
+                                execution_id,
+                                elapsed_ms,
+                                chains_ctx,
+                                &exec_ctx,
+                                &mut results,
+                                &mut pending,
+                                &mut ready,
+                            )
+                            .await?;
                         }
                     }
                     continue;

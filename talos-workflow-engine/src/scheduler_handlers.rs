@@ -969,15 +969,35 @@ impl ParallelWorkflowEngine {
     /// [`SystemNodeKind::SubWorkflow`] — invoke another workflow by
     /// id, seeded with this node's gathered input.
     ///
-    /// Emits `node_started` / `node_completed` (or `node_failed`) events on
-    /// the parent's `execution_id` so the per-node trace surfaces the
-    /// dispatch as a real node with measurable duration. Without these
-    /// events the parent trace showed only a wall-clock gap before
-    /// downstream nodes started — operators had to know the workflow
-    /// architecture to read the gap as "sub-workflow LLM latency."
-    /// `node_started` is fire-and-forget (matches regular module dispatch);
-    /// `node_completed` / `node_failed` are awaited so the parent trace
-    /// orders correctly relative to downstream `node_started` events.
+    /// Emits `node_started` / `node_completed` events on the parent's
+    /// `execution_id` so the per-node trace surfaces the dispatch as a real
+    /// node with measurable duration. Without these events the parent trace
+    /// showed only a wall-clock gap before downstream nodes started —
+    /// operators had to know the workflow architecture to read the gap as
+    /// "sub-workflow LLM latency." `node_started` is fire-and-forget
+    /// (matches regular module dispatch); `node_completed` is awaited so
+    /// the parent trace orders correctly relative to downstream
+    /// `node_started` events.
+    ///
+    /// **The FAILURE event is deliberately NOT emitted here.** This function
+    /// used to emit `node_failed` itself whenever the collapsed child output
+    /// carried an [`output_reports_error`] marker, and then hand that same
+    /// envelope back to the reactor, which committed it as a SUCCESSFUL node
+    /// result. The two halves disagreed inside one function pair: the events
+    /// table said the node failed, the run said `completed`, and
+    /// `workflow_executions.error_message` stayed NULL — a record
+    /// contradicting itself with nothing to reconcile the three. Failure
+    /// eventing now belongs to the reactor's one failure path
+    /// (`route_system_node_output` → `handle_completed_future` →
+    /// `handle_node_failure`), exactly as it does for every other node kind,
+    /// so the `node_failed` event and the run's fate are decided by the same
+    /// code. That also DLP-scrubs the message (this site never did) and lets
+    /// error edges / `__continue_on_error` participate.
+    ///
+    /// Returns the collapsed child output together with the MONOTONIC
+    /// elapsed milliseconds of the dispatch, so the reactor can bind a real
+    /// measurement onto whichever completion event it ends up writing — a
+    /// sub-workflow that fails took just as long as one that succeeded.
     pub(crate) async fn try_dispatch_sub_workflow(
         &self,
         node_idx: NodeIndex,
@@ -986,7 +1006,7 @@ impl ParallelWorkflowEngine {
         dispatcher: &Arc<dyn NodeDispatcher>,
         worker_shared_key: &Option<WorkerSharedKey>,
         results: &HashMap<Uuid, JsonValue>,
-    ) -> Option<JsonValue> {
+    ) -> Option<(JsonValue, u64)> {
         let (
             _,
             _,
@@ -1069,46 +1089,38 @@ impl ParallelWorkflowEngine {
         // dispatch loop's node_started — without it, a fast downstream
         // node could race ahead of this node_completed in the events
         // table and the trace builder would show out-of-order activity.
-        let is_error = output_reports_error(&output);
-        let (event_type, status, log_message) = if is_error {
-            (
-                "node_failed",
-                "Failed",
-                output
-                    .get("error_message")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-            )
-        } else {
-            (
-                "node_completed",
-                "Completed",
-                Some(format!("sub_workflow duration_ms={}", elapsed_ms)),
-            )
-        };
-        if let Some(ref sink) = self.event_sink {
-            sink.emit(talos_workflow_engine_core::NodeEventWrite {
-                execution_id,
-                event_type: event_type.to_string(),
-                node_id: Some(node_id),
-                status: status.to_string(),
-                log_message,
-                iteration_index: None,
-                error_class: None,
-                // MONOTONIC: `dispatch_started` above is a
-                // `std::time::Instant`. Before this, `elapsed_ms` was
-                // FORMATTED INTO PROSE on the success branch
-                // (`log_message = "sub_workflow duration_ms={}"`) while the
-                // `duration_ms` COLUMN it belongs in was left to the
-                // trigger's wall-clock subtraction — a measurement rendered
-                // to a string beside the field that wanted it. It is bound
-                // on BOTH branches: a sub-workflow that fails took just as
-                // long as one that succeeded.
-                duration_ms: talos_workflow_engine_core::NodeEventWrite::monotonic_ms(elapsed_ms),
-            })
-            .await;
+        //
+        // SUCCESS ONLY. The failure event is the reactor's to write (see
+        // the note on this function) — emitting one here as well would
+        // put two `node_failed` rows on one node, and emitting one here
+        // INSTEAD is what let a failed node ride a `completed` run.
+        if !output_reports_error(&output) {
+            if let Some(ref sink) = self.event_sink {
+                sink.emit(talos_workflow_engine_core::NodeEventWrite {
+                    execution_id,
+                    event_type: "node_completed".to_string(),
+                    node_id: Some(node_id),
+                    status: "Completed".to_string(),
+                    log_message: Some(format!("sub_workflow duration_ms={}", elapsed_ms)),
+                    iteration_index: None,
+                    error_class: None,
+                    // MONOTONIC: `dispatch_started` above is a
+                    // `std::time::Instant`. Before this, `elapsed_ms` was
+                    // FORMATTED INTO PROSE (`log_message = "sub_workflow
+                    // duration_ms={}"`) while the `duration_ms` COLUMN it
+                    // belongs in was left to the trigger's wall-clock
+                    // subtraction — a measurement rendered to a string beside
+                    // the field that wanted it. The failure branch keeps the
+                    // same binding: the reactor is handed `elapsed_ms` below
+                    // and passes it to `handle_completed_future`.
+                    duration_ms: talos_workflow_engine_core::NodeEventWrite::monotonic_ms(
+                        elapsed_ms,
+                    ),
+                })
+                .await;
+            }
         }
-        Some(output)
+        Some((output, elapsed_ms))
     }
 
     /// [`SystemNodeKind::FanIn`] — join parent-branch outputs per the

@@ -107,6 +107,111 @@ pub fn dispatcher_branch_for(kind: &SystemNodeKind) -> &'static str {
     }
 }
 
+/// How a [`SystemNodeKind`]'s dispatcher output reaches the reactor's
+/// FAILURE path, if it can reach it at all.
+///
+/// [`dispatcher_branch_for`] answers "does this variant run?".  This
+/// answers the question that outlived it: "when it reports a failure,
+/// who decides the run's fate?" — the one a `SubWorkflow` node got wrong
+/// for as long as the kind existed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SystemNodeErrorRouting {
+    /// The reactor hands this kind's output to `route_system_node_output`
+    /// (or `handle_completed_future` directly), so an `__error` envelope
+    /// takes the ONE failure path: `node_failed` is written by the same
+    /// code that decides the run's fate, error edges and
+    /// `__continue_on_error` get their say, and the lifecycle hook fires.
+    ReactorFailurePath,
+    /// The reactor's branch for this kind inspects `output_reports_error`
+    /// itself and returns `Err` inline.  The run does fail — but no
+    /// `node_failed` event is written, error edges off the node are never
+    /// consulted, and `on_node_failed` (DLQ + sibling-cancel) never runs.
+    /// A second implementation of a rule that already has one; kept as-is
+    /// only because unifying it would newly let an error edge RESCUE a run
+    /// that fails today, which is a behaviour change in the permissive
+    /// direction and wants its own decision.
+    BranchLocal,
+    /// The dispatcher's envelope is a fixed shape with no top-level
+    /// [`ERROR_FLAG`](talos_workflow_engine_core::reserved_keys::ERROR_FLAG)
+    /// key — `{iterations, output}`, `{items, count}`, `{__waiting__}` and
+    /// friends.  There is no failure signal for the reactor to route.
+    NeverSignalsError,
+    /// The output is author- or upstream-supplied data that the engine
+    /// passes through.  An `__error` key inside it is DATA — exactly as it
+    /// is in an ordinary module node's output, which the engine has never
+    /// re-classified as a failure — so the engine draws no conclusion from
+    /// it.  Reclassifying these would make a workflow fail on its own
+    /// author's payload.
+    OutputIsData,
+}
+
+/// Classify how each [`SystemNodeKind`] variant's failures reach the
+/// reactor's failure path.
+///
+/// **EXHAUSTIVE**, for the same reason [`dispatcher_branch_for`] is: a new
+/// variant that compiles without an arm here is a variant whose failure
+/// semantics nobody stated.  Three of this file's own historical bugs were
+/// "added the variant, forgot a step"; `SubWorkflow` and `AgentLoop`
+/// committing their own `{__error: …}` envelope as a SUCCESSFUL node
+/// result was the same shape one level down — the variant ran, and its
+/// failure went nowhere.
+///
+/// **What this does and does not buy.**  It is a compile-time obligation
+/// to CLASSIFY, not a proof that the classification is true: nothing here
+/// can observe a reactor branch quietly reverting to `commit_result!`.
+/// The enforcement for that is behavioural, at the call site —
+/// `tests/system_node_failure_routing.rs` drives the real reactor for
+/// `SubWorkflow` / `AgentLoop` / `ReActLoop`, and `tests/precheck_errors.rs`
+/// and the judge/verify suites cover others.  Variants classified
+/// `ReactorFailurePath` with no such test are claims, not guarantees; say
+/// so rather than reading this table as coverage.
+pub fn error_routing_for(kind: &SystemNodeKind) -> SystemNodeErrorRouting {
+    use SystemNodeErrorRouting::{
+        BranchLocal, NeverSignalsError, OutputIsData, ReactorFailurePath,
+    };
+    match kind {
+        // ── Fixed-shape envelopes: nothing to route ──────────────
+        SystemNodeKind::Wait { .. } => NeverSignalsError,
+        SystemNodeKind::WhileLoop { .. } => NeverSignalsError,
+        SystemNodeKind::RepeatLoop { .. } => NeverSignalsError,
+        SystemNodeKind::FanIn { .. } => NeverSignalsError,
+        SystemNodeKind::Collect => NeverSignalsError,
+        // ── Pass-through data ────────────────────────────────────
+        // Carrying the upstream error IS the job.
+        SystemNodeKind::ErrorHandler { .. } => OutputIsData,
+        // Whatever the author's `synthesis_expr` returns.
+        SystemNodeKind::Synthesize { .. } => OutputIsData,
+        // ── Reactor failure path ─────────────────────────────────
+        SystemNodeKind::SubWorkflow { .. } => ReactorFailurePath,
+        SystemNodeKind::OpsAlertsDigest { .. } => ReactorFailurePath,
+        SystemNodeKind::PendingApprovals { .. } => ReactorFailurePath,
+        SystemNodeKind::AssistantReport { .. } => ReactorFailurePath,
+        SystemNodeKind::OperatorDigest { .. } => ReactorFailurePath,
+        SystemNodeKind::Verify { .. } => ReactorFailurePath,
+        SystemNodeKind::DynamicDispatch { .. } => ReactorFailurePath,
+        // ── Decided inside the reactor branch ────────────────────
+        SystemNodeKind::Loop { .. } => BranchLocal,
+        SystemNodeKind::CapabilityDispatch { .. } => BranchLocal,
+        // ── Feature-gated (llm-primitives, default-on) ───────────
+        #[cfg(feature = "llm-primitives")]
+        SystemNodeKind::AgentLoop { .. } => ReactorFailurePath,
+        #[cfg(feature = "llm-primitives")]
+        SystemNodeKind::ReActLoop { .. } => ReactorFailurePath,
+        #[cfg(feature = "llm-primitives")]
+        SystemNodeKind::Judge { .. } => ReactorFailurePath,
+        #[cfg(feature = "llm-primitives")]
+        SystemNodeKind::InlineJudge { .. } => ReactorFailurePath,
+        #[cfg(feature = "llm-primitives")]
+        SystemNodeKind::Ensemble { .. } => ReactorFailurePath,
+        #[cfg(feature = "llm-primitives")]
+        SystemNodeKind::ConfidenceGate { .. } => ReactorFailurePath,
+        #[cfg(feature = "llm-primitives")]
+        SystemNodeKind::ReflectiveRetry { .. } => ReactorFailurePath,
+        #[cfg(feature = "llm-primitives")]
+        SystemNodeKind::LlmDispatch { .. } => ReactorFailurePath,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +380,72 @@ mod tests {
              update the constructor to include every new variant, \
              then bump the constants here"
         );
+    }
+
+    /// Every variant states how its failures reach the run's fate.
+    ///
+    /// The exhaustive match in [`error_routing_for`] already forces a new
+    /// variant to be classified at COMPILE time; this walks the sample
+    /// constructor so the classification is also exercised, and pins the
+    /// two facts that a regression would quietly change.
+    #[test]
+    fn every_variant_states_its_error_routing() {
+        use SystemNodeErrorRouting::{BranchLocal, ReactorFailurePath};
+        for variant in all_sample_variants() {
+            // Total function — the assertion is that calling it is
+            // meaningful for every sample, which the match guarantees.
+            let _ = error_routing_for(&variant);
+        }
+
+        // Tripwire, and it names what changed: `BranchLocal` is the
+        // hand-rolled `output_reports_error` + `return Err` copy in the
+        // reactor. There are exactly TWO of them and both predate this
+        // classification. A third means someone wrote a third
+        // implementation of a rule that has one; a first means one of
+        // these was unified, which is a real (and welcome) change that
+        // should be deliberate rather than incidental.
+        let branch_local: Vec<_> = all_sample_variants()
+            .into_iter()
+            .filter(|v| error_routing_for(v) == BranchLocal)
+            .collect();
+        assert_eq!(
+            branch_local.len(),
+            2,
+            "expected exactly Loop + CapabilityDispatch to decide failure \
+             inside their own reactor branch, got: {branch_local:?}"
+        );
+
+        // The kinds whose failure routing this file's own history is
+        // about. A `SubWorkflow` reclassified away from the reactor
+        // failure path is the defect returning.
+        for kind in [
+            SystemNodeKind::SubWorkflow {
+                workflow_id: Uuid::new_v4(),
+                timeout_secs: 30,
+            },
+            #[cfg(feature = "llm-primitives")]
+            SystemNodeKind::AgentLoop {
+                body_workflow_id: Uuid::new_v4(),
+                max_iterations: 1,
+                inject_history: false,
+                timeout_secs: 30,
+            },
+            #[cfg(feature = "llm-primitives")]
+            SystemNodeKind::ReActLoop {
+                body_workflow_id: Uuid::new_v4(),
+                max_iterations: 1,
+                inject_history: false,
+                timeout_secs: 30,
+            },
+        ] {
+            assert_eq!(
+                error_routing_for(&kind),
+                ReactorFailurePath,
+                "{kind:?} must route failures through the reactor's one \
+                 failure path — the behavioural proof lives in \
+                 tests/system_node_failure_routing.rs"
+            );
+        }
     }
 
     /// Smoke check: every dispatcher classification is one of the
