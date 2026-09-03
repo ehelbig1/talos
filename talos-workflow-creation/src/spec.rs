@@ -302,7 +302,7 @@ impl super::WorkflowCreationService {
                 // operator-actionable surface; telemetry-only fix.
                 let resolved_id = match self
                     .module_repo
-                    .find_template_id_by_name_normalised(module_name)
+                    .find_template_id_by_name_normalised(module_name, user_id)
                     .await
                 {
                     Ok(opt) => opt,

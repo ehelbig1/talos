@@ -10608,19 +10608,21 @@ async fn handle_plan_and_execute_workflow(
                 // `{"nodes": [], "edges": []}`, and the caller was told the plan
                 // was built. The step then did nothing, silently, forever.
                 // "We could not look it up" is not "it is not there".
-                let name_lower = module_name.to_lowercase().replace(['-', '_', ' '], "%");
-                let pattern = format!("%{}%", name_lower);
-                let lookup = async {
-                    match state
-                        .module_repo
-                        .find_template_id_by_strip_normalise(module_name)
-                        .await?
-                    {
-                        Some(id) => Ok(Some(id)),
-                        None => state.module_repo.find_template_id_by_ilike(&pattern).await,
-                    }
-                }
-                .await;
+                //
+                // The two-step (exact strip-normalise, then fuzzy ILIKE) and
+                // the `%pattern%` it needs used to be built right here,
+                // against a repository method with no owner predicate at all.
+                // A caller-supplied `module_name` therefore matched ANY
+                // tenant's module and the winning row was chosen by heap
+                // order. Both steps now live behind
+                // `resolve_module_id_by_name_for_user`, which is scoped
+                // catalog-or-mine and totally ordered — so this handler has
+                // no lookup SQL, no pattern building, and nothing to get
+                // wrong beyond passing the authenticated user.
+                let lookup = state
+                    .module_repo
+                    .resolve_module_id_by_name_for_user(module_name, user_id)
+                    .await;
                 match lookup {
                     Ok(v) => v,
                     Err(e) => {

@@ -698,9 +698,16 @@ async fn build_and_create_starter_workflow(
     // would silently miss it. The 4-way normaliser folds spaces↔dashes and
     // strips non-kebab chars on both sides so canonical-name lookups land
     // regardless of which install path wrote the row.
+    //
+    // Scoped to `user_id` (catalog-or-mine). If this user has installed their
+    // own copy of `llm-inference` it now wins deterministically over the
+    // catalog original — which is both what they meant and the row
+    // `Registry::get_module` resolves without falling through to its
+    // stale-name successor lookup. Pre-fix the two tied under a bare
+    // `LIMIT 1` and the winner was heap order.
     let module_id = match deps
         .module_repo
-        .find_template_id_by_name_normalised("llm-inference")
+        .find_template_id_by_name_normalised("llm-inference", user_id)
         .await
         .map_err(|e| format!("Lookup of catalog 'llm-inference' failed: {}", e))?
     {
