@@ -555,22 +555,49 @@ impl WorkflowRepository {
     }
 
     /// Fetch the declared input_schema for a workflow. Returns None if not set.
+    ///
+    /// NOTE the deliberate flattening: this collapses "no such workflow (or not
+    /// yours)" and "the workflow exists and declares no schema" into the same
+    /// `None`. That is fine for the ENFORCEMENT callers, which only ask "is
+    /// there a schema to check against?" — but a REPORTING caller that renders
+    /// the answer as a claim needs the two apart, or it tells its caller "this
+    /// workflow declares no input schema" about a workflow that does not exist.
+    /// Those callers use [`Self::get_workflow_input_schema_scoped`] instead.
     pub async fn get_workflow_input_schema(
         &self,
         workflow_id: Uuid,
         user_id: Uuid,
     ) -> Result<Option<serde_json::Value>> {
+        Ok(self
+            .get_workflow_input_schema_scoped(workflow_id, user_id)
+            .await?
+            .flatten())
+    }
+
+    /// Fetch the declared input_schema, keeping the two absences apart.
+    ///
+    /// * `Ok(None)` — no workflow with that id is visible to `user_id`.
+    /// * `Ok(Some(None))` — the workflow exists and `input_schema IS NULL`.
+    /// * `Ok(Some(Some(schema)))` — the workflow exists and declares a schema.
+    ///
+    /// One query, two projections: [`Self::get_workflow_input_schema`] is
+    /// defined in terms of this, so the enforcement and reporting views can
+    /// never drift onto different SQL or different tenancy scoping.
+    pub async fn get_workflow_input_schema_scoped(
+        &self,
+        workflow_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<Option<serde_json::Value>>> {
         // RFC 0005 S3: self-scope (see get_workflow).
         let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
-        let schema: Option<serde_json::Value> =
+        let row: Option<Option<serde_json::Value>> =
             sqlx::query_scalar("SELECT input_schema FROM workflows WHERE id = $1 AND user_id = $2")
                 .bind(workflow_id)
                 .bind(user_id)
                 .fetch_optional(&mut *tx)
-                .await?
-                .flatten();
+                .await?;
         tx.commit().await?;
-        Ok(schema)
+        Ok(row)
     }
 
     // ── Mutation ───────────────────────────────────────────────────────────

@@ -1770,11 +1770,34 @@ async fn handle_get_archive_policy(
     req_id: Option<serde_json::Value>,
     state: &McpState,
 ) -> JsonRpcResponse {
-    let db_value: Option<serde_json::Value> = state
-        .advanced_repo
-        .get_archive_policy()
-        .await
-        .unwrap_or(None);
+    // #730: fail closed, exactly as MCP-552 already did for the sibling
+    // `handle_get_wasm_config` — that fix landed in May 2026 and was never
+    // swept to this handler, which is the same defect on the same shape of
+    // surface. `.unwrap_or(None)` reported `db_setting: null` +
+    // `source: "environment"` + a specific `effective_days` on a DB outage,
+    // byte-identical to a successful read that found no override row. The
+    // provenance field is the sharpest part: `source` is an affirmative claim
+    // about WHERE the live setting comes from, and it named the one place we
+    // had not failed to read.
+    let db_value: Option<serde_json::Value> = match state.advanced_repo.get_archive_policy().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(
+                target: "talos_mcp_handlers::advanced",
+                event_kind = "get_archive_policy_read_failed",
+                error = %e,
+                "get_archive_policy: system_settings read failed — refusing to report a \
+                 misleading source: \"environment\" on DB outage"
+            );
+            return mcp_error(
+                req_id,
+                -32000,
+                "Could not read the archive-policy setting (see server logs). No effective \
+                 policy is reported: a DB override may be in force, so this is NOT a \
+                 statement that the environment default applies.",
+            );
+        }
+    };
     // MCP-677 (2026-05-13): route through `positive_env_or_default` so
     // the displayed env default matches what the controller scheduler
     // actually uses (controller/src/main.rs:1292 has the canonical
@@ -1839,6 +1862,10 @@ async fn handle_set_archive_policy(
     // window to evaporate, or extend it to 365 to balloon storage.
     // Same require_platform_admin family as MCP-323/324/325 — the
     // `users.is_platform_admin` column is the deployment-wide gate.
+    // allow-benign-default: fail-CLOSED admin gate. A failed read denies the
+    // operation, costing the caller a refusal rather than granting anything —
+    // the second shape check 74's opt-out admits. Direction, not disclosure,
+    // is what makes this one correct.
     let is_platform_admin = state
         .actor_repo
         .is_platform_admin(user_id)

@@ -717,7 +717,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "validate_workflow_input",
-            "description": "Validate a proposed input payload against a workflow's declared input_schema. Returns { valid: bool, unvalidated: bool, schema_present: bool, errors: [...] }. `valid: true` ONLY when a schema is present AND the input passed all checks. When no schema is set, returns `valid: false, unvalidated: true, schema_present: false` so a defensive caller doing `if (response.valid) { proceed }` will NOT forward unvalidated input. To accept schema-less input intentionally, gate on `unvalidated === true` (you've explicitly opted in) instead of `valid`.",
+            "description": "Validate a proposed input payload against a workflow's declared input_schema. Returns { valid: bool, unvalidated: bool, schema_present: bool, errors: [...] }. `valid: true` ONLY when a schema is present AND the input passed all checks. When no schema is set, returns `valid: false, unvalidated: true, schema_present: false` so a defensive caller doing `if (response.valid) { proceed }` will NOT forward unvalidated input. To accept schema-less input intentionally, gate on `unvalidated === true` (you've explicitly opted in) instead of `valid`. `unvalidated: true` is emitted ONLY when the workflow was read successfully and genuinely declares no schema: a workflow that does not exist (or is not yours) is an ERROR, and a failure to read the schema is a DIFFERENT error saying so — neither is reported as `unvalidated`, because both would otherwise advise accepting input for a schema nobody looked at.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -9783,12 +9783,89 @@ async fn handle_validate_workflow_input(
         return resp;
     }
 
-    let input_schema = state
-        .workflow_repo
-        .get_workflow_input_schema(wf_id, user_id)
-        .await
-        .unwrap_or(None);
+    // #730: the read is a PRECONDITION for every claim this tool makes, so it
+    // is classified, not defaulted. See `InputSchemaLookup`.
+    match classify_input_schema_read(
+        state
+            .workflow_repo
+            .get_workflow_input_schema_scoped(wf_id, user_id)
+            .await,
+    ) {
+        InputSchemaLookup::Unreadable(e) => {
+            tracing::error!(
+                target: "talos_mcp_handlers::workflows",
+                event_kind = "validate_workflow_input_schema_read_failed",
+                workflow_id = %wf_id,
+                error = %e,
+                "validate_workflow_input: input-schema read failed — refusing to report \
+                 'no schema defined' (which advises ACCEPTING the input) for a schema we \
+                 could not look at"
+            );
+            mcp_error(
+                req_id,
+                -32000,
+                "Could not read this workflow's input schema, so the input was NOT validated. \
+                 This is a read failure, not an absent schema — do not treat it as \
+                 `unvalidated` and do not accept the input on the strength of it. Retry.",
+            )
+        }
+        InputSchemaLookup::NotFound => crate::utils::workflow_not_found_error(req_id),
+        outcome => mcp_text(
+            req_id,
+            &serde_json::to_string_pretty(&render_input_validation(&outcome, &input))
+                .unwrap_or_default(),
+        ),
+    }
+}
 
+/// What the input-schema read actually told us.
+///
+/// #730: the three cases below were ONE `None` before, because the handler
+/// wrote `get_workflow_input_schema(..).await.unwrap_or(None)` over a repo
+/// method that itself flattened "no such workflow" into "no schema". So a DB
+/// error AND a mistyped workflow id both rendered
+/// `unvalidated: true` + *"gate on `unvalidated === true` to accept
+/// schema-less input intentionally"* — the tool advising its caller to accept
+/// a payload for a workflow it had never successfully looked at. Verified live
+/// against a nil-ish UUID before the fix; no DB outage was required.
+///
+/// `Unreadable` and `NotFound` are refusals; only `NoSchema` may carry the
+/// accept-intentionally advice, because only there do we KNOW there is no
+/// schema.
+#[derive(Debug)]
+pub(crate) enum InputSchemaLookup {
+    /// The read failed. We know nothing about this workflow's schema.
+    Unreadable(String),
+    /// The read succeeded and no such workflow is visible to the caller.
+    NotFound,
+    /// The workflow exists and declares no `input_schema`.
+    NoSchema,
+    /// The workflow exists and declares this schema.
+    Present(serde_json::Value),
+}
+
+pub(crate) fn classify_input_schema_read<E: std::fmt::Display>(
+    read: Result<Option<Option<serde_json::Value>>, E>,
+) -> InputSchemaLookup {
+    match read {
+        Err(e) => InputSchemaLookup::Unreadable(e.to_string()),
+        Ok(None) => InputSchemaLookup::NotFound,
+        Ok(Some(None)) => InputSchemaLookup::NoSchema,
+        Ok(Some(Some(schema))) => InputSchemaLookup::Present(schema),
+    }
+}
+
+/// Render the two REPORTABLE outcomes. The refusals never reach here — passing
+/// one yields a body that says so rather than a reassuring default, so a future
+/// miswiring is loud instead of silent.
+///
+/// The `NoSchema` and `Present` bodies are byte-identical to the pre-#730 ones:
+/// this change narrows WHEN the schema-less body is emitted, it does not
+/// restate it.
+pub(crate) fn render_input_validation(
+    outcome: &InputSchemaLookup,
+    input: &serde_json::Value,
+) -> serde_json::Value {
     // `valid: true` means "input was checked against a schema AND
     // passed". A schema-less workflow returns `valid: false` (with
     // `schema_present: false` and `unvalidated: true` to disambiguate
@@ -9799,7 +9876,7 @@ async fn handle_validate_workflow_input(
     // shape was a security-broken default: docstring documented
     // "always returns valid" but downstream guards reading just
     // `valid` would happily forward malformed payloads.
-    let schema_present = input_schema.is_some();
+    //
     // MCP-128 (2026-05-08): when no schema exists, the meta-note used
     // to be stamped into `errors[0]`. That's confusing — `errors[]`
     // semantically holds schema-validation failures, and a defensive
@@ -9808,37 +9885,64 @@ async fn handle_validate_workflow_input(
     // meta-note now lives ONLY in `message` (and `unvalidated: true`
     // signals the case to programmatic callers). `errors` stays an
     // array of literal validation failures or empty.
-    let (valid, errors) = match input_schema {
-        None => (false, Vec::<String>::new()),
-        Some(schema) => {
-            let errs = talos_workflow_validation::validate_input_against_schema(&schema, &input);
-            (errs.is_empty(), errs)
+    // `unvalidated` is a serde Value, not a bool, for one reason: `true` is the
+    // flag this tool's own docstring tells callers to gate on in order to
+    // ACCEPT the input. It may therefore be `true` only where we KNOW the
+    // workflow declares no schema. On the unreachable refusal arm it is JSON
+    // `null` — `unvalidated === true` is false against null, and `null` cannot
+    // be mistaken for a measured `false` (which would claim validation ran).
+    let (schema_present, valid, unvalidated, errors, message): (
+        bool,
+        bool,
+        serde_json::Value,
+        Vec<String>,
+        &str,
+    ) = match outcome {
+        InputSchemaLookup::Present(schema) => {
+            let errs = talos_workflow_validation::validate_input_against_schema(schema, input);
+            let ok = errs.is_empty();
+            (
+                true,
+                ok,
+                serde_json::Value::Bool(false),
+                errs,
+                if ok {
+                    "Input is valid"
+                } else {
+                    "Input schema validation failed"
+                },
+            )
         }
+        InputSchemaLookup::NoSchema => (
+            false,
+            false,
+            serde_json::Value::Bool(true),
+            Vec::new(),
+            "No input schema defined on this workflow — input was NOT checked against any rules. `valid: false` here means validation did not run, not that it failed; gate on `unvalidated === true` to accept schema-less input intentionally. Add a schema via set_workflow_input_schema.",
+        ),
+        // Unreachable through the handler, which refuses on both. Kept total
+        // and NON-reassuring so a future rewiring cannot silently turn a
+        // refusal back into accept-this advice.
+        InputSchemaLookup::Unreadable(_) | InputSchemaLookup::NotFound => (
+            false,
+            false,
+            serde_json::Value::Null,
+            Vec::new(),
+            "The input was NOT validated and this response makes no claim about the workflow's schema — do not accept the input on the strength of it.",
+        ),
     };
 
-    let unvalidated = !schema_present;
-    let message = if unvalidated {
-        "No input schema defined on this workflow — input was NOT checked against any rules. `valid: false` here means validation did not run, not that it failed; gate on `unvalidated === true` to accept schema-less input intentionally. Add a schema via set_workflow_input_schema."
-    } else if valid {
-        "Input is valid"
-    } else {
-        "Input schema validation failed"
-    };
     // MCP-36 (2026-05-07): emit pretty-printed JSON to match every
     // other handler. Pre-fix this site used `.to_string()` (compact)
     // while every peer used `serde_json::to_string_pretty` so the
     // response was a single unbroken line that operators couldn't scan.
-    mcp_text(
-        req_id,
-        &serde_json::to_string_pretty(&serde_json::json!({
-            "valid": valid,
-            "unvalidated": unvalidated,
-            "schema_present": schema_present,
-            "errors": errors,
-            "message": message,
-        }))
-        .unwrap_or_default(),
-    )
+    serde_json::json!({
+        "valid": valid,
+        "unvalidated": unvalidated,
+        "schema_present": schema_present,
+        "errors": errors,
+        "message": message,
+    })
 }
 
 async fn handle_set_workflow_type(
@@ -11739,5 +11843,162 @@ mod workflow_view_tests {
         let err = parse_workflow_view(&json!({"view": 3})).unwrap_err();
         assert!(err.contains("'view' must be a string"), "{err}");
         assert!(err.contains("number"), "{err}");
+    }
+}
+
+/// #730 — `validate_workflow_input` must not advise ACCEPTING a payload for a
+/// schema nobody successfully read.
+///
+/// The defect these pin was live and needed no DB outage to reproduce: called
+/// with a workflow id that does not exist, the tool answered
+/// `unvalidated: true` plus *"gate on `unvalidated === true` to accept
+/// schema-less input intentionally"*. `unvalidated` is the flag this tool's own
+/// docstring nominates as the opt-in to accept — so the one field a defensive
+/// caller is told to trust was set by a read that found nothing at all.
+///
+/// These drive the production `classify_input_schema_read` /
+/// `render_input_validation` directly. They deliberately do NOT prove the
+/// handler is wired to them — a renderer test cannot see a call site, which is
+/// #726's lesson — that half is lint check 74's job (see the `validate_workflow_input`
+/// term in its glob).
+#[cfg(test)]
+mod input_schema_lookup_tests {
+    use super::{classify_input_schema_read, render_input_validation, InputSchemaLookup};
+
+    fn err() -> Result<Option<Option<serde_json::Value>>, String> {
+        Err("connection closed".to_string())
+    }
+
+    #[test]
+    fn a_failed_read_is_not_an_absent_schema() {
+        assert!(matches!(
+            classify_input_schema_read(err()),
+            InputSchemaLookup::Unreadable(_)
+        ));
+    }
+
+    #[test]
+    fn a_missing_workflow_is_not_an_absent_schema() {
+        let read: Result<Option<Option<serde_json::Value>>, String> = Ok(None);
+        assert!(matches!(
+            classify_input_schema_read(read),
+            InputSchemaLookup::NotFound
+        ));
+    }
+
+    #[test]
+    fn an_existing_workflow_with_a_null_column_is_an_absent_schema() {
+        let read: Result<Option<Option<serde_json::Value>>, String> = Ok(Some(None));
+        assert!(matches!(
+            classify_input_schema_read(read),
+            InputSchemaLookup::NoSchema
+        ));
+    }
+
+    #[test]
+    fn a_declared_schema_is_carried_through_verbatim() {
+        let schema = serde_json::json!({"type": "object"});
+        let read: Result<Option<Option<serde_json::Value>>, String> =
+            Ok(Some(Some(schema.clone())));
+        match classify_input_schema_read(read) {
+            InputSchemaLookup::Present(s) => assert_eq!(s, schema),
+            other => panic!("expected Present, got {other:?}"),
+        }
+    }
+
+    /// The invariant, stated once over every outcome: `unvalidated === true` is
+    /// the ACCEPT opt-in, so it may appear only where we know there is no
+    /// schema. A future arm that forgets this fails here.
+    #[test]
+    fn only_a_known_absent_schema_may_report_unvalidated_true() {
+        let input = serde_json::json!({"anything": 1});
+        for outcome in [
+            InputSchemaLookup::Unreadable("boom".into()),
+            InputSchemaLookup::NotFound,
+            InputSchemaLookup::Present(serde_json::json!({"type": "object"})),
+        ] {
+            let body = render_input_validation(&outcome, &input);
+            assert_ne!(
+                body["unvalidated"],
+                serde_json::json!(true),
+                "{outcome:?} must not advise accepting the input"
+            );
+        }
+        let body = render_input_validation(&InputSchemaLookup::NoSchema, &input);
+        assert_eq!(body["unvalidated"], serde_json::json!(true));
+    }
+
+    /// A refusal renders `unvalidated: null`, not `false`. `false` would claim
+    /// validation RAN; `null` says nobody looked, and `=== true` is false
+    /// against it either way.
+    #[test]
+    fn a_refusal_makes_no_claim_about_validation_having_run() {
+        let input = serde_json::json!({});
+        for outcome in [
+            InputSchemaLookup::Unreadable("boom".into()),
+            InputSchemaLookup::NotFound,
+        ] {
+            let body = render_input_validation(&outcome, &input);
+            assert!(body["unvalidated"].is_null(), "{outcome:?}");
+            assert_eq!(body["valid"], serde_json::json!(false));
+            assert_eq!(body["schema_present"], serde_json::json!(false));
+            let msg = body["message"].as_str().unwrap_or_default();
+            assert!(
+                msg.contains("NOT validated") && !msg.contains("No input schema defined"),
+                "a refusal must not reuse the schema-less wording: {msg}"
+            );
+        }
+    }
+
+    /// The two REPORTABLE bodies are byte-identical to the pre-#730 ones. This
+    /// change narrows when the schema-less body is emitted; it does not restate
+    /// it, and an operator's saved assertion on the wording still holds.
+    #[test]
+    fn the_reportable_bodies_are_unchanged() {
+        let no_schema =
+            render_input_validation(&InputSchemaLookup::NoSchema, &serde_json::json!({}));
+        assert_eq!(
+            no_schema,
+            serde_json::json!({
+                "valid": false,
+                "unvalidated": true,
+                "schema_present": false,
+                "errors": [],
+                "message": "No input schema defined on this workflow — input was NOT checked against any rules. `valid: false` here means validation did not run, not that it failed; gate on `unvalidated === true` to accept schema-less input intentionally. Add a schema via set_workflow_input_schema.",
+            })
+        );
+
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"n": {"type": "number"}},
+            "required": ["n"],
+        });
+        let ok = render_input_validation(
+            &InputSchemaLookup::Present(schema.clone()),
+            &serde_json::json!({"n": 1}),
+        );
+        assert_eq!(
+            ok,
+            serde_json::json!({
+                "valid": true,
+                "unvalidated": false,
+                "schema_present": true,
+                "errors": [],
+                "message": "Input is valid",
+            })
+        );
+
+        let bad = render_input_validation(
+            &InputSchemaLookup::Present(schema),
+            &serde_json::json!({"n": "not a number"}),
+        );
+        assert_eq!(bad["valid"], serde_json::json!(false));
+        assert_eq!(bad["unvalidated"], serde_json::json!(false));
+        assert_eq!(bad["schema_present"], serde_json::json!(true));
+        assert_eq!(bad["message"], "Input schema validation failed");
+        assert!(
+            !bad["errors"].as_array().map(Vec::is_empty).unwrap_or(true),
+            "a real validation failure still populates errors[]"
+        );
     }
 }

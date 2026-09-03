@@ -1977,6 +1977,10 @@ async fn handle_get_secret_access_log(
     // The right per-tenant path would be a user-scoped variant that
     // joins on `secrets.created_by = $user_id` — separate work; this
     // patch closes the cross-tenant leak fail-closed.
+    // allow-benign-default: fail-CLOSED admin gate. A failed read denies the
+    // operation, costing the caller a refusal rather than granting anything —
+    // the second shape check 74's opt-out admits. Direction, not disclosure,
+    // is what makes this one correct.
     let is_platform_admin = state
         .actor_repo
         .is_platform_admin(user_id)
