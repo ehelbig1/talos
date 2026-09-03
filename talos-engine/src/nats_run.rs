@@ -31,13 +31,35 @@ use crate::retry_classifier::HeuristicRetryClassifier;
 /// workflows run without a configured `WORKER_SHARED_KEY`.
 ///
 /// L-28: extracted from `run_with_trigger_input_via_nats` and applied
-/// to ALL public NATS-dispatch entry points. Previously the seed
+/// to the three `run_*_via_nats` entry points. Previously the seed
 /// variant (used by workflow chains and resume-from-checkpoint) had no
 /// guard — a misconfigured production controller would silently
 /// dispatch unsigned jobs after a restart.
+///
+/// That "three of four" was for a long time WRITTEN HERE AS "ALL", and it
+/// was false: [`build_nats_dispatcher`] is a fourth public entry point,
+/// and a caller that builds a dispatcher and dispatches through it
+/// directly (`execute_subworkflow_graph`, i.e. `test_subworkflow_contract`)
+/// bypassed the guard entirely while its three siblings refused. The
+/// docstring on `talos_mcp_handlers::utils::load_worker_shared_key_logged`
+/// asserted the same thing from the other side ("every NATS dispatch path
+/// runs through `run_with_trigger_input_via_nats`") and was false for the
+/// same one path, so the two claims covered for each other.
+///
+/// The fix is structural rather than a fourth call: this gate now has
+/// exactly ONE caller, [`build_nats_dispatcher`], which every dispatch
+/// path must go through to obtain a dispatcher at all. It returns
+/// `Result`, so a fifth entry point cannot be added without handling the
+/// refusal — the type system enforces what the comment used to claim.
+///
+/// `execution_id` is `None` for callers that dispatch under a synthetic
+/// execution with no `workflow_executions` row (the sub-workflow contract
+/// path); `entry_point` names the caller either way so the security log
+/// says which path refused.
 fn ensure_signing_key_present_in_production(
     worker_shared_key: Option<&WorkerSharedKey>,
-    execution_id: Uuid,
+    entry_point: &'static str,
+    execution_id: Option<Uuid>,
 ) -> Result<(), WorkflowEngineError> {
     // MCP-671 (2026-05-13): route through `talos_config::is_production()`
     // so `RUST_ENV=""` (helm placeholder) doesn't silently bypass the
@@ -48,7 +70,9 @@ fn ensure_signing_key_present_in_production(
     // worker NATS-auth gate closed in MCP-668.
     if worker_shared_key.is_none() && talos_config::is_production() {
         tracing::error!(
-            execution_id = %execution_id,
+            target: "talos_security",
+            entry_point,
+            execution_id = ?execution_id,
             "SECURITY: refusing NATS dispatch with no WORKER_SHARED_KEY in production. \
              Job signing is required to prevent on-wire forgery and replay."
         );
@@ -80,11 +104,31 @@ pub fn install_llm_usage_sink(sink: talos_workflow_engine_nats::LlmUsageSink) {
 /// and `run_with_trigger_input_via_nats` so construction is in exactly
 /// one place. Also used by direct callers of `execute_subworkflow_graph`
 /// (e.g. `subworkflow_contract_service`).
+///
+/// **This is the single production signing gate** for NATS dispatch: it
+/// runs [`ensure_signing_key_present_in_production`] and returns `Err`
+/// rather than a dispatcher, so no dispatch path can obtain a dispatcher
+/// without the refusal having been considered. Holding the gate HERE
+/// rather than in each `run_*` wrapper is deliberate — a caller that
+/// builds a dispatcher and drives it itself (the sub-workflow contract
+/// test) used to escape a per-wrapper gate, and the docstring on that
+/// gate claimed otherwise for months.
+///
+/// `entry_point` / `execution_id` are for the refusal log only; pass
+/// `None` for the latter when dispatching under a synthetic execution
+/// with no `workflow_executions` row.
 pub fn build_nats_dispatcher(
     engine: &ParallelWorkflowEngine,
     nats_client: Arc<async_nats::Client>,
     worker_shared_key: Option<WorkerSharedKey>,
-) -> Arc<dyn NodeDispatcher> {
+    entry_point: &'static str,
+    execution_id: Option<Uuid>,
+) -> Result<Arc<dyn NodeDispatcher>, WorkflowEngineError> {
+    ensure_signing_key_present_in_production(
+        worker_shared_key.as_ref(),
+        entry_point,
+        execution_id,
+    )?;
     // RFC 0010 P3 (D3b): keep a client handle for the claim responder before the
     // transport consumes `nats_client`.
     let nats_client_for_seal = nats_client.clone();
@@ -164,7 +208,7 @@ pub fn build_nats_dispatcher(
         }
         None => dispatcher,
     };
-    Arc::new(dispatcher)
+    Ok(Arc::new(dispatcher))
 }
 
 /// RFC 0010 P3 (D3b): the process-wide claim responder singleton + its
@@ -349,8 +393,15 @@ pub async fn run_with_nats(
     worker_shared_key: Option<WorkerSharedKey>,
     execution_id: Uuid,
 ) -> Result<WorkflowContext, WorkflowEngineError> {
-    ensure_signing_key_present_in_production(worker_shared_key.as_ref(), execution_id)?;
-    let dispatcher = build_nats_dispatcher(engine, nats_client, worker_shared_key.clone());
+    // The production signing gate lives inside `build_nats_dispatcher` —
+    // the one place every dispatch path must pass through.
+    let dispatcher = build_nats_dispatcher(
+        engine,
+        nats_client,
+        worker_shared_key.clone(),
+        "run_with_nats",
+        Some(execution_id),
+    )?;
     talos_workflow_engine_nats::run_with_nats(engine, dispatcher, worker_shared_key, execution_id)
         .await
 }
@@ -384,15 +435,19 @@ pub fn run_with_seed_via_nats(
     initial_results: HashMap<Uuid, JsonValue>,
     execution_id: Uuid,
 ) -> Pin<Box<dyn Future<Output = Result<WorkflowContext, WorkflowEngineError>> + Send + '_>> {
-    // L-28: gate has to live INSIDE the returned Future since the function
-    // signature returns a boxed future, not a `Result`. Build a future that
-    // checks the gate first and short-circuits on failure.
-    if let Err(e) =
-        ensure_signing_key_present_in_production(worker_shared_key.as_ref(), execution_id)
-    {
-        return Box::pin(async move { Err(e) });
-    }
-    let dispatcher = build_nats_dispatcher(engine, nats_client, worker_shared_key.clone());
+    // L-28: this function returns a boxed future rather than a `Result`, so
+    // the gate's refusal (raised by `build_nats_dispatcher`) is converted
+    // into an immediately-ready `Err` future.
+    let dispatcher = match build_nats_dispatcher(
+        engine,
+        nats_client,
+        worker_shared_key.clone(),
+        "run_with_seed_via_nats",
+        Some(execution_id),
+    ) {
+        Ok(d) => d,
+        Err(e) => return Box::pin(async move { Err(e) }),
+    };
     talos_workflow_engine_nats::run_with_seed_via_nats(
         engine,
         dispatcher,
@@ -422,8 +477,13 @@ pub async fn run_with_trigger_input_via_nats(
     trigger_input: JsonValue,
     execution_id: Uuid,
 ) -> Result<WorkflowContext, WorkflowEngineError> {
-    ensure_signing_key_present_in_production(worker_shared_key.as_ref(), execution_id)?;
-    let dispatcher = build_nats_dispatcher(engine, nats_client, worker_shared_key.clone());
+    let dispatcher = build_nats_dispatcher(
+        engine,
+        nats_client,
+        worker_shared_key.clone(),
+        "run_with_trigger_input_via_nats",
+        Some(execution_id),
+    )?;
     engine
         .run_with_trigger_input_transport(
             dispatcher,

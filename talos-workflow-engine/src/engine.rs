@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{LazyLock, OnceLock};
+use talos_workflow_engine_core::reserved_keys::output_reports_error;
 
 /// Wrap a scheduler future in the workflow-level wall-clock cap and
 /// produce the typed [`crate::WorkflowEngineError`] result.
@@ -2598,11 +2599,7 @@ impl ParallelWorkflowEngine {
                     )
                     .await
                 {
-                    if output
-                        .get("__error")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false)
-                    {
+                    if output_reports_error(&output) {
                         let continue_on_error = self
                             .node_configs
                             .get(&node_id)
@@ -2649,11 +2646,7 @@ impl ParallelWorkflowEngine {
                     // body failure (vs. condition-false / max-iterations).
                     // Honor `continue_on_error` the same way the
                     // capability-dispatch branch does.
-                    if output
-                        .get("__error")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false)
-                    {
+                    if output_reports_error(&output) {
                         let continue_on_error = self
                             .node_configs
                             .get(&node_id)

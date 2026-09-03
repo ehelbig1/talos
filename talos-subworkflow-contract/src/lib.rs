@@ -262,11 +262,25 @@ pub async fn run_contract_test(
     // Pending NATS/DB awaits release; a worker-side sandbox that was
     // mid-flight completes under its per-node timeout (bounded). No
     // controller-side resource leak.
+    // `build_nats_dispatcher` carries the production job-signing gate, so
+    // this path refuses an unsigned dispatch exactly like the three
+    // `run_*_via_nats` entry points do. It used to be the ONE dispatch
+    // origination point in the workspace that escaped that gate.
+    // `execution_id` is `None`: `execute_subworkflow_graph` runs under a
+    // synthetic execution id with no `workflow_executions` row.
     let dispatcher = talos_engine::nats_run::build_nats_dispatcher(
         &engine,
         nats_client,
         worker_shared_key.clone(),
-    );
+        "test_subworkflow_contract",
+        None,
+    )
+    .map_err(|e| {
+        ContractTestError::ExecutionFailed(into_subflow_envelope(
+            SubflowError::BuildFailed(e.to_string()),
+            "Sub-workflow contract test (dispatcher build)",
+        ))
+    })?;
     let fut = engine.execute_subworkflow_graph(workflow_id, input, dispatcher, worker_shared_key);
     let exec_result = tokio::time::timeout(Duration::from_secs(timeout_secs), fut).await;
 
@@ -321,10 +335,17 @@ pub fn interpret(
             (passed, None, class)
         }
         ContractKind::Reflection | ContractKind::Child | ContractKind::Subworkflow => {
-            let errored = collapsed
-                .get("__error")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            // `__error` is caller-reachable, not engine-authored: it is one
+            // of only two `__` keys that survive the reserved-key strip on
+            // a module's own output, and `collapse_subworkflow_output`
+            // returns a single terminal node's output verbatim. So a module
+            // (or a custom dispatcher, or an LLM) can put ANY JSON here.
+            // Reading it as `.as_bool().unwrap_or(false)` reported
+            // `{"__error": "upstream 502"}` as a PASSING contract — a test
+            // tool that cannot fail. Classify instead, via the same one
+            // implementation the Rhai condition scope uses.
+            let errored =
+                talos_workflow_engine_core::reserved_keys::output_reports_error(collapsed);
             (!errored, None, None)
         }
     };
@@ -533,5 +554,96 @@ mod tests {
         )
         .to_tool_body();
         assert!(jud.get("classifier_class").is_none());
+    }
+
+    // ---- __error polarity on the reflection / child / subworkflow arms ----
+    //
+    // These drive `interpret()`, the PRODUCTION function, at the CALL SITE.
+    // The classifier's own unit tests in talos-workflow-engine-core cannot
+    // see this call site: reverting this branch to
+    // `.get("__error").and_then(|v| v.as_bool()).unwrap_or(false)` leaves
+    // every one of those tests green. These are the tests that fail.
+    //
+    // `collapse_subworkflow_output` returns a single terminal node's output
+    // VERBATIM and `__error` survives the reserved-key strip, so the value
+    // here is module-authored and can be any JSON at all.
+
+    /// The three non-judge, non-classifier contracts all decide purely on
+    /// `__error`, so each shape is asserted against ALL THREE — fixing one
+    /// arm and not its siblings is this repo's recurring defect shape.
+    fn error_only_contracts() -> [ContractKind; 3] {
+        [
+            ContractKind::Reflection,
+            ContractKind::Child,
+            ContractKind::Subworkflow,
+        ]
+    }
+
+    #[test]
+    fn interpret_non_bool_error_marker_must_not_pass() {
+        // THE DEFECT. A module that reports failure as a message string —
+        // a natural shape the engine never validates — used to produce a
+        // GREEN contract test, i.e. a test tool that could not fail.
+        for contract in error_only_contracts() {
+            for collapsed in [
+                json!({"__error": "upstream returned 502"}),
+                json!({"__error": 500}),
+                json!({"__error": {"code": 500}}),
+                json!({"__error": ["boom"]}),
+            ] {
+                let out = interpret(&collapsed, contract, wf());
+                assert!(
+                    !out.passed,
+                    "a present-but-mis-shaped __error must FAIL the {:?} \
+                     contract, not read as success; collapsed = {collapsed}",
+                    contract
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn interpret_bool_true_error_marker_still_fails() {
+        // The engine-authored shape. Must be unchanged by the fix.
+        for contract in error_only_contracts() {
+            let out = interpret(&json!({"__error": true}), contract, wf());
+            assert!(!out.passed, "{contract:?} must fail on __error: true");
+        }
+    }
+
+    #[test]
+    fn interpret_falsy_or_absent_error_marker_passes() {
+        // The other half of the rule, and why a bare `.is_some()` would be
+        // WRONG: an explicit success envelope must still pass. Regressing
+        // to `is_some()` turns every one of these green cases red.
+        for contract in error_only_contracts() {
+            for collapsed in [
+                json!({"result": "ok"}),
+                json!({"__error": false}),
+                json!({"__error": null}),
+                json!({"__error": ""}),
+            ] {
+                let out = interpret(&collapsed, contract, wf());
+                assert!(
+                    out.passed,
+                    "{:?} must pass when __error is absent or falsy; \
+                     collapsed = {collapsed}",
+                    contract
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn interpret_non_object_collapsed_output_passes() {
+        // A bare string / array terminal output carries no marker.
+        for contract in error_only_contracts() {
+            for collapsed in [json!("plain text"), json!([1, 2, 3])] {
+                assert!(
+                    interpret(&collapsed, contract, wf()).passed,
+                    "{contract:?} on non-object output: {collapsed}"
+                );
+            }
+        }
     }
 }

@@ -9343,6 +9343,7 @@ dependencies = [
  "talos-secrets-manager",
  "talos-text-util",
  "talos-workflow-engine",
+ "talos-workflow-engine-core",
  "talos-workflow-job-protocol",
  "tokio",
  "tracing",

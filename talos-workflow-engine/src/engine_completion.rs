@@ -20,6 +20,7 @@
 //! auditable in isolation.
 
 use std::collections::{HashMap, VecDeque};
+use talos_workflow_engine_core::reserved_keys::output_reports_error;
 
 use petgraph::graph::NodeIndex;
 use petgraph::Direction;
@@ -94,10 +95,7 @@ impl ParallelWorkflowEngine {
         // `executing.next()` completion path marks its own nodes and
         // never reaches this function, so there is no double count.
         self.progress.mark_finished(self.graph[node_idx]);
-        let is_error = output
-            .get("__error")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let is_error = output_reports_error(&output);
         if is_error {
             let msg = output
                 .get("error_message")
