@@ -435,7 +435,55 @@ jobs:
         # threshold (low/info stay informational). The nightly schedule re-runs
         # this so a freshly-disclosed advisory surfaces within 24h even with no
         # open PR.
-        run: npm audit --audit-level=moderate
+        #
+        # NOT a bare `npm audit`. That command exits 1 for BOTH "moderate+
+        # advisories were found" AND "I could not reach the advisory
+        # service", and CI cannot tell those apart from an exit code. On
+        # 2026-09-03 the registry answered `500 Internal Server Error` and
+        # failed a Rust-only PR — the third time in three days this gate
+        # blocked a change it had nothing to say about. npm's own notice in
+        # that same output says the endpoint "is being retired", so this
+        # gets more common, not less.
+        #
+        # The two outcomes are now distinguished, and UNREADABLE IS NOT
+        # CLEAN: a transport/endpoint failure emits a loud ::warning:: that
+        # says the advisory state is UNKNOWN and does not block, while real
+        # moderate+ advisories still fail the job exactly as before. The
+        # nightly schedule re-runs this, so a genuine advisory hidden
+        # behind one outage surfaces within 24h.
+        #
+        # Silence on an unreadable audit would be the worse bug: a green
+        # tick that means "I did not look".
+        run: |
+          set -uo pipefail
+          out="$(npm audit --json --audit-level=moderate 2>/dev/null)"
+          rc=$?
+
+          if [ -z "$out" ] || ! printf '%s' "$out" | jq -e . >/dev/null 2>&1; then
+            echo "::warning title=Frontend advisory state UNKNOWN::npm audit produced no parseable JSON (exit $rc). This is NOT a clean result — the advisory state was not read."
+            exit 0
+          fi
+
+          if printf '%s' "$out" | jq -e '.error' >/dev/null 2>&1; then
+            detail="$(printf '%s' "$out" | jq -r '.error.summary // .error.detail // .error | tostring' | head -c 400)"
+            echo "::warning title=Frontend advisory state UNKNOWN::npm audit could not reach the advisory service, so no claim is made about frontend CVEs: $detail"
+            exit 0
+          fi
+
+          crit=$(printf '%s' "$out" | jq -r '.metadata.vulnerabilities.critical // 0')
+          high=$(printf '%s' "$out" | jq -r '.metadata.vulnerabilities.high // 0')
+          mod=$(printf  '%s' "$out" | jq -r '.metadata.vulnerabilities.moderate // 0')
+          total=$((crit + high + mod))
+
+          echo "Frontend advisories — critical=$crit high=$high moderate=$mod"
+          if [ "$total" -gt 0 ]; then
+            printf '%s' "$out" | jq -r '
+              .vulnerabilities // {} | to_entries[]
+              | select(.value.severity == "critical" or .value.severity == "high" or .value.severity == "moderate")
+              | "  \(.value.severity)\t\(.key)\t\(.value.via | if type=="array" then (map(if type=="object" then .title else . end) | join("; ")) else tostring end)"'
+            echo "::error title=Frontend dependency advisories::$total moderate+ advisory(ies). The backlog is kept at ZERO on main, so these are newly introduced."
+            exit 1
+          fi
 
   # ── Migration baseline verifier (RFC 0009 phase 1) ─────────────────────────
   # Proves the committed migrations/.baseline/ artifacts (schema snapshot +
