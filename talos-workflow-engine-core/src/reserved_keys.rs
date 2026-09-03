@@ -41,7 +41,95 @@
 
 /// Error marker: boolean `true` on an output object flags the node
 /// as having failed. Paired with a free-form `error_message` string.
+///
+/// **Engine writers always emit a literal `true`, but READERS must not
+/// assume the shape.** `__error` is one of exactly two `__`-prefixed keys
+/// that survive the reserved-key strip on a module's own output (the other
+/// is [`CONTINUED`] — see the `retain` calls in
+/// `engine_dispatch_system.rs`), and `collapse_subworkflow_output` returns
+/// a single terminal node's output verbatim. So the value reaching a
+/// reader can have been authored by a WASM module, a custom
+/// `NodeDispatcher` (`docs/workflow-engine/custom-dispatcher.md` documents
+/// returning `Ok` with an `__error` envelope), or an LLM's JSON — none of
+/// which the engine validates. Classify it with [`classify_error_flag`] /
+/// [`output_reports_error`]; never `.as_bool().unwrap_or(false)`, which
+/// reads a present-but-mis-shaped marker as "no error".
 pub const ERROR_FLAG: &str = "__error";
+
+/// What an [`ERROR_FLAG`]-style marker's value actually says.
+///
+/// Returned by [`classify_error_flag`]. Three JSON values mean "this node
+/// did not fail" and everything else means it did — see that function for
+/// the rule and why it is drawn there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErrorFlag {
+    /// No marker at all, or a marker whose value means "no failure":
+    /// `null`, `false`, or the empty string.
+    NoError,
+    /// The marker is present with a value that means the node failed.
+    /// `message` is the operator-facing rendering of that value.
+    Failed {
+        /// A non-empty string value verbatim; any other value rendered
+        /// as compact JSON (so `true` renders as `"true"`).
+        message: String,
+    },
+}
+
+impl ErrorFlag {
+    /// `true` for [`ErrorFlag::Failed`].
+    pub fn is_failed(&self) -> bool {
+        matches!(self, ErrorFlag::Failed { .. })
+    }
+}
+
+/// Classify an [`ERROR_FLAG`] (or bare `error`) marker value.
+///
+/// **The rule: only a falsy-or-empty value means success.** Precisely,
+/// these four inputs are [`ErrorFlag::NoError`] —
+///
+/// * `None` (the key is absent),
+/// * `Null` — the success envelope `database-query`-style templates emit,
+/// * `false` — an explicit "did not fail",
+/// * `""` — a present but empty error message carries no error;
+///
+/// — and **every other value is [`ErrorFlag::Failed`]**, including a
+/// non-empty string, a number, an array and an object.
+///
+/// Why the rule is drawn here rather than at either extreme:
+///
+/// * `.as_bool().unwrap_or(false)` (the shape this function replaces)
+///   treats a mis-shaped marker as success. A module reporting
+///   `{"__error": "upstream 502"}` — a natural shape, and one the engine
+///   never validates away — reads as a clean run. A present error marker
+///   nobody could parse is the one thing that must not read as success.
+/// * A bare `.is_some()` is the opposite error: it makes `__error: false`
+///   and `__error: null` mean *failed*, which would break every template
+///   that emits an explicit success envelope. Presence is not the test.
+///
+/// This is the semantics `talos-engine`'s Rhai condition scope has always
+/// used for `is_error` / `error_message`; it now has one implementation so
+/// a skip-condition, an edge predicate and a contract test cannot disagree
+/// about whether the same output errored.
+pub fn classify_error_flag(value: Option<&serde_json::Value>) -> ErrorFlag {
+    match value {
+        None | Some(serde_json::Value::Null | serde_json::Value::Bool(false)) => ErrorFlag::NoError,
+        Some(serde_json::Value::String(s)) if s.is_empty() => ErrorFlag::NoError,
+        Some(serde_json::Value::String(s)) => ErrorFlag::Failed { message: s.clone() },
+        Some(other) => ErrorFlag::Failed {
+            message: other.to_string(),
+        },
+    }
+}
+
+/// `true` when `output`'s [`ERROR_FLAG`] marker reports a failure, per
+/// [`classify_error_flag`].
+///
+/// A non-object `output` has no marker to read and is therefore not an
+/// error (`Value::get` returns `None`), which matches how every caller
+/// treated a bare string / array output before.
+pub fn output_reports_error(output: &serde_json::Value) -> bool {
+    classify_error_flag(output.get(ERROR_FLAG)).is_failed()
+}
 
 /// Signals downstream aggregators that input fan-in collapsed with
 /// missing or erroring branches.
@@ -726,5 +814,113 @@ mod tests {
         assert_eq!(u["entries"].as_array().unwrap().len(), 0);
         // describe over an unverified report is empty, not a panic.
         assert_eq!(describe_stale_entries(&u), "");
+    }
+
+    // ---- __error polarity (classify_error_flag / output_reports_error) ----
+    //
+    // These drive the PRODUCTION classifier. The rule under test is that
+    // only a falsy-or-empty marker means success; a present-but-mis-shaped
+    // marker must read as a FAILURE, because it used to read as success
+    // (`.as_bool().unwrap_or(false)`) on paths that decide execution
+    // status, node_completed vs node_failed events, ensemble consensus,
+    // loop termination reason and the sub-workflow contract test.
+
+    #[test]
+    fn error_flag_absent_or_falsy_is_not_an_error() {
+        // The four shapes that legitimately mean "this node did not fail".
+        assert_eq!(classify_error_flag(None), ErrorFlag::NoError);
+        assert_eq!(
+            classify_error_flag(Some(&serde_json::Value::Null)),
+            ErrorFlag::NoError,
+            "{{\"error\": null}} is the success envelope database-query-style \
+             templates emit; presence alone must not mean failure"
+        );
+        assert_eq!(
+            classify_error_flag(Some(&serde_json::json!(false))),
+            ErrorFlag::NoError
+        );
+        assert_eq!(
+            classify_error_flag(Some(&serde_json::json!(""))),
+            ErrorFlag::NoError,
+            "an empty error message carries no error"
+        );
+    }
+
+    #[test]
+    fn error_flag_bool_true_is_an_error_with_rendered_message() {
+        // The shape every engine writer emits. Behaviour here must be
+        // byte-identical to the pre-fix `.as_bool().unwrap_or(false)`.
+        assert_eq!(
+            classify_error_flag(Some(&serde_json::json!(true))),
+            ErrorFlag::Failed {
+                message: "true".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn error_flag_non_empty_string_is_an_error_carrying_it_verbatim() {
+        // THE DEFECT: a module reporting `{"__error": "upstream 502"}` read
+        // as a clean run under `.as_bool()`, because as_bool() on a string
+        // is None.
+        assert_eq!(
+            classify_error_flag(Some(&serde_json::json!("upstream 502"))),
+            ErrorFlag::Failed {
+                message: "upstream 502".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn error_flag_any_other_shape_is_an_error() {
+        // Numbers, arrays and objects are all mis-shaped markers, and a
+        // mis-shaped marker must never be the benign answer. Rendered as
+        // compact JSON so an operator sees what was actually there.
+        for v in [
+            serde_json::json!(500),
+            serde_json::json!(0),
+            serde_json::json!(["boom"]),
+            serde_json::json!({"code": 500}),
+        ] {
+            let got = classify_error_flag(Some(&v));
+            assert!(
+                got.is_failed(),
+                "a mis-shaped __error must read as failed, got {got:?} for {v}"
+            );
+        }
+        assert_eq!(
+            classify_error_flag(Some(&serde_json::json!({"code": 500}))),
+            ErrorFlag::Failed {
+                message: "{\"code\":500}".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn output_reports_error_reads_the_error_flag_key_off_an_object() {
+        assert!(!output_reports_error(&serde_json::json!({"ok": 1})));
+        assert!(!output_reports_error(
+            &serde_json::json!({ERROR_FLAG: false})
+        ));
+        assert!(output_reports_error(&serde_json::json!({ERROR_FLAG: true})));
+        assert!(
+            output_reports_error(&serde_json::json!({ERROR_FLAG: "boom"})),
+            "the string form is the one that used to pass as success"
+        );
+    }
+
+    #[test]
+    fn output_reports_error_on_a_non_object_is_not_an_error() {
+        // A bare string / array / number node output has no marker to
+        // read; `Value::get` returns None. Matches how every caller
+        // behaved before the classifier existed.
+        for v in [
+            serde_json::json!("just a string"),
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!(7),
+            serde_json::Value::Null,
+        ] {
+            assert!(!output_reports_error(&v), "non-object output: {v}");
+        }
     }
 }

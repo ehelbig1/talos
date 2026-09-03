@@ -15,6 +15,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use talos_workflow_engine_core::reserved_keys::output_reports_error;
 
 use petgraph::graph::NodeIndex;
 use petgraph::Direction;
@@ -1068,10 +1069,7 @@ impl ParallelWorkflowEngine {
         // dispatch loop's node_started — without it, a fast downstream
         // node could race ahead of this node_completed in the events
         // table and the trace builder would show out-of-order activity.
-        let is_error = output
-            .get("__error")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let is_error = output_reports_error(&output);
         let (event_type, status, log_message) = if is_error {
             (
                 "node_failed",
@@ -1402,10 +1400,7 @@ impl ParallelWorkflowEngine {
                         // failed. Promote that into the Err variant so the
                         // workflow-level failure path engages — matches the
                         // capability_dispatch caller's detection.
-                        let is_error = sub_result
-                            .get("__error")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
+                        let is_error = output_reports_error(&sub_result);
                         if is_error {
                             let msg = sub_result
                                 .get("error_message")
@@ -2507,11 +2502,7 @@ impl ParallelWorkflowEngine {
                     // body failure so the termination reason reflects
                     // reality instead of silently rolling up "looks like
                     // we ran N iterations" to the caller.
-                    if clean
-                        .get("__error")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false)
-                    {
+                    if output_reports_error(&clean) {
                         let msg = clean
                             .get("error_message")
                             .and_then(|v| v.as_str())
@@ -2645,10 +2636,7 @@ impl ParallelWorkflowEngine {
                 // Detect the marker and convert to `Halt` so the caller
                 // can route through the normal failure path (where
                 // continue_on_error + error edges still work).
-                let is_error_envelope = gate_result
-                    .get("__error")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                let is_error_envelope = output_reports_error(&gate_result);
                 if is_error_envelope {
                     let msg = gate_result
                         .get("error_message")

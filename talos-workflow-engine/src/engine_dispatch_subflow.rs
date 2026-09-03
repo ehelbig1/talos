@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use talos_workflow_engine_core::reserved_keys::output_reports_error;
 
 use futures::stream::StreamExt;
 use petgraph::graph::NodeIndex;
@@ -523,7 +524,7 @@ impl ParallelWorkflowEngine {
         let consensus_output: JsonValue = match consensus_strategy.as_str() {
             "first_pass" => all_results
                 .iter()
-                .find(|r| !r.get("__error").and_then(|v| v.as_bool()).unwrap_or(false))
+                .find(|r| !output_reports_error(r))
                 .cloned()
                 .unwrap_or_else(|| {
                     all_results.first().cloned().unwrap_or_else(|| {
@@ -560,12 +561,7 @@ impl ParallelWorkflowEngine {
                 // owned data plus `&self`.
                 let scored_candidates: Vec<JsonValue> = all_results
                     .iter()
-                    .filter(|candidate| {
-                        !candidate
-                            .get("__error")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false)
-                    })
+                    .filter(|candidate| !output_reports_error(candidate))
                     .cloned()
                     .collect();
                 // Eagerly materialize the futures into an owned Vec so
@@ -638,7 +634,7 @@ impl ParallelWorkflowEngine {
                     std::collections::HashMap::new();
                 const MAX_VOTE_KEY_BYTES: usize = 8_192;
                 for r in &all_results {
-                    if r.get("__error").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    if output_reports_error(r) {
                         continue;
                     }
                     let key_val = {
@@ -911,11 +907,7 @@ impl ParallelWorkflowEngine {
                 Err(e) => e.into_error_envelope("ReflectiveRetry child"),
             };
 
-            if !child_out
-                .get("__error")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
+            if !output_reports_error(&child_out) {
                 Self::emit_quality_gate_event(
                     "reflective_retry",
                     true,

@@ -7366,6 +7366,162 @@ else
 fi
 echo
 
+# ── 77. `__error` must be CLASSIFIED, not shape-assumed ───────────────
+# `__error` is one of exactly TWO `__`-prefixed keys that survive the
+# reserved-key strip on a module's own output (`engine_dispatch_system.rs`
+# retains `__error` and `__continued` deliberately), and
+# `collapse_subworkflow_output` returns a single terminal node's output
+# VERBATIM. So the value a reader sees can be authored by a WASM module, a
+# custom `NodeDispatcher` (which the custom-dispatcher doc explicitly tells
+# integrators to use for an error envelope), or an LLM — none validated.
+# `.get("__error").and_then(|v| v.as_bool()).unwrap_or(false)` returns
+# `false` for ANY non-boolean value, so a module reporting
+# `{"__error": "upstream 502"}` read as a CLEAN RUN. Twelve sites shared
+# the shape and the benign collapse decided, among other things:
+# execution status (`route_system_node_output`), node_completed vs
+# node_failed in the events table, ensemble consensus winner selection,
+# reflective-retry's quality gate, loop termination reason, and the
+# `test_subworkflow_contract` verdict. The rule has ONE home,
+# `talos_workflow_engine_core::reserved_keys::classify_error_flag` /
+# `output_reports_error`: only absent / `null` / `false` / `""` mean
+# success, everything else is a failure — the semantics the Rhai condition
+# scope had always used, so a skip condition, an edge predicate and a
+# contract test can no longer disagree about the same output. A behavioural
+# test cannot cover this population: reverting the highest-severity site
+# (execution status) left all 244 engine unit tests GREEN, which is why
+# this is a lint. Note the `)` in the character class: the house shape is
+# `.and_then(|v| v.as_bool())\n.unwrap_or(false)`, so a CLOSE PAREN sits
+# between the two once lines are joined. The first version of this check
+# omitted it, and run against the pre-fix tree it reported CLEAN over all
+# twelve defects — the gate-that-doesn't-gate class inside the guard for
+# it (#624, checks 64/65). Opt-out `// allow-unclassified-error-flag: <reason>`.
+bold "▶ check 77: __error reads are classified, not shape-assumed"
+ERRFLAG_FAIL=0
+while IFS=: read -r f n _rest; do
+    [ -n "${f:-}" ] || continue
+    # The classifier's own home defines the rule.
+    case "$f" in ./talos-workflow-engine-core/src/reserved_keys.rs) continue ;; esac
+    # 4-line window from the read, with WHOLE-LINE comments dropped: a doc
+    # comment or a test comment quoting the banned expression would
+    # otherwise self-report (check 73 was bitten by exactly that).
+    if ! sed -n "${n},$((n + 3))p" "$f" 2>/dev/null \
+        | grep -v '^[[:space:]]*//' \
+        | tr -d '\n' \
+        | grep -qE '\.as_bool\(\)[[:space:])]*\.unwrap_or'; then
+        continue
+    fi
+    lo=$(( n > 8 ? n - 8 : 1 ))
+    if sed -n "${lo},${n}p" "$f" | grep -q 'allow-unclassified-error-flag:'; then continue; fi
+    red "✗ $f:$n reads __error via .as_bool().unwrap_or — a mis-shaped marker reads as success"
+    ERRFLAG_FAIL=$((ERRFLAG_FAIL + 1))
+done < <(grep -rn --include='*.rs' --exclude-dir=target --exclude-dir=vendor \
+             --exclude-dir=node_modules "${TREE_PRUNE_GREP[@]}" \
+             -E '\.get\([[:space:]]*("__error"|(reserved_keys::)?ERROR_FLAG)[[:space:]]*\)' . 2>/dev/null || true)
+
+if [ "$ERRFLAG_FAIL" -gt 0 ]; then
+    yellow "  → a PRESENT but mis-shaped error marker must never read as success."
+    yellow "    Use talos_workflow_engine_core::reserved_keys::output_reports_error(&v)"
+    yellow "    (or classify_error_flag when you also need the message). Note a bare"
+    yellow "    .is_some() is the OPPOSITE error: {\"__error\": null} is the success"
+    yellow "    envelope database-query-style templates emit, so presence is not the test."
+    EXIT_CODE=1
+else
+    green "✓ every __error read goes through the shared classifier"
+fi
+echo
+
+# ── 78. ONE production signing gate for NATS dispatch ─────────────────
+# `ensure_signing_key_present_in_production` refuses to dispatch when
+# `WORKER_SHARED_KEY` is unset in production (unsigned jobs are forgeable
+# and replayable on the wire). Its own docstring claimed for months that it
+# was "applied to ALL public NATS-dispatch entry points"; it was applied to
+# THREE of four. `build_nats_dispatcher` is the fourth, and a caller that
+# builds a dispatcher and drives it itself (`execute_subworkflow_graph`,
+# i.e. `test_subworkflow_contract`) bypassed the gate entirely while its
+# three siblings refused. `talos-mcp-handlers`' own
+# `load_worker_shared_key_logged` docstring asserted the same property from
+# the other side ("every NATS dispatch path runs through
+# run_with_trigger_input_via_nats") and was false for the same one path, so
+# the two claims propped each other up — the #732 defect class (a comment
+# asserting a safety property the code drops), one file over.
+#
+# The gate now lives at the DISPATCHER-CONSTRUCTION chokepoint and returns
+# `Result`, so a fifth entry point cannot be added without handling the
+# refusal. Two legs, because either alone is trivially evaded:
+#   (a) `build_nats_dispatcher` must still return `Result` AND still call
+#       the gate — a refactor could keep the signature and drop the call,
+#       or keep the call and drop the refusal. On the pre-fix tree this leg
+#       FIRES on both counts, so it is measured against the real defect,
+#       not a synthetic one.
+#   (b) a raw `NatsNodeDispatcher::new(` may be constructed only in
+#       `talos-engine/src/nats_run.rs` (the builder) and inside
+#       `talos-workflow-engine-nats/` (the type's own crate + its tests) —
+#       without this, (a) is defeated by hand-rolling a dispatcher next to
+#       the builder and never calling it. Leg (b) ships at ZERO and is
+#       PROPHYLACTIC: it found nothing on either tree.
+# Stated limits: both legs are TEXTUAL. (a) locates the function by its
+# name and reads to the next column-0 `}`, so a rename or a nested
+# column-0 brace inside a string would mislead it (loud direction: the
+# region shrinks and the gate reads as missing). (b) pins one constructor
+# identifier, so a differently-named dispatcher type, or one obtained from
+# a helper in a third crate, is invisible. Neither leg can prove the gate's
+# DECISION is right — only that it is present and can refuse.
+# Opt-out `// allow-ungated-nats-dispatcher: <reason>` (leg b).
+bold "▶ check 78: one production signing gate for NATS dispatch"
+DISPATCH_GATE_FAIL=0
+NATS_RUN_FILE="talos-engine/src/nats_run.rs"
+if [ ! -f "$NATS_RUN_FILE" ]; then
+    red "✗ $NATS_RUN_FILE not found — the dispatch signing gate's home moved;"
+    yellow "  → repoint check 78 rather than letting it silently pass."
+    DISPATCH_GATE_FAIL=$((DISPATCH_GATE_FAIL + 1))
+else
+    BND_START="$(grep -n '^pub fn build_nats_dispatcher(' "$NATS_RUN_FILE" | head -1 | cut -d: -f1 || true)"
+    if [ -z "${BND_START:-}" ]; then
+        red "✗ build_nats_dispatcher not found in $NATS_RUN_FILE (renamed or removed?)"
+        yellow "  → the signing gate hangs off this function; repoint check 78."
+        DISPATCH_GATE_FAIL=$((DISPATCH_GATE_FAIL + 1))
+    else
+        BND_END="$(awk -v s="$BND_START" 'NR>s && /^\}/ {print NR; exit}' "$NATS_RUN_FILE")"
+        BND_END="${BND_END:-$(wc -l < "$NATS_RUN_FILE")}"
+        BND_REGION="$(sed -n "${BND_START},${BND_END}p" "$NATS_RUN_FILE")"
+        if ! printf '%s' "$BND_REGION" | grep -q 'ensure_signing_key_present_in_production'; then
+            red "✗ build_nats_dispatcher ($NATS_RUN_FILE:$BND_START) does not call ensure_signing_key_present_in_production"
+            DISPATCH_GATE_FAIL=$((DISPATCH_GATE_FAIL + 1))
+        fi
+        if ! printf '%s' "$BND_REGION" | grep -qE '^\)[[:space:]]*->[[:space:]]*Result<|->[[:space:]]*Result<'; then
+            red "✗ build_nats_dispatcher ($NATS_RUN_FILE:$BND_START) does not return Result — it cannot refuse"
+            DISPATCH_GATE_FAIL=$((DISPATCH_GATE_FAIL + 1))
+        fi
+    fi
+fi
+
+while IFS=: read -r f n _rest; do
+    [ -n "${f:-}" ] || continue
+    case "$f" in
+        ./talos-engine/src/nats_run.rs) continue ;;
+        ./talos-workflow-engine-nats/*) continue ;;
+    esac
+    lo=$(( n > 8 ? n - 8 : 1 ))
+    if sed -n "${lo},${n}p" "$f" | grep -q 'allow-ungated-nats-dispatcher:'; then continue; fi
+    red "✗ $f:$n constructs a NatsNodeDispatcher outside build_nats_dispatcher — bypasses the signing gate"
+    DISPATCH_GATE_FAIL=$((DISPATCH_GATE_FAIL + 1))
+done < <(grep -rn --include='*.rs' --exclude-dir=target --exclude-dir=vendor \
+             --exclude-dir=node_modules "${TREE_PRUNE_GREP[@]}" \
+             -E 'NatsNodeDispatcher::new\(' . 2>/dev/null || true)
+
+if [ "$DISPATCH_GATE_FAIL" -gt 0 ]; then
+    yellow "  → every NATS dispatch path must obtain its dispatcher from"
+    yellow "    talos_engine::nats_run::build_nats_dispatcher, which runs the"
+    yellow "    production signing gate and returns Err instead of a dispatcher."
+    yellow "    Do NOT re-add a per-wrapper gate: that shape is what let the"
+    yellow "    sub-workflow contract path dispatch unsigned for months while"
+    yellow "    two docstrings claimed otherwise."
+    EXIT_CODE=1
+else
+    green "✓ the NATS dispatch signing gate is the single construction chokepoint"
+fi
+echo
+
 # ── 54. Lint self-consistency (meta-check) ────────────────────────────
 # The system whose purpose is catching drift drifted from its own docs:
 # by 2026-07-01 the script had 49 checks while CLAUDE.md said 43 and the

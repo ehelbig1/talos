@@ -103,26 +103,24 @@ fn build_condition_scope<'a>(context: &'a JsonValue) -> Scope<'a> {
         // Detect error state from the context JSON:
         // 1. An `__error` or `error` field indicates an error.
         // 2. If the context only contains a string that looks like an error.
-        for key in &["__error", "error"] {
-            if let Some(val) = map.get(*key) {
-                // Only treat as an error if the value is a non-empty, non-null value.
-                // Templates like database-query always emit {"error": null} on success,
-                // so key presence alone is not sufficient.
-                match val {
-                    JsonValue::Null => {}
-                    JsonValue::String(s) if s.is_empty() => {}
-                    JsonValue::Bool(false) => {}
-                    JsonValue::String(s) => {
-                        detected_error = true;
-                        detected_error_message = s.clone();
-                        break;
-                    }
-                    other => {
-                        detected_error = true;
-                        detected_error_message = other.to_string();
-                        break;
-                    }
-                }
+        // Only treat as an error if the value is a non-empty, non-null value.
+        // Templates like database-query always emit {"error": null} on
+        // success, so key presence alone is not sufficient. The rule lives
+        // in `reserved_keys::classify_error_flag` (ONE implementation, so
+        // this evaluator, the edge predicates and `test_subworkflow_contract`
+        // cannot disagree about whether the same output errored) — see that
+        // function for why neither `.as_bool().unwrap_or(false)` nor
+        // `.is_some()` is correct here.
+        for key in &[
+            talos_workflow_engine_core::reserved_keys::ERROR_FLAG,
+            "error",
+        ] {
+            if let talos_workflow_engine_core::reserved_keys::ErrorFlag::Failed { message } =
+                talos_workflow_engine_core::reserved_keys::classify_error_flag(map.get(*key))
+            {
+                detected_error = true;
+                detected_error_message = message;
+                break;
             }
         }
 

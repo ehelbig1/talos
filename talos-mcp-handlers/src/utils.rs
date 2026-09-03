@@ -276,10 +276,20 @@ pub use talos_http_utils::ssrf::check_outbound_url_no_ssrf;
 ///   visible in observability instead of becoming an invisible "jobs are
 ///   unsigned" regression.
 ///
-/// The hard fail-closed in production happens downstream — every NATS
-/// dispatch path runs through `talos_engine::nats_run::run_with_trigger_input_via_nats`,
-/// which refuses to dispatch with `None` when `RUST_ENV=production`. This
-/// helper centralizes the load+log so call-sites stay one-liners.
+/// The hard fail-closed in production happens downstream, in
+/// `talos_engine::nats_run::build_nats_dispatcher`, which refuses to
+/// return a dispatcher at all when the key is `None` and
+/// `RUST_ENV=production`. This helper centralizes the load+log so
+/// call-sites stay one-liners.
+///
+/// This paragraph used to say "every NATS dispatch path runs through
+/// `run_with_trigger_input_via_nats`", which was FALSE: the sub-workflow
+/// contract test built its own dispatcher and dispatched through it,
+/// bypassing that wrapper — and the gate's own docstring in `nats_run`
+/// simultaneously claimed it was applied to "ALL" entry points, so the
+/// two false claims propped each other up. The gate now lives at the
+/// dispatcher-construction chokepoint and returns `Result`, so the
+/// property is enforced by the type system instead of by these comments.
 pub fn load_worker_shared_key_logged(
     operation: &str,
 ) -> Option<talos_workflow_engine_core::WorkerSharedKey> {
