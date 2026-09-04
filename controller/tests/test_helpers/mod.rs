@@ -25,11 +25,14 @@ async fn shared_conn_string() -> String {
             // hardcoded default tag, but Talos migrations require:
             //   - `gen_random_uuid()` (native to Postgres 13+)
             //   - `vector` extension (third-party pgvector image)
-            // Use the same pgvector/pgvector:pg16 image as docker-compose.yml +
-            // the CI services postgres so test, dev, and prod run the same image.
+            // Use the same pgvector/pgvector:pg17 image as docker-compose.yml +
+            // the CI services postgres so test, dev, and prod run the same
+            // image. This comment previously said pg16 and claimed parity with
+            // prod; prod is pg17, so the claim was false and the tag was the
+            // odd one out.
             let container = PostgresImage::default()
                 .with_name("pgvector/pgvector")
-                .with_tag("pg16")
+                .with_tag("pg17")
                 .start()
                 .await
                 .expect("Failed to start PostgreSQL container");

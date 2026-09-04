@@ -544,7 +544,9 @@ jobs:
     timeout-minutes: 15
     services:
       postgres:
-        image: pgvector/pgvector:pg17
+        # Digest-pinned like docker-compose.yml and ci.yml — an unpinned tag
+        # lets an upstream rebuild silently change what CI tests.
+        image: pgvector/pgvector:pg17@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
         env:
           POSTGRES_PASSWORD: verify
         ports:
@@ -616,7 +618,9 @@ jobs:
     timeout-minutes: 25
     services:
       postgres:
-        image: pgvector/pgvector:pg17
+        # Digest-pinned like docker-compose.yml and ci.yml — an unpinned tag
+        # lets an upstream rebuild silently change what CI tests.
+        image: pgvector/pgvector:pg17@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
         env:
           POSTGRES_PASSWORD: sqlxcheck
           # DATABASE_URL below points at /talos; without this the image

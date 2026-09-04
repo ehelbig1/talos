@@ -146,11 +146,15 @@ jobs:
       postgres:
         # Migrations require three extensions: pgcrypto (bundled),
         # pg_trgm (bundled), and `vector` (pgvector — third-party).
-        # Plain `postgres:16-alpine` lacks `vector`, so migrations
-        # would fail mid-stream on `CREATE EXTENSION vector`. Match
-        # production by using the pgvector/pgvector image with the
-        # same pinned digest as docker-compose.yml.
-        image: pgvector/pgvector:pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
+        # Plain postgres images lack `vector`, so migrations would fail
+        # mid-stream on `CREATE EXTENSION vector`. Same pinned digest as
+        # docker-compose.yml.
+        #
+        # This comment used to say it matched production while pinning pg16,
+        # and production is pg17 — a comment asserting a property the config
+        # did not have. It now genuinely matches: production, quality.yml and
+        # the migration baseline are all pg17.
+        image: pgvector/pgvector:pg17@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
         env:
           POSTGRES_USER: talos
           POSTGRES_PASSWORD: talos

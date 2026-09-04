@@ -10,10 +10,16 @@ services:
         reservations:
           memory: 256M
           cpus: '0.25'
-    # Digest-pinned for supply-chain integrity — `:pg16` tag kept for
-    # human readability; the digest is what actually gets pulled. Update
-    # both when bumping: `docker buildx imagetools inspect pgvector/pgvector:pg16`
-    image: pgvector/pgvector:pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
+    # Digest-pinned for supply-chain integrity — the `:pg17` tag is kept for
+    # human readability; the digest is what actually gets pulled. Update both
+    # when bumping: `docker buildx imagetools inspect pgvector/pgvector:pg17`
+    #
+    # pg17 because PRODUCTION is pg17 (deploy/helm values.yaml: "derived from
+    # postgres:17") and `migrations/.baseline/schema.sql` is dumped from 17.10.
+    # On pg16 that baseline cannot be applied at all — it emits
+    # `SET transaction_timeout = 0`, a PG17-only GUC, so under ON_ERROR_STOP=1
+    # `migrate_db()` fails and `make test-integration` is unrunnable locally.
+    image: pgvector/pgvector:pg17@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
     container_name: talos-postgres
     environment:
       POSTGRES_USER: talos
@@ -61,7 +67,7 @@ services:
   # rather than the untestable "artifacts + the live host ⇒ readable".
   postgres-backup:
     restart: unless-stopped
-    image: pgvector/pgvector:pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
+    image: pgvector/pgvector:pg17@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
     container_name: talos-postgres-backup
     depends_on:
       postgres:
@@ -95,7 +101,7 @@ services:
   # tooling involved.
   vault-backup:
     restart: unless-stopped
-    image: pgvector/pgvector:pg16@sha256:7d400e340efb42f4d8c9c12c6427adb253f726881a9985d2a471bf0eed824dff
+    image: pgvector/pgvector:pg17@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
     container_name: talos-vault-backup
     depends_on:
       vault:
