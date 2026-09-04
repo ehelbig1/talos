@@ -2263,75 +2263,99 @@ pub(crate) fn spawn_cleanup_tasks(
     });
     tracing::info!("OAuth state token cleanup task started (runs every hour)");
 
-    // ---------- Start workflow execution cleanup task ----------
-    let cleanup_pool = db_pool.clone();
-    // MCP-622 (2026-05-12): use `talos_config::execution_retention_days()`
-    // instead of a hardcoded `7`. Pre-fix the helper existed (defaulting
-    // to 30) but had ZERO callers — operators who set
-    // `EXECUTION_RETENTION_DAYS=90` thinking they were extending
-    // retention had data silently deleted at 7 days. The
-    // `execution_max_rows()` sibling helper also has no callers but is
-    // not used by this task (separate ceiling concern). Cache the value
-    // once at task start so a mid-process env mutation can't make the
-    // window jitter unpredictably between iterations; operators
-    // re-deploy to change retention.
-    let retention_days = talos_config::execution_retention_days();
-    // MCP-1044: subscribe to bg_shutdown_rx so SIGTERM exits the
-    // retention-DELETE loop cleanly between top-level ticks. Inner
-    // batched-DELETE chunks still run to natural completion within
-    // one tick (5K-row chunks complete in seconds); the shutdown
-    // select gates the OUTER 6-hour ticker only.
-    let exec_retention_shutdown = bg_shutdown_rx.clone();
+    // ---------- Start the execution retention task (ONE path, two tiers) ----------
+    //
+    // This slot used to hold TWO competing loops, and the destructive one won
+    // every race:
+    //
+    //   * a 6-hourly plain `DELETE FROM workflow_executions WHERE started_at <
+    //     NOW() - EXECUTION_RETENTION_DAYS AND status != 'queued'`, spawned
+    //     FIRST, and
+    //   * a daily archival CTE whose `INSERT INTO workflow_executions_archive
+    //     SELECT * FROM archived` had never once succeeded.
+    //
+    // `tokio::time::interval` fires its first tick immediately, so on every boot
+    // the DELETE ran first over a predicate that was a strict superset of the
+    // archival one. Measured on the dev fleet: `workflow_executions_archive`
+    // held 0 rows across the platform's entire history, and the oldest live
+    // execution was exactly 30 days old. The archival statement could not have
+    // worked anyway — 32 live columns against 25 archive columns is a PARSE-time
+    // error, raised on every tick since 2026-03-26 and discarded by `if let
+    // Ok(r) = result`.
+    //
+    // Three further reasons the plain DELETE had to go rather than be reordered:
+    //
+    //   * it was PIN-BLIND — no `is_pinned` reference at all, so
+    //     `pin_execution` ("Mark an execution as pinned/important for easy
+    //     reference later") was honoured only by the loop that never ran.
+    //     Latent, not live: 0 pinned executions existed when this was written;
+    //   * it keyed on `started_at` and excluded only `queued`, which is not a
+    //     terminal test — a `running` or `resuming` execution that started more
+    //     than the window ago was deleted mid-flight. Latent and remote on this
+    //     fleet (0 in-flight rows; longest observed run 2h02m against a 30-day
+    //     window), but wrong in principle;
+    //   * its DELETE could be blocked outright by ONE replay pair. The live
+    //     self-FK was `NO ACTION`, so deleting a replay parent whose child was
+    //     still live raised a constraint violation that aborted the whole
+    //     5000-row batch. Fixed to ON DELETE SET NULL in 20260904120000.
+    //
+    // OPERATOR-FACING SEMANTIC CHANGE, stated rather than smuggled:
+    // `EXECUTION_RETENTION_DAYS` no longer means "delete live executions after N
+    // days". It now means "purge ARCHIVED executions after N days", clocked on
+    // `archived_at`. With both windows at their default of 30, an execution is
+    // readable for 30 days in `workflow_executions` and a further 30 in
+    // `workflow_executions_archive` — total lifetime 30 -> 60 days, and
+    // correspondingly more disk. Operators who need the old total set the two
+    // windows to sum to it. `ARCHIVE_AFTER_DAYS` (or
+    // `system_settings.archive_after_days`) is now the window that bounds the
+    // LIVE table, and therefore the one
+    // `talos_workflow_validation::history_window_days()` reads.
+    //
+    // CADENCE: one loop at 6 hours, replacing a 6-hourly DELETE and a DAILY
+    // archival sweep. Archival therefore runs 4x more often than before — the
+    // same total work in smaller batches, with less lag between an execution
+    // ageing out and leaving the live table.
+    //
+    // WHY THIS BLOCK IS THIS THIN. Everything below the ticker is `resolve ->
+    // run -> log`. That is deliberate and it is load-bearing: with the logic
+    // inline here, two mutations of THIS WIRING survived the entire test suite
+    // — re-instating the swallowed `Result`, and swapping the two windows
+    // (which at the shared default of 30 silently restores the original
+    // no-op). Both now live in `talos_advanced_repository`, under test:
+    // `resolve_retention_windows` is the only thing that decides which window
+    // governs which tier, so this block never holds two interchangeable
+    // integers, and `RetentionPassOutcome` is `#[must_use]`, so dropping the
+    // answer is a clippy error under CI's `-D warnings`.
+    let retention_pool = db_pool.clone();
+    let retention_repo = talos_advanced_repository::AdvancedRepository::new(db_pool.clone());
+    // MCP-1044: subscribe to bg_shutdown_rx so SIGTERM exits between top-level
+    // ticks. The inner batched statements still run to natural completion
+    // within one tick; the shutdown select gates the OUTER ticker.
+    let retention_shutdown = bg_shutdown_rx.clone();
     tokio::spawn(async move {
-        let mut shutdown = exec_retention_shutdown;
+        let mut shutdown = retention_shutdown;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    // Delete executions older than `retention_days` (skip queued executions).
-                    // Batched in chunks of 5000 to avoid long-held row locks and
-                    // WAL bloat on the first run (or after a long outage).
-                    let mut total_deleted = 0u64;
-                    loop {
-                        match sqlx::query(
-                            "DELETE FROM workflow_executions \
-                             WHERE id IN ( \
-                                 SELECT id FROM workflow_executions \
-                                 WHERE started_at < NOW() - INTERVAL '1 day' * $1 \
-                                   AND status != 'queued' \
-                                 LIMIT 5000 \
-                             )",
-                        )
-                        .bind(retention_days)
-                        .execute(&cleanup_pool)
-                        .await
-                        {
-                            Ok(result) => {
-                                let batch = result.rows_affected();
-                                total_deleted += batch;
-                                if batch < 5000 {
-                                    break; // last batch — done
-                                }
-                                // Yield between batches to avoid monopolising the pool.
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to cleanup old workflow executions: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                    if total_deleted > 0 {
-                        tracing::info!(
-                            "Cleaned up {} old workflow executions (older than {} days)",
-                            total_deleted,
-                            retention_days
-                        );
-                    }
+                    // ONE call, then logging. There is deliberately no
+                    // decision in this block: `run_retention_pass_from_config`
+                    // resolves the windows, applies each to its own tier, and
+                    // reports what happened — including the case where the
+                    // configured window could not be READ, which must skip the
+                    // sweep rather than guess (#661). Every one of those was a
+                    // choice this loop used to make, and each was a mutation
+                    // that survived the whole test suite while it lived here.
+                    let outcome = talos_advanced_repository::run_retention_pass_from_config(
+                        &retention_repo,
+                        &retention_pool,
+                    )
+                    .await;
+                    outcome.report();
                 }
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
-                        tracing::info!("Workflow execution retention loop received shutdown signal");
+                        tracing::info!("Execution retention loop received shutdown signal");
                         break;
                     }
                 }
@@ -2339,137 +2363,11 @@ pub(crate) fn spawn_cleanup_tasks(
         }
     });
     tracing::info!(
-        retention_days,
-        "Workflow execution cleanup task started (runs every 6 hours, EXECUTION_RETENTION_DAYS)"
+        "Execution retention task started (runs every 6 hours; tier 1 MOVES executions older \
+         than system_settings.archive_after_days / ARCHIVE_AFTER_DAYS into \
+         workflow_executions_archive, tier 2 PURGES archived executions kept longer than \
+         EXECUTION_RETENTION_DAYS)"
     );
-
-    // ---------- Start execution archival task ----------
-    // MCP-1044: subscribe to bg_shutdown_rx — this daily sweep issues
-    // a transactional CTE that DELETEs from workflow_executions and
-    // INSERTs into workflow_executions_archive in a single statement.
-    // Mid-statement abort on SIGTERM would leave the transaction in
-    // an uncommitted state (rolled back by Postgres) but the
-    // connection-pool entry stuck until the server-side timeout. The
-    // shutdown gate makes the exit point predictable.
-    let archive_pool = db_pool.clone();
-    let archive_shutdown = bg_shutdown_rx.clone();
-    tokio::spawn(async move {
-        let mut shutdown = archive_shutdown;
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(86400)); // daily
-        loop {
-            let tick_result = tokio::select! {
-                _ = interval.tick() => Some(()),
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
-                        tracing::info!("Execution archival loop received shutdown signal");
-                        None
-                    } else {
-                        Some(())
-                    }
-                }
-            };
-            if tick_result.is_none() {
-                break;
-            }
-            // Prefer DB setting over env var.
-            // MCP-758 (2026-05-13): filter `db_days <= 0` so the DB-stored
-            // override path matches the env-side hardening from MCP-643.
-            // Pre-fix a `system_settings.value = 0` row took
-            // db_days.unwrap_or(env_days) → 0, then bound 0 into
-            // `make_interval(days => $1::int)` below — "completed_at < NOW() -
-            // 0 days" matches every completed/failed/cancelled execution
-            // ever, archiving the entire table at the next daily tick.
-            // Negative DB values would have the same effect (Postgres
-            // accepts negative make_interval; "older than -7 days" =
-            // "older than now + 7 days" = also everything). Same =0
-            // destructive class as MCP-703 (DB-stored fuel_budget) and
-            // MCP-643 (env-side ARCHIVE_AFTER_DAYS). The DB row can be
-            // written via admin SQL — there's no public API path that
-            // sets it today, but defense-in-depth before a future admin
-            // surface is cheap. Warn on the misconfiguration so an
-            // operator who deliberately wrote 0/negative gets a clear
-            // signal that the value was ignored.
-            // MCP-961 sibling: saturating i64→i32 conversion. Sibling
-            // of the advanced.rs fix — operator-supplied DB value
-            // could exceed i32::MAX and silently wrap pre-fix.
-            // #661 (error-as-absence): the retention setting must be READ, not
-            // guessed. `.unwrap_or(None)` made an unreadable `system_settings`
-            // row indistinguishable from an unset one, so a DB fault silently
-            // substituted the env default (30) for whatever the operator had
-            // configured. Everything the MCP-758 comment above is about — this
-            // number binding into `make_interval(days => $1::int)` on a
-            // statement that DELETEs from `workflow_executions` — applies just
-            // as much when the number is wrong because the read failed. An
-            // operator running 365-day retention would have had ~11 months of
-            // executions swept out of the live table on the next daily tick.
-            //
-            // The sweep is periodic and idempotent, so the correct response to
-            // "cannot tell what the retention is" is to skip THIS tick and
-            // re-read tomorrow, not to archive on a guess.
-            let db_days_read = sqlx::query_scalar::<_, serde_json::Value>(
-                "SELECT value FROM system_settings WHERE key = 'archive_after_days'",
-            )
-            .fetch_optional(&archive_pool)
-            .await;
-            let db_days: Option<i32> = match db_days_read {
-                Ok(v) => v.and_then(|v| {
-                    v.as_i64()
-                        .map(|n| i32::try_from(n).unwrap_or(i32::MAX))
-                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                }),
-                Err(e) => {
-                    tracing::error!(
-                        target: "talos_engine",
-                        event_kind = "archive_after_days_unreadable_skipped",
-                        error = %e,
-                        "could not READ system_settings.archive_after_days — skipping this \
-                         archival tick rather than sweeping workflow_executions on the \
-                         env-derived default, which may be far shorter than the configured \
-                         retention"
-                    );
-                    continue;
-                }
-            };
-            let env_days = talos_config::positive_env_or_default::<i32>("ARCHIVE_AFTER_DAYS", 30);
-            let days = match db_days {
-                Some(d) if d > 0 => d,
-                Some(d) => {
-                    tracing::warn!(
-                        target: "talos_engine",
-                        event_kind = "archive_after_days_nonpositive_substituted",
-                        configured = d,
-                        fallback = env_days,
-                        "system_settings.archive_after_days = {} is non-positive — \
-                         ignored to prevent archiving every completed execution; \
-                         falling back to env-derived value",
-                        d
-                    );
-                    env_days
-                }
-                None => env_days,
-            };
-            // Move old completed/failed/cancelled executions to archive
-            let result = sqlx::query(
-                "WITH archived AS (
-                    DELETE FROM workflow_executions
-                    WHERE status IN ('completed', 'failed', 'cancelled')
-                    AND completed_at < NOW() - make_interval(days => $1::int)
-                    AND is_pinned = false
-                    RETURNING *
-                )
-                INSERT INTO workflow_executions_archive SELECT * FROM archived",
-            )
-            .bind(days)
-            .execute(&archive_pool)
-            .await;
-            if let Ok(r) = result {
-                if r.rows_affected() > 0 {
-                    tracing::info!(count = r.rows_affected(), "Archived old executions");
-                }
-            }
-        }
-    });
-    tracing::info!("Execution archival task started (runs daily, archives executions older than ARCHIVE_AFTER_DAYS env var, default 30)");
 
     // ---------- Start audit log cleanup task ----------
     // MCP-1045: subscribe to bg_shutdown_rx so SIGTERM exits the

@@ -1100,6 +1100,37 @@ pub fn execution_retention_days() -> i32 {
     positive_env_or_default::<i32>("EXECUTION_RETENTION_DAYS", 30)
 }
 
+/// Days an execution stays in `workflow_executions` before being MOVED to
+/// `workflow_executions_archive`. Default: 30.
+///
+/// One retention path (2026-09-04): this is the window that bounds the LIVE
+/// table. [`execution_retention_days`] used to be that window — it drove a
+/// plain `DELETE FROM workflow_executions` — and now bounds the ARCHIVE
+/// instead. Anything reasoning about "how far back can I read an execution
+/// row, or a row that CASCADEs from one" wants THIS number, not that one.
+///
+/// Two existing call sites read the same env var inline
+/// (`controller/src/bootstrap/background.rs`'s archival loop and
+/// `talos-mcp-handlers/src/advanced.rs::handle_get_archive_policy`); both now
+/// route through here so the default cannot drift between the loop that
+/// enforces the window and the tool that reports it.
+///
+/// Same `=0`/negative hardening as its sibling, and for the same reason: the
+/// value binds into `make_interval(days => $1::int)` on a statement that
+/// DELETEs from `workflow_executions`. MCP-643 is the env-side instance of
+/// that class.
+///
+/// **Stated limit:** this reads the ENV window only. The archival loop prefers
+/// `system_settings.archive_after_days` when that row is present, so a DB
+/// override to a SHORTER window is invisible here — a reader using this to
+/// describe its own coverage may describe a window wider than the store holds.
+/// That is unchanged in kind from the helper this replaced
+/// (`EXECUTION_RETENTION_DAYS` was equally env-only) and strictly closer to
+/// the truth, but it is a real gap, not a rounding.
+pub fn archive_after_days() -> i32 {
+    positive_env_or_default::<i32>("ARCHIVE_AFTER_DAYS", 30)
+}
+
 /// Is the opt-in `module_executions` payload-retention sweep enabled?
 /// Default: **false**, and it must stay false until the stated
 /// precondition below is met.
@@ -1131,6 +1162,19 @@ pub fn module_payload_retention_enabled() -> bool {
 /// `created_at < NOW()`, i.e. prune every terminal row on the first sweep,
 /// and a negative value would prune every row including future-dated ones.
 /// Same `=0`/negative footgun family as MCP-1063.
+///
+/// **Boundary note (2026-09-04, one retention path).** The parity claim above
+/// is now about `ARCHIVE_AFTER_DAYS`, not `EXECUTION_RETENTION_DAYS`: an
+/// execution LEAVES `workflow_executions` (CASCADEing `execution_events` with
+/// it) at the archive boundary, and `EXECUTION_RETENTION_DAYS` governs how long
+/// the ARCHIVED copy is then kept. The default derivation below is
+/// DELIBERATELY left on [`execution_retention_days`] rather than switched to
+/// [`archive_after_days`]: both default to 30, so nothing changes out of the
+/// box, and switching it would SHORTEN this sweep's window for any operator
+/// running `ARCHIVE_AFTER_DAYS` below `EXECUTION_RETENTION_DAYS`. Keeping
+/// module data longer than strict parity errs in the safe direction; deleting
+/// it earlier as a side effect of an unrelated change does not. An operator who
+/// wants exact parity sets this env var explicitly.
 pub fn module_payload_retention_days() -> i32 {
     positive_env_or_default::<i32>("MODULE_PAYLOAD_RETENTION_DAYS", execution_retention_days())
 }
@@ -1243,6 +1287,19 @@ pub fn module_execution_retention_enabled() -> bool {
 /// future-dated rows too. Same `=0`/negative footgun family as MCP-1063. The
 /// consumer refuses a non-positive value a second time at the function
 /// boundary — defense in depth, matching `prune_terminal_payloads`.
+///
+/// **Boundary note (2026-09-04, one retention path).** The parity claim above
+/// is now about `ARCHIVE_AFTER_DAYS`, not `EXECUTION_RETENTION_DAYS`: an
+/// execution LEAVES `workflow_executions` (CASCADEing `execution_events` with
+/// it) at the archive boundary, and `EXECUTION_RETENTION_DAYS` governs how long
+/// the ARCHIVED copy is then kept. The default derivation below is
+/// DELIBERATELY left on [`execution_retention_days`] rather than switched to
+/// [`archive_after_days`]: both default to 30, so nothing changes out of the
+/// box, and switching it would SHORTEN this sweep's window for any operator
+/// running `ARCHIVE_AFTER_DAYS` below `EXECUTION_RETENTION_DAYS`. Keeping
+/// module data longer than strict parity errs in the safe direction; deleting
+/// it earlier as a side effect of an unrelated change does not. An operator who
+/// wants exact parity sets this env var explicitly.
 pub fn module_execution_retention_days() -> i32 {
     positive_env_or_default::<i32>(
         "MODULE_EXECUTION_RETENTION_DAYS",

@@ -87,7 +87,8 @@ The production overlay:
 | `API_RATE_LIMIT` | `100` | API requests/min per IP |
 | `WEBHOOK_RATE_LIMIT` | `60` | Webhook requests/min per IP |
 | `GLOBAL_RATE_LIMIT` | `1000` | Total requests/min globally |
-| `EXECUTION_RETENTION_DAYS` | `30` | Days to keep workflow executions |
+| `ARCHIVE_AFTER_DAYS` | `30` | Days an execution stays live before being moved to `workflow_executions_archive` |
+| `EXECUTION_RETENTION_DAYS` | `30` | Days an **archived** execution is kept before permanent deletion (total lifetime = the two windows summed) |
 | `EXECUTION_MAX_ROWS` | `100000` | Max execution rows before eviction |
 | `AUDIT_LOG_RETENTION_DAYS` | `90` | Days to keep audit logs |
 | `AUDIT_CHAIN_SWEEP_INTERVAL_SECS` | `3600` | Cadence of the continuous WORM audit-chain verification sweep (clamped [300, 86400]; `0` disables). No-op without a WORM S3/MinIO endpoint; verification also needs `TALOS_AUDIT_SIGNING_KEY`. Logs `audit_chain_verification_failed` on any break. |

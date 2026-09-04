@@ -1662,9 +1662,15 @@ impl ModuleExecutionService {
     ///
     /// 1. terminal status only — never `pending` / `running`;
     /// 2. `created_at` older than `retention_days` — the age BELT, whose
-    ///    natural value is `EXECUTION_RETENTION_DAYS`, because that is when
-    ///    this platform already DELETES the whole parent `workflow_executions`
-    ///    row (and CASCADEs `execution_events` with it). Retention parity;
+    ///    natural value tracks the boundary at which this platform already
+    ///    removes the whole parent `workflow_executions` row (CASCADEing
+    ///    `execution_events` with it) — since 2026-09-04 that is
+    ///    `ARCHIVE_AFTER_DAYS`, where the row is MOVED to
+    ///    `workflow_executions_archive`, not `EXECUTION_RETENTION_DAYS`, which
+    ///    now governs how long the archived copy is kept. The default is
+    ///    deliberately still derived from the latter (see
+    ///    `talos_config::module_execution_retention_days`); both default to 30.
+    ///    Retention parity;
     /// 3. not among the `corpus_keep` most recent `completed` rows for its
     ///    `(module_id, user_id)`, ranked by the readers' own ORDER BY;
     /// 4. it still has a payload — which makes the sweep idempotent and keeps
@@ -1809,8 +1815,12 @@ impl ModuleExecutionService {
     /// 1. **terminal status only** — never `pending` / `running`. A live row is
     ///    an in-flight dispatch; deleting it would strand the worker's result.
     /// 2. **`created_at` older than `retention_days`** — the age BELT, whose
-    ///    natural value is `EXECUTION_RETENTION_DAYS`, because that is when this
-    ///    platform already DELETEs the parent `workflow_executions` row.
+    ///    natural value tracks the boundary at which this platform already
+    ///    removes the parent `workflow_executions` row from the LIVE table.
+    ///    Since 2026-09-04 that is `ARCHIVE_AFTER_DAYS` (the row is MOVED to
+    ///    the archive there), not `EXECUTION_RETENTION_DAYS` (which now bounds
+    ///    the archived copy). The default derivation is deliberately unchanged;
+    ///    both default to 30.
     /// 3. **the parent is gone** — `NOT EXISTS` against `workflow_executions`.
     ///    This is what makes the sweep a *gap closure* rather than an
     ///    independent retention policy: it deletes only what the parent sweep
