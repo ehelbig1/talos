@@ -27,11 +27,53 @@ NATS_NAME="talos-it-nats"
 PG_USER="postgres"
 PG_PASS="test"
 
+# ── Reaping the TC_TESTS harness containers ────────────────────────────────
+#
+# The 14 TC_TESTS binaries at the bottom of this script self-provision their own
+# Postgres through controller/tests/test_helpers, which holds the handle in a
+# `static`. Statics are never dropped, testcontainers 0.23.3 has no reaper, and
+# `AutoRemove` is hardcoded false — so before this each binary left one live
+# Postgres behind and one run of this script leaked >= 14 of them.
+#
+# The harness now reaps its own container via `libc::atexit`, which covers a
+# clean exit AND a failing/panicking test. It CANNOT cover SIGKILL (an agent
+# killed on a rate limit, `kill -9`), so this is the bounded-blast-radius
+# backstop for that case.
+#
+# Every container the harness starts carries `talos.test-harness=controller`;
+# when TALOS_TEST_RUN_ID is exported it ALSO carries `talos.test-run=<id>`. The
+# exit trap sweeps only THIS run's id, so a concurrent run in another worktree
+# is untouched — two concurrent agent sessions is exactly how ~50 containers
+# accumulated. `make test-clean` is the deliberate sweep of every run's.
+#
+# Filtered on the LABEL, never the IMAGE: the dev stack's talos-postgres,
+# talos-postgres-backup and talos-vault-backup all run the same
+# pgvector/pgvector:pg17 image an image filter would match.
+TALOS_TEST_RUN_ID="it-$$-$(date +%s)"
+export TALOS_TEST_RUN_ID
+
 cleanup() {
     docker rm -f "$REDIS_NAME" "$PG_NAME" "$NATS_NAME" >/dev/null 2>&1 || true
+    local ids
+    ids=$(docker ps -aq --filter "label=talos.test-run=${TALOS_TEST_RUN_ID}" 2>/dev/null) || return 0
+    [ -n "$ids" ] || return 0
+    # shellcheck disable=SC2086  # word splitting is the point: a list of ids
+    docker rm -f $ids >/dev/null 2>&1 || true
+    echo "▶ reaped $(printf '%s\n' "$ids" | wc -l | tr -d ' ') leaked test-harness container(s) from this run"
 }
 trap cleanup EXIT
 cleanup # remove any stale containers from a previous interrupted run
+
+# Pre-existing harness containers are REPORTED, never removed here. Removing
+# every `talos.test-harness=controller` container at start-of-run would kill a
+# CONCURRENT run's live container — and two concurrent agent sessions is
+# precisely how ~50 of these accumulated. `make test-clean` is the deliberate,
+# developer-invoked sweep of every run's; this line is what makes the backlog
+# visible instead of silent.
+stale_harness=$(docker ps -aq --filter label=talos.test-harness=controller 2>/dev/null | wc -l | tr -d ' ')
+if [ "${stale_harness:-0}" -gt 0 ]; then
+    echo "⚠ ${stale_harness} test-harness container(s) left by earlier runs (SIGKILL leaves no exit hook) — 'make test-clean' removes them"
+fi
 
 command -v sqlx >/dev/null 2>&1 \
     || { echo "✗ sqlx-cli missing — install: cargo install sqlx-cli --locked"; exit 1; }

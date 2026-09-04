@@ -24,7 +24,7 @@ export GIT_SHA_OVERRIDE   := $(shell git rev-parse --short=7 HEAD 2>/dev/null ||
 export GIT_DIRTY_OVERRIDE := $(shell test -n "$$(git status --porcelain 2>/dev/null)" && echo true || echo false)
 
 .PHONY: help setup up down rebuild restart logs ps shell doctor quickstart \
-        check build lint lint-frontend hooks test test-changed test-integration coverage-html audit check-catalog ci \
+        check build lint lint-frontend hooks test test-changed test-integration test-clean coverage-html audit check-catalog ci \
         drill drill-schedule drill-unschedule drill-schedule-status \
         offhost-upload offhost-backfill offhost-plan offhost-probe \
         offhost-schedule offhost-unschedule offhost-status \
@@ -285,6 +285,23 @@ test-integration: ## Run env-gated integration tests against disposable Redis+Po
 	@command -v docker >/dev/null 2>&1 \
 	    || { printf '\033[1;31m✗ docker missing\033[0m — required to provision the disposable datastores\n'; exit 1; }
 	@bash scripts/test-integration.sh
+
+test-clean: ## Remove EVERY Postgres container the controller test harness ever started (all runs, this machine)
+	@command -v docker >/dev/null 2>&1 \
+	    || { printf '\033[1;31m✗ docker missing\033[0m\n'; exit 1; }
+	@# Filtered on the harness LABEL, never on the image: the dev stack's
+	@# talos-postgres, talos-postgres-backup and talos-vault-backup all run the
+	@# same pgvector/pgvector:pg17 image, so an image filter would delete a
+	@# developer's live database. This is the SIGKILL backstop — the harness
+	@# reaps its own container at exit, but no exit hook runs on `kill -9`.
+	@ids=$$(docker ps -aq --filter label=talos.test-harness=controller); \
+	if [ -z "$$ids" ]; then \
+	    printf '\033[0;32m✓\033[0m no leaked test-harness containers\n'; \
+	else \
+	    n=$$(printf '%s\n' "$$ids" | wc -l | tr -d ' '); \
+	    docker rm -f $$ids >/dev/null; \
+	    printf '\033[0;32m✓\033[0m removed %s leaked test-harness container(s)\n' "$$n"; \
+	fi
 
 coverage-html: ## HTML coverage report via cargo-tarpaulin (slow; local only)
 	@command -v cargo-tarpaulin >/dev/null 2>&1 \
