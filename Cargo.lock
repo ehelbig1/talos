@@ -9252,6 +9252,7 @@ dependencies = [
 name = "talos-security-audit"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "hex",
  "redis",
  "serde_json",
@@ -9260,6 +9261,7 @@ dependencies = [
  "talos-config",
  "talos-secrets-manager",
  "talos-system-repo",
+ "talos-worker-identity-repository",
  "talos-workflow-job-protocol",
  "tokio",
  "tracing",

@@ -187,6 +187,52 @@ pub(crate) struct WorkerKeyRegistrationRequest {
     /// turn a diagnostic into a spoofable authorization input.
     #[serde(default)]
     build_version: Option<String>,
+    /// Worker-reported `TALOS_WRITE_CEILING_ENFORCED` — whether THAT process
+    /// actually refuses a `readonly` actor's mutating host ops.
+    /// `#[serde(default)]` → `None` for a pre-feature worker (and for the
+    /// operator CLI, which never posts here at all).
+    ///
+    /// UNTRUSTED AND UNSIGNED, on exactly the `build_version` terms above: it
+    /// is deliberately outside the proof-of-possession, so a registrant can
+    /// put anything here. Acceptable because NOTHING BRANCHES ON IT — it is
+    /// stored, logged, and reported by `get_platform_info.fleet`,
+    /// `set_actor_write_ceiling`, `get_actor_summary`,
+    /// `get_my_capability_ceiling` and `security_audit`. Every one of those is
+    /// a report. Adding a decision that reads it would turn a diagnostic into
+    /// a spoofable authorization input — and note the lie only runs toward
+    /// MORE operator caution, never toward permitting anything.
+    ///
+    /// `None` means UNREPORTED and must never be normalised to `false`; the
+    /// summary treats the two differently on purpose.
+    #[serde(default)]
+    write_ceiling_enforced: Option<bool>,
+    /// Worker-reported `TALOS_WRITE_CEILING_STRICT_EGRESS`. Same standing.
+    #[serde(default)]
+    write_ceiling_strict_egress: Option<bool>,
+}
+
+/// Map the two self-reported write-ceiling bits onto the repository's report
+/// type.
+///
+/// No sanitation is needed or possible: serde has already constrained each to
+/// `true` / `false` / absent, and absent is a MEANING we keep rather than
+/// collapse to `false`.
+///
+/// A three-line function with its own name because the alternative — two
+/// `Option<bool>` assignments inline in a 200-line handler — is a transposition
+/// nothing can see. Both fields have the same type, a swap compiles, and it
+/// would make the controller advertise a strict-egress narrowing that is off
+/// while reporting the live mutation gate off: the report inverted on both
+/// axes, on every worker, silently. This is the seam
+/// `write_ceiling_report_does_not_transpose_the_bits` pins.
+fn write_ceiling_report(
+    enforced: Option<bool>,
+    strict_egress: Option<bool>,
+) -> talos_worker_identity_repository::WriteCeilingReport {
+    talos_worker_identity_repository::WriteCeilingReport {
+        enforced,
+        strict_egress,
+    }
 }
 
 /// Longest build string we accept. The real shape is `0.1.0+ab85eb2` (~15
@@ -388,6 +434,8 @@ pub(crate) async fn register_worker_key_handler(
     // (partial move: no later site reads `req` as a whole, and a hostile 10 KB
     // payload should not be cloned before it is capped)
     let build_version = sanitize_build_version(req.build_version);
+    let write_ceiling =
+        write_ceiling_report(req.write_ceiling_enforced, req.write_ceiling_strict_egress);
 
     let repo = talos_worker_identity_repository::WorkerIdentityRepository::new(db_pool);
     let path = classify_registration_bearer(
@@ -413,6 +461,7 @@ pub(crate) async fn register_worker_key_handler(
                 &public_key,
                 req.supports_sealing,
                 build_version.as_deref(),
+                write_ceiling,
             )
             .await
             .map(|o| match o {
@@ -435,6 +484,7 @@ pub(crate) async fn register_worker_key_handler(
                 req.supports_sealing,
                 auth.require_bound,
                 build_version.as_deref(),
+                write_ceiling,
             )
             .await
         }
@@ -455,6 +505,8 @@ pub(crate) async fn register_worker_key_handler(
                 event_kind = "worker_key_registered",
                 worker_id = %req.worker_id,
                 supports_sealing = req.supports_sealing,
+                write_ceiling_enforced = ?write_ceiling.enforced,
+                write_ceiling_strict_egress = ?write_ceiling.strict_egress,
                 auth_path = ?path,
                 "worker self-registered an Ed25519 identity key"
             );
@@ -2369,6 +2421,79 @@ mod worker_build_identity_tests {
     use super::{controller_build_version, sanitize_build_version, MAX_BUILD_VERSION_BYTES};
     use talos_worker_identity_repository::{build_suffix, builds_match};
 
+    use super::{write_ceiling_report, WorkerKeyRegistrationRequest};
+
+    /// The two self-reported write-ceiling bits must not transpose on the way
+    /// from the request struct to the repository.
+    ///
+    /// Both are `Option<bool>`, so a swap compiles and every symmetric fixture
+    /// passes; a `true`/`false` pair is the only thing that can see it. The
+    /// damage would be the report inverted on BOTH axes on every worker —
+    /// advertising a strict-egress narrowing that is off while reporting the
+    /// live mutation gate off.
+    #[test]
+    fn write_ceiling_report_does_not_transpose_the_bits() {
+        let r = write_ceiling_report(Some(true), Some(false));
+        assert_eq!(r.enforced, Some(true));
+        assert_eq!(r.strict_egress, Some(false));
+        let r = write_ceiling_report(Some(false), Some(true));
+        assert_eq!(r.enforced, Some(false));
+        assert_eq!(r.strict_egress, Some(true));
+        // Absent stays absent — it is a distinct meaning, never `false`.
+        let r = write_ceiling_report(None, None);
+        assert_eq!(r.enforced, None);
+        assert_eq!(r.strict_egress, None);
+    }
+
+    /// The controller must actually PARSE the field names the worker emits.
+    ///
+    /// The producer side is pinned in `worker::self_register`
+    /// (`write_ceiling_flags_travel_unswapped_and_unsigned`); this is the
+    /// consumer half. The two crates share no type, so the JSON key names are
+    /// the whole contract and a rename on either side is otherwise silent —
+    /// and silently benign-looking, because an unparsed field lands in the
+    /// `unreported` state, which renders as an honest "unknown".
+    ///
+    /// The literal below is the worker's body shape verbatim.
+    #[test]
+    fn a_worker_body_parses_into_the_reported_posture() {
+        let body = serde_json::json!({
+            "worker_id": "w-1",
+            "public_key": "00",
+            "issued_at_ms": 1_700_000_000_000u64,
+            "nonce": "n",
+            "proof": "00",
+            "supports_sealing": true,
+            "build_version": "0.1.0+abc1234",
+            "write_ceiling_enforced": true,
+            "write_ceiling_strict_egress": false,
+        });
+        let req: WorkerKeyRegistrationRequest =
+            serde_json::from_value(body).expect("worker body must deserialize");
+        let r = write_ceiling_report(req.write_ceiling_enforced, req.write_ceiling_strict_egress);
+        assert_eq!(r.enforced, Some(true), "the worker's key name must match");
+        assert_eq!(r.strict_egress, Some(false));
+    }
+
+    /// A PRE-FEATURE worker sends neither field, and that must deserialize to
+    /// UNREPORTED rather than failing or defaulting to `false` — the rollout
+    /// runs in either order.
+    #[test]
+    fn a_pre_feature_worker_body_parses_as_unreported() {
+        let body = serde_json::json!({
+            "worker_id": "w-1",
+            "public_key": "00",
+            "issued_at_ms": 1_700_000_000_000u64,
+            "nonce": "n",
+            "proof": "00",
+        });
+        let req: WorkerKeyRegistrationRequest =
+            serde_json::from_value(body).expect("an old worker's body must still deserialize");
+        let r = write_ceiling_report(req.write_ceiling_enforced, req.write_ceiling_strict_egress);
+        assert_eq!(r.enforced, None);
+        assert_eq!(r.strict_egress, None);
+    }
+
     fn san(s: &str) -> Option<String> {
         sanitize_build_version(Some(s.to_string()))
     }
@@ -3943,6 +4068,8 @@ mod worker_liveness_endpoint_attack_tests {
         bool,
         Option<String>,
         Option<chrono::DateTime<chrono::Utc>>,
+        Option<bool>,
+        Option<bool>,
     )> {
         sqlx::query_as::<
             _,
@@ -3951,9 +4078,12 @@ mod worker_liveness_endpoint_attack_tests {
                 bool,
                 Option<String>,
                 Option<chrono::DateTime<chrono::Utc>>,
+                Option<bool>,
+                Option<bool>,
             ),
         >(
-            "SELECT active, supports_sealing, build_version, last_liveness_at
+            "SELECT active, supports_sealing, build_version, last_liveness_at,
+                    write_ceiling_enforced, write_ceiling_strict_egress
              FROM worker_identities WHERE worker_id = $1",
         )
         .bind(wid)
@@ -4000,9 +4130,20 @@ mod worker_liveness_endpoint_attack_tests {
         );
 
         // Register the victim so the remaining attacks have a real target.
-        repo.register(victim, &pk, false, Some("0.1.0+aaaaaaa"))
-            .await
-            .unwrap();
+        // Registered WITH an asymmetric reported posture, so ATTACK 6's
+        // assertion below has content: a swap or an overwrite is detectable.
+        repo.register(
+            victim,
+            &pk,
+            false,
+            Some("0.1.0+aaaaaaa"),
+            talos_worker_identity_repository::WriteCeilingReport {
+                enforced: Some(true),
+                strict_egress: Some(false),
+            },
+        )
+        .await
+        .unwrap();
         let before = row(&pool, victim).await.unwrap();
         assert!(before.0 && !before.1 && before.3.is_none());
 
@@ -4062,11 +4203,17 @@ mod worker_liveness_endpoint_attack_tests {
         assert!(row(&pool, victim).await.unwrap().3.is_none(), "no write");
 
         // ATTACK 6 — extra fields: can a caller smuggle `active`,
-        // `supports_sealing` or `build_version` past the deserializer?
+        // `supports_sealing`, `build_version` or the WRITE-CEILING POSTURE past
+        // the deserializer? The liveness PoP message deliberately binds no row
+        // property, so the guarantee is structural — the endpoint's UPDATE
+        // touches exactly one column — and this is what pins it as a NEW
+        // reported field joins the row.
         let mut smuggle = ping_body(&sk, victim, &pk, ts_now_ms());
         smuggle["active"] = serde_json::json!(false);
         smuggle["supports_sealing"] = serde_json::json!(true);
         smuggle["build_version"] = serde_json::json!("0.1.0+deadbee");
+        smuggle["write_ceiling_enforced"] = serde_json::json!(false);
+        smuggle["write_ceiling_strict_egress"] = serde_json::json!(true);
         assert_eq!(post(&pool, smuggle).await, StatusCode::OK);
         let after = row(&pool, victim).await.unwrap();
         assert!(after.0, "active untouched");
@@ -4075,6 +4222,18 @@ mod worker_liveness_endpoint_attack_tests {
             after.2.as_deref(),
             Some("0.1.0+aaaaaaa"),
             "build_version untouched"
+        );
+        // Both directions matter: the smuggled values are the OPPOSITE of the
+        // registered ones, so an overwrite OR a swap would show here.
+        assert_eq!(
+            after.4,
+            Some(true),
+            "write_ceiling_enforced untouched by a liveness ping"
+        );
+        assert_eq!(
+            after.5,
+            Some(false),
+            "write_ceiling_strict_egress untouched by a liveness ping"
         );
         assert!(after.3.is_some(), "only last_liveness_at moved");
 

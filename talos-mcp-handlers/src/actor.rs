@@ -208,7 +208,9 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         serde_json::json!({
             "name": "get_actor_summary",
             "description": "Full picture of an actor: owned workflows, recent executions, budget usage, \
-                memory count, and active approval policies.",
+                memory count, active approval policies, its three enforcement ceilings \
+                (max_llm_tier / max_write_ceiling / egress_scope), and whether the registered worker \
+                fleet actually enforces the write ceiling ('write_ceiling_enforcement.enforced_by').",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -363,7 +365,9 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             "description": "Set the data-mutation (WRITE) ceiling for an actor — a default-deny gate on data-mutating operations. \
                 'readonly' = the actor's workflows may only READ; every mutating host surface (actor-memory writes, DB DML, non-GET HTTP, webhook/email/messaging/object-storage/integration-state writes, GraphQL execute) is refused at the worker. \
                 'write' = mutation permitted (subject to the module's capability grant). \
-                Enforcement is worker-side, gated by TALOS_WRITE_CEILING_ENFORCED. NEW actors default to 'readonly' (so a freshly-built workflow can't silently mutate your data); existing actors were grandfathered to 'write'. Grant 'write' deliberately to actors that need to mutate.",
+                Enforcement is worker-side, gated by TALOS_WRITE_CEILING_ENFORCED — a WORKER-ONLY flag that is default OFF, so the ceiling can be recorded on a deployment where nothing enforces it. \
+                The response therefore reports what the registered fleet actually says: 'enforcement_fleet.enforced_by' is all|some|none|unknown, and 'ceiling_is_advisory' is true for anything but 'all' (including 'unknown' — 'we cannot say it will be enforced' is not 'it will be'). Setting a ceiling before enabling enforcement is allowed; it is disclosed, not refused. \
+                NEW actors default to 'readonly' (so a freshly-built workflow can't silently mutate your data); existing actors were grandfathered to 'write'. Grant 'write' deliberately to actors that need to mutate.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -680,7 +684,9 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         serde_json::json!({
             "name": "get_my_capability_ceiling",
             "description": "Get your current capability ceiling. This is the maximum capability world \
-                you are allowed to assign to an Actor. Default is 'http-node' for all new users.",
+                you are allowed to assign to an Actor. Default is 'http-node' for all new users. \
+                Also reports 'write_ceiling_enforcement' — a DEPLOYMENT-WIDE fact, not part of your \
+                grant: whether the registered workers enforce the separate per-actor write ceiling.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -1867,6 +1873,40 @@ async fn handle_get_actor_summary(
         })
     });
 
+    // The three ENFORCEMENT ceilings, absent from this summary until now — one
+    // extra query (`get_actor_ceilings` reads all three in one row read), on a
+    // path whose ownership gate has already run in `resolve_actor_via_repo`.
+    //
+    // Reported as a Result, never defaulted: a DB failure here must not print a
+    // ceiling nobody read. `Ok(None)` cannot normally happen (the summary above
+    // already found the row) but is classified rather than folded into the
+    // error, on the same rule.
+    let ceilings = match state.actor_repo.get_actor_ceilings(actor_id).await {
+        Ok(Some((tier, write, egress))) => serde_json::json!({
+            "max_llm_tier": tier.as_signing_str(),
+            "max_write_ceiling": write.as_signing_str(),
+            "egress_scope": egress.map(|e| e.as_signing_str()),
+        }),
+        Ok(None) => serde_json::json!({
+            "error": "the actor row disappeared between reads; ceilings not reported",
+        }),
+        Err(e) => {
+            tracing::warn!(%actor_id, error = %format!("{e:#}"), "get_actor_summary: ceiling read failed");
+            serde_json::json!({
+                "error": "NOT MEASURED: the ceiling read failed, so no ceiling is reported here. \
+                          This is a database problem, not a permissive configuration.",
+            })
+        }
+    };
+
+    // ...and whether the write ceiling above is actually enforced anywhere.
+    // Printing `max_write_ceiling: "readonly"` with no enforcement context is
+    // exactly the shape that made a decorative column read as a live control.
+    let write_ceiling_enforcement =
+        talos_worker_identity_repository::render_write_ceiling_enforcement(
+            crate::platform::read_write_ceiling_fleet(&state.db_pool).await,
+        );
+
     mcp_text(
         req_id,
         &serde_json::to_string_pretty(&serde_json::json!({
@@ -1887,6 +1927,9 @@ async fn handle_get_actor_summary(
             "memory_entries":      summary.memory_count,
             "approval_policies":   summary.approval_policy_count,
             "budget_policy":       budget_summary,
+            // ADDED fields; every pre-existing key above is unchanged.
+            "ceilings":            ceilings,
+            "write_ceiling_enforcement": write_ceiling_enforcement,
         }))
         .unwrap_or_default(),
     )
@@ -2885,6 +2928,15 @@ async fn handle_set_actor_write_ceiling(
         );
     }
 
+    // DISCLOSE, do not refuse. Setting a ceiling before enabling enforcement
+    // is a legitimate order of operations, so this never blocks the write — but
+    // answering with the same sentence whether or not any worker enforces is
+    // what made a decorative column look like a live control. `None` = the
+    // fleet read failed, which is reported as unknown, not as "not enforced".
+    let fleet = crate::platform::read_write_ceiling_fleet(&state.db_pool).await;
+    let advisory = talos_worker_identity_repository::write_ceiling_is_advisory(fleet.as_ref());
+    let fleet_json = talos_worker_identity_repository::render_write_ceiling_enforcement(fleet);
+
     mcp_text(
         req_id,
         &serde_json::to_string_pretty(&serde_json::json!({
@@ -2892,6 +2944,13 @@ async fn handle_set_actor_write_ceiling(
             "previous_ceiling": prev_str,
             "max_write_ceiling": ceiling.as_signing_str(),
             "enforcement": "Worker-side at every data-mutating host surface, gated by TALOS_WRITE_CEILING_ENFORCED. Takes effect on the NEXT job dispatched for this actor.",
+            // ADDED fields; every pre-existing key above is byte-identical.
+            "enforcement_fleet": fleet_json,
+            // The one-line answer to "did this actually change anything?".
+            // True whenever the fleet is not unanimously enforcing — including
+            // when it is unknown, because "we cannot say it will be enforced"
+            // must read the same as "it will not be".
+            "ceiling_is_advisory": advisory,
         }))
         .unwrap_or_default(),
     )
@@ -4549,7 +4608,7 @@ async fn handle_get_my_capability_ceiling(
         }
     };
 
-    let result = match row {
+    let mut result = match row {
         Some(g) => serde_json::json!({
             "ceiling": g.max_capability_world,
             "source": "grant",
@@ -4565,6 +4624,32 @@ async fn handle_get_my_capability_ceiling(
             "notes": "Default ceiling — no explicit grant. Contact an admin to request an elevated ceiling via grant_capability_ceiling.",
         }),
     };
+
+    // A DEPLOYMENT-WIDE fact, not a property of this user's grant — hence a
+    // separate key with its own name, never merged into `ceiling`/`source`.
+    //
+    // It belongs on the tool an operator opens to ask "what am I allowed to
+    // do", because the answer has two halves and only one of them was here:
+    // the capability world above is enforced by the controller at dispatch,
+    // while the per-actor WRITE ceiling is enforced only inside the worker and
+    // only when that worker's operator enabled it. A reader who saw one and not
+    // the other had no way to tell the two apart.
+    if let Some(obj) = result.as_object_mut() {
+        let fleet = talos_worker_identity_repository::render_write_ceiling_enforcement(
+            crate::platform::read_write_ceiling_fleet(&state.db_pool).await,
+        );
+        obj.insert("write_ceiling_enforcement".to_string(), fleet);
+        obj.insert(
+            "write_ceiling_note".to_string(),
+            serde_json::json!(
+                "Deployment-wide, NOT part of your grant above. 'ceiling'/'source' describe the \
+                 capability world the controller enforces at dispatch; the per-actor write \
+                 ceiling (actors.max_write_ceiling, set via set_actor_write_ceiling) is a \
+                 separate axis enforced inside the WORKER process and only where \
+                 TALOS_WRITE_CEILING_ENFORCED is on."
+            ),
+        );
+    }
 
     mcp_text(
         req_id,

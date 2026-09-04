@@ -14,10 +14,20 @@ talos-auth = { path = "../talos-auth" }
 talos-config = { path = "../talos-config" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-system-repo = { path = "../talos-system-repo" }
+# `WriteCeilingFleetSummary` only — the TYPE, not a database handle. The fleet
+# rows are read by the caller and passed in, so this crate keeps its single DB
+# touchpoint. Sharing the type (rather than re-deriving the state machine here)
+# is what stops security_audit and get_platform_info disagreeing about one
+# fleet — the `build_suffix` argument restated.
+talos-worker-identity-repository = { path = "../talos-worker-identity-repository" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 tokio = { version = "1", features = ["time"] }
 tracing.workspace = true
 hex = "0.4"
+
+[dev-dependencies]
+# Only to build `WorkerBuildRow` fixtures in the write-ceiling check tests.
+chrono.workspace = true
 
 [lints]
 workspace = true
