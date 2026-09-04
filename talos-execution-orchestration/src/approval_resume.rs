@@ -37,6 +37,7 @@ use crate::crash_recovery::{resume_one, RecoveryDeps, ResumeOrigin};
 use crate::errors::OrchestrationError;
 use crate::trigger::map_trigger_auth_error;
 use crate::ExecutionOrchestrationService;
+use talos_execution_repository::ExecutionOwnerLookup;
 use uuid::Uuid;
 
 /// What the resume attempt did. Both variants are successful protocol
@@ -203,14 +204,36 @@ impl ExecutionOrchestrationService {
         // user_id at mint). Never differentiate "not yours" from
         // "doesn't exist" to the caller; the HTTP layer maps both to the
         // uniform invalid-link page.
+        //
+        // #749: the `Archived` arm here is PROPHYLACTIC, and saying so
+        // matters more than implying it caught something. This method's one
+        // caller (`talos-webhooks`'s one-click approval link) resolves an
+        // `execution_approval_tokens` row FIRST, and that table carries
+        // `ON DELETE CASCADE` to `workflow_executions` — so the archival
+        // move destroys the token and the link is refused as invalid before
+        // reaching here. The arm exists because a SECOND caller would not
+        // know that, and because `_ =>` swallowing `Archived` is exactly the
+        // collapse this change is about. The refusal itself is right either
+        // way: the sweep only moves TERMINAL rows, so an archived execution
+        // is never `waiting` and never resumable.
         match self
             .execution_repo
-            .get_workflow_execution_owner(execution_id)
+            .lookup_execution_owner(execution_id, user_id)
             .await
             .map_err(OrchestrationError::Internal)?
         {
-            Some(owner) if owner == user_id => {}
-            _ => return Err(OrchestrationError::ExecutionNotFound(execution_id)),
+            ExecutionOwnerLookup::Live(owner) if owner == user_id => {}
+            ExecutionOwnerLookup::Archived { owner, archived_at } if owner == user_id => {
+                return Err(OrchestrationError::ExecutionArchived(
+                    execution_id,
+                    archived_at,
+                ))
+            }
+            ExecutionOwnerLookup::Live(_)
+            | ExecutionOwnerLookup::Archived { .. }
+            | ExecutionOwnerLookup::Absent => {
+                return Err(OrchestrationError::ExecutionNotFound(execution_id))
+            }
         }
 
         // 1. Record the decision on the pending execution_approvals row.

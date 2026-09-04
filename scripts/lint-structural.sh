@@ -7986,16 +7986,21 @@ echo
 bold "▶ check 81: ARCHIVED is not ABSENT on a by-id execution read"
 ARCHIVED_FAIL=0
 
-# (a) the deleted flattening reader must stay deleted
-if grep -rn --include='*.rs' -E '^[[:space:]]*pub async fn get_execution\(' \
+# (a) the deleted flattening readers must stay deleted. FOUR names now: #748
+# retired `get_execution`, #749 retired the three siblings that read
+# `workflow_executions` alone on the SAME two-valued shape.
+ARCHIVED_FLATTENED_READERS='get_execution|get_execution_base|get_workflow_execution_owner|get_latest_execution_for_workflow'
+if grep -rn --include='*.rs' -E "^[[:space:]]*pub async fn (${ARCHIVED_FLATTENED_READERS})\(" \
         talos-execution-repository/src/ 2>/dev/null | grep -q .; then
-    grep -rn --include='*.rs' -E '^[[:space:]]*pub async fn get_execution\(' \
+    grep -rn --include='*.rs' -E "^[[:space:]]*pub async fn (${ARCHIVED_FLATTENED_READERS})\(" \
         talos-execution-repository/src/ 2>/dev/null \
         | while IFS= read -r hit; do
-            red "✗ ${hit%%:*}: ExecutionRepository::get_execution is back"
+            red "✗ ${hit%%:*}: a flattening ExecutionRepository reader is back"
         done
     yellow "  → it reads workflow_executions ALONE, so Ok(None) cannot tell an"
-    yellow "    archived execution from an absent one. Use lookup_execution."
+    yellow "    archived execution from an absent one. Use the three-way sibling:"
+    yellow "    lookup_execution / lookup_execution_base / lookup_execution_owner /"
+    yellow "    lookup_latest_execution_for_workflow."
     ARCHIVED_FAIL=1
 fi
 
@@ -8016,18 +8021,23 @@ if [ -n "$ARCHIVED_RS_FILES" ]; then
         # (c1) an Archived arm that renders the not-found string. The window
         # STOPS at the next arm — the sibling Absent arm legitimately renders
         # it, and without the stop every site false-positives (measured 14/14).
-        while (/ExecutionLookup::Archived[^=]*=>/g) {
+        # #749 widened this from the one enum to the FOUR archived-arm
+        # spellings now in the tree, and the arm HEADER from `[^=]*=>` to a
+        # same-line non-greedy run: the owner-lookup arms carry a `==` guard
+        # (`Archived { owner, .. } if owner == user_id =>`), which `[^=]*`
+        # stops dead at, so the old pattern silently did not inspect them.
+        while (/(?:ExecutionLookup::Archived|ExecutionOwnerLookup::Archived|ExecutionBaseLookup::Archived|OwnerVerdict::ArchivedOwned)[^\n]{0,200}?=>/g) {
             my $pos = pos($_);
             my $win = substr($_, $pos, 800);
-            if ($win =~ /^(.*?)(?:Ok\(ExecutionLookup::|Err\(\s*e\s*\)\s*=>|Err\(_\)\s*=>)/s) { $win = $1; }
+            if ($win =~ /^(.*?)(?:Ok\(ExecutionLookup::|Ok\(ExecutionOwnerLookup::|Ok\(ExecutionBaseLookup::|ExecutionOwnerLookup::(?:Live|Absent)|ExecutionBaseLookup::(?:Live|Absent)|OwnerVerdict::(?:LiveOwned|Foreign|Absent)|Err\(\s*e\s*\)\s*=>|Err\(_\)\s*=>)/s) { $win = $1; }
             if ($win =~ /Execution not found/s) {
                 my $line = (substr($_, 0, $pos) =~ tr/\n//) + 1;
                 print "$ARGV:$line:c\n";
             }
         }
-        # (c2) a wildcard arm on a lookup_execution match swallows Archived
-        # past the exhaustiveness check the enum otherwise buys.
-        while (/\.lookup_execution\s*\(/g) {
+        # (c2) a wildcard arm on any three-way execution lookup swallows
+        # Archived past the exhaustiveness check the enum otherwise buys.
+        while (/\.(?:lookup_execution|lookup_execution_owner|lookup_execution_base|lookup_latest_execution_for_workflow)\s*\(/g) {
             my $pos = pos($_);
             my $win = substr($_, $pos, 700);
             if ($win =~ /(?:^|\n)\s*(?:_|Ok\(_\))\s*=>/s) {

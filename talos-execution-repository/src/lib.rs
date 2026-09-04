@@ -74,6 +74,96 @@ pub enum ExecutionLookup {
     Absent,
 }
 
+/// Three-way OWNER resolution — [`ExecutionLookup`] for the reads that need
+/// only `user_id`, not the whole row.
+///
+/// #748 fixed the fourteen call sites of `get_execution`; it left this one
+/// on `get_workflow_execution_owner`, which read `workflow_executions` alone
+/// and so answered `Ok(None)` — "no such execution" — for an archived one.
+/// `tail_worker_logs` is the site that made that a LOSS rather than a wrong
+/// diagnosis: `module_executions` and `module_execution_logs` carry NO
+/// foreign key to `workflow_executions`, so the worker's own log lines
+/// SURVIVE the archival move (measured on the dev fleet: 929 rows across
+/// 133 of 133 archived executions), and the ownership gate was discarding
+/// all of them behind "Execution not found or access denied".
+///
+/// **The two legs are scoped differently, on purpose.** The LIVE read is
+/// deliberately un-scoped, exactly as before: the caller compares the owner
+/// itself so it can log distinct "belongs to a different user" telemetry
+/// without ever differentiating that from "no such execution" in the
+/// response. The ARCHIVE read is scoped `AND user_id = $2` on a
+/// `begin_user_scoped` transaction — strictly TIGHTER than its live sibling,
+/// so another tenant's archived row resolves to [`Self::Absent`] and gets
+/// the canonical not-found answer, and so the read carries the forced-RLS
+/// backstop `workflow_executions_archive` gained in
+/// `20260904210000_rls_workflow_executions_archive.sql`. The consequence is
+/// that `Archived.owner` is always the caller; it is carried anyway so the
+/// call site's `owner == user_id` comparison is written once for both arms.
+#[derive(Debug)]
+#[must_use = "an owner lookup must be classified: Archived is not Absent"]
+pub enum ExecutionOwnerLookup {
+    /// The execution is in `workflow_executions`, owned by this user id.
+    Live(Uuid),
+    /// The execution is in `workflow_executions_archive` and is owned by the
+    /// caller (the archive leg is user-scoped, so it never resolves for
+    /// anyone else).
+    Archived {
+        owner: Uuid,
+        archived_at: DateTime<Utc>,
+    },
+    /// No execution with that id, or it is archived and belongs to someone
+    /// else. Both collapse here so the caller cannot build an existence
+    /// oracle across tenants.
+    Absent,
+}
+
+/// The stable base columns `get_execution_lineage` verifies an execution with
+/// before it touches the lineage columns (which post-date the table).
+#[derive(Debug, Clone)]
+pub struct ExecutionBase {
+    pub status: String,
+    /// Rendered as text because the lineage JSON emits it as a string.
+    pub workflow_id: String,
+    pub actor_id: Option<String>,
+    pub trigger_type: Option<String>,
+}
+
+/// Three-way resolution of [`ExecutionBase`]. Same rule as
+/// [`ExecutionLookup`]: an archived execution is neither absent nor denied,
+/// and the lineage handler's opening "Execution not found or access denied"
+/// was false on both clauses for one.
+#[derive(Debug)]
+#[must_use = "a base lookup must be classified: Archived is not Absent"]
+pub enum ExecutionBaseLookup {
+    Live(ExecutionBase),
+    Archived {
+        base: ExecutionBase,
+        archived_at: DateTime<Utc>,
+    },
+    Absent,
+}
+
+/// One node of an execution lineage tree, plus WHICH TABLE it came from.
+///
+/// `parent_execution_id` and `root_execution_id` are plain `uuid` columns
+/// with NO foreign key to `workflow_executions` (unlike `replayed_from_id`,
+/// which is `ON DELETE SET NULL` and is therefore severed by the archival
+/// move). So a lineage link SURVIVES archival as a dangling id, and a walk
+/// that reads only the live table truncates the tree silently — it does not
+/// error, it just returns fewer nodes and reports that count as the total.
+/// `archived_at` is `Some` for a node read out of the archive.
+#[derive(Debug, Clone)]
+pub struct LineageNode {
+    pub id: Uuid,
+    pub parent_execution_id: Option<Uuid>,
+    pub root_execution_id: Option<Uuid>,
+    pub status: String,
+    pub workflow_id: String,
+    pub trigger_type: Option<String>,
+    pub actor_id: Option<String>,
+    pub archived_at: Option<DateTime<Utc>>,
+}
+
 /// The projection every `ExecutionRow` read shares. `id` and
 /// `output_data_format` are load-bearing for `read_output_from_row`'s AEAD
 /// dispatch (see its contract) — do not trim them.
@@ -94,6 +184,29 @@ macro_rules! execution_row_columns {
          error_message, is_pinned, pin_note, replayed_from_id, actor_id, \
          workflow_version_id, priority, is_test_execution, provenance, \
          acknowledged_at, acknowledgement_reason"
+    };
+}
+
+/// The stable base projection shared by the live and archive legs of
+/// [`ExecutionRepository::lookup_execution_base`]. A macro rather than a
+/// `const` for the same reason `execution_row_columns!` is one: `concat!`
+/// assembles the two queries at COMPILE time, so neither is a runtime
+/// `format!` over a constant — safe in fact, but a shape the structural
+/// lints cannot read.
+macro_rules! execution_base_columns {
+    () => {
+        "status, workflow_id::text, actor_id::text, \
+         COALESCE(provenance->>'trigger_type', 'manual')"
+    };
+}
+
+/// The lineage-tree projection, shared verbatim by both halves of the
+/// `UNION ALL` in [`ExecutionRepository::get_execution_lineage_tree`] so the
+/// two cannot drift. `archived_at` is appended per-branch, not here.
+macro_rules! lineage_node_columns {
+    () => {
+        "id, parent_execution_id, root_execution_id, status, workflow_id::text, \
+         COALESCE(provenance->>'trigger_type', 'manual'), actor_id::text"
     };
 }
 
@@ -1207,50 +1320,70 @@ impl ExecutionRepository {
             .collect::<Result<Vec<_>>>()
     }
 
-    /// Most recent execution for a workflow (for watch_execution workflow_id lookup).
-    pub async fn get_latest_execution_for_workflow(
+    /// Most recent execution for a workflow, three ways: LIVE, ARCHIVED,
+    /// ABSENT (for the `watch_execution` workflow_id branch).
+    ///
+    /// Replaced `get_latest_execution_for_workflow(..) ->
+    /// Result<Option<ExecutionRow>>`, which read `workflow_executions` alone.
+    /// That had TWO failure modes, and the second is the worse one:
+    ///
+    /// * a workflow whose executions have ALL aged into the archive answered
+    ///   "No executions found for this workflow" — false;
+    /// * a workflow with an OLD live execution and a NEWER archived one
+    ///   returned the old row AS "the latest", with nothing marking it stale.
+    ///   Reachable because the sweep skips pinned rows (`is_pinned = false`
+    ///   in `archive_move_sql`), so a pinned older execution outlives an
+    ///   unpinned newer one.
+    ///
+    /// So this is the one lookup here that CANNOT be "live first, archive on
+    /// a miss": which table holds the latest row is exactly the unknown. It
+    /// is one `UNION ALL` ordered across both — a single round trip, and
+    /// each branch is an index probe (`idx_we_workflow_started`,
+    /// `workflow_executions_archive_workflow_id_started_at_idx`).
+    ///
+    /// Both branches carry `AND user_id = $2` on one `begin_user_scoped`
+    /// transaction. Ties on `started_at` break on `id` so the answer is
+    /// stable (check 28's rule; two executions of one workflow can share a
+    /// `started_at` when a fan-out dispatches them together — measured on
+    /// the dev fleet, the archive holds such pairs).
+    pub async fn lookup_latest_execution_for_workflow(
         &self,
         wf_id: Uuid,
         user_id: Uuid,
-    ) -> Result<Option<ExecutionRow>> {
-        let row = sqlx::query(
-            "SELECT id, workflow_id, status, started_at, completed_at, output_data, \
-                    output_data_enc, output_enc_key_id, output_data_format, \
-                    error_message, is_pinned, pin_note, replayed_from_id, actor_id, \
-                    workflow_version_id, priority, is_test_execution, provenance \
-             FROM workflow_executions \
-             WHERE workflow_id = $1 AND user_id = $2 \
-             ORDER BY started_at DESC NULLS LAST \
-             LIMIT 1",
-        )
+    ) -> Result<ExecutionLookup> {
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
+        let row = sqlx::query(concat!(
+            "SELECT ",
+            execution_row_columns!(),
+            ", NULL::timestamptz AS archived_at \
+             FROM workflow_executions WHERE workflow_id = $1 AND user_id = $2 \
+             UNION ALL \
+             SELECT ",
+            execution_row_columns!(),
+            ", archived_at \
+             FROM workflow_executions_archive WHERE workflow_id = $1 AND user_id = $2 \
+             ORDER BY started_at DESC NULLS LAST, id DESC \
+             LIMIT 1"
+        ))
         .bind(wf_id)
         .bind(user_id)
-        .fetch_optional(&self.db_pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await?;
 
-        let Some(r) = row else { return Ok(None) };
+        let Some(r) = row else {
+            return Ok(ExecutionLookup::Absent);
+        };
+        let archived_at: Option<DateTime<Utc>> = r.try_get("archived_at")?;
         let output_data = self.read_output_from_row(&r).await?;
-        Ok(Some(ExecutionRow {
-            id: r.try_get("id")?,
-            workflow_id: r.try_get("workflow_id")?,
-            status: r.try_get("status")?,
-            started_at: r.try_get::<Option<_>, _>("started_at")?,
-            completed_at: r.try_get::<Option<_>, _>("completed_at")?,
-            output_data,
-            error_message: r.try_get::<Option<_>, _>("error_message")?,
-            is_pinned: r.try_get::<Option<_>, _>("is_pinned")?.unwrap_or(false),
-            pin_note: r.try_get::<Option<_>, _>("pin_note")?,
-            replayed_from_id: r.try_get::<Option<_>, _>("replayed_from_id")?,
-            actor_id: r.try_get::<Option<_>, _>("actor_id")?,
-            workflow_version_id: r.try_get::<Option<_>, _>("workflow_version_id")?,
-            priority: r.try_get::<Option<_>, _>("priority")?,
-            is_test_execution: r
-                .try_get::<Option<_>, _>("is_test_execution")?
-                .unwrap_or(false),
-            provenance: r.try_get::<Option<_>, _>("provenance")?,
-            acknowledged_at: None,
-            acknowledgement_reason: None,
-        }))
+        let exec = execution_row_from(&r, output_data)?;
+        Ok(match archived_at {
+            Some(at) => ExecutionLookup::Archived {
+                row: exec,
+                archived_at: at,
+            },
+            None => ExecutionLookup::Live(exec),
+        })
     }
 
     /// Recent executions across all workflows, with optional status filter. Cap at 50.
@@ -2991,24 +3124,72 @@ impl ExecutionRepository {
 
     // ── Lineage queries (handle_get_execution_lineage) ─────────────────────
 
-    /// Fetch stable base columns for an execution — verifies ownership and existence.
-    /// Returns `(status, workflow_id_str, actor_id_str, trigger_type)`.
-    /// Returns `Err` only on a real DB failure.
-    pub async fn get_execution_base(
+    /// Fetch stable base columns for an execution, three ways: LIVE,
+    /// ARCHIVED, ABSENT. Verifies existence and ownership.
+    ///
+    /// Replaced `get_execution_base(..) -> Result<Option<(..)>>`, whose
+    /// `Ok(None)` was rendered by `get_execution_lineage` as "Execution not
+    /// found or access denied" — false on both clauses for an archived
+    /// execution. Both legs are user-scoped and run on the SAME
+    /// `begin_user_scoped` transaction; the archive read only runs on a live
+    /// MISS, so there is no UNION on the hot path.
+    pub async fn lookup_execution_base(
         &self,
         execution_id: Uuid,
         user_id: Uuid,
-    ) -> Result<Option<(String, String, Option<String>, Option<String>)>> {
-        sqlx::query_as(
-            "SELECT status, workflow_id::text, actor_id::text, \
-                    COALESCE(provenance->>'trigger_type', 'manual') \
-             FROM workflow_executions WHERE id = $1 AND user_id = $2",
-        )
+    ) -> Result<ExecutionBaseLookup> {
+        type BaseTuple = (String, String, Option<String>, Option<String>);
+        fn base_of(t: BaseTuple) -> ExecutionBase {
+            ExecutionBase {
+                status: t.0,
+                workflow_id: t.1,
+                actor_id: t.2,
+                trigger_type: t.3,
+            }
+        }
+
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
+        let live: Option<BaseTuple> = sqlx::query_as(concat!(
+            "SELECT ",
+            execution_base_columns!(),
+            " FROM workflow_executions WHERE id = $1 AND user_id = $2"
+        ))
         .bind(execution_id)
         .bind(user_id)
-        .fetch_optional(&self.db_pool)
-        .await
-        .map_err(Into::into)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(t) = live {
+            tx.commit().await?;
+            return Ok(ExecutionBaseLookup::Live(base_of(t)));
+        }
+
+        let archived: Option<(
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            DateTime<Utc>,
+        )> = sqlx::query_as(concat!(
+            "SELECT ",
+            execution_base_columns!(),
+            ", archived_at FROM workflow_executions_archive \
+                 WHERE id = $1 AND user_id = $2"
+        ))
+        .bind(execution_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        Ok(match archived {
+            Some((status, workflow_id, actor_id, trigger_type, archived_at)) => {
+                ExecutionBaseLookup::Archived {
+                    base: base_of((status, workflow_id, actor_id, trigger_type)),
+                    archived_at,
+                }
+            }
+            None => ExecutionBaseLookup::Absent,
+        })
     }
 
     /// Resolve an execution's owning workflow id with NO user scoping —
@@ -3018,33 +3199,88 @@ impl ExecutionRepository {
     /// execution's workflow_id, so a tenant-scoped read would wrongly
     /// restrict it to the admin's own org). Single-column, non-sensitive
     /// (a UUID), no payload. Do NOT call this from user-facing paths —
-    /// use `get_execution_base` (user-scoped) instead.
+    /// use `lookup_execution_base` (user-scoped) instead.
+    ///
+    /// Reads the ARCHIVE on a live miss. The cryptographic audit chain this
+    /// feeds lives in the offline WORM ledger, keyed by
+    /// `(workflow_id, execution_id)` and entirely unaffected by the DB
+    /// retention sweep — so before this fallback existed, an admin auditing
+    /// any execution older than the retention window was told "Execution not
+    /// found" about a chain that was sitting in object storage, intact. An
+    /// audit surface that stops at the archive boundary silently
+    /// under-reports, which is the one failure an audit surface may not have.
+    ///
+    /// Unlike its siblings this keeps `Result<Option<Uuid>>`: the workflow id
+    /// is the SAME whichever table holds the row, the ledger read that
+    /// follows is byte-for-byte identical, and there is therefore no
+    /// archived-vs-absent claim for the caller to render differently. The
+    /// remaining `None` means genuinely absent. (Consequence: no structural
+    /// lint leg covers this method — `execution_archive_read_tests::
+    /// platform_admin_workflow_id_resolves_for_an_archived_execution` does.)
+    ///
+    /// Both legs stay deliberately cross-tenant: authorization was
+    /// established upstream by `is_platform_admin`, and the archive read is
+    /// on the bare pool for exactly the same reason the live one is — a
+    /// user-scoped tx would re-introduce the tenant restriction the whole
+    /// method exists to bypass.
     pub async fn get_workflow_id_any_user(&self, execution_id: Uuid) -> Result<Option<Uuid>> {
         let workflow_id: Option<Uuid> =
             sqlx::query_scalar("SELECT workflow_id FROM workflow_executions WHERE id = $1")
                 .bind(execution_id)
                 .fetch_optional(&self.db_pool)
                 .await?;
-        Ok(workflow_id)
+        if workflow_id.is_some() {
+            return Ok(workflow_id);
+        }
+        sqlx::query_scalar("SELECT workflow_id FROM workflow_executions_archive WHERE id = $1")
+            .bind(execution_id)
+            .fetch_optional(&self.db_pool)
+            .await
+            .map_err(Into::into)
     }
 
     /// Fetch `(root_execution_id, parent_execution_id)` for an execution —
     /// used to resolve the lineage tree root. Returns `Err` if the lineage
     /// columns don't exist yet (pre-migration); caller treats that as "use exec_id as root".
+    ///
+    /// Falls back to `workflow_executions_archive` on a live miss. These two
+    /// columns have NO foreign key (unlike `replayed_from_id`, which is
+    /// `ON DELETE SET NULL` and is severed by the archival move), so an
+    /// archived execution still carries its links — reading only the live
+    /// table would make an archived member of a tree look standalone.
+    ///
+    /// `Ok(None)` here means "no lineage columns to read", which the caller
+    /// treats as "this execution is its own root" — a benign fallback, NOT a
+    /// not-found claim. The not-found claim is made once, upstream, by
+    /// [`Self::lookup_execution_base`].
     pub async fn get_execution_lineage_root(
         &self,
         execution_id: Uuid,
         user_id: Uuid,
     ) -> Result<Option<(Option<Uuid>, Option<Uuid>)>> {
-        sqlx::query_as(
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
+        let live: Option<(Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
             "SELECT root_execution_id, parent_execution_id \
              FROM workflow_executions WHERE id = $1 AND user_id = $2",
         )
         .bind(execution_id)
         .bind(user_id)
-        .fetch_optional(&self.db_pool)
-        .await
-        .map_err(Into::into)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(row) = live {
+            tx.commit().await?;
+            return Ok(Some(row));
+        }
+        let archived: Option<(Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
+            "SELECT root_execution_id, parent_execution_id \
+             FROM workflow_executions_archive WHERE id = $1 AND user_id = $2",
+        )
+        .bind(execution_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(archived)
     }
 
     /// List the direct child executions of `parent_execution_id` with timing
@@ -3091,8 +3327,24 @@ impl ExecutionRepository {
         &self,
         root_id: Uuid,
         user_id: Uuid,
-    ) -> Result<
-        Vec<(
+    ) -> Result<Vec<LineageNode>> {
+        // ONE statement over BOTH tables. This is the one place in this
+        // change that unions rather than falling back on a miss, and the
+        // reason is that this is a SET query, not a by-id lookup: a lineage
+        // tree can legitimately have members in both tables at once (the
+        // links survive archival — see [`LineageNode`]), so "live first,
+        // archive only on a miss" would return a silently truncated tree
+        // and report its size as the total. One statement also keeps this a
+        // SINGLE round trip whatever the tree's depth or size, exactly as
+        // before: the pre-#749 walk was already flat, not recursive, so this
+        // adds no query and cannot become an N+1.
+        //
+        // Both branches carry `AND user_id = $2` and run on the same
+        // `begin_user_scoped` transaction, so the archive half has the
+        // identical app-layer predicate and forced-RLS backstop as the live
+        // half. The LIMIT applies to the merged result.
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
+        let rows: Vec<(
             Uuid,
             Option<Uuid>,
             Option<Uuid>,
@@ -3100,20 +3352,51 @@ impl ExecutionRepository {
             String,
             Option<String>,
             Option<String>,
-        )>,
-    > {
-        sqlx::query_as(
-            "SELECT id, parent_execution_id, root_execution_id, status, workflow_id::text, \
-                    COALESCE(provenance->>'trigger_type', 'manual'), actor_id::text \
+            Option<DateTime<Utc>>,
+        )> = sqlx::query_as(concat!(
+            "SELECT ",
+            lineage_node_columns!(),
+            ", NULL::timestamptz AS archived_at \
              FROM workflow_executions \
              WHERE (id = $1 OR root_execution_id = $1) AND user_id = $2 \
-             ORDER BY id LIMIT 10000",
-        )
+             UNION ALL \
+             SELECT ",
+            lineage_node_columns!(),
+            ", archived_at \
+             FROM workflow_executions_archive \
+             WHERE (id = $1 OR root_execution_id = $1) AND user_id = $2 \
+             ORDER BY 1 LIMIT 10000"
+        ))
         .bind(root_id)
         .bind(user_id)
-        .fetch_all(&self.db_pool)
-        .await
-        .map_err(Into::into)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    parent_execution_id,
+                    root_execution_id,
+                    status,
+                    workflow_id,
+                    trigger_type,
+                    actor_id,
+                    archived_at,
+                )| LineageNode {
+                    id,
+                    parent_execution_id,
+                    root_execution_id,
+                    status,
+                    workflow_id,
+                    trigger_type,
+                    actor_id,
+                    archived_at,
+                },
+            )
+            .collect())
     }
 
     // ── resources.rs MCP-handler support ───────────────────────────────────
@@ -3342,16 +3625,51 @@ impl ExecutionRepository {
             .collect())
     }
 
-    /// Fetch the `user_id` (owner) of a workflow_execution row. Returns
-    /// `Ok(None)` when the row doesn't exist. Used by `submit_workflow_approval`
-    /// for ownership-check before allowing a decision write.
-    pub async fn get_workflow_execution_owner(&self, execution_id: Uuid) -> Result<Option<Uuid>> {
+    /// Resolve the owner of an execution, three ways: LIVE, ARCHIVED, ABSENT.
+    ///
+    /// Replaced `get_workflow_execution_owner(execution_id) ->
+    /// Result<Option<Uuid>>`, which read `workflow_executions` alone and so
+    /// could not tell an archived execution from one that never existed. See
+    /// [`ExecutionOwnerLookup`] for why the live leg stays un-scoped while
+    /// the archive leg is user-scoped, and for the measurement that makes
+    /// this a data loss rather than only a wrong diagnosis.
+    ///
+    /// The archive read only runs on a live MISS — no UNION on the hot path.
+    pub async fn lookup_execution_owner(
+        &self,
+        execution_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<ExecutionOwnerLookup> {
+        // Live leg: un-scoped, byte-for-byte the pre-#749 query. The caller
+        // does the ownership comparison so it can log a distinct
+        // "belongs to a different user" event without leaking that
+        // distinction into the response.
         let row: Option<(Uuid,)> =
             sqlx::query_as("SELECT user_id FROM workflow_executions WHERE id = $1")
                 .bind(execution_id)
                 .fetch_optional(&self.db_pool)
                 .await?;
-        Ok(row.map(|(u,)| u))
+        if let Some((owner,)) = row {
+            return Ok(ExecutionOwnerLookup::Live(owner));
+        }
+
+        // Archive leg: user-scoped, so it resolves ONLY the caller's own row
+        // and carries the forced-RLS backstop.
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
+        let archived: Option<(Uuid, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT user_id, archived_at FROM workflow_executions_archive \
+             WHERE id = $1 AND user_id = $2",
+        )
+        .bind(execution_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        Ok(match archived {
+            Some((owner, archived_at)) => ExecutionOwnerLookup::Archived { owner, archived_at },
+            None => ExecutionOwnerLookup::Absent,
+        })
     }
 
     /// Update a pending execution_approvals row with a decision (approved/denied

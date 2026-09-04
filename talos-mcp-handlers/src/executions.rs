@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::fmt::Write as FmtWrite;
 use std::sync::Arc;
-use talos_execution_repository::ExecutionLookup;
+use talos_execution_repository::{ExecutionBaseLookup, ExecutionLookup, ExecutionOwnerLookup};
 use uuid::Uuid;
 
 pub fn tool_schemas() -> Vec<serde_json::Value> {
@@ -624,20 +624,47 @@ pub(crate) fn archived_note(archived_at: DateTime<Utc>) -> String {
     )
 }
 
+/// `module_executions` and `module_execution_logs` have NO foreign key to
+/// `workflow_executions`, so unlike the CASCADEd `execution_events` /
+/// `workflow_execution_logs` the WORKER's own log lines survive the archival
+/// move intact — measured on the dev fleet at 929 rows across 133 of 133
+/// archived executions. `tail_worker_logs` therefore needs its own note:
+/// stamping [`ARCHIVED_EVENTS_GONE`] on a response that is CURRENTLY SHOWING
+/// those lines would be a report contradicting itself, which is the class
+/// this whole area exists to close.
+pub(crate) const ARCHIVED_WORKER_LOGS_RETAINED: &str =
+    "worker log lines are stored in module_execution_logs, which has no cascade to \
+     workflow_executions, so they survived the move and are complete below";
+
+/// One-line operator-facing note for a surface reading an archived execution
+/// whose OWN data survived the move. Sibling of [`archived_note`], which is
+/// for the surfaces whose children were CASCADEd away.
+pub(crate) fn archived_note_retained(archived_at: DateTime<Utc>, what: &str) -> String {
+    format!(
+        "This execution was archived at {} and is being read from \
+         workflow_executions_archive. {what}.",
+        archived_at.to_rfc3339()
+    )
+}
+
 /// Stamp the archival provenance onto a JSON report object. A no-op for a
 /// live execution, so every call site can pass its `Option` unconditionally
 /// and none of them has to remember a conditional.
 pub(crate) fn stamp_archived(report: &mut Value, archived_at: Option<DateTime<Utc>>) {
     let Some(at) = archived_at else { return };
+    stamp_archived_note(report, at, &archived_note(at));
+}
+
+/// The stamping half of [`stamp_archived`], with the note supplied — so a
+/// surface whose data SURVIVED (see [`ARCHIVED_WORKER_LOGS_RETAINED`]) can
+/// say so instead of inheriting the events-are-gone wording.
+fn stamp_archived_note(report: &mut Value, at: DateTime<Utc>, note: &str) {
     let Some(obj) = report.as_object_mut() else {
         return;
     };
     obj.insert("archived".to_string(), Value::Bool(true));
     obj.insert("archived_at".to_string(), Value::String(at.to_rfc3339()));
-    obj.insert(
-        "archived_note".to_string(),
-        Value::String(archived_note(at)),
-    );
+    obj.insert("archived_note".to_string(), Value::String(note.to_string()));
 }
 
 /// Answer a report request that MAY be reading an archived execution.
@@ -675,20 +702,76 @@ pub(crate) fn respond_maybe_archived(
     archived_at: Option<DateTime<Utc>>,
     body: impl Into<String>,
 ) -> JsonRpcResponse {
+    let note = archived_at.map(archived_note);
+    respond_maybe_archived_noted(req_id, archived_at, note, body)
+}
+
+/// [`respond_maybe_archived`] with the note supplied. Split out for the one
+/// surface whose data SURVIVED archival (`tail_worker_logs` — see
+/// [`ARCHIVED_WORKER_LOGS_RETAINED`]); everything else goes through the
+/// wrapper above and keeps the events-are-gone wording.
+pub(crate) fn respond_maybe_archived_noted(
+    req_id: Option<Value>,
+    archived_at: Option<DateTime<Utc>>,
+    note: Option<String>,
+    body: impl Into<String>,
+) -> JsonRpcResponse {
     let body = body.into();
     let Some(at) = archived_at else {
         return mcp_text(req_id, &body);
     };
+    let note = note.unwrap_or_else(|| archived_note(at));
     if let Ok(v) = serde_json::from_str::<Value>(&body) {
         let mut out = if v.is_object() {
             v
         } else {
             serde_json::json!({ "result": v })
         };
-        stamp_archived(&mut out, Some(at));
+        stamp_archived_note(&mut out, at, &note);
         return mcp_text(req_id, &serde_json::to_string_pretty(&out).unwrap_or(body));
     }
-    mcp_text(req_id, &format!("{}\n\n{}", archived_note(at), body))
+    mcp_text(req_id, &format!("{note}\n\n{body}"))
+}
+
+/// What an [`ExecutionOwnerLookup`] means for a given caller — the four
+/// answers, named, in ONE place so the two handlers that consult the owner
+/// gate (`tail_worker_logs`, which READS an archived execution, and
+/// `submit_workflow_approval`, which REFUSES one) cannot come to different
+/// conclusions about which lookups are authorised. They differ only in what
+/// they DO with `ArchivedOwned`, which is the whole point of naming it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OwnerVerdict {
+    /// Live, and owned by this caller.
+    LiveOwned,
+    /// Archived, and owned by this caller — carries WHEN it was archived.
+    ArchivedOwned(DateTime<Utc>),
+    /// A LIVE row owned by somebody else. Distinct from [`Self::Absent`] for
+    /// SERVER-SIDE telemetry only; both must render the same message to the
+    /// caller or the response becomes a cross-tenant existence oracle. (There
+    /// is no archived twin of this variant: the archive leg of the lookup is
+    /// user-scoped, so another tenant's archived row arrives as `Absent`.)
+    Foreign,
+    /// Nothing this caller may see.
+    Absent,
+}
+
+/// Classify an owner lookup for a caller. Pure, so the classification is
+/// unit-testable without a database — the DB half (that an archived row
+/// resolves to `Archived` at all) is covered by
+/// `controller/tests/execution_archive_read_tests.rs`.
+pub(crate) fn classify_owner(lookup: ExecutionOwnerLookup, user_id: Uuid) -> OwnerVerdict {
+    match lookup {
+        ExecutionOwnerLookup::Live(owner) if owner == user_id => OwnerVerdict::LiveOwned,
+        ExecutionOwnerLookup::Live(_) => OwnerVerdict::Foreign,
+        ExecutionOwnerLookup::Archived { owner, archived_at } if owner == user_id => {
+            OwnerVerdict::ArchivedOwned(archived_at)
+        }
+        // Unreachable while the archive leg stays user-scoped; folded into
+        // `Absent` rather than `Foreign` because if that scoping is ever
+        // loosened, the safe answer is the one that reveals nothing.
+        ExecutionOwnerLookup::Archived { .. } => OwnerVerdict::Absent,
+        ExecutionOwnerLookup::Absent => OwnerVerdict::Absent,
+    }
 }
 
 /// The refusal for an operation that ACTS ON an execution (cancel, retry,
@@ -1636,29 +1719,43 @@ async fn handle_tail_worker_logs(
     };
 
     // Authorization: workflow_execution must be owned by this user.
-    // Both branches (no row, or owned by another user) collapse to the same
-    // canonical message — distinguishing them would leak existence across users.
-    // The hint about standalone module runs is generic, so it's safe to surface
-    // for unauthorised callers too.
-    match state
+    // The two DENIAL branches (no row, or owned by another user) collapse to
+    // the same canonical message — distinguishing them would leak existence
+    // across users. The hint about standalone module runs is generic, so it's
+    // safe to surface for unauthorised callers too.
+    //
+    // ARCHIVED is not ABSENT, and here that was a LOSS rather than only a
+    // wrong diagnosis. `module_executions` and `module_execution_logs` carry
+    // NO foreign key to `workflow_executions`, so the worker's own log lines
+    // SURVIVE the retention move — measured on the dev fleet at 929 rows
+    // across 133 of 133 archived executions — and this gate was answering
+    // "Execution not found or access denied" while holding every one of them.
+    // So the archived arm READS: it runs the same query and stamps the
+    // response (`respond_maybe_archived` at the end of this handler).
+    let archived_at = match state
         .execution_repo
-        .get_workflow_execution_owner(exec_id)
+        .lookup_execution_owner(exec_id, user_id)
         .await
     {
-        Ok(Some(owner)) if owner == user_id => {}
-        Ok(_) => {
-            return mcp_error(
-                req_id,
-                -32000,
-                "Execution not found or access denied. tail_worker_logs only supports \
-                 workflow executions; for standalone module runs use get_execution_logs.",
-            );
-        }
+        Ok(lookup) => match classify_owner(lookup, user_id) {
+            OwnerVerdict::LiveOwned => None,
+            OwnerVerdict::ArchivedOwned(at) => Some(at),
+            // Both denial verdicts render the SAME message — distinguishing
+            // them would leak existence across tenants.
+            OwnerVerdict::Foreign | OwnerVerdict::Absent => {
+                return mcp_error(
+                    req_id,
+                    -32000,
+                    "Execution not found or access denied. tail_worker_logs only supports \
+                     workflow executions; for standalone module runs use get_execution_logs.",
+                );
+            }
+        },
         Err(e) => {
             tracing::error!(execution_id = %exec_id, "tail_worker_logs ownership check failed: {}", e);
             return mcp_error(req_id, -32000, "Failed to verify execution ownership");
         }
-    }
+    };
 
     let rows = match state
         .execution_repo
@@ -1704,9 +1801,11 @@ async fn handle_tail_worker_logs(
         .collect();
 
     let returned = entries.len();
-    mcp_text(
+    respond_maybe_archived_noted(
         req_id,
-        &serde_json::to_string_pretty(&serde_json::json!({
+        archived_at,
+        archived_at.map(|at| archived_note_retained(at, ARCHIVED_WORKER_LOGS_RETAINED)),
+        serde_json::to_string_pretty(&serde_json::json!({
             "execution_id": exec_id,
             "filter": {
                 "min_level": min_level,
@@ -3317,11 +3416,35 @@ async fn handle_watch_execution(
     {
         match state
             .execution_repo
-            .get_latest_execution_for_workflow(wf_id, user_id)
+            .lookup_latest_execution_for_workflow(wf_id, user_id)
             .await
         {
-            Ok(Some(e)) => e,
-            Ok(None) => return mcp_error(req_id, -32000, "No executions found for this workflow"),
+            Ok(ExecutionLookup::Live(e)) => e,
+            // The workflow's most recent execution is ARCHIVED. Two things
+            // were wrong before this arm existed, and the second is worse
+            // than the first: the live-only read answered "No executions
+            // found for this workflow" for a workflow whose runs had all
+            // aged out, AND — because the sweep skips pinned rows — it could
+            // return an OLDER live execution as "the latest" while a newer
+            // one sat in the archive, with nothing in the response marking
+            // it stale. Now the latest is resolved across both tables and,
+            // when it is the archived one, this refuses by NAME: an archived
+            // execution is terminal and its `execution_events` were CASCADEd
+            // away, so there is genuinely nothing to watch.
+            Ok(ExecutionLookup::Archived { row, archived_at }) => {
+                return mcp_error(
+                    req_id,
+                    -32000,
+                    &format!(
+                        "{} It was this workflow's most recent execution; \
+                         list_archived_executions(workflow_id) shows the rest.",
+                        archived_refusal("watch this workflow", row.id, archived_at)
+                    ),
+                )
+            }
+            Ok(ExecutionLookup::Absent) => {
+                return mcp_error(req_id, -32000, "No executions found for this workflow")
+            }
             Err(e) => {
                 tracing::error!("watch_execution (by workflow_id) failed: {}", e);
                 return mcp_error(req_id, -32000, "Failed to load latest execution");
@@ -5767,21 +5890,28 @@ async fn handle_get_execution_lineage(
 
     // Step 1: Verify the execution exists using stable columns (no lineage columns).
     // Fails loudly with a proper error — never swallows DB errors silently.
-    let base = match state
+    //
+    // #749: three-way. `parent_execution_id` / `root_execution_id` carry NO
+    // foreign key, so a lineage link SURVIVES the archival move as a dangling
+    // id — the tree can legitimately span both tables, and each node below is
+    // stamped with which one it came from. Answering "not found or access
+    // denied" for an archived anchor was false on both clauses; answering
+    // "archived" over an EMPTY tree would have been the other half of the
+    // same mistake, so the walk itself reads both tables too.
+    let (base, archived_at) = match state
         .execution_repo
-        .get_execution_base(exec_id, user_id)
+        .lookup_execution_base(exec_id, user_id)
         .await
     {
-        Ok(row) => row,
+        Ok(ExecutionBaseLookup::Live(base)) => (base, None),
+        Ok(ExecutionBaseLookup::Archived { base, archived_at }) => (base, Some(archived_at)),
+        Ok(ExecutionBaseLookup::Absent) => {
+            return mcp_error(req_id, -32000, "Execution not found or access denied")
+        }
         Err(e) => {
             tracing::error!(execution_id = %exec_id, "get_execution_lineage: DB error: {}", e);
             return mcp_error(req_id, -32000, "Database error looking up execution");
         }
-    };
-
-    let (status, wf_id_str, actor_id_str, trigger_type) = match base {
-        None => return mcp_error(req_id, -32000, "Execution not found or access denied"),
-        Some(row) => row,
     };
 
     // Step 2: Determine the tree root using lineage columns (added in migration 20260326000002).
@@ -5802,61 +5932,103 @@ async fn handle_get_execution_lineage(
         }
     };
 
-    // Step 3: Fetch the entire tree in a single flat query.
+    // Step 3: Fetch the entire tree in a single flat query over BOTH tables.
     // root: found by id = lineage_root; children: found by root_execution_id = lineage_root.
     // If lineage columns don't exist, fall back to returning just this execution.
-    let tree = match state
+    //
+    // The `Err` arm is SPLIT from the empty-result arm. Before #749 both
+    // landed in the same fallback with no logging at all, so a DB failure
+    // rendered as a confident "This execution has no parent or child
+    // executions — it is a standalone run." — a determinate claim about a
+    // tree nobody read. The fallback shape is preserved (returning the
+    // anchor alone is right when there genuinely are no lineage columns),
+    // but a read failure now says so in the response.
+    let (tree, tree_degraded) = match state
         .execution_repo
         .get_execution_lineage_tree(lineage_root, user_id)
         .await
     {
-        Ok(rows) if !rows.is_empty() => rows,
-        Ok(_) | Err(_) => {
-            // Fallback: return just this execution as a standalone entry.
-            vec![(
-                exec_id,
-                None,
-                None,
-                status,
-                wf_id_str,
-                trigger_type,
-                actor_id_str,
-            )]
+        Ok(rows) if !rows.is_empty() => (rows, false),
+        Ok(_) => (
+            vec![anchor_lineage_node(exec_id, &base, archived_at)],
+            false,
+        ),
+        Err(e) => {
+            tracing::warn!(
+                execution_id = %exec_id,
+                "get_execution_lineage: lineage tree unavailable ({}), returning standalone view", e
+            );
+            (vec![anchor_lineage_node(exec_id, &base, archived_at)], true)
         }
     };
 
+    let archived_in_lineage = tree.iter().filter(|n| n.archived_at.is_some()).count();
     let nodes: Vec<serde_json::Value> = tree
         .iter()
-        .map(|(id, parent, root, exec_status, wf_id, trigger, actor)| {
+        .map(|n| {
             serde_json::json!({
-                "execution_id": id.to_string(),
-                "parent_execution_id": parent.map(|p| p.to_string()),
-                "root_execution_id": root.map(|r| r.to_string()),
-                "workflow_id": wf_id,
-                "status": exec_status,
-                "trigger_type": trigger,
-                "actor_id": actor,
-                "is_requested_execution": *id == exec_id,
-                "is_root": parent.is_none(),
+                "execution_id": n.id.to_string(),
+                "parent_execution_id": n.parent_execution_id.map(|p| p.to_string()),
+                "root_execution_id": n.root_execution_id.map(|r| r.to_string()),
+                "workflow_id": n.workflow_id,
+                "status": n.status,
+                "trigger_type": n.trigger_type,
+                "actor_id": n.actor_id,
+                "is_requested_execution": n.id == exec_id,
+                "is_root": n.parent_execution_id.is_none(),
+                // WHICH TABLE this node came from. A lineage tree can span
+                // both, so a reader that does not say which is claiming a
+                // uniformity it did not check.
+                "archived": n.archived_at.is_some(),
+                "archived_at": n.archived_at.map(|a| a.to_rfc3339()),
             })
         })
         .collect();
 
+    let mut report = serde_json::json!({
+        "root_execution_id": lineage_root.to_string(),
+        "requested_execution_id": exec_id.to_string(),
+        "total_executions_in_lineage": nodes.len(),
+        "archived_executions_in_lineage": archived_in_lineage,
+        "lineage": nodes,
+        "note": if tree_degraded {
+            "The lineage tree could not be read; only the requested execution is shown. \
+             This is NOT a statement that it has no parent or children."
+        } else if archived_in_lineage > 0 {
+            "Lineage includes all executions linked via root_execution_id, across the live \
+             table AND workflow_executions_archive — see each node's `archived` flag."
+        } else if nodes.len() == 1 {
+            "This execution has no parent or child executions — it is a standalone run."
+        } else {
+            "Lineage includes all executions linked via root_execution_id."
+        }
+    });
+    // The ANCHOR's own archival provenance, stamped the same way every other
+    // archived read stamps it.
+    stamp_archived(&mut report, archived_at);
     mcp_text(
         req_id,
-        &serde_json::to_string_pretty(&serde_json::json!({
-            "root_execution_id": lineage_root.to_string(),
-            "requested_execution_id": exec_id.to_string(),
-            "total_executions_in_lineage": nodes.len(),
-            "lineage": nodes,
-            "note": if nodes.len() == 1 {
-                "This execution has no parent or child executions — it is a standalone run."
-            } else {
-                "Lineage includes all executions linked via root_execution_id."
-            }
-        }))
-        .unwrap_or_default(),
+        &serde_json::to_string_pretty(&report).unwrap_or_default(),
     )
+}
+
+/// The single-node fallback tree: the requested execution alone, carrying the
+/// archival provenance the anchor lookup already resolved.
+fn anchor_lineage_node(
+    exec_id: Uuid,
+    base: &talos_execution_repository::ExecutionBase,
+    archived_at: Option<DateTime<Utc>>,
+) -> talos_execution_repository::LineageNode {
+    talos_execution_repository::LineageNode {
+        id: exec_id,
+        parent_execution_id: None,
+        root_execution_id: None,
+        status: base.status.clone(),
+        workflow_id: base.workflow_id.clone(),
+        trigger_type: base.trigger_type.clone(),
+        actor_id: base.actor_id.clone(),
+        archived_at,
+    }
 }
 
 async fn handle_list_pending_approvals(
@@ -6014,12 +6186,23 @@ async fn handle_submit_workflow_approval(
     // "not found or access denied" with zero operator signal. This is the twin
     // of the `talos-webhooks::approval_handler` site fixed under MCP-535; that
     // sweep did not reach the MCP handler.
-    let owner = match state
+    //
+    // #749: ARCHIVED is not ABSENT here either, and the correct answer is a
+    // REFUSAL WITH THE RIGHT REASON rather than a read. The retention sweep
+    // only ever moves TERMINAL rows (`archive_move_sql` selects
+    // `status IN ('completed','failed','cancelled') AND completed_at IS NOT
+    // NULL`), and an approval needs a `pending` `execution_approvals` row
+    // plus a `waiting` execution to resume — so an archived execution can
+    // never be approvable. Denying was right; saying "not found or access
+    // denied" about a row `list_archived_executions` returns to the same
+    // caller was not, and it sends an operator to the permissions model
+    // during what is actually a retention event.
+    let verdict = match state
         .execution_repo
-        .get_workflow_execution_owner(exec_id)
+        .lookup_execution_owner(exec_id, user_id)
         .await
     {
-        Ok(o) => o,
+        Ok(lookup) => classify_owner(lookup, user_id),
         Err(e) => {
             tracing::error!(
                 target: "talos_mcp",
@@ -6033,9 +6216,16 @@ async fn handle_submit_workflow_approval(
         }
     };
 
-    match owner {
-        Some(owner_id) if owner_id == user_id => {} // authorised
-        Some(_) => {
+    match verdict {
+        OwnerVerdict::LiveOwned => {} // authorised
+        OwnerVerdict::ArchivedOwned(archived_at) => {
+            return mcp_error(
+                req_id,
+                -32000,
+                &archived_refusal("submit an approval for", exec_id, archived_at),
+            );
+        }
+        OwnerVerdict::Foreign => {
             // Log distinct telemetry server-side, but never differentiate this from
             // "no such execution" in the response — distinguishing them would leak
             // existence of other users' executions.
@@ -6046,7 +6236,7 @@ async fn handle_submit_workflow_approval(
             );
             return mcp_error(req_id, -32000, "Execution not found or access denied");
         }
-        None => {
+        OwnerVerdict::Absent => {
             return mcp_error(req_id, -32000, "Execution not found or access denied");
         }
     }
@@ -6593,6 +6783,161 @@ mod comparison_view_tests {
         let err = parse_comparison_view(&json!({"view": 3})).unwrap_err();
         assert!(err.contains("'view' must be a string"), "{err}");
         assert!(err.contains("number"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod archived_owner_gate_tests {
+    //! #749 — the owner gate, and the note a surface whose data SURVIVED
+    //! archival must NOT print.
+    //!
+    //! `classify_owner` is the one place the two owner-gate handlers agree
+    //! about which lookups are authorised; the DB half (that an archived row
+    //! resolves to `Archived` at all) lives in
+    //! `controller/tests/execution_archive_read_tests.rs`.
+    //!
+    //! STATED LIMIT, because implying otherwise is the defect one level up:
+    //! these drive the CLASSIFIER and the RENDERERS, not the handler bodies.
+    //! A mutation that classifies correctly and then discards the answer in
+    //! `handle_tail_worker_logs`'s own match survives them — that is what
+    //! lint check 81(c) covers, and neither instrument alone is enough.
+
+    use super::*;
+
+    fn at() -> DateTime<Utc> {
+        "2026-09-04T16:47:56Z".parse().unwrap()
+    }
+
+    #[test]
+    fn an_archived_execution_the_caller_owns_is_not_absent() {
+        let me = Uuid::new_v4();
+        assert_eq!(
+            classify_owner(
+                ExecutionOwnerLookup::Archived {
+                    owner: me,
+                    archived_at: at()
+                },
+                me
+            ),
+            OwnerVerdict::ArchivedOwned(at()),
+            "collapsing this into Absent is the whole defect — it made tail_worker_logs \
+             answer \"not found or access denied\" while holding the caller's own log lines"
+        );
+    }
+
+    #[test]
+    fn a_live_execution_the_caller_owns_is_allowed() {
+        let me = Uuid::new_v4();
+        assert_eq!(
+            classify_owner(ExecutionOwnerLookup::Live(me), me),
+            OwnerVerdict::LiveOwned
+        );
+    }
+
+    #[test]
+    fn a_foreign_live_execution_is_distinguished_server_side_only() {
+        // `Foreign` exists so the caller can log it; both denial verdicts
+        // must still render the same message, which is asserted at the two
+        // call sites by their shared `mcp_error` string.
+        assert_eq!(
+            classify_owner(ExecutionOwnerLookup::Live(Uuid::new_v4()), Uuid::new_v4()),
+            OwnerVerdict::Foreign
+        );
+    }
+
+    #[test]
+    fn an_absent_execution_is_still_absent() {
+        assert_eq!(
+            classify_owner(ExecutionOwnerLookup::Absent, Uuid::new_v4()),
+            OwnerVerdict::Absent
+        );
+    }
+
+    /// Defence in depth for the tenancy note on `ExecutionOwnerLookup`: the
+    /// archive leg is user-scoped so this shape cannot arise today, but if
+    /// that scoping is ever loosened the answer must reveal nothing.
+    #[test]
+    fn a_foreign_archived_execution_reveals_nothing() {
+        assert_eq!(
+            classify_owner(
+                ExecutionOwnerLookup::Archived {
+                    owner: Uuid::new_v4(),
+                    archived_at: at()
+                },
+                Uuid::new_v4()
+            ),
+            OwnerVerdict::Absent
+        );
+    }
+
+    /// **A report must not contradict itself.** `tail_worker_logs` reads
+    /// `module_execution_logs`, which has NO cascade to `workflow_executions`
+    /// and therefore SURVIVES archival — so stamping it with the default
+    /// note, which says the logs "were not retained past the archive window",
+    /// would print that sentence directly above the retained logs.
+    #[test]
+    fn the_worker_log_note_does_not_claim_the_logs_are_gone() {
+        let note = archived_note_retained(at(), ARCHIVED_WORKER_LOGS_RETAINED);
+        assert!(
+            !note.contains(ARCHIVED_EVENTS_GONE),
+            "a surface that is SHOWING the data must not say it was not retained: {note}"
+        );
+        assert!(note.contains("2026-09-04T16:47:56+00:00"), "{note}");
+        assert!(
+            note.contains("module_execution_logs"),
+            "the note must say WHY these survived: {note}"
+        );
+        // …and the default note, for the surfaces whose children really were
+        // CASCADEd away, still says so.
+        assert!(archived_note(at()).contains(ARCHIVED_EVENTS_GONE));
+    }
+
+    /// The noted variant stamps the note it was given, not the default one.
+    #[test]
+    fn a_noted_archived_response_carries_its_own_note() {
+        let resp = respond_maybe_archived_noted(
+            None,
+            Some(at()),
+            Some(archived_note_retained(at(), ARCHIVED_WORKER_LOGS_RETAINED)),
+            r#"{"entries":[{"message":"gate=egress allowed"}],"returned":1}"#.to_string(),
+        );
+        let text = resp
+            .result
+            .as_ref()
+            .and_then(|r| r.get("content"))
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("text"))
+            .and_then(|t| t.as_str())
+            .expect("mcp_text content")
+            .to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("still JSON");
+        assert_eq!(parsed.get("archived"), Some(&serde_json::Value::Bool(true)));
+        assert!(
+            !parsed
+                .get("archived_note")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .contains("not retained"),
+            "the retained-data note must survive the stamp: {parsed}"
+        );
+        assert_eq!(
+            parsed.get("returned").and_then(|v| v.as_u64()),
+            Some(1),
+            "the log payload is untouched by stamping: {parsed}"
+        );
+    }
+
+    /// A LIVE response through the noted variant is byte-for-byte unchanged —
+    /// same guarantee `a_live_response_is_unchanged` gives the wrapper.
+    #[test]
+    fn a_live_response_through_the_noted_variant_is_unchanged() {
+        let json = r#"{"entries":[],"returned":0}"#.to_string();
+        let with = respond_maybe_archived_noted(None, None, Some("ignored".into()), json.clone());
+        let without = mcp_text(None, &json);
+        assert_eq!(
+            serde_json::to_string(&with.result).unwrap(),
+            serde_json::to_string(&without.result).unwrap()
+        );
     }
 }
 
