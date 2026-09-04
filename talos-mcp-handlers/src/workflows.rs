@@ -3988,37 +3988,67 @@ async fn handle_get_workflow_raw_json(
 
 // ── Handlers from handle_extra_tools (already use req_id, return Option<JsonRpcResponse>) ────
 
-async fn handle_validate_workflow(
-    req_id: Option<serde_json::Value>,
-    args: &serde_json::Value,
-    state: Arc<McpState>,
-    agent: Arc<auth::AgentIdentity>,
-) -> Option<JsonRpcResponse> {
-    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
-    let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
-        Ok(id) => id,
-        Err(resp) => return Some(resp),
-    };
+/// The four analytics reads the readiness score is computed over, plus the
+/// clock.
+///
+/// Passed in as `Result`s rather than pre-defaulted values so the DEGRADATION
+/// ACCOUNTING happens inside [`render_validate_workflow`] — a caller cannot
+/// resolve a read and forget to disclose it, because it never gets the chance.
+/// `now` is an argument for the same reason `Coverage::new` requires its cap:
+/// a wall-clock read inside a "pure" function is an input the test cannot
+/// control, and `freshness` depends on it.
+pub(crate) struct ReadinessReads<E> {
+    pub exec_data: Result<talos_analytics_repository::ReadinessExecData, E>,
+    pub last_exec_at: Result<Option<chrono::DateTime<chrono::Utc>>, E>,
+    pub expiring_secrets: Result<i64, E>,
+    pub wf_meta: Result<Option<talos_analytics_repository::WorkflowFullRow>, E>,
+    pub now: chrono::DateTime<chrono::Utc>,
+}
 
-    // ── Structural validation via extracted service ───────────────────────
-    let validation = match talos_workflow_validation::WorkflowValidationService::validate(
-        &state.workflow_repo,
-        wf_id,
-        user_id,
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("not found") || msg.contains("access denied") {
-                return Some(mcp_error(req_id.clone(), -32000, &msg));
-            }
-            tracing::error!("validate_workflow failed: {}", e);
-            return Some(crate::utils::database_error(req_id.clone()));
-        }
-    };
+/// What `validate_workflow` answers.
+///
+/// The refusal is a VARIANT rather than an early `return` in the handler so
+/// that the decision to refuse lives in the same pure function as the decision
+/// to disclose — one place, one test.
+#[derive(Debug)]
+pub(crate) enum ValidateWorkflowOutcome {
+    /// The graph row is gone: the workflow does not exist, or is not this
+    /// user's. Rendered by the caller as the operator-recognisable
+    /// `"Workflow not found or access denied"`.
+    WorkflowMissing,
+    /// The report body.
+    Report(serde_json::Value),
+}
 
+/// Build the `validate_workflow` response body.
+///
+/// PURE: no `async`, no repository, no `McpState`, no clock. Everything that
+/// decides what the operator is told is here, which is the point —
+/// #740 measured three call-site mutations that survived every unit test and
+/// both structural-lint legs while the guards stayed green:
+///
+///   * dropping the `degraded_inputs.push("graph")`,
+///   * re-emitting `node_count` unconditionally (which fully restores the
+///     original defect: `node_count: 0` for a workflow nobody could read),
+///   * rendering an unmeasured list as `[]` rather than `null`.
+///
+/// All three were survivable because the CONSEQUENCES of a failed read were
+/// scattered through 400 lines of handler that no test could drive. Two of the
+/// three are now single expressions inside this function, and
+/// `validate_workflow_render_tests` asserts the complete consequence set on
+/// both branches. (This also satisfies the Architectural Mandate's thin-handler
+/// rule, and follows #730's `render_input_validation`, which put the same shape
+/// in this same file.)
+///
+/// `graph_measured` is the ONE boolean driving every consequence — the nulled
+/// counts, the withheld recommendations, the `degraded_inputs` entry and the
+/// dedicated note — so they cannot drift apart.
+pub(crate) fn render_validate_workflow<E: std::fmt::Display>(
+    wf_id: uuid::Uuid,
+    graph_read: crate::utils::GraphRead,
+    validation: talos_workflow_validation::ValidationResult,
+    reads: ReadinessReads<E>,
+) -> ValidateWorkflowOutcome {
     // Map ValidationIssues back to string lists for backward-compatible response
     use talos_workflow_validation::ValidationSeverity;
     let issues: Vec<String> = validation
@@ -4052,13 +4082,64 @@ async fn handle_validate_workflow(
         talos_workflow_validation::HistoryCoverage::Unavailable => (None, None),
     };
 
-    // Re-fetch graph for readiness score computation (lightweight — single row)
-    let graph_json_str = match state.workflow_repo.get_workflow_graph(wf_id, user_id).await {
-        Ok(Some(gj)) => gj,
-        _ => String::from("{\"nodes\":[],\"edges\":[]}"),
+    let mut degraded_inputs: Vec<&'static str> = Vec::new();
+    // CLASSIFIED, not defaulted. The pre-fix arm was
+    // `_ => "{\"nodes\":[],\"edges\":[]}"`, so a DB failure and a deleted
+    // workflow both became a graph with zero nodes — and then EIGHT
+    // operator-facing fields were computed over it: `node_count: 0` and
+    // `edge_count: 0` for a workflow that has nodes, `has_node_desc` /
+    // `has_timeout` / `has_error_edges` all false, the risk and documentation
+    // score components deducted, and `top_improvements` recommending the
+    // operator add node descriptions, an execution timeout and error edges
+    // that are already there. A benign substitute did not merely lower a
+    // number; it produced specific, actionable, wrong advice.
+    //
+    // `Absent` REFUSES. `workflows.graph_json` is NOT NULL and the read is
+    // `WHERE id = $1 AND user_id = $2`, so the row can only be missing when
+    // the workflow does not exist or is not this user's — and
+    // `WorkflowValidationService::prepare`, which the caller ran first, issues
+    // THE SAME query and reports exactly this string. This arm is therefore
+    // only reachable when the workflow was deleted between the two reads, and
+    // scoring a workflow that no longer exists is worse than saying so.
+    //
+    // `Unreadable` DISCLOSES rather than refuses, matching the two disclosure
+    // precedents already in this response — `HistoryCoverage` above and the
+    // #661 `degraded_inputs` block below. `valid` / `issues` / `warnings` came
+    // from a read that SUCCEEDED, so discarding a correct structural verdict
+    // because a redundant re-read blipped would cost the caller the answer it
+    // came for. What is not done is emit a zero: the graph-derived counts are
+    // NULLED and the graph-derived recommendations are withheld, because "not
+    // measured" is not "measured as absent".
+    let mut graph_measured = graph_read.measured();
+    let graph_json_str = match graph_read {
+        crate::utils::GraphRead::Present(gj) => Some(gj),
+        crate::utils::GraphRead::Absent => return ValidateWorkflowOutcome::WorkflowMissing,
+        crate::utils::GraphRead::Unreadable => None,
     };
-    let graph: serde_json::Value =
-        serde_json::from_str(&graph_json_str).unwrap_or(serde_json::json!({"nodes":[],"edges":[]}));
+    // A parse failure is the same defect one step later: the column is JSONB
+    // round-tripped through `::text`, so unparseable text means the projection
+    // or the column changed under us, and `unwrap_or(empty)` would report that
+    // as a workflow with no nodes.
+    let graph: serde_json::Value = match graph_json_str {
+        Some(s) => match serde_json::from_str(&s) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(
+                    target: "talos_mcp",
+                    %wf_id, error = %e, event_kind = "readiness_input_read_failed",
+                    "readiness: workflow graph_json did not parse — graph-derived fields are not measured"
+                );
+                graph_measured = false;
+                serde_json::json!({"nodes":[],"edges":[]})
+            }
+        },
+        None => serde_json::json!({"nodes":[],"edges":[]}),
+    };
+    // Derived from the boolean, not pushed from inside each failure arm, where
+    // an added arm silently forgets it.
+    if !graph_measured {
+        degraded_inputs.push("graph");
+    }
     let nodes = graph
         .get("nodes")
         .and_then(|n| n.as_array())
@@ -4070,20 +4151,14 @@ async fn handle_validate_workflow(
         .cloned()
         .unwrap_or_default();
 
-    // ── Readiness score — weighted formula (MUST match get_readiness_breakdown) ──
-    // Reliability 50% + Documentation 20% + Freshness 20% + Risk 10%
-    // Pre-MCP-1-fix this used 40%/30% with reliability saturating at 100 runs;
-    // get_readiness_breakdown uses 50%/20% with reliability saturating at 10 runs.
-    // The mismatch produced the canonical operator complaint:
-    //   validate_workflow → 50, get_readiness_breakdown → 77
-    // for the same workflow. Aligned 2026-05-07.
-    // Then deduct for hard structural/config failures detected above.
-    let (exec_data_res, last_exec_res, expiring_res, wf_meta_res) = tokio::join!(
-        state.analytics_repo.get_readiness_exec_data(wf_id),
-        state.analytics_repo.get_max_execution_started_at(wf_id),
-        state.analytics_repo.count_expiring_secrets(user_id),
-        state.analytics_repo.get_workflow_full(wf_id, user_id),
-    );
+    let ReadinessReads {
+        exec_data: exec_data_res,
+        last_exec_at: last_exec_res,
+        expiring_secrets: expiring_res,
+        wf_meta: wf_meta_res,
+        now,
+    } = reads;
+
     // #661 (error-as-absence): each of these four `unwrap_or` defaults is the
     // value that an EMPTY result would produce, so a failed read is scored
     // exactly like a workflow that has never run and has no description —
@@ -4094,7 +4169,6 @@ async fn handle_validate_workflow(
     // followed here: keep the fail-soft default so the handler still answers,
     // but stamp a structured event AND put a non-numeric hint in the response
     // so the number is never read as a verdict on the workflow.
-    let mut degraded_inputs: Vec<&'static str> = Vec::new();
     let exec_data = exec_data_res.unwrap_or_else(|e| {
         tracing::error!(
             target: "talos_mcp",
@@ -4161,9 +4235,10 @@ async fn handle_validate_workflow(
         exec_data.total_count,
     );
 
-    // Freshness (20 pts)
-    let days_since_last =
-        last_exec_at.map(|t| chrono::Utc::now().signed_duration_since(t).num_days());
+    // Freshness (20 pts). The clock is the caller's `now`, not
+    // `chrono::Utc::now()` — a wall-clock read here would make this function
+    // untestable in exactly the component that depends on it.
+    let days_since_last = last_exec_at.map(|t| now.signed_duration_since(t).num_days());
     let freshness = talos_analytics_repository::compute_freshness_score(days_since_last);
 
     // Risk (10 pts): deduct for missing safeguards and expiring secrets
@@ -4292,7 +4367,10 @@ async fn handle_validate_workflow(
             }),
         ));
     }
-    if !has_node_desc {
+    // Withheld when the graph was not measured: "add descriptions to nodes"
+    // is an instruction, and issuing it because nobody could read the graph
+    // sends the operator to fix documentation that may already be there.
+    if !has_node_desc && graph_measured {
         all_improvements.push((
             5,
             serde_json::json!({
@@ -4330,7 +4408,10 @@ async fn handle_validate_workflow(
         ));
     }
     // Risk
-    if !has_timeout {
+    // Same rule as the node-description recommendation above: both risk
+    // signals are read off the graph, so an unread graph makes no claim
+    // about them.
+    if !has_timeout && graph_measured {
         all_improvements.push((
             3,
             serde_json::json!({
@@ -4342,7 +4423,7 @@ async fn handle_validate_workflow(
             }),
         ));
     }
-    if !has_error_edges {
+    if !has_error_edges && graph_measured {
         all_improvements.push((
             3,
             serde_json::json!({
@@ -4378,8 +4459,11 @@ async fn handle_validate_workflow(
     let mut result = serde_json::json!({
         "valid": valid,
         "readiness_score": readiness_score,
-        "node_count": nodes.len(),
-        "edge_count": edges.len(),
+        // NULL, never 0, when the graph was not read. A zero here is a
+        // determinate statement about the workflow's shape reached by never
+        // having looked at it.
+        "node_count": if graph_measured { serde_json::json!(nodes.len()) } else { serde_json::Value::Null },
+        "edge_count": if graph_measured { serde_json::json!(edges.len()) } else { serde_json::Value::Null },
         "issues": issues,
         "warnings": warnings,
         "top_improvements": improvement_actions,
@@ -4392,6 +4476,19 @@ async fn handle_validate_workflow(
     });
     // #661: say which happened. Absent this field the caller cannot tell a
     // genuinely low score from a score computed on inputs that failed to load.
+    // The graph is disclosed on its own field as well as in the shared list:
+    // it is the only degraded input that nulls a top-level COUNT and
+    // suppresses recommendations, so a caller reading `node_count: null`
+    // needs the reason next to it rather than inside a score note.
+    if !graph_measured {
+        result["graph_read"] = serde_json::json!("failed");
+        result["graph_note"] = serde_json::json!(
+            "The workflow graph could NOT BE READ. node_count and edge_count are null — \
+             not zero — and every graph-derived signal (node descriptions, execution \
+             timeout, error edges) was scored as absent and its recommendation withheld. \
+             This is not evidence that the workflow lacks them."
+        );
+    }
     if !degraded_inputs.is_empty() {
         result["readiness_score_degraded"] = serde_json::json!(true);
         result["readiness_unreadable_inputs"] = serde_json::json!(degraded_inputs);
@@ -4401,10 +4498,382 @@ async fn handle_validate_workflow(
         );
     }
 
-    Some(mcp_text(
-        req_id.clone(),
-        &serde_json::to_string_pretty(&result).unwrap_or_default(),
-    ))
+    ValidateWorkflowOutcome::Report(result)
+}
+
+async fn handle_validate_workflow(
+    req_id: Option<serde_json::Value>,
+    args: &serde_json::Value,
+    state: Arc<McpState>,
+    agent: Arc<auth::AgentIdentity>,
+) -> Option<JsonRpcResponse> {
+    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
+    let wf_id = match crate::utils::require_uuid(args, "workflow_id", req_id.clone()) {
+        Ok(id) => id,
+        Err(resp) => return Some(resp),
+    };
+
+    // ── Structural validation via extracted service ───────────────────────
+    let validation = match talos_workflow_validation::WorkflowValidationService::validate(
+        &state.workflow_repo,
+        wf_id,
+        user_id,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("not found") || msg.contains("access denied") {
+                return Some(mcp_error(req_id.clone(), -32000, &msg));
+            }
+            tracing::error!("validate_workflow failed: {}", e);
+            return Some(crate::utils::database_error(req_id.clone()));
+        }
+    };
+
+    // Re-fetch graph for readiness score computation (lightweight — single row).
+    let graph_read = crate::utils::classify_workflow_graph_read(
+        "validate_workflow",
+        wf_id,
+        state.workflow_repo.get_workflow_graph(wf_id, user_id).await,
+    );
+
+    // ── Readiness score — weighted formula (MUST match get_readiness_breakdown) ──
+    // Reliability 50% + Documentation 20% + Freshness 20% + Risk 10%. The
+    // weights, the penalties and every disclosure live in the pure renderer
+    // below; this function only READS.
+    //
+    // These four run even when `graph_read` is `Absent`, which costs four
+    // queries on a path that then refuses. Deliberate: `Absent` is reachable
+    // ONLY when the workflow was deleted between the validation service's read
+    // and this one, and one decision site for "refuse vs disclose" is worth
+    // more than saving four reads on a race.
+    let (exec_data, last_exec_at, expiring_secrets, wf_meta) = tokio::join!(
+        state.analytics_repo.get_readiness_exec_data(wf_id),
+        state.analytics_repo.get_max_execution_started_at(wf_id),
+        state.analytics_repo.count_expiring_secrets(user_id),
+        state.analytics_repo.get_workflow_full(wf_id, user_id),
+    );
+
+    match render_validate_workflow(
+        wf_id,
+        graph_read,
+        validation,
+        ReadinessReads {
+            exec_data,
+            last_exec_at,
+            expiring_secrets,
+            wf_meta,
+            now: chrono::Utc::now(),
+        },
+    ) {
+        ValidateWorkflowOutcome::WorkflowMissing => Some(mcp_error(
+            req_id.clone(),
+            -32000,
+            "Workflow not found or access denied",
+        )),
+        ValidateWorkflowOutcome::Report(result) => Some(mcp_text(
+            req_id.clone(),
+            &serde_json::to_string_pretty(&result).unwrap_or_default(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod validate_workflow_render_tests {
+    use super::*;
+    use crate::utils::GraphRead;
+    use talos_workflow_validation::{HistoryCoverage, ValidationResult};
+
+    fn wf() -> uuid::Uuid {
+        uuid::Uuid::nil()
+    }
+
+    /// A workflow that is structurally fine, HAS node descriptions, HAS an
+    /// execution timeout and HAS an error edge — i.e. every graph-derived
+    /// signal is PRESENT. That is what makes the unreadable case a lie rather
+    /// than a pessimistic guess.
+    fn a_graph_with_everything() -> String {
+        serde_json::json!({
+            "execution_timeout_secs": 300,
+            "nodes": [
+                {"id": "a", "description": "fetches the thing"},
+                {"id": "b", "description": "sends the thing"}
+            ],
+            "edges": [
+                {"source": "a", "target": "b"},
+                {"source": "a", "target": "handler", "edge_type": "error"}
+            ]
+        })
+        .to_string()
+    }
+
+    fn clean_validation() -> ValidationResult {
+        ValidationResult {
+            valid: true,
+            issues: vec![],
+            history: HistoryCoverage::Empty { window_days: 30 },
+        }
+    }
+
+    /// Healthy analytics reads: the workflow has run, successfully, recently,
+    /// is documented and has capability tags — so NOTHING in the report may be
+    /// attributable to a defaulted analytics read.
+    fn healthy_reads() -> (ReadinessReads<String>, chrono::DateTime<chrono::Utc>) {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-03T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        (
+            ReadinessReads {
+                exec_data: Ok(talos_analytics_repository::ReadinessExecData {
+                    success_rate: Some(1.0),
+                    total_count: 50,
+                }),
+                last_exec_at: Ok(Some(now - chrono::Duration::hours(1))),
+                expiring_secrets: Ok(0),
+                wf_meta: Ok(Some(talos_analytics_repository::WorkflowFullRow {
+                    id: wf(),
+                    name: "wf".into(),
+                    graph_json: None,
+                    tags: None,
+                    description: Some("a described workflow".into()),
+                    max_concurrent_executions: None,
+                    capabilities: Some(vec!["email".into()]),
+                    intent: None,
+                })),
+                now,
+            },
+            now,
+        )
+    }
+
+    fn report(outcome: ValidateWorkflowOutcome) -> serde_json::Value {
+        match outcome {
+            ValidateWorkflowOutcome::Report(v) => v,
+            other => panic!("expected a report, got {other:?}"),
+        }
+    }
+
+    fn actions(body: &serde_json::Value) -> Vec<String> {
+        body["top_improvements"]
+            .as_array()
+            .expect("top_improvements is an array")
+            .iter()
+            .map(|a| a["action"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// BASELINE. With the graph measured, the report is a plain verdict: real
+    /// counts, no degradation fields, no graph-derived advice (because the
+    /// graph HAS all three signals).
+    #[test]
+    fn a_measured_graph_reports_its_real_counts_and_no_degradation() {
+        let (reads, _) = healthy_reads();
+        let body = report(render_validate_workflow(
+            wf(),
+            GraphRead::Present(a_graph_with_everything()),
+            clean_validation(),
+            reads,
+        ));
+        assert_eq!(body["node_count"], serde_json::json!(2));
+        assert_eq!(body["edge_count"], serde_json::json!(2));
+        assert!(body["graph_read"].is_null(), "{body}");
+        assert!(body["graph_note"].is_null(), "{body}");
+        assert!(body["readiness_score_degraded"].is_null(), "{body}");
+        assert!(body["readiness_unreadable_inputs"].is_null(), "{body}");
+        assert_eq!(body["valid"], serde_json::json!(true));
+        assert!(
+            actions(&body).is_empty(),
+            "a fully-signalled graph earns no graph-derived advice: {:?}",
+            actions(&body)
+        );
+    }
+
+    /// A ZERO count must stay a zero when it was MEASURED. Without this, the
+    /// obvious "fix" for the unreadable case — null every count — would render
+    /// an empty scaffold identically to an unreadable one, which is the same
+    /// defect facing the other way.
+    #[test]
+    fn a_measured_empty_graph_still_reports_zero_not_null() {
+        let (reads, _) = healthy_reads();
+        let body = report(render_validate_workflow(
+            wf(),
+            GraphRead::Present(r#"{"nodes":[],"edges":[]}"#.to_string()),
+            clean_validation(),
+            reads,
+        ));
+        assert_eq!(body["node_count"], serde_json::json!(0));
+        assert_eq!(body["edge_count"], serde_json::json!(0));
+        assert!(body["graph_read"].is_null(), "{body}");
+        // ...and an empty graph DOES earn the graph-derived advice, because it
+        // was actually observed to lack these things.
+        let a = actions(&body);
+        assert!(
+            a.iter().any(|s| s.contains("Add descriptions to nodes")),
+            "{a:?}"
+        );
+    }
+
+    /// THE MUTATION GUARD. Asserts the COMPLETE consequence set of an
+    /// unreadable graph in one place, so each of the mutations #740 measured
+    /// as survivors now fails here:
+    ///
+    ///   * M6 (re-emit `node_count` unconditionally) fails on the null asserts;
+    ///   * M5 (drop the `degraded_inputs.push("graph")`) fails on
+    ///     `readiness_unreadable_inputs` / `readiness_score_degraded`;
+    ///   * withdrawing any of the three recommendation guards fails on the
+    ///     `actions` assert.
+    ///
+    /// Every analytics read is HEALTHY here, so nothing asserted can be
+    /// attributed to anything but the graph.
+    #[test]
+    fn an_unreadable_graph_makes_no_claim_about_the_workflow() {
+        let (reads, _) = healthy_reads();
+        let body = report(render_validate_workflow(
+            wf(),
+            GraphRead::Unreadable,
+            clean_validation(),
+            reads,
+        ));
+
+        // 1. Counts are NULL, never 0.
+        assert!(
+            body["node_count"].is_null(),
+            "node_count must be null, not a count over a graph nobody read: {body}"
+        );
+        assert!(body["edge_count"].is_null(), "{body}");
+
+        // 2. The dedicated disclosure fires, next to the nulls.
+        assert_eq!(body["graph_read"], serde_json::json!("failed"));
+        let note = body["graph_note"].as_str().expect("graph_note present");
+        assert!(note.contains("could NOT BE READ"), "{note}");
+        assert!(
+            note.contains("not zero"),
+            "the note must say null is not zero: {note}"
+        );
+
+        // 3. The shared degradation ledger names the graph.
+        assert_eq!(body["readiness_score_degraded"], serde_json::json!(true));
+        assert_eq!(
+            body["readiness_unreadable_inputs"],
+            serde_json::json!(["graph"]),
+            "the graph must appear in the unreadable-input list and nothing else \
+             may, since every analytics read succeeded: {body}"
+        );
+        assert!(body["readiness_score_note"]
+            .as_str()
+            .is_some_and(|n| n.contains("lower bound")));
+
+        // 4. NO graph-derived recommendation is issued. This is the sharper
+        //    half of the defect: the pre-fix tool told operators to add node
+        //    descriptions, an execution timeout and error edges that a
+        //    12-node production workflow already had.
+        let a = actions(&body);
+        for withheld in [
+            "Add descriptions to nodes in the graph",
+            "Set an execution timeout on the workflow to prevent runaway executions",
+            "Add error edges from high-risk nodes to a handler node",
+        ] {
+            assert!(
+                !a.iter().any(|s| s == withheld),
+                "advice derived from an unread graph was issued: {withheld:?} in {a:?}"
+            );
+        }
+
+        // 5. The verdict the caller came for is still there and still true.
+        assert_eq!(body["valid"], serde_json::json!(true));
+    }
+
+    /// A non-graph degraded input must NOT trip the graph disclosure, or the
+    /// two would be indistinguishable and `node_count: null` would start
+    /// appearing for reasons that have nothing to do with the graph.
+    #[test]
+    fn a_degraded_analytics_read_does_not_null_the_graph_counts() {
+        let (mut reads, _) = healthy_reads();
+        reads.expiring_secrets = Err("pool timed out".to_string());
+        let body = report(render_validate_workflow(
+            wf(),
+            GraphRead::Present(a_graph_with_everything()),
+            clean_validation(),
+            reads,
+        ));
+        assert_eq!(body["node_count"], serde_json::json!(2));
+        assert!(body["graph_read"].is_null(), "{body}");
+        assert_eq!(body["readiness_score_degraded"], serde_json::json!(true));
+        assert_eq!(
+            body["readiness_unreadable_inputs"],
+            serde_json::json!(["expiring_secrets"])
+        );
+    }
+
+    /// An absent row REFUSES — it is not a report with zero nodes, and it is
+    /// not the unreadable case either.
+    #[test]
+    fn an_absent_row_refuses_rather_than_reporting() {
+        let (reads, _) = healthy_reads();
+        let outcome = render_validate_workflow(wf(), GraphRead::Absent, clean_validation(), reads);
+        assert!(
+            matches!(outcome, ValidateWorkflowOutcome::WorkflowMissing),
+            "{outcome:?}"
+        );
+    }
+
+    /// The healthy body's operator-recognisable keys are unchanged, so an
+    /// existing consumer (or a saved assertion) still holds. Byte-identical to
+    /// the pre-#740 shape on the measured path.
+    #[test]
+    fn the_measured_report_shape_is_unchanged() {
+        let (reads, _) = healthy_reads();
+        let body = report(render_validate_workflow(
+            wf(),
+            GraphRead::Present(a_graph_with_everything()),
+            clean_validation(),
+            reads,
+        ));
+        let obj = body.as_object().expect("object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "edge_count",
+                "history_coverage",
+                "issues",
+                "node_count",
+                "readiness_score",
+                "top_improvements",
+                "valid",
+                "warnings",
+            ],
+            "the healthy response gained or lost a key"
+        );
+        assert_eq!(
+            body["history_coverage"]["window_days"],
+            serde_json::json!(30)
+        );
+    }
+
+    /// The clock is an INPUT: same reads, two different `now`s, two different
+    /// freshness verdicts. Pinning this is what makes the rest of these
+    /// assertions reproducible rather than time-of-day-dependent.
+    #[test]
+    fn freshness_is_computed_against_the_supplied_clock() {
+        let (mut reads, now) = healthy_reads();
+        reads.now = now + chrono::Duration::days(400);
+        let body = report(render_validate_workflow(
+            wf(),
+            GraphRead::Present(a_graph_with_everything()),
+            clean_validation(),
+            reads,
+        ));
+        let a = actions(&body);
+        assert!(
+            a.iter()
+                .any(|s| s.contains("Execute within the last 30 days")),
+            "a 400-day-old last run must cost freshness: {a:?}"
+        );
+    }
 }
 
 async fn handle_call_workflow(
@@ -7169,39 +7638,98 @@ async fn handle_get_workflow_health(
     // trips (per-id `get_workflow` + per-id `get_workflow_execution_stats`)
     // — replaced with two parallel batched calls keyed on the same id
     // set, then in-memory map lookups inside the loop.
-    let mut sub_workflows: Vec<serde_json::Value> = Vec::new();
-    if let Ok(Some(gj)) = state.workflow_repo.get_workflow_graph(wf_id, user_id).await {
-        if let Ok(graph) = serde_json::from_str::<serde_json::Value>(&gj) {
-            let sub_wf_ids: Vec<uuid::Uuid> =
-                talos_workflow_repository::extract_sub_workflow_uuids(&graph);
-            if !sub_wf_ids.is_empty() {
-                let (names_res, stats_res) = tokio::join!(
-                    state
-                        .workflow_repo
-                        .get_workflow_names_by_ids(&sub_wf_ids, user_id),
-                    state.workflow_repo.get_workflow_execution_stats_for_ids(
-                        &sub_wf_ids,
-                        user_id,
-                        days
-                    ),
-                );
-                let names = names_res.unwrap_or_default();
-                let stats_map = stats_res.unwrap_or_default();
-                for sub_wf_id in &sub_wf_ids {
-                    let Some(name) = names.get(sub_wf_id) else {
-                        continue; // not user-owned or missing — match prior behaviour
-                    };
-                    let cs = stats_map
-                        .get(sub_wf_id)
-                        .map(|s| s.to_json(days))
-                        .unwrap_or_else(|| {
-                            talos_workflow_repository::WorkflowExecStats::empty().to_json(days)
-                        });
-                    sub_workflows.push(serde_json::json!({
-                        "workflow_id": sub_wf_id.to_string(),
-                        "name": name,
-                        "stats": cs,
-                    }));
+    //
+    // #740 (check 74b): `if let Ok(Some(gj))` routed a graph read FAILURE into
+    // the same branch as "this workflow has no sub-workflows", and the answer
+    // was then rendered as `sub_workflows: []` NEXT TO A CLEAN `Readings`
+    // LEDGER — which renders "complete: every field in this report was
+    // measured". That is not a missing disclosure, it is an affirmative false
+    // completeness claim: the disclosure lying about itself.
+    //
+    // Three reads decide this list and all three are now on the ledger. The
+    // two inner ones were invisible to leg 74 AND to 74b because their
+    // `.await` lives in the `tokio::join!` and not in the defaulted chain:
+    //   * `names_res` failing emptied the map, every id hit the `continue`,
+    //     and a workflow WITH sub-workflows reported none.
+    //   * `stats_res` failing rendered each child with
+    //     `WorkflowExecStats::empty()` — zero runs, zero failures — which is
+    //     the headline of a tool called `get_workflow_health`, for the child.
+    // `stats` (the parent's) is recorded above, so the field names here are
+    // the literal keys the report emits.
+    let mut sub_workflows: Option<Vec<serde_json::Value>> = Some(Vec::new());
+    let graph_read = crate::utils::classify_workflow_graph_read(
+        "get_workflow_health",
+        wf_id,
+        state.workflow_repo.get_workflow_graph(wf_id, user_id).await,
+    );
+    match graph_read {
+        // The parent row resolved a moment ago, so an absent graph means the
+        // workflow was deleted mid-handler. A deleted workflow genuinely has
+        // no sub-workflows, so `[]` is true here and stays undisclosed.
+        crate::utils::GraphRead::Absent => {}
+        crate::utils::GraphRead::Unreadable => {
+            readings.mark_derived("sub_workflows");
+            sub_workflows = None;
+        }
+        crate::utils::GraphRead::Present(gj) => {
+            match serde_json::from_str::<serde_json::Value>(&gj) {
+                Err(e) => {
+                    tracing::error!(
+                        target: "talos_mcp",
+                        %wf_id, error = %e, event_kind = "workflow_graph_read_failed",
+                        "get_workflow_health: graph_json did not parse — sub-workflows not enumerated"
+                    );
+                    readings.mark_derived("sub_workflows");
+                    sub_workflows = None;
+                }
+                Ok(graph) => {
+                    let sub_wf_ids: Vec<uuid::Uuid> =
+                        talos_workflow_repository::extract_sub_workflow_uuids(&graph);
+                    if !sub_wf_ids.is_empty() {
+                        let (names_res, stats_res) = tokio::join!(
+                            state
+                                .workflow_repo
+                                .get_workflow_names_by_ids(&sub_wf_ids, user_id),
+                            state.workflow_repo.get_workflow_execution_stats_for_ids(
+                                &sub_wf_ids,
+                                user_id,
+                                days
+                            ),
+                        );
+                        let names = match readings.record("sub_workflows", names_res) {
+                            Some(n) => n,
+                            None => {
+                                sub_workflows = None;
+                                Default::default()
+                            }
+                        };
+                        let stats_map = readings.record("sub_workflows[].stats", stats_res);
+                        if let Some(list) = sub_workflows.as_mut() {
+                            for sub_wf_id in &sub_wf_ids {
+                                let Some(name) = names.get(sub_wf_id) else {
+                                    continue; // not user-owned or missing — match prior behaviour
+                                };
+                                // A child MEASURED at zero runs keeps its zeroed
+                                // block, byte-identically to before. A child whose
+                                // stats read FAILED gets `null` — it has not been
+                                // observed to run zero times, and the two must not
+                                // render the same.
+                                let cs = stats_map.as_ref().map(|m| {
+                                    m.get(sub_wf_id)
+                                        .map(|s| s.to_json(days))
+                                        .unwrap_or_else(|| {
+                                            talos_workflow_repository::WorkflowExecStats::empty()
+                                                .to_json(days)
+                                        })
+                                });
+                                list.push(serde_json::json!({
+                                    "workflow_id": sub_wf_id.to_string(),
+                                    "name": name,
+                                    "stats": cs,
+                                }));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -7210,7 +7738,10 @@ async fn handle_get_workflow_health(
     if let Some(obj) = health.as_object_mut() {
         obj.insert(
             "sub_workflows".to_string(),
-            serde_json::json!(sub_workflows),
+            match sub_workflows {
+                Some(list) => serde_json::json!(list),
+                None => serde_json::Value::Null,
+            },
         );
     }
     readings.attach(&mut health);

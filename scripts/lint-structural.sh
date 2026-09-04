@@ -7016,6 +7016,20 @@ FNR == 1 { flush(); intest = 0; pending = ""; fn = "?"; fnindent = 0; FILE = FIL
     # and `.ok()` is the spelling #727 found only by mutation. Measured before
     # widening: ZERO new sites, on the original tree and on the fixed one.
     if (line ~ /\.await[[:space:]]*\.(unwrap_or(_default|_else)?|ok|map_or)[[:space:]]*\(/) { record(FNR, line) }
+    # #740: `if let Ok(Some(x)) = <read>.await` is the same collapse in a
+    # SHAPE the chain alternation above structurally cannot see — there is no
+    # `.unwrap_or`, no `.ok()`, no `map_or`; the discard is the `if`. It was
+    # NOT theoretical: `handle_get_workflow_health` built a `Readings`, wrote
+    # `sub_workflows: []` from a swallowed graph read, and 74b reported ZERO
+    # on it while the ledger published "complete: every field in this report
+    # was measured". Measured before widening, on pristine `origin/main`: the
+    # workspace holds exactly TWO occurrences of this spelling, ONE of which
+    # is that defect and the other of which is in a repository crate with no
+    # ledger — so this leg contributes 1 finding, 1 real, 0 false positives,
+    # and 0 on the fixed tree. Whole-line comments are dropped first, because
+    # the fix's own comment quotes the banned expression verbatim (check 73
+    # was bitten by exactly that).
+    if (line !~ /^[[:space:]]*\/\// && line ~ /if[[:space:]]+let[[:space:]]+Ok\(Some\(.*\.await/) { record(FNR, line) }
     if (pending != "" && line ~ /^[[:space:]]*\.(unwrap_or(_default|_else)?|ok|map_or)[[:space:]]*\(/) { record(pendingno, line) }
     if (line ~ /\.await[[:space:]]*$/) { pending = line; pendingno = FNR } else { pending = "" }
 }
@@ -7643,6 +7657,100 @@ if [ "$INTEG_READ_FAIL" -gt 0 ]; then
     EXIT_CODE=1
 else
     green "✓ no integration read reports a failed lookup as \"not found\""
+fi
+echo
+
+# ── 79b. Sub-leg: a WORKFLOW-GRAPH read must be classified, not collapsed ──
+# Not a new numbered check (`--count` stays 79) — same rule, second method
+# family. Precedent: 52b/52c, 74b.
+#
+# `workflows.graph_json` is `TEXT NOT NULL` and every reader's query is
+# `WHERE id = $1 AND user_id = $2` through `fetch_optional`, so the three
+# outcomes are UNAMBIGUOUS and mean three different things: `Ok(Some)` is the
+# graph, `Ok(None)` is "no such workflow for this user", `Err` is "we could
+# not look". Three collapse spellings routed the third into one of the first
+# two, and each produced a determinate operator-facing claim reached by never
+# having read the graph:
+#
+#   * `handle_validate_workflow` — `_ => "{\"nodes\":[],\"edges\":[]}"`, then
+#     EIGHT fields computed over it: `node_count: 0` / `edge_count: 0` for a
+#     workflow that has nodes, and `top_improvements` telling the operator to
+#     add node descriptions, an execution timeout and error edges that are
+#     already there. Not a lowered number — specific, actionable, wrong advice.
+#   * `handle_get_workflow_health` — `if let Ok(Some(gj))`, `sub_workflows: []`
+#     (also caught by 74b's widening; two instruments, deliberately).
+#   * `handle_list_workflow_webhooks` and `HandoffService` — `.unwrap_or(None)`
+#     then "Workflow not found or access denied". The #736 shape verbatim; the
+#     handoff one sits on an AUTHORIZATION path, so the refusal direction was
+#     right and only the diagnosis was wrong — which sends an operator to look
+#     at permissions during a database incident.
+#
+# TWO SHAPES ARE DELIBERATELY OUT OF RANGE, and both exclusions are the same
+# test — does the substituted value make a STATEMENT to a caller?
+#   * `.ok().flatten()` feeding `build_node_label_map`: TWELVE sites in
+#     `executions.rs`, every one of which falls back to printing the bare node
+#     UUID. The counts beside them are untouched and the degradation is
+#     visible in the output rather than hidden by it.
+#   * a VALUE-FREE `_ => return` in a `-> ()` helper (`auto_apply_capability_
+#     suggestions`, the `auto_fill_config` spawn): it abandons background work
+#     and no caller is waiting on an answer.
+#
+# MEASURED IN BOTH DIRECTIONS BEFORE IT WAS WRITTEN, against a clean
+# `git archive` of `origin/main`: FIVE findings, one of which carries the
+# opt-out, so FOUR reportable — exactly the four defects above, ZERO false
+# positives — and 0 on the fixed tree.
+#
+# Stated limits, each confirmed rather than inferred: it is TEXTUAL and
+# WINDOW-bounded at 8 lines from the read, so a reflowed match or a read
+# reached through a wrapper in another crate is invisible (false NEGATIVE, the
+# quiet direction); it matches on the METHOD-NAME family, so the same collapse
+# over a differently-named graph read is out of range; the value-free-`return`
+# exclusion is literal, so `_ => return None` in a `-> Option<T>` helper still
+# fires (that is the loud direction and correct — `None` IS an answer); and it
+# proves the arms are SPLIT, never that the `Err` arm is right — an
+# `Err(_) => mcp_error(.., "not found")` written longhand still passes.
+#
+# Opt-out: `// allow-collapsed-graph-read: <reason>` on the read line or
+# within the 8 lines above.
+bold "▶ check 79b: a workflow-graph read must be classified, not collapsed"
+GRAPH_READ_FAIL=0
+while IFS= read -r hit; do
+    [ -n "$hit" ] || continue
+    red "✗ $hit collapses a failed workflow-graph read into a benign answer"
+    GRAPH_READ_FAIL=$((GRAPH_READ_FAIL + 1))
+done < <(find . -name '*.rs' -not -path './target/*' -not -path './vendor/*' \
+              -not -path './node_modules/*' -not -path '*/tests/*' \
+              -not -name '*_tests.rs' "${TREE_PRUNE_FIND[@]}" -print0 2>/dev/null \
+         | xargs -0 perl -e '
+for my $f (@ARGV) {
+  open(my $fh, "<", $f) or next; my @l = <$fh>; close $fh; chomp @l;
+  for my $i (0..$#l) {
+    next if $l[$i] =~ m{^\s*//};
+    next unless $l[$i] =~ /\.(get_workflow_graph\w*|get_workflow_name_and_graph|get_workflow_graph_and_name|get_workflow_graph_and_capabilities)\s*\(/;
+    my $lo = $i - 8 < 0 ? 0 : $i - 8;
+    next if join("\n", @l[$lo..$i]) =~ /allow-collapsed-graph-read/;
+    my $hi = $i + 8 > $#l ? $#l : $i + 8;
+    my $w = join("\n", @l[$i..$hi]);
+    # label prettification — the fallback prints a bare UUID and claims nothing
+    next if $w =~ /\.ok\(\)\s*\n?\s*\.flatten\(\)/;
+    # a value-free `_ => return` abandons background work; no caller is told anything
+    next if $w =~ /^\s*_\s*=>\s*return\s*[,;]/m;
+    next unless $w =~ /^\s*_\s*=>/m || $w =~ /\.unwrap_or\(None\)/ || $w =~ /if let Ok\(Some\(/;
+    printf("%s:%d\n", $f, $i + 1);
+  }
+}' 2>/dev/null | sed 's|^\./||' || true)
+
+if [ "$GRAPH_READ_FAIL" -gt 0 ]; then
+    yellow "  → split the arms. Ok(None) is a DEFINITE answer (graph_json is NOT"
+    yellow "    NULL, so the row is genuinely absent for this user) and keeps its"
+    yellow "    existing message; Err logs the chain server-side and either"
+    yellow "    refuses generically or DISCLOSES — never emits a zero count, an"
+    yellow "    empty list, or an empty graph as if it had been measured."
+    yellow "  → \`crate::utils::classify_workflow_graph_read\` is the mcp-handlers"
+    yellow "    chokepoint; \`talos_measurement::Readings\` is the disclosure."
+    EXIT_CODE=1
+else
+    green "✓ no workflow-graph read reports a failed read as an empty graph"
 fi
 echo
 

@@ -2917,6 +2917,12 @@ async fn handle_get_error_report(
     // `unwrap_or_else` in the map), so the failure COUNTS are untouched and the
     // degradation is visible in the output rather than hidden by it. Nothing
     // here makes a claim about system state.
+    // allow-collapsed-graph-read: same exemption as the check-74 marker below
+    // and for the same reason — this graph is read ONLY to turn node UUIDs into
+    // display labels, and the fallback prints the bare UUID. Spelled out as its
+    // own marker rather than teaching check 79b to honour another check's,
+    // because a marker quietly serving a second justification is the drift
+    // these checks exist to catch.
     let graph_json_str = state
         .analytics_repo
         .get_workflow_graph_json(wf_id, user_id)
