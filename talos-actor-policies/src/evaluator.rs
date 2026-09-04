@@ -227,7 +227,32 @@ impl PolicyEvaluator {
 
         for policy in policies.iter() {
             let is_match = match &policy.trigger {
-                TriggerCondition::Custom(expr) => rhai_eval::evaluate(expr, &event),
+                // #736: an expression we could not evaluate says NOTHING about
+                // whether the policy should have fired, so it must not be read
+                // as "did not match". Pre-fix `rhai_eval::evaluate` returned a
+                // bare `bool` and this arm was just that bool, which fell into
+                // `if !is_match { continue; }` — for `Block` that let the gated
+                // action proceed UNGATED, with no signal in the verdict, the
+                // response, or the action log. The built-in arm immediately
+                // below has always refused on an unreadable rule
+                // (`builtin_detect(..).await?`), and so does the policy-cache
+                // load above; this was the one arm that did not, and the only
+                // one reachable by a user-authored expression.
+                TriggerCondition::Custom(expr) => match resolve_custom_trigger(
+                    expr,
+                    &event,
+                    policy.mode,
+                    policy.policy_id,
+                    actor_id,
+                ) {
+                    PolicyDecision::Matched => true,
+                    PolicyDecision::NotMatched => false,
+                    PolicyDecision::Refuse { policy_id, reason } => anyhow::bail!(
+                        "actor policy {policy_id} (mode=block) could not evaluate its trigger \
+                         condition, so this action was refused rather than allowed through an \
+                         ungated block policy: {reason}"
+                    ),
+                },
                 builtin => match builtin_detect(builtin, &event, tx).await? {
                     DetectionResult::Match => true,
                     DetectionResult::NoMatch => false,
@@ -547,5 +572,207 @@ impl PolicyEvaluator {
     #[doc(hidden)]
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+}
+
+/// The verdict on ONE policy's trigger condition.
+///
+/// #736 follow-up (2): this replaced a `Result<bool>`. The `Result` was
+/// already better than the original bare `bool` — the whole defect was a
+/// security decision a caller could take without saying so — but it was still
+/// bypassable in one token: `resolve_unevaluable(..)?` mutated to
+/// `.unwrap_or(false)` compiled, and left all 23 tests green. That is the
+/// "guard that passes its own mutation" trap, sitting on the security wiring
+/// of the entire fix.
+///
+/// An exhaustive enum with no `unwrap_or`, no `unwrap_or_default`, no
+/// `Into<bool>` and no `Default` cannot be collapsed by accident: the caller
+/// must `match`, and bypassing costs a visible, deliberate
+/// `Refuse { .. } => false`. Same principle as CLAUDE.md check 17, where
+/// dropping `Default` from `EncryptedSecrets` made the accidental-empty bug
+/// unable to compile.
+///
+/// There is deliberately no `Unevaluable` variant that means "not matched":
+/// an expression we could not read is never evidence about whether a policy
+/// should fire, so the only two ways out are a verdict we actually computed
+/// and a refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "a policy trigger verdict must be acted on, never dropped"]
+pub enum PolicyDecision {
+    /// The trigger condition was evaluated and matched. The policy fires.
+    Matched,
+    /// The trigger condition was evaluated and did not match. Skip this
+    /// policy — this is the ONLY skip that rests on an answer we computed.
+    NotMatched,
+    /// The trigger condition could not be READ, and this policy's mode makes
+    /// that fatal. The caller must stop, not continue.
+    Refuse {
+        policy_id: Uuid,
+        /// Operator-facing reason. Carries the Rhai engine's own message; it
+        /// never contains policy-subject data beyond the expression's error.
+        reason: String,
+    },
+}
+
+/// Evaluate one `Custom` (Rhai) trigger condition into a [`PolicyDecision`].
+///
+/// The rule for an unevaluable expression is about a policy's EFFECT, not its
+/// severity label: `Block` is the only mode whose absence CHANGES what the
+/// caller is allowed to do, so it is the only mode for which "I could not read
+/// the rule" must stop the action. `Log` and `Notify` are observers — their
+/// only effects are an action-log row and a webhook — so refusing a publish
+/// because a *reporting* policy could not be evaluated would be a strictly
+/// worse trade. Their behaviour is deliberately unchanged from pre-#736; only
+/// the logging is new.
+///
+/// Note what this is NOT: a broken expression never yields [`PolicyDecision::
+/// Matched`]. The pre-#736 docstring's claim that `evaluate` "fails closed"
+/// was true for exactly that reading, and false for the one that mattered.
+pub fn resolve_custom_trigger(
+    expr: &str,
+    event: &PolicyEvent,
+    mode: PolicyMode,
+    policy_id: Uuid,
+    actor_id: Uuid,
+) -> PolicyDecision {
+    match rhai_eval::evaluate(expr, event) {
+        rhai_eval::ExpressionOutcome::Matched => PolicyDecision::Matched,
+        rhai_eval::ExpressionOutcome::NotMatched => PolicyDecision::NotMatched,
+        rhai_eval::ExpressionOutcome::Unevaluable(err) => match mode {
+            PolicyMode::Block => {
+                tracing::error!(
+                    target: "actor_policies",
+                    event_kind = "block_policy_expression_unevaluable",
+                    %policy_id,
+                    %actor_id,
+                    error = %err,
+                    "BLOCK policy trigger expression could not be evaluated — refusing the \
+                     action rather than letting it through ungated",
+                );
+                PolicyDecision::Refuse {
+                    policy_id,
+                    reason: err,
+                }
+            }
+            PolicyMode::Log | PolicyMode::Notify => {
+                tracing::warn!(
+                    target: "actor_policies",
+                    event_kind = "observer_policy_expression_unevaluable",
+                    %policy_id,
+                    %actor_id,
+                    mode = mode.as_str(),
+                    error = %err,
+                    "observer policy trigger expression could not be evaluated — treating as \
+                     not-matched; this policy recorded NOTHING for this event",
+                );
+                PolicyDecision::NotMatched
+            }
+        },
+    }
+}
+
+#[cfg(test)]
+mod unevaluable_decision_tests {
+    use super::{resolve_custom_trigger, PolicyDecision, PolicyEvent, PolicyMode};
+    use uuid::Uuid;
+
+    fn sample_event() -> PolicyEvent {
+        PolicyEvent::PublishVersion {
+            actor_id: Uuid::new_v4(),
+            workflow_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+        }
+    }
+
+    /// The whole point of #736. A `Block` policy whose trigger expression
+    /// cannot be evaluated must NOT be skipped — skipping it let the gated
+    /// action proceed with nothing in the verdict, the response, or the action
+    /// log to say the gate never ran.
+    #[test]
+    fn block_refuses_when_the_rule_cannot_be_read() {
+        let pid = Uuid::new_v4();
+        match resolve_custom_trigger(
+            "this is not rhai",
+            &sample_event(),
+            PolicyMode::Block,
+            pid,
+            Uuid::nil(),
+        ) {
+            // The operator has to be able to tell WHICH policy stopped them,
+            // and that it stopped them because the rule was unreadable — not
+            // because the rule matched.
+            PolicyDecision::Refuse { policy_id, reason } => {
+                assert_eq!(policy_id, pid);
+                assert!(!reason.is_empty());
+            }
+            other => panic!("a block policy must refuse, got {other:?}"),
+        }
+    }
+
+    /// Observers proceed — but never as a MATCH. There is no path by which an
+    /// expression we could not evaluate causes a policy to fire.
+    #[test]
+    fn observers_treat_an_unreadable_rule_as_not_matched() {
+        for mode in [PolicyMode::Log, PolicyMode::Notify] {
+            assert_eq!(
+                resolve_custom_trigger(
+                    "this is not rhai",
+                    &sample_event(),
+                    mode,
+                    Uuid::new_v4(),
+                    Uuid::nil()
+                ),
+                PolicyDecision::NotMatched,
+                "{mode:?} must not refuse and must not match"
+            );
+        }
+    }
+
+    /// An unreadable rule NEVER matches, in any mode. This is the half of the
+    /// old "fails closed" docstring that was actually true, kept explicit.
+    #[test]
+    fn an_unreadable_rule_never_matches_in_any_mode() {
+        for mode in [PolicyMode::Log, PolicyMode::Notify, PolicyMode::Block] {
+            assert_ne!(
+                resolve_custom_trigger(
+                    "undefined_var == true",
+                    &sample_event(),
+                    mode,
+                    Uuid::new_v4(),
+                    Uuid::nil()
+                ),
+                PolicyDecision::Matched,
+                "{mode:?}"
+            );
+        }
+    }
+
+    /// A rule that DOES evaluate is unaffected by any of this, in every mode.
+    #[test]
+    fn a_readable_rule_is_decided_on_its_own_value() {
+        for mode in [PolicyMode::Log, PolicyMode::Notify, PolicyMode::Block] {
+            assert_eq!(
+                resolve_custom_trigger(
+                    r#"event == "publish_version""#,
+                    &sample_event(),
+                    mode,
+                    Uuid::new_v4(),
+                    Uuid::nil()
+                ),
+                PolicyDecision::Matched,
+                "{mode:?}"
+            );
+            assert_eq!(
+                resolve_custom_trigger(
+                    r#"event == "something_else""#,
+                    &sample_event(),
+                    mode,
+                    Uuid::new_v4(),
+                    Uuid::nil()
+                ),
+                PolicyDecision::NotMatched,
+                "{mode:?}"
+            );
+        }
     }
 }
