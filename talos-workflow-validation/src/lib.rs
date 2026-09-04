@@ -478,14 +478,26 @@ pub fn node_budget_retry_ceiling(
 
 /// How far back the history slice may reach, in days.
 ///
-/// Pinned to the execution-retention default rather than chosen freely:
+/// Pinned to the live-table retention default rather than chosen freely:
 /// `execution_events` rows CASCADE from `workflow_executions`, which the
-/// retention sweep DELETEs after `EXECUTION_RETENTION_DAYS` (default 30). A
-/// longer lookback cannot return older data — it would just be a window that
-/// silently shrinks to whatever retention happens to be, which is the trap
-/// this check must not fall into. [`history_window_days`] narrows it further
-/// when an operator has configured a shorter retention, so the window is never
-/// wider than the store can actually hold.
+/// retention path removes from the LIVE table after `ARCHIVE_AFTER_DAYS`
+/// (default 30). A longer lookback cannot return older data — it would just be
+/// a window that silently shrinks to whatever retention happens to be, which
+/// is the trap this check must not fall into. [`history_window_days`] narrows
+/// it further when an operator has configured a shorter window, so the window
+/// is never wider than the store can actually hold.
+///
+/// **This tracks `ARCHIVE_AFTER_DAYS`, not `EXECUTION_RETENTION_DAYS`**
+/// (2026-09-04). Before the one-retention-path change those were the same
+/// boundary: a plain `DELETE FROM workflow_executions` keyed on
+/// `EXECUTION_RETENTION_DAYS` was what removed live rows. Now executions are
+/// MOVED to `workflow_executions_archive` at the archive boundary and the
+/// archive is purged at the retention boundary — and the CASCADE children this
+/// module reads (`execution_events`) die at the MOVE, since they hang off the
+/// live table. Reading `EXECUTION_RETENTION_DAYS` here after that change would
+/// describe a 90-day lookback over a 7-day store the moment an operator set
+/// `ARCHIVE_AFTER_DAYS=7`, which is exactly the trap the paragraph above
+/// forbids.
 pub const HISTORY_WINDOW_DAYS: i32 = 30;
 
 /// Hard cap on executions in the slice, independent of cadence.
@@ -540,11 +552,12 @@ pub const CHRONIC_FAILURE_RATE: f64 = 0.10;
 
 /// The lookback to use, never wider than the store can hold.
 ///
-/// Reads `EXECUTION_RETENTION_DAYS` so a cluster configured to keep 7 days is
-/// described as a 7-day window instead of a 30-day one that quietly contains 7.
+/// Reads `ARCHIVE_AFTER_DAYS` so a cluster configured to keep 7 days of live
+/// executions is described as a 7-day window instead of a 30-day one that
+/// quietly contains 7.
 #[must_use]
 pub fn history_window_days() -> i32 {
-    HISTORY_WINDOW_DAYS.min(talos_config::execution_retention_days())
+    HISTORY_WINDOW_DAYS.min(talos_config::archive_after_days())
 }
 
 /// What the history read actually covered. Carried on every
@@ -5199,13 +5212,18 @@ mod failure_history_tests {
         assert_eq!(HISTORY_WINDOW_DAYS, 30);
     }
 
-    /// The lookback must never claim a window wider than retention can hold —
-    /// a window that silently shrinks is exactly the trap this check must not
-    /// walk into.
+    /// The lookback must never claim a window wider than the LIVE table can
+    /// hold — a window that silently shrinks is exactly the trap this check
+    /// must not walk into.
+    ///
+    /// The bound is `ARCHIVE_AFTER_DAYS`, not `EXECUTION_RETENTION_DAYS`:
+    /// `execution_events` CASCADE from `workflow_executions`, so they are gone
+    /// the moment an execution is MOVED to the archive, whatever happens to
+    /// the archived row afterwards.
     #[test]
     fn window_never_exceeds_retention() {
         assert!(history_window_days() <= HISTORY_WINDOW_DAYS);
-        assert!(history_window_days() <= talos_config::execution_retention_days());
+        assert!(history_window_days() <= talos_config::archive_after_days());
         assert!(history_window_days() > 0);
     }
 

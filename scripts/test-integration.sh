@@ -405,6 +405,18 @@ TC_TESTS=(
     # alive, and the completed replay corpus of a rarely-run module (whose
     # oldest rows ARE its whole corpus).
     "module_execution_retention_tests"
+    # ── Execution retention: ONE path, two tiers (added 2026-09-04) ─────────
+    # The archive had held 0 rows across the platform's entire history: a
+    # 6-hourly plain DELETE spawned before the daily archival sweep deleted
+    # exactly the rows archival existed to move, and the archival statement
+    # could not have worked anyway (32 live columns vs 25 archive columns is a
+    # PARSE-time error, raised on every tick since 2026-03-26 and discarded by
+    # `if let Ok(r) = result`). Nothing could tell: `list_archived_executions`
+    # reported "none" forever and no metric or log moved.
+    # `archive_schema_parity_in_the_database` is the standing gate the three
+    # hand-written `sync_archive_*` migrations never had — it fails the moment
+    # a column is added to workflow_executions and not to the archive.
+    "execution_retention_tests"
 )
 for tctest in "${TC_TESTS[@]}"; do
     echo

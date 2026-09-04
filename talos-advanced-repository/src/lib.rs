@@ -231,6 +231,409 @@ pub struct PromoteWorkflowRow {
 // Repository
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ── Archive executions — the one retention path ───────────────────────────
+
+/// Every column of `workflow_executions`, and therefore every column the
+/// archive must be able to hold. **The single source of truth for the move.**
+///
+/// Both archival paths were wrong in opposite directions before this. The
+/// background sweep used `INSERT INTO workflow_executions_archive SELECT *
+/// FROM archived`, which is a **parse-time** error the moment the two
+/// tables' column counts differ — `DELETE ... WHERE false RETURNING *`
+/// raises it identically, so the sweep had returned `Err` on every daily
+/// tick since 2026-03-26 and the caller discarded it. The manual
+/// [`AdvancedRepository::archive_executions`] path enumerated columns
+/// by hand and so parsed fine, with the opposite defect: it named 24 of 32
+/// and **silently dropped eight**, including the encrypted output payload
+/// (`output_data_enc` / `output_enc_key_id` / `output_data_format`) and the
+/// tenancy pin (`org_id`). `list_archived_executions` selects six columns,
+/// so that loss was unobservable from any surface.
+///
+/// Adding a column to `workflow_executions` now means adding it here AND to
+/// the archive table in a migration. `archive_schema_parity_in_the_database`
+/// (`controller/tests/execution_retention_tests.rs`) fails if either half is
+/// forgotten — the gate the three hand-written `sync_archive_*` migrations
+/// never had. `archived_at` is deliberately absent: it is the one column the
+/// archive has that the live table does not (see the purge clock below).
+pub const ARCHIVED_EXECUTION_COLUMNS: &[&str] = &[
+    "id",
+    "workflow_id",
+    "user_id",
+    "status",
+    "started_at",
+    "completed_at",
+    "error_message",
+    "created_at",
+    "updated_at",
+    "output_data",
+    "checkpoint_data",
+    "workflow_version_id",
+    "is_test_execution",
+    "checkpoint_encrypted",
+    "checkpoint_nonce",
+    "is_pinned",
+    "pin_note",
+    "priority",
+    "replayed_from_id",
+    "input_data",
+    "actor_id",
+    "provenance",
+    "acknowledged_at",
+    "acknowledgement_reason",
+    "parent_execution_id",
+    "root_execution_id",
+    "output_data_enc",
+    "output_enc_key_id",
+    "output_data_format",
+    "org_id",
+    "checkpoint_seq",
+    "epoch",
+];
+
+/// Statuses an execution must be in before it may be moved or purged.
+///
+/// Written out rather than expressed as "not queued" — the pre-change
+/// cleanup DELETE used `status != 'queued'`, which is not a terminal test:
+/// it takes `running`, `resuming` and `pending` rows too. Latent on this
+/// fleet (0 in-flight rows, longest observed run 2h02m against a 30-day
+/// window) but wrong in principle, and the purge leg must never be the
+/// thing that deletes a live execution's record.
+pub const TERMINAL_EXECUTION_STATUSES: &[&str] = &["completed", "failed", "cancelled"];
+
+/// Rows moved or purged per statement. Matches the pre-change cleanup
+/// batch size: bounded row locks and WAL on the first sweep after a long
+/// outage, without an N+1.
+const RETENTION_BATCH: i64 = 5000;
+
+/// The archival column list as SQL. Used verbatim on BOTH sides of the
+/// `INSERT ... SELECT`, so the two halves cannot drift from each other.
+///
+/// Interpolating this into SQL is safe by construction: every element is a
+/// compile-time literal in [`ARCHIVED_EXECUTION_COLUMNS`], never caller
+/// input. Identifiers cannot be bind parameters, so there is no
+/// parameterised alternative.
+#[must_use]
+pub fn archived_execution_column_sql() -> String {
+    ARCHIVED_EXECUTION_COLUMNS.join(", ")
+}
+
+/// The archival move, as one atomic statement.
+///
+/// `extra_predicate` is appended to the victim selection; it is only ever a
+/// compile-time literal from this module (the user-scoped path adds an
+/// owner clause), never caller input.
+fn archive_move_sql(extra_predicate: &str) -> String {
+    let cols = archived_execution_column_sql();
+    let statuses = TERMINAL_EXECUTION_STATUSES
+        .iter()
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "WITH victims AS ( \
+             SELECT id FROM workflow_executions \
+             WHERE status IN ({statuses}) \
+               AND completed_at IS NOT NULL \
+               AND completed_at < NOW() - make_interval(days => $1::int) \
+               AND is_pinned = false \
+               {extra_predicate} \
+             ORDER BY completed_at \
+             LIMIT {batch} \
+         ), archived AS ( \
+             DELETE FROM workflow_executions \
+             WHERE id IN (SELECT id FROM victims) \
+             RETURNING {cols} \
+         ) \
+         INSERT INTO workflow_executions_archive ({cols}) SELECT {cols} FROM archived",
+        batch = RETENTION_BATCH
+    )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The retention PASS — one path, two tiers, one testable function
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// These three items exist because the two `tokio::spawn` bodies in
+// `controller/src/bootstrap/background.rs` were UNTESTABLE, and that is not a
+// stylistic complaint — it was measured. With the retention logic inline in the
+// spawn blocks, two mutations of the WIRING survived the entire test suite:
+//
+//   * re-instating `if let Ok(_) = result` on the archival call — the exact
+//     defect this whole change exists to remove, and the reason a broken sweep
+//     went unnoticed for five months; and
+//   * swapping the two windows, which silently turns the archive tier back into
+//     a no-op at the shared default of 30 days — the original bug, reproduced.
+//
+// Both are now inside functions the tests drive:
+//
+//   * `resolve_retention_windows` decides WHICH window is which, so the caller
+//     never holds two interchangeable integers. The window swap is no longer
+//     expressible at the call site; performed here, it fails
+//     `windows_are_not_interchangeable` and `each_window_governs_its_own_tier`.
+//   * `run_retention_pass` runs both tiers and RECORDS what happened, including
+//     failures. A swallow performed here fails
+//     `an_unrunnable_archive_statement_is_reported_not_hidden`.
+//   * `RetentionPassOutcome` is `#[must_use]`, so dropping it at the call site
+//     is a clippy `unused_must_use` — and CI runs `-D warnings`. That half is a
+//     compiler guarantee rather than a test, which is the stronger of the two.
+
+/// The two windows of the one retention path, as NAMED fields.
+///
+/// Named, not positional, and built only by [`resolve_retention_windows`] —
+/// `run_retention_pass(repo, a, b)` with two bare `i32`s is exactly the shape
+/// that let a silent swap live at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionWindows {
+    /// Days an execution stays in `workflow_executions` before being MOVED to
+    /// the archive. Bounds the LIVE table, and the boundary at which
+    /// `execution_events` / `workflow_execution_logs` /
+    /// `execution_approval_tokens` CASCADE away.
+    pub archive_after_days: i32,
+    /// Days an ARCHIVED execution is kept, clocked on `archived_at`, before
+    /// permanent deletion. Bounds the archive.
+    pub purge_after_days: i32,
+}
+
+/// What resolving the windows decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetentionWindowDecision {
+    /// Both windows are known; run the pass.
+    Run(RetentionWindows),
+    /// `system_settings.archive_after_days` could not be READ.
+    ///
+    /// #661's rule, preserved verbatim through the extraction: an unreadable
+    /// setting is NOT an unset one. The sweep is periodic and idempotent, so
+    /// the correct answer to "I cannot tell what the retention is" is to skip
+    /// this pass and re-read next tick — never to sweep
+    /// `workflow_executions` on a guess that may be far shorter than what the
+    /// operator configured.
+    SkipUnreadable(String),
+}
+
+/// Resolve both windows: the DB override for the archive tier where present,
+/// the env-derived defaults otherwise.
+///
+/// This function is the ONLY place that decides which configured number
+/// governs which tier.
+pub async fn resolve_retention_windows(pool: &PgPool) -> RetentionWindowDecision {
+    let env_archive_days = talos_config::archive_after_days();
+    let purge_after_days = talos_config::execution_retention_days();
+
+    let db_read = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT value FROM system_settings WHERE key = 'archive_after_days'",
+    )
+    .fetch_optional(pool)
+    .await;
+
+    let db_days: Option<i32> = match db_read {
+        Ok(v) => v.and_then(|v| {
+            v.as_i64()
+                .map(|n| i32::try_from(n).unwrap_or(i32::MAX))
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        }),
+        Err(e) => return RetentionWindowDecision::SkipUnreadable(e.to_string()),
+    };
+
+    // MCP-758 / MCP-643: a non-positive override binds into
+    // `make_interval(days => $1::int)` as "older than now" (or, negative, "older
+    // than the future") and archives every completed execution on the next tick.
+    // Ignore it loudly rather than obeying it.
+    let archive_after_days = match db_days {
+        Some(d) if d > 0 => d,
+        Some(d) => {
+            tracing::warn!(
+                target: "talos_engine",
+                event_kind = "archive_after_days_nonpositive_substituted",
+                configured = d,
+                fallback = env_archive_days,
+                "system_settings.archive_after_days = {} is non-positive — ignored to \
+                 prevent archiving every completed execution; falling back to the \
+                 env-derived value",
+                d
+            );
+            env_archive_days
+        }
+        None => env_archive_days,
+    };
+
+    RetentionWindowDecision::Run(RetentionWindows {
+        archive_after_days,
+        purge_after_days,
+    })
+}
+
+/// What one retention pass actually did.
+///
+/// `#[must_use]`: dropping this is dropping the answer to "did retention work",
+/// which is the shape of the original defect. CI's `-D warnings` turns that
+/// into a build failure.
+#[must_use]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetentionPassOutcome {
+    /// The windows this pass ran under, or `None` if it did not run.
+    pub windows: Option<RetentionWindows>,
+    /// Why the pass did not run at all.
+    ///
+    /// `Some(_)` means the archive window could not be READ and NOTHING was
+    /// swept. Distinct from a pass that ran and found nothing, and distinct
+    /// again from a pass whose statements failed.
+    pub skipped_window: Option<String>,
+    /// Executions MOVED from `workflow_executions` to the archive.
+    pub archived: u64,
+    /// Archived executions permanently deleted.
+    pub purged: u64,
+    /// Why the archival tier could not run, if it could not.
+    ///
+    /// `Some(_)` with `archived == 0` and `None` with `archived == 0` are
+    /// DIFFERENT answers — "the move is broken" versus "nothing was old
+    /// enough". Collapsing them is what hid a five-month outage.
+    pub archive_error: Option<String>,
+    /// Why the purge tier could not run, if it could not.
+    pub purge_error: Option<String>,
+}
+
+impl RetentionPassOutcome {
+    /// Turn the pass self into log lines — the ONLY place the retention
+    /// loop's result is reported. Lives on the self rather than inline in
+    /// the `tokio::spawn` tick so that (a) forgetting to call it leaves a
+    /// `#[must_use]` value unused, which CI's `-D warnings` refuses, and (b)
+    /// dropping any branch here is caught by `retention_report_tests`, which
+    /// installs a capturing subscriber and asserts on the emitted events.
+    /// Before this extraction the identical five blocks sat inline in
+    /// `background.rs`, and deleting the `archive_error` one — reinstating the
+    /// exact swallow this change exists to remove — compiled and passed every
+    /// test (measured).
+    pub fn report(&self) {
+        if let Some(e) = &self.skipped_window {
+            tracing::error!(
+                target: "talos_engine",
+                event_kind = "archive_after_days_unreadable_skipped",
+                error = %e,
+                "could not READ system_settings.archive_after_days — SKIPPED this \
+                 retention pass rather than sweeping workflow_executions on the \
+                 env-derived default, which may be far shorter than the configured \
+                 retention"
+            );
+        }
+        if self.archived > 0 {
+            tracing::info!(
+                target: "talos_engine",
+                event_kind = "executions_archived",
+                count = self.archived,
+                archive_after_days = self
+                    .windows
+                    .map_or(-1, |w| w.archive_after_days),
+                "archived {} executions into workflow_executions_archive",
+                self.archived
+            );
+        }
+        if self.purged > 0 {
+            tracing::info!(
+                target: "talos_engine",
+                event_kind = "archived_executions_purged",
+                count = self.purged,
+                purge_after_days = self
+                    .windows
+                    .map_or(-1, |w| w.purge_after_days),
+                "purged {} archived executions past their retention window",
+                self.purged
+            );
+        }
+        // An unreported failure is how the five-month outage above
+        // stayed invisible. Nothing else in the system can tell
+        // "nothing was old enough" from "the move is broken".
+        if let Some(e) = &self.archive_error {
+            tracing::error!(
+                target: "talos_engine",
+                event_kind = "execution_archival_failed",
+                error = %e,
+                "execution archival FAILED — no executions are being moved to \
+                 workflow_executions_archive; live-table growth is unbounded \
+                 until this succeeds"
+            );
+        }
+        if let Some(e) = &self.purge_error {
+            tracing::error!(
+                target: "talos_engine",
+                event_kind = "archived_execution_purge_failed",
+                error = %e,
+                "archived-execution purge FAILED — the archive is NOT being \
+                 trimmed and will grow without bound until this succeeds"
+            );
+        }
+    }
+}
+
+impl RetentionPassOutcome {
+    /// Did either tier fail?
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        self.archive_error.is_some() || self.purge_error.is_some()
+    }
+}
+
+/// Run one full retention pass: archive, then purge.
+///
+/// Order matters and is not arbitrary — archiving first means a row that
+/// becomes eligible for the archive during this pass is moved before the purge
+/// looks at the archive, and because the purge is clocked on `archived_at` a
+/// just-moved row can never be purged by the same pass whatever the windows.
+///
+/// Neither tier's failure aborts the other: a broken archive statement must not
+/// also stop the archive from being trimmed, and both failures are reported.
+pub async fn run_retention_pass(
+    repo: &AdvancedRepository,
+    windows: RetentionWindows,
+) -> RetentionPassOutcome {
+    let mut outcome = RetentionPassOutcome {
+        windows: Some(windows),
+        ..RetentionPassOutcome::default()
+    };
+
+    match repo
+        .sweep_archive_executions(windows.archive_after_days)
+        .await
+    {
+        Ok(n) => outcome.archived = n,
+        Err(e) => outcome.archive_error = Some(format!("{e:#}")),
+    }
+    match repo
+        .purge_archived_executions(windows.purge_after_days)
+        .await
+    {
+        Ok(n) => outcome.purged = n,
+        Err(e) => outcome.purge_error = Some(format!("{e:#}")),
+    }
+
+    outcome
+}
+
+/// Resolve the windows from configuration and run one pass — **the entry point
+/// `background.rs` calls, and the only one it may call.**
+///
+/// This exists so the spawn loop holds NO decision whatsoever. When the loop
+/// matched on [`RetentionWindowDecision`] itself, a mutation that ignored
+/// `SkipUnreadable` and swept on a fabricated 30/30 guess survived the entire
+/// suite — the wiring could still choose wrongly, and no test could reach it.
+/// Folding the skip into the outcome moves that choice in here, where
+/// `an_unreadable_window_skips_the_whole_pass` drives it. The caller's only
+/// remaining job is to log what came back.
+///
+/// The skip arm reports `archived == 0` / `purged == 0` because it genuinely
+/// swept nothing: an unreadable window is not a short window (#661).
+pub async fn run_retention_pass_from_config(
+    repo: &AdvancedRepository,
+    pool: &PgPool,
+) -> RetentionPassOutcome {
+    match resolve_retention_windows(pool).await {
+        RetentionWindowDecision::Run(windows) => run_retention_pass(repo, windows).await,
+        RetentionWindowDecision::SkipUnreadable(error) => RetentionPassOutcome {
+            skipped_window: Some(error),
+            ..RetentionPassOutcome::default()
+        },
+    }
+}
+
 pub struct AdvancedRepository {
     db_pool: PgPool,
 }
@@ -438,10 +841,14 @@ impl AdvancedRepository {
         .context("set_archive_policy")
     }
 
-    // ── Archive executions ────────────────────────────────────────────────────
-
-    /// Move old completed/failed/cancelled executions to the archive table.
-    /// Returns the number of rows moved.
+    // ── Archive executions — the one retention path ───────────────────────────
+    /// Move one user's old terminal executions into the archive.
+    ///
+    /// Backs the `archive_executions` MCP tool. The fleet-wide background
+    /// sweep is [`sweep_archive_executions`](Self::sweep_archive_executions);
+    /// both build their SQL from [`ARCHIVED_EXECUTION_COLUMNS`], so an
+    /// execution archived by hand and one archived by the sweep are the
+    /// same row.
     pub async fn archive_executions(&self, days: i32, user_id: Uuid) -> Result<u64> {
         // MCP-1062 (2026-05-15): refuse non-positive `days`. Sibling
         // caller-supplied-negative class as MCP-997. With
@@ -461,38 +868,112 @@ impl AdvancedRepository {
         // RFC 0005 S3: self-scope so the workflow_executions RLS policy
         // backstops the DELETE (only the caller's rows are archived).
         let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
-        let n = sqlx::query(
-            "WITH archived AS (
-                DELETE FROM workflow_executions
-                WHERE status IN ('completed', 'failed', 'cancelled')
-                AND completed_at < NOW() - make_interval(days => $1::int)
-                AND is_pinned = false
-                AND user_id = $2
-                RETURNING *
-            )
-            INSERT INTO workflow_executions_archive (
-                id, workflow_id, user_id, status, started_at, completed_at,
-                error_message, created_at, updated_at, output_data, workflow_version_id,
-                is_pinned, pin_note, priority, replayed_from_id, input_data,
-                checkpoint_data, is_test_execution, checkpoint_encrypted, checkpoint_nonce,
-                actor_id, provenance, acknowledged_at, acknowledgement_reason
-            )
-            SELECT
-                id, workflow_id, user_id, status, started_at, completed_at,
-                error_message, created_at, updated_at, output_data, workflow_version_id,
-                is_pinned, pin_note, priority, replayed_from_id, input_data,
-                checkpoint_data, is_test_execution, checkpoint_encrypted, checkpoint_nonce,
-                actor_id, provenance, acknowledged_at, acknowledgement_reason
-            FROM archived",
-        )
-        .bind(days)
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await
-        .map(|r| r.rows_affected())
-        .context("archive_executions")?;
+        let n = sqlx::query(&archive_move_sql("AND user_id = $2"))
+            .bind(days)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map(|r| r.rows_affected())
+            .context("archive_executions")?;
         tx.commit().await?;
         Ok(n)
+    }
+
+    /// Fleet-wide archival sweep: move every user's terminal executions
+    /// older than `days` into the archive. Returns the number moved.
+    ///
+    /// Tier one of the one retention path. Batched, and each batch is a
+    /// single CTE, so the DELETE and the INSERT commit together — an
+    /// execution is never in neither table.
+    ///
+    /// **This returns `Err` rather than swallowing.** The pre-change caller
+    /// wrote `if let Ok(r) = result`, which discarded a parse error that had
+    /// been raised on every tick for five months; the whole defect was
+    /// invisible because of that one line.
+    pub async fn sweep_archive_executions(&self, days: i32) -> Result<u64> {
+        if days <= 0 {
+            tracing::warn!(
+                target: "talos_audit",
+                days,
+                "archival sweep refused: days must be positive (would archive every non-pinned execution)"
+            );
+            return Ok(0);
+        }
+        let sql = archive_move_sql("");
+        let mut total = 0u64;
+        loop {
+            let moved = sqlx::query(&sql)
+                .bind(days)
+                .execute(&self.db_pool)
+                .await
+                .map(|r| r.rows_affected())
+                .context("sweep_archive_executions")?;
+            total += moved;
+            if moved < RETENTION_BATCH as u64 {
+                break;
+            }
+            // Yield between batches so a large first sweep does not
+            // monopolise the pool.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        Ok(total)
+    }
+
+    /// Fleet-wide purge: delete archived executions kept longer than
+    /// `days`. Returns the number deleted. Tier two of the one retention
+    /// path — and the ONLY thing in the platform that permanently deletes
+    /// an execution record.
+    ///
+    /// Three belts, each of which the pre-change plain-DELETE cleanup loop
+    /// lacked:
+    ///
+    /// * clocked on `archived_at`, so `days` means "days kept in the
+    ///   archive" and cannot select a row the archival sweep just moved;
+    /// * `is_pinned = false`, so `pin_execution`'s promise survives the
+    ///   whole path (the cleanup loop had no `is_pinned` reference at all);
+    /// * terminal statuses only, so a `running` / `resuming` / `pending`
+    ///   row can never be purged even if one somehow reached the archive.
+    pub async fn purge_archived_executions(&self, days: i32) -> Result<u64> {
+        if days <= 0 {
+            tracing::warn!(
+                target: "talos_audit",
+                days,
+                "archive purge refused: days must be positive (would delete the whole archive)"
+            );
+            return Ok(0);
+        }
+        let statuses = TERMINAL_EXECUTION_STATUSES
+            .iter()
+            .map(|s| format!("'{s}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "DELETE FROM workflow_executions_archive WHERE id IN ( \
+                 SELECT id FROM workflow_executions_archive \
+                 WHERE status IN ({statuses}) \
+                   AND is_pinned = false \
+                   AND archived_at < NOW() - make_interval(days => $1::int) \
+                 ORDER BY archived_at, id \
+                 LIMIT {batch} \
+                 FOR UPDATE SKIP LOCKED \
+             )",
+            batch = RETENTION_BATCH
+        );
+        let mut total = 0u64;
+        loop {
+            let deleted = sqlx::query(&sql)
+                .bind(days)
+                .execute(&self.db_pool)
+                .await
+                .map(|r| r.rows_affected())
+                .context("purge_archived_executions")?;
+            total += deleted;
+            if deleted < RETENTION_BATCH as u64 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        Ok(total)
     }
 
     /// List archived executions, optionally filtered by workflow_id.
@@ -2932,5 +3413,89 @@ mod tests {
         // documents that the dispatch enum is downstream of this step.
         row.wasm_bytes = normalize_wasm_bytes(row.wasm_bytes);
         assert_eq!(InstallDispatch::from_source(&row), InstallDispatch::Reject);
+    }
+}
+
+#[cfg(test)]
+mod retention_report_tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+        type Writer = Buf;
+        fn make_writer(&'a self) -> Buf {
+            self.clone()
+        }
+    }
+
+    fn captured(outcome: &RetentionPassOutcome) -> String {
+        let sink: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(Buf(Arc::clone(&sink)))
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        tracing::subscriber::with_default(sub, || outcome.report());
+        let bytes = sink.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    fn quiet() -> RetentionPassOutcome {
+        RetentionPassOutcome {
+            windows: None,
+            skipped_window: None,
+            archived: 0,
+            purged: 0,
+            archive_error: None,
+            purge_error: None,
+        }
+    }
+
+    /// The M6 guard. Reinstating the historical swallow — dropping the
+    /// `archive_error` branch — makes this fail.
+    #[test]
+    fn a_failed_archive_is_reported_at_error_level() {
+        let out = captured(&RetentionPassOutcome {
+            archive_error: Some("boom".into()),
+            ..quiet()
+        });
+        assert!(out.contains("ERROR"), "no ERROR-level event: {out:?}");
+        assert!(
+            out.contains("execution_archival_failed"),
+            "archive failure not reported: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_purge_is_reported_at_error_level() {
+        let out = captured(&RetentionPassOutcome {
+            purge_error: Some("boom".into()),
+            ..quiet()
+        });
+        assert!(
+            out.contains("ERROR") && out.contains("archived_execution_purge_failed"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn a_quiet_pass_reports_no_failure() {
+        let out = captured(&quiet());
+        assert!(
+            !out.contains("_failed"),
+            "a clean pass must not report a failure: {out:?}"
+        );
     }
 }

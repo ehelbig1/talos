@@ -12,7 +12,9 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+talos-config = { path = "../talos-config" }
 talos-db = { path = "../talos-db" }
+tokio = { workspace = true, features = ["time"] }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-tenancy = { path = "../talos-tenancy" }
 talos-text-util = { path = "../talos-text-util" }
@@ -20,6 +22,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
 [lints]

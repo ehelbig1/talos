@@ -347,9 +347,9 @@ into both deployments.
 
 | Variable | Default | Component | Purpose | Sensitive |
 |---|---|---|---|---|
-| `EXECUTION_RETENTION_DAYS` | `30` | controller | Workflow-execution retention (destructive-zero guarded) | |
+| `EXECUTION_RETENTION_DAYS` | `30` | controller | Days an **archived** execution is kept before permanent deletion, clocked on `archived_at` (destructive-zero guarded). **Changed 2026-09-04:** this used to delete rows from the LIVE table; live rows are now MOVED to `workflow_executions_archive` after `ARCHIVE_AFTER_DAYS` and purged from there after this window. Default total lifetime is therefore 30 + 30 = 60 days, not 30. | |
 | `EXECUTION_MAX_ROWS` | `100000` | controller | Max execution rows retained | |
-| `ARCHIVE_AFTER_DAYS` | `30` | controller | Archive-after age | |
+| `ARCHIVE_AFTER_DAYS` | `30` | controller | Days an execution stays in `workflow_executions` before being MOVED to the archive. This is the window that bounds the LIVE table, and the one `execution_events` / `workflow_execution_logs` / `execution_approval_tokens` CASCADE at. Overridden per-cluster by `system_settings.archive_after_days` (`set_archive_policy`). | |
 | `AUDIT_LOG_RETENTION_DAYS` | `90` | controller | Audit-log retention | |
 | `STUCK_EXECUTION_TIMEOUT_MINS` | `30` | controller | Mark executions stuck after N minutes | |
 | `EXECUTION_RESUME_STALE_MINS` | `5` | controller | Stale threshold to resume executions | |

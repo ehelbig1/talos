@@ -1807,7 +1807,7 @@ async fn handle_get_archive_policy(
     // used 30 (via the canonical helper's positive-substitute) — a
     // confusing display/reality drift on the same env var. Sibling to
     // the broader `=0`/empty-env footgun sweep (MCP-643/665/670/671).
-    let env_default: i32 = talos_config::positive_env_or_default::<i32>("ARCHIVE_AFTER_DAYS", 30);
+    let env_default: i32 = talos_config::archive_after_days();
 
     // MCP-961 sibling: saturating i64→i32 conversion. The value
     // originates from the `system_config` DB row's `value` column
