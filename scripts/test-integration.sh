@@ -320,6 +320,13 @@ CTRL_TESTS=(
     # trigger can prove a supplied duration survives AND an unsupplied one is
     # still derived.
     "module_execution_duration_tests"
+    # What `module_executions.error_type` MEANS (2026-09-04). The column had
+    # five writers and none covered a module that RAN and FAILED, so 59 of 59
+    # failed rows stored NULL while `ModuleExecution.errorType` published the
+    # field over GraphQL. Needs a real Postgres because the derivation is
+    # bound inside `record_completed`'s UPDATE: a pure-Rust test proves the
+    # classifier, only the round trip proves the value is bound and survives.
+    "module_execution_error_type_tests"
     # The same question one table over (2026-08-31). `execution_events.
     # duration_ms` was derived by a BEFORE INSERT trigger from two event
     # timestamps while the engine already held a monotonic `Instant` reading

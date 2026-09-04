@@ -437,6 +437,34 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
         // measurement pass `None` and land in the NULL branch, where the
         // `calculate_module_execution_duration()` BEFORE UPDATE trigger derives
         // `completed_at - started_at` and stamps `'wallclock'` itself.
+        // `error_type` — the CAUSE, derived from the same text bound into
+        // `error_message` one line below.
+        //
+        // This column was never unwritable: `fail_execution` takes it, the
+        // stuck sweep and `timeout_execution` hardcode it, and four integration
+        // dispatch paths pass `signing_error` / `nats_publish` /
+        // `dlq_replay_dispatch`. What had no writer was the COMMON case — a
+        // module that ran and failed — because `record_completed`'s trait
+        // signature has no `error_type` slot, and this is its only production
+        // impl. Measured on the live ledger before the fix: 59 of 59 `failed`
+        // rows NULL, against 21 874 `timeout` rows that did carry a value. So
+        // `ModuleExecution.errorType` was null on GraphQL for exactly the
+        // status where a cause matters.
+        //
+        // Derived HERE rather than at the caller for a dependency reason worth
+        // stating: `finalize_module_execution_row` — the engine-side chokepoint
+        // that already picks `status` from this same message — lives in
+        // `talos-workflow-engine`, which cannot reach the classifier without an
+        // engine -> repository-layer edge (the classifier crate depends on
+        // `talos-execution-repository`). That is the edge lint 51 forbids in
+        // the sibling case. This crate already carries that layer, and already
+        // derives three other bound values from its inputs a few lines up
+        // (`fuel_consumed`, `format_arg`, `duration_source`).
+        //
+        // NULL on an unrecognised message, never a fall-through bucket — see
+        // `module_error_type` for why, and for the under-reporting it costs.
+        let error_type =
+            crate::module_error_type::derive_error_type(status, redacted_error.as_deref());
         let refused = sqlx::query(
             "UPDATE module_executions \
              SET status = $1, output_data = $2, output_data_enc = $3, \
@@ -446,8 +474,9 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
                  duration_source = CASE WHEN $6::int4 IS NULL \
                                         THEN NULL ELSE 'monotonic' END, \
                  error_message = $7, \
-                 fuel_consumed = COALESCE($8, fuel_consumed), completed_at = NOW() \
-             WHERE id = $9 AND status IN ('pending', 'running')",
+                 error_type = $8, \
+                 fuel_consumed = COALESCE($9, fuel_consumed), completed_at = NOW() \
+             WHERE id = $10 AND status IN ('pending', 'running')",
         )
         .bind(status)
         .bind(pt_output)
@@ -456,6 +485,7 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
         .bind(format_arg)
         .bind(duration_ms)
         .bind(redacted_error.as_deref())
+        .bind(error_type)
         .bind(fuel_consumed)
         .bind(id)
         .execute(&self.pool)
