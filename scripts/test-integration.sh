@@ -369,6 +369,7 @@ CTRL_TESTS=(
     # bound inside `record_completed`'s UPDATE: a pure-Rust test proves the
     # classifier, only the round trip proves the value is bound and survives.
     "module_execution_error_type_tests"
+    "execution_archive_read_tests"
     # The same question one table over (2026-08-31). `execution_events.
     # duration_ms` was derived by a BEFORE INSERT trigger from two event
     # timestamps while the engine already held a monotonic `Instant` reading
@@ -469,7 +470,6 @@ TC_TESTS=(
     # this change, `workflow_executions_archive` had relrowsecurity=false and
     # zero policies while holding real tenant ciphertext, so the app-layer
     # `AND user_id = $2` was the only tenancy guard on it.
-    "execution_archive_read_tests"
 )
 for tctest in "${TC_TESTS[@]}"; do
     echo

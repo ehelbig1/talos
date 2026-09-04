@@ -5070,6 +5070,40 @@ $(
         CI_GATE_FAIL=1
     fi
 
+    # ── 64b: named by a runner is not named by the RIGHT runner (2026-09-04, #748) ──
+    # The controller DB-harness binaries partition by an invisible property:
+    # `mod common;` files need DATABASE_URL (the CTRL_TESTS loop supplies it,
+    # plus TALOS_MASTER_KEY, default threads); `mod test_helpers;` files
+    # self-provision a testcontainer (TC_TESTS, no DATABASE_URL,
+    # --test-threads=1). Leg 64 above proves only the UNION — that a binary is
+    # named SOMEWHERE — so a `common` binary registered in TC_TESTS is green
+    # here and dies in CI in 0.00 s at `common/mod.rs:117` before any
+    # assertion. That is exactly how #748's own first CI run failed. Measured
+    # before writing: post-fix 45 agree / 0 mismatch; pristine main 0
+    # pre-existing — a population of one, deterministic (a `^mod X;` grep
+    # against two arrays), 100% precision. Proven three ways on scratch copies
+    # of the runner: silent on the fixed tree, fires "OTHER list" on the
+    # pre-fix registration, fires "neither" when unregistered. Stated limit:
+    # literal array names and literal `mod` lines — a third harness or a
+    # renamed array is invisible until added here. No opt-out: there is no
+    # legitimate reason for a binary to sit in the list whose environment it
+    # cannot run in.
+    CTRL64="$(awk '/^CTRL_TESTS=\(/{f=1;next} f&&/^\)/{f=0} f' "$INTEGRATION_SH" | grep -oE '"[a-z_0-9]+"' | tr -d '"')"
+    TC64="$(awk '/^TC_TESTS=\(/{f=1;next} f&&/^\)/{f=0} f' "$INTEGRATION_SH" | grep -oE '"[a-z_0-9]+"' | tr -d '"')"
+    for f64 in controller/tests/*.rs; do
+        name64="$(basename "$f64" .rs)"
+        if grep -qE '^mod common;' "$f64"; then want64="CTRL_TESTS"; have64="$CTRL64"; other64="$TC64"; h64="common"
+        elif grep -qE '^mod test_helpers;' "$f64"; then want64="TC_TESTS"; have64="$TC64"; other64="$CTRL64"; h64="test_helpers"
+        else continue; fi
+        if ! printf '%s\n' "$have64" | grep -qx "$name64"; then
+            if printf '%s\n' "$other64" | grep -qx "$name64"; then
+                red "✗ controller/tests/${name64}.rs uses the ${h64} harness but is registered in the OTHER runner list — it starts in CI and dies before any assertion; move it to ${want64}"
+            else
+                red "✗ controller/tests/${name64}.rs uses the ${h64} harness but is in neither runner list; add it to ${want64}"
+            fi
+            CI_GATE_FAIL=1
+        fi
+    done
     if [ "$CI_GATE_FAIL" -eq 0 ]; then
         green "✓ all $CI_GATE_SCANNED cargo test targets are gated or explicitly marked ci-ungated (runners wired, no stale entries)"
     fi
