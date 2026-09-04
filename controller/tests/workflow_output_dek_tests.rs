@@ -86,11 +86,10 @@ async fn workflow_output_writes_v4_under_workflow_org_dek_and_reads_back() {
     assert_eq!(kid, org_dek.id, "must use the workflow's org DEK");
 
     // Reads back decrypted through the versioned path.
-    let row = repo
-        .get_execution(exec, user)
-        .await
-        .unwrap()
-        .expect("execution row present");
+    let row = match repo.lookup_execution(exec, user).await.unwrap() {
+        talos_execution_repository::ExecutionLookup::Live(r) => r,
+        other => panic!("execution row must be Live, got {other:?}"),
+    };
     assert_eq!(row.output_data, Some(output));
 }
 
@@ -181,11 +180,10 @@ async fn re_encrypt_outputs_to_org_migrates_v3_global_rows_to_v4() {
     let org_dek = sm.get_active_dek_for_org(org).await.unwrap().unwrap();
     assert_eq!(rkid, org_dek.id, "row must now reference the org DEK");
 
-    let row = repo
-        .get_execution(exec, user)
-        .await
-        .unwrap()
-        .expect("execution row");
+    let row = match repo.lookup_execution(exec, user).await.unwrap() {
+        talos_execution_repository::ExecutionLookup::Live(r) => r,
+        other => panic!("execution row must be Live, got {other:?}"),
+    };
     assert_eq!(
         row.output_data,
         Some(output),

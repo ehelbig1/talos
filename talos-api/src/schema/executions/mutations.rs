@@ -71,6 +71,12 @@ impl ExecutionsMutations {
                     | OrchestrationError::ValidationFailed(_)
                     | OrchestrationError::WorkflowNotFound(_)
                     | OrchestrationError::ExecutionNotFound(_)
+                    // ARCHIVED is not ABSENT — the row exists and the caller
+                    // may see it, retention just moved it out of the live
+                    // table. Its Display renders id + timestamp, both facts
+                    // the caller already owns, so it surfaces verbatim like
+                    // the other actionable variants.
+                    | OrchestrationError::ExecutionArchived(..)
                     | OrchestrationError::ExecutionPaused
                     | OrchestrationError::WorkflowDisabled(_)
                     | OrchestrationError::StatusConflict(_)

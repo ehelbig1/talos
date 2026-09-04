@@ -43,6 +43,89 @@ pub struct ExecutionRow {
     pub acknowledgement_reason: Option<String>,
 }
 
+/// The three ways an execution id can resolve for a given user: it is in the
+/// live table, it has been moved to `workflow_executions_archive` by the
+/// retention sweep, or there is no such execution the caller can see.
+///
+/// **`Archived` is not `Absent`.** The distinction did not exist before #746
+/// because the archive had never held a row; the moment it did, every by-id
+/// reader answered "Execution not found or access denied" for executions that
+/// were both found and permitted. Callers must `match` all three arms — there
+/// is no accessor that merges `Archived` into `Absent`, and nothing here
+/// converts to `Option`.
+#[derive(Debug)]
+#[must_use = "an execution lookup must be classified: Archived is not Absent"]
+pub enum ExecutionLookup {
+    /// The execution is in `workflow_executions`.
+    Live(ExecutionRow),
+    /// The execution was moved to `workflow_executions_archive` at
+    /// `archived_at`. The row itself is complete (the archive is column-for-
+    /// column identical to the live table plus `archived_at`, asserted by
+    /// `archive_schema_parity_in_the_database`), including the encrypted
+    /// output payload — but its `execution_events` and
+    /// `workflow_execution_logs` children were CASCADEd away by the move, so
+    /// event-derived views have nothing left to render.
+    Archived {
+        row: ExecutionRow,
+        archived_at: DateTime<Utc>,
+    },
+    /// No execution with that id is visible to this user (it never existed,
+    /// it belongs to someone else, or it was purged after the archive window).
+    Absent,
+}
+
+/// The projection every `ExecutionRow` read shares. `id` and
+/// `output_data_format` are load-bearing for `read_output_from_row`'s AEAD
+/// dispatch (see its contract) — do not trim them.
+///
+/// The archive is column-for-column identical to the live table (plus
+/// `archived_at`), so ONE projection and ONE row mapping serve both. That is
+/// not an accident to rely on quietly: `archive_schema_parity_in_the_database`
+/// fails the moment the two diverge.
+///
+/// A macro rather than a `const` so the two queries below are assembled by
+/// `concat!` at COMPILE time. The house rule is "never string-concatenate
+/// SQL"; a runtime `format!` over a constant is safe in fact but it is also
+/// the shape lint check 70 cannot read, and a literal costs nothing.
+macro_rules! execution_row_columns {
+    () => {
+        "id, workflow_id, status, started_at, completed_at, output_data, \
+         output_data_enc, output_enc_key_id, output_data_format, \
+         error_message, is_pinned, pin_note, replayed_from_id, actor_id, \
+         workflow_version_id, priority, is_test_execution, provenance, \
+         acknowledged_at, acknowledgement_reason"
+    };
+}
+
+/// Map a row selected with `execution_row_columns!()` into an [`ExecutionRow`].
+/// `output_data` is passed in because decryption is async and this is not.
+fn execution_row_from(
+    r: &sqlx::postgres::PgRow,
+    output_data: Option<serde_json::Value>,
+) -> Result<ExecutionRow> {
+    Ok(ExecutionRow {
+        id: r.try_get("id")?,
+        workflow_id: r.try_get("workflow_id")?,
+        status: r.try_get("status")?,
+        started_at: r.try_get::<Option<_>, _>("started_at")?,
+        completed_at: r.try_get::<Option<_>, _>("completed_at")?,
+        output_data,
+        error_message: r.try_get::<Option<_>, _>("error_message")?,
+        is_pinned: r.try_get::<Option<_>, _>("is_pinned")?.unwrap_or(false),
+        pin_note: r.try_get::<Option<_>, _>("pin_note")?,
+        replayed_from_id: r.try_get::<Option<_>, _>("replayed_from_id")?,
+        actor_id: r.try_get::<Option<_>, _>("actor_id")?,
+        workflow_version_id: r.try_get::<Option<_>, _>("workflow_version_id")?,
+        priority: r.try_get::<Option<_>, _>("priority")?,
+        is_test_execution: r
+            .try_get::<Option<_>, _>("is_test_execution")?
+            .unwrap_or(false),
+        provenance: r.try_get::<Option<_>, _>("provenance")?,
+        acknowledged_at: r.try_get::<Option<_>, _>("acknowledged_at")?,
+        acknowledgement_reason: r.try_get::<Option<_>, _>("acknowledgement_reason")?,
+    })
+}
+
 #[derive(Debug)]
 pub struct ExecutionSummary {
     pub id: Uuid,
@@ -925,9 +1008,9 @@ impl ExecutionRepository {
 
     // ── Execution reads ────────────────────────────────────────────────────
 
-    /// Batch sibling to [`get_execution`]. Single round-trip via
+    /// Batch sibling to [`lookup_execution`]. Single round-trip via
     /// `WHERE id = ANY($1) AND user_id = $2`, replacing the per-id
-    /// `get_execution` loop used by report-style handlers (comparison,
+    /// per-id lookup loop used by report-style handlers (comparison,
     /// lineage tree, etc.). Per-row decryption runs sequentially after
     /// the SELECT — multiple rows often share a DEK, so the cache makes
     /// repeated key-fetches O(1) after the first.
@@ -936,7 +1019,7 @@ impl ExecutionRepository {
     /// are returned in DB-default order (no ORDER BY); callers who need
     /// the original input ordering should index by id.
     ///
-    /// Security: same user-bound scoping as `get_execution` — an attacker
+    /// Security: same user-bound scoping as `lookup_execution` — an attacker
     /// passing another user's id sees that row excluded from the result.
     pub async fn get_executions_by_ids(
         &self,
@@ -987,56 +1070,76 @@ impl ExecutionRepository {
         Ok(out)
     }
 
-    /// Full execution record for a user-scoped ID. Returns None if not found/access denied.
-    /// Transparently decrypts output if stored encrypted.
-    pub async fn get_execution(
-        &self,
-        exec_id: Uuid,
-        user_id: Uuid,
-    ) -> Result<Option<ExecutionRow>> {
+    /// Resolve an execution by id, three ways: it is LIVE, it is ARCHIVED, or
+    /// it is ABSENT.
+    ///
+    /// This replaced `get_execution(..) -> Result<Option<ExecutionRow>>`, which
+    /// read `workflow_executions` alone and therefore could not tell an
+    /// archived execution from one that never existed. Until #746 that was
+    /// academic — `workflow_executions_archive` had held zero rows across the
+    /// platform's entire history, so no reader had ever had to represent an
+    /// archived execution. The first real archival pass moved 96 rows, and
+    /// every by-id reader immediately began answering `Execution not found or
+    /// access denied` for a row that is *found* (the archive holds it, and
+    /// `list_archived_executions` returns it) and *not denied* (same user).
+    ///
+    /// Returning an enum rather than an `Option` is the point: a caller cannot
+    /// re-collapse the two without writing the `Archived` arm. There is
+    /// deliberately no `Into<Option<ExecutionRow>>`, no `row()` accessor and no
+    /// `ok()`; the type is `#[must_use]`.
+    ///
+    /// Both reads run on the SAME `begin_user_scoped` transaction, so the
+    /// archive read carries the identical tenancy scoping (app-layer
+    /// `user_id = $2` plus the RLS policy `workflow_executions_archive`
+    /// gained in `20260904210000_rls_workflow_executions_archive.sql`).
+    /// The archive query only runs on a live MISS, which is the rare case —
+    /// no UNION on the hot path.
+    pub async fn lookup_execution(&self, exec_id: Uuid, user_id: Uuid) -> Result<ExecutionLookup> {
         // RFC 0005 S3: self-scope on a per-user tx so the
         // workflow_executions RLS policy backstops the read for ALL callers
         // (the MCP execution handlers + the GraphQL module-execution
         // resolver), with no per-caller change. The query already filters
         // `user_id = $2`; the scope's user-clause mirrors it.
         let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
-        let row = sqlx::query(
-            "SELECT id, workflow_id, status, started_at, completed_at, output_data, \
-                    output_data_enc, output_enc_key_id, output_data_format, \
-                    error_message, is_pinned, pin_note, replayed_from_id, actor_id, \
-                    workflow_version_id, priority, is_test_execution, provenance, \
-                    acknowledged_at, acknowledgement_reason \
-             FROM workflow_executions WHERE id = $1 AND user_id = $2",
-        )
+        let live = sqlx::query(concat!(
+            "SELECT ",
+            execution_row_columns!(),
+            " FROM workflow_executions WHERE id = $1 AND user_id = $2"
+        ))
+        .bind(exec_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if let Some(r) = live {
+            tx.commit().await?;
+            let output_data = self.read_output_from_row(&r).await?;
+            return Ok(ExecutionLookup::Live(execution_row_from(&r, output_data)?));
+        }
+
+        // Live miss. The row may have been moved to the archive by the
+        // retention sweep — `archived_at` is the moment of the move.
+        let archived = sqlx::query(concat!(
+            "SELECT ",
+            execution_row_columns!(),
+            ", archived_at \
+             FROM workflow_executions_archive WHERE id = $1 AND user_id = $2"
+        ))
         .bind(exec_id)
         .bind(user_id)
         .fetch_optional(&mut *tx)
         .await?;
         tx.commit().await?;
 
-        let Some(r) = row else { return Ok(None) };
+        let Some(r) = archived else {
+            return Ok(ExecutionLookup::Absent);
+        };
+        let archived_at: DateTime<Utc> = r.try_get("archived_at")?;
         let output_data = self.read_output_from_row(&r).await?;
-        Ok(Some(ExecutionRow {
-            id: r.try_get("id")?,
-            workflow_id: r.try_get("workflow_id")?,
-            status: r.try_get("status")?,
-            started_at: r.try_get::<Option<_>, _>("started_at")?,
-            completed_at: r.try_get::<Option<_>, _>("completed_at")?,
-            output_data,
-            error_message: r.try_get::<Option<_>, _>("error_message")?,
-            is_pinned: r.try_get::<Option<_>, _>("is_pinned")?.unwrap_or(false),
-            pin_note: r.try_get::<Option<_>, _>("pin_note")?,
-            replayed_from_id: r.try_get::<Option<_>, _>("replayed_from_id")?,
-            actor_id: r.try_get::<Option<_>, _>("actor_id")?,
-            workflow_version_id: r.try_get::<Option<_>, _>("workflow_version_id")?,
-            priority: r.try_get::<Option<_>, _>("priority")?,
-            is_test_execution: r
-                .try_get::<Option<_>, _>("is_test_execution")?
-                .unwrap_or(false),
-            provenance: r.try_get::<Option<_>, _>("provenance")?,
-            acknowledged_at: r.try_get::<Option<_>, _>("acknowledged_at")?,
-            acknowledgement_reason: r.try_get::<Option<_>, _>("acknowledgement_reason")?,
-        }))
+        Ok(ExecutionLookup::Archived {
+            row: execution_row_from(&r, output_data)?,
+            archived_at,
+        })
     }
 
     /// Executions for a workflow (paginated). Left joins workflow to get name.
@@ -1046,7 +1149,7 @@ impl ExecutionRepository {
     /// page query stays cheap; the count can be approximated server-side
     /// in a future optimisation if it becomes a hot path.
     pub async fn count_executions(&self, wf_id: Uuid, user_id: Uuid) -> Result<i64> {
-        // RFC 0005 S3: self-scope (see get_execution).
+        // RFC 0005 S3: self-scope (see lookup_execution).
         let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM workflow_executions WHERE workflow_id = $1 AND user_id = $2",
@@ -1066,7 +1169,7 @@ impl ExecutionRepository {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<ExecutionSummary>> {
-        // RFC 0005 S3: self-scope (see get_execution). The LEFT JOIN to
+        // RFC 0005 S3: self-scope (see lookup_execution). The LEFT JOIN to
         // workflows also picks up the workflows RLS backstop.
         let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let rows = sqlx::query(
@@ -1677,7 +1780,7 @@ impl ExecutionRepository {
     ) -> Result<Option<(Uuid, String)>> {
         // Scoped by user_id via JOIN on workflows. All current callers check
         // ownership upstream (handle_enqueue_workflow / handle_retry_execution
-        // both verify via get_workflow_graph_for_user / get_execution before
+        // both verify via get_workflow_graph_for_user / lookup_execution before
         // reaching this), but the SQL itself enforces it as defense in depth
         // — a future refactor that calls this without an upstream check
         // would silently leak another user's active graph otherwise.
@@ -2798,7 +2901,7 @@ impl ExecutionRepository {
         Ok(())
     }
 
-    /// Poll [`get_execution`] every 150 ms until the execution reaches a
+    /// Poll [`lookup_execution`] every 150 ms until the execution reaches a
     /// terminal status (`completed` / `failed` / `cancelled`) or `timeout`
     /// elapses. Returns:
     /// * `Some(status)` when a terminal row was observed within the window
@@ -2822,7 +2925,13 @@ impl ExecutionRepository {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             tokio::time::sleep(POLL_INTERVAL).await;
-            if let Ok(Some(row)) = self.get_execution(execution_id, user_id).await {
+            // Deliberately `Live` only. This polls an execution created
+            // milliseconds ago against a ≤30 s deadline; the retention sweep
+            // archives on a day-scale window, so `Archived` here is not a
+            // reachable state and treating it as one would be theatre.
+            if let Ok(ExecutionLookup::Live(row)) =
+                self.lookup_execution(execution_id, user_id).await
+            {
                 if matches!(row.status.as_str(), "completed" | "failed" | "cancelled") {
                     return Some(row.status);
                 }

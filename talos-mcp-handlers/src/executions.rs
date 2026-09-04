@@ -1,9 +1,11 @@
 use super::types::JsonRpcResponse;
 use super::utils::{mcp_error, mcp_text};
 use super::{auth, McpState};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::fmt::Write as FmtWrite;
 use std::sync::Arc;
+use talos_execution_repository::ExecutionLookup;
 use uuid::Uuid;
 
 pub fn tool_schemas() -> Vec<serde_json::Value> {
@@ -586,6 +588,124 @@ fn build_node_label_map(
 /// here for the two execution-trace call sites below.
 use talos_failure_analysis_service::build_node_display_label_map;
 
+// ── Archived executions ──────────────────────────────────────────────────────
+//
+// `ExecutionRepository::lookup_execution` is three-way: Live / Archived /
+// Absent. Before #746 the archive had never held a row, so every reader here
+// collapsed the last two and answered "Execution not found or access denied"
+// — a sentence with two clauses, BOTH false for an archived execution: it IS
+// found (`list_archived_executions` returns it) and access is NOT denied
+// (same user, same tenancy predicate).
+//
+// The helpers below are the one place that fact is rendered, so the wording
+// cannot drift between the fourteen call sites.
+
+/// What survives the archival move, stated once. `execution_events` and
+/// `workflow_execution_logs` carry `ON DELETE CASCADE` to
+/// `workflow_executions`, so the move destroys them; the execution ROW
+/// (status, timestamps, error_message, the encrypted output payload) moves
+/// intact, and `module_executions` / `execution_cost_rollup` /
+/// `execution_memory_context` / `judge_scores` / `llm_usage` still reference
+/// it by id.
+///
+/// Measured on the dev fleet against the first 96 archived rows:
+/// events 0, logs 0, module_executions 294, cost_rollup 294,
+/// memory_context 694, judge_scores 16, llm_usage 15.
+pub(crate) const ARCHIVED_EVENTS_GONE: &str =
+    "its per-node events and logs were not retained past the archive window";
+
+/// One-line operator-facing note for a report rendered FROM the archive.
+pub(crate) fn archived_note(archived_at: DateTime<Utc>) -> String {
+    format!(
+        "This execution was archived at {} and is being read from \
+         workflow_executions_archive. The execution row is complete; {}.",
+        archived_at.to_rfc3339(),
+        ARCHIVED_EVENTS_GONE
+    )
+}
+
+/// Stamp the archival provenance onto a JSON report object. A no-op for a
+/// live execution, so every call site can pass its `Option` unconditionally
+/// and none of them has to remember a conditional.
+pub(crate) fn stamp_archived(report: &mut Value, archived_at: Option<DateTime<Utc>>) {
+    let Some(at) = archived_at else { return };
+    let Some(obj) = report.as_object_mut() else {
+        return;
+    };
+    obj.insert("archived".to_string(), Value::Bool(true));
+    obj.insert("archived_at".to_string(), Value::String(at.to_rfc3339()));
+    obj.insert(
+        "archived_note".to_string(),
+        Value::String(archived_note(at)),
+    );
+}
+
+/// Answer a report request that MAY be reading an archived execution.
+///
+/// One place, so the TEN read handlers that funnel through it cannot each
+/// decide differently whether to mention it (`build_execution_trace_json` is
+/// the eleventh read path and stamps its finished report directly, since it
+/// returns a `String` rather than a response). `archived_at == None` returns `body` byte-for-byte
+/// — a live execution's response is completely unchanged by this change.
+///
+/// For an archived one, three cases, and the split is about not breaking a
+/// caller's parse:
+///
+/// * a JSON **object** is stamped IN PLACE with `archived` / `archived_at` /
+///   `archived_note`. Purely additive — every existing field keeps its
+///   position and meaning.
+/// * a JSON **array or scalar** is WRAPPED as
+///   `{archived, archived_at, archived_note, result: <original>}`. Prefixing
+///   prose to it would make the response unparseable, and returning the bare
+///   value would hide the fact. `get_execution_logs` is the case that forces
+///   this: archival CASCADEs `workflow_execution_logs` away, so its array is
+///   `[]`, and a caller testing `.length === 0` would read "this execution
+///   logged nothing" where the truth is "we no longer have its logs". After
+///   the wrap that test yields `undefined`, not `0` — the shape changes so
+///   the claim cannot be made by accident.
+/// * **prose** (the timeline / waterfall / sub-workflow renderers) gets the
+///   note as a leading line. Prose has no parse contract to break, and a
+///   human reads the first line first.
+///
+/// The re-parse is deliberate and cheap at this call rate: these are
+/// per-request operator report tools, not a hot path, and paying one parse
+/// buys the guarantee that no site renders an archived row as if it were live.
+pub(crate) fn respond_maybe_archived(
+    req_id: Option<Value>,
+    archived_at: Option<DateTime<Utc>>,
+    body: impl Into<String>,
+) -> JsonRpcResponse {
+    let body = body.into();
+    let Some(at) = archived_at else {
+        return mcp_text(req_id, &body);
+    };
+    if let Ok(v) = serde_json::from_str::<Value>(&body) {
+        let mut out = if v.is_object() {
+            v
+        } else {
+            serde_json::json!({ "result": v })
+        };
+        stamp_archived(&mut out, Some(at));
+        return mcp_text(req_id, &serde_json::to_string_pretty(&out).unwrap_or(body));
+    }
+    mcp_text(req_id, &format!("{}\n\n{}", archived_note(at), body))
+}
+
+/// The refusal for an operation that ACTS ON an execution (cancel, retry,
+/// replay, acknowledge, watch). The row is real and the caller is permitted —
+/// the operation is refused because of WHERE the row now lives, and the
+/// message says exactly that. It must never reuse the not-found wording:
+/// that is the whole defect, and it sends an operator to the permissions
+/// model during what is actually a retention event.
+pub(crate) fn archived_refusal(action: &str, exec_id: Uuid, archived_at: DateTime<Utc>) -> String {
+    format!(
+        "Cannot {action}: execution {exec_id} was archived at {} and is no longer in the live \
+         executions table. It remains readable via list_archived_executions and \
+         get_execution_status.",
+        archived_at.to_rfc3339()
+    )
+}
+
 async fn handle_get_execution_status(
     req_id: Option<serde_json::Value>,
     args: &Value,
@@ -608,14 +728,27 @@ async fn handle_get_execution_status(
     };
     if detail {
         return match build_execution_trace_json(exec_id, user_id, state).await {
+            // `build_execution_trace_json` does its own three-way lookup and
+            // stamps the archival fields itself, so this early return (which
+            // happens BEFORE this handler's own lookup) must not re-stamp.
             Ok(trace) => mcp_text(req_id, &trace),
             Err(msg) => mcp_error(req_id, -32000, &msg),
         };
     }
 
-    let exec = match state.execution_repo.get_execution(exec_id, user_id).await {
-        Ok(Some(e)) => e,
-        Ok(None) => return mcp_error(req_id, -32000, "Execution not found or access denied"),
+    let (exec, archived_at) = match state
+        .execution_repo
+        .lookup_execution(exec_id, user_id)
+        .await
+    {
+        Ok(ExecutionLookup::Live(e)) => (e, None),
+        // ARCHIVED is not ABSENT. The row is complete in the archive, so
+        // this report is rendered from it and STAMPED as archived — an
+        // unlabelled archived row would read as a live one.
+        Ok(ExecutionLookup::Archived { row, archived_at }) => (row, Some(archived_at)),
+        Ok(ExecutionLookup::Absent) => {
+            return mcp_error(req_id, -32000, "Execution not found or access denied")
+        }
         Err(e) => {
             tracing::error!(execution_id = %exec_id, "get_execution_status query failed: {}", e);
             return mcp_error(req_id, -32000, "Failed to query execution");
@@ -695,9 +828,10 @@ async fn handle_get_execution_status(
             );
         }
     }
-    mcp_text(
+    respond_maybe_archived(
         req_id,
-        &serde_json::to_string_pretty(&summary).unwrap_or_default(),
+        archived_at,
+        serde_json::to_string_pretty(&summary).unwrap_or_default(),
     )
 }
 
@@ -1053,7 +1187,7 @@ async fn handle_cancel_execution(
         Ok(_) => {
             // rows_affected = 0: either the ID doesn't exist or already in terminal state.
             // Do a follow-up read so we can give an actionable message.
-            match state.execution_repo.get_execution(exec_id, user_id).await {
+            match state.execution_repo.lookup_execution(exec_id, user_id).await {
                 // MCP-57 (2026-05-07): align error wording with the
                 // canonical "current status: X" phrasing used by the
                 // orchestration service (see retry_execution / replay_*
@@ -1061,7 +1195,7 @@ async fn handle_cancel_execution(
                 // cancel path used "already in terminal state" while
                 // sibling action tools used "current status" — same
                 // class of error, two different operator-facing strings.
-                Ok(Some(exec)) => mcp_error(
+                Ok(ExecutionLookup::Live(exec)) => mcp_error(
                     req_id,
                     -32000,
                     &format!(
@@ -1070,7 +1204,18 @@ async fn handle_cancel_execution(
                         exec.status
                     ),
                 ),
-                Ok(None) => {
+                // This whole branch is the "0 rows affected" diagnosis. An
+                // archived execution explains that outcome exactly: the
+                // UPDATE could not match because the row is no longer in
+                // `workflow_executions`. Saying "not found or access
+                // denied" here would send an operator to the permissions
+                // model for a retention event.
+                Ok(ExecutionLookup::Archived { archived_at, .. }) => mcp_error(
+                    req_id,
+                    -32000,
+                    &archived_refusal("cancel execution", exec_id, archived_at),
+                ),
+                Ok(ExecutionLookup::Absent) => {
                     mcp_error(req_id, -32000, "Execution not found or access denied")
                 }
                 Err(e) => {
@@ -1169,9 +1314,19 @@ async fn handle_get_execution_logs(
     };
 
     // Verify the execution belongs to this user and get workflow_id for label resolution
-    let exec = match state.execution_repo.get_execution(exec_id, user_id).await {
-        Ok(Some(e)) => e,
-        Ok(None) => return mcp_error(req_id, -32000, "Execution not found or access denied"),
+    let (exec, archived_at) = match state
+        .execution_repo
+        .lookup_execution(exec_id, user_id)
+        .await
+    {
+        Ok(ExecutionLookup::Live(e)) => (e, None),
+        // ARCHIVED is not ABSENT. The row is complete in the archive, so
+        // this report is rendered from it and STAMPED as archived — an
+        // unlabelled archived row would read as a live one.
+        Ok(ExecutionLookup::Archived { row, archived_at }) => (row, Some(archived_at)),
+        Ok(ExecutionLookup::Absent) => {
+            return mcp_error(req_id, -32000, "Execution not found or access denied")
+        }
         Err(e) => {
             tracing::error!(execution_id = %exec_id, "get_execution_logs: load failed: {}", e);
             return mcp_error(req_id, -32000, "Failed to load execution");
@@ -1242,9 +1397,10 @@ async fn handle_get_execution_logs(
         })
         .collect();
 
-    mcp_text(
+    respond_maybe_archived(
         req_id,
-        &serde_json::to_string_pretty(&event_list).unwrap_or_default(),
+        archived_at,
+        serde_json::to_string_pretty(&event_list).unwrap_or_default(),
     )
 }
 
@@ -1587,9 +1743,19 @@ async fn handle_get_node_output(
         _ => return mcp_error(req_id, -32602, "Missing or empty node_id"),
     };
 
-    let exec = match state.execution_repo.get_execution(exec_id, user_id).await {
-        Ok(Some(e)) => e,
-        Ok(None) => return mcp_error(req_id, -32000, "Execution not found or access denied"),
+    let (exec, archived_at) = match state
+        .execution_repo
+        .lookup_execution(exec_id, user_id)
+        .await
+    {
+        Ok(ExecutionLookup::Live(e)) => (e, None),
+        // ARCHIVED is not ABSENT. The row is complete in the archive, so
+        // this report is rendered from it and STAMPED as archived — an
+        // unlabelled archived row would read as a live one.
+        Ok(ExecutionLookup::Archived { row, archived_at }) => (row, Some(archived_at)),
+        Ok(ExecutionLookup::Absent) => {
+            return mcp_error(req_id, -32000, "Execution not found or access denied")
+        }
         Err(e) => {
             tracing::error!("get_node_output query failed: {}", e);
             return mcp_error(req_id, -32000, "Failed to fetch execution output");
@@ -1619,16 +1785,18 @@ async fn handle_get_node_output(
     ];
     for key in &try_keys {
         if let Some(node_output) = data.get(key) {
-            return mcp_text(
+            return respond_maybe_archived(
                 req_id,
-                &serde_json::to_string_pretty(node_output).unwrap_or_default(),
+                archived_at,
+                serde_json::to_string_pretty(node_output).unwrap_or_default(),
             );
         }
         if let Some(nodes_obj) = data.get("nodes").or_else(|| data.get("results")) {
             if let Some(node_output) = nodes_obj.get(key) {
-                return mcp_text(
+                return respond_maybe_archived(
                     req_id,
-                    &serde_json::to_string_pretty(node_output).unwrap_or_default(),
+                    archived_at,
+                    serde_json::to_string_pretty(node_output).unwrap_or_default(),
                 );
             }
         }
@@ -1644,9 +1812,10 @@ async fn handle_get_node_output(
         let alt_uuid = compute_node_uuid_from_rf_id(&rf_id).to_string();
         for key in [&rf_id, &alt_uuid] {
             if let Some(node_output) = data.get(key) {
-                return mcp_text(
+                return respond_maybe_archived(
                     req_id,
-                    &serde_json::to_string_pretty(node_output).unwrap_or_default(),
+                    archived_at,
+                    serde_json::to_string_pretty(node_output).unwrap_or_default(),
                 );
             }
         }
@@ -2027,9 +2196,19 @@ async fn handle_get_execution_timeline(
     };
 
     // Load execution record
-    let exec = match state.execution_repo.get_execution(exec_id, user_id).await {
-        Ok(Some(e)) => e,
-        Ok(None) => return mcp_error(req_id, -32000, "Execution not found or access denied"),
+    let (exec, archived_at) = match state
+        .execution_repo
+        .lookup_execution(exec_id, user_id)
+        .await
+    {
+        Ok(ExecutionLookup::Live(e)) => (e, None),
+        // ARCHIVED is not ABSENT. The row is complete in the archive, so
+        // this report is rendered from it and STAMPED as archived — an
+        // unlabelled archived row would read as a live one.
+        Ok(ExecutionLookup::Archived { row, archived_at }) => (row, Some(archived_at)),
+        Ok(ExecutionLookup::Absent) => {
+            return mcp_error(req_id, -32000, "Execution not found or access denied")
+        }
         Err(e) => {
             tracing::error!(execution_id = %exec_id, "get_execution_timeline: load failed: {}", e);
             return mcp_error(req_id, -32000, "Failed to load execution");
@@ -2217,7 +2396,7 @@ async fn handle_get_execution_timeline(
         }
     }
 
-    mcp_text(req_id, &timeline)
+    respond_maybe_archived(req_id, archived_at, timeline)
 }
 
 async fn handle_pin_execution(
@@ -3009,9 +3188,19 @@ async fn handle_get_sub_workflow_output(
     };
 
     // Load the parent execution's output_data
-    let exec = match state.execution_repo.get_execution(exec_id, user_id).await {
-        Ok(Some(e)) => e,
-        Ok(None) => return mcp_error(req_id, -32000, "Execution not found or access denied"),
+    let (exec, archived_at) = match state
+        .execution_repo
+        .lookup_execution(exec_id, user_id)
+        .await
+    {
+        Ok(ExecutionLookup::Live(e)) => (e, None),
+        // ARCHIVED is not ABSENT. The row is complete in the archive, so
+        // this report is rendered from it and STAMPED as archived — an
+        // unlabelled archived row would read as a live one.
+        Ok(ExecutionLookup::Archived { row, archived_at }) => (row, Some(archived_at)),
+        Ok(ExecutionLookup::Absent) => {
+            return mcp_error(req_id, -32000, "Execution not found or access denied")
+        }
         Err(e) => {
             tracing::error!("get_sub_workflow_output: load failed: {}", e);
             return mcp_error(req_id, -32000, "Failed to load execution");
@@ -3054,7 +3243,7 @@ async fn handle_get_sub_workflow_output(
                         .push_str(&serde_json::to_string_pretty(sub_output).unwrap_or_default());
                 }
 
-                mcp_text(req_id, &formatted)
+                respond_maybe_archived(req_id, archived_at, formatted)
             } else {
                 // List available node IDs for guidance
                 let available: Vec<&str> = output_data
@@ -3096,9 +3285,26 @@ async fn handle_watch_execution(
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse::<uuid::Uuid>().ok())
     {
-        match state.execution_repo.get_execution(exec_id, user_id).await {
-            Ok(Some(e)) => e,
-            Ok(None) => return mcp_error(req_id, -32000, "Execution not found or access denied"),
+        match state
+            .execution_repo
+            .lookup_execution(exec_id, user_id)
+            .await
+        {
+            Ok(ExecutionLookup::Live(e)) => e,
+            // `watch_execution` polls for progress on a run that is still
+            // going. An archived execution is terminal AND its
+            // `execution_events` were CASCADEd away by the move, so there
+            // is nothing to watch — a genuine refusal, but not an absence.
+            Ok(ExecutionLookup::Archived { archived_at, .. }) => {
+                return mcp_error(
+                    req_id,
+                    -32000,
+                    &archived_refusal("watch this execution", exec_id, archived_at),
+                )
+            }
+            Ok(ExecutionLookup::Absent) => {
+                return mcp_error(req_id, -32000, "Execution not found or access denied")
+            }
             Err(e) => {
                 tracing::error!("watch_execution failed: {}", e);
                 return mcp_error(req_id, -32000, "Failed to load execution");
@@ -3367,9 +3573,19 @@ async fn handle_get_execution_output(
         Err(resp) => return resp,
     };
 
-    let exec = match state.execution_repo.get_execution(exec_id, user_id).await {
-        Ok(Some(e)) => e,
-        Ok(None) => return mcp_error(req_id, -32000, "Execution not found or access denied"),
+    let (exec, archived_at) = match state
+        .execution_repo
+        .lookup_execution(exec_id, user_id)
+        .await
+    {
+        Ok(ExecutionLookup::Live(e)) => (e, None),
+        // ARCHIVED is not ABSENT. The row is complete in the archive, so
+        // this report is rendered from it and STAMPED as archived — an
+        // unlabelled archived row would read as a live one.
+        Ok(ExecutionLookup::Archived { row, archived_at }) => (row, Some(archived_at)),
+        Ok(ExecutionLookup::Absent) => {
+            return mcp_error(req_id, -32000, "Execution not found or access denied")
+        }
         Err(e) => {
             tracing::error!("get_execution_output: load failed: {}", e);
             return mcp_error(req_id, -32000, "Failed to fetch execution");
@@ -3377,10 +3593,25 @@ async fn handle_get_execution_output(
     };
 
     let Some(output) = exec.output_data else {
-        return mcp_text(
-            req_id,
-            "Execution has no output data (may still be running).",
-        );
+        // "may still be running" is FALSE for an archived execution — it is
+        // terminal by construction (only a terminal row is swept) — and it
+        // would CONTRADICT the archival note `respond_maybe_archived`
+        // prefixes above it. Two statements disagreeing inside one response
+        // is the shape this whole change exists to remove, so the archived
+        // case gets its own sentence.
+        return match archived_at {
+            None => mcp_text(
+                req_id,
+                "Execution has no output data (may still be running).",
+            ),
+            Some(at) => mcp_text(
+                req_id,
+                &format!(
+                    "{}\n\nThis archived execution has no stored output data.",
+                    archived_note(at)
+                ),
+            ),
+        };
     };
 
     // MCP-23 + MCP-24: build a UUID → label map from the workflow graph
@@ -3445,9 +3676,10 @@ async fn handle_get_execution_output(
         "nodes": nodes_array,
         "note": "Each entry surfaces both the per-execution node UUID (`node`) and the human-readable graph label (`node_label`, null when the node was removed from the graph or for engine-internal keys). Synthetic engine-internal trace nodes are filtered.",
     });
-    mcp_text(
+    respond_maybe_archived(
         req_id,
-        &serde_json::to_string_pretty(&body).unwrap_or_default(),
+        archived_at,
+        serde_json::to_string_pretty(&body).unwrap_or_default(),
     )
 }
 
@@ -4208,9 +4440,19 @@ async fn handle_get_execution_cost(
         Err(resp) => return resp,
     };
 
-    let exec = match state.execution_repo.get_execution(exec_id, user_id).await {
-        Ok(Some(e)) => e,
-        Ok(None) => return mcp_error(req_id, -32000, "Execution not found or access denied"),
+    let (exec, archived_at) = match state
+        .execution_repo
+        .lookup_execution(exec_id, user_id)
+        .await
+    {
+        Ok(ExecutionLookup::Live(e)) => (e, None),
+        // ARCHIVED is not ABSENT. The row is complete in the archive, so
+        // this report is rendered from it and STAMPED as archived — an
+        // unlabelled archived row would read as a live one.
+        Ok(ExecutionLookup::Archived { row, archived_at }) => (row, Some(archived_at)),
+        Ok(ExecutionLookup::Absent) => {
+            return mcp_error(req_id, -32000, "Execution not found or access denied")
+        }
         Err(e) => {
             tracing::error!("get_execution_cost query failed: {}", e);
             return mcp_error(req_id, -32000, "Failed to fetch execution");
@@ -4343,9 +4585,10 @@ async fn handle_get_execution_cost(
         "timing_source": timing_source,
     });
 
-    mcp_text(
+    respond_maybe_archived(
         req_id,
-        &serde_json::to_string_pretty(&result).unwrap_or_default(),
+        archived_at,
+        serde_json::to_string_pretty(&result).unwrap_or_default(),
     )
 }
 
@@ -4361,9 +4604,19 @@ async fn handle_get_execution_waterfall(
     };
 
     // Load execution record
-    let exec = match state.execution_repo.get_execution(exec_id, user_id).await {
-        Ok(Some(e)) => e,
-        Ok(None) => return mcp_error(req_id, -32000, "Execution not found or access denied"),
+    let (exec, archived_at) = match state
+        .execution_repo
+        .lookup_execution(exec_id, user_id)
+        .await
+    {
+        Ok(ExecutionLookup::Live(e)) => (e, None),
+        // ARCHIVED is not ABSENT. The row is complete in the archive, so
+        // this report is rendered from it and STAMPED as archived — an
+        // unlabelled archived row would read as a live one.
+        Ok(ExecutionLookup::Archived { row, archived_at }) => (row, Some(archived_at)),
+        Ok(ExecutionLookup::Absent) => {
+            return mcp_error(req_id, -32000, "Execution not found or access denied")
+        }
         Err(e) => {
             tracing::error!(execution_id = %exec_id, "get_execution_waterfall fetch failed: {}", e);
             return mcp_error(req_id, -32000, "Database error fetching execution");
@@ -4454,7 +4707,11 @@ async fn handle_get_execution_waterfall(
     }
 
     if timings.is_empty() {
-        return mcp_text(req_id, "No node timing data available for this execution.");
+        return respond_maybe_archived(
+            req_id,
+            archived_at,
+            "No node timing data available for this execution.",
+        );
     }
 
     // Sort by start time
@@ -4549,7 +4806,7 @@ async fn handle_get_execution_waterfall(
         ));
     }
 
-    mcp_text(req_id, &waterfall)
+    respond_maybe_archived(req_id, archived_at, waterfall)
 }
 
 async fn handle_get_execution_replay_chain(
@@ -4564,9 +4821,19 @@ async fn handle_get_execution_replay_chain(
     };
 
     // Fetch the base execution record (user-scoped)
-    let exec = match state.execution_repo.get_execution(exec_id, user_id).await {
-        Ok(Some(e)) => e,
-        Ok(None) => return mcp_error(req_id, -32000, "Execution not found or access denied"),
+    let (exec, archived_at) = match state
+        .execution_repo
+        .lookup_execution(exec_id, user_id)
+        .await
+    {
+        Ok(ExecutionLookup::Live(e)) => (e, None),
+        // ARCHIVED is not ABSENT. The row is complete in the archive, so
+        // this report is rendered from it and STAMPED as archived — an
+        // unlabelled archived row would read as a live one.
+        Ok(ExecutionLookup::Archived { row, archived_at }) => (row, Some(archived_at)),
+        Ok(ExecutionLookup::Absent) => {
+            return mcp_error(req_id, -32000, "Execution not found or access denied")
+        }
         Err(e) => {
             tracing::error!(execution_id = %exec_id, "get_execution_replay_chain fetch failed: {}", e);
             return mcp_error(req_id, -32000, "Database error fetching execution");
@@ -4604,9 +4871,10 @@ async fn handle_get_execution_replay_chain(
         "descendants": descendants.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
     });
 
-    mcp_text(
+    respond_maybe_archived(
         req_id,
-        &serde_json::to_string_pretty(&result).unwrap_or_default(),
+        archived_at,
+        serde_json::to_string_pretty(&result).unwrap_or_default(),
     )
 }
 
@@ -4795,9 +5063,21 @@ pub async fn build_execution_trace_json(
     user_id: Uuid,
     state: &McpState,
 ) -> Result<String, String> {
-    let exec = match state.execution_repo.get_execution(exec_id, user_id).await {
-        Ok(Some(e)) => e,
-        Ok(None) => return Err("Execution not found or access denied".to_string()),
+    let (exec, archived_at) = match state
+        .execution_repo
+        .lookup_execution(exec_id, user_id)
+        .await
+    {
+        Ok(ExecutionLookup::Live(e)) => (e, None),
+        // The execution row survives archival intact, so the trace HEADER
+        // (status, timings, error, output) is real. The per-node section
+        // below is built from `execution_events`, which the move CASCADEd
+        // away — so it will be empty, and the stamp says why rather than
+        // letting an empty node list read as "this workflow ran no nodes".
+        Ok(ExecutionLookup::Archived { row, archived_at }) => (row, Some(archived_at)),
+        Ok(ExecutionLookup::Absent) => {
+            return Err("Execution not found or access denied".to_string())
+        }
         Err(e) => {
             tracing::error!(execution_id = %exec_id, "build_execution_trace_json fetch failed: {}", e);
             return Err("Database error fetching execution".to_string());
@@ -5176,6 +5456,15 @@ pub async fn build_execution_trace_json(
         }
     });
 
+    // Stamp the archival provenance LAST, so it lands on the finished
+    // report. The per-node sections above were built from
+    // `execution_events`, which the archival move CASCADEs away — so for an
+    // archived execution `total_nodes` is 0 and `nodes` is empty. Without
+    // this stamp that reads as "the workflow ran no nodes", which is a
+    // statement about the workflow rather than about retention.
+    let mut result = result;
+    stamp_archived(&mut result, archived_at);
+
     Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
 }
 
@@ -5330,9 +5619,28 @@ async fn handle_acknowledge_execution_failure(
     };
 
     // Verify the execution exists, belongs to user, and is in a failed state.
-    let exec = match state.execution_repo.get_execution(exec_id, user_id).await {
-        Ok(Some(e)) => e,
-        Ok(None) => return mcp_error(req_id, -32000, "Execution not found or access denied"),
+    //
+    // This handler WRITES (`acknowledged_at` / `acknowledgement_reason` on
+    // `workflow_executions`), so an archived execution is a genuine refusal
+    // — the row is not in that table any more. What it is NOT is "not found
+    // or access denied": that sends an operator looking for a permissions
+    // problem instead of telling them the row aged out of the live tier.
+    let exec = match state
+        .execution_repo
+        .lookup_execution(exec_id, user_id)
+        .await
+    {
+        Ok(ExecutionLookup::Live(e)) => e,
+        Ok(ExecutionLookup::Archived { archived_at, .. }) => {
+            return mcp_error(
+                req_id,
+                -32000,
+                &archived_refusal("acknowledge this failure", exec_id, archived_at),
+            )
+        }
+        Ok(ExecutionLookup::Absent) => {
+            return mcp_error(req_id, -32000, "Execution not found or access denied")
+        }
         Err(e) => {
             tracing::error!(execution_id = %exec_id, "acknowledge_execution_failure fetch failed: {}", e);
             return mcp_error(req_id, -32000, "Database error fetching execution");
@@ -6000,9 +6308,19 @@ async fn handle_get_node_io(
     };
 
     // Load execution (ownership check)
-    let exec = match state.execution_repo.get_execution(exec_id, user_id).await {
-        Ok(Some(e)) => e,
-        Ok(None) => return mcp_error(req_id, -32000, "Execution not found or access denied"),
+    let (exec, archived_at) = match state
+        .execution_repo
+        .lookup_execution(exec_id, user_id)
+        .await
+    {
+        Ok(ExecutionLookup::Live(e)) => (e, None),
+        // ARCHIVED is not ABSENT. The row is complete in the archive, so
+        // this report is rendered from it and STAMPED as archived — an
+        // unlabelled archived row would read as a live one.
+        Ok(ExecutionLookup::Archived { row, archived_at }) => (row, Some(archived_at)),
+        Ok(ExecutionLookup::Absent) => {
+            return mcp_error(req_id, -32000, "Execution not found or access denied")
+        }
         Err(e) => {
             tracing::error!(execution_id = %exec_id, "get_node_io: load failed: {}", e);
             return mcp_error(req_id, -32000, "Failed to load execution");
@@ -6095,9 +6413,10 @@ async fn handle_get_node_io(
         })
         .unwrap_or(serde_json::Value::Null);
 
-    mcp_text(
+    respond_maybe_archived(
         req_id,
-        &serde_json::to_string_pretty(&serde_json::json!({
+        archived_at,
+        serde_json::to_string_pretty(&serde_json::json!({
             "node_id": node_id_str,
             "input": input_value,
             "output": output_value,
@@ -6274,5 +6593,208 @@ mod comparison_view_tests {
         let err = parse_comparison_view(&json!({"view": 3})).unwrap_err();
         assert!(err.contains("'view' must be a string"), "{err}");
         assert!(err.contains("number"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod archived_render_tests {
+    //! What an archived execution's report must SAY.
+    //!
+    //! Lint check 81 proves an archived execution is classified separately
+    //! from an absent one; it cannot prove the resulting answer is any good.
+    //! These pin the answer. They drive the production helpers directly —
+    //! `respond_maybe_archived` is the single funnel all ten read handlers'
+    //! success responses now pass through, and `archived_refusal` is the
+    //! single wording for the three that act.
+
+    use super::*;
+
+    fn at() -> DateTime<Utc> {
+        "2026-09-04T16:47:56Z".parse().unwrap()
+    }
+
+    fn body_of(resp: &JsonRpcResponse) -> String {
+        serde_json::to_string(&resp.result).unwrap()
+    }
+
+    /// The text payload the caller actually reads, unwrapped from the MCP
+    /// content envelope. Asserting on the escaped envelope instead is how the
+    /// first version of `an_archived_json_report_is_stamped` came to assert a
+    /// string that could never appear.
+    fn text_of(resp: &JsonRpcResponse) -> String {
+        resp.result
+            .as_ref()
+            .and_then(|r| r.get("content"))
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("text"))
+            .and_then(|t| t.as_str())
+            .expect("mcp_text response carries content[0].text")
+            .to_string()
+    }
+
+    /// A LIVE execution's response must be byte-for-byte what it was before
+    /// this change. The archived path is additive or it is a regression.
+    #[test]
+    fn a_live_response_is_unchanged() {
+        let json = r#"{"execution_id":"abc","status":"completed"}"#.to_string();
+        let with = respond_maybe_archived(None, None, json.clone());
+        let without = mcp_text(None, &json);
+        assert_eq!(
+            body_of(&with),
+            body_of(&without),
+            "archived_at = None must return the body untouched — a live execution's \
+             response is not this change's business"
+        );
+    }
+
+    /// A JSON object report gains the three archival fields.
+    #[test]
+    fn an_archived_json_report_is_stamped() {
+        let resp = respond_maybe_archived(
+            None,
+            Some(at()),
+            r#"{"execution_id":"abc","status":"completed"}"#.to_string(),
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text_of(&resp)).expect("a JSON report stays JSON after stamping");
+        assert_eq!(
+            parsed.get("archived"),
+            Some(&serde_json::Value::Bool(true)),
+            "{parsed}"
+        );
+        assert_eq!(
+            parsed.get("archived_at").and_then(|v| v.as_str()),
+            Some("2026-09-04T16:47:56+00:00"),
+            "{parsed}"
+        );
+        assert!(
+            parsed
+                .get("archived_note")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .contains("workflow_executions_archive"),
+            "the note must name WHERE the row is being read from: {parsed}"
+        );
+        assert_eq!(
+            parsed.get("status").and_then(|v| v.as_str()),
+            Some("completed"),
+            "the original report must survive the stamp: {parsed}"
+        );
+    }
+
+    /// A prose body cannot be stamped, so it is PREFIXED. Without this, the
+    /// text-rendering handlers (timeline, waterfall, sub-workflow output)
+    /// would present an archived execution as a live one.
+    #[test]
+    fn an_archived_text_report_is_prefixed() {
+        let resp = respond_maybe_archived(
+            None,
+            Some(at()),
+            "=== Execution Timeline ===\nStatus: completed".to_string(),
+        );
+        let text = text_of(&resp);
+        assert!(text.contains("archived at 2026-09-04T16:47:56"), "{text}");
+        assert!(
+            text.contains("Execution Timeline"),
+            "the original prose must survive the prefix: {text}"
+        );
+    }
+
+    /// The note must say the events are gone. An archived execution's trace
+    /// renders zero nodes because `execution_events` carries `ON DELETE
+    /// CASCADE`; unlabelled, that reads as "this workflow ran no nodes",
+    /// which is a claim about the WORKFLOW rather than about retention.
+    #[test]
+    fn the_note_explains_the_missing_children() {
+        let note = archived_note(at());
+        assert!(note.contains("not retained"), "{note}");
+        assert!(
+            note.contains("events"),
+            "the note must name what is missing, not just that something is: {note}"
+        );
+    }
+
+    /// A refusal must NAME retention as the reason and must NOT reuse the
+    /// not-found wording. This is the whole defect in one assertion: an
+    /// operator told "not found or access denied" goes looking for a
+    /// permissions problem that does not exist.
+    #[test]
+    fn a_refusal_names_retention_and_never_claims_absence() {
+        let id = Uuid::nil();
+        let msg = archived_refusal("cancel execution", id, at());
+        assert!(msg.contains("archived"), "{msg}");
+        assert!(msg.contains("2026-09-04T16:47:56"), "{msg}");
+        assert!(
+            !msg.contains("not found") && !msg.contains("access denied"),
+            "a refusal about an archived row must never claim it is absent or forbidden: {msg}"
+        );
+        assert!(
+            msg.contains("list_archived_executions"),
+            "…and must point at where the row IS still readable: {msg}"
+        );
+    }
+
+    /// `stamp_archived` must be a no-op for a live row and must not panic on
+    /// a non-object body (a report that renders a top-level array).
+    #[test]
+    fn stamping_is_inert_where_it_cannot_apply() {
+        let mut live = serde_json::json!({"a": 1});
+        stamp_archived(&mut live, None);
+        assert_eq!(live, serde_json::json!({"a": 1}));
+
+        let mut arr = serde_json::json!([1, 2, 3]);
+        stamp_archived(&mut arr, Some(at()));
+        assert_eq!(arr, serde_json::json!([1, 2, 3]));
+    }
+}
+
+#[cfg(test)]
+mod archived_array_wrap_tests {
+    //! The `get_execution_logs` case, isolated.
+    //!
+    //! Archival CASCADEs `workflow_execution_logs` and `execution_events`
+    //! away (measured: 0 rows for all 96 of the first archived executions,
+    //! against 294 surviving `module_executions`). So the logs handler's
+    //! array is `[]` for an archived execution, and `[]` is exactly the shape
+    //! its own comment says callers test with `.length === 0`. Left bare it
+    //! reads "this execution logged nothing"; the truth is "we no longer have
+    //! its logs".
+
+    use super::*;
+
+    fn at() -> DateTime<Utc> {
+        "2026-09-04T16:47:56Z".parse().unwrap()
+    }
+
+    fn text_of(resp: &JsonRpcResponse) -> String {
+        resp.result
+            .as_ref()
+            .and_then(|r| r.get("content"))
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("text"))
+            .and_then(|t| t.as_str())
+            .expect("mcp_text response carries content[0].text")
+            .to_string()
+    }
+
+    #[test]
+    fn an_empty_log_array_is_wrapped_not_left_bare() {
+        let resp = respond_maybe_archived(None, Some(at()), "[]".to_string());
+        let parsed: serde_json::Value = serde_json::from_str(&text_of(&resp))
+            .expect("the wrap must still be valid JSON — prefixing prose would not be");
+        assert_eq!(parsed.get("archived"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(parsed.get("result"), Some(&serde_json::json!([])));
+        assert!(
+            parsed.get("length").is_none(),
+            "a caller testing `.length === 0` must now get undefined, not 0 — that is the \
+             point of the wrap: {parsed}"
+        );
+    }
+
+    /// The live path must still hand back the bare array, byte for byte.
+    #[test]
+    fn a_live_log_array_is_still_a_bare_array() {
+        let resp = respond_maybe_archived(None, None, "[]".to_string());
+        assert_eq!(text_of(&resp), "[]");
     }
 }

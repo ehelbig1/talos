@@ -459,6 +459,17 @@ TC_TESTS=(
     # hand-written `sync_archive_*` migrations never had — it fails the moment
     # a column is added to workflow_executions and not to the archive.
     "execution_retention_tests"
+    # ── Archived is not absent (added 2026-09-04) ───────────────────────────
+    # #746's first successful archival pass moved 96 executions into
+    # `workflow_executions_archive`; within the hour every by-id reader
+    # answered "Execution not found or access denied" for one of them — a
+    # sentence whose BOTH clauses are false for an archived row. These drive
+    # the three-way `ExecutionRepository::lookup_execution` and, more
+    # importantly, the RLS backstop the archive never had: measured before
+    # this change, `workflow_executions_archive` had relrowsecurity=false and
+    # zero policies while holding real tenant ciphertext, so the app-layer
+    # `AND user_id = $2` was the only tenancy guard on it.
+    "execution_archive_read_tests"
 )
 for tctest in "${TC_TESTS[@]}"; do
     echo

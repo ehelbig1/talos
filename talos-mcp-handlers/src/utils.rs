@@ -360,6 +360,11 @@ pub fn orchestration_error_to_response(
         }
         E::WorkflowNotFound(_) => "Workflow not found or access denied".to_string(),
         E::ExecutionNotFound(_) => "Execution not found or access denied".to_string(),
+        // ARCHIVED is not ABSENT: the row exists and the caller may see it,
+        // the retention sweep just moved it out of `workflow_executions`.
+        // The Display impl already renders id + timestamp and leaks nothing
+        // (both are caller-supplied / caller-owned facts).
+        E::ExecutionArchived(..) => err.to_string(),
         E::StatusConflict(reason) => {
             // Reason already encodes "current status: X" (set by the
             // service); historical handler used the same body.
