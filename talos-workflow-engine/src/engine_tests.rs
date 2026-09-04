@@ -995,8 +995,11 @@ impl ModuleFetcher for CountingFetcher {
         })
     }
 
-    async fn load_rate_limits(&self, _module_ids: &[Uuid]) -> HashMap<Uuid, i32> {
-        HashMap::new()
+    async fn load_rate_limits(
+        &self,
+        _module_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, i32>, talos_workflow_engine_core::BoxError> {
+        Ok(HashMap::new())
     }
 }
 

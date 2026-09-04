@@ -271,12 +271,28 @@ impl GmailWatchService {
             Ok(r) => r,
             Err(_) => return Ok(()),
         };
-        let integration_opt = self
+        let integration_opt = match self
             .integrations
             .get_integration(row.integration_id, user_id)
             .await
-            .ok()
-            .flatten();
+        {
+            Ok(found) => found,
+            Err(e) => {
+                // `.ok().flatten()` routed a read FAILURE into the same
+                // branch as "this integration is gone": we skipped the
+                // Google-side `users.stop` and then deleted the row anyway,
+                // losing the identity needed to stop that watch later. The
+                // orphaned Google watch goes on pushing at us forever, and
+                // the audit row recorded `success = true`.
+                //
+                // `stop_watch` is idempotent, so refusing costs the caller
+                // only a retry once the database answers.
+                return Err(e).context(
+                    "gmail stop_watch: integration lookup failed; refusing to \
+                     delete the row and orphan the Google watch",
+                );
+            }
+        };
 
         let mut google_err: Option<String> = None;
         if let Some(integration) = integration_opt {

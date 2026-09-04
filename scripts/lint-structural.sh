@@ -7522,6 +7522,94 @@ else
 fi
 echo
 
+# ── 79. An integration read must be CLASSIFIED, not collapsed into 404 ──
+# `service.get_integration(user, id)` returns `Result<Option<_>>` and the
+# two failure shapes mean opposite things: `Ok(None)` is "that integration
+# does not exist" (404 is correct), `Err` is a pool timeout, a Postgres
+# restart, or a projection drift on the row (we could not look). Four
+# handlers wrote `Ok(Some(i)) => i, _ => 404 "Integration not found"`, so a
+# DATABASE FAILURE told the operator their integration DOES NOT EXIST —
+# the most reassuring answer the surface can give, and false.
+#
+# The correct form is one file away in the same crate: gcal's
+# `test_watch_channel_handler` already splits `Ok(None)` (404) from
+# `Err(e)` (log the full chain server-side, return a generic 500), and
+# every one of the four collapsed sites sat directly ABOVE a
+# `get_access_token` arm that handled `Err` correctly. So this is not a
+# rule nobody knew; it is a rule that did not replicate when
+# `docs/integration-pattern.md` was copied for the second and third
+# integration — which is exactly what the fourth will do too.
+#
+# Detection: a bare `_ =>` / `Err(_) =>` arm within 3 lines of an
+# `Ok(Some(` arm whose match scrutinee (within 12 lines above) calls
+# `.get_integration*(`. Scope is DERIVED from the method name, not a
+# hand-maintained crate list (check 74s rot mode) — a fifth integration
+# crate is covered the day it is written.
+#
+# MEASURED IN BOTH DIRECTIONS before it shipped: 4 findings against a
+# clean `git archive origin/main` (gmail x2, gcal admin, google-cloud) —
+# exactly the four real defects, 0 false positives — and 0 on the fixed
+# tree. It does NOT fire on the correct `Ok(None)` + `Err(e)` sibling.
+#
+# Stated limits, each confirmed rather than inferred:
+#   * TEXTUAL and line-based. `if let Ok(Some(x)) = svc.get_integration(..)`
+#     collapses identically and is invisible; measured at 0 occurrences
+#     today, so the leg ships covering the shape that actually exists.
+#   * WINDOW-bounded (12 lines scrutinee -> arm, 3 lines arm -> wildcard).
+#     A reflowed match reads as clean — a false NEGATIVE, the quiet
+#     direction, so a reviewer is still the backstop for exotic layouts.
+#   * It matches on the METHOD NAME, so the same collapse over a
+#     differently-named read is out of range. That population is real:
+#     `find_by_id` / `find_channel_by_id_raw` return `Result<Row>` where
+#     ABSENCE IS ALREADY AN `Err` (the flattening lives in
+#     `talos_integration_helpers::state_store::get_entry`, which maps
+#     `IntegrationStateError::KeyNotFound` into an anyhow string), so
+#     `Err(_) => 404 "Watch not found"` there cannot be split at the call
+#     site at all. Fixing that needs a three-way callee contract across
+#     three crates and is deliberately NOT what this check asserts.
+#   * It proves the arms are SPLIT, never that the `Err` arm is right —
+#     `Err(_) => 404` written out longhand still passes. The
+#     log-server-side/return-generic posture is a review property.
+# Opt-out: `// allow-collapsed-integration-read: <reason>` on the read
+# line or within the 8 lines above it.
+bold "▶ check 79: an integration read must not collapse a failure into \"not found\""
+INTEG_READ_FAIL=0
+while IFS= read -r hit; do
+    [ -n "$hit" ] || continue
+    red "✗ $hit collapses a failed integration read into the absent branch"
+    INTEG_READ_FAIL=$((INTEG_READ_FAIL + 1))
+done < <(find . -name '*.rs' -not -path './target/*' -not -path './vendor/*' \
+              -not -path './node_modules/*' "${TREE_PRUNE_FIND[@]}" -print0 2>/dev/null \
+         | xargs -0 perl -e '
+for my $f (@ARGV) {
+  open(my $fh, "<", $f) or next; my @l = <$fh>; close $fh;
+  for my $i (0..$#l) {
+    next unless $l[$i] =~ /\.get_integration\w*\s*\(/;
+    my $lo = $i - 8 < 0 ? 0 : $i - 8;
+    next if join("", @l[$lo..$i]) =~ /allow-collapsed-integration-read/;
+    my $end = $i + 12 > $#l ? $#l : $i + 12;
+    my $some;
+    for my $j ($i + 1 .. $end) { if ($l[$j] =~ /^\s*Ok\(Some\(/) { $some = $j; last } }
+    next unless defined $some;
+    my $ae = $some + 3 > $#l ? $#l : $some + 3;
+    for my $k ($some + 1 .. $ae) {
+      if ($l[$k] =~ /^\s*(?:_|Err\(_\))\s*=>/) { printf("%s:%d\n", $f, $k + 1); last }
+    }
+  }
+}' 2>/dev/null || true)
+
+if [ "$INTEG_READ_FAIL" -gt 0 ]; then
+    yellow "  → split the arms: Ok(None) keeps the 404 and its existing message;"
+    yellow "    Err(e) logs the full chain server-side (it can carry vault paths,"
+    yellow "    refresh-token paths and upstream response bodies) and returns a"
+    yellow "    GENERIC 500. Copy the get_access_token arm that already sits"
+    yellow "    directly below every one of these reads."
+    EXIT_CODE=1
+else
+    green "✓ no integration read reports a failed lookup as \"not found\""
+fi
+echo
+
 # ── 54. Lint self-consistency (meta-check) ────────────────────────────
 # The system whose purpose is catching drift drifted from its own docs:
 # by 2026-07-01 the script had 49 checks while CLAUDE.md said 43 and the

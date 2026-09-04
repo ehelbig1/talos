@@ -7,13 +7,14 @@
 //! makes the engine route every `check_rate_limit` through the trait
 //! object; failure modes flow through the documented fail-open path.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::json;
-use talos_workflow_engine::{ParallelWorkflowEngine, WorkflowGraphBuilder};
-use talos_workflow_engine_core::{BoxError, RateLimitStore, WasmModuleArtifact};
+use talos_workflow_engine::{ParallelWorkflowEngine, WorkflowEngineError, WorkflowGraphBuilder};
+use talos_workflow_engine_core::{BoxError, ModuleFetcher, RateLimitStore, WasmModuleArtifact};
 use talos_workflow_engine_test_utils::{
     dispatch::ScriptedDispatcher, memory::InMemoryModuleFetcher, minimal_engine,
     rate_limit::CountingRateLimitStore,
@@ -276,4 +277,74 @@ async fn counting_rate_limit_store_from_test_utils_records_calls() {
     assert_eq!(store.calls_for(module_id), 1);
     assert_eq!(store.current_count(module_id), 1);
     assert_eq!(dispatcher.dispatch_count(module_id), 1);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A rate-limit read that FAILS must refuse the load, not run unlimited
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A [`ModuleFetcher`] whose artifact resolution works but whose
+/// rate-limit load always fails — the shape of a pool timeout, a
+/// Postgres restart, or a projection drift on the `modules` read.
+struct RateLimitReadFails(InMemoryModuleFetcher);
+
+#[async_trait]
+impl ModuleFetcher for RateLimitReadFails {
+    async fn fetch(&self, module_id: Uuid, user_id: Uuid) -> Result<WasmModuleArtifact, BoxError> {
+        self.0.fetch(module_id, user_id).await
+    }
+
+    async fn load_rate_limits(&self, _ids: &[Uuid]) -> Result<HashMap<Uuid, i32>, BoxError> {
+        Err("connection refused (os error 61)".into())
+    }
+}
+
+/// The engine reads an ABSENT entry in `rate_limits` as UNLIMITED
+/// (`check_rate_limit` does `*self.rate_limits.get(&id)?`, and the `?`
+/// on that `Option` means "dispatch may proceed"). So a failed load
+/// that yielded an empty map did not degrade enforcement, it REMOVED
+/// it — for every module in the execution, with nothing in the
+/// execution record saying the control had not run.
+///
+/// The load must therefore refuse.
+#[tokio::test]
+async fn a_failed_rate_limit_read_refuses_the_graph_load() {
+    let module_id = Uuid::new_v4();
+    let mut engine = minimal_engine();
+    engine.set_user_id(Uuid::new_v4());
+    engine.set_module_fetcher(Arc::new(RateLimitReadFails(
+        InMemoryModuleFetcher::new()
+            .with_module(module_id, stub_artifact(module_id))
+            .with_rate_limit(module_id, 5),
+    )));
+
+    let err = engine
+        .load_graph_from_json(&serde_json::to_string(&graph_with_rate_limit(module_id, 5)).unwrap())
+        .await
+        .expect_err("an unreadable rate-limit set must refuse the load, not run unlimited");
+
+    assert!(
+        matches!(err, WorkflowEngineError::RateLimitsUnavailable(_)),
+        "expected RateLimitsUnavailable, got {err:?}"
+    );
+}
+
+/// The refusal is specific to a FAILED read: a fetcher that
+/// successfully reports "no module declares a limit" is the ordinary
+/// case and must still load. Without this, the test above would pass
+/// just as well against an engine that refused every load.
+#[tokio::test]
+async fn an_empty_but_successful_rate_limit_read_still_loads() {
+    let module_id = Uuid::new_v4();
+    let mut engine = minimal_engine();
+    engine.set_user_id(Uuid::new_v4());
+    engine.set_module_fetcher(Arc::new(
+        // No `with_rate_limit` — the fetcher returns Ok(empty).
+        InMemoryModuleFetcher::new().with_module(module_id, stub_artifact(module_id)),
+    ));
+
+    engine
+        .load_graph_from_json(&serde_json::to_string(&graph_with_rate_limit(module_id, 5)).unwrap())
+        .await
+        .expect("a successful read of zero limits is not a failure");
 }

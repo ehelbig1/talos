@@ -82,11 +82,11 @@ impl ModuleFetcher for InMemoryModuleFetcher {
             })
     }
 
-    async fn load_rate_limits(&self, module_ids: &[Uuid]) -> HashMap<Uuid, i32> {
-        module_ids
+    async fn load_rate_limits(&self, module_ids: &[Uuid]) -> Result<HashMap<Uuid, i32>, BoxError> {
+        Ok(module_ids
             .iter()
             .filter_map(|id| self.rate_limits.get(id).map(|e| (*id, *e)))
-            .collect()
+            .collect())
     }
 }
 
@@ -402,7 +402,10 @@ mod tests {
         let fetcher = InMemoryModuleFetcher::new()
             .with_rate_limit(a, 10)
             .with_rate_limit(b, 20);
-        let got = fetcher.load_rate_limits(&[a, b, c]).await;
+        let got = fetcher
+            .load_rate_limits(&[a, b, c])
+            .await
+            .expect("in-memory fetcher never fails");
         assert_eq!(got.len(), 2);
         assert_eq!(got[&a], 10);
         assert_eq!(got[&b], 20);

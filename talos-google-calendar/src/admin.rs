@@ -107,15 +107,29 @@ pub async fn create_watch(
         talos_public_url::public_base_url_or(talos_config::get_base_url)
     );
 
-    // Resolve the owning user_id for the audit log. If this SELECT
-    // fails the watch-channel call will fail too, so we don't need
-    // to gate on it separately.
+    // Resolve the owning user_id for the audit log. A read failure here
+    // is not fatal — the `create_watch_channel` call below fails too on a
+    // genuine outage — but it must not be SILENT: `None` from a failed
+    // SELECT is indistinguishable from `None` for an unknown integration,
+    // and the only visible consequence is a MISSING AUDIT ROW for an
+    // admin action that did happen.
     let owner: Option<Uuid> =
-        sqlx::query_scalar("SELECT user_id FROM google_calendar_integrations WHERE id = $1")
+        match sqlx::query_scalar("SELECT user_id FROM google_calendar_integrations WHERE id = $1")
             .bind(integration_id)
             .fetch_optional(&service.db_pool)
             .await
-            .unwrap_or(None);
+        {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!(
+                    ?integration_id,
+                    "gcal admin: owner lookup for the audit log failed; the \
+                     admin_watch_created audit row will be skipped: {:#}",
+                    e
+                );
+                None
+            }
+        };
 
     match service
         .create_watch_channel(integration_id, &calendar_id, &webhook_url, None)
@@ -235,7 +249,7 @@ pub async fn stop_orphan(
     // captured in audit metadata (pre-commit 7018372), this check
     // still passes on channel_uuid alone — resource_id is validated
     // by Google's stop API itself.
-    let pair_known: Option<bool> = sqlx::query_scalar(
+    let pair_known: Option<bool> = match sqlx::query_scalar(
         "SELECT EXISTS (\
            SELECT 1 FROM google_calendar_audit_log \
            WHERE user_id = $1 \
@@ -247,8 +261,30 @@ pub async fn stop_orphan(
     .bind(&channel_id)
     .fetch_optional(&service.db_pool)
     .await
-    .ok()
-    .flatten();
+    {
+        Ok(v) => v,
+        Err(e) => {
+            // The pre-fix `.ok().flatten()` routed a read failure into the
+            // SAME branch as a genuine miss, so a database error answered
+            // the operator with "no audit record of this channel being
+            // created for this user" — a determinate claim about an audit
+            // log we had in fact failed to read. Refusing stays correct
+            // (this is the cross-tenant guard), but it must refuse for the
+            // reason that is true.
+            tracing::error!(
+                %user_id,
+                channel_id = %channel_id,
+                "gcal admin: stop_orphan ownership-guard read failed: {:#}",
+                e
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    json!({"error": "Failed to verify channel ownership. Check controller logs."}),
+                ),
+            );
+        }
+    };
     if !pair_known.unwrap_or(false) {
         tracing::warn!(
             %user_id,
@@ -278,14 +314,30 @@ pub async fn stop_orphan(
     // has multiple integrations and the orphan belongs to a specific
     // one, the caller would need to pass integration_id; leaving
     // this as a follow-up since orphan cleanup is rare.
-    let integration_id: Option<Uuid> = sqlx::query_scalar(
+    let integration_id: Option<Uuid> = match sqlx::query_scalar(
         "SELECT id FROM google_calendar_integrations \
          WHERE user_id = $1 AND is_active = true LIMIT 1",
     )
     .bind(user_id)
     .fetch_optional(&service.db_pool)
     .await
-    .unwrap_or(None);
+    {
+        Ok(id) => id,
+        Err(e) => {
+            // `.unwrap_or(None)` used to report a DB failure as "no active
+            // gcal integration for this user" — a statement about the
+            // operator's account made from a row we never read.
+            tracing::error!(
+                %user_id,
+                "gcal admin: active-integration lookup failed: {:#}",
+                e
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to look up integration. Check controller logs."})),
+            );
+        }
+    };
     let integration_id = match integration_id {
         Some(id) => id,
         None => {
@@ -298,11 +350,29 @@ pub async fn stop_orphan(
 
     let integration = match service.get_integration(user_id, integration_id).await {
         Ok(Some(i)) => i,
-        _ => {
+        Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": "integration not found"})),
             )
+        }
+        Err(e) => {
+            // The pre-fix `_` arm collapsed `Ok(None)` (genuinely absent —
+            // 404 is right) with `Err(_)` (a pool timeout, a Postgres
+            // restart, a projection drift), so a failed read told the
+            // operator their integration DOES NOT EXIST. Same split, and
+            // the same log-full-chain / return-generic posture, as the
+            // `get_access_token` arm immediately below.
+            tracing::error!(
+                %user_id,
+                ?integration_id,
+                "gcal admin: integration lookup for orphan-stop failed: {:#}",
+                e
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to look up integration. Check controller logs."})),
+            );
         }
     };
     let access_token = match service.get_access_token(&integration).await {
@@ -478,4 +548,156 @@ pub async fn stop_all(
             "failed": failed,
         })),
     )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A failed read must not be reported as a determinate fact
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod read_disclosure_tests {
+    //! `stop_orphan` makes three claims about the operator's own data
+    //! before it does any work: "we have no audit record of this
+    //! channel", "you have no active gcal integration", "that
+    //! integration does not exist". Each was reachable from a DATABASE
+    //! FAILURE, because each read collapsed `Err` into the same branch
+    //! as a genuine miss.
+    //!
+    //! These tests drive the real handler against a pool that can never
+    //! connect, so every query returns `Err`. The assertion is that the
+    //! handler says it could not look, not that there was nothing there.
+
+    use super::*;
+    use axum::http::HeaderValue;
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// `ADMIN_SECRET_KEY` / `ENABLE_ADMIN_OPS` are process-global, so
+    /// the env-touching tests in this module serialize against each
+    /// other.
+    fn env_guard() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A `GoogleCalendarService` over a pool pointed at a closed port:
+    /// every query fails with a connection error, none of them with
+    /// "no rows".
+    fn service_over_a_dead_pool() -> Arc<GoogleCalendarService> {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(2))
+            .connect_lazy("postgres://nobody:nobody@127.0.0.1:1/nowhere")
+            .expect("lazy pool builds without connecting");
+        let kek = std::sync::Arc::new(
+            talos_secrets_manager::kek_provider::EnvKekProvider::from_raw_bytes_owned(vec![
+                7u8;
+                32
+            ])
+            .expect("32-byte non-zero test key"),
+        );
+        let secrets = std::sync::Arc::new(
+            talos_secrets_manager::SecretsManager::with_kek_provider(pool.clone(), kek)
+                .expect("secrets manager builds"),
+        );
+        Arc::new(GoogleCalendarService::new(pool, secrets))
+    }
+
+    fn admin_headers(secret: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("X-Admin-Secret", HeaderValue::from_str(secret).unwrap());
+        h
+    }
+
+    fn error_text(body: &JsonValue) -> String {
+        body.get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<no error field>")
+            .to_string()
+    }
+
+    /// Pre-fix, the ownership guard read through `.ok().flatten()`, so
+    /// an unreachable database produced `None` — the same value as "no
+    /// such audit row" — and the operator was told, with a 403, that
+    /// there was **no audit record of this channel being created for
+    /// this user**. That is a determinate statement about an audit log
+    /// we had just failed to read.
+    ///
+    /// Refusing is still correct (this is the cross-tenant guard); the
+    /// refusal has to be for the reason that is true.
+    #[tokio::test]
+    async fn stop_orphan_says_it_could_not_read_the_audit_log_not_that_the_channel_is_unknown() {
+        let _g = env_guard();
+        std::env::set_var("ENABLE_ADMIN_OPS", "1");
+        std::env::set_var("ADMIN_SECRET_KEY", "read-disclosure-test-secret");
+
+        let (status, Json(body)) = stop_orphan(
+            State(service_over_a_dead_pool()),
+            admin_headers("read-disclosure-test-secret"),
+            ApiJson(json!({
+                "user_id": Uuid::new_v4(),
+                "channel_id": "some-google-channel-id",
+                "resource_id": "some-google-resource-id",
+            })),
+        )
+        .await;
+
+        std::env::remove_var("ENABLE_ADMIN_OPS");
+        std::env::remove_var("ADMIN_SECRET_KEY");
+
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "an unreadable audit log must not be reported as an absent audit row; got {status} / {}",
+            error_text(&body)
+        );
+        let msg = error_text(&body);
+        assert!(
+            !msg.contains("no audit record"),
+            "the 403 'no audit record of this channel being created for this user' asserts a \
+             fact about a table we failed to read; got {msg:?}"
+        );
+        // Internal error detail (sqlx message, host, port) must not reach the client.
+        assert!(
+            !msg.to_ascii_lowercase().contains("connection")
+                && !msg.contains("127.0.0.1")
+                && !msg.contains("postgres"),
+            "generic message only; got {msg:?}"
+        );
+    }
+
+    /// The admin envelope still fails closed ahead of any of this — a
+    /// wrong secret must never reach a database read. Without this, the
+    /// test above would pass just as well against a handler that 500s
+    /// unconditionally.
+    #[tokio::test]
+    async fn stop_orphan_still_refuses_a_bad_admin_secret_before_reading_anything() {
+        let _g = env_guard();
+        std::env::set_var("ENABLE_ADMIN_OPS", "1");
+        std::env::set_var("ADMIN_SECRET_KEY", "read-disclosure-test-secret");
+
+        let (status, Json(body)) = stop_orphan(
+            State(service_over_a_dead_pool()),
+            admin_headers("wrong-secret"),
+            ApiJson(json!({
+                "user_id": Uuid::new_v4(),
+                "channel_id": "c",
+                "resource_id": "r",
+            })),
+        )
+        .await;
+
+        std::env::remove_var("ENABLE_ADMIN_OPS");
+        std::env::remove_var("ADMIN_SECRET_KEY");
+
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "got {}",
+            error_text(&body)
+        );
+        assert_eq!(error_text(&body), "unauthorized");
+    }
 }

@@ -472,13 +472,35 @@ pub async fn test_watch_channel_handler(
         .await
     {
         Ok(Some(i)) => i,
-        _ => {
+        Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(ApiResponse::<serde_json::Value> {
                     success: false,
                     data: None,
                     error: Some("Integration not found".into()),
+                }),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            // The pre-fix `_` arm collapsed `Ok(None)` (genuinely absent)
+            // with `Err(_)` (pool timeout / Postgres restart / projection
+            // drift) and told the caller their integration does not exist.
+            // Same posture as the `get_access_token` arm below: log the
+            // full chain server-side, return a generic message.
+            tracing::error!(
+                user_id = %user_id,
+                channel_uuid = %channel_uuid,
+                error = %e,
+                "gmail probe: integration lookup failed"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<serde_json::Value> {
+                    success: false,
+                    data: None,
+                    error: Some("Failed to look up integration".into()),
                 }),
             )
                 .into_response();
@@ -747,8 +769,20 @@ pub async fn pubsub_push_handler(
             .await
         {
             Ok(Some(i)) => i,
-            _ => {
+            Ok(None) => {
                 tracing::warn!(%user_id, "gmail push: integration not found");
+                return;
+            }
+            Err(e) => {
+                // Pre-fix, a failed read logged "integration not found" —
+                // an operator grepping for a disconnected integration
+                // would have found a sentence about a row we never read.
+                tracing::error!(
+                    %user_id,
+                    error = %e,
+                    "gmail push: integration lookup FAILED (not absent); \
+                     this push was dropped"
+                );
                 return;
             }
         };

@@ -33,9 +33,9 @@ impl ModuleFetcher for ModuleRegistry {
         Ok(wasm_module_to_artifact(module_id, m))
     }
 
-    async fn load_rate_limits(&self, module_ids: &[Uuid]) -> HashMap<Uuid, i32> {
+    async fn load_rate_limits(&self, module_ids: &[Uuid]) -> Result<HashMap<Uuid, i32>, BoxError> {
         if module_ids.is_empty() {
-            return HashMap::new();
+            return Ok(HashMap::new());
         }
         // Phase 5.1: query the unified `modules` table by canonical id.
         let rows: Vec<(Uuid, i32)> = sqlx::query_as(
@@ -45,25 +45,33 @@ impl ModuleFetcher for ModuleRegistry {
         .bind(module_ids)
         .fetch_all(&self.db_pool)
         .await
-        .map_err(|e| {
-            // Was a bare `.unwrap_or_default()` with NO log at all: a failed
-            // read produced an empty map, which is indistinguishable from
-            // "no module declares a limit" — so every per-module rate limit
-            // silently vanished for the whole execution. The empty-map
-            // fallback is KEPT (a dispatcher must not die because a limit
-            // lookup blipped) but it is no longer silent.
+        .map_err(|e| -> BoxError {
+            // Two repairs, in order. It was first a bare `.unwrap_or_default()`
+            // with NO log at all. Adding the log fixed the DISCLOSURE and left
+            // the ENFORCEMENT gap: the empty map still reached the engine, and
+            // an absent entry is read there as UNLIMITED
+            // (`engine_dispatch_pipeline::check_rate_limit` does
+            // `*self.rate_limits.get(&id)?`), so a failed read removed every
+            // per-module limit for the whole execution while the controller
+            // log said so to nobody the execution could reach.
+            //
+            // The availability that the fallback bought is illusory: the graph
+            // JSON this load runs against was already read from Postgres with
+            // `?` by the caller, so a genuine outage killed the run before it
+            // got here. The only window the fallback covered is a failure
+            // specific to THIS query — in which the sole thing it bought was
+            // running unlimited.
             tracing::warn!(
                 target: "talos_rpc",
                 error = %e,
                 module_count = module_ids.len(),
-                "per-module rate-limit lookup failed; this execution runs with \
-                 NO per-module limits — an empty result here is a READ FAILURE, \
-                 not an absence of configured limits"
+                "per-module rate-limit lookup failed; refusing the graph load — \
+                 an empty result here is a READ FAILURE, not an absence of \
+                 configured limits, and the engine reads absent as unlimited"
             );
-            e
-        })
-        .unwrap_or_default();
-        rows.into_iter().collect()
+            e.to_string().into()
+        })?;
+        Ok(rows.into_iter().collect())
     }
 }
 

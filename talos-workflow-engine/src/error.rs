@@ -218,6 +218,22 @@ pub enum WorkflowEngineError {
     #[error("workflow graph has no nodes")]
     EmptyGraph,
 
+    /// Per-module rate limits could not be read at graph-load time.
+    ///
+    /// The engine refuses the load rather than proceeding, because an
+    /// absent entry in the rate-limit map is read as UNLIMITED by
+    /// `check_rate_limit` — so continuing would silently run the whole
+    /// execution with every per-module rate limit switched off, and
+    /// nothing in the execution record would say so. Same posture as
+    /// [`SecretsResolverMissing`](Self::SecretsResolverMissing) and
+    /// [`ModuleFetcherMissing`](Self::ModuleFetcherMissing): refuse
+    /// rather than dispatch under a control that is not there.
+    ///
+    /// The message body is the fetcher's own error rendered as a
+    /// string; do not pattern-match its text.
+    #[error("per-module rate limits could not be loaded: {0}")]
+    RateLimitsUnavailable(String),
+
     /// A graph-loading method rejected its input for a reason the
     /// engine has not yet promoted to a typed variant. The message
     /// body is human-readable; do not pattern-match its text — match
