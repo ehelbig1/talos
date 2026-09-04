@@ -383,6 +383,19 @@ CTRL_TESTS=(
     # silently discarded every Loop-body iteration's logs while `add_log`
     # returned Ok. A mock cannot fail the way the real statement failed.
     "wasm_log_routing_tests"
+    # The `__memory_write__` write-ceiling gate (#750). Needs a real Postgres
+    # because the property under test is "no actor_memory ROW" — the thing a
+    # silent drop and a correct refusal both produce, distinguished only by the
+    # refusal record. Drives the real engine + real ControllerNodeHook.
+    # `common` harness ⇒ CTRL_TESTS, not TC_TESTS (sub-leg 64b).
+    "write_ceiling_memory_write_tests"
+    # Sibling of the above, deliberately a SEPARATE binary: the engine strips a
+    # refused envelope before the hook sees it, so the hook's own gate is
+    # unreachable from that binary (mutation-proved: neutering it leaves that
+    # binary green). This one calls the hook directly, the way test_module
+    # does. Also a separate PROCESS, because the memory crypto hook is a
+    # process-wide OnceLock.
+    "write_ceiling_hook_gate_tests"
     "env_vars"
 )
 # 'talos_ctl' is now the migrated TEMPLATE: setup_test_context clones it into a

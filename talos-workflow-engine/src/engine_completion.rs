@@ -295,7 +295,50 @@ impl ParallelWorkflowEngine {
         };
         let mut output = output;
         sanitize_node_output(&mut output);
+
+        // ── Write ceiling on the `__memory_write__` envelope (#750) ──
+        // A module reaches actor_memory two ways: an `agent_memory::set` host
+        // call (gated in the worker) and a returned `__memory_write__`
+        // envelope (this path, which had NO gate — so a `readonly` actor was
+        // refused one and permitted the other on the same job). Applied HERE,
+        // before `results.insert`, so a refused envelope never reaches the
+        // stored output, the downstream nodes' gathered inputs, or the
+        // lifecycle hook that would persist it. The ceiling is the ENGINE's
+        // — on a sub-engine that is the value `bind_subengine_actor_and_ceilings`
+        // already narrowed, so a sub-workflow bound to a stricter actor is
+        // gated at the stricter ceiling.
+        let refused_memory_write = crate::write_ceiling_gate::apply_memory_write_ceiling(
+            &mut output,
+            self.max_write_ceiling,
+            crate::write_ceiling_gate::controller_write_ceiling_enforced(),
+            |s| self.redact_str(s),
+        );
         results.insert(finished_id, output.clone());
+        if let Some(ref refusal) = refused_memory_write {
+            // DEBUG, not WARN, and deliberately so: the ONE operator-facing
+            // WARN for a refusal is emitted by the hook
+            // (`ControllerNodeHook::record_memory_write_refusal`), which owns
+            // the audit vocabulary and the metric. Logging it at WARN here too
+            // would double-count every refusal for anyone grepping
+            // `talos_audit`. This line exists to carry the `execution_id` the
+            // hook signature does not receive, and to leave a breadcrumb on an
+            // engine wired with no hook at all.
+            tracing::debug!(
+                key = %refusal.key,
+                node_id = %finished_id,
+                actor_id = ?self.actor_id,
+                %execution_id,
+                "write-ceiling: __memory_write__ envelope removed from node output"
+            );
+            if let Some(hook) = self.node_hook.as_ref() {
+                hook.on_memory_write_refused(
+                    self.actor_id,
+                    Some(finished_id),
+                    &refusal.key,
+                    self.max_write_ceiling,
+                );
+            }
+        }
 
         // Post-completion hook: drives fuel attribution,
         // `__memory_write__` persistence, and any future cross-cutting
@@ -315,6 +358,7 @@ impl ParallelWorkflowEngine {
                     node_label,
                     module_id,
                     actor_id: self.actor_id,
+                    max_write_ceiling: self.max_write_ceiling,
                     wall_time_ms,
                 },
                 &output,
@@ -672,6 +716,7 @@ impl ParallelWorkflowEngine {
                     node_label,
                     module_id,
                     actor_id: self.actor_id,
+                    max_write_ceiling: self.max_write_ceiling,
                     wall_time_ms,
                 },
                 &error_msg,

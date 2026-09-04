@@ -626,6 +626,14 @@ const OBJECT_STORAGE_OPS: &[&str] = &["object-storage-put", "object-storage-dele
 /// Redis `cache` (ephemeral), sandboxed `files` writes (module-local
 /// scratch), and execution `state` (engine-internal durability).
 ///
+/// SCOPE (#750): this is a profile of HOST OPS. It says nothing about what a
+/// module can do by RETURNING a value — the `__memory_write__` envelope
+/// reaches `actor_memory` through the controller's node-completion hook with
+/// no host call and no capability, so `Minimal`'s EMPTY profile must not be
+/// read as "this module cannot mutate anything". That route is gated by the
+/// same ceiling controller-side (`talos_workflow_engine::write_ceiling_gate`)
+/// and audits under the same `agent-memory-set` / `write-ceiling` labels.
+///
 /// `Unknown` returns the FULL Trusted profile — fail-closed presentation:
 /// a world the inspector can't classify must be assumed capable of
 /// everything when an operator reviews it.

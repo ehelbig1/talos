@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 use talos_workflow_engine_core::{
     BoxError, EventSink, ExecutionStartedContext, ModuleExecutionStore, NodeCompletionContext,
-    NodeEventWrite, NodeLifecycleHook,
+    NodeEventWrite, NodeLifecycleHook, WriteCeiling,
 };
 use uuid::Uuid;
 
@@ -153,6 +153,22 @@ pub enum LifecycleCall {
         actor_id: Option<Uuid>,
         /// Step output.
         step_output: JsonValue,
+        /// Data-mutation ceiling in force for the step.
+        max_write_ceiling: WriteCeiling,
+    },
+    /// `on_memory_write_refused` — a `__memory_write__` envelope was dropped
+    /// by the write ceiling (#750). Captured so a test can assert the
+    /// REFUSAL was recorded, not merely that no row appeared: "no row" is
+    /// also what a silent drop looks like.
+    MemoryWriteRefused {
+        /// Actor owning the execution, if any.
+        actor_id: Option<Uuid>,
+        /// Node that emitted the envelope; `None` for a pipeline step.
+        node_id: Option<Uuid>,
+        /// Requested memory key (engine-redacted, length-bounded).
+        key: String,
+        /// Ceiling that refused it.
+        max_write_ceiling: WriteCeiling,
     },
 }
 
@@ -249,13 +265,37 @@ impl NodeLifecycleHook for CaptureNodeLifecycleHook {
             });
     }
 
-    fn on_pipeline_step_completed(&self, actor_id: Option<Uuid>, step_output: &JsonValue) {
+    fn on_pipeline_step_completed(
+        &self,
+        actor_id: Option<Uuid>,
+        step_output: &JsonValue,
+        max_write_ceiling: WriteCeiling,
+    ) {
         self.calls
             .lock()
             .expect("CaptureNodeLifecycleHook mutex poisoned")
             .push(LifecycleCall::PipelineStepCompleted {
                 actor_id,
                 step_output: step_output.clone(),
+                max_write_ceiling,
+            });
+    }
+
+    fn on_memory_write_refused(
+        &self,
+        actor_id: Option<Uuid>,
+        node_id: Option<Uuid>,
+        key: &str,
+        max_write_ceiling: WriteCeiling,
+    ) {
+        self.calls
+            .lock()
+            .expect("CaptureNodeLifecycleHook mutex poisoned")
+            .push(LifecycleCall::MemoryWriteRefused {
+                actor_id,
+                node_id,
+                key: key.to_string(),
+                max_write_ceiling,
             });
     }
 }

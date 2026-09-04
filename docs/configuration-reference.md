@@ -383,7 +383,7 @@ into both deployments.
 | `MCP_AUTH_RATE_WINDOW` | `60` | both | MCP auth window (seconds) | |
 | `MCP_EXPENSIVE_OP_RATE_LIMIT` | `10` | both | Rate limit for expensive MCP operations | |
 | `MCP_TOKEN_REVALIDATION_INTERVAL_SECS` | `60` | both | MCP token revalidation cadence | |
-| `TALOS_WRITE_CEILING_ENFORCED` | bool default | both | Enforce actor write ceiling | 🔒 (posture) |
+| `TALOS_WRITE_CEILING_ENFORCED` | bool default | both | Enforce actor write ceiling. **Set it on BOTH** — the worker gates mutating host calls, the controller gates the `__memory_write__` envelope it persists on node completion (#750); on the worker alone a `readonly` actor is refused one route and permitted the other. | 🔒 (posture) |
 | `TALOS_WRITE_CEILING_STRICT_EGRESS` | bool default | both | Strict egress under the write ceiling | 🔒 (posture) |
 | `TALOS_DISTRIBUTED_REPLAY` | off | controller | Enable distributed replay | |
 | `TALOS_REPLAY_FAIL_CLOSED` | policy default | both | Fail closed on replay-guard errors | 🔒 (posture) |

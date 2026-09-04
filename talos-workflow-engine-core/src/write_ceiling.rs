@@ -103,6 +103,46 @@ impl WriteCeiling {
     }
 }
 
+/// The one write-ceiling decision in the workspace: does this job's ceiling
+/// REFUSE a data-mutating operation?
+///
+/// Split from every call site's env read and audit side effects so the rule is
+/// unit-testable without a live context, a process env, or a database — and,
+/// more importantly, so the WORKER's host-function gate and the CONTROLLER's
+/// `__memory_write__` envelope gate cannot answer the same question two
+/// different ways. Before this lived here the worker owned a private copy
+/// (`talos_worker_runtime::context::write_ceiling_denies`) and the controller
+/// owned nothing at all, which is exactly how a `readonly` actor came to be
+/// refused at `agent_memory::set` and permitted at `__memory_write__` on the
+/// same job (#750).
+///
+/// `enforced` is the per-process staged-rollout flag
+/// (`TALOS_WRITE_CEILING_ENFORCED`). It stays a PARAMETER rather than an env
+/// read inside this function because this crate is dependency-light and
+/// portable by design; each process caches its own read and passes it in.
+///
+/// Returns `true` when the operation MUST be refused.
+#[must_use]
+pub fn write_ceiling_denies(enforced: bool, ceiling: WriteCeiling) -> bool {
+    enforced && !ceiling.allows_write()
+}
+
+/// Audit `policy` token for a write-ceiling refusal. The worker stamps this
+/// exact string on its `wasi:capability_denied` rows
+/// (`TalosContext::write_ceiling_refuses`), and `get_module_info`'s
+/// `mutation_profile` promises operators that its labels correlate to those
+/// events one-to-one — so a controller-side refusal that invented its own
+/// token would break a documented correlation.
+pub const WRITE_CEILING_POLICY: &str = "write-ceiling";
+
+/// Audit `capability` / op token for an actor-memory WRITE. Byte-identical to
+/// the label the worker passes to `write_ceiling_refuses` at
+/// `agent_memory::set`, and a member of
+/// `talos_capability_world::write_gated_ops` for every world that can reach
+/// agent memory. The `__memory_write__` envelope reaches the SAME table by a
+/// different transport, so it audits under the SAME label.
+pub const AGENT_MEMORY_SET_OP: &str = "agent-memory-set";
+
 #[cfg(test)]
 mod tests {
     use super::WriteCeiling;
@@ -177,5 +217,23 @@ mod tests {
         // system job) must NOT be silently blocked. The restrictive default
         // is enforced at the actor layer, not the wire.
         assert_eq!(WriteCeiling::default(), WriteCeiling::Write);
+    }
+
+    #[test]
+    fn denies_only_when_enforced_and_read_only() {
+        use super::write_ceiling_denies;
+        // Flag off (the staged-rollout default): the ceiling is inert.
+        assert!(!write_ceiling_denies(false, WriteCeiling::ReadOnly));
+        assert!(!write_ceiling_denies(false, WriteCeiling::Write));
+        // Flag on: only a read-only ceiling refuses.
+        assert!(write_ceiling_denies(true, WriteCeiling::ReadOnly));
+        assert!(!write_ceiling_denies(true, WriteCeiling::Write));
+    }
+
+    /// The audit vocabulary is a cross-process contract, not a local string.
+    #[test]
+    fn audit_labels_are_the_worker_spelling() {
+        assert_eq!(super::WRITE_CEILING_POLICY, "write-ceiling");
+        assert_eq!(super::AGENT_MEMORY_SET_OP, "agent-memory-set");
     }
 }

@@ -209,6 +209,29 @@ pub const ACTOR_CONTEXT: &str = "__actor_context__";
 /// after dispatch and commits the writes.
 pub const MEMORY_WRITE: &str = "__memory_write__";
 
+/// ENGINE-AUTHORED refusal marker, written onto a node's output when a
+/// [`MEMORY_WRITE`] envelope was DROPPED because the job's actor is
+/// `readonly` and the write ceiling is enforced.
+///
+/// A module cannot know it was refused — it returned an envelope and the
+/// engine declined to act on it — so without this key the node completes with
+/// whatever success language the module wrote (`"written_key": "…"`) and every
+/// downstream reader, including the operator, believes the write happened.
+/// The envelope itself is REMOVED alongside, so no later consumer can act on a
+/// refused write.
+///
+/// Like every engine-authored key, this is written **unconditionally**:
+/// set-or-REMOVE, never set-or-inherit. A module (or an upstream node whose
+/// output was merged in) that emits its own `__memory_write_refused__` must
+/// never be able to fabricate a refusal record — the same rule the judge
+/// envelope learned (`build_judge_envelope`) and the same rule the inbound
+/// reserved-key strip enforces on trigger payloads.
+///
+/// Value shape:
+/// `{"key": <requested key, redacted+truncated>, "reason": "write-ceiling",
+///   "ceiling": "readonly"}`.
+pub const MEMORY_WRITE_REFUSED: &str = "__memory_write_refused__";
+
 /// Per-node config key that OPTS a send node into idempotent retries. When
 /// present and truthy the engine stamps a stable idempotency key onto the
 /// dispatch (see [`resolve_idempotency_key`]); the worker then emits that key as

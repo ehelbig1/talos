@@ -1878,6 +1878,7 @@ dependencies = [
  "talos-workflow-engine",
  "talos-workflow-engine-core",
  "talos-workflow-engine-nats",
+ "talos-workflow-engine-test-utils",
  "talos-workflow-job-protocol",
  "talos-workflow-manifest",
  "talos-workflow-repository",

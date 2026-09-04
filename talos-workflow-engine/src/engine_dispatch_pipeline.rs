@@ -665,7 +665,7 @@ impl ParallelWorkflowEngine {
             retry_delay_expr: chain_retry.retry_delay_expression.clone(),
         };
 
-        let chain_result = match dispatcher.dispatch_chain(chain_request).await {
+        let mut chain_result = match dispatcher.dispatch_chain(chain_request).await {
             Ok(r) => r,
             Err(e) => {
                 // A FRESH INSTANCE OF THE CLASS THIS CHANGE FIXES, found in
@@ -725,8 +725,56 @@ impl ParallelWorkflowEngine {
         // it still short-circuits the per-step loop (and the memory-write
         // hook is nested inside it) — keep the shape, drop the unused bind.
         if self.module_execution_store.is_some() {
-            for (i, step_result) in chain_result.steps.iter().enumerate() {
+            for (i, step_result) in chain_result.steps.iter_mut().enumerate() {
                 if let Some(&step_exec_id) = step_exec_ids.get(i) {
+                    // Write ceiling (#750). Applied BEFORE the
+                    // `module_executions` row is finalized so the step's
+                    // STORED output carries the refusal too — otherwise
+                    // `get_node_io` on that step would show a
+                    // `__memory_write__` envelope with nothing saying it was
+                    // declined. A step's envelope is the same write, by the
+                    // same actor, to the same table as a node's; CLAUDE.md
+                    // says the protocol "fires at both node-completion AND
+                    // per-pipeline-step so chain-dispatched modules can emit
+                    // memory writes too", so gating only the node path would
+                    // leave the gap open for every chain-dispatched module.
+                    //
+                    // Scoped to SUCCESSFUL steps, matching exactly where the
+                    // hook would have persisted. A failed step's envelope was
+                    // never going to be written, and stamping
+                    // `__memory_write_refused__` on it would name the WRONG
+                    // CAUSE — "the ceiling declined this" when the truth is
+                    // "the step failed". Attributing a refusal to a policy
+                    // that did not fire is the misleading-report class one
+                    // level down.
+                    let step_succeeded = matches!(
+                        step_result.status,
+                        talos_workflow_engine_core::StepStatus::Success
+                    );
+                    if let Some(refusal) = crate::write_ceiling_gate::apply_memory_write_ceiling(
+                        &mut step_result.output,
+                        self.max_write_ceiling,
+                        step_succeeded
+                            && crate::write_ceiling_gate::controller_write_ceiling_enforced(),
+                        |s| self.redact_str(s),
+                    ) {
+                        // DEBUG for the same reason as the node path: the
+                        // hook emits the single operator-facing WARN.
+                        tracing::debug!(
+                            key = %refusal.key,
+                            actor_id = ?self.actor_id,
+                            "write-ceiling: __memory_write__ envelope removed from a \
+                             pipeline step's output"
+                        );
+                        if let Some(hook) = self.node_hook.as_ref() {
+                            hook.on_memory_write_refused(
+                                self.actor_id,
+                                None,
+                                &refusal.key,
+                                self.max_write_ceiling,
+                            );
+                        }
+                    }
                     let status_str = match step_result.status {
                         talos_workflow_engine_core::StepStatus::Success => "completed",
                         talos_workflow_engine_core::StepStatus::TimedOut => "timeout",
@@ -769,7 +817,11 @@ impl ParallelWorkflowEngine {
                         talos_workflow_engine_core::StepStatus::Success
                     ) {
                         if let Some(hook) = self.node_hook.as_ref() {
-                            hook.on_pipeline_step_completed(self.actor_id, &step_result.output);
+                            hook.on_pipeline_step_completed(
+                                self.actor_id,
+                                &step_result.output,
+                                self.max_write_ceiling,
+                            );
                         }
                     }
                 }

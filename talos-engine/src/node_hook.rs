@@ -35,7 +35,7 @@
 
 use serde_json::Value as JsonValue;
 use sqlx::{Pool, Postgres};
-use talos_workflow_engine_core::{NodeCompletionContext, NodeLifecycleHook};
+use talos_workflow_engine_core::{NodeCompletionContext, NodeLifecycleHook, WriteCeiling};
 use uuid::Uuid;
 
 /// Default Talos impl of [`NodeLifecycleHook`]. Owns a `PgPool` so it
@@ -85,7 +85,12 @@ impl ControllerNodeHook {
     /// surface and in live workflows — pre-fix, test_module accepted the
     /// envelope and silently dropped it (the hook only fired on engine
     /// executions), a confusing divergence found by the functional sweep.
-    pub fn persist_memory_write_if_present(&self, actor_id: Option<Uuid>, output: &JsonValue) {
+    pub fn persist_memory_write_if_present(
+        &self,
+        actor_id: Option<Uuid>,
+        output: &JsonValue,
+        max_write_ceiling: WriteCeiling,
+    ) {
         let Some(mw) = output
             .get("__memory_write__")
             .and_then(JsonValue::as_object)
@@ -119,6 +124,39 @@ impl ControllerNodeHook {
             );
             return;
         };
+        // ── Write ceiling (#750) ──────────────────────────────────────────
+        // DEFENCE IN DEPTH, and the ONLY gate on one of this method's three
+        // callers. The engine strips a refused envelope before the lifecycle
+        // hook ever sees it, so on the two engine paths this branch is
+        // unreachable by construction (mutation-proved: neutering it leaves
+        // `write_ceiling_memory_write_tests` green, which is why
+        // `write_ceiling_hook_gate_tests` exists). `handle_test_module` calls
+        // this method DIRECTLY with no engine in the loop, and that path is
+        // why the ceiling is a required PARAMETER rather than something
+        // inferred — every caller must state which ceiling it writes under.
+        //
+        // Placed AFTER the actor resolution on purpose: an unbound execution
+        // already has a more specific diagnostic above ("no actor is bound"),
+        // and reporting that same drop as a ceiling refusal would name the
+        // wrong cause.
+        //
+        // Uses the shared `write_ceiling_denies`, not a local re-derivation:
+        // the whole defect was two paths answering one question differently.
+        if talos_workflow_engine_core::write_ceiling_denies(
+            talos_workflow_engine::write_ceiling_gate::controller_write_ceiling_enforced(),
+            max_write_ceiling,
+        ) {
+            let key_raw = mw
+                .get("key")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("<missing>");
+            let key_preview: String = talos_dlp_provider::redact_str(key_raw)
+                .chars()
+                .take(120)
+                .collect();
+            self.record_memory_write_refusal(Some(actor_id), None, &key_preview, max_write_ceiling);
+            return;
+        }
         // MCP-835 (2026-05-14): route through canonical
         // `talos_memory::validate_memory_key` (MCP-834). The pre-fix
         // `is_empty()` check let WASM-guest envelopes through with
@@ -225,6 +263,56 @@ impl ControllerNodeHook {
         });
     }
 
+    /// Record a write-ceiling refusal of a `__memory_write__` envelope.
+    ///
+    /// ONE routine for both entry points — the engine's
+    /// [`NodeLifecycleHook::on_memory_write_refused`] notification and the
+    /// in-method gate above — so the operator-facing vocabulary cannot drift
+    /// between them.
+    ///
+    /// **Audit parity, and its stated limit.** `op` and `policy` are the
+    /// EXACT tokens the worker stamps on its `wasi:capability_denied` rows for
+    /// the same refusal (`agent-memory-set` / `write-ceiling`), because
+    /// `get_module_info.mutation_profile` promises operators the two correlate
+    /// one-to-one. The parity is in the VOCABULARY, not in the transport: the
+    /// worker's refusals also land in the hash-chained, HMAC-signed WORM
+    /// ledger, and the controller has no `ExecutionLedger` producer anywhere
+    /// in the workspace (every `talos.audit.ledger` publish site is under
+    /// `talos-worker-runtime`). Publishing an un-chained event onto that
+    /// subject would break the consumer's chain verification, so this refusal
+    /// is recorded to the `talos_audit` tracing target and the metric only.
+    /// Closing that half needs a controller-side ledger producer and is
+    /// deliberately not this change.
+    fn record_memory_write_refusal(
+        &self,
+        actor_id: Option<Uuid>,
+        node_id: Option<Uuid>,
+        key: &str,
+        max_write_ceiling: WriteCeiling,
+    ) {
+        tracing::warn!(
+            target: "talos_audit",
+            op = talos_workflow_engine_core::AGENT_MEMORY_SET_OP,
+            policy = talos_workflow_engine_core::WRITE_CEILING_POLICY,
+            key = %key,
+            actor_id = ?actor_id,
+            node_id = ?node_id,
+            ceiling = max_write_ceiling.as_signing_str(),
+            "write-ceiling: __memory_write__ envelope refused — no actor_memory row written"
+        );
+        if let Some(m) = talos_metrics::global() {
+            // Same counter, new label value, for the same reason
+            // `invalid_key` uses it: this is a "the write did not happen"
+            // event and operators look for it in one place. The two live
+            // alerts on this counter select `reason="crypto"` and
+            // `reason="db"` specifically, so a policy refusal cannot page
+            // anyone.
+            m.memory_write_failures_total
+                .with_label_values(&["write_ceiling"])
+                .inc();
+        }
+    }
+
     /// Persist normalized ops-alerts when the node output carries the opt-in
     /// `__ops_alert__` key (sibling of [`Self::persist_memory_write_if_present`]
     /// — same opt-in, best-effort, fire-on-completion semantics; see
@@ -282,7 +370,7 @@ impl NodeLifecycleHook for ControllerNodeHook {
         }
 
         // ── 2. `__memory_write__` protocol: persist to actor_memory ──
-        self.persist_memory_write_if_present(ctx.actor_id, output);
+        self.persist_memory_write_if_present(ctx.actor_id, output, ctx.max_write_ceiling);
 
         // ── 3. `__ml_distill__` protocol (RFC 0011 P2d): LLM answers →
         // dataset auto-append + shadow prediction. Same opt-in-output
@@ -295,14 +383,32 @@ impl NodeLifecycleHook for ControllerNodeHook {
         self.persist_ops_alert_if_present(ctx.actor_id, output);
     }
 
-    fn on_pipeline_step_completed(&self, actor_id: Option<Uuid>, step_output: &JsonValue) {
+    fn on_pipeline_step_completed(
+        &self,
+        actor_id: Option<Uuid>,
+        step_output: &JsonValue,
+        max_write_ceiling: WriteCeiling,
+    ) {
         // Pipeline-step memory writes: same extraction, NO fuel
         // attribution. Chain-level fuel is recorded once on the chain
         // head via on_node_completed; double-billing per step would
         // inflate rollups by the chain length.
-        self.persist_memory_write_if_present(actor_id, step_output);
+        self.persist_memory_write_if_present(actor_id, step_output, max_write_ceiling);
         talos_ml::spawn_distill_from_output(actor_id, step_output);
         self.persist_ops_alert_if_present(actor_id, step_output);
+    }
+
+    fn on_memory_write_refused(
+        &self,
+        actor_id: Option<Uuid>,
+        node_id: Option<Uuid>,
+        key: &str,
+        max_write_ceiling: WriteCeiling,
+    ) {
+        // The engine already removed the envelope and annotated the output;
+        // this hook owns the observability side the engine cannot reach (no
+        // metrics registry, no audit target of its own).
+        self.record_memory_write_refusal(actor_id, node_id, key, max_write_ceiling);
     }
 
     fn on_node_failed(
