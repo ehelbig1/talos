@@ -16,7 +16,8 @@ use std::hash::Hash;
 use std::sync::Arc;
 use talos_integration_state::execute_op;
 use talos_memory::integration_state_rpc::{
-    IndexedSlots, IntegrationOp, IntegrationOpResult, ListFilter, StoredEntry,
+    IndexedSlots, IntegrationOp, IntegrationOpResult, IntegrationStateError, ListFilter,
+    StoredEntry,
 };
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
@@ -116,12 +117,27 @@ impl ChannelStore {
         Ok(())
     }
 
-    /// Get a row by `id`. Note `execute_op` returns `Err(KeyNotFound)`
-    /// for missing keys, so a missing row surfaces as
-    /// `Err("integration_state get failed: KeyNotFound")` — exactly
-    /// the pre-extraction behavior. `Ok(None)` only covers the
-    /// (never-observed) non-`Entry` success variant; callers map it to
-    /// their own not-found message.
+    /// Get a row by `id`. **Three-way**, and that is the whole point:
+    ///
+    /// * `Ok(Some(entry))` — the row exists.
+    /// * `Ok(None)` — the row genuinely does not exist (or its TTL has
+    ///   passed). `execute_op` signals this as
+    ///   `Err(IntegrationStateError::KeyNotFound)`; it is an ANSWER, not
+    ///   a failure, so it is folded into the success side here.
+    /// * `Err(_)` — we could not look: pool timeout, Postgres restart,
+    ///   decrypt/projection drift. Nothing may be concluded about
+    ///   whether the row exists.
+    ///
+    /// Before this split every absent key arrived as
+    /// `Err("integration_state get failed: KeyNotFound")`, so `Ok(None)`
+    /// was unreachable and every caller had to collapse the two —
+    /// which is how a database outage came to be reported as
+    /// "Watch not found" (404) on the probe handlers and, worse, as a
+    /// SUCCESSFUL stop on the idempotent `stop_watch` paths.
+    ///
+    /// A non-`Entry` success variant cannot occur for a `Get` (the op
+    /// returns `Entry` or errors), so it is a protocol violation and is
+    /// reported as one rather than being laundered into "absent".
     pub async fn get_entry(&self, user_id: Uuid, id: Uuid) -> Result<Option<StoredEntry>> {
         match execute_op(
             &self.pool,
@@ -130,10 +146,14 @@ impl ChannelStore {
             IntegrationOp::Get { key: self.key(id) },
         )
         .await
-        .map_err(|e| anyhow!("integration_state get failed: {:?}", e))?
         {
-            IntegrationOpResult::Entry { entry } => Ok(Some(entry)),
-            _ => Ok(None),
+            Ok(IntegrationOpResult::Entry { entry }) => Ok(Some(entry)),
+            Ok(other) => Err(anyhow!(
+                "integration_state get returned a non-entry result: {:?}",
+                other
+            )),
+            Err(IntegrationStateError::KeyNotFound) => Ok(None),
+            Err(e) => Err(anyhow!("integration_state get failed: {:?}", e)),
         }
     }
 

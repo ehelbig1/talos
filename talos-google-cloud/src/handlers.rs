@@ -524,14 +524,35 @@ pub async fn test_watch_channel_handler(
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
     let row = match service.find_by_id(user_id, channel_uuid).await {
-        Ok(r) => r,
-        Err(_) => {
+        Ok(Some(r)) => r,
+        Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(ApiResponse::<serde_json::Value> {
                     success: false,
                     data: None,
                     error: Some("Watch not found".into()),
+                }),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            // The pre-split `Err(_)` arm told the caller their watch does
+            // not exist when the truth was that we could not look. The
+            // callee now separates the two; the error chain can carry
+            // vault paths and sqlx schema detail, so it stays server-side.
+            tracing::error!(
+                user_id = %user_id,
+                channel_uuid = %channel_uuid,
+                error = %e,
+                "gcp probe: watch lookup failed"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<serde_json::Value> {
+                    success: false,
+                    data: None,
+                    error: Some("Failed to look up watch channel".into()),
                 }),
             )
                 .into_response();

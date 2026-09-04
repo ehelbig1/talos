@@ -268,8 +268,19 @@ impl GcpWatchService {
     /// no-active-watch ack.
     pub async fn stop_watch(&self, user_id: Uuid, channel_uuid: Uuid) -> Result<()> {
         let row = match self.find_by_id(user_id, channel_uuid).await {
-            Ok(r) => r,
-            Err(_) => return Ok(()),
+            Ok(Some(r)) => r,
+            // Genuinely gone — stop is idempotent, so this is success.
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                // Pre-split this arm was `Err(_) => return Ok(())`: a pool
+                // timeout read as "already gone", so `stop_watch` reported
+                // success and left the row (and the push URL it serves) in
+                // place. Refusing costs the caller a retry.
+                return Err(e).context(
+                    "gcp stop_watch: watch lookup failed; refusing to report \
+                     a stop that did not happen",
+                );
+            }
         };
 
         self.store().delete(user_id, row.id).await?;
@@ -374,7 +385,7 @@ impl GcpWatchService {
     /// (or unset), so a burst of pushes doesn't hammer integration_state
     /// for a liveness field.
     pub async fn record_push_received(&self, user_id: Uuid, channel_uuid: Uuid) -> Result<()> {
-        let mut row = self.find_by_id(user_id, channel_uuid).await?;
+        let mut row = self.require_by_id(user_id, channel_uuid).await?;
         let now_ms = Utc::now().timestamp_millis();
         let should_write = match row.last_push_received_ms {
             Some(prev) => now_ms.saturating_sub(prev) >= PUSH_RECEIVED_THROTTLE_MS,
@@ -389,20 +400,36 @@ impl GcpWatchService {
     }
 
     /// Load one watch row by internal uuid (ownership via the
-    /// user-scoped store).
+    /// user-scoped store). **Three-way** — `Ok(None)` is "no such
+    /// watch", `Err` is "we could not look". Callers that cannot act
+    /// on the distinction take [`Self::require_by_id`].
     pub(crate) async fn find_by_id(
         &self,
         user_id: Uuid,
         channel_uuid: Uuid,
-    ) -> Result<GcpWatchRow> {
+    ) -> Result<Option<GcpWatchRow>> {
         match self.store().get_entry(user_id, channel_uuid).await? {
-            Some(entry) => decode_row(&entry),
-            None => Err(anyhow!(
-                "google_cloud watch {} not found for user {}",
-                channel_uuid,
-                user_id
-            )),
+            Some(entry) => decode_row(&entry).map(Some),
+            None => Ok(None),
         }
+    }
+
+    /// [`Self::find_by_id`] for callers to which an absent row is just
+    /// another failure. The message is the pre-split one, verbatim.
+    pub(crate) async fn require_by_id(
+        &self,
+        user_id: Uuid,
+        channel_uuid: Uuid,
+    ) -> Result<GcpWatchRow> {
+        self.find_by_id(user_id, channel_uuid)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "google_cloud watch {} not found for user {}",
+                    channel_uuid,
+                    user_id
+                )
+            })
     }
 
     /// List every google_cloud watch row this user owns.
