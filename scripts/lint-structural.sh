@@ -7762,6 +7762,116 @@ echo
 # a renumber went wrong or a check was deleted without renumbering), and
 # (b) CLAUDE.md's "N checks today" sentence matches the real count. The
 # pre-push hook no longer states a number (it points at --count).
+# ── check 80: every Postgres image reference must be the SAME pinned digest ──
+#
+# The version was named in SEVEN places and had silently split three ways:
+# docker-compose.yml (postgres, postgres-backup, vault-backup) and
+# .github/workflows/ci.yml pinned pg16; .github/workflows/quality.yml ran an
+# UNPINNED pg17; controller/tests/test_helpers used tag pg17-or-16 via
+# testcontainers; scripts/drills/backup-restore.sh pinned pg16 — while
+# PRODUCTION (deploy/helm values.yaml) is pg17 and
+# migrations/.baseline/schema.sql is dumped from 17.10.
+#
+# That is not cosmetic drift. The baseline emits `SET transaction_timeout = 0`,
+# a PG17-only GUC, so on pg16 `migrate_db()` fails under ON_ERROR_STOP=1 and
+# `make test-integration` is unrunnable locally — while the job that VERIFIES
+# the baseline runs on the one version where it works, so the gate stayed
+# green. Two more are correctness bugs outright: `pg_dump` refuses to dump a
+# server newer than itself (postgres-backup), and a scratch server cannot
+# restore a dump from a newer major (the restore drill).
+#
+# A shared config mechanism is impossible here — the sites are compose YAML,
+# GitHub Actions YAML, Rust source and bash, with no common substitution. This
+# lint is the enforcement that duplication needs, exactly as check 62 is for
+# the three build.rs copies and check 16 for the duplicated WIT file.
+#
+# Precision is trivially 100%: it is an exact-match assertion over a literal,
+# not a heuristic. It fails in three directions — a reference to a DIFFERENT
+# digest, an UNPINNED `pgvector/pgvector:pgNN` tag (an upstream rebuild would
+# silently change what runs), and a testcontainers `.with_tag("pgNN")` whose
+# NN disagrees with the pinned tag.
+#
+# Opt-out: `# allow-postgres-image-drift: <reason>` on the referencing line.
+bold "▶ check 80: one pinned Postgres image across compose, CI, tests and drills"
+# Only ACTUAL image references count, never prose. A doc line, a README, or a
+# comment explaining how to bump the pin all mention the string — including
+# this fix's own comments, which is check 73's lesson. So the line must be an
+# assignment: `image: <ref>` (compose/Actions YAML) or a shell variable default
+# (`VAR="..."` / `\${VAR:-...}`). Markdown is excluded outright.
+PG_REFS="$(grep -rn "${TREE_PRUNE_GREP[@]}" --exclude-dir=target --include='*.yml' --include='*.yaml' --include='*.sh' \
+    -E '^[^#]*(image:[[:space:]]*|IMAGE=|IMAGE:-|:-)["'\'']?pgvector/pgvector:pg[0-9]+' . 2>/dev/null \
+    | grep -v 'allow-postgres-image-drift' \
+    | sed -E 's|^([^:]+:[0-9]+):.*(pgvector/pgvector:pg[0-9]+(@sha256:[0-9a-f]{64})?).*|\1:\2|' || true)"
+PG_CANON="$(grep -oE 'pgvector/pgvector:pg[0-9]+@sha256:[0-9a-f]{64}' docker-compose.yml | head -1 || true)"
+PG_FAIL=0
+if [ -z "$PG_CANON" ]; then
+    red "✗ docker-compose.yml names no digest-pinned pgvector image — cannot establish the canonical pin"
+    PG_FAIL=1
+else
+    PG_TAG="$(printf '%s' "$PG_CANON" | sed -E 's/.*:(pg[0-9]+)@.*/\1/')"
+    while IFS= read -r ref; do
+        [ -z "$ref" ] && continue
+        img="pgvector/pgvector${ref##*:pgvector/pgvector}"
+        loc="${ref%%:pgvector/pgvector*}"
+        reftag="$(printf '%s' "$img" | sed -E 's|.*/pgvector:(pg[0-9]+).*|\1|')"
+        # (a) EVERY reference must name the same MAJOR — this is the correctness axis.
+        if [ "$reftag" != "$PG_TAG" ]; then
+            red "✗ ${loc} names ${reftag} but the canonical Postgres major is ${PG_TAG}"
+            PG_FAIL=1
+            continue
+        fi
+        # (b) Reproducibility surfaces must additionally be DIGEST-pinned. The
+        #     deploy chart and installer are deliberately exempt: an
+        #     operator-overridable tag is the normal chart convention, and
+        #     pinning a digest there would dictate the image an operator runs.
+        case "$loc" in
+            ./docker-compose*|./.github/workflows/*|./controller/tests/*|./scripts/drills/*)
+                case "$img" in
+                    *@sha256:*)
+                        if [ "$img" != "$PG_CANON" ]; then
+                            red "✗ ${loc} pins a DIFFERENT digest than docker-compose.yml"
+                            PG_FAIL=1
+                        fi ;;
+                    *)
+                        red "✗ ${loc} is a reproducibility surface but references an UNPINNED tag — pin the digest"
+                        PG_FAIL=1 ;;
+                esac ;;
+        esac
+    done <<< "$PG_REFS"
+    while IFS= read -r t; do
+        [ -z "$t" ] && continue
+        got="$(printf '%s' "$t" | sed -E 's/.*with_tag\("(pg[0-9]+)"\).*/\1/')"
+        if [ "$got" != "$PG_TAG" ]; then
+            red "✗ ${t%%:*} uses testcontainers tag ${got} but the canonical major is ${PG_TAG}"
+            PG_FAIL=1
+        fi
+    done <<< "$(grep -rn "${TREE_PRUNE_GREP[@]}" --exclude-dir=target 'with_tag("pg[0-9]*")' . 2>/dev/null | grep -v 'allow-postgres-image-drift' || true)"
+    # (c) The Helm chart declares its image as SPLIT `repository:` + `tag:`
+    #     fields, so the combined `pgvector/pgvector:pgNN` form never appears
+    #     and legs (a)/(b) are blind to it. The chart is the PRODUCTION
+    #     authority — a chart bumped to pgNN+1 while compose stayed put is the
+    #     most consequential drift there is — so it gets its own leg.
+    while IFS= read -r vf; do
+        [ -z "$vf" ] && continue
+        charttag="$(awk '/repository:[[:space:]]*pgvector\/pgvector/{f=1;next} f&&/tag:/{gsub(/["'\'' ]/,"",$2); print $2; exit}' "$vf")"
+        [ -z "$charttag" ] && continue
+        if [ "$charttag" != "$PG_TAG" ]; then
+            red "✗ ${vf} (the PRODUCTION chart) declares tag ${charttag} but the canonical major is ${PG_TAG}"
+            PG_FAIL=1
+        fi
+    done <<< "$(grep -rl "${TREE_PRUNE_GREP[@]}" --exclude-dir=target --include='values.yaml' 'repository:[[:space:]]*pgvector/pgvector' . 2>/dev/null || true)"
+fi
+if [ "$PG_FAIL" -gt 0 ]; then
+    yellow "  → production (deploy/helm values.yaml) and migrations/.baseline/schema.sql are pg17."
+    yellow "    A pg16 server cannot apply that baseline (PG17-only \`transaction_timeout\` GUC),"
+    yellow "    pg_dump cannot dump a newer server, and a restore drill cannot restore a newer dump."
+    EXIT_CODE=1
+else
+    green "✓ every Postgres image reference uses the pinned ${PG_CANON##*/}"
+fi
+echo
+
+
 bold "▶ check 54: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
 EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"
