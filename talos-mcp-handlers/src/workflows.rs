@@ -234,7 +234,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                         "type": "object",
                         "description": "Optional map of crate name → version string for the inline compile (e.g. {\"chrono\": \"0.4\", \"url\": \"2\"}). serde and serde_json are pre-bundled. Only allowlisted crates are accepted — see compile_custom_sandbox.dependencies for the full list. Mirrors compile_custom_sandbox semantics so inline-compiled nodes don't have to be compiled separately just to pull a dependency."
                     },
-                    "config": { "type": "object", "description": "Per-node module config key/value pairs merged with the module's default config. Also carries per-node ENGINE HINTS, chiefly `max_fuel` (integer): a node-level fuel budget that OVERRIDES the module row's default at dispatch. Set it when this node sees a bigger payload than the module's typical one (e.g. a fan-in collect payload). The response echoes it back as `node_max_fuel_override`, and `effective_max_fuel` reports what the node will actually run with — note `applied_max_fuel` is the MODULE row and is expected to differ." },
+                    "config": { "type": "object", "description": "Per-node module config key/value pairs merged with the module's default config. Also carries per-node ENGINE HINTS, chiefly `max_fuel` (integer): a node-level fuel budget that OVERRIDES the module row's default at dispatch. Set it when this node sees a bigger payload than the module's typical one (e.g. a fan-in collect payload). The response echoes it back as `node_max_fuel_override`, and `configured_max_fuel` reports the budget as authored — note `applied_max_fuel` is the MODULE row and is expected to differ. `configured_max_fuel` is NOT a prediction of the enforced ceiling: at dispatch the engine takes max(configured, adaptive-fuel learned floor) clamped to max_fuel_per_node, so what a worker enforces can be higher or lower. Read the enforced value from get_fuel_usage_report / get_execution_trace after the node has run." },
                     "skip_condition": { "type": "string", "description": "Rhai expression evaluated before the node runs — if it returns true the node is skipped and execution continues with the next node. Fields bind as BARE variables: \"dry_run == true\", NOT \"input.dry_run == true\" (there is no `input` wrapper unless an upstream output has an `input` key); use `ctx.a.b` for nested access. `is_error` / `error_message` are always in scope. FAIL-OPEN: an expression that cannot be evaluated defaults to false, i.e. the node is NOT skipped and RUNS — syntax is rejected at save time, but verify names with test_condition against a representative payload. Max 2000 chars." },
                     "continue_on_error": { "type": "boolean", "description": "If true, a node failure does not halt the workflow — execution continues with downstream nodes. Use with care: downstream nodes receive error output. Default: false." },
                     "timeout_secs": { "type": "number", "description": "Per-node execution timeout in seconds (default: 60). Nodes that exceed this limit are treated as timed-out failures. Set higher when a node calls an LLM (Ollama synthesis typically 20-45s), performs large HTTP fetches, or runs expensive SQL. Use the global set_wasm_config `execution_timeout_secs` to change the default for nodes that don't specify one." },
@@ -1947,12 +1947,30 @@ pub(crate) fn node_max_fuel_override(config: &serde_json::Value) -> Option<u64> 
     config.get("max_fuel").and_then(serde_json::Value::as_u64)
 }
 
-/// The budget the node will actually run with: the node-level override when the
+/// The budget the node is CONFIGURED with: the node-level override when the
 /// caller supplied one, else the module row's post-upsert `max_fuel`.
 ///
 /// Exists because reporting only the module row under the name
 /// `applied_max_fuel` made a *live* node override look silently dropped.
-pub(crate) fn effective_max_fuel(
+///
+/// # It is NOT what the node will actually run with
+///
+/// It was called `effective_max_fuel` until 2026-09-03, under a doc comment
+/// that said "the budget the node will actually run with". It reads two of the
+/// three inputs to that answer. `ParallelWorkflowEngine::resolve_node_max_fuel`
+/// computes `baseline.max(learned).min(max_fuel_per_node)`, so the enforced
+/// ceiling leaves this value in both directions: adaptive fuel
+/// (`talos_engine::adaptive_fuel`) applies a learned p95/max-derived ceiling as
+/// a FLOOR, and the engine-wide `max_fuel_per_node` clamp (default 50M) caps a
+/// larger configured value. Neither is knowable at authoring time — the learned
+/// floor is a function of a sliding 30-day execution history that this node,
+/// just created, does not have.
+///
+/// So this function answers "what did I configure", which is the only question
+/// an `add_node_to_workflow` response is in a position to answer. "What did it
+/// run under" is `execution_cost_rollup.max_fuel` and is reported by
+/// `get_fuel_usage_report` / `get_execution_trace` once the node has run.
+pub(crate) fn configured_max_fuel(
     node_override: Option<u64>,
     module_max_fuel: Option<i64>,
 ) -> Option<i64> {
@@ -2631,7 +2649,7 @@ async fn handle_add_node_to_workflow(
     // (engine_config::resolve_node_max_fuel). Report both, plus the number the
     // caller actually cares about, so the response can't imply a silent drop.
     let node_max_fuel_override = node_max_fuel_override(&config);
-    let effective_max_fuel = effective_max_fuel(node_max_fuel_override, applied_max_fuel);
+    let configured_max_fuel = configured_max_fuel(node_max_fuel_override, applied_max_fuel);
 
     // The response body is pure JSON — `status` IS the headline here, so a
     // blocked reference must change IT rather than ride along in a field
@@ -2664,8 +2682,8 @@ async fn handle_add_node_to_workflow(
                 "connect_from": connect_from,
                 "connect_to": connect_to,
             },
-            // MODULE-ROW fuel budget, post-upsert. NOT the node's effective
-            // budget when `config.max_fuel` is set — see effective_max_fuel.
+            // MODULE-ROW fuel budget, post-upsert. NOT the node's configured
+            // budget when `config.max_fuel` is set — see configured_max_fuel.
             // For inline-compile + fuel_budget callers: this reflects the
             // computed value from the formula (clamped [1M, 50M]). If you
             // bumped fuel_budget but this number didn't move, the args
@@ -2676,9 +2694,19 @@ async fn handle_add_node_to_workflow(
             // Node-level `config.max_fuel` override as persisted into the
             // node's graph-JSON `data` (null when the caller supplied none).
             "node_max_fuel_override": node_max_fuel_override,
-            // What this node will ACTUALLY run with: the node override when
-            // present, else the module-row default. Read this one.
-            "effective_max_fuel": effective_max_fuel,
+            // What this node is CONFIGURED with: the node override when
+            // present, else the module-row default. Read this one — but read it
+            // as configuration, not as prophecy: the engine applies the
+            // adaptive-fuel learned FLOOR and the engine-wide `max_fuel_per_node`
+            // clamp on top of it at dispatch, so the ceiling a worker enforces
+            // can be higher or lower. See `configured_max_fuel`.
+            "configured_max_fuel": configured_max_fuel,
+            "configured_max_fuel_note": "the budget as AUTHORED. The engine resolves \
+                 max(this, adaptive-fuel learned floor) clamped to the engine-wide \
+                 max_fuel_per_node, so the ceiling actually enforced can differ in either \
+                 direction and is not knowable until the node runs. get_fuel_usage_report \
+                 and get_execution_trace report the enforced value from \
+                 execution_cost_rollup.max_fuel — the worker's own __fuel_limit__ stamp.",
             "template_interpolation_warnings": template_warnings,
             "auto_publish_note": auto_publish_note.trim(),
             "next_steps_checklist": checklist,
@@ -11621,13 +11649,13 @@ async fn handle_export_yaml_workflow(
 #[cfg(test)]
 mod tests {
 
-    use super::{effective_max_fuel, node_max_fuel_override};
+    use super::{configured_max_fuel, node_max_fuel_override};
     use talos_workflow_creation_helpers::detect_tool_call_xml_leak;
 
     /// The 2026-07-26 confusion: a caller passed `config.max_fuel = 12_000_000`
     /// and read back `applied_max_fuel: 1_380_000` (the MODULE row), concluding
     /// their override had been silently dropped. It had not — the override is
-    /// persisted into node `data` and wins at dispatch. `effective_max_fuel`
+    /// persisted into node `data` and wins at dispatch. `configured_max_fuel`
     /// must report the override, not the module default.
     #[test]
     fn node_override_beats_module_row_in_reported_fuel() {
@@ -11635,7 +11663,7 @@ mod tests {
         let over = node_max_fuel_override(&config);
         assert_eq!(over, Some(12_000_000));
         assert_eq!(
-            effective_max_fuel(over, Some(1_380_000)),
+            configured_max_fuel(over, Some(1_380_000)),
             Some(12_000_000),
             "reported fuel must be the node override, not the module row"
         );
@@ -11647,8 +11675,8 @@ mod tests {
     fn absent_override_falls_back_to_module_row() {
         let config = serde_json::json!({ "some_other_key": 1 });
         assert_eq!(node_max_fuel_override(&config), None);
-        assert_eq!(effective_max_fuel(None, Some(1_380_000)), Some(1_380_000));
-        assert_eq!(effective_max_fuel(None, None), None);
+        assert_eq!(configured_max_fuel(None, Some(1_380_000)), Some(1_380_000));
+        assert_eq!(configured_max_fuel(None, None), None);
     }
 
     /// A non-numeric or negative `max_fuel` is not an override — it must not be
@@ -11669,17 +11697,60 @@ mod tests {
             );
             // …and the module row still gets reported, unchanged.
             assert_eq!(
-                effective_max_fuel(node_max_fuel_override(&bad), Some(1_380_000)),
+                configured_max_fuel(node_max_fuel_override(&bad), Some(1_380_000)),
                 Some(1_380_000)
             );
         }
+    }
+
+    /// The tool's own description must not promise a prediction it cannot make.
+    ///
+    /// Until 2026-09-03 it told operators that "`effective_max_fuel` reports
+    /// what the node will actually run with". It does not:
+    /// `ParallelWorkflowEngine::resolve_node_max_fuel` computes
+    /// `baseline.max(learned).min(max_fuel_per_node)`, and neither the
+    /// adaptive-fuel learned FLOOR nor the engine-wide clamp is visible to a
+    /// handler that has just created the node — the floor is derived from a
+    /// 30-day execution history the node does not have yet.
+    ///
+    /// Schema prose is the only place this claim reached an operator, so it is
+    /// pinned here: a rename that leaves the sentence behind fixes nothing.
+    #[test]
+    fn the_add_node_schema_does_not_promise_the_enforced_ceiling() {
+        let schemas = super::tool_schemas();
+        let add_node = schemas
+            .iter()
+            .find(|s| s["name"] == "add_node_to_workflow")
+            .expect("add_node_to_workflow schema");
+        let desc = add_node["inputSchema"]["properties"]["config"]["description"]
+            .as_str()
+            .expect("config description");
+
+        assert!(
+            !desc.contains("will actually run with"),
+            "the schema must not promise the enforced ceiling: {desc}"
+        );
+        assert!(
+            !desc.contains("effective_max_fuel"),
+            "the finality-asserting field name must be gone, not aliased: {desc}"
+        );
+        assert!(
+            desc.contains("configured_max_fuel"),
+            "the response field must still be named: {desc}"
+        );
+        // …and the reader must be told WHY the configured value is not the
+        // enforced one, or the rename is cosmetic.
+        assert!(
+            desc.contains("adaptive"),
+            "the schema must name the adaptive floor as the reason: {desc}"
+        );
     }
 
     /// Guard the u64 → i64 narrowing: a huge override must saturate rather than
     /// wrap to a negative "budget" in the JSON response.
     #[test]
     fn oversized_override_saturates_instead_of_wrapping() {
-        let reported = effective_max_fuel(Some(u64::MAX), Some(1_380_000)).unwrap();
+        let reported = configured_max_fuel(Some(u64::MAX), Some(1_380_000)).unwrap();
         assert!(
             reported > 0,
             "narrowing must not wrap negative, got {reported}"
