@@ -224,11 +224,32 @@ pub(crate) async fn dispatch_monitoring_incident(
     let (resolved_actor, actor_tier, actor_write_ceiling, actor_egress) =
         match actor_repo.resolve_effective_actor(user_id, None).await {
             Ok(aid) => {
-                // One joined SELECT, fail-OPEN to actor-less Tier-2 on any
-                // error (a module bound to an air-gapped (egress=local) actor
-                // stays air-gapped via the egress override), matching the
-                // Tier-2 fail-open posture of this inbound-incident path.
-                let (tier, write_ceiling, egress) = actor_repo.get_module_bound_ceilings(aid).await;
+                // #736: one joined SELECT, CLASSIFIED rather than collapsed.
+                //
+                // The parenthetical this comment used to carry — "a module
+                // bound to an air-gapped (egress=local) actor stays air-gapped
+                // via the egress override" — was FALSE, and the measurement is
+                // worth keeping: the old fallback passed `None` for egress and
+                // `resolve_local_egress_only` reads
+                // `None => matches!(max_llm_tier, Tier1)`, so `(Tier2, _, None)`
+                // derives PUBLIC egress. The claim would have held only for an
+                // actor with an EXPLICIT `egress_scope = 'local'`.
+                //
+                // Refusing is NOT available here: `pubsub_push_handler` has
+                // already returned 200 (this runs in a detached `tokio::spawn`)
+                // and `reserve_dedup` claimed a 24 h SETNX key above, so an
+                // error would lose the incident permanently AND block a manual
+                // re-push. So the choice is grant-vs-restrict, and we restrict.
+                let (tier, write_ceiling, egress) = match actor_repo
+                    .read_module_bound_ceilings(aid)
+                    .await
+                    .resolve_for(
+                        aid,
+                        talos_actor_repository::DispatchSite::GcpMonitoringIncident,
+                    ) {
+                    Ok(triple) => triple,
+                    Err(refusal) => return Err(anyhow::anyhow!("{refusal}")),
+                };
                 (Some(aid), tier, write_ceiling, egress)
             }
             Err(e) => {
