@@ -29,6 +29,11 @@ sqlx = { version = "0.8", default-features = false, features = ["postgres", "run
 talos-actor-memory-service = { path = "../talos-actor-memory-service" }
 talos-actor-repository = { path = "../talos-actor-repository" }
 talos-execution-repository = { path = "../talos-execution-repository" }
+# `module_executions.error_type` derivation. Consumed rather than re-implemented:
+# this crate's classifier is the SAME one `analyze_execution_failure` shows an
+# operator for the same message, so the stored column and the report it sits
+# beside cannot give two names to one cause. See `module_error_type`.
+talos-failure-analysis-service = { path = "../talos-failure-analysis-service" }
 talos-ops-alerts-repository = { path = "../talos-ops-alerts-repository" }
 talos-config = { path = "../talos-config" }
 talos-public-url = { path = "../talos-public-url" }
