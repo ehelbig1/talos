@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT worker_id, build_version, supports_sealing, last_seen_at, last_liveness_at\n             FROM worker_identities\n             WHERE active\n             ORDER BY worker_id, public_key\n             LIMIT $1",
+  "query": "SELECT worker_id, build_version, supports_sealing, last_seen_at, last_liveness_at,\n                    write_ceiling_enforced, write_ceiling_strict_egress\n             FROM worker_identities\n             WHERE active\n             ORDER BY worker_id, public_key\n             LIMIT $1",
   "describe": {
     "columns": [
       {
@@ -27,6 +27,16 @@
         "ordinal": 4,
         "name": "last_liveness_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "write_ceiling_enforced",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "write_ceiling_strict_egress",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -39,8 +49,10 @@
       true,
       false,
       false,
+      true,
+      true,
       true
     ]
   },
-  "hash": "da5bdab98fdfb257ea8158197d24e009a4c261bdf3f90c2132ce16bb3a1a45f4"
+  "hash": "8469c0a7a1b7660d13661f6b87b69df4e67680012602a247e0dee20b787ff4af"
 }

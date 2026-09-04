@@ -338,6 +338,14 @@ CTRL_TESTS=(
     # caller that feeds it the wrong column — which is exactly the defect that
     # left one model five days and 161 examples past its last policy verdict.
     "ml_promotion_legibility_tests"
+    # #750: the write-ceiling enforcement posture's DB round trip. Uses the
+    # `common` DATABASE_URL harness, so it belongs in CTRL_TESTS and not
+    # TC_TESTS (sub-leg 64b). It is the only coverage of the parts BETWEEN the
+    # pure summariser and the worker's body shape: that the registration write
+    # persists both bits, unswapped, on both the `register` and `register_tofu`
+    # arms, and that a re-registration overwrites a stale claim including back
+    # to NULL.
+    "worker_write_ceiling_reporting_tests"
     # ── Tenancy / crypto / status-drift siblings (gated 2026-07-30) ─────────
     # Same story: isolated-DB-harness binaries that never had a runner entry.
     # Three guard a security boundary directly — github_app_tenancy_tests

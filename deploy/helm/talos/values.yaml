@@ -748,7 +748,19 @@ worker:
     # (set via the `set_actor_write_ceiling` operator tool). Default
     # off: the signed ceiling travels on every job but changes nothing
     # until enabled — a staged rollout, same shape as the tier ceiling.
-    # Read once at boot.
+    # Read once at boot, on BOTH sides. The ceiling itself is HMAC-bound on
+    # every JobRequest; the worker gates mutating HOST CALLS under it, and
+    # since #750 the controller gates the `__memory_write__` envelope it
+    # persists on node completion — set the flag on controller.env too, or a
+    # 'readonly' actor is refused one route and permitted the other. The
+    # worker also REPORTS this flag's value (and the strict-egress one below)
+    # with its boot self-registration, DIAGNOSTIC ONLY and outside the
+    # registration proof, so get_platform_info.fleet, set_actor_write_ceiling,
+    # get_actor_summary, get_my_capability_ceiling and security_audit can say
+    # whether a 'readonly' ceiling is a live control here or a decorative
+    # column. A worker that does not self-register (statically-keyed via
+    # TALOS_WORKER_PUBLIC_KEYS) reports nothing and is summarised as UNKNOWN,
+    # never as 'not enforcing'.
     # Injection audit 2026-07-20: enforced by default — a readonly
     # actor's ceiling must be a live control, not a decorative column.
     #

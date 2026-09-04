@@ -169,7 +169,9 @@ impl CheckKind {
 /// `security_score / max_score` decomposes the same way whatever the
 /// deployment looks like.
 ///
-/// The nine weights sum to [`MAX_SCORE`]; `weights_sum_to_max_score` pins it.
+/// The nine SCORED weights sum to [`MAX_SCORE`]; `weights_sum_to_max_score`
+/// pins it. `write_ceiling_enforcement` is deliberately weighted **0** — see
+/// its entry below.
 const CHECK_WEIGHTS: &[(&str, u32, CheckKind)] = &[
     ("production_mode", 10, CheckKind::DeploymentPosture),
     ("jwt_algorithm", 10, CheckKind::Control),
@@ -180,6 +182,31 @@ const CHECK_WEIGHTS: &[(&str, u32, CheckKind)] = &[
     ("redis_tls", 10, CheckKind::Control),
     ("audit_immutability_triggers", 10, CheckKind::Control),
     ("cors_origins", 10, CheckKind::Control),
+    // WEIGHT 0 — REPORTED, NOT SCORED, and the zero is a decision rather than
+    // an oversight.
+    //
+    // Three reasons, in order:
+    //  1. `TALOS_WRITE_CEILING_ENFORCED` is DEFAULT OFF by design (a staged
+    //     rollout, the same shape as TALOS_ENVELOPE_SEALING). Docking points
+    //     for using the documented default would make the score say "less
+    //     secure" about a deployment that did nothing wrong.
+    //  2. The grade bands here are ABSOLUTE against a 100-point total, and
+    //     `MAX_SCORE`'s own doc block leans on that calibration (a dev stack
+    //     tops out at exactly 90, which is exactly GRADE_A). A tenth weighted
+    //     check would silently re-grade every deployment — collateral far
+    //     larger than this finding.
+    //  3. The finding is CONDITIONAL: an unenforced ceiling only matters where
+    //     an actor is configured `readonly`, and this check deliberately does
+    //     not read actor rows (see `check_write_ceiling_enforcement`).
+    //
+    // A zero weight does NOT make it decorative. It carries `Status` and
+    // `Verification`, so it lands in `status_counts`, in
+    // `verification_counts`, and — the part an operator actually reads — in
+    // `recommendation_for`, which names warning and unverified checks by name.
+    // `unweighted_checks_cost_nothing` pins the arithmetic, because a check
+    // whose legend says "ungraded" while it quietly costs points is a defect
+    // this file has shipped before.
+    ("write_ceiling_enforcement", 0, CheckKind::Control),
 ];
 
 /// One rendered check.
@@ -810,6 +837,98 @@ pub fn check_audit_immutability_triggers(count: Option<i64>) -> Check {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Check 10 — per-actor write-ceiling enforcement (reported, unscored)
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Render `write_ceiling_enforcement`.
+///
+/// # What this grades
+///
+/// `actors.max_write_ceiling` (`readonly` | `write`) is set on the controller
+/// and travels HMAC-bound on every job, but it is enforced only inside the
+/// WORKER process, gated on a worker-only env flag that is default OFF. So
+/// until the fleet reported that flag, an enforcing deployment and a
+/// decorative one were indistinguishable from every controller surface — and
+/// this audit had no ceiling check at all.
+///
+/// # Why it never awards from a default
+///
+/// `None` means the fleet registry could not be read. That is [`NotVerified`]
+/// with zero points, never a pass: "nobody looked" and "nothing enforces" are
+/// different findings, and only one of them is about the database.
+///
+/// [`FleetWriteCeilingState::Unknown`] is likewise NOT a pass. It is what a
+/// fleet reports when nothing has registered, or when nobody reports
+/// enforcement and at least one row said nothing — the state in which the most
+/// tempting wrong answer ("no evidence of a problem") is exactly backwards.
+/// It maps to `NotVerified`, so the report's own `verification_counts` and the
+/// recommendation both name it as unestablished rather than fine.
+///
+/// # Verification level, and why not higher
+///
+/// Even the positive answer is [`ConfigPresence`], matching
+/// `aot_integrity_key` — whose enforcing key ring likewise lives in the worker
+/// process. Nothing here was exercised: the controller read a value another
+/// process reported about its own env at ITS boot, transported unsigned. It is
+/// evidence about configuration, not a demonstration that a mutation would be
+/// refused. Calling it `Parsed` would claim the value was read through the code
+/// that enforces it, which is true only in the worker, not here.
+///
+/// # What it deliberately does not do
+///
+/// It does not count `readonly` actors. That would need a cross-tenant actor
+/// query for a platform-wide audit, and it would invent an awkward "zero
+/// readonly actors" arm whose only honest answer is the one this check already
+/// gives. The per-actor consequence is disclosed where it is actionable —
+/// `set_actor_write_ceiling` prints this same summary at the moment an
+/// operator sets a ceiling.
+///
+/// [`NotVerified`]: Verification::NotVerified
+/// [`ConfigPresence`]: Verification::ConfigPresence
+#[must_use]
+pub fn check_write_ceiling_enforcement(
+    fleet: Option<talos_worker_identity_repository::WriteCeilingFleetSummary>,
+) -> Check {
+    use talos_worker_identity_repository::FleetWriteCeilingState as S;
+
+    let Some(f) = fleet else {
+        return Check {
+            name: "write_ceiling_enforcement",
+            status: Status::Warn,
+            detail: "NOT VERIFIED: the worker-identity registry query failed, so this run did \
+                     not establish whether any worker enforces the per-actor write ceiling. \
+                     This is a database problem, not a finding about the ceiling."
+                .to_string(),
+            verification: Verification::NotVerified,
+            points: 0,
+        };
+    };
+
+    let (status, verification) = match f.state {
+        S::All => (Status::Pass, Verification::ConfigPresence),
+        // A mixed fleet is a real finding: nothing routes jobs by enforcement
+        // posture, so a readonly actor's job may land on the worker that does
+        // not enforce.
+        S::Some | S::None => (Status::Warn, Verification::ConfigPresence),
+        // Not a pass. Nothing was established.
+        S::Unknown => (Status::Warn, Verification::NotVerified),
+    };
+
+    Check {
+        name: "write_ceiling_enforcement",
+        status,
+        detail: format!(
+            "{} Worker-self-reported at registration and UNSIGNED — diagnostic only, never an \
+             authorization input; the enforcing gate lives in the worker process, so the \
+             controller cannot exercise it from here. Reported, not scored.",
+            f.note()
+        ),
+        verification,
+        points: 0,
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Check 9 — CORS origins
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -1129,9 +1248,14 @@ pub fn render_report(checks: &[Check]) -> serde_json::Value {
 ///
 /// Idempotent and side-effect free: see the per-probe documentation. The only
 /// database access is a read of `pg_trigger`.
+/// `write_ceiling_fleet` is supplied by the CALLER rather than read here, so
+/// this crate keeps its single database touchpoint (`pg_trigger`) and every
+/// branch of the check stays unit-testable without Postgres. `None` = the
+/// caller's fleet read failed, which the check reports as NOT VERIFIED.
 pub async fn run_security_audit(
     sysrepo: &SystemRepository,
     secrets: &SecretsManager,
+    write_ceiling_fleet: Option<talos_worker_identity_repository::WriteCeilingFleetSummary>,
 ) -> serde_json::Value {
     let is_prod = talos_config::is_production();
 
@@ -1172,6 +1296,7 @@ pub async fn run_security_audit(
             is_prod,
         ),
         check_audit_immutability_triggers(triggers),
+        check_write_ceiling_enforcement(write_ceiling_fleet),
         check_cors_origins(
             &talos_config::check_allowed_origins(),
             talos_config::env_var_is_set_nonempty("ALLOWED_ORIGIN"),

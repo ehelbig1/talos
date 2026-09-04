@@ -383,8 +383,8 @@ into both deployments.
 | `MCP_AUTH_RATE_WINDOW` | `60` | both | MCP auth window (seconds) | |
 | `MCP_EXPENSIVE_OP_RATE_LIMIT` | `10` | both | Rate limit for expensive MCP operations | |
 | `MCP_TOKEN_REVALIDATION_INTERVAL_SECS` | `60` | both | MCP token revalidation cadence | |
-| `TALOS_WRITE_CEILING_ENFORCED` | bool default | both | Enforce actor write ceiling. **Set it on BOTH** — the worker gates mutating host calls, the controller gates the `__memory_write__` envelope it persists on node completion (#750); on the worker alone a `readonly` actor is refused one route and permitted the other. | 🔒 (posture) |
-| `TALOS_WRITE_CEILING_STRICT_EGRESS` | bool default | both | Strict egress under the write ceiling | 🔒 (posture) |
+| `TALOS_WRITE_CEILING_ENFORCED` | bool default | both | Enforce actor write ceiling. **Set it on BOTH** — the worker gates mutating host calls, the controller gates the `__memory_write__` envelope it persists on node completion (#750); on the worker alone a `readonly` actor is refused one route and permitted the other. The worker reports its value to the controller at self-registration, diagnostic only, outside the registration proof (`get_platform_info.fleet.write_ceiling`). | 🔒 (posture) |
+| `TALOS_WRITE_CEILING_STRICT_EGRESS` | bool default | worker | Strict egress under the write ceiling; inert unless the flag above is on. Reported alongside it at self-registration. | 🔒 (posture) |
 | `TALOS_DISTRIBUTED_REPLAY` | off | controller | Enable distributed replay | |
 | `TALOS_REPLAY_FAIL_CLOSED` | policy default | both | Fail closed on replay-guard errors | 🔒 (posture) |
 | `TALOS_VERSION` | derived from build | controller | Build/version string override | |
