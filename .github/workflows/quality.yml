@@ -392,7 +392,12 @@ jobs:
   frontend:
     name: Frontend (lint + test)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 10 left no headroom: `npm ci` is normally 1m02s-2m34s but was measured
+    # at 7m02s on 2026-09-04 against a degraded registry, which alone spent 70%
+    # of the budget and got the job cancelled mid-audit. 20 absorbs that without
+    # hiding it — the audit now bounds itself, so a slow registry degrades to a
+    # loud UNKNOWN warning rather than to no result at all.
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: frontend
@@ -454,10 +459,49 @@ jobs:
         #
         # Silence on an unreadable audit would be the worse bug: a green
         # tick that means "I did not look".
+        #
+        # BOUNDED (2026-09-04). #738 taught this step to distinguish "found
+        # advisories" from "could not reach the service", but only for a
+        # service that ANSWERS. A service that simply does not answer was
+        # still unhandled: the command substitution blocks, the step
+        # consumes whatever remains of the job budget, and the JOB IS
+        # CANCELLED. That is strictly worse than either outcome it was
+        # built to separate — a cancelled check is neither green nor red,
+        # so it reports nothing at all. "Unreadable is not clean" has to
+        # include "unreachable within a bounded time".
+        #
+        # 300s is measured, not guessed: across the runs on record this
+        # step succeeds in 1m13s-3m20s, so the bound sits at ~1.5x the
+        # slowest observed SUCCESS. Setting it near the typical case would
+        # cut legitimate slow audits and silently turn the gate off, which
+        # is the failure this whole step exists to avoid.
+        #
+        # `set +e` IS LOad-BEARING. GitHub runs every `run:` block as
+        # `bash -e {0}` (visible in the job log), and `set -uo pipefail`
+        # does NOT turn that off. Under `-e` the assignment below is a
+        # simple command whose status is the substitution's, so ANY
+        # non-zero npm audit exit killed the step right there — `rc=$?`
+        # and every branch under it were unreachable. That is precisely
+        # how this step failed on its own PR with `exit code 124`: the
+        # 300s bound fired exactly as intended and the handler for it
+        # never ran.
+        #
+        # It also means #738's error paths had never executed in CI. They
+        # were verified against a fixture harness run under a plain shell,
+        # which does not model `-e`, and every real run until now happened
+        # to be the clean case where npm audit exits 0. A verification
+        # harness has to reproduce the ENVIRONMENT, not just the logic.
         run: |
           set -uo pipefail
-          out="$(npm audit --json --audit-level=moderate 2>/dev/null)"
+          set +e
+          out="$(timeout 300 npm audit --json --audit-level=moderate 2>/dev/null)"
           rc=$?
+          set -e
+
+          if [ "$rc" -eq 124 ]; then
+            echo "::warning title=Frontend advisory state UNKNOWN::npm audit did not answer within 300s and was stopped. This is NOT a clean result — the advisory state was not read. The nightly run re-checks."
+            exit 0
+          fi
 
           if [ -z "$out" ] || ! printf '%s' "$out" | jq -e . >/dev/null 2>&1; then
             echo "::warning title=Frontend advisory state UNKNOWN::npm audit produced no parseable JSON (exit $rc). This is NOT a clean result — the advisory state was not read."
