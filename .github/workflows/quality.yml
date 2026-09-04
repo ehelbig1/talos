@@ -475,10 +475,28 @@ jobs:
         # slowest observed SUCCESS. Setting it near the typical case would
         # cut legitimate slow audits and silently turn the gate off, which
         # is the failure this whole step exists to avoid.
+        #
+        # `set +e` IS LOad-BEARING. GitHub runs every `run:` block as
+        # `bash -e {0}` (visible in the job log), and `set -uo pipefail`
+        # does NOT turn that off. Under `-e` the assignment below is a
+        # simple command whose status is the substitution's, so ANY
+        # non-zero npm audit exit killed the step right there — `rc=$?`
+        # and every branch under it were unreachable. That is precisely
+        # how this step failed on its own PR with `exit code 124`: the
+        # 300s bound fired exactly as intended and the handler for it
+        # never ran.
+        #
+        # It also means #738's error paths had never executed in CI. They
+        # were verified against a fixture harness run under a plain shell,
+        # which does not model `-e`, and every real run until now happened
+        # to be the clean case where npm audit exits 0. A verification
+        # harness has to reproduce the ENVIRONMENT, not just the logic.
         run: |
           set -uo pipefail
+          set +e
           out="$(timeout 300 npm audit --json --audit-level=moderate 2>/dev/null)"
           rc=$?
+          set -e
 
           if [ "$rc" -eq 124 ]; then
             echo "::warning title=Frontend advisory state UNKNOWN::npm audit did not answer within 300s and was stopped. This is NOT a clean result — the advisory state was not read. The nightly run re-checks."
