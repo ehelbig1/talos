@@ -1915,6 +1915,120 @@ pub(crate) fn append_warning_block(resp: &mut talos_mcp::JsonRpcResponse, warnin
     }
 }
 
+/// What a `workflows.graph_json` read actually established.
+///
+/// The read returns `Result<Option<String>>` and the three outcomes mean
+/// three different things, but the two spellings that collapsed them —
+/// `_ => "{\"nodes\":[],\"edges\":[]}"` and `if let Ok(Some(gj))` — routed a
+/// DB/pool failure into the SAME branch as a workflow that does not exist,
+/// and every graph-derived field downstream then made a determinate
+/// statement about a graph nobody read.
+///
+/// `Absent` is unambiguous and does not need a hedge: `workflows.graph_json`
+/// is `TEXT NOT NULL` (`001_initial_schema.sql`) and the query is
+/// `WHERE id = $1 AND user_id = $2` through `fetch_optional`, so the only way
+/// the row is missing is that the workflow does not exist or is not this
+/// user's. It is the same read, with the same predicate, that
+/// `WorkflowValidationService::prepare` turns into
+/// `"Workflow not found or access denied"`.
+///
+/// `Unreadable` carries nothing from the error. The chain is logged
+/// server-side by [`classify_workflow_graph_read`]; internal detail must not
+/// reach a protocol client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GraphRead {
+    /// The graph JSON, verbatim.
+    Present(String),
+    /// The workflow row is not there — it does not exist, or is not this
+    /// user's. A definite answer.
+    Absent,
+    /// The read failed. NOT an empty graph, NOT a missing workflow.
+    Unreadable,
+}
+
+impl GraphRead {
+    /// True only for [`GraphRead::Present`] — i.e. every graph-derived field
+    /// downstream is a measurement rather than an assumption.
+    pub(crate) fn measured(&self) -> bool {
+        matches!(self, GraphRead::Present(_))
+    }
+}
+
+/// Classify one `get_workflow_graph`-shaped read, logging the failure chain
+/// server-side so the caller can answer generically.
+///
+/// `surface` names the tool doing the reading and appears only in the server
+/// log, never in a response.
+pub(crate) fn classify_workflow_graph_read<E: std::fmt::Display>(
+    surface: &'static str,
+    workflow_id: uuid::Uuid,
+    read: Result<Option<String>, E>,
+) -> GraphRead {
+    match read {
+        Ok(Some(gj)) => GraphRead::Present(gj),
+        Ok(None) => GraphRead::Absent,
+        Err(e) => {
+            tracing::error!(
+                target: "talos_mcp",
+                event_kind = "workflow_graph_read_failed",
+                surface = surface,
+                workflow_id = %workflow_id,
+                error = %e,
+                "workflow graph read failed — refusing to report it as an empty graph"
+            );
+            GraphRead::Unreadable
+        }
+    }
+}
+
+#[cfg(test)]
+mod graph_read_classification_tests {
+    use super::*;
+
+    fn wf() -> uuid::Uuid {
+        uuid::Uuid::nil()
+    }
+
+    /// The whole point. A pool timeout is not a graph with no nodes.
+    #[test]
+    fn a_failed_read_is_not_an_empty_graph() {
+        let r = classify_workflow_graph_read::<String>("t", wf(), Err("pool timed out".into()));
+        assert_eq!(r, GraphRead::Unreadable);
+        assert!(!r.measured());
+    }
+
+    /// ...and it is not a missing workflow either. Collapsing those two is
+    /// the #736 shape; this keeps them apart.
+    #[test]
+    fn a_failed_read_is_not_a_missing_workflow() {
+        let failed = classify_workflow_graph_read::<String>("t", wf(), Err("boom".into()));
+        let missing = classify_workflow_graph_read::<String>("t", wf(), Ok(None));
+        assert_ne!(failed, missing);
+        assert_eq!(missing, GraphRead::Absent);
+    }
+
+    /// Real absence keeps its definite answer — `graph_json` is NOT NULL, so
+    /// `Ok(None)` can only be "no such row for this user".
+    #[test]
+    fn an_absent_row_is_a_definite_answer_and_is_not_measured() {
+        let r = classify_workflow_graph_read::<String>("t", wf(), Ok(None));
+        assert_eq!(r, GraphRead::Absent);
+        assert!(
+            !r.measured(),
+            "an absent row measured no graph, so no graph-derived count may be emitted"
+        );
+    }
+
+    /// The healthy path is carried through byte-for-byte.
+    #[test]
+    fn a_present_graph_is_carried_through_verbatim() {
+        let gj = r#"{"nodes":[{"id":"a"}],"edges":[]}"#;
+        let r = classify_workflow_graph_read::<String>("t", wf(), Ok(Some(gj.to_string())));
+        assert_eq!(r, GraphRead::Present(gj.to_string()));
+        assert!(r.measured());
+    }
+}
+
 #[cfg(test)]
 mod unknown_arg_tests {
     use super::*;

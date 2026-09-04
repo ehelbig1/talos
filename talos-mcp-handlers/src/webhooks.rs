@@ -605,15 +605,31 @@ async fn handle_list_workflow_webhooks(
         Err(resp) => return resp,
     };
 
-    // Get the graph_json from the workflow
+    // Get the graph_json from the workflow.
+    //
+    // #740: not defaulted. `.unwrap_or(None)` turned a DB failure into
+    // "Workflow not found or access denied" — a definite claim about
+    // existence and authorisation, reached by never having looked. Identical
+    // shape, identical repository method and identical string to the one
+    // #730 fixed in `handle_get_version_diff_summary`; that sibling is
+    // followed here. Real absence keeps its original message.
     let graph_str = match state
         .workflow_repo
         .get_workflow_graph_for_similarity(workflow_id, user_id)
         .await
-        .unwrap_or(None)
     {
-        Some(g) => g,
-        None => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Ok(Some(g)) => g,
+        Ok(None) => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Err(e) => {
+            tracing::error!(
+                target: "talos_mcp_handlers::webhooks",
+                event_kind = "workflow_graph_read_failed",
+                workflow_id = %workflow_id,
+                error = %e,
+                "list_workflow_webhooks: graph read failed — refusing to report 'not found'"
+            );
+            return crate::utils::database_error(req_id);
+        }
     };
 
     // Extract module IDs from graph_json (handles v1/v2 format)
