@@ -43,6 +43,20 @@ pub struct NodeCompletionContext<'a> {
     /// actor-scoped side effects (for example, an actor-memory write
     /// triggered by an engine protocol field in `output`) key off this.
     pub actor_id: Option<Uuid>,
+    /// Data-mutation ceiling in force for this job — the engine's
+    /// `max_write_ceiling`, already narrowed for a sub-workflow by
+    /// `bind_subengine_actor_and_ceilings`.
+    ///
+    /// Present because the `__memory_write__` envelope reaches `actor_memory`
+    /// through this hook, and until #750 the hook had no way to ask whether
+    /// the job's actor was allowed to write: a `readonly` actor was refused at
+    /// `agent_memory::set` in the worker and permitted here on the same job.
+    /// Impls that persist on the actor's behalf MUST consult it.
+    ///
+    /// Permissive `Write` is the correct default for the same reason it is the
+    /// wire default — an actor-less system job must not be blocked — and the
+    /// restrictive default lives at the actor layer.
+    pub max_write_ceiling: crate::WriteCeiling,
     /// MONOTONIC execution time in milliseconds, measured from dispatch
     /// to completion with `std::time::Instant` — despite the field name,
     /// which is preserved because it is also the name of the column it
@@ -106,7 +120,45 @@ pub trait NodeLifecycleHook: Send + Sync {
     /// attribution — pipeline fuel is aggregated at the chain level
     /// and billing here would double-count.
     ///
+    /// `max_write_ceiling` is the job's data-mutation ceiling. A step's
+    /// `__memory_write__` is the same write by the same actor as a node's, so
+    /// it obeys the same ceiling; the parameter is explicit rather than
+    /// implied so a new impl cannot forget it. See
+    /// [`NodeCompletionContext::max_write_ceiling`].
+    ///
     /// Default impl: no-op. Consumers without per-step semantics
     /// rely on `on_node_completed` alone.
-    fn on_pipeline_step_completed(&self, _actor_id: Option<Uuid>, _step_output: &JsonValue) {}
+    fn on_pipeline_step_completed(
+        &self,
+        _actor_id: Option<Uuid>,
+        _step_output: &JsonValue,
+        _max_write_ceiling: crate::WriteCeiling,
+    ) {
+    }
+
+    /// Synchronous notification that a `__memory_write__` envelope was
+    /// REFUSED by the write ceiling and dropped by the engine.
+    ///
+    /// The engine has already removed the envelope from the node output and
+    /// stamped
+    /// [`reserved_keys::MEMORY_WRITE_REFUSED`](crate::reserved_keys::MEMORY_WRITE_REFUSED)
+    /// in its place, so nothing downstream will act on the write or assert it
+    /// happened. This method exists so the impl that OWNS the persistence side
+    /// effect — and therefore the audit stream, the metric, and the operator
+    /// log — can record the refusal, which the engine cannot do (it has no
+    /// database, no metrics registry and no audit ledger).
+    ///
+    /// `key` is the requested memory key, already redacted and length-bounded
+    /// by the engine. `node_id` is `None` for a pipeline step, which completes
+    /// without its own node identity.
+    ///
+    /// Default impl: no-op — a metrics-only or test-capture hook need not care.
+    fn on_memory_write_refused(
+        &self,
+        _actor_id: Option<Uuid>,
+        _node_id: Option<Uuid>,
+        _key: &str,
+        _max_write_ceiling: crate::WriteCeiling,
+    ) {
+    }
 }

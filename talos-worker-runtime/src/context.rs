@@ -865,12 +865,15 @@ pub(crate) fn write_ceiling_enforced() -> bool {
 /// without a live context or process env. Returns `true` when a data-mutating
 /// host op MUST be refused: enforcement is on AND the ceiling forbids writes.
 /// Mirrors the `decide_llm_tier_access` split for the tier-1 gate.
-pub(crate) fn write_ceiling_denies(
-    enforced: bool,
-    ceiling: talos_workflow_job_protocol::WriteCeiling,
-) -> bool {
-    enforced && !ceiling.allows_write()
-}
+/// (#750) The BODY moved to `talos_workflow_engine_core::write_ceiling_denies`
+/// and this is now a re-export, not a second implementation. The worker was
+/// the only holder of the rule while the controller's `__memory_write__`
+/// envelope path had no gate at all — a `readonly` actor was refused at
+/// `agent_memory::set` and permitted at `__memory_write__` on the same job.
+/// A shared type (`WriteCeiling`) with a per-process copy of the PREDICATE is
+/// how two paths end up disagreeing about one control; the predicate is now
+/// shared too. The decision tests below still drive it from here.
+pub(crate) use talos_workflow_job_protocol::write_ceiling_denies;
 
 /// Whether read-side STRICT EGRESS is enforced for read-only actors.
 /// Default **off**, and only meaningful when `TALOS_WRITE_CEILING_ENFORCED`

@@ -1121,7 +1121,13 @@ fn mutation_profile_for_world(capability_world: Option<&str>) -> serde_json::Val
                  passes (the ceiling is a mutation control, not an egress control; \
                  TALOS_WRITE_CEILING_STRICT_EGRESS=1 additionally restricts read-only \
                  actors' reads to hosts NAMED in allowed_hosts). Labels match the \
-                 worker's write-ceiling audit events one-to-one.",
+                 worker's write-ceiling audit events one-to-one. NOTE (#750): this \
+                 list is HOST OPS only. A module ALSO reaches actor_memory by \
+                 returning a `__memory_write__` envelope, which is not a host call \
+                 and so appears in NO world's profile — an empty list here (every \
+                 minimal-node module) does NOT mean the module cannot write memory. \
+                 That route is gated by the SAME ceiling, controller-side, and \
+                 audits under the same `agent-memory-set` / `write-ceiling` labels.",
     })
 }
 

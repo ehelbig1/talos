@@ -1847,6 +1847,10 @@ pub fn is_llm_provider_vault_path(path: &str) -> bool {
     LLM_PROVIDER_VAULT_PATHS.contains(&path)
 }
 
+/// The write-ceiling DECISION, re-exported from its one home in engine-core so
+/// the worker's host-function gate and the controller's `__memory_write__`
+/// envelope gate answer the same question with the same code (#750).
+pub use talos_workflow_engine_core::write_ceiling_denies;
 /// Re-export so controller + worker can `use talos_workflow_job_protocol::LlmTier`
 /// without pulling engine-core directly. The underlying type lives in
 /// engine-core because `DispatchJob` carries it through the dispatch

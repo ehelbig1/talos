@@ -85,6 +85,60 @@ Accepted `__memory_write__` fields:
   the `agent-node` capability ceiling — the http-node ceiling is enough.
 * `ttl_hours` (number, default 168) — TTL from now; semantic memories ignore TTL
 
+**The envelope obeys the actor's WRITE CEILING (#750).** `actors.max_write_ceiling`
+is ONE control with TWO enforcement surfaces, and until #750 only the worker's
+existed. A module reaches `actor_memory` either by calling `agent_memory::set`
+(refused in the worker by `TalosContext::write_ceiling_refuses`) or by RETURNING
+this envelope, which the CONTROLLER persists on node completion — a route that
+needs **no capability at all**: a `minimal-node` module — whose
+`get_module_info.mutation_profile` is EMPTY, because `write_gated_ops` profiles
+HOST OPS and the envelope is not one — wrote durable memory for a `readonly`
+actor simply by returning a JSON object, and the execution reported success.
+The profile was not wrong so much as SILENT about a real write route, which an
+operator reading "this module mutates nothing" cannot tell apart; both
+`write_gated_ops` and the tool's `note` now say so explicitly.
+Now: the engine applies `talos_workflow_engine::write_ceiling_gate::apply_memory_write_ceiling`
+at node completion AND per pipeline step, using the ENGINE's `max_write_ceiling`
+(already narrowed for a sub-workflow by `bind_subengine_actor_and_ceilings`, so a
+sub-workflow bound to a stricter actor is gated at the stricter ceiling). On
+refusal the envelope is REMOVED (never merely flagged — a flagged envelope is one
+`unwrap_or(false)` away from being honoured) and the engine-authored
+`__memory_write_refused__` `{key, reason, ceiling}` is written in its place; the
+node COMPLETES rather than fails (see the fn's docs for why — the worker path
+returns an error to the GUEST and does not itself guarantee node failure either).
+Like every engine-authored key it is **set-or-REMOVE, never set-or-inherit** — a
+module cannot fabricate a refusal record. The DECISION is
+`talos_workflow_engine_core::write_ceiling_denies(enforced, ceiling)`, shared with
+the worker (whose copy is now a re-export) — do NOT hand-copy it; two paths
+answering one question differently IS the bug. **`TALOS_WRITE_CEILING_ENFORCED`
+must be set on BOTH processes** (the controller cannot read the worker's env);
+`docker-compose.yml` and `values.yaml` now set both, and the chart's old
+"controller side needs no change … Worker-only env" comment was false.
+Defence in depth: `ControllerNodeHook::persist_memory_write_if_present` takes the
+ceiling as a REQUIRED parameter, which is the only gate on `test_module` (that
+tool now resolves the actor's real ceiling instead of hardcoding `Write`).
+Audit parity is in the VOCABULARY (`op = "agent-memory-set"`,
+`policy = "write-ceiling"` — the worker's exact tokens) but NOT the transport:
+the worker's refusals also enter the hash-chained WORM ledger and the controller
+has no `ExecutionLedger` producer, so its refusals reach the `talos_audit`
+tracing target and `talos_memory_write_failures_total{reason="write_ceiling"}`
+only. Routes deliberately NOT gated, for the record: the memory-RPC
+`MemoryOp::Set` handler (`talos-rpc-subscribers`) still TRUSTS the worker's gate
+— an asymmetry that only bites a mixed-config fleet; and operator-invoked writes
+(`actor_remember`, `clone_memories`, `scaffold_actor` seeds, the GraphQL memory
+mutations) plus platform-authored ones (`ml_digest`, consolidation/reflection,
+the `upsert_scratchpad_trace` execution trace) are the OPERATOR's or the
+PLATFORM's writes, not the actor's, and the ceiling does not speak to them.
+**And the class is wider than this key.** The SAME hook, on the SAME
+module-returned output and the SAME actor binding, also drives
+`__ops_alert__` (→ `ops_alerts`) and `__ml_distill__` (→ ML dataset rows). Both
+take the actor id, both refuse only when it is ABSENT, and neither consults the
+ceiling — i.e. "a module bypasses the ceiling by returning a value" is true of
+three output protocols and #750 gated one. They write different tables with
+different semantics (a diagnostic; training data), so whether `readonly` should
+bar them is an operator policy call, not a memory-write fix. Recorded so the
+population is visible rather than rediscovered.
+
 Writes that omit `metadata` produce rows with `metadata IS NULL`, which
 pass every filter — the right default for engine-trace style writes that
 shouldn't be excluded from recall. Readers don't need an `"execution"`

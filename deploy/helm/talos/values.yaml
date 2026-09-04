@@ -149,6 +149,13 @@ controller:
   # reads via std::env::var (see controller/src/).
   env:
     RUST_LOG: "info,controller=debug,audit_ledger=info"
+    # Per-actor write ceiling — the CONTROLLER's half of a two-surface gate
+    # (#750). Keep in lockstep with `worker.env.TALOS_WRITE_CEILING_ENFORCED`,
+    # where the rationale and the corrected "worker-only" claim live. On the
+    # controller this gates the `__memory_write__` envelope the engine
+    # persists on node completion; unset, a `readonly` actor's module can
+    # still write durable actor memory simply by returning a JSON object.
+    TALOS_WRITE_CEILING_ENFORCED: "1"
     # SECURITY — in-transit TLS is FAIL-CLOSED when RUST_ENV=production.
     # The controller REFUSES TO BOOT in production unless every backend
     # connection uses TLS (transmission security: HIPAA §164.312(e) /
@@ -741,10 +748,20 @@ worker:
     # (set via the `set_actor_write_ceiling` operator tool). Default
     # off: the signed ceiling travels on every job but changes nothing
     # until enabled — a staged rollout, same shape as the tier ceiling.
-    # Read once at boot; controller side needs no change (the field is
-    # already HMAC-bound on every JobRequest). Worker-only env.
+    # Read once at boot.
     # Injection audit 2026-07-20: enforced by default — a readonly
     # actor's ceiling must be a live control, not a decorative column.
+    #
+    # #750 — CORRECTION. This block used to say "controller side needs no
+    # change (the field is already HMAC-bound on every JobRequest).
+    # Worker-only env." That was false, and the claim is what kept the gap
+    # open: a module reaches actor_memory EITHER by an `agent_memory::set`
+    # host call (gated here) OR by RETURNING a `__memory_write__` envelope
+    # that the CONTROLLER persists on node completion — a route that needs
+    # no capability at all and had no gate. Set the SAME value in
+    # `controller.env` (it is there by default now); the two must move
+    # together or a readonly actor is refused one route and permitted the
+    # other on the same job.
     TALOS_WRITE_CEILING_ENFORCED: "1"
 
   # Sigstore enforcement for OCI template signatures. The publish workflow

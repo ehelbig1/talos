@@ -1881,10 +1881,16 @@ async fn handle_run_sandbox(
             Some(effective_actor_id),
             caller_user_id,
             llm_tier,
-            // Write ceiling: diagnostic in-process execution
-            // (run_sandbox / test_module), an operator-invoked test path —
-            // run permissively. The ceiling gates live actor dispatch,
-            // which the actor binding stamps at engine dispatch.
+            // Write ceiling: `run_sandbox` runs CALLER-SUPPLIED source with
+            // no module row and no `__memory_write__` route, so it stays
+            // permissive. NOTE (#750) this is now the ONLY permissive
+            // hardcode of the three that used to share this comment —
+            // `test_module` resolves the actor's real ceiling. Left as-is
+            // deliberately rather than swept: run_sandbox CAN still reach
+            // agent-memory host functions under `effective_actor_id`, so the
+            // same asymmetry exists here on the host-call axis. Fixing it
+            // means resolving a ceiling for a path whose actor binding is a
+            // synthetic per-user fallback, which is a separate decision.
             talos_workflow_job_protocol::WriteCeiling::Write,
             None,                     // egress_scope — internal path: tier-derived default
             None,                     // llm_usage_out — internal sandbox path doesn't collect usage
@@ -3303,6 +3309,43 @@ async fn handle_test_module(
             .unwrap_or(talos_workflow_job_protocol::LlmTier::Tier1),
         None => talos_workflow_job_protocol::LlmTier::Tier1,
     };
+    // #750: resolve the actor's REAL data-mutation ceiling, for the same
+    // reason MCP-692 resolves the LLM tier here — `test_module` exists to be
+    // PREDICTIVE of workflow behaviour, and a permissive hardcode makes it
+    // predict the wrong thing. Pre-fix this path stamped `WriteCeiling::Write`
+    // on the runtime call AND handed the `__memory_write__` envelope to the
+    // persistence hook with no ceiling at all, so a `readonly` actor's memory
+    // could be mutated from the dev-test surface by either route while the
+    // live workflow refused one of them. Fail-closed to `ReadOnly` on a DB
+    // error / missing row, matching `apply_actor_to_engine`; no `actor_id` at
+    // all means there is no actor row to read and the historical permissive
+    // behaviour stands (the synthetic per-user binding is not an actor).
+    //
+    // `ceiling_unreadable` exists because fail-closing and REPORTING are two
+    // different obligations. Collapsing `Err` into `ReadOnly` is correct — a DB
+    // failure must cost a refusal, never grant a write — but then TELLING the
+    // operator "this actor's ceiling is readonly" states a fact nobody read.
+    // That is the misleading-report class this repo keeps paying for (checks
+    // 74 / 76 / 79). The refusal is the same either way; only the sentence
+    // changes.
+    let (write_ceiling, ceiling_unreadable) = match actor_id_opt {
+        Some(aid) => match state.actor_repo.get_actor_max_write_ceiling(aid).await {
+            Ok(Some(c)) => (c, false),
+            // Actor row absent: the caller's `actor_id` was ownership-checked
+            // above, so this is drift, not a normal miss. Fail closed, and say
+            // it is unverified.
+            Ok(None) => (talos_workflow_job_protocol::WriteCeiling::ReadOnly, true),
+            Err(e) => {
+                tracing::warn!(
+                    actor_id = %aid,
+                    error = %e,
+                    "test_module: could not read the actor's write ceiling —                      failing closed to readonly for this run"
+                );
+                (talos_workflow_job_protocol::WriteCeiling::ReadOnly, true)
+            }
+        },
+        None => (talos_workflow_job_protocol::WriteCeiling::Write, false),
+    };
     let security_policy = talos_worker_runtime::runtime::SecurityPolicy {
         allowed_secrets: module.allowed_secrets.clone(),
         integration_name: module.integration_name.clone(),
@@ -3347,11 +3390,14 @@ async fn handle_test_module(
             Some(effective_actor_id),
             user_id,
             llm_tier,
-            // Write ceiling: diagnostic in-process execution
-            // (run_sandbox / test_module), an operator-invoked test path —
-            // run permissively. The ceiling gates live actor dispatch,
-            // which the actor binding stamps at engine dispatch.
-            talos_workflow_job_protocol::WriteCeiling::Write,
+            // Write ceiling: the ACTOR's own ceiling (#750), not a
+            // permissive hardcode. `test_module` writes to the actor's LIVE
+            // actor_memory through both the host-call and envelope routes —
+            // these are real durable writes, not simulated ones — so running
+            // permissively here meant the dev-test surface could mutate a
+            // readonly actor's memory that a workflow would refuse. See the
+            // resolution above for the fail-closed contract.
+            write_ceiling,
             None,                     // egress_scope — internal path: tier-derived default
             None,                     // llm_usage_out — internal sandbox path doesn't collect usage
             Some(host_diags.clone()), // host_diag_out — no execution row, so this is the ONLY route
@@ -3375,12 +3421,38 @@ async fn handle_test_module(
             //     instead of silently dropping.
             let memory_write_note = if output.get("__memory_write__").is_some() {
                 if actor_id_opt.is_some() {
+                    // Same hook, same ceiling the engine would apply (#750).
+                    // The hook itself refuses and records when the ceiling
+                    // says so, so this call site cannot report "persisted"
+                    // for a write that policy declined.
                     talos_engine::node_hook::ControllerNodeHook::new(state.db_pool.clone())
-                        .persist_memory_write_if_present(actor_id_opt, output);
-                    Some(
-                        "output contains __memory_write__ — persisted to the supplied actor's \
-                         memory (same path as workflow execution)",
-                    )
+                        .persist_memory_write_if_present(actor_id_opt, output, write_ceiling);
+                    if talos_workflow_engine_core::write_ceiling_denies(
+                        talos_workflow_engine::write_ceiling_gate::controller_write_ceiling_enforced(),
+                        write_ceiling,
+                    ) {
+                        if ceiling_unreadable {
+                            Some(
+                                "output contains __memory_write__ and the write was REFUSED — \
+                                 but this run could NOT read the actor's write ceiling (see \
+                                 controller logs) and failed closed to 'readonly'. This is a \
+                                 statement about this run, NOT about the actor's configured \
+                                 ceiling. Retry once the database is reachable.",
+                            )
+                        } else {
+                            Some(
+                                "output contains __memory_write__ but the actor's write ceiling \
+                                 is 'readonly' and enforcement is on — the write was REFUSED, \
+                                 exactly as it would be in a workflow. Grant write with \
+                                 set_actor_write_ceiling if the actor is meant to mutate memory.",
+                            )
+                        }
+                    } else {
+                        Some(
+                            "output contains __memory_write__ — persisted to the supplied actor's \
+                             memory (same path as workflow execution)",
+                        )
+                    }
                 } else {
                     Some(
                         "output contains __memory_write__ but NO actor_id was supplied — the \

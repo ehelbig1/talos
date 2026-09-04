@@ -64,6 +64,7 @@ mod scheduler_handlers;
 mod secrets_pipeline;
 mod validation;
 pub mod vault_resolver;
+pub mod write_ceiling_gate;
 
 pub use chain_detect::detect_linear_chains;
 #[allow(deprecated)]
