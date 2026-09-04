@@ -7559,17 +7559,40 @@ echo
 #     A reflowed match reads as clean — a false NEGATIVE, the quiet
 #     direction, so a reviewer is still the backstop for exotic layouts.
 #   * It matches on the METHOD NAME, so the same collapse over a
-#     differently-named read is out of range. That population is real:
-#     `find_by_id` / `find_channel_by_id_raw` return `Result<Row>` where
-#     ABSENCE IS ALREADY AN `Err` (the flattening lives in
-#     `talos_integration_helpers::state_store::get_entry`, which maps
-#     `IntegrationStateError::KeyNotFound` into an anyhow string), so
-#     `Err(_) => 404 "Watch not found"` there cannot be split at the call
-#     site at all. Fixing that needs a three-way callee contract across
-#     three crates and is deliberately NOT what this check asserts.
+#     differently-named read is out of range.
 #   * It proves the arms are SPLIT, never that the `Err` arm is right —
-#     `Err(_) => 404` written out longhand still passes. The
+#     `Err(_) => 404` written out longhand still passes. MEASURED, not
+#     inferred: splitting `Ok(Some)`/`Ok(None)`/`Err(e)` correctly and
+#     then having the `Err(e)` arm return the 404 with the original
+#     "Watch not found" text SURVIVES this check. The direction is
+#     under-reporting — the check goes green while the handler still
+#     tells the caller their watch does not exist. The
 #     log-server-side/return-generic posture is a review property.
+#
+# LEG (b), added when the callee contract landed. The three watch-row
+# readers — `find_by_id` (gmail, google_cloud) and
+# `find_channel_by_id_raw` (gcal) — used to return `Result<Row>`, with
+# ABSENCE ALREADY FOLDED INTO `Err` by
+# `talos_integration_helpers::state_store::get_entry`, which mapped
+# `IntegrationStateError::KeyNotFound` through `anyhow!`. So `Ok(None)`
+# was unreachable and `Err(_) => 404 "Watch not found"` could not be
+# split at the call site at all — the limit this check's first version
+# recorded. `get_entry` is now three-way (`Ok(Some)` / `Ok(None)` /
+# `Err`) and the three readers return `Result<Option<Row>>`, so the
+# split is expressible and the collapse is a defect like any other.
+#
+# The pre-split shape is a plain `Ok(r) => r`, NOT `Ok(Some(`, so leg
+# (b) anchors on the wider `Ok(`. MEASURED IN BOTH DIRECTIONS: against a
+# clean `git archive origin/main` leg (b) reports SEVEN sites and all
+# seven are real, 0 false positives — the three probe handlers
+# (`Err(_) => 404 "Watch not found"`), the three `stop_watch` /
+# `stop_watch_channel` idempotency arms (`Err(_) => return Ok(())`,
+# i.e. a pool timeout reported as a SUCCESSFUL stop of a watch that is
+# still running), and gmail's push-loop row re-read (`Err(_) =>
+# row.clone()`, an undisclosed fall back to a stale row). 0 on the
+# fixed tree, and it fires on either call site mutated back.
+# Widening leg (a) to the same `Ok(` anchor was measured and changes
+# nothing on either tree, so leg (a) is left narrow.
 # Opt-out: `// allow-collapsed-integration-read: <reason>` on the read
 # line or within the 8 lines above it.
 bold "▶ check 79: an integration read must not collapse a failure into \"not found\""
@@ -7581,22 +7604,35 @@ while IFS= read -r hit; do
 done < <(find . -name '*.rs' -not -path './target/*' -not -path './vendor/*' \
               -not -path './node_modules/*' "${TREE_PRUNE_FIND[@]}" -print0 2>/dev/null \
          | xargs -0 perl -e '
+# (read-method regex, Ok-arm regex). Leg (a): the Result<Option<_>>
+# integration read — its Ok arm is necessarily Ok(Some(..). Leg (b): the
+# watch-row readers, whose three-way contract is NEW, so the pre-split
+# shape is a plain `Ok(r) => r` and the anchor has to be the wider
+# `Ok(`. Widening leg (a) to `Ok(` as well was measured and changes
+# nothing on either tree, so it is left narrow.
+my @RULES = (
+  [ qr/\.get_integration\w*\s*\(/,                       qr/^\s*Ok\(Some\(/ ],
+  [ qr/\.(?:find_by_id|find_channel_by_id_raw)\s*\(/,      qr/^\s*Ok\(/       ],
+);
 for my $f (@ARGV) {
   open(my $fh, "<", $f) or next; my @l = <$fh>; close $fh;
   for my $i (0..$#l) {
-    next unless $l[$i] =~ /\.get_integration\w*\s*\(/;
-    my $lo = $i - 8 < 0 ? 0 : $i - 8;
-    next if join("", @l[$lo..$i]) =~ /allow-collapsed-integration-read/;
-    my $end = $i + 12 > $#l ? $#l : $i + 12;
-    my $some;
-    for my $j ($i + 1 .. $end) { if ($l[$j] =~ /^\s*Ok\(Some\(/) { $some = $j; last } }
-    next unless defined $some;
-    my $ae = $some + 3 > $#l ? $#l : $some + 3;
-    for my $k ($some + 1 .. $ae) {
-      if ($l[$k] =~ /^\s*(?:_|Err\(_\))\s*=>/) { printf("%s:%d\n", $f, $k + 1); last }
+    for my $r (@RULES) {
+      my ($meth, $okarm) = @$r;
+      next unless $l[$i] =~ $meth;
+      my $lo = $i - 8 < 0 ? 0 : $i - 8;
+      next if join("", @l[$lo..$i]) =~ /allow-collapsed-integration-read/;
+      my $end = $i + 12 > $#l ? $#l : $i + 12;
+      my $some;
+      for my $j ($i + 1 .. $end) { if ($l[$j] =~ $okarm) { $some = $j; last } }
+      next unless defined $some;
+      my $ae = $some + 3 > $#l ? $#l : $some + 3;
+      for my $k ($some + 1 .. $ae) {
+        if ($l[$k] =~ /^\s*(?:_|Err\(_\))\s*=>/) { printf("%s:%d\n", $f, $k + 1); last }
+      }
     }
   }
-}' 2>/dev/null || true)
+}' 2>/dev/null | sort -u || true)
 
 if [ "$INTEG_READ_FAIL" -gt 0 ]; then
     yellow "  → split the arms: Ok(None) keeps the 404 and its existing message;"

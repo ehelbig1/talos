@@ -829,14 +829,35 @@ pub async fn test_watch_channel_handler(
 
     // 1. Resolve the channel row (also enforces authz: scoped to user_id).
     let row = match service.find_channel_by_id_raw(user_id, channel_uuid).await {
-        Ok(r) => r,
-        Err(_) => {
+        Ok(Some(r)) => r,
+        Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(ApiResponse::<serde_json::Value> {
                     success: false,
                     data: None,
                     error: Some("Watch channel not found".into()),
+                }),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            // The pre-split `Err(_)` arm told the caller their channel does
+            // not exist when the truth was that we could not look. Matches
+            // the `Ok(None)` / `Err(e)` split the integration lookup
+            // immediately below has always used.
+            tracing::error!(
+                user_id = %user_id,
+                channel_uuid = %channel_uuid,
+                error = %e,
+                "test_watch: channel lookup failed"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<serde_json::Value> {
+                    success: false,
+                    data: None,
+                    error: Some("Failed to look up watch channel".to_string()),
                 }),
             )
                 .into_response();

@@ -179,6 +179,13 @@ TESTS=(
     # and the app role carries `rolbypassrls`. Every property is a WHERE or
     # ORDER BY clause, so only a live database can evaluate one.
     "talos-module-repository:module_lookup_tenancy:migrated"
+    # "the row is absent" vs "we could not look". `ChannelStore::get_entry`
+    # folded `execute_op`'s Err(KeyNotFound) into an anyhow string, so
+    # Ok(None) was unreachable and three probe handlers answered a pool
+    # timeout with 404 "Watch not found" while three stop_watch paths
+    # answered one with Ok(()). Both halves are properties of a live
+    # database (a real SELECT missing a row; a real pool refusing).
+    "talos-integration-helpers:absence_vs_failure:migrated"
     "talos-memory:integration:migrated"
     "talos-system-repo:revocation_query:migrated"
 )

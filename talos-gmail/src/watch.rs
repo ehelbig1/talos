@@ -213,7 +213,7 @@ impl GmailWatchService {
         user_id: Uuid,
         channel_uuid: Uuid,
     ) -> Result<GmailWatchRow> {
-        let old = self.find_by_id(user_id, channel_uuid).await?;
+        let old = self.require_by_id(user_id, channel_uuid).await?;
 
         let _guard = self.acquire_lock(user_id, old.integration_id).await;
 
@@ -268,8 +268,21 @@ impl GmailWatchService {
     /// Stop + delete. Idempotent: missing rows succeed silently.
     pub async fn stop_watch(&self, user_id: Uuid, channel_uuid: Uuid) -> Result<()> {
         let row = match self.find_by_id(user_id, channel_uuid).await {
-            Ok(r) => r,
-            Err(_) => return Ok(()),
+            Ok(Some(r)) => r,
+            // Genuinely gone — stop is idempotent, so this is success.
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                // Pre-split this arm was `Err(_) => return Ok(())`: a pool
+                // timeout read as "already gone" and `stop_watch` reported
+                // SUCCESS without stopping the Google-side watch or deleting
+                // the row. Exactly the failure the `get_integration` arm
+                // below was already fixed for, one read earlier in the same
+                // function. Refusing costs the caller a retry.
+                return Err(e).context(
+                    "gmail stop_watch: watch lookup failed; refusing to \
+                     report a stop that did not happen",
+                );
+            }
         };
         let integration_opt = match self
             .integrations
@@ -399,7 +412,7 @@ impl GmailWatchService {
         channel_uuid: Uuid,
         new_history_id: u64,
     ) -> Result<()> {
-        let mut row = self.find_by_id(user_id, channel_uuid).await?;
+        let mut row = self.require_by_id(user_id, channel_uuid).await?;
         // Monotonic: never regress. If a later push arrived first
         // (unlikely but technically possible under retry pressure),
         // we keep the higher cursor.
@@ -556,19 +569,37 @@ impl GmailWatchService {
         self.store().delete(user_id, channel_uuid).await
     }
 
+    /// Load one watch row by internal uuid (ownership via the
+    /// user-scoped store). **Three-way** — `Ok(None)` is "no such
+    /// watch", `Err` is "we could not look". Callers that cannot act
+    /// on the distinction take [`Self::require_by_id`].
     pub(crate) async fn find_by_id(
         &self,
         user_id: Uuid,
         channel_uuid: Uuid,
-    ) -> Result<GmailWatchRow> {
+    ) -> Result<Option<GmailWatchRow>> {
         match self.store().get_entry(user_id, channel_uuid).await? {
-            Some(entry) => decode_row(&entry),
-            None => Err(anyhow!(
-                "gmail watch {} not found for user {}",
-                channel_uuid,
-                user_id
-            )),
+            Some(entry) => decode_row(&entry).map(Some),
+            None => Ok(None),
         }
+    }
+
+    /// [`Self::find_by_id`] for callers to which an absent row is just
+    /// another failure. The message is the pre-split one, verbatim.
+    pub(crate) async fn require_by_id(
+        &self,
+        user_id: Uuid,
+        channel_uuid: Uuid,
+    ) -> Result<GmailWatchRow> {
+        self.find_by_id(user_id, channel_uuid)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "gmail watch {} not found for user {}",
+                    channel_uuid,
+                    user_id
+                )
+            })
     }
 
     async fn find_single_for_integration(

@@ -369,15 +369,26 @@ impl GoogleCalendarService {
         user_id: Uuid,
         channel_id: Uuid,
     ) -> Result<WatchChannel> {
-        let old_row = self
-            .find_channel_by_id_raw(user_id, channel_id)
-            .await
-            .with_context(|| {
-                format!(
+        // The `not found` wording used to sit as `with_context` over BOTH
+        // outcomes, so a pool timeout was logged as a missing channel.
+        let old_row = match self.find_channel_by_id_raw(user_id, channel_id).await {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                return Err(anyhow!(
                     "Watch channel {} not found in integration_state for user {}",
-                    channel_id, user_id
-                )
-            })?;
+                    channel_id,
+                    user_id
+                ))
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "gcal renew: watch channel {} lookup failed for user {}",
+                        channel_id, user_id
+                    )
+                })
+            }
+        };
 
         let integration_obj = self
             .get_integration(user_id, old_row.integration_id)
@@ -542,7 +553,7 @@ impl GoogleCalendarService {
         user_id: Uuid,
         channel_id: Uuid,
     ) -> Result<Vec<JsonValue>> {
-        let row = self.find_channel_by_id_raw(user_id, channel_id).await?;
+        let row = self.require_channel_by_id_raw(user_id, channel_id).await?;
 
         let integration_obj = self
             .get_integration(user_id, row.integration_id)
@@ -576,8 +587,19 @@ impl GoogleCalendarService {
     /// `user_id` is the owning user.
     pub async fn stop_watch_channel(&self, user_id: Uuid, channel_id: Uuid) -> Result<()> {
         let row = match self.find_channel_by_id_raw(user_id, channel_id).await {
-            Ok(r) => r,
-            Err(_) => return Ok(()), // already gone; idempotent
+            Ok(Some(r)) => r,
+            Ok(None) => return Ok(()), // already gone; idempotent
+            Err(e) => {
+                // Pre-split this arm was `Err(_) => return Ok(())`: a pool
+                // timeout read as "already gone", so `stop_watch_channel`
+                // reported success while the Google-side channel kept
+                // pushing and the row kept serving webhooks. Refusing costs
+                // the caller a retry; this path is idempotent.
+                return Err(e).context(
+                    "gcal stop_watch_channel: channel lookup failed; refusing \
+                     to report a stop that did not happen",
+                );
+            }
         };
 
         let integration_obj = self.get_integration(user_id, row.integration_id).await?;
@@ -639,19 +661,32 @@ impl GoogleCalendarService {
     /// Look up a watch channel by its internal UUID, scoped to the
     /// owning user. Used by paths where we already have the uuid from
     /// an earlier lookup — no slot index needed.
+    ///
+    /// **Three-way** — `Ok(None)` is "no such channel", `Err` is "we
+    /// could not look". Callers that cannot act on the distinction take
+    /// [`Self::require_channel_by_id_raw`].
     pub(crate) async fn find_channel_by_id_raw(
         &self,
         user_id: Uuid,
         channel_uuid: Uuid,
-    ) -> Result<WatchChannelRow> {
+    ) -> Result<Option<WatchChannelRow>> {
         match self.store().get_entry(user_id, channel_uuid).await? {
-            Some(entry) => decode_row(&entry),
-            None => Err(anyhow!(
-                "channel {} not found for user {}",
-                channel_uuid,
-                user_id
-            )),
+            Some(entry) => decode_row(&entry).map(Some),
+            None => Ok(None),
         }
+    }
+
+    /// [`Self::find_channel_by_id_raw`] for callers to which an absent
+    /// row is just another failure. The message is the pre-split one,
+    /// verbatim.
+    pub(crate) async fn require_channel_by_id_raw(
+        &self,
+        user_id: Uuid,
+        channel_uuid: Uuid,
+    ) -> Result<WatchChannelRow> {
+        self.find_channel_by_id_raw(user_id, channel_uuid)
+            .await?
+            .ok_or_else(|| anyhow!("channel {} not found for user {}", channel_uuid, user_id))
     }
 
     /// Look up a watch channel by `(user_id, google_channel_id)`.
