@@ -80,6 +80,21 @@ pub enum HandoffError {
     #[error("Workflow not found or access denied")]
     WorkflowNotFound,
 
+    /// The workflow-graph read FAILED — distinct from [`Self::WorkflowNotFound`],
+    /// which is a definite answer.
+    ///
+    /// #740: `.unwrap_or(None)` collapsed the two, so a pool timeout told the
+    /// operator their workflow does not exist or is not theirs. The graph is
+    /// loaded here specifically so `authorize_workflow_trigger` can check
+    /// module worlds against the to_actor's ceiling, so the refusal direction
+    /// was already correct — it was the DIAGNOSIS that was wrong, and a wrong
+    /// diagnosis on an authorization path sends the operator to look at
+    /// permissions during a database incident.
+    ///
+    /// Collapses to a generic string; the chain is logged by the service.
+    #[error("Failed to load the workflow graph")]
+    WorkflowGraphUnreadable,
+
     /// `to_actor` failed `authorize_workflow_trigger`. Pre-rendered via
     /// [`render_trigger_auth_error`] — the `Database` arm collapses to a
     /// generic string (detail is logged server-side by the service).
@@ -433,10 +448,19 @@ impl ActorLifecycleService {
             .actor_repo
             .get_workflow_graph_for_user(wf_id, user_id)
             .await
-            .unwrap_or(None)
         {
-            Some(g) => g,
-            None => return Err(HandoffError::WorkflowNotFound),
+            Ok(Some(g)) => g,
+            Ok(None) => return Err(HandoffError::WorkflowNotFound),
+            Err(e) => {
+                tracing::error!(
+                    target: "talos_actor_lifecycle",
+                    event_kind = "workflow_graph_read_failed",
+                    workflow_id = %wf_id,
+                    error = %e,
+                    "handoff: workflow graph read failed — refusing to report 'not found'"
+                );
+                return Err(HandoffError::WorkflowGraphUnreadable);
+            }
         };
 
         // MCP-727 (2026-05-13): full `authorize_workflow_trigger` for the
@@ -799,6 +823,35 @@ mod tests {
             HandoffError::FromActorBudget("Actor not found".into()).user_facing_message(),
             "from_actor budget check failed: Actor not found"
         );
+    }
+
+    /// #740: an unreadable graph must not borrow the not-found message.
+    /// A `.unwrap_or(None)` collapse made the two indistinguishable, so a
+    /// database failure on an AUTHORIZATION path was reported as a definite
+    /// statement that the workflow does not exist or is not the caller's.
+    #[test]
+    fn an_unreadable_graph_does_not_claim_the_workflow_is_missing() {
+        assert_ne!(
+            HandoffError::WorkflowGraphUnreadable.user_facing_message(),
+            HandoffError::WorkflowNotFound.user_facing_message(),
+        );
+        assert_eq!(
+            HandoffError::WorkflowGraphUnreadable.user_facing_message(),
+            "Failed to load the workflow graph"
+        );
+        // Generic: no schema, query, table or driver detail may reach a client.
+        let m = HandoffError::WorkflowGraphUnreadable.user_facing_message();
+        for leak in [
+            "SELECT",
+            "sqlx",
+            "graph_json",
+            "workflows",
+            "pool",
+            "connection",
+        ] {
+            assert!(!m.contains(leak), "internal detail leaked: {m}");
+        }
+        assert_eq!(HandoffError::WorkflowGraphUnreadable.jsonrpc_code(), -32000);
     }
 
     #[test]
