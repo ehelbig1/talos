@@ -1,9 +1,68 @@
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{ConnectOptions, Connection, PgConnection, Pool, Postgres};
 use std::str::FromStr;
+use std::sync::OnceLock;
 use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres as PostgresImage;
 use tokio::sync::OnceCell;
+
+// ─────────────────────────────────────────────────────────────────────────
+// Reaping the shared container.
+//
+// testcontainers 0.23.3 has NO reaper: default features are `[]` (no `ryuk`,
+// no `watchdog`), and `core/ports.rs` hardcodes `"AutoRemove": false`. The one
+// and only remover is `ContainerAsync::drop`, which issues `docker rm` — and
+// `PG_CONTAINER` below is a `static`, which Rust never drops at process exit.
+// Result, measured: `cargo test -p controller --test <any of the 14 binaries>`
+// left one still-RUNNING Postgres behind, every invocation, forever. One
+// `make test-integration` leaked >= 14; two agent sessions left ~50.
+//
+// The crate's own Drop cannot be reused at exit even if we could reach it:
+// `core/async_drop.rs` opens with `tokio::runtime::Handle::current()`, which
+// PANICS with no runtime, and at process exit there is none. So the exit-time
+// remover is a BLOCKING `docker rm -f` via `std::process::Command`.
+//
+// `libc::atexit` (rather than the `ctor` crate's `#[dtor]`) because `libc` is
+// already in `Cargo.lock` as a transitive dependency, so this costs no new
+// crate — and an atexit handler runs on BOTH exit paths libtest uses: `main`
+// returning, and the `std::process::exit(101)` it takes when a test fails or
+// panics. A SIGKILL runs neither, which is what the label + sweep below is for.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Stamped on every container this harness starts so a sweep can find them by
+/// LABEL. Never sweep by image: the dev stack's `talos-postgres`,
+/// `talos-postgres-backup` and `talos-vault-backup` all run the same
+/// `pgvector/pgvector:pg17` image, so an image-filtered sweep would delete a
+/// developer's live database.
+pub const HARNESS_LABEL: &str = "talos.test-harness";
+pub const HARNESS_LABEL_VALUE: &str = "controller";
+
+/// Second, per-INVOCATION label, applied only when `TALOS_TEST_RUN_ID` is
+/// exported (`scripts/test-integration.sh` does). It lets that script's EXIT
+/// trap remove exactly the containers ITS OWN run created — a sweep of every
+/// `HARNESS_LABEL` container at exit would kill a concurrent run's, and two
+/// concurrent agent sessions is precisely the situation that produced ~50
+/// leaked containers in the first place.
+pub const RUN_ID_LABEL: &str = "talos.test-run";
+
+/// Set exactly once, immediately after the container starts and BEFORE the
+/// atexit handler is registered. Read-only thereafter, so the handler can never
+/// observe a torn value and takes no lock that could deadlock at exit.
+static CONTAINER_ID: OnceLock<String> = OnceLock::new();
+
+extern "C" fn reap_shared_container() {
+    let Some(id) = CONTAINER_ID.get() else {
+        return;
+    };
+    // Best-effort and deliberately silent: if the container is already gone
+    // (a sweep, a `docker rm` by hand) `docker rm -f` exits non-zero and there
+    // is nothing to report. Blocking on purpose — nothing may outlive us.
+    let _ = std::process::Command::new("docker")
+        .args(["rm", "-f", id])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
 
 /// Shared PostgreSQL container for integration tests, started once per binary.
 /// NOTE: only the *container* is shared — NOT a pool. Each `#[tokio::test]` runs
@@ -30,12 +89,34 @@ async fn shared_conn_string() -> String {
             // image. This comment previously said pg16 and claimed parity with
             // prod; prod is pg17, so the claim was false and the tag was the
             // odd one out.
-            let container = PostgresImage::default()
+            let mut request = PostgresImage::default()
                 .with_name("pgvector/pgvector")
                 .with_tag("pg17")
+                .with_label(HARNESS_LABEL, HARNESS_LABEL_VALUE);
+            // Empty is unset (check 73): an exported-but-empty TALOS_TEST_RUN_ID
+            // would otherwise stamp a label no filter can ever match.
+            if let Some(run_id) = std::env::var("TALOS_TEST_RUN_ID")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+            {
+                request = request.with_label(RUN_ID_LABEL, run_id);
+            }
+            let container = request
                 .start()
                 .await
                 .expect("Failed to start PostgreSQL container");
+
+            // Register the exit-time reaper the moment we have an id — before
+            // migrations, so a panic in the migration step below still reaps.
+            if CONTAINER_ID.set(container.id().to_string()).is_ok() {
+                // SAFETY: `atexit` wants an `extern "C" fn()`. The handler only
+                // reads `CONTAINER_ID`, which is written once above and never
+                // mutated, and is registered exactly once (guarded by the
+                // `OnceLock::set` succeeding).
+                unsafe {
+                    libc::atexit(reap_shared_container);
+                }
+            }
 
             let port = container
                 .get_host_port_ipv4(5432)

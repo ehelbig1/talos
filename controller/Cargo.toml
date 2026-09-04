@@ -252,6 +252,11 @@ prometheus = "0.14" # opentelemetry-prometheus 0.32 supports prometheus 0.14.x, 
 [dev-dependencies]
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["postgres"] }
+# `libc::atexit` in controller/tests/test_helpers: the shared testcontainer is
+# held in a `static`, which is never dropped, so the crate's Drop-based
+# `docker rm` never runs and every test-binary invocation leaked a live
+# Postgres. Already in Cargo.lock as a transitive dep, so this adds no crate.
+libc = "0.2"
 # github_app_tenancy_tests: exercise the per-user installation lookup directly.
 talos-github-repository = { path = "../talos-github-repository" }
 # Used by gmail::pubsub_jwt tests to mint RSA keypairs that back

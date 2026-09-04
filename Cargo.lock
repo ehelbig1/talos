@@ -1751,6 +1751,7 @@ dependencies = [
  "image",
  "ipnetwork",
  "jsonwebtoken",
+ "libc",
  "neo4rs",
  "oci-distribution",
  "opentelemetry",
