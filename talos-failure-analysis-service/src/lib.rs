@@ -282,6 +282,36 @@ pub fn classify_error(msg: &str) -> (&'static str, &'static str) {
         return classify_reason_class(fam);
     }
 
+    // ── The UNMARKED circuit-breaker fast-fail ────────────────────────
+    //
+    // The breaker refuses a call two ways and only ONE of them carries a
+    // marker. When it fires inside the host HTTP function the message is a
+    // guest `networkerror` with `[reason_class=circuit-open]` appended, and
+    // the arm above already answers `circuit_open`. When it fires in the
+    // RETRY GATE — `talos_worker_runtime::runtime::circuit_open_message`,
+    // which short-circuits before any call is attempted — the message is
+    // plain prose with no marker at all, and matched nothing here: the same
+    // cause reached the operator as two different answers, one of them
+    // `runtime_error` / "An unexpected runtime error occurred inside the
+    // module" for the platform's own protective refusal.
+    //
+    // Measured on the deployed stack 2026-09-04: 12 of the 20 `node_failed`
+    // events that fell through this chain in 30 days were this string.
+    //
+    // The needles are the SAME PAIR the sibling controller-side classifier
+    // `talos_retry_intelligence::classify_error` has keyed on since the
+    // breaker shipped, and it hoists them for the same reason this does:
+    // the fast-fail message may carry the last underlying error, which can
+    // contain transient tokens ("connection refused", "timed out") that the
+    // prose chain below would match first and answer `network_error` /
+    // `timeout` for a call that was never made.
+    //
+    // No new vocabulary: `circuit_open` and its playbook already exist for
+    // the marked form, and this arm answers with them.
+    if lower.contains("circuit open") || lower.contains("circuit breaker open") {
+        return classify_reason_class(talos_reason_class::Family::CircuitOpen);
+    }
+
     // ── Most specific gates first ────────────────────────────────────
     // Order matters: each branch is `else if`; the first match wins.
     if lower.contains("output_schema enforcement fired")
@@ -438,11 +468,138 @@ pub fn classify_error(msg: &str) -> (&'static str, &'static str) {
     {
         ("database_error", "A database operation failed.")
     } else {
+        // ── THE FALL-THROUGH ASSERTS NOTHING ──────────────────────────
+        //
+        // This arm is reached precisely when the message matched none of
+        // the gates above, so the one thing that is known about it is that
+        // its cause is NOT known. The previous answer — `runtime_error` /
+        // "An unexpected runtime error occurred inside the module" —
+        // stated a determinate cause AND a location for input the
+        // classifier had explicitly failed to recognise, and it was wrong
+        // about both far more often than not: of the 20 `node_failed`
+        // events that reached this arm on the deployed stack in the 30
+        // days to 2026-09-04, 19 were platform-side (a circuit-breaker
+        // fast-fail, a rejected signed result, an unreadable job result)
+        // and none was a fault inside a module.
+        //
+        // Coverage cannot fix that. Any pattern list has a fall-through,
+        // and the next unrecognised cause would be misreported identically
+        // — so the fall-through itself has to be honest. The crate's own
+        // prose already was: `remediation_steps`' matching arm says "this
+        // is the fall-through bucket, so the error text matched no
+        // specific gate", and the MCP tool description says to treat the
+        // bucket as "unexplained" rather than "explained". Only the two
+        // machine-readable fields still claimed to know.
+        //
+        // Both sibling controller-side classifiers over the same strings
+        // already answer honestly here — `talos_retry_intelligence`
+        // returns `unknown` and `talos_ops_alerts_repository::self_monitor`
+        // returns `other` / "unclassified failure". This surface, the only
+        // one of the three that hands an operator a remediation playbook,
+        // was the one asserting.
         (
-            "runtime_error",
-            "An unexpected runtime error occurred inside the module.",
+            "unclassified",
+            "The failure text matched no known cause, so this analysis does NOT know what went wrong — and in particular has NOT established that the fault is in the module. Platform-side causes arrive here as text this classifier does not recognise: a host-policy denial (recorded only in the worker's own log), a rejected or unreadable job result, a breaker or budget refusal from an older worker. Read raw_error and the worker's own lines before changing the module.",
         )
     }
+}
+
+/// Everything [`build_failed_node_diagnosis`] needs, and nothing it can read
+/// from a database.
+#[derive(Debug, Clone, Copy)]
+pub struct NodeDiagnosis<'a> {
+    /// Rendered `execution_events.node_id`, or `None` for the workflow-level
+    /// entry (which reports `node_id: null`).
+    pub node_id: Option<&'a str>,
+    /// Display label for the report's `label` field.
+    pub label: &'a str,
+    /// Label interpolated into the remediation steps. Usually the same as
+    /// `label`; the workflow-level entry deliberately differs.
+    pub remediation_label: &'a str,
+    /// The raw failure text this diagnosis is about.
+    pub error_text: &'a str,
+    /// The engine-stamped failure class, when the dispatcher recorded one.
+    pub engine_error_class: Option<&'a str>,
+    /// Whether to surface the host-stamped `reason_class` token when present.
+    pub surface_reason_class: bool,
+}
+
+/// Build ONE `failed_nodes[]` entry. Pure — no repository, no clock, no I/O.
+///
+/// # Why this is a function and not four lines inside the loop
+///
+/// It was four lines inside the loop, and that made the CALL SITE
+/// untestable: every test in this crate drove `classify_error` and
+/// `remediation_steps` directly, so a mutation that classified correctly and
+/// then wrote a hard-coded `("runtime_error", "An unexpected runtime error
+/// occurred inside the module.")` into the report — i.e. the exact defect
+/// this change exists to remove, fully restored — was MEASURED to leave every
+/// test in this crate green. That is the silent direction: green tests over a
+/// report that misdiagnoses every failure.
+///
+/// Extracting it puts the whole classification-to-report mapping in one pure
+/// function that a test can drive and read the FIELDS of. `analyze` keeps only
+/// what genuinely needs the database (the fuel-history attachment).
+///
+/// The remaining, stated limit: a mutation inside `analyze` that ignored this
+/// function's return value entirely would still survive, because proving that
+/// needs a repository. This shrinks the untested surface; it does not close it.
+#[must_use]
+pub fn build_failed_node_diagnosis(input: NodeDiagnosis<'_>) -> serde_json::Value {
+    let NodeDiagnosis {
+        node_id,
+        label,
+        remediation_label,
+        error_text,
+        engine_error_class,
+        surface_reason_class,
+    } = input;
+
+    let (error_type, description) = classify_error(error_text);
+    let steps = remediation_steps(error_type, remediation_label);
+
+    // Surface the engine-stamped failure class alongside our string-regex
+    // classification. They answer different questions:
+    //   - `engine_error_class` ("non-transient", "transient", classifier
+    //     tags like "not_found") tells callers WHY retries were / weren't
+    //     attempted — authoritative, populated by the NATS dispatcher.
+    //   - `error_type` (ours, regex-based) classifies into user-actionable
+    //     buckets (missing_secret / rate_limit / wasm_trap / etc.) with
+    //     matching remediation_steps.
+    // Both being present lets agents pick whichever signal they need.
+    let mut failed_node = serde_json::json!({
+        "node_id": node_id,
+        "label": label,
+        "error_type": error_type,
+        "error_description": description,
+        "raw_error": error_text,
+        "remediation_steps": steps,
+    });
+    if let Some(ec) = engine_error_class {
+        if let Some(obj) = failed_node.as_object_mut() {
+            obj.insert("engine_error_class".to_string(), serde_json::json!(ec));
+        }
+    }
+
+    // The exact host-stamped token, when the worker put one on this
+    // message. `error_type` is the REMEDIATION bucket and deliberately
+    // merges causes that share a fix (`no-allowlist` and
+    // `allowed-hosts` are one bucket); this field is the precise
+    // cause, so an operator or agent that wants to distinguish them
+    // does not have to re-parse `raw_error`. Present only when a
+    // marker is present, exactly like `engine_error_class` — never a
+    // fabricated "unknown".
+    if surface_reason_class {
+        if let Some(tok) =
+            talos_reason_class::token(&truncate_for_classify(error_text).to_lowercase())
+        {
+            if let Some(obj) = failed_node.as_object_mut() {
+                obj.insert("reason_class".to_string(), serde_json::json!(tok));
+            }
+        }
+    }
+
+    failed_node
 }
 
 /// Remediation-step playbook per error bucket. Strings preserved
@@ -625,7 +782,7 @@ pub fn remediation_steps(error_type: &str, module_label: &str) -> Vec<serde_json
             serde_json::json!({ "step": 1, "action": "inspect_worker_logs", "description": format!("Read the WORKER's own log lines for node '{}' with tail_worker_logs. This is the fall-through bucket, so the error text matched no specific gate — and a host-policy denial is exactly that case: `[host:<policy>] <capability> denied by policy '<policy>' (target: ...)` is written by the worker at WARN, lands in module_execution_logs, and is NOT in the engine event stream this analysis classified. The module's own downstream error (an 'invalidurl', a bare HTTP failure) is what you were shown; the control that actually fired is only here.", module_label), "tool": "tail_worker_logs" }),
             serde_json::json!({ "step": 2, "action": "inspect_logs", "description": format!("Review the engine's node-state event stream for node '{}' in get_execution_logs — node_input carries the resolved config the node actually ran with.", module_label), "tool": "get_execution_logs" }),
             serde_json::json!({ "step": 3, "action": "trace", "description": "Use get_execution_status(detail: true) for a full data-flow view of what succeeded before the failure.", "tool": "get_execution_status" }),
-            serde_json::json!({ "step": 4, "action": "test_sandbox", "description": "Reproduce in isolation using run_sandbox with the same input data.", "tool": "run_sandbox" }),
+            serde_json::json!({ "step": 4, "action": "test_sandbox", "description": "ONLY IF steps 1-3 point at the module: reproduce in isolation using run_sandbox with the same input data. This bucket means the cause is UNKNOWN — it is NOT a finding that the module is at fault. A circuit-breaker fast-fail, a cancelled execution, a rejected signed result and a host-policy denial all arrive here as text this classifier does not recognise, and reproducing a module that is fine will only show that it is fine.", "tool": "run_sandbox" }),
         ],
     }
 }
@@ -822,47 +979,19 @@ impl FailureAnalysisService {
                 .as_deref()
                 .unwrap_or("(no error message recorded)");
 
-            let (error_type, description) = classify_error(error_text);
-            let steps = remediation_steps(error_type, &label);
-
-            // Surface the engine-stamped failure class alongside our string-regex
-            // classification. They answer different questions:
-            //   - `engine_error_class` ("non-transient", "transient", classifier
-            //     tags like "not_found") tells callers WHY retries were / weren't
-            //     attempted — authoritative, populated by the NATS dispatcher.
-            //   - `error_type` (ours, regex-based) classifies into user-actionable
-            //     buckets (missing_secret / rate_limit / wasm_trap / etc.) with
-            //     matching remediation_steps.
-            // Both being present lets agents pick whichever signal they need.
-            let mut failed_node = serde_json::json!({
-                "node_id": node_id_str,
-                "label": label,
-                "error_type": error_type,
-                "error_description": description,
-                "raw_error": error_text,
-                "remediation_steps": steps,
+            let mut failed_node = build_failed_node_diagnosis(NodeDiagnosis {
+                node_id: Some(node_id_str.as_str()),
+                label: &label,
+                remediation_label: &label,
+                error_text,
+                engine_error_class: ev.error_class.as_deref(),
+                surface_reason_class: true,
             });
-            if let Some(ref ec) = ev.error_class {
-                if let Some(obj) = failed_node.as_object_mut() {
-                    obj.insert("engine_error_class".to_string(), serde_json::json!(ec));
-                }
-            }
-
-            // The exact host-stamped token, when the worker put one on this
-            // message. `error_type` is the REMEDIATION bucket and deliberately
-            // merges causes that share a fix (`no-allowlist` and
-            // `allowed-hosts` are one bucket); this field is the precise
-            // cause, so an operator or agent that wants to distinguish them
-            // does not have to re-parse `raw_error`. Present only when a
-            // marker is present, exactly like `engine_error_class` — never a
-            // fabricated "unknown".
-            if let Some(tok) =
-                talos_reason_class::token(&truncate_for_classify(error_text).to_lowercase())
-            {
-                if let Some(obj) = failed_node.as_object_mut() {
-                    obj.insert("reason_class".to_string(), serde_json::json!(tok));
-                }
-            }
+            let error_type = failed_node
+                .get("error_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
 
             // Fuel-exhaustion advisor (2026-07-18 retrospective): the
             // generic playbook explains the fuel FORMULA but never told
@@ -910,15 +1039,19 @@ impl FailureAnalysisService {
             let error_text = global_error
                 .as_deref()
                 .unwrap_or("(no error details available)");
-            let (error_type, description) = classify_error(error_text);
-            let steps = remediation_steps(error_type, "workflow");
-            failed_nodes.push(serde_json::json!({
-                "node_id": null,
-                "label": "workflow-level",
-                "error_type": error_type,
-                "error_description": description,
-                "raw_error": error_text,
-                "remediation_steps": steps,
+            failed_nodes.push(build_failed_node_diagnosis(NodeDiagnosis {
+                node_id: None,
+                label: "workflow-level",
+                // The pre-extraction handler passed "workflow" here while
+                // labelling the entry "workflow-level"; the two differ and the
+                // difference is preserved verbatim.
+                remediation_label: "workflow",
+                error_text,
+                engine_error_class: None,
+                // Preserved: the workflow-level entry has never carried a
+                // `reason_class` field. Surfacing one here would be an
+                // additive shape change, and this change is not about that.
+                surface_reason_class: false,
             }));
         }
 
@@ -1233,6 +1366,263 @@ mod tests {
         );
     }
 
+    // ── The fall-through must not assert a cause ────────────────────────────
+
+    /// The exact `execution_events.log_message` of a live failure, and the
+    /// answer it used to get.
+    ///
+    /// Observed 2026-09-04. Nothing was wrong with the module: this is the
+    /// platform's own per-host circuit breaker deliberately refusing to call
+    /// an upstream that had been failing, which is correct protective
+    /// behaviour and self-healed within the hour. The report named
+    /// `runtime_error` / "An unexpected runtime error occurred inside the
+    /// module" and prescribed a four-step investigation INTO the module,
+    /// ending at `run_sandbox`.
+    ///
+    /// The string carries no `[reason_class=…]` marker — asserted below,
+    /// because that absence is the whole reason the marked form was already
+    /// handled and this one was not.
+    #[test]
+    fn the_observed_circuit_breaker_trip_is_not_blamed_on_the_module() {
+        const OBSERVED: &str = "Job failed (retry_condition not met): execution failure: \
+circuit open for host gmail.googleapis.com: cooling down after repeated failures — \
+skipping retries until the host recovers";
+
+        assert!(
+            !OBSERVED.contains(talos_reason_class::MARKER_KEY),
+            "the observed message now carries a marker — if the worker started \
+             stamping the retry-gate fast-fail, the hoisted marker arm handles it \
+             and this unmarked arm is redundant"
+        );
+
+        let (bucket, description) = classify_error(OBSERVED);
+        assert_eq!(bucket, "circuit_open");
+        assert!(
+            !description.contains("inside the module"),
+            "the platform's own protective refusal is reported as a module fault: \
+             {description}"
+        );
+        assert!(
+            description.contains("Nothing is misconfigured"),
+            "the description must say the module is not at fault: {description}"
+        );
+
+        // And the playbook must not send the operator to reproduce a module
+        // that is fine.
+        let steps = remediation_steps(bucket, "gmail_work");
+        let first_tool = steps
+            .first()
+            .and_then(|s| s.get("tool"))
+            .and_then(|t| t.as_str());
+        assert_eq!(first_tool, Some("tail_worker_logs"));
+    }
+
+    /// The MARKED and UNMARKED spellings of ONE refusal must give ONE answer.
+    ///
+    /// The breaker fires on two paths. Inside the host HTTP function it
+    /// produces a guest `networkerror` with `[reason_class=circuit-open]`
+    /// appended; in the retry gate
+    /// (`talos_worker_runtime::runtime::circuit_open_message`) it produces
+    /// plain prose with no marker. Both are the same refusal for the same
+    /// reason and deserve the same playbook — the marked one got it and the
+    /// unmarked one got `runtime_error`.
+    #[test]
+    fn both_spellings_of_the_breaker_refusal_agree() {
+        let marked = "Job failed after 3 attempts: execution failure: Component returned \
+error: list fetch: Error { code: 2, name: \"networkerror\", message: \"\" } \
+[reason_class=circuit-open]";
+        let unmarked = "Job failed after 1 attempts: execution failure: circuit open for \
+host www.googleapis.com: cooling down after repeated failures — skipping retries until \
+the host recovers";
+        assert_eq!(
+            classify_error(marked),
+            classify_error(unmarked),
+            "the same refusal answers differently depending on which breaker path fired"
+        );
+    }
+
+    /// The breaker hoist has to sit ABOVE the prose chain, not below it.
+    ///
+    /// The fast-fail message can carry the last underlying error, and that
+    /// tail contains transient tokens the chain matches first — so a call
+    /// that was never attempted would be reported as a live network failure
+    /// or a timeout, with a playbook that says to retry. This is the same
+    /// reason `talos_retry_intelligence::classify_error` hoists its own
+    /// circuit-open arm above everything.
+    #[test]
+    fn the_breaker_hoist_beats_a_transient_tail() {
+        for tail in [
+            "circuit open for host api.example.com (last error: connection refused)",
+            "circuit open for host api.example.com (last error: request timed out)",
+        ] {
+            assert_eq!(
+                classify_error(tail).0,
+                "circuit_open",
+                "a transient token in the fast-fail's tail outranked the refusal itself"
+            );
+        }
+    }
+
+    /// AN UNRECOGNISED MESSAGE MUST NOT CLAIM TO KNOW WHAT HAPPENED.
+    ///
+    /// This is the durable half of the fix and the reason coverage alone was
+    /// not enough: a pattern cascade always has a fall-through, so whatever
+    /// the next unrecognised cause turns out to be, it lands here. The old
+    /// answer stated a determinate cause AND a location — "An unexpected
+    /// runtime error occurred inside the module" — for input the classifier
+    /// had explicitly failed to match, while the remediation prose for the
+    /// same bucket already said "the error text matched no specific gate"
+    /// and the tool description already said to treat it as "unexplained".
+    /// The two machine-readable fields were the last ones still asserting.
+    #[test]
+    fn the_fall_through_makes_no_claim_about_where_the_fault_is() {
+        let (bucket, description) = classify_error("something nobody has ever seen before");
+        assert_eq!(bucket, "unclassified");
+        assert!(
+            !description.contains("An unexpected runtime error occurred inside the module"),
+            "the fall-through still asserts a cause and a location: {description}"
+        );
+        assert!(
+            description.contains("does NOT know what went wrong"),
+            "the fall-through must say the cause is unknown: {description}"
+        );
+        assert!(
+            description.contains("NOT established that the fault is in the module"),
+            "the fall-through must decline to locate the fault: {description}"
+        );
+    }
+
+    /// The fall-through PLAYBOOK must not prescribe reproducing the module.
+    ///
+    /// `run_sandbox` is not wrong to offer — it is wrong to offer
+    /// unconditionally, because the bucket's own meaning is that nobody knows
+    /// whether the module is involved. Of the 20 `node_failed` events that
+    /// reached this arm on the deployed stack in the 30 days to 2026-09-04,
+    /// 19 were platform-side and reproducing the module would have shown it
+    /// working.
+    #[test]
+    fn the_fall_through_playbook_does_not_prescribe_reproducing_the_module() {
+        let steps = remediation_steps("unclassified", "some_node");
+        let sandbox = steps
+            .iter()
+            .find(|s| s.get("tool").and_then(|t| t.as_str()) == Some("run_sandbox"))
+            .expect("the fall-through playbook still offers run_sandbox");
+        let text = sandbox
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or_default();
+        assert!(
+            text.contains("ONLY IF"),
+            "the fall-through prescribes reproducing the module unconditionally: {text}"
+        );
+        assert!(
+            text.contains("NOT a finding that the module is at fault"),
+            "the fall-through's sandbox step must state that the bucket is not a \
+             diagnosis: {text}"
+        );
+    }
+
+    /// The bucket NAME is part of the claim, not just its description.
+    ///
+    /// `error_type` is the machine-readable field an agent branches on, and
+    /// `runtime_error` names a determinate cause ("a runtime error") in the
+    /// same breath as the description named a location. Fixing only the prose
+    /// would have left the field an agent reads still asserting while the
+    /// field a human reads told the truth — the same split, one level down.
+    #[test]
+    fn the_fall_through_bucket_name_names_no_cause() {
+        let (bucket, _) = classify_error("something nobody has ever seen before");
+        for asserted in ["runtime", "module", "error"] {
+            assert!(
+                !bucket.contains(asserted),
+                "the fall-through bucket name `{bucket}` still names a cause"
+            );
+        }
+    }
+
+    /// THE REPORT FIELD, not just the classifier's return value.
+    ///
+    /// Drives the production builder that `analyze` calls for every failed
+    /// node and reads what the operator actually receives. Written because a
+    /// call-site mutation — classify correctly, then write a hard-coded
+    /// `("runtime_error", "An unexpected runtime error occurred inside the
+    /// module.")` into the report — was MEASURED to leave every other test in
+    /// this crate green, which is the whole defect restored under a green
+    /// suite.
+    #[test]
+    fn the_report_field_an_operator_reads_does_not_blame_the_module() {
+        const OBSERVED: &str = "Job failed (retry_condition not met): execution failure: \
+circuit open for host gmail.googleapis.com: cooling down after repeated failures — \
+skipping retries until the host recovers";
+
+        let node = build_failed_node_diagnosis(NodeDiagnosis {
+            node_id: Some("11111111-1111-1111-1111-111111111111"),
+            label: "gmail_work",
+            remediation_label: "gmail_work",
+            error_text: OBSERVED,
+            engine_error_class: Some("non-transient"),
+            surface_reason_class: true,
+        });
+
+        assert_eq!(
+            node.get("error_type").and_then(|v| v.as_str()),
+            Some("circuit_open")
+        );
+        let desc = node
+            .get("error_description")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            !desc.contains("inside the module"),
+            "the report blames the module for the platform's own refusal: {desc}"
+        );
+        // Preserved fields the report has always carried.
+        assert_eq!(
+            node.get("label").and_then(|v| v.as_str()),
+            Some("gmail_work")
+        );
+        assert_eq!(
+            node.get("raw_error").and_then(|v| v.as_str()),
+            Some(OBSERVED)
+        );
+        assert_eq!(
+            node.get("engine_error_class").and_then(|v| v.as_str()),
+            Some("non-transient")
+        );
+        // No marker on this message, so no fabricated `reason_class`.
+        assert!(node.get("reason_class").is_none());
+    }
+
+    /// The workflow-level entry keeps its pre-extraction shape exactly.
+    ///
+    /// Two details are easy to lose in a refactor and both are load-bearing:
+    /// the entry labels itself `workflow-level` but interpolates `workflow`
+    /// into its remediation steps, and it has never carried a `reason_class`
+    /// field even when the global error text has a marker.
+    #[test]
+    fn the_workflow_level_entry_keeps_its_shape() {
+        let node = build_failed_node_diagnosis(NodeDiagnosis {
+            node_id: None,
+            label: "workflow-level",
+            remediation_label: "workflow",
+            error_text: "Scheduled workflow failed: something odd [reason_class=dns]",
+            engine_error_class: None,
+            surface_reason_class: false,
+        });
+        assert!(node.get("node_id").is_some_and(serde_json::Value::is_null));
+        assert_eq!(
+            node.get("label").and_then(|v| v.as_str()),
+            Some("workflow-level")
+        );
+        assert!(node.get("reason_class").is_none());
+        assert!(node.get("engine_error_class").is_none());
+        let steps = serde_json::to_string(node.get("remediation_steps").unwrap()).unwrap();
+        assert!(
+            steps.contains("'workflow'"),
+            "the workflow-level entry stopped interpolating `workflow`: {steps}"
+        );
+    }
+
     // ── classify_error buckets ──────────────────────────────────────────────
 
     /// A HOST-POLICY DENIAL IS INVISIBLE TO `classify_error`, AND THAT IS WHY
@@ -1261,7 +1651,7 @@ Component returned error: HTTP request failed: Error { code: 0, name: \"invalidu
 
         let (bucket, _) = classify_error(OBSERVED);
         assert_eq!(
-            bucket, "runtime_error",
+            bucket, "unclassified",
             "the observed host-denial error now classifies as `{bucket}`; move the \
              tail_worker_logs remediation step into that bucket's arm"
         );
@@ -1289,7 +1679,7 @@ Component returned error: HTTP request failed: Error { code: 0, name: \"invalidu
     /// reads `execution_events` and structurally cannot contain the line.
     #[test]
     fn the_playbooks_for_a_policy_denial_name_the_tool_that_shows_it() {
-        for bucket in ["host_not_allowed", "runtime_error", "an_unmatched_bucket"] {
+        for bucket in ["host_not_allowed", "unclassified", "an_unmatched_bucket"] {
             let steps = remediation_steps(bucket, "some_node");
             let names_it = steps
                 .iter()
@@ -1340,7 +1730,7 @@ Component returned error: HTTP request failed: Error { code: 0, name: \"invalidu
         // the bucket would change which failures offer the auto-fix.
         assert_eq!(
             classify_error("Missing 'AUTH_HEADER' in config").0,
-            "runtime_error"
+            "unclassified"
         );
         assert_eq!(
             classify_error("missing field 'AUTH_HEADER'").0,
@@ -1355,7 +1745,7 @@ Component returned error: HTTP request failed: Error { code: 0, name: \"invalidu
             classify_error("postgres pool exhausted").0,
             "database_error"
         );
-        assert_eq!(classify_error("something inexplicable").0, "runtime_error");
+        assert_eq!(classify_error("something inexplicable").0, "unclassified");
     }
 
     #[test]
@@ -1366,7 +1756,7 @@ Component returned error: HTTP request failed: Error { code: 0, name: \"invalidu
         );
         assert_eq!(
             classify_error("something inexplicable").1,
-            "An unexpected runtime error occurred inside the module."
+            "The failure text matched no known cause, so this analysis does NOT know what went wrong — and in particular has NOT established that the fault is in the module. Platform-side causes arrive here as text this classifier does not recognise: a host-policy denial (recorded only in the worker's own log), a rejected or unreadable job result, a breaker or budget refusal from an older worker. Read raw_error and the worker's own lines before changing the module."
         );
         assert_eq!(
             classify_error("missing field 'X'").1,
@@ -1403,7 +1793,7 @@ Component returned error: HTTP request failed: Error { code: 0, name: \"invalidu
     fn classify_ignores_tokens_buried_past_cap() {
         let mut s = "x".repeat(5000);
         s.push_str("out of fuel");
-        assert_eq!(classify_error(&s).0, "runtime_error");
+        assert_eq!(classify_error(&s).0, "unclassified");
     }
 
     // ── extract_config_field ────────────────────────────────────────────────
@@ -1470,7 +1860,7 @@ Component returned error: HTTP request failed: Error { code: 0, name: \"invalidu
             "config_error",
             "auth_error",
             "database_error",
-            "runtime_error",
+            "unclassified",
         ] {
             let steps = remediation_steps(bucket, "my-node");
             assert!(!steps.is_empty(), "bucket {bucket} has no steps");
@@ -1599,21 +1989,21 @@ Component returned error: HTTP request failed: Error { code: 0, name: \"invalidu
     /// defects this change deliberately does not touch on the unmarked path:
     /// `forbidden-host` (the http-stream spelling) answers `http_403` — "the
     /// credential lacks the required scope" for what is actually a host
-    /// denial — and `connection-failed` answers `runtime_error` because the
+    /// denial — and `connection-failed` answers `unclassified` because the
     /// chain's needle is `connection failed` with a SPACE.
     #[test]
     fn unmarked_messages_classify_exactly_as_before() {
         let expected: &[(&str, &str)] = &[
             ("networkerror", "network_error"),
-            ("invalidurl", "runtime_error"),
+            ("invalidurl", "unclassified"),
             ("forbiddenhost", "host_not_allowed"),
             ("timeout", "timeout"),
-            ("queryerror", "runtime_error"),
-            ("sendfailed", "runtime_error"),
+            ("queryerror", "unclassified"),
+            ("sendfailed", "unclassified"),
             ("forbidden-host", "http_403"),
-            ("invalid-url", "runtime_error"),
-            ("connection-failed", "runtime_error"),
-            ("rate-limited", "runtime_error"),
+            ("invalid-url", "unclassified"),
+            ("connection-failed", "unclassified"),
+            ("rate-limited", "unclassified"),
         ];
         assert_eq!(expected.len(), WIT_NAMES.len());
         for (wit, bucket) in expected {
@@ -1724,7 +2114,7 @@ Component returned error: HTTP request failed: Error { code: 0, name: \"invalidu
             "{} [reason_class=from-the-future]",
             guest_error("invalidurl")
         );
-        assert_eq!(classify_error(&msg).0, "runtime_error");
+        assert_eq!(classify_error(&msg).0, "unclassified");
     }
 
     /// The 4 KiB cap and the marker's position interact, and the interaction
@@ -1744,7 +2134,7 @@ Component returned error: HTTP request failed: Error { code: 0, name: \"invalidu
         s.push_str(" [reason_class=insecure-scheme]");
         assert_eq!(
             classify_error(&s).0,
-            "runtime_error",
+            "unclassified",
             "an over-cap marker must be invisible, not half-read"
         );
         // Under the cap, the same message is explained.
@@ -1761,7 +2151,7 @@ Component returned error: HTTP request failed: Error { code: 0, name: \"invalidu
     /// the same `invalidurl` body as the pre-marker capture pinned by
     /// `a_host_policy_denial_reaches_the_classifier_only_as_its_downstream_error`
     /// above, plus the marker the worker now appends. That test asserts the
-    /// UNMARKED form still answers `runtime_error`; this one asserts the
+    /// UNMARKED form still answers `unclassified`; this one asserts the
     /// MARKED form no longer does — the two together are the whole change.
     #[test]
     fn the_observed_live_denial_is_now_explained() {

@@ -652,7 +652,7 @@ mod tests {
             "config_error",
             "auth_error",
             "database_error",
-            "runtime_error",
+            "unclassified",
             // Host-stamped `[reason_class=…]` denial buckets. Every tool these
             // name is checked to EXIST here — which is the guard that stops a
             // playbook prescribing a tool that was removed (six hints once
